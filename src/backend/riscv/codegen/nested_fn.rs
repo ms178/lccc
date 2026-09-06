@@ -50,7 +50,7 @@
 //! source-visible global-register assignments that an entry snapshot
 //! would erase (the same reasoning as the x86-64/AArch64 implementations).
 
-use super::emit::{callee_saved_name, RiscvCodegen};
+use super::emit::{RiscvCodegen, callee_saved_name};
 use crate::ir::reexports::{Operand, Value};
 
 impl RiscvCodegen {

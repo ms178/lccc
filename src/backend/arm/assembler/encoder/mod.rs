@@ -164,11 +164,7 @@ pub fn parse_reg_num(name: &str) -> Option<u32> {
             match prefix {
                 'x' | 'w' | 'd' | 's' | 'q' | 'v' | 'h' | 'b' => {
                     let num: u32 = name[1..].parse().ok()?;
-                    if num <= 31 {
-                        Some(num)
-                    } else {
-                        None
-                    }
+                    if num <= 31 { Some(num) } else { None }
                 }
                 _ => None,
             }
@@ -1214,9 +1210,5 @@ fn get_symbol(operands: &[Operand], idx: usize) -> Result<(String, i64), String>
 }
 
 fn sf_bit(is_64: bool) -> u32 {
-    if is_64 {
-        1
-    } else {
-        0
-    }
+    if is_64 { 1 } else { 0 }
 }

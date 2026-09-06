@@ -646,7 +646,12 @@ impl SemanticAnalyzer {
                 }
                 let is_incomplete = match elem_type {
                     CType::Struct(key) | CType::Union(key) => {
-                        !self.defined_structs.borrow().contains(&**key)
+                        // Keep the RefCell borrow in a named, completed scope.
+                        // Besides documenting the lock boundary, this retains
+                        // identical behavior across Rust 2021/2024 temporary
+                        // drop-order rules before diagnostics are mutated.
+                        let is_defined = self.defined_structs.borrow().contains(&**key);
+                        !is_defined
                     }
                     _ => false,
                 };
@@ -663,12 +668,13 @@ impl SemanticAnalyzer {
             // For _Alignas(N) or __attribute__((aligned(N))), use the parsed numeric value.
             let explicit_alignment = if let Some(ref alignas_ts) = decl.alignas_type {
                 let ct = self.type_spec_to_ctype(alignas_ts);
-                let a = ct.align_ctx(&*self.result.type_context.borrow_struct_layouts());
-                if a > 0 {
-                    Some(a)
-                } else {
-                    None
-                }
+                // Evaluate with a short, explicit layout borrow.  Rust 2024
+                // drops it before later diagnostic/symbol-table mutations.
+                let a = {
+                    let layouts = self.result.type_context.borrow_struct_layouts();
+                    ct.align_ctx(&*layouts)
+                };
+                if a > 0 { Some(a) } else { None }
             } else {
                 decl.alignment
             };
@@ -894,11 +900,7 @@ impl SemanticAnalyzer {
             Expr::CharLiteral(n, _) => Some(*n as usize),
             _ => {
                 let val = self.eval_const_expr(expr)?;
-                if val >= 0 {
-                    Some(val as usize)
-                } else {
-                    None
-                }
+                if val >= 0 { Some(val as usize) } else { None }
             }
         }
     }

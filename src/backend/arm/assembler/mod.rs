@@ -15,7 +15,7 @@ pub mod parser;
 
 use crate::common::fx_hash::FxHashMap;
 use elf_writer::ElfWriter;
-use parser::{parse_asm, AsmDirective, AsmStatement, DataValue, Operand};
+use parser::{AsmDirective, AsmStatement, DataValue, Operand, parse_asm};
 
 /// Assemble AArch64 assembly text into an ELF object file.
 ///

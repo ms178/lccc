@@ -27,7 +27,9 @@
  *
  * Trip counts stay inside each narrow type's domain (where the C program is
  * defined and terminating): 8-bit counters below 128/256, 16-bit below
- * 32768/65536.
+ * 32768/65536. The companion .env also enables loop rotation: this drives the
+ * classic Cmp fallback where a narrow RHS is staged through %rcx, which must
+ * use %cl/%cx rather than invalid mixed-width `cmpb/cmpw %rcx, ...` assembly.
  */
 #include <stdio.h>
 

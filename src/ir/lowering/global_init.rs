@@ -96,7 +96,7 @@ impl Lowerer {
         // Resolve _Generic selections: unwrap to the selected expression before
         // any other processing, so all downstream logic (const eval, string
         // literals, address expressions, etc.) sees the resolved expression.
-        if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
+        if let Expr::GenericSelection(controlling, associations, _) = expr {
             if let Some(selected) = self.resolve_generic_selection_expr(controlling, associations) {
                 return self.lower_global_init_expr(
                     selected,
@@ -148,7 +148,7 @@ impl Lowerer {
 
         // &(compound_literal) at file scope
         if let Expr::AddressOf(inner, _) = expr {
-            if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref() {
+            if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
                 return self.create_compound_literal_global(cl_type_spec, cl_init);
             }
         }
@@ -158,13 +158,12 @@ impl Lowerer {
         {
             let stripped = Self::strip_casts(expr);
             if !std::ptr::eq(expr as *const _, stripped as *const _) {
-                if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = stripped {
+                if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = stripped {
                     return self.create_compound_literal_global(cl_type_spec, cl_init);
                 }
                 // (void*) &(CompoundLiteral) – cast wrapping address-of compound literal
                 if let Expr::AddressOf(inner, _) = stripped {
-                    if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref()
-                    {
+                    if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
                         return self.create_compound_literal_global(cl_type_spec, cl_init);
                     }
                 }
@@ -172,7 +171,7 @@ impl Lowerer {
         }
 
         // Compound literal used directly as initializer value
-        if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = expr {
+        if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = expr {
             return self.lower_compound_literal_init(cl_type_spec, cl_init, base_ty, is_array);
         }
 
@@ -215,7 +214,7 @@ impl Lowerer {
     /// anonymous global before the pointer arithmetic can be resolved.
     fn materialize_compound_literals_in_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::CompoundLiteral(ref type_spec, ref init, _) => {
+            Expr::CompoundLiteral(type_spec, init, _) => {
                 let key = expr as *const Expr as usize;
                 if !self.materialized_compound_literals.contains_key(&key) {
                     // Materialize this compound literal as an anonymous global
@@ -259,7 +258,7 @@ impl Lowerer {
     fn try_address_of_compound_literal(&mut self, expr: &Expr) -> Option<GlobalInit> {
         let stripped = Self::strip_casts(expr);
         if let Expr::AddressOf(inner, _) = stripped {
-            if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref() {
+            if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
                 return Some(self.create_compound_literal_global(cl_type_spec, cl_init));
             }
         }
@@ -275,8 +274,8 @@ impl Lowerer {
     /// `1.5F128` literal or a `_Float128`-typed constant).
     fn const_to_f128_bits(val: &IrConst) -> Option<u128> {
         use crate::common::long_double::{
-            f64_to_f128_bytes_lossless, i128_to_f128_bytes, i64_to_f128_bytes, u128_to_f128_bytes,
-            u64_to_f128_bytes,
+            f64_to_f128_bytes_lossless, i64_to_f128_bytes, i128_to_f128_bytes, u64_to_f128_bytes,
+            u128_to_f128_bytes,
         };
         let le = |b: [u8; 16]| u128::from_le_bytes(b);
         Some(match val {
@@ -491,7 +490,7 @@ impl Lowerer {
         }
 
         // Struct/union initializer list
-        if let Some(ref layout) = struct_layout {
+        if let Some(layout) = struct_layout {
             return self.lower_struct_global_init(items, layout);
         }
 
@@ -608,7 +607,7 @@ impl Lowerer {
         );
 
         // Struct array (byte-serialized or compound for pointer fields)
-        if let Some(ref layout) = struct_layout {
+        if let Some(layout) = struct_layout {
             return self.lower_struct_array_init(
                 items,
                 layout,
@@ -725,18 +724,17 @@ impl Lowerer {
         let has_addr_exprs = items.iter().any(|item| {
             if let Initializer::Expr(expr) = &item.init {
                 // Resolve _Generic to its selected expression for detection
-                let expr =
-                    if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
-                        if let Some(selected) =
-                            self.resolve_generic_selection_expr(controlling, associations)
-                        {
-                            selected
-                        } else {
-                            expr
-                        }
+                let expr = if let Expr::GenericSelection(controlling, associations, _) = expr {
+                    if let Some(selected) =
+                        self.resolve_generic_selection_expr(controlling, associations)
+                    {
+                        selected
                     } else {
                         expr
-                    };
+                    }
+                } else {
+                    expr
+                };
                 if matches!(expr, Expr::StringLiteral(_, _)) {
                     return !is_multidim_char_array;
                 }
@@ -793,7 +791,7 @@ impl Lowerer {
                 .designators
                 .iter()
                 .filter_map(|d| {
-                    if let Designator::Index(ref idx_expr) = d {
+                    if let Designator::Index(idx_expr) = d {
                         self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
                     } else {
                         None
@@ -838,7 +836,7 @@ impl Lowerer {
                                 .designators
                                 .iter()
                                 .filter_map(|d| {
-                                    if let Designator::Index(ref idx_expr) = d {
+                                    if let Designator::Index(idx_expr) = d {
                                         self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
                                     } else {
                                         None
@@ -965,7 +963,7 @@ impl Lowerer {
         }
         let mut current_idx = 0usize;
         for item in items {
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
                     current_idx = idx;
                 }
@@ -1058,7 +1056,7 @@ impl Lowerer {
     ) {
         // Unwrap casts to find the inner compound literal
         let inner = Self::strip_casts(expr);
-        if let Expr::CompoundLiteral(_ts, ref cl_init, _) = inner {
+        if let Expr::CompoundLiteral(_ts, cl_init, _) = inner {
             if let Initializer::List(sub_items) = cl_init.as_ref() {
                 self.collect_vector_scalars_from_items(
                     sub_items,
@@ -1132,7 +1130,7 @@ impl Lowerer {
             let mut values = vec![zero_val; num_elems];
             let mut current_idx = 0usize;
             for item in items {
-                if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                     if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
                         current_idx = idx;
                     }
@@ -1300,7 +1298,7 @@ impl Lowerer {
 
         let is_array = matches!(type_spec, TypeSpecifier::Array(_, _));
         let (elem_size, base_ty, computed_alloc_size) =
-            if let TypeSpecifier::Array(ref elem_ts, _) = type_spec {
+            if let TypeSpecifier::Array(elem_ts, _) = type_spec {
                 let elem_ir_ty = self.type_spec_to_ir(elem_ts);
                 let e_size = self.sizeof_type(elem_ts);
                 let num_elems = if let Initializer::List(items) = init {
@@ -1404,7 +1402,7 @@ impl Lowerer {
             None => return 0,
         };
         let (elem_ty, last_field_idx) = match &last_field.ty {
-            CType::Array(ref elem_ty, None) => (elem_ty, layout.fields.len() - 1),
+            CType::Array(elem_ty, None) => (elem_ty, layout.fields.len() - 1),
             _ => return 0,
         };
         let elem_size = self.resolve_ctype_size(elem_ty);
@@ -1654,7 +1652,7 @@ impl Lowerer {
                         return true;
                     }
                 }
-                if let Expr::CompoundLiteral(_, ref cl_init, _) = expr {
+                if let Expr::CompoundLiteral(_, cl_init, _) = expr {
                     return self.init_has_addr_exprs(cl_init);
                 }
                 self.eval_const_expr(expr).is_none() && self.eval_global_addr_expr(expr).is_some()
@@ -1742,7 +1740,7 @@ impl Lowerer {
                 .designators
                 .iter()
                 .filter_map(|d| {
-                    if let Designator::Index(ref idx_expr) = d {
+                    if let Designator::Index(idx_expr) = d {
                         self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
                     } else {
                         None
@@ -1789,7 +1787,7 @@ impl Lowerer {
     ) {
         let mut current_idx = 0usize;
         for item in items {
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
                     current_idx = idx;
                 }
@@ -2032,18 +2030,17 @@ impl Lowerer {
             Initializer::Expr(expr) => {
                 // Resolve _Generic selections to their selected expression
                 // before any other processing.
-                let expr =
-                    if let Expr::GenericSelection(ref controlling, ref associations, _) = expr {
-                        if let Some(selected) =
-                            self.resolve_generic_selection_expr(controlling, associations)
-                        {
-                            selected
-                        } else {
-                            expr
-                        }
+                let expr = if let Expr::GenericSelection(controlling, associations, _) = expr {
+                    if let Some(selected) =
+                        self.resolve_generic_selection_expr(controlling, associations)
+                    {
+                        selected
                     } else {
                         expr
-                    };
+                    }
+                } else {
+                    expr
+                };
                 if let Expr::StringLiteral(s, _) = expr {
                     let label = self.intern_string_literal(s);
                     elements.push(GlobalInit::GlobalAddr(label));

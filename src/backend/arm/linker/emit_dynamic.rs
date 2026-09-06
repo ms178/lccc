@@ -8,7 +8,7 @@ use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::reloc;
-use super::types::{GlobalSymbol, BASE_ADDR, INTERP, PAGE_SIZE};
+use super::types::{BASE_ADDR, GlobalSymbol, INTERP, PAGE_SIZE};
 use crate::backend::linker_common;
 use linker_common::{DynStrTab, OutputSection};
 

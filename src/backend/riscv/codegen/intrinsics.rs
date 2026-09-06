@@ -554,12 +554,12 @@ impl RiscvCodegen {
         // Actually simplest approach: process byte by byte using a loop-like unroll
         // For correctness, use a helper that processes 8 bytes of XOR result
         self.emit_rv_zero_byte_mask("t1", "t3"); // t3 = mask where equal bytes -> 0xFF
-                                                 // Do the same for high 8 bytes
+        // Do the same for high 8 bytes
         self.state.emit("    ld t1, 8(a6)");
         self.state.emit("    ld t2, 8(a7)");
         self.state.emit("    xor t1, t1, t2");
         self.emit_rv_zero_byte_mask("t1", "t4"); // t4 = mask for high bytes
-                                                 // Store results
+        // Store results
         self.state.emit("    sd t3, 0(a5)");
         self.state.emit("    sd t4, 8(a5)");
     }
@@ -636,7 +636,7 @@ impl RiscvCodegen {
         self.state.emit("    not t3, t3"); // -1 if equal, 0 if not -> 0xFFFFFFFF or 0
         self.state.emit("    slli t3, t3, 32");
         self.state.emit("    srli t3, t3, 32"); // mask to 32 bits
-                                                // Compare high dword (bits 32-63)
+        // Compare high dword (bits 32-63)
         self.state.emit("    srli t5, t1, 32");
         self.state.emit("    srli t6, t2, 32");
         self.state.emit("    sub t5, t5, t6");
@@ -691,11 +691,11 @@ impl RiscvCodegen {
         self.state.emit("    ld t1, 0(a6)"); // a_lo
         self.state.emit("    ld t2, 0(a7)"); // b_lo
         self.emit_rv_psubusb_8bytes("t1", "t2", "t3"); // t3 = saturate(a_lo - b_lo)
-                                                       // Process high 8 bytes
+        // Process high 8 bytes
         self.state.emit("    ld t1, 8(a6)"); // a_hi
         self.state.emit("    ld t2, 8(a7)"); // b_hi
         self.emit_rv_psubusb_8bytes("t1", "t2", "t4"); // t4 = saturate(a_hi - b_hi)
-                                                       // Store results
+        // Store results
         self.state.emit("    sd t3, 0(a5)");
         self.state.emit("    sd t4, 8(a5)");
     }
@@ -759,11 +759,11 @@ impl RiscvCodegen {
         self.state.emit("    ld t1, 0(a6)"); // a_lo
         self.state.emit("    ld t2, 0(a7)"); // b_lo
         self.emit_rv_psubsb_8bytes("t1", "t2", "t3"); // t3 = signed_saturate(a_lo - b_lo)
-                                                      // Process high 8 bytes
+        // Process high 8 bytes
         self.state.emit("    ld t1, 8(a6)"); // a_hi
         self.state.emit("    ld t2, 8(a7)"); // b_hi
         self.emit_rv_psubsb_8bytes("t1", "t2", "t4"); // t4 = signed_saturate(a_hi - b_hi)
-                                                      // Store results
+        // Store results
         self.state.emit("    sd t3, 0(a5)");
         self.state.emit("    sd t4, 8(a5)");
     }
@@ -788,7 +788,7 @@ impl RiscvCodegen {
                 ));
             }
             self.state.emit("    srai t5, t5, 56"); // sign-extend byte to 64-bit
-                                                    // Extract byte i from b into t6 (as signed)
+            // Extract byte i from b into t6 (as signed)
             if shift == 0 {
                 self.state
                     .emit_fmt(format_args!("    slli t6, {b}, 56", b = b_reg));
@@ -800,7 +800,7 @@ impl RiscvCodegen {
                 ));
             }
             self.state.emit("    srai t6, t6, 56"); // sign-extend byte to 64-bit
-                                                    // Compute difference in t5
+            // Compute difference in t5
             self.state.emit("    sub t5, t5, t6");
             // Clamp to [-128, 127]
             let no_clamp_hi = self.state.fresh_label("psubsb_noclamp_hi");
@@ -835,13 +835,13 @@ impl RiscvCodegen {
         self.operand_to_t0(&args[0]);
         self.state.emit("    ld t1, 0(t0)"); // low 8 bytes
         self.state.emit("    ld t2, 8(t0)"); // high 8 bytes
-                                             // Extract bit 7 of each byte and collect into a mask.
-                                             // For low 8 bytes (t1) -> bits 0-7 of result
-                                             // For high 8 bytes (t2) -> bits 8-15 of result
-                                             // Method: AND with 0x8080808080808080, then compress.
-                                             // After AND, each byte is either 0x80 or 0x00.
-                                             // Multiply by magic constant to pack bits together:
-                                             //   0x0002040810204081 will shift each 0x80 bit to accumulate in the high byte
+        // Extract bit 7 of each byte and collect into a mask.
+        // For low 8 bytes (t1) -> bits 0-7 of result
+        // For high 8 bytes (t2) -> bits 8-15 of result
+        // Method: AND with 0x8080808080808080, then compress.
+        // After AND, each byte is either 0x80 or 0x00.
+        // Multiply by magic constant to pack bits together:
+        //   0x0002040810204081 will shift each 0x80 bit to accumulate in the high byte
         self.state.emit("    li t3, 0x8080808080808080");
         self.state.emit("    and t1, t1, t3");
         self.state.emit("    and t2, t2, t3");
@@ -852,7 +852,7 @@ impl RiscvCodegen {
         self.state.emit("    srli t1, t1, 56"); // extract byte 7 = low 8-bit mask
         self.state.emit("    mul t2, t2, t3");
         self.state.emit("    srli t2, t2, 56"); // high 8-bit mask
-                                                // Combine
+        // Combine
         self.state.emit("    slli t2, t2, 8");
         self.state.emit("    or t0, t1, t2");
         // Store scalar result

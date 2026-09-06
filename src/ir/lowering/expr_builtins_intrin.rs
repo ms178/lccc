@@ -5,7 +5,7 @@
 //! l/ll suffix variants).
 
 use super::lower::Lowerer;
-use crate::common::types::{target_int_ir_type, IrType};
+use crate::common::types::{IrType, target_int_ir_type};
 use crate::frontend::parser::ast::Expr;
 use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand};
 

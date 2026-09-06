@@ -302,7 +302,7 @@ impl Lowerer {
     fn compound_literal_size(&self, type_spec: &TypeSpecifier, init: &Initializer) -> usize {
         let ctype = self.type_spec_to_ctype(type_spec);
         match (&ctype, init) {
-            (CType::Array(ref elem_ct, None), Initializer::List(items)) => {
+            (CType::Array(elem_ct, None), Initializer::List(items)) => {
                 let elem_size = elem_ct
                     .size_ctx(&*self.types.borrow_struct_layouts())
                     .max(1);
@@ -310,9 +310,9 @@ impl Lowerer {
                 // the array size is the string length + 1 (null terminator)
                 if elem_size == 1 && items.len() == 1 {
                     if let Initializer::Expr(ref expr) = items[0].init {
-                        if let Expr::StringLiteral(ref s, _)
-                        | Expr::WideStringLiteral(ref s, _)
-                        | Expr::Char16StringLiteral(ref s, _) = expr
+                        if let Expr::StringLiteral(s, _)
+                        | Expr::WideStringLiteral(s, _)
+                        | Expr::Char16StringLiteral(s, _) = expr
                         {
                             if matches!(expr, Expr::StringLiteral(_, _)) {
                                 s.chars().count() + 1
@@ -413,7 +413,7 @@ impl Lowerer {
 
         let mut current_idx = 0usize;
         for item in items {
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
                     current_idx = idx_val;
                 }
@@ -851,7 +851,7 @@ impl Lowerer {
                     matches!(ctype, CType::Array(_, _))
                 };
                 if is_char_array {
-                    if let Expr::StringLiteral(ref s, _) = expr {
+                    if let Expr::StringLiteral(s, _) = expr {
                         self.emit_string_to_alloca(alloca, s, 0, size);
                     } else {
                         let val = self.lower_expr(expr);
@@ -1049,7 +1049,7 @@ impl Lowerer {
         // direct function pointers (no-op deref) from pointer-to-function-pointers
         // (which need a real load despite having similar CType shapes).
         let pointee_is_no_load = |ct: &CType| -> bool {
-            if let CType::Pointer(ref pointee, _) = ct {
+            if let CType::Pointer(pointee, _) = ct {
                 matches!(
                     pointee.as_ref(),
                     CType::Array(_, _) | CType::Struct(_) | CType::Union(_) | CType::Vector(_, _)
@@ -1432,9 +1432,12 @@ impl Lowerer {
             semantic_volatile: false,
         });
         let op = match (src_is_float, dst_is_float) {
-            (false, true) => IntrinsicOp::CvtEp32ToPs128,   // cvtdq2ps
-            (true, false) => IntrinsicOp::CvttPs2Ep32_128,  // cvttps2dq (truncate)
-            other => panic!("__builtin_convertvector: unsupported lane conversion {:?} (only int<->float 32-bit lanes)", other),
+            (false, true) => IntrinsicOp::CvtEp32ToPs128, // cvtdq2ps
+            (true, false) => IntrinsicOp::CvttPs2Ep32_128, // cvttps2dq (truncate)
+            other => panic!(
+                "__builtin_convertvector: unsupported lane conversion {:?} (only int<->float 32-bit lanes)",
+                other
+            ),
         };
         let dest_val = self.fresh_value();
         self.emit(Instruction::Intrinsic {

@@ -13,7 +13,7 @@ use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerIte
 /// Returns `None` if the item has no designators or the first is not a Field.
 pub(super) fn first_field_designator(item: &InitializerItem) -> Option<&str> {
     match item.designators.first() {
-        Some(Designator::Field(ref name)) => Some(name.as_str()),
+        Some(Designator::Field(name)) => Some(name.as_str()),
         _ => None,
     }
 }

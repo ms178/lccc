@@ -95,7 +95,7 @@ fn parse_decimal_field(raw: &[u8]) -> Result<usize, String> {
                 return Err(format!(
                     "archive header decimal field '{}' overflows usize",
                     String::from_utf8_lossy(digits)
-                ))
+                ));
             }
         };
     }
@@ -580,11 +580,7 @@ pub fn parse_linker_script(content: &str) -> Option<Vec<String>> {
             LinkerScriptEntry::Lib(_) => None,
         })
         .collect();
-    if paths.is_empty() {
-        None
-    } else {
-        Some(paths)
-    }
+    if paths.is_empty() { None } else { Some(paths) }
 }
 
 /// Parse a GNU linker script, returning all entries including `-l` references.
@@ -1131,7 +1127,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(MAGIC_REGULAR);
         data.extend_from_slice(&member_header(b"lost.o/", 999)); // no payload
-                                                                 // Declared overrun → member skipped, no error, iteration terminates.
+        // Declared overrun → member skipped, no error, iteration terminates.
         assert!(parse_archive_members(&data).unwrap().is_empty());
     }
 

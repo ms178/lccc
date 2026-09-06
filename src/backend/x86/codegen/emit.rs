@@ -4,7 +4,6 @@ use crate::backend::cast::FloatOp;
 use crate::backend::common::PtrDirective;
 use crate::backend::inline_asm::emit_inline_asm_common;
 use crate::backend::regalloc::{PhysReg, RaConfig};
-use std::sync::Arc;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::{
     ArchCodegen, MAX_JUMP_TABLE_RANGE, MIN_JUMP_TABLE_CASES, MIN_JUMP_TABLE_DENSITY_PERCENT,
@@ -17,6 +16,7 @@ use crate::ir::reexports::{
     AtomicOrdering, AtomicRmwOp, BlockId, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction,
     IrUnaryOp, Operand, Value,
 };
+use std::sync::Arc;
 
 /// x86-64 callee-saved registers available for register allocation.
 /// System V AMD64 ABI callee-saved: rbx, r12, r13, r14, r15.
@@ -249,6 +249,25 @@ pub(super) fn cmp_width_info(ty: IrType) -> (&'static str, &'static str, &'stati
         IrType::I16 | IrType::U16 => ("cmpw", "testw", "ax"),
         IrType::I32 | IrType::U32 => ("cmpl", "testl", "eax"),
         _ => ("cmpq", "testq", "rax"),
+    }
+}
+
+/// Return the `%rcx` sub-register matching an integer comparison width.
+///
+/// The classic comparison emitter stages non-register operands through the
+/// full `%rcx` scratch register.  The staging move intentionally remains a
+/// full-width move — it preserves the low byte/word of every source — but the
+/// subsequent `cmp` must name the corresponding sub-register.  Using `%rcx`
+/// with `cmpb`/`cmpw` is rejected by GAS and is not repaired by text
+/// peepholes.  Keep this mapping adjacent to `cmp_width_info` so every
+/// scratch-backed comparison uses the same width contract as `%rax`.
+#[inline]
+pub(super) fn cmp_secondary_reg(ty: IrType) -> &'static str {
+    match ty {
+        IrType::I8 | IrType::U8 => "cl",
+        IrType::I16 | IrType::U16 => "cx",
+        IrType::I32 | IrType::U32 => "ecx",
+        _ => "rcx",
     }
 }
 
@@ -1255,7 +1274,7 @@ impl X86Codegen {
                 self.operand_to_rcx(rhs);
             }
         }
-        let rreg = if use_32bit { "ecx" } else { "rcx" };
+        let rreg = cmp_secondary_reg(ty);
         self.state
             .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, acc_reg));
     }
@@ -1329,7 +1348,7 @@ impl X86Codegen {
                 }
             }
             self.operand_to_rcx(rhs);
-            let rcx = if use_32bit { "ecx" } else { "rcx" };
+            let rcx = cmp_secondary_reg(ty);
             self.state
                 .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, lhs_name));
         } else if let Some(rhs_r) = rhs_phys {
@@ -1354,7 +1373,7 @@ impl X86Codegen {
                 }
             }
             self.operand_to_rcx(rhs);
-            let rcx = if use_32bit { "ecx" } else { "rcx" };
+            let rcx = cmp_secondary_reg(ty);
             self.state
                 .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, acc_reg));
         }
@@ -3016,7 +3035,7 @@ impl X86Codegen {
     pub(super) fn emit_x86_atomic_op_loop(&mut self, ty: IrType, op: &str) {
         // Save val to rdi (using rdi instead of r8 to free r8 for register allocation)
         self.state.emit("    movq %rax, %rdi"); // rdi = val
-                                                // Load old value
+        // Load old value
         let load_instr = Self::mov_load_for_type(ty);
         let load_dest = Self::load_dest_reg(ty);
         self.state
@@ -4421,7 +4440,7 @@ impl X86Codegen {
         info: &crate::ir::reexports::CallInfo,
         folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
     ) -> bool {
-        use super::isel::{build_typed_call, build_typed_call_ex, TypedCallSrc};
+        use super::isel::{TypedCallSrc, build_typed_call, build_typed_call_ex};
         use super::machinst::{CallArgMove, CallTarget, MachInst, MachOperand, MachReg, OpSize};
 
         let _ = folded_global_addrs; // subset needs no fold-map interaction
@@ -5704,7 +5723,10 @@ impl ArchCodegen for X86Codegen {
         // (4) A vreg that survives all three stages still trips the
         //     unresolvable gate and replays the window through the default
         //     path: the fail-safe, now the exception instead of the cliff.
-        let reg_classified = super::machinst_alloc::classify_window(&self.machinst_buf);
+        let reg_classified = super::machinst_alloc::classify_window(
+            &self.machinst_buf,
+            Some(&self.state.small_slot_values),
+        );
         let resolved: Vec<MachInst> = self
             .machinst_buf
             .iter()
@@ -6709,5 +6731,17 @@ mod machinst_resolution_tests {
             size: OpSize::S64,
         };
         assert!(!has_unresolvable_vreg(&inst, &FxHashMap::default()));
+    }
+
+    #[test]
+    fn cmp_secondary_register_tracks_comparison_width() {
+        assert_eq!(cmp_secondary_reg(IrType::I8), "cl");
+        assert_eq!(cmp_secondary_reg(IrType::U8), "cl");
+        assert_eq!(cmp_secondary_reg(IrType::I16), "cx");
+        assert_eq!(cmp_secondary_reg(IrType::U16), "cx");
+        assert_eq!(cmp_secondary_reg(IrType::I32), "ecx");
+        assert_eq!(cmp_secondary_reg(IrType::U32), "ecx");
+        assert_eq!(cmp_secondary_reg(IrType::I64), "rcx");
+        assert_eq!(cmp_secondary_reg(IrType::U64), "rcx");
     }
 }

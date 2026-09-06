@@ -3,6 +3,12 @@
 Rotate-ON vs GCC -O2 on the 19-name PF-17 A/B: **19 MATCH / 0 FAIL**.
 Rotation stays opt-in. Snapshot after this note.
 
+> **2026-09-06 update.** The then-pending full opt-in corpus has since passed
+> at 666 pass / 0 fail / 13 skip-compare / 679 total after Guard F (reject
+> un-cloned header work) and the narrow `%rcx` compare-width repair. Rotation
+> remains opt-in pending broader fuzz/performance evidence. See
+> `engineering/FOLLOWUP-2026-09-06-pf17-header-effects-narrow-cmp.md`.
+
 ## Fixes landed this session
 
 | File | What |

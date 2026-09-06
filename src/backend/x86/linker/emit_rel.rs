@@ -23,11 +23,11 @@ use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use crate::backend::elf::{
-    read_u32, w16, w32, w64, ELFCLASS64, ELFDATA2LSB, ELF_MAGIC, EM_X86_64, ET_REL, SHN_ABS,
-    SHN_COMMON, SHN_UNDEF, SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL, SHT_RELA,
-    SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_SECTION,
+    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, EM_X86_64, ET_REL, SHN_ABS, SHN_COMMON, SHN_UNDEF,
+    SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
+    STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_SECTION, read_u32, w16, w32, w64,
 };
-use crate::backend::linker_common::{write_elf64_shdr, Elf64Object};
+use crate::backend::linker_common::{Elf64Object, write_elf64_shdr};
 
 /// One merged output section under construction.
 struct RelOutSec {
@@ -59,7 +59,7 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
             if flags & 1 == 0 {
                 continue;
             } // not GRP_COMDAT
-              // Signature symbol: symtab entry sec.info
+            // Signature symbol: symtab entry sec.info
             let sig_idx = sec.info as usize;
             let sig = obj
                 .symbols

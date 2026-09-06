@@ -292,7 +292,7 @@ pub(crate) fn substitute_x86_asm_operands(
 
                 let mut found = false;
                 for (idx, op_name) in op_names.iter().enumerate() {
-                    if let Some(ref n) = op_name {
+                    if let Some(n) = op_name {
                         if n == &name {
                             emit_operand(
                                 &mut result,

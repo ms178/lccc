@@ -8,7 +8,7 @@
 //! - Helpers: maybe_narrow_call_result, is_function_variadic, get_func_ptr_return_ir_type
 
 use super::lower::Lowerer;
-use crate::common::types::{target_int_ir_type, AddressSpace, CType, IrType};
+use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type};
 use crate::frontend::parser::ast::Expr;
 use crate::ir::reexports::{CallInfo, Instruction, IrBinOp, IrConst, Operand, Terminator, Value};
 

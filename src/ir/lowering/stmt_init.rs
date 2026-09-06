@@ -873,7 +873,7 @@ impl Lowerer {
                 .and_then(|l| l.struct_layout.clone())
         };
 
-        if let Some(ref cplx_ctype) = complex_elem_ctype {
+        if let Some(cplx_ctype) = complex_elem_ctype {
             // Array of complex elements (handles both 1D and multi-dimensional)
             self.lower_array_of_complex_init(items, alloca, da, cplx_ctype);
         } else if da.is_array_of_pointers || da.is_array_of_func_ptrs {
@@ -969,7 +969,7 @@ impl Lowerer {
             let item = &items[item_idx];
 
             // Handle designators for index positioning
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
                     *flat_idx = idx_val * elems_per_slot;
                 }
@@ -977,7 +977,7 @@ impl Lowerer {
 
             let base_byte_offset = *flat_idx * struct_size;
             let field_designator_name = item.designators.iter().find_map(|d| {
-                if let Designator::Field(ref name) = d {
+                if let Designator::Field(name) = d {
                     Some(name.clone())
                 } else {
                     None
@@ -1262,7 +1262,7 @@ impl Lowerer {
         for item in items.iter() {
             let start_index = *flat_idx;
 
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
                     if dim_strides.len() > 1 {
                         // Designator at outer dimension: set flat index to start of that row
@@ -1340,7 +1340,7 @@ impl Lowerer {
 
         let mut current_idx = 0usize;
         for item in items.iter() {
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
                     current_idx = idx_val;
                 }

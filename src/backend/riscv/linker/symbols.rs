@@ -6,8 +6,8 @@
 
 use super::elf_read::*;
 use super::relocations::{
-    got_sym_key, GlobalSym, MergedSection, R_RISCV_GOT_HI20, R_RISCV_TLS_GD_HI20,
-    R_RISCV_TLS_GOT_HI20,
+    GlobalSym, MergedSection, R_RISCV_GOT_HI20, R_RISCV_TLS_GD_HI20, R_RISCV_TLS_GOT_HI20,
+    got_sym_key,
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 

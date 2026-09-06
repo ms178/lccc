@@ -82,7 +82,7 @@ impl RiscvCodegen {
             }
             RvConstraintKind::Immediate => {
                 // Check for immediate symbol first (e.g., string literal, function/variable name)
-                if let Some(Some(ref sym)) = op_imm_symbols.get(idx) {
+                if let Some(Some(sym)) = op_imm_symbols.get(idx) {
                     return sym.clone();
                 }
                 // Emit the immediate value directly
@@ -138,7 +138,7 @@ impl RiscvCodegen {
                         }
                         let mut found = false;
                         for (idx, op_name) in op_names.iter().enumerate() {
-                            if let Some(ref n) = op_name {
+                            if let Some(n) = op_name {
                                 if n == &name {
                                     // Check if operand is zero
                                     if let Some(imm) = op_imm_values[idx] {
@@ -224,7 +224,7 @@ impl RiscvCodegen {
 
                     let mut found = false;
                     for (idx, op_name) in op_names.iter().enumerate() {
-                        if let Some(ref n) = op_name {
+                        if let Some(n) = op_name {
                             if n == &name {
                                 result.push_str(&Self::format_operand(
                                     idx,

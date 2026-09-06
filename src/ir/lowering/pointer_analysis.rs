@@ -5,7 +5,7 @@
 //! IR types (for correct loads/stores through pointer dereference and subscript).
 
 use super::lower::Lowerer;
-use crate::common::types::{target_ptr_size, AddressSpace, CType, IrType, RcLayout};
+use crate::common::types::{AddressSpace, CType, IrType, RcLayout, target_ptr_size};
 use crate::frontend::parser::ast::{BinOp, DerivedDeclarator, Expr, TypeSpecifier, UnaryOp};
 
 impl Lowerer {
@@ -149,7 +149,7 @@ impl Lowerer {
                 }
                 false
             }
-            Expr::Cast(ref type_spec, _, _) => {
+            Expr::Cast(type_spec, _, _) => {
                 match type_spec {
                     TypeSpecifier::Pointer(_, _) => true,
                     // Resolve typedef names to check if the resolved type is a pointer
@@ -368,8 +368,8 @@ impl Lowerer {
                 // struct/union types (since they map to IrType::Ptr in the IR).
                 self.sizeof_expr(inner).max(1)
             }
-            Expr::Cast(ref type_spec, _, _) => {
-                if let TypeSpecifier::Pointer(ref inner, _) = type_spec {
+            Expr::Cast(type_spec, _, _) => {
+                if let TypeSpecifier::Pointer(inner, _) = type_spec {
                     self.sizeof_type(inner)
                 } else {
                     // Resolve typedef names (e.g., typedef struct Foo *FooPtr)
@@ -388,7 +388,7 @@ impl Lowerer {
                     match &ctype {
                         CType::Array(elem_ty, _) => return self.resolve_ctype_size(elem_ty).max(1),
                         CType::Pointer(pointee_ty, _) => {
-                            return self.resolve_ctype_size(pointee_ty).max(1)
+                            return self.resolve_ctype_size(pointee_ty).max(1);
                         }
                         _ => {}
                     }
@@ -433,8 +433,8 @@ impl Lowerer {
                 }
                 self.get_pointee_type_of_expr(rhs)
             }
-            Expr::Cast(ref type_spec, inner, _) => {
-                if let TypeSpecifier::Pointer(ref pointee_ts, _) = type_spec {
+            Expr::Cast(type_spec, inner, _) => {
+                if let TypeSpecifier::Pointer(pointee_ts, _) = type_spec {
                     let pt = self.type_spec_to_ir(pointee_ts);
                     return Some(pt);
                 }

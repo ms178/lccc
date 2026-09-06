@@ -1277,8 +1277,8 @@ pub(super) fn emit_shared_library(
     if so_got_plt_size > 0 {
         let gp = so_got_plt_offset as usize;
         w64(&mut out, gp, dynamic_addr_so); // GOT[0] = _DYNAMIC
-                                            // GOT[1] and GOT[2] are filled by the dynamic linker
-                                            // GOT[3..] are PLT GOT entries: initialized to PLT[0] (resolved eagerly via DF_BIND_NOW)
+        // GOT[1] and GOT[2] are filled by the dynamic linker
+        // GOT[3..] are PLT GOT entries: initialized to PLT[0] (resolved eagerly via DF_BIND_NOW)
         for i in 0..so_plt_names.len() {
             w64(&mut out, gp + 24 + i * 8, so_plt_addr);
         }

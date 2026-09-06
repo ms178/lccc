@@ -1512,11 +1512,7 @@ pub(super) fn register_overlaps(a: &str, b: &str) -> bool {
 /// Get the register family (0-15) for an x86 register name.
 pub(super) fn register_family(reg: &str) -> Option<u8> {
     let id = register_family_fast(reg);
-    if id == REG_NONE {
-        None
-    } else {
-        Some(id)
-    }
+    if id == REG_NONE { None } else { Some(id) }
 }
 
 /// Fast register family lookup using byte-level dispatch.

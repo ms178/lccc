@@ -10,7 +10,7 @@
 //! without storing the result.
 
 use super::lower::Lowerer;
-use crate::common::types::{target_int_ir_type, target_is_32bit, AddressSpace, CType, IrType};
+use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type, target_is_32bit};
 use crate::frontend::parser::ast::Expr;
 use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, Operand, Value};
 

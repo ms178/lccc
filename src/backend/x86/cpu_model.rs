@@ -653,11 +653,7 @@ impl X86Cpu {
             out.line_bytes = line as u8;
             any = true;
         }
-        if any {
-            out
-        } else {
-            base
-        }
+        if any { out } else { base }
     }
 
     /// Decode an Intel/AMD family/model signature.  Split out from CPUID so

@@ -14,10 +14,10 @@
 use std::sync::OnceLock;
 
 use crate::backend::liveness::{
-    for_each_operand_in_instruction, for_each_operand_in_terminator,
-    for_each_value_use_in_instruction, LivenessResult,
+    LivenessResult, for_each_operand_in_instruction, for_each_operand_in_terminator,
+    for_each_value_use_in_instruction,
 };
-use crate::backend::regalloc::{detect_phi_coalesce_groups, PhysReg};
+use crate::backend::regalloc::{PhysReg, detect_phi_coalesce_groups};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
@@ -1534,315 +1534,6 @@ fn is_sole_operand_of_terminator(term: &Terminator, value_id: u32) -> bool {
     saw && !extra
 }
 
-#[cfg(test)]
-mod cfg_copy_coalesce_tests {
-    use super::*;
-    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
-
-    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
-        BasicBlock {
-            label: BlockId(label),
-            instructions,
-            source_spans: Vec::new(),
-            terminator,
-        }
-    }
-
-    fn scalar_def(dest: u32, value: i32) -> Instruction {
-        Instruction::BinOp {
-            dest: Value(dest),
-            op: IrBinOp::Add,
-            lhs: Operand::Const(IrConst::I32(value)),
-            rhs: Operand::Const(IrConst::I32(0)),
-            ty: IrType::I32,
-        }
-    }
-
-    #[test]
-    fn cfg_copy_coalesces_a_straight_line_copy() {
-        let mut func = IrFunction::new("straight".to_string(), IrType::I32, vec![], false);
-        func.blocks.push(block(
-            0,
-            vec![
-                scalar_def(0, 7),
-                Instruction::Copy {
-                    dest: Value(1),
-                    src: Operand::Value(Value(0)),
-                },
-            ],
-            Terminator::Return(Some(Operand::Value(Value(1)))),
-        ));
-        let (aliases, force) =
-            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
-        assert_eq!(aliases.get(&1), Some(&0));
-        assert!(force.contains(&1));
-    }
-
-    #[test]
-    fn cfg_copy_rejects_a_phi_edge_source_live_on_another_path() {
-        let mut func = IrFunction::new("diamond".to_string(), IrType::I32, vec![], false);
-        func.blocks = vec![
-            block(
-                0,
-                vec![scalar_def(0, 11)],
-                Terminator::CondBranch {
-                    cond: Operand::Const(IrConst::I32(1)),
-                    true_label: BlockId(1),
-                    false_label: BlockId(2),
-                },
-            ),
-            block(
-                1,
-                vec![Instruction::Copy {
-                    dest: Value(2),
-                    src: Operand::Value(Value(0)),
-                }],
-                Terminator::Branch(BlockId(3)),
-            ),
-            block(
-                2,
-                vec![
-                    scalar_def(1, 22),
-                    Instruction::Copy {
-                        dest: Value(2),
-                        src: Operand::Value(Value(1)),
-                    },
-                ],
-                Terminator::Branch(BlockId(3)),
-            ),
-            block(
-                3,
-                vec![Instruction::BinOp {
-                    dest: Value(3),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Value(Value(0)),
-                    rhs: Operand::Value(Value(2)),
-                    ty: IrType::I32,
-                }],
-                Terminator::Return(Some(Operand::Value(Value(3)))),
-            ),
-        ];
-        let mut multi_def = FxHashSet::default();
-        multi_def.insert(2);
-        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
-        assert_ne!(aliases.get(&0), Some(&2));
-        assert_ne!(aliases.get(&2), Some(&0));
-        assert_eq!(aliases.get(&1), Some(&2));
-    }
-
-    #[test]
-    fn cfg_copy_coalesces_loop_carried_phi_sources() {
-        let mut func = IrFunction::new("loop_phi".to_string(), IrType::I32, vec![], false);
-        func.blocks = vec![
-            block(
-                0,
-                vec![
-                    scalar_def(0, 3),
-                    Instruction::Copy {
-                        dest: Value(2),
-                        src: Operand::Value(Value(0)),
-                    },
-                ],
-                Terminator::Branch(BlockId(1)),
-            ),
-            block(
-                1,
-                vec![Instruction::BinOp {
-                    dest: Value(1),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Value(Value(2)),
-                    rhs: Operand::Const(IrConst::I32(1)),
-                    ty: IrType::I32,
-                }],
-                Terminator::CondBranch {
-                    cond: Operand::Const(IrConst::I32(1)),
-                    true_label: BlockId(2),
-                    false_label: BlockId(3),
-                },
-            ),
-            block(
-                2,
-                vec![Instruction::Copy {
-                    dest: Value(2),
-                    src: Operand::Value(Value(1)),
-                }],
-                Terminator::Branch(BlockId(1)),
-            ),
-            block(
-                3,
-                vec![],
-                Terminator::Return(Some(Operand::Value(Value(2)))),
-            ),
-        ];
-        let mut multi_def = FxHashSet::default();
-        multi_def.insert(2);
-        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
-        assert_eq!(aliases.get(&0), Some(&2));
-        assert_ne!(aliases.get(&1), Some(&2));
-    }
-
-    #[test]
-    fn cfg_copy_excludes_i128_from_scalar_slot_aliasing() {
-        let mut func = IrFunction::new("wide".to_string(), IrType::I32, vec![], false);
-        func.blocks.push(block(
-            0,
-            vec![
-                Instruction::BinOp {
-                    dest: Value(0),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Const(IrConst::I128(1)),
-                    rhs: Operand::Const(IrConst::I128(2)),
-                    ty: IrType::I128,
-                },
-                Instruction::Copy {
-                    dest: Value(1),
-                    src: Operand::Value(Value(0)),
-                },
-            ],
-            Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
-        ));
-        let (aliases, _) =
-            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
-        assert!(aliases.is_empty());
-    }
-
-    #[test]
-    fn cfg_copy_refuses_self_copy() {
-        let mut func = IrFunction::new("self".to_string(), IrType::I32, vec![], false);
-        func.blocks.push(block(
-            0,
-            vec![
-                scalar_def(0, 1),
-                Instruction::Copy {
-                    dest: Value(0),
-                    src: Operand::Value(Value(0)),
-                },
-            ],
-            Terminator::Return(Some(Operand::Value(Value(0)))),
-        ));
-        let (aliases, _) =
-            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
-        assert!(aliases.is_empty());
-    }
-
-    #[test]
-    fn immediately_consumed_picks_adjacent_cast() {
-        let mut func = IrFunction::new("adj".to_string(), IrType::I32, vec![], false);
-        func.blocks.push(block(
-            0,
-            vec![
-                scalar_def(0, 9),
-                Instruction::Cast {
-                    dest: Value(1),
-                    src: Operand::Value(Value(0)),
-                    from_ty: IrType::I32,
-                    to_ty: IrType::I64,
-                },
-            ],
-            Terminator::Return(Some(Operand::Value(Value(1)))),
-        ));
-        let skip = compute_immediately_consumed(&func, false);
-        assert!(skip.contains(&0));
-        assert!(!skip.contains(&1));
-    }
-
-    #[test]
-    fn immediately_consumed_rejects_two_uses() {
-        let mut func = IrFunction::new("two".to_string(), IrType::I32, vec![], false);
-        func.blocks.push(block(
-            0,
-            vec![
-                scalar_def(0, 9),
-                Instruction::Cast {
-                    dest: Value(1),
-                    src: Operand::Value(Value(0)),
-                    from_ty: IrType::I32,
-                    to_ty: IrType::I64,
-                },
-                Instruction::UnaryOp {
-                    dest: Value(2),
-                    op: crate::ir::reexports::IrUnaryOp::Neg,
-                    src: Operand::Value(Value(0)),
-                    ty: IrType::I32,
-                },
-            ],
-            Terminator::Return(Some(Operand::Value(Value(1)))),
-        ));
-        let skip = compute_immediately_consumed(&func, false);
-        assert!(!skip.contains(&0));
-    }
-
-    #[test]
-    fn immediately_consumed_rejects_float_producer() {
-        let mut func = IrFunction::new("fp".to_string(), IrType::F64, vec![], false);
-        func.blocks.push(block(
-            0,
-            vec![
-                Instruction::BinOp {
-                    dest: Value(0),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Const(IrConst::I64(0)),
-                    rhs: Operand::Const(IrConst::I64(0)),
-                    ty: IrType::F64,
-                },
-                Instruction::Copy {
-                    dest: Value(1),
-                    src: Operand::Value(Value(0)),
-                },
-            ],
-            Terminator::Return(Some(Operand::Value(Value(1)))),
-        ));
-        let skip = compute_immediately_consumed(&func, false);
-        assert!(!skip.contains(&0));
-    }
-
-    #[test]
-    fn immediately_consumed_binop_const_rhs_on_x86() {
-        let mut func = IrFunction::new("imm".to_string(), IrType::I32, vec![], false);
-        func.blocks.push(block(
-            0,
-            vec![
-                scalar_def(0, 1),
-                Instruction::BinOp {
-                    dest: Value(1),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Value(Value(0)),
-                    rhs: Operand::Const(IrConst::I32(1)),
-                    ty: IrType::I32,
-                },
-            ],
-            Terminator::Return(Some(Operand::Value(Value(1)))),
-        ));
-        let skip = compute_immediately_consumed(&func, false);
-        assert!(skip.contains(&0));
-    }
-
-    #[test]
-    fn immediately_consumed_copy_rename_chain() {
-        let mut func = IrFunction::new("rename".to_string(), IrType::I32, vec![], false);
-        func.blocks.push(block(
-            0,
-            vec![
-                scalar_def(0, 4),
-                Instruction::Copy {
-                    dest: Value(1),
-                    src: Operand::Value(Value(0)),
-                },
-                Instruction::Cast {
-                    dest: Value(2),
-                    src: Operand::Value(Value(1)),
-                    from_ty: IrType::I32,
-                    to_ty: IrType::I64,
-                },
-            ],
-            Terminator::Return(Some(Operand::Value(Value(2)))),
-        ));
-        let skip = compute_immediately_consumed(&func, false);
-        assert!(skip.contains(&0), "src of dead copy should stay in acc");
-        assert!(skip.contains(&1), "copy dest consumed by cast");
-    }
-}
-
 pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
@@ -2652,4 +2343,313 @@ pub(super) fn compute_vector_defer_values(
     }
 
     result
+}
+
+#[cfg(test)]
+mod cfg_copy_coalesce_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            source_spans: Vec::new(),
+            terminator,
+        }
+    }
+
+    fn scalar_def(dest: u32, value: i32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Const(IrConst::I32(value)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        }
+    }
+
+    #[test]
+    fn cfg_copy_coalesces_a_straight_line_copy() {
+        let mut func = IrFunction::new("straight".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 7),
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let (aliases, force) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
+        assert_eq!(aliases.get(&1), Some(&0));
+        assert!(force.contains(&1));
+    }
+
+    #[test]
+    fn cfg_copy_rejects_a_phi_edge_source_live_on_another_path() {
+        let mut func = IrFunction::new("diamond".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![scalar_def(0, 11)],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(0)),
+                }],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                2,
+                vec![
+                    scalar_def(1, 22),
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(1)),
+                    },
+                ],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                3,
+                vec![Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(2)),
+                    ty: IrType::I32,
+                }],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+        ];
+        let mut multi_def = FxHashSet::default();
+        multi_def.insert(2);
+        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
+        assert_ne!(aliases.get(&0), Some(&2));
+        assert_ne!(aliases.get(&2), Some(&0));
+        assert_eq!(aliases.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn cfg_copy_coalesces_loop_carried_phi_sources() {
+        let mut func = IrFunction::new("loop_phi".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    scalar_def(0, 3),
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(0)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ),
+        ];
+        let mut multi_def = FxHashSet::default();
+        multi_def.insert(2);
+        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
+        assert_eq!(aliases.get(&0), Some(&2));
+        assert_ne!(aliases.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn cfg_copy_excludes_i128_from_scalar_slot_aliasing() {
+        let mut func = IrFunction::new("wide".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I128(1)),
+                    rhs: Operand::Const(IrConst::I128(2)),
+                    ty: IrType::I128,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        ));
+        let (aliases, _) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn cfg_copy_refuses_self_copy() {
+        let mut func = IrFunction::new("self".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 1),
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(0)))),
+        ));
+        let (aliases, _) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn immediately_consumed_picks_adjacent_cast() {
+        let mut func = IrFunction::new("adj".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 9),
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(skip.contains(&0));
+        assert!(!skip.contains(&1));
+    }
+
+    #[test]
+    fn immediately_consumed_rejects_two_uses() {
+        let mut func = IrFunction::new("two".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 9),
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(2),
+                    op: crate::ir::reexports::IrUnaryOp::Neg,
+                    src: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(!skip.contains(&0));
+    }
+
+    #[test]
+    fn immediately_consumed_rejects_float_producer() {
+        let mut func = IrFunction::new("fp".to_string(), IrType::F64, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I64(0)),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::F64,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(!skip.contains(&0));
+    }
+
+    #[test]
+    fn immediately_consumed_binop_const_rhs_on_x86() {
+        let mut func = IrFunction::new("imm".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 1),
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(skip.contains(&0));
+    }
+
+    #[test]
+    fn immediately_consumed_copy_rename_chain() {
+        let mut func = IrFunction::new("rename".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 4),
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(skip.contains(&0), "src of dead copy should stay in acc");
+        assert!(skip.contains(&1), "copy dest consumed by cast");
+    }
 }

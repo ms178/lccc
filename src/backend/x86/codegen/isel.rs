@@ -1206,8 +1206,8 @@ fn try_lower_shiftx(
 }
 
 pub mod stats {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     pub static LOWERED: AtomicU64 = AtomicU64::new(0);
     pub static REJECTED: AtomicU64 = AtomicU64::new(0);

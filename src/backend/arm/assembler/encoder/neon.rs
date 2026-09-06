@@ -150,7 +150,7 @@ pub(crate) fn encode_neon_three_diff(
             return Err(format!(
                 "unsupported source arrangement for three-diff: {}",
                 arr_n
-            ))
+            ));
         }
     };
 
@@ -199,7 +199,7 @@ pub(crate) fn encode_neon_sqshrun(
             return Err(format!(
                 "sqshrun: unsupported source arrangement: {}",
                 arr_n
-            ))
+            ));
         }
     };
 
@@ -254,7 +254,7 @@ pub(crate) fn encode_neon_xtl(
             return Err(format!(
                 "uxtl/sxtl: unsupported source arrangement: {}",
                 arr_n
-            ))
+            ));
         }
     };
 
@@ -323,7 +323,7 @@ pub(crate) fn encode_neon_two_misc_narrow(
             return Err(format!(
                 "unsupported source arrangement for narrow: {}",
                 arr_n
-            ))
+            ));
         }
     };
 
@@ -374,7 +374,7 @@ pub(crate) fn encode_neon_elem_long(
             return Err(format!(
                 "expected register lane operand, got {:?}",
                 operands[2]
-            ))
+            ));
         }
     };
 
@@ -388,7 +388,7 @@ pub(crate) fn encode_neon_elem_long(
             return Err(format!(
                 "unsupported source arrangement for elem-long: {}",
                 arr_n
-            ))
+            ));
         }
     };
     let q = if is_high { 1 } else { q };
@@ -882,7 +882,10 @@ pub(crate) fn encode_neon_movi(operands: &[Operand]) -> Result<EncodeResult, Str
                 if byte_val == 0xFF {
                     imm8 |= 1 << i;
                 } else if byte_val != 0 {
-                    return Err(format!("movi .2d: each byte of immediate must be 0x00 or 0xFF, got 0x{:02x} at byte {}", byte_val, i));
+                    return Err(format!(
+                        "movi .2d: each byte of immediate must be 0x00 or 0xFF, got 0x{:02x} at byte {}",
+                        byte_val, i
+                    ));
                 }
             }
             let abc = (imm8 >> 5) & 0x7;
@@ -1304,7 +1307,7 @@ pub(crate) fn encode_neon_ld_st_single(
             return Err(format!(
                 "unsupported element size for ld/st single: {}",
                 elem_size
-            ))
+            ));
         }
     };
 
@@ -1362,7 +1365,7 @@ pub(crate) fn encode_neon_ld_st_multi(
                     return Err(format!(
                         "ld{}/st{}: expected RegArrangement in list",
                         num_structs, num_structs
-                    ))
+                    ));
                 }
             };
             validate_consecutive_reglist(regs, first_reg)?;
@@ -1372,7 +1375,7 @@ pub(crate) fn encode_neon_ld_st_multi(
             return Err(format!(
                 "ld{}/st{}: expected register list",
                 num_structs, num_structs
-            ))
+            ));
         }
     };
 
@@ -1394,7 +1397,7 @@ pub(crate) fn encode_neon_ld_st_multi(
             return Err(format!(
                 "ld{}/st{}: expected [Xn] memory operand",
                 num_structs, num_structs
-            ))
+            ));
         }
     };
 
@@ -1841,7 +1844,7 @@ pub(crate) fn encode_neon_float_three_same(
             return Err(format!(
                 "float three-same: unsupported arrangement: {}",
                 arr_d
-            ))
+            ));
         }
     };
     let size = (size_hi << 1) | sz;
@@ -1908,7 +1911,7 @@ pub(crate) fn encode_neon_pairwise_long(
             return Err(format!(
                 "unsupported source arrangement for pairwise long: {}",
                 arr_n
-            ))
+            ));
         }
     };
     let word = (q << 30)
@@ -1943,7 +1946,7 @@ pub(crate) fn encode_neon_float_two_misc(
             return Err(format!(
                 "float two-misc: unsupported arrangement: {}",
                 arr_d
-            ))
+            ));
         }
     };
     let size = (size_hi << 1) | sz;
@@ -2184,7 +2187,7 @@ pub(crate) fn encode_neon_ldnr(
             return Err(format!(
                 "ld{}r: unsupported arrangement: {}",
                 num_structs, arr
-            ))
+            ));
         }
     };
     // opcode: ld1r=110, ld2r=110(S=1), ld3r=111, ld4r=111(S=1)
@@ -2517,7 +2520,7 @@ pub(crate) fn encode_neon_shift_left_imm(
             return Err(format!(
                 "shift left imm: unsupported arrangement: {}",
                 arr_d
-            ))
+            ));
         }
     };
 

@@ -5,7 +5,7 @@
 //! executable and shared library linking.
 
 use super::elf_read::*;
-use super::relocations::{output_section_name, InputSecRef, MergedSection};
+use super::relocations::{InputSecRef, MergedSection, output_section_name};
 use crate::common::fx_hash::FxHashMap;
 
 /// Merge sections from all input objects into output sections.

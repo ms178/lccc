@@ -1,6 +1,6 @@
 //! ArmCodegen: return operations.
 
-use super::emit::{callee_saved_name, ArmCodegen};
+use super::emit::{ArmCodegen, callee_saved_name};
 use crate::backend::state::SlotAddr;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;

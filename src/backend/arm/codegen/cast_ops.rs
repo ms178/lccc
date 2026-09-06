@@ -1,9 +1,9 @@
 //! ArmCodegen: cast operations.
 
 use super::emit::{
-    arm_fp_name, callee_saved_name, callee_saved_name_32, is_arm_fp_phys, ArmCodegen,
+    ArmCodegen, arm_fp_name, callee_saved_name, callee_saved_name_32, is_arm_fp_phys,
 };
-use crate::backend::cast::{classify_cast, CastKind};
+use crate::backend::cast::{CastKind, classify_cast};
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::ir::reexports::{Operand, Value};

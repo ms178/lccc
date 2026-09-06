@@ -3499,7 +3499,7 @@ pub fn normalize_atomic_size_suffix(name: &str) -> Option<&'static str> {
 /// `size_t` / `ssize_t` are pointer-width, so the table is target-dependent and
 /// must be queried, not cached.
 pub fn libc_alias_param_types(libc_name: &str) -> Option<Vec<crate::common::types::IrType>> {
-    use crate::common::types::{target_ptr_size, IrType};
+    use crate::common::types::{IrType, target_ptr_size};
     // size_t: unsigned, pointer-width (LP64 -> U64, ILP32 -> U32).
     let size_t = if target_ptr_size() == 8 {
         IrType::U64
@@ -3536,7 +3536,7 @@ pub fn libc_alias_param_types(libc_name: &str) -> Option<Vec<crate::common::type
 #[cfg(test)]
 mod libc_alias_param_type_tests {
     use super::libc_alias_param_types;
-    use crate::common::types::{target_ptr_size, IrType};
+    use crate::common::types::{IrType, target_ptr_size};
 
     fn size_t() -> IrType {
         if target_ptr_size() == 8 {

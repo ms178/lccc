@@ -1288,11 +1288,7 @@ fn strip_outer_parens(s: &str) -> &str {
             _ => {}
         }
     }
-    if depth == 0 {
-        inner.trim()
-    } else {
-        s
-    }
+    if depth == 0 { inner.trim() } else { s }
 }
 
 /// Find a comparison operator at the top level (not inside parentheses).

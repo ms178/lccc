@@ -542,7 +542,13 @@ fn propagate_stable_aliases<T: Clone>(
                 if stab.def_count.get(&dest.0).copied() != Some(1) || map.contains_key(&dest.0) {
                     continue;
                 }
-                if let Some(info) = map.get(&src.0).cloned() {
+                // Materialize the optional clone before mutating `map`.  This
+                // gives its temporary an explicit scope under Rust 2024's
+                // tail-expression drop order and makes the immutable/mutable
+                // borrow boundary obvious to both readers and the borrow
+                // checker.
+                let copied_info = map.get(&src.0).cloned();
+                if let Some(info) = copied_info {
                     map.insert(dest.0, info);
                     changed = true;
                 }
@@ -3466,7 +3472,7 @@ pub(crate) fn x86_inline_memset_len(
     args: &[Operand],
     is_variadic: bool,
 ) -> Option<usize> {
-    use crate::backend::x86::cpu_model::{active, CopyStrategy};
+    use crate::backend::x86::cpu_model::{CopyStrategy, active};
     let n = inline_memset_const_len(func, args, is_variadic)?;
     match active().memset_strategy(n, 16) {
         CopyStrategy::LibCall => None,
@@ -5266,7 +5272,7 @@ pub(super) fn generate_instruction(
             va_list_ptr,
             size,
             align,
-            ref eightbyte_classes,
+            eightbyte_classes,
         } => {
             cg.emit_va_arg_struct_ex(dest_ptr, va_list_ptr, *size, *align, eightbyte_classes);
             clobber_after_call_like(cg);

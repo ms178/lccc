@@ -523,7 +523,7 @@ impl super::InstructionEncoder {
                     _ => {
                         return Err(
                             "lcall requires indirect memory or segment:offset operands".to_string()
-                        )
+                        );
                     }
                 };
                 // `lcalll *mem` keeps the default 32-bit operand size

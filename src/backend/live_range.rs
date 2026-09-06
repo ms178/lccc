@@ -38,8 +38,8 @@
 //! These two formulas are *supposed* to differ. Unifying them is a bug.
 
 use super::liveness::{
-    for_each_operand_in_instruction, for_each_operand_in_terminator,
-    for_each_value_use_in_instruction, LiveInterval,
+    LiveInterval, for_each_operand_in_instruction, for_each_operand_in_terminator,
+    for_each_value_use_in_instruction,
 };
 use super::regalloc::{PhysReg, RaConfig};
 use crate::common::fx_hash::FxHashMap;
@@ -502,7 +502,8 @@ impl LinearScanAllocator {
         // hole-aware coverage AND the kill switch is unset. Unit tests and
         // unenriched scans (Phase 2b, synthetic vector intervals) run the
         // exact fat kernel.
-        let segment_mode = !ra_config.no_segment_scan && ranges.iter().any(|r| !r.segments.is_empty());
+        let segment_mode =
+            !ra_config.no_segment_scan && ranges.iter().any(|r| !r.segments.is_empty());
         Self {
             ranges,
             active: Vec::new(),
@@ -1059,8 +1060,14 @@ impl LinearScanAllocator {
                         {
                             eprintln!(
                                 "[ALLOC-BUG] Assigning val{}[{}-{}] to reg={} but val{}[{}-{}] already in reg={}!",
-                                range.value_id, range.start, range.end, reg.0,
-                                active.range.value_id, active.range.start, active.range.end, areg.0
+                                range.value_id,
+                                range.start,
+                                range.end,
+                                reg.0,
+                                active.range.value_id,
+                                active.range.start,
+                                active.range.end,
+                                areg.0
                             );
                         }
                     }
@@ -1445,11 +1452,7 @@ fn next_use_after(range: &LiveRange, pos: u32) -> u32 {
     debug_assert_uses_sorted(&range.uses);
     let uses = range.uses.as_slice();
     let i = uses.partition_point(|&u| u < pos);
-    if i < uses.len() {
-        uses[i]
-    } else {
-        range.end
-    }
+    if i < uses.len() { uses[i] } else { range.end }
 }
 
 /// Eviction policy selector (`RaConfig::evict_mode`, parsed from

@@ -28,7 +28,7 @@
 //! - ALU identities (+0/|0/^0/&-1/<<0) and commutative-immediate
 //!   canonicalisation: the IR already folds/canonicalises these (verified).
 
-use super::emit::{alu_mnemonic, shift_mnemonic, I686Codegen};
+use super::emit::{I686Codegen, alu_mnemonic, shift_mnemonic};
 use super::magic_div::{magic_s32, magic_u32};
 use crate::backend::regalloc::PhysReg;
 use crate::common::types::IrType;
@@ -1361,7 +1361,7 @@ fn synth_mul_uncached(
 
 #[cfg(test)]
 mod synth_mul_tests {
-    use super::{synth_mul, MulStep};
+    use super::{MulStep, synth_mul};
 
     /// Interpret a chain symbolically: returns the multiple of `src` held in
     /// `dest` (mod 2^32), and checks the src/dest aliasing contract.
@@ -1421,9 +1421,9 @@ mod synth_mul_tests {
                                 );
                             }
                             if !scale {
-                                assert!(!chain
-                                    .iter()
-                                    .any(|s| matches!(s, MulStep::LeaScaleSrc(_))));
+                                assert!(
+                                    !chain.iter().any(|s| matches!(s, MulStep::LeaScaleSrc(_)))
+                                );
                             }
                             assert_eq!(eval(&chain, same), imm, "{c} same={same} chain={chain:?}");
                         }

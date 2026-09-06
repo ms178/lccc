@@ -3262,13 +3262,7 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 fn line_reg_use_def(store: &LineStore, infos: &[LineInfo], idx: usize) -> (u16, u16) {
     let info = infos[idx];
     let line = trimmed(store, &info, idx);
-    let bit = |reg: RegId| -> u16 {
-        if reg <= REG_GP_MAX {
-            1 << reg
-        } else {
-            0
-        }
-    };
+    let bit = |reg: RegId| -> u16 { if reg <= REG_GP_MAX { 1 << reg } else { 0 } };
     let mut uses = 0u16;
     for reg in 0..=REG_GP_MAX {
         if line_references_reg(line, reg) {
@@ -8260,7 +8254,7 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                         }
                         match infos[k].kind {
                             LineKind::Pop { .. } | LineKind::Directive | LineKind::Empty => {
-                                continue
+                                continue;
                             }
                             _ => {
                                 let line = trimmed(store, &infos[k], k);
@@ -9630,10 +9624,10 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
                 let t = trimmed(store, &infos[i], i);
                 if !t.starts_with(".L") {
                     suppress = false; // new function
-                                      // Function boundary: known depth again. Any pending
-                                      // outer depth is irrelevant here — a global label only
-                                      // starts a new translation unit's function stream in
-                                      // generated output.
+                    // Function boundary: known depth again. Any pending
+                    // outer depth is irrelevant here — a global label only
+                    // starts a new translation unit's function stream in
+                    // generated output.
                     depth = Some(0);
                 } else {
                     // Internal join point: fallthrough or branch target.
@@ -12998,7 +12992,7 @@ mod tests {
         // pusha reads all eight (including %esp) and writes %esp only.
         assert_eq!(classify_implicit_operands("pushad").0, 0xFF);
         assert_eq!(classify_implicit_operands("pushad").1, esp);
-        assert_eq!(classify_implicit_operands("popad").1, 0xFF & !esp);
+        assert_eq!(classify_implicit_operands("popad").1, !esp);
     }
 
     #[test]

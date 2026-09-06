@@ -200,16 +200,16 @@ impl BitSet {
     /// `self = gen ∪ (out − kill)`. Returns whether `self` changed.
     fn assign_gen_union_out_minus_kill(
         &mut self,
-        gen: &BitSet,
+        gen_set: &BitSet,
         out: &BitSet,
         kill: &BitSet,
     ) -> bool {
-        debug_assert_eq!(self.words.len(), gen.words.len());
+        debug_assert_eq!(self.words.len(), gen_set.words.len());
         debug_assert_eq!(self.words.len(), out.words.len());
         debug_assert_eq!(self.words.len(), kill.words.len());
         let mut changed = false;
         for i in 0..self.words.len() {
-            let new_val = gen.words[i] | (out.words[i] & !kill.words[i]);
+            let new_val = gen_set.words[i] | (out.words[i] & !kill.words[i]);
             if new_val != self.words[i] {
                 self.words[i] = new_val;
                 changed = true;
@@ -623,7 +623,7 @@ fn assign_program_points(
     for (block_idx, block) in func.blocks.iter().enumerate() {
         block_id_to_idx.insert(block.label.0, block_idx);
         block_start_points.push(point);
-        let mut gen = BitSet::new(num_values);
+        let mut gen_set = BitSet::new(num_values);
         let mut kill = BitSet::new(num_values);
 
         for inst in &block.instructions {
@@ -692,7 +692,7 @@ fn assign_program_points(
                 }
             }
 
-            collect_instruction_gen_dense(inst, alloca_set, id_to_dense, &kill, &mut gen);
+            collect_instruction_gen_dense(inst, alloca_set, id_to_dense, &kill, &mut gen_set);
 
             if let Some(dest) = inst.dest() {
                 if !alloca_set.contains(&dest.0) {
@@ -718,11 +718,17 @@ fn assign_program_points(
             &mut last_use_points,
             &mut touches,
         );
-        collect_terminator_gen_dense(&block.terminator, alloca_set, id_to_dense, &kill, &mut gen);
+        collect_terminator_gen_dense(
+            &block.terminator,
+            alloca_set,
+            id_to_dense,
+            &kill,
+            &mut gen_set,
+        );
         block_end_points.push(point);
         point = point.saturating_add(1);
 
-        block_gen.push(gen);
+        block_gen.push(gen_set);
         block_kill.push(kill);
     }
 
@@ -1400,7 +1406,7 @@ fn collect_instruction_gen_dense(
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
     kill: &BitSet,
-    gen: &mut BitSet,
+    gen_set: &mut BitSet,
 ) {
     let mut add_use = |vid: u32| {
         if alloca_set.contains(&vid) {
@@ -1408,7 +1414,7 @@ fn collect_instruction_gen_dense(
         }
         if let Some(&dense) = id_to_dense.get(&vid) {
             if !kill.contains(dense) {
-                gen.insert(dense);
+                gen_set.insert(dense);
             }
         }
     };
@@ -1425,7 +1431,7 @@ fn collect_terminator_gen_dense(
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
     kill: &BitSet,
-    gen: &mut BitSet,
+    gen_set: &mut BitSet,
 ) {
     for_each_operand_in_terminator(term, |op| {
         if let Operand::Value(v) = op {
@@ -1434,7 +1440,7 @@ fn collect_terminator_gen_dense(
             }
             if let Some(&dense) = id_to_dense.get(&v.0) {
                 if !kill.contains(dense) {
-                    gen.insert(dense);
+                    gen_set.insert(dense);
                 }
             }
         }
@@ -2373,21 +2379,21 @@ mod tests {
 
     #[test]
     fn bitset_transfer_function() {
-        let mut gen = BitSet::new(80);
+        let mut gen_set = BitSet::new(80);
         let mut kill = BitSet::new(80);
         let mut out = BitSet::new(80);
         let mut live_in = BitSet::new(80);
-        gen.insert(1);
-        gen.insert(70);
+        gen_set.insert(1);
+        gen_set.insert(70);
         kill.insert(2);
         out.insert(2);
         out.insert(3);
-        assert!(live_in.assign_gen_union_out_minus_kill(&gen, &out, &kill));
+        assert!(live_in.assign_gen_union_out_minus_kill(&gen_set, &out, &kill));
         assert!(live_in.contains(1));
         assert!(live_in.contains(70));
         assert!(!live_in.contains(2), "killed");
         assert!(live_in.contains(3));
-        assert!(!live_in.assign_gen_union_out_minus_kill(&gen, &out, &kill));
+        assert!(!live_in.assign_gen_union_out_minus_kill(&gen_set, &out, &kill));
     }
 
     #[test]
@@ -2400,15 +2406,16 @@ mod tests {
         let preds = invert_cfg(&succs, n);
         let (_, post) = analyze_forward_cfg(&succs, n);
 
-        let mut gen: Vec<BitSet> = (0..n).map(|_| BitSet::new(1)).collect();
+        let mut gen_set: Vec<BitSet> = (0..n).map(|_| BitSet::new(1)).collect();
         let kill: Vec<BitSet> = (0..n).map(|_| BitSet::new(1)).collect();
-        gen[n - 1].insert(0);
+        gen_set[n - 1].insert(0);
         let mut kill0 = BitSet::new(1);
         kill0.insert(0);
         let mut kill = kill;
         kill[0] = kill0;
 
-        let (live_in, live_out) = run_backward_dataflow(n, 1, &succs, &preds, &post, &gen, &kill);
+        let (live_in, live_out) =
+            run_backward_dataflow(n, 1, &succs, &preds, &post, &gen_set, &kill);
         assert!(!live_in[0].contains(0), "def kills upward exposure");
         for i in 1..n {
             assert!(live_in[i].contains(0), "live_in[{i}] missing");

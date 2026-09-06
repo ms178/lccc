@@ -70,7 +70,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::emit;
 use crate::ir::reexports::{Operand, Value};
 
-use crate::backend::i686::codegen::emit::{phys_reg_name, I686Codegen};
+use crate::backend::i686::codegen::emit::{I686Codegen, phys_reg_name};
 
 /// Site-unique suffix generator for the static template/slot label pairs.
 static TRAMPOLINE_SITES: AtomicU32 = AtomicU32::new(0);

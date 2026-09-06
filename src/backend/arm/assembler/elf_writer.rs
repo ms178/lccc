@@ -11,10 +11,10 @@
 // ELF writer helpers; some section/relocation utilities defined for completeness.
 #![allow(dead_code)]
 
-use super::encoder::{encode_instruction, EncodeResult, RelocType};
+use super::encoder::{EncodeResult, RelocType, encode_instruction};
 use super::parser::{AsmDirective, AsmStatement, DataValue, Operand, SizeExpr, SymbolKind};
 use crate::backend::elf::{
-    self, ElfWriterBase, ObjReloc, ELFCLASS64, EM_AARCH64, STT_FUNC, STT_NOTYPE, STT_OBJECT,
+    self, ELFCLASS64, EM_AARCH64, ElfWriterBase, ObjReloc, STT_FUNC, STT_NOTYPE, STT_OBJECT,
     STT_TLS, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
 };
 
@@ -576,11 +576,7 @@ impl ElfWriter {
                 let data = match count {
                     Some(c) => {
                         let c = *c as usize;
-                        if c < data.len() {
-                            &data[..c]
-                        } else {
-                            data
-                        }
+                        if c < data.len() { &data[..c] } else { data }
                     }
                     None => data,
                 };
@@ -1240,8 +1236,8 @@ mod movw_tests {
         .expect("assembles");
         let data = text_of(&writer);
         let v = (-10526724i64) as u64; // 0 - 4 - 10526720
-                                       // Base words: sf=1, opc=10/11, fixed "100101" at bits 28-23
-                                       // (i.e. 0b1010_0101 << 23), then hw at 22-21 and imm16 at 20-5.
+        // Base words: sf=1, opc=10/11, fixed "100101" at bits 28-23
+        // (i.e. 0b1010_0101 << 23), then hw at 22-21 and imm16 at 20-5.
         let want = [
             0xD2800000u32 | (2 << 21) | (((v >> 32) & 0xFFFF) as u32) << 5,
             0xF2800000u32 | (1 << 21) | (((v >> 16) & 0xFFFF) as u32) << 5,

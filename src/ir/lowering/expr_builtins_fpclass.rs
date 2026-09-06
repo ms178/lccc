@@ -159,9 +159,9 @@ impl Lowerer {
             // So: libc_0->class_vals[0], libc_1->class_vals[1], libc_2->class_vals[4],
             //     libc_3->class_vals[3], libc_4->class_vals[2]
             let libc_to_user = [0usize, 1, 4, 3, 2]; // libc class index -> user class_vals index
-                                                     // Comparison results (I8) must be widened to I64 before I64 multiply,
-                                                     // because on 32-bit targets I64 occupies two stack slots and loading
-                                                     // a narrow value as I64 reads uninitialized upper bytes.
+            // Comparison results (I8) must be widened to I64 before I64 multiply,
+            // because on 32-bit targets I64 occupies two stack slots and loading
+            // a narrow value as I64 reads uninitialized upper bytes.
             let is_class: Vec<Value> = (0..5)
                 .map(|libc_cls| {
                     let cmp = self.emit_cmp_val(

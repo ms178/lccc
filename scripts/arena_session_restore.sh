@@ -31,14 +31,17 @@ if ! grep -q '^/swapfile' /proc/swaps 2>/dev/null; then
 fi
 log "swap: $(awk '/SwapTotal/{print $2"kB"}' /proc/meminfo)"
 
-# ---- 2. exact Rust/Cargo toolchain in the persisted workspace --------------
+# ---- 2. current Rust/Cargo toolchain in the persisted workspace ------------
 # Do not reinstall under /opt: the harness wipes it and the old restore path
-# silently downgraded the next session to an image-provided Cargo.  The
-# repository's rust-toolchain.toml and this explicit channel must agree.
+# silently downgraded the next session to an image-provided Cargo.  Resolve the
+# channel from rust-toolchain.toml so a source upgrade changes every script's
+# toolchain consistently.
 export RUSTUP_HOME=${RUSTUP_HOME:-/home/user/.rustup}
 export CARGO_HOME=${CARGO_HOME:-/home/user/.cargo}
-export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}
 export PATH="$CARGO_HOME/bin:$PATH"
+# shellcheck source=rust_toolchain.sh
+source "$repo_root/scripts/rust_toolchain.sh"
+lccc_select_rust_toolchain "$repo_root"
 if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
     log 'installing rustup into persisted /home/user/.cargo'
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -51,6 +54,12 @@ if ! "$CARGO_HOME/bin/rustup" toolchain list 2>/dev/null | grep -q "^${RUSTUP_TO
         --profile minimal --no-self-update >/dev/null
 fi
 "$CARGO_HOME/bin/rustup" default "$RUSTUP_TOOLCHAIN" >/dev/null 2>&1 || true
+# The minimal profile deliberately omits these, but the repository's strict
+# formatting and Clippy gates require both after every harness restore.
+if ! "$CARGO_HOME/bin/rustup" component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy >/dev/null; then
+    log "FATAL: unable to install rustfmt/clippy for $RUSTUP_TOOLCHAIN"
+    exit 1
+fi
 log "rustc: $(rustc --version 2>/dev/null || echo MISSING)"
 log "cargo: $(cargo --version 2>/dev/null || echo MISSING)"
 

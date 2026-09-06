@@ -1,7 +1,7 @@
 //! AArch64 InlineAsmEmitter implementation: constraint classification, scratch
 //! register allocation, operand loading/storing, and template substitution.
 
-use super::emit::{is_arm_fp_reg, ArmCodegen};
+use super::emit::{ArmCodegen, is_arm_fp_reg};
 use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::CodegenState;

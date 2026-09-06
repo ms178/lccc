@@ -7,9 +7,20 @@ WT=/home/user/bisect
 REPO=/home/user/lccc
 K=/home/user/kernel-work/linux-6.18.47
 export PATH=/home/user/.cargo/bin:$PATH
-export RUSTUP_TOOLCHAIN=stable
+# Resolve from the live checkout, not from a historical worktree: a bisection
+# must use the current supported compiler toolchain for every candidate.
+# shellcheck source=rust_toolchain.sh
+source "$REPO/scripts/rust_toolchain.sh"
+lccc_select_rust_toolchain "$REPO"
 export CARGO_BUILD_JOBS=2
-export RUSTFLAGS=""
+# A warning-free compiler build is part of the bisection contract as well.
+# Permit an explicit local escape hatch only when deliberately bisecting an
+# historical revision which predates the warning policy.
+if [[ "${LCCC_ALLOW_WARNINGS:-0}" == "1" ]]; then
+  export RUSTFLAGS="${RUSTFLAGS:-}"
+else
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-D warnings"
+fi
 
 if [[ -d $WT ]]; then
   git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1
@@ -17,7 +28,7 @@ if [[ -d $WT ]]; then
 fi
 git -C "$REPO" worktree add -q --detach "$WT" "$REV" >/dev/null 2>&1 || { echo "worktree add failed for $REV"; exit 1; }
 cd "$WT"
-if ! cargo build --profile fastbuild -j2 >/tmp/bisect-build.log 2>&1; then
+if ! cargo build --profile fastbuild --locked -j2 >/tmp/bisect-build.log 2>&1; then
   echo "BUILD-FAILED"; tail -5 /tmp/bisect-build.log; exit 1
 fi
 LCCC=$WT/target/fastbuild/lccc LCCC_LD=$WT/target/fastbuild/lccc-ld \

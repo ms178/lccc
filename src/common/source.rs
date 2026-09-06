@@ -564,11 +564,7 @@ impl SourceManager {
         {
             Ok(idx) => {
                 let names = &self.macro_expansions[idx].macro_names;
-                if names.is_empty() {
-                    None
-                } else {
-                    Some(names)
-                }
+                if names.is_empty() { None } else { Some(names) }
             }
             Err(_) => None,
         }

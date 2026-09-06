@@ -4,13 +4,13 @@
 //! in x86/linker/elf.rs, arm/linker/elf.rs, and riscv/linker/elf_read.rs.
 //! The only parameter that differed was the expected e_machine value.
 
+use super::SymStr;
 use super::filemap::FileBacking;
 use super::secdata::SectionData;
 use super::types::{Elf64Object, Elf64Rela, Elf64Section, Elf64Symbol};
-use super::SymStr;
 use crate::backend::elf::{
-    read_cstr, read_cstr_ref, read_i64, read_u16, read_u32, read_u64, slice_at, table_entry,
-    ELFCLASS64, ELFDATA2LSB, ELF_MAGIC, ET_REL, SHT_NOBITS, SHT_RELA, SHT_SYMTAB,
+    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_REL, SHT_NOBITS, SHT_RELA, SHT_SYMTAB, read_cstr,
+    read_cstr_ref, read_i64, read_u16, read_u32, read_u64, slice_at, table_entry,
 };
 
 /// Parse an ELF64 relocatable object file (.o).
@@ -254,12 +254,12 @@ fn parse_elf64_object_inner(
             // cost more than the section copy this type removed.
             let sym_data: &[u8] = section_data[i].as_slice();
             let sym_count = sym_data.len() / 24; // sizeof(Elf64_Sym) = 24
-                                                 // Reserve the exact count up front. Growing one element at a time
-                                                 // reallocated 15 times and memcpy'd 3.1 MB of Elf64Symbol on a
-                                                 // 20 000-symbol object (DHAT). `sym_count` is derived from the
-                                                 // section size, so this is exact, not a guess -- and it is bounded
-                                                 // by the section that is already in memory, so a malformed header
-                                                 // cannot make it request an absurd allocation.
+            // Reserve the exact count up front. Growing one element at a time
+            // reallocated 15 times and memcpy'd 3.1 MB of Elf64Symbol on a
+            // 20 000-symbol object (DHAT). `sym_count` is derived from the
+            // section size, so this is exact, not a guess -- and it is bounded
+            // by the section that is already in memory, so a malformed header
+            // cannot make it request an absurd allocation.
             symbols.reserve(sym_count);
             for j in 0..sym_count {
                 let off = j * 24;

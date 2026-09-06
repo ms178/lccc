@@ -1,6 +1,6 @@
 //! I686Codegen: comparison operations (float, int, fused branches, select).
 
-use super::emit::{phys_reg_name, I686Codegen};
+use super::emit::{I686Codegen, phys_reg_name};
 use crate::backend::state::SlotAddr;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;

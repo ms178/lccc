@@ -2879,6 +2879,33 @@ fn simplify_math_call(
     None
 }
 
+/// Fold calls to math functions that map to inline intrinsics (sqrt, fabs,
+/// `__fabstf2`, `__copysigntf3`, `copysignl`, ...) into `Instruction::Intrinsic`.
+///
+/// The full -O2/-O3 pipeline does this inside `try_simplify`; the cheap -O0/-O1
+/// tiers skip `simplify` entirely, so a call to `__copysigntf3` (the lowering
+/// of `__builtin_copysignf128`) would otherwise survive to the backend as an
+/// external reference and fail to link (LCCC links no libgcc). Running the
+/// same folding here makes `_Float128` math builtins work at every opt level.
+/// Semantics-preserving: the fold is a rename to the backend's own intrinsic.
+pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
+    for func in &mut module.functions {
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                if let Instruction::Call { func: callee, info } = inst {
+                    if let Some(d) = info.dest {
+                        if let Some(new_inst) =
+                            simplify_math_call(d, callee, &info.args, info.return_type)
+                        {
+                            *inst = new_inst;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3823,16 +3850,18 @@ mod tests {
         }
         // Sign-extended negative bytes compare differently under an unsigned
         // wide predicate, so this must remain wide.
-        assert!(narrow_widened_cmp_pair(
-            Value(7),
-            IrCmpOp::Ult,
-            &Operand::Value(Value(1)),
-            &Operand::Value(Value(2)),
-            IrType::I32,
-            &defs,
-            &[],
-        )
-        .is_none());
+        assert!(
+            narrow_widened_cmp_pair(
+                Value(7),
+                IrCmpOp::Ult,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+                &defs,
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -3853,16 +3882,18 @@ mod tests {
             IrCmpOp::Ugt,
             IrCmpOp::Uge,
         ] {
-            assert!(narrow_widened_cmp_pair(
-                Value(7),
-                op,
-                &Operand::Value(Value(1)),
-                &Operand::Value(Value(2)),
-                IrType::I32,
-                &defs,
-                &[],
-            )
-            .is_none());
+            assert!(
+                narrow_widened_cmp_pair(
+                    Value(7),
+                    op,
+                    &Operand::Value(Value(1)),
+                    &Operand::Value(Value(2)),
+                    IrType::I32,
+                    &defs,
+                    &[],
+                )
+                .is_none()
+            );
         }
     }
 
@@ -3872,28 +3903,32 @@ mod tests {
         let mut uses = vec![0; 8];
         uses[1] = 1;
         uses[2] = 2; // An additional consumer keeps this widened value live.
-        assert!(narrow_widened_cmp_pair(
-            Value(7),
-            IrCmpOp::Eq,
-            &Operand::Value(Value(1)),
-            &Operand::Value(Value(2)),
-            IrType::I32,
-            &defs,
-            &uses,
-        )
-        .is_none());
+        assert!(
+            narrow_widened_cmp_pair(
+                Value(7),
+                IrCmpOp::Eq,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+                &defs,
+                &uses,
+            )
+            .is_none()
+        );
 
         uses[2] = 1;
-        assert!(narrow_widened_cmp_pair(
-            Value(7),
-            IrCmpOp::Eq,
-            &Operand::Value(Value(1)),
-            &Operand::Value(Value(2)),
-            IrType::I32,
-            &defs,
-            &uses,
-        )
-        .is_some());
+        assert!(
+            narrow_widened_cmp_pair(
+                Value(7),
+                IrCmpOp::Eq,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+                &defs,
+                &uses,
+            )
+            .is_some()
+        );
 
         uses[1] = 2;
         assert!(widened_cond_replacement(Operand::Value(Value(1)), &defs, &uses).is_none());
@@ -3907,28 +3942,32 @@ mod tests {
             from_ty: IrType::U8,
             to_ty: IrType::I32,
         });
-        assert!(narrow_widened_cmp_pair(
-            Value(7),
-            IrCmpOp::Eq,
-            &Operand::Value(Value(1)),
-            &Operand::Value(Value(2)),
-            IrType::I32,
-            &mixed,
-            &[],
-        )
-        .is_none());
+        assert!(
+            narrow_widened_cmp_pair(
+                Value(7),
+                IrCmpOp::Eq,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+                &mixed,
+                &[],
+            )
+            .is_none()
+        );
 
         let same_width = widening_pair_defs(IrType::I32, IrType::U32);
-        assert!(narrow_widened_cmp_pair(
-            Value(7),
-            IrCmpOp::Eq,
-            &Operand::Value(Value(1)),
-            &Operand::Value(Value(2)),
-            IrType::U32,
-            &same_width,
-            &[],
-        )
-        .is_none());
+        assert!(
+            narrow_widened_cmp_pair(
+                Value(7),
+                IrCmpOp::Eq,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::U32,
+                &same_width,
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -5031,32 +5070,5 @@ mod tests {
             ty: IrType::I32,
         };
         assert!(simplify_default(&inst).is_none());
-    }
-}
-
-/// Fold calls to math functions that map to inline intrinsics (sqrt, fabs,
-/// `__fabstf2`, `__copysigntf3`, `copysignl`, ...) into `Instruction::Intrinsic`.
-///
-/// The full -O2/-O3 pipeline does this inside `try_simplify`; the cheap -O0/-O1
-/// tiers skip `simplify` entirely, so a call to `__copysigntf3` (the lowering
-/// of `__builtin_copysignf128`) would otherwise survive to the backend as an
-/// external reference and fail to link (LCCC links no libgcc). Running the
-/// same folding here makes `_Float128` math builtins work at every opt level.
-/// Semantics-preserving: the fold is a rename to the backend's own intrinsic.
-pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
-    for func in &mut module.functions {
-        for block in &mut func.blocks {
-            for inst in &mut block.instructions {
-                if let Instruction::Call { func: callee, info } = inst {
-                    if let Some(d) = info.dest {
-                        if let Some(new_inst) =
-                            simplify_math_call(d, callee, &info.args, info.return_type)
-                        {
-                            *inst = new_inst;
-                        }
-                    }
-                }
-            }
-        }
     }
 }

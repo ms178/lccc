@@ -618,7 +618,7 @@ fn rename_block(
             // Find which alloca this phi is for
             if let Some(&alloca_idx) = phi_dests[block_idx]
                 .iter()
-                .find(|(_, &v)| v == *dest)
+                .find(|&(_, &v)| v == *dest)
                 .map(|(idx, _)| idx)
             {
                 def_stacks[alloca_idx].push(Operand::Value(*dest));
@@ -807,7 +807,7 @@ fn rename_block(
                     // Find which alloca this phi is for
                     if let Some(&alloca_idx) = phi_dests[succ_idx]
                         .iter()
-                        .find(|(_, &v)| v == *dest)
+                        .find(|&(_, &v)| v == *dest)
                         .map(|(idx, _)| idx)
                     {
                         let current_val = if let Some(snapshot) = goto_snapshot {
@@ -1054,15 +1054,19 @@ mod tests {
         // The alloca should be removed, store removed, load replaced with copy
         let entry = &func.blocks[0];
         // Should have just a Copy instruction (load was replaced)
-        assert!(entry
-            .instructions
-            .iter()
-            .any(|inst| matches!(inst, Instruction::Copy { .. })));
+        assert!(
+            entry
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Copy { .. }))
+        );
         // Should not have any Store to the promoted alloca
-        assert!(!entry
-            .instructions
-            .iter()
-            .any(|inst| matches!(inst, Instruction::Store { ptr: Value(0), .. })));
+        assert!(
+            !entry
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Store { ptr: Value(0), .. }))
+        );
     }
 
     #[test]
@@ -1594,7 +1598,7 @@ mod tests {
         // The InlineAsm should now have a fresh SSA value as output (not the alloca)
         let asm_output = func.blocks[0].instructions.iter().find_map(|inst| {
             if let Instruction::InlineAsm { outputs, .. } = inst {
-                Some(outputs[0].1 .0) // Value ID of first output
+                Some(outputs[0].1.0) // Value ID of first output
             } else {
                 None
             }
@@ -1836,11 +1840,15 @@ mod tests {
         promote_allocas_with_params(&mut module);
 
         let instructions = &module.functions[0].blocks[0].instructions;
-        assert!(instructions
-            .iter()
-            .any(|inst| matches!(inst, Instruction::Load { ptr: Value(0), .. })));
-        assert!(instructions
-            .iter()
-            .any(|inst| matches!(inst, Instruction::Store { ptr: Value(0), .. })));
+        assert!(
+            instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Load { ptr: Value(0), .. }))
+        );
+        assert!(
+            instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Store { ptr: Value(0), .. }))
+        );
     }
 }

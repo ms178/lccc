@@ -1,7 +1,8 @@
 [package]
 name = "lccc"
 version = "0.1.0"
-edition = "2021"
+rust-version = "1.98.1"
+edition = "2024"
 description = "LCCC (Lev's C Compiler) — a high-performance C compiler fork targeting x86-64, i686, ARM64, and RISC-V"
 
 [lib]

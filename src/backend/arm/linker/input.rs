@@ -7,7 +7,7 @@ use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
 use super::elf::*;
-use super::types::{arm_should_replace_extra, GlobalSymbol};
+use super::types::{GlobalSymbol, arm_should_replace_extra};
 use crate::backend::linker_common;
 
 pub fn load_file(

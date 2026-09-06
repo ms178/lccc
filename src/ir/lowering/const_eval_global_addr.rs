@@ -153,7 +153,7 @@ impl Lowerer {
             // The initializer path handles patterns like:
             //   ((struct Wrap) {func_ptr})
             // where the compound literal wraps a function pointer.
-            Expr::CompoundLiteral(_, ref init, _) => {
+            Expr::CompoundLiteral(_, init, _) => {
                 // Check if this compound literal was pre-materialized as an anonymous global
                 let key = expr as *const Expr as usize;
                 if let Some(label) = self.materialized_compound_literals.get(&key) {
@@ -239,7 +239,7 @@ impl Lowerer {
             // expression and evaluate it as a global address. This is critical for
             // QEMU's OUTOP macro which uses _Generic in designated initializers:
             //   [INDEX_op_st32] = _Generic(outop_st, TCGOutOpStore: &outop_st.base)
-            Expr::GenericSelection(ref controlling, ref associations, _) => {
+            Expr::GenericSelection(controlling, associations, _) => {
                 let selected = self.resolve_generic_selection_expr(controlling, associations)?;
                 self.eval_global_addr_expr(selected)
             }
@@ -415,22 +415,25 @@ impl Lowerer {
                     let mut current_layout = start_layout;
                     let mut final_field_ty: Option<CType> = None;
                     for field_name in fields.iter().rev() {
-                        if let Some((foff, fty)) = current_layout
+                        match current_layout
                             .field_offset(field_name, &*self.types.borrow_struct_layouts())
                         {
-                            member_offset += foff as i64;
-                            final_field_ty = Some(fty.clone());
-                            current_layout = match &fty {
-                                CType::Struct(key) | CType::Union(key) => self
-                                    .types
-                                    .borrow_struct_layouts()
-                                    .get(&**key)
-                                    .cloned()
-                                    .unwrap_or_else(StructLayout::empty_rc),
-                                _ => StructLayout::empty_rc(),
-                            };
-                        } else {
-                            return None;
+                            Some((foff, fty)) => {
+                                member_offset += foff as i64;
+                                final_field_ty = Some(fty.clone());
+                                current_layout = match &fty {
+                                    CType::Struct(key) | CType::Union(key) => self
+                                        .types
+                                        .borrow_struct_layouts()
+                                        .get(&**key)
+                                        .cloned()
+                                        .unwrap_or_else(StructLayout::empty_rc),
+                                    _ => StructLayout::empty_rc(),
+                                };
+                            }
+                            _ => {
+                                return None;
+                            }
                         }
                     }
 

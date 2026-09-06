@@ -179,7 +179,7 @@ impl DseContext {
                     return Some(CellAddr {
                         root: CellRoot::Other(cur.0),
                         offset: Some(offset),
-                    })
+                    });
                 }
             };
             match def {
@@ -849,9 +849,11 @@ mod tests {
         });
         let n = eliminate_dead_stores(&mut f);
         assert_eq!(n, 1, "x=1 is overwritten by the volatile store");
-        assert!(f.blocks[0]
-            .instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::Store { volatile: true, .. })));
+        assert!(
+            f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Store { volatile: true, .. }))
+        );
     }
 }
