@@ -1,156 +1,135 @@
-# Current compiler state
+# Current engineering state
 
-State refreshed against **`2f5e9af3`** (`ms178/lccc` main, PR #281) with
-16-byte-granular `va_arg` support on AArch64/RISC-V64 and target-aware
-plain-char signedness. Re-verify line numbers before editing. The item catalog is
-[`agent/BACKLOG.md`](agent/BACKLOG.md); the active queue is
-[`tasks/`](tasks/README.md); the negative-results ledger is
-[`DECISIONS.md`](DECISIONS.md).
+This document describes the checked-in compiler at `f7f88be8` (rebased on
+mainline base `3e1b71dd`) and is refreshed with each validated change. The source is based on
+`3e1b71dd04372b3c4907d402dd1ea8fc1efb897e` and uses Rust 1.98.1, edition 2024,
+and `rust-version = "1.98.1"`.
 
-## What is production
+## Architecture
 
-- **C frontend** → SSA IR → `-O0` skip / `-O1` light / `-O2` full /
-  `-O3` +unroll / `-Os`/`-Oz` size (`src/passes/README.md` is the
-  authoritative tier list).
-- **Linear-scan RA** in `src/backend/live_range.rs` (scan) +
-  `src/backend/regalloc.rs` (policy). **Segment-aware interference is the
-  scan's primary model** (RA-05a landed): `LiveRange::segs` +
-  `segments_conflict`, coalesce-leader piece/use union, Phase-2f residual
-  fill generalized to all targets and default-ON (multi-piece values
-  ranked first, pressure-gated). Kill switches: `CCC_NO_SEGMENT_FILL`.
-  Tier-2 hole-aware graph coloring is **production default** for the
-  eligible subset (`CCC_NO_TIER2_GRAPH` restores the scan-only path).
-- **ABI physical hints** (RA-26) retain leading ParamRefs across safe
-  call-free x86 CFG leaves; ordered caller homes; stack-arg/mixed/calling
-  shapes fail closed (`CCC_NO_LEAF_PARAM_GPR`,
-  `CCC_NO_EMPTY_LOCAL_FRAME_ELISION`).
-- **RA verifier**: `CCC_VERIFY_REGALLOC=1` hard-verifies segment interference,
-  final assignments, and the eviction occupancy history (half-open
-  `[start, cut)` for evicted ranges).
-- **-O0** deliberately uses canonical stack homes on all four backends
-  because phi elimination leaves non-SSA multi-def webs (RA-27).
-- **Liveness** `src/backend/liveness.rs` — worklist backward dataflow (no
-  `MAX_ITERATIONS` cap), fat `intervals` plus hole-aware `segments`.
-- **FMA / FP contract**: `FpContract { Off, OnExpr, Fast }` threaded
-  cli→pipeline→passes→backend. Default **Off** (GCC `gnu*` parity);
-  `-ffp-contract=fast`/`-ffast-math` enable Fast; `-ffp-contract=on`
-  contracts only within a tagged statement root. FMA emission requires the
-  FMA3 ISA feature (SIGILL guard). Scalar and packed `vfmadd231*` emitters
-  are production.
-- **Vectorizers**: reduction (single/multi/secondary accumulator),
-  widening I32→I64 + masked conditional-sum, stencil (constant-tap affine),
-  elementwise map expression trees, plain-copy; per-natural-loop PGO
-  profitability gate (exact trips; trip <8 rejected, >80-inst bodies need
-  ≥32 trips). Kill switches: `CCC_NO_STENCIL_VEC`, `CCC_NO_MAP_VEC`,
-  `CCC_NO_VECREG`.
-- **Loop rotation** `src/passes/loop_rotate.rs` is **opt-in**
-  (`CCC_LOOP_ROTATE=1`): correctness-clean for the canonical counted-loop
-  shape (v14 exit-merge-phi fix, v17 cross-phi latch-incoming rewrite), but
-  15 shapes still miscompile under default-enable (DECISIONS.md). Runs
-  after vectorize.
-- **DSE** `src/passes/dse.rs` (same-block, closed-alloca escape analysis,
-  byte-range kills; `CCC_NO_DSE`); backedge PRE (integer recurrences
-  default-on; FP variants gated); GVN per-object epochs for disjoint
-  non-escaping allocas + `restrict` params; GlobalAddr CSE with
-  oracle-derived placement (cold branch-local, loop preheader, reuse of
-  dominating defs; derived variable-index bases site-local).
-- **Aggregates**: AVX2 64-byte assignment = 2 YMM pairs + `vzeroupper`;
-  32/48-byte copies stay XMM (measured). SysV all-SSE 16-byte struct
-  returns use xmm0/xmm1.
-- **MachInst** ISel/emit path exists, gated off when loop body > 32 insts
-  (`CCC_MI_MAX_LOOP_INSTS`; the local scheduler regressed gzip ~3 %). The
-  dead `machinst_regalloc.rs` module was deleted (P0-01a).
-- **PGO** generate/use; layout must not reorder hot loops (expat
-  131→248 ms). Per-loop trip/body profitability only.
-- **Sema** enforces assignment/prototype-arity/return constraints,
-  `__seg_fs`/`__seg_gs` declarator/local threading, GNU char-pointee
-  pointer-sign warning parity; C2x `__VA_OPT__`, `_Pragma` operator,
-  address-space-qualified lvalue stores (LK-26 fix, `afa22485`).
-- **Multi-arch**: x86-64, i686 (natural 4-byte slots, m16 boot pipeline,
-  32 KiB boot gate PASS at `.text` 23,378 / cliff 23,384), AArch64
-  (CASP, MOVW `:abs_g*:`, `.org`, PREL64, G1/G2/SABS reloc repair),
-  RISC-V (va_arg struct{long double} end-to-end padding). Assembler +
-  ELF linker in-tree for all four.
-- **Kernel bring-up**: linux-cachymod **6.18.47** (bumped from 6.18.46;
-  `scripts/prepare_kernel_tree.sh` + boot harnesses). Early IDT `.fill`
-  → `.org` restretch landed in PR #289 (`12c80ed`) and confirmed on the
-  6.18.47 bzImage (32×9-byte slots). **P0:** lccc-built preboot ZSTD
-  decoder reports `ZSTD-compressed data is corrupt` (host-zstd payload
-  is intact). See `FOLLOWUP-2026-08-29-kernel-6.18.47.md`.
+```text
+C source
+  -> lexer/parser/sema and target ABI lowering
+  -> typed SSA IR
+  -> verification + optimization pipeline
+  -> target code generation / register allocation
+  -> textual assembly
+  -> in-tree assembler and ELF linker
+```
 
-## What is still losing vs GCC (canonical 2026-08-28 screening)
+The supported backend families are x86-64, i686, AArch64, and RISC-V 64. The
+standalone `lccc-ld` path shares the ELF/linker-common machinery with the
+compiler driver. GCC-backed assembler/linker paths remain explicit Cargo
+features; the default path is the in-tree implementation.
 
-Ratio = LCCC/GCC, `-O2`, paired medians, checksums verified. Geomean
-0.738 (33 pairs), conventional-code geomean 1.096 (30 pairs, recursion
-folds excluded). Full table: root `README.md`; evidence:
-`evidence/benchmarks/2026-08-28-1b3994e7/`. Root-caused gaps, by magnitude:
+### Frontend and IR
 
-| Gap | Kernel | Root cause | Tracked as |
-|-----|--------|-----------|------------|
-| 2.15× | tls_seg_access | thread-pointer materialization; direct `%fs:offset` covers only link-time-constant offsets | unassigned (candidate IS) |
-| ~1.50× | adler32 | arithmetic-chain copy webs; no reload-at-use | RA-06/PF-05 (P0) |
-| 1.23× / 1.31× | nbody / spectral | non-reduction FP loops; multi-store scatter; marching-pointer slot-homing (mandelbrot 1.23×) | OP-05b, RA-01b (P0) |
-| suite-wide | every loop kernel | loop rotation default-off (double-jump preheader, ~1 branch/iter) | PF-17 hardening (P0) |
-| ~1.80× | expat | hash-multiply `imul` chains | OP-25/PF-15 (P1) |
-| ~1.51× | linux_find_bit | branchy ffs tree → andn+cmov chain | IS-11 (P1) |
-| isort (CE) | instruction count | secondary-IV strength reduction (43 vs 23) | PF-06 (P1) |
+- The frontend covers the C11/C17 core plus the GNU/C2x features exercised by
+the regression and workload suites: inline assembly, atomics, variadics,
+`__VA_OPT__`, TLS segment/address-space forms, `_Pragma`, and target-aware
+plain-`char` signedness.
+- The typed SSA IR has structural verification between passes. Phis, block
+predecessors, terminators, value spans, and asm-goto edges are checked.
+- `-O0` is deliberately conservative and uses canonical stack homes. `-O1`
+uses light optimization; `-O2` enables the full default pipeline; `-O3`, `-Os`,
+and `-Oz` add their documented size/unroll policies.
 
-## Dead code — nuanced assessment
+### Optimization and generated code
 
-Not all dead code should be deleted:
+- Scalar simplification, constant/cast folding, GVN/PRE, backedge PRE,
+dead-store elimination, address CSE, copy propagation, tail-call elimination,
+loop transforms, and epilogue/block layout passes are active where their
+soundness and profitability gates permit.
+- Reduction, widening, stencil, elementwise-map, interleave, and plain-copy
+vectorizers are profitability-gated. PGO trip/body data may enable a transform;
+flat or insufficient profiles do not.
+- Register allocation uses segment-aware liveness and linear scan, with a
+tier-2 hole-aware graph-coloring path for eligible functions. ABI physical hints,
+spill-slot width tracking, and the optional `CCC_VERIFY_REGALLOC=1` verifier are
+active. `CCC_NO_TIER2_GRAPH` restores scan-only allocation for bisection.
+- MachInst instruction selection is used only within its measured loop-size
+policy. Calls, floating stores without a suitable register class, and other
+unsupported classes stay on the conservative text path.
+- Floating-point contraction defaults to `Off`; `-ffp-contract=fast` and
+`-ffast-math` opt into broader contraction. FMA emission is ISA-gated.
+- Loop rotation remains opt-in (`CCC_LOOP_ROTATE=1`) until the known
+non-canonical miscompile shapes are eliminated.
 
-| Item | Verdict |
+### Rust 1.98.1 pass
+
+Adoption is limited to changes with a clear maintenance or compiler-host cost:
+
+- `core::fmt::NumBuffer` formats the decimal suffix of fresh compiler-generated
+labels with caller-owned storage. This is on the shared `CodegenState` path used
+by all backends and preserves exact `.Lprefix_N` spelling.
+- `str::strip_circumfix` replaces manual byte-range slicing in AArch64 inline-asm
+constraint parsing, AArch64 peephole memory parsing, and balanced-parenthesis
+normalization. The surrounding checks remain conservative, so malformed or
+non-ASCII input cannot turn into an unchecked slice.
+- No algebraic floating-point APIs or semantic-changing language features were
+introduced: generated-code correctness has priority over novelty.
+
+## Validation state
+
+The following results are from this pass on the rebased source. The benchmark
+report and raw samples are under
+`engineering/evidence/benchmarks/2026-09-06-rust198-3e1b71dd/`.
+
+| Check | Result |
 |---|---|
-| `machinst_regalloc.rs` | DELETED (P0-01a) |
-| `graph_coloring.rs` (slot colorer) | KEPT/PERFECTED — Tier-2 production default, `CCC_NO_TIER2_GRAPH` |
-| `reg_hint: Option<PhysReg>` | WIRED (RA-26) |
-| `enable_splitting: bool` | KEPT — the RA-06 stub gate (do not delete) |
-| `handled: Vec<ActiveInterval>` | WIRED (RA-13 verifier) |
+| `cargo fmt --all -- --check` | pass |
+| `cargo check --all-targets` | pass |
+| `cargo check --all-targets --all-features` | pass; GCC-linker feature now also compiles the standalone built-in linker exports |
+| `cargo test --all-targets` | **2,020 passed**, 0 failed, 6 ignored |
+| `tests/regression/run_regression.py --lccc target/release/lccc -j 2` | **670 passed**, 0 failed; 13 honest GCC-incompatible `SKIP-COMPARE`; 683 total |
+| `scripts/check_benchmark_outputs.sh` | **156 passed**, 0 failed, 0 skipped across the full program corpus and `-O0`…`-O3` |
+| `.github/scripts/ci-codegen-gate.py` | pass for gzip, zlib-ng, Expat, SQLite, glibc memcmp, hash table, and stencil sentinel |
+| full benchmark runner | **33/33 correct**; paired nine-round VM screening; geometric mean LCCC/GCC `0.7314` |
 
-## Hard constraints (short form; full list in `agent/RULES.md`)
+The compiler binary used for release measurements came from
+`scripts/build_lccc_o1_j2.sh`: Rust 1.98.1, release profile, compiler
+opt-level 1, Cargo jobs 2, with warnings denied. `fastbuild` remains the normal
+iteration profile and uses the same compiler opt-level policy with incremental
+compilation and LTO disabled.
 
-1. gzip `longest_match` stack-mem must not rise; adler/gzip/expat oracles
-   gate RA work.
-2. Do not enable MachInst on large loops; do not enable `CCC_SROA_COPYOUT`
-   without a dominance proof; do not set `CCC_EVICT_MODE=5` or
-   `CCC_PGO_WEIGHT_MAX>1` as defaults.
-3. PhysReg(11)=`%r10` (static chain), PhysReg(10)=`%r11`; `cmp` never in
-   `CCC_X64_NOHOME_CLASSES`.
-4. `FpContract::Off` is the default; FMA needs the FMA3 feature gate.
-5. Loop rotation stays opt-in until the 15 known miscompiles are
-   root-caused.
-6. Preserve `ExplicitLocation::{Reg,Accumulator}` and exact
-   `SlotAddr::Reg(PhysReg)`; no dummy frame offsets.
+The benchmark VM is hypervisor-backed and has no usable PMU. Wall-clock values
+are therefore screening evidence. Assembly metrics, deterministic outputs,
+repeated paired timing, and differential correctness are retained; no hardware
+counter claim is made.
 
-## S09: preboot ZSTD signed cast-chain Copy (2026-08-29)
+## Benchmark and workload policy
 
-- **P0 kernel boot**: lccc -O1+ `simplify_cast` folded `Cast(I32→I64→I32)` to
-  `Copy`. Signed I32 homes are zext (`movl`); the round-trip is `movslq`.
-  Copy kept garbage high bits; ZSTD match/RLE (≥320 B patterned) SEGV /
-  `ZSTD-compressed data is corrupt`. Fix: Copy only for **unsigned** A;
-  mixed B-widest fold skips A→B→A and mixed-sign C>A. Oracle +
-  `tests/regression/signed_i32_ptr_add.c`. Unsigned Copy kept (perf).
-- Do not relink mixed gcc objects on the 6.18.47 tree; rebuild compressed/.
+- CI runs the complete registered corpus in `tests/benchmark/run_benchmarks.py`,
+not the former five-program smoke list. The `.github/scripts/ci-bench.py` name is
+now a compatibility entry point to that canonical runner.
+- The corpus includes synthetic compiler kernels and checked-in extracts from
+gzip, zlib-ng, Expat, SQLite, glibc, and Linux. Full-project runners live under
+`tests/workloads/` and are separate from the fast CI corpus.
+- Paired rounds randomize compiler order, exclude warm-up, retain every sample,
+record CPU/PMU/toolchain metadata, compare output to GCC, and report geometric
+and arithmetic aggregates. Ratios below 1 mean LCCC was faster.
+- `.github/scripts/ci-codegen-gate.py` protects assembly-quality metrics for the
+golden workload subset. `scripts/check_benchmark_outputs.sh` is the fast
+correctness gate and compares every checked-in benchmark program at four C
+optimization levels.
 
-## S08: wide va_arg + target char signedness (2026-08-28)
+## Guardrails and known limitations
 
-- **16-byte-granular va_arg, AArch64 + RISC-V64**: `va_arg(ap, __int128)`
-  has dedicated 16-byte-aligned arms on both backends (AArch64 rounds
-  `__gr_offs` UP like glibc; RISC-V rounds the overflow-area POINTER);
-  `va_arg(ap, long double)` on RISC-V stores the full binary128 value
-  (was silently `__trunctfdf2`-truncated). The riscv arms stage values
-  through t3/t4 — t0/t1 clobbered the `&va_list` pointer needed for the
-  write-back (SIGSEGV). Align-16 composites now take even-aligned GP
-  pairs on BOTH arches, named and variadic (GCC oracles verified;
-  the old "AAPCS64 needs no even pairs" call_abi note was wrong and is
-  gone). `tests/regression/va_arg_wide_struct.c` green on aarch64 AND
-  riscv64; lib 1273/0/6; ARM 378/30/75; x86 536/5 (same 5 pre-existing).
-- **Target plain-char signedness**: plain `char` was compiled signed on
-  every target (x86 default leaking into AArch64/RISC-V SysV where char
-  is unsigned). Resolved at the parse boundary — the parser rewrites
-  plain char to UnsignedChar on unsigned-char targets, so downstream
-  CType/IR mappings stay unconditional; `-fsigned-char` /
-  `-funsigned-char` override (both directions GCC-verified). Caught by
-  cast_chain_fold.c GCC differential; new
-  `tests/regression/char_signedness_target.c` pins the
-  declaration-vs-constant agreement invariant on all targets.
+- Do not enable loop rotation globally, MachInst on large loops, unsafe SROA
+copy-out, or unvalidated high-pressure register-allocation modes. Use the
+kill-switch and negative-results ledger before any default change.
+- The built-in compiler/linker supports the tested ELF targets, but full parent
+project support still depends on headers, CRT objects, libraries, and target
+runtime availability. The complete workload scripts document those external
+requirements.
+- The VM has no PMU and cannot establish bare-metal microarchitectural wins.
+Promising results require repeated timing plus assembly/differential evidence,
+then confirmation on suitable hardware.
+
+Authoritative follow-up material:
+
+- [`agent/RULES.md`](agent/RULES.md) — safety and fastbuild/O1/J2 policy
+- [`DECISIONS.md`](DECISIONS.md) — negative results and kill switches
+- [`agent/BACKLOG.md`](agent/BACKLOG.md) — measured work queue
+- [`../docs/architecture.md`](../docs/architecture.md) — subsystem map
+- [`../docs/benchmarks.md`](../docs/benchmarks.md) — runner protocol

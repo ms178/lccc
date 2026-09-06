@@ -13,6 +13,7 @@ use super::common::AsmOutput;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, IrCmpOp, Operand};
+use core::fmt::NumBuffer;
 use std::sync::Arc;
 
 /// Stack slot location for a value. Interpretation varies by arch:
@@ -604,10 +605,26 @@ impl CodegenState {
         self.current_text_section.clear();
     }
 
+    /// Format a compiler-generated label without routing the numeric suffix
+    /// through the general-purpose formatting machinery. `NumBuffer` is the
+    /// Rust 1.98 integer formatter: it writes directly into caller-owned
+    /// storage, which matters here because label creation is on every backend's
+    /// hot code-generation path.
+    #[inline]
+    fn format_label(prefix: &str, id: u32) -> String {
+        let mut label = String::with_capacity(prefix.len() + 12);
+        label.push_str(".L");
+        label.push_str(prefix);
+        label.push('_');
+        let mut number = NumBuffer::<u32>::new();
+        label.push_str(id.format_into(&mut number));
+        label
+    }
+
     /// Generate a fresh label with the given prefix.
     pub fn fresh_label(&mut self, prefix: &str) -> String {
         let id = self.next_label_id();
-        format!(".L{}_{}", prefix, id)
+        Self::format_label(prefix, id)
     }
 
     /// Central x87-pending flush gate. Any emitted line that could mutate
@@ -1066,5 +1083,12 @@ mod slot_addr_tests {
             .insert(18, ExplicitLocation::Accumulator);
         assert!(state.is_accumulator_location(18));
         assert!(state.resolve_slot_addr(18).is_none());
+    }
+
+    #[test]
+    fn fresh_labels_use_the_decimal_suffix_without_changing_spelling() {
+        let mut state = CodegenState::new();
+        assert_eq!(state.fresh_label("loop"), ".Lloop_0");
+        assert_eq!(state.fresh_label("loop"), ".Lloop_1");
     }
 }
