@@ -84,9 +84,10 @@ pub(crate) fn resolve_in_frame(
     frame: u32,
     v: Value,
 ) -> Option<lmp::LinForm> {
-    static EMPTY: std::sync::OnceLock<FxHashSet<usize>> = std::sync::OnceLock::new();
+    static EMPTY: std::sync::LazyLock<FxHashSet<usize>> =
+        std::sync::LazyLock::new(FxHashSet::default);
     let (body_ref, header_idx) = if frame == NO_FRAME {
-        (EMPTY.get_or_init(FxHashSet::default), usize::MAX)
+        (&*EMPTY, usize::MAX)
     } else {
         let (h, b) = &lf.frames[frame as usize];
         (b, *h)

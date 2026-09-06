@@ -523,26 +523,26 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
 /// `CCC_DEBUG_LIVE_FUNC=<name>` restricts the `CCC_DEBUG_LIVE` dump to one
 /// function (value ids are per-function, so a TU-wide dump is mostly noise).
 fn debug_live_func_matches(name: &str) -> bool {
-    static F: OnceLock<Option<String>> = OnceLock::new();
-    F.get_or_init(|| std::env::var("CCC_DEBUG_LIVE_FUNC").ok())
-        .as_deref()
-        .is_none_or(|f| f == name)
+    static F: std::sync::LazyLock<Option<String>> =
+        std::sync::LazyLock::new(|| std::env::var("CCC_DEBUG_LIVE_FUNC").ok());
+    F.as_deref().is_none_or(|f| f == name)
 }
 
 fn debug_live_target() -> Option<u32> {
-    static T: OnceLock<Option<u32>> = OnceLock::new();
-    *T.get_or_init(|| {
+    static T: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
         std::env::var("CCC_DEBUG_LIVE")
             .ok()
             .and_then(|s| s.parse().ok())
-    })
+    });
+    *T
 }
 
 /// `CCC_DEBUG_LIVE_TRACE=1` (with `CCC_DEBUG_LIVE=<v>`): print each raw
 /// def/use event that touches the traced value, as it is recorded.
 fn debug_live_trace_enabled() -> bool {
-    static T: OnceLock<bool> = OnceLock::new();
-    *T.get_or_init(|| std::env::var_os("CCC_DEBUG_LIVE_TRACE").is_some())
+    static T: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_LIVE_TRACE").is_some());
+    *T
 }
 
 /// Single IR walk: alloca set + dense remap of every non-alloca value.

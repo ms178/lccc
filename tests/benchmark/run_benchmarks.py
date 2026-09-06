@@ -133,6 +133,18 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("linux_find_bit.c",), ("workload", "linux", "bitmap", "bit")),
     Benchmark("glibc_memcmp", "glibc aligned-word memcmp path",
               ("glibc_memcmp.c",), ("workload", "glibc", "memory", "branch")),
+    Benchmark("chacha20_block", "ChaCha20 20-round ARX block cipher / register pressure",
+              ("chacha20_block.c",), ("workload", "crypto", "arx", "integer")),
+    Benchmark("sha256_transform", "SHA-256 64-step block transform / rotate and schedule",
+              ("sha256_transform.c",), ("workload", "crypto", "sha256", "integer")),
+    Benchmark("linux_rbtree", "Linux kernel intrusive Red-Black tree insertion and search",
+              ("linux_rbtree.c",), ("workload", "linux", "rbtree", "tree", "memory")),
+    Benchmark("zstd_count", "Zstandard fast unaligned match counting (ZSTD_count / ctz)",
+              ("zstd_count.c",), ("workload", "zstd", "compression", "bit")),
+    Benchmark("lz4_compress", "LZ4 fast block compression / 4-byte hash matching",
+              ("lz4_compress.c",), ("workload", "lz4", "compression", "memory")),
+    Benchmark("glibc_strstr", "glibc two-way string search / needle shift table",
+              ("glibc_strstr.c",), ("workload", "glibc", "string", "search")),
 )
 
 

@@ -2776,10 +2776,11 @@ fn is_numeric_label_ref(s: &str) -> bool {
 /// are handled by callers).
 fn strip_outer_parens(s: &str) -> &str {
     let s = s.trim();
-    let Some(inner) = s.strip_circumfix('(', ')') else {
+    if !s.starts_with('(') || !s.ends_with(')') {
         return s;
-    };
+    }
     // Check if the outer parens are actually matched (not "(a)-(b)")
+    let inner = &s[1..s.len() - 1];
     let mut depth = 0i32;
     for ch in inner.chars() {
         match ch {

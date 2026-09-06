@@ -1761,7 +1761,7 @@ fn mentions_token(text: &str, token: &str) -> usize {
             || !text[..at]
                 .chars()
                 .next_back()
-                .map_or(false, |c| c.is_ascii_alphanumeric() || c == '_' || c == '%');
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '%');
         let ok_after = !text[after..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
         if ok_before && ok_after {
             count += 1;

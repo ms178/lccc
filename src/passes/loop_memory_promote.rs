@@ -61,8 +61,9 @@ struct Path {
 }
 
 fn promote_debug() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CCC_DEBUG_PROMOTE").is_some())
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_PROMOTE").is_some());
+    *FLAG
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {

@@ -642,6 +642,7 @@ const DIRECT_LD_AARCH64: DirectLdArchConfig = DirectLdArchConfig {
 // $LCCC_SYSROOT/usr/lib/gcc/i686-linux-gnu/<ver> when those exist.
 
 /// Map an absolute candidate path onto the active sysroot (if any).
+#[cfg(not(feature = "gcc_linker"))]
 pub(crate) fn with_sysroot_prefix(path: &str) -> String {
     match std::env::var("LCCC_SYSROOT") {
         Ok(root) if !root.is_empty() => format!("{}{}", root.trim_end_matches('/'), path),
@@ -650,6 +651,7 @@ pub(crate) fn with_sysroot_prefix(path: &str) -> String {
 }
 
 /// Existence probe honouring LCCC_SYSROOT (prefixed path first, host fallback).
+#[cfg(not(feature = "gcc_linker"))]
 pub(crate) fn exists_with_sysroot(path: &str) -> bool {
     std::path::Path::new(&with_sysroot_prefix(path)).exists() || std::path::Path::new(path).exists()
 }
@@ -2378,7 +2380,7 @@ pub(crate) fn compute_value_type_map(
                 if let Some(ty) = inst.result_type() {
                     if let Some(dest) = inst.dest() {
                         let old = value_types.get(&dest.0).copied();
-                        if old.map_or(true, |o| o.size() < ty.size()) {
+                        if old.is_none_or(|o| o.size() < ty.size()) {
                             widen(&mut value_types, dest.0, ty);
                             changed = true;
                         }
@@ -2392,7 +2394,7 @@ pub(crate) fn compute_value_type_map(
                         };
                         if let Some(t) = t {
                             let old = value_types.get(&dest.0).copied();
-                            if old.map_or(true, |o| o.size() < t.size()) {
+                            if old.is_none_or(|o| o.size() < t.size()) {
                                 widen(&mut value_types, dest.0, t);
                                 changed = true;
                             }
@@ -2408,7 +2410,7 @@ pub(crate) fn compute_value_type_map(
                             };
                             if let Some(t) = t {
                                 let old = value_types.get(&dest.0).copied();
-                                if old.map_or(true, |o| o.size() < t.size()) {
+                                if old.is_none_or(|o| o.size() < t.size()) {
                                     widen(&mut value_types, dest.0, t);
                                     changed = true;
                                 }

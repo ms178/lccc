@@ -1456,7 +1456,7 @@ fn line_refs_gp_family(line: &str, fam: u8) -> bool {
             let boundary = line
                 .as_bytes()
                 .get(end)
-                .map_or(true, |&c| !(c as char).is_ascii_alphanumeric());
+                .is_none_or(|&c| !(c as char).is_ascii_alphanumeric());
             if boundary {
                 return true;
             }

@@ -376,7 +376,7 @@ fn seed(func: &IrFunction, usedef: &UseDefInfo, state: &mut SccpState, num_value
     // table involved so a size disagreement can never index out of range.
     let scan = num_values.min(usedef.len()).min(state.lattice.len());
     for v in 0..scan {
-        let used = usedef.use_count.get(v).map_or(false, |&n| n > 0);
+        let used = usedef.use_count.get(v).is_some_and(|&n| n > 0);
         if used && usedef.def_of(v as u32).is_none() {
             state.lattice[v] = LatticeVal::Bottom;
         }
@@ -962,8 +962,7 @@ struct RewriteGates {
 }
 
 fn gates() -> &'static RewriteGates {
-    static GATES: std::sync::OnceLock<RewriteGates> = std::sync::OnceLock::new();
-    GATES.get_or_init(|| {
+    static GATES: std::sync::LazyLock<RewriteGates> = std::sync::LazyLock::new(|| {
         let on = |k: &str| std::env::var_os(k).is_some();
         RewriteGates {
             no_prune: on("CCC_SCCP_NO_PRUNE"),
@@ -972,7 +971,8 @@ fn gates() -> &'static RewriteGates {
             no_fold: on("CCC_SCCP_NO_FOLD"),
             trace_prune: on("CCC_SCCP_TRACE_PRUNE"),
         }
-    })
+    });
+    &GATES
 }
 
 /// Opcodes whose destination the rewrite is allowed to overwrite with a

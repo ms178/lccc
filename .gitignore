@@ -52,6 +52,9 @@ bench_*
 *.log
 *.png
 *.pdf
+regression-results.json
+inline-asm-utf8.json
+ci-regression-environment.txt
 
 # Misc
 .tmp

@@ -418,9 +418,7 @@ fn build_gnu_hash(mut names: Vec<String>, machine: ScriptMachine) -> (Vec<u8>, V
     } else {
         32usize
     };
-    let bloom_size = ((names.len() + word_bits - 1) / word_bits)
-        .next_power_of_two()
-        .max(1);
+    let bloom_size = names.len().div_ceil(word_bits).next_power_of_two().max(1);
     let bloom_shift = 6u32;
     // Store bloom words in u64 while building; ELF32 serialises their low 32
     // bits as Elf32_Addr words.

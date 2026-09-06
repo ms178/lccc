@@ -844,13 +844,13 @@ impl LoopNest {
     /// Check if a loop is an innermost loop (has no child subloops).
     #[inline(always)]
     pub fn is_innermost(&self, loop_idx: usize) -> bool {
-        self.children.get(loop_idx).map_or(true, |c| c.is_empty())
+        self.children.get(loop_idx).is_none_or(|c| c.is_empty())
     }
 
     /// Check if a loop is an outermost loop (has no parent loop).
     #[inline(always)]
     pub fn is_outermost(&self, loop_idx: usize) -> bool {
-        self.parent.get(loop_idx).map_or(true, |p| p.is_none())
+        self.parent.get(loop_idx).is_none_or(|p| p.is_none())
     }
 }
 

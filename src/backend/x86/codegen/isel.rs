@@ -1215,8 +1215,9 @@ pub mod stats {
     static BY_KIND: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
     pub fn enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("CCC_ISEL_STATS").is_ok())
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("CCC_ISEL_STATS").is_ok());
+        *ON
     }
 
     /// Record a lowering that a caller handled outside `lower_instruction_typed`.

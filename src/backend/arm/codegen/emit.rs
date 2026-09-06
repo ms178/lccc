@@ -569,7 +569,8 @@ impl ArmCodegen {
 
                     for (constraint, _, _) in outputs {
                         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
-                        if let Some(reg_name) = c.strip_circumfix('{', '}') {
+                        if c.starts_with('{') && c.ends_with('}') {
+                            let reg_name = &c[1..c.len() - 1];
                             // Normalize rN -> xN (GCC AArch64 alias)
                             let normalized =
                                 super::asm_emitter::normalize_aarch64_register(reg_name);
@@ -622,7 +623,8 @@ impl ArmCodegen {
                             continue;
                         }
                         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
-                        if let Some(reg_name) = c.strip_circumfix('{', '}') {
+                        if c.starts_with('{') && c.ends_with('}') {
+                            let reg_name = &c[1..c.len() - 1];
                             // Normalize rN -> xN (GCC AArch64 alias)
                             let normalized =
                                 super::asm_emitter::normalize_aarch64_register(reg_name);
@@ -2547,12 +2549,12 @@ impl ArchCodegen for ArmCodegen {
         }
         if self
             .get_phys_reg_for_value(info.index.0)
-            .map_or(true, is_arm_fp_phys)
+            .is_none_or(is_arm_fp_phys)
         {
             return false;
         }
         self.get_phys_reg_for_value(info.base.0)
-            .map_or(false, |r| !is_arm_fp_phys(r))
+            .is_some_and(|r| !is_arm_fp_phys(r))
     }
     fn supports_fused_fp_cmp_branch(&self) -> bool {
         true

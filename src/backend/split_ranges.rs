@@ -95,8 +95,9 @@ fn set_dominates(sets: &[FxHashSet<usize>], a: usize, b: usize) -> bool {
 }
 
 fn split_debug_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CCC_DEBUG_SPLIT").is_some())
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_SPLIT").is_some());
+    *FLAG
 }
 
 /// Insert `inst` at `idx`, keeping `source_spans` 1:1 when it already was.
@@ -841,7 +842,7 @@ fn pick_call_split_candidate(func: &IrFunction, rejected: &FxHashSet<u32>) -> Op
         if uses < calls_in.saturating_mul(4).saturating_add(5) {
             continue;
         }
-        if best.map_or(true, |(_, u)| uses > u) {
+        if best.is_none_or(|(_, u)| uses > u) {
             best = Some((iv.value_id, uses));
         }
     }

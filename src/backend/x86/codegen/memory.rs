@@ -2143,7 +2143,7 @@ impl X86Codegen {
                 .reg_assignments
                 .get(&index.0)
                 .copied()
-                .map_or(true, is_xmm_reg)
+                .is_none_or(is_xmm_reg)
         {
             return false;
         }
@@ -2183,7 +2183,7 @@ impl X86Codegen {
                 .reg_assignments
                 .get(&index.0)
                 .copied()
-                .map_or(true, is_xmm_reg)
+                .is_none_or(is_xmm_reg)
         {
             return false;
         }
