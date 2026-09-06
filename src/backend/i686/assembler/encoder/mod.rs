@@ -31,7 +31,7 @@ fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
         .or_else(|| m.strip_prefix("vfnm").map(|r| (r, true)))?;
     let (rest, negated) = rest;
 
-    let (rest, ty) = rest.split_at(rest.len().checked_sub(2)?);
+    let (rest, ty) = rest.split_at_checked(rest.len().checked_sub(2)?)?;
     let (w, scalar) = match ty {
         "ps" => (0u8, false),
         "pd" => (1, false),
@@ -40,7 +40,7 @@ fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
         _ => return None,
     };
 
-    let (op, order) = rest.split_at(rest.len().checked_sub(3)?);
+    let (op, order) = rest.split_at_checked(rest.len().checked_sub(3)?)?;
     let order_step: u8 = match order {
         "132" => 0,
         "213" => 1,

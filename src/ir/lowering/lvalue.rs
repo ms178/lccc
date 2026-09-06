@@ -681,8 +681,8 @@ impl Lowerer {
             Expr::MemberAccess(base_expr, field_name, _) => {
                 // Check if the field is an array type - arrays decay to pointers,
                 // so we return the field address (not load the value).
-                let field_is_vla_array = self.func_state.as_ref().map_or(false, |fs| {
-                    self.get_expr_ctype(base_expr).map_or(false, |ctype| {
+                let field_is_vla_array = self.func_state.as_ref().is_some_and(|fs| {
+                    self.get_expr_ctype(base_expr).is_some_and(|ctype| {
                         let mut struct_key = None;
                         match &ctype {
                             CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
@@ -694,7 +694,7 @@ impl Lowerer {
                             },
                             _ => {}
                         }
-                        struct_key.map_or(false, |k| {
+                        struct_key.is_some_and(|k| {
                             let field_key = format!("{k}::{field_name}");
                             fs.vla_field_strides.contains_key(&field_key)
                         })
@@ -703,8 +703,7 @@ impl Lowerer {
                 let field_is_array = field_is_vla_array
                     || self
                         .resolve_field_ctype(base_expr, field_name, false)
-                        .map(|ct| matches!(ct, CType::Array(_, _)))
-                        .unwrap_or(false);
+                        .is_some_and(|ct| matches!(ct, CType::Array(_, _)));
                 if field_is_array {
                     // Return address of the array field (array decays to pointer)
                     let (field_offset, _) = self.resolve_member_access(base_expr, field_name);
@@ -729,8 +728,8 @@ impl Lowerer {
             }
             Expr::PointerMemberAccess(base_expr, field_name, _) => {
                 // Check if the field is an array type - arrays decay to pointers
-                let field_is_vla_array = self.func_state.as_ref().map_or(false, |fs| {
-                    self.get_expr_ctype(base_expr).map_or(false, |ctype| {
+                let field_is_vla_array = self.func_state.as_ref().is_some_and(|fs| {
+                    self.get_expr_ctype(base_expr).is_some_and(|ctype| {
                         let mut struct_key = None;
                         match &ctype {
                             CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
@@ -742,7 +741,7 @@ impl Lowerer {
                             },
                             _ => {}
                         }
-                        struct_key.map_or(false, |k| {
+                        struct_key.is_some_and(|k| {
                             let field_key = format!("{k}::{field_name}");
                             fs.vla_field_strides.contains_key(&field_key)
                         })
@@ -751,8 +750,7 @@ impl Lowerer {
                 let field_is_array = field_is_vla_array
                     || self
                         .resolve_field_ctype(base_expr, field_name, true)
-                        .map(|ct| matches!(ct, CType::Array(_, _)))
-                        .unwrap_or(false);
+                        .is_some_and(|ct| matches!(ct, CType::Array(_, _)));
                 if field_is_array {
                     // Return address of the array field (array decays to pointer)
                     let ptr_val = self.lower_expr(base_expr);

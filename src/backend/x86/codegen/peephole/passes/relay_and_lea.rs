@@ -930,11 +930,11 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
             continue;
         }
         let lea = infos[li].trimmed(store.get(li)).to_string();
-        let (lea_rest, prod_w) = if let Some(r) = lea.strip_prefix("leaq ") {
-            (r, 64u8)
-        } else if let Some(r) = lea.strip_prefix("leal ") {
-            (r, 32u8)
-        } else {
+        let Some((lea_rest, prod_w)) = lea
+            .strip_prefix("leaq ")
+            .map(|r| (r, 64u8))
+            .or_else(|| lea.strip_prefix("leal ").map(|r| (r, 32u8)))
+        else {
             continue;
         };
         if has_implicit_reg_usage(&lea) {
@@ -961,11 +961,11 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
             continue;
         }
         let copy = infos[j].trimmed(store.get(j)).to_string();
-        let (copy_w, copy_rest) = if let Some(r) = copy.strip_prefix("movq ") {
-            (64u8, r)
-        } else if let Some(r) = copy.strip_prefix("movl ") {
-            (32u8, r)
-        } else {
+        let Some((copy_w, copy_rest)) = copy
+            .strip_prefix("movq ")
+            .map(|r| (64u8, r))
+            .or_else(|| copy.strip_prefix("movl ").map(|r| (32u8, r)))
+        else {
             continue;
         };
         let Some((copy_src, copy_dst)) = split_two_operands(copy_rest) else {

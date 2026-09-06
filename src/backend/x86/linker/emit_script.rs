@@ -418,7 +418,9 @@ fn build_gnu_hash(mut names: Vec<String>, machine: ScriptMachine) -> (Vec<u8>, V
     } else {
         32usize
     };
-    let bloom_size = ((names.len() + word_bits - 1) / word_bits)
+    let bloom_size = names
+        .len()
+        .div_ceil(word_bits)
         .next_power_of_two()
         .max(1);
     let bloom_shift = 6u32;

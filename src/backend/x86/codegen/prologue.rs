@@ -2396,13 +2396,10 @@ impl X86Codegen {
                 }
             }
 
-            let (slot, ty) = if let Some((dest, ty)) = find_param_alloca(func, i) {
-                if let Some(slot) = self.state.get_slot(dest.0) {
-                    (slot, ty)
-                } else {
-                    continue;
-                }
-            } else {
+            let Some((dest, ty)) = find_param_alloca(func, i) else {
+                continue;
+            };
+            let Some(slot) = self.state.get_slot(dest.0) else {
                 continue;
             };
 

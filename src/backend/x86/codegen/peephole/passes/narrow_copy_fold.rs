@@ -135,17 +135,12 @@ fn replace_reg(line: &str, name: &str, with: &str) -> String {
 /// Parse `mov{b,w,l,q} %S, %D` with both operands plain registers of the
 /// mnemonic's own width. Returns `(width_index, src_family, dst_family)`.
 fn parse_reg_to_reg_mov(trimmed: &str) -> Option<(usize, RegId, RegId)> {
-    let (mnemonic, width) = if let Some(r) = trimmed.strip_prefix("movq ") {
-        (r, W64)
-    } else if let Some(r) = trimmed.strip_prefix("movl ") {
-        (r, W32)
-    } else if let Some(r) = trimmed.strip_prefix("movw ") {
-        (r, W16)
-    } else if let Some(r) = trimmed.strip_prefix("movb ") {
-        (r, W8)
-    } else {
-        return None;
-    };
+    let (mnemonic, width) = trimmed
+        .strip_prefix("movq ")
+        .map(|r| (r, W64))
+        .or_else(|| trimmed.strip_prefix("movl ").map(|r| (r, W32)))
+        .or_else(|| trimmed.strip_prefix("movw ").map(|r| (r, W16)))
+        .or_else(|| trimmed.strip_prefix("movb ").map(|r| (r, W8)))?;
     let (src_part, dst_part) = mnemonic.split_once(',')?;
     let src = src_part.trim();
     let dst = dst_part.trim();

@@ -381,12 +381,11 @@ impl RiscvCodegen {
         for (i, _param) in func.params.iter().enumerate() {
             let class = param_classes[i];
 
-            let (slot, ty) = match find_param_alloca(func, i) {
-                Some((dest, ty)) => match self.state.get_slot(dest.0) {
-                    Some(slot) => (slot, ty),
-                    None => continue,
-                },
-                None => continue,
+            let Some((dest, ty)) = find_param_alloca(func, i) else {
+                continue;
+            };
+            let Some(slot) = self.state.get_slot(dest.0) else {
+                continue;
             };
 
             match class {

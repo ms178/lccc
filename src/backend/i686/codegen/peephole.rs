@@ -256,13 +256,10 @@ fn narrow_reg_name(id: RegId, size: MoveSize) -> Option<&'static str> {
 /// a different byte than `movzbl %al` — callers must compare it against the
 /// expected low sub-register, not just the family.
 fn parse_zext32(s: &str) -> Option<(MoveSize, &str, RegId)> {
-    let (rest, w) = if let Some(r) = s.strip_prefix("movzbl ") {
-        (r, MoveSize::B)
-    } else if let Some(r) = s.strip_prefix("movzwl ") {
-        (r, MoveSize::W)
-    } else {
-        return None;
-    };
+    let (rest, w) = s
+        .strip_prefix("movzbl ")
+        .map(|r| (r, MoveSize::B))
+        .or_else(|| s.strip_prefix("movzwl ").map(|r| (r, MoveSize::W)))?;
     let (a, b) = rest.split_once(',')?;
     let a = a.trim();
     let dst = register_family(b.trim());
@@ -282,15 +279,11 @@ fn is_caller_saved(reg: RegId) -> bool {
 
 /// Parse `movX %reg, offset(%ebp)` → (reg_name, offset_str, MoveSize)
 fn parse_store_to_ebp(s: &str) -> Option<(&str, &str, MoveSize)> {
-    let (rest, size) = if let Some(r) = s.strip_prefix("movl ") {
-        (r, MoveSize::L)
-    } else if let Some(r) = s.strip_prefix("movw ") {
-        (r, MoveSize::W)
-    } else if let Some(r) = s.strip_prefix("movb ") {
-        (r, MoveSize::B)
-    } else {
-        return None;
-    };
+    let (rest, size) = s
+        .strip_prefix("movl ")
+        .map(|r| (r, MoveSize::L))
+        .or_else(|| s.strip_prefix("movw ").map(|r| (r, MoveSize::W)))
+        .or_else(|| s.strip_prefix("movb ").map(|r| (r, MoveSize::B)))?;
     // rest = "%eax, -8(%ebp)"
     let rest = rest.trim();
     if !rest.starts_with('%') {
@@ -323,15 +316,11 @@ fn parse_store_to_ebp(s: &str) -> Option<(&str, &str, MoveSize)> {
 
 /// Parse `movX offset(%ebp), %reg` → (offset_str, reg_name, MoveSize)
 fn parse_load_from_ebp(s: &str) -> Option<(&str, &str, MoveSize)> {
-    let (rest, size) = if let Some(r) = s.strip_prefix("movl ") {
-        (r, MoveSize::L)
-    } else if let Some(r) = s.strip_prefix("movw ") {
-        (r, MoveSize::W)
-    } else if let Some(r) = s.strip_prefix("movb ") {
-        (r, MoveSize::B)
-    } else {
-        return None;
-    };
+    let (rest, size) = s
+        .strip_prefix("movl ")
+        .map(|r| (r, MoveSize::L))
+        .or_else(|| s.strip_prefix("movw ").map(|r| (r, MoveSize::W)))
+        .or_else(|| s.strip_prefix("movb ").map(|r| (r, MoveSize::B)))?;
     let rest = rest.trim();
     // Accept both frame-pointer and stack-pointer slots (see
     // parse_store_to_ebp for the -fomit-frame-pointer rationale).

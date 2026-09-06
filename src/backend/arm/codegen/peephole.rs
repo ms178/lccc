@@ -522,7 +522,8 @@ fn parse_sp_offset(addr: &str) -> Option<i32> {
         return Some(0);
     }
     // [sp, #N] or [sp, #-N]
-    if let Some(inner) = addr.strip_circumfix("[sp, #", "]") {
+    if addr.starts_with("[sp, #") && addr.ends_with(']') {
+        let inner = &addr[6..addr.len() - 1]; // strip "[sp, #" and "]"
         return inner.parse::<i32>().ok();
     }
     // [sp, #N]! (pre-index) — not a simple stack slot access
@@ -1322,13 +1323,10 @@ enum FpAddr {
 /// Parse `str dS, ...` / `ldr dD, ...` (d/s/q widths) into (reg, FpAddr).
 fn parse_fp_mem(line: &str) -> Option<(bool, u8, FpAddr, u8)> {
     let t = line.trim();
-    let (is_store, rest) = if let Some(r) = t.strip_prefix("str ") {
-        (true, r)
-    } else if let Some(r) = t.strip_prefix("ldr ") {
-        (false, r)
-    } else {
-        return None;
-    };
+    let (is_store, rest) = t
+        .strip_prefix("str ")
+        .map(|r| (true, r))
+        .or_else(|| t.strip_prefix("ldr ").map(|r| (false, r)))?;
     let (reg_str, addr) = rest.split_once(", ")?;
     let reg_str = reg_str.trim();
     let width = reg_str.as_bytes().first().copied()?;
@@ -1340,10 +1338,8 @@ fn parse_fp_mem(line: &str) -> Option<(bool, u8, FpAddr, u8)> {
     if let Some(off) = parse_sp_offset(addr) {
         return Some((is_store, reg, FpAddr::Sp(off), width));
     }
-    if let Some(inner) = addr.strip_circumfix('[', ']')
-        && inner.starts_with('x')
-        && !addr.contains('!')
-    {
+    if addr.starts_with("[x") && addr.ends_with(']') && !addr.contains('!') {
+        let inner = &addr[1..addr.len() - 1];
         let (base, off) = match inner.split_once(", ") {
             Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i32>().ok()?),
             None => (inner.trim(), 0),

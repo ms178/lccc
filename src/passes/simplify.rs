@@ -742,13 +742,12 @@ struct BinOpDef {
 /// comma-separated list of fold families to disable:
 /// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`.
 fn simplify_skip(family: &str) -> bool {
-    use std::sync::OnceLock;
-    static SKIP: OnceLock<String> = OnceLock::new();
-    let raw = SKIP.get_or_init(|| std::env::var("CCC_SIMPLIFY_SKIP").unwrap_or_default());
-    if raw.is_empty() {
+    static SKIP: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| std::env::var("CCC_SIMPLIFY_SKIP").unwrap_or_default());
+    if SKIP.is_empty() {
         return false;
     }
-    raw.split(',').any(|s| s.trim() == family)
+    SKIP.split(',').any(|s| s.trim() == family)
 }
 
 fn try_simplify_with_types(

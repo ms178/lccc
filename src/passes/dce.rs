@@ -460,8 +460,9 @@ fn sweep_block<S>(
 /// (lock + hash lookup + OsString alloc × every function × every DCE
 /// invocation). Cache it for the process lifetime.
 fn dce_debug_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CCC_DEBUG_DCE").is_some())
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_DCE").is_some());
+    *FLAG
 }
 
 fn dump_dead_instructions(func: &IrFunction, live: &[u8], block_off: &[u32]) {

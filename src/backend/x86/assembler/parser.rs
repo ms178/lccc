@@ -2291,13 +2291,10 @@ fn try_parse_sym_diff_expr(s: &str) -> Option<DataValue> {
         rest = tail.trim();
     }
     if !rest.is_empty() {
-        let (sign, r) = if let Some(r) = rest.strip_prefix('+') {
-            (1i64, r)
-        } else if let Some(r) = rest.strip_prefix('-') {
-            (-1i64, r)
-        } else {
-            return None;
-        };
+        let (sign, r) = rest
+            .strip_prefix('+')
+            .map(|r| (1i64, r))
+            .or_else(|| rest.strip_prefix('-').map(|r| (-1i64, r)))?;
         addend = sign.checked_mul(parse_integer_expr(r.trim()).ok()?)?;
         rest = "";
     }

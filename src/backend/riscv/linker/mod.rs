@@ -33,5 +33,7 @@ mod relocations;
 mod sections;
 mod symbols;
 
+#[cfg(not(feature = "gcc_linker"))]
 pub use link::link_builtin;
+#[cfg(not(feature = "gcc_linker"))]
 pub use link::link_shared;

@@ -856,11 +856,10 @@ fn narrow_cmps(func: &mut IrFunction, widen_map: &[Option<CastInfo>]) -> usize {
                     _ => None,
                 };
 
-                let narrow_ty = if let Some(lhs_info) = lhs_cast {
-                    lhs_info.from_ty
-                } else {
+                let Some(lhs_info) = lhs_cast else {
                     continue;
                 };
+                let narrow_ty = lhs_info.from_ty;
 
                 let is_signed_cmp = matches!(
                     op,
@@ -878,12 +877,8 @@ fn narrow_cmps(func: &mut IrFunction, widen_map: &[Option<CastInfo>]) -> usize {
                     continue;
                 }
 
-                let new_lhs = if let Some(info) = lhs_cast {
-                    if info.from_ty == narrow_ty {
-                        info.src
-                    } else {
-                        continue;
-                    }
+                let new_lhs = if lhs_info.from_ty == narrow_ty {
+                    lhs_info.src
                 } else {
                     continue;
                 };
@@ -895,11 +890,10 @@ fn narrow_cmps(func: &mut IrFunction, widen_map: &[Option<CastInfo>]) -> usize {
                         continue;
                     }
                 } else if let Operand::Const(c) = rhs {
-                    if let Some(narrow_c) = try_narrow_const_for_cmp(c, narrow_ty) {
-                        Operand::Const(narrow_c)
-                    } else {
+                    let Some(narrow_c) = try_narrow_const_for_cmp(c, narrow_ty) else {
                         continue;
-                    }
+                    };
+                    Operand::Const(narrow_c)
                 } else {
                     continue;
                 };

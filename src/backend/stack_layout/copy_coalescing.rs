@@ -23,8 +23,9 @@ use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
 
 fn cfg_copy_coalesce_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("CCC_NO_CFG_COPY_COALESCE").is_none())
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_CFG_COPY_COALESCE").is_none());
+    *ENABLED
 }
 
 fn env_flag(name: &'static str) -> bool {

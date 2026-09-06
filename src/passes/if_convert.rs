@@ -1499,26 +1499,12 @@ fn detect_triangle(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> 
             _ => None,
         };
 
-        if let Some(tt) = true_target {
-            if tt == false_idx {
-                // true arm branches to false_idx which is the merge block
-                (true_idx, false_idx, true)
-            } else if let Some(ft) = false_target {
-                if ft == true_idx {
-                    // false arm branches to true_idx which is the merge block
-                    (false_idx, true_idx, false)
-                } else {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-        } else if let Some(ft) = false_target {
-            if ft == true_idx {
-                (false_idx, true_idx, false)
-            } else {
-                return None;
-            }
+        if true_target == Some(false_idx) {
+            // true arm branches to false_idx which is the merge block
+            (true_idx, false_idx, true)
+        } else if false_target == Some(true_idx) {
+            // false arm branches to true_idx which is the merge block
+            (false_idx, true_idx, false)
         } else {
             return None;
         }

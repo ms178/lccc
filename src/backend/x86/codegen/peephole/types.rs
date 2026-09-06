@@ -950,22 +950,15 @@ pub(super) fn strip_mov_prefix(s: &str, allow_slq: bool) -> Option<(&str, MoveSi
 /// rejected by construction (the slot operand, not `%ds:/%es:` or an XMM,
 /// must be one of the two ends).
 pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
-    let body = if let Some(r) = s.strip_prefix("vmovsd ") {
-        (r, MoveSize::SD)
-    } else if let Some(r) = s.strip_prefix("vmovss ") {
-        (r, MoveSize::SS)
-    } else if let Some(r) = s.strip_prefix("movsd ") {
-        (r, MoveSize::SD)
-    } else if let Some(r) = s.strip_prefix("movss ") {
-        (r, MoveSize::SS)
-    } else if let Some(r) = s.strip_prefix("movd ") {
-        (r, MoveSize::L)
-    } else if let Some(r) = s.strip_prefix("vmovd ") {
-        (r, MoveSize::L)
-    } else {
-        return None;
-    };
-    let (src, dst) = body.0.split_once(',')?;
+    let (rest, size) = s
+        .strip_prefix("vmovsd ")
+        .map(|r| (r, MoveSize::SD))
+        .or_else(|| s.strip_prefix("vmovss ").map(|r| (r, MoveSize::SS)))
+        .or_else(|| s.strip_prefix("movsd ").map(|r| (r, MoveSize::SD)))
+        .or_else(|| s.strip_prefix("movss ").map(|r| (r, MoveSize::SS)))
+        .or_else(|| s.strip_prefix("movd ").map(|r| (r, MoveSize::L)))
+        .or_else(|| s.strip_prefix("vmovd ").map(|r| (r, MoveSize::L)))?;
+    let (src, dst) = rest.split_once(',')?;
     let src = src.trim();
     let dst = dst.trim();
     let store = src.starts_with('%') && (dst.ends_with("(%rbp)") || dst.ends_with("(%rsp)"));
@@ -974,13 +967,10 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
         return None;
     }
     let mem = if store { dst } else { src };
-    if mem.ends_with("(%rbp)") {
-        Some((store, &mem[..mem.len() - 6], body.1))
-    } else if mem.ends_with("(%rsp)") {
-        Some((store, &mem[..mem.len() - 6], body.1))
-    } else {
-        None
-    }
+    let offset_str = mem
+        .strip_suffix("(%rbp)")
+        .or_else(|| mem.strip_suffix("(%rsp)"))?;
+    Some((store, offset_str, size))
 }
 
 /// True when `reg_id` is an XMM family id (24..39), which cannot be

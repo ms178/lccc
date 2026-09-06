@@ -1165,7 +1165,7 @@ impl Preprocessor {
                 // missing bits/*.h.  Mapped generic dirs are appended after
                 // the arch dirs (still ahead of every unprefixed fallback);
                 // with no LCCC_SYSROOT nothing changes at all.
-                if std::env::var("LCCC_SYSROOT").map_or(false, |r| !r.is_empty()) {
+                if std::env::var("LCCC_SYSROOT").is_ok_and(|r| !r.is_empty()) {
                     const GENERIC_LIB_DIRS: [&str; 2] = ["/usr/local/include", "/usr/include"];
                     let mapped_generic: Vec<String> = GENERIC_LIB_DIRS
                         .iter()

@@ -281,13 +281,10 @@ fn is_window_kind(kind: LineKind) -> bool {
 
 /// Parse `mov{l,q} MEM, %reg` into `(is_q, mem, family)`.
 fn parse_memory_load(t: &str) -> Option<(bool, &str, RegId)> {
-    let (is_q, rest) = if let Some(r) = t.strip_prefix("movl ") {
-        (false, r)
-    } else if let Some(r) = t.strip_prefix("movq ") {
-        (true, r)
-    } else {
-        return None;
-    };
+    let (is_q, rest) = t
+        .strip_prefix("movl ")
+        .map(|r| (false, r))
+        .or_else(|| t.strip_prefix("movq ").map(|r| (true, r)))?;
     let (src, dst) = split_two_operands(rest)?;
     if !is_plain_memory_operand(src) {
         return None;
@@ -336,13 +333,10 @@ fn parse_reg_reg_alu(t: &str) -> Option<(&'static str, bool, RegId, RegId)> {
 /// Parse `mov{l,q} %src, %dst` (plain GP register copy).  Returns
 /// `(is_q, src_fam, dst_fam)`.
 fn parse_reg_copy(t: &str) -> Option<(bool, RegId, RegId)> {
-    let (is_q, rest) = if let Some(r) = t.strip_prefix("movl ") {
-        (false, r)
-    } else if let Some(r) = t.strip_prefix("movq ") {
-        (true, r)
-    } else {
-        return None;
-    };
+    let (is_q, rest) = t
+        .strip_prefix("movl ")
+        .map(|r| (false, r))
+        .or_else(|| t.strip_prefix("movq ").map(|r| (true, r)))?;
     let (a, b) = split_two_operands(rest)?;
     let src = plain_gp_operand(a)?;
     let dst = plain_gp_operand(b)?;
@@ -1029,11 +1023,11 @@ pub(super) fn narrow_wide_immediates(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
         let t = infos[i].trimmed(store.get(i));
-        let (limit, rest) = if let Some(r) = t.strip_prefix("movabsq ") {
-            (0xFFFF_FFFFi128, r)
-        } else if let Some(r) = t.strip_prefix("movq ") {
-            (0x7FFF_FFFFi128, r)
-        } else {
+        let Some((limit, rest)) = t
+            .strip_prefix("movabsq ")
+            .map(|r| (0xFFFF_FFFFi128, r))
+            .or_else(|| t.strip_prefix("movq ").map(|r| (0x7FFF_FFFFi128, r)))
+        else {
             continue;
         };
         let Some((imm, dst)) = split_two_operands(rest) else {

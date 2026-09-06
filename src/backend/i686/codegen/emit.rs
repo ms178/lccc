@@ -2360,7 +2360,7 @@ impl ArchCodegen for I686Codegen {
         let idx_ok = self
             .reg_assignments
             .get(&info.index.0)
-            .map_or(false, |r| matches!(r.0, 0..=3));
+            .is_some_and(|r| matches!(r.0, 0..=3));
         let base_ok = match self.reg_assignments.get(&info.base.0) {
             Some(r) => matches!(r.0, 0..=3),
             None => matches!(

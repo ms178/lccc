@@ -361,13 +361,9 @@ fn is_tail_call_candidate(
 fn convert_call_to_jmp(trimmed_call: &str) -> Option<String> {
     // Direct call: "call foo" or "call foo@PLT" or "callq foo"
     // Indirect call: "call *%r10" or "callq *%r10"
-    let rest = if let Some(r) = trimmed_call.strip_prefix("callq ") {
-        r
-    } else if let Some(r) = trimmed_call.strip_prefix("call ") {
-        r
-    } else {
-        return None;
-    };
+    let rest = trimmed_call
+        .strip_prefix("callq ")
+        .or_else(|| trimmed_call.strip_prefix("call "))?;
 
     if rest.starts_with('*') {
         // Indirect call: call *%r10 -> jmp *%r10

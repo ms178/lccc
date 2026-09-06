@@ -4100,7 +4100,7 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, 
         MachInst::Lea {
             base, index, dst, ..
         } => {
-            check_reg(base) || index.as_ref().map_or(false, |(r, _)| check_reg(r)) || check_reg(dst)
+            check_reg(base) || index.as_ref().is_some_and(|(r, _)| check_reg(r)) || check_reg(dst)
         }
         MachInst::Div { divisor, .. } => check_op(divisor),
         MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {

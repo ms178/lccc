@@ -739,11 +739,8 @@ fn find_derived_exprs(
                     ..
                 } => {
                     if l.0 == r.0 {
-                        if let Some(idx) = find_iv(l.0) {
-                            (*dest, idx, 2, 0)
-                        } else {
-                            continue;
-                        }
+                        let Some(idx) = find_iv(l.0) else { continue; };
+                        (*dest, idx, 2, 0)
                     } else {
                         continue;
                     }

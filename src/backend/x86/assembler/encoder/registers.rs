@@ -972,7 +972,7 @@ pub(crate) fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
     let (rest, negated) = rest;
 
     // Element type: the last two characters.
-    let (rest, ty) = rest.split_at(rest.len().checked_sub(2)?);
+    let (rest, ty) = rest.split_at_checked(rest.len().checked_sub(2)?)?;
     let (w, scalar) = match ty {
         "ps" => (0u8, false),
         "pd" => (1, false),
@@ -982,7 +982,7 @@ pub(crate) fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
     };
 
     // Operand order: the three digits before the element type.
-    let (op, order) = rest.split_at(rest.len().checked_sub(3)?);
+    let (op, order) = rest.split_at_checked(rest.len().checked_sub(3)?)?;
     let order_step: u8 = match order {
         "132" => 0,
         "213" => 1,

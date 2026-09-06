@@ -384,11 +384,8 @@ fn eval_const_function(
                             active,
                             budget,
                         )?;
-                        if let Some(dest) = info.dest {
-                            values.insert(dest.0, result);
-                        } else {
-                            return None;
-                        }
+                        let dest = info.dest?;
+                        values.insert(dest.0, result);
                     }
                     // Memory, address-taking, indirect calls, atomics, inline
                     // asm, and target intrinsics are intentionally not evaluated.
