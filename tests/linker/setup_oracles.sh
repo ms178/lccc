@@ -12,6 +12,10 @@
 #     lccc was right in both cases and wild-git agrees).  See
 #     docs/linker/FOLLOWUP_2026-08-17_SESSION2.md §0.
 #
+#   * lld is pinned to the release/23.x branch (matching the Clang 23.1
+#     codegen oracle channel) and built with LLVM_TARGETS_TO_BUILD=X86 only —
+#     the same restrict-the-targets trick as mold, applied to LLVM.
+#
 #   * Build both with `-march=native`: the oracles are timing references, so
 #     they must not be handicapped relative to lccc.
 #
@@ -157,6 +161,55 @@ else
   log "bfd 2.47: $("$BIN/ld.bfd-2.47" --version | head -1)"
 fi
 
+# ---------------------------------------------------------------------------
+# lld 23.1 (pinned major) — matches the Clang 23.1 codegen oracle channel
+# ---------------------------------------------------------------------------
+# Built with the same "restrict the targets" trick as mold: lld itself is
+# target-generic, but it links against LLVM libraries that instantiate every
+# backend.  Restricting LLVM_TARGETS_TO_BUILD to X86 (the only target the
+# local linker comparisons run on) cuts the build from ~1 h to ~15 min on a
+# 2-core box.  A system lld whose major version matches the pin is accepted
+# as-is; anything else is built from the release/23.x branch so the oracle
+# tracks the same LLVM major as the pinned Compiler Explorer clang.
+LLD_MAJOR=23
+# `lld --version` output varies by distro ("lld version 23.1.0",
+# "Ubuntu lld version 14.0.6", "LLD 23.1.0"); match the major anywhere.
+if have lld; then
+  log "lld already present: $(\"$BIN/lld\" --version | head -1)"
+elif command -v lld >/dev/null && lld --version 2>/dev/null | grep -Eq "(lld|LLD)[^-]*${LLD_MAJOR}\.[0-9]"; then
+  install -m755 "$(command -v lld)" "$BIN/lld"
+  ln -sf lld "$BIN/ld.lld"
+  log "lld (system): $(lld --version | head -1)"
+else
+  log "building lld from LLVM release/${LLD_MAJOR}.x (X86 backend only)"
+  command -v cmake >/dev/null || { echo "cmake is required" >&2; exit 1; }
+  command -v ninja >/dev/null || { echo "ninja is required for the lld oracle build" >&2; exit 1; }
+  if [[ ! -d "$SRC/llvm-src/.git" ]]; then
+    rm -rf "$SRC/llvm-src"
+    git clone --depth 1 --branch "release/${LLD_MAJOR}.x" \
+      https://github.com/llvm/llvm-project.git "$SRC/llvm-src"
+  else
+    git -C "$SRC/llvm-src" fetch --depth 1 origin "release/${LLD_MAJOR}.x" && \
+    git -C "$SRC/llvm-src" reset --hard FETCH_HEAD
+  fi
+  cmake -S "$SRC/llvm-src/lld" -B "$SRC/llvm-src/lld/build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLLVM_TARGETS_TO_BUILD=X86 \
+        -DLLVM_ENABLE_PROJECTS=lld \
+        -DLLVM_INCLUDE_TESTS=OFF \
+        -DLLVM_INCLUDE_BENCHMARKS=OFF \
+        -DLLVM_INCLUDE_EXAMPLES=OFF \
+        -DLLVM_ENABLE_ASSERTIONS=OFF \
+        -DCMAKE_C_FLAGS="-O2 $NATIVE" \
+        -DCMAKE_CXX_FLAGS="-O2 $NATIVE" \
+        -DCMAKE_INSTALL_PREFIX="$SRC/llvm-inst"
+  cmake --build "$SRC/llvm-src/lld/build" -j "$JOBS"
+  cmake --install "$SRC/llvm-src/lld/build"
+  install -m755 "$SRC/llvm-inst/bin/lld" "$BIN/lld"
+  ln -sf lld "$BIN/ld.lld"
+  log "lld: $(\"$BIN/lld\" --version | head -1)"
+fi
+
 # Record the resolved oracle revisions so session docs can cite exact
 # versions instead of an unreproducible "HEAD".  mold/wild are built from
 # git HEAD by policy, but WHICH head must be auditable after the fact.
@@ -167,6 +220,9 @@ fi
   fi
   if [[ -d "$SRC/wild-src/.git" ]]; then
     echo "wild:  $(git -C "$SRC/wild-src" rev-parse HEAD 2>/dev/null || echo unknown)"
+  fi
+  if [[ -d "$SRC/llvm-src/.git" ]]; then
+    echo "lld:   $(git -C "$SRC/llvm-src" rev-parse HEAD 2>/dev/null || echo unknown) (release/${LLD_MAJOR}.x, X86 backend only)"
   fi
   echo "binutils (bfd/as reference): $BINUTILS_VERSION"
   echo "mold build targets: X86_64;I386"

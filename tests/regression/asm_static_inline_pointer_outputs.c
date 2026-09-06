@@ -9,6 +9,10 @@ int main(void) {
   unsigned a, b, c, d;
   cpuid2(1, &a, &b, &c, &d);
   if (!((d >> 26) & 1)) { printf("FAIL: SSE2 bit not set\n"); return 1; }
-  printf("OK eax=%08x ebx=%08x ecx=%08x edx=%08x\n", a, b & 0xFEFFFFFFu, c, d); /* mask TSC-deadline bit (24): toggles at runtime on this sandbox CPU */
+  /* EBX bits 24-31 of leaf 1 are the Initial APIC ID: which core this
+   * process was scheduled on. Mask the whole field (bits 0-23 are
+   * machine-stable) or the differential compare flakes on multi-core
+   * CI runners whenever the two binaries land on different cores. */
+  printf("OK eax=%08x ebx=%08x ecx=%08x edx=%08x\n", a, b & 0x00FFFFFFu, c, d);
   return 0;
 }

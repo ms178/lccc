@@ -42,6 +42,13 @@ are installed. The original CCC is opt-in via `--compilers lccc,ccc,gcc` and
 compiler (`-O2` by default); `-march=native` is opt-in rather than silently
 mixed into a baseline.
 
+CI runs LCCC and GCC over the **complete registered corpus** (all 39 kernels,
+9 paired rounds + 1 excluded warm-up, `--strict`) through the thin
+compatibility wrapper
+[`.github/scripts/ci-bench.py`](../.github/scripts/ci-bench.py), which
+delegates to the canonical runner — it deliberately does not maintain a
+second, smaller benchmark list that could drift out of sync.
+
 **PGO A/B.** For profile-guided work there is a dedicated harness,
 [`tests/benchmark/run_pgo_ab.py`](../tests/benchmark/run_pgo_ab.py).  For each
 kernel and compiler it builds both a plain binary and a

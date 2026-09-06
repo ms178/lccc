@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper forwarding to scripts/perf_ab.py --preset vector_remainder."""
+"""Compatibility wrapper forwarding to scripts/perf_ab.py --preset vector_remainder.
+
+Historical flag spellings (--repetitions/--pairs/--iterations, --compiler,
+--output, ...) are translated by perf_ab.translate_legacy_args.
+"""
 import sys
 from pathlib import Path
 
@@ -8,5 +12,6 @@ sys.path.insert(0, str(REPO / "scripts"))
 import perf_ab
 
 if __name__ == "__main__":
-    sys.argv = [sys.argv[0], "--preset", "vector_remainder", *sys.argv[1:]]
+    argv = perf_ab.translate_legacy_args(sys.argv[1:])
+    sys.argv = [sys.argv[0], "--preset", "vector_remainder", *argv]
     sys.exit(perf_ab.main())
