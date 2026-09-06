@@ -14,7 +14,7 @@ use super::constants::*;
 use super::linker_symbols::default_section_flags;
 use super::object_writer::write_relocatable_object;
 use super::object_writer::{ElfConfig, ObjReloc, ObjSection};
-use super::symbol_table::{build_elf_symbol_table, ObjSymbol, SymbolTableInput};
+use super::symbol_table::{ObjSymbol, SymbolTableInput, build_elf_symbol_table};
 use crate::common::fx_hash::FxHashMap;
 
 /// Shared ELF writer state used by both ARM and RISC-V assembler backends.

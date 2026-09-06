@@ -417,8 +417,10 @@ pub fn apply_one_reloc(
         R_AARCH64_TLSLE_ADD_TPREL_HI12 => {
             let tp = tprel(s, a, tls_info);
             if std::env::var("LINKER_DEBUG_TLS").is_ok() {
-                eprintln!("  TLSLE_HI12: sym='{}' s=0x{:x} a={} tls_addr=0x{:x} tls_size=0x{:x} -> tp=0x{:x}",
-                    sym_name, s, a, tls_info.tls_addr, tls_info.tls_size, tp as u64);
+                eprintln!(
+                    "  TLSLE_HI12: sym='{}' s=0x{:x} a={} tls_addr=0x{:x} tls_size=0x{:x} -> tp=0x{:x}",
+                    sym_name, s, a, tls_info.tls_addr, tls_info.tls_size, tp as u64
+                );
             }
             let imm12 = ((tp as u64 >> 12) & 0xFFF) as u32;
             encode_add_imm12(out, fp, imm12);

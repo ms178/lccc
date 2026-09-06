@@ -68,7 +68,7 @@
 //! replay remains the fail-safe, but it is now the exception it was always
 //! meant to be, not the cliff every spilled pointer fell off.
 
-use super::machinst::{MachInst, MachOperand, MachReg, OpSize, MACHINST_ALLOCATABLE_GPRS, RBP};
+use super::machinst::{MACHINST_ALLOCATABLE_GPRS, MachInst, MachOperand, MachReg, OpSize, RBP};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 
@@ -136,15 +136,27 @@ struct VregInfo {
 
 /// Scan state: vreg biographies plus per-index physical-register touch sets.
 #[derive(Default)]
-struct Scan {
+struct Scan<'a> {
     infos: FxHashMap<u32, VregInfo>,
     phys_touched: Vec<FxHashSet<u8>>,
     /// Set when an instruction shape must refuse the whole window
     /// (a vreg shift amount, a vreg inside `CallTyped`).
     refused: bool,
+    /// Values whose spill slot is 4 bytes, when known (`None` in pure unit
+    /// tests). A WIDE (S64) reference to such a value cannot take the
+    /// slot-substitution path — the memory operand would read 8 bytes of a
+    /// 4-byte slot and pull in the neighbour's garbage (the resolver's
+    /// `slot_fits` guard exists for exactly this). Those vregs are promoted
+    /// to window registers here so the allocator reloads them at their TRUE
+    /// width instead: a `movl` reload zero-extends and defines the full
+    /// register, which is precisely the discipline the text path applies
+    /// ("loads every value at its true width"). This closes the residual
+    /// whole-window replay class (`Mov Vreg -> Phys/StackSlot` and wide
+    /// `Test` on small-slot values).
+    small_slots: Option<&'a FxHashSet<u32>>,
 }
 
-impl Scan {
+impl<'a> Scan<'a> {
     fn touch(&mut self, r: &MachReg, idx: usize, kind: RefKind, reg_only: bool) {
         let MachReg::Vreg(id) = r else { return };
         let e = self.infos.entry(*id).or_default();
@@ -180,11 +192,31 @@ impl Scan {
         }
     }
 
+    /// True when a vreg's 4-byte slot cannot legally back an instruction of
+    /// this width (memory-operand substitution would over-read the slot).
+    /// Only S64 reads of small slots qualify: S8/S16/S32 stay in-bounds.
+    fn slot_too_narrow(&self, id: u32, size: OpSize) -> bool {
+        size == OpSize::S64 && self.small_slots.is_some_and(|ss| ss.contains(&id))
+    }
+
     /// Scan an operand. `kind` applies to register operands; memory
     /// base/index registers are always reads. `substitutable` marks operand
     /// positions whose vregs may keep the stack-slot substitution.
-    fn touch_op(&mut self, o: &MachOperand, idx: usize, kind: RefKind, substitutable: bool) {
+    /// `size` is the width at which this operand position accesses the
+    /// value — it drives the narrow-slot promotion above.
+    fn touch_op(
+        &mut self,
+        o: &MachOperand,
+        idx: usize,
+        kind: RefKind,
+        substitutable: bool,
+        size: OpSize,
+    ) {
         match o {
+            MachOperand::Reg(MachReg::Vreg(id)) => {
+                let promote = !substitutable || self.slot_too_narrow(*id, size);
+                self.touch(&MachReg::Vreg(*id), idx, kind, promote);
+            }
             MachOperand::Reg(r) => self.touch(r, idx, kind, !substitutable),
             MachOperand::Mem { base, .. } => self.touch(base, idx, RefKind::Read, true),
             MachOperand::MemIndex { base, index, .. } => {
@@ -226,18 +258,18 @@ impl Scan {
 
     fn scan_inst(&mut self, inst: &MachInst, idx: usize) {
         match inst {
-            MachInst::Mov { src, dst, .. } => {
-                self.touch_op(src, idx, RefKind::Read, true);
+            MachInst::Mov { src, dst, size } => {
+                self.touch_op(src, idx, RefKind::Read, true, *size);
                 match dst {
                     MachOperand::Reg(r) => self.touch(r, idx, RefKind::PureWrite, false),
-                    _ => self.touch_op(dst, idx, RefKind::Read, true),
+                    _ => self.touch_op(dst, idx, RefKind::Read, true, *size),
                 }
             }
-            MachInst::FMov { src, dst, .. } => {
+            MachInst::FMov { src, dst, size } => {
                 // Register operands are XMM-domain: resolve never substitutes
                 // FMov, so a Vreg here stays and must refuse the window (a
                 // GPR scratch rewrite would be unencodable).
-                self.touch_op(src, idx, RefKind::Read, true);
+                self.touch_op(src, idx, RefKind::Read, true, *size);
                 if let MachOperand::Reg(r) = src {
                     self.touch_xmm(r);
                 }
@@ -246,7 +278,7 @@ impl Scan {
                         self.touch(r, idx, RefKind::PureWrite, false);
                         self.touch_xmm(r);
                     }
-                    _ => self.touch_op(dst, idx, RefKind::Read, true),
+                    _ => self.touch_op(dst, idx, RefKind::Read, true, *size),
                 }
             }
             MachInst::FAlu {
@@ -257,7 +289,7 @@ impl Scan {
                 // there is XMM-domain: the emitter's register form only
                 // accepts XMM Phys, so a GPR scratch rewrite would be
                 // unencodable — mark the domain and refuse if it stays.
-                self.touch_op(src2, idx, RefKind::Read, true);
+                self.touch_op(src2, idx, RefKind::Read, true, OpSize::S64);
                 if let MachOperand::Reg(r) = src2 {
                     self.touch_xmm(r);
                 }
@@ -267,15 +299,26 @@ impl Scan {
                 self.touch_xmm(dst);
             }
             MachInst::Mov128 { src, dst } => {
-                self.touch_op(src, idx, RefKind::Read, false);
-                self.touch_op(dst, idx, RefKind::Read, false);
+                self.touch_op(src, idx, RefKind::Read, false, OpSize::S64);
+                self.touch_op(dst, idx, RefKind::Read, false, OpSize::S64);
             }
-            MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
-                self.touch_op(src, idx, RefKind::Read, true);
+            MachInst::Movzx {
+                src,
+                dst,
+                from_size,
+                ..
+            }
+            | MachInst::Movsx {
+                src,
+                dst,
+                from_size,
+                ..
+            } => {
+                self.touch_op(src, idx, RefKind::Read, true, *from_size);
                 self.touch(dst, idx, RefKind::PureWrite, false);
             }
-            MachInst::Alu { src, dst, .. } => {
-                self.touch_op(src, idx, RefKind::Read, true);
+            MachInst::Alu { src, dst, size, .. } => {
+                self.touch_op(src, idx, RefKind::Read, true, *size);
                 // Two-address dest: register-only (a memory dest is not an
                 // encodable ALU form).
                 self.touch(dst, idx, RefKind::Rmw, true);
@@ -295,7 +338,7 @@ impl Scan {
                 if let MachOperand::Reg(MachReg::Vreg(_)) = amount {
                     self.refused = true;
                 }
-                self.touch_op(amount, idx, RefKind::Read, true);
+                self.touch_op(amount, idx, RefKind::Read, true, OpSize::S64);
                 self.touch(dst, idx, RefKind::Rmw, true);
             }
             MachInst::ShiftX {
@@ -320,18 +363,18 @@ impl Scan {
             MachInst::LeaSlot { dst, .. } => {
                 self.touch(dst, idx, RefKind::PureWrite, false);
             }
-            MachInst::Div { divisor, .. } => {
-                self.touch_op(divisor, idx, RefKind::Read, true);
+            MachInst::Div { divisor, size, .. } => {
+                self.touch_op(divisor, idx, RefKind::Read, true, *size);
             }
-            MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
-                self.touch_op(lhs, idx, RefKind::Read, true);
-                self.touch_op(rhs, idx, RefKind::Read, true);
+            MachInst::Cmp { lhs, rhs, size } | MachInst::Test { lhs, rhs, size } => {
+                self.touch_op(lhs, idx, RefKind::Read, true, *size);
+                self.touch_op(rhs, idx, RefKind::Read, true, *size);
             }
             MachInst::SetCC { dst, .. } => {
                 self.touch(dst, idx, RefKind::PureWrite, false);
             }
-            MachInst::Cmov { src, dst, .. } => {
-                self.touch_op(src, idx, RefKind::Read, true);
+            MachInst::Cmov { src, dst, size, .. } => {
+                self.touch_op(src, idx, RefKind::Read, true, *size);
                 self.touch(dst, idx, RefKind::Rmw, true);
             }
             MachInst::CallTyped { args, ret, .. } => {
@@ -457,9 +500,13 @@ fn has_vreg_operand(o: &MachOperand) -> bool {
 /// The vregs that must be register-allocated (register-only positions or
 /// memory bases/indices). `resolve_stack_vregs` skips substituting exactly
 /// these IDs so the allocator rewrites every occurrence uniformly.
-pub(crate) fn classify_window(insts: &[MachInst]) -> FxHashSet<u32> {
+pub(crate) fn classify_window(
+    insts: &[MachInst],
+    small_slots: Option<&FxHashSet<u32>>,
+) -> FxHashSet<u32> {
     let mut scan = Scan {
         phys_touched: vec![FxHashSet::default(); insts.len()],
+        small_slots,
         ..Default::default()
     };
     for (idx, inst) in insts.iter().enumerate() {
@@ -521,8 +568,13 @@ pub(crate) fn allocate_window(
     }
 
     // ── Phase 1: scan ────────────────────────────────────────────────
+    // `small_slots` MUST mirror the classify_window call (same set, same
+    // promotion): classify decides which vregs the resolver leaves for the
+    // allocator, and this scan decides which vregs the allocator homed.
+    // A disagreement leaves a Vreg mid-window and trips the replay gate.
     let mut scan = Scan {
         phys_touched: vec![FxHashSet::default(); insts.len()],
+        small_slots: Some(ctx.small_slots),
         ..Default::default()
     };
     for (idx, inst) in insts.iter().enumerate() {
@@ -586,11 +638,7 @@ pub(crate) fn allocate_window(
         .collect();
     pool.sort_by_key(|&r| {
         let caller_saved = matches!(r, 10 | 11 | 12 | 13 | 14 | 15 | 16); // r11,r10,r8,r9,rdi,rsi,rdx
-        if caller_saved {
-            0
-        } else {
-            1
-        }
+        if caller_saved { 0 } else { 1 }
     });
 
     // Whole-window-busy registers (main-RA homes live across the window).
@@ -1361,12 +1409,127 @@ mod tests {
                 size: OpSize::S64,
             },
         ];
-        let classified = classify_window(&insts);
+        let classified = classify_window(&insts, None);
         assert!(classified.contains(&2), "two-address dest must classify");
         assert!(classified.contains(&3), "memory base must classify");
         assert!(
             !classified.contains(&1),
             "substitutable positions must not classify"
+        );
+    }
+
+    /// The narrow-slot promotion: a small-slot vreg read at S64 by a
+    /// substitutable-position instruction cannot take the slot-substitution
+    /// path (the memory operand would read 8 bytes of a 4-byte slot), so it
+    /// must be classified for a window register. The resolver leaves it
+    /// untouched and the allocator rewrites every occurrence — this is the
+    /// agreement that makes the flush pipeline sound.
+    #[test]
+    fn classify_window_promotes_wide_reads_of_small_slots() {
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(1)), // small slot, read at S64
+                dst: MachOperand::Reg(phys(2)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(1)),
+                dst: MachOperand::Reg(phys(3)),
+                size: OpSize::S32, // fits a 4-byte slot: stays substitutable
+            },
+            MachInst::Cmp {
+                lhs: MachOperand::Reg(vreg(1)),
+                rhs: MachOperand::Imm(0),
+                size: OpSize::S64, // wide Test shape: promoted too
+            },
+        ];
+        let mut small = FxHashSet::default();
+        small.insert(1);
+        let classified = classify_window(&insts, Some(&small));
+        assert!(
+            classified.contains(&1),
+            "S64 access of a 4-byte slot must promote to a window register"
+        );
+        // Without small-slot knowledge the same vreg stays substitutable.
+        let blind = classify_window(&insts, None);
+        assert!(
+            !blind.contains(&1),
+            "without slot-width knowledge the position is substitutable"
+        );
+    }
+
+    /// End-to-end: a wide Mov from a small-slot vreg gets a scratch register
+    /// with a 32-bit reload (movl zero-extends — the full register is
+    /// defined, exactly the text path's discipline), the S64 Mov then reads
+    /// the whole scratch, and the slot image is never widened.
+    #[test]
+    fn wide_read_of_small_slot_gets_typed_reload() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(7, StackSlot(-12)); // 4-byte small slot
+        types.insert(7, IrType::I32);
+        uses.insert(7, 1); // only this read: dead after the window
+        let mut small = FxHashSet::default();
+        small.insert(7);
+        let empty = FxHashSet::default();
+        let c = WindowCtx {
+            slots: &slots,
+            small_slots: &small,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let insts = vec![MachInst::Mov {
+            src: MachOperand::Reg(vreg(7)),
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        let out = allocate_window(insts, &c).expect("promotion must allocate");
+        assert_no_vregs(&out);
+        // Reload inserted before the Mov, at the value's own width (S32 for
+        // a small slot — never S64: that would read the neighbour's bytes).
+        match &out[..] {
+            [
+                MachInst::Mov {
+                    src: MachOperand::StackSlot(-12),
+                    dst: MachOperand::Reg(MachReg::Phys(r)),
+                    size: OpSize::S32,
+                },
+                MachInst::Mov { src, dst, size },
+            ] => {
+                assert!(matches!(src, MachOperand::Reg(MachReg::Phys(p)) if *p == *r));
+                assert!(matches!(dst, MachOperand::Reg(MachReg::Phys(d)) if d.0 == 2));
+                assert!(*size == OpSize::S64);
+            }
+            other => panic!("expected [reload(S32), wide mov], got {other:?}"),
+        }
+    }
+
+    /// The promotion must NOT fire for an 8-byte slot (S64 substitution is
+    /// in-bounds there) nor for S32 accesses of a small slot: both keep the
+    /// optimal memory-operand substitution.
+    #[test]
+    fn promotion_is_narrow_slot_and_wide_access_only() {
+        let insts = vec![MachInst::Mov {
+            src: MachOperand::Reg(vreg(9)),
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        let mut small = FxHashSet::default();
+        small.insert(9);
+        // v9 IS small-slotted... but the access below is S32.
+        let insts32 = vec![MachInst::Mov {
+            src: MachOperand::Reg(vreg(9)),
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S32,
+        }];
+        let classified64 = classify_window(&insts, Some(&small));
+        assert!(classified64.contains(&9));
+        let classified32 = classify_window(&insts32, Some(&small));
+        assert!(
+            !classified32.contains(&9),
+            "S32 access of a 4-byte slot stays substitutable"
         );
     }
 

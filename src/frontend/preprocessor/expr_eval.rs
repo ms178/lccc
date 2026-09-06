@@ -327,7 +327,7 @@ impl Preprocessor {
             return "0";
         }
         *i += 1; // skip '('
-                 // Skip whitespace
+        // Skip whitespace
         while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
             *i += 1;
         }
@@ -386,11 +386,7 @@ impl Preprocessor {
             self.resolve_include_path(header_name, is_system).is_some()
         };
 
-        if found {
-            "1"
-        } else {
-            "0"
-        }
+        if found { "1" } else { "0" }
     }
 
     /// Skip a parenthesized argument (byte-oriented).

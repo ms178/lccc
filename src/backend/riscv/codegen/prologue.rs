@@ -1,10 +1,10 @@
 //! RiscvCodegen: prologue/epilogue and stack frame operations.
 
 use super::emit::{
-    callee_saved_name, collect_inline_asm_callee_saved_riscv, RiscvCodegen, CALL_TEMP_CALLEE_SAVED,
-    RISCV_ARG_REGS, RISCV_CALLEE_SAVED,
+    CALL_TEMP_CALLEE_SAVED, RISCV_ARG_REGS, RISCV_CALLEE_SAVED, RiscvCodegen, callee_saved_name,
+    collect_inline_asm_callee_saved_riscv,
 };
-use crate::backend::call_abi::{classify_params, ParamClass};
+use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::common::types::IrType;
 use crate::ir::reexports::IrFunction;
@@ -201,8 +201,7 @@ impl RiscvCodegen {
                 && crate::backend::regalloc::riscv_param_caller_homes_safe_with_config(
                     func,
                     &self.state.ra_config,
-                )
-        {
+                ) {
             (12..=19).map(crate::backend::regalloc::PhysReg).collect()
         } else {
             Vec::new()

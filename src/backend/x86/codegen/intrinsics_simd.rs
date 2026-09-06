@@ -1443,7 +1443,7 @@ impl X86Codegen {
         self.evex_load_arg_to(&args[0], "zmm0"); // a (dest)
         self.evex_load_arg_to(&args[1], "zmm1"); // b (r/m)
         self.evex_load_arg_to(&args[2], "zmm2"); // c (vvvv)
-                                                 // vfmadd132ps %B, %C, %A: dst = dst*r/m + vvvv = a*b + c
+        // vfmadd132ps %B, %C, %A: dst = dst*r/m + vvvv = a*b + c
         self.state
             .emit_fmt(format_args!("    {} %zmm1, %zmm2, %zmm0", inst));
         self.evex_store_dest(dest_ptr);
@@ -1809,7 +1809,7 @@ impl X86Codegen {
                 self.sse_load_arg(&args[0], "xmm0"); // a (dest)
                 self.sse_load_arg(&args[1], "xmm1"); // b (r/m)
                 self.sse_load_arg(&args[2], "xmm2"); // c (vvvv)
-                                                     // vfmadd132ps %B, %C, %A: dst = dst*r/m + vvvv = a*b + c
+                // vfmadd132ps %B, %C, %A: dst = dst*r/m + vvvv = a*b + c
                 self.state
                     .emit_fmt(format_args!("    {} %xmm1, %xmm2, %xmm0", inst));
                 self.sse_store_dest(dest_ptr, "xmm0");

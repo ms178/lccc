@@ -208,7 +208,7 @@ fn an_asm_goto_edge_counts_as_a_real_predecessor() {
 }
 
 #[test]
-fn a_missing_incoming_for_an_UNREACHABLE_predecessor_is_tolerated() {
+fn a_missing_incoming_for_an_unreachable_predecessor_is_tolerated() {
     // Block 2 branches to 3 but nothing branches to 2, so the edge 2 -> 3 can
     // never execute and needs no phi operand. Reporting it would bury the
     // reachable cases, which are the ones that miscompile.
@@ -222,7 +222,7 @@ fn a_missing_incoming_for_an_UNREACHABLE_predecessor_is_tolerated() {
 }
 
 #[test]
-fn a_missing_incoming_for_a_REACHABLE_predecessor_is_still_reported() {
+fn a_missing_incoming_for_a_reachable_predecessor_is_still_reported() {
     // Same shape, except block 2 is now reachable from the entry, so the
     // 2 -> 3 edge really executes and the phi leaves its register undefined
     // on that path.
@@ -236,7 +236,7 @@ fn a_missing_incoming_for_a_REACHABLE_predecessor_is_still_reported() {
 }
 
 #[test]
-fn a_stale_predecessor_inside_an_UNREACHABLE_block_is_tolerated() {
+fn a_stale_predecessor_inside_an_unreachable_block_is_tolerated() {
     // Block 2 is unreachable, so its phi is dead by construction. SCCP folds a
     // constant Switch to a single Branch and deliberately leaves the blocks it
     // orphaned untouched, documenting that cfg_simplify will delete them --

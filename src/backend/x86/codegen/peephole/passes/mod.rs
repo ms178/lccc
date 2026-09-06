@@ -376,8 +376,7 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
     // valid programs (found via differential fuzzing on generated C; gzip was
     // unaffected but other code with certain loop shapes was). It also does not
     // help gzip (measured slower/larger). Opt in with CCC_PEEPHOLE_PHASE4=1.
-    let skip_phase4 =
-        std::env::var("CCC_PEEPHOLE_PHASE4").is_err() || !ra_config.no_machinst; // Phase 4 renaming is not MachInst-safe
+    let skip_phase4 = std::env::var("CCC_PEEPHOLE_PHASE4").is_err() || !ra_config.no_machinst; // Phase 4 renaming is not MachInst-safe
     let skip_phase5 = std::env::var("CCC_NO_PEEPHOLE_PHASE5").is_ok();
     let skip_phase6 = std::env::var("CCC_NO_PEEPHOLE_PHASE6").is_ok();
     let skip_phase7 = std::env::var("CCC_NO_PEEPHOLE_PHASE7").is_ok();
@@ -3186,7 +3185,7 @@ mod regression_tests {
 
     #[test]
     fn test_rotate_idiom_fold() {
-        let asm="    movq %r9, %rsi\n    shlq $13, %rsi\n    movq %r9, %rdx\n    shrq $51, %rdx\n    movq %rsi, %r9\n    orq %rdx, %r9\n    addq %rax, %rbx\n";
+        let asm = "    movq %r9, %rsi\n    shlq $13, %rsi\n    movq %r9, %rdx\n    shrq $51, %rdx\n    movq %rsi, %r9\n    orq %rdx, %r9\n    addq %rax, %rbx\n";
         let out = peephole_optimize(asm.to_string());
         assert!(out.contains("rolq $13, %r9"), "{}", out);
         assert!(!out.contains("shrq $51"), "{}", out);
@@ -3194,7 +3193,7 @@ mod regression_tests {
 
     #[test]
     fn test_compare_branch_rsp_signed_byte_reload() {
-        let asm="    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lno\n    jmp .Lyes\n.Lno:\n";
+        let asm = "    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lno\n    jmp .Lyes\n.Lno:\n";
         let out = peephole_optimize(asm.to_string());
         assert!(
             out.contains("jae .Lno") || out.contains("jb .Lyes"),

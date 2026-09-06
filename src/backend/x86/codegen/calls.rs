@@ -1,7 +1,7 @@
 //! X86Codegen: function call operations.
 
-use super::emit::{X86Codegen, X86_ARG_REGS};
-use crate::backend::call_abi::{compute_stack_push_bytes, CallAbiConfig, CallArgClass};
+use super::emit::{X86_ARG_REGS, X86Codegen};
+use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_push_bytes};
 use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
@@ -315,7 +315,7 @@ impl X86Codegen {
             match arg_classes[si] {
                 CallArgClass::F128Stack => {
                     match &args[si] {
-                        Operand::Const(ref c) => {
+                        Operand::Const(c) => {
                             let x87_bytes: [u8; 10] = match c {
                                 IrConst::LongDouble(_, f128_bytes) => {
                                     let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(
@@ -353,7 +353,7 @@ impl X86Codegen {
                             self.flush_pending_vec_store_impl();
                             self.state.invalidate_vec_peephole();
                         }
-                        Operand::Value(ref v) => {
+                        Operand::Value(v) => {
                             if self.state.f128_direct_slots.contains(&v.0) {
                                 self.state.emit("    subq $16, %rsp");
                                 sp_adjust += 16;

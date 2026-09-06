@@ -2419,7 +2419,7 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                     let line_j = infos[j].trimmed(store.get(j));
                     if line_j.starts_with("movq %rax, %") && !line_j.ends_with("%xmm0") {
                         let gpr_a = &line_j[12..]; // "movq %rax, %" is 12 chars
-                                                   // Find K: "movq %<gprB>, %rcx"
+                        // Find K: "movq %<gprB>, %rcx"
                         let mut k = j + 1;
                         while k < len && k < j + 4 && infos[k].is_nop() {
                             k += 1;
@@ -2428,7 +2428,7 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                             let line_k = infos[k].trimmed(store.get(k));
                             if line_k.starts_with("movq %") && line_k.ends_with(", %rcx") {
                                 let gpr_b = &line_k[6..line_k.len() - 6]; // strip "movq %" and ", %rcx"
-                                                                          // Find L: "movq %<gprA>, (%rcx)"
+                                // Find L: "movq %<gprA>, (%rcx)"
                                 let mut l = k + 1;
                                 while l < len && l < k + 4 && infos[l].is_nop() {
                                     l += 1;
@@ -2654,7 +2654,7 @@ pub(super) fn eliminate_fp_spill_around_load(
             && (line_i.ends_with("(%rbp)") || line_i.ends_with("(%rsp)"))
         {
             let mem_operand = &line_i[13..]; // after "movsd %xmm0, " (13 chars)
-                                             // Extract numeric offset from e.g. "-48(%rbp)"
+            // Extract numeric offset from e.g. "-48(%rbp)"
             let paren_pos = mem_operand.find('(');
             if let Some(pp) = paren_pos {
                 let offset_num: Result<i64, _> = mem_operand[..pp].parse();
@@ -2959,12 +2959,12 @@ pub(super) fn fuse_copy_and_operation(store: &mut LineStore, infos: &mut [LineIn
             if let Some(comma) = line_i.find(", %") {
                 let src_reg = &line_i[6..comma]; // after "movq %"
                 let dst_reg_str = &line_i[comma + 3..]; // after ", %"
-                                                        // A segment override source (e.g. `movq %fs:0, %rax` from TLS
-                                                        // initial-exec) must NOT be folded into a following lea:
-                                                        // `lea disp(%fs:0), %rax` would compute disp WITHOUT adding the
-                                                        // segment base (LEA ignores segment overrides by design), so
-                                                        // the TLS address would be wrong. `movq %fs:0, %rax` + `leaq
-                                                        // tpoff(%rax), %rax` must stay two instructions.
+                // A segment override source (e.g. `movq %fs:0, %rax` from TLS
+                // initial-exec) must NOT be folded into a following lea:
+                // `lea disp(%fs:0), %rax` would compute disp WITHOUT adding the
+                // segment base (LEA ignores segment overrides by design), so
+                // the TLS address would be wrong. `movq %fs:0, %rax` + `leaq
+                // tpoff(%rax), %rax` must stay two instructions.
                 if src_reg == dst_reg_str || src_reg.contains('(') || src_reg.contains(':') {
                     i += 1;
                     continue;
@@ -3150,7 +3150,7 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
             let line_i = infos[i].trimmed(store.get(i));
             if line_i.starts_with("movq %") && line_i.ends_with(", %rcx") {
                 let src_reg = &line_i[6..line_i.len() - 6]; // between "movq %" and ", %rcx"
-                                                            // src_reg must not be "rcx" itself (no-op move) and must be a plain GPR
+                // src_reg must not be "rcx" itself (no-op move) and must be a plain GPR
                 if src_reg != "rcx" && !src_reg.contains('(') && !src_reg.contains('$') {
                     let mut j = i + 1;
                     while j < len && j < i + 4 && infos[j].is_nop() {
@@ -4964,8 +4964,8 @@ pub(super) fn rotate_loops(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
                 if let Some(comma) = first_setup.find(", %") {
                     let src_32 = &first_setup[7..comma]; // e.g., "%r12d"
                     let dst_64 = &first_setup[comma + 2..]; // e.g., "%r14"
-                                                            // src_32 should be a 32-bit register like "%r12d"
-                                                            // Derive the 64-bit version by removing the 'd' suffix
+                    // src_32 should be a 32-bit register like "%r12d"
+                    // Derive the 64-bit version by removing the 'd' suffix
                     let src_64 = if src_32.ends_with('d') {
                         let base = &src_32[..src_32.len() - 1];
                         if base.starts_with("%r") && base.len() >= 3 {
@@ -5051,9 +5051,9 @@ pub(super) fn rotate_loops(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
             if let Some(comma) = first_text.find(", %") {
                 let src_32 = &first_text[7..comma]; // e.g., "%r12d"
                 let dst_64 = &first_text[comma + 2..]; // e.g., "%r14"
-                                                       // `starts_with("%r")` is TRUE for %rdx/%rsi/... too, so the
-                                                       // numbered-register test must be explicit or `%rdx` becomes
-                                                       // the nonexistent `%rdxd`.
+                // `starts_with("%r")` is TRUE for %rdx/%rsi/... too, so the
+                // numbered-register test must be explicit or `%rdx` becomes
+                // the nonexistent `%rdxd`.
                 let dst_32 = reg_64_to_32(dst_64);
                 let last_setup_idx = *header_instrs.last().unwrap();
                 let cmp_text = store.get(last_setup_idx).to_string();
@@ -5164,7 +5164,7 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
         // Check if this is `leaq X, %rax`
         if line.starts_with("leaq ") && line.ends_with(", %rax") {
             let src = &line[5..line.len() - 6]; // between "leaq " and ", %rax"
-                                                // Collect the register families referenced by the source.
+            // Collect the register families referenced by the source.
             let mut src_fams: Vec<RegId> = Vec::new();
             let mut rest = src;
             while let Some(pct) = rest.find('%') {

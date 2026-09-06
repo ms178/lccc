@@ -38,7 +38,7 @@
 //! are complementary, and COMDAT runs first because it is cheaper and strictly
 //! more reliable.
 
-use crate::backend::elf::{read_u32, GRP_COMDAT, SHT_GROUP};
+use crate::backend::elf::{GRP_COMDAT, SHT_GROUP, read_u32};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::types::Elf64Object;

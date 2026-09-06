@@ -1378,9 +1378,11 @@ fn an_unresolved_top_condition_keeps_both_successors_executable() {
 
     let incoming = phi_incoming(&f, 3);
     assert_eq!(incoming.len(), 2, "both b3 phi operands must survive");
-    assert!(incoming
-        .iter()
-        .any(|(op, _)| matches!(op, Operand::Value(_))));
+    assert!(
+        incoming
+            .iter()
+            .any(|(op, _)| matches!(op, Operand::Value(_)))
+    );
     assert!(
         incoming
             .iter()

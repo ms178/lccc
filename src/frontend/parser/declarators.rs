@@ -68,7 +68,7 @@ impl Parser {
         }
 
         // Parse the direct-declarator part
-        let (name, inner_derived) = if let TokenKind::Identifier(ref n) = self.peek() {
+        let (name, inner_derived) = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
             self.advance();
             (Some(n), Vec::new())
@@ -447,7 +447,7 @@ impl Parser {
         }
 
         // Check for K&R-style identifier list
-        if let TokenKind::Identifier(ref name) = self.peek() {
+        if let TokenKind::Identifier(name) = self.peek() {
             if (!self.typedefs.contains(name) || self.shadowed_typedefs.contains(name))
                 && !self.is_type_specifier()
             {
@@ -554,7 +554,7 @@ impl Parser {
     /// Parse a K&R-style identifier list: foo(a, b, c)
     fn parse_kr_identifier_list(&mut self) -> (Vec<ParamDecl>, bool) {
         let mut params = Vec::with_capacity(8);
-        while let TokenKind::Identifier(ref n) = self.peek() {
+        while let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
             self.advance();
             params.push(ParamDecl {
@@ -624,7 +624,7 @@ impl Parser {
                 &mut fptr_variadic,
                 &mut fptr_inner_ptr_depth,
             )
-        } else if let TokenKind::Identifier(ref n) = self.peek() {
+        } else if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
             self.advance();
             Some(n)
@@ -724,7 +724,7 @@ impl Parser {
                 // E.g., `void (*__attribute__((unused)) fp)(int)` is valid GNU C.
                 self.skip_gcc_extensions();
             }
-            let name = if let TokenKind::Identifier(ref n) = self.peek() {
+            let name = if let TokenKind::Identifier(n) = self.peek() {
                 let n = n.clone();
                 self.advance();
                 Some(n)
@@ -786,7 +786,7 @@ impl Parser {
             name
         } else if self.consume_if(&TokenKind::Caret) {
             // Block pointer (Apple extension)
-            let name = if let TokenKind::Identifier(ref n) = self.peek() {
+            let name = if let TokenKind::Identifier(n) = self.peek() {
                 let n = n.clone();
                 self.advance();
                 Some(n)
@@ -800,7 +800,7 @@ impl Parser {
             name
         } else if let TokenKind::Identifier(_) = self.peek() {
             // Parenthesized name: (name), (name)(params), or (name(params))
-            let name = if let TokenKind::Identifier(ref n) = self.peek() {
+            let name = if let TokenKind::Identifier(n) = self.peek() {
                 let n = n.clone();
                 self.advance();
                 Some(n)
@@ -875,7 +875,7 @@ impl Parser {
     /// Extract a name from nested parentheses: (name), ((name)), (*(name)), etc.
     pub(super) fn extract_paren_name(&mut self) -> Option<String> {
         if !matches!(self.peek(), TokenKind::LParen) {
-            if let TokenKind::Identifier(ref n) = self.peek() {
+            if let TokenKind::Identifier(n) = self.peek() {
                 let n = n.clone();
                 self.advance();
                 return Some(n);
@@ -889,7 +889,7 @@ impl Parser {
         }
         let name = if matches!(self.peek(), TokenKind::LParen) {
             self.extract_paren_name()
-        } else if let TokenKind::Identifier(ref n) = self.peek() {
+        } else if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
             self.advance();
             Some(n)

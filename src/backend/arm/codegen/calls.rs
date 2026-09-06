@@ -1,7 +1,7 @@
 //! ArmCodegen: function call operations.
 
-use super::emit::{callee_saved_name, ArmCodegen};
-use crate::backend::call_abi::{compute_stack_arg_space, CallAbiConfig, CallArgClass};
+use super::emit::{ArmCodegen, callee_saved_name};
+use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
 use crate::backend::generation::is_i128_type;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;

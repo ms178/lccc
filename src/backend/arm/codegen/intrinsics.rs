@@ -3,7 +3,7 @@
 //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
-use super::emit::{arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys, ArmCodegen};
+use super::emit::{ArmCodegen, arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys};
 use crate::common::types::IrType;
 use crate::ir::reexports::{IntrinsicOp, Operand, Value};
 

@@ -105,15 +105,15 @@ pub use secdata::SectionData;
 pub use symstr::SymStr;
 
 // version_script.rs
-pub use version_script::{wildcard_match_pattern, VersionNode, VersionScript};
+pub use version_script::{VersionNode, VersionScript, wildcard_match_pattern};
 
 // mapfile.rs
-pub use mapfile::{build_link_map, LinkMap, MapArchiveMember, MapSectionContribution};
+pub use mapfile::{LinkMap, MapArchiveMember, MapSectionContribution, build_link_map};
 
 // symbols.rs
 pub use symbols::{
-    is_layout_anchor_symbol, is_linker_defined_symbol, is_valid_c_identifier_for_section,
-    resolve_start_stop_symbols, GlobalSymbolOps, InputSection, OutputSection,
+    GlobalSymbolOps, InputSection, OutputSection, is_layout_anchor_symbol,
+    is_linker_defined_symbol, is_valid_c_identifier_for_section, resolve_start_stop_symbols,
 };
 
 // merge.rs

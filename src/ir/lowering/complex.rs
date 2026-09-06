@@ -1069,7 +1069,7 @@ impl Lowerer {
         is_variadic_call: bool,
     ) {
         let pctypes = match param_ctypes {
-            Some(ref ct) => ct.clone(),
+            Some(ct) => ct.clone(),
             None => {
                 // No param type info available - try to infer from expressions
                 args.iter().map(|a| self.expr_ctype(a)).collect()

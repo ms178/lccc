@@ -486,11 +486,7 @@ fn parse_alu_dest(line: &str) -> Option<u8> {
         args.trim()
     };
     let reg = parse_reg(first_arg);
-    if reg != REG_NONE {
-        Some(reg)
-    } else {
-        None
-    }
+    if reg != REG_NONE { Some(reg) } else { None }
 }
 
 // ── Main entry point ─────────────────────────────────────────────────────────

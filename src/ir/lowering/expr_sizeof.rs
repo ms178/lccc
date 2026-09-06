@@ -147,7 +147,7 @@ impl Lowerer {
                     match &ctype {
                         CType::Array(elem_ty, _) => return self.resolve_ctype_size(elem_ty).max(1),
                         CType::Pointer(pointee, _) => {
-                            return self.resolve_ctype_size(pointee).max(1)
+                            return self.resolve_ctype_size(pointee).max(1);
                         }
                         _ => {}
                     }
@@ -263,11 +263,7 @@ impl Lowerer {
             // Unsigned long literal: on ILP32, unsigned long is 4 bytes unless value overflows
             Expr::ULongLiteral(val, _) => {
                 if crate::common::types::target_is_32bit() {
-                    if *val <= u32::MAX as u64 {
-                        4
-                    } else {
-                        8
-                    }
+                    if *val <= u32::MAX as u64 { 4 } else { 8 }
                 } else {
                     8 // LP64: unsigned long is always 8 bytes
                 }
@@ -383,10 +379,10 @@ impl Lowerer {
             }
 
             // Compound literal: size of the type (handle incomplete array types)
-            Expr::CompoundLiteral(ts, ref init, _) => {
+            Expr::CompoundLiteral(ts, init, _) => {
                 let ctype = self.type_spec_to_ctype(ts);
                 match (&ctype, init.as_ref()) {
-                    (CType::Array(ref elem_ct, None), Initializer::List(items)) => {
+                    (CType::Array(elem_ct, None), Initializer::List(items)) => {
                         // Char arrays may hold a brace-wrapped string literal,
                         // which contributes len+1 elements, not 1.
                         let base_ty = match elem_ct.as_ref() {
@@ -403,7 +399,7 @@ impl Lowerer {
                     }
                     // sizeof((char[]){"..."}) — the array sized by the literal
                     // (bytes + NUL). Narrow literals store one C byte per char.
-                    (CType::Array(ref elem_ct, None), Initializer::Expr(init_expr)) => {
+                    (CType::Array(elem_ct, None), Initializer::Expr(init_expr)) => {
                         let elem_size = self.ctype_size(elem_ct).max(1);
                         match (elem_ct.as_ref(), init_expr) {
                             (CType::Char | CType::UChar, Expr::StringLiteral(s, _)) => {

@@ -266,11 +266,7 @@ impl ParamClass {
             ParamClass::I128RegPair { .. } => 2,
             ParamClass::StructByValReg { size, .. } => {
                 // 1 reg for <=8 bytes, 2 regs for >8 bytes (up to 16)
-                if *size <= 8 {
-                    1
-                } else {
-                    2
-                }
+                if *size <= 8 { 1 } else { 2 }
             }
             ParamClass::F128GpPair { .. } => 2,
             ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. } => 1,
@@ -1264,7 +1260,11 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                 if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
                     eprintln!(
                         "[STACK-ALIGN-ARM] fn={} i={} size={} ir_align={:?} slot_size={} cap={} aligning={}",
-                        func.name, i, size, param.and_then(|p| p.struct_align), slot_size,
+                        func.name,
+                        i,
+                        size,
+                        param.and_then(|p| p.struct_align),
+                        slot_size,
                         config.stack_arg_align_cap,
                         struct_align > slot_size as usize
                     );

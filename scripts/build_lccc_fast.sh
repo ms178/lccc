@@ -20,15 +20,19 @@ cd "$repo_root"
 "$repo_root/scripts/ensure_swap.sh"
 
 # Prefer the persisted rustup installation after an Arena restore.  The
-# system-image Cargo is intentionally not the research baseline: it lags the
-# moving stable channel this repository tracks (rust-toolchain.toml pins the
-# CHANNEL "stable", never a version — stable-only regressions are fixed at
-# the source instead of freezing the toolchain).
+# system-image Cargo is intentionally not the project toolchain; select the
+# current channel from rust-toolchain.toml rather than pinning it in scripts.
 if [[ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]]; then
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 fi
-export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}
-export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
+# shellcheck source=rust_toolchain.sh
+source "$repo_root/scripts/rust_toolchain.sh"
+lccc_select_rust_toolchain "$repo_root"
+# Compiler builds are deliberately bounded to two jobs on the constrained
+# research host; do not silently inherit an oversubscribing Cargo setting.
+export CARGO_BUILD_JOBS=2
+printf '%s\n' "Rust toolchain: $LCCC_SELECTED_RUST_TOOLCHAIN ($(rustc --version))"
+printf '%s\n' "Cargo jobs: $CARGO_BUILD_JOBS (fixed research policy)"
 
 # Honour the repo's clang+mold preference (.cargo/config.toml) when both are
 # on PATH. If only mold is available, drive it through the gcc driver

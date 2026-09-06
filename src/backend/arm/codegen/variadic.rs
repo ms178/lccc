@@ -1,6 +1,6 @@
 //! ArmCodegen: variadic function operations (va_arg, va_start, va_copy).
 
-use super::emit::{callee_saved_name, ArmCodegen};
+use super::emit::{ArmCodegen, callee_saved_name};
 use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::ir::reexports::Value;

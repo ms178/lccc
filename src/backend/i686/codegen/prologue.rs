@@ -1,10 +1,10 @@
 //! I686Codegen: prologue/epilogue and stack frame operations.
 
 use super::emit::{
-    i686_clobber_to_phys, i686_constraint_to_phys, phys_reg_name, I686Codegen, I686_CALLEE_SAVED,
-    I686_CALLEE_SAVED_WITH_EBP, I686_CALLER_SAVED,
+    I686_CALLEE_SAVED, I686_CALLEE_SAVED_WITH_EBP, I686_CALLER_SAVED, I686Codegen,
+    i686_clobber_to_phys, i686_constraint_to_phys, phys_reg_name,
 };
-use crate::backend::call_abi::{classify_params, ParamClass};
+use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{
     calculate_stack_space_common, filter_available_regs, find_param_alloca, is_i128_type,
     run_regalloc_and_merge_clobbers,

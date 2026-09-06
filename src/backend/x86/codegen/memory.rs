@@ -1,6 +1,6 @@
 //! X86Codegen: memory operations (load, store, memcpy, GEP, stack).
 
-use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name, X86Codegen};
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
 use crate::backend::state::{SlotAddr, StackSlot};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
@@ -1313,9 +1313,13 @@ impl X86Codegen {
                             }
                             Some(SlotAddr::Indirect(slot)) => {
                                 if std::env::var_os("LCCC_DBG_STORE").is_some() {
-                                    eprintln!("[DBGSTORE] base={} get_slot={:?} reg_assign={:?} offset={}",
-                                        base.0, self.state.get_slot(base.0),
-                                        self.reg_assignments.get(&base.0), offset);
+                                    eprintln!(
+                                        "[DBGSTORE] base={} get_slot={:?} reg_assign={:?} offset={}",
+                                        base.0,
+                                        self.state.get_slot(base.0),
+                                        self.reg_assignments.get(&base.0),
+                                        offset
+                                    );
                                 }
                                 if let Some(&reg) = self.reg_assignments.get(&base.0) {
                                     let reg_name = phys_reg_name(reg);
@@ -2035,7 +2039,7 @@ impl X86Codegen {
         }
         let store_instr = Self::mov_store_for_type(ty);
         let _ = index; // liveness handled by the RA link wiring
-                       // Immediate-direct: one instruction, no rax staging.
+        // Immediate-direct: one instruction, no rax staging.
         if let Operand::Const(c) = val {
             if let Some(imm) = c.to_i64() {
                 if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {

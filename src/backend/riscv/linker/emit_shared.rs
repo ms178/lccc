@@ -9,7 +9,7 @@
 
 use super::elf_read::*;
 use super::relocations::{
-    align_up, section_order, write_phdr_at, GlobalSym, MergedSection, R_RISCV_64, R_RISCV_CALL_PLT,
+    GlobalSym, MergedSection, R_RISCV_64, R_RISCV_CALL_PLT, align_up, section_order, write_phdr_at,
 };
 use super::{reloc, symbols};
 use crate::backend::linker_common::{self, DynStrTab};

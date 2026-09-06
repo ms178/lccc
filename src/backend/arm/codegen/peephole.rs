@@ -176,11 +176,7 @@ fn classify_implicit_operands_a64(line: &str) -> (u64, u64) {
         "ret" => {
             // Bare `ret` returns through the link register; `ret xN` names
             // its target explicitly (and is then not an implicit read).
-            if rest.is_empty() {
-                (X30, 0)
-            } else {
-                (0, 0)
-            }
+            if rest.is_empty() { (X30, 0) } else { (0, 0) }
         }
         _ => {
             let writes = match writeback_base(rest) {

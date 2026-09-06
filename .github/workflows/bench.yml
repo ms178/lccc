@@ -15,24 +15,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo build
-        uses: actions/cache@v4
+      # Cache downloaded dependencies, not `target/`: benchmark results must
+      # come from a compiler rebuilt from the checked-out source, never a
+      # binary restored from an unrelated revision with the same lockfile.
+      - name: Cache cargo dependencies
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-bench-deps-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build LCCC
-        run: cargo build --release
+        run: ./scripts/build_lccc_o1_j2.sh
 
       - name: Detect GCC include path
         id: gcc
@@ -68,7 +70,7 @@ jobs:
 
       - name: Upload benchmark results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-results
           path: |

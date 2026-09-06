@@ -5,7 +5,6 @@ use crate::backend::common::PtrDirective;
 use crate::backend::generation::find_param_alloca;
 use crate::backend::inline_asm::emit_inline_asm_common;
 use crate::backend::regalloc::{PhysReg, RaConfig};
-use std::sync::Arc;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::fp_contract::FpContract;
@@ -16,6 +15,7 @@ use crate::ir::reexports::{
     AtomicOrdering, AtomicRmwOp, BlockId, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst,
     IrFunction, Operand, Value,
 };
+use std::sync::Arc;
 
 /// Callee-saved registers available for register allocation: x20-x28.
 /// x19 is reserved (some ABIs use it), x29=fp, x30=lr.

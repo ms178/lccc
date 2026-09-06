@@ -41,6 +41,19 @@ def default_rustc() -> str:
     return "rustc"
 
 
+def manifest_toolchain(repo: Path) -> str:
+    """Read the repository-selected channel without baking a Rust version in."""
+    manifest = repo / "rust-toolchain.toml"
+    if manifest.is_file():
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip() == "channel":
+                channel = value.strip().strip('"').strip("'")
+                if channel:
+                    return channel
+    return "stable"
+
+
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -135,6 +148,11 @@ def main() -> int:
         if args.timeout < 1:
             parser.error("--timeout must be positive")
         repo = args.repo.resolve()
+        # `rustc` may be invoked from a temporary source directory; tell the
+        # rustup proxy which manifest-selected channel to use explicitly so it
+        # does not fall back to an old process-default toolchain.
+        selected_toolchain = os.environ.setdefault("RUSTUP_TOOLCHAIN", manifest_toolchain(repo))
+        result["rustup_toolchain"] = selected_toolchain
         historical = git_show(repo, f"{HISTORICAL_FIX}^:{SOURCE_PATH}")
         ident = extract_function(historical, "is_ident_char")
         replacement = extract_function(historical, "replace_whole_word")
@@ -180,6 +198,9 @@ fn main() {{
         source = temporary / "historical.rs"
         binary = temporary / "historical-reproducer"
         source.write_bytes(harness_bytes)
+        # Keep the historical source in its original Rust-2021 semantic mode;
+        # this isolated reproducer demonstrates a past helper rather than
+        # compiling the Rust-2024 LCCC crate itself.
         result["compile"] = run([args.rustc, "--edition=2021", "-O", str(source), "-o", str(binary)], args.timeout)
         if result["compile"]["returncode"] == 0:
             result["run"] = run([str(binary)], args.timeout)

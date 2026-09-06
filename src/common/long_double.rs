@@ -308,11 +308,7 @@ fn shifted_limb(divisor: &[u32], i: usize, word_shift: usize, bit_shift: u32) ->
     }
     let di = i - word_shift;
     if bit_shift == 0 {
-        if di < divisor.len() {
-            divisor[di]
-        } else {
-            0
-        }
+        if di < divisor.len() { divisor[di] } else { 0 }
     } else {
         let lo = if di < divisor.len() { divisor[di] } else { 0 };
         let hi = if di > 0 && di - 1 < divisor.len() {
@@ -719,11 +715,7 @@ pub fn x87_bytes_to_f64(bytes: &[u8; 16]) -> f64 {
     } else {
         // Subnormal in f64 - not common for constants, just convert approximately
         let val = d.mantissa as f64 * 2.0_f64.powi(unbiased - 63);
-        if d.sign {
-            -val
-        } else {
-            val
-        }
+        if d.sign { -val } else { val }
     }
 }
 
@@ -1002,11 +994,7 @@ pub fn f128_bytes_to_f64(f128_bytes: &[u8; 16]) -> f64 {
     } else {
         // Subnormal in f64
         let val = mantissa as f64 * 2.0_f64.powi(unbiased as i32 - 112);
-        if sign {
-            -val
-        } else {
-            val
-        }
+        if sign { -val } else { val }
     }
 }
 
@@ -1040,8 +1028,8 @@ fn u64_to_f128_bytes_with_sign(val: u64, negative: bool) -> [u8; 16] {
         return make_f128_zero(negative);
     }
     let bl = 64 - val.leading_zeros(); // number of significant bits
-                                       // binary_exp = bl - 1 (position of MSB)
-                                       // We need to normalize to 113-bit mantissa with bit 112 set
+    // binary_exp = bl - 1 (position of MSB)
+    // We need to normalize to 113-bit mantissa with bit 112 set
     let mantissa113: u128 = (val as u128) << (113 - bl);
     let binary_exp = (bl as i32) - 1;
     encode_f128(negative, binary_exp, mantissa113)
@@ -1633,11 +1621,7 @@ fn x87_addsub_soft(a: &[u8; 16], b: &[u8; 16], negate_b: bool) -> [u8; 16] {
         let s = shift_to_normalize as u32;
         let sticky = result_mag & ((1u128 << s) - 1) != 0;
         let shifted = result_mag >> s;
-        if sticky {
-            shifted | 1
-        } else {
-            shifted
-        }
+        if sticky { shifted | 1 } else { shifted }
     } else if shift_to_normalize < 0 {
         // Result shrank (cancellation in subtraction) — shift left
         let s = (-shift_to_normalize) as u32;
@@ -2526,11 +2510,7 @@ pub fn f128_cmp(a: &[u8; 16], b: &[u8; 16]) -> i32 {
         0
     };
     // If negative, reverse the comparison
-    if a_sign {
-        -cmp
-    } else {
-        cmp
-    }
+    if a_sign { -cmp } else { cmp }
 }
 
 // --- Helper functions for wide arithmetic ---
@@ -2782,9 +2762,14 @@ mod soft_mul_tests {
         let hw = x87_mul(a, b);
         let sw = x87_mul_soft(a, b);
         assert_eq!(
-            hw, sw,
+            hw,
+            sw,
             "{}: x87_mul != x87_mul_soft\n  a = {:02x?}\n  b = {:02x?}\n  hw = {:02x?}\n  sw = {:02x?}",
-            label, &a[..10], &b[..10], &hw[..10], &sw[..10]
+            label,
+            &a[..10],
+            &b[..10],
+            &hw[..10],
+            &sw[..10]
         );
     }
 

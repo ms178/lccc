@@ -111,7 +111,7 @@ impl RiscvCodegen {
             self.state.emit("    addiw a4, a4, -1"); // a4 = 0xFFFF
         }
         self.state.emit("    sllw a4, a4, a3"); // a4 = mask << shift
-                                                // a5 = ~mask (inverted mask for clearing the field)
+        // a5 = ~mask (inverted mask for clearing the field)
         self.state.emit("    not a5, a4");
         // Shift the value into position: t2 = (val & field_mask) << shift
         if bits == 8 {

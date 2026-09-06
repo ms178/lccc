@@ -8,7 +8,7 @@
 //! mnemonics, S0-relative addressing). The shared orchestration logic lives
 //! in `backend/f128_softfloat.rs`.
 
-use super::emit::{callee_saved_name, RiscvCodegen};
+use super::emit::{RiscvCodegen, callee_saved_name};
 use crate::backend::f128_softfloat::F128SoftFloat;
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{SlotAddr, StackSlot};

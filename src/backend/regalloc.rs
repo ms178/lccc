@@ -10,8 +10,8 @@
 
 use super::live_range::{self, LinearScanAllocator};
 use super::liveness::{
-    compute_live_intervals, for_each_operand_in_instruction, for_each_operand_in_terminator,
-    for_each_value_use_in_instruction, LiveInterval, LivenessResult,
+    LiveInterval, LivenessResult, compute_live_intervals, for_each_operand_in_instruction,
+    for_each_operand_in_terminator, for_each_value_use_in_instruction,
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -22,6 +22,13 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PhysReg(pub u8);
+
+/// Single source of truth for the MachInst loop-size threshold.
+///
+/// This is a sanity bound for the SSA-driven window allocator, not a
+/// profitability gate; keeping the constructor and tests on this constant
+/// prevents a rebase from leaving one stale default literal behind.
+pub(crate) const MI_MAX_LOOP_INSTS_DEFAULT: usize = 4096;
 
 /// Immutable register-allocation/codegen policy captured once for a compiler
 /// invocation.  `CCC_*` remains the public bisection surface; parsing it here
@@ -162,7 +169,8 @@ pub(crate) struct RaConfig {
     pub(crate) no_x64_immed_nohome: bool,
     /// `CCC_X64_NOHOME_CLASSES`: selected no-home consumer classes (default: `ret,store,copy,cast,unary,binop`).
     pub(crate) x64_nohome_classes: String,
-    /// `CCC_MI_MAX_LOOP_INSTS`: MachInst loop-size threshold (default: 4096).
+    /// `CCC_MI_MAX_LOOP_INSTS`: MachInst loop-size threshold
+    /// (default: [`MI_MAX_LOOP_INSTS_DEFAULT`]).
     pub(crate) mi_max_loop_insts: usize,
     /// `CCC_MI_FN_DISABLE`: comma-separated MachInst-disabled name substrings (default: empty).
     pub(crate) mi_fn_disable: String,
@@ -289,7 +297,7 @@ impl RaConfig {
             no_x64_immed_nohome: present("CCC_NO_X64_IMMED_NOHOME"),
             x64_nohome_classes: text("CCC_X64_NOHOME_CLASSES")
                 .unwrap_or_else(|| "ret,store,copy,cast,unary,binop".into()),
-            mi_max_loop_insts: number("CCC_MI_MAX_LOOP_INSTS", 4096),
+            mi_max_loop_insts: number("CCC_MI_MAX_LOOP_INSTS", MI_MAX_LOOP_INSTS_DEFAULT),
             mi_fn_disable: text("CCC_MI_FN_DISABLE").unwrap_or_default(),
             mi_all_classic: present("CCC_MI_ALL_CLASSIC"),
             mi_fn_force: text("CCC_MI_FN_FORCE").unwrap_or_default(),
@@ -1645,11 +1653,7 @@ pub(crate) fn compute_i686_mulacc_chains_with_config(
 /// fused head also reads the feeder SOURCES (whose natural death is their
 //  zext cast, potentially before the head). Patch both interval families
 /// before any interval map is derived — the divrem-tail contract.
-fn patch_mulacc_intervals(
-    func: &IrFunction,
-    liveness: &mut LivenessResult,
-    ra_config: &RaConfig,
-) {
+fn patch_mulacc_intervals(func: &IrFunction, liveness: &mut LivenessResult, ra_config: &RaConfig) {
     let chains = compute_i686_mulacc_chains_with_config(func, ra_config);
     if chains.chains.is_empty() {
         return;
@@ -2526,7 +2530,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             accumulator_assignments: if has_builtin_setjmp {
                 Vec::new()
             } else {
-                analyze_accumulator_assignments_with_config(func, config.accumulator_policy, &config.ra_config)
+                analyze_accumulator_assignments_with_config(
+                    func,
+                    config.accumulator_policy,
+                    &config.ra_config,
+                )
             },
             used_regs: Vec::new(),
             caller_save_spans: FxHashMap::default(),
@@ -2579,7 +2587,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
         let multi_def: FxHashSet<u32> = def_count
             .iter()
-            .filter(|(_, &c)| c > 1)
+            .filter(|&(_, &c)| c > 1)
             .map(|(&v, _)| v)
             .collect();
         for (idx, dests) in &config.folded_index_uses {
@@ -3073,7 +3081,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let scan_ivs =
         collect_gpr_scan_intervals(&liveness, &eligible, &merged_of, &coalesce_member_of);
     let build_gpr_ranges = |intervals: &[LiveInterval]| {
-        let mut ranges = live_range::build_live_ranges_with_config(intervals, &liveness.block_loop_depth, func, &config.ra_config);
+        let mut ranges = live_range::build_live_ranges_with_config(
+            intervals,
+            &liveness.block_loop_depth,
+            func,
+            &config.ra_config,
+        );
         apply_physical_reg_hints(&mut ranges, &config.reg_hints);
         bump_folded_index_priority(
             &mut ranges,
@@ -3175,7 +3188,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let mut phase1_ranges = build_gpr_ranges(&phase1_intervals);
     bump_coalesce_group_priority(&mut phase1_ranges, &coalesce_groups, &use_count);
     bump_gep_base_priority(&mut phase1_ranges, &liveness);
-    let mut allocator = LinearScanAllocator::new_with_config(phase1_ranges, config.available_regs.clone(), &config.ra_config);
+    let mut allocator = LinearScanAllocator::new_with_config(
+        phase1_ranges,
+        config.available_regs.clone(),
+        &config.ra_config,
+    );
     allocator.run();
     let mut assignments = allocator.assignments;
     if config.ra_config.debug_ra_phases {
@@ -3249,7 +3266,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     continue;
                 }
                 let ranges = build_gpr_ranges(&intervals);
-                let mut alloc = LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
+                let mut alloc =
+                    LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
                 alloc.run();
                 for (vid, r) in alloc.assignments {
                     assignments.insert(vid, r);
@@ -3269,8 +3287,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if !phase2_intervals.is_empty() {
                     let phase2_ranges = build_gpr_ranges(&phase2_intervals);
-                    let mut caller_allocator =
-                        LinearScanAllocator::new_with_config(phase2_ranges, config.caller_saved_regs.clone(), &config.ra_config);
+                    let mut caller_allocator = LinearScanAllocator::new_with_config(
+                        phase2_ranges,
+                        config.caller_saved_regs.clone(),
+                        &config.ra_config,
+                    );
                     caller_allocator.run();
                     for (vid, reg) in caller_allocator.assignments {
                         assignments.insert(vid, reg);
@@ -3317,7 +3338,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if !w1.is_empty() && !no_arg_no_indirect_pool.is_empty() {
                     let ranges = build_gpr_ranges(&w1);
-                    let mut alloc = LinearScanAllocator::new_with_config(ranges, no_arg_no_indirect_pool, &config.ra_config);
+                    let mut alloc = LinearScanAllocator::new_with_config(
+                        ranges,
+                        no_arg_no_indirect_pool,
+                        &config.ra_config,
+                    );
                     alloc.run();
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
@@ -3360,7 +3385,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if !w2.is_empty() && !no_indirect_pool.is_empty() {
                     let ranges = build_gpr_ranges(&w2);
-                    let mut alloc = LinearScanAllocator::new_with_config(ranges, no_indirect_pool, &config.ra_config);
+                    let mut alloc = LinearScanAllocator::new_with_config(
+                        ranges,
+                        no_indirect_pool,
+                        &config.ra_config,
+                    );
                     alloc.run_with_seed(&seeded);
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
@@ -3396,7 +3425,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if !w3.is_empty() && !no_arg_pool.is_empty() {
                     let ranges = build_gpr_ranges(&w3);
-                    let mut alloc = LinearScanAllocator::new_with_config(ranges, no_arg_pool, &config.ra_config);
+                    let mut alloc = LinearScanAllocator::new_with_config(
+                        ranges,
+                        no_arg_pool,
+                        &config.ra_config,
+                    );
                     alloc.run_with_seed(&seeded);
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
@@ -3489,7 +3522,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // uses before the spill allocator ranks them.
                 bump_coalesce_group_priority(&mut phase2c_ranges, &coalesce_groups, &use_count);
                 bump_gep_base_priority(&mut phase2c_ranges, &liveness);
-                let mut spill_allocator = LinearScanAllocator::new_with_config(phase2c_ranges, free_callee, &config.ra_config);
+                let mut spill_allocator = LinearScanAllocator::new_with_config(
+                    phase2c_ranges,
+                    free_callee,
+                    &config.ra_config,
+                );
                 spill_allocator.run();
                 for (vid, reg) in spill_allocator.assignments {
                     assignments.insert(vid, reg);
@@ -3605,7 +3642,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // the bound's leal clobbered the counter).
                 let holders: Vec<(u32, u32)> = assignments
                     .iter()
-                    .filter(|(_, &r)| r == reg)
+                    .filter(|&(_, &r)| r == reg)
                     .filter_map(|(&v, _)| iv_map.get(&v).copied())
                     .collect();
                 let intervals: Vec<LiveInterval> = scan_ivs
@@ -3629,7 +3666,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     continue;
                 }
                 let ranges = build_gpr_ranges(&intervals);
-                let mut alloc = LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
+                let mut alloc =
+                    LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
                 alloc.run();
                 for (vid, r) in alloc.assignments {
                     assignments.insert(vid, r);
@@ -3727,7 +3765,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         let reg = PhysReg(6);
         let holders: Vec<(u32, u32)> = assignments
             .iter()
-            .filter(|(_, &r)| r == reg)
+            .filter(|&(_, &r)| r == reg)
             .filter_map(|(&v, _)| iv_map.get(&v).copied())
             .collect();
         let intervals: Vec<LiveInterval> = scan_ivs
@@ -3760,7 +3798,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
         if !intervals.is_empty() {
             let ranges = build_gpr_ranges(&intervals);
-            let mut alloc = LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
+            let mut alloc =
+                LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
             alloc.run();
             for (vid, r) in alloc.assignments {
                 assignments.insert(vid, r);
@@ -4061,13 +4100,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
                 let holders: Vec<(u32, u32)> = assignments
                     .iter()
-                    .filter(|(_, &r)| r == reg)
+                    .filter(|&(_, &r)| r == reg)
                     .filter_map(|(&v, _)| iv_map.get(&v).copied())
                     .collect();
                 if round == 0 && config.ra_config.debug_ra_intervals {
                     let holders_dbg: Vec<String> = assignments
                         .iter()
-                        .filter(|(_, &r)| r == reg)
+                        .filter(|&(_, &r)| r == reg)
                         .filter_map(|(&v, _)| {
                             iv_map
                                 .get(&v)
@@ -4119,7 +4158,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     continue;
                 }
                 let ranges = build_gpr_ranges(&intervals);
-                let mut alloc = LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
+                let mut alloc =
+                    LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
                 alloc.run();
                 for (vid, r) in alloc.assignments {
                     assignments.insert(vid, r);
@@ -4495,13 +4535,21 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
 
         if !f64_intervals.is_empty() {
-            let mut f64_ranges =
-                live_range::build_live_ranges_with_config(&f64_intervals, &liveness.block_loop_depth, func, &config.ra_config);
+            let mut f64_ranges = live_range::build_live_ranges_with_config(
+                &f64_intervals,
+                &liveness.block_loop_depth,
+                func,
+                &config.ra_config,
+            );
             // RA-05: hole-aware coverage for the XMM scan as well — FP phi
             // webs spanning mutually exclusive arms get the same treatment
             // as the GPR scan.
             attach_scan_segments(&mut f64_ranges, &liveness, &coalesce_member_of);
-            let mut xmm_allocator = LinearScanAllocator::new_with_config(f64_ranges, config.xmm_regs.clone(), &config.ra_config);
+            let mut xmm_allocator = LinearScanAllocator::new_with_config(
+                f64_ranges,
+                config.xmm_regs.clone(),
+                &config.ra_config,
+            );
             xmm_allocator.run();
             for (&vid, &reg) in &xmm_allocator.assignments {
                 assignments.insert(vid, reg);
@@ -4535,7 +4583,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                             func,
                             &config.ra_config,
                         );
-                        let mut vec_allocator = LinearScanAllocator::new_with_config(vec_ranges, vec_pool, &config.ra_config);
+                        let mut vec_allocator = LinearScanAllocator::new_with_config(
+                            vec_ranges,
+                            vec_pool,
+                            &config.ra_config,
+                        );
                         vec_allocator.run();
                         for (vid, reg) in vec_allocator.assignments {
                             assignments.insert(vid, reg);
@@ -4635,7 +4687,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 phase2b_ranges
                     .sort_by(|a, b| a.start.cmp(&b.start).then(b.priority.cmp(&a.priority)));
-                let mut span_allocator = LinearScanAllocator::new_with_config(phase2b_ranges, span_regs, &config.ra_config);
+                let mut span_allocator = LinearScanAllocator::new_with_config(
+                    phase2b_ranges,
+                    span_regs,
+                    &config.ra_config,
+                );
                 span_allocator.run();
                 for (vid, reg) in span_allocator.assignments {
                     assignments.insert(vid, reg);
@@ -4712,11 +4768,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
                 let (wa, wb) = (class_weight(a), class_weight(b));
                 let loser = if wa != wb {
-                    if wa < wb {
-                        a
-                    } else {
-                        b
-                    }
+                    if wa < wb { a } else { b }
                 } else if a < b {
                     b
                 } else {
@@ -4906,8 +4958,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    let mut accumulator_assignments =
-        analyze_accumulator_assignments_with_config(func, config.accumulator_policy, &config.ra_config);
+    let mut accumulator_assignments = analyze_accumulator_assignments_with_config(
+        func,
+        config.accumulator_policy,
+        &config.ra_config,
+    );
     // A physical assignment is the durable home and always wins. Publishing
     // both locations made downstream behavior depend on insertion order.
     accumulator_assignments.retain(|a| !assignments.contains_key(&a.value_id));
@@ -5602,7 +5657,7 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>
                             )
                             .is_some()) =>
                 {
-                    continue
+                    continue;
                 }
                 Instruction::Call { info, .. } => (&info.args, false),
                 Instruction::CallIndirect { info, .. } => (&info.args, true),
@@ -5710,6 +5765,10 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                             | IntrinsicOp::HorizontalAddF64x2
                             | IntrinsicOp::VecHorizontalAddF64x4
                             | IntrinsicOp::VecHorizontalAddF64x2
+                            // StrictRecipMulAdd is scalar F64 despite doing
+                            // AVX2 work internally; its ordered accumulator
+                            // must use the normal XMM scalar allocation path.
+                            | IntrinsicOp::StrictRecipMulAddF64x4
                             | IntrinsicOp::VecHorizontalAddF32x8
                             | IntrinsicOp::VecHorizontalAddF32x4
                     ) || op.produces_vector_value()
@@ -5861,6 +5920,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // them poison the whole function.
                                 | O::VecWidenAddI32x4ToI64x2
                                 | O::VecWidenMaskedAddI32x4ToI64x2
+                                // StrictRecipMulAddF64x4 owns only the
+                                // reserved xmm0/xmm1 scratch pair and has no
+                                // vector SSA result. It therefore cannot
+                                // poison an unrelated mature vector
+                                // accumulator web in the same function.
+                                | O::StrictRecipMulAddF64x4
                                 // v12 Fix C: broadcast/store intrinsics do
                                 // not themselves need an accumulator, but
                                 // they appear in the SAME function as
@@ -6414,6 +6479,7 @@ fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
                         | O::HorizontalAddF64x2
                         | O::VecHorizontalAddF64x4
                         | O::VecHorizontalAddF64x2
+                        | O::StrictRecipMulAddF64x4
                         | O::VecHorizontalAddF32x8
                         | O::VecHorizontalAddF32x4
                 ) =>
@@ -7972,7 +8038,7 @@ fn uses_value(inst: &Instruction, val_id: u32) -> bool {
 
 #[cfg(test)]
 mod ra_config_tests {
-    use super::{PhysReg, RaConfig};
+    use super::{MI_MAX_LOOP_INSTS_DEFAULT, PhysReg, RaConfig};
 
     fn from(entries: &[(&str, &str)]) -> RaConfig {
         RaConfig::from_sources(
@@ -7990,11 +8056,7 @@ mod ra_config_tests {
     fn parser_covers_every_boolean_ra_switch_without_process_environment() {
         macro_rules! switch {
             ($field:ident, $name:literal) => {{
-                assert!(
-                    !from(&[]).$field,
-                    "{} must default to disabled",
-                    $name
-                );
+                assert!(!from(&[]).$field, "{} must default to disabled", $name);
                 assert!(
                     from(&[($name, "enabled")]).$field,
                     "{} must be presence-enabled",
@@ -8055,7 +8117,10 @@ mod ra_config_tests {
         switch!(mi_debug, "CCC_MI_DEBUG");
         switch!(no_load_cast_fold, "CCC_NO_LOAD_CAST_FOLD");
         switch!(debug_load_cast_fold, "CCC_DEBUG_LOAD_CAST_FOLD");
-        switch!(no_empty_local_frame_elision, "CCC_NO_EMPTY_LOCAL_FRAME_ELISION");
+        switch!(
+            no_empty_local_frame_elision,
+            "CCC_NO_EMPTY_LOCAL_FRAME_ELISION"
+        );
         switch!(debug_param_store, "CCC_DEBUG_PARAM_STORE");
         switch!(debug_paramref, "CCC_DEBUG_PARAMREF");
         switch!(no_machinst, "CCC_NO_MACHINST");
@@ -8068,8 +8133,11 @@ mod ra_config_tests {
         assert_eq!(defaults.hot_web_steal, 3);
         assert_eq!(defaults.evict_mode, 3);
         assert_eq!(defaults.pgo_weight_max, 1);
-        assert_eq!(defaults.x64_nohome_classes, "ret,store,copy,cast,unary,binop");
-        assert_eq!(defaults.mi_max_loop_insts, 32);
+        assert_eq!(
+            defaults.x64_nohome_classes,
+            "ret,store,copy,cast,unary,binop"
+        );
+        assert_eq!(defaults.mi_max_loop_insts, MI_MAX_LOOP_INSTS_DEFAULT);
         assert_eq!(defaults.legacy_debug_ra_func, "");
         assert_eq!(defaults.mi_fn_disable, "");
         assert_eq!(defaults.mi_fn_force, "");
@@ -8117,7 +8185,10 @@ mod ra_config_tests {
         assert_eq!(configured.ra_drop_func.as_deref(), Some("drop_fn"));
         assert_eq!(configured.phi_coalesce_skip.as_deref(), Some("7,11"));
         assert_eq!(configured.phi_coalesce_func.as_deref(), Some("phi_fn"));
-        assert_eq!(configured.no_regalloc_func.as_deref(), Some("slow_fn,other_fn"));
+        assert_eq!(
+            configured.no_regalloc_func.as_deref(),
+            Some("slow_fn,other_fn")
+        );
         assert_eq!(configured.mi_fn_disable, "cold");
         assert_eq!(configured.mi_fn_force, "hot");
         assert_eq!(configured.mi_disable_kinds, "call,load");
@@ -8133,7 +8204,7 @@ mod ra_config_tests {
         assert_eq!(malformed.hot_web_steal, 3);
         assert_eq!(malformed.evict_mode, 3);
         assert_eq!(malformed.pgo_weight_max, 1);
-        assert_eq!(malformed.mi_max_loop_insts, 4096);
+        assert_eq!(malformed.mi_max_loop_insts, MI_MAX_LOOP_INSTS_DEFAULT);
 
         let fp_override = from(&[
             ("CCC_DISABLE_SCALAR_FP_XMM", "1"),

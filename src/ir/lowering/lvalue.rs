@@ -1072,28 +1072,16 @@ impl Lowerer {
         match ty {
             CType::Pointer(pointee, _) => {
                 let sz = self.resolve_ctype_size(pointee);
-                if sz > 0 {
-                    Some(sz)
-                } else {
-                    None
-                }
+                if sz > 0 { Some(sz) } else { None }
             }
             CType::Array(elem, _) => {
                 let sz = self.resolve_ctype_size(elem);
-                if sz > 0 {
-                    Some(sz)
-                } else {
-                    None
-                }
+                if sz > 0 { Some(sz) } else { None }
             }
             CType::Vector(elem, _) => {
                 // Vector element subscript: v[i] accesses the i-th scalar element
                 let sz = self.resolve_ctype_size(elem);
-                if sz > 0 {
-                    Some(sz)
-                } else {
-                    None
-                }
+                if sz > 0 { Some(sz) } else { None }
             }
             _ => None,
         }

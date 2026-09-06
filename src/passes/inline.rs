@@ -3157,7 +3157,7 @@ fn inline_call_site(
         if substitutable[i] {
             if let Operand::Const(c) = &site.args[i] {
                 if let Some(at) = const_ir_type(c) {
-                    home_subst.insert(param_alloca_info[i].0 .0, (site.args[i], at));
+                    home_subst.insert(param_alloca_info[i].0.0, (site.args[i], at));
                 }
             }
         }
@@ -3190,7 +3190,7 @@ fn inline_call_site(
         let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
         let mut inserted_arg_count = 0usize;
         for i in (0..num_args_to_store).rev() {
-            if home_subst.contains_key(&param_alloca_info[i].0 .0) {
+            if home_subst.contains_key(&param_alloca_info[i].0.0) {
                 continue; // value flows via the older pure-home substitution
             }
             let param_struct_size = callee.param_struct_sizes.get(i).copied().flatten();
@@ -3769,7 +3769,7 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             va_list_ptr,
             size,
             align,
-            ref eightbyte_classes,
+            eightbyte_classes,
         } => Instruction::VaArgStruct {
             dest_ptr: remap_value(*dest_ptr, vo),
             va_list_ptr: remap_value(*va_list_ptr, vo),

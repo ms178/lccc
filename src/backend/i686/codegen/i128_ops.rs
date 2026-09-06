@@ -5,7 +5,7 @@
 //! mul-accumulate chain fusion (`res = res*base + val`, the kstrtoull/
 //! simple_strtoull parser hot shape).
 
-use super::emit::{phys_reg_name, I686Codegen};
+use super::emit::{I686Codegen, phys_reg_name};
 use crate::backend::regalloc::compute_i686_mulacc_chains_with_config;
 use crate::backend::state::StackSlot;
 use crate::backend::traits::ArchCodegen;

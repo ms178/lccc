@@ -17,10 +17,10 @@
 //! the `supports_deferred_skips()` trait method.
 
 use crate::backend::elf::{
-    self as elf_mod, parse_section_flags, resolve_numeric_labels, ElfConfig, ObjReloc, ObjSection,
-    ObjSymbol, SymbolTableInput, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS,
-    STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_TLS,
-    STV_DEFAULT, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
+    self as elf_mod, ElfConfig, ObjReloc, ObjSection, ObjSymbol, SHF_ALLOC, SHF_EXECINSTR,
+    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC,
+    STT_NOTYPE, STT_OBJECT, STT_TLS, STV_DEFAULT, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
+    SymbolTableInput, parse_section_flags, resolve_numeric_labels,
 };
 use crate::backend::x86::assembler::parser::*;
 use crate::common::fx_hash::FxHashMap;
@@ -605,7 +605,7 @@ fn tokenize_expr(expr: &str) -> Result<Vec<ExprToken>, String> {
                 return Err(format!(
                     "unexpected character in expression: '{}' (0x{:02x})",
                     c as char, c
-                ))
+                ));
             }
         }
     }
@@ -1231,11 +1231,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let data = match count {
                     Some(c) => {
                         let c = *c as usize;
-                        if c < data.len() {
-                            &data[..c]
-                        } else {
-                            data
-                        }
+                        if c < data.len() { &data[..c] } else { data }
                     }
                     None => data,
                 };

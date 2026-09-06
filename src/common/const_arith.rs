@@ -17,11 +17,7 @@ use crate::ir::reexports::IrConst;
 /// This handles the C semantics of truncating arithmetic results to `int` width.
 #[inline]
 fn wrap_result(v: i64, is_32bit: bool) -> i64 {
-    if is_32bit {
-        v as i32 as i64
-    } else {
-        v
-    }
+    if is_32bit { v as i32 as i64 } else { v }
 }
 
 /// Perform an unsigned binary operation, handling 32-bit vs 64-bit width.
@@ -39,11 +35,7 @@ fn unsigned_op(l: i64, r: i64, is_32bit: bool, op: fn(u64, u64) -> u64) -> i64 {
 /// Convert a boolean to i64 (1 for true, 0 for false).
 #[inline]
 fn bool_to_i64(b: bool) -> i64 {
-    if b {
-        1
-    } else {
-        0
-    }
+    if b { 1 } else { 0 }
 }
 
 // === Shared constant binary operation evaluators ===

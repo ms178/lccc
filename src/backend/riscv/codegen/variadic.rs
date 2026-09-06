@@ -1,6 +1,6 @@
 //! RiscvCodegen: va_arg, va_start, va_copy operations.
 
-use super::emit::{callee_saved_name, RiscvCodegen};
+use super::emit::{RiscvCodegen, callee_saved_name};
 use crate::common::types::IrType;
 use crate::ir::reexports::Value;
 

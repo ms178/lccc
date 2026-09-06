@@ -960,11 +960,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 }
             }
         }
-        if saw_value {
-            root
-        } else {
-            None
-        }
+        if saw_value { root } else { None }
     }
     let mut invalid = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -1257,10 +1253,12 @@ mod tests {
         });
 
         assert_eq!(forward_store_only_temporaries(&mut func), 0);
-        assert!(func.blocks[0]
-            .instructions
-            .iter()
-            .any(|instruction| matches!(instruction, Instruction::Memcpy { .. })));
+        assert!(
+            func.blocks[0]
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Memcpy { .. }))
+        );
     }
 
     #[test]

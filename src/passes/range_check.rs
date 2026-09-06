@@ -510,11 +510,11 @@ fn fold_phi_diamonds(
             _ => continue,
         };
 
-        let bcond_idx = match idx_of.get(&const_arm.1 .0) {
+        let bcond_idx = match idx_of.get(&const_arm.1.0) {
             Some(&i) => i,
             None => continue,
         };
-        let bcheck_idx = match idx_of.get(&val_arm.1 .0) {
+        let bcheck_idx = match idx_of.get(&val_arm.1.0) {
             Some(&i) => i,
             None => continue,
         };

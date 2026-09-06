@@ -1785,8 +1785,10 @@ fn plan_block_splits(
                     }
                 }
             }
-            eprintln!("[SPLIT-PRESSURE] {} blk{} peak_pt={} peak={} REJECT span={} used_at_peak={} noprev={} gap={} outside={}",
-                func.name, bi, peak_pt, peak, r_span, r_used, r_noprev, r_gap, r_out);
+            eprintln!(
+                "[SPLIT-PRESSURE] {} blk{} peak_pt={} peak={} REJECT span={} used_at_peak={} noprev={} gap={} outside={}",
+                func.name, bi, peak_pt, peak, r_span, r_used, r_noprev, r_gap, r_out
+            );
         }
         let Some((_, vid, store_at, reload_before)) = best else {
             // Nothing further is splittable here; leave the rest to the

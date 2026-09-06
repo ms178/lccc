@@ -46,7 +46,7 @@
 //! global-register assignments that an entry snapshot would erase (the
 //! same reasoning as the x86-64 implementation).
 
-use super::emit::{callee_saved_name, ArmCodegen};
+use super::emit::{ArmCodegen, callee_saved_name};
 use crate::ir::reexports::{Operand, Value};
 
 impl ArmCodegen {

@@ -568,19 +568,25 @@ fn a_symbol_address_emits_leaq_not_movq() {
 
 #[test]
 fn control_flow_variants_emit_their_targets() {
-    assert!(emit1(&MachInst::Jmp {
-        target: ".L7".into()
-    })
-    .contains(".L7"));
-    assert!(emit1(&MachInst::Jcc {
-        cc: CondCode::Ne,
-        target: ".L9".into()
-    })
-    .contains(".L9"));
-    assert!(emit1(&MachInst::Call {
-        target: "printf".into()
-    })
-    .contains("printf"));
+    assert!(
+        emit1(&MachInst::Jmp {
+            target: ".L7".into()
+        })
+        .contains(".L7")
+    );
+    assert!(
+        emit1(&MachInst::Jcc {
+            cc: CondCode::Ne,
+            target: ".L9".into()
+        })
+        .contains(".L9")
+    );
+    assert!(
+        emit1(&MachInst::Call {
+            target: "printf".into()
+        })
+        .contains("printf")
+    );
     assert_eq!(emit1(&MachInst::Ret), "ret");
 }
 
@@ -1965,7 +1971,7 @@ fn div_uses_rax_rdx_and_computes_quotient_when_executed() {
     body.push_str("    movq %rsi, %r10\n");
     body.push_str(&out.buf);
     body.push_str("\n    movq %rdx, %rsi\n"); // save remainder for round 2
-                                              // Return quotient and remainder: run twice, once returning rax, once rdx.
+    // Return quotient and remainder: run twice, once returning rax, once rdx.
     let body_q = format!("{body}    movq %rax, %r11\n    movq %r11, %rax\n    ret\n");
     let _ = dst;
     let inputs = &[(100i64, 7i64), (-100, 7), (7, 100), (i64::MIN, 2), (0, 5)];
@@ -2640,11 +2646,13 @@ fn float_moves_lower_through_machinst() {
         &mut out,
     ));
     match &out[..] {
-        [MachInst::FMov {
-            src: MachOperand::Reg(MachReg::Phys(s)),
-            dst: MachOperand::StackSlot(off),
-            size,
-        }] => {
+        [
+            MachInst::FMov {
+                src: MachOperand::Reg(MachReg::Phys(s)),
+                dst: MachOperand::StackSlot(off),
+                size,
+            },
+        ] => {
             assert_eq!(*s, PhysReg(20));
             assert_eq!(*off, -8);
             assert_eq!(*size, OpSize::S64);
@@ -2662,11 +2670,13 @@ fn float_moves_lower_through_machinst() {
         &mut out,
     ));
     match &out[..] {
-        [MachInst::FMov {
-            dst: MachOperand::Mem { base, offset },
-            size,
-            ..
-        }] => {
+        [
+            MachInst::FMov {
+                dst: MachOperand::Mem { base, offset },
+                size,
+                ..
+            },
+        ] => {
             assert_eq!(*base, MachReg::Phys(PhysReg(11)));
             assert_eq!(*offset, 0);
             assert_eq!(*size, OpSize::S32);
@@ -2684,11 +2694,13 @@ fn float_moves_lower_through_machinst() {
         &mut out,
     ));
     match &out[..] {
-        [MachInst::FMov {
-            src: MachOperand::Mem { .. },
-            dst: MachOperand::Reg(MachReg::Phys(d)),
-            size,
-        }] => {
+        [
+            MachInst::FMov {
+                src: MachOperand::Mem { .. },
+                dst: MachOperand::Reg(MachReg::Phys(d)),
+                size,
+            },
+        ] => {
             assert_eq!(*d, PhysReg(21));
             assert_eq!(*size, OpSize::S64);
         }
@@ -2705,11 +2717,13 @@ fn float_moves_lower_through_machinst() {
         &mut out,
     ));
     match &out[..] {
-        [MachInst::FMov {
-            src: MachOperand::StackSlot(off),
-            size,
-            ..
-        }] => {
+        [
+            MachInst::FMov {
+                src: MachOperand::StackSlot(off),
+                size,
+                ..
+            },
+        ] => {
             assert_eq!(*off, -8);
             assert_eq!(*size, OpSize::S32);
         }
@@ -2731,11 +2745,13 @@ fn float_moves_lower_through_machinst() {
         &mut out,
     ));
     match &out[..] {
-        [MachInst::FMov {
-            src: MachOperand::Reg(MachReg::Phys(s)),
-            dst: MachOperand::Reg(MachReg::Phys(d)),
-            size,
-        }] => {
+        [
+            MachInst::FMov {
+                src: MachOperand::Reg(MachReg::Phys(s)),
+                dst: MachOperand::Reg(MachReg::Phys(d)),
+                size,
+            },
+        ] => {
             assert_eq!(*s, PhysReg(20));
             assert_eq!(*d, PhysReg(21));
             assert_eq!(*size, OpSize::S32);
@@ -3015,13 +3031,15 @@ fn float_binops_lower_with_exact_operand_order() {
         &mut out,
     ));
     match &out[..] {
-        [MachInst::FAlu {
-            op: FAluOp::Sub,
-            src2: MachOperand::Reg(MachReg::Phys(s2)),
-            src1: MachReg::Phys(s1),
-            dst: MachReg::Phys(d),
-            size,
-        }] => {
+        [
+            MachInst::FAlu {
+                op: FAluOp::Sub,
+                src2: MachOperand::Reg(MachReg::Phys(s2)),
+                src1: MachReg::Phys(s1),
+                dst: MachReg::Phys(d),
+                size,
+            },
+        ] => {
             assert_eq!(*s1, PhysReg(20), "lhs must stay src1 for sub");
             assert_eq!(*s2, PhysReg(21));
             assert_eq!(*d, PhysReg(22));
@@ -3061,12 +3079,14 @@ fn float_binops_lower_with_exact_operand_order() {
         &mut out,
     ));
     match &out[..] {
-        [MachInst::FAlu {
-            op: FAluOp::Mul,
-            src2: MachOperand::Reg(MachReg::Vreg(7)),
-            src1: MachReg::Phys(s1),
-            ..
-        }] => assert_eq!(*s1, PhysReg(21), "rhs must become src1 in swapped form"),
+        [
+            MachInst::FAlu {
+                op: FAluOp::Mul,
+                src2: MachOperand::Reg(MachReg::Vreg(7)),
+                src1: MachReg::Phys(s1),
+                ..
+            },
+        ] => assert_eq!(*s1, PhysReg(21), "rhs must become src1 in swapped form"),
         other => panic!("unexpected lowering: {other:?}"),
     }
 
@@ -3092,11 +3112,13 @@ fn float_binops_lower_with_exact_operand_order() {
         &mut out,
     ));
     match &out[..] {
-        [MachInst::FAlu {
-            src2: MachOperand::Reg(MachReg::Vreg(7)),
-            src1: MachReg::Phys(s1),
-            ..
-        }] => assert_eq!(*s1, PhysReg(20)),
+        [
+            MachInst::FAlu {
+                src2: MachOperand::Reg(MachReg::Vreg(7)),
+                src1: MachReg::Phys(s1),
+                ..
+            },
+        ] => assert_eq!(*s1, PhysReg(20)),
         other => panic!("unexpected lowering: {other:?}"),
     }
 
@@ -3142,7 +3164,7 @@ fn float_binops_lower_with_exact_operand_order() {
 
 mod call_builder {
     use super::super::isel::{
-        build_typed_call, build_typed_call_ex, TypedCallReject, TypedCallSrc,
+        TypedCallReject, TypedCallSrc, build_typed_call, build_typed_call_ex,
     };
     use super::*;
     use crate::common::types::IrType;
@@ -4366,11 +4388,11 @@ mod typed_indirect_calls {
     /// GPR/slot homes only.)
     #[test]
     fn ir_callindirect_lowers_through_the_typed_path() {
-        use super::super::isel::{lower_instruction_typed, TypedCallSrc};
+        use super::super::isel::{TypedCallSrc, lower_instruction_typed};
         let _ = TypedCallSrc::Imm(0); // keep the import honest for doc builds
-                                      // The isel-side dispatch lives in emit.rs (needs codegen state), so
-                                      // the builder-level contract is what the unit layer pins; the
-                                      // emitted form above plus the corpus differential cover the rest.
+        // The isel-side dispatch lives in emit.rs (needs codegen state), so
+        // the builder-level contract is what the unit layer pins; the
+        // emitted form above plus the corpus differential cover the rest.
         let ra: FxHashMap<u32, PhysReg> = FxHashMap::default();
         let slots: FxHashMap<u32, i64> = [(2u32, -40i64)].into_iter().collect();
         let inst = Instruction::CallIndirect {

@@ -669,7 +669,7 @@ fn run_inline_phase(
     let dump_pre =
         std::env::var("CCC_DUMP_EACH_PASS").is_ok() || std::env::var("CCC_VALIDATE_SSA").is_ok();
     macro_rules! iphase_dump {
-        ($name:expr) => {
+        ($name:expr_2021) => {
             if dump_pre {
                 dump_ir_filtered(module, &format!("pre-loop {}", $name));
             }
@@ -719,7 +719,8 @@ fn run_inline_phase(
             inline::run(module);
         }
     }
-    if ra_config.dump_ir || std::env::var("CCC_DUMP_EACH_PASS").is_ok()
+    if ra_config.dump_ir
+        || std::env::var("CCC_DUMP_EACH_PASS").is_ok()
         || std::env::var("CCC_VALIDATE_SSA").is_ok()
     {
         dump_ir_filtered(module, "pre-loop after inliner");
@@ -883,6 +884,8 @@ pub(crate) fn run_passes(
     fp_reassoc: bool,
     fp_contract: crate::common::fp_contract::FpContract,
     x86_avx: bool,
+    x86_avx2: bool,
+    x86_sse4_1: bool,
     x86_fma: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
@@ -890,6 +893,13 @@ pub(crate) fn run_passes(
     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
     // ignores this.
     vectorize::set_x86_fma_enabled(x86_fma && target == crate::backend::Target::X86_64);
+    // PERF-41's strict computed-reciprocal prefix uses VPINSRD (SSE4.1) plus
+    // AVX2 packed conversion/division.  Do not infer this from generic x86
+    // vectorization or from AVX alone; the pass must fail closed for a target
+    // which has not explicitly enabled both required ISA subsets.
+    vectorize::set_x86_strict_recip_avx2_enabled(
+        target == crate::backend::Target::X86_64 && x86_avx2 && x86_sse4_1,
+    );
     // FMA3 availability for the fma/fmaf libcall fold (simplify.rs): the
     // fused form is required for the C99 single-rounding semantics, so the
     // fold must only fire when the backend can actually emit vfmadd*.
@@ -1064,7 +1074,7 @@ pub(crate) fn run_passes(
     // inlining.
 
     macro_rules! preloop_dump {
-        ($name:expr) => {
+        ($name:expr_2021) => {
             if dump_each_pass {
                 dump_ir_filtered(module, &format!("pre-loop {}", $name));
             }
@@ -1216,7 +1226,7 @@ pub(crate) fn run_passes(
         changed.iter_mut().for_each(|c| *c = false);
 
         macro_rules! timed_pass {
-            ($name:expr, $body:expr) => {{
+            ($name:expr_2021, $body:expr_2021) => {{
                 if time_passes {
                     let t0 = std::time::Instant::now();
                     let n = $body;
@@ -1256,7 +1266,7 @@ pub(crate) fn run_passes(
         //   if_convert → copy_prop, dce (eliminated branches)
         //   dce → cfg_simplify (empty blocks)
         macro_rules! should_run {
-            ($self_idx:expr, $($upstream:expr),*) => {{
+            ($self_idx:expr_2021, $($upstream:expr_2021),*) => {{
                 prev_pass_changes[$self_idx] > 0 $(|| prev_pass_changes[$upstream] > 0)*
             }};
         }

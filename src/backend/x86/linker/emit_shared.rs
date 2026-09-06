@@ -146,7 +146,7 @@ pub(super) fn emit_shared_library(
     // is stated and tested exactly once (see that type's documentation).
     let mut packer = super::layout_plan::SegmentPacker::new(base_addr, PAGE_SIZE);
     macro_rules! vaddr {
-        ($off:expr) => {
+        ($off:expr_2021) => {
             packer.vaddr($off)
         };
     }
@@ -737,13 +737,13 @@ pub(super) fn emit_shared_library(
         // The base node (1) carries the SONAME.
         let mut versym = Vec::with_capacity(dynsym_count as usize * 2);
         versym.extend_from_slice(&0u16.to_le_bytes()); // dynsym[0]
-                                                       // Emit versym in dyn_sym_names' FINAL order. sym_versions was built
-                                                       // before the undef-first reorder and the .gnu.hash bucket sort;
-                                                       // iterating it here assigned version indices to the WRONG symbols
-                                                       // once any reordering happened (glibc libc.so: every .symver export
-                                                       // landed on versym 1 "*global*", so versioned references like
-                                                       // fdopen@GLIBC_2.2.5 failed at load time). Re-derive each entry's
-                                                       // version from its (still composed) name.
+        // Emit versym in dyn_sym_names' FINAL order. sym_versions was built
+        // before the undef-first reorder and the .gnu.hash bucket sort;
+        // iterating it here assigned version indices to the WRONG symbols
+        // once any reordering happened (glibc libc.so: every .symver export
+        // landed on versym 1 "*global*", so versioned references like
+        // fdopen@GLIBC_2.2.5 failed at load time). Re-derive each entry's
+        // version from its (still composed) name.
         for name in &dyn_sym_names {
             let (ver, hidden): (Option<&str>, bool) = if let Some(pos) = name.find("@@") {
                 (Some(&name[pos + 2..]), false)
@@ -1738,9 +1738,9 @@ pub(super) fn emit_shared_library(
     let mut glob_dat_entries: Vec<(u64, String)> = Vec::new(); // (offset, sym_name) for GLOB_DAT relocs
     let mut tpoff64_entries: Vec<(u64, String)> = Vec::new(); // (offset, sym_name) for R_X86_64_TPOFF64 relocs
     let mut abs64_entries: Vec<(u64, String, i64)> = Vec::new(); // (offset, sym_name, addend) for R_X86_64_64 relocs
-                                                                 // TLS module-id relocations: (got_slot_vaddr, sym_name_or_empty).
-                                                                 // DTPMOD64 always needed (module id known only at load time). DTPOFF64
-                                                                 // needed only for symbols that may be interposed (named globals).
+    // TLS module-id relocations: (got_slot_vaddr, sym_name_or_empty).
+    // DTPMOD64 always needed (module id known only at load time). DTPOFF64
+    // needed only for symbols that may be interposed (named globals).
     let mut dtpmod64_entries: Vec<(u64, String)> = Vec::new();
     let mut dtpoff64_entries: Vec<(u64, String)> = Vec::new();
 
@@ -1750,7 +1750,7 @@ pub(super) fn emit_shared_library(
         let slot = got_addr + tlsgd_got_base + i as u64 * 16;
         tlsgd_slot_addr.insert(name.clone(), slot);
         dtpmod64_entries.push((slot, String::new())); // module id of THIS module
-                                                      // DTPOFF: statically known when the symbol is defined here; store it.
+        // DTPOFF: statically known when the symbol is defined here; store it.
         let mut static_off: Option<u64> = None;
         if let Some(g) = globals_snap.get(name) {
             if g.defined_in.is_some() && !g.is_dynamic && g.section_idx != SHN_UNDEF {
