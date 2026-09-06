@@ -25,8 +25,12 @@ Developer and research tooling. None of these are needed to build LCCC.
 | `x86_gcc_torture.py` | Full native x86-64 GCC `gcc.c-torture/execute` matrix. Splits compilation and linking so every PASS covers LCCC object generation **and standalone `lccc-ld`**, uses GCC only as eligibility/CRT oracle, understands unconditional `dg-options`, enforces timeouts, and writes deterministic JSON/failure logs. |
 | `lccc-snapshot.sh` | Harness-wipe-resistant autosave: commits then atomically publishes a verified squashed `ms178-1.patch`, series, tarball, bundle, and ledger with SHA-256 records. Set `LCCC_BASE_REF` when re-anchoring a new session after an upstream rebase. |
 | `bench_kernels.py` | Separate-TU kernel timing harness. Supports a CPU-pinned, AB/BA-balanced `lccc-alt` compiler arm via `--lccc-alt-env NAME=VALUE`, verifies checksums, and hashes only the timed function. |
-| `benchmark_fp_memfold_ab.py` | Builds the stencil5 scalar-FP memory-fold treatment/control and retains randomized CPU-pinned paired samples plus a bootstrap interval. Results are explicitly VM screening, not PMU evidence. |
-| `benchmark_reduction_vecreg_ab.py` | Builds register- and stack-accumulator variants of the F32 sum+dot workload and retains randomized CPU-pinned paired samples with a bootstrap interval. |
+| `fuzz_diff.py` | Unified differential-testing harness (engines: `synthetic`, `csmith`, `yarpgen`, `stress_suite`). Compiles every generated program with LCCC **and all selected references** across the requested `-O` levels, compares stdout/stderr/exit status, and saves miscompile reproducers. `--check-engines` is the CI wiring guard against stub engines. |
+| `csmith_diff.py`, `yarpgen_diff.py` | Compatibility wrappers: translate the historical flag spellings (`--ccc`, `--clang`, `--gcc`, `--jobs`, `--tests`, `--seed-start`, ...) and forward to `scripts/fuzz_diff.py --engine csmith|yarpgen`. |
+| `benchmark_fp_memfold_ab.py` | Thin wrapper forwarding to `scripts/perf_ab.py --preset fp_memfold` (interleaved AB/BA screening with empty-process floor exclusion; see `perf_ab.py`). |
+| `benchmark_reduction_vecreg_ab.py` | Thin wrapper forwarding to `scripts/perf_ab.py --preset reduction_vecreg`. |
+| `benchmark_vecreg_new_ops_ab.py` | Thin wrapper forwarding to `scripts/perf_ab.py --preset vecreg_ops`. |
+| `benchmark_vector_remainder_ab.py` | Thin wrapper forwarding to `scripts/perf_ab.py --preset vector_remainder`. |
 | `symstr_migrate.py` | Span-driven `String` → `SymStr` migration helper. Its diagnostic build resolves the manifest-selected Rust channel, locates the persisted Cargo proxy, and denies warnings unless explicitly opted out. |
 | `gen_lcccsimd.py`, `strip_scalar_dups.py` | SIMD intrinsic header generation helpers. |
 

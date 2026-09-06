@@ -135,6 +135,24 @@ jobs:
       # byte-level gate additionally rejects the historical UTF-8-to-Latin-1
       # recoding in the emitted #APP region, including an adjacent-literal
       # multibyte sequence split.
+      # Wiring guard for the unified differential-testing harness: every
+      # advertised engine must be a real implementation.  This exists because
+      # the csmith/yarpgen engines once regressed to silent no-op stubs that
+      # reported TOTAL: 0 with exit status 0 — a validation vacuum.
+      - name: Verify differential-fuzz engine wiring
+        run: python3 scripts/fuzz_diff.py --check-engines
+
+      # Dependency-free differential smoke: a handful of synthetic programs
+      # compiled with LCCC and the host GCC across -O0/-O2 must agree.  This
+      # is the shortest end-to-end proof that the harness, the freshly built
+      # compiler, and the reference oracle all actually execute.  The seed is
+      # pinned so a failure is always reproducible locally.
+      - name: Differential fuzz smoke (synthetic)
+        run: |
+          python3 scripts/fuzz_diff.py --engine synthetic --count 4 \
+            --lccc target/fastbuild/lccc --refs gcc --opts=-O0,-O2 \
+            --seed 20260906
+
       - name: Verify inline-asm UTF-8 assembly text
         run: |
           python3 scripts/check_inline_asm_utf8.py \

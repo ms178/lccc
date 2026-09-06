@@ -30,7 +30,11 @@ mod plt_got;
 pub mod types;
 pub use icf::parse_icf_mode;
 
-#[cfg(not(feature = "gcc_linker"))]
+// NOTE: `link_builtin`/`link_shared` must stay exported under the
+// `gcc_linker` feature: the standalone `lccc-ld` driver (src/linker_entry.rs)
+// links with the built-in ELF linker regardless of which link path the
+// *compiler* driver uses.  Gating these re-exports on
+// `not(feature = "gcc_linker")` breaks `cargo build --features gcc_linker`.
 pub use link::link_builtin;
 
 /// Self-contained input loader for the standalone `lccc-ld` driver.
@@ -118,5 +122,6 @@ pub fn load_inputs_for_ld(
     }
     Ok(())
 }
-#[cfg(not(feature = "gcc_linker"))]
+// See the x86 linker note: lccc-ld always drives the built-in linker, so this
+// re-export must remain available under the `gcc_linker` feature.
 pub use link::link_shared;

@@ -53,16 +53,20 @@ jobs:
           echo "Running (includes fib(90) — impossible without rec2iter)..."
           /tmp/fib_rec2iter
 
-      - name: Run benchmarks
-        env:
-          GCC_INC: ${{ steps.gcc.outputs.inc }}
+      - name: Run complete benchmark corpus
         run: |
+          # ci-bench.py delegates to tests/benchmark/run_benchmarks.py. With
+          # no --only selection this is the complete checked-in corpus:
+          # synthetic kernels plus every pinned workload-derived kernel.
           python3 .github/scripts/ci-bench.py \
             --lccc target/release/lccc \
-            --gcc-inc "$GCC_INC" \
-            --reps 5 \
+            --compilers lccc,gcc \
+            --reps 9 \
+            --warmup 1 \
+            --artifact-dir bench-artifacts \
             --json bench-results.json \
-            --summary > bench-summary.md
+            --markdown bench-summary.md \
+            --strict | tee bench-terminal.txt
 
       - name: Post benchmark summary
         if: always()
@@ -76,3 +80,5 @@ jobs:
           path: |
             bench-results.json
             bench-summary.md
+            bench-terminal.txt
+            bench-artifacts/
