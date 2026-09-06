@@ -1,6 +1,7 @@
 //! X86Codegen: memory operations (load, store, memcpy, GEP, stack).
 
 use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
+use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{SlotAddr, StackSlot};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
@@ -39,6 +40,24 @@ pub(super) fn direct_store_imm(imm: i64, ty: IrType) -> Option<i64> {
         };
         Some(imm & mask)
     }
+}
+
+/// Source classification for the `%rdi`/`%rsi` parallel-copy staging of
+/// memcpy/memmove addresses (see `X86Codegen::stage_copy_operands`).
+#[derive(Clone, Copy, Debug)]
+enum CopyAddrSource {
+    /// Home GPR of the value (may itself be `%rdi`/`%rsi`).
+    Gpr(PhysReg),
+    /// XMM home: `movq %xmmN, %target`.
+    Xmm(PhysReg),
+    /// Slot whose ADDRESS is the operand (allocas, direct 16/32-byte payload
+    /// slots); over-alignment is applied by `emit_alloca_addr_to`.
+    SlotAddress(StackSlot, u32),
+    /// Slot holding the pointer value: `movq off(%rbp), %target`.
+    SlotLoad(StackSlot),
+    /// Constants and anything else: `operand_to_reg` (never reads rdi/rsi
+    /// unless the value is register-homed, which the cases above catch).
+    Generic,
 }
 
 impl X86Codegen {
@@ -2675,36 +2694,111 @@ impl X86Codegen {
     /// pointer operands; load them into rdi/rsi and run the fixed-size copy.
     /// This turns the bundled SIMD headers' `__builtin_memcpy(&x, &y, 16)`
     /// software fallbacks into a single movdqu pair instead of a libc call.
-    /// Register home of a value operand, if it has one (`None` for constants
-    /// and stack-resident values).
-    fn operand_reg_home(&self, op: &Operand) -> Option<u8> {
-        match op {
-            Operand::Value(v) => self.reg_assignments.get(&v.0).map(|r| r.0),
-            Operand::Const(_) => None,
+    /// Where a copy-address operand currently lives. Only `Gpr` sources can
+    /// alias the staging targets (`%rdi`/`%rsi`); every other kind is
+    /// materialised from `%rbp`/`%rsp`/an XMM register/an immediate and can
+    /// be emitted in any order.
+    fn copy_addr_source(&self, op: &Operand) -> CopyAddrSource {
+        let v = match op {
+            Operand::Value(v) => *v,
+            Operand::Const(_) => return CopyAddrSource::Generic,
+        };
+        if let Some(&reg) = self.reg_assignments.get(&v.0) {
+            return if is_xmm_reg(reg) {
+                CopyAddrSource::Xmm(reg)
+            } else {
+                CopyAddrSource::Gpr(reg)
+            };
+        }
+        match self.state.resolve_slot_addr(v.0) {
+            Some(SlotAddr::Reg(reg)) if is_xmm_reg(reg) => CopyAddrSource::Xmm(reg),
+            Some(SlotAddr::Reg(reg)) => CopyAddrSource::Gpr(reg),
+            // Allocas (plain or over-aligned) and 16/32-byte payload values
+            // (i128/F128/Vec*) live DIRECTLY in their slot: the address IS
+            // the operand. `emit_alloca_addr_to` applies the over-alignment
+            // fix-up when the value has one and a plain `leaq` otherwise.
+            Some(SlotAddr::Direct(slot)) | Some(SlotAddr::OverAligned(slot, _)) => {
+                CopyAddrSource::SlotAddress(slot, v.0)
+            }
+            Some(SlotAddr::Indirect(slot)) => CopyAddrSource::SlotLoad(slot),
+            None => CopyAddrSource::Generic,
         }
     }
 
-    /// Stage `dest → %rdi`, `src → %rsi` without the read-after-clobber
-    /// hazard: with parameters kept in their ABI registers across inline
-    /// expansions (`regalloc::x86_param_caller_homes_safe`), `memcpy(d, s)`
-    /// called as `f(char *s, char *d)` has `s` homed in %rdi.  Loading `d`
-    /// first would destroy it.  The order follows the homes; the full swap
-    /// (`s` in %rdi *and* `d` in %rsi) is one `xchgq`.
-    fn stage_copy_operands(&mut self, dest: &Operand, src: &Operand) {
-        const RDI: u8 = 14;
-        const RSI: u8 = 15;
-        let src_in_rdi = self.operand_reg_home(src) == Some(RDI);
-        let dest_in_rsi = self.operand_reg_home(dest) == Some(RSI);
+    /// Materialise one copy-address operand into `target` (`"rdi"`/`"rsi"`).
+    fn emit_copy_addr_to(&mut self, op: &Operand, src: &CopyAddrSource, target: &'static str) {
+        match *src {
+            CopyAddrSource::Gpr(reg) => {
+                let name = phys_reg_name(reg);
+                if name != target {
+                    self.state.out.emit_instr_reg_reg("    movq", name, target);
+                }
+            }
+            CopyAddrSource::Xmm(reg) => {
+                self.state.emit_fmt(format_args!(
+                    "    movq %{}, %{}",
+                    phys_reg_name(reg),
+                    target
+                ));
+            }
+            CopyAddrSource::SlotAddress(slot, val_id) => {
+                self.emit_alloca_addr_to(target, val_id, slot.0);
+            }
+            CopyAddrSource::SlotLoad(slot) => {
+                self.state
+                    .out
+                    .emit_instr_rbp_reg("    movq", slot.0, target);
+            }
+            CopyAddrSource::Generic => self.operand_to_reg(op, target),
+        }
+    }
+
+    /// Stage `dest → %rdi`, `src → %rsi` as a **parallel copy**.
+    ///
+    /// The two targets are also possible *sources*: with parameters kept in
+    /// their ABI registers across inline expansions
+    /// (`regalloc::x86_param_caller_homes_safe`) and with the allocator free
+    /// to home any pointer in `%rdi`/`%rsi`, `memcpy(d, s)` may see `s` in
+    /// `%rdi`, `d` in `%rsi`, or both. Sequential staging through a scratch
+    /// register destroyed the not-yet-read operand (`mc2`: `%rsi` was
+    /// overwritten with `%rdi` before it was read, so source and destination
+    /// collapsed onto the same address and the copy became a no-op).
+    ///
+    /// Resolution is the classic two-node parallel-move schedule:
+    ///   * neither target is the other operand's source → any order;
+    ///   * exactly one target is the other operand's source → write the
+    ///     *other* target first (its source is untouched);
+    ///   * both cross → one `xchgq`.
+    /// Non-register sources (slot loads, `leaq` of allocas, constants) never
+    /// read `%rdi`/`%rsi`, so they impose no ordering constraint.
+    pub(super) fn stage_copy_operands(&mut self, dest: &Operand, src: &Operand) {
+        const RDI: PhysReg = PhysReg(14);
+        const RSI: PhysReg = PhysReg(15);
+        let d_src = self.copy_addr_source(dest);
+        let s_src = self.copy_addr_source(src);
+        let src_in_rdi = matches!(s_src, CopyAddrSource::Gpr(r) if r == RDI);
+        let dest_in_rsi = matches!(d_src, CopyAddrSource::Gpr(r) if r == RSI);
         if src_in_rdi && dest_in_rsi {
             self.state.emit("    xchgq %rdi, %rsi");
-            self.state.reg_cache.invalidate_all();
         } else if src_in_rdi {
-            self.operand_to_reg(src, "rsi");
-            self.operand_to_reg(dest, "rdi");
+            // `%rdi` must be read before it is written: stage src first.
+            self.emit_copy_addr_to(src, &s_src, "rsi");
+            self.emit_copy_addr_to(dest, &d_src, "rdi");
         } else {
-            self.operand_to_reg(dest, "rdi");
-            self.operand_to_reg(src, "rsi");
+            self.emit_copy_addr_to(dest, &d_src, "rdi");
+            self.emit_copy_addr_to(src, &s_src, "rsi");
         }
+        // %rdi/%rsi are not tracked by the acc/sec cache, but a value that
+        // *was* cached there through an operand load (Generic path) is now
+        // stale relative to the register file.
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// IR `Memcpy { dest, src, size }` (x86 override of the generic trait
+    /// default, which staged both addresses through `%rcx` sequentially).
+    pub(super) fn emit_memcpy_ir_impl(&mut self, dest: &Value, src: &Value, size: usize) {
+        self.stage_copy_operands(&Operand::Value(*dest), &Operand::Value(*src));
+        self.emit_memcpy_impl_impl(size);
     }
 
     /// Materialise the call result (= dest) from the copy kept in %rdx.
@@ -2741,8 +2835,7 @@ impl X86Codegen {
     ) {
         // Source slot may still be a deferred vector result.
         self.flush_pending_vec_store_impl();
-        self.operand_to_reg(dest, "rdi");
-        self.operand_to_reg(src, "rsi");
+        self.stage_copy_operands(dest, src);
         // memmove must handle overlapping ranges. With dst > src, a forward
         // copy would read source bytes that were already overwritten, so the
         // copy must run backward (DF=1). Direction flag is restored after.

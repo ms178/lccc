@@ -558,64 +558,138 @@ pub(crate) fn riscv_param_caller_homes_safe_with_config(
 /// excludes %rdx (PhysReg 16) from allocation — both gates must stay in
 /// lockstep: a value homed in %rdx is unsound exactly when the body can
 /// overwrite %rdx behind the allocator's back.
-pub fn x86_body_implicitly_clobbers_rdx(func: &IrFunction) -> bool {
+/// Fixed-GPR scratch model of the x86-64 text emitters (single source of
+/// truth — the prologue register census and the caller-saved-parameter-home
+/// gate both consume it; the two used to keep hand-maintained copies and
+/// drifted apart, C4: `Load { ty: I128 }` was missing from one of them).
+///
+/// `rdx`: the instruction's emitter writes `%rdx` behind the allocator's
+/// back (division `cqto`/`idiv`, i128 `rax:rdx` pairs, `rdtsc(p)`,
+/// jump-table dispatch, the cmpxchg-loop RMWs, cmpxchg's `desired`
+/// operand, atomic stores, fixed-scratch vector intrinsics).
+/// `rdi`: the cmpxchg-loop RMWs park the operand value in `%rdi`
+/// (`emit_x86_atomic_op_loop`), `rdtscp` writes `%rdi` too.
+///
+/// Values homed in a clobbered register across such an instruction read
+/// garbage afterwards (at1: `__atomic_fetch_and` loop destroyed the `%rdx`
+/// home of a live temp, at2: `cmpxchg` destroyed the `%rdx` home of a
+/// parameter; both silent wrong results at -O1+).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct X86FixedScratch {
+    pub rdx: bool,
+    pub rdi: bool,
+}
+
+impl X86FixedScratch {
+    #[inline]
+    pub fn any(self) -> bool {
+        self.rdx || self.rdi
+    }
+    #[inline]
+    fn or(self, o: Self) -> Self {
+        Self {
+            rdx: self.rdx || o.rdx,
+            rdi: self.rdi || o.rdi,
+        }
+    }
+}
+
+/// Fixed-GPR clobbers of ONE instruction's x86-64 emitter. See
+/// [`X86FixedScratch`].
+pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
+    use crate::ir::ops::AtomicRmwOp;
+    const RDX: X86FixedScratch = X86FixedScratch {
+        rdx: true,
+        rdi: false,
+    };
+    const RDX_RDI: X86FixedScratch = X86FixedScratch {
+        rdx: true,
+        rdi: true,
+    };
+    const NONE: X86FixedScratch = X86FixedScratch {
+        rdx: false,
+        rdi: false,
+    };
+    let wide = |t: &IrType| matches!(t, IrType::I128 | IrType::U128);
+    match inst {
+        Instruction::BinOp { op, ty, .. } => {
+            if matches!(
+                op,
+                IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+            ) || wide(ty)
+            {
+                RDX
+            } else {
+                NONE
+            }
+        }
+        Instruction::UnaryOp { ty, .. }
+        | Instruction::Cmp { ty, .. }
+        | Instruction::Store { ty, .. }
+        | Instruction::Load { ty, .. } => {
+            if wide(ty) {
+                RDX
+            } else {
+                NONE
+            }
+        }
+        Instruction::Cast { from_ty, to_ty, .. } => {
+            if wide(from_ty) || wide(to_ty) {
+                RDX
+            } else {
+                NONE
+            }
+        }
+        // `lock xadd` / `xchg` / test-and-set run on rax+rcx only; every
+        // other RMW is a cmpxchg loop with old in rax, new in rdx and the
+        // operand value in rdi.
+        Instruction::AtomicRmw { op, .. } => match op {
+            AtomicRmwOp::Add | AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => NONE,
+            _ => RDX_RDI,
+        },
+        // cmpxchg: desired in rdx. Atomic store: value in rdx.
+        Instruction::AtomicCmpxchg { .. } | Instruction::AtomicStore { .. } => RDX,
+        Instruction::Intrinsic { op, .. } => match op {
+            IntrinsicOp::Rdtscp => RDX_RDI,
+            IntrinsicOp::Rdtsc
+            | IntrinsicOp::F128Copysign
+            | IntrinsicOp::FmaF64x2
+            | IntrinsicOp::FmaF64x4
+            | IntrinsicOp::FmaF64x4Hoisted
+            | IntrinsicOp::FmaF64x4SIB
+            | IntrinsicOp::FmaF64x4HoistedSIB
+            | IntrinsicOp::LoadF64x4
+            | IntrinsicOp::LoadF64x2
+            | IntrinsicOp::LoadI32x8
+            | IntrinsicOp::LoadI32x4
+            | IntrinsicOp::VecZeroI32x8
+            | IntrinsicOp::VecZeroI32x4 => RDX,
+            _ => NONE,
+        },
+        _ => NONE,
+    }
+}
+
+/// Union of [`x86_inst_fixed_scratch`] over the whole body, plus the
+/// jump-table dispatch of `Switch` terminators (`%rdx`).
+pub fn x86_body_fixed_scratch(func: &IrFunction) -> X86FixedScratch {
+    let mut acc = X86FixedScratch::default();
     for block in &func.blocks {
         for inst in &block.instructions {
-            match inst {
-                Instruction::BinOp { op, ty, .. } => {
-                    if matches!(
-                        op,
-                        IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
-                    ) {
-                        return true;
-                    }
-                    if matches!(ty, IrType::I128 | IrType::U128) {
-                        return true;
-                    }
-                }
-                Instruction::UnaryOp { ty, .. }
-                | Instruction::Cmp { ty, .. }
-                | Instruction::Store { ty, .. } => {
-                    if matches!(ty, IrType::I128 | IrType::U128) {
-                        return true;
-                    }
-                }
-                Instruction::Cast { from_ty, to_ty, .. } => {
-                    if matches!(from_ty, IrType::I128 | IrType::U128)
-                        || matches!(to_ty, IrType::I128 | IrType::U128)
-                    {
-                        return true;
-                    }
-                }
-                Instruction::Intrinsic { op, .. } => {
-                    if matches!(
-                        op,
-                        IntrinsicOp::Rdtsc
-                            | IntrinsicOp::Rdtscp
-                            | IntrinsicOp::F128Copysign
-                            | IntrinsicOp::FmaF64x2
-                            | IntrinsicOp::FmaF64x4
-                            | IntrinsicOp::FmaF64x4Hoisted
-                            | IntrinsicOp::FmaF64x4SIB
-                            | IntrinsicOp::FmaF64x4HoistedSIB
-                            | IntrinsicOp::LoadF64x4
-                            | IntrinsicOp::LoadF64x2
-                            | IntrinsicOp::LoadI32x8
-                            | IntrinsicOp::LoadI32x4
-                            | IntrinsicOp::VecZeroI32x8
-                            | IntrinsicOp::VecZeroI32x4
-                    ) {
-                        return true;
-                    }
-                }
-                _ => {}
+            acc = acc.or(x86_inst_fixed_scratch(inst));
+            if acc.rdx && acc.rdi {
+                return acc;
             }
         }
         if matches!(block.terminator, Terminator::Switch { .. }) {
-            return true;
+            acc.rdx = true;
         }
     }
-    false
+    acc
+}
+
+pub fn x86_body_implicitly_clobbers_rdx(func: &IrFunction) -> bool {
+    x86_body_fixed_scratch(func).rdx
 }
 
 /// Companion of [`x86_param_caller_homes_safe`]: with parameters parked in

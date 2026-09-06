@@ -976,6 +976,9 @@ impl X86Codegen {
     /// Disable SSE (-mno-sse). Prevents emission of any SSE/XMM instructions.
     pub fn set_no_sse(&mut self, enabled: bool) {
         self.no_sse = enabled;
+        // The MachInst typed route must follow the same ISA contract as the
+        // text emitters: no xmm-relayed 16-byte integer moves under -mno-sse.
+        super::isel::set_sse_integer_moves(!enabled);
     }
 
     /// Apply all relevant options from a `CodegenOptions` struct.
@@ -4980,6 +4983,13 @@ impl X86Codegen {
 impl ArchCodegen for X86Codegen {
     fn is_value_reg_assigned(&self, vid: u32) -> bool {
         self.reg_assignments.contains_key(&vid)
+    }
+
+    /// x86 override: stage `dest`/`src` into `%rdi`/`%rsi` as a parallel
+    /// copy (the generic default routes both through `%rcx` sequentially and
+    /// swaps them when the homes cross — regression `memcpy_param_home_swap`).
+    fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
+        self.emit_memcpy_ir_impl(dest, src, size);
     }
 
     fn flush_pending_widen(&mut self) {
