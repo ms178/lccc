@@ -614,7 +614,7 @@ fn outline_switch_cases(
 
             // Check if any block has a Return terminator.
             let has_return = case_blocks.iter().any(|bid| {
-                block_map.get(bid).map_or(false, |&idx| {
+                block_map.get(bid).is_some_and(|&idx| {
                     matches!(func.blocks[idx].terminator, Terminator::Return(_))
                 })
             });

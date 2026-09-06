@@ -283,7 +283,7 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
             _ => None,
         };
         let slot = operand.and_then(|op| direct_stack_slot(op.trim()));
-        if slot.map_or(false, |slot| address_taken.contains(&slot)) {
+        if slot.is_some_and(|slot| address_taken.contains(&slot)) {
             infos[i].pinned = true;
         }
     }

@@ -84,15 +84,16 @@ enum Mode {
 /// allocates a `String`) on the disabled path would be pure waste in the
 /// overwhelmingly common case where verification is off.
 fn mode() -> Mode {
-    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("CCC_VERIFY_IR") {
-        Err(_) => Mode::Off,
-        Ok(v) => match v.trim() {
-            "" | "0" | "off" | "no" => Mode::Off,
-            "abort" | "panic" | "2" => Mode::Abort,
-            _ => Mode::Report,
-        },
-    })
+    static MODE: std::sync::LazyLock<Mode> =
+        std::sync::LazyLock::new(|| match std::env::var("CCC_VERIFY_IR") {
+            Err(_) => Mode::Off,
+            Ok(v) => match v.trim() {
+                "" | "0" | "off" | "no" => Mode::Off,
+                "abort" | "panic" | "2" => Mode::Abort,
+                _ => Mode::Report,
+            },
+        });
+    *MODE
 }
 
 /// Visit every CFG successor label of a terminator.

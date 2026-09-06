@@ -937,7 +937,7 @@ impl X86Codegen {
                                 let is_round_trip = self
                                     .param_source_regs
                                     .get(&phys.0)
-                                    .map_or(false, |&src| src == target_reg);
+                                    .is_some_and(|&src| src == target_reg);
                                 if !is_round_trip {
                                     let src = super::emit::phys_reg_name(phys);
                                     self.state

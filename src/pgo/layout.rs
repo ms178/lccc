@@ -349,7 +349,7 @@ fn layout_function(
                     let mut best: Option<(i64, u32, u64)> = None;
                     for (v, t) in cases {
                         let e = fp.edge_count(b.label.0, t.0);
-                        if best.map_or(true, |(_, _, be)| e > be) {
+                        if best.is_none_or(|(_, _, be)| e > be) {
                             best = Some((*v, t.0, e));
                         }
                     }

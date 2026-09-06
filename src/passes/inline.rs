@@ -2129,7 +2129,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 };
                 succs
                     .iter()
-                    .any(|succ| label_to_order.get(succ).map_or(false, |&j| j <= i))
+                    .any(|succ| label_to_order.get(succ).is_some_and(|&j| j <= i))
             })
         };
         let is_recursive = func.blocks.iter().any(|block| {

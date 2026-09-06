@@ -578,8 +578,9 @@ impl Parser {
     /// Standard C typedef names commonly provided by system headers.
     /// Since we don't actually include system headers, we pre-seed these.
     fn builtin_typedefs_cached() -> FxHashSet<String> {
-        static CACHE: OnceLock<FxHashSet<String>> = OnceLock::new();
-        CACHE.get_or_init(Self::builtin_typedefs).clone()
+        static CACHE: std::sync::LazyLock<FxHashSet<String>> =
+            std::sync::LazyLock::new(Parser::builtin_typedefs);
+        CACHE.clone()
     }
 
     fn builtin_typedefs() -> FxHashSet<String> {

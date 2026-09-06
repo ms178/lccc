@@ -239,7 +239,7 @@ fn vectorize_with_analysis_mode(
             // remainder for zero win and ~3x code size). Unknown (dynamic)
             // trip counts still vectorize - the runtime guard handles n < width.
             let skip_small = match &pattern.limit {
-                Operand::Const(c) => c.to_i64().map_or(false, |n| n < 2 * machine_step_width),
+                Operand::Const(c) => c.to_i64().is_some_and(|n| n < 2 * machine_step_width),
                 _ => false,
             };
             if skip_small {
@@ -400,7 +400,7 @@ fn vectorize_with_analysis_mode(
             // Same profitability gate as the matmul path (the reduction path
             // historically had NO trip-count check at all).
             let skip_small = match &red_pattern.limit {
-                Operand::Const(c) => c.to_i64().map_or(false, |n| n < 2 * vec_width),
+                Operand::Const(c) => c.to_i64().is_some_and(|n| n < 2 * vec_width),
                 _ => false,
             };
             if skip_small {
@@ -813,8 +813,8 @@ fn analyze_loop_pattern(
             } => {
                 let then_idx = label_to_idx.get(true_label).copied();
                 let else_idx = label_to_idx.get(false_label).copied();
-                let then_in_loop = then_idx.map_or(false, |i| loop_info.body.contains(&i));
-                let else_in_loop = else_idx.map_or(false, |i| loop_info.body.contains(&i));
+                let then_in_loop = then_idx.is_some_and(|i| loop_info.body.contains(&i));
+                let else_in_loop = else_idx.is_some_and(|i| loop_info.body.contains(&i));
                 if !then_in_loop {
                     exit_label = Some(*true_label);
                     break;
@@ -825,7 +825,7 @@ fn analyze_loop_pattern(
             }
             Terminator::Branch(target) => {
                 let target_idx = label_to_idx.get(target).copied();
-                if !target_idx.map_or(false, |i| loop_info.body.contains(&i)) {
+                if !target_idx.is_some_and(|i| loop_info.body.contains(&i)) {
                     exit_label = Some(*target);
                     break;
                 }
@@ -3974,7 +3974,7 @@ fn analyze_map_pattern(
 
     // Constant trip counts of 4 or fewer are better left scalar.
     if let Operand::Const(c) = &limit {
-        if c.to_i64().map_or(false, |n| n <= 4) {
+        if c.to_i64().is_some_and(|n| n <= 4) {
             if debug {
                 eprintln!("[VEC-MAP] BAIL: const trip <= 4");
             }
@@ -13018,7 +13018,7 @@ fn transform_map_vector(
 
     // A zero-iteration vector loop plus scalar remainder only adds overhead.
     if matches!(&pattern.limit, Operand::Const(c)
-        if c.to_i64().map_or(false, |n| n <= vec_width as i64))
+        if c.to_i64().is_some_and(|n| n <= vec_width as i64))
     {
         return 0;
     }

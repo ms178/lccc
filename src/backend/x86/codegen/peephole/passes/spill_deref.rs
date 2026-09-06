@@ -805,7 +805,7 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 if let Some((m2, m2_mem, m2_reg)) = parse_2op_load(&t) {
                     if m2 == store_mnem
                         && m2_reg == src_reg
-                        && parse_slot(m2_mem).map_or(false, |(n2, b2)| n2 == n && b2 == base)
+                        && parse_slot(m2_mem).is_some_and(|(n2, b2)| n2 == n && b2 == base)
                     {
                         l2 = Some(j);
                         break;

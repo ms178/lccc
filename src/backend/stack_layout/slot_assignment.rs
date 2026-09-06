@@ -777,14 +777,10 @@ fn classify_value(
     // Don't skip copy-aliased values that have cross-block uses: the alias
     // root might be block-local (Tier 3, reusable), but this value needs
     // its data to persist across blocks.
-    let has_cross_block_use = ctx
-        .use_blocks_map
-        .get(&dest.0)
-        .map(|blks| {
-            blks.iter()
-                .any(|&b| ctx.def_block.get(&dest.0).map_or(true, |&db| b != db))
-        })
-        .unwrap_or(false);
+    let has_cross_block_use = ctx.use_blocks_map.get(&dest.0).is_some_and(|blks| {
+        blks.iter()
+            .any(|&b| ctx.def_block.get(&dest.0).is_none_or(|&db| b != db))
+    });
     // Always classify copy-aliased values into their own slots. The
     // resolve_copy_aliases phase may later share the slot with the alias root
     // when safe (no interference), but values must have their own fallback slot
@@ -1246,7 +1242,7 @@ pub(super) fn finalize_deferred_slots(
         // 4-mod-8 base, finalize's alignment rounding shifts wide slots onto
         // small slots' bytes (rot() v11/v14 overlap).
         let aligned_nls = if max_align > 8 {
-            ((non_local_space + max_align - 1) / max_align) * max_align
+            crate::common::types::align_up(non_local_space as usize, max_align as usize) as i64
         } else {
             (non_local_space + 7) & !7
         };
