@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -20,28 +20,62 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+      # Do not cache `target/` across commits.  A source-independent target
+      # cache can leave a release compiler from a prior revision beside fresh
+      # sources, making the regression gate test the wrong binary. Registry
+      # and git dependency caches above retain the useful network speed-up;
+      # the compiler executable is deliberately rebuilt from this checkout.
 
+      - name: Verify manifest Rust-toolchain selection
+        run: bash tests/regression/check_rust_toolchain_selector.sh
+
+      # Keep CI on the documented compiler build policy: fastbuild, Rust -O1
+      # and two jobs. This is deliberately not Cargo's default release -O3.
       - name: Build
-        run: cargo build --release
+        run: ./scripts/build_lccc_fast.sh
 
       - name: Run tests
-        run: cargo test --lib
+        env:
+          CARGO_BUILD_JOBS: "2"
+          RUSTFLAGS: -D warnings
+        # Keep every Rust compilation that produces LCCC code at the project
+        # fastbuild policy: opt-level 1 and no more than two Cargo jobs.
+        run: cargo test --profile fastbuild --all-targets --locked -j 2
+
+      # Record the exact host/toolchain contract beside the regression JSON.
+      # Hosted runners vary their GCC/binutils versions and exposed CPU flags;
+      # a failing native-code test is not diagnosable from an exit status alone.
+      - name: Record regression environment
+        run: |
+          {
+            echo '== system =='
+            uname -a
+            cat /etc/os-release || true
+            echo '== locale =='
+            locale || true
+            echo '== Rust =='
+            rustc -Vv
+            cargo --version
+            echo '== C toolchain =='
+            gcc --version | head -1
+            as --version | head -1
+            ld --version | head -1
+            echo '== CPU flags =='
+            grep -m1 -E '^flags[[:space:]]*:' /proc/cpuinfo || true
+            echo '== tested compiler =='
+            sha256sum target/fastbuild/lccc target/fastbuild/lccc-ld
+          } | tee ci-regression-environment.txt
 
       # This is deliberately a bounded-parallel full corpus rather than a
       # hand-picked smoke: the SSA validator catches stale value watermarks
@@ -52,10 +86,37 @@ jobs:
         env:
           CCC_VALIDATE_SSA: "1"
         run: |
+          set -o pipefail
           python3 tests/regression/run_regression.py \
-            --lccc target/release/lccc \
+            --lccc target/fastbuild/lccc \
             -j 2 \
-            --json regression-results.json
+            --json regression-results.json 2>&1 | tee regression-results.log
+
+      # The result artifact is retained already, but GitHub's public job view
+      # hides raw logs/artifacts from anonymous triage. Turn each result into a
+      # normal check annotation so the failing test and phase stay visible.
+      - name: Surface regression failures in annotations
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("regression-results.json")
+          if not path.is_file():
+              print("::error title=Regression harness::no regression-results.json was written")
+          else:
+              report = json.loads(path.read_text(encoding="utf-8"))
+              failures = report.get("failures", [])
+              if not failures:
+                  print("::error title=Regression harness::runner failed before reporting a test result")
+              for failure in failures:
+                  name = failure.get("name", "unknown")
+                  phases = ", ".join(failure.get("phases", [])) or "no phase"
+                  detail = " ".join(str(failure.get("detail", "")).split())
+                  detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print(f"::error title=Regression {name} ({phases})::{detail[:1500]}")
+          PY
 
       # The ordinary C regression proves the inline asm executes.  This
       # byte-level gate additionally rejects the historical UTF-8-to-Latin-1
@@ -64,17 +125,28 @@ jobs:
       - name: Verify inline-asm UTF-8 assembly text
         run: |
           python3 scripts/check_inline_asm_utf8.py \
-            --lccc target/release/lccc \
+            --lccc target/fastbuild/lccc \
             --expect preserved \
             --json inline-asm-utf8.json
 
+      # PERF-41 has a structural codegen oracle in addition to the runtime
+      # differential test above. Keep it in CI so a later emitter change
+      # cannot silently replace packed reciprocal/product work with four
+      # scalar divisions, or reassociate the ordered accumulator.
+      - name: Verify strict computed-reciprocal codegen
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_strict_computed_recip_codegen.sh
+
       - name: Upload regression results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: regression-results
           path: |
             regression-results.json
+            regression-results.log
+            ci-regression-environment.txt
             inline-asm-utf8.json
           if-no-files-found: warn
 
@@ -82,7 +154,7 @@ jobs:
       # making ordinary PRs depend on an unbounded corpus or external fuzzer.
       - name: Run linker fuzz smoke
         env:
-          LCCC_LD: ${{ github.workspace }}/target/release/lccc-ld
+          LCCC_LD: ${{ github.workspace }}/target/fastbuild/lccc-ld
           FUZZ_N: "128"
           FUZZ_SEED: "20260906"
         run: |
@@ -97,15 +169,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
 
-      - name: Run clippy
-        run: cargo clippy -- -D warnings
-        continue-on-error: true
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run strict Clippy
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings

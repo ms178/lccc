@@ -938,7 +938,7 @@ impl Preprocessor {
                 self.define_simple_macro("__ARM_ARCH_8A", "1");
                 self.define_simple_macro("__ARM_ARCH_ISA_A64", "1");
                 self.define_simple_macro("__ARM_ARCH_PROFILE", "65"); // 'A'
-                                                                      // Floating-point and SIMD
+                // Floating-point and SIMD
                 self.define_simple_macro("__ARM_FP", "14"); // 0b1110: half+single+double precision
                 self.define_simple_macro("__ARM_NEON", "1");
                 self.define_simple_macro("__ARM_FP16_ARGS", "1");

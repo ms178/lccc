@@ -1542,7 +1542,7 @@ mod tests {
         paths.insert(
             4,
             Path {
-                root: TAG_PARAM | 0,
+                root: TAG_PARAM,
                 offset: 0,
             },
         );

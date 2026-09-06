@@ -27,7 +27,7 @@ impl I686Codegen {
         from_ty: IrType,
         to_ty: IrType,
     ) {
-        use crate::backend::cast::{classify_cast_with_f128, CastKind};
+        use crate::backend::cast::{CastKind, classify_cast_with_f128};
 
         // Register-preserving no-op: when dest and src share a register and the
         // cast does not change the 32-bit register contents, emit nothing.
@@ -573,7 +573,7 @@ impl I686Codegen {
     /// Emit scalar cast instructions (non-F64/F128, non-64-bit integer).
     /// Operates on value already in eax, result left in eax.
     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
-        use crate::backend::cast::{classify_cast, CastKind};
+        use crate::backend::cast::{CastKind, classify_cast};
 
         match classify_cast(from_ty, to_ty) {
             CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {}

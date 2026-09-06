@@ -307,11 +307,7 @@ impl Lexer {
             }
             let (eu, _) = Self::accumulate_digits(&self.input[exp_start..self.pos], 10);
             let e: i64 = eu as i64;
-            if exp_neg {
-                -e
-            } else {
-                e
-            }
+            if exp_neg { -e } else { e }
         } else {
             0
         };

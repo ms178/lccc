@@ -112,8 +112,8 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     result.z_relro = true; // RELRO is on by default, like GNU ld/mold
     let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
     let mut pending_rpath = false; // for -Wl,-rpath -Wl,/path two-arg form
-                                   // Positional state: --whole-archive applies to archives that FOLLOW it,
-                                   // until --no-whole-archive turns it back off.
+    // Positional state: --whole-archive applies to archives that FOLLOW it,
+    // until --no-whole-archive turns it back off.
     let mut whole_archive = false;
     // GNU ld defaults to --no-as-needed; gcc's driver passes --as-needed
     // explicitly when it wants it.
@@ -431,9 +431,11 @@ mod map_arg_tests {
 
     #[test]
     fn map_path_absent_by_default() {
-        assert!(parse_linker_args(&args(&["-static", "a.o"]))
-            .map_path
-            .is_none());
+        assert!(
+            parse_linker_args(&args(&["-static", "a.o"]))
+                .map_path
+                .is_none()
+        );
     }
 
     /// A path containing '=' (legal) must survive intact.

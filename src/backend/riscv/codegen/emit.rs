@@ -3,7 +3,6 @@ use crate::backend::cast::FloatOp;
 use crate::backend::common::PtrDirective;
 use crate::backend::inline_asm::emit_inline_asm_common;
 use crate::backend::regalloc::{PhysReg, RaConfig};
-use std::sync::Arc;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -13,6 +12,7 @@ use crate::ir::reexports::{
     AtomicOrdering, AtomicRmwOp, BlockId, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction,
     Operand, Value,
 };
+use std::sync::Arc;
 
 /// RISC-V callee-saved registers always available for register allocation.
 /// s0 is the frame pointer.

@@ -111,11 +111,7 @@ fn operands_start(trimmed: &str) -> Option<usize> {
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
-    if i == bytes.len() {
-        None
-    } else {
-        Some(i)
-    }
+    if i == bytes.len() { None } else { Some(i) }
 }
 
 fn splice_source_rewrite(

@@ -331,7 +331,7 @@ fn find_external_values(
 /// The type hint is the best guess at the value's type from context.
 fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) {
     macro_rules! vop {
-        ($op:expr, $ty:expr) => {
+        ($op:expr_2021, $ty:expr_2021) => {
             if let Operand::Value(v) = $op {
                 f(*v, $ty);
             }

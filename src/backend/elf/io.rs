@@ -586,7 +586,7 @@ mod bounds_tests {
     fn memchr0_matches_naive_for_all_alignments_and_positions() {
         const N: usize = 40;
         // A backing buffer big enough to slice at every alignment offset.
-        let mut buf = vec![0xffu8; N + 16];
+        let mut buf = [0xffu8; N + 16];
         for align in 0..16usize {
             for pos in 0..N {
                 for b in buf.iter_mut() {

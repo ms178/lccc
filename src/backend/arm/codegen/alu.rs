@@ -1,7 +1,7 @@
 //! ArmCodegen: ALU operations (integer arithmetic, bitwise, unary).
 
 use super::emit::{
-    arm_alu_mnemonic, callee_saved_name, callee_saved_name_32, is_arm_fp_phys, ArmCodegen,
+    ArmCodegen, arm_alu_mnemonic, callee_saved_name, callee_saved_name_32, is_arm_fp_phys,
 };
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrBinOp, Operand, Value};
@@ -371,7 +371,7 @@ impl ArmCodegen {
                 // Emit `op dest, lhs, rhs` with lhs either its assigned register
                 // (three-operand form, no setup mov) or dest preloaded with lhs.
                 macro_rules! emit3 {
-                    ($rhs:expr) => {
+                    ($rhs:expr_2021) => {
                         if let Some(lp) = lhs_phys {
                             if use_32bit {
                                 let l = callee_saved_name_32(lp);

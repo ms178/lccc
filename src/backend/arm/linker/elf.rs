@@ -7,15 +7,15 @@
 // Re-export shared ELF constants so existing callers (mod.rs, reloc.rs)
 // continue to work via `use super::elf::*`.
 pub use crate::backend::elf::{
-    get_standard_linker_symbols, is_thin_archive, parse_linker_script_entries, read_u16, read_u32,
-    w16, w32, w64, wphdr, write_bytes, LinkerScriptEntry, LinkerSymbolAddresses, DF_1_NOW,
-    DF_BIND_NOW, DT_DEBUG, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_GNU_HASH,
-    DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTGOT, DT_PLTREL,
-    DT_PLTRELSZ, DT_RELA, DT_RELACOUNT, DT_RELAENT, DT_RELASZ, DT_SONAME, DT_STRSZ, DT_STRTAB,
-    DT_SYMENT, DT_SYMTAB, ELFCLASS64, ELFDATA2LSB, ELF_MAGIC, EM_AARCH64, ET_DYN, ET_EXEC, PF_R,
-    PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS,
-    SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_NOBITS,
-    STB_GLOBAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_OBJECT, STT_SECTION, STT_TLS,
+    DF_1_NOW, DF_BIND_NOW, DT_DEBUG, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1,
+    DT_GNU_HASH, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTGOT,
+    DT_PLTREL, DT_PLTRELSZ, DT_RELA, DT_RELACOUNT, DT_RELAENT, DT_RELASZ, DT_SONAME, DT_STRSZ,
+    DT_STRTAB, DT_SYMENT, DT_SYMTAB, ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, EM_AARCH64, ET_DYN,
+    ET_EXEC, LinkerScriptEntry, LinkerSymbolAddresses, PF_R, PF_W, PF_X, PT_DYNAMIC,
+    PT_GNU_EH_FRAME, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHF_ALLOC, SHF_EXECINSTR,
+    SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_NOBITS, STB_GLOBAL, STB_WEAK, STT_FUNC,
+    STT_GNU_IFUNC, STT_OBJECT, STT_SECTION, STT_TLS, get_standard_linker_symbols, is_thin_archive,
+    parse_linker_script_entries, read_u16, read_u32, w16, w32, w64, wphdr, write_bytes,
 };
 
 use crate::backend::linker_common;
@@ -39,14 +39,14 @@ pub const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
 pub const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
 pub const R_AARCH64_JUMP26: u32 = 282; // S + A - P (26-bit B)
 pub const R_AARCH64_CALL26: u32 = 283; // S + A - P (26-bit BL)
-                                       // MOVW (movz/movk) absolute halfword relocations, ABI numbers per
-                                       // IHI0056B / llvm/include/llvm/BinaryFormat/ELFRelocs/AArch64.def:
-                                       // G0=0x107 G0_NC=0x108 G1=0x109 G1_NC=0x10a G2=0x10b G2_NC=0x10c
-                                       // G3=0x10d SABS_G0=0x10e SABS_G1=0x10f SABS_G2=0x110.
-                                       // (There is deliberately no G3_NC and no SABS_G3 in the ABI. The
-                                       // previous table here assumed a consecutive G0/G0_NC/G1_NC/G2_NC/G3
-                                       // numbering that matched nothing — any object carrying real ABI MOVW
-                                       // relocs would have been resolved with the wrong shift.)
+// MOVW (movz/movk) absolute halfword relocations, ABI numbers per
+// IHI0056B / llvm/include/llvm/BinaryFormat/ELFRelocs/AArch64.def:
+// G0=0x107 G0_NC=0x108 G1=0x109 G1_NC=0x10a G2=0x10b G2_NC=0x10c
+// G3=0x10d SABS_G0=0x10e SABS_G1=0x10f SABS_G2=0x110.
+// (There is deliberately no G3_NC and no SABS_G3 in the ABI. The
+// previous table here assumed a consecutive G0/G0_NC/G1_NC/G2_NC/G3
+// numbering that matched nothing — any object carrying real ABI MOVW
+// relocs would have been resolved with the wrong shift.)
 pub const R_AARCH64_MOVW_UABS_G0: u32 = 263; // 0x107
 pub const R_AARCH64_MOVW_UABS_G0_NC: u32 = 264; // 0x108
 pub const R_AARCH64_MOVW_UABS_G1: u32 = 265; // 0x109

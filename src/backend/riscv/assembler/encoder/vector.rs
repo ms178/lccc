@@ -136,7 +136,7 @@ pub(crate) fn encode_v_arith_vv(operands: &[Operand], funct6: u32) -> Result<Enc
     let vs2 = get_vreg(operands, 1)?;
     let vs1 = get_vreg(operands, 2)?;
     let vm: u32 = 1; // unmasked
-                     // funct3=000 (OPIVV)
+    // funct3=000 (OPIVV)
     let word = (funct6 << 26) | (vm << 25) | (vs2 << 20) | (vs1 << 15) | (vd << 7) | OP_V;
     Ok(EncodeResult::Word(word))
 }

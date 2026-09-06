@@ -55,7 +55,7 @@ fn a_32_bit_self_move_is_dead_when_the_upper_half_is_already_zero() {
 }
 
 #[test]
-fn a_32_bit_self_move_SURVIVES_when_the_upper_half_is_unknown() {
+fn a_32_bit_self_move_survives_when_the_upper_half_is_unknown() {
     // SOUNDNESS: `movl %ebx,%ebx` is the idiomatic 64->32 truncation. With a
     // 64-bit value in %rbx it is load-bearing, and the following 64-bit read
     // must see the truncated value.
@@ -71,7 +71,7 @@ fn a_32_bit_self_move_SURVIVES_when_the_upper_half_is_unknown() {
 }
 
 #[test]
-fn a_32_bit_self_move_SURVIVES_across_a_label() {
+fn a_32_bit_self_move_survives_across_a_label() {
     // The upper half may be nonzero on another incoming path.
     let out = run(&f(concat!(
         "    movl %edi, %ebx\n",
@@ -89,7 +89,7 @@ fn a_32_bit_self_move_SURVIVES_across_a_label() {
 }
 
 #[test]
-fn a_32_bit_self_move_SURVIVES_across_a_call() {
+fn a_32_bit_self_move_survives_across_a_call() {
     // A call clobbers the caller-saved set, so the fact does not carry.
     let out = run(&f(concat!(
         "    movl %edi, %ecx\n",
@@ -130,7 +130,7 @@ fn a_32_bit_copy_folds_into_a_32_bit_compare() {
 }
 
 #[test]
-fn a_64_bit_copy_folds_into_an_ADDRESS_operand() {
+fn a_64_bit_copy_folds_into_an_address_operand() {
     // The capability the previous 32-bit-only attempt lacked: under `movq` the
     // whole register matches, so an address operand is rewritable. Refusing
     // memory operands is why that version removed 10 instructions across 220
@@ -149,7 +149,7 @@ fn a_64_bit_copy_folds_into_an_ADDRESS_operand() {
 }
 
 #[test]
-fn a_64_bit_copy_folds_into_a_SIB_address() {
+fn a_64_bit_copy_folds_into_a_sib_address() {
     let out = run(&f(concat!(
         "    movq %rdi, %r11\n",
         "    movzbl (%r11, %rbx, 2), %eax\n",
@@ -176,7 +176,7 @@ fn a_64_bit_copy_folds_into_several_uses_at_once() {
 // ── B. copy folding: the width rule, which is where miscompiles live ────────
 
 #[test]
-fn a_32_bit_copy_does_NOT_fold_into_a_64_bit_use() {
+fn a_32_bit_copy_does_not_fold_into_a_64_bit_use() {
     // SOUNDNESS: `movl` forces bits 32..63 of %D to zero; %S's may be
     // anything. A 64-bit reader would see a different value.
     let out = run(&f(concat!(
@@ -189,7 +189,7 @@ fn a_32_bit_copy_does_NOT_fold_into_a_64_bit_use() {
 }
 
 #[test]
-fn a_32_bit_copy_does_NOT_fold_into_an_address_operand() {
+fn a_32_bit_copy_does_not_fold_into_an_address_operand() {
     // An address is read as 64 bits, so the same argument applies.
     let out = run(&f(concat!(
         "    movl %eax, %esi\n",
@@ -201,7 +201,7 @@ fn a_32_bit_copy_does_NOT_fold_into_an_address_operand() {
 }
 
 #[test]
-fn a_16_bit_copy_does_NOT_fold_into_a_32_bit_use() {
+fn a_16_bit_copy_does_not_fold_into_a_32_bit_use() {
     // SOUNDNESS: `movw` leaves bits 16..63 of %D STALE — it does not even
     // zero them — so only 16- and 8-bit reads see %S's value.
     let out = run(&f(concat!(
@@ -214,7 +214,7 @@ fn a_16_bit_copy_does_NOT_fold_into_a_32_bit_use() {
 }
 
 #[test]
-fn an_8_bit_copy_does_NOT_fold_into_a_16_bit_use() {
+fn an_8_bit_copy_does_not_fold_into_a_16_bit_use() {
     let out = run(&f(concat!(
         "    movb %al, %cl\n",
         "    addw %cx, %dx\n",
@@ -225,7 +225,7 @@ fn an_8_bit_copy_does_NOT_fold_into_a_16_bit_use() {
 }
 
 #[test]
-fn an_8_bit_copy_DOES_fold_into_an_8_bit_use() {
+fn an_8_bit_copy_does_fold_into_an_8_bit_use() {
     let out = run(&f(concat!(
         "    movb %al, %cl\n",
         "    testb %cl, %cl\n",
@@ -241,7 +241,7 @@ fn an_8_bit_copy_DOES_fold_into_an_8_bit_use() {
 // ── B. copy folding: the remaining legality rules ───────────────────────────
 
 #[test]
-fn a_copy_SURVIVES_when_the_use_also_writes_the_destination() {
+fn a_copy_survives_when_the_use_also_writes_the_destination() {
     // Rule 4: `addl %eax, %esi` would become `addl %eax, %eax` and clobber the
     // source.
     let out = run(&f(concat!(
@@ -269,7 +269,7 @@ fn a_copy_SURVIVES_when_the_use_also_writes_the_destination() {
 }
 
 #[test]
-fn a_copy_SURVIVES_when_the_destination_is_still_live_afterwards() {
+fn a_copy_survives_when_the_destination_is_still_live_afterwards() {
     // Rule 5. The scan window ends at the branch, but %esi is read on the
     // far side of it, so it is live out of the window and the copy must stay.
     //
@@ -291,7 +291,7 @@ fn a_copy_SURVIVES_when_the_destination_is_still_live_afterwards() {
 }
 
 #[test]
-fn a_copy_SURVIVES_when_the_source_is_clobbered_before_the_use() {
+fn a_copy_survives_when_the_source_is_clobbered_before_the_use() {
     // Rule 2.
     let out = run(&f(concat!(
         "    movl %eax, %esi\n",
@@ -303,7 +303,7 @@ fn a_copy_SURVIVES_when_the_source_is_clobbered_before_the_use() {
 }
 
 #[test]
-fn a_copy_SURVIVES_across_a_label() {
+fn a_copy_survives_across_a_label() {
     // Rule 1: another path can reach the use with a different %S.
     let out = run(&f(concat!(
         "    movl %eax, %esi\n",
@@ -316,7 +316,7 @@ fn a_copy_SURVIVES_across_a_label() {
 }
 
 #[test]
-fn a_copy_SURVIVES_when_the_use_is_a_variable_shift_count() {
+fn a_copy_survives_when_the_use_is_a_variable_shift_count() {
     // Rule 6, and a real corpus failure (`pgo_sections`): the count is pinned
     // to %cl even though it is written explicitly, so the implicit-use test
     // does not catch it. Renaming yields `shrq %r9b, %rsi`, which the
@@ -477,7 +477,7 @@ fn no_output_line_names_a_nonexistent_register() {
 // ── Rule 2/3/4: architectural implicit writes (the stress-lab regression) ───
 
 #[test]
-fn a_copy_does_NOT_fold_across_a_division_that_clobbers_its_source() {
+fn a_copy_does_not_fold_across_a_division_that_clobbers_its_source() {
     // SOUNDNESS, stress lab `intexpr` seed 1 at -O1 (the ms178-1 regression):
     // `cqto`/`idivq %r11` overwrite %rdx without naming it in their operand
     // text. The window walk used to see "no mention of %rdx" between the
@@ -505,7 +505,7 @@ fn a_copy_does_NOT_fold_across_a_division_that_clobbers_its_source() {
 }
 
 #[test]
-fn a_copy_into_rdx_does_NOT_fold_across_an_idiv_that_rewrites_it() {
+fn a_copy_into_rdx_does_not_fold_across_an_idiv_that_rewrites_it() {
     // Rules 3/4 mirrored through the oracle: `idivq %rcx` rewrites
     // %rax:%rdx but names neither. Pre-union its reg_refs were {%rcx} only,
     // so the window walk sailed through and retargeted later %rdx uses at

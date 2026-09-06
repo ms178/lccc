@@ -1,6 +1,6 @@
 //! X86Codegen: comparison and select operations.
 
-use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_32, X86Codegen};
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32};
 use crate::backend::regalloc::PhysReg;
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};

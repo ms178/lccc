@@ -226,7 +226,7 @@ impl Lowerer {
                 }
                 Some(result)
             }
-            Expr::Cast(ref target_type, inner, _) => self.eval_const_cast(target_type, inner),
+            Expr::Cast(target_type, inner, _) => self.eval_const_cast(target_type, inner),
             Expr::Identifier(name, _) => self.eval_const_identifier(name),
             Expr::Sizeof(arg, _) => {
                 // VLA sizeof is a runtime value (C99 6.7.6.2 / 6.5.3.4): the
@@ -244,19 +244,19 @@ impl Lowerer {
                 };
                 Some(IrConst::I64(size as i64))
             }
-            Expr::Alignof(ref ts, _) => {
+            Expr::Alignof(ts, _) => {
                 let align = self.alignof_type(ts);
                 Some(IrConst::I64(align as i64))
             }
-            Expr::AlignofExpr(ref inner_expr, _) => {
+            Expr::AlignofExpr(inner_expr, _) => {
                 let align = self.alignof_expr(inner_expr);
                 Some(IrConst::I64(align as i64))
             }
-            Expr::GnuAlignof(ref ts, _) => {
+            Expr::GnuAlignof(ts, _) => {
                 let align = self.preferred_alignof_type(ts);
                 Some(IrConst::I64(align as i64))
             }
-            Expr::GnuAlignofExpr(ref inner_expr, _) => {
+            Expr::GnuAlignofExpr(inner_expr, _) => {
                 let align = self.preferred_alignof_expr(inner_expr);
                 Some(IrConst::I64(align as i64))
             }
@@ -289,13 +289,7 @@ impl Lowerer {
             }
             // Handle &((type*)0)->member pattern (offsetof)
             Expr::AddressOf(inner, _) => self.eval_offsetof_pattern(inner),
-            Expr::BuiltinTypesCompatibleP(
-                ref type1,
-                ref type2,
-                ref qualifiers1,
-                ref qualifiers2,
-                _,
-            ) => {
+            Expr::BuiltinTypesCompatibleP(type1, type2, qualifiers1, qualifiers2, _) => {
                 let result = self.eval_types_compatible(type1, type2, qualifiers1, qualifiers2);
                 Some(IrConst::I64(result as i64))
             }
@@ -309,10 +303,10 @@ impl Lowerer {
                     None
                 }
             }
-            Expr::CompoundLiteral(ref type_spec, ref init, _) => {
+            Expr::CompoundLiteral(type_spec, init, _) => {
                 self.eval_const_compound_literal(type_spec, init)
             }
-            Expr::GenericSelection(ref controlling, ref associations, _) => {
+            Expr::GenericSelection(controlling, associations, _) => {
                 let selected = self.resolve_generic_selection_expr(controlling, associations)?;
                 self.eval_const_expr(selected)
             }
@@ -585,7 +579,7 @@ impl Lowerer {
     /// for the struct type and any accumulated offset from nested member access.
     fn extract_null_pointer_cast_with_offset(&self, expr: &Expr) -> Option<(TypeSpecifier, usize)> {
         match expr {
-            Expr::Cast(ref type_spec, inner, _) => {
+            Expr::Cast(type_spec, inner, _) => {
                 // The type should be a Pointer to a struct
                 if let TypeSpecifier::Pointer(inner_ts, _) = type_spec {
                     // Check that the inner expression is 0
@@ -609,7 +603,7 @@ impl Lowerer {
     /// Signedness determines how the value is widened in the next cast.
     fn eval_const_expr_as_bits(&self, expr: &Expr) -> Option<(u64, bool)> {
         match expr {
-            Expr::Cast(ref target_type, inner, _) => {
+            Expr::Cast(target_type, inner, _) => {
                 let (bits, _src_signed) = self.eval_const_expr_as_bits(inner)?;
                 let target_ir_ty = self.type_spec_to_ir(target_type);
                 let target_width = target_ir_ty.size() * 8;
@@ -705,7 +699,7 @@ impl Lowerer {
 
     /// Check if an expression has an unsigned type for constant evaluation.
     fn is_expr_unsigned_for_const(&self, expr: &Expr) -> bool {
-        if let Expr::Cast(ref target_type, _, _) = expr {
+        if let Expr::Cast(target_type, _, _) = expr {
             let ty = self.type_spec_to_ir(target_type);
             return ty.is_unsigned();
         }
@@ -816,10 +810,10 @@ impl Lowerer {
         // Try simple literals first (fast path)
         match expr {
             Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => {
-                return Some(*n)
+                return Some(*n);
             }
             Expr::UIntLiteral(n, _) | Expr::ULongLiteral(n, _) | Expr::ULongLongLiteral(n, _) => {
-                return Some(*n as i64)
+                return Some(*n as i64);
             }
             _ => {}
         }

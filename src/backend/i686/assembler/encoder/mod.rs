@@ -559,8 +559,10 @@ impl InstructionEncoder {
             // `lcallw $0xc000, $3` — without this the offset would be encoded
             // as imm32 and the following bytes misinterpreted as code).
             "lcallw" => match ops.as_slice() {
-                [Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Integer(off))] =>
-                {
+                [
+                    Operand::Immediate(ImmediateValue::Integer(seg)),
+                    Operand::Immediate(ImmediateValue::Integer(off)),
+                ] => {
                     self.sized_op = true;
                     self.bytes.push(0x66);
                     self.bytes.push(0x9A);

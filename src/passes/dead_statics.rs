@@ -92,11 +92,7 @@ fn asm_symbol_base(s: &str) -> &str {
     while end < bytes.len() && is_asm_ident_char(bytes[end]) {
         end += 1;
     }
-    if start < end {
-        &s[start..end]
-    } else {
-        s
-    }
+    if start < end { &s[start..end] } else { s }
 }
 
 #[inline]

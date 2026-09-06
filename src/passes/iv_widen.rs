@@ -126,7 +126,7 @@ use crate::ir::analysis::{CfgAnalysis, FlatAdj};
 use crate::ir::constants::IrConst;
 use crate::ir::instruction::{BasicBlock, Instruction, Operand, Terminator, Value};
 use crate::ir::reexports::{BlockId, IrBinOp, IrCmpOp, IrFunction};
-use crate::passes::loop_analysis::{find_natural_loops, merge_loops_by_header, NaturalLoop};
+use crate::passes::loop_analysis::{NaturalLoop, find_natural_loops, merge_loops_by_header};
 
 /// Entry point used by the dirty-tracking pipeline.
 pub(crate) fn run_function(func: &mut IrFunction) -> usize {
@@ -2597,10 +2597,12 @@ mod tests {
                 ..
             }
         ));
-        assert!(!func.blocks[2]
-            .instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::Cast { .. })));
+        assert!(
+            !func.blocks[2]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Cast { .. }))
+        );
         assert!(func.blocks[2].instructions.iter().any(
             |i| matches!(i, Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 1)
         ));
@@ -3387,16 +3389,18 @@ mod tests {
             }
         ));
         // The narrow shift is retyped to I64 with its count left as-is.
-        assert!(func.blocks[2]
-            .instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::BinOp {
+        assert!(
+            func.blocks[2]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::BinOp {
                 op: IrBinOp::Shl,
                 ty: IrType::I64,
                 lhs: Operand::Value(v),
                 rhs: Operand::Const(IrConst::I32(1)),
                 ..
-            } if v.0 == 1)));
+            } if v.0 == 1))
+        );
         // The widening cast was dropped; the GEP reads the shifted member.
         assert!(func.blocks[2].instructions.iter().any(
             |i| matches!(i, Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 10)

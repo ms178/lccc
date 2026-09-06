@@ -68,7 +68,7 @@
 //! replay remains the fail-safe, but it is now the exception it was always
 //! meant to be, not the cliff every spilled pointer fell off.
 
-use super::machinst::{MachInst, MachOperand, MachReg, OpSize, MACHINST_ALLOCATABLE_GPRS, RBP};
+use super::machinst::{MACHINST_ALLOCATABLE_GPRS, MachInst, MachOperand, MachReg, OpSize, RBP};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 
@@ -586,11 +586,7 @@ pub(crate) fn allocate_window(
         .collect();
     pool.sort_by_key(|&r| {
         let caller_saved = matches!(r, 10 | 11 | 12 | 13 | 14 | 15 | 16); // r11,r10,r8,r9,rdi,rsi,rdx
-        if caller_saved {
-            0
-        } else {
-            1
-        }
+        if caller_saved { 0 } else { 1 }
     });
 
     // Whole-window-busy registers (main-RA homes live across the window).

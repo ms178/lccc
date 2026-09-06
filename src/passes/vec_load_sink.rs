@@ -528,7 +528,8 @@ mod tests {
         // Hold ENV_LOCK across the whole set/run/remove window: the env var
         // is process-global and every other sink_locked() caller reads it.
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("CCC_NO_VEC_LOAD_SINK", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("CCC_NO_VEC_LOAD_SINK", "1") };
         let mut f = mkfunc();
         f.blocks.push(block(
             0,
@@ -540,7 +541,8 @@ mod tests {
         ));
         // Direct call: the guard above already serializes us.
         let n = sink_vector_loads(&mut f);
-        std::env::remove_var("CCC_NO_VEC_LOAD_SINK");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("CCC_NO_VEC_LOAD_SINK") };
         assert_eq!(n, 0);
     }
 

@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 #[cfg(unix)]
 mod sys {
-    extern "C" {
+    unsafe extern "C" {
         pub fn mmap(
             addr: *mut core::ffi::c_void,
             length: usize,

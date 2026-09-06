@@ -104,6 +104,12 @@ thread_local! {
     // even under `-ffp-contract=fast`. Set once per `run_passes` (per TU) by
     // the driver; AArch64 `fmla` is baseline ISA and needs no gate.
     static X86_FMA_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // PERF-41's ordered reciprocal prefix packs scalar I32 values with
+    // VPINSRD (SSE4.1) and converts/divides packed F64 values with AVX2.
+    // Keep this distinct from the older generic vectorizer's AVX policy: a
+    // generic vector pass being active is not evidence that both instructions
+    // are legal for this particular lowering.
+    static X86_STRICT_RECIP_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Record whether the x86 target has FMA3. Called by `run_passes` before any
@@ -114,6 +120,18 @@ pub(crate) fn set_x86_fma_enabled(enabled: bool) {
 
 fn x86_fma_enabled() -> bool {
     X86_FMA_AVAILABLE.with(|f| f.get())
+}
+
+/// Record whether the exact AVX2 + SSE4.1 profile required by the strict
+/// computed-reciprocal lowering is active.  Called once per translation unit
+/// alongside set_x86_fma_enabled so a previous compile on the same worker
+/// thread cannot leak ISA permission into the next one.
+pub(crate) fn set_x86_strict_recip_avx2_enabled(enabled: bool) {
+    X86_STRICT_RECIP_AVX2_AVAILABLE.with(|available| available.set(enabled));
+}
+
+fn x86_strict_recip_avx2_enabled() -> bool {
+    X86_STRICT_RECIP_AVX2_AVAILABLE.with(|available| available.get())
 }
 
 fn set_reject(reason: &'static str) {
@@ -247,6 +265,20 @@ fn vectorize_with_analysis_mode(
                 }
                 total_changes += transform_to_fma_f64x4(func, &pattern);
             }
+        } else if !neon
+            && !force_two_wide
+            && std::env::var("LCCC_FORCE_SSE2").is_err()
+            && x86_strict_recip_avx2_enabled()
+            && let Some(strict_pattern) =
+                analyze_strict_computed_recip_reduction(func, loop_info, cfg)
+            && let Some(changes) = transform_strict_computed_recip_reduction(func, &strict_pattern)
+        {
+            // This deliberately precedes the generic strict-FP reduction
+            // rejection.  It never changes addition order: only the four
+            // independent quotient/products become packed, then codegen folds
+            // products 0, 1, 2, 3 into the scalar accumulator in that order.
+            total_changes += changes;
+            continue;
         } else if let Some(red_pattern) = analyze_reduction_pattern(
             func,
             loop_info,
@@ -6839,6 +6871,886 @@ fn find_inst_in_loop<'a>(
     None
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Strict computed reciprocal reductions (PERF-41)
+//
+// A scalar loop of the form
+//
+//   sum += (1.0 / (double)integer_dag(j, invariant...)) * values[j];
+//
+// is not a conventional vector reduction.  The quotient/product for different
+// j values are lane-independent, but an FP horizontal add tree changes the
+// observable result.  This deliberately narrow transform versions the loop:
+// a four-wide AVX2 prefix calculates four quotient/products at once and then
+// folds their lanes into the scalar accumulator in source order.  The original
+// loop remains intact as the exact scalar tail.
+//
+// The accepted CFG is intentionally stricter than the generic reduction
+// matcher: a two-block, zero-based, signed-I32 counted loop with a single F64
+// load and one `sum + reciprocal * load` update.  Keeping the surface small is
+// important: this is a correctness feature, not a relaxed fast-math path.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug)]
+struct StrictComputedRecipReductionPattern {
+    header_idx: usize,
+    body_idx: usize,
+    preheader_idx: usize,
+    iv: Value,
+    sum_phi: Value,
+    sum_init: Operand,
+    limit: Operand,
+    denominator: Value,
+    source_base: Value,
+}
+
+/// Does `dominator` dominate `block` in the immutable CFG snapshot used by
+/// vectorize_with_analysis_mode?  The pass builds new blocks only after all
+/// legality checks, so the snapshot is exactly the relevant graph.
+fn strict_cfg_dominates(cfg: &CfgAnalysis, dominator: usize, block: usize) -> bool {
+    if dominator >= cfg.num_blocks || block >= cfg.num_blocks {
+        return false;
+    }
+    let mut cursor = block;
+    for _ in 0..=cfg.num_blocks {
+        if cursor == dominator {
+            return true;
+        }
+        let Some(&parent) = cfg.idom.get(cursor) else {
+            return false;
+        };
+        if parent == cursor || parent >= cfg.num_blocks {
+            return false;
+        }
+        cursor = parent;
+    }
+    false
+}
+
+fn strict_value_def_block(func: &IrFunction, value: Value) -> Option<usize> {
+    func.blocks
+        .iter()
+        .enumerate()
+        .find_map(|(block_idx, block)| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| inst.dest() == Some(value))
+                .then_some(block_idx)
+        })
+}
+
+/// The vector prefix starts from the scalar loop's preheader, rather than its
+/// header.  A dependency which merely dominates the original header is not
+/// enough: it must already be available at that new earlier point.
+fn strict_external_value_available(
+    func: &IrFunction,
+    cfg: &CfgAnalysis,
+    loop_blocks: &FxHashSet<usize>,
+    preheader_idx: usize,
+    value: Value,
+) -> bool {
+    let Some(def_block) = strict_value_def_block(func, value) else {
+        return false;
+    };
+    !loop_blocks.contains(&def_block) && strict_cfg_dominates(cfg, def_block, preheader_idx)
+}
+
+fn strict_i32_operand_is_clonable(
+    func: &IrFunction,
+    cfg: &CfgAnalysis,
+    loop_blocks: &FxHashSet<usize>,
+    body_idx: usize,
+    preheader_idx: usize,
+    iv: Value,
+    operand: &Operand,
+    memo: &mut FxHashMap<Value, bool>,
+    visiting: &mut FxHashSet<Value>,
+) -> bool {
+    match operand {
+        Operand::Const(c) => c.to_i64().is_some(),
+        Operand::Value(value) => strict_i32_dag_is_clonable(
+            func,
+            cfg,
+            loop_blocks,
+            body_idx,
+            preheader_idx,
+            iv,
+            *value,
+            memo,
+            visiting,
+        ),
+    }
+}
+
+/// Validate the scalar I32 coefficient DAG before mutating any IR.  Every
+/// loop-local operation is cloned per lane, preserving its precise scalar C
+/// semantics (notably the sign/bias sequence that represents signed `/ 2`).
+/// Only values defined before the preheader may be referenced unchanged.
+#[allow(clippy::too_many_arguments)]
+fn strict_i32_dag_is_clonable(
+    func: &IrFunction,
+    cfg: &CfgAnalysis,
+    loop_blocks: &FxHashSet<usize>,
+    body_idx: usize,
+    preheader_idx: usize,
+    iv: Value,
+    value: Value,
+    memo: &mut FxHashMap<Value, bool>,
+    visiting: &mut FxHashSet<Value>,
+) -> bool {
+    if value == iv {
+        return true;
+    }
+    if let Some(&known) = memo.get(&value) {
+        return known;
+    }
+    // A malformed/self-referential DAG is never a reason to attempt a clone.
+    if !visiting.insert(value) {
+        return false;
+    }
+    let result = match find_inst_in_loop(func, loop_blocks, value) {
+        Some((block_idx, inst)) if block_idx == body_idx => match inst {
+            Instruction::BinOp {
+                op, ty, lhs, rhs, ..
+            } if *ty == IrType::I32 && !op.can_trap() => {
+                strict_i32_operand_is_clonable(
+                    func,
+                    cfg,
+                    loop_blocks,
+                    body_idx,
+                    preheader_idx,
+                    iv,
+                    lhs,
+                    memo,
+                    visiting,
+                ) && strict_i32_operand_is_clonable(
+                    func,
+                    cfg,
+                    loop_blocks,
+                    body_idx,
+                    preheader_idx,
+                    iv,
+                    rhs,
+                    memo,
+                    visiting,
+                )
+            }
+            // A no-width-change cast is rare after copy propagation but is
+            // harmless; a widening/narrowing step would need a type-aware
+            // clone contract and is intentionally not admitted here.
+            Instruction::Cast {
+                src,
+                from_ty: IrType::I32,
+                to_ty: IrType::I32,
+                ..
+            }
+            | Instruction::Copy { src, .. } => strict_i32_operand_is_clonable(
+                func,
+                cfg,
+                loop_blocks,
+                body_idx,
+                preheader_idx,
+                iv,
+                src,
+                memo,
+                visiting,
+            ),
+            _ => false,
+        },
+        // A definition from the loop header is deliberately rejected: the
+        // prefix executes before that header.  Definitions outside the loop
+        // need an explicit dominance proof to the preheader.
+        Some(_) => false,
+        None => strict_external_value_available(func, cfg, loop_blocks, preheader_idx, value),
+    };
+    visiting.remove(&value);
+    memo.insert(value, result);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clone_strict_i32_operand_for_lane(
+    func: &IrFunction,
+    body_idx: usize,
+    iv: Value,
+    lane_iv: Value,
+    operand: &Operand,
+    cache: &mut FxHashMap<Value, Value>,
+    out: &mut Vec<Instruction>,
+    next_value_id: &mut u32,
+) -> Option<Operand> {
+    match operand {
+        Operand::Const(c) => Some(Operand::Const(c.clone())),
+        Operand::Value(value) => Some(Operand::Value(clone_strict_i32_dag_for_lane(
+            func,
+            body_idx,
+            iv,
+            lane_iv,
+            *value,
+            cache,
+            out,
+            next_value_id,
+        )?)),
+    }
+}
+
+/// Clone one prevalidated scalar I32 DAG with `iv` substituted by a concrete
+/// lane index.  This helper deliberately has no "best effort" fallback: an
+/// unexpected instruction means the prevalidation contract regressed and the
+/// whole transform is abandoned before committing its CFG edits.
+#[allow(clippy::too_many_arguments)]
+fn clone_strict_i32_dag_for_lane(
+    func: &IrFunction,
+    body_idx: usize,
+    iv: Value,
+    lane_iv: Value,
+    value: Value,
+    cache: &mut FxHashMap<Value, Value>,
+    out: &mut Vec<Instruction>,
+    next_value_id: &mut u32,
+) -> Option<Value> {
+    if value == iv {
+        return Some(lane_iv);
+    }
+    if let Some(&cloned) = cache.get(&value) {
+        return Some(cloned);
+    }
+    let inst = find_inst_by_dest(&func.blocks[body_idx], value);
+    // A value not defined in the scalar body was proven preheader-available by
+    // strict_i32_dag_is_clonable and can be shared unchanged.
+    let Some(inst) = inst else {
+        return Some(value);
+    };
+    let cloned = match inst {
+        Instruction::BinOp {
+            op, lhs, rhs, ty, ..
+        } if *ty == IrType::I32 && !op.can_trap() => {
+            let lhs = clone_strict_i32_operand_for_lane(
+                func,
+                body_idx,
+                iv,
+                lane_iv,
+                lhs,
+                cache,
+                out,
+                next_value_id,
+            )?;
+            let rhs = clone_strict_i32_operand_for_lane(
+                func,
+                body_idx,
+                iv,
+                lane_iv,
+                rhs,
+                cache,
+                out,
+                next_value_id,
+            )?;
+            let dest = Value(*next_value_id);
+            *next_value_id += 1;
+            out.push(Instruction::BinOp {
+                dest,
+                op: *op,
+                lhs,
+                rhs,
+                ty: *ty,
+            });
+            dest
+        }
+        Instruction::Cast {
+            src,
+            from_ty: IrType::I32,
+            to_ty: IrType::I32,
+            ..
+        } => {
+            let src = clone_strict_i32_operand_for_lane(
+                func,
+                body_idx,
+                iv,
+                lane_iv,
+                src,
+                cache,
+                out,
+                next_value_id,
+            )?;
+            let dest = Value(*next_value_id);
+            *next_value_id += 1;
+            out.push(Instruction::Cast {
+                dest,
+                src,
+                from_ty: IrType::I32,
+                to_ty: IrType::I32,
+            });
+            dest
+        }
+        Instruction::Copy { src, .. } => {
+            let src = clone_strict_i32_operand_for_lane(
+                func,
+                body_idx,
+                iv,
+                lane_iv,
+                src,
+                cache,
+                out,
+                next_value_id,
+            )?;
+            let dest = Value(*next_value_id);
+            *next_value_id += 1;
+            out.push(Instruction::Copy { dest, src });
+            dest
+        }
+        _ => return None,
+    };
+    cache.insert(value, cloned);
+    Some(cloned)
+}
+
+/// Match a very narrow strict-FP computed reciprocal reduction.  See the
+/// section comment above StrictComputedRecipReductionPattern for its contract.
+fn analyze_strict_computed_recip_reduction(
+    func: &IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+    cfg: &CfgAnalysis,
+) -> Option<StrictComputedRecipReductionPattern> {
+    // A simple header + one unconditional body/latch makes it possible to
+    // retain the unmodified source loop as a scalar tail.  Anything less
+    // canonical belongs in a future generalized versioning transform.
+    if loop_info.body.len() != 2 {
+        return None;
+    }
+    let header_idx = loop_info.header;
+    let header = func.blocks.get(header_idx)?;
+    let header_label = header.label;
+
+    let (exit_cmp_dest, true_label, false_label) = match &header.terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(cond),
+            true_label,
+            false_label,
+        } => (*cond, *true_label, *false_label),
+        _ => return None,
+    };
+    let body_idx = func
+        .blocks
+        .iter()
+        .position(|block| block.label == true_label)?;
+    if body_idx == header_idx || !loop_info.body.contains(&body_idx) {
+        return None;
+    }
+    let exit_idx = func
+        .blocks
+        .iter()
+        .position(|block| block.label == false_label)?;
+    if loop_info.body.contains(&exit_idx) {
+        return None;
+    }
+    let body = &func.blocks[body_idx];
+    if !matches!(body.terminator, Terminator::Branch(label) if label == header_label) {
+        return None;
+    }
+
+    // The prefix replaces the one and only external predecessor.  A critical
+    // edge or a second loop-carried phi would require a more general phi
+    // forwarding protocol, so fail closed instead.
+    let outside_preds: Vec<usize> = cfg
+        .preds
+        .row(header_idx)
+        .iter()
+        .map(|&pred| pred as usize)
+        .filter(|pred| !loop_info.body.contains(pred))
+        .collect();
+    if outside_preds.len() != 1 {
+        return None;
+    }
+    let preheader_idx = outside_preds[0];
+    let preheader = func.blocks.get(preheader_idx)?;
+    if !matches!(preheader.terminator, Terminator::Branch(label) if label == header_label) {
+        return None;
+    }
+    let preheader_label = preheader.label;
+    let body_label = body.label;
+
+    let phis: Vec<(Value, IrType, &Vec<(Operand, BlockId)>)> = header
+        .instructions
+        .iter()
+        .filter_map(|inst| match inst {
+            Instruction::Phi { dest, ty, incoming } => Some((*dest, *ty, incoming)),
+            _ => None,
+        })
+        .collect();
+    if phis.len() != 2 {
+        return None;
+    }
+
+    let mut iv_info: Option<(Value, Value)> = None; // (phi, latch value)
+    let mut sum_info: Option<(Value, Operand, Value)> = None; // (phi, init, latch value)
+    for (dest, ty, incoming) in phis {
+        if incoming.len() != 2 {
+            return None;
+        }
+        let pre = incoming
+            .iter()
+            .find(|(_, label)| *label == preheader_label)?;
+        let latch = incoming.iter().find(|(_, label)| *label == body_label)?;
+        match ty {
+            IrType::I32 => {
+                let (Operand::Const(IrConst::I32(0)), Operand::Value(next)) = (&pre.0, &latch.0)
+                else {
+                    return None;
+                };
+                if iv_info.replace((dest, *next)).is_some() {
+                    return None;
+                }
+            }
+            IrType::F64 => {
+                let Operand::Value(next) = latch.0 else {
+                    return None;
+                };
+                if sum_info.replace((dest, pre.0.clone(), next)).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let (iv, iv_latch) = iv_info?;
+    let (sum_phi, sum_init, sum_latch) = sum_info?;
+
+    // The header may contain only its two phis and the exact signed `j < n`
+    // condition.  This restriction is what lets `n - j > 3` be the vector
+    // guard without duplicating arbitrary header computations.
+    let mut limit = None;
+    for inst in &header.instructions {
+        match inst {
+            Instruction::Phi { .. } => {}
+            Instruction::Cmp {
+                dest,
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(lhs),
+                rhs,
+                ty: IrType::I32,
+            } if *dest == exit_cmp_dest && *lhs == iv => {
+                if limit.replace(rhs.clone()).is_some() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    let limit = limit?;
+    match &limit {
+        Operand::Const(IrConst::I32(_)) => {}
+        Operand::Value(value)
+            if strict_external_value_available(
+                func,
+                cfg,
+                &loop_info.body,
+                preheader_idx,
+                *value,
+            ) => {}
+        _ => return None,
+    }
+
+    // The scalar latch must advance exactly one element and the accumulator
+    // update must be the exact left-to-right `sum + product` source order.
+    let mut iv_next_ok = false;
+    let mut product = None;
+    for inst in &body.instructions {
+        match inst {
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(lhs),
+                rhs: Operand::Const(c),
+                ty: IrType::I32,
+            } if *dest == iv_latch && *lhs == iv && c.to_i64() == Some(1) => {
+                iv_next_ok = true;
+            }
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(lhs),
+                rhs: Operand::Value(rhs),
+                ty: IrType::F64,
+            } if *dest == sum_latch && *lhs == sum_phi => {
+                if product.replace(*rhs).is_some() {
+                    return None;
+                }
+            }
+            // The body has no stores/calls/atomics or opaque intrinsics.  An
+            // otherwise unused nonvolatile load still matters (it can fault),
+            // so it is rejected below rather than silently omitted.
+            Instruction::BinOp { .. }
+            | Instruction::Cast { .. }
+            | Instruction::Copy { .. }
+            | Instruction::GetElementPtr { .. }
+            | Instruction::Load { .. } => {}
+            _ => return None,
+        }
+    }
+    if !iv_next_ok {
+        return None;
+    }
+    let product = product?;
+
+    let (reciprocal, loaded_value) = match find_inst_by_dest(body, product)? {
+        Instruction::BinOp {
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(reciprocal),
+            rhs: Operand::Value(load),
+            ty: IrType::F64,
+            ..
+        } => (*reciprocal, *load),
+        _ => return None,
+    };
+    let denominator_cast = match find_inst_by_dest(body, reciprocal)? {
+        Instruction::BinOp {
+            op: IrBinOp::SDiv,
+            lhs: Operand::Const(IrConst::F64(one)),
+            rhs: Operand::Value(cast),
+            ty: IrType::F64,
+            ..
+        } if one.to_bits() == 1.0f64.to_bits() => *cast,
+        _ => return None,
+    };
+    let denominator = match find_inst_by_dest(body, denominator_cast)? {
+        Instruction::Cast {
+            src: Operand::Value(value),
+            from_ty: IrType::I32,
+            to_ty: IrType::F64,
+            ..
+        } => *value,
+        _ => return None,
+    };
+    // Require a nontrivial scalar calculation in the body.  A simple invariant
+    // denominator is better handled by the ordinary map/reduction machinery.
+    if !matches!(
+        find_inst_by_dest(body, denominator),
+        Some(Instruction::BinOp {
+            ty: IrType::I32,
+            ..
+        })
+    ) {
+        return None;
+    }
+
+    let (_source_gep, source_base) = match find_inst_by_dest(body, loaded_value)? {
+        Instruction::Load {
+            ptr,
+            ty: IrType::F64,
+            volatile: false,
+            seg_override: AddressSpace::Default,
+            ..
+        } => {
+            let Instruction::GetElementPtr {
+                base,
+                offset,
+                ty: IrType::Ptr,
+                ..
+            } = find_inst_by_dest(body, *ptr)?
+            else {
+                return None;
+            };
+            let affine = affine_operand(func, &loop_info.body, offset, iv, 0)?;
+            if affine.scale != 8 || affine.const_bytes != 0 {
+                return None;
+            }
+            (*ptr, *base)
+        }
+        _ => return None,
+    };
+    // Do not omit any other potentially-faulting or observable load.
+    let f64_load_count = body
+        .instructions
+        .iter()
+        .filter(|inst| {
+            matches!(
+                inst,
+                Instruction::Load {
+                    ty: IrType::F64,
+                    ..
+                }
+            )
+        })
+        .count();
+    if f64_load_count != 1 {
+        return None;
+    }
+    if !strict_external_value_available(func, cfg, &loop_info.body, preheader_idx, source_base) {
+        return None;
+    }
+
+    let mut memo = FxHashMap::default();
+    let mut visiting = FxHashSet::default();
+    if !strict_i32_dag_is_clonable(
+        func,
+        cfg,
+        &loop_info.body,
+        body_idx,
+        preheader_idx,
+        iv,
+        denominator,
+        &mut memo,
+        &mut visiting,
+    ) {
+        return None;
+    }
+
+    Some(StrictComputedRecipReductionPattern {
+        header_idx,
+        body_idx,
+        preheader_idx,
+        iv,
+        sum_phi,
+        sum_init,
+        limit,
+        denominator,
+        source_base,
+    })
+}
+
+fn fresh_strict_value(next_value_id: &mut u32) -> Value {
+    let value = Value(*next_value_id);
+    *next_value_id += 1;
+    value
+}
+
+/// Insert the ordered four-lane prefix ahead of the original scalar loop.
+/// The scalar header/body are deliberately not cloned or edited beyond their
+/// preheader phi inputs: their existing body is the exact tail for 0..3
+/// elements, and its result remains the source-order final value.
+fn transform_strict_computed_recip_reduction(
+    func: &mut IrFunction,
+    pattern: &StrictComputedRecipReductionPattern,
+) -> Option<usize> {
+    let mut next_value_id = func.next_value_id;
+    let mut next_label = func.next_label.max(
+        func.blocks
+            .iter()
+            .map(|block| block.label.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
+    let vector_header_label = BlockId(next_label);
+    next_label += 1;
+    let vector_body_label = BlockId(next_label);
+    next_label += 1;
+    let vector_iv = fresh_strict_value(&mut next_value_id);
+    let vector_sum = fresh_strict_value(&mut next_value_id);
+    let remaining = fresh_strict_value(&mut next_value_id);
+    let enough_lanes = fresh_strict_value(&mut next_value_id);
+    let scratch = fresh_strict_value(&mut next_value_id);
+
+    // Build every new instruction before changing the original CFG.  A future
+    // extension which accidentally widens the accepted DAG therefore fails as
+    // an all-or-nothing no-op rather than leaving half-versioned IR behind.
+    let mut vector_body_instructions = Vec::new();
+    let mut lane_ivs = Vec::with_capacity(4);
+    lane_ivs.push(vector_iv);
+    for lane in 1..4 {
+        let lane_iv = fresh_strict_value(&mut next_value_id);
+        vector_body_instructions.push(Instruction::BinOp {
+            dest: lane_iv,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(vector_iv),
+            rhs: Operand::Const(IrConst::I32(lane)),
+            ty: IrType::I32,
+        });
+        lane_ivs.push(lane_iv);
+    }
+
+    let mut denominators = Vec::with_capacity(4);
+    for lane_iv in lane_ivs {
+        let mut cache = FxHashMap::default();
+        let denominator = clone_strict_i32_dag_for_lane(
+            func,
+            pattern.body_idx,
+            pattern.iv,
+            lane_iv,
+            pattern.denominator,
+            &mut cache,
+            &mut vector_body_instructions,
+            &mut next_value_id,
+        )?;
+        denominators.push(denominator);
+    }
+
+    let byte_offset_index = fresh_strict_value(&mut next_value_id);
+    let byte_offset = fresh_strict_value(&mut next_value_id);
+    vector_body_instructions.push(Instruction::Cast {
+        dest: byte_offset_index,
+        src: Operand::Value(vector_iv),
+        from_ty: IrType::I32,
+        to_ty: IrType::I64,
+    });
+    vector_body_instructions.push(Instruction::BinOp {
+        dest: byte_offset,
+        op: IrBinOp::Shl,
+        lhs: Operand::Value(byte_offset_index),
+        rhs: Operand::Const(IrConst::I64(3)),
+        ty: IrType::I64,
+    });
+    let vector_sum_next = fresh_strict_value(&mut next_value_id);
+    vector_body_instructions.push(Instruction::Intrinsic {
+        dest: Some(vector_sum_next),
+        op: IntrinsicOp::StrictRecipMulAddF64x4,
+        dest_ptr: None,
+        args: vec![
+            Operand::Value(vector_sum),
+            Operand::Value(denominators[0]),
+            Operand::Value(denominators[1]),
+            Operand::Value(denominators[2]),
+            Operand::Value(denominators[3]),
+            Operand::Value(pattern.source_base),
+            Operand::Value(byte_offset),
+            Operand::Value(scratch),
+        ],
+    });
+    let vector_iv_next = fresh_strict_value(&mut next_value_id);
+    vector_body_instructions.push(Instruction::BinOp {
+        dest: vector_iv_next,
+        op: IrBinOp::Add,
+        lhs: Operand::Value(vector_iv),
+        rhs: Operand::Const(IrConst::I32(4)),
+        ty: IrType::I32,
+    });
+
+    let vector_header = BasicBlock {
+        label: vector_header_label,
+        instructions: vec![
+            Instruction::Phi {
+                dest: vector_sum,
+                ty: IrType::F64,
+                incoming: vec![
+                    (
+                        pattern.sum_init.clone(),
+                        func.blocks[pattern.preheader_idx].label,
+                    ),
+                    (Operand::Value(vector_sum_next), vector_body_label),
+                ],
+            },
+            Instruction::Phi {
+                dest: vector_iv,
+                ty: IrType::I32,
+                incoming: vec![
+                    (
+                        Operand::Const(IrConst::I32(0)),
+                        func.blocks[pattern.preheader_idx].label,
+                    ),
+                    (Operand::Value(vector_iv_next), vector_body_label),
+                ],
+            },
+            // Avoid `j + 3 < n`: it creates signed-overflow UB for an
+            // otherwise valid source trip count near INT_MAX.  Once a prefix
+            // iteration has executed, this invariant proves both `n - j` and
+            // `j + 4` are defined in the I32 domain.
+            Instruction::BinOp {
+                dest: remaining,
+                op: IrBinOp::Sub,
+                lhs: pattern.limit.clone(),
+                rhs: Operand::Value(vector_iv),
+                ty: IrType::I32,
+            },
+            Instruction::Cmp {
+                dest: enough_lanes,
+                op: IrCmpOp::Sgt,
+                lhs: Operand::Value(remaining),
+                rhs: Operand::Const(IrConst::I32(3)),
+                ty: IrType::I32,
+            },
+        ],
+        terminator: Terminator::CondBranch {
+            cond: Operand::Value(enough_lanes),
+            true_label: vector_body_label,
+            false_label: func.blocks[pattern.header_idx].label,
+        },
+        source_spans: vec![],
+    };
+    let vector_body = BasicBlock {
+        label: vector_body_label,
+        instructions: vector_body_instructions,
+        terminator: Terminator::Branch(vector_header_label),
+        source_spans: vec![],
+    };
+
+    let preheader_label = func.blocks[pattern.preheader_idx].label;
+    let original_header_label = func.blocks[pattern.header_idx].label;
+    // Locate both phi inputs while the old CFG is still wholly intact.  The
+    // matcher proved these indices exist, but keeping the plan explicit makes
+    // the mutation below transactional even if that contract changes later.
+    let phi_input_index = |dest: Value| {
+        func.blocks[pattern.header_idx]
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(inst_idx, inst)| match inst {
+                Instruction::Phi {
+                    dest: phi_dest,
+                    incoming,
+                    ..
+                } if *phi_dest == dest => incoming
+                    .iter()
+                    .position(|(_, label)| *label == preheader_label)
+                    .map(|incoming_idx| (inst_idx, incoming_idx)),
+                _ => None,
+            })
+    };
+    let sum_input = phi_input_index(pattern.sum_phi)?;
+    let iv_input = phi_input_index(pattern.iv)?;
+
+    let mut rewritten_header_instructions = func.blocks[pattern.header_idx].instructions.clone();
+    for (inst_idx, incoming_idx, replacement) in [
+        (sum_input.0, sum_input.1, Operand::Value(vector_sum)),
+        (iv_input.0, iv_input.1, Operand::Value(vector_iv)),
+    ] {
+        let Instruction::Phi { incoming, .. } = &mut rewritten_header_instructions[inst_idx] else {
+            // This is intentionally before the first IR mutation.  The
+            // analyzer established the shape, but keep a future matcher edit
+            // from leaving a partially rewritten CFG on a surprise mismatch.
+            return None;
+        };
+        let (value, label) = &mut incoming[incoming_idx];
+        *value = replacement;
+        *label = vector_header_label;
+    }
+    let change_count = 1 + vector_header.instructions.len() + vector_body.instructions.len() + 2;
+
+    // `scratch` is normally unused by the direct XMM-result lowering, but it
+    // gives the code generator a sound register-pressure fallback without
+    // borrowing an allocator-owned XMM register or dynamically moving %rsp.
+    func.blocks[pattern.header_idx].instructions = rewritten_header_instructions;
+    func.blocks[pattern.preheader_idx]
+        .instructions
+        .push(Instruction::Alloca {
+            dest: scratch,
+            ty: IrType::F64,
+            size: 32,
+            align: 32,
+            volatile: false,
+            semantic_volatile: false,
+        });
+    debug_assert!(matches!(
+        func.blocks[pattern.preheader_idx].terminator,
+        Terminator::Branch(label) if label == original_header_label
+    ));
+    func.blocks[pattern.preheader_idx].terminator = Terminator::Branch(vector_header_label);
+    func.blocks.push(vector_header);
+    func.blocks.push(vector_body);
+    func.next_value_id = next_value_id;
+    func.next_label = next_label;
+
+    if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
+        eprintln!(
+            "[VEC-STRICT-RECIP] {}: inserted ordered 4-wide prefix before block {}",
+            func.name, original_header_label.0
+        );
+    }
+    // This count includes the private alloca, both new block payloads, and
+    // the two forwarded scalar-tail phi inputs.
+    Some(change_count)
+}
+
 /// Element size in bytes for a vectorizable reduction element type.
 fn reduction_element_size(ty: IrType) -> Option<u32> {
     match ty {
@@ -8427,7 +9339,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     *ty = IrType::I64;
                     changes += 1;
                     if debug {
-                        eprintln!("[VEC]   Changed IV increment from +1 to +128 (quad FMA) and promoted to I64");
+                        eprintln!(
+                            "[VEC]   Changed IV increment from +1 to +128 (quad FMA) and promoted to I64"
+                        );
                     }
                 }
             }
@@ -8653,7 +9567,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
         changes += 4;
         if debug {
-            eprintln!("[VEC]   Inserted quad FmaF64x4HoistedSIB intrinsics (SIB + hoisted broadcast, step 128)");
+            eprintln!(
+                "[VEC]   Inserted quad FmaF64x4HoistedSIB intrinsics (SIB + hoisted broadcast, step 128)"
+            );
         }
     }
 
@@ -13383,8 +14299,8 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
         lane_addresses.push((a_addr, b_addr));
     }
     lane_addresses.sort_by_key(|((_, offset), _)| *offset);
-    let a_base = lane_addresses[0].0 .0;
-    let b_base = lane_addresses[0].1 .0;
+    let a_base = lane_addresses[0].0.0;
+    let b_base = lane_addresses[0].1.0;
     let elem_size = if ty == IrType::F64 { 8 } else { 4 };
     for (lane, ((this_a, a_offset), (this_b, b_offset))) in lane_addresses.iter().enumerate() {
         let expected = lane as i64 * elem_size;

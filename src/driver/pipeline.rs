@@ -1445,7 +1445,7 @@ impl Driver {
 
         // Apply #pragma weak directives from the preprocessor.
         for (symbol, target) in &preprocessor.weak_pragmas {
-            if let Some(ref alias_target) = target {
+            if let Some(alias_target) = target {
                 // #pragma weak symbol = alias -> create weak alias
                 module
                     .aliases
@@ -1617,6 +1617,14 @@ impl Driver {
             self.fp_contract,
             self.target == Target::X86_64
                 && self.enable_avx
+                && !self.no_sse
+                && !self.general_regs_only,
+            self.target == Target::X86_64
+                && self.enable_avx2
+                && !self.no_sse
+                && !self.general_regs_only,
+            self.target == Target::X86_64
+                && self.enable_sse4_1
                 && !self.no_sse
                 && !self.general_regs_only,
             self.enable_fma,

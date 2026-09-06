@@ -31,7 +31,7 @@ pub fn link_builtin(
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
     let mut t_phase = std::time::Instant::now();
     macro_rules! phase {
-        ($name:expr) => {
+        ($name:expr_2021) => {
             if ld_time {
                 eprintln!(
                     "[ldtime] {:<24} {:>7.1} ms",

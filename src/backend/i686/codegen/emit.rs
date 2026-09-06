@@ -12,7 +12,6 @@ use crate::backend::call_abi;
 use crate::backend::common::PtrDirective;
 use crate::backend::generation::is_i128_type;
 use crate::backend::regalloc::{PhysReg, RaConfig};
-use std::sync::Arc;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::fx_hash::FxHashMap;
@@ -24,6 +23,7 @@ use crate::ir::reexports::{
     AtomicOrdering, AtomicRmwOp, BlockId, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction,
     IrUnaryOp, Operand, Value,
 };
+use std::sync::Arc;
 
 use super::i128_ops::MulAccPlan;
 
@@ -2398,11 +2398,7 @@ impl ArchCodegen for I686Codegen {
     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
         // Under -mregparm>=1 the sret pointer is passed in %eax, not pushed,
         // so the callee's plain `ret` pops nothing (mirrors emit_epilogue).
-        if is_sret && self.regparm == 0 {
-            4
-        } else {
-            0
-        }
+        if is_sret && self.regparm == 0 { 4 } else { 0 }
     }
 
     // ---- Control flow ----
@@ -3240,7 +3236,7 @@ impl I686Codegen {
         s.emit("    shrl %eax");
         s.emit("    shrl %cl, %eax"); // q = qs >> (1+i)
         s.emit("    movl %eax, %edi"); // edi = q
-                                       // Verify: compute a - q*b, adjust if negative
+        // Verify: compute a - q*b, adjust if negative
         s.emit("    mull 20(%esp)"); // edx:eax = q * B_lo
         s.emit("    movl 12(%esp), %ebx");
         s.emit("    movl 16(%esp), %ecx"); // ecx:ebx = a
@@ -3369,7 +3365,7 @@ impl I686Codegen {
         s.emit("    xorl %ecx, %edi"); // edi = sign of result (bit 31)
         s.emit("    movl 16(%esp), %eax"); // A_lo
         s.emit("    movl 24(%esp), %ebx"); // B_lo
-                                           // Negate A if negative
+        // Negate A if negative
         s.emit("    testl %edx, %edx");
         s.emit("    jns .Ldiv_a_pos");
         s.emit("    negl %eax");
@@ -3423,7 +3419,7 @@ impl I686Codegen {
         s.emit("    movl %edx, %edi"); // save A_hi sign (remainder sign = dividend sign)
         s.emit("    movl 16(%esp), %eax"); // A_lo
         s.emit("    movl 24(%esp), %ebx"); // B_lo
-                                           // Negate A if negative
+        // Negate A if negative
         s.emit("    testl %edx, %edx");
         s.emit("    jns .Lmod_a_pos");
         s.emit("    negl %eax");

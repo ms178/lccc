@@ -526,7 +526,7 @@ fn find_div2_result(func: &IrFunction, loop_body: &FxHashSet<usize>, prod: Value
                             && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) =>
                     {
                         adj = None; // placeholder; LShr dest is the mask
-                                    // record mask separately below
+                        // record mask separately below
                     }
                     _ => {}
                 }

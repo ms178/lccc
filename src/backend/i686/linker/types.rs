@@ -9,14 +9,14 @@ use crate::common::fx_hash::FxHashMap;
 
 // Re-export shared ELF constants used throughout the linker
 pub(super) use crate::backend::elf::{
-    get_standard_linker_symbols, is_thin_archive, parse_archive_members,
-    parse_linker_script_entries, parse_thin_archive_members, read_cstr, read_i32, read_u16,
-    read_u32, LinkerScriptEntry, LinkerSymbolAddresses, ELFCLASS32, ELFDATA2LSB, ELF_MAGIC, EM_386,
-    ET_DYN, ET_EXEC, ET_REL, EV_CURRENT, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME,
+    ELF_MAGIC, ELFCLASS32, ELFDATA2LSB, EM_386, ET_DYN, ET_EXEC, ET_REL, EV_CURRENT,
+    LinkerScriptEntry, LinkerSymbolAddresses, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME,
     PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_DYNSYM,
     SHT_FINI_ARRAY, SHT_GROUP, SHT_INIT_ARRAY, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL,
     SHT_RELA, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_FUNC,
-    STT_GNU_IFUNC, STT_OBJECT, STT_SECTION, STT_TLS, STV_DEFAULT,
+    STT_GNU_IFUNC, STT_OBJECT, STT_SECTION, STT_TLS, STV_DEFAULT, get_standard_linker_symbols,
+    is_thin_archive, parse_archive_members, parse_linker_script_entries,
+    parse_thin_archive_members, read_cstr, read_i32, read_u16, read_u32,
 };
 
 // ── ELF32-specific constants ──────────────────────────────────────────────────

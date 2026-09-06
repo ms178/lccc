@@ -1,7 +1,7 @@
 //! ArmCodegen: memory operations (load, store, memcpy, GEP, stack).
 
 use super::emit::{
-    arm_fp_name, callee_saved_name, callee_saved_name_32, is_arm_fp_phys, ArmCodegen,
+    ArmCodegen, arm_fp_name, callee_saved_name, callee_saved_name_32, is_arm_fp_phys,
 };
 use crate::backend::state::{SlotAddr, StackSlot};
 use crate::backend::traits::ArchCodegen;

@@ -928,8 +928,8 @@ mod tests {
         let (va, vb, vc) = (Value(0), Value(1), Value(2));
         let (vp, vq) = (Value(6), Value(7));
         let vr = Value(8); // join phi result
-                           // Mirror the real front-end shape: entry block opens with one
-                           // ParamRef per parameter defining its value id.
+        // Mirror the real front-end shape: entry block opens with one
+        // ParamRef per parameter defining its value id.
         let b0 = BasicBlock {
             label: BlockId(0),
             instructions: vec![

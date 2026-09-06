@@ -501,6 +501,14 @@ pub enum IntrinsicOp {
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 2×F64 → F64
     /// args[0] = source vector value; dest = scalar F64 result
     VecHorizontalAddF64x2,
+    /// Strict source-order four-lane reciprocal multiply-add for computed
+    /// integer denominators. Arguments are `[acc, d0, d1, d2, d3, base,
+    /// byte_offset, scratch]`; it evaluates `acc + (1.0/(double)d0)*base[0]`
+    /// through lane 3 in that exact order. Unlike a horizontal reduction, it
+    /// never forms a reassociated FP addition tree. `scratch` is a private
+    /// 32-byte alloca used only if the scalar result cannot remain XMM-homed.
+    /// x86-64 AVX2-only; emitted solely by the strict computed-reduction pass.
+    StrictRecipMulAddF64x4,
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
     /// args[0] = source vector value; dest = scalar I32 result
     VecHorizontalAddI32x8,

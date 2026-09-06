@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_a_sign_extension_from_a_DIFFERENT_register() {
+    fn keeps_a_sign_extension_from_a_different_register() {
         // `movslq %eax, %r15` moves a different value into r15; the fact that
         // r15 already held a sign-extended value says nothing about it.
         let out = run_maybe(concat!(

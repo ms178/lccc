@@ -1657,6 +1657,14 @@ fn should_swap(lhs: &VNOperand, rhs: &VNOperand) -> bool {
     }
 }
 
+/// The pointee type of a GEP instruction (helper for canonical address keys).
+fn inst_ty_of(inst: &Instruction) -> IrType {
+    match inst {
+        Instruction::GetElementPtr { ty, .. } => *ty,
+        _ => IrType::Ptr,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2975,13 +2983,5 @@ mod tests {
                 .count(),
             2
         );
-    }
-}
-
-/// The pointee type of a GEP instruction (helper for canonical address keys).
-fn inst_ty_of(inst: &Instruction) -> IrType {
-    match inst {
-        Instruction::GetElementPtr { ty, .. } => *ty,
-        _ => IrType::Ptr,
     }
 }

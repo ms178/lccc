@@ -8,7 +8,7 @@
 //! - expr_builtins_fpclass.rs: FP classification (fpclassify, isnan, isinf, etc.)
 
 use super::lower::Lowerer;
-use crate::common::types::{target_is_32bit, AddressSpace, CType, IrType};
+use crate::common::types::{AddressSpace, CType, IrType, target_is_32bit};
 use crate::frontend::parser::ast::{Expr, UnaryOp};
 use crate::frontend::sema::builtins::{self, BuiltinIntrinsic, BuiltinKind};
 use crate::ir::reexports::{
@@ -1857,7 +1857,10 @@ impl Lowerer {
 
     fn lower_shufflevector(&mut self, args: &[Expr]) -> Option<Operand> {
         if args.len() != 6 {
-            panic!("__builtin_shufflevector: only the 4-lane 32-bit form (2 vectors + 4 indices) is supported, got {} args", args.len());
+            panic!(
+                "__builtin_shufflevector: only the 4-lane 32-bit form (2 vectors + 4 indices) is supported, got {} args",
+                args.len()
+            );
         }
         let v1 = self.vec128_arg_ptr(&args[0]);
         let v2 = self.vec128_arg_ptr(&args[1]);

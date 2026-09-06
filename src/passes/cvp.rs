@@ -467,11 +467,7 @@ fn decide_bool(
                 match &func.blocks[bi].instructions[ii] {
                     Instruction::Copy { src, .. } => go(stack, func, defs, src, depth - 1),
                     Instruction::Cmp {
-                        ref op,
-                        ref lhs,
-                        ref rhs,
-                        ref ty,
-                        ..
+                        op, lhs, rhs, ty, ..
                     } => decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?),
                     _ => None,
                 }

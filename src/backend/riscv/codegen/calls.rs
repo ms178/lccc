@@ -1,7 +1,7 @@
 //! RiscvCodegen: call ABI operations.
 
-use super::emit::{callee_saved_name, RiscvCodegen, RISCV_ARG_REGS};
-use crate::backend::call_abi::{compute_stack_arg_space, CallAbiConfig, CallArgClass};
+use super::emit::{RISCV_ARG_REGS, RiscvCodegen, callee_saved_name};
+use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
 use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
@@ -182,7 +182,7 @@ impl RiscvCodegen {
                     }
                     CallArgClass::F128Stack => {
                         match arg {
-                            Operand::Const(ref c) => {
+                            Operand::Const(c) => {
                                 let bytes = match c {
                                     IrConst::LongDouble(_, f128_bytes) => *f128_bytes,
                                     _ => {
@@ -333,7 +333,7 @@ impl RiscvCodegen {
         for (i, arg) in args.iter().enumerate() {
             if let CallArgClass::F128Reg { reg_idx: base_reg } = arg_classes[i] {
                 match arg {
-                    Operand::Const(ref c) => {
+                    Operand::Const(c) => {
                         let bytes = match c {
                             IrConst::LongDouble(_, f128_bytes) => *f128_bytes,
                             // _Float128 lowered to the IrType::U128 carrier:

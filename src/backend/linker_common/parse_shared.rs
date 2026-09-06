@@ -6,9 +6,10 @@
 
 use super::types::DynSymbol;
 use crate::backend::elf::{
-    read_cstr, read_i64, read_u16, read_u32, read_u64, slice_at, table_entry, DT_GNU_HASH, DT_NULL,
-    DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMTAB, DT_VERSYM, ELFCLASS64, ELFDATA2LSB, ELF_MAGIC,
-    ET_DYN, PT_DYNAMIC, SHN_UNDEF, SHT_DYNAMIC, SHT_DYNSYM, SHT_GNU_VERDEF, SHT_GNU_VERSYM,
+    DT_GNU_HASH, DT_NULL, DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMTAB, DT_VERSYM, ELF_MAGIC,
+    ELFCLASS64, ELFDATA2LSB, ET_DYN, PT_DYNAMIC, SHN_UNDEF, SHT_DYNAMIC, SHT_DYNSYM,
+    SHT_GNU_VERDEF, SHT_GNU_VERSYM, read_cstr, read_i64, read_u16, read_u32, read_u64, slice_at,
+    table_entry,
 };
 
 /// Extract dynamic symbols from a shared library (.so) file.

@@ -428,7 +428,7 @@ impl IrConst {
         target: IrType,
     ) -> Option<IrConst> {
         use crate::common::long_double::{
-            f128_bytes_to_i128, f128_bytes_to_i64, f128_bytes_to_u128, f128_bytes_to_u64,
+            f128_bytes_to_i64, f128_bytes_to_i128, f128_bytes_to_u64, f128_bytes_to_u128,
         };
         Some(match target {
             IrType::F64 => IrConst::F64(fv),

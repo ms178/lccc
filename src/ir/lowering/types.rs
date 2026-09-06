@@ -620,7 +620,7 @@ impl Lowerer {
         // On i686, check if scalar type has preferred alignment different from ABI
         match ts {
             TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Double => {
-                return 8
+                return 8;
             }
             TypeSpecifier::ComplexDouble => return 8,
             _ => {}

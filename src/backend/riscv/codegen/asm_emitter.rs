@@ -2,7 +2,7 @@
 //! register allocation, operand loading/storing, and template substitution.
 
 use super::emit::RiscvCodegen;
-use super::inline_asm::{classify_rv_constraint, RvConstraintKind};
+use super::inline_asm::{RvConstraintKind, classify_rv_constraint};
 use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter};
 use crate::backend::state::CodegenState;
 use crate::common::types::IrType;

@@ -94,7 +94,7 @@
 use super::loop_analysis::{self, DominanceChecker, NaturalLoop};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
-use crate::common::types::{target_ptr_size, AddressSpace, IrType};
+use crate::common::types::{AddressSpace, IrType, target_ptr_size};
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{
     BlockId, Instruction, IrBinOp, IrConst, IrFunction, IrModule, Operand, Value,
@@ -290,10 +290,10 @@ impl<'a> Ctx<'a> {
             let (b, i) = self.defs.get(cur)?;
             match self.inst(b, i) {
                 Instruction::GlobalAddr { name, .. } => {
-                    return Some(Lin::of_root(Root::Global(name.clone())))
+                    return Some(Lin::of_root(Root::Global(name.clone())));
                 }
                 Instruction::Alloca { dest, .. } => {
-                    return Some(Lin::of_root(Root::Alloca(dest.0)))
+                    return Some(Lin::of_root(Root::Alloca(dest.0)));
                 }
                 Instruction::Copy {
                     src: Operand::Value(s),
@@ -370,7 +370,7 @@ impl<'a> Ctx<'a> {
                             base: 0,
                         }),
                         _ => None,
-                    }
+                    };
                 }
             }
         }
@@ -388,7 +388,7 @@ impl<'a> Ctx<'a> {
     /// integer add/sub of a constant, or a GEP by a constant byte offset).
     /// Copies are looked through.
     fn phi_step(&self, lp: &NaturalLoop, phi: Value, next: &Operand) -> Option<i64> {
-        let Operand::Value(mut cur) = next else {
+        let &Operand::Value(mut cur) = next else {
             return None;
         };
         for _ in 0..LIN_FUEL {
@@ -412,7 +412,7 @@ impl<'a> Ctx<'a> {
                         (Operand::Value(v), Operand::Const(c)) if *v == phi => const_i64(c),
                         (Operand::Const(c), Operand::Value(v)) if *v == phi => const_i64(c),
                         _ => None,
-                    }
+                    };
                 }
                 Instruction::BinOp {
                     op: IrBinOp::Sub,
@@ -917,7 +917,15 @@ fn plan_loop(cx: &Ctx, sh: &LoopShape, out: &mut Vec<Rewrite>) {
             if cx.env.debug {
                 eprintln!(
                     "[lcfwd] {}: loop@{} forward store b{}i{} -> load b{}i{} ({:?}, stride {}, base {})",
-                    cx.func.name, sh.header, s.block, s.idx, l.block, l.idx, l.ty, ll.stride, ll.base
+                    cx.func.name,
+                    sh.header,
+                    s.block,
+                    s.idx,
+                    l.block,
+                    l.idx,
+                    l.ty,
+                    ll.stride,
+                    ll.base
                 );
             }
             if out.len() >= MAX_REWRITES {

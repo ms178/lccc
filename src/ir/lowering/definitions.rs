@@ -382,7 +382,7 @@ impl DeclAnalysis {
         }
         // Array of vectors: CType::Array(Vector(elem, size), count)
         let mut inner = ct;
-        while let CType::Array(ref elem, _) = inner {
+        while let CType::Array(elem, _) = inner {
             inner = elem.as_ref();
         }
         if let Some((elem_ct, _)) = inner.vector_info() {
@@ -398,7 +398,7 @@ impl DeclAnalysis {
         let ct = self.c_type.as_ref()?;
         // Unwrap array layers to find the element type
         let mut inner = ct;
-        while let CType::Array(ref elem, _) = inner {
+        while let CType::Array(elem, _) = inner {
             inner = elem.as_ref();
         }
         if inner.is_complex() {

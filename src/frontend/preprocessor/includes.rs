@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::macro_defs::{parse_define, MacroDef};
+use super::macro_defs::{MacroDef, parse_define};
 use super::pipeline::Preprocessor;
 
 /// Maximum recursive inclusion depth, matching GCC's default of 200.
@@ -687,8 +687,7 @@ impl Preprocessor {
                 if candidate.is_file() {
                     // Use canonicalize for comparison to detect same-file
                     let candidate_canon = std::fs::canonicalize(&candidate).ok();
-                    if let (Some(ref cur), Some(ref cand)) = (&current_file_canon, &candidate_canon)
-                    {
+                    if let (Some(cur), Some(cand)) = (&current_file_canon, &candidate_canon) {
                         if cur == cand {
                             continue;
                         }

@@ -51,11 +51,7 @@ impl VlaDynCursor {
 }
 
 fn gcd_usize(a: usize, b: usize) -> usize {
-    if b == 0 {
-        a
-    } else {
-        gcd_usize(b, a % b)
-    }
+    if b == 0 { a } else { gcd_usize(b, a % b) }
 }
 
 impl Lowerer {

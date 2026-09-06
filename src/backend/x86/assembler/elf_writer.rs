@@ -142,7 +142,7 @@ impl X86Arch for X86_64Arch {
                         ".code32 in 64-bit object: relocation type {} for '{}' has no \
                      R_X86_64_* equivalent with matching semantics",
                         other, r.symbol
-                    ))
+                    ));
                 }
             };
             relocations.push(EncoderReloc {

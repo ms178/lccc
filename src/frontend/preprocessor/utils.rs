@@ -105,7 +105,7 @@ pub fn copy_literal_bytes_to_string(
             i += 2; // skip escape sequence
         } else if bytes[i] == quote {
             i += 1; // include closing quote
-                    // Source text is valid UTF-8 and we copy a contiguous substring.
+            // Source text is valid UTF-8 and we copy a contiguous substring.
             let slice =
                 std::str::from_utf8(&bytes[start..i]).expect("literal copy produced non-UTF8");
             result.push_str(slice);

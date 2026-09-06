@@ -72,7 +72,7 @@
 use super::loop_analysis::{self, DominanceChecker, NaturalLoop};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
-use crate::common::types::{target_elf_machine, target_ptr_size, IrType};
+use crate::common::types::{IrType, target_elf_machine, target_ptr_size};
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Value,
@@ -1602,10 +1602,12 @@ mod tests {
         };
         assert!(incoming.contains(&(Operand::Const(IrConst::I64(1)), BlockId(0))));
         // v4 is gone and every former use reads q.
-        assert!(header
-            .instructions
-            .iter()
-            .all(|i| i.dest() != Some(Value(4))));
+        assert!(
+            header
+                .instructions
+                .iter()
+                .all(|i| i.dest() != Some(Value(4)))
+        );
         let xor = header
             .instructions
             .iter()
@@ -1632,7 +1634,8 @@ mod tests {
                 }
             }
         }
-        std::env::remove_var("CCC_BEPRE_FP");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("CCC_BEPRE_FP") };
         assert_eq!(run(&mut f), 0);
     }
 

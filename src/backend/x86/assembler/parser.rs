@@ -725,7 +725,10 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                         let expr = format!("({}) * {}", repeat_str, size);
                         Ok(AsmItem::SkipExpr(expr, 0))
                     } else {
-                        Err(format!("bad .fill repeat: {}: deferred .fill with size > 1 and non-zero value not supported", repeat_str))
+                        Err(format!(
+                            "bad .fill repeat: {}: deferred .fill with size > 1 and non-zero value not supported",
+                            repeat_str
+                        ))
                     }
                 }
             }

@@ -450,7 +450,7 @@ fn layout_function(
                     continue;
                 }
                 let mut idx: Vec<usize> = (0..cases.len()).collect();
-                idx.sort_by_key(|&i| std::cmp::Reverse(fp.edge_count(src, cases[i].1 .0)));
+                idx.sort_by_key(|&i| std::cmp::Reverse(fp.edge_count(src, cases[i].1.0)));
                 let sorted: Vec<_> = idx.into_iter().map(|i| cases[i]).collect();
                 *cases = sorted;
             }

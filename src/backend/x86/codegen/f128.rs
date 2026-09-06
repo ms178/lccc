@@ -4,7 +4,7 @@
 //! extended precision and other types, and emitting x86-specific cast instructions.
 
 use super::emit::X86Codegen;
-use crate::backend::cast::{classify_cast, CastKind};
+use crate::backend::cast::{CastKind, classify_cast};
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
@@ -648,7 +648,7 @@ impl X86Codegen {
     /// This is used for F128 arithmetic and for pushing F128 call arguments.
     pub(super) fn emit_f128_load_to_x87(&mut self, operand: &Operand) {
         match operand {
-            Operand::Const(ref c) => {
+            Operand::Const(c) => {
                 match c {
                     IrConst::LongDouble(_, f128_raw) => {
                         // Convert f128 bytes to x87, push to stack and fldt
@@ -683,7 +683,7 @@ impl X86Codegen {
                     }
                 }
             }
-            Operand::Value(ref v) => {
+            Operand::Value(v) => {
                 if self.state.f128_direct_slots.contains(&v.0) {
                     // Full 80-bit x87 precision in the slot; use fldt
                     if let Some(slot) = self.state.get_slot(v.0) {

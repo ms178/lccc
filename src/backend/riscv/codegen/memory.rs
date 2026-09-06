@@ -1,6 +1,6 @@
 //! RiscvCodegen: memory operations (load, store, memcpy, GEP, stack).
 
-use super::emit::{callee_saved_name, RiscvCodegen};
+use super::emit::{RiscvCodegen, callee_saved_name};
 use crate::backend::state::{SlotAddr, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;

@@ -8,7 +8,7 @@
 //! - Arithmetic conversion helpers: usual_arithmetic_conversions, promote_for_op, narrow_from_op
 
 use super::lower::Lowerer;
-use crate::common::types::{widened_op_type, AddressSpace, CType, IrType, SsoMode};
+use crate::common::types::{AddressSpace, CType, IrType, SsoMode, widened_op_type};
 use crate::frontend::parser::ast::{BinOp, Expr};
 use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Value};
 
@@ -221,11 +221,7 @@ impl Lowerer {
         // Widths above int precision use the declared 64-bit extended
         // bit-field type; narrower fields use ordinary integer promotion.
         let op_ty = if bit_width > 32 {
-            if is_signed {
-                IrType::I64
-            } else {
-                IrType::U64
-            }
+            if is_signed { IrType::I64 } else { IrType::U64 }
         } else {
             widened_op_type(IrType::I32)
         };

@@ -7,7 +7,7 @@ use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::reloc;
-use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE};
+use super::types::{BASE_ADDR, GlobalSymbol, PAGE_SIZE};
 use crate::backend::linker_common;
 use linker_common::OutputSection;
 
@@ -185,8 +185,10 @@ pub(super) fn emit_executable(
             sec.addr = tls_addr + aligned;
             sec.file_offset = offset;
             if debug_layout {
-                eprintln!("  LAYOUT TBSS: {} addr=0x{:x} aligned_off=0x{:x} sz=0x{:x} align={} tls_mem_size=0x{:x}",
-                    sec.name, sec.addr, aligned, sec.mem_size, a, tls_mem_size);
+                eprintln!(
+                    "  LAYOUT TBSS: {} addr=0x{:x} aligned_off=0x{:x} sz=0x{:x} align={} tls_mem_size=0x{:x}",
+                    sec.name, sec.addr, aligned, sec.mem_size, a, tls_mem_size
+                );
             }
             tls_mem_size = aligned + sec.mem_size;
             if a > tls_align {
@@ -396,8 +398,15 @@ pub(super) fn emit_executable(
                     let old_val = gsym.value;
                     gsym.value += output_sections[oi].addr + so;
                     if std::env::var("LINKER_DEBUG").is_ok() && gsym.info & 0xf == STT_TLS {
-                        eprintln!("  TLS sym '{}': old=0x{:x} -> new=0x{:x} (sec={} addr=0x{:x} off=0x{:x})",
-                                  name, old_val, gsym.value, output_sections[oi].name, output_sections[oi].addr, so);
+                        eprintln!(
+                            "  TLS sym '{}': old=0x{:x} -> new=0x{:x} (sec={} addr=0x{:x} off=0x{:x})",
+                            name,
+                            old_val,
+                            gsym.value,
+                            output_sections[oi].name,
+                            output_sections[oi].addr,
+                            so
+                        );
                     }
                 } else if std::env::var("LINKER_DEBUG").is_ok() && gsym.info & 0xf == STT_TLS {
                     eprintln!("  TLS sym '{}': NO MAPPING for ({}, {})", name, obj_idx, si);
@@ -649,8 +658,10 @@ pub(super) fn emit_executable(
                 if tls_addr != 0 {
                     let offset = (sym_addr as i64) - (tls_addr as i64) + 16;
                     if std::env::var("LINKER_DEBUG_TLS").is_ok() {
-                        eprintln!("  GOT TLS IE: key='{}' sym_addr=0x{:x} tls_addr=0x{:x} -> got_val=0x{:x}",
-                            key, sym_addr, tls_addr, offset as u64);
+                        eprintln!(
+                            "  GOT TLS IE: key='{}' sym_addr=0x{:x} tls_addr=0x{:x} -> got_val=0x{:x}",
+                            key, sym_addr, tls_addr, offset as u64
+                        );
                     }
                     offset as u64
                 } else {

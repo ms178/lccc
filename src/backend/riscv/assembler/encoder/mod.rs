@@ -180,11 +180,7 @@ pub fn reg_num(name: &str) -> Option<u32> {
             // x0-x31
             if let Some(rest) = name.strip_prefix('x') {
                 let n: u32 = rest.parse().ok()?;
-                if n <= 31 {
-                    Some(n)
-                } else {
-                    None
-                }
+                if n <= 31 { Some(n) } else { None }
             } else {
                 None
             }
@@ -236,11 +232,7 @@ pub fn freg_num(name: &str) -> Option<u32> {
                 && !name.starts_with("fa")
             {
                 let n: u32 = name[1..].parse().ok()?;
-                if n <= 31 {
-                    Some(n)
-                } else {
-                    None
-                }
+                if n <= 31 { Some(n) } else { None }
             } else {
                 None
             }
@@ -255,11 +247,7 @@ pub fn vreg_num(name: &str) -> Option<u32> {
     if let Some(rest) = name.strip_prefix('v') {
         // Avoid matching "vector" etc. - must be just digits after 'v'
         let n: u32 = rest.parse().ok()?;
-        if n <= 31 {
-            Some(n)
-        } else {
-            None
-        }
+        if n <= 31 { Some(n) } else { None }
     } else {
         None
     }

@@ -35,12 +35,12 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
             let imm20 = (word >> 12) as i32;
             // Sign-extend the 20-bit value
             let imm20 = (imm20 << 12) >> 12; // sign-extend from 20 bits
-                                             // C.LUI uses imm[17:12], so the actual nzimm is bits 17:12
-                                             // which is imm20[5:0] (since LUI loads imm into [31:12])
-                                             // C.LUI constraint: nzimm != 0, and it's sign-extended from 6 bits
+            // C.LUI uses imm[17:12], so the actual nzimm is bits 17:12
+            // which is imm20[5:0] (since LUI loads imm into [31:12])
+            // C.LUI constraint: nzimm != 0, and it's sign-extended from 6 bits
             let nzimm = imm20; // this is the full 20-bit value
-                               // C.LUI stores bits [17:12] = nzimm[5:0], sign-extended from bit 17
-                               // So nzimm must fit in signed 6-bit range: -32..31 (but not 0)
+            // C.LUI stores bits [17:12] = nzimm[5:0], sign-extended from bit 17
+            // So nzimm must fit in signed 6-bit range: -32..31 (but not 0)
             if nzimm == 0 {
                 return None;
             }

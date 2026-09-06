@@ -734,7 +734,7 @@ fn resolve_symbols_and_immediates(
     for (i, sym) in input_symbols.iter().enumerate() {
         let op_idx = num_outputs + i;
         if op_idx < operands.len() {
-            if let Some(ref s) = sym {
+            if let Some(s) = sym {
                 operands[op_idx].imm_symbol = Some(s.clone());
                 // Promote to Immediate so the symbol is emitted directly
                 if matches!(
@@ -1215,7 +1215,7 @@ pub fn substitute_goto_labels(
                 if j < chars.len() {
                     j += 1;
                 } // skip ]
-                  // Look up the label name
+                // Look up the label name
                 if let Some((_, block_id)) = goto_labels.iter().find(|(n, _)| n == &name) {
                     result.push_str(&block_id.to_string());
                     i = j;
@@ -1255,50 +1255,6 @@ pub fn substitute_goto_labels(
         }
     }
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_inline_asm_reg_name_strips_gcc_adornments() {
-        assert_eq!(normalize_inline_asm_reg_name("rcx"), "rcx");
-        assert_eq!(normalize_inline_asm_reg_name("%rcx"), "rcx");
-        assert_eq!(normalize_inline_asm_reg_name("~{rcx}"), "rcx");
-        assert_eq!(normalize_inline_asm_reg_name(" {r12} "), "r12");
-    }
-
-    #[test]
-    fn collect_excluded_registers_treats_percent_prefixed_clobbers_as_real_regs() {
-        let regs = collect_excluded_registers(&[], &["%rcx".to_string(), "memory".to_string()]);
-        assert!(regs.iter().any(|r| r == "rcx"));
-        assert!(!regs.iter().any(|r| r == "%rcx"));
-    }
-
-    #[test]
-    fn copy_metadata_from_preserves_tied_operand_class_and_immediates() {
-        let source = AsmOperand {
-            kind: AsmOperandKind::Immediate,
-            reg: "rcx".to_string(),
-            reg_hi: String::new(),
-            name: None,
-            mem_addr: String::new(),
-            mem_offset: 0,
-            imm_value: Some(7),
-            imm_symbol: Some("sym".to_string()),
-            operand_type: IrType::I64,
-            constraint: "i".to_string(),
-            seg_prefix: "%gs:".to_string(),
-        };
-        let mut dest = AsmOperand::new(AsmOperandKind::Tied(0), None);
-        dest.copy_metadata_from(&source);
-        assert!(matches!(dest.kind, AsmOperandKind::Immediate));
-        assert_eq!(dest.reg, "rcx");
-        assert_eq!(dest.imm_value, Some(7));
-        assert_eq!(dest.imm_symbol.as_deref(), Some("sym"));
-        assert_eq!(dest.seg_prefix, "%gs:");
-    }
 }
 
 /// Normalize an x86 register name to its 64-bit canonical form.
@@ -1413,4 +1369,48 @@ fn to_8bit_setcc_dest(line: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_inline_asm_reg_name_strips_gcc_adornments() {
+        assert_eq!(normalize_inline_asm_reg_name("rcx"), "rcx");
+        assert_eq!(normalize_inline_asm_reg_name("%rcx"), "rcx");
+        assert_eq!(normalize_inline_asm_reg_name("~{rcx}"), "rcx");
+        assert_eq!(normalize_inline_asm_reg_name(" {r12} "), "r12");
+    }
+
+    #[test]
+    fn collect_excluded_registers_treats_percent_prefixed_clobbers_as_real_regs() {
+        let regs = collect_excluded_registers(&[], &["%rcx".to_string(), "memory".to_string()]);
+        assert!(regs.iter().any(|r| r == "rcx"));
+        assert!(!regs.iter().any(|r| r == "%rcx"));
+    }
+
+    #[test]
+    fn copy_metadata_from_preserves_tied_operand_class_and_immediates() {
+        let source = AsmOperand {
+            kind: AsmOperandKind::Immediate,
+            reg: "rcx".to_string(),
+            reg_hi: String::new(),
+            name: None,
+            mem_addr: String::new(),
+            mem_offset: 0,
+            imm_value: Some(7),
+            imm_symbol: Some("sym".to_string()),
+            operand_type: IrType::I64,
+            constraint: "i".to_string(),
+            seg_prefix: "%gs:".to_string(),
+        };
+        let mut dest = AsmOperand::new(AsmOperandKind::Tied(0), None);
+        dest.copy_metadata_from(&source);
+        assert!(matches!(dest.kind, AsmOperandKind::Immediate));
+        assert_eq!(dest.reg, "rcx");
+        assert_eq!(dest.imm_value, Some(7));
+        assert_eq!(dest.imm_symbol.as_deref(), Some("sym"));
+        assert_eq!(dest.seg_prefix, "%gs:");
+    }
 }

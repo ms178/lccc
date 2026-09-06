@@ -11,7 +11,7 @@
 //! - Frame/return address intrinsics
 //! - SSE scalar float math (sqrt, fabs) for F32/F64
 
-use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_256, X86Codegen};
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_256};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::StackSlot;
 use crate::common::types::IrType;
@@ -3088,9 +3088,9 @@ impl X86Codegen {
                 self.state.emit("    vaddpd %xmm1, %xmm0, %xmm0"); // Add upper + lower (4→2)
                 self.state.emit("    vunpckhpd %xmm0, %xmm0, %xmm1"); // Shuffle element 1 to position 0
                 self.state.emit("    vaddsd %xmm1, %xmm0, %xmm0"); // Final scalar add (2→1)
-                                                                   // Keep the scalar result in the SSE domain: an XMM-homed
-                                                                   // destination receives `movapd %xmm0, %xmmN`, a stack-slot
-                                                                   // destination a direct `movsd`, never a GPR round trip.
+                // Keep the scalar result in the SSE domain: an XMM-homed
+                // destination receives `movapd %xmm0, %xmmN`, a stack-slot
+                // destination a direct `movsd`, never a GPR round trip.
                 if let Some(d) = dest {
                     self.store_xmm_to(d, "xmm0", IrType::F64);
                 }
@@ -4212,6 +4212,103 @@ impl X86Codegen {
                 self.state.invalidate_vec_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "movupd", "xmm0");
             }
+            IntrinsicOp::StrictRecipMulAddF64x4 => {
+                // Strict computed-expression reduction, four elements at a
+                // time.  This is intentionally NOT a horizontal reduction:
+                // binary64 addition is observable under ordinary (non-fast)
+                // C semantics, so the final four scalar additions must remain
+                // acc+p0, then +p1, then +p2, then +p3.
+                //
+                // Args are [acc, denom0..denom3, source_base, byte_offset,
+                // scratch].  The scalar denominator DAG is cloned by the pass
+                // for each lane; packing only its already-computed I32 leaves
+                // C's signed-div/mod semantics to the ordinary scalar IR.
+                if args.len() != 8 {
+                    panic!("StrictRecipMulAddF64x4 expects 8 args, got {}", args.len());
+                }
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+
+                // Pack d0..d3 into the low four i32 lanes, convert the full
+                // XMM payload to four F64 lanes, and form 1.0 / denom.  All
+                // scratch is confined to xmm0/ymm0 and xmm1/ymm1; the scalar
+                // allocator deliberately reserves those families.
+                self.operand_to_eax(&args[1]);
+                self.state.emit("    movd %eax, %xmm0");
+                for (lane, denom) in args[2..5].iter().enumerate() {
+                    self.operand_to_eax(denom);
+                    self.state
+                        .emit_fmt(format_args!("    pinsrd ${}, %eax, %xmm0", lane + 1));
+                }
+                self.state.dirty_upper_ymm = true;
+                self.state.emit("    vcvtdq2pd %xmm0, %ymm0");
+                let one = self.vec_const_rip_operand(1.0f64.to_bits(), 8);
+                self.state
+                    .emit_fmt(format_args!("    vbroadcastsd {}, %ymm1", one));
+                // AT&T VEX order is src2, src1, dst: ymm0 = ymm1 / ymm0.
+                self.state.emit("    vdivpd %ymm0, %ymm1, %ymm0");
+
+                // Form the contiguous source address before using rax for a
+                // fallback scratch pointer; vec_mem_operand may materialize
+                // non-register base/offset operands through rax/rcx.
+                let source = self.vec_mem_operand(&args[5], &args[6], 0);
+                // Preserve the source expression's multiplication order:
+                // original scalar IR is reciprocal * load, hence src1=ymm0
+                // and src2=the memory operand in this AT&T VEX form.
+                self.state
+                    .emit_fmt(format_args!("    vmulpd {}, %ymm0, %ymm0", source));
+
+                // Fast path: the destination is a normal scalar F64 register
+                // (xmm2..xmm15).  Keep the accumulator there, extract the
+                // upper pair before rewriting the lower pair in ymm0, then
+                // consume lanes in source order.  No vector value can be live
+                // in xmm0/xmm1 across this intrinsic.
+                let direct_dest = dest
+                    .and_then(|d| self.reg_assignments.get(&d.0).copied())
+                    .filter(|&r| is_xmm_reg(r))
+                    .map(phys_reg_name)
+                    .filter(|&name| name != "xmm0" && name != "xmm1");
+                if let Some(name) = direct_dest {
+                    self.state.reg_cache.invalidate_acc();
+                    self.emit_fp_operand_to_xmm(&args[0], IrType::F64, name);
+                    self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
+                    // acc = acc + p0
+                    self.state
+                        .emit_fmt(format_args!("    vaddsd %xmm0, %{}, %{}", name, name));
+                    // ymm0.low becomes {p1, p1}; its upper half is dead after
+                    // the earlier extract, so the VEX.128 upper-zero rule is
+                    // harmless.
+                    self.state.emit("    vunpckhpd %xmm0, %xmm0, %xmm0");
+                    // acc = acc + p1
+                    self.state
+                        .emit_fmt(format_args!("    vaddsd %xmm0, %{}, %{}", name, name));
+                    // xmm1 initially holds {p2,p3}.
+                    self.state
+                        .emit_fmt(format_args!("    vaddsd %xmm1, %{}, %{}", name, name));
+                    self.state.emit("    vunpckhpd %xmm1, %xmm1, %xmm1");
+                    // acc = acc + p3
+                    self.state
+                        .emit_fmt(format_args!("    vaddsd %xmm1, %{}, %{}", name, name));
+                } else {
+                    // Register pressure must not turn into a correctness hole.
+                    // The transform supplies a private aligned alloca so the
+                    // packed product can be spilled once and read lane-by-lane
+                    // without clobbering an allocator-owned XMM register.
+                    self.operand_to_reg(&args[7], "rax");
+                    self.state.emit("    vmovupd %ymm0, (%rax)");
+                    self.state.reg_cache.invalidate_acc();
+                    self.emit_fp_operand_to_xmm(&args[0], IrType::F64, "xmm0");
+                    // Same VEX order as above: accumulator (src1) plus each
+                    // lane memory operand (src2), strictly in lane order.
+                    self.state.emit("    vaddsd (%rax), %xmm0, %xmm0");
+                    self.state.emit("    vaddsd 8(%rax), %xmm0, %xmm0");
+                    self.state.emit("    vaddsd 16(%rax), %xmm0, %xmm0");
+                    self.state.emit("    vaddsd 24(%rax), %xmm0, %xmm0");
+                    if let Some(d) = dest {
+                        self.store_xmm_to(d, "xmm0", IrType::F64);
+                    }
+                }
+            }
             IntrinsicOp::VecHorizontalAddF64x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
@@ -4493,8 +4590,7 @@ impl X86Codegen {
                         name, name, scratch
                     )); // lanes {2,2,2,2}
                     self.state
-                        .emit_fmt(format_args!("    vaddss {}, %{}, %{}", scratch, name, name));
-                // (s0+s1)+(s2+s3)
+                        .emit_fmt(format_args!("    vaddss {}, %{}, %{}", scratch, name, name)); // (s0+s1)+(s2+s3)
                 } else {
                     self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
                     self.state.emit("    vaddps %xmm1, %xmm0, %xmm0"); // [s0 s1 s2 s3]

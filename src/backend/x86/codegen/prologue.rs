@@ -1,10 +1,10 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
 use super::emit::{
-    collect_inline_asm_callee_saved_x86, is_xmm_reg, phys_reg_name, X86Codegen, X86_ARG_REGS,
-    X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED,
+    X86_ARG_REGS, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED, X86Codegen,
+    collect_inline_asm_callee_saved_x86, is_xmm_reg, phys_reg_name,
 };
-use crate::backend::call_abi::{classify_params, ParamClass};
+use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::liveness::{for_each_operand_in_instruction, for_each_operand_in_terminator};
 use crate::backend::regalloc::PhysReg;
@@ -1715,10 +1715,10 @@ impl X86Codegen {
             }
             if self.state.ra_config.debug_load_cast_fold && !lcf.is_empty() {
                 eprintln!(
-                        "[LOAD-CAST-FOLD] fn={} folds={} (candidates; each fires only if its load takes a redirecting path)",
-                        func.name,
-                        lcf.len()
-                    );
+                    "[LOAD-CAST-FOLD] fn={} folds={} (candidates; each fires only if its load takes a redirecting path)",
+                    func.name,
+                    lcf.len()
+                );
             }
             if self.state.ra_config.no_load_cast_fold {
                 lcf.clear();

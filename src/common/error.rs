@@ -828,8 +828,10 @@ impl DiagnosticEngine {
         // Limit to 3 levels to avoid noisy output for deeply nested macros.
         for name in interesting.iter().take(3) {
             if self.use_color {
-                eprintln!("\x1b[1m{}:{}:{}: \x1b[0m\x1b[1;36mnote:\x1b[0m \x1b[1min expansion of macro '{}'\x1b[0m",
-                    loc.file, loc.line, loc.column, name);
+                eprintln!(
+                    "\x1b[1m{}:{}:{}: \x1b[0m\x1b[1;36mnote:\x1b[0m \x1b[1min expansion of macro '{}'\x1b[0m",
+                    loc.file, loc.line, loc.column, name
+                );
             } else {
                 eprintln!(
                     "{}:{}:{}: note: in expansion of macro '{}'",
