@@ -2,7 +2,7 @@
 # Verify Fibonacci performance claim: LCCC should be dramatically faster
 # than GCC on recursive Fibonacci thanks to the rec2iter optimization.
 #
-# Usage: ./tests/bench_fib_verify.sh [path-to-lccc] [reps]
+# Usage: ./tests/verify_fib_perf.sh [path-to-lccc] [reps]
 set -euo pipefail
 
 LCCC="${1:-target/release/lccc}"
@@ -48,26 +48,50 @@ fi
 echo ""
 echo "Benchmarking ($REPS runs each)..."
 
-best_gcc=999
-best_lccc=999
-for i in $(seq 1 "$REPS"); do
-    t=$( { time "$TMPDIR/fib_gcc" > /dev/null; } 2>&1 | grep real | sed 's/real\t//;s/m/*60+/;s/s//' | bc -l )
-    if (( $(echo "$t < $best_gcc" | bc -l) )); then best_gcc=$t; fi
-done
+# Use Python's monotonic clock instead of shell `time` or `bc`.  The old
+# version required `bc`, which is absent from minimal CI images and made a
+# valid compiler result fail before the assertion.  Python is already a
+# repository test prerequisite and gives a locale-independent float.
+best_gcc=$(python3 - "$TMPDIR/fib_gcc" "$REPS" <<'PY'
+import subprocess
+import sys
+import time
 
-for i in $(seq 1 "$REPS"); do
-    t=$( { time "$TMPDIR/fib_lccc" > /dev/null; } 2>&1 | grep real | sed 's/real\t//;s/m/*60+/;s/s//' | bc -l )
-    if (( $(echo "$t < $best_lccc" | bc -l) )); then best_lccc=$t; fi
-done
+binary, repetitions = sys.argv[1], int(sys.argv[2])
+samples = []
+for _ in range(repetitions):
+    start = time.perf_counter()
+    completed = subprocess.run([binary], stdout=subprocess.DEVNULL, check=False)
+    if completed.returncode:
+        raise SystemExit(f"{binary} exited with {completed.returncode}")
+    samples.append(time.perf_counter() - start)
+print(f"{min(samples):.9f}")
+PY
+)
+best_lccc=$(python3 - "$TMPDIR/fib_lccc" "$REPS" <<'PY'
+import subprocess
+import sys
+import time
 
-ratio=$(echo "$best_gcc / $best_lccc" | bc -l)
+binary, repetitions = sys.argv[1], int(sys.argv[2])
+samples = []
+for _ in range(repetitions):
+    start = time.perf_counter()
+    completed = subprocess.run([binary], stdout=subprocess.DEVNULL, check=False)
+    if completed.returncode:
+        raise SystemExit(f"{binary} exited with {completed.returncode}")
+    samples.append(time.perf_counter() - start)
+print(f"{min(samples):.9f}")
+PY
+)
+ratio=$(awk -v gcc="$best_gcc" -v lccc="$best_lccc" 'BEGIN { print gcc / lccc }')
 printf "GCC  best: %.4fs\n" "$best_gcc"
 printf "LCCC best: %.4fs\n" "$best_lccc"
 printf "Speedup:   %.0fx faster\n" "$ratio"
 
 # 5. Assert minimum speedup (conservative: 10x, we typically see 100-400x)
 MIN_SPEEDUP=10
-if (( $(echo "$ratio < $MIN_SPEEDUP" | bc -l) )); then
+if awk -v ratio="$ratio" -v minimum="$MIN_SPEEDUP" 'BEGIN { exit !(ratio < minimum) }'; then
     echo ""
     echo "FAIL: Expected at least ${MIN_SPEEDUP}x speedup, got ${ratio}x"
     echo "The rec2iter optimization may not be working correctly."

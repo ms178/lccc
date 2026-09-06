@@ -60,6 +60,18 @@ Generated-code performance is evaluated using paired, deterministic execution be
 
 All 39 benchmark outputs are verified for **100% byte-for-byte correctness and algorithmic equivalence** against reference compilers.
 
+> **Provenance & interpretation.** The medians below come from a bare-metal
+> run of `tests/benchmark/run_benchmarks.py` (paired rounds, excluded warm-ups,
+> CPU pinning, raw-sample retention) on the project's reference host; the
+> checked-in runner reproduces the protocol anywhere and writes the JSON /
+> Markdown evidence. Read the table as a *screening matrix*: the large
+> `constant_recursion` / `ackermann` / `fib` ratios reflect LCCC's aggressive
+> recursive-specialization (rec2iter) that GCC deliberately does not perform,
+> while codec and parser kernels (`lz4_compress`, `chacha20_block`,
+> `sha256_transform`) are honest losses with root-cause analyses and fix
+> backlogs in
+> [`engineering/FOLLOWUP-2026-09-06-RUST-MODERNIZATION-AND-WORKLOAD-CORPUS.md`](engineering/FOLLOWUP-2026-09-06-RUST-MODERNIZATION-AND-WORKLOAD-CORPUS.md).
+
 ### Benchmark Results (39 Workloads & Kernels)
 
 | Benchmark | Category / Stress Focus | LCCC Median | GCC Median | Clang Median | LCCC / Best Ref | Verdict |
@@ -119,9 +131,11 @@ All 39 benchmark outputs are verified for **100% byte-for-byte correctness and a
 - **C Compiler & Linker:** Clang/GCC + `mold` (optional fast linker).
 
 ### Fast Development Build (`fastbuild`)
-For sub-second incremental development iterations:
+For fast incremental edit-compile-test cycles (Rust `-O1`, LTO off,
+incremental, 256 codegen units; ~2–3 min cold on a 2-core VM, seconds for
+typical incremental rebuilds):
 ```bash
-# Builds target/fastbuild/lccc using -O1, mold linker, and incremental compilation
+# Builds target/fastbuild/lccc (gcc/bfd link unless clang+mold are on PATH)
 ./scripts/build_lccc_fast.sh
 ```
 
@@ -148,13 +162,25 @@ python3 scripts/godbolt.py audit
 
 ## Code Generation Oracle Comparison
 
-LCCC includes an automated Godbolt/Compiler Explorer comparison oracle against GCC 16.2, Clang 23.1, Intel ICC 2021.10, and Intel ICX (latest):
+LCCC includes an automated Godbolt/Compiler Explorer comparison oracle
+(`scripts/codegen_oracle.py`, built on `scripts/godbolt.py`) against GCC 16.2,
+Clang 23.1, Intel ICC 2021.10, and Intel ICX (latest). Instruction counts are
+static size metrics (`-O3 -march=x86-64-v3`), not latency/throughput evidence —
+use `tests/benchmark/run_benchmarks.py` for timing. Verified 2026-09-06:
 
-| Target Kernel | LCCC Instructions | GCC 16.2 Insns | Clang 23.1 Insns | Intel ICC Insns | Intel ICX Insns | LCCC vs Best |
-|---|---:|---:|---:|---:|---:|:---:|
-| `glibc_strstr` (`two_way_short_needle`) | **75** | 150 | 89 | 94 | 155 | **1.00× (World-Class Best)** |
-| `zstd_count` | **67** | 77 | 37 | 69 | 68 | **Beats GCC, ICC & ICX** |
-| `sha256_transform` | **231** | 154 | 126 | 171 | 1069 | **Beats ICX by 4.6×** |
+| Target (unit measured) | LCCC | GCC 16.2 | Clang 23.1 | ICC | ICX | Best | LCCC vs Best |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `glibc_strstr` `two_way_short_needle` (function) | **75** | 144 | *(inlined)* | *(inlined)* | *(inlined)* | **LCCC** | **1.92× smaller than GCC** |
+| `sha256_transform` (whole TU) | 444 | 275 | **267** | 438 | 1145 | Clang | 0.60× (0 vector insns vs Clang's 44) |
+
+The oracle's purpose is to *find and rank codegen gaps*, kernel by kernel, not
+to declare overall victory: every cell above is reproducible via
+`scripts/codegen_oracle.py <source> --function <fn> --local ./target/fastbuild/lccc`
+(clang/icc/icx inline the named statics in some kernels, hence the whole-TU
+row). Flag sensitivity matters: at `-O2` GCC emits 58 instructions for
+`two_way_short_needle` and beats LCCC's 75 — the LCCC win above is an `-O3`
+result. The measured sha256 gap (zero vector instructions, 194 spills vs
+Clang's 35) is the top codegen backlog item in the follow-up document.
 
 ---
 

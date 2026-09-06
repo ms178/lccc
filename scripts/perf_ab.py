@@ -52,6 +52,57 @@ REPO = Path(__file__).resolve().parent.parent
 DEFAULT_LCCC = REPO / "target" / "fastbuild" / "lccc"
 PROGRAMS_DIR = REPO / "tests" / "benchmark" / "programs"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy flag translation (benchmark_*_ab.py wrapper compatibility)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_AB_LEGACY_VALUE_FLAGS = {
+    # legacy spelling -> unified spelling
+    "--repetitions": "--reps",
+    "--pairs": "--reps",
+    "--iterations": "--reps",
+    "--compiler": "--compiler-a",
+    "--output": "--json",
+}
+_AB_LEGACY_IGNORED = {
+    # Historical knobs of the pre-unification standalone A/B testers with no
+    # unified-harness equivalent.  Accepted (documented invocations keep
+    # working) but reported, never silently dropped.
+    "--seed": "A/B pairing is deterministic (alternating AB/BA rounds)",
+    "--bootstrap": "the unified reporter emits min/low3 ratios; bootstrap CIs are run_benchmarks.py's job",
+    "--cpu": "pinning is handled by tests/benchmark/run_benchmarks.py; perf_ab interleaves instead",
+    "--source": "presets pin their benchmark sources; use --only to narrow",
+    "--expected": "output verification is automatic on every run",
+    "--kernel-description": "presets carry their own descriptions",
+    "--baseline-compiler": "use --compiler-a / --compiler-b",
+}
+
+
+def translate_legacy_args(argv: list[str]) -> list[str]:
+    """Translate historical benchmark_*_ab.py flag spellings to perf_ab's."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+
+        def value() -> str:
+            nonlocal i
+            if i + 1 >= len(argv):
+                sys.exit(f"error: {a} requires a value")
+            i += 1
+            return argv[i]
+
+        if a in _AB_LEGACY_VALUE_FLAGS:
+            out.extend([_AB_LEGACY_VALUE_FLAGS[a], value()])
+        elif a in _AB_LEGACY_IGNORED:
+            print(f"note: {a} is accepted for compatibility but ignored: "
+                  f"{_AB_LEGACY_IGNORED[a]}", file=sys.stderr)
+        else:
+            out.append(a)
+        i += 1
+    return out
+
 PRESETS: dict[str, dict[str, Any]] = {
     "fp_memfold": {
         "desc": "Scalar FP memory-source folding",

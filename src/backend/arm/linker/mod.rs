@@ -36,7 +36,5 @@ mod plt_got;
 pub mod reloc;
 pub mod types;
 
-#[cfg(not(feature = "gcc_linker"))]
 pub use link::link_builtin;
-#[cfg(not(feature = "gcc_linker"))]
 pub use link::link_shared;
