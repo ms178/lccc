@@ -106,6 +106,29 @@ pub fn decode_pua_byte(input: &[u8], pos: usize) -> (u8, usize) {
     (input[pos], 1)
 }
 
+/// Decode the lexer's narrow-string raw-byte carrier as UTF-8 text.
+///
+/// `Lexer::lex_string` intentionally represents each narrow-string byte by a
+/// Rust `char` in the U+0000..U+00FF range.  That lets ordinary C string data
+/// preserve `\\xNN` and non-UTF-8 input byte-for-byte through codegen.  Inline
+/// assembly is different: its template is later appended to a UTF-8 assembly
+/// `String`, so a valid UTF-8 byte sequence must be decoded before that append
+/// rather than encoded a second time as Latin-1 characters.
+///
+/// `None` means the carrier contains a non-byte character or is not valid
+/// UTF-8.  Callers that can only transport Rust strings retain the original
+/// carrier in that case rather than silently replacing or dropping bytes.
+pub fn narrow_string_byte_carrier_to_utf8(carrier: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(carrier.chars().count());
+    for ch in carrier.chars() {
+        if (ch as u32) > u8::MAX as u32 {
+            return None;
+        }
+        bytes.push(ch as u8);
+    }
+    String::from_utf8(bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +211,23 @@ mod tests {
             let (decoded, _) = decode_pua_byte(&input, 0);
             assert_eq!(decoded, b, "Byte 0x{:02X} failed round-trip", b);
         }
+    }
+
+    #[test]
+    fn narrow_byte_carrier_decodes_valid_utf8_once() {
+        let text = "# MS09 UTF-8: café € 🦀";
+        let carrier: String = text.bytes().map(char::from).collect();
+        assert_ne!(carrier, text, "the test must exercise the byte carrier");
+        assert_eq!(
+            narrow_string_byte_carrier_to_utf8(&carrier).as_deref(),
+            Some(text)
+        );
+    }
+
+    #[test]
+    fn narrow_byte_carrier_refuses_non_utf8_or_non_byte_text() {
+        let invalid: String = [0xe9u8].into_iter().map(char::from).collect();
+        assert_eq!(narrow_string_byte_carrier_to_utf8(&invalid), None);
+        assert_eq!(narrow_string_byte_carrier_to_utf8("€"), None);
     }
 }

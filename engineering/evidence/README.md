@@ -15,4 +15,6 @@ numbers as screening records, not current claims; the live state is
 | `benchmarks/2026-08-28-1b3994e7/` | canonical 33-kernel screening run (raw JSON + verified merge) behind the root README table |
 | `aarch64/session59..61/` | AArch64 torture + VM screening records (frozen) |
 | `simd-fp-oracle.md` | SIMD/FP oracle audit methodology + 2026-08-18 record |
+| `ms09-peephole-utf8-audit-2026-09-06.md` | bounded historic/publication audit, live UTF-8 repair, and validation record |
+| `godbolt/ms09-inline-asm-utf8.c` | noinline inline-asm companion used for the successful four-oracle MS-09 screen |
 | `pmu/` | (future) hardware PMU snapshots from the 14700KF metal runner (MS-14) |

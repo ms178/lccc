@@ -247,8 +247,7 @@ How to gather data (mandatory):
 | MS-04 | P1 | OnceLock env knobs break parameterized tests | `live_range.rs` | **C** | tests independent | |
 | MS-05 | P2 | Compile-time: pass rescans | use-def FE-13 | **C** | | |
 | MS-06 | P1 | Document PhysReg map once (RA-19) | | **C** | | |
-| MS-08 | P1 | Consolidate 50+ `CCC_` env vars into a `RaConfig` struct | `regalloc.rs` (29), `live_range.rs` (7), `prologue.rs` (16) | **C** mixed polarity | single source of truth | env vars in hot path |
-| MS-09 | P1 | Close the peephole UTF-8 audit: verify no shipped binary carried corrupted asm from the old `bytes[i] as char` | `engineering/evidence/` | **C** old code corrupted UTF-8 | audit report | re-enable `bytes[i] as char` |
+| MS-09 | P1 | **Complete 2026-09-06.** Audit historic peephole UTF-8 corruption and tracked public binary publication; distinguish unprovable private/manual distribution; repair exposed live reconstruction paths | `engineering/evidence/ms09-peephole-utf8-audit-2026-09-06.md`, UTF-8 CI gate | **C** historic semantics reproduced; no tracked public GitHub release/tag/compiler artifact found | audit report + byte-level regression/CI gate | claim no private/manual distribution; re-enable raw `bytes[i] as char` reconstruction |
 | MS-10 | P1 | `CCC_VALIDATE_SSA` in CI for the regression corpus (watermark + duplicate-def post phi-elim) | run_regression.py | **C** validator landed | gate behind env in runner | |
 | MS-11 | P0 | glibc `make check` triage harness (classify {miscompile, unsupported-feature, environment}) — promised in session 56, never built | new harness | **C** | harness + first triage table | ad-hoc triage |
 | MS-12 | P1 | Audit remaining ~40 `phys_reg_name_32`/`typed_phys_reg_name` sites for XMM-homed operands; consider a `debug_assert!` wrapper | grep audit | **C** 8 fixed on evidence | loud unreachable, never silent | silent fallback |
@@ -336,7 +335,9 @@ OP-15, OP-31, OP-34 · OP-05a (stencil + map trees) · UN-01 (general
 complete unrolling) · FE-01, FE-21, FE-22 · AB-09, AB-13, AB-14,
 AB-06/07 (session 90) · PG-03 · MS-01a (gate wired), MS-02, MS-07 ·
 LK-04 (CASP/MOVW/.org/PREL64), LK-17 (pcre2), LK-26 (seg_fs lvalue stores,
-`afa22485`) · loop rotation infrastructure v13–v17 (opt-in) · DSE
+`afa22485`) · MS-08 (invocation-owned `RaConfig`, 73 compatibility inputs;
+see [follow-up](../FOLLOWUP-2026-09-06-ms08-ra-config.md)) · loop rotation
+infrastructure v13–v17 (opt-in) · DSE
 same-block · backedge PRE · GVN disjoint epochs · FpContract tri-state ·
 mcount/`-pg` family · 32 KiB boot gate PASS · i686 natural slots ·
 width-partitioned slots · RISC-V va_arg struct{long double} · ci-codegen

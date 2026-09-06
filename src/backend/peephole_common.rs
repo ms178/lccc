@@ -342,9 +342,13 @@ mod tests {
 
     #[test]
     fn replace_whole_word_preserves_utf8() {
-        let src = "add x1, x2  // café";
+        // Cover 2-, 3-, and 4-byte code points. A `u8 as char` rebuilding
+        // loop turns each of these source bytes into a second UTF-8 sequence.
+        let src = "add x1, x2  // café € 🦀";
+        let expected = "add x9, x2  // café € 🦀";
         let out = replace_whole_word(src, "x1", "x9");
-        assert_eq!(out, "add x9, x2  // café");
+        assert_eq!(out, expected);
+        assert_eq!(out.as_bytes(), expected.as_bytes());
         assert!(out.is_char_boundary(out.len()));
     }
 

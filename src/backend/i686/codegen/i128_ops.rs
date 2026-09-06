@@ -6,7 +6,7 @@
 //! simple_strtoull parser hot shape).
 
 use super::emit::{phys_reg_name, I686Codegen};
-use crate::backend::regalloc::compute_i686_mulacc_chains;
+use crate::backend::regalloc::compute_i686_mulacc_chains_with_config;
 use crate::backend::state::StackSlot;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
@@ -82,10 +82,10 @@ impl I686Codegen {
         self.mulacc_head_of.clear();
         self.mulacc_fused_tails.clear();
         self.mulacc_virtual_casts.clear();
-        if std::env::var_os("CCC_NO_MULACC").is_some() {
+        if self.state.ra_config.no_mulacc {
             return;
         }
-        let table = compute_i686_mulacc_chains(func);
+        let table = compute_i686_mulacc_chains_with_config(func, &self.state.ra_config);
         if table.chains.is_empty() {
             return;
         }

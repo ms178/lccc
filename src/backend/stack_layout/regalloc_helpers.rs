@@ -3,7 +3,8 @@
 //! Shared utilities that eliminate duplicated regalloc setup boilerplate
 //! across all four backends (x86-64, i686, AArch64, RISC-V 64).
 
-use super::super::regalloc::PhysReg;
+use super::super::regalloc::{PhysReg, RaConfig};
+use std::sync::Arc;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrFunction, Value};
@@ -46,6 +47,7 @@ pub fn run_regalloc_and_merge_clobbers(
         Vec::new(),
         Vec::new(),
         crate::common::fx_hash::FxHashMap::default(),
+        &Arc::new(RaConfig::from_process_env()),
     )
 }
 
@@ -57,9 +59,10 @@ fn collect_abi_reg_hints(
     func: &IrFunction,
     available_regs: &[PhysReg],
     caller_saved_regs: &[PhysReg],
+    ra_config: &RaConfig,
 ) -> FxHashMap<u32, PhysReg> {
     let mut hints = FxHashMap::default();
-    if std::env::var_os("CCC_NO_ABI_REG_HINTS").is_some() {
+    if ra_config.no_abi_reg_hints {
         return hints;
     }
     if func.uses_sret
@@ -154,6 +157,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     call_arg_regs: Vec<PhysReg>,
     indirect_target_regs: Vec<PhysReg>,
     folded_index_uses: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
+    ra_config: &Arc<RaConfig>,
 ) -> (
     FxHashMap<u32, PhysReg>,
     Option<super::super::liveness::LivenessResult>,
@@ -253,8 +257,8 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     // CCC_ENABLE_SCALAR_FP_XMM=1 (legacy) also enables XMM.
     let disable_scalar_fp_xmm = has_scalar_fp
         && !has_memcpy_or_vector_intrinsic
-        && std::env::var("CCC_DISABLE_SCALAR_FP_XMM").is_ok()
-        && std::env::var("CCC_ENABLE_SCALAR_FP_XMM").is_err();
+        && ra_config.disable_scalar_fp_xmm
+        && !ra_config.enable_scalar_fp_xmm;
     // x86-64 detection: callee-saved pool contains rbx=PhysReg(1). This MUST
     // exclude 32-bit targets: i686's pool is ebx/esi/edi/ebp = PhysReg(0..3),
     // where PhysReg(1) is %esi -- the old `any(r.0 == 1)` check matched it and
@@ -267,7 +271,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         // x86-64's caller pool marker (%r10=10) before opening XMM homes.
         && caller_saved_regs.iter().any(|r| r.0 == 10)
         && !crate::common::types::target_is_32bit()
-        && std::env::var("CCC_NO_XMM_REGALLOC").is_err()
+        && !ra_config.no_xmm_regalloc
         && !disable_scalar_fp_xmm
     {
         // x86-64: xmm2-xmm7 for F64 values. xmm2 is normally a safe stable
@@ -327,7 +331,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         // so nbody's three velocity accumulators do not idle d27-d31 while
         // d16-d23 overflow (levkropp 9f304050). CCC_NO_PROMOTED_FP_TAIL
         // restores the all-or-nothing reservation for A/B.
-        let mut regs: Vec<PhysReg> = if std::env::var_os("CCC_NO_PROMOTED_FP_TAIL").is_some() {
+        let mut regs: Vec<PhysReg> = if ra_config.no_promoted_fp_tail {
             if func.loop_promoted_f64_values.is_empty() {
                 (40..=55).map(PhysReg).collect()
             } else {
@@ -344,14 +348,14 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         // the prologue saves only the ones actually assigned. d15/v15 stays
         // reserved (scratch in the FMA intrinsic path). CCC_NO_FP_CALLEE_SAVED
         // disables for A/B.
-        if std::env::var("CCC_NO_FP_CALLEE_SAVED").is_err() {
+        if !ra_config.no_fp_callee_saved {
             regs.extend((32..=38).map(PhysReg));
         }
         regs
     } else {
         Vec::new()
     };
-    let reg_hints = collect_abi_reg_hints(func, &available_regs, &caller_saved_regs);
+    let reg_hints = collect_abi_reg_hints(func, &available_regs, &caller_saved_regs, ra_config);
 
     // ── Static-chain register reservation (GNU C nested functions) ───────
     //
@@ -424,22 +428,26 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         never_materialized: never_materialized.unwrap_or_default(),
         folded_index_uses,
         reg_hints,
+        ra_config: Arc::clone(ra_config),
     };
     // Debug: CCC_NO_REGALLOC forces pure slot-based codegen (A/B experiments).
     // CCC_NO_REGALLOC_FUNC=<name,...> does the same for the listed functions
     // only, so a whole-TU miscompile that disappears under CCC_NO_REGALLOC
     // (the preboot ZSTD decoder was one) can be bisected to a single
     // function without touching the source. Names are compared exactly.
-    let no_regalloc = std::env::var("CCC_NO_REGALLOC").is_ok()
-        || std::env::var("CCC_NO_REGALLOC_FUNC")
+    let no_regalloc = ra_config.no_regalloc
+        || ra_config
+            .no_regalloc_func
+            .as_deref()
             .map(|v| v.split(',').any(|n| n.trim() == func.name))
             .unwrap_or(false);
     let alloc_result = if no_regalloc {
         super::super::regalloc::RegAllocResult {
             assignments: Default::default(),
-            accumulator_assignments: super::super::regalloc::analyze_accumulator_assignments(
+            accumulator_assignments: super::super::regalloc::analyze_accumulator_assignments_with_config(
                 func,
                 config.accumulator_policy,
+                ra_config,
             ),
             used_regs: Vec::new(),
             caller_save_spans: Default::default(),

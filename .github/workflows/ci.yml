@@ -43,6 +43,55 @@ jobs:
       - name: Run tests
         run: cargo test --lib
 
+      # This is deliberately a bounded-parallel full corpus rather than a
+      # hand-picked smoke: the SSA validator catches stale value watermarks
+      # and duplicate definitions only after real optimization/codegen paths.
+      # Two workers keep the release compiler and simultaneous linker jobs
+      # within GitHub's standard runner memory envelope.
+      - name: Run regression corpus with SSA validation
+        env:
+          CCC_VALIDATE_SSA: "1"
+        run: |
+          python3 tests/regression/run_regression.py \
+            --lccc target/release/lccc \
+            -j 2 \
+            --json regression-results.json
+
+      # The ordinary C regression proves the inline asm executes.  This
+      # byte-level gate additionally rejects the historical UTF-8-to-Latin-1
+      # recoding in the emitted #APP region, including an adjacent-literal
+      # multibyte sequence split.
+      - name: Verify inline-asm UTF-8 assembly text
+        run: |
+          python3 scripts/check_inline_asm_utf8.py \
+            --lccc target/release/lccc \
+            --expect preserved \
+            --json inline-asm-utf8.json
+
+      - name: Upload regression results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-results
+          path: |
+            regression-results.json
+            inline-asm-utf8.json
+          if-no-files-found: warn
+
+      # Deterministic bounded fuzzing catches parser/linker panics without
+      # making ordinary PRs depend on an unbounded corpus or external fuzzer.
+      - name: Run linker fuzz smoke
+        env:
+          LCCC_LD: ${{ github.workspace }}/target/release/lccc-ld
+          FUZZ_N: "128"
+          FUZZ_SEED: "20260906"
+        run: |
+          python3 tests/linker/fuzz_ld.py
+          python3 tests/linker/fuzz_elf_grammar.py \
+            --lccc "$LCCC_LD" \
+            --iters 64 \
+            --seed "$FUZZ_SEED"
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

@@ -8,7 +8,7 @@ use crate::backend::liveness::{
     for_each_operand_in_instruction, for_each_operand_in_terminator,
     for_each_value_use_in_instruction,
 };
-use crate::backend::regalloc::PhysReg;
+use crate::backend::regalloc::{PhysReg, RaConfig};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{Instruction, IrFunction, Operand};
 
@@ -153,6 +153,7 @@ pub(super) fn find_dead_param_allocas(
     used_values: &FxHashSet<u32>,
     reg_assigned: &FxHashMap<u32, PhysReg>,
     callee_saved_regs: &[PhysReg],
+    ra_config: &RaConfig,
 ) -> FxHashSet<u32> {
     let mut dead = FxHashSet::default();
     if func.param_alloca_values.is_empty() {
@@ -207,7 +208,7 @@ pub(super) fn find_dead_param_allocas(
                     let leaf = !function_makes_calls(func)
                         || (crate::common::types::target_elf_machine()
                             == 62 // EM_X86_64 (elf::constants is private)
-                            && crate::backend::regalloc::x86_param_caller_homes_safe(func));
+                            && crate::backend::regalloc::x86_param_caller_homes_safe_with_config(func, ra_config));
                     let has_stable_home = reg_assigned
                         .get(&dest_id)
                         .map(|phys| {

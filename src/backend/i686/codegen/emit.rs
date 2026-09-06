@@ -11,7 +11,8 @@
 use crate::backend::call_abi;
 use crate::backend::common::PtrDirective;
 use crate::backend::generation::is_i128_type;
-use crate::backend::regalloc::PhysReg;
+use crate::backend::regalloc::{PhysReg, RaConfig};
+use std::sync::Arc;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::fx_hash::FxHashMap;
@@ -299,8 +300,12 @@ impl I686Codegen {
         self.state.reg_cache.invalidate_acc();
     }
     pub fn new() -> Self {
+        Self::new_with_ra_config(Arc::new(RaConfig::from_process_env()))
+    }
+
+    pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
         Self {
-            state: CodegenState::new(),
+            state: CodegenState::new_with_ra_config(ra_config),
             current_return_type: IrType::I32,
             is_variadic: false,
             reg_assignments: FxHashMap::default(),
@@ -2378,7 +2383,7 @@ impl ArchCodegen for I686Codegen {
         // links wired into register allocation (prologue passes
         // collect_gep_fold_base_links).  When that extension is disabled the
         // folds must be refused too — the two are one contract.
-        if std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_some() {
+        if self.state.ra_config.no_folded_index_liveness {
             return false;
         }
         match self.reg_assignments.get(&base.0) {

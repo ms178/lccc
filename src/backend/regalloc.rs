@@ -18,9 +18,293 @@ use crate::common::types::IrType;
 use crate::ir::analysis;
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PhysReg(pub u8);
+
+/// Immutable register-allocation/codegen policy captured once for a compiler
+/// invocation.  `CCC_*` remains the public bisection surface; parsing it here
+/// keeps mixed-polarity switches out of the per-function allocator hot path.
+///
+/// The field comments are the compatibility contract: every environment name,
+/// its polarity, and its default live in this one declaration.  `NO_*` fields
+/// default to `false`; positive diagnostic/experimental fields likewise default
+/// to `false` unless a numeric or text default is stated explicitly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RaConfig {
+    // Core allocation / fusion policy.
+    /// `CCC_NO_LEAF_PARAM_GPR`: disable leaf ABI parameter homes (default: false).
+    pub(crate) no_leaf_param_gpr: bool,
+    /// `CCC_NO_IR_DIVREM`: disable same-block div/rem pairing (default: false).
+    pub(crate) no_ir_divrem: bool,
+    /// `CCC_NO_MULACC`: disable i686 mul-accumulate pairing (default: false).
+    pub(crate) no_mulacc: bool,
+    /// `CCC_NO_INDEX_HOME`: disable folded-index homes (default: false).
+    pub(crate) no_index_home: bool,
+    /// `CCC_NO_FOLDED_INDEX_LIVENESS`: disable folded-index interval extension (default: false).
+    pub(crate) no_folded_index_liveness: bool,
+    /// `CCC_NO_VECREG`: disable vector-register allocation (default: false).
+    pub(crate) no_vecreg: bool,
+    /// `CCC_NO_PHI_COALESCE`: disable phi-copy coalescing (default: false).
+    pub(crate) no_phi_coalesce: bool,
+    /// `CCC_NO_COALESCE`: disable general copy-web coalescing (default: false).
+    pub(crate) no_coalesce: bool,
+    /// `CCC_NO_HOT_LOOP`: disable hot-loop Phase-1 homes (default: false).
+    pub(crate) no_hot_loop: bool,
+    /// `CCC_LEAF_STRICT_CALL_FREE`: require a truly call-free leaf policy (default: false).
+    pub(crate) leaf_strict_call_free: bool,
+    /// `CCC_NO_LEAF_CALLER_HOME`: disable volatile homes for eligible leaves (default: false).
+    pub(crate) no_leaf_caller_home: bool,
+    /// `CCC_NO_LOAD_HAZARD_REFINE`: disable i686 load hazard refinement (default: false).
+    pub(crate) no_load_hazard_refine: bool,
+    /// `CCC_NO_EAX_ALLOC`: disable the i686 eax allocation phase (default: false).
+    pub(crate) no_eax_alloc: bool,
+    /// `CCC_NO_LOOP_PIN`: disable AArch64 loop-pin steals (default: false).
+    pub(crate) no_loop_pin: bool,
+    /// `CCC_LOOP_PIN`: maximum AArch64 loop-pin steals (default: 2).
+    pub(crate) loop_pin: usize,
+    /// `CCC_NO_HOT_WEB_STEAL`: disable i686 hot-web steals (default: false).
+    pub(crate) no_hot_web_steal: bool,
+    /// `CCC_HOT_WEB_STEAL`: maximum i686 hot-web steals (default: 3).
+    pub(crate) hot_web_steal: usize,
+    /// `CCC_NO_ITERATED_HAZARD`: disable i686 iterated hazard refinement (default: false).
+    pub(crate) no_iterated_hazard: bool,
+    /// `CCC_NO_SEGMENT_FILL`: disable segment-fill allocation (default: false).
+    pub(crate) no_segment_fill: bool,
+    /// `CCC_NO_REDUCTION_VECREG`: disable reduction vector homes (default: false).
+    pub(crate) no_reduction_vecreg: bool,
+    /// `CCC_NO_MAP_VECREG`: disable map vector homes (default: false).
+    pub(crate) no_map_vecreg: bool,
+    /// `CCC_NO_FP_COPY_WEB`: disable x86 FP copy-web homes (default: false).
+    pub(crate) no_fp_copy_web: bool,
+    /// `CCC_CALLER_SAVE_SPANNING`: enable caller-save spans (default: false).
+    pub(crate) caller_save_spanning: bool,
+    /// `CCC_NO_SEGMENT_SCAN`: disable hole-aware scanning (default: false).
+    pub(crate) no_segment_scan: bool,
+    /// `CCC_EVICT_MODE`: eviction mode (default: 3; malformed values use 3).
+    pub(crate) evict_mode: i32,
+    /// `CCC_PGO_WEIGHT_MAX`: PGO multiplier cap (default: 1; clamped to 1..=16).
+    pub(crate) pgo_weight_max: u64,
+
+    // Allocation diagnostics and scoped bisection filters.
+    /// `CCC_DEBUG_COALESCE`: emit copy-web diagnostics (default: false).
+    pub(crate) debug_coalesce: bool,
+    /// `CCC_DEBUG_COALESCE_MEMBERS`: emit copy-web member diagnostics (default: false).
+    pub(crate) debug_coalesce_members: bool,
+    /// `CCC_DEBUG_PHI_COALESCE`: emit phi-copy diagnostics (default: false).
+    pub(crate) debug_phi_coalesce: bool,
+    /// `CCC_DEBUG_RA_PHASES`: emit allocator phase diagnostics (default: false).
+    pub(crate) debug_ra_phases: bool,
+    /// `CCC_DEBUG_RA_INTERVALS`: emit allocator interval diagnostics (default: false).
+    pub(crate) debug_ra_intervals: bool,
+    /// `CCC_DEBUG_SEGMENT_FILL`: emit segment-fill diagnostics (default: false).
+    pub(crate) debug_segment_fill: bool,
+    /// `CCC_DEBUG_RA`: emit general allocator diagnostics (default: false).
+    pub(crate) debug_ra: bool,
+    /// `CCC_DEBUG_RA_REPAIR`: emit allocator repair diagnostics (default: false).
+    pub(crate) debug_ra_repair: bool,
+    /// `CCC_DEBUG_HAZARDS`: emit i686 hazard diagnostics (default: false).
+    pub(crate) debug_hazards: bool,
+    /// `CCC_TRACE_ALLOC`: emit linear-scan assignment tracing (default: false).
+    pub(crate) trace_alloc: bool,
+    /// `CCC_TRACE_ALLOCSTATS`: enable allocation statistics (default: false).
+    pub(crate) trace_allocstats: bool,
+    /// Text value of `CCC_TRACE_ALLOCSTATS` (default: absent).
+    pub(crate) trace_allocstats_filter: Option<String>,
+    /// `CCC_VERIFY_REGALLOC`: verify full allocation history (default: false).
+    pub(crate) verify_regalloc: bool,
+    /// `LCCC_DBG_RA`: enable legacy allocator diagnostics (default: false).
+    pub(crate) legacy_debug_ra: bool,
+    /// `LCCC_DBG_RA_FUNC`: legacy exact function filter (default: empty).
+    pub(crate) legacy_debug_ra_func: String,
+    /// `CCC_RA_EXPLAIN`: allocation-explanation function filter (default: absent).
+    pub(crate) ra_explain: Option<String>,
+    /// `CCC_RA_EXPLAIN_HOMES`: include homes in allocation explanations (default: false).
+    pub(crate) ra_explain_homes: bool,
+    /// `CCC_RA_DROP`: comma-separated values forced out of allocation (default: absent).
+    pub(crate) ra_drop: Option<String>,
+    /// `CCC_RA_DROP_FUNC`: scope `CCC_RA_DROP` to a function (default: absent).
+    pub(crate) ra_drop_func: Option<String>,
+    /// `CCC_PHI_COALESCE_SKIP`: comma-separated phi sources to preserve (default: absent).
+    pub(crate) phi_coalesce_skip: Option<String>,
+    /// `CCC_PHI_COALESCE_FUNC`: function scope for phi skip list (default: absent).
+    pub(crate) phi_coalesce_func: Option<String>,
+
+    // Shared helper policy.
+    /// `CCC_NO_ABI_REG_HINTS`: disable ABI register hints (default: false).
+    pub(crate) no_abi_reg_hints: bool,
+    /// `CCC_DISABLE_SCALAR_FP_XMM`: request scalar-FP XMM home disable (default: false).
+    pub(crate) disable_scalar_fp_xmm: bool,
+    /// `CCC_ENABLE_SCALAR_FP_XMM`: override `CCC_DISABLE_SCALAR_FP_XMM` (default: false).
+    pub(crate) enable_scalar_fp_xmm: bool,
+    /// `CCC_NO_XMM_REGALLOC`: disable scalar-FP XMM allocation (default: false).
+    pub(crate) no_xmm_regalloc: bool,
+    /// `CCC_NO_PROMOTED_FP_TAIL`: reserve the promoted FP tail (default: false).
+    pub(crate) no_promoted_fp_tail: bool,
+    /// `CCC_NO_FP_CALLEE_SAVED`: exclude AArch64 callee-saved FP homes (default: false).
+    pub(crate) no_fp_callee_saved: bool,
+    /// `CCC_NO_REGALLOC`: force slot-only allocation (default: false).
+    pub(crate) no_regalloc: bool,
+    /// `CCC_NO_REGALLOC_FUNC`: comma-separated function names forced slot-only (default: absent).
+    pub(crate) no_regalloc_func: Option<String>,
+
+    // x86 prologue / MachInst policy.
+    /// `CCC_DUMP_IR`: dump IR in the pass and codegen diagnostics (default: false).
+    pub(crate) dump_ir: bool,
+    /// `CCC_DUMP_IR_FUNC`: substring filter for codegen IR dumps (default: absent).
+    pub(crate) dump_ir_func: Option<String>,
+    /// `CCC_NO_VA_ROOT_GUARD`: disable conservative va_list root guarding (default: false).
+    pub(crate) no_va_root_guard: bool,
+    /// `CCC_DEBUG_VARARG`: emit vararg classification diagnostics (default: false).
+    pub(crate) debug_vararg: bool,
+    /// `CCC_NO_X64_IMMED_NOHOME`: disable x86 immediate-consumer no-home policy (default: false).
+    pub(crate) no_x64_immed_nohome: bool,
+    /// `CCC_X64_NOHOME_CLASSES`: selected no-home consumer classes (default: `ret,store,copy,cast,unary,binop`).
+    pub(crate) x64_nohome_classes: String,
+    /// `CCC_MI_MAX_LOOP_INSTS`: MachInst loop-size threshold (default: 32).
+    pub(crate) mi_max_loop_insts: usize,
+    /// `CCC_MI_FN_DISABLE`: comma-separated MachInst-disabled name substrings (default: empty).
+    pub(crate) mi_fn_disable: String,
+    /// `CCC_MI_ALL_CLASSIC`: suppress normal MachInst per-function use (default: false).
+    pub(crate) mi_all_classic: bool,
+    /// `CCC_MI_FN_FORCE`: comma-separated MachInst-forced name substrings (default: empty).
+    pub(crate) mi_fn_force: String,
+    /// `CCC_MI_FORCE_LOOPS`: bypass the MachInst loop-size threshold (default: false).
+    pub(crate) mi_force_loops: bool,
+    /// `CCC_MI_DEBUG`: emit MachInst profitability diagnostics (default: false).
+    pub(crate) mi_debug: bool,
+    /// `CCC_NO_LOAD_CAST_FOLD`: disable x86 load-cast folding (default: false).
+    pub(crate) no_load_cast_fold: bool,
+    /// `CCC_DEBUG_LOAD_CAST_FOLD`: emit x86 load-cast diagnostics (default: false).
+    pub(crate) debug_load_cast_fold: bool,
+    /// `CCC_NO_EMPTY_LOCAL_FRAME_ELISION`: retain empty x86 local frames (default: false).
+    pub(crate) no_empty_local_frame_elision: bool,
+    /// `CCC_DEBUG_PARAM_STORE`: emit parameter-store diagnostics (default: false).
+    pub(crate) debug_param_store: bool,
+    /// `CCC_DEBUG_PARAMREF`: emit parameter-reference diagnostics (default: false).
+    pub(crate) debug_paramref: bool,
+    /// `CCC_NO_MACHINST`: disable MachInst globally (default: false).
+    pub(crate) no_machinst: bool,
+    /// `CCC_MI_DISABLE_KINDS`: comma-separated MachInst kind mask (default: empty).
+    pub(crate) mi_disable_kinds: String,
+}
+
+impl Default for RaConfig {
+    fn default() -> Self {
+        Self::from_sources(|_| false, |_| None)
+    }
+}
+
+impl RaConfig {
+    /// Capture all compatibility knobs once, at compiler-invocation setup.
+    pub(crate) fn from_process_env() -> Self {
+        Self::from_sources(
+            |name| std::env::var_os(name).is_some(),
+            |name| std::env::var(name).ok(),
+        )
+    }
+
+    /// Factored solely for table-driven parser tests. `present` mirrors
+    /// `var_os(...).is_some()` for boolean switches, while `text` mirrors
+    /// `var(...).ok()` for values and keeps their historical UTF-8 behavior.
+    fn from_sources<P, T>(present: P, text: T) -> Self
+    where
+        P: Fn(&str) -> bool,
+        T: Fn(&str) -> Option<String>,
+    {
+        let number = |name: &str, default: usize| {
+            text(name)
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(default)
+        };
+        Self {
+            no_leaf_param_gpr: present("CCC_NO_LEAF_PARAM_GPR"),
+            no_ir_divrem: present("CCC_NO_IR_DIVREM"),
+            no_mulacc: present("CCC_NO_MULACC"),
+            no_index_home: present("CCC_NO_INDEX_HOME"),
+            no_folded_index_liveness: present("CCC_NO_FOLDED_INDEX_LIVENESS"),
+            no_vecreg: present("CCC_NO_VECREG"),
+            no_phi_coalesce: present("CCC_NO_PHI_COALESCE"),
+            no_coalesce: present("CCC_NO_COALESCE"),
+            no_hot_loop: present("CCC_NO_HOT_LOOP"),
+            leaf_strict_call_free: present("CCC_LEAF_STRICT_CALL_FREE"),
+            no_leaf_caller_home: present("CCC_NO_LEAF_CALLER_HOME"),
+            no_load_hazard_refine: present("CCC_NO_LOAD_HAZARD_REFINE"),
+            no_eax_alloc: present("CCC_NO_EAX_ALLOC"),
+            no_loop_pin: present("CCC_NO_LOOP_PIN"),
+            loop_pin: number("CCC_LOOP_PIN", 2),
+            no_hot_web_steal: present("CCC_NO_HOT_WEB_STEAL"),
+            hot_web_steal: number("CCC_HOT_WEB_STEAL", 3),
+            no_iterated_hazard: present("CCC_NO_ITERATED_HAZARD"),
+            no_segment_fill: present("CCC_NO_SEGMENT_FILL"),
+            no_reduction_vecreg: present("CCC_NO_REDUCTION_VECREG"),
+            no_map_vecreg: present("CCC_NO_MAP_VECREG"),
+            no_fp_copy_web: present("CCC_NO_FP_COPY_WEB"),
+            caller_save_spanning: present("CCC_CALLER_SAVE_SPANNING"),
+            no_segment_scan: present("CCC_NO_SEGMENT_SCAN"),
+            evict_mode: text("CCC_EVICT_MODE")
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(3),
+            pgo_weight_max: text("CCC_PGO_WEIGHT_MAX")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1)
+                .clamp(1, 16),
+
+            debug_coalesce: present("CCC_DEBUG_COALESCE"),
+            debug_coalesce_members: present("CCC_DEBUG_COALESCE_MEMBERS"),
+            debug_phi_coalesce: present("CCC_DEBUG_PHI_COALESCE"),
+            debug_ra_phases: present("CCC_DEBUG_RA_PHASES"),
+            debug_ra_intervals: present("CCC_DEBUG_RA_INTERVALS"),
+            debug_segment_fill: present("CCC_DEBUG_SEGMENT_FILL"),
+            debug_ra: present("CCC_DEBUG_RA"),
+            debug_ra_repair: present("CCC_DEBUG_RA_REPAIR"),
+            debug_hazards: present("CCC_DEBUG_HAZARDS"),
+            trace_alloc: present("CCC_TRACE_ALLOC"),
+            trace_allocstats: present("CCC_TRACE_ALLOCSTATS"),
+            trace_allocstats_filter: text("CCC_TRACE_ALLOCSTATS"),
+            verify_regalloc: present("CCC_VERIFY_REGALLOC"),
+            legacy_debug_ra: present("LCCC_DBG_RA"),
+            legacy_debug_ra_func: text("LCCC_DBG_RA_FUNC").unwrap_or_default(),
+            ra_explain: text("CCC_RA_EXPLAIN"),
+            ra_explain_homes: present("CCC_RA_EXPLAIN_HOMES"),
+            ra_drop: text("CCC_RA_DROP"),
+            ra_drop_func: text("CCC_RA_DROP_FUNC"),
+            phi_coalesce_skip: text("CCC_PHI_COALESCE_SKIP"),
+            phi_coalesce_func: text("CCC_PHI_COALESCE_FUNC"),
+
+            no_abi_reg_hints: present("CCC_NO_ABI_REG_HINTS"),
+            disable_scalar_fp_xmm: present("CCC_DISABLE_SCALAR_FP_XMM"),
+            enable_scalar_fp_xmm: present("CCC_ENABLE_SCALAR_FP_XMM"),
+            no_xmm_regalloc: present("CCC_NO_XMM_REGALLOC"),
+            no_promoted_fp_tail: present("CCC_NO_PROMOTED_FP_TAIL"),
+            no_fp_callee_saved: present("CCC_NO_FP_CALLEE_SAVED"),
+            no_regalloc: present("CCC_NO_REGALLOC"),
+            no_regalloc_func: text("CCC_NO_REGALLOC_FUNC"),
+
+            dump_ir: present("CCC_DUMP_IR"),
+            dump_ir_func: text("CCC_DUMP_IR_FUNC"),
+            no_va_root_guard: present("CCC_NO_VA_ROOT_GUARD"),
+            debug_vararg: present("CCC_DEBUG_VARARG"),
+            no_x64_immed_nohome: present("CCC_NO_X64_IMMED_NOHOME"),
+            x64_nohome_classes: text("CCC_X64_NOHOME_CLASSES")
+                .unwrap_or_else(|| "ret,store,copy,cast,unary,binop".into()),
+            mi_max_loop_insts: number("CCC_MI_MAX_LOOP_INSTS", 32),
+            mi_fn_disable: text("CCC_MI_FN_DISABLE").unwrap_or_default(),
+            mi_all_classic: present("CCC_MI_ALL_CLASSIC"),
+            mi_fn_force: text("CCC_MI_FN_FORCE").unwrap_or_default(),
+            mi_force_loops: present("CCC_MI_FORCE_LOOPS"),
+            mi_debug: present("CCC_MI_DEBUG"),
+            no_load_cast_fold: present("CCC_NO_LOAD_CAST_FOLD"),
+            debug_load_cast_fold: present("CCC_DEBUG_LOAD_CAST_FOLD"),
+            no_empty_local_frame_elision: present("CCC_NO_EMPTY_LOCAL_FRAME_ELISION"),
+            debug_param_store: present("CCC_DEBUG_PARAM_STORE"),
+            debug_paramref: present("CCC_DEBUG_PARAMREF"),
+            no_machinst: present("CCC_NO_MACHINST"),
+            mi_disable_kinds: text("CCC_MI_DISABLE_KINDS").unwrap_or_default(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccumulatorOperandOrder {
@@ -45,9 +329,20 @@ pub struct AccumulatorAssignment {
 /// contract. Stack layout no longer owns this decision; it consumes the
 /// allocator result. Program points use the same instruction+terminator order
 /// as liveness.
+/// Compatibility helper for isolated unit tests. Production code must pass
+/// the invocation-owned [`RaConfig`] through
+/// [`analyze_accumulator_assignments_with_config`].
 pub fn analyze_accumulator_assignments(
     func: &IrFunction,
     policy: AccumulatorPolicy,
+) -> Vec<AccumulatorAssignment> {
+    analyze_accumulator_assignments_with_config(func, policy, &RaConfig::default())
+}
+
+pub(crate) fn analyze_accumulator_assignments_with_config(
+    func: &IrFunction,
+    policy: AccumulatorPolicy,
+    config: &RaConfig,
 ) -> Vec<AccumulatorAssignment> {
     let lhs_first = matches!(policy.operand_order, AccumulatorOperandOrder::LhsFirst);
     let candidates = crate::backend::stack_layout::copy_coalescing::compute_immediately_consumed(
@@ -62,7 +357,7 @@ pub fn analyze_accumulator_assignments(
     // accumulator chain starting from a tail dest would let the consumer
     // read a stale %eax.
     let divrem = match divrem_target_for_current_arch() {
-        Some(t) => compute_i686_divrem_pairs(func, t),
+        Some(t) => compute_i686_divrem_pairs_with_config(func, t, config),
         None => return Vec::new(),
     };
     if !divrem.tail_dests.is_empty() {
@@ -197,8 +492,17 @@ pub struct RegAllocResult {
 /// entry prefix (before any generated instruction can clobber a0–a7) can
 /// keep its scalar parameters directly in their incoming registers — the
 /// ParamRef emits nothing at all when the home matches the incoming reg.
+/// Compatibility query for isolated callers. Production code must use the
+/// explicit invocation policy variant below.
 pub fn riscv_param_caller_homes_safe(func: &IrFunction) -> bool {
-    if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
+    riscv_param_caller_homes_safe_with_config(func, &RaConfig::default())
+}
+
+pub(crate) fn riscv_param_caller_homes_safe_with_config(
+    func: &IrFunction,
+    ra_config: &RaConfig,
+) -> bool {
+    if func.blocks.is_empty() || ra_config.no_leaf_param_gpr {
         return false;
     }
     if func.blocks.len() > 1 && func.params.len() > 8 {
@@ -367,8 +671,17 @@ fn x86_params_dead_after_inline_libc_calls(
     true
 }
 
+/// Compatibility query for isolated callers. Production code must use the
+/// explicit invocation policy variant below.
 pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
-    if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
+    x86_param_caller_homes_safe_with_config(func, &RaConfig::default())
+}
+
+pub(crate) fn x86_param_caller_homes_safe_with_config(
+    func: &IrFunction,
+    ra_config: &RaConfig,
+) -> bool {
+    if func.blocks.is_empty() || ra_config.no_leaf_param_gpr {
         return false;
     }
     // Multi-block expansion is limited to the six SysV register arguments.
@@ -487,6 +800,8 @@ pub struct RegAllocConfig {
     /// Hints never override `follow_value` and are honored only when the
     /// physical register belongs to the current allocation wave.
     pub reg_hints: FxHashMap<u32, PhysReg>,
+    /// Invocation-scoped policy captured by the driver before code generation.
+    pub ra_config: Arc<RaConfig>,
     /// Leaf-function home policy (x86-64 only today).
     ///
     /// Session 28's "hot loop-carried values join Phase 1" rule hands every
@@ -505,10 +820,6 @@ pub struct RegAllocConfig {
     /// i.e. the prologue saves exactly the registers the loop actually
     /// needs. Kill switch: `CCC_NO_LEAF_CALLER_HOME`.
     pub leaf_caller_saved_homes: bool,
-}
-
-fn env_on(name: &'static str) -> bool {
-    std::env::var_os(name).is_some()
 }
 
 fn interval_map(liveness: &LivenessResult) -> FxHashMap<u32, (u32, u32)> {
@@ -726,9 +1037,19 @@ pub(crate) struct I686DivRemPairs {
     pub head_point_of_tail: FxHashMap<u32, u32>,
 }
 
+/// Compatibility helper for unit tests; production code uses the explicit
+/// config-taking variant below.
 pub(crate) fn compute_i686_divrem_pairs(
     func: &IrFunction,
     target: DivRemTarget,
+) -> I686DivRemPairs {
+    compute_i686_divrem_pairs_with_config(func, target, &RaConfig::default())
+}
+
+pub(crate) fn compute_i686_divrem_pairs_with_config(
+    func: &IrFunction,
+    target: DivRemTarget,
+    config: &RaConfig,
 ) -> I686DivRemPairs {
     let mut pairs = I686DivRemPairs {
         tail_dests: FxHashSet::default(),
@@ -736,7 +1057,7 @@ pub(crate) fn compute_i686_divrem_pairs(
         tail_points: FxHashSet::default(),
         head_point_of_tail: FxHashMap::default(),
     };
-    if std::env::var_os("CCC_NO_IR_DIVREM").is_some() {
+    if config.no_ir_divrem {
         return pairs;
     }
 
@@ -873,11 +1194,15 @@ pub(crate) fn compute_i686_divrem_pairs(
 /// handed to another value in the head..tail window and silently clobbered.
 /// This patches both the fat intervals and the hole-aware segments, then
 /// restores the segments' `(start, value_id)` sort order.
-fn patch_divrem_tail_intervals(func: &IrFunction, liveness: &mut LivenessResult) {
+fn patch_divrem_tail_intervals(
+    func: &IrFunction,
+    liveness: &mut LivenessResult,
+    ra_config: &RaConfig,
+) {
     let Some(target) = divrem_target_for_current_arch() else {
         return;
     };
-    let pairs = compute_i686_divrem_pairs(func, target);
+    let pairs = compute_i686_divrem_pairs_with_config(func, target, ra_config);
     if pairs.head_point_of_tail.is_empty() {
         return;
     }
@@ -979,13 +1304,22 @@ pub(crate) struct I686MulAccChains {
 ///   between head and tail, so the source's def point is checked).
 ///
 /// Kill switch: `CCC_NO_MULACC` (both the RA patch and the emitter respect it).
+/// Compatibility helper for unit tests; production code uses the explicit
+/// config-taking variant below.
 pub(crate) fn compute_i686_mulacc_chains(func: &IrFunction) -> I686MulAccChains {
+    compute_i686_mulacc_chains_with_config(func, &RaConfig::default())
+}
+
+pub(crate) fn compute_i686_mulacc_chains_with_config(
+    func: &IrFunction,
+    config: &RaConfig,
+) -> I686MulAccChains {
     let mut out = I686MulAccChains {
         chains: Vec::new(),
         head_of: FxHashMap::default(),
         tail_of: FxHashMap::default(),
     };
-    if std::env::var_os("CCC_NO_MULACC").is_some() {
+    if config.no_mulacc {
         return out;
     }
 
@@ -1307,8 +1641,12 @@ pub(crate) fn compute_i686_mulacc_chains(func: &IrFunction) -> I686MulAccChains 
 /// fused head also reads the feeder SOURCES (whose natural death is their
 //  zext cast, potentially before the head). Patch both interval families
 /// before any interval map is derived — the divrem-tail contract.
-fn patch_mulacc_intervals(func: &IrFunction, liveness: &mut LivenessResult) {
-    let chains = compute_i686_mulacc_chains(func);
+fn patch_mulacc_intervals(
+    func: &IrFunction,
+    liveness: &mut LivenessResult,
+    ra_config: &RaConfig,
+) {
+    let chains = compute_i686_mulacc_chains_with_config(func, ra_config);
     if chains.chains.is_empty() {
         return;
     }
@@ -1575,8 +1913,9 @@ fn bump_folded_index_priority(
     ranges: &mut [crate::backend::live_range::LiveRange],
     folded_index_uses: &FxHashMap<u32, Vec<u32>>,
     safe_homes: &FxHashSet<u32>,
+    ra_config: &RaConfig,
 ) {
-    if env_on("CCC_NO_INDEX_HOME") {
+    if ra_config.no_index_home {
         return;
     }
     for range in ranges {
@@ -1676,6 +2015,7 @@ fn build_coalesce_groups(
     iv_map: &FxHashMap<u32, (u32, u32)>,
     eligible: &FxHashSet<u32>,
     param_ref_values: &FxHashSet<u32>,
+    ra_config: &RaConfig,
 ) -> FxHashMap<u32, Vec<u32>> {
     let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
     let load_def_types = unique_load_def_types(func);
@@ -2000,14 +2340,14 @@ fn build_coalesce_groups(
         }
     }
 
-    if env_on("CCC_DEBUG_COALESCE") {
+    if ra_config.debug_coalesce {
         eprintln!(
             "[COALESCE] fn={} groups={} members={}",
             func.name,
             result.len(),
             result.values().map(|m| m.len()).sum::<usize>()
         );
-        if std::env::var_os("CCC_DEBUG_COALESCE_MEMBERS").is_some() {
+        if ra_config.debug_coalesce_members {
             let mut rows: Vec<(&u32, &Vec<u32>)> = result.iter().collect();
             rows.sort_unstable();
             for (leader, members) in rows {
@@ -2182,7 +2522,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             accumulator_assignments: if has_builtin_setjmp {
                 Vec::new()
             } else {
-                analyze_accumulator_assignments(func, config.accumulator_policy)
+                analyze_accumulator_assignments_with_config(func, config.accumulator_policy, &config.ra_config)
             },
             used_regs: Vec::new(),
             caller_save_spans: FxHashMap::default(),
@@ -2195,13 +2535,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // DivRem pair tails are physically born at their head's dual-store;
     // extend their intervals before ANY interval map is derived. Without
     // this, homes/slots in the head..tail window get double-assigned.
-    patch_divrem_tail_intervals(func, &mut liveness);
+    patch_divrem_tail_intervals(func, &mut liveness, &config.ra_config);
     // Mul-acc chain tails are born at their head's fused store, and the
     // virtual feeder sources live until the head reads them — same contract.
-    patch_mulacc_intervals(func, &mut liveness);
+    patch_mulacc_intervals(func, &mut liveness, &config.ra_config);
     // Extend live intervals for backend-folded index consumers BEFORE any
     // interval map is derived (see RegAllocConfig::folded_index_uses).
-    if !config.folded_index_uses.is_empty() && !env_on("CCC_NO_FOLDED_INDEX_LIVENESS") {
+    if !config.folded_index_uses.is_empty() && !config.ra_config.no_folded_index_liveness {
         // value_id -> (start, end) from the consumer GEP-dest intervals. The
         // dest's END is the access that re-reads the operand RA-invisibly
         // (SIB load/store, replayed cmp). dest.start is the GEP / Cmp itself
@@ -2354,7 +2694,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let call_points = &liveness.call_points;
 
     let arm_fp_pool =
-        config.xmm_regs.first().is_some_and(|r| r.0 == 40) && !env_on("CCC_NO_VECREG");
+        config.xmm_regs.first().is_some_and(|r| r.0 == 40) && !config.ra_config.no_vecreg;
     // XMM2 is deliberately removed when an intrinsic uses it as implicit
     // scratch, so the safe x86 pool may start at PhysReg(21) (XMM3). Do not
     // mistake that quarantine for a non-x86 pool and disable SIMD allocation.
@@ -2498,7 +2838,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         // indexed addressing. Keep it eligible; folded-index liveness extends
         // the value to the actual access and the emitter folds only when a
         // physical home was assigned.
-        if env_on("CCC_NO_INDEX_HOME") || !safe_folded_index_homes.contains(v) {
+        if config.ra_config.no_index_home || !safe_folded_index_homes.contains(v) {
             eligible.remove(v);
         }
     }
@@ -2506,13 +2846,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let x86_ordered_param_copies = !is_32bit
         && config.available_regs.iter().any(|r| r.0 == 1)
         && config.caller_saved_regs.iter().any(|r| r.0 == 10)
-        && x86_param_caller_homes_safe(func);
+        && x86_param_caller_homes_safe_with_config(func, &config.ra_config);
     // riscv64: same lever for the a0–a7 pool.  Param homes are pinned to
     // their incoming registers by the ABI hints, so the "ordered copies"
     // degenerate to zero instructions per ParamRef.
     let riscv_ordered_param_copies = config.available_regs.iter().any(|r| r.0 == 11)
         && config.caller_saved_regs.iter().any(|r| r.0 == 12)
-        && riscv_param_caller_homes_safe(func);
+        && riscv_param_caller_homes_safe_with_config(func, &config.ra_config);
     let ordered_param_homes = x86_ordered_param_copies || riscv_ordered_param_copies;
     let mut param_ref_values: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
@@ -2527,9 +2867,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         exclude_every_third_mul_temp(func, &mut eligible);
     }
 
-    let all_phi_pairs = detect_phi_coalesce_groups(func, &liveness);
+    let all_phi_pairs = detect_phi_coalesce_groups_with_config(func, &liveness, &config.ra_config);
     let mut phi_coalesce: Vec<PhiCoalesceCandidate> = Vec::new();
-    if !env_on("CCC_NO_PHI_COALESCE") {
+    if !config.ra_config.no_phi_coalesce {
         let mut seen_dest: FxHashSet<u32> = FxHashSet::default();
         for cand in &all_phi_pairs {
             if seen_dest.insert(cand.phi_dest) {
@@ -2564,7 +2904,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             candidate.copy_idx,
         ) > 0;
         if !phi_window_clobbers_caller_saved(func, candidate) && !src_has_other_consumers {
-            if env_on("CCC_DEBUG_PHI_COALESCE") {
+            if config.ra_config.debug_phi_coalesce {
                 eprintln!(
                     "[PHI_COALESCE] fn={} HOMELESS src=v{} (dest=v{} block={} copy_idx={})",
                     func.name,
@@ -2578,8 +2918,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    let coalesce_groups: FxHashMap<u32, Vec<u32>> = if !env_on("CCC_NO_COALESCE") {
-        build_coalesce_groups(func, &iv_map, &eligible, &param_ref_values)
+    let coalesce_groups: FxHashMap<u32, Vec<u32>> = if !config.ra_config.no_coalesce {
+        build_coalesce_groups(
+            func,
+            &iv_map,
+            &eligible,
+            &param_ref_values,
+            &config.ra_config,
+        )
     } else {
         FxHashMap::default()
     };
@@ -2723,12 +3069,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let scan_ivs =
         collect_gpr_scan_intervals(&liveness, &eligible, &merged_of, &coalesce_member_of);
     let build_gpr_ranges = |intervals: &[LiveInterval]| {
-        let mut ranges = live_range::build_live_ranges(intervals, &liveness.block_loop_depth, func);
+        let mut ranges = live_range::build_live_ranges_with_config(intervals, &liveness.block_loop_depth, func, &config.ra_config);
         apply_physical_reg_hints(&mut ranges, &config.reg_hints);
         bump_folded_index_priority(
             &mut ranges,
             &config.folded_index_uses,
             &safe_folded_index_homes,
+            &config.ra_config,
         );
         // RA-05: hole-aware coverage for the scan's interference tests.
         // Values without segment data keep their fat semantics.
@@ -2776,7 +3123,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // dedicated home because the in-loop call fragments the volatile pool).
     // A/B: `CCC_LEAF_STRICT_CALL_FREE=1` restores the call-free-only rule.
     let calls_only_outside_loops = !call_points.is_empty()
-        && !env_on("CCC_LEAF_STRICT_CALL_FREE")
+        && !config.ra_config.leaf_strict_call_free
         && call_points.iter().all(|&p| {
             liveness
                 .block_starts
@@ -2787,9 +3134,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         });
     let leaf_prefers_caller_saved = config.leaf_caller_saved_homes
         && (call_points.is_empty() || calls_only_outside_loops)
-        && !env_on("CCC_NO_LEAF_CALLER_HOME");
+        && !config.ra_config.no_leaf_caller_home;
     let hot_loop_home = |iv: &LiveInterval| -> bool {
-        if env_on("CCC_NO_HOT_LOOP") || leaf_prefers_caller_saved {
+        if config.ra_config.no_hot_loop || leaf_prefers_caller_saved {
             return false;
         }
         if call_spanning.contains(&iv.value_id) {
@@ -2824,10 +3171,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let mut phase1_ranges = build_gpr_ranges(&phase1_intervals);
     bump_coalesce_group_priority(&mut phase1_ranges, &coalesce_groups, &use_count);
     bump_gep_base_priority(&mut phase1_ranges, &liveness);
-    let mut allocator = LinearScanAllocator::new(phase1_ranges, config.available_regs.clone());
+    let mut allocator = LinearScanAllocator::new_with_config(phase1_ranges, config.available_regs.clone(), &config.ra_config);
     allocator.run();
     let mut assignments = allocator.assignments;
-    if env_on("CCC_DEBUG_RA_PHASES") {
+    if config.ra_config.debug_ra_phases {
         let mut ids: Vec<u32> = assignments.keys().copied().collect();
         ids.sort_unstable();
         eprintln!(
@@ -2856,6 +3203,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 func,
                 &non_gpr_values,
                 &FxHashSet::default(),
+                &config.ra_config,
             ))
         } else {
             None
@@ -2869,7 +3217,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         };
 
         if let Some((ecx_hazards, edx_hazards)) = hazards {
-            if env_on("CCC_DEBUG_RA_INTERVALS") {
+            if config.ra_config.debug_ra_intervals {
                 eprintln!(
                     "[RA-P2] fn={} ecx_hazards={:?} edx_hazards={:?}",
                     func.name, ecx_hazards, edx_hazards
@@ -2886,7 +3234,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .filter(|iv| !scratch_denied.contains(&iv.value_id))
                     .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
                     .collect();
-                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                if config.ra_config.debug_ra_intervals {
                     let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
                     eprintln!(
                         "[RA-P2] fn={} reg={:?} candidates={:?}",
@@ -2897,7 +3245,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     continue;
                 }
                 let ranges = build_gpr_ranges(&intervals);
-                let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
+                let mut alloc = LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
                 alloc.run();
                 for (vid, r) in alloc.assignments {
                     assignments.insert(vid, r);
@@ -2918,7 +3266,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 if !phase2_intervals.is_empty() {
                     let phase2_ranges = build_gpr_ranges(&phase2_intervals);
                     let mut caller_allocator =
-                        LinearScanAllocator::new(phase2_ranges, config.caller_saved_regs.clone());
+                        LinearScanAllocator::new_with_config(phase2_ranges, config.caller_saved_regs.clone(), &config.ra_config);
                     caller_allocator.run();
                     for (vid, reg) in caller_allocator.assignments {
                         assignments.insert(vid, reg);
@@ -2965,7 +3313,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if !w1.is_empty() && !no_arg_no_indirect_pool.is_empty() {
                     let ranges = build_gpr_ranges(&w1);
-                    let mut alloc = LinearScanAllocator::new(ranges, no_arg_no_indirect_pool);
+                    let mut alloc = LinearScanAllocator::new_with_config(ranges, no_arg_no_indirect_pool, &config.ra_config);
                     alloc.run();
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
@@ -2989,7 +3337,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     }
                 }
 
-                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                if config.ra_config.debug_ra_intervals {
                     let ids: Vec<(u32, u8)> = w1
                         .iter()
                         .filter(|iv| assignments.contains_key(&iv.value_id))
@@ -3008,7 +3356,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if !w2.is_empty() && !no_indirect_pool.is_empty() {
                     let ranges = build_gpr_ranges(&w2);
-                    let mut alloc = LinearScanAllocator::new(ranges, no_indirect_pool);
+                    let mut alloc = LinearScanAllocator::new_with_config(ranges, no_indirect_pool, &config.ra_config);
                     alloc.run_with_seed(&seeded);
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
@@ -3025,7 +3373,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     }
                 }
 
-                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                if config.ra_config.debug_ra_intervals {
                     let ids: Vec<(u32, u8)> = w2
                         .iter()
                         .filter(|iv| assignments.contains_key(&iv.value_id))
@@ -3044,7 +3392,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if !w3.is_empty() && !no_arg_pool.is_empty() {
                     let ranges = build_gpr_ranges(&w3);
-                    let mut alloc = LinearScanAllocator::new(ranges, no_arg_pool);
+                    let mut alloc = LinearScanAllocator::new_with_config(ranges, no_arg_pool, &config.ra_config);
                     alloc.run_with_seed(&seeded);
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
@@ -3061,7 +3409,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     }
                 }
 
-                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                if config.ra_config.debug_ra_intervals {
                     let ids: Vec<(u32, u8)> = w3
                         .iter()
                         .filter(|iv| assignments.contains_key(&iv.value_id))
@@ -3071,7 +3419,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
                 // Wave 4: the rest (non-call-args and direct arg-0 values) —
                 // full caller-saved pool.
-                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                if config.ra_config.debug_ra_intervals {
                     let mut regs = vec![];
                     for (r, spans) in &seeded {
                         regs.push((r.0, spans.clone()));
@@ -3088,14 +3436,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if !w4.is_empty() {
                     let ranges = build_gpr_ranges(&w4);
-                    let mut alloc =
-                        LinearScanAllocator::new(ranges, config.caller_saved_regs.clone());
+                    let mut alloc = LinearScanAllocator::new_with_config(
+                        ranges,
+                        config.caller_saved_regs.clone(),
+                        &config.ra_config,
+                    );
                     alloc.run_with_seed(&seeded);
                     for (vid, reg) in alloc.assignments {
                         assignments.insert(vid, reg);
                         caller_used_regs_set.insert(reg.0);
                     }
-                    if env_on("CCC_DEBUG_RA_INTERVALS") {
+                    if config.ra_config.debug_ra_intervals {
                         let ids: Vec<(u32, u8)> = w4
                             .iter()
                             .filter(|iv| assignments.contains_key(&iv.value_id))
@@ -3134,7 +3485,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // uses before the spill allocator ranks them.
                 bump_coalesce_group_priority(&mut phase2c_ranges, &coalesce_groups, &use_count);
                 bump_gep_base_priority(&mut phase2c_ranges, &liveness);
-                let mut spill_allocator = LinearScanAllocator::new(phase2c_ranges, free_callee);
+                let mut spill_allocator = LinearScanAllocator::new_with_config(phase2c_ranges, free_callee, &config.ra_config);
                 spill_allocator.run();
                 for (vid, reg) in spill_allocator.assignments {
                     assignments.insert(vid, reg);
@@ -3144,7 +3495,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
     propagate_coalesce_members(&mut assignments, &coalesce_member_of);
-    if env_on("CCC_DEBUG_RA_PHASES") {
+    if config.ra_config.debug_ra_phases {
         let mut ids: Vec<u32> = assignments.keys().copied().collect();
         ids.sort_unstable();
         let spills: Vec<u32> = {
@@ -3170,7 +3521,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // and never touch %ecx.  Now that assignments exist, recompute the hazard
     // set with the real pointer homes and hand the newly hazard-free
     // caller-saved registers to the values Phase 2 had to refuse.
-    if !env_on("CCC_NO_LOAD_HAZARD_REFINE")
+    if !config.ra_config.no_load_hazard_refine
         && config
             .caller_saved_regs
             .iter()
@@ -3235,6 +3586,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 &non_gpr_values,
                 &ecx_clean_ptrs,
                 Some(&assignments),
+                &config.ra_config,
             );
             for (reg, reg_hazards) in [(PhysReg(5), &edx_hazards2), (PhysReg(4), &ecx_hazards2)] {
                 if !config.caller_saved_regs.contains(&reg) {
@@ -3273,7 +3625,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     continue;
                 }
                 let ranges = build_gpr_ranges(&intervals);
-                let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
+                let mut alloc = LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
                 alloc.run();
                 for (vid, r) in alloc.assignments {
                     assignments.insert(vid, r);
@@ -3302,7 +3654,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     //    accumulator (m32 fuzz seed 0).  `acc_first_uses` records exactly
     //    the values whose EVERY use is such a position.
     //  * any hazard strictly between def and last use destroys the value.
-    if !env_on("CCC_NO_EAX_ALLOC")
+    if !config.ra_config.no_eax_alloc
         && config
             .caller_saved_regs
             .iter()
@@ -3404,7 +3756,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
         if !intervals.is_empty() {
             let ranges = build_gpr_ranges(&intervals);
-            let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
+            let mut alloc = LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
             alloc.run();
             for (vid, r) in alloc.assignments {
                 assignments.insert(vid, r);
@@ -3416,11 +3768,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     // AArch64-only: steal a callee-saved from a colder holder for a missed IV.
     // x86 stays out — same eviction already lost gzip inside the scan.
-    if !env_on("CCC_NO_LOOP_PIN") && arm_fp_pool && !all_phi_pairs.is_empty() {
-        let k: usize = std::env::var("CCC_LOOP_PIN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
+    if !config.ra_config.no_loop_pin && arm_fp_pool && !all_phi_pairs.is_empty() {
+        let k = config.ra_config.loop_pin;
         let phi_pair_values: FxHashSet<u32> = phi_coalesce
             .iter()
             .flat_map(|c| [c.phi_dest, c.backedge_src])
@@ -3525,11 +3874,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         .iter()
         .any(|r| matches!(r.0, 4 | 5))
         && config.available_regs.iter().all(|r| r.0 <= 3);
-    if !env_on("CCC_NO_HOT_WEB_STEAL") && i686_narrow_pool && !all_phi_pairs.is_empty() {
-        let k: usize = std::env::var("CCC_HOT_WEB_STEAL")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
+    if !config.ra_config.no_hot_web_steal && i686_narrow_pool && !all_phi_pairs.is_empty() {
+        let k = config.ra_config.hot_web_steal;
         // Web-aware use count: the leader's own count plus every coalesce
         // member's (the state-machine webs the phi-coalesce machinery
         // propagates homes through).
@@ -3639,7 +3985,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // born in %edx at the fused div, survives the digits GEP (edx-clean) and
     // the indexed load (refined edx-clean), so it keeps %edx and the load
     // folds to `movsbl digits(,%edx),%eax` — GCC's shape, −5 insns/iter.
-    if !env_on("CCC_NO_ITERATED_HAZARD")
+    if !config.ra_config.no_iterated_hazard
         && config
             .caller_saved_regs
             .iter()
@@ -3696,8 +4042,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 &non_gpr_values,
                 &ecx_clean_ptrs_2h,
                 Some(&assignments),
+                &config.ra_config,
             );
-            if env_on("CCC_DEBUG_RA_INTERVALS") {
+            if config.ra_config.debug_ra_intervals {
                 eprintln!(
                     "[RA-P2h] fn={} round={} refined edx_hazards={:?}",
                     func.name, round, edx_hazards_h
@@ -3713,7 +4060,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .filter(|(_, &r)| r == reg)
                     .filter_map(|(&v, _)| iv_map.get(&v).copied())
                     .collect();
-                if round == 0 && env_on("CCC_DEBUG_RA_INTERVALS") {
+                if round == 0 && config.ra_config.debug_ra_intervals {
                     let holders_dbg: Vec<String> = assignments
                         .iter()
                         .filter(|(_, &r)| r == reg)
@@ -3745,7 +4092,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                             .any(|&h| intervals_overlap((iv.start, iv.end), h))
                     })
                     .collect();
-                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                if config.ra_config.debug_ra_intervals {
                     #[allow(unused_mut)]
                     let mut unassigned: Vec<String> = scan_ivs
                         .iter()
@@ -3768,7 +4115,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     continue;
                 }
                 let ranges = build_gpr_ranges(&intervals);
-                let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
+                let mut alloc = LinearScanAllocator::new_with_config(ranges, vec![reg], &config.ra_config);
                 alloc.run();
                 for (vid, r) in alloc.assignments {
                     assignments.insert(vid, r);
@@ -3780,7 +4127,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             if assigned_this_round == 0 {
                 break;
             }
-            if env_on("CCC_DEBUG_RA_INTERVALS") {
+            if config.ra_config.debug_ra_intervals {
                 eprintln!(
                     "[RA-P2h] fn={} round={} assigned={}",
                     func.name, round, assigned_this_round
@@ -3813,7 +4160,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // could hand the register to a value that fat-overlaps the survivor).
     // i686 validated this fill first (boot C text -1,573 B, stack refs
     // -13.1%); x86-64/AArch64/RISC-V get the same treatment now.
-    if !env_on("CCC_NO_SEGMENT_FILL") && !used_regs_set.is_empty() {
+    if !config.ra_config.no_segment_fill && !used_regs_set.is_empty() {
         let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
 
         let mut owned_segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
@@ -3920,7 +4267,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }) else {
                 continue;
             };
-            if env_on("CCC_DEBUG_SEGMENT_FILL") {
+            if config.ra_config.debug_segment_fill {
                 eprintln!(
                     "[RA-SEGMENT-FILL] fn={} v{} group={:?} segs={:?} -> r{} occupied={:?}",
                     func.name,
@@ -3941,16 +4288,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         if added != 0 {
             propagate_coalesce_members(&mut assignments, &coalesce_member_of);
         }
-        if env_on("CCC_DEBUG_SEGMENT_FILL") {
+        if config.ra_config.debug_segment_fill {
             eprintln!("[RA-SEGMENT-FILL] fn={} added={}", func.name, added);
         }
     }
 
-    if env_on("CCC_DEBUG_RA") {
+    if config.ra_config.debug_ra {
         let mut v: Vec<(u32, u8)> = assignments.iter().map(|(k, r)| (*k, r.0)).collect();
         v.sort_unstable();
         eprintln!("[RA] fn={} FINAL={:?}", func.name, v);
-        if env_on("CCC_DEBUG_RA_INTERVALS") {
+        if config.ra_config.debug_ra_intervals {
             let mut ivs: Vec<(u32, u32, u32, bool, u64)> = iv_map
                 .iter()
                 .map(|(vid, &(s, e))| {
@@ -3984,24 +4331,25 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    apply_phi_coalesce_assignments(
+    apply_phi_coalesce_assignments_with_config(
         func,
         &liveness,
         &iv_map,
         &phi_coalesce,
         &mut assignments,
         &config.available_regs,
+        &config.ra_config,
     );
 
     let vector_values = if arm_fp_pool {
         collect_vector_values(func)
     } else if x86_fp_pool {
-        let mut values = if !env_on("CCC_NO_REDUCTION_VECREG") {
+        let mut values = if !config.ra_config.no_reduction_vecreg {
             collect_x86_reduction_vector_values(func)
         } else {
             FxHashSet::default()
         };
-        if !env_on("CCC_NO_MAP_VECREG") {
+        if !config.ra_config.no_map_vecreg {
             values.extend(collect_x86_map_broadcast_values(func));
             values.extend(collect_x86_map_intermediate_values(func));
         }
@@ -4009,7 +4357,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     } else {
         FxHashSet::default()
     };
-    let f64_value_set = if arm_fp_pool || (x86_fp_pool && !env_on("CCC_NO_FP_COPY_WEB")) {
+    let f64_value_set = if arm_fp_pool || (x86_fp_pool && !config.ra_config.no_fp_copy_web) {
         collect_f64_values(func)
     } else {
         FxHashSet::default()
@@ -4138,12 +4486,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
         if !f64_intervals.is_empty() {
             let mut f64_ranges =
-                live_range::build_live_ranges(&f64_intervals, &liveness.block_loop_depth, func);
+                live_range::build_live_ranges_with_config(&f64_intervals, &liveness.block_loop_depth, func, &config.ra_config);
             // RA-05: hole-aware coverage for the XMM scan as well — FP phi
             // webs spanning mutually exclusive arms get the same treatment
             // as the GPR scan.
             attach_scan_segments(&mut f64_ranges, &liveness, &coalesce_member_of);
-            let mut xmm_allocator = LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
+            let mut xmm_allocator = LinearScanAllocator::new_with_config(f64_ranges, config.xmm_regs.clone(), &config.ra_config);
             xmm_allocator.run();
             for (&vid, &reg) in &xmm_allocator.assignments {
                 assignments.insert(vid, reg);
@@ -4157,7 +4505,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
         }
 
-        if !env_on("CCC_NO_VECREG") {
+        if !config.ra_config.no_vecreg {
             let vec_candidates = collect_vecreg_candidates(func);
             if !vec_candidates.is_empty() {
                 let mut vec_pool: Vec<PhysReg> = (21..=25).map(PhysReg).collect();
@@ -4171,12 +4519,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         .filter(|iv| !spans_any_call(iv, call_points))
                         .collect();
                     if !vec_intervals.is_empty() {
-                        let vec_ranges = live_range::build_live_ranges(
+                        let vec_ranges = live_range::build_live_ranges_with_config(
                             &vec_intervals,
                             &liveness.block_loop_depth,
                             func,
+                            &config.ra_config,
                         );
-                        let mut vec_allocator = LinearScanAllocator::new(vec_ranges, vec_pool);
+                        let mut vec_allocator = LinearScanAllocator::new_with_config(vec_ranges, vec_pool, &config.ra_config);
                         vec_allocator.run();
                         for (vid, reg) in vec_allocator.assignments {
                             assignments.insert(vid, reg);
@@ -4236,7 +4585,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     let mut caller_save_spans: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
-    if !config.caller_saved_regs.is_empty() && env_on("CCC_CALLER_SAVE_SPANNING") {
+    if !config.caller_saved_regs.is_empty() && config.ra_config.caller_save_spanning {
         let span_regs: Vec<PhysReg> = config
             .caller_saved_regs
             .iter()
@@ -4276,7 +4625,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 phase2b_ranges
                     .sort_by(|a, b| a.start.cmp(&b.start).then(b.priority.cmp(&a.priority)));
-                let mut span_allocator = LinearScanAllocator::new(phase2b_ranges, span_regs);
+                let mut span_allocator = LinearScanAllocator::new_with_config(phase2b_ranges, span_regs, &config.ra_config);
                 span_allocator.run();
                 for (vid, reg) in span_allocator.assignments {
                     assignments.insert(vid, reg);
@@ -4318,7 +4667,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             unite_map(&mut parent, pair.phi_dest, pair.backedge_src);
         }
         let rep = find_overlapping_classes(&liveness, &assignments, &parent);
-        if env_on("CCC_DEBUG_RA_REPAIR") {
+        if config.ra_config.debug_ra_repair {
             eprintln!(
                 "[RA-REPAIR] fn={} scanned assignments={} classes={} overlaps={}",
                 func.name,
@@ -4371,7 +4720,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     evicted.push(v);
                 }
             }
-            if env_on("CCC_DEBUG_RA_REPAIR") {
+            if config.ra_config.debug_ra_repair {
                 eprintln!(
                     "[RA-REPAIR] fn={} evicted {:?} (classes {:?})",
                     func.name, evicted, evict_classes
@@ -4380,15 +4729,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    if env_on("CCC_VERIFY_REGALLOC") {
+    if config.ra_config.verify_regalloc {
         verify_no_overlap(&liveness, &assignments, &coalesce_member_of, &all_phi_pairs);
     }
 
     // Session-28 debug: per-value home census (register vs slot) for one
     // function, to analyze spill/slot-traffic decisions.
-    if std::env::var_os("LCCC_DBG_RA").is_some() {
-        let filter = std::env::var("LCCC_DBG_RA_FUNC").unwrap_or_default();
-        if filter.is_empty() || func.name.contains(&filter) {
+    if config.ra_config.legacy_debug_ra {
+        let filter = &config.ra_config.legacy_debug_ra_func;
+        if filter.is_empty() || func.name.contains(filter.as_str()) {
             let mut rows: Vec<(u32, u32, u32, String)> = Vec::new();
             for iv in &liveness.intervals {
                 let home = match assignments.get(&iv.value_id) {
@@ -4421,8 +4770,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    if let Ok(filter) = std::env::var("CCC_TRACE_ALLOCSTATS") {
-        if filter.is_empty() || filter == "*" || func.name.contains(&filter) {
+    if let Some(filter) = &config.ra_config.trace_allocstats_filter {
+        if filter.is_empty() || filter == "*" || func.name.contains(filter.as_str()) {
             let scan_values: FxHashSet<u32> = scan_ivs.iter().map(|iv| iv.value_id).collect();
             let assigned_scan = scan_values
                 .iter()
@@ -4457,8 +4806,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    if let Ok(filter) = std::env::var("CCC_RA_EXPLAIN") {
-        if filter.is_empty() || filter == "*" || func.name.contains(&filter) {
+    if let Some(filter) = &config.ra_config.ra_explain {
+        if filter.is_empty() || filter == "*" || func.name.contains(filter.as_str()) {
             let mut segment_count: FxHashMap<u32, usize> = FxHashMap::default();
             for segment in &liveness.segments {
                 *segment_count.entry(segment.value_id).or_insert(0) += 1;
@@ -4483,7 +4832,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             // the segments printed here are exactly what the scan and the
             // verifier reason about, so a read the IR does not show (folded
             // SIB index, replayed cmp operand) is visible as a segment gap.
-            if std::env::var_os("CCC_RA_EXPLAIN_HOMES").is_some() {
+            if config.ra_config.ra_explain_homes {
                 let mut homes: Vec<(u32, PhysReg)> =
                     assignments.iter().map(|(&v, &r)| (v, r)).collect();
                 homes.sort_unstable_by_key(|&(v, _)| v);
@@ -4528,14 +4877,18 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // authority has run. Dropping a home is always sound, so a delta-debug
     // over the home list isolates the one value whose register home the
     // emitted code violates (used to localize the preboot-ZSTD failures).
-    if let Ok(list) = std::env::var("CCC_RA_DROP") {
-        let scoped = std::env::var("CCC_RA_DROP_FUNC").is_ok_and(|f| f != func.name);
+    if let Some(list) = &config.ra_config.ra_drop {
+        let scoped = config
+            .ra_config
+            .ra_drop_func
+            .as_deref()
+            .is_some_and(|f| f != func.name);
         if !scoped {
             for tok in list.split(',') {
                 let tok = tok.trim();
                 let tok = tok.strip_prefix('v').unwrap_or(tok);
                 if let Ok(v) = tok.parse::<u32>() {
-                    if assignments.remove(&v).is_some() && env_on("CCC_DEBUG_RA") {
+                    if assignments.remove(&v).is_some() && config.ra_config.debug_ra {
                         eprintln!("[RA-DROP] fn={} v{} demoted to slot", func.name, v);
                     }
                 }
@@ -4544,7 +4897,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     let mut accumulator_assignments =
-        analyze_accumulator_assignments(func, config.accumulator_policy);
+        analyze_accumulator_assignments_with_config(func, config.accumulator_policy, &config.ra_config);
     // A physical assignment is the durable home and always wins. Publishing
     // both locations made downstream behavior depend on insertion order.
     accumulator_assignments.retain(|a| !assignments.contains_key(&a.value_id));
@@ -6320,8 +6673,9 @@ fn collect_i686_scratch_hazard_points(
     func: &IrFunction,
     wide: &FxHashSet<u32>,
     ecx_clean_load_ptrs: &FxHashSet<u32>,
+    ra_config: &RaConfig,
 ) -> (Vec<u32>, Vec<u32>) {
-    collect_i686_scratch_hazard_points_refined(func, wide, ecx_clean_load_ptrs, None)
+    collect_i686_scratch_hazard_points_refined(func, wide, ecx_clean_load_ptrs, None, ra_config)
 }
 
 /// Assignment-aware hazard refinement (Phase 2h). `assignments` carries the
@@ -6341,6 +6695,7 @@ fn collect_i686_scratch_hazard_points_refined(
     wide: &FxHashSet<u32>,
     ecx_clean_load_ptrs: &FxHashSet<u32>,
     assignments: Option<&FxHashMap<u32, PhysReg>>,
+    ra_config: &RaConfig,
 ) -> (Vec<u32>, Vec<u32>) {
     use crate::ir::reexports::{IrBinOp, IrUnaryOp};
     let mut ecx: Vec<u32> = Vec::new();
@@ -6352,7 +6707,7 @@ fn collect_i686_scratch_hazard_points_refined(
     // Constant-RHS pairs fold at the head with the same clobber set as a
     // staged `divl`, so the model is exact for them too.
     let divrem_pairs = match divrem_target_for_current_arch() {
-        Some(t) => compute_i686_divrem_pairs(func, t),
+        Some(t) => compute_i686_divrem_pairs_with_config(func, t, ra_config),
         None => I686DivRemPairs {
             tail_dests: Default::default(),
             head_partners: Default::default(),
@@ -6549,7 +6904,7 @@ fn collect_i686_scratch_hazard_points_refined(
             };
             if !ecx_clean {
                 ecx.push(point);
-                if env_on("CCC_DEBUG_HAZARDS") {
+                if ra_config.debug_hazards {
                     eprintln!(
                         "[HZ] fn={} pt={} ECX-DIRTY {:?}",
                         func.name,
@@ -6560,7 +6915,7 @@ fn collect_i686_scratch_hazard_points_refined(
             }
             if !edx_clean {
                 edx.push(point);
-                if env_on("CCC_DEBUG_HAZARDS") {
+                if ra_config.debug_hazards {
                     eprintln!(
                         "[HZ] fn={} pt={} EDX-DIRTY {:?}",
                         func.name,
@@ -6584,13 +6939,13 @@ fn collect_i686_scratch_hazard_points_refined(
         };
         if !t_ecx_clean {
             ecx.push(point);
-            if env_on("CCC_DEBUG_HAZARDS") {
+            if ra_config.debug_hazards {
                 eprintln!("[HZ] fn={} pt={} ECX-DIRTY term", func.name, point);
             }
         }
         if !t_edx_clean {
             edx.push(point);
-            if env_on("CCC_DEBUG_HAZARDS") {
+            if ra_config.debug_hazards {
                 eprintln!("[HZ] fn={} pt={} EDX-DIRTY term", func.name, point);
             }
         }
@@ -6897,6 +7252,26 @@ fn apply_phi_coalesce_assignments(
     assignments: &mut FxHashMap<u32, PhysReg>,
     callee_saved: &[PhysReg],
 ) {
+    apply_phi_coalesce_assignments_with_config(
+        func,
+        liveness,
+        iv_map,
+        candidates,
+        assignments,
+        callee_saved,
+        &RaConfig::default(),
+    )
+}
+
+fn apply_phi_coalesce_assignments_with_config(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+    iv_map: &FxHashMap<u32, (u32, u32)>,
+    candidates: &[PhiCoalesceCandidate],
+    assignments: &mut FxHashMap<u32, PhysReg>,
+    callee_saved: &[PhysReg],
+    ra_config: &RaConfig,
+) {
     for candidate in candidates {
         let phi_dest = candidate.phi_dest;
         let backedge_src = candidate.backedge_src;
@@ -6943,7 +7318,7 @@ fn apply_phi_coalesce_assignments(
         if phi_window_clobbers_caller_saved(func, candidate)
             && !callee_saved.iter().any(|r| r.0 == reg.0)
         {
-            if env_on("CCC_DEBUG_PHI_COALESCE") {
+            if ra_config.debug_phi_coalesce {
                 eprintln!(
                     "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: call in window",
                     phi_dest, backedge_src, reg.0
@@ -6970,7 +7345,7 @@ fn apply_phi_coalesce_assignments(
             if spans_any_call(&src_live, &liveness.call_points)
                 && !callee_saved.iter().any(|r| r.0 == reg.0)
             {
-                if env_on("CCC_DEBUG_PHI_COALESCE") {
+                if ra_config.debug_phi_coalesce {
                     eprintln!(
                         "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: source live across a call",
                         phi_dest, backedge_src, reg.0
@@ -6996,8 +7371,8 @@ fn apply_phi_coalesce_assignments(
         // Bisect aid: CCC_PHI_COALESCE_SKIP=<src-id,...> vetoes the
         // destructive update for the listed backedge sources (optionally
         // scoped with CCC_PHI_COALESCE_FUNC=<function name>).
-        if phi_coalesce_skip_listed(func, backedge_src) {
-            if env_on("CCC_DEBUG_PHI_COALESCE") {
+        if phi_coalesce_skip_listed_with_config(func, backedge_src, ra_config) {
+            if ra_config.debug_phi_coalesce {
                 eprintln!(
                     "[PHI_COALESCE] fn={} SKIPPED (env) dest=v{} src=v{} r{}",
                     func.name, phi_dest, backedge_src, reg.0
@@ -7005,7 +7380,7 @@ fn apply_phi_coalesce_assignments(
             }
             continue;
         }
-        if env_on("CCC_DEBUG_PHI_COALESCE") {
+        if ra_config.debug_phi_coalesce {
             eprintln!(
                 "[PHI_COALESCE] fn={} ASSIGN dest=v{} src=v{} r{}",
                 func.name, phi_dest, backedge_src, reg.0
@@ -7018,10 +7393,18 @@ fn apply_phi_coalesce_assignments(
 /// `CCC_PHI_COALESCE_SKIP` / `CCC_PHI_COALESCE_FUNC` bisect helper (see
 /// `apply_phi_coalesce_assignments`). Off unless the variable is set.
 fn phi_coalesce_skip_listed(func: &IrFunction, backedge_src: u32) -> bool {
-    let Ok(list) = std::env::var("CCC_PHI_COALESCE_SKIP") else {
+    phi_coalesce_skip_listed_with_config(func, backedge_src, &RaConfig::default())
+}
+
+fn phi_coalesce_skip_listed_with_config(
+    func: &IrFunction,
+    backedge_src: u32,
+    ra_config: &RaConfig,
+) -> bool {
+    let Some(list) = ra_config.phi_coalesce_skip.as_deref() else {
         return false;
     };
-    if let Ok(f) = std::env::var("CCC_PHI_COALESCE_FUNC") {
+    if let Some(f) = ra_config.phi_coalesce_func.as_deref() {
         if f != func.name {
             return false;
         }
@@ -7048,9 +7431,18 @@ fn phi_coalesce_skip_listed(func: &IrFunction, backedge_src: u32) -> bool {
 /// hottest latch (deeper loop, later copy) comes first — that is what
 /// makes Part 1's first-wins pick the backedge rather than the preheader
 /// init (the gzip longest_match shuffle).
+/// Compatibility helper for isolated slot-layout/unit-test callers.
 pub(crate) fn detect_phi_coalesce_groups(
     func: &IrFunction,
     liveness: &LivenessResult,
+) -> Vec<PhiCoalesceCandidate> {
+    detect_phi_coalesce_groups_with_config(func, liveness, &RaConfig::default())
+}
+
+pub(crate) fn detect_phi_coalesce_groups_with_config(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+    ra_config: &RaConfig,
 ) -> Vec<PhiCoalesceCandidate> {
     // A phi-elim dest is a Copy destination with more than one definition
     // (any instruction, any block). Requiring Copies in *different* blocks
@@ -7180,7 +7572,7 @@ pub(crate) fn detect_phi_coalesce_groups(
         }
     }
 
-    let debug = env_on("CCC_DEBUG_PHI_COALESCE");
+    let debug = ra_config.debug_phi_coalesce;
     let mut candidates = Vec::new();
 
     // Pre-def dataflow closure of `phi` inside `block[..def_idx]`: every value
@@ -7555,6 +7947,223 @@ fn uses_value(inst: &Instruction, val_id: u32) -> bool {
         });
     }
     found
+}
+
+#[cfg(test)]
+mod ra_config_tests {
+    use super::{PhysReg, RaConfig};
+
+    fn from(entries: &[(&str, &str)]) -> RaConfig {
+        RaConfig::from_sources(
+            |name| entries.iter().any(|(key, _)| *key == name),
+            |name| {
+                entries
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            },
+        )
+    }
+
+    #[test]
+    fn parser_covers_every_boolean_ra_switch_without_process_environment() {
+        macro_rules! switch {
+            ($field:ident, $name:literal) => {{
+                assert!(
+                    !from(&[]).$field,
+                    "{} must default to disabled",
+                    $name
+                );
+                assert!(
+                    from(&[($name, "enabled")]).$field,
+                    "{} must be presence-enabled",
+                    $name
+                );
+            }};
+        }
+
+        switch!(no_leaf_param_gpr, "CCC_NO_LEAF_PARAM_GPR");
+        switch!(no_ir_divrem, "CCC_NO_IR_DIVREM");
+        switch!(no_mulacc, "CCC_NO_MULACC");
+        switch!(no_index_home, "CCC_NO_INDEX_HOME");
+        switch!(no_folded_index_liveness, "CCC_NO_FOLDED_INDEX_LIVENESS");
+        switch!(no_vecreg, "CCC_NO_VECREG");
+        switch!(no_phi_coalesce, "CCC_NO_PHI_COALESCE");
+        switch!(no_coalesce, "CCC_NO_COALESCE");
+        switch!(no_hot_loop, "CCC_NO_HOT_LOOP");
+        switch!(leaf_strict_call_free, "CCC_LEAF_STRICT_CALL_FREE");
+        switch!(no_leaf_caller_home, "CCC_NO_LEAF_CALLER_HOME");
+        switch!(no_load_hazard_refine, "CCC_NO_LOAD_HAZARD_REFINE");
+        switch!(no_eax_alloc, "CCC_NO_EAX_ALLOC");
+        switch!(no_loop_pin, "CCC_NO_LOOP_PIN");
+        switch!(no_hot_web_steal, "CCC_NO_HOT_WEB_STEAL");
+        switch!(no_iterated_hazard, "CCC_NO_ITERATED_HAZARD");
+        switch!(no_segment_fill, "CCC_NO_SEGMENT_FILL");
+        switch!(no_reduction_vecreg, "CCC_NO_REDUCTION_VECREG");
+        switch!(no_map_vecreg, "CCC_NO_MAP_VECREG");
+        switch!(no_fp_copy_web, "CCC_NO_FP_COPY_WEB");
+        switch!(caller_save_spanning, "CCC_CALLER_SAVE_SPANNING");
+        switch!(no_segment_scan, "CCC_NO_SEGMENT_SCAN");
+        switch!(debug_coalesce, "CCC_DEBUG_COALESCE");
+        switch!(debug_coalesce_members, "CCC_DEBUG_COALESCE_MEMBERS");
+        switch!(debug_phi_coalesce, "CCC_DEBUG_PHI_COALESCE");
+        switch!(debug_ra_phases, "CCC_DEBUG_RA_PHASES");
+        switch!(debug_ra_intervals, "CCC_DEBUG_RA_INTERVALS");
+        switch!(debug_segment_fill, "CCC_DEBUG_SEGMENT_FILL");
+        switch!(debug_ra, "CCC_DEBUG_RA");
+        switch!(debug_ra_repair, "CCC_DEBUG_RA_REPAIR");
+        switch!(debug_hazards, "CCC_DEBUG_HAZARDS");
+        switch!(trace_alloc, "CCC_TRACE_ALLOC");
+        switch!(trace_allocstats, "CCC_TRACE_ALLOCSTATS");
+        switch!(verify_regalloc, "CCC_VERIFY_REGALLOC");
+        switch!(legacy_debug_ra, "LCCC_DBG_RA");
+        switch!(ra_explain_homes, "CCC_RA_EXPLAIN_HOMES");
+        switch!(no_abi_reg_hints, "CCC_NO_ABI_REG_HINTS");
+        switch!(disable_scalar_fp_xmm, "CCC_DISABLE_SCALAR_FP_XMM");
+        switch!(enable_scalar_fp_xmm, "CCC_ENABLE_SCALAR_FP_XMM");
+        switch!(no_xmm_regalloc, "CCC_NO_XMM_REGALLOC");
+        switch!(no_promoted_fp_tail, "CCC_NO_PROMOTED_FP_TAIL");
+        switch!(no_fp_callee_saved, "CCC_NO_FP_CALLEE_SAVED");
+        switch!(no_regalloc, "CCC_NO_REGALLOC");
+        switch!(dump_ir, "CCC_DUMP_IR");
+        switch!(no_va_root_guard, "CCC_NO_VA_ROOT_GUARD");
+        switch!(debug_vararg, "CCC_DEBUG_VARARG");
+        switch!(no_x64_immed_nohome, "CCC_NO_X64_IMMED_NOHOME");
+        switch!(mi_all_classic, "CCC_MI_ALL_CLASSIC");
+        switch!(mi_force_loops, "CCC_MI_FORCE_LOOPS");
+        switch!(mi_debug, "CCC_MI_DEBUG");
+        switch!(no_load_cast_fold, "CCC_NO_LOAD_CAST_FOLD");
+        switch!(debug_load_cast_fold, "CCC_DEBUG_LOAD_CAST_FOLD");
+        switch!(no_empty_local_frame_elision, "CCC_NO_EMPTY_LOCAL_FRAME_ELISION");
+        switch!(debug_param_store, "CCC_DEBUG_PARAM_STORE");
+        switch!(debug_paramref, "CCC_DEBUG_PARAMREF");
+        switch!(no_machinst, "CCC_NO_MACHINST");
+    }
+
+    #[test]
+    fn parser_preserves_numeric_text_and_polarity_contracts() {
+        let defaults = from(&[]);
+        assert_eq!(defaults.loop_pin, 2);
+        assert_eq!(defaults.hot_web_steal, 3);
+        assert_eq!(defaults.evict_mode, 3);
+        assert_eq!(defaults.pgo_weight_max, 1);
+        assert_eq!(defaults.x64_nohome_classes, "ret,store,copy,cast,unary,binop");
+        assert_eq!(defaults.mi_max_loop_insts, 32);
+        assert_eq!(defaults.legacy_debug_ra_func, "");
+        assert_eq!(defaults.mi_fn_disable, "");
+        assert_eq!(defaults.mi_fn_force, "");
+        assert_eq!(defaults.mi_disable_kinds, "");
+        assert_eq!(defaults.trace_allocstats_filter, None);
+        assert_eq!(defaults.dump_ir_func, None);
+        assert_eq!(defaults.no_regalloc_func, None);
+        assert_eq!(defaults.ra_explain, None);
+        assert_eq!(defaults.ra_drop, None);
+        assert_eq!(defaults.ra_drop_func, None);
+        assert_eq!(defaults.phi_coalesce_skip, None);
+        assert_eq!(defaults.phi_coalesce_func, None);
+
+        let configured = from(&[
+            ("CCC_LOOP_PIN", "7"),
+            ("CCC_HOT_WEB_STEAL", "9"),
+            ("CCC_EVICT_MODE", "6"),
+            ("CCC_PGO_WEIGHT_MAX", "99"),
+            ("CCC_X64_NOHOME_CLASSES", "ret,cast"),
+            ("CCC_MI_MAX_LOOP_INSTS", "41"),
+            ("CCC_DUMP_IR_FUNC", "dump_only_this"),
+            ("CCC_TRACE_ALLOCSTATS", "ra_fn"),
+            ("LCCC_DBG_RA_FUNC", "legacy_fn"),
+            ("CCC_RA_EXPLAIN", "explain_fn"),
+            ("CCC_RA_DROP", "3,5"),
+            ("CCC_RA_DROP_FUNC", "drop_fn"),
+            ("CCC_PHI_COALESCE_SKIP", "7,11"),
+            ("CCC_PHI_COALESCE_FUNC", "phi_fn"),
+            ("CCC_NO_REGALLOC_FUNC", "slow_fn,other_fn"),
+            ("CCC_MI_FN_DISABLE", "cold"),
+            ("CCC_MI_FN_FORCE", "hot"),
+            ("CCC_MI_DISABLE_KINDS", "call,load"),
+        ]);
+        assert_eq!(configured.loop_pin, 7);
+        assert_eq!(configured.hot_web_steal, 9);
+        assert_eq!(configured.evict_mode, 6);
+        assert_eq!(configured.pgo_weight_max, 16);
+        assert_eq!(configured.x64_nohome_classes, "ret,cast");
+        assert_eq!(configured.mi_max_loop_insts, 41);
+        assert_eq!(configured.dump_ir_func.as_deref(), Some("dump_only_this"));
+        assert_eq!(configured.trace_allocstats_filter.as_deref(), Some("ra_fn"));
+        assert_eq!(configured.legacy_debug_ra_func, "legacy_fn");
+        assert_eq!(configured.ra_explain.as_deref(), Some("explain_fn"));
+        assert_eq!(configured.ra_drop.as_deref(), Some("3,5"));
+        assert_eq!(configured.ra_drop_func.as_deref(), Some("drop_fn"));
+        assert_eq!(configured.phi_coalesce_skip.as_deref(), Some("7,11"));
+        assert_eq!(configured.phi_coalesce_func.as_deref(), Some("phi_fn"));
+        assert_eq!(configured.no_regalloc_func.as_deref(), Some("slow_fn,other_fn"));
+        assert_eq!(configured.mi_fn_disable, "cold");
+        assert_eq!(configured.mi_fn_force, "hot");
+        assert_eq!(configured.mi_disable_kinds, "call,load");
+
+        let malformed = from(&[
+            ("CCC_LOOP_PIN", "not-a-number"),
+            ("CCC_HOT_WEB_STEAL", "-1"),
+            ("CCC_EVICT_MODE", "bad"),
+            ("CCC_PGO_WEIGHT_MAX", "0"),
+            ("CCC_MI_MAX_LOOP_INSTS", "bad"),
+        ]);
+        assert_eq!(malformed.loop_pin, 2);
+        assert_eq!(malformed.hot_web_steal, 3);
+        assert_eq!(malformed.evict_mode, 3);
+        assert_eq!(malformed.pgo_weight_max, 1);
+        assert_eq!(malformed.mi_max_loop_insts, 32);
+
+        let fp_override = from(&[
+            ("CCC_DISABLE_SCALAR_FP_XMM", "1"),
+            ("CCC_ENABLE_SCALAR_FP_XMM", "1"),
+        ]);
+        assert!(fp_override.disable_scalar_fp_xmm);
+        assert!(fp_override.enable_scalar_fp_xmm);
+    }
+
+    #[test]
+    fn explicit_config_controls_linear_scan_without_process_environment() {
+        use crate::backend::live_range::{LinearScanAllocator, LiveRange};
+        use crate::backend::liveness::LiveInterval;
+        use std::sync::Arc;
+
+        let mut range = LiveRange::from_interval(
+            LiveInterval {
+                value_id: 1,
+                start: 0,
+                end: 10,
+            },
+            0,
+        );
+        range.set_segments(vec![(0, 2), (8, 10)]);
+        let defaults = Arc::new(from(&[]));
+        let disabled = Arc::new(from(&[("CCC_NO_SEGMENT_SCAN", "1")]));
+
+        let enabled_scan =
+            LinearScanAllocator::new_with_config(vec![range.clone()], vec![PhysReg(1)], &defaults);
+        let disabled_scan =
+            LinearScanAllocator::new_with_config(vec![range], vec![PhysReg(1)], &disabled);
+        assert!(enabled_scan.segment_mode);
+        assert!(!disabled_scan.segment_mode);
+    }
+
+    #[test]
+    fn parser_instances_are_isolated() {
+        let enabled = from(&[
+            ("CCC_NO_SEGMENT_SCAN", "1"),
+            ("CCC_EVICT_MODE", "5"),
+            ("CCC_RA_EXPLAIN", "only_here"),
+        ]);
+        let defaults = from(&[]);
+
+        assert!(enabled.no_segment_scan);
+        assert_eq!(enabled.evict_mode, 5);
+        assert_eq!(enabled.ra_explain.as_deref(), Some("only_here"));
+        assert!(!defaults.no_segment_scan);
+        assert_eq!(defaults.evict_mode, 3);
+        assert_eq!(defaults.ra_explain, None);
+    }
 }
 
 #[cfg(test)]
@@ -8656,6 +9265,7 @@ mod phi_coalesce_tests {
             never_materialized: FxHashSet::default(),
             folded_index_uses: folded,
             reg_hints: FxHashMap::default(),
+            ra_config: Arc::new(RaConfig::default()),
         };
         let result = allocate_registers(&func, &config);
         let liv = result.liveness.expect("liveness");

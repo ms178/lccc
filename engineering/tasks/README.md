@@ -23,13 +23,12 @@ naive version of the work was already measured negative).
 | [TASK-LK-24-PIE-STARTUP.md](TASK-LK-24-PIE-STARTUP.md) | Linker/crt | `ld`, `crt`, TLS init |
 | [TASK-LK-29-STMT-EXPR-ASM-TYPING.md](TASK-LK-29-STMT-EXPR-ASM-TYPING.md) | Sema types | `sema/` |
 | [TASK-FE-25-MARCH-NATIVE.md](TASK-FE-25-MARCH-NATIVE.md) | Driver/codegen options | `driver/`, `common/` |
-| [TASK-MS-08-RA-CONFIG.md](TASK-MS-08-RA-CONFIG.md) | RA plumbing | `regalloc.rs` + env knobs |
 | [TASK-FIX-DASH.md](TASK-FIX-DASH.md) | RISC-V | needs qemu-user environment |
 
-Conflict warning: TASK-MS-08 and TASK-RA-06A both touch `regalloc.rs` —
-run them in that order or in separate sessions, never interleaved.
-TASK-LK-19 and TASK-LK-24 both exercise the glibc campaign; coordinate
-the oracle/ld.so builds.
+MS-08 has landed; TASK-RA-06A now starts from its explicit `RaConfig`
+boundary. Do not reintroduce direct environment reads while modifying its
+shared `regalloc.rs` surface. TASK-LK-19 and TASK-LK-24 both exercise the
+glibc campaign; coordinate the oracle/ld.so builds.
 
 ## Wave 2 (queued, files created when wave 1 drains)
 

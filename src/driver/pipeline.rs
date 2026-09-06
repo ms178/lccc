@@ -1258,6 +1258,11 @@ impl Driver {
     ///
     /// Set `CCC_TIME_PHASES=1` in the environment to print per-phase timing to stderr.
     fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
+        // Capture RA/codegen bisection policy once, before this compilation
+        // reaches any function-level backend path.  The Arc is threaded via
+        // CodegenOptions rather than re-reading process environment there.
+        let ra_config = std::sync::Arc::new(crate::backend::regalloc::RaConfig::from_process_env());
+
         // Resolve the microarchitectural tuning row once per compilation.
         // `-mtune` wins over `-march`, `native` goes through CPUID; both
         // the middle end (process-global accessor) and the backend
@@ -1615,6 +1620,7 @@ impl Driver {
                 && !self.no_sse
                 && !self.general_regs_only,
             self.enable_fma,
+            ra_config.as_ref(),
         );
         if time_phases {
             eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());
@@ -2074,6 +2080,7 @@ impl Driver {
         // Generate assembly using target-specific codegen
         let t8 = std::time::Instant::now();
         let opts = crate::backend::CodegenOptions {
+            ra_config,
             // At -O0 phi elimination leaves non-SSA multi-def webs. The linear
             // scan assumes one definition and miscompiled 125/200 CFG seeds;
             // use canonical stack homes until an SSA-aware O0 allocator exists.
