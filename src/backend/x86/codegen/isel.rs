@@ -44,7 +44,26 @@ fn is_xmm_phys(reg: PhysReg) -> bool {
 /// xmm pool (20..=33). The allocator itself never assigns 18/19, so any
 /// entry there is a live incoming parameter home.
 fn xmm_scratch_unsafe(ra: &FxHashMap<u32, PhysReg>) -> bool {
-    ra.values().any(|r| r.0 == 18 || r.0 == 19)
+    !sse_integer_moves() || ra.values().any(|r| r.0 == 18 || r.0 == 19)
+}
+
+/// Whether the typed route may stage 16-byte integer moves through the
+/// SSE scratch (`movdqu` via xmm0).  Cleared by `-mno-sse` /
+/// `-mgeneral-regs-only` (`X86Codegen::set_no_sse`): kernel code is
+/// compiled with the SSE state disabled (CR0.TS / no XSAVE area), so a
+/// `movdqu` there is an immediate #UD — the freelist-ABA `u128` load in
+/// mm/slub.c `__update_freelist_fast` faulted exactly this way while every
+/// other i128 path already honoured the flag.  When cleared the relay takes
+/// the GPR pair route (rax:rdx), mirroring the mature text emitter.
+static SSE_INTEGER_MOVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_sse_integer_moves(enabled: bool) {
+    SSE_INTEGER_MOVES.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn sse_integer_moves() -> bool {
+    SSE_INTEGER_MOVES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Convert an IR Operand to a MachOperand, using physical registers for

@@ -350,13 +350,9 @@ impl X86Codegen {
         let mut has_indirect_call = false;
         let mut has_calls = false;
         let mut has_i128_ops = false;
-        let mut has_atomic_rmw = false;
-        // Track rdx-clobbering patterns for conditional rdx allocation
-        let mut has_div_rem = false;
         let mut has_gep = false; // GEP → indirect stores → emit_save_acc uses rdx
         let mut has_switch = false; // Switch → jump tables use rdx
         let mut has_select = false; // Select → cmov path uses rdx
-        let mut has_rdx_intrinsic = false; // Fixed-scratch intrinsic paths overwrite rdx
         let mut has_i32_widening = false; // Cast from I32/U32 to I64/pointer → needs sign-ext
         for block in &func.blocks {
             for inst in &block.instructions {
@@ -388,15 +384,9 @@ impl X86Codegen {
                         has_calls = true;
                         has_indirect_call = true;
                     }
-                    Instruction::BinOp { op, ty, .. } => {
+                    Instruction::BinOp { ty, .. } => {
                         if matches!(ty, IrType::I128 | IrType::U128) {
                             has_i128_ops = true;
-                        }
-                        if matches!(
-                            op,
-                            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
-                        ) {
-                            has_div_rem = true;
                         }
                     }
                     Instruction::UnaryOp { ty, .. } => {
@@ -422,38 +412,11 @@ impl X86Codegen {
                             has_i128_ops = true;
                         }
                     }
-                    Instruction::AtomicRmw { .. } => {
-                        has_atomic_rmw = true;
-                    }
                     Instruction::GetElementPtr { .. } => {
                         has_gep = true;
                     }
                     Instruction::Select { .. } => {
                         has_select = true;
-                    }
-                    Instruction::Intrinsic { op, .. } => {
-                        // These x86 emitters use rdx as an unmodeled fixed
-                        // scratch (or architectural output for rdtsc).  Keep
-                        // allocator-owned values out of rdx across them.  A
-                        // late vectorizer SDiv used to hide this bug by
-                        // disabling rdx allocation for the whole function.
-                        has_rdx_intrinsic |= matches!(
-                            op,
-                            IntrinsicOp::Rdtsc
-                                | IntrinsicOp::Rdtscp
-                                | IntrinsicOp::F128Copysign
-                                | IntrinsicOp::FmaF64x2
-                                | IntrinsicOp::FmaF64x4
-                                | IntrinsicOp::FmaF64x4Hoisted
-                                | IntrinsicOp::FmaF64x4SIB
-                                | IntrinsicOp::FmaF64x4HoistedSIB
-                                | IntrinsicOp::LoadF64x4
-                                | IntrinsicOp::LoadF64x2
-                                | IntrinsicOp::LoadI32x8
-                                | IntrinsicOp::LoadI32x4
-                                | IntrinsicOp::VecZeroI32x8
-                                | IntrinsicOp::VecZeroI32x4
-                        );
                     }
                     _ => {}
                 }
@@ -469,13 +432,20 @@ impl X86Codegen {
             caller_saved_regs.retain(|r| r.0 != 12 && r.0 != 13 && r.0 != 14 && r.0 != 15);
             // r8, r9, rdi, rsi
         }
-        // r8: atomic RMW uses rdi instead of r8 (frees r8 unless i128 excludes it).
-        // rdx (PhysReg 16) is available as caller-saved when no instruction
-        // implicitly clobbers it: division (rdx:rax), i128 ops (rax:rdx pair),
-        // switch jump tables (rdx as dispatch), or fixed-scratch intrinsics.
+        // Fixed-scratch model (shared with the regalloc parameter-home gate,
+        // `regalloc::x86_inst_fixed_scratch`): rdx (PhysReg 16) is available
+        // as caller-saved only when no instruction implicitly clobbers it —
+        // division (rdx:rax), i128 ops (rax:rdx pair), switch jump tables
+        // (rdx as dispatch), cmpxchg-loop RMWs / cmpxchg / atomic stores,
+        // fixed-scratch intrinsics. rdi (PhysReg 14) leaves the pool when a
+        // cmpxchg-loop RMW or rdtscp is present (operand parked in %rdi).
         // GEP indirect stores and Select cmov paths use %r11 when rdx is
         // allocated.
-        if !has_div_rem && !has_i128_ops && !has_switch && !has_rdx_intrinsic {
+        let fixed = crate::backend::regalloc::x86_body_fixed_scratch(func);
+        if fixed.rdi {
+            caller_saved_regs.retain(|r| r.0 != 14);
+        }
+        if !fixed.rdx && !has_i128_ops && !has_switch {
             caller_saved_regs.push(PhysReg(16)); // rdx
         }
 
@@ -2136,14 +2106,21 @@ impl X86Codegen {
         // is register-allocated, we can store the ABI arg register directly
         // to the callee-saved register, skipping the alloca slot entirely.
         let mut paramref_dests: Vec<Option<Value>> = vec![None; func.params.len()];
+        // ParamRef result type per parameter (may be narrower than the
+        // declared parameter type); drives the typed early materialisation
+        // of late ABI reads below.
+        let mut paramref_tys: Vec<Option<IrType>> = vec![None; func.params.len()];
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Instruction::ParamRef {
-                    dest, param_idx, ..
+                    dest,
+                    param_idx,
+                    ty,
                 } = inst
                 {
                     if *param_idx < paramref_dests.len() {
                         paramref_dests[*param_idx] = Some(*dest);
+                        paramref_tys[*param_idx] = Some(*ty);
                     }
                 }
             }
@@ -2592,6 +2569,100 @@ impl X86Codegen {
                 | ParamClass::LargeStructByRefStack { .. }
                 | ParamClass::StructSplitRegStack { .. }
                 | ParamClass::ZeroSizeSkip => {}
+            }
+        }
+
+        // LATE ABI READS. A register parameter whose ParamRef is neither
+        // pre-stored nor backed by an alloca slot is read from its incoming
+        // ABI register AT THE PARAMREF SITE in the body (`emit_param_ref_impl`
+        // fallback / `try_lower_paramref_typed` case 2). That register is
+        // guaranteed intact only at function entry: the parallel copies below
+        // may move ANOTHER parameter into it (at1/at2/at3: the atomic pointer
+        // param was left unhomed by `remove_ineligible_operands`, param 3 took
+        // %rdi as its caller-saved home, and the prologue emitted
+        // `movq %rcx, %rdi` BEFORE the body's `movq %rdi, 16(%rsp)` — every
+        // later dereference used a scalar as a pointer), and calls or
+        // fixed-scratch emitters clobber it later still. The read therefore
+        // belongs at entry, before any ABI register is written: materialise it
+        // into the value's own slot now and mark the parameter pre-stored so
+        // the body emits nothing (both text and MachInst paths honour
+        // `param_pre_stored` + no alloca slot as "no code"). Emitting the exact
+        // ParamRef sequence here is code-size neutral for entry-block
+        // ParamRefs and strictly safer for ParamRefs living in later blocks.
+        //
+        // The other unpre-stored shape — a register-homed ParamRef whose home
+        // is SHARED with another parameter — cannot be materialised early
+        // (the shared register still carries the other value), so its late
+        // read must find the ABI register untouched; assert that no pending
+        // pre-store targets it rather than emit a silent miscompile.
+        {
+            let mut early: Vec<(usize, Value, IrType)> = Vec::new();
+            for i in 0..func.params.len() {
+                let (Some(dest), Some(ty)) = (paramref_dests[i], paramref_tys[i]) else {
+                    continue;
+                };
+                if self.state.param_pre_stored.contains(&i)
+                    || gpr_prestores.iter().any(|p| p.0 == i)
+                    || fp_prestores.iter().any(|p| p.0 == i)
+                {
+                    continue;
+                }
+                if self
+                    .state
+                    .param_alloca_slots
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some()
+                {
+                    // The main loop stored the ABI register to the alloca
+                    // slot above; the body loads from that slot.
+                    continue;
+                }
+                let abi_reg: &'static str = match param_classes[i] {
+                    ParamClass::IntReg { reg_idx } => X86_ARG_REGS[reg_idx],
+                    ParamClass::FloatReg { reg_idx } => xmm_regs[reg_idx],
+                    _ => continue,
+                };
+                if self
+                    .state
+                    .value_use_counts
+                    .get(dest.0 as usize)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+                {
+                    continue;
+                }
+                if self.reg_assignments.contains_key(&dest.0) {
+                    let clobbered = gpr_prestores.iter().any(|p| p.3 == abi_reg)
+                        || fp_prestores.iter().any(|p| p.3 == abi_reg);
+                    assert!(
+                        !clobbered,
+                        "x86 prologue: parameter {} of `{}` shares its register home and \
+                         its incoming ABI register %{} is the pre-store target of another \
+                         parameter; the late ABI read would observe the wrong value",
+                        i, func.name, abi_reg
+                    );
+                    continue;
+                }
+                early.push((i, dest, ty));
+            }
+            if !early.is_empty() {
+                for (i, dest, ty) in early {
+                    if self.state.ra_config.debug_param_store {
+                        eprintln!(
+                            "[PRE-STORE] param {} early ABI read -> slot (dest=v{})",
+                            i, dest.0
+                        );
+                    }
+                    self.emit_param_ref_impl(&dest, i, ty);
+                    self.state.param_pre_stored.insert(i);
+                }
+                // The materialisation went through %rax; the parallel copy
+                // below may reuse %rax as its cycle scratch, so the
+                // accumulator cache must not remember the parameter there.
+                self.state.reg_cache.invalidate_all();
             }
         }
 

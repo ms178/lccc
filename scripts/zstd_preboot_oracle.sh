@@ -4,6 +4,15 @@
 # like arch/x86/boot/compressed/misc.c, then calls
 #   __decompress(input_data, input_len, NULL, NULL, out, output_len, NULL, error)
 # where input_len/output_len are extern unsigned int (the piggy.S types).
+#
+# Two decisive properties (both learned the hard way, session 12):
+#   * BMI2 is MASKED by default (ZSTD_cpuid_bmi2 -> 0) so the `_default`
+#     clones that the qemu64 guest actually executes are the ones under test;
+#     EXTRA_CFLAGS=-DZSTD_ORACLE_HOST_CPU restores host CPUID dispatch.
+#   * Besides the separate-buffer driver, an IN-PLACE driver reproduces the
+#     guest geometry (input copied to out+in_off, decompress into out).
+# Leaves $OUT/{oracle.c,driver.c,driver_inplace.c,cflags.rsp} behind for
+# scripts/zstd_oracle_cc.sh.
 set -euo pipefail
 
 K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
@@ -112,6 +121,19 @@ void *memmove(void *dest, const void *src, size_t n)
 	}
 	return dest;
 }
+
+/* CPU-feature MASK (default ON): the qemu64 guest reports no BMI2, so the
+ * boot decompressor runs the `_default` (non-BMI2) clones of every
+ * HUF/ZSTD hot loop.  A host with BMI2 would silently exercise the `_bmi2`
+ * clones instead and MATCH while the guest fails (session 12: the -O1/-O2
+ * miscompiles lived only in HUF_decompress4X2_usingDTable_internal_default
+ * and ZSTD_decompressSequences_body).  Build with -DZSTD_ORACLE_HOST_CPU to
+ * follow the host CPUID instead. */
+#ifndef ZSTD_ORACLE_HOST_CPU
+#include "zstd/common/cpu.h"
+static inline int zstd_oracle_no_bmi2(ZSTD_cpuid_t c) { (void)c; return 0; }
+#define ZSTD_cpuid_bmi2 zstd_oracle_no_bmi2
+#endif
 
 #include "DECOMPRESS_UNZSTD_PATH_PLACEHOLDER"
 
@@ -292,6 +314,64 @@ int main(int argc, char **argv)
 }
 EOF
 
+# --- in-place driver: the guest geometry --------------------------------
+# head_64.S relocates the ZO to the END of the output buffer and misc.c then
+# decompresses in place: out=B, in=B+in_off with in_off chosen so the input
+# tail is only overwritten after it has been consumed (see
+# arch/x86/boot/header.S z_extract_offset / init_size).  The separate-buffer
+# driver above can MATCH while this shape fails, because a miscompiled
+# sequence decoder that reads *stale* literals only shows up when the output
+# window overlaps the not-yet-consumed input.  Default in_off is the value
+# observed for the VM-config kernel (0xc0029b); pass another as argv[3].
+cat > "$OUT/driver_inplace.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+extern int preboot_decompress_sized(unsigned char *in, unsigned in_len,
+				    unsigned char *out, unsigned out_len,
+				    void (*error)(char *));
+unsigned char *input_data; unsigned input_len, output_len;
+static void on_error(char *x) { fprintf(stderr, "error: %s\n", x); }
+static unsigned char *rd(const char *p, unsigned *n)
+{
+	int fd = open(p, O_RDONLY);
+	struct stat st;
+	if (fd < 0 || fstat(fd, &st) < 0) { perror(p); exit(2); }
+	unsigned char *b = mmap(0, st.st_size, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (read(fd, b, st.st_size) != st.st_size) { perror(p); exit(2); }
+	close(fd);
+	*n = st.st_size;
+	return b;
+}
+int main(int argc, char **argv)
+{
+	if (argc < 3) {
+		fprintf(stderr, "usage: %s vmlinux.bin.zst vmlinux.bin [in_off] [dump]\n", argv[0]);
+		return 2;
+	}
+	unsigned zl, pl;
+	unsigned char *z = rd(argv[1], &zl), *p = rd(argv[2], &pl);
+	unsigned long in_off = argc > 3 ? strtoul(argv[3], 0, 0) : 0xc0029b;
+	size_t total = in_off + zl + 0x100000;
+	unsigned char *B = mmap(0, total, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	memcpy(B + in_off, z, zl);
+	int rc = preboot_decompress_sized(B + in_off, zl, B, pl, on_error);
+	unsigned first = pl;
+	for (unsigned i = 0; i < pl; i++)
+		if (B[i] != p[i]) { first = i; break; }
+	printf("inplace off=0x%lx rc=%d %s first_diff=0x%x\n", in_off, rc,
+	       first == pl ? "MATCH" : "MISMATCH", first);
+	if (argc > 4) { FILE *f = fopen(argv[4], "wb"); fwrite(B, 1, pl, f); fclose(f); }
+	return first == pl && rc >= 0 ? 0 : 1;
+}
+EOF
+
 # The TU heredoc above is quoted (no expansion), so patch the kernel-tree
 # absolute include path in afterwards. KERNEL_DIR (K) is the single source
 # of truth — no hardcoded /home/user.
@@ -301,11 +381,13 @@ sed -i "s|DECOMPRESS_UNZSTD_PATH_PLACEHOLDER|$K/lib/decompress_unzstd.c|" \
 compile_one() {
   local cc=$1 name=$2
   echo "CC  oracle ($name)"
-  $cc $CFLAGS_COMMON @"$OUT/cflags.rsp" -c "$OUT/oracle.c" -o "$OUT/oracle-$name.o"
+  $cc $CFLAGS_COMMON ${EXTRA_CFLAGS:-} @"$OUT/cflags.rsp" -c "$OUT/oracle.c" -o "$OUT/oracle-$name.o"
   echo "CC  driver ($name)"
   # driver is userspace; use host gcc always for libc
   gcc -O2 -fPIE -c "$OUT/driver.c" -o "$OUT/driver.o"
   gcc -pie -o "$OUT/oracle-$name" "$OUT/driver.o" "$OUT/oracle-$name.o"
+  gcc -O2 -fPIE -c "$OUT/driver_inplace.c" -o "$OUT/driver_inplace.o"
+  gcc -pie -o "$OUT/oracle-inplace-$name" "$OUT/driver_inplace.o" "$OUT/oracle-$name.o"
 }
 
 compile_one gcc gcc
@@ -315,3 +397,12 @@ echo "==== gcc ===="
 "$OUT/oracle-gcc" "$@" || true
 echo "==== lccc ===="
 "$OUT/oracle-lccc" "$@" || true
+
+# In-place (guest geometry) run on the real piggy payload, when present.
+ZFILE=${ZFILE:-$K/arch/x86/boot/compressed/vmlinux.bin.zst}
+PFILE=${PFILE:-$K/arch/x86/boot/compressed/vmlinux.bin}
+if [[ -f "$ZFILE" && -f "$PFILE" ]]; then
+  echo "==== in-place (guest geometry) ===="
+  printf '%-6s ' gcc;  "$OUT/oracle-inplace-gcc"  "$ZFILE" "$PFILE" || true
+  printf '%-6s ' lccc; "$OUT/oracle-inplace-lccc" "$ZFILE" "$PFILE" || true
+fi

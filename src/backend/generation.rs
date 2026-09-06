@@ -3789,12 +3789,14 @@ fn generate_function(
     let frame_size = cg.aligned_frame_size(raw_space);
     cg.state().frame_size = frame_size;
     cg.emit_prologue(func, frame_size);
+    // Use counts must be visible to `emit_store_params`: the x86 prologue
+    // materialises late ABI parameter reads through `store_rax_to`, which
+    // consults them to skip dead destinations.
+    let value_use_counts = count_value_uses(func);
+    cg.state().value_use_counts = value_use_counts.clone();
     cg.emit_store_params(func);
 
     let entry_label = func.blocks.first().map(|b| b.label);
-
-    let value_use_counts = count_value_uses(func);
-    cg.state().value_use_counts = value_use_counts.clone();
 
     // Loop-carried accumulator destinations for the fmsub gate (levkropp
     // e3b21b8f, audited). Fusing `acc -= a*b` into fmsub puts the multiply
