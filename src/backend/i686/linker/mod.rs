@@ -54,9 +54,7 @@ impl DynStrTab {
     }
 }
 
-#[cfg(not(feature = "gcc_linker"))]
 pub use link::link_builtin;
-#[cfg(not(feature = "gcc_linker"))]
 pub use link::link_shared;
 
 /// Load ELF32/i386 inputs for the shared linker-script layout engine and

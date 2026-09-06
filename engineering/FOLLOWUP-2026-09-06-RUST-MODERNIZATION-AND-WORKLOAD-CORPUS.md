@@ -72,3 +72,29 @@ Ran full 39-benchmark suite (`-O2`, paired rounds, taskset-pinned):
 - **Symptom:** In `gzip_crc32`, GCC emits 15 static instructions with `xorl table(,%reg,4), %eax` using SIB memory operands directly in the ALU instruction. LCCC materializes the table address into a register first (36 instructions).
 - **Recommended Action:**
   1. In `src/backend/x86/codegen/peephole/passes/load_op_fuse.rs` and `src/backend/x86/codegen/isel.rs`, extend SIB memory folding to support global symbol base with index and scale: `symbol(,%reg,4)`.
+
+---
+
+## Addendum (2026-09-06, red-team audit session): corrected oracle numbers
+
+The §1.4 instruction counts were not reproducible with the checked-in kernel
+sources and `scripts/codegen_oracle.py` defaults (`-O3 -march=x86-64-v3`).
+Re-verified live against the same pinned Compiler Explorer channels:
+
+- `glibc_strstr` / `two_way_short_needle`: LCCC **75** vs GCC 16.2 **144**
+  (1.92× smaller — LCCC best). Clang 23.1 / ICC / ICX inline the static
+  callee at `-O3`, so their §1.4 numbers (89/94/155) are not reproducible as
+  function-level measurements. At `-O2`, GCC emits **58** and beats LCCC's
+  75 — the LCCC advantage is an `-O3` result, not an unconditional win.
+- `sha256_transform`: whole-TU comparison (all compilers inline) — Clang 23.1
+  **267** (44 vector instructions), GCC 16.2 **275** (37 vector), ICC 438,
+  LCCC **444** (0 vector instructions, 194 spills), ICX 1145. LCCC is 0.60×
+  the best; the "beats ICX by 4.6×" framing in §1.4 cherry-picked the weakest
+  comparator.
+- `zstd_count` / `ZSTD_count`: only LCCC emits the static function (62
+  instructions) at `-O3`; every reference compiler inlines it, so the §1.4
+  row is not a comparable measurement.
+
+The gaps (zero vectorization on the SHA-256 schedule, spill-heavy ARX codegen)
+remain the genuine optimization targets; see the 2026-09-06 audit follow-up
+document for the current, verified numbers and the prioritized backlog.

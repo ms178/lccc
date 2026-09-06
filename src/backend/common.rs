@@ -642,7 +642,9 @@ const DIRECT_LD_AARCH64: DirectLdArchConfig = DirectLdArchConfig {
 // $LCCC_SYSROOT/usr/lib/gcc/i686-linux-gnu/<ver> when those exist.
 
 /// Map an absolute candidate path onto the active sysroot (if any).
-#[cfg(not(feature = "gcc_linker"))]
+// NOTE: deliberately NOT gated on `not(feature = "gcc_linker")`: the always-
+// compiled i686 shared-library linker (linker/shared.rs) resolves NEEDED
+// libraries through the sysroot helpers under every feature combination.
 pub(crate) fn with_sysroot_prefix(path: &str) -> String {
     match std::env::var("LCCC_SYSROOT") {
         Ok(root) if !root.is_empty() => format!("{}{}", root.trim_end_matches('/'), path),
@@ -651,7 +653,8 @@ pub(crate) fn with_sysroot_prefix(path: &str) -> String {
 }
 
 /// Existence probe honouring LCCC_SYSROOT (prefixed path first, host fallback).
-#[cfg(not(feature = "gcc_linker"))]
+// See the with_sysroot_prefix note: used by the unconditional i686 shared
+// linker path, so this must exist under `gcc_linker` too.
 pub(crate) fn exists_with_sysroot(path: &str) -> bool {
     std::path::Path::new(&with_sysroot_prefix(path)).exists() || std::path::Path::new(path).exists()
 }
