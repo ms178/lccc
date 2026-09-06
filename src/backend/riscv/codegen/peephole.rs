@@ -187,7 +187,6 @@ fn reg_name(id: u8) -> &'static str {
     }
 }
 
-
 // ── Implicit register operands (central oracle) ─────────────────────────────
 //
 // RISC-V names nearly every operand explicitly, so its implicit surface is
@@ -1889,5 +1888,4 @@ mod jump_near_tests {
         assert!(!implicitly_writes_rv("ret", REG_RA));
         assert_eq!(classify_implicit_operands_rv("ret").0, ra);
     }
-
 }

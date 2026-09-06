@@ -1335,6 +1335,37 @@ impl X86Codegen {
                 &self.state.ra_config,
             );
 
+        // ── MachInst window-allocator busy map ──────────────────────────────
+        // Per-GPR live spans of every main-RA home, for the window allocator:
+        // a register holding a value live ACROSS a MachInst window but never
+        // referenced INSIDE it is invisible to operand-level interference, and
+        // using it as a window scratch would silently clobber the value.
+        // Derived from the RA assignments × the same liveness the allocator
+        // itself used (hole-aware segments when present, fat intervals
+        // otherwise — segments only ever shrink busy spans, never grow them).
+        // XMM homes (ids ≥ 20) are irrelevant to the GPR scratch pool; rax
+        // (accumulator) and rcx (shift scratch) are never MachInst window
+        // homes, so they are simply not recorded.
+        {
+            self.machine_reg_busy.clear();
+            if let Some(liv) = &cached_liveness {
+                let segs = if liv.segments.is_empty() {
+                    &liv.intervals
+                } else {
+                    &liv.segments
+                };
+                for (&v, &reg) in &self.reg_assignments {
+                    if reg.0 >= 20 {
+                        continue; // XMM bank: not in the GPR window pool
+                    }
+                    let spans = self.machine_reg_busy.entry(reg.0).or_default();
+                    for seg in segs.iter().filter(|s| s.value_id == v) {
+                        spans.push((seg.start, seg.end));
+                    }
+                }
+            }
+        }
+
         // ── CMP-REPLAY post-RA home pruning (IS-09) ─────────────────────────
         // The scan accepted every Value operand optimistically; now that
         // homes are final, keep only entries whose operands are readable at
@@ -1444,11 +1475,19 @@ impl X86Codegen {
             }
         }
 
-        // MachInst is profitable on straight-line and modest-CFG code, but its
-        // current local scheduler regressed gzip's large hot loops by ~3% even
-        // while shrinking them. Keep it default-on selectively: functions with
-        // a large static loop body use the mature backend. This is a target-
-        // independent cost decision, not a function-name exception.
+        // MachInst loop-body profitability gate.
+        //
+        // History: the original limit (32) existed because ONE spilled value
+        // in a register-only position replayed the whole buffered window
+        // through the accumulator text path — in a large loop body that was
+        // both a size and a ~3% runtime regression on gzip. The window
+        // register allocator (machinst_alloc.rs) removed that cliff: spilled
+        // values now get window scratch registers with SSA-exact reloads
+        // and stores, and the two forced-loop conformance failures that
+        // motivated the gate (ra09_selfop_xor, range_check_fold) pass with
+        // the gate unlimited. The default is therefore a generous sanity
+        // bound (not a profitability decision): effectively "loops allowed",
+        // still overridable for bisects via CCC_MI_MAX_LOOP_INSTS.
         let max_loop_insts = self.state.ra_config.mi_max_loop_insts;
         let loop_insts = cached_liveness
             .as_ref()

@@ -197,52 +197,64 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
     }
 }
 
-/// If `op` is an immediate outside the signed-32-bit range, materialize it
-/// into %rax with movabsq and return a register operand (plus the emitted
-/// movabsq line). x86 `cmp/test` (like all ALU ops) only support imm32
-/// sign-extended operands; using the raw 64-bit immediate would truncate it
-/// and miscompare (regression: simd_movnt's `lo == 0x1122334455667788ULL`
-/// check compiled to `cmp $0x55667788`).
-/// x86-64 ALU and compare immediates are sign-extended 32-bit. A wider
-/// constant has to be loaded into a register first; emitting it inline is not
-/// a silent truncation but a hard assembler error ("operand type mismatch for
-/// `add'"), so any path that forgets this breaks the build.
-///
-/// The scratch is `%rax`, matching the accumulator convention the rest of this
-/// backend uses. That is only sound while no *other* operand of the same
-/// instruction already lives in `%rax` -- see [`assert_scratch_free`], which
-/// makes the assumption checkable instead of implicit.
-fn materialize_large_imm(op: &MachOperand, out: &mut AsmOutput) -> MachOperand {
-    match op {
-        MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64 => {
-            out.emit_fmt(format_args!("    movabsq ${}, %rax", v));
-            MachOperand::Reg(MachReg::Phys(super::machinst::RAX))
-        }
-        _ => op.clone(),
+/// Scratch-register selection for staging a wide immediate at emission
+/// time. `rax` is the conventional scratch; `rcx` — equally reserved in the
+/// MachInst model (not allocatable, not a main-RA home, only ever holding
+/// single-instruction staging) — takes over whenever `rax` is an operand of
+/// the very instruction being staged for. This is the release-sound
+/// replacement for what `assert_scratch_free` used to only *debug*-assert:
+/// staging a wide immediate through a register the instruction also reads
+/// silently computes the wrong result while still assembling cleanly.
+fn imm_scratch(other: &MachOperand) -> PhysReg {
+    if matches!(other, MachOperand::Reg(MachReg::Phys(RAX))) {
+        RCX
+    } else {
+        RAX
     }
 }
 
-/// True when `op` needs [`materialize_large_imm`].
+/// Materialize a wide immediate into a chosen scratch register.
+fn materialize_large_imm_into(v: i64, scratch: PhysReg, out: &mut AsmOutput) -> MachOperand {
+    out.emit_fmt(format_args!("    movabsq ${}, %{}", v, reg_name(scratch)));
+    MachOperand::Reg(MachReg::Phys(scratch))
+}
+
+/// True when `op` is a wide immediate needing register staging.
 fn needs_scratch(op: &MachOperand) -> bool {
     matches!(op, MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64)
 }
 
-/// Guard the `%rax`-as-scratch assumption in [`materialize_large_imm`].
-///
-/// If a large immediate has to be staged through `%rax` while another operand
-/// of the same instruction already IS `%rax`, staging overwrites it and the
-/// instruction computes the wrong thing -- silently, because the result still
-/// assembles. No current lowering produces that shape (the codegen materializes
-/// wide constants long before this point), so rather than emit a heavier
-/// save/restore sequence for a path that never runs, make the invariant
-/// explicit and let a debug build fail loudly the day it stops holding.
-#[inline]
-fn assert_scratch_free(imm: &MachOperand, other: &MachReg) {
-    debug_assert!(
-        !(needs_scratch(imm) && *other == MachReg::Phys(super::machinst::RAX)),
-        "a wide immediate must be staged through %rax, but %rax is already an \
-         operand of this instruction; the staging would clobber it"
-    );
+/// Stage both operands' wide immediates in one shot, rax for the lhs and rcx
+/// for the rhs. Both operands are immediates here, so neither scratch can
+/// collide with a register operand of this instruction. (Staging both through
+/// rax — the historical behavior — compared `%rax` with itself: an
+/// always-equal compare that assembles perfectly. Unreachable from the isel
+/// today, one defensive caller away from a silent miscompile tomorrow.)
+fn stage_both_imms(
+    lhs: &MachOperand,
+    rhs: &MachOperand,
+    out: &mut AsmOutput,
+) -> (MachOperand, MachOperand) {
+    let l = materialize_large_imm_into(imm_value(lhs), RAX, out);
+    let r = materialize_large_imm_into(imm_value(rhs), RCX, out);
+    (l, r)
+}
+
+fn imm_value(op: &MachOperand) -> i64 {
+    match op {
+        MachOperand::Imm(v) => *v,
+        _ => unreachable!("stage_both_imms on a non-immediate"),
+    }
+}
+
+/// True when `op` is a memory operand whose base register is `r`.
+fn mem_base_is(op: &MachOperand, r: PhysReg) -> bool {
+    let base = match op {
+        MachOperand::Mem { base, .. } => Some(base),
+        MachOperand::MemIndex { base, .. } => Some(base),
+        _ => None,
+    };
+    base.is_some_and(|b| matches!(b, MachReg::Phys(p) if *p == r))
 }
 
 /// Map an XMM-allocated PhysReg to its scalar SSE register name.
@@ -488,16 +500,26 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             match (src, dst) {
                 // Self-move: nothing to do (same xmm home).
                 (MachOperand::Reg(a), MachOperand::Reg(b)) if a == b => return,
-                // Register-to-register copies use the VEX 3-operand form,
-                // exactly like the text path's load_fp_to_reg: the legacy
-                // 2-operand `movsd %src, %dst` is a MERGING move that reads
-                // the destination's upper lane, creating a false dependence
-                // on whatever last wrote it (nbody's sqrt loop serialised
-                // 3.1x vs GCC from this before the text path switched).
+                // Register-to-register copies use the VEX PACKED move
+                // (`vmovapd`/`vmovaps`): full-register semantics, so no
+                // MERGING false dependence on the destination's upper lane
+                // (the nbody 3.1x serialization the legacy 2-operand
+                // `movsd %src, %dst` caused), and the form every modern
+                // core eliminates at rename — zero-latency, no execution
+                // port — where the scalar 3-operand `vmovsd s, s, d` form
+                // this used to emit is not reliably eliminated (2026-09-06
+                // mandelbrot A/B: the scalar form cost ~7% in the float
+                // loop; `vmovapd` matches the mature text path's movapd
+                // exactly). GCC's register-copy form for doubles is the
+                // same vmovapd.
                 (MachOperand::Reg(_), MachOperand::Reg(_)) => {
+                    let packed = match size {
+                        OpSize::S32 => "vmovaps",
+                        _ => "vmovapd",
+                    };
                     let src_str = fmt(src);
                     let dst_str = fmt(dst);
-                    out.emit_fmt(format_args!("    v{mnem} {src_str}, {src_str}, {dst_str}"));
+                    out.emit_fmt(format_args!("    {} {}, {}", packed, src_str, dst_str));
                     return;
                 }
                 // x86 has no mem-to-mem SSE move; the lowering gate refuses
@@ -587,9 +609,19 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 *size
             };
             let suffix = size.suffix();
-            // A wide immediate cannot be an ALU operand; stage it first.
-            assert_scratch_free(src, dst);
-            let src = materialize_large_imm(src, out);
+            // A wide immediate cannot be an ALU operand; stage it first —
+            // through rcx when dst is rax, so the staging can never clobber
+            // the very register the operation accumulates into.
+            let src = if needs_scratch(src) {
+                let scratch = if matches!(dst, MachReg::Phys(RAX)) {
+                    RCX
+                } else {
+                    RAX
+                };
+                materialize_large_imm_into(imm_value(src), scratch, out)
+            } else {
+                src.clone()
+            };
             let src_str = fmt_operand(&src, *size, out);
             let dst_str = fmt_reg(dst, *size);
             out.emit_fmt(format_args!(
@@ -604,24 +636,44 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             dst,
             size,
         } => {
+            // THERE IS NO 8-BIT THREE-OPERAND IMUL (`imulb $i, %r, %r' is
+            // rejected outright), and the 16-bit form's immediate field is
+            // imm16 — an imm32-range constant is unencodable at S16. Widen
+            // to S32 in both cases (the low 8/16 bits of the product are
+            // identical, and a narrow-typed value's consumers only observe
+            // those). Same discipline as the two-address Alu arm. Found by
+            // the extended randomized corpus.
+            let size = &if matches!(size, OpSize::S8)
+                || (matches!(size, OpSize::S16)
+                    && (*imm < i16::MIN as i64 || *imm > i16::MAX as i64))
+            {
+                OpSize::S32
+            } else {
+                *size
+            };
             let suffix = size.suffix();
             // `imul $imm, src, dst` takes a sign-extended imm32 like the ALU
             // forms. A wider multiplier must go through a register, and there
             // is no three-operand register form -- fall back to the
             // two-address sequence.
             if *imm < i32::MIN as i64 || *imm > i32::MAX as i64 {
-                assert_scratch_free(&MachOperand::Imm(*imm), dst);
-                let staged = materialize_large_imm(&MachOperand::Imm(*imm), out);
+                // Stage the wide multiplier through a scratch that is never
+                // the destination (rax→rcx), then run the two-address form.
+                let scratch = if matches!(dst, MachReg::Phys(RAX)) {
+                    RCX
+                } else {
+                    RAX
+                };
+                let staged = materialize_large_imm_into(*imm, scratch, out);
                 let src_str = fmt_reg(src, *size);
                 let dst_str = fmt_reg(dst, *size);
-                if fmt_operand(&staged, *size, out) != dst_str {
+                let staged_str = fmt_operand(&staged, *size, out);
+                if staged_str != dst_str {
                     out.emit_fmt(format_args!("    mov{} {}, {}", suffix, src_str, dst_str));
                 }
                 out.emit_fmt(format_args!(
                     "    imul{} {}, {}",
-                    suffix,
-                    fmt_operand(&staged, *size, out),
-                    dst_str
+                    suffix, staged_str, dst_str
                 ));
                 return;
             }
@@ -680,7 +732,11 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 (ShiftOp::Sar, _) => "sarxl",
             };
             // shlx has no 8/16-bit form; isel only selects S32/S64.
-            let sz = if *size == OpSize::S64 { OpSize::S64 } else { OpSize::S32 };
+            let sz = if *size == OpSize::S64 {
+                OpSize::S64
+            } else {
+                OpSize::S32
+            };
             out.emit_fmt(format_args!(
                 "    {} {}, {}, {}",
                 mnem,
@@ -747,18 +803,31 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
 
         MachInst::Cmp { lhs, rhs, size } => {
             let suffix = size.suffix();
-            let mut lhs = lhs.clone();
-            let mut rhs = rhs.clone();
             // 64-bit immediates don't fit in the imm32 of cmp; materialize.
-            if let MachOperand::Reg(r) = &rhs {
-                assert_scratch_free(&lhs, r);
-            }
-            if let MachOperand::Reg(r) = &lhs {
-                assert_scratch_free(&rhs, r);
-            }
-            lhs = materialize_large_imm(&lhs, out);
-            rhs = materialize_large_imm(&rhs, out);
-            // x86 cmp can't have two memory operands — load rhs to rax
+            // RELEASE-SOUND staging: a single wide immediate stages through
+            // rax unless the other operand IS rax (then rcx); two wide
+            // immediates stage into rax and rcx — never both into rax, which
+            // compared the register with itself.
+            let (lhs, rhs) = if needs_scratch(lhs) && needs_scratch(rhs) {
+                stage_both_imms(lhs, rhs, out)
+            } else if needs_scratch(lhs) {
+                (
+                    materialize_large_imm_into(imm_value(lhs), imm_scratch(rhs), out),
+                    rhs.clone(),
+                )
+            } else if needs_scratch(rhs) {
+                (
+                    lhs.clone(),
+                    materialize_large_imm_into(imm_value(rhs), imm_scratch(lhs), out),
+                )
+            } else {
+                (lhs.clone(), rhs.clone())
+            };
+            // x86 cmp can't have two memory operands — relay one through a
+            // scratch. The relay load reads the source before writeback, so
+            // the relay register may share the SOURCE's base; it must not
+            // share the DESTINATION operand's base (the relay value has to
+            // still address it afterwards).
             let both_mem = matches!(
                 (&lhs, &rhs),
                 (MachOperand::StackSlot(_), MachOperand::StackSlot(_))
@@ -767,14 +836,21 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                     | (MachOperand::Mem { .. }, MachOperand::StackSlot(_))
             );
             if both_mem {
+                let relay = if mem_base_is(&lhs, RAX) { RCX } else { RAX };
                 let rhs_str = fmt_operand(&rhs, *size, out);
                 // Relay register named at operand size (%al/%ax/%eax/%rax):
                 // a `movb …, %rax` relay load is unencodable.
-                let rax = sized_reg_name(RAX, *size);
-                out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
+                let relay_name = sized_reg_name(relay, *size);
+                out.emit_fmt(format_args!(
+                    "    mov{} {}, %{}",
+                    suffix, rhs_str, relay_name
+                ));
                 let lhs_str = fmt_operand(&lhs, *size, out);
                 // AT&T: cmp rhs, lhs
-                out.emit_fmt(format_args!("    cmp{} %{}, {}", suffix, rax, lhs_str));
+                out.emit_fmt(format_args!(
+                    "    cmp{} %{}, {}",
+                    suffix, relay_name, lhs_str
+                ));
             } else {
                 let rhs_str = fmt_operand(&rhs, *size, out);
                 let lhs_str = fmt_operand(&lhs, *size, out);
@@ -784,17 +860,24 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
 
         MachInst::Test { lhs, rhs, size } => {
             let suffix = size.suffix();
-            let mut lhs = lhs.clone();
-            let mut rhs = rhs.clone();
-            if let MachOperand::Reg(r) = &rhs {
-                assert_scratch_free(&lhs, r);
-            }
-            if let MachOperand::Reg(r) = &lhs {
-                assert_scratch_free(&rhs, r);
-            }
-            lhs = materialize_large_imm(&lhs, out);
-            rhs = materialize_large_imm(&rhs, out);
-            // x86 test can't have two memory operands — load one to rax
+            // Same release-sound staging discipline as Cmp (see there).
+            let (lhs, rhs) = if needs_scratch(lhs) && needs_scratch(rhs) {
+                stage_both_imms(lhs, rhs, out)
+            } else if needs_scratch(lhs) {
+                (
+                    materialize_large_imm_into(imm_value(lhs), imm_scratch(rhs), out),
+                    rhs.clone(),
+                )
+            } else if needs_scratch(rhs) {
+                (
+                    lhs.clone(),
+                    materialize_large_imm_into(imm_value(rhs), imm_scratch(lhs), out),
+                )
+            } else {
+                (lhs.clone(), rhs.clone())
+            };
+            // x86 test can't have two memory operands — relay one through a
+            // scratch (destination-base-safe, see Cmp).
             let both_mem = matches!(
                 (&lhs, &rhs),
                 (MachOperand::StackSlot(_), MachOperand::StackSlot(_))
@@ -803,13 +886,18 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                     | (MachOperand::Mem { .. }, MachOperand::StackSlot(_))
             );
             if both_mem {
+                let relay = if mem_base_is(&lhs, RAX) { RCX } else { RAX };
                 let rhs_str = fmt_operand(&rhs, *size, out);
-                // Relay register named at operand size (%al/%ax/%eax/%rax):
-                // a `movb …, %rax` relay load is unencodable.
-                let rax = sized_reg_name(RAX, *size);
-                out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
+                let relay_name = sized_reg_name(relay, *size);
+                out.emit_fmt(format_args!(
+                    "    mov{} {}, %{}",
+                    suffix, rhs_str, relay_name
+                ));
                 let lhs_str = fmt_operand(&lhs, *size, out);
-                out.emit_fmt(format_args!("    test{} %{}, {}", suffix, rax, lhs_str));
+                out.emit_fmt(format_args!(
+                    "    test{} %{}, {}",
+                    suffix, relay_name, lhs_str
+                ));
             } else {
                 let rhs_str = fmt_operand(&rhs, *size, out);
                 let lhs_str = fmt_operand(&lhs, *size, out);
@@ -848,17 +936,34 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             // (The previous `_ => movzbl` fallback TRUNCATED 32-bit values to
             // 8 bits — miscompiling every U32->U64 zero-extending cast, e.g.
             // gzip's send_bits bit packing: wrong values -> corrupt output.)
-            let mnem = match (from_size, to_size) {
-                (OpSize::S8, _) => "movzbl",
-                (OpSize::S16, _) => "movzwl",
-                _ => "movl",
+            //
+            // WIDTH RULE (2026-09-06, found by the extended randomized
+            // corpus): the destination register of every movz* form is named
+            // at 32 bits REGARDLESS of to_size — `movzbl %al, %bl` (the old
+            // to_size-based naming for to_size=S8) is rejected by every
+            // assembler, and the machine's zero-extension always fills the
+            // full register anyway, so the 32-bit spelling is exact for
+            // every to_size.
+            if *from_size > *to_size {
+                unreachable!(
+                    "zero-extension into a narrower type ({from_size:?} -> {to_size:?}) \
+                     is not a representable movzx"
+                );
+            }
+            let (mnem, dst_width) = match from_size {
+                OpSize::S8 => ("movzbl", OpSize::S32),
+                OpSize::S16 => ("movzwl", OpSize::S32),
+                // S32 -> wider: a 32-bit write zero-extends into the full
+                // register, so the 32-bit spelling is exact.
+                OpSize::S32 => ("movl", OpSize::S32),
+                // S64 -> S64 is identity: a full-width move. The old table
+                // emitted `movl %rax, %ebp` here — an operand-size mismatch
+                // every assembler rejects. Found by the extended randomized
+                // corpus (an (op, width) pair no hand-written goldens had
+                // instantiated).
+                OpSize::S64 => ("movq", OpSize::S64),
             };
-            let actual_dst_size = if *to_size == OpSize::S64 {
-                OpSize::S32
-            } else {
-                *to_size
-            };
-            let dst_str = fmt_reg(dst, actual_dst_size);
+            let dst_str = fmt_reg(dst, dst_width);
             out.emit_fmt(format_args!("    {} {}, {}", mnem, src_str, dst_str));
         }
 
@@ -869,19 +974,44 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             to_size,
         } => {
             let src_str = fmt_operand(src, *from_size, out);
-            let dst_str = fmt_reg(dst, *to_size);
+            // WIDTH RULE (2026-09-06, found by the extended randomized
+            // corpus): the (from, to) pair must be a STRICT widening — the
+            // old `_ => "movslq"` fallback emitted `movslq src, %eax`
+            // (operand size mismatch) for every pair it did not enumerate,
+            // and sign-extension into a narrower type is not a representable
+            // operation at all. Identity (from == to) degenerates to a
+            // plain move at the shared width.
             let mnem = match (from_size, to_size) {
+                (OpSize::S8, OpSize::S16) => "movsbw",
                 (OpSize::S8, OpSize::S32) => "movsbl",
-                (OpSize::S16, OpSize::S32) => "movswl",
                 (OpSize::S8, OpSize::S64) => "movsbq",
+                (OpSize::S16, OpSize::S32) => "movswl",
                 (OpSize::S16, OpSize::S64) => "movswq",
                 (OpSize::S32, OpSize::S64) => "movslq",
-                _ => "movslq", // fallback
+                (OpSize::S32, OpSize::S32) => "movl",
+                (OpSize::S64, OpSize::S64) => "movq",
+                (a, b) if a > b => unreachable!(
+                    "sign-extension into a narrower type ({a:?} -> {b:?}) is unencodable"
+                ),
+                (a, a2) if a == a2 => unreachable!("unhandled identity movsx {a:?}"),
+                _ => unreachable!("unhandled movsx pair {from_size:?} -> {to_size:?}"),
             };
+            let dst_str = fmt_reg(dst, *to_size);
             out.emit_fmt(format_args!("    {} {}, {}", mnem, src_str, dst_str));
         }
 
         MachInst::Cmov { cc, src, dst, size } => {
+            // THERE IS NO 8-BIT CMOV (and the isel never selects one: byte
+            // selects are rejected at the gate). x86-64 CMOVcc starts at 16
+            // bits; promoting an S8/S16 request to the 32-bit form writes
+            // the identical low bits and zero-extends the rest, which a
+            // narrow-typed value's consumers never observe. Found by the
+            // extended randomized corpus.
+            let size = if matches!(size, OpSize::S8 | OpSize::S16) {
+                &OpSize::S32
+            } else {
+                size
+            };
             let cc_str = cc_suffix(*cc);
             let suffix = size.suffix();
             let src_str = fmt_operand(src, *size, out);
@@ -987,6 +1117,23 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             out.emit_fmt(format_args!(
                 "    leaq {}(%rip), {}",
                 sym,
+                fmt_reg(dst, OpSize::S64)
+            ));
+        }
+
+        MachInst::LeaSlot { slot, dst } => {
+            // The address of a frame slot, in the emitter's frame mode — the
+            // same addressing every StackSlot operand formatting applies, so
+            // rsp-mode functions stay self-consistent.
+            let (off, base) = if out.use_rsp_addressing {
+                (out.rsp_frame_size + slot, "%rsp")
+            } else {
+                (*slot, "%rbp")
+            };
+            out.emit_fmt(format_args!(
+                "    leaq {}({}), {}",
+                off,
+                base,
                 fmt_reg(dst, OpSize::S64)
             ));
         }

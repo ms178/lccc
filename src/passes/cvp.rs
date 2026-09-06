@@ -285,10 +285,21 @@ fn edge_facts(
             out.push(Fact {
                 value: *cv,
                 bits: BOOL_BITS,
-                set: if truth { vec![(1, umax(BOOL_BITS))] } else { vec![(0, 0)] },
+                set: if truth {
+                    vec![(1, umax(BOOL_BITS))]
+                } else {
+                    vec![(0, 0)]
+                },
             });
             if let Some(&(bi, ii)) = defs.get(cv) {
-                if let Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } = func.blocks[bi].instructions[ii] {
+                if let Instruction::Cmp {
+                    ref op,
+                    ref lhs,
+                    ref rhs,
+                    ref ty,
+                    ..
+                } = func.blocks[bi].instructions[ii]
+                {
                     if let Some(p) = canonical_pred(*op, lhs, rhs, *ty) {
                         out.push(Fact::from_pred(p, truth));
                     }
@@ -455,9 +466,13 @@ fn decide_bool(
                 let &(bi, ii) = defs.get(v)?;
                 match &func.blocks[bi].instructions[ii] {
                     Instruction::Copy { src, .. } => go(stack, func, defs, src, depth - 1),
-                    Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } => {
-                        decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?)
-                    }
+                    Instruction::Cmp {
+                        ref op,
+                        ref lhs,
+                        ref rhs,
+                        ref ty,
+                        ..
+                    } => decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?),
                     _ => None,
                 }
             }
@@ -518,7 +533,13 @@ pub fn run_function(func: &mut IrFunction) -> usize {
             let mut i = 0;
             while i < func.blocks[blk].instructions.len() {
                 let repl = match &func.blocks[blk].instructions[i] {
-                    Instruction::Cmp { dest, op, lhs, rhs, ty } => canonical_pred(*op, lhs, rhs, *ty)
+                    Instruction::Cmp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
+                    } => canonical_pred(*op, lhs, rhs, *ty)
                         .and_then(|p| decide_pred(&stack, p))
                         .map(|t| Instruction::Copy {
                             dest: *dest,
@@ -553,8 +574,13 @@ pub fn run_function(func: &mut IrFunction) -> usize {
                     cond,
                     true_label,
                     false_label,
-                } if true_label != false_label => decide_bool(&stack, func, &defs, cond)
-                    .map(|t| if t { (*true_label, *false_label) } else { (*false_label, *true_label) }),
+                } if true_label != false_label => decide_bool(&stack, func, &defs, cond).map(|t| {
+                    if t {
+                        (*true_label, *false_label)
+                    } else {
+                        (*false_label, *true_label)
+                    }
+                }),
                 _ => None,
             };
             if let Some((keep, drop)) = decided {
@@ -711,21 +737,38 @@ mod tests {
                     false_label: BlockId(4),
                 },
             ),
-            mk(3, vec![], Terminator::Return(Some(Operand::Value(Value(3))))),
-            mk(4, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(0))))),
+            mk(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+            mk(
+                4,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
+            ),
         ];
         f.next_value_id = 5;
         let n = run_function(&mut f);
         assert_eq!(n, 4, "guard cmp, select, second cmp, branch");
         assert!(matches!(
             f.blocks[2].instructions[0],
-            Instruction::Copy { src: Operand::Const(IrConst::I32(0)), .. }
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(0)),
+                ..
+            }
         ));
         assert!(matches!(
             f.blocks[2].instructions[1],
-            Instruction::Copy { src: Operand::Value(Value(0)), .. }
+            Instruction::Copy {
+                src: Operand::Value(Value(0)),
+                ..
+            }
         ));
-        assert!(matches!(f.blocks[2].terminator, Terminator::Branch(BlockId(3))));
+        assert!(matches!(
+            f.blocks[2].terminator,
+            Terminator::Branch(BlockId(3))
+        ));
         assert_eq!(run_function(&mut f), 0, "idempotent");
     }
 
@@ -758,7 +801,11 @@ mod tests {
                     false_label: BlockId(2),
                 },
             ),
-            mk(2, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(0))))),
+            mk(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
+            ),
             mk(
                 3,
                 vec![
@@ -778,7 +825,11 @@ mod tests {
                     false_label: BlockId(5),
                 },
             ),
-            mk(4, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(9))))),
+            mk(
+                4,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(9)))),
+            ),
             mk(5, vec![], Terminator::Return(Some(Operand::Value(v)))),
         ];
         f.next_value_id = 5;
@@ -788,8 +839,14 @@ mod tests {
         // loses the b1 incoming.  b3 is then reached only from b0 with
         // v != 0, so the guard folds and the branch goes to b5.
         assert_eq!(n, 4);
-        assert!(matches!(f.blocks[1].terminator, Terminator::Branch(BlockId(2))));
-        assert!(matches!(f.blocks[3].terminator, Terminator::Branch(BlockId(5))));
+        assert!(matches!(
+            f.blocks[1].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+        assert!(matches!(
+            f.blocks[3].terminator,
+            Terminator::Branch(BlockId(5))
+        ));
         if let Instruction::Phi { incoming, .. } = &f.blocks[3].instructions[0] {
             assert_eq!(incoming.len(), 1);
             assert_eq!(incoming[0].1, BlockId(0));
@@ -824,9 +881,21 @@ mod tests {
                     ty: IrType::I32,
                 },
             ),
-            mk(1, vec![cmpk(1, 1)], Terminator::Return(Some(Operand::Value(Value(1))))),
-            mk(2, vec![cmpk(2, 1)], Terminator::Return(Some(Operand::Value(Value(2))))),
-            mk(3, vec![cmpk(3, 2)], Terminator::Return(Some(Operand::Value(Value(3))))),
+            mk(
+                1,
+                vec![cmpk(1, 1)],
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            ),
+            mk(
+                2,
+                vec![cmpk(2, 1)],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ),
+            mk(
+                3,
+                vec![cmpk(3, 2)],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
         ];
         f.next_value_id = 4;
         assert_eq!(run_function(&mut f), 3);

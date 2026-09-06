@@ -210,7 +210,11 @@ impl X86Codegen {
             op,
             IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
         );
-        let (first, second) = if swap_operands { (rhs, lhs) } else { (lhs, rhs) };
+        let (first, second) = if swap_operands {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
         self.emit_fp_operand_to_xmm(first, ty, "xmm0");
         self.emit_fp_operand_to_xmm(second, ty, "xmm1");
         if ty == IrType::F64 {
@@ -244,10 +248,14 @@ impl X86Codegen {
         // (vcmpsd/vcmpss, see try_emit_fp_select_blend) from the recorded
         // operands and blends the FP arms. The scan excluded `fused` dests,
         // so no pending-flag handshake state is skipped with it.
-        if std::env::var_os("CCC_NO_FP_SELECT").is_none() && self.fp_select_cmps.contains_key(&dest.0)
+        if std::env::var_os("CCC_NO_FP_SELECT").is_none()
+            && self.fp_select_cmps.contains_key(&dest.0)
         {
             if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
-                eprintln!("[FP-SELECT] cmp %{} emits nothing (blend at select)", dest.0);
+                eprintln!(
+                    "[FP-SELECT] cmp %{} emits nothing (blend at select)",
+                    dest.0
+                );
             }
             return;
         }
@@ -1296,8 +1304,10 @@ impl X86Codegen {
             //    homes can only be xmm2-xmm15, so no aliasing with scratch.)
             self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
             self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
-            self.state
-                .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0, %xmm0", cmp_insn, imm));
+            self.state.emit_fmt(format_args!(
+                "    {} ${}, %xmm1, %xmm0, %xmm0",
+                cmp_insn, imm
+            ));
             // 2. true → xmm1 BEFORE false can clobber a shared home.
             self.emit_fp_operand_to_xmm(true_val, ty, "xmm1");
             // 3. false → dest home (no-op when the false arm already lives
@@ -1336,8 +1346,10 @@ impl X86Codegen {
         // 1. mask → xmm1: lhs → xmm0, rhs → xmm1, vcmpsd into xmm1.
         self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
         self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
-        self.state
-            .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0, %xmm1", cmp_insn, imm));
+        self.state.emit_fmt(format_args!(
+            "    {} ${}, %xmm1, %xmm0, %xmm1",
+            cmp_insn, imm
+        ));
         // 2. true → xmm0 (any operand kind; the false arm stays in its home).
         self.emit_fp_operand_to_xmm(true_val, ty, "xmm0");
         // 3. blend into the accumulator: mask ? xmm0 : %f.

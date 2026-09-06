@@ -162,7 +162,7 @@ pub(crate) struct RaConfig {
     pub(crate) no_x64_immed_nohome: bool,
     /// `CCC_X64_NOHOME_CLASSES`: selected no-home consumer classes (default: `ret,store,copy,cast,unary,binop`).
     pub(crate) x64_nohome_classes: String,
-    /// `CCC_MI_MAX_LOOP_INSTS`: MachInst loop-size threshold (default: 32).
+    /// `CCC_MI_MAX_LOOP_INSTS`: MachInst loop-size threshold (default: 4096).
     pub(crate) mi_max_loop_insts: usize,
     /// `CCC_MI_FN_DISABLE`: comma-separated MachInst-disabled name substrings (default: empty).
     pub(crate) mi_fn_disable: String,
@@ -289,7 +289,7 @@ impl RaConfig {
             no_x64_immed_nohome: present("CCC_NO_X64_IMMED_NOHOME"),
             x64_nohome_classes: text("CCC_X64_NOHOME_CLASSES")
                 .unwrap_or_else(|| "ret,store,copy,cast,unary,binop".into()),
-            mi_max_loop_insts: number("CCC_MI_MAX_LOOP_INSTS", 32),
+            mi_max_loop_insts: number("CCC_MI_MAX_LOOP_INSTS", 4096),
             mi_fn_disable: text("CCC_MI_FN_DISABLE").unwrap_or_default(),
             mi_all_classic: present("CCC_MI_ALL_CLASSIC"),
             mi_fn_force: text("CCC_MI_FN_FORCE").unwrap_or_default(),
@@ -648,7 +648,9 @@ fn x86_params_dead_after_inline_libc_calls(
     }
     if seen_inline {
         let mut used = false;
-        entry.terminator.for_each_used_value(|v| used |= params.contains(&v));
+        entry
+            .terminator
+            .for_each_used_value(|v| used |= params.contains(&v));
         if used {
             return false;
         }
@@ -662,7 +664,9 @@ fn x86_params_dead_after_inline_libc_calls(
                 return false;
             }
             let mut used = false;
-            block.terminator.for_each_used_value(|v| used |= params.contains(&v));
+            block
+                .terminator
+                .for_each_used_value(|v| used |= params.contains(&v));
             if used {
                 return false;
             }
@@ -4436,7 +4440,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         // x86-only: the horizontal-add admission and direct-emit live in the
         // x86 SSE domain; the AArch64 NEON pool keeps its existing behavior.
         let fp_web_groups = if x86_fp_pool {
-            fp_copy_web_groups(func, &f64_value_set, &real_use, &assignments, &liveness.segments)
+            fp_copy_web_groups(
+                func,
+                &f64_value_set,
+                &real_use,
+                &assignments,
+                &liveness.segments,
+            )
         } else {
             FxHashMap::default()
         };
@@ -5579,8 +5589,18 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>
                 // spilled parameters and bought a frame.
                 Instruction::Call { func: name, info }
                     if !crate::common::types::target_is_32bit()
-                        && (crate::backend::generation::inline_memcpy_len(name, &info.args, info.is_variadic).is_some()
-                            || crate::backend::generation::x86_inline_memset_len(name, &info.args, info.is_variadic).is_some()) =>
+                        && (crate::backend::generation::inline_memcpy_len(
+                            name,
+                            &info.args,
+                            info.is_variadic,
+                        )
+                        .is_some()
+                            || crate::backend::generation::x86_inline_memset_len(
+                                name,
+                                &info.args,
+                                info.is_variadic,
+                            )
+                            .is_some()) =>
                 {
                     continue
                 }
@@ -6500,7 +6520,10 @@ fn fp_copy_web_groups(
     // falls back to separate homes (the copies stay real moves).
     let mut seg_of: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
     for seg in segments {
-        seg_of.entry(seg.value_id).or_default().push((seg.start, seg.end));
+        seg_of
+            .entry(seg.value_id)
+            .or_default()
+            .push((seg.start, seg.end));
     }
     groups.retain(|_leader, members| {
         for i in 0..members.len() {
@@ -7410,7 +7433,13 @@ fn phi_coalesce_skip_listed_with_config(
         }
     }
     list.split(',')
-        .filter_map(|t| t.trim().strip_prefix('v').unwrap_or(t.trim()).parse::<u32>().ok())
+        .filter_map(|t| {
+            t.trim()
+                .strip_prefix('v')
+                .unwrap_or(t.trim())
+                .parse::<u32>()
+                .ok()
+        })
         .any(|v| v == backedge_src)
 }
 
@@ -7592,65 +7621,61 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
     // Load depends on the `n`-indexed GEP, which put `a_next`/`s_next`
     // into `n`'s derived set, and the latch copies of a/s then counted as
     // reads of a derived value — vetoing the n-chain copy forever.
-    let derived_before = |block: &crate::ir::reexports::BasicBlock,
-                          def_idx: usize,
-                          phi: u32|
-     -> FxHashSet<u32> {
-        let mut derived: FxHashSet<u32> = FxHashSet::default();
-        derived.insert(phi);
-        for earlier in &block.instructions[..def_idx] {
-            // Mirror the backend's SIB `resolve_index` peel set exactly:
-            // widening Cast, GEP, and the constant-operand scale/offset
-            // arithmetic (`Shl`/`Mul` by a constant → SIB scale,
-            // `Add`/`Sub` a constant → SIB displacement). Each of these is
-            // folded away when the access absorbs the chain, so the root
-            // register is re-read at the Load/Store. Missing the `Shl` arm
-            // let `xs[i] = 1.0/(i+1)` share `i`'s register with `i+1`: the
-            // folded `(%base,%i,8)` store then indexed with the incremented
-            // value (fpweb_dot_and_sum / init_shift_index regression).
-            let peelable_binop = matches!(
-                earlier,
-                Instruction::BinOp {
-                    op: IrBinOp::Shl | IrBinOp::Mul | IrBinOp::Add | IrBinOp::Sub,
-                    ..
+    let derived_before =
+        |block: &crate::ir::reexports::BasicBlock, def_idx: usize, phi: u32| -> FxHashSet<u32> {
+            let mut derived: FxHashSet<u32> = FxHashSet::default();
+            derived.insert(phi);
+            for earlier in &block.instructions[..def_idx] {
+                // Mirror the backend's SIB `resolve_index` peel set exactly:
+                // widening Cast, GEP, and the constant-operand scale/offset
+                // arithmetic (`Shl`/`Mul` by a constant → SIB scale,
+                // `Add`/`Sub` a constant → SIB displacement). Each of these is
+                // folded away when the access absorbs the chain, so the root
+                // register is re-read at the Load/Store. Missing the `Shl` arm
+                // let `xs[i] = 1.0/(i+1)` share `i`'s register with `i+1`: the
+                // folded `(%base,%i,8)` store then indexed with the incremented
+                // value (fpweb_dot_and_sum / init_shift_index regression).
+                let peelable_binop = matches!(
+                    earlier,
+                    Instruction::BinOp {
+                        op: IrBinOp::Shl | IrBinOp::Mul | IrBinOp::Add | IrBinOp::Sub,
+                        ..
+                    }
+                ) && {
+                    let mut has_const = false;
+                    for_each_operand_in_instruction(earlier, |op| {
+                        if matches!(op, Operand::Const(_)) {
+                            has_const = true;
+                        }
+                    });
+                    has_const
+                } && earlier.dest().is_some_and(|d| addr_fed.contains(&d.0));
+                if !matches!(
+                    earlier,
+                    Instruction::Cast { .. } | Instruction::GetElementPtr { .. }
+                ) && !peelable_binop
+                {
+                    continue;
                 }
-            ) && {
-                let mut has_const = false;
+                let mut depends = false;
                 for_each_operand_in_instruction(earlier, |op| {
-                    if matches!(op, Operand::Const(_)) {
-                        has_const = true;
+                    if matches!(op, Operand::Value(v) if derived.contains(&v.0)) {
+                        depends = true;
                     }
                 });
-                has_const
-            } && earlier
-                .dest()
-                .is_some_and(|d| addr_fed.contains(&d.0));
-            if !matches!(
-                earlier,
-                Instruction::Cast { .. } | Instruction::GetElementPtr { .. }
-            ) && !peelable_binop
-            {
-                continue;
-            }
-            let mut depends = false;
-            for_each_operand_in_instruction(earlier, |op| {
-                if matches!(op, Operand::Value(v) if derived.contains(&v.0)) {
-                    depends = true;
-                }
-            });
-            for_each_value_use_in_instruction(earlier, |v| {
-                if derived.contains(&v.0) {
-                    depends = true;
-                }
-            });
-            if depends {
-                if let Some(d) = earlier.dest() {
-                    derived.insert(d.0);
+                for_each_value_use_in_instruction(earlier, |v| {
+                    if derived.contains(&v.0) {
+                        depends = true;
+                    }
+                });
+                if depends {
+                    if let Some(d) = earlier.dest() {
+                        derived.insert(d.0);
+                    }
                 }
             }
-        }
-        derived
-    };
+            derived
+        };
     let terminator_uses = |term: &Terminator, set: &FxHashSet<u32>| -> bool {
         let mut found = false;
         for_each_operand_in_terminator(term, |op| {
@@ -7773,11 +7798,10 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                     .chain(block.instructions[..copy_idx].iter())
                     .any(|middle| derived.iter().any(|&v| uses_value(middle, v)));
                 let read_by_terminator = terminator_uses(&src_blk.terminator, &derived);
-                let phi_escapes = succs
-                    .row(source_block)
-                    .iter()
-                    .any(|&s| s as usize != block_idx && liveness.is_live_in(s as usize, dest.0))
-                    || liveness.is_live_in(block_idx, dest.0);
+                let phi_escapes =
+                    succs.row(source_block).iter().any(|&s| {
+                        s as usize != block_idx && liveness.is_live_in(s as usize, dest.0)
+                    }) || liveness.is_live_in(block_idx, dest.0);
                 let derived_escapes = derived
                     .iter()
                     .filter(|&&v| v != dest.0)
@@ -7850,14 +7874,11 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
             // tight-loop accumulator webs even though the old value's last
             // read is BEFORE the source definition (double_reduction's four
             // accumulators lost their homes; got [] regression).
-            let phi_live_in_window = liveness
-                .folded_read_points
-                .get(&dest.0)
-                .is_some_and(|pts| {
-                    windows.iter().any(|&(lo, hi)| {
-                        lo <= hi && pts.iter().any(|&p| lo <= p && p <= hi)
-                    })
-                });
+            let phi_live_in_window = liveness.folded_read_points.get(&dest.0).is_some_and(|pts| {
+                windows
+                    .iter()
+                    .any(|&(lo, hi)| lo <= hi && pts.iter().any(|&p| lo <= p && p <= hi))
+            });
             let source_used_before_copy = !same_block
                 && block.instructions[..copy_idx]
                     .iter()
@@ -8112,7 +8133,7 @@ mod ra_config_tests {
         assert_eq!(malformed.hot_web_steal, 3);
         assert_eq!(malformed.evict_mode, 3);
         assert_eq!(malformed.pgo_weight_max, 1);
-        assert_eq!(malformed.mi_max_loop_insts, 32);
+        assert_eq!(malformed.mi_max_loop_insts, 4096);
 
         let fp_override = from(&[
             ("CCC_DISABLE_SCALAR_FP_XMM", "1"),
@@ -8385,7 +8406,12 @@ mod phi_coalesce_tests {
         // and nothing reads the OLD n after the destructive update (the exit
         // returns a constant).  Pre-Fable this shape was restricted to FP
         // sources, leaving 2 copies per iteration in every counted loop.
-        let mut func = IrFunction::new("split_latch_counter".to_string(), IrType::I32, vec![], false);
+        let mut func = IrFunction::new(
+            "split_latch_counter".to_string(),
+            IrType::I32,
+            vec![],
+            false,
+        );
         func.blocks = vec![
             block(
                 0,
@@ -8418,7 +8444,11 @@ mod phi_coalesce_tests {
                 }],
                 Terminator::Branch(BlockId(1)),
             ),
-            block(3, Vec::new(), Terminator::Return(Some(Operand::Const(IrConst::I32(0))))),
+            block(
+                3,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            ),
         ];
         func.next_value_id = 4;
 
@@ -8438,7 +8468,12 @@ mod phi_coalesce_tests {
         // phi AFTER the destructive update in the body; sharing the homes
         // would hand the exit the POST-increment value.  The exit block
         // reads the phi, so `phi_escapes` must block the candidate.
-        let mut func = IrFunction::new("split_latch_return_phi".to_string(), IrType::I32, vec![], false);
+        let mut func = IrFunction::new(
+            "split_latch_return_phi".to_string(),
+            IrType::I32,
+            vec![],
+            false,
+        );
         func.blocks = vec![
             block(
                 0,
@@ -8471,7 +8506,11 @@ mod phi_coalesce_tests {
                 }],
                 Terminator::Branch(BlockId(1)),
             ),
-            block(3, Vec::new(), Terminator::Return(Some(Operand::Value(Value(1))))),
+            block(
+                3,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            ),
         ];
         func.next_value_id = 4;
 
@@ -8493,8 +8532,12 @@ mod phi_coalesce_tests {
         // (Cast/GEP) keep the register dependency; a BinOp would have been
         // materialized at its own point and is therefore a legal coalesce
         // (see `accepts_materialized_binop_escaping_source_block`).
-        let mut func =
-            IrFunction::new("split_latch_derived_escape".to_string(), IrType::I32, vec![], false);
+        let mut func = IrFunction::new(
+            "split_latch_derived_escape".to_string(),
+            IrType::I32,
+            vec![],
+            false,
+        );
         func.blocks = vec![
             block(
                 0,
@@ -8567,8 +8610,12 @@ mod phi_coalesce_tests {
         // successor. Coalescing is legal: the consumer reads the
         // materialized register, not the phi's home.  (`v3 = n1 * 2`
         // followed by `return v3` after the exit branch.)
-        let mut func =
-            IrFunction::new("split_latch_binop_escape".to_string(), IrType::I32, vec![], false);
+        let mut func = IrFunction::new(
+            "split_latch_binop_escape".to_string(),
+            IrType::I32,
+            vec![],
+            false,
+        );
         func.blocks = vec![
             block(
                 0,
@@ -8610,7 +8657,11 @@ mod phi_coalesce_tests {
                 }],
                 Terminator::Branch(BlockId(1)),
             ),
-            block(3, Vec::new(), Terminator::Return(Some(Operand::Value(Value(3))))),
+            block(
+                3,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
         ];
         func.next_value_id = 5;
 
@@ -8633,8 +8684,12 @@ mod phi_coalesce_tests {
         // operand and re-read the phi's register there, so the destructive
         // coalesce MUST stay vetoed (the addr_fed gate narrows the binop
         // peel to address-fed chains, it does not remove it).
-        let mut func =
-            IrFunction::new("folded_binop_index_escape".to_string(), IrType::I32, vec![], false);
+        let mut func = IrFunction::new(
+            "folded_binop_index_escape".to_string(),
+            IrType::I32,
+            vec![],
+            false,
+        );
         func.blocks = vec![
             block(
                 0,
@@ -9551,14 +9606,20 @@ mod phi_coalesce_tests {
                 }],
                 Terminator::Branch(BlockId(0)),
             ),
-            block(6, Vec::new(), Terminator::Return(Some(Operand::Const(IrConst::I32(0))))),
+            block(
+                6,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            ),
         ];
         func.next_value_id = 10;
 
         let liveness = compute_live_intervals(&func);
         let candidates = detect_phi_coalesce_groups(&func, &liveness);
         assert!(
-            !candidates.iter().any(|c| c.phi_dest == 1 && c.backedge_src == 2),
+            !candidates
+                .iter()
+                .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
             "second backedge copy of the phi must veto coalescing: {candidates:?}"
         );
     }
@@ -9607,8 +9668,16 @@ mod map_collector_tests {
         let f = func(
             vec![
                 intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
-                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(1)), Operand::Value(Value(1))]),
-                intrinsic(O::VecCmpF32x8, 3, vec![Operand::Value(Value(1)), Operand::Value(Value(1))]),
+                intrinsic(
+                    O::VecMinF32x8,
+                    2,
+                    vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                ),
+                intrinsic(
+                    O::VecCmpF32x8,
+                    3,
+                    vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                ),
                 intrinsic(
                     O::VecBlendvF32x8,
                     4,
@@ -9635,13 +9704,20 @@ mod map_collector_tests {
         let f = func(
             vec![
                 intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
-                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(1)), Operand::Value(Value(1))]),
+                intrinsic(
+                    O::VecMinF32x8,
+                    2,
+                    vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                ),
                 store(O::VecStoreF32x8, 2, Some(101)),
             ],
             Terminator::Return(Some(Operand::Value(Value(1)))),
         );
         let set = collect_x86_map_intermediate_values(&f);
-        assert!(!set.contains(&1), "terminator consumer must strand the load");
+        assert!(
+            !set.contains(&1),
+            "terminator consumer must strand the load"
+        );
         assert!(set.contains(&2), "min still admissible");
     }
 
@@ -9652,7 +9728,11 @@ mod map_collector_tests {
         let f = func(
             vec![
                 intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
-                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(1)), Operand::Value(Value(1))]),
+                intrinsic(
+                    O::VecMinF32x8,
+                    2,
+                    vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                ),
                 store(O::VecStoreF32x8, 9, Some(2)),
             ],
             Terminator::Return(None),
@@ -9668,14 +9748,21 @@ mod map_collector_tests {
         let f = func(
             vec![
                 intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
-                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(1)), Operand::Value(Value(1))]),
+                intrinsic(
+                    O::VecMinF32x8,
+                    2,
+                    vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                ),
                 intrinsic(O::VecLoadF32x8, 3, vec![Operand::Value(Value(2))]),
                 store(O::VecStoreF32x8, 3, Some(101)),
             ],
             Terminator::Return(None),
         );
         let set = collect_x86_map_intermediate_values(&f);
-        assert!(!set.contains(&2), "load-address consumer must strand the min");
+        assert!(
+            !set.contains(&2),
+            "load-address consumer must strand the min"
+        );
     }
 
     #[test]
@@ -9685,19 +9772,34 @@ mod map_collector_tests {
         let f = func(
             vec![
                 intrinsic(O::VecBroadcastF32x8, 1, vec![Operand::Value(Value(100))]),
-                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(9)), Operand::Value(Value(1))]),
-                intrinsic(O::VecCmpF32x8, 3, vec![Operand::Value(Value(9)), Operand::Value(Value(1))]),
-                intrinsic(O::VecBlendvF32x8, 4, vec![
-                    Operand::Value(Value(3)),
-                    Operand::Value(Value(2)),
-                    Operand::Value(Value(1)),
-                ]),
+                intrinsic(
+                    O::VecMinF32x8,
+                    2,
+                    vec![Operand::Value(Value(9)), Operand::Value(Value(1))],
+                ),
+                intrinsic(
+                    O::VecCmpF32x8,
+                    3,
+                    vec![Operand::Value(Value(9)), Operand::Value(Value(1))],
+                ),
+                intrinsic(
+                    O::VecBlendvF32x8,
+                    4,
+                    vec![
+                        Operand::Value(Value(3)),
+                        Operand::Value(Value(2)),
+                        Operand::Value(Value(1)),
+                    ],
+                ),
                 store(O::VecStoreF32x8, 4, Some(101)),
             ],
             Terminator::Return(None),
         );
         let set = collect_x86_map_broadcast_values(&f);
-        assert!(set.contains(&1), "broadcast feeding min/cmp/blendv admitted: {set:?}");
+        assert!(
+            set.contains(&1),
+            "broadcast feeding min/cmp/blendv admitted: {set:?}"
+        );
     }
 
     #[test]
@@ -9707,7 +9809,11 @@ mod map_collector_tests {
         let f = func(
             vec![
                 intrinsic(O::VecBroadcastF32x8, 1, vec![Operand::Value(Value(100))]),
-                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(9)), Operand::Value(Value(1))]),
+                intrinsic(
+                    O::VecMinF32x8,
+                    2,
+                    vec![Operand::Value(Value(9)), Operand::Value(Value(1))],
+                ),
                 intrinsic(
                     O::VecWidenMaskedAddI32x4ToI64x2,
                     3,
@@ -9723,6 +9829,9 @@ mod map_collector_tests {
             Terminator::Return(None),
         );
         let set = collect_x86_map_broadcast_values(&f);
-        assert!(!set.contains(&1), "unlisted consumer must strand the broadcast");
+        assert!(
+            !set.contains(&1),
+            "unlisted consumer must strand the broadcast"
+        );
     }
 }

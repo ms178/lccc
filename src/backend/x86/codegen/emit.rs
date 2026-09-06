@@ -570,6 +570,12 @@ pub struct X86Codegen {
     /// Maps PhysReg ID → list of (start, end) program points.
     /// At each call, only save registers with an interval containing the call point.
     pub(super) caller_save_intervals: FxHashMap<u8, Vec<(u32, u32)>>,
+    /// Main-RA GPR homes × liveness spans (reg id → inclusive program-point
+    /// ranges of the values homed there). The MachInst window allocator
+    /// consults it so a window scratch register can never clobber the home of
+    /// a value live across the window but not referenced inside it — exactly
+    /// the class operand-level interference cannot see.
+    pub(super) machine_reg_busy: FxHashMap<u8, Vec<(u32, u32)>>,
     /// MachInst buffer for virtual register ISel. Instructions are accumulated
     /// here by try_lower_machinst and flushed (allocated + emitted) by flush_machinst.
     pub(super) machinst_buf: Vec<super::machinst::MachInst>,
@@ -890,6 +896,7 @@ impl X86Codegen {
             param_source_regs: FxHashMap::default(),
             caller_save_spill_slots: FxHashMap::default(),
             caller_save_intervals: FxHashMap::default(),
+            machine_reg_busy: FxHashMap::default(),
             machinst_buf: Vec::new(),
             machinst_buf_ir: Vec::new(),
             machinst_enabled,
@@ -3557,10 +3564,26 @@ impl X86Codegen {
                     ));
                 }
             } else {
-                self.emit_shift_cl_legacy(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest_value_id);
+                self.emit_shift_cl_legacy(
+                    op,
+                    lhs,
+                    rhs,
+                    dest_phys,
+                    use_32bit,
+                    is_unsigned,
+                    dest_value_id,
+                );
             }
         } else {
-            self.emit_shift_cl_legacy(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest_value_id);
+            self.emit_shift_cl_legacy(
+                op,
+                lhs,
+                rhs,
+                dest_phys,
+                use_32bit,
+                is_unsigned,
+                dest_value_id,
+            );
         }
         self.state.reg_cache.invalidate_acc();
     }
@@ -3725,184 +3748,34 @@ impl X86Codegen {
 
 pub(super) const X86_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 
-/// Collect all vreg IDs from a MachInst, separating into all_vregs and def_vregs.
-fn collect_vregs_in_inst(
-    inst: &super::machinst::MachInst,
-    all: &mut crate::common::fx_hash::FxHashSet<u32>,
-    defs: &mut crate::common::fx_hash::FxHashSet<u32>,
-) {
-    use super::machinst::{MachInst, MachOperand, MachReg};
-    let use_reg = |r: &MachReg, all: &mut crate::common::fx_hash::FxHashSet<u32>| {
-        if let MachReg::Vreg(id) = r {
-            all.insert(*id);
-        }
-    };
-    let use_op = |o: &MachOperand, all: &mut crate::common::fx_hash::FxHashSet<u32>| match o {
-        MachOperand::Reg(r) => {
-            if let MachReg::Vreg(id) = r {
-                all.insert(*id);
-            }
-        }
-        MachOperand::Mem { base, .. } => {
-            if let MachReg::Vreg(id) = base {
-                all.insert(*id);
-            }
-        }
-        MachOperand::MemIndex { base, index, .. } => {
-            if let MachReg::Vreg(id) = base {
-                all.insert(*id);
-            }
-            if let MachReg::Vreg(id) = index {
-                all.insert(*id);
-            }
-        }
-        _ => {}
-    };
-    let def_reg = |r: &MachReg,
-                   all: &mut crate::common::fx_hash::FxHashSet<u32>,
-                   defs: &mut crate::common::fx_hash::FxHashSet<u32>| {
-        if let MachReg::Vreg(id) = r {
-            all.insert(*id);
-            defs.insert(*id);
-        }
-    };
-    match inst {
-        MachInst::Mov { src, dst, .. } => {
-            use_op(src, all);
-            if let MachOperand::Reg(r) = dst {
-                def_reg(r, all, defs);
-            } else {
-                use_op(dst, all);
-            }
-        }
-        MachInst::Alu { src, dst, .. } => {
-            use_op(src, all);
-            use_reg(dst, all);
-            def_reg(dst, all, defs);
-        }
-        MachInst::Imul3 { src, dst, .. } => {
-            use_reg(src, all);
-            def_reg(dst, all, defs);
-        }
-        MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => {
-            use_reg(dst, all);
-            def_reg(dst, all, defs);
-        }
-        MachInst::Shift { amount, dst, .. } => {
-            use_op(amount, all);
-            use_reg(dst, all);
-            def_reg(dst, all, defs);
-        }
-        MachInst::ShiftX {
-            count, src, dst, ..
-        } => {
-            use_reg(count, all);
-            use_reg(src, all);
-            def_reg(dst, all, defs);
-        }
-        MachInst::Lea {
-            base, index, dst, ..
-        } => {
-            use_reg(base, all);
-            if let Some((r, _)) = index {
-                use_reg(r, all);
-            }
-            def_reg(dst, all, defs);
-        }
-        MachInst::Div { divisor, .. } => {
-            use_op(divisor, all);
-        }
-        MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
-            use_op(lhs, all);
-            use_op(rhs, all);
-        }
-        MachInst::SetCC { dst, .. } => {
-            def_reg(dst, all, defs);
-        }
-        MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
-            use_op(src, all);
-            def_reg(dst, all, defs);
-        }
-        MachInst::Cmov { src, dst, .. } => {
-            use_op(src, all);
-            use_reg(dst, all);
-            def_reg(dst, all, defs);
-        }
-        _ => {}
-    }
-}
-
-/// Peephole: fold store followed by immediate reload when the slot is re-written later.
-fn fold_spill_relays(insts: &mut Vec<super::machinst::MachInst>) {
-    use super::machinst::{MachInst, MachOperand};
-    let mut last_write: crate::common::fx_hash::FxHashMap<i64, usize> =
-        crate::common::fx_hash::FxHashMap::default();
-    for (idx, inst) in insts.iter().enumerate() {
-        if let MachInst::Mov {
-            dst: MachOperand::StackSlot(s),
-            ..
-        } = inst
-        {
-            last_write.insert(*s, idx);
-        }
-    }
-    let mut i = 0;
-    while i + 1 < insts.len() {
-        if let MachInst::Mov {
-            src: src1,
-            dst: MachOperand::StackSlot(s1),
-            size: sz1,
-        } = &insts[i]
-        {
-            if let MachInst::Mov {
-                src: MachOperand::StackSlot(s2),
-                dst: dst2,
-                size: sz2,
-            } = &insts[i + 1]
-            {
-                if s1 == s2 && sz1 == sz2 && matches!(dst2, MachOperand::Reg(_)) {
-                    if let Some(&last_idx) = last_write.get(s1) {
-                        if last_idx > i {
-                            let folded = MachInst::Mov {
-                                src: src1.clone(),
-                                dst: dst2.clone(),
-                                size: *sz1,
-                            };
-                            insts[i] = folded;
-                            insts.remove(i + 1);
-                            last_write.clear();
-                            for (idx, inst) in insts.iter().enumerate() {
-                                if let MachInst::Mov {
-                                    dst: MachOperand::StackSlot(s),
-                                    ..
-                                } = inst
-                                {
-                                    last_write.insert(*s, idx);
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-}
+// The vreg def/use scanner and the store/reload peephole that used to live
+// here were dead scaffolding for a MachInst-local register allocator that was
+// never wired up (and the peephole was unsound if it ever had been: folding a
+// store→reload pair drops the store, and nothing proved the slot had no later
+// reader). Both are superseded — properly — by `machinst_alloc.rs`, whose
+// scanner is def/use-aware across every variant and whose reload/store
+// insertion is driven by SSA-exact window liveness instead of adjacency.
 
 /// Resolve stack-only vregs in a MachInst: replace MachReg::Vreg(id) with the
-/// value's stack slot as a memory operand. For instructions where the vreg is a
-/// dst (two-address ALU), we need to use rax as scratch: load→operate→store.
+/// value's stack slot as a memory operand — EXCEPT for vregs the window
+/// register allocator will handle (`reg_classified`): those keep their
+/// register positions so the allocator rewrites every occurrence uniformly
+/// (mixing a slot-substituted read with a register-held def of the same SSA
+/// value inside one window would read a stale slot image).
+///
+/// For instructions where the vreg is a dst (two-address ALU), we need to use
+/// rax as scratch: load→operate→store (or, now, the window allocator's
+/// reload/operate/store).
 fn resolve_stack_vregs(
     inst: &super::machinst::MachInst,
     ra: &FxHashMap<u32, PhysReg>,
     state: &CodegenState,
+    reg_classified: &crate::common::fx_hash::FxHashSet<u32>,
 ) -> super::machinst::MachInst {
     use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
 
-    // Helper: resolve a MachReg. If it's a vreg without a register, keep it as-is
-    // (the has_unresolvable_vreg check will catch it and abandon the buffer).
-    let resolve_reg = |r: &MachReg| -> MachReg { *r };
+    // (a `resolve_reg` no-op helper was here; the window allocator owns
+    // register-form resolution now, so only operand substitution remains)
 
     // WIDTH SOUNDNESS: a spilled vreg's slot is 4 bytes (small slot) or 8
     // bytes. Substituting it into an instruction whose size is WIDER than
@@ -3928,9 +3801,12 @@ fn resolve_stack_vregs(
     };
 
     // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible.
+    // Vregs the window allocator owns (reg_classified) are never substituted.
     let resolve_op = |op: &MachOperand, inst_size: OpSize| -> MachOperand {
         match op {
-            MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
+            MachOperand::Reg(MachReg::Vreg(id))
+                if !ra.contains_key(id) && !reg_classified.contains(id) =>
+            {
                 if let Some(slot) = state.get_slot(*id) {
                     if slot_fits(id, inst_size) {
                         MachOperand::StackSlot(slot.0)
@@ -3945,7 +3821,9 @@ fn resolve_stack_vregs(
                 base: MachReg::Vreg(id),
                 offset,
             } if !ra.contains_key(id) => {
-                // Can't have a stack-slot-based-memory operand. Keep as vreg.
+                // Can't have a stack-slot-based-memory operand. Keep as vreg
+                // for the window allocator to home; without a slot it trips
+                // the final unresolvable check.
                 op.clone()
             }
             _ => op.clone(),
@@ -3958,30 +3836,31 @@ fn resolve_stack_vregs(
             dst,
             size,
         } => {
-            // AllocaAddr: resolve to StackSlot but keep AllocaAddr tag so
-            // the emitter knows to use leaq instead of movq.
+            // AllocaAddr: the ADDRESS of the alloca's stack slot. Typed as a
+            // LeaSlot (frame-mode-aware in the emitter) instead of the old
+            // Raw("leaq …") text: a Raw escape hatch hides its register
+            // effects from the window allocator's scan and forced it to
+            // conservatively block the entire scratch pool. The dst stays
+            // whatever it was — a Phys, or a Vreg the window allocator owns.
             if let Some(slot) = state.get_slot(*id) {
-                // Emit as: Mov { src: AllocaAddr but with resolved slot, dst }
-                // We encode the slot in a special way the emitter recognizes.
-                // Actually, just resolve to a Lea with StackSlot-based addressing.
-                // The emitter handles StackSlot with use_rsp_addressing.
-                // Produce: Raw("    leaq slot(%rbp), %reg") with correct addressing.
-                if let MachOperand::Reg(r) = dst {
-                    let dst_name = super::machinst_emit::reg_name_pub(*r);
-                    if state.out.use_rsp_addressing {
-                        let rsp_off = state.out.rsp_frame_size + slot.0;
-                        return MachInst::Raw(format!("    leaq {}(%rsp), %{}", rsp_off, dst_name));
-                    } else {
-                        return MachInst::Raw(format!("    leaq {}(%rbp), %{}", slot.0, dst_name));
+                match dst {
+                    MachOperand::Reg(r) => {
+                        return MachInst::LeaSlot {
+                            slot: slot.0,
+                            dst: *r,
+                        };
+                    }
+                    _ => {
+                        // A non-register destination for an address is not a
+                        // shape the lowering produces; keep the Mov so the
+                        // final gate can reject it.
                     }
                 }
-                MachInst::Mov {
-                    src: MachOperand::StackSlot(slot.0),
-                    dst: resolve_op(dst, *size),
-                    size: *size,
-                }
-            } else {
-                inst.clone()
+            }
+            MachInst::Mov {
+                src: MachOperand::AllocaAddr(*id),
+                dst: resolve_op(dst, *size),
+                size: *size,
             }
         }
         MachInst::Mov { src, dst, size } => MachInst::Mov {
@@ -4036,27 +3915,12 @@ fn resolve_stack_vregs(
             to_size,
         } => {
             // movzx/movsx accept a memory source: a slot-backed (spilled) src
-            // vreg can be resolved to StackSlot directly. The emitter formats
-            // the src through fmt_operand, so `movzbl slot, %eax` is emitted.
-            // The memory read is `from_size` bytes wide, which never exceeds
-            // the slot (S8/S16/S32 reads of a 4-byte small slot read the
-            // stored low bytes, exactly the value's bits). A slot-backed dst
-            // stays a vreg and is caught by
-            // has_unresolvable_vreg -> default-path fallback.
-            let src_resolved = match src {
-                MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
-                    if let Some(slot) = state.get_slot(*id) {
-                        if slot_fits(id, *from_size) {
-                            MachOperand::StackSlot(slot.0)
-                        } else {
-                            src.clone()
-                        }
-                    } else {
-                        src.clone()
-                    }
-                }
-                _ => src.clone(),
-            };
+            // vreg can be resolved to StackSlot directly (unless the window
+            // allocator owns it — see resolve_op). The memory read is
+            // `from_size` bytes wide, which never exceeds the slot.
+            // A slot-backed dst stays a vreg and is caught by
+            // has_unresolvable_vreg -> window allocator (or fallback).
+            let src_resolved = resolve_reg_or_slot(src, ra, state, reg_classified, *from_size);
             MachInst::Movzx {
                 src: src_resolved,
                 dst: *dst,
@@ -4070,20 +3934,7 @@ fn resolve_stack_vregs(
             from_size,
             to_size,
         } => {
-            let src_resolved = match src {
-                MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
-                    if let Some(slot) = state.get_slot(*id) {
-                        if slot_fits(id, *from_size) {
-                            MachOperand::StackSlot(slot.0)
-                        } else {
-                            src.clone()
-                        }
-                    } else {
-                        src.clone()
-                    }
-                }
-                _ => src.clone(),
-            };
+            let src_resolved = resolve_reg_or_slot(src, ra, state, reg_classified, *from_size);
             MachInst::Movsx {
                 src: src_resolved,
                 dst: *dst,
@@ -4114,7 +3965,13 @@ fn resolve_stack_vregs(
             size,
         } => MachInst::Shift {
             op: *op,
-            amount: resolve_op(amount, *size),
+            // The emitter's variable-shift form is %cl-only: a Vreg amount
+            // must NEVER be rewritten to a StackSlot (the historical bug:
+            // the resolver silently substituted it and the emitter then
+            // ignored the operand, dropping the count). Leave it as-is: a
+            // Vreg amount trips the final unresolvable gate and replays the
+            // window; the window allocator likewise refuses it.
+            amount: amount.clone(),
             dst: *dst,
             size: *size,
         },
@@ -4143,6 +4000,45 @@ fn resolve_stack_vregs(
         // For instructions where the vreg is always a register (dst of SetCC,
         // Movzx, etc.), we can't replace with stack slot. Keep as-is.
         _ => inst.clone(),
+    }
+}
+
+/// Resolve a single operand that may substitute to a memory form, honoring
+/// the window allocator's `reg_classified` skip set. Shared by the extending
+/// moves (movzx/movsx), whose source width is `from_size`, not the inst size.
+fn resolve_reg_or_slot(
+    op: &MachOperand,
+    ra: &FxHashMap<u32, PhysReg>,
+    state: &CodegenState,
+    reg_classified: &crate::common::fx_hash::FxHashSet<u32>,
+    size: super::machinst::OpSize,
+) -> MachOperand {
+    use super::machinst::MachOperand;
+    match op {
+        MachOperand::Reg(super::machinst::MachReg::Vreg(id))
+            if !ra.contains_key(id) && !reg_classified.contains(id) =>
+        {
+            if let Some(slot) = state.get_slot(*id) {
+                let fits = if state.is_small_slot(*id) {
+                    matches!(
+                        size,
+                        super::machinst::OpSize::S8
+                            | super::machinst::OpSize::S16
+                            | super::machinst::OpSize::S32
+                    )
+                } else {
+                    true
+                };
+                if fits {
+                    MachOperand::StackSlot(slot.0)
+                } else {
+                    op.clone()
+                }
+            } else {
+                op.clone()
+            }
+        }
+        _ => op.clone(),
     }
 }
 
@@ -4192,6 +4088,7 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, 
             check_op(lhs) || check_op(rhs)
         }
         MachInst::SetCC { dst, .. } => check_reg(dst),
+        MachInst::LeaSym { dst, .. } | MachInst::LeaSlot { dst, .. } => check_reg(dst),
         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
             check_op(src) || check_reg(dst)
         }
@@ -5792,13 +5689,70 @@ impl ArchCodegen for X86Codegen {
                 eprintln!("  {mi:?}");
             }
         }
+
+        // ── Window register allocation pipeline ─────────────────────────
+        // (1) Classify which vregs must get window registers (BEFORE
+        //     resolution, so the resolver can skip substituting exactly
+        //     those — mixing a slot-substituted read with a register-held
+        //     def of the same SSA value in one window would read a stale
+        //     slot image).
+        // (2) Resolve memory-form vreg positions to stack-slot operands
+        //     (the optimal folded-memory access, unchanged behavior).
+        // (3) Allocate window scratch registers for the classified vregs,
+        //     inserting reloads (arriving values) and stores (live-out
+        //     defs) — SSA-exact within the window.
+        // (4) A vreg that survives all three stages still trips the
+        //     unresolvable gate and replays the window through the default
+        //     path: the fail-safe, now the exception instead of the cliff.
+        let reg_classified = super::machinst_alloc::classify_window(&self.machinst_buf);
         let resolved: Vec<MachInst> = self
             .machinst_buf
             .iter()
-            .map(|inst| resolve_stack_vregs(inst, &self.reg_assignments, &self.state))
+            .map(|inst| {
+                resolve_stack_vregs(inst, &self.reg_assignments, &self.state, &reg_classified)
+            })
             .collect();
+        let final_insts = if reg_classified.is_empty() {
+            // Fast path: nothing needs a window register — the resolution
+            // result is the emission input, exactly as before.
+            resolved
+        } else {
+            let ir_len = self.machinst_buf_ir.len() as u32;
+            let pp_end = self.state.current_program_point;
+            let window_span = (pp_end.saturating_sub(ir_len), pp_end.saturating_sub(1));
+            let ctx = super::machinst_alloc::WindowCtx {
+                slots: &self.state.value_locations,
+                small_slots: &self.state.small_slot_values,
+                types: &self.value_types,
+                total_uses: &self.value_use_counts,
+                alloca_values: &self.state.alloca_values,
+                reg_busy: &self.machine_reg_busy,
+                window_span,
+            };
+            match super::machinst_alloc::allocate_window(resolved, &ctx) {
+                Some(v) => v,
+                None => {
+                    // Allocation refused (XMM domain, SSA discipline, pool
+                    // exhaustion, …): the skip-set vregs never got
+                    // substituted, so re-resolve WITHOUT the skip set —
+                    // giving the memory-operand path its chance before the
+                    // replay decides.
+                    self.machinst_buf
+                        .iter()
+                        .map(|inst| {
+                            resolve_stack_vregs(
+                                inst,
+                                &self.reg_assignments,
+                                &self.state,
+                                &crate::common::fx_hash::FxHashSet::default(),
+                            )
+                        })
+                        .collect()
+                }
+            }
+        };
 
-        let has_bad = resolved
+        let has_bad = final_insts
             .iter()
             .any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
         if has_bad {
@@ -5807,7 +5761,7 @@ impl ArchCodegen for X86Codegen {
                     "[MI-FALLBACK] {} instructions -> default path",
                     self.machinst_buf_ir.len()
                 );
-                for mi in &resolved {
+                for mi in &final_insts {
                     if has_unresolvable_vreg(mi, &self.reg_assignments) {
                         eprintln!("[MI-FALLBACK]   unresolvable: {mi:?}");
                     }
@@ -5857,7 +5811,7 @@ impl ArchCodegen for X86Codegen {
             return;
         }
 
-        super::machinst_emit::emit_machinsts(&resolved, &mut self.state.out);
+        super::machinst_emit::emit_machinsts(&final_insts, &mut self.state.out);
 
         self.machinst_buf.clear();
         self.machinst_buf_ir.clear();

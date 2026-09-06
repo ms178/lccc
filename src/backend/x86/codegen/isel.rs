@@ -275,13 +275,34 @@ pub fn lower_binop(
 
     // 64-bit Add is an address-generation operation regardless of whether the
     // C source spells it as pointer arithmetic or integer arithmetic. Use LEA
-    // whenever both inputs fit its base/index/displacement form. Unlike the old
-    // mov+add sequence this is one uop and does not create a flags dependency.
+    // whenever it replaces a `mov + add` pair (three distinct registers) or a
+    // flags-clobbering add the consumer cannot afford: one uop, no flags
+    // dependency. When the allocator COALESCED the dest with the base,
+    // though, the two-address `add src, dst` is strictly better than a
+    // 2-register LEA: same 1-uop/1-cycle shape, but ADD executes on 4 ports
+    // (p0156) vs LEA's 2 (p15) on every Intel P-core and the same 4-vs-2 on
+    // Zen — dependency-THROUGHPUT-bound bit-manipulation and address-churn
+    // loops (bitops/mandelbrot class) measurably stall on the narrower port
+    // set (2026-09-06 A/B: +6.4% bitops, +7.2% mandelbrot with the LEA-only
+    // rule; the ADD form restores them). Prefer ADD whenever dst is already
+    // the base register; the operand may even fold a spilled RHS as a memory
+    // source, which LEA cannot.
     if op == IrBinOp::Add && size == OpSize::S64 {
         match (lhs, rhs) {
             (Operand::Value(base), Operand::Value(index)) => {
+                let base_reg = value_to_reg(base, ra);
+                if base_reg == dst && matches!(dst, MachReg::Phys(_)) {
+                    // dst IS the base (coalesced): plain two-address ADD.
+                    out.push(MachInst::Alu {
+                        op: AluOp::Add,
+                        src: MachOperand::Reg(value_to_reg(index, ra)),
+                        dst,
+                        size,
+                    });
+                    return true;
+                }
                 out.push(MachInst::Lea {
-                    base: value_to_reg(base, ra),
+                    base: base_reg,
                     index: Some((value_to_reg(index, ra), 1)),
                     offset: 0,
                     dst,
@@ -290,8 +311,20 @@ pub fn lower_binop(
             }
             (Operand::Value(base), Operand::Const(_)) => {
                 if let Some(offset) = const_as_imm32(rhs) {
+                    let base_reg = value_to_reg(base, ra);
+                    if base_reg == dst && matches!(dst, MachReg::Phys(_)) {
+                        // `add $imm, dst` beats `lea off(dst), dst` on ports
+                        // and encoding length alike.
+                        out.push(MachInst::Alu {
+                            op: AluOp::Add,
+                            src: MachOperand::Imm(offset),
+                            dst,
+                            size,
+                        });
+                        return true;
+                    }
                     out.push(MachInst::Lea {
-                        base: value_to_reg(base, ra),
+                        base: base_reg,
                         index: None,
                         offset,
                         dst,
@@ -301,8 +334,18 @@ pub fn lower_binop(
             }
             (Operand::Const(_), Operand::Value(base)) => {
                 if let Some(offset) = const_as_imm32(lhs) {
+                    let base_reg = value_to_reg(base, ra);
+                    if base_reg == dst && matches!(dst, MachReg::Phys(_)) {
+                        out.push(MachInst::Alu {
+                            op: AluOp::Add,
+                            src: MachOperand::Imm(offset),
+                            dst,
+                            size,
+                        });
+                        return true;
+                    }
                     out.push(MachInst::Lea {
-                        base: value_to_reg(base, ra),
+                        base: base_reg,
                         index: None,
                         offset,
                         dst,
@@ -343,7 +386,11 @@ pub fn lower_binop(
                 // (docs/CPU_MODEL_AUDIT.md §4).
                 if imm != 0 && imm != 1 && !matches!(size, OpSize::S8 | OpSize::S16) {
                     let tune = crate::backend::x86::cpu_model::active();
-                    let plan_k = if size == OpSize::S32 { imm as i32 as i64 } else { imm };
+                    let plan_k = if size == OpSize::S32 {
+                        imm as i32 as i64
+                    } else {
+                        imm
+                    };
                     if let Some(plan) = tune.mul_const_plan(plan_k) {
                         let src_reg = match lhs {
                             Operand::Value(v) => Some(value_to_reg(v, ra)),

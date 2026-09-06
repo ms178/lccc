@@ -1,9 +1,12 @@
-# Reproducible LCCC research toolchain.
+# LCCC research toolchain.
 #
-# Rust 1.98.0 is the session/compiler-build baseline. `rustup` resolves this
-# file automatically; the Arena restore script provisions the same channel in
-# the persisted /home/user/.rustup and /home/user/.cargo trees.
+# Policy: track the LATEST STABLE Rust toolchain — never pin a specific
+# version. The compiler tree is kept warning-clean and clippy-clean against
+# the moving stable channel; any stable-only regression is fixed at the
+# source instead of freezing the toolchain. `rustup` resolves this file
+# automatically; the Arena restore / bootstrap scripts install the same
+# "stable" channel into the persisted cargo/rustup trees.
 [toolchain]
-channel = "1.98.0"
+channel = "stable"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

@@ -119,8 +119,21 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
     // Bare mnemonics (no operand) that are flag-neutral.
     if matches!(
         t,
-        "ret" | "leave" | "cltq" | "cqto" | "cwtl" | "cdqe" | "nop" | "endbr64" | "cltd" | "cwtd"
-            | "cdq" | "cwd" | "cbw" | "cwde" | "cbtw"
+        "ret"
+            | "leave"
+            | "cltq"
+            | "cqto"
+            | "cwtl"
+            | "cdqe"
+            | "nop"
+            | "endbr64"
+            | "cltd"
+            | "cwtd"
+            | "cdq"
+            | "cwd"
+            | "cbw"
+            | "cwde"
+            | "cbtw"
     ) {
         return FlagsEffect::Neutral;
     }
@@ -177,10 +190,38 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
         .unwrap_or(base);
     if matches!(
         mnem,
-        "sahf" | "stc" | "clc" | "cld" | "std" | "shld" | "shldl" | "shldq" | "shrd" | "shrdl"
-            | "shrdq" | "bts" | "btsl" | "btsq" | "btsw" | "btr" | "btrl" | "btrq" | "btrw"
-            | "btc" | "btcl" | "btcq" | "btcw" | "ptest" | "popf" | "popfl" | "popfq" | "popfw"
-            | "comiss" | "comisd" | "ucomiss" | "ucomisd"
+        "sahf"
+            | "stc"
+            | "clc"
+            | "cld"
+            | "std"
+            | "shld"
+            | "shldl"
+            | "shldq"
+            | "shrd"
+            | "shrdl"
+            | "shrdq"
+            | "bts"
+            | "btsl"
+            | "btsq"
+            | "btsw"
+            | "btr"
+            | "btrl"
+            | "btrq"
+            | "btrw"
+            | "btc"
+            | "btcl"
+            | "btcq"
+            | "btcw"
+            | "ptest"
+            | "popf"
+            | "popfl"
+            | "popfq"
+            | "popfw"
+            | "comiss"
+            | "comisd"
+            | "ucomiss"
+            | "ucomisd"
     ) {
         return FlagsEffect::Writes;
     }
@@ -227,38 +268,148 @@ fn suffix_exact_writer(base: &str, stem: &str) -> bool {
 fn fp_data_op(base: &str) -> bool {
     const FP_NEUTRAL: &[&str] = &[
         // scalar/vector FP arithmetic, compares, rounding, sqrt, rcps
-        "addsd", "addss", "addps", "addpd", "addsubps", "addsubpd",
-        "subsd", "subss", "subps", "subpd",
-        "mulsd", "mulss", "mulps", "mulpd",
-        "divsd", "divss", "divps", "divpd",
-        "minss", "minsd", "minps", "minpd",
-        "maxss", "maxsd", "maxps", "maxpd",
-        "cmpps", "cmppd", "blendvps", "blendvpd",
-        "sqrtss", "sqrtsd", "sqrtps", "sqrtpd",
-        "roundss", "roundsd", "roundps", "roundpd",
-        "rcpss", "rcpps", "rsqrtss", "rsqrtps",
-        "shufps", "shufpd",
-        "andps", "andpd", "andnps", "andnpd", "orps", "orpd", "xorps", "xorpd",
-        "unpcklps", "unpckhps", "unpcklpd", "unpckhpd",
-        "cvt", "cvtt",
-        "hadd", "hsub",
+        "addsd",
+        "addss",
+        "addps",
+        "addpd",
+        "addsubps",
+        "addsubpd",
+        "subsd",
+        "subss",
+        "subps",
+        "subpd",
+        "mulsd",
+        "mulss",
+        "mulps",
+        "mulpd",
+        "divsd",
+        "divss",
+        "divps",
+        "divpd",
+        "minss",
+        "minsd",
+        "minps",
+        "minpd",
+        "maxss",
+        "maxsd",
+        "maxps",
+        "maxpd",
+        "cmpps",
+        "cmppd",
+        "blendvps",
+        "blendvpd",
+        "sqrtss",
+        "sqrtsd",
+        "sqrtps",
+        "sqrtpd",
+        "roundss",
+        "roundsd",
+        "roundps",
+        "roundpd",
+        "rcpss",
+        "rcpps",
+        "rsqrtss",
+        "rsqrtps",
+        "shufps",
+        "shufpd",
+        "andps",
+        "andpd",
+        "andnps",
+        "andnpd",
+        "orps",
+        "orpd",
+        "xorps",
+        "xorpd",
+        "unpcklps",
+        "unpckhps",
+        "unpcklpd",
+        "unpckhpd",
+        "cvt",
+        "cvtt",
+        "hadd",
+        "hsub",
         // integer SIMD data ops
-        "pshufb", "pshufd", "pshufhw", "pshuflw", "palignr",
-        "padd", "psub", "pmul", "pmadd", "pavg", "psll", "psrl", "psra",
-        "pand", "pandn", "por", "pxor",
-        "pcmpeq", "pcmpgt", "pmins", "pminu", "pmaxs", "pmaxu",
-        "psadbw", "pmuludq", "mpsadbw", "phadd", "phsub", "psign", "pabs",
-        "pmaddubsw", "pack", "punpck", "pinsr", "pextr", "extract", "insert",
-        "insertps", "extractps", "blend", "pblend", "perm", "maskmov",
+        "pshufb",
+        "pshufd",
+        "pshufhw",
+        "pshuflw",
+        "palignr",
+        "padd",
+        "psub",
+        "pmul",
+        "pmadd",
+        "pavg",
+        "psll",
+        "psrl",
+        "psra",
+        "pand",
+        "pandn",
+        "por",
+        "pxor",
+        "pcmpeq",
+        "pcmpgt",
+        "pmins",
+        "pminu",
+        "pmaxs",
+        "pmaxu",
+        "psadbw",
+        "pmuludq",
+        "mpsadbw",
+        "phadd",
+        "phsub",
+        "psign",
+        "pabs",
+        "pmaddubsw",
+        "pack",
+        "punpck",
+        "pinsr",
+        "pextr",
+        "extract",
+        "insert",
+        "insertps",
+        "extractps",
+        "blend",
+        "pblend",
+        "perm",
+        "maskmov",
         // data movement / mask extraction / broadcasts / gathers / FMA / AES
-        "movdqa", "movdqu", "movaps", "movups", "movapd", "movupd", "movdq",
-        "movhlps", "movlhps", "movnti", "movntq", "movntdqa", "lddqu",
-        "movshdup", "movsldup", "movddup", "movmskps", "movmskpd", "pmovmskb",
-        "broadcast", "pbroadcast", "gather", "pgather",
-        "fmadd", "fmsub", "fnmadd", "fnmsub", "aes", "pclmul",
-        "zero", "ldmxcsr", "stmxcsr",
+        "movdqa",
+        "movdqu",
+        "movaps",
+        "movups",
+        "movapd",
+        "movupd",
+        "movdq",
+        "movhlps",
+        "movlhps",
+        "movnti",
+        "movntq",
+        "movntdqa",
+        "lddqu",
+        "movshdup",
+        "movsldup",
+        "movddup",
+        "movmskps",
+        "movmskpd",
+        "pmovmskb",
+        "broadcast",
+        "pbroadcast",
+        "gather",
+        "pgather",
+        "fmadd",
+        "fmsub",
+        "fnmadd",
+        "fnmsub",
+        "aes",
+        "pclmul",
+        "zero",
+        "ldmxcsr",
+        "stmxcsr",
         // moves and LEAs (covers v-prefixed data moves too: vmovq, vmovd)
-        "mov", "lea", "xchg", "not",
+        "mov",
+        "lea",
+        "xchg",
+        "not",
     ];
     FP_NEUTRAL.iter().any(|p| base.starts_with(p))
 }
@@ -1998,6 +2149,4 @@ mod tests {
         );
         assert!(out.contains("movl $1, %eax"), "{out}");
     }
-
-    
 }

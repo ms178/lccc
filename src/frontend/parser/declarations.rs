@@ -140,7 +140,7 @@ impl Parser {
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
             d.set_volatile(self.attrs.parsing_volatile());
-        d.set_pointer_const(self.attrs.parsing_pointer_const());
+            d.set_pointer_const(self.attrs.parsing_pointer_const());
             d.set_thread_local(self.attrs.parsing_thread_local());
             return Some(ExternalDecl::Declaration(d));
         }
@@ -829,7 +829,7 @@ impl Parser {
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
             d.set_volatile(self.attrs.parsing_volatile());
-        d.set_pointer_const(self.attrs.parsing_pointer_const());
+            d.set_pointer_const(self.attrs.parsing_pointer_const());
             d.set_thread_local(self.attrs.parsing_thread_local());
             return Some(d);
         }

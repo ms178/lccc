@@ -742,8 +742,8 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        let store_survives = out.contains("movl $2, 8(%rsp, %r8)")
-            || out.contains("movl $2, (%rcx, %r8)");
+        let store_survives =
+            out.contains("movl $2, 8(%rsp, %r8)") || out.contains("movl $2, (%rcx, %r8)");
         assert!(store_survives, "observable SIB store deleted: {out}");
     }
 

@@ -284,7 +284,9 @@ impl Lowerer {
                     .map(|ct| self.ctype_align(ct).max(1))
                     .or_else(|| self.get_call_return_struct_align(stripped_func))
                     .unwrap_or(0),
-                _ => self.get_call_return_struct_align(stripped_func).unwrap_or(0),
+                _ => self
+                    .get_call_return_struct_align(stripped_func)
+                    .unwrap_or(0),
             };
             let alloca = self.fresh_value();
             self.emit(Instruction::Alloca {

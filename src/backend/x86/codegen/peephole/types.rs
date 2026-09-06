@@ -304,7 +304,10 @@ pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
 /// 20060420-1.c at -O2/-O3). Same contract as `cmp_line_info`.
 #[inline]
 pub(super) fn xmm_slot_line_info(kind: LineKind, ts: u16, s: &str, sb: &[u8]) -> LineInfo {
-    debug_assert!(matches!(kind, LineKind::StoreXmmRbp { .. } | LineKind::LoadXmmRbp { .. }));
+    debug_assert!(matches!(
+        kind,
+        LineKind::StoreXmmRbp { .. } | LineKind::LoadXmmRbp { .. }
+    ));
     let has_indirect = has_indirect_memory_access(s);
     let rbp_off = if has_indirect {
         RBP_OFFSET_NONE

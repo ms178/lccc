@@ -387,13 +387,21 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
             // the slot (`movq %rax, -72(%rbp)` / `movss -72(%rbp), %xmm0` —
             // the -O0 int<->float bit-transfer idiom) is a live store; an XMM
             // store that fully covers our bytes kills it exactly like a GP one.
-            if let LineKind::LoadXmmRbp { offset: load_off, size: load_sz } = infos[j].kind {
+            if let LineKind::LoadXmmRbp {
+                offset: load_off,
+                size: load_sz,
+            } = infos[j].kind
+            {
                 if ranges_overlap(store_offset, store_bytes, load_off, load_sz.byte_size()) {
                     slot_read = true;
                     break;
                 }
             }
-            if let LineKind::StoreXmmRbp { offset: new_off, size: new_sz } = infos[j].kind {
+            if let LineKind::StoreXmmRbp {
+                offset: new_off,
+                size: new_sz,
+            } = infos[j].kind
+            {
                 let new_bytes = new_sz.byte_size();
                 if new_off <= store_offset && new_off + new_bytes >= store_offset + store_bytes {
                     slot_overwritten = true;

@@ -1861,7 +1861,12 @@ pub trait ArchCodegen {
     /// contract (`X86Tune::memset_strategy`: straight-line stores, counted
     /// vector loop, `rep stosb`, or `LibCall` above the L3-derived bound).
     /// Default: never (non-x86 backends keep the libc call).
-    fn inline_memset_len(&self, _func: &str, _args: &[Operand], _is_variadic: bool) -> Option<usize> {
+    fn inline_memset_len(
+        &self,
+        _func: &str,
+        _args: &[Operand],
+        _is_variadic: bool,
+    ) -> Option<usize> {
         None
     }
 

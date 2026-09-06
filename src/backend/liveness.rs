@@ -1244,7 +1244,12 @@ fn apply_f128_source_gen(
             if *ptr_entry == u32::MAX || dest_last > *ptr_entry {
                 *ptr_entry = dest_last;
             }
-            touches.add(pd, block_of_point(block_start_points, dest_last), dest_last, false);
+            touches.add(
+                pd,
+                block_of_point(block_start_points, dest_last),
+                dest_last,
+                false,
+            );
         }
     }
 

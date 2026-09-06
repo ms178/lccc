@@ -35,7 +35,10 @@ pub(super) fn eliminate_redundant_self_zext(store: &LineStore, infos: &mut [Line
         }
         let t = info.trimmed(store.get(i));
         match info.kind {
-            LineKind::Label | LineKind::CondJmp | LineKind::Jmp | LineKind::JmpIndirect
+            LineKind::Label
+            | LineKind::CondJmp
+            | LineKind::Jmp
+            | LineKind::JmpIndirect
             | LineKind::Ret => {
                 zero_upper = [false; 16];
                 i += 1;
@@ -55,8 +58,12 @@ pub(super) fn eliminate_redundant_self_zext(store: &LineStore, infos: &mut [Line
                 i += 1;
                 continue;
             }
-            LineKind::Push { .. } | LineKind::SetCC { .. } | LineKind::Directive
-            | LineKind::Cmp | LineKind::StoreRbp { .. } | LineKind::StoreXmmRbp { .. } => {
+            LineKind::Push { .. }
+            | LineKind::SetCC { .. }
+            | LineKind::Directive
+            | LineKind::Cmp
+            | LineKind::StoreRbp { .. }
+            | LineKind::StoreXmmRbp { .. } => {
                 // no GP-64 write
                 i += 1;
                 continue;

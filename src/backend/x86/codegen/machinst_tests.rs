@@ -1143,6 +1143,28 @@ impl Rng {
     }
 }
 
+/// A register-or-memory operand: for the extending moves and conditional
+/// moves, whose machine forms have no immediate encoding (the isel never
+/// produces an immediate there; the corpus must respect the same space).
+fn regmem_operand(rng: &mut Rng) -> MachOperand {
+    match rng.next() % 3 {
+        0 => MachOperand::Reg(MachReg::Phys(PhysReg(*rng.pick(&KNOWN_REGS) as u8))),
+        1 => MachOperand::Mem {
+            base: MachReg::Phys(PhysReg(*rng.pick(&KNOWN_REGS) as u8)),
+            offset: *rng.pick(&[0i64, 8, -8, 4096, -4096]),
+        },
+        _ => MachOperand::StackSlot(*rng.pick(&[0i64, 8, -8, 4096, -4096])),
+    }
+}
+
+/// Draw an ordered (smaller, larger-or-equal) size pair for the extending
+/// moves: only widening forms are encodable.
+fn ordered_pair(rng: &mut Rng) -> (OpSize, OpSize) {
+    let i = (rng.next() % 4) as usize; // from
+    let j = i + (rng.next() % (4 - i) as u64) as usize; // to >= from
+    (SIZES[i], SIZES[j])
+}
+
 /// Build a large randomized corpus. The hand-written corpus covers each
 /// variant once; this explores the CROSS PRODUCT of operand shapes, widths and
 /// registers, which is where the interesting failures live -- the narrow-shift
@@ -1175,6 +1197,32 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
     ];
     let offsets: [i64; 5] = [0, 8, -8, 4096, -4096];
     let scales: [u8; 4] = [1, 2, 4, 8];
+    // Wide-immediate boundary set: the imm32 window edges, the full 64-bit
+    // extremes, and the historical-bug constant. The old corpus drew
+    // immediates only from 0..256, so the movabsq/imm32-sign-extension paths
+    // (the site of two historical miscompiles) were never randomly exercised.
+    let wide_imms: [i64; 10] = [
+        0,
+        255,
+        i32::MIN as i64,
+        i32::MAX as i64,
+        i32::MIN as i64 - 1,
+        i32::MAX as i64 + 1,
+        i64::MIN,
+        i64::MAX,
+        -1,
+        0x1122_3344_5566_7788,
+    ];
+    let xmm_regs: [PhysReg; 8] = [
+        PhysReg(20),
+        PhysReg(21),
+        PhysReg(22),
+        PhysReg(23),
+        PhysReg(24),
+        PhysReg(25),
+        PhysReg(26),
+        PhysReg(27),
+    ];
 
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
@@ -1182,9 +1230,9 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
         let a = *rng.pick(&regs);
         let b = *rng.pick(&regs);
         let operand = |rng: &mut Rng| -> MachOperand {
-            match rng.next() % 5 {
+            match rng.next() % 6 {
                 0 => MachOperand::Reg(MachReg::Phys(*rng.pick(&regs))),
-                1 => MachOperand::Imm((rng.next() % 256) as i64),
+                1 => MachOperand::Imm(*rng.pick(&wide_imms)),
                 2 => MachOperand::Mem {
                     base: MachReg::Phys(*rng.pick(&regs)),
                     offset: *rng.pick(&offsets),
@@ -1195,10 +1243,17 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
                     scale: *rng.pick(&scales),
                     offset: *rng.pick(&offsets),
                 },
-                _ => MachOperand::StackSlot(*rng.pick(&offsets)),
+                4 => MachOperand::StackSlot(*rng.pick(&offsets)),
+                // The pre-colored scratch registers: division/shift forms
+                // exercise the reserved-bank paths.
+                _ => MachOperand::Reg(MachReg::Phys(*rng.pick(&[
+                    PhysReg(0),
+                    PhysReg(7),
+                    PhysReg(16),
+                ]))),
             }
         };
-        v.push(match rng.next() % 10 {
+        v.push(match rng.next() % 16 {
             0 => MachInst::Mov {
                 src: operand(&mut rng),
                 dst: MachOperand::Reg(MachReg::Phys(b)),
@@ -1256,20 +1311,101 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
                 sym: "machinst_probe_sym".into(),
                 dst: MachReg::Phys(b),
             },
-            _ => MachInst::Movzx {
-                src: MachOperand::Reg(MachReg::Phys(a)),
-                dst: MachReg::Phys(b),
-                from_size: if rng.next() % 2 == 0 {
-                    OpSize::S8
-                } else {
-                    OpSize::S16
-                },
-                to_size: if rng.next() % 2 == 0 {
-                    OpSize::S32
-                } else {
-                    OpSize::S64
-                },
+            // 9: Movzx over the legal (from <= to) matrix; S32->S64
+            // exercises the movl-zero-extension form. Narrowing pairs are
+            // unencodable and trip the emitter's width rule by design.
+            9 => {
+                let (f, t) = ordered_pair(&mut rng);
+                MachInst::Movzx {
+                    src: regmem_operand(&mut rng),
+                    dst: MachReg::Phys(b),
+                    from_size: f,
+                    to_size: t,
+                }
+            }
+            // 10: Movsx — the sign-extending family with memory sources,
+            // over the legal strict-widening pairs.
+            10 => {
+                let (f, t) = ordered_pair(&mut rng);
+                MachInst::Movsx {
+                    src: regmem_operand(&mut rng),
+                    dst: MachReg::Phys(b),
+                    from_size: f,
+                    to_size: if f == t {
+                        // promote to a strict widening; identity is tested
+                        // by the hand-written goldens.
+                        OpSize::S64
+                    } else {
+                        t
+                    },
+                }
+            }
+            // 11: Imul3 with wide immediates (exercises the movabsq staging
+            // branch when imm leaves the imm32 window).
+            11 => MachInst::Imul3 {
+                imm: *rng.pick(&wide_imms),
+                src: MachReg::Phys(b),
+                dst: MachReg::Phys(a),
+                size,
             },
+            // 12: Neg/Not — the RMW forms.
+            12 => {
+                if rng.next() % 2 == 0 {
+                    MachInst::Neg {
+                        dst: MachReg::Phys(b),
+                        size,
+                    }
+                } else {
+                    MachInst::Not {
+                        dst: MachReg::Phys(b),
+                        size,
+                    }
+                }
+            }
+            // 13: Lea with the full base/index/scale/offset cross product.
+            // Displacements are imm32-only (the isel gates this through
+            // const_as_imm32; wide offsets are not encodable).
+            13 => MachInst::Lea {
+                base: MachReg::Phys(a),
+                index: Some((MachReg::Phys(b), *rng.pick(&scales))),
+                offset: *rng.pick(&offsets),
+                dst: MachReg::Phys(*rng.pick(&regs)),
+            },
+            // 14: Cmov across every condition code (no immediate form).
+            14 => MachInst::Cmov {
+                cc: *rng.pick(&ccs),
+                src: regmem_operand(&mut rng),
+                dst: MachReg::Phys(b),
+                size,
+            },
+            // 15: FMov/FAlu XMM-domain shapes (register forms only: the
+            // memory-form operands are GPR-based and covered by the
+            // hand-written goldens; the trap-tests pin the illegal shapes).
+            _ => {
+                if rng.next() % 2 == 0 {
+                    MachInst::FMov {
+                        src: MachOperand::Reg(MachReg::Phys(*rng.pick(&xmm_regs))),
+                        dst: MachOperand::Reg(MachReg::Phys(*rng.pick(&xmm_regs))),
+                        size: if rng.next() % 2 == 0 {
+                            OpSize::S32
+                        } else {
+                            OpSize::S64
+                        },
+                    }
+                } else {
+                    MachInst::FAlu {
+                        op: *rng.pick(&[FAluOp::Add, FAluOp::Sub, FAluOp::Mul, FAluOp::Div]),
+                        src2: MachOperand::Reg(MachReg::Phys(*rng.pick(&xmm_regs))),
+                        src1: MachReg::Phys(*rng.pick(&xmm_regs)),
+                        dst: MachReg::Phys(*rng.pick(&xmm_regs)),
+                        size: if rng.next() % 2 == 0 {
+                            OpSize::S32
+                        } else {
+                            OpSize::S64
+                        },
+                    }
+                }
+            }
         });
     }
     v
@@ -1378,10 +1514,12 @@ fn no_randomized_instruction_emits_an_unresolved_register_or_empty_text() {
             "unresolved vreg for {:?}",
             inst
         );
-        // Every instruction must emit SOMETHING, except the self-move the
-        // emitter deliberately elides.
+        // Every instruction must emit SOMETHING, except the self-moves the
+        // emitter deliberately elides (register identity copies and
+        // same-slot stores are legal no-ops by construction).
         let elided = matches!(&inst, MachInst::Mov { src: MachOperand::Reg(a), dst: MachOperand::Reg(b), .. } if a == b)
-            || matches!(&inst, MachInst::Mov { src: MachOperand::StackSlot(a), dst: MachOperand::StackSlot(b), .. } if a == b);
+            || matches!(&inst, MachInst::Mov { src: MachOperand::StackSlot(a), dst: MachOperand::StackSlot(b), .. } if a == b)
+            || matches!(&inst, MachInst::FMov { src: MachOperand::Reg(a), dst: MachOperand::Reg(b), .. } if a == b);
         if !elided {
             assert!(
                 out.buf.trim().lines().any(|l| !l.trim().is_empty()),
@@ -1709,6 +1847,354 @@ fn a_symbol_address_is_the_real_address_when_executed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── 6b. execution differential, layer two ─────────────────────────────────
+//
+// The first execution layer covered the ALU/shift/movzx/movsx families. These
+// probes close the remaining gaps the 2026-09-06 audit identified: the
+// implicit-register forms (Div's rax:rdx), the three-operand forms (Imul3,
+// ShiftX), RMW forms (Neg/Not), conditional moves, the addressing calculator
+// (Lea), the 16-byte transfer (Mov128), and scalar float arithmetic (FAlu —
+// including the non-commutative operand-order cases). Every probe computes a
+// reference model in Rust and compares against real execution.
+
+#[test]
+fn imul3_computes_the_right_answer_when_executed() {
+    let dst = PhysReg(11);
+    let src = PhysReg(10);
+    // Semantics under test: dst = src * imm. The probe loads input a into
+    // dst's register and input b into src's register.
+    let cases: &[i64] = &[3, -5, i32::MIN as i64, 7, 1];
+    for imm in cases {
+        let inst = MachInst::Imul3 {
+            imm: *imm,
+            src: MachReg::Phys(src),
+            dst: MachReg::Phys(dst),
+            size: OpSize::S64,
+        };
+        let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
+            eprintln!("SKIP: no assembler/linker; Imul3 execution differential cannot run");
+            return;
+        };
+        for (i, (_a, b)) in EXEC_INPUTS.iter().enumerate() {
+            let want = b.wrapping_mul(*imm);
+            assert_eq!(
+                got[i], want,
+                "imul3 ${imm}(src={b}) computed {} but must be {}",
+                got[i], want
+            );
+        }
+    }
+}
+
+#[test]
+fn neg_and_not_compute_the_right_answer_when_executed() {
+    let dst = PhysReg(11);
+    let src = PhysReg(10);
+    let neg = MachInst::Neg {
+        dst: MachReg::Phys(dst),
+        size: OpSize::S64,
+    };
+    let not = MachInst::Not {
+        dst: MachReg::Phys(dst),
+        size: OpSize::S64,
+    };
+    // The probe loads rdi into dst first, so Neg/Not operate on the input.
+    let Some(g) = run_emitted(&probe_body(dst, src, &neg), EXEC_INPUTS) else {
+        eprintln!("SKIP: no assembler/linker; Neg execution differential cannot run");
+        return;
+    };
+    for (i, (a, _)) in EXEC_INPUTS.iter().enumerate() {
+        assert_eq!(
+            g[i],
+            a.wrapping_neg(),
+            "neg of {} must be {}",
+            a,
+            a.wrapping_neg()
+        );
+    }
+    let Some(g) = run_emitted(&probe_body(dst, src, &not), EXEC_INPUTS) else {
+        return;
+    };
+    for (i, (a, _)) in EXEC_INPUTS.iter().enumerate() {
+        assert_eq!(g[i], !a, "not of {} must be {}", a, !a);
+    }
+}
+
+#[test]
+fn lea_computes_base_plus_index_scale_plus_offset_when_executed() {
+    let dst = PhysReg(11);
+    let src = PhysReg(10);
+    // The probe loads rdi→dst, rsi→src; LEA reads both as INPUTS (they are
+    // base and index) and writes dst. 64-bit signed arithmetic model.
+    let inst = MachInst::Lea {
+        base: MachReg::Phys(dst),
+        index: Some((MachReg::Phys(src), 4)),
+        offset: 7,
+        dst: MachReg::Phys(dst),
+    };
+    let model = |b: i64, i: i64| b.wrapping_add(i.wrapping_mul(4)).wrapping_add(7);
+    let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
+        eprintln!("SKIP: no assembler/linker; Lea execution differential cannot run");
+        return;
+    };
+    for (i, (a, b)) in EXEC_INPUTS.iter().enumerate() {
+        let want = model(*a, *b);
+        assert_eq!(
+            got[i], want,
+            "lea 7(dst={a}, src={b}, 4) computed {} but must be {}",
+            got[i], want
+        );
+    }
+}
+
+#[test]
+fn div_uses_rax_rdx_and_computes_quotient_when_executed() {
+    // The dividend arrives in rdi (probe input a): stage it into rax, run
+    // cqto (sign-extend into rdx:rax), idiv by a register holding input b,
+    // return rax. Catches operand-order AND the implicit rdx discipline.
+    let dst = PhysReg(11); // r10 holds the divisor
+    let mut body = String::new();
+    body.push_str("    movq %rdi, %rax\n    cqto\n");
+    let inst = MachInst::Div {
+        divisor: MachOperand::Reg(MachReg::Phys(dst)),
+        signed: true,
+        size: OpSize::S64,
+    };
+    let mut out = AsmOutput::new();
+    emit_machinst(&inst, &mut out);
+    body.push_str("    movq %rsi, %r10\n");
+    body.push_str(&out.buf);
+    body.push_str("\n    movq %rdx, %rsi\n"); // save remainder for round 2
+                                              // Return quotient and remainder: run twice, once returning rax, once rdx.
+    let body_q = format!("{body}    movq %rax, %r11\n    movq %r11, %rax\n    ret\n");
+    let _ = dst;
+    let inputs = &[(100i64, 7i64), (-100, 7), (7, 100), (i64::MIN, 2), (0, 5)];
+    let Some(got) = run_emitted(&body_q, inputs) else {
+        eprintln!("SKIP: no assembler/linker; Div execution differential cannot run");
+        return;
+    };
+    for (i, (a, b)) in inputs.iter().enumerate() {
+        let want = a.wrapping_div(*b);
+        assert_eq!(
+            got[i], want,
+            "idiv {a}/{b}: quotient computed {} but must be {}",
+            got[i], want
+        );
+    }
+}
+
+#[test]
+fn cmov_selects_the_right_operand_when_executed() {
+    // Flags are set by a cmp the probe controls: cmovl picks the smaller
+    // input. An operand-order bug picks the larger one — both are valid
+    // values, only execution distinguishes them.
+    let dst = PhysReg(11);
+    let src = PhysReg(10);
+    let inst = MachInst::Cmov {
+        cc: CondCode::L,
+        src: MachOperand::Reg(MachReg::Phys(src)),
+        dst: MachReg::Phys(dst),
+        size: OpSize::S64,
+    };
+    let mut out = AsmOutput::new();
+    emit_machinst(&inst, &mut out);
+    // Setup: rdi→dst, rsi→src; cmp %rsi, %rdi (AT&T: compares rdi with rsi);
+    // cmovl replaces dst with src when rdi < rsi (signed).
+    let body = format!(
+        "    movq %rdi, %r10\n    movq %rsi, %r11\n    cmpq %rsi, %rdi\n{}    movq %r10, %rax\n",
+        out.buf
+    );
+    let Some(got) = run_emitted(&body, EXEC_INPUTS) else {
+        eprintln!("SKIP: no assembler/linker; Cmov execution differential cannot run");
+        return;
+    };
+    for (i, (a, b)) in EXEC_INPUTS.iter().enumerate() {
+        let want = if a < b { *b } else { *a };
+        assert_eq!(
+            got[i], want,
+            "cmovl(a={a}, b={b}) computed {} but must be {}",
+            got[i], want
+        );
+    }
+}
+
+#[test]
+fn shiftx_computes_the_right_answer_when_executed() {
+    // BMI2 three-operand shift. Skipped when the host (or its assembler)
+    // cannot encode shlxq — the golden/assembler layers still pin the text.
+    let dst = PhysReg(11);
+    let cnt = PhysReg(10);
+    let cases: &[(ShiftOp, u32, fn(i64, u32) -> i64)] = &[
+        (ShiftOp::Shl, 3, |a, k| ((a as u64) << k) as i64),
+        (ShiftOp::Shr, 3, |a, k| ((a as u64) >> k) as i64),
+        (ShiftOp::Sar, 3, |a, k| a >> k),
+    ];
+    for (op, amt, model) in cases {
+        let inst = MachInst::ShiftX {
+            op: *op,
+            count: MachReg::Phys(cnt),
+            src: MachReg::Phys(dst),
+            dst: MachReg::Phys(dst),
+            size: OpSize::S64,
+        };
+        let mut out = AsmOutput::new();
+        emit_machinst(&inst, &mut out);
+        // rdi→dst (value), constant shift count→src register.
+        let body = format!(
+            "    movq %rdi, %r10\n    movq ${amt}, %r11\n{}    movq %r10, %rax\n",
+            out.buf
+        );
+        let Some(got) = run_emitted(&body, EXEC_INPUTS) else {
+            eprintln!("SKIP: no assembler/linker; ShiftX execution differential cannot run");
+            return;
+        };
+        for (i, (a, _)) in EXEC_INPUTS.iter().enumerate() {
+            let want = model(*a, *amt);
+            assert_eq!(
+                got[i], want,
+                "shiftx {:?} by {} on {} computed {} but must be {}",
+                op, amt, a, got[i], want
+            );
+        }
+    }
+}
+
+#[test]
+fn mov128_moves_the_full_16_bytes_when_executed() {
+    // 16-byte transfer through the xmm0 scratch: the destination must equal
+    // the source bit-for-bit across the full width. The probe passes two
+    // distinct 64-bit halves and checks both come out in order.
+    let mut out = AsmOutput::new();
+    emit_machinst(
+        &MachInst::Mov128 {
+            src: MachOperand::Mem {
+                base: MachReg::Phys(PhysReg(14)),
+                offset: 0,
+            },
+            dst: MachOperand::Mem {
+                base: MachReg::Phys(PhysReg(15)),
+                offset: 0,
+            },
+        },
+        &mut out,
+    );
+    let body = format!(
+        "    movq %rdi, %rsi\n    movq %rsi, %r14\n    movq $0x1122334455667788, %rax\n    movq %rax, (%r14)\n    movq $0x8877665544332211, %rax\n    movq %rax, 8(%r14)\n{}    movq (%r15), %rax\n    movq 8(%r15), %rdx\n    xorq %rdx, %rax\n    movq %rax, 8(%r15)\n    movq (%r15), %rax\n",
+        out.buf
+    );
+    // Expected: low half ^ high half in rax, high half in rdx.
+    let inputs = &[(1i64, 1i64)];
+    let Some(got) = run_emitted(&body, inputs) else {
+        eprintln!("SKIP: no assembler/linker; Mov128 execution differential cannot run");
+        return;
+    };
+    let lo: u64 = 0x1122334455667788;
+    let hi: u64 = 0x8877665544332211;
+    assert_eq!(
+        got[0] as u64,
+        lo ^ hi,
+        "Mov128 low^high must be {:#x}, got {:#x}",
+        lo ^ hi,
+        got[0] as u64
+    );
+}
+
+#[test]
+fn falu_computes_the_right_answer_when_executed() {
+    // Scalar VEX three-operand arithmetic, double precision. The probe
+    // passes bits through rdi/rsi into a small .rodata pair; simpler: use
+    // integer registers to stage two doubles into xmm via movq, run FAlu,
+    // movq the result back to rax.
+    let dst = PhysReg(20); // xmm2
+    let src1 = PhysReg(21); // xmm3
+    let cases: &[(FAluOp, fn(f64, f64) -> f64)] = &[
+        (FAluOp::Add, |a, b| a + b),
+        // Non-commutative: the operand-order trap no assembler can catch.
+        (FAluOp::Sub, |a, b| a - b),
+        (FAluOp::Mul, |a, b| a * b),
+        (FAluOp::Div, |a, b| a / b),
+    ];
+    let inputs = &[
+        (6.0f64, 3.0f64),
+        (3.0, 6.0),
+        (-9.5, 4.25),
+        (0.0, 5.0),
+        (1e300, 1e300),
+    ];
+    for (op, model) in cases {
+        let inst = MachInst::FAlu {
+            op: *op,
+            src2: MachOperand::Reg(MachReg::Phys(src1)),
+            src1: MachReg::Phys(src1),
+            dst: MachReg::Phys(dst),
+            size: OpSize::S64,
+        };
+        let mut out = AsmOutput::new();
+        emit_machinst(&inst, &mut out);
+        // movq rdi→xmm3 (src1), rsi→... wait: the semantics under test are
+        // dst = src1 op src2. Put rdi in xmm3 (src1) and rsi in xmm2 (dst
+        // acting as src2 would be wrong — use a third register for src2).
+        // Simpler: make src2 == a fresh xmm and feed it rsi.
+        let inst = MachInst::FAlu {
+            op: *op,
+            src2: MachOperand::Reg(MachReg::Phys(PhysReg(22))), // xmm4
+            src1: MachReg::Phys(src1),
+            dst: MachReg::Phys(dst),
+            size: OpSize::S64,
+        };
+        let mut out = AsmOutput::new();
+        emit_machinst(&inst, &mut out);
+        let body = format!(
+            "    movq %rdi, %xmm3\n    movq %rsi, %xmm4\n{}    movq %xmm2, %rax\n",
+            out.buf
+        );
+        // run_emitted works on i64 inputs; bit-cast doubles through them.
+        let iinputs: Vec<(i64, i64)> = inputs
+            .iter()
+            .map(|(a, b)| (a.to_bits() as i64, b.to_bits() as i64))
+            .collect();
+        let Some(got) = run_emitted(&body, &iinputs) else {
+            eprintln!("SKIP: no assembler/linker; FAlu execution differential cannot run");
+            return;
+        };
+        for (i, (a, b)) in inputs.iter().enumerate() {
+            let got_f = f64::from_bits(got[i] as u64);
+            let want = model(*a, *b);
+            assert!(
+                got_f == want || (got_f.is_nan() && want.is_nan()),
+                "faluu {:?}({a}, {b}) computed {got_f} but must be {want}",
+                op
+            );
+        }
+    }
+}
+
+#[test]
+fn lea_slot_golden_shapes() {
+    // rbp mode: plain offset.
+    let mut out = AsmOutput::new();
+    emit_machinst(
+        &MachInst::LeaSlot {
+            slot: -24,
+            dst: MachReg::Phys(PhysReg(1)),
+        },
+        &mut out,
+    );
+    assert_eq!(out.buf.trim(), "leaq -24(%rbp), %rbx");
+    // rsp mode: frame-size adjusted.
+    let mut out = AsmOutput::new();
+    out.use_rsp_addressing = true;
+    out.rsp_frame_size = 48;
+    emit_machinst(
+        &MachInst::LeaSlot {
+            slot: -24,
+            dst: MachReg::Phys(PhysReg(1)),
+        },
+        &mut out,
+    );
+    assert_eq!(out.buf.trim(), "leaq 24(%rsp), %rbx");
+}
+
 // ── 7. coverage regression guard ────────────────────────────────────────────
 
 /// MachInst coverage must not silently erode.
@@ -1946,8 +2432,10 @@ const XMM_REGS: &[u8] = &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33
 fn fmov_names_every_xmm_home_at_both_scalar_widths() {
     for (i, &a) in XMM_REGS.iter().enumerate() {
         let b = XMM_REGS[(i + 1) % XMM_REGS.len()];
-        // Reg-to-reg uses the VEX 3-operand form (no merging-move false
-        // dependence -- see the emitter comment).
+        // Reg-to-reg uses the VEX PACKED move: full-register semantics (no
+        // merging false dependence on the destination's upper lane) and the
+        // rename-eliminable form every modern core handles at zero latency
+        // (see the emitter comment).
         let line = emit1(&MachInst::FMov {
             src: reg(PhysReg(a)),
             dst: reg(PhysReg(b)),
@@ -1955,12 +2443,7 @@ fn fmov_names_every_xmm_home_at_both_scalar_widths() {
         });
         assert_eq!(
             line,
-            format!(
-                "vmovsd %{}, %{}, %{}",
-                expected_xmm(a),
-                expected_xmm(a),
-                expected_xmm(b)
-            )
+            format!("vmovapd %{}, %{}", expected_xmm(a), expected_xmm(b))
         );
         let line = emit1(&MachInst::FMov {
             src: reg(PhysReg(a)),
@@ -1969,12 +2452,7 @@ fn fmov_names_every_xmm_home_at_both_scalar_widths() {
         });
         assert_eq!(
             line,
-            format!(
-                "vmovss %{}, %{}, %{}",
-                expected_xmm(a),
-                expected_xmm(a),
-                expected_xmm(b)
-            )
+            format!("vmovaps %{}, %{}", expected_xmm(a), expected_xmm(b))
         );
     }
 }

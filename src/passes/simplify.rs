@@ -3823,18 +3823,16 @@ mod tests {
         }
         // Sign-extended negative bytes compare differently under an unsigned
         // wide predicate, so this must remain wide.
-        assert!(
-            narrow_widened_cmp_pair(
-                Value(7),
-                IrCmpOp::Ult,
-                &Operand::Value(Value(1)),
-                &Operand::Value(Value(2)),
-                IrType::I32,
-                &defs,
-                &[],
-            )
-            .is_none()
-        );
+        assert!(narrow_widened_cmp_pair(
+            Value(7),
+            IrCmpOp::Ult,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            IrType::I32,
+            &defs,
+            &[],
+        )
+        .is_none());
     }
 
     #[test]
@@ -3855,18 +3853,16 @@ mod tests {
             IrCmpOp::Ugt,
             IrCmpOp::Uge,
         ] {
-            assert!(
-                narrow_widened_cmp_pair(
-                    Value(7),
-                    op,
-                    &Operand::Value(Value(1)),
-                    &Operand::Value(Value(2)),
-                    IrType::I32,
-                    &defs,
-                    &[],
-                )
-                .is_none()
-            );
+            assert!(narrow_widened_cmp_pair(
+                Value(7),
+                op,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+                &defs,
+                &[],
+            )
+            .is_none());
         }
     }
 
@@ -3876,32 +3872,28 @@ mod tests {
         let mut uses = vec![0; 8];
         uses[1] = 1;
         uses[2] = 2; // An additional consumer keeps this widened value live.
-        assert!(
-            narrow_widened_cmp_pair(
-                Value(7),
-                IrCmpOp::Eq,
-                &Operand::Value(Value(1)),
-                &Operand::Value(Value(2)),
-                IrType::I32,
-                &defs,
-                &uses,
-            )
-            .is_none()
-        );
+        assert!(narrow_widened_cmp_pair(
+            Value(7),
+            IrCmpOp::Eq,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            IrType::I32,
+            &defs,
+            &uses,
+        )
+        .is_none());
 
         uses[2] = 1;
-        assert!(
-            narrow_widened_cmp_pair(
-                Value(7),
-                IrCmpOp::Eq,
-                &Operand::Value(Value(1)),
-                &Operand::Value(Value(2)),
-                IrType::I32,
-                &defs,
-                &uses,
-            )
-            .is_some()
-        );
+        assert!(narrow_widened_cmp_pair(
+            Value(7),
+            IrCmpOp::Eq,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            IrType::I32,
+            &defs,
+            &uses,
+        )
+        .is_some());
 
         uses[1] = 2;
         assert!(widened_cond_replacement(Operand::Value(Value(1)), &defs, &uses).is_none());
@@ -3915,32 +3907,28 @@ mod tests {
             from_ty: IrType::U8,
             to_ty: IrType::I32,
         });
-        assert!(
-            narrow_widened_cmp_pair(
-                Value(7),
-                IrCmpOp::Eq,
-                &Operand::Value(Value(1)),
-                &Operand::Value(Value(2)),
-                IrType::I32,
-                &mixed,
-                &[],
-            )
-            .is_none()
-        );
+        assert!(narrow_widened_cmp_pair(
+            Value(7),
+            IrCmpOp::Eq,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            IrType::I32,
+            &mixed,
+            &[],
+        )
+        .is_none());
 
         let same_width = widening_pair_defs(IrType::I32, IrType::U32);
-        assert!(
-            narrow_widened_cmp_pair(
-                Value(7),
-                IrCmpOp::Eq,
-                &Operand::Value(Value(1)),
-                &Operand::Value(Value(2)),
-                IrType::U32,
-                &same_width,
-                &[],
-            )
-            .is_none()
-        );
+        assert!(narrow_widened_cmp_pair(
+            Value(7),
+            IrCmpOp::Eq,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            IrType::U32,
+            &same_width,
+            &[],
+        )
+        .is_none());
     }
 
     #[test]

@@ -4805,7 +4805,9 @@ fn line_defines_gp(line: &str, kind: LineKind, reg: u8) -> Option<bool> {
         // operand lied `Some(false)` for the second — exactly the lie a
         // hoist/remat must never hear about the register it moves.
         if (mnem == "ldp" || mnem == "ldnp")
-            && ops.next().is_some_and(|second| parse_reg(second.trim()) == reg)
+            && ops
+                .next()
+                .is_some_and(|second| parse_reg(second.trim()) == reg)
         {
             return Some(true);
         }
@@ -6819,7 +6821,10 @@ f:
         // `bl sym` links through x30 without naming it.
         assert_eq!(classify_implicit_operands_a64("bl printf"), (0, 1u64 << 30));
         // `blr x3` READS the branch target and links through x30.
-        assert_eq!(classify_implicit_operands_a64("blr x3"), (1 << 3, 1u64 << 30));
+        assert_eq!(
+            classify_implicit_operands_a64("blr x3"),
+            (1 << 3, 1u64 << 30)
+        );
         // `br x3` reads the target and writes nothing.
         assert_eq!(classify_implicit_operands_a64("br x3"), (1 << 3, 0));
         // Bare `ret` returns through the link register: an implicit read.
@@ -6832,19 +6837,37 @@ f:
     fn oracle_writeback_forms_write_their_base() {
         // The byte-copy loop registers: post-index writes the base the
         // destination-oriented scans never see.
-        assert_eq!(classify_implicit_operands_a64("strb w12, [x9], #1").1, 1 << 9);
-        assert_eq!(classify_implicit_operands_a64("ldrb w12, [x10], #1").1, 1 << 10);
-        assert_eq!(classify_implicit_operands_a64("str x0, [x1, #8]!").1, 1 << 1);
+        assert_eq!(
+            classify_implicit_operands_a64("strb w12, [x9], #1").1,
+            1 << 9
+        );
+        assert_eq!(
+            classify_implicit_operands_a64("ldrb w12, [x10], #1").1,
+            1 << 10
+        );
+        assert_eq!(
+            classify_implicit_operands_a64("str x0, [x1, #8]!").1,
+            1 << 1
+        );
         // Every epilogue: `ldp x29, x30, [sp], #frame` writes sp.
-        assert_eq!(classify_implicit_operands_a64("ldp x29, x30, [sp], #16").1, 1 << 31);
-        assert_eq!(classify_implicit_operands_a64("stp x29, x30, [sp, #-16]!").1, 1 << 31);
+        assert_eq!(
+            classify_implicit_operands_a64("ldp x29, x30, [sp], #16").1,
+            1 << 31
+        );
+        assert_eq!(
+            classify_implicit_operands_a64("stp x29, x30, [sp, #-16]!").1,
+            1 << 31
+        );
         // Plain offset forms do NOT write the base.
         assert_eq!(classify_implicit_operands_a64("ldr x0, [x1, #8]").1, 0);
         assert_eq!(classify_implicit_operands_a64("str x0, [sp, #8]").1, 0);
         // The base is the register inside the brackets, not the data reg.
         assert_eq!(classify_implicit_operands_a64("ldr x0, [x5], #8").1, 1 << 5);
         // Scaled register offsets do not confuse the bracket parse.
-        assert_eq!(classify_implicit_operands_a64("ldr x0, [x1, x2, lsl #3]").1, 0);
+        assert_eq!(
+            classify_implicit_operands_a64("ldr x0, [x1, x2, lsl #3]").1,
+            0
+        );
     }
 
     #[test]
@@ -6878,9 +6901,18 @@ f:
     #[test]
     fn line_defines_gp_tells_the_truth_about_pair_loads_and_writeback() {
         // ldp defines BOTH registers — the second one used to be `Some(false)`.
-        assert_eq!(line_defines_gp("ldp x9, x10, [sp]", LineKind::LoadPairSp, 9), Some(true));
-        assert_eq!(line_defines_gp("ldp x9, x10, [sp]", LineKind::LoadPairSp, 10), Some(true));
-        assert_eq!(line_defines_gp("ldp x9, x10, [sp]", LineKind::LoadPairSp, 11), Some(false));
+        assert_eq!(
+            line_defines_gp("ldp x9, x10, [sp]", LineKind::LoadPairSp, 9),
+            Some(true)
+        );
+        assert_eq!(
+            line_defines_gp("ldp x9, x10, [sp]", LineKind::LoadPairSp, 10),
+            Some(true)
+        );
+        assert_eq!(
+            line_defines_gp("ldp x9, x10, [sp]", LineKind::LoadPairSp, 11),
+            Some(false)
+        );
         // A post-index store defines its base despite the store mnemonic.
         assert_eq!(
             line_defines_gp("str x0, [x9], #8", LineKind::MemOther, 9),
@@ -6909,5 +6941,4 @@ f:
             "the writeback base must keep the copy's destination:\n{result}"
         );
     }
-
 }

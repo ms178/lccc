@@ -37,7 +37,7 @@ log "swap: $(awk '/SwapTotal/{print $2"kB"}' /proc/meminfo)"
 # repository's rust-toolchain.toml and this explicit channel must agree.
 export RUSTUP_HOME=${RUSTUP_HOME:-/home/user/.rustup}
 export CARGO_HOME=${CARGO_HOME:-/home/user/.cargo}
-export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.98.0}
+export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}
 export PATH="$CARGO_HOME/bin:$PATH"
 if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
     log 'installing rustup into persisted /home/user/.cargo'

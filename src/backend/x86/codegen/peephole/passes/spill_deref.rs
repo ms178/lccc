@@ -494,19 +494,30 @@ fn parse_plain_deref(line: &str, expected_base: u8) -> Option<(&'static str, u8,
 /// slot address (leaq of a frame slot, or a raw %rsp/%esp value) — in which
 /// case data-register derefs may alias frame slots and MEM? Mirrors the
 /// discipline of the address-taken-slot pinning and dead-store analysis.
-fn frame_has_escape(store: &LineStore, infos: &[LineInfo], body_start: usize, body_end: usize) -> bool {
+fn frame_has_escape(
+    store: &LineStore,
+    infos: &[LineInfo],
+    body_start: usize,
+    body_end: usize,
+) -> bool {
     for k in body_start..body_end.min(store.len()) {
         if infos[k].is_nop() || infos[k].kind == LineKind::Empty {
             continue;
         }
         let t = infos[k].trimmed(store.get(k));
         if (t.starts_with("leaq ") || t.starts_with("lea "))
-            && (t.contains("(%rsp)") || t.contains("(%rbp)") || t.contains("(%rsp,") || t.contains("(%rbp,"))
+            && (t.contains("(%rsp)")
+                || t.contains("(%rbp)")
+                || t.contains("(%rsp,")
+                || t.contains("(%rbp,"))
         {
             return true;
         }
         let mentions_sp = t.contains("%rsp") || t.contains("%esp");
-        if mentions_sp && !t.contains("(%rsp") && !t.contains("(%esp") && !is_rsp_shift_line(&t)
+        if mentions_sp
+            && !t.contains("(%rsp")
+            && !t.contains("(%esp")
+            && !is_rsp_shift_line(&t)
             && t != "movq %rsp, %rbp"
             && t != "movl %esp, %ebp"
         {
@@ -538,7 +549,10 @@ fn is_epilogue_tail(store: &LineStore, infos: &[LineInfo], k: usize, func_end: u
     let mut j = k;
     let limit = (k + 24).min(func_end);
     while j < limit {
-        if infos[j].is_nop() || infos[j].kind == LineKind::Empty || matches!(infos[j].kind, LineKind::Directive) {
+        if infos[j].is_nop()
+            || infos[j].kind == LineKind::Empty
+            || matches!(infos[j].kind, LineKind::Directive)
+        {
             j += 1;
             continue;
         }
@@ -571,7 +585,9 @@ fn is_epilogue_tail(store: &LineStore, infos: &[LineInfo], k: usize, func_end: u
 /// are invisible to operand parsing (bare `movsb`/`stosq`/…; `rep`-prefixed
 /// forms are already covered by has_implicit_reg_usage).
 fn is_string_op(line: &str) -> bool {
-    const PREFIXES: [&str; 8] = ["movs", "stos", "lods", "scas", "cmps", "ins", "outs", "rep "];
+    const PREFIXES: [&str; 8] = [
+        "movs", "stos", "lods", "scas", "cmps", "ins", "outs", "rep ",
+    ];
     PREFIXES.iter().any(|p| line.starts_with(p))
 }
 
@@ -706,7 +722,8 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 rbp_frame = true;
                 break;
             }
-            if t.starts_with(".cfi_endproc") || t.starts_with(".size ")
+            if t.starts_with(".cfi_endproc")
+                || t.starts_with(".size ")
                 || infos[k].kind == LineKind::Ret
             {
                 break;
@@ -777,7 +794,8 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 // must be tested FIRST: the L2 line itself references the
                 // slot, and it is a pure load, exempt from the window bails.
                 if let Some((m2, m2_mem, m2_reg)) = parse_2op_load(&t) {
-                    if m2 == store_mnem && m2_reg == src_reg
+                    if m2 == store_mnem
+                        && m2_reg == src_reg
                         && parse_slot(m2_mem).map_or(false, |(n2, b2)| n2 == n && b2 == base)
                     {
                         l2 = Some(j);
@@ -853,8 +871,7 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
                     slot_dead = false;
                     break;
                 }
-                let anchored =
-                    t.contains("(%rsp") || (rbp_frame && t.contains("(%rbp"));
+                let anchored = t.contains("(%rsp") || (rbp_frame && t.contains("(%rbp"));
                 if !anchored {
                     post += 1;
                     continue;

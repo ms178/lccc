@@ -735,10 +735,8 @@ fn narrow_binops_with_cast(
                         ShiftCount::InRange => {}
                         ShiftCount::ConstOutOfRange => match binop_info.op {
                             IrBinOp::AShr => {
-                                shift_rhs_override = Some(Operand::Const(IrConst::from_i64(
-                                    width_bits - 1,
-                                    *to_ty,
-                                )));
+                                shift_rhs_override =
+                                    Some(Operand::Const(IrConst::from_i64(width_bits - 1, *to_ty)));
                             }
                             _ => fold_to_zero = true,
                         },
@@ -783,7 +781,9 @@ fn narrow_binops_with_cast(
                     try_narrow_operand(&binop_info.lhs, *to_ty, None, widen_map, narrowed_map);
                 let narrow_rhs = match &shift_rhs_override {
                     Some(o) => Some(o.clone()),
-                    None => try_narrow_operand(&binop_info.rhs, *to_ty, None, widen_map, narrowed_map),
+                    None => {
+                        try_narrow_operand(&binop_info.rhs, *to_ty, None, widen_map, narrowed_map)
+                    }
                 };
 
                 if let (Some(new_lhs), Some(new_rhs)) = (narrow_lhs, narrow_rhs) {
@@ -958,11 +958,7 @@ enum ShiftCount {
 /// (the C idiom `x >> (n & 31)`); every other variable count is `Unknown`
 /// because the wide shift and the narrow shift disagree for counts in
 /// `[width, 64)`.
-fn shift_count_class(
-    rhs: &Operand,
-    width_bits: i64,
-    binop_map: &[Option<BinOpDef>],
-) -> ShiftCount {
+fn shift_count_class(rhs: &Operand, width_bits: i64, binop_map: &[Option<BinOpDef>]) -> ShiftCount {
     let const_val = |c: &IrConst| -> Option<i64> {
         match c {
             IrConst::I64(v) => Some(*v),
@@ -1655,16 +1651,28 @@ mod tests {
         let mut func =
             shift_through_zext(IrBinOp::LShr, Operand::Const(IrConst::I64(56)), Vec::new());
         let changes = narrow_function(&mut func);
-        assert!(changes > 0, "out-of-range count must be folded, not narrowed");
+        assert!(
+            changes > 0,
+            "out-of-range count must be folded, not narrowed"
+        );
         match &func.blocks[0].instructions[2] {
-            Instruction::Copy { dest: Value(3), src: Operand::Const(c) } => {
+            Instruction::Copy {
+                dest: Value(3),
+                src: Operand::Const(c),
+            } => {
                 assert_eq!(c.to_i64(), Some(0), "fold value must be zero, got {:?}", c);
             }
             other => panic!("expected Copy of zero, got {:?}", other),
         }
         // The pass must never have produced a U32 shift by 56.
         for inst in &func.blocks[0].instructions {
-            if let Instruction::BinOp { op: IrBinOp::LShr, ty: IrType::U32, rhs, .. } = inst {
+            if let Instruction::BinOp {
+                op: IrBinOp::LShr,
+                ty: IrType::U32,
+                rhs,
+                ..
+            } = inst
+            {
                 panic!("narrowed shift with out-of-range count {:?}", rhs);
             }
         }
@@ -1717,7 +1725,12 @@ mod tests {
         }]);
         narrow_function(&mut func);
         match &func.blocks[0].instructions[2] {
-            Instruction::BinOp { op: IrBinOp::AShr, ty: IrType::I32, rhs, .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::AShr,
+                ty: IrType::I32,
+                rhs,
+                ..
+            } => {
                 assert_eq!(
                     match rhs {
                         Operand::Const(c) => c.to_i64(),
@@ -1750,7 +1763,11 @@ mod tests {
         assert!(
             matches!(
                 &func.blocks[0].instructions[3],
-                Instruction::Cast { from_ty: IrType::U64, to_ty: IrType::U32, .. }
+                Instruction::Cast {
+                    from_ty: IrType::U64,
+                    to_ty: IrType::U32,
+                    ..
+                }
             ),
             "unbounded variable count must not be narrowed: {:?}",
             func.blocks[0].instructions[3]
@@ -1791,13 +1808,22 @@ mod tests {
             shift_count_class(&Operand::Value(Value(4)), 32, &wide_mask),
             ShiftCount::Unknown
         );
-        assert_eq!(shift_count_class(&Operand::Const(IrConst::I64(31)), 32, &[]), ShiftCount::InRange);
+        assert_eq!(
+            shift_count_class(&Operand::Const(IrConst::I64(31)), 32, &[]),
+            ShiftCount::InRange
+        );
         assert_eq!(
             shift_count_class(&Operand::Const(IrConst::I64(32)), 32, &[]),
             ShiftCount::ConstOutOfRange
         );
-        assert_eq!(shift_count_class(&Operand::Const(IrConst::I64(64)), 32, &[]), ShiftCount::Unknown);
-        assert_eq!(shift_count_class(&Operand::Const(IrConst::I64(-1)), 32, &[]), ShiftCount::Unknown);
+        assert_eq!(
+            shift_count_class(&Operand::Const(IrConst::I64(64)), 32, &[]),
+            ShiftCount::Unknown
+        );
+        assert_eq!(
+            shift_count_class(&Operand::Const(IrConst::I64(-1)), 32, &[]),
+            ShiftCount::Unknown
+        );
 
         let mut func = shift_through_zext(
             IrBinOp::LShr,
@@ -1812,7 +1838,13 @@ mod tests {
         );
         narrow_function(&mut func);
         for inst in &func.blocks[0].instructions {
-            if let Instruction::BinOp { op: IrBinOp::LShr, ty: IrType::U32, rhs, .. } = inst {
+            if let Instruction::BinOp {
+                op: IrBinOp::LShr,
+                ty: IrType::U32,
+                rhs,
+                ..
+            } = inst
+            {
                 assert!(
                     matches!(rhs, Operand::Const(_)),
                     "a narrowed shift must not carry a wide count operand: {:?}",

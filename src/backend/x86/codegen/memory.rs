@@ -2825,35 +2825,26 @@ impl X86Codegen {
                             .emit_fmt(format_args!("    movabsq $0x{:x}, %rax", pat));
                         *rax_pat = true;
                     }
-                    self.state
-                        .emit_fmt(format_args!("    movq %rax, {}", mem));
+                    self.state.emit_fmt(format_args!("    movq %rax, {}", mem));
                 }
             }
-            (8, None) => self
-                .state
-                .emit_fmt(format_args!("    movq %rax, {}", mem)),
+            (8, None) => self.state.emit_fmt(format_args!("    movq %rax, {}", mem)),
             (4, Some(b)) => self.state.emit_fmt(format_args!(
                 "    movl $0x{:x}, {}",
                 (b as u32).wrapping_mul(0x0101_0101),
                 mem
             )),
-            (4, None) => self
-                .state
-                .emit_fmt(format_args!("    movl %eax, {}", mem)),
+            (4, None) => self.state.emit_fmt(format_args!("    movl %eax, {}", mem)),
             (2, Some(b)) => self.state.emit_fmt(format_args!(
                 "    movw $0x{:x}, {}",
                 (b as u16).wrapping_mul(0x0101),
                 mem
             )),
-            (2, None) => self
-                .state
-                .emit_fmt(format_args!("    movw %ax, {}", mem)),
+            (2, None) => self.state.emit_fmt(format_args!("    movw %ax, {}", mem)),
             (_, Some(b)) => self
                 .state
                 .emit_fmt(format_args!("    movb $0x{:x}, {}", b, mem)),
-            (_, None) => self
-                .state
-                .emit_fmt(format_args!("    movb %al, {}", mem)),
+            (_, None) => self.state.emit_fmt(format_args!("    movb %al, {}", mem)),
         }
     }
 
@@ -2899,7 +2890,8 @@ impl X86Codegen {
         };
         let store = |this: &mut Self, off: i64| {
             if off == 0 {
-                this.state.emit_fmt(format_args!("    {} {}, (%rdi)", mv, reg));
+                this.state
+                    .emit_fmt(format_args!("    {} {}, (%rdi)", mv, reg));
             } else {
                 this.state
                     .emit_fmt(format_args!("    {} {}, {}(%rdi)", mv, reg, off));
@@ -2978,9 +2970,7 @@ impl X86Codegen {
     fn emit_memset_rep_stosb(&mut self, size: usize, const_byte: Option<u8>) {
         match const_byte {
             Some(0) => self.state.emit("    xorl %eax, %eax"),
-            Some(b) => self
-                .state
-                .emit_fmt(format_args!("    movl ${}, %eax", b)),
+            Some(b) => self.state.emit_fmt(format_args!("    movl ${}, %eax", b)),
             None => {} // %rax already holds the broadcast; %al is the byte.
         }
         self.state
@@ -3147,7 +3137,8 @@ impl X86Codegen {
                 .emit_instr_imm_reg("    movq", full_chunks as i64, "rcx");
             let loop_label = format!(".Lmset_loop_{}", self.state.next_label_id());
             self.state.emit_fmt(format_args!("{}:", loop_label));
-            self.state.emit_fmt(format_args!("    {} {}, (%rdi)", mv, reg));
+            self.state
+                .emit_fmt(format_args!("    {} {}, (%rdi)", mv, reg));
             self.state
                 .emit_fmt(format_args!("    {} {}, {}(%rdi)", mv, reg, vb));
             self.state
@@ -3376,8 +3367,7 @@ impl X86Codegen {
             use crate::backend::x86::cpu_model::CopyStrategy;
             let vb = self.tune.block_copy_vector_bytes(self.avx2_enabled);
             let strategy = self.tune.memcpy_strategy(size, vb);
-            if strategy == CopyStrategy::RepMovsb
-                && std::env::var_os("CCC_NO_REP_MOVSB").is_none()
+            if strategy == CopyStrategy::RepMovsb && std::env::var_os("CCC_NO_REP_MOVSB").is_none()
             {
                 self.state
                     .out
@@ -3447,7 +3437,11 @@ impl X86Codegen {
             // Remainder ladder.  After the counted loop %rsi/%rdi already
             // point past the copied prefix (offset 0); after the straight-line
             // form they do not, so the ladder continues at the prefix length.
-            let mut offset = if unrolled { full_chunks * chunk } else { 0usize };
+            let mut offset = if unrolled {
+                full_chunks * chunk
+            } else {
+                0usize
+            };
             let mut remaining = remainder;
             while remaining > 0 {
                 if remaining >= 32 && use_ymm {

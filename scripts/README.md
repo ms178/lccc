@@ -4,10 +4,10 @@ Developer and research tooling. None of these are needed to build LCCC.
 
 | Script | Purpose |
 |---|---|
-| `build_lccc_fast.sh` | Incremental `fastbuild` profile (target compiler opt-level 1, no LTO), pinned to Rust/Cargo 1.98.0. Use for RA/codegen loops. |
-| `build_lccc_o1_j2.sh` | Ship-quality release: Rust opt-level 1, two Cargo jobs, thin LTO, swap active, Rust/Cargo 1.98.0. |
+| `build_lccc_fast.sh` | Incremental `fastbuild` profile (target compiler opt-level 1, no LTO), tracking the latest stable Rust channel. Use for RA/codegen loops. |
+| `build_lccc_o1_j2.sh` | Ship-quality release: Rust opt-level 1, two Cargo jobs, thin LTO, swap active, latest stable Rust. |
 | `ensure_swap.sh` | Idempotently verify swap or recreate/activate the disposable 8 GiB `/swapfile` after a constrained-harness root reset; both compiler build scripts invoke it. |
-| `arena_session_restore.sh` | Rehydrates swap, the persisted Rust/Cargo 1.98.0 toolchain, host multilib/kernel packages, git metadata and fastbuild after an Arena reset. |
+| `arena_session_restore.sh` | Rehydrates swap, the persisted latest-stable Rust/Cargo toolchain, host multilib/kernel packages, git metadata and fastbuild after an Arena reset. |
 | `prepare_kernel_tree.sh` | Recreate Linux 6.18.44 with the linux-cachymod patch series and generated boot headers after a harness wipe. |
 | `build_kernel_boot.sh` | Build all x86 real-mode setup objects with LCCC (`-ffunction-sections`), link with `lccc-ld --gc-sections`, preserve non-relocation boot payloads through a build-local `KEEP` script, enforce the authentic 32 KiB ASSERTs, and require flat-image byte identity with available BFD/LLD oracles. |
 | `realmode_corpus.sh` | Compare LCCC/GCC executable text per `arch/x86/boot` C file under the real `-m16 -Os` flags. |

@@ -649,15 +649,30 @@ mod tests {
     #[test]
     fn string_instruction_predicate_accepts_only_real_string_ops() {
         for ok in [
-            "rep movsb", "rep movsq", "rep stosb", "rep stosq", "repne scasb",
-            "repe cmpsb", "movsb", "stosq", "lodsb", "movsl", "rep stosl",
+            "rep movsb",
+            "rep movsq",
+            "rep stosb",
+            "rep stosq",
+            "repne scasb",
+            "repe cmpsb",
+            "movsb",
+            "stosq",
+            "lodsb",
+            "movsl",
+            "rep stosl",
         ] {
             assert!(is_string_instruction(ok), "{ok}");
         }
         for no in [
-            "movsbl %al, %eax", "movslq %eax, %rax", "movsd %xmm0, (%rdi)",
-            "movss %xmm1, %xmm0", "movsx %al, %eax", "movq %rax, %rcx",
-            "cmpq $1, %rax", "repz ret", "movsxd %eax, %rax",
+            "movsbl %al, %eax",
+            "movslq %eax, %rax",
+            "movsd %xmm0, (%rdi)",
+            "movss %xmm1, %xmm0",
+            "movsx %al, %eax",
+            "movq %rax, %rcx",
+            "cmpq $1, %rax",
+            "repz ret",
+            "movsxd %eax, %rax",
         ] {
             assert!(!is_string_instruction(no), "{no}");
         }
@@ -675,9 +690,21 @@ mod tests {
         );
         let (store, _infos, lv) = build(asm);
         let n = line_of(&store, "movq $4096, %rcx");
-        assert_eq!(lv.live_after(n, 1), Some(true), "%rcx must be live into rep movsb");
-        assert_eq!(lv.live_after(n, 6), Some(true), "%rsi must be live into rep movsb");
-        assert_eq!(lv.live_after(n, 7), Some(true), "%rdi must be live into rep movsb");
+        assert_eq!(
+            lv.live_after(n, 1),
+            Some(true),
+            "%rcx must be live into rep movsb"
+        );
+        assert_eq!(
+            lv.live_after(n, 6),
+            Some(true),
+            "%rsi must be live into rep movsb"
+        );
+        assert_eq!(
+            lv.live_after(n, 7),
+            Some(true),
+            "%rdi must be live into rep movsb"
+        );
     }
 
     #[test]
@@ -693,7 +720,11 @@ mod tests {
         );
         let (store, _infos, lv) = build(asm);
         let n = line_of(&store, "xorl %eax, %eax");
-        assert_eq!(lv.live_after(n, 0), Some(true), "%rax must be live into rep stosb");
+        assert_eq!(
+            lv.live_after(n, 0),
+            Some(true),
+            "%rax must be live into rep stosb"
+        );
     }
 
     #[test]
@@ -849,5 +880,4 @@ mod tests {
             "cltd's implicit %rdx write must kill the loop-carried def"
         );
     }
-
 }

@@ -640,8 +640,11 @@ anyway (the bullet carries the *why*).
 
 - **[history/session18/24/64/84]** Environment protocol (harness wipes
   everything between sessions): swap first (`ensure_swap.sh`; some
-  sandboxes cannot swapon — no `CAP_SYS_ADMIN`); Rust 1.98.0 pinned in
-  `rust-toolchain.toml`, install under a persisted path; apt
+  sandboxes cannot swapon — no `CAP_SYS_ADMIN`); Rust toolchain policy
+  (2026-09-06): track the LATEST STABLE channel — `rust-toolchain.toml`
+  pins the channel `stable`, never a version, and every build/restore
+  script installs `stable` under a persisted path; stable-only regressions
+  are fixed at the source instead of freezing the toolchain; apt
   `gcc-multilib libc6-dev-i386` (m32 tests "cannot execute" ENOENT if
   absent — environment, not code), bison/flex/bc/cpio/libelf-dev/kmod;
   the kernel tree + 26 CachyMod patches is NOT persisted (re-extract each

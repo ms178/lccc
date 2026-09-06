@@ -1938,8 +1938,7 @@ fn emit_init_data(
                     // Count consecutive zero elements and emit as a single .zero
                     let elem_size = elem_ty.size();
                     let mut zero_count = 1usize;
-                    while i + zero_count < values.len()
-                        && values[i + zero_count].is_all_zero_bits()
+                    while i + zero_count < values.len() && values[i + zero_count].is_all_zero_bits()
                     {
                         zero_count += 1;
                     }

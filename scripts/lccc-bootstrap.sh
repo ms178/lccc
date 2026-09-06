@@ -9,7 +9,7 @@
 #   1. A 6 GiB swap file on the largest writable filesystem   (hard requirement:
 #      the sandbox has ~1.9 GiB RAM; linking/optimising lccc OOMs without it).
 #   2. VM tuning appropriate for a swap-backed, memory-starved build box.
-#   3. A working Rust 1.98.0 toolchain, INCLUDING the rustup proxy binaries and
+#   3. A working latest-stable Rust toolchain, INCLUDING the rustup proxy binaries and
 #      rustup's own execute bit -- both are lost by a harness wipe and neither
 #      is restored by `rustup toolchain install` (see setup_rust).
 #   3. The lccc worktree at $LCCC_REPO, rebased on ms178/lccc main, with the
@@ -94,8 +94,10 @@ setup_repo() {
 #      so the toolchain installs successfully and `cargo` is still not found.
 #
 # rustup dispatches on argv[0], so symlinking the proxies back to it is the
-# supported recovery. Pin 1.98.0: the tree is built and validated against it.
-RUST_VERSION=${RUST_VERSION:-1.98.0}
+# supported recovery. Track the LATEST STABLE channel (matching
+# rust-toolchain.toml): the tree is kept warning-clean against the moving
+# stable toolchain, so there is no version to pin.
+RUST_VERSION=${RUST_VERSION:-stable}
 RUST_PROXIES=(cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver
               rust-gdb rust-lldb)
 

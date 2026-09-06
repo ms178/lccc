@@ -128,7 +128,6 @@ pub struct LiveRange {
     pub occupancy_len: u32,
 }
 
-
 impl LiveRange {
     /// Create a placeholder range. [`build_live_ranges`] overwrites uses,
     /// priority, hints and spill weight with the real facts.
@@ -2428,7 +2427,11 @@ mod tests {
         let mut incoming = lr_weighted(2, 50, 120, vec![(60, 1), (110, 1)]);
         incoming.priority = 2;
 
-        assert_eq!(victim.remaining_cost(50), 0, "victim is dead at the scan point");
+        assert_eq!(
+            victim.remaining_cost(50),
+            0,
+            "victim is dead at the scan point"
+        );
         assert_eq!(incoming.remaining_cost(50), 2);
 
         // Global-priority order (mode 3): 2 <= 300, so the victim is immune
@@ -2470,8 +2473,12 @@ mod tests {
         // `one_hot`: one use at depth 2 (weight 100) plus cold uses.
         let mut one_hot = lr_weighted(1, 0, 300, vec![(100, 100), (101, 1), (102, 1)]);
         // `many_hot`: four uses at depth 2.
-        let mut many_hot =
-            lr_weighted(2, 0, 300, vec![(100, 100), (101, 100), (102, 100), (103, 100)]);
+        let mut many_hot = lr_weighted(
+            2,
+            0,
+            300,
+            vec![(100, 100), (101, 100), (102, 100), (103, 100)],
+        );
         // The legacy scalar model gives BOTH `10^2 * n_uses`, and `one_hot`
         // (3 uses) would even look comparable to `many_hot` (4 uses).
         one_hot.priority = 300;
@@ -2485,7 +2492,9 @@ mod tests {
         // An incoming hotter than `one_hot` but colder than `many_hot` must
         // pick `one_hot` as the victim.
         let incoming = lr_weighted(3, 50, 60, vec![(55, 200)]);
-        let pick = a.select_evict_victim(&incoming, 6).expect("a victim exists");
+        let pick = a
+            .select_evict_victim(&incoming, 6)
+            .expect("a victim exists");
         assert_eq!(
             a.active[pick].range.value_id, 1,
             "must evict the range with the lower REMAINING weighted cost"

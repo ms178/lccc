@@ -325,7 +325,12 @@ impl X86Codegen {
             disp.to_string()
         };
         let mem = match index {
-            Some(ix) => format!("{}(%{},%{})", disp_str, phys_reg_name(base), phys_reg_name(ix)),
+            Some(ix) => format!(
+                "{}(%{},%{})",
+                disp_str,
+                phys_reg_name(base),
+                phys_reg_name(ix)
+            ),
             None => format!("{}(%{})", disp_str, phys_reg_name(base)),
         };
         if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
@@ -994,9 +999,7 @@ impl X86Codegen {
             let consumes = args
                 .iter()
                 .any(|a| matches!(a, Operand::Value(v) if v.0 == pv));
-            if !consumes
-                && !crate::backend::stack_layout::copy_coalescing::is_pure_vec_load(op)
-            {
+            if !consumes && !crate::backend::stack_layout::copy_coalescing::is_pure_vec_load(op) {
                 self.materialize_pending_memfold();
             }
         }
@@ -3085,9 +3088,9 @@ impl X86Codegen {
                 self.state.emit("    vaddpd %xmm1, %xmm0, %xmm0"); // Add upper + lower (4→2)
                 self.state.emit("    vunpckhpd %xmm0, %xmm0, %xmm1"); // Shuffle element 1 to position 0
                 self.state.emit("    vaddsd %xmm1, %xmm0, %xmm0"); // Final scalar add (2→1)
-                // Keep the scalar result in the SSE domain: an XMM-homed
-                // destination receives `movapd %xmm0, %xmmN`, a stack-slot
-                // destination a direct `movsd`, never a GPR round trip.
+                                                                   // Keep the scalar result in the SSE domain: an XMM-homed
+                                                                   // destination receives `movapd %xmm0, %xmmN`, a stack-slot
+                                                                   // destination a direct `movsd`, never a GPR round trip.
                 if let Some(d) = dest {
                     self.store_xmm_to(d, "xmm0", IrType::F64);
                 }
@@ -4244,10 +4247,8 @@ impl X86Codegen {
                 if let Some(name) = direct_dest {
                     // phys_reg_name yields the bare mnemonic ("xmm9").
                     let scratch = "%xmm1";
-                    self.state.emit_fmt(format_args!(
-                        "    vextractf128 $1, %ymm0, {}",
-                        scratch
-                    ));
+                    self.state
+                        .emit_fmt(format_args!("    vextractf128 $1, %ymm0, {}", scratch));
                     self.state
                         .emit_fmt(format_args!("    vaddpd {}, %xmm0, %{}", scratch, name));
                     // CRITICAL: unpack the SUMMED halves (the vaddpd
@@ -4257,10 +4258,8 @@ impl X86Codegen {
                         "    vunpckhpd %{}, %{}, {}",
                         name, name, scratch
                     ));
-                    self.state.emit_fmt(format_args!(
-                        "    vaddsd {}, %{}, %{}",
-                        scratch, name, name
-                    ));
+                    self.state
+                        .emit_fmt(format_args!("    vaddsd {}, %{}, %{}", scratch, name, name));
                 } else {
                     self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
                     self.state.emit("    vaddpd %xmm1, %xmm0, %xmm0");
@@ -4481,30 +4480,21 @@ impl X86Codegen {
                     .filter(|&name| name != "xmm1");
                 if let Some(name) = direct_dest {
                     let scratch = "%xmm1";
-                    self.state.emit_fmt(format_args!(
-                        "    vextractf128 $1, %ymm0, {}",
-                        scratch
-                    ));
-                    self.state.emit_fmt(format_args!(
-                        "    vaddps {}, %xmm0, %{}",
-                        scratch, name
-                    )); // [s0 s1 s2 s3]
-                    self.state.emit_fmt(format_args!(
-                        "    vmovshdup %{}, {}",
-                        name, scratch
-                    )); // [s1 s1 s3 s3]
-                    self.state.emit_fmt(format_args!(
-                        "    vaddps {}, %{}, %{}",
-                        scratch, name, name
-                    )); // [s0+s1, .., s2+s3, ..]
+                    self.state
+                        .emit_fmt(format_args!("    vextractf128 $1, %ymm0, {}", scratch));
+                    self.state
+                        .emit_fmt(format_args!("    vaddps {}, %xmm0, %{}", scratch, name)); // [s0 s1 s2 s3]
+                    self.state
+                        .emit_fmt(format_args!("    vmovshdup %{}, {}", name, scratch)); // [s1 s1 s3 s3]
+                    self.state
+                        .emit_fmt(format_args!("    vaddps {}, %{}, %{}", scratch, name, name)); // [s0+s1, .., s2+s3, ..]
                     self.state.emit_fmt(format_args!(
                         "    vshufps $0xAA, %{}, %{}, {}",
                         name, name, scratch
                     )); // lanes {2,2,2,2}
-                    self.state.emit_fmt(format_args!(
-                        "    vaddss {}, %{}, %{}",
-                        scratch, name, name
-                    )); // (s0+s1)+(s2+s3)
+                    self.state
+                        .emit_fmt(format_args!("    vaddss {}, %{}, %{}", scratch, name, name));
+                // (s0+s1)+(s2+s3)
                 } else {
                     self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
                     self.state.emit("    vaddps %xmm1, %xmm0, %xmm0"); // [s0 s1 s2 s3]
@@ -4755,7 +4745,10 @@ impl X86Codegen {
             .pending_vec_memfold
             .as_ref()
             .map(|(pv, _, _)| *pv)
-            .filter(|pv| args.iter().any(|a| matches!(a, Operand::Value(v) if v.0 == *pv)));
+            .filter(|pv| {
+                args.iter()
+                    .any(|a| matches!(a, Operand::Value(v) if v.0 == *pv))
+            });
         self.emit_avx_map_fma_inner(dest, args, mnemonic);
         if folded.is_some() {
             self.state.pending_vec_memfold = None;
@@ -4920,7 +4913,9 @@ impl X86Codegen {
                     mem
                 } else {
                     self.value_ptr_mem_operand(sv.0).unwrap_or_else(|| {
-                        unreachable!("vfmadd132 scale operand must be homed, tracked, or slot-homed")
+                        unreachable!(
+                            "vfmadd132 scale operand must be homed, tracked, or slot-homed"
+                        )
                     })
                 };
                 self.state
@@ -4970,8 +4965,9 @@ impl X86Codegen {
         let Operand::Value(v) = arg else {
             unreachable!("{}: vector operand must be a value", what);
         };
-        self.value_ptr_mem_operand(v.0)
-            .unwrap_or_else(|| unreachable!("{}: operand must be homed, folded, or slot-homed", what))
+        self.value_ptr_mem_operand(v.0).unwrap_or_else(|| {
+            unreachable!("{}: operand must be homed, folded, or slot-homed", what)
+        })
     }
 
     /// Packed FP compare (AVX): `dest = args[0] PRED args[1]` as an all-ones /
@@ -5093,8 +5089,10 @@ impl X86Codegen {
                 ("%ymm1".to_string(), t)
             }
         };
-        self.state
-            .emit_fmt(format_args!("    {} {}, {}, %ymm0, %ymm0", inst, mask, tval));
+        self.state.emit_fmt(format_args!(
+            "    {} {}, {}, %ymm0, %ymm0",
+            inst, mask, tval
+        ));
         self.state.vec_last_store_reg = false;
         self.avx_store_dest(dest);
     }
@@ -5124,12 +5122,14 @@ impl X86Codegen {
         }
         self.sse_load_arg(&args[2], "xmm1");
         self.sse_load_arg(&args[1], "xmm0");
-        self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", and));
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0", and));
         let fsrc = match self.vec_home_128(&args[0]) {
             Some(reg) => reg,
             None => self.vec_mem_source_after_flush(&args[0], andn),
         };
-        self.state.emit_fmt(format_args!("    {} {}, %xmm1", andn, fsrc));
+        self.state
+            .emit_fmt(format_args!("    {} {}, %xmm1", andn, fsrc));
         self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", or));
         self.sse_store_dest(dest, "xmm0");
     }
@@ -5217,7 +5217,10 @@ impl X86Codegen {
             .pending_vec_memfold
             .as_ref()
             .map(|(pv, _, _)| *pv)
-            .filter(|pv| args.iter().any(|a| matches!(a, Operand::Value(v) if v.0 == *pv)));
+            .filter(|pv| {
+                args.iter()
+                    .any(|a| matches!(a, Operand::Value(v) if v.0 == *pv))
+            });
         self.emit_avx_binary_256_inner(dest_ptr, args, avx_inst, commutative);
         // VLFOLD: every path of the consumer either used the memory operand
         // or materialised the load; the elided value is consumed now.
@@ -5261,10 +5264,8 @@ impl X86Codegen {
                         .filter(|r| is_xmm_reg(*r));
                     if let Some(dest_reg) = dest_home {
                         let dst = phys_reg_name_256(dest_reg);
-                        self.state.emit_fmt(format_args!(
-                            "    {} {}, %{}, %{}",
-                            avx_inst, mem, src, dst
-                        ));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %{}, %{}", avx_inst, mem, src, dst));
                         self.state.vec_live_regs.insert(dest_ptr.0, dst);
                         self.state.vec_last_store_val = Some(dest_ptr.0);
                         self.state.vec_last_store_reg = true;
@@ -5274,10 +5275,8 @@ impl X86Codegen {
                         // %ymm0 may hold a deferred value of a different def:
                         // commit it before overwriting the scratch register.
                         self.flush_pending_vec_store_impl();
-                        self.state.emit_fmt(format_args!(
-                            "    {} {}, %{}, %ymm0",
-                            avx_inst, mem, src
-                        ));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %{}, %ymm0", avx_inst, mem, src));
                         self.state.vec_last_store_reg = false;
                         self.avx_store_dest(dest_ptr);
                     }

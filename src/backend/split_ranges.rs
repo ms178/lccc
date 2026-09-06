@@ -1513,10 +1513,9 @@ fn uses_outside_are_only_phis_from(func: &IrFunction, block: usize, vid: u32) ->
         for inst in &b.instructions {
             if let Instruction::Phi { incoming, .. } = inst {
                 // Only an incoming pair from THIS block may reference `vid`.
-                if incoming
-                    .iter()
-                    .any(|(op, pred)| *pred != label && matches!(op, Operand::Value(v) if v.0 == vid))
-                {
+                if incoming.iter().any(|(op, pred)| {
+                    *pred != label && matches!(op, Operand::Value(v) if v.0 == vid)
+                }) {
                     return false;
                 }
                 continue;
@@ -1606,7 +1605,10 @@ fn analyze_block_liveness(
                 }
             }
         };
-        let last_use = uses.get(&v).and_then(|u| u.last().copied()).unwrap_or(start);
+        let last_use = uses
+            .get(&v)
+            .and_then(|u| u.last().copied())
+            .unwrap_or(start);
         let end = if live_out.contains(&v) {
             term_pt
         } else {
@@ -1647,7 +1649,11 @@ fn plan_block_splits(
     if split_debug_enabled() {
         eprintln!(
             "[SPLIT-PRESSURE] {} block {} pts={} live_spans={} budget={}",
-            func.name, bi, n_pts, bl.span.len(), budget
+            func.name,
+            bi,
+            n_pts,
+            bl.span.len(),
+            budget
         );
     }
     if bl.span.len() <= budget {
@@ -1703,8 +1709,7 @@ fn plan_block_splits(
             let store_at = vuses
                 .iter()
                 .copied()
-                .filter(|&u| u <= peak_pt)
-                .next_back()
+                .rfind(|&u| u <= peak_pt)
                 .or_else(|| bl.def.get(&v).copied())
                 .map_or(0, |p| p + 1);
 
@@ -1716,8 +1721,7 @@ fn plan_block_splits(
                     // No further read inside the block. Only worth splitting
                     // when the value survives the block, and only when every
                     // outside consumer is a successor phi operand.
-                    if !bl.live_out.contains(&v) || !uses_outside_are_only_phis_from(func, bi, v)
-                    {
+                    if !bl.live_out.contains(&v) || !uses_outside_are_only_phis_from(func, bi, v) {
                         continue;
                     }
                     (n_pts - 1, usize::MAX)
@@ -1743,17 +1747,42 @@ fn plan_block_splits(
         }
 
         if split_debug_enabled() && best.is_none() {
-            let mut r_used = 0; let mut r_noprev = 0; let mut r_gap = 0; let mut r_out = 0; let mut r_span = 0;
+            let mut r_used = 0;
+            let mut r_noprev = 0;
+            let mut r_gap = 0;
+            let mut r_out = 0;
+            let mut r_span = 0;
             for (&v, &(sp0, e)) in bl.span.iter() {
-                if done.contains(&v) || sp0 > peak_pt || e < peak_pt { r_span += 1; continue; }
+                if done.contains(&v) || sp0 > peak_pt || e < peak_pt {
+                    r_span += 1;
+                    continue;
+                }
                 let empty: Vec<usize> = Vec::new();
                 let vu = bl.uses.get(&v).unwrap_or(&empty);
-                if vu.contains(&peak_pt) || bl.def.get(&v) == Some(&peak_pt) { r_used += 1; continue; }
-                let prev = vu.iter().copied().filter(|&u| u <= peak_pt).next_back().or_else(|| bl.def.get(&v).copied()).map_or(0, |p| p + 1);
+                if vu.contains(&peak_pt) || bl.def.get(&v) == Some(&peak_pt) {
+                    r_used += 1;
+                    continue;
+                }
+                let prev = vu
+                    .iter()
+                    .copied()
+                    .rfind(|&u| u <= peak_pt)
+                    .or_else(|| bl.def.get(&v).copied())
+                    .map_or(0, |p| p + 1);
                 let _ = &mut r_noprev;
                 match vu.iter().copied().find(|&u| u > peak_pt) {
-                    Some(u) => { if u.saturating_sub(prev) < min_gap { r_gap += 1; } }
-                    None => { if !bl.live_out.contains(&v) || !uses_outside_are_only_phis_from(func, bi, v) { r_out += 1; } }
+                    Some(u) => {
+                        if u.saturating_sub(prev) < min_gap {
+                            r_gap += 1;
+                        }
+                    }
+                    None => {
+                        if !bl.live_out.contains(&v)
+                            || !uses_outside_are_only_phis_from(func, bi, v)
+                        {
+                            r_out += 1;
+                        }
+                    }
                 }
             }
             eprintln!("[SPLIT-PRESSURE] {} blk{} peak_pt={} peak={} REJECT span={} used_at_peak={} noprev={} gap={} outside={}",
@@ -1827,8 +1856,12 @@ fn apply_block_splits(
     }
     let mut mats: Vec<Materialized> = Vec::new();
     for sp in plan {
-        let Some(alloca) = next_value(next_val) else { break };
-        let Some(new_val) = next_value(next_val) else { break };
+        let Some(alloca) = next_value(next_val) else {
+            break;
+        };
+        let Some(new_val) = next_value(next_val) else {
+            break;
+        };
         let reload_at = if sp.reload_before == usize::MAX {
             n
         } else {

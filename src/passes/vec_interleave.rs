@@ -117,17 +117,78 @@ fn acc_op_info(op: IntrinsicOp) -> Option<AccOp> {
     // lowering for it (unimplemented no-op), so nothing may ever select it.
     use ReductionOp as R;
     let (kind, combine, zero, is_fp, red_op, bits) = match op {
-        O::VecFmaF64x4 => (AccKind::Add, O::VecAddF64x4, Some(O::VecZeroF64x4), true, R::Fma, 256),
-        O::VecAddF64x4 => (AccKind::Add, O::VecAddF64x4, Some(O::VecZeroF64x4), true, R::FAdd, 256),
-        O::VecFmaF32x8 => (AccKind::Add, O::VecAddF32x8, Some(O::VecZeroF32x8), true, R::Fma, 256),
-        O::VecAddF32x8 => (AccKind::Add, O::VecAddF32x8, Some(O::VecZeroF32x8), true, R::FAdd, 256),
-        O::VecAddF64x2 => (AccKind::Add, O::VecAddF64x2, Some(O::VecZeroF64x2), true, R::FAdd, 128),
-        O::VecAddF32x4 => (AccKind::Add, O::VecAddF32x4, Some(O::VecZeroF32x4), true, R::FAdd, 128),
-        O::VecAddI32x8 => (AccKind::Add, O::VecAddI32x8, Some(O::VecZeroI32x8), false, R::IntAdd, 256),
-        O::VecAddI32x4 => (AccKind::Add, O::VecAddI32x4, Some(O::VecZeroI32x4), false, R::IntAdd, 128),
-        O::VecAddI64x2 | O::VecWidenAddI32x4ToI64x2 => {
-            (AccKind::Add, O::VecAddI64x2, Some(O::VecZeroI64x2), false, R::IntAdd, 128)
-        }
+        O::VecFmaF64x4 => (
+            AccKind::Add,
+            O::VecAddF64x4,
+            Some(O::VecZeroF64x4),
+            true,
+            R::Fma,
+            256,
+        ),
+        O::VecAddF64x4 => (
+            AccKind::Add,
+            O::VecAddF64x4,
+            Some(O::VecZeroF64x4),
+            true,
+            R::FAdd,
+            256,
+        ),
+        O::VecFmaF32x8 => (
+            AccKind::Add,
+            O::VecAddF32x8,
+            Some(O::VecZeroF32x8),
+            true,
+            R::Fma,
+            256,
+        ),
+        O::VecAddF32x8 => (
+            AccKind::Add,
+            O::VecAddF32x8,
+            Some(O::VecZeroF32x8),
+            true,
+            R::FAdd,
+            256,
+        ),
+        O::VecAddF64x2 => (
+            AccKind::Add,
+            O::VecAddF64x2,
+            Some(O::VecZeroF64x2),
+            true,
+            R::FAdd,
+            128,
+        ),
+        O::VecAddF32x4 => (
+            AccKind::Add,
+            O::VecAddF32x4,
+            Some(O::VecZeroF32x4),
+            true,
+            R::FAdd,
+            128,
+        ),
+        O::VecAddI32x8 => (
+            AccKind::Add,
+            O::VecAddI32x8,
+            Some(O::VecZeroI32x8),
+            false,
+            R::IntAdd,
+            256,
+        ),
+        O::VecAddI32x4 => (
+            AccKind::Add,
+            O::VecAddI32x4,
+            Some(O::VecZeroI32x4),
+            false,
+            R::IntAdd,
+            128,
+        ),
+        O::VecAddI64x2 | O::VecWidenAddI32x4ToI64x2 => (
+            AccKind::Add,
+            O::VecAddI64x2,
+            Some(O::VecZeroI64x2),
+            false,
+            R::IntAdd,
+            128,
+        ),
         O::VecMaxI32x8 => (AccKind::Max, O::VecMaxI32x8, None, false, R::IntMax, 256),
         _ => return None,
     };
@@ -448,7 +509,9 @@ fn analyze(
             .iter()
             .filter_map(|&i| hb.instructions[i].dest().map(|d| d.0))
             .collect();
-        if operand_mentions(inst, &|id| loop_defs.contains(&id) && !hoisted_so_far.contains(&id)) {
+        if operand_mentions(inst, &|id| {
+            loop_defs.contains(&id) && !hoisted_so_far.contains(&id)
+        }) {
             return reject("header instruction depends on a loop-carried value");
         }
         hoist.push(idx);
@@ -494,7 +557,8 @@ fn analyze(
             }
         }
         for inst in &hb.instructions {
-            if !matches!(inst, Instruction::Phi { .. }) && operand_mentions(inst, &|id| id == phi_id)
+            if !matches!(inst, Instruction::Phi { .. })
+                && operand_mentions(inst, &|id| id == phi_id)
             {
                 return reject("accumulator phi is read by the header");
             }
@@ -1112,10 +1176,7 @@ mod tests {
                 Instruction::Phi {
                     dest: Value(5),
                     ty: IrType::F64,
-                    incoming: vec![
-                        (Operand::Value(Value(4)), e),
-                        (Operand::Value(Value(9)), b),
-                    ],
+                    incoming: vec![(Operand::Value(Value(4)), e), (Operand::Value(Value(9)), b)],
                 },
                 Instruction::Phi {
                     dest: Value(6),
@@ -1220,7 +1281,10 @@ mod tests {
         ];
         assert_eq!(acc_arg_index(IntrinsicOp::VecFmaF64x4, &args, acc), Some(0));
         let swapped = vec![Operand::Value(Value(1)), Operand::Value(acc)];
-        assert_eq!(acc_arg_index(IntrinsicOp::VecAddI32x8, &swapped, acc), Some(1));
+        assert_eq!(
+            acc_arg_index(IntrinsicOp::VecAddI32x8, &swapped, acc),
+            Some(1)
+        );
         assert_eq!(acc_arg_index(IntrinsicOp::VecAddI32x8, &args, acc), None);
     }
 

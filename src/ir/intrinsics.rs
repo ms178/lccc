@@ -1549,7 +1549,9 @@ mod vector_result_width_tests {
     #[test]
     fn declared_width_agrees_with_the_lane_count_in_the_name() {
         const SRC: &str = include_str!("intrinsics.rs");
-        let enum_start = SRC.find("pub enum IntrinsicOp").expect("enum block present");
+        let enum_start = SRC
+            .find("pub enum IntrinsicOp")
+            .expect("enum block present");
         let enum_body = &SRC[enum_start..];
         let enum_body = &enum_body[..enum_body.find("\n}\n").expect("enum block terminated")];
         let mut names: Vec<&str> = Vec::new();
@@ -1576,10 +1578,14 @@ mod vector_result_width_tests {
         // (name suffix token) -> (type bytes, lanes). Searched as exact
         // substrings; the LAST occurrence in the name wins.
         const SHAPES: [(&str, u32, u32); 8] = [
-            ("I32x8", 4, 8), ("I32x4", 4, 4),
-            ("I64x4", 8, 4), ("I64x2", 8, 2),
-            ("F32x8", 4, 8), ("F32x4", 4, 4),
-            ("F64x4", 8, 4), ("F64x2", 8, 2),
+            ("I32x8", 4, 8),
+            ("I32x4", 4, 4),
+            ("I64x4", 8, 4),
+            ("I64x2", 8, 2),
+            ("F32x8", 4, 8),
+            ("F32x4", 4, 4),
+            ("F64x4", 8, 4),
+            ("F64x2", 8, 2),
         ];
         let mut checked = 0usize;
         for name in names {
@@ -1595,11 +1601,7 @@ mod vector_result_width_tests {
             let Some((_, tok, ty, lanes)) = last else {
                 continue; // no shape token: grammar cannot judge (VecAdd, ...)
             };
-            let expected = if exempt_none {
-                None
-            } else {
-                Some(ty * lanes)
-            };
+            let expected = if exempt_none { None } else { Some(ty * lanes) };
             let op: IntrinsicOp = names_to_op(name)
                 .unwrap_or_else(|| panic!("unhandled Vec* variant {name}: add it to names_to_op"));
             assert_eq!(

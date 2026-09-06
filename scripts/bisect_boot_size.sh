@@ -7,7 +7,7 @@ WT=/home/user/bisect
 REPO=/home/user/lccc
 K=/home/user/kernel-work/linux-6.18.47
 export PATH=/home/user/.cargo/bin:$PATH
-export RUSTUP_TOOLCHAIN=1.98.0
+export RUSTUP_TOOLCHAIN=stable
 export CARGO_BUILD_JOBS=2
 export RUSTFLAGS=""
 

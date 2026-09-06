@@ -156,13 +156,9 @@ impl<'a> SemaConstEval<'a> {
                     // including unsigned ones, become signed int). Clamping
                     // the size to 4 here while forwarding `ct.is_unsigned()`
                     // mis-typed `(uint8_t)201 | (int16_t)-1` as unsigned int.
-                    let lhs_size = lhs_ctype
-                        .as_ref()
-                        .map_or(4, |ct| self.ctype_size(ct));
+                    let lhs_size = lhs_ctype.as_ref().map_or(4, |ct| self.ctype_size(ct));
                     let lhs_unsigned = lhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned());
-                    let rhs_size = rhs_ctype
-                        .as_ref()
-                        .map_or(4, |ct| self.ctype_size(ct));
+                    let rhs_size = rhs_ctype.as_ref().map_or(4, |ct| self.ctype_size(ct));
                     let rhs_unsigned = rhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned());
                     let result = shared_const_eval::eval_binop_with_types(
                         op,

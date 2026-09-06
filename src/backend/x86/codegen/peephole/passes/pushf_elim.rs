@@ -316,7 +316,10 @@ mod tests {
         );
         let mut asm = input.to_string();
         let changed = eliminate_redundant_pushfq(&mut asm);
-        assert_eq!(asm, input, "user bytes are immutable and the pair is unverifiable");
+        assert_eq!(
+            asm, input,
+            "user bytes are immutable and the pair is unverifiable"
+        );
         assert!(!changed);
     }
 

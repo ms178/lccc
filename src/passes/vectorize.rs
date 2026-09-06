@@ -1225,8 +1225,8 @@ fn reduction_pattern_is_sound(
                     // (reproducer: `s += a[i]; last = a[i];` — `last` ended up
                     // reading A[0], A[8], ... instead of A[i]). Reject the
                     // whole loop (fail-closed; the scalar form is correct).
-                    let is_iv_or_accum = *dest == iv_phi
-                        || accumulator_phis.iter().any(|phi| *phi == *dest);
+                    let is_iv_or_accum =
+                        *dest == iv_phi || accumulator_phis.iter().any(|phi| *phi == *dest);
                     if !is_iv_or_accum {
                         let loop_carried = incoming.iter().any(|(op, lbl)| {
                             loop_block_labels.contains(&lbl.0) && matches!(op, Operand::Value(_))
@@ -3775,14 +3775,18 @@ fn analyze_map_pattern(
     let exit_idx = match find_exit(func, loop_info) {
         Some(e) => e,
         None => {
-            if debug { eprintln!("[VEC-MAP] BAIL: no exit"); }
+            if debug {
+                eprintln!("[VEC-MAP] BAIL: no exit");
+            }
             return None;
         }
     };
     let latch_idx = match find_latch(func, loop_info) {
         Some(l) => l,
         None => {
-            if debug { eprintln!("[VEC-MAP] BAIL: no latch"); }
+            if debug {
+                eprintln!("[VEC-MAP] BAIL: no latch");
+            }
             return None;
         }
     };
@@ -3792,7 +3796,9 @@ fn analyze_map_pattern(
         Terminator::CondBranch { false_label, .. }
             if false_label == func.blocks[exit_idx].label)
     {
-        if debug { eprintln!("[VEC-MAP] BAIL: header shape"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: header shape");
+        }
         return None;
     }
 
@@ -3804,7 +3810,9 @@ fn analyze_map_pattern(
                 Terminator::CondBranch { .. }
             )
     }) {
-        if debug { eprintln!("[VEC-MAP] BAIL: internal condbranch"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: internal condbranch");
+        }
         return None;
     }
 
@@ -3839,7 +3847,9 @@ fn analyze_map_pattern(
         }
     }
     let Some((iv, iv_ty)) = iv else {
-        if debug { eprintln!("[VEC-MAP] BAIL: no IV phi"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: no IV phi");
+        }
         return None;
     };
 
@@ -3858,7 +3868,9 @@ fn analyze_map_pattern(
         .any(|inst| matches!(inst, Instruction::Phi { dest, .. } if *dest != iv))
     {
         set_reject("map loop carries a value other than its induction variable");
-        if debug { eprintln!("[VEC-MAP] BAIL: non-IV header phi"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: non-IV header phi");
+        }
         return None;
     }
 
@@ -3913,21 +3925,27 @@ fn analyze_map_pattern(
         }
     }
     let Some((exit_cmp_op, limit)) = exit_cmp_info else {
-        if debug { eprintln!("[VEC-MAP] BAIL: no exit cmp"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: no exit cmp");
+        }
         return None;
     };
     if matches!(&limit, Operand::Value(v)
         if find_inst_in_loop(func, &loop_info.body, *v).is_some())
     {
         set_reject("map trip count is not loop-invariant");
-        if debug { eprintln!("[VEC-MAP] BAIL: trip count not invariant"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: trip count not invariant");
+        }
         return None;
     }
 
     // Constant trip counts of 4 or fewer are better left scalar.
     if let Operand::Const(c) = &limit {
         if c.to_i64().map_or(false, |n| n <= 4) {
-            if debug { eprintln!("[VEC-MAP] BAIL: const trip <= 4"); }
+            if debug {
+                eprintln!("[VEC-MAP] BAIL: const trip <= 4");
+            }
             return None;
         }
     }
@@ -3940,7 +3958,9 @@ fn analyze_map_pattern(
                 && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)))
     });
     if !has_unit_increment {
-        if debug { eprintln!("[VEC-MAP] BAIL: no unit increment"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: no unit increment");
+        }
         return None;
     }
 
@@ -3960,7 +3980,9 @@ fn analyze_map_pattern(
                     if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
                         || load_infos.len() >= MAP_MAX_STREAMS
                     {
-                        if debug { eprintln!("[VEC-MAP] BAIL: bad load ty/streams"); }
+                        if debug {
+                            eprintln!("[VEC-MAP] BAIL: bad load ty/streams");
+                        }
                         return None;
                     }
                     load_infos.push((block_idx, *dest, *ptr, *ty));
@@ -3969,17 +3991,23 @@ fn analyze_map_pattern(
                     if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
                         || store_info.is_some()
                     {
-                        if debug { eprintln!("[VEC-MAP] BAIL: bad store ty/dup"); }
+                        if debug {
+                            eprintln!("[VEC-MAP] BAIL: bad store ty/dup");
+                        }
                         return None;
                     }
                     let Operand::Value(store_val) = val else {
-                        if debug { eprintln!("[VEC-MAP] BAIL: store val not value"); }
+                        if debug {
+                            eprintln!("[VEC-MAP] BAIL: store val not value");
+                        }
                         return None;
                     };
                     store_info = Some((block_idx, *ptr, *store_val, *ty));
                 }
                 Instruction::BinOp { op, ty, .. } if op.can_trap() && !ty.is_float() => {
-                    if debug { eprintln!("[VEC-MAP] BAIL: trapping binop"); }
+                    if debug {
+                        eprintln!("[VEC-MAP] BAIL: trapping binop");
+                    }
                     return None;
                 }
                 // Scalar sqrt lowers to a pure intrinsic; the map tree
@@ -3998,24 +4026,32 @@ fn analyze_map_pattern(
                 | Instruction::GetElementPtr { .. }
                 | Instruction::GlobalAddr { .. } => {}
                 _ => {
-                    if debug { eprintln!("[VEC-MAP] BAIL: unwhitelisted inst in scan"); }
+                    if debug {
+                        eprintln!("[VEC-MAP] BAIL: unwhitelisted inst in scan");
+                    }
                     return None;
                 }
             }
         }
     }
     let Some((body_idx, dst_gep, store_val, elem_ty)) = store_info else {
-        if debug { eprintln!("[VEC-MAP] BAIL: no store info"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: no store info");
+        }
         return None;
     };
     // At least one source stream is required (a pure store of a loop
     // invariant is not a map).
     if load_infos.is_empty() {
-        if debug { eprintln!("[VEC-MAP] BAIL: no loads"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: no loads");
+        }
         return None;
     }
     if load_infos.iter().any(|&(_, _, _, ty)| ty != elem_ty) {
-        if debug { eprintln!("[VEC-MAP] BAIL: load/store ty mismatch"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: load/store ty mismatch");
+        }
         return None;
     }
 
@@ -4036,7 +4072,9 @@ fn analyze_map_pattern(
     }
     if find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none() {
         set_reject("map access is not a contiguous element-size stride");
-        if debug { eprintln!("[VEC-MAP] BAIL: dst not contiguous"); }
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: dst not contiguous");
+        }
         return None;
     }
     // Every source stream must be IV-indexed and contiguous as well.
@@ -4045,7 +4083,9 @@ fn analyze_map_pattern(
             || find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
         {
             set_reject("map source access is not a contiguous element-size stride");
-            if debug { eprintln!("[VEC-MAP] BAIL: src not contiguous"); }
+            if debug {
+                eprintln!("[VEC-MAP] BAIL: src not contiguous");
+            }
             return None;
         }
     }
@@ -4358,13 +4398,12 @@ fn parse_map_expr(
             let Operand::Value(cond_val) = cond else {
                 return None;
             };
-            let Some((_, Instruction::Cmp {
-                op,
-                lhs,
-                rhs,
-                ty,
-                ..
-            })) = find_inst_in_loop(func, loop_blocks, *cond_val)
+            let Some((
+                _,
+                Instruction::Cmp {
+                    op, lhs, rhs, ty, ..
+                },
+            )) = find_inst_in_loop(func, loop_blocks, *cond_val)
             else {
                 return None;
             };
@@ -4642,9 +4681,7 @@ fn expr_uses_stream(expr: &MapExpr, stream: usize) -> bool {
                 || expr_uses_stream(t, stream)
                 || expr_uses_stream(f, stream)
         }
-        MapExpr::MinMax { l, r, .. } => {
-            expr_uses_stream(l, stream) || expr_uses_stream(r, stream)
-        }
+        MapExpr::MinMax { l, r, .. } => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
     }
 }
 
@@ -6404,7 +6441,12 @@ fn build_stencil_remainder_loop(
     // The blocks are appended by `RemainderLoop::commit`; the final layout
     // pass re-orders everything in reverse post-order.
     Some(RemainderLoop {
-        blocks: vec![vec_exit_block, rem_header_block, rem_body_block, rem_latch_block],
+        blocks: vec![
+            vec_exit_block,
+            rem_header_block,
+            rem_body_block,
+            rem_latch_block,
+        ],
         vec_exit_label,
         header_label: rem_header_label,
         iv_phi: i_rem_iv,
@@ -12731,7 +12773,13 @@ fn emit_alias_guards(
             false_label: next_target,
         };
         let cur_label = cur.label;
-        add_phi_incoming(func, rem_header_label, rem_iv_phi, rem_start.clone(), cur_label);
+        add_phi_incoming(
+            func,
+            rem_header_label,
+            rem_iv_phi,
+            rem_start.clone(),
+            cur_label,
+        );
         if i + 1 < n {
             func.blocks.push(BasicBlock {
                 label: next_target,
@@ -12762,7 +12810,13 @@ fn emit_alias_guards(
 }
 
 /// Add `(value, pred)` to the phi `phi` in the block labelled `block`.
-fn add_phi_incoming(func: &mut IrFunction, block: BlockId, phi: Value, value: Operand, pred: BlockId) {
+fn add_phi_incoming(
+    func: &mut IrFunction,
+    block: BlockId,
+    phi: Value,
+    value: Operand,
+    pred: BlockId,
+) {
     if let Some(b) = func.blocks.iter_mut().find(|b| b.label == block) {
         for inst in b.instructions.iter_mut() {
             if let Instruction::Phi { dest, incoming, .. } = inst {
@@ -13875,15 +13929,11 @@ mod map_fp_select_tests {
 
     fn analyze(func: &IrFunction) -> MapExpr {
         let cfg = CfgAnalysis::build(func);
-        let loops = loop_analysis::find_natural_loops(
-            func.blocks.len(),
-            &cfg.preds,
-            &cfg.succs,
-            &cfg.idom,
-        );
+        let loops =
+            loop_analysis::find_natural_loops(func.blocks.len(), &cfg.preds, &cfg.succs, &cfg.idom);
         let loop_info = &loops[0];
-        let pattern = analyze_map_pattern(func, loop_info, false)
-            .expect("canonical select loop must parse");
+        let pattern =
+            analyze_map_pattern(func, loop_info, false).expect("canonical select loop must parse");
         pattern.expr
     }
 
@@ -13924,7 +13974,9 @@ mod map_fp_select_tests {
     #[test]
     fn fold_min_from_slt() {
         // a < b ? a : b  ->  min(a, b)
-        let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Slt, a, b));
+        let f = build_loop(true, |next, a, b| {
+            select_body(next, a, b, IrCmpOp::Slt, a, b)
+        });
         assert_eq!(
             analyze(&f),
             MapExpr::MinMax {
@@ -13938,7 +13990,9 @@ mod map_fp_select_tests {
     #[test]
     fn fold_max_from_sgt() {
         // a > b ? a : b  ->  max(a, b)
-        let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Sgt, a, b));
+        let f = build_loop(true, |next, a, b| {
+            select_body(next, a, b, IrCmpOp::Sgt, a, b)
+        });
         assert_eq!(
             analyze(&f),
             MapExpr::MinMax {
@@ -13952,7 +14006,9 @@ mod map_fp_select_tests {
     #[test]
     fn fold_min_from_sgt_swapped_arms() {
         // a > b ? b : a  ->  min(b, a)  (clamp tail: a > 1 ? 1 : a)
-        let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Sgt, b, a));
+        let f = build_loop(true, |next, a, b| {
+            select_body(next, a, b, IrCmpOp::Sgt, b, a)
+        });
         assert_eq!(
             analyze(&f),
             MapExpr::MinMax {
@@ -13969,7 +14025,9 @@ mod map_fp_select_tests {
         // MAX(src1 = b, src2 = a) returns src2 = a on NaN and on both-zero
         // lanes, which is exactly the ternary's false arm.  max(a, b) would
         // be wrong on a +0/-0 lane.  This is the clamp head `a < 0 ? 0 : a`.
-        let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Slt, b, a));
+        let f = build_loop(true, |next, a, b| {
+            select_body(next, a, b, IrCmpOp::Slt, b, a)
+        });
         assert_eq!(
             analyze(&f),
             MapExpr::MinMax {
@@ -13983,7 +14041,9 @@ mod map_fp_select_tests {
     #[test]
     fn sle_select_does_not_fold() {
         // a <= b ? a : b  is NOT min(a, b) for +-0 lanes: compare+blendv.
-        let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Sle, a, b));
+        let f = build_loop(true, |next, a, b| {
+            select_body(next, a, b, IrCmpOp::Sle, a, b)
+        });
         assert!(matches!(
             analyze(&f),
             MapExpr::Select(box_, _, _) if matches!(*box_, MapExpr::Cmp(IrCmpOp::Sle, _, _))
@@ -14039,9 +14099,7 @@ mod map_fp_select_tests {
                     *f,
                     MapExpr::MinMax {
                         is_max: false,
-                        l: Box::new(MapExpr::Invariant(Operand::Const(IrConst::F32(
-                            1.0
-                        )))),
+                        l: Box::new(MapExpr::Invariant(Operand::Const(IrConst::F32(1.0)))),
                         r: Box::new(load_of(0)),
                     },
                     "inner a > 1 ? 1 : a must fold to min(1, a)"

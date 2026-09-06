@@ -1133,7 +1133,10 @@ mod tests {
         });
 
         let removed = propagate_copies_post_phi(&mut func);
-        assert!(removed >= (N - 1) as usize, "chain should collapse, removed={removed}");
+        assert!(
+            removed >= (N - 1) as usize,
+            "chain should collapse, removed={removed}"
+        );
 
         // Every remaining Value operand must have a definition.
         let mut defined = std::collections::HashSet::new();
@@ -1148,13 +1151,22 @@ mod tests {
             for inst in &b.instructions {
                 crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
                     if let Operand::Value(v) = op {
-                        assert!(defined.contains(&v.0), "dangling use of v{} in {:?}", v.0, inst);
+                        assert!(
+                            defined.contains(&v.0),
+                            "dangling use of v{} in {:?}",
+                            v.0,
+                            inst
+                        );
                     }
                 });
             }
             crate::backend::liveness::for_each_operand_in_terminator(&b.terminator, |op| {
                 if let Operand::Value(v) = op {
-                    assert!(defined.contains(&v.0), "dangling use of v{} in terminator", v.0);
+                    assert!(
+                        defined.contains(&v.0),
+                        "dangling use of v{} in terminator",
+                        v.0
+                    );
                 }
             });
         }
@@ -1164,7 +1176,16 @@ mod tests {
             .iter()
             .find(|i| matches!(i, Instruction::Copy { dest, .. } if dest.0 == N))
             .expect("last link kept");
-        assert!(matches!(last, Instruction::Copy { src: Operand::Const(IrConst::I32(0)), .. }), "{last:?}");
+        assert!(
+            matches!(
+                last,
+                Instruction::Copy {
+                    src: Operand::Const(IrConst::I32(0)),
+                    ..
+                }
+            ),
+            "{last:?}"
+        );
     }
 
     #[test]

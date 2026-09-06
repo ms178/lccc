@@ -88,9 +88,10 @@ fn lookup(mnemonic: &str) -> Option<Form> {
     use Form::*;
     Some(match mnemonic {
         "movss" | "movsd" => MovScalar,
-        "cvttss2si" | "cvttss2sil" | "cvttss2siq" | "cvttsd2si" | "cvttsd2sil"
-        | "cvttsd2siq" | "cvtss2si" | "cvtss2sil" | "cvtss2siq" | "cvtsd2si" | "cvtsd2sil"
-        | "cvtsd2siq" => CvtToInt,
+        "cvttss2si" | "cvttss2sil" | "cvttss2siq" | "cvttsd2si" | "cvttsd2sil" | "cvttsd2siq"
+        | "cvtss2si" | "cvtss2sil" | "cvtss2siq" | "cvtsd2si" | "cvtsd2sil" | "cvtsd2siq" => {
+            CvtToInt
+        }
         "cvtsi2ss" | "cvtsi2ssl" | "cvtsi2ssq" | "cvtsi2sd" | "cvtsi2sdl" | "cvtsi2sdq" => {
             CvtFromInt
         }
@@ -98,44 +99,43 @@ fn lookup(mnemonic: &str) -> Option<Form> {
         // writers: operand list unchanged.  `movd`/`movq` are handled
         // separately: their register-to-register form has no safe VEX
         // spelling (merge → zero, no three-operand encoding exists).
-        "movdqu" | "movdqa" | "movaps" | "movups" | "movapd" | "movupd"
-        | "lddqu" | "movddup" | "movshdup" | "movsldup" | "pshufd" | "pshufhw" | "pshuflw"
-        | "cvtdq2ps" | "cvtps2pd" | "cvtpd2ps" | "cvttps2dq" | "cvtps2dq" | "cvtdq2pd"
-        | "cvttpd2dq" | "cvtpd2dq" | "ptest" | "ucomiss" | "ucomisd" | "comiss" | "comisd"
-        | "pextrb" | "pextrw" | "pextrd" | "pextrq" | "pmovmskb" | "movmskps" | "movmskpd"
-        | "pabsb" | "pabsw" | "pabsd" | "sqrtps" | "sqrtpd" | "rcpps" | "rsqrtps"
-        | "roundps" | "roundpd" | "pmovzxbw" | "pmovzxbd" | "pmovzxbq" | "pmovzxwd"
-        | "pmovzxwq" | "pmovzxdq" | "pmovsxbw" | "pmovsxbd" | "pmovsxbq" | "pmovsxwd"
-        | "pmovsxwq" | "pmovsxdq" | "phminposuw" | "aesimc" | "movntdq" | "movntdqa"
-        | "movntps" | "movntpd" | "aeskeygenassist" => Two,
+        "movdqu" | "movdqa" | "movaps" | "movups" | "movapd" | "movupd" | "lddqu" | "movddup"
+        | "movshdup" | "movsldup" | "pshufd" | "pshufhw" | "pshuflw" | "cvtdq2ps" | "cvtps2pd"
+        | "cvtpd2ps" | "cvttps2dq" | "cvtps2dq" | "cvtdq2pd" | "cvttpd2dq" | "cvtpd2dq"
+        | "ptest" | "ucomiss" | "ucomisd" | "comiss" | "comisd" | "pextrb" | "pextrw"
+        | "pextrd" | "pextrq" | "pmovmskb" | "movmskps" | "movmskpd" | "pabsb" | "pabsw"
+        | "pabsd" | "sqrtps" | "sqrtpd" | "rcpps" | "rsqrtps" | "roundps" | "roundpd"
+        | "pmovzxbw" | "pmovzxbd" | "pmovzxbq" | "pmovzxwd" | "pmovzxwq" | "pmovzxdq"
+        | "pmovsxbw" | "pmovsxbd" | "pmovsxbq" | "pmovsxwd" | "pmovsxwq" | "pmovsxdq"
+        | "phminposuw" | "aesimc" | "movntdq" | "movntdqa" | "movntps" | "movntpd"
+        | "aeskeygenassist" => Two,
         // Destructive binary ops: destination becomes the first source.
-        "addss" | "addsd" | "subss" | "subsd" | "mulss" | "mulsd" | "divss" | "divsd"
-        | "minss" | "minsd" | "maxss" | "maxsd" | "sqrtss" | "sqrtsd" | "rcpss" | "rsqrtss"
-        | "cvtss2sd" | "cvtsd2ss" | "addps" | "addpd" | "subps" | "subpd" | "mulps"
-        | "mulpd" | "divps" | "divpd" | "minps" | "minpd" | "maxps" | "maxpd" | "xorps"
-        | "xorpd" | "andps" | "andpd" | "andnps" | "andnpd" | "orps" | "orpd" | "pxor"
-        | "pand" | "pandn" | "por" | "paddb" | "paddw" | "paddd" | "paddq" | "psubb"
-        | "psubw" | "psubd" | "psubq" | "paddusb" | "paddusw" | "paddsb" | "paddsw"
-        | "psubusb" | "psubusw" | "psubsb" | "psubsw" | "pminsw" | "pmaxsw" | "pminub"
-        | "pmaxub" | "pminsb" | "pmaxsb" | "pminsd" | "pmaxsd" | "pminud" | "pmaxud"
-        | "pminuw" | "pmaxuw" | "pcmpeqb" | "pcmpeqw" | "pcmpeqd" | "pcmpeqq" | "pcmpgtb"
-        | "pcmpgtw" | "pcmpgtd" | "pcmpgtq" | "punpcklbw" | "punpcklwd" | "punpckldq"
-        | "punpcklqdq" | "punpckhbw" | "punpckhwd" | "punpckhdq" | "punpckhqdq"
-        | "packsswb" | "packssdw" | "packuswb" | "packusdw" | "pmulld" | "pmullw"
-        | "pmulhw" | "pmulhuw" | "pmuludq" | "pmuldq" | "pmaddwd" | "pmaddubsw" | "psadbw"
-        | "pavgb" | "pavgw" | "pshufb" | "palignr" | "pclmulqdq" | "aesenc" | "aesenclast"
-        | "aesdec" | "aesdeclast" | "pinsrb" | "pinsrw" | "pinsrd" | "pinsrq" | "shufps"
-        | "shufpd" | "unpcklps" | "unpckhps" | "unpcklpd" | "unpckhpd" | "movhlps"
-        | "movlhps" | "roundss" | "roundsd" | "psllw" | "pslld" | "psllq" | "psrlw"
-        | "psrld" | "psrlq" | "psraw" | "psrad" | "pslldq" | "psrldq" | "addsubps"
-        | "addsubpd" | "haddps" | "haddpd" | "hsubps" | "hsubpd" | "blendps" | "blendpd"
-        | "pblendw" | "insertps" | "dpps" | "dppd" | "mpsadbw" | "cmpps" | "cmppd" | "cmpss"
-        | "cmpsd" | "cmpeqss" | "cmpltss" | "cmpless" | "cmpunordss" | "cmpneqss"
-        | "cmpnltss" | "cmpnless" | "cmpordss" | "cmpeqsd" | "cmpltsd" | "cmplesd"
-        | "cmpunordsd" | "cmpneqsd" | "cmpnltsd" | "cmpnlesd" | "cmpordsd" | "cmpeqps"
-        | "cmpltps" | "cmpleps" | "cmpunordps" | "cmpneqps" | "cmpnltps" | "cmpnleps"
-        | "cmpordps" | "cmpeqpd" | "cmpltpd" | "cmplepd" | "cmpunordpd" | "cmpneqpd"
-        | "cmpnltpd" | "cmpnlepd" | "cmpordpd" => Three,
+        "addss" | "addsd" | "subss" | "subsd" | "mulss" | "mulsd" | "divss" | "divsd" | "minss"
+        | "minsd" | "maxss" | "maxsd" | "sqrtss" | "sqrtsd" | "rcpss" | "rsqrtss" | "cvtss2sd"
+        | "cvtsd2ss" | "addps" | "addpd" | "subps" | "subpd" | "mulps" | "mulpd" | "divps"
+        | "divpd" | "minps" | "minpd" | "maxps" | "maxpd" | "xorps" | "xorpd" | "andps"
+        | "andpd" | "andnps" | "andnpd" | "orps" | "orpd" | "pxor" | "pand" | "pandn" | "por"
+        | "paddb" | "paddw" | "paddd" | "paddq" | "psubb" | "psubw" | "psubd" | "psubq"
+        | "paddusb" | "paddusw" | "paddsb" | "paddsw" | "psubusb" | "psubusw" | "psubsb"
+        | "psubsw" | "pminsw" | "pmaxsw" | "pminub" | "pmaxub" | "pminsb" | "pmaxsb" | "pminsd"
+        | "pmaxsd" | "pminud" | "pmaxud" | "pminuw" | "pmaxuw" | "pcmpeqb" | "pcmpeqw"
+        | "pcmpeqd" | "pcmpeqq" | "pcmpgtb" | "pcmpgtw" | "pcmpgtd" | "pcmpgtq" | "punpcklbw"
+        | "punpcklwd" | "punpckldq" | "punpcklqdq" | "punpckhbw" | "punpckhwd" | "punpckhdq"
+        | "punpckhqdq" | "packsswb" | "packssdw" | "packuswb" | "packusdw" | "pmulld"
+        | "pmullw" | "pmulhw" | "pmulhuw" | "pmuludq" | "pmuldq" | "pmaddwd" | "pmaddubsw"
+        | "psadbw" | "pavgb" | "pavgw" | "pshufb" | "palignr" | "pclmulqdq" | "aesenc"
+        | "aesenclast" | "aesdec" | "aesdeclast" | "pinsrb" | "pinsrw" | "pinsrd" | "pinsrq"
+        | "shufps" | "shufpd" | "unpcklps" | "unpckhps" | "unpcklpd" | "unpckhpd" | "movhlps"
+        | "movlhps" | "roundss" | "roundsd" | "psllw" | "pslld" | "psllq" | "psrlw" | "psrld"
+        | "psrlq" | "psraw" | "psrad" | "pslldq" | "psrldq" | "addsubps" | "addsubpd"
+        | "haddps" | "haddpd" | "hsubps" | "hsubpd" | "blendps" | "blendpd" | "pblendw"
+        | "insertps" | "dpps" | "dppd" | "mpsadbw" | "cmpps" | "cmppd" | "cmpss" | "cmpsd"
+        | "cmpeqss" | "cmpltss" | "cmpless" | "cmpunordss" | "cmpneqss" | "cmpnltss"
+        | "cmpnless" | "cmpordss" | "cmpeqsd" | "cmpltsd" | "cmplesd" | "cmpunordsd"
+        | "cmpneqsd" | "cmpnltsd" | "cmpnlesd" | "cmpordsd" | "cmpeqps" | "cmpltps" | "cmpleps"
+        | "cmpunordps" | "cmpneqps" | "cmpnltps" | "cmpnleps" | "cmpordps" | "cmpeqpd"
+        | "cmpltpd" | "cmplepd" | "cmpunordpd" | "cmpneqpd" | "cmpnltpd" | "cmpnlepd"
+        | "cmpordpd" => Three,
         _ => return None,
     })
 }
@@ -342,7 +342,11 @@ fn label_name(l: &str) -> Option<&str> {
 /// Successor line indices of `i` inside one function body.  Direct `jmp`/
 /// `jcc` targets resolve through `labels`; an unresolved or indirect branch
 /// conservatively reaches every line (fail closed).
-fn successor_lines(body: &[&str], labels: &std::collections::HashMap<&str, usize>, i: usize) -> Vec<usize> {
+fn successor_lines(
+    body: &[&str],
+    labels: &std::collections::HashMap<&str, usize>,
+    i: usize,
+) -> Vec<usize> {
     let n = body.len();
     let fall = |v: &mut Vec<usize>| {
         if i + 1 < n {
@@ -420,7 +424,9 @@ fn allowed_masks(body: &[&str]) -> Vec<u32> {
                 Some(p) => t[p..].trim(),
                 None => "",
             };
-            let last_span = split_operands(rest).last().map(|op| (t.len() - op.len(), t.len()));
+            let last_span = split_operands(rest)
+                .last()
+                .map(|op| (t.len() - op.len(), t.len()));
             if let Some(rest) = t.find("%ymm") {
                 let mut j = rest + 4;
                 while j < t.len() {
@@ -477,11 +483,17 @@ fn allowed_masks(body: &[&str]) -> Vec<u32> {
             continue;
         }
         let last = split_operands(rest).last().copied().unwrap_or("");
-        if let Some(num) = last.strip_prefix("%ymm").and_then(|r| r.parse::<u32>().ok()) {
+        if let Some(num) = last
+            .strip_prefix("%ymm")
+            .and_then(|r| r.parse::<u32>().ok())
+        {
             if num < 16 {
                 kill[i] |= 1 << num;
             }
-        } else if let Some(num) = last.strip_prefix("%xmm").and_then(|r| r.parse::<u32>().ok()) {
+        } else if let Some(num) = last
+            .strip_prefix("%xmm")
+            .and_then(|r| r.parse::<u32>().ok())
+        {
             if num < 16 {
                 kill[i] |= 1 << num;
             }
@@ -877,7 +889,10 @@ b:
 
     #[test]
     fn ymm_mask_parses_all_registers() {
-        assert_eq!(ymm_mask("vaddps %ymm15, %ymm1, %ymm0"), (1 << 15) | (1 << 1) | 1);
+        assert_eq!(
+            ymm_mask("vaddps %ymm15, %ymm1, %ymm0"),
+            (1 << 15) | (1 << 1) | 1
+        );
         assert_eq!(ymm_mask("vmovups %ymm7, (%rdi)"), 1 << 7);
         assert_eq!(ymm_mask("nothing"), 0);
     }
