@@ -46,11 +46,7 @@ pub fn run(module: &mut IrModule) -> usize {
     for func in &module.functions {
         for block in &func.blocks {
             for inst in &block.instructions {
-                if let Instruction::Call {
-                    func: ref fname,
-                    info,
-                } = inst
-                {
+                if let Instruction::Call { func: fname, info } = inst {
                     if info.is_const {
                         const_fns.insert(fname.clone());
                         pure_fns.insert(fname.clone());
@@ -106,7 +102,7 @@ pub fn run(module: &mut IrModule) -> usize {
     for func in &mut module.functions {
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
-                if let Instruction::Call {
+                if let &mut Instruction::Call {
                     func: ref callee,
                     ref mut info,
                 } = inst

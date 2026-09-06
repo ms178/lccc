@@ -17,8 +17,8 @@ pub mod parser;
 
 use crate::backend::elf::{ELFCLASS32, ELFCLASS64};
 use elf_writer::{
-    ElfWriter, EF_RISCV_FLOAT_ABI_DOUBLE, EF_RISCV_FLOAT_ABI_QUAD, EF_RISCV_FLOAT_ABI_SINGLE,
-    EF_RISCV_RVC,
+    EF_RISCV_FLOAT_ABI_DOUBLE, EF_RISCV_FLOAT_ABI_QUAD, EF_RISCV_FLOAT_ABI_SINGLE, EF_RISCV_RVC,
+    ElfWriter,
 };
 use parser::parse_asm;
 

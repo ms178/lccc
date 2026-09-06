@@ -9,9 +9,10 @@
 #   1. A 6 GiB swap file on the largest writable filesystem   (hard requirement:
 #      the sandbox has ~1.9 GiB RAM; linking/optimising lccc OOMs without it).
 #   2. VM tuning appropriate for a swap-backed, memory-starved build box.
-#   3. A working latest-stable Rust toolchain, INCLUDING the rustup proxy binaries and
-#      rustup's own execute bit -- both are lost by a harness wipe and neither
-#      is restored by `rustup toolchain install` (see setup_rust).
+#   3. The current stable Rust toolchain selected by rust-toolchain.toml,
+#      INCLUDING the rustup proxy binaries and rustup's own execute bit -- both
+#      are lost by a harness wipe and neither is restored by `rustup toolchain
+#      install` alone (see setup_rust).
 #   3. The lccc worktree at $LCCC_REPO, rebased on ms178/lccc main, with the
 #      accumulated session patch (ms178-1.patch) re-applied if present.
 #   4. The artifacts directory used by lccc-snapshot.sh.
@@ -94,10 +95,14 @@ setup_repo() {
 #      so the toolchain installs successfully and `cargo` is still not found.
 #
 # rustup dispatches on argv[0], so symlinking the proxies back to it is the
-# supported recovery. Track the LATEST STABLE channel (matching
-# rust-toolchain.toml): the tree is kept warning-clean against the moving
-# stable toolchain, so there is no version to pin.
-RUST_VERSION=${RUST_VERSION:-stable}
+# supported recovery.  The shared selector follows the manifest's stable
+# channel; preserve RUST_VERSION as a backwards-compatible explicit override.
+if [[ -n ${RUST_VERSION:-} && -z ${LCCC_RUST_TOOLCHAIN:-} && -z ${RUSTUP_TOOLCHAIN:-} ]]; then
+  export LCCC_RUST_TOOLCHAIN=$RUST_VERSION
+fi
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=rust_toolchain.sh
+source "$script_dir/rust_toolchain.sh"
 RUST_PROXIES=(cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver
               rust-gdb rust-lldb)
 
@@ -124,6 +129,14 @@ setup_rust() {
   fi
   "$bin/rustup" default "$RUST_VERSION" >/dev/null 2>&1 || true
 
+  # The minimal toolchain profile keeps bootstrap lean, while Rust-2024
+  # maintenance still requires the repository's rustfmt and strict-Clippy
+  # gates. Install them explicitly after every recovered toolchain.
+  if ! "$bin/rustup" component add --toolchain "$RUST_VERSION" rustfmt clippy >/dev/null; then
+    log "FATAL: unable to install rustfmt/clippy for $RUST_VERSION"
+    return 1
+  fi
+
   # Recreate any missing proxy. Harmless when they already exist.
   local p missing=0
   for p in "${RUST_PROXIES[@]}"; do
@@ -145,7 +158,11 @@ setup_rust() {
 
 setup_swap
 tune_vm
-setup_rust
+# Clone/update the worktree before resolving rust-toolchain.toml. This lets a
+# fresh checkout choose its own configured channel rather than the fallback.
 setup_repo "${1:-}"
+lccc_select_rust_toolchain "$REPO"
+RUST_VERSION=$LCCC_SELECTED_RUST_TOOLCHAIN
+setup_rust
 log "environment ready:  repo=$REPO  artifacts=$ART"
 free -h | sed 's/^/    /'

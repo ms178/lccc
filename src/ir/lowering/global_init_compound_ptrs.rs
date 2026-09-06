@@ -89,7 +89,7 @@ impl Lowerer {
             // Sequential items: each item maps to one element at this_stride
             let mut current_idx = 0usize;
             for item in items {
-                if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                     if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
                         current_idx = idx;
                     }
@@ -404,7 +404,7 @@ impl Lowerer {
                 let mut ai = 0usize;
                 for inner_item in inner_items.iter() {
                     // Check for index designator
-                    if let Some(crate::frontend::parser::ast::Designator::Index(ref idx_expr)) =
+                    if let Some(crate::frontend::parser::ast::Designator::Index(idx_expr)) =
                         inner_item.designators.first()
                     {
                         if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
@@ -460,7 +460,7 @@ impl Lowerer {
         while item_idx < items.len() {
             let item = &items[item_idx];
             // Check if this item has an [N] array index designator
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx) = self.eval_const_expr_for_designator(idx_expr) {
                     current_idx = idx;
                 }
@@ -484,10 +484,10 @@ impl Lowerer {
                     );
                     item_idx += 1;
                 }
-                Initializer::Expr(ref expr) => {
+                Initializer::Expr(expr) => {
                     // Compound literal, e.g., ((struct Wrap) {inc_global}):
                     // unwrap it and process the inner initializer list as struct fields.
-                    if let Expr::CompoundLiteral(_, ref inner_init, _) = expr {
+                    if let Expr::CompoundLiteral(_, inner_init, _) = expr {
                         if let Initializer::List(ref sub_items) = **inner_init {
                             self.fill_struct_fields_from_items(
                                 sub_items,
@@ -571,7 +571,7 @@ impl Lowerer {
             let mut elem_idx = current_elem_idx;
             let mut remaining_desigs_start = 0;
 
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
                     if idx != current_elem_idx {
                         current_field_idx = 0;
@@ -582,8 +582,7 @@ impl Lowerer {
             }
 
             let mut field_desig: Option<&str> = None;
-            if let Some(Designator::Field(ref name)) = item.designators.get(remaining_desigs_start)
-            {
+            if let Some(Designator::Field(name)) = item.designators.get(remaining_desigs_start) {
                 field_desig = Some(name.as_str());
                 remaining_desigs_start += 1;
             }
@@ -877,7 +876,7 @@ impl Lowerer {
         } else if let Expr::StringLiteral(s, _) = expr {
             // String literal initializing a char array field (e.g., {"hello", &ptr} in a struct
             // with pointer members). write_string_to_bytes handles copying the string bytes.
-            if let CType::Array(ref elem, Some(arr_size)) = ty {
+            if let CType::Array(elem, Some(arr_size)) = ty {
                 if matches!(elem.as_ref(), CType::Char | CType::UChar) {
                     Self::write_string_to_bytes(bytes, offset, s, *arr_size);
                 }
@@ -972,7 +971,7 @@ impl Lowerer {
         let elem_ir_ty = IrType::from_ctype(elem_ty);
         let mut current_idx = 0usize;
         for item in items.iter() {
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
                     current_idx = idx;
                 }
@@ -1102,7 +1101,7 @@ impl Lowerer {
                     while ai < arr_size && sub_idx < items.len() {
                         let elem_offset = offset + ai * struct_size;
                         match &items[sub_idx].init {
-                            Initializer::List(ref sub_items) => {
+                            Initializer::List(sub_items) => {
                                 self.fill_struct_global_bytes(
                                     sub_items,
                                     &elem_layout,
@@ -1126,7 +1125,7 @@ impl Lowerer {
                         ai += 1;
                     }
                 }
-            } else if let CType::Array(ref inner_elem, Some(inner_size)) = elem_ty.as_ref() {
+            } else if let CType::Array(inner_elem, Some(inner_size)) = elem_ty.as_ref() {
                 // Multi-dimensional array of scalars (e.g., unsigned char hash[2][4]):
                 // each item is a braced list for one row of the outer dimension.
                 let elem_size = self.resolve_ctype_size(elem_ty);
@@ -1175,7 +1174,7 @@ impl Lowerer {
             }
             Initializer::Expr(expr) => {
                 // Unwrap compound literal: (type){ init_list } -> use inner init_list
-                if let Expr::CompoundLiteral(_, ref cl_init, _) = expr {
+                if let Expr::CompoundLiteral(_, cl_init, _) = expr {
                     if let Initializer::List(sub_items) = cl_init.as_ref() {
                         self.fill_nested_struct_with_ptrs(
                             sub_items,
@@ -1196,11 +1195,7 @@ impl Lowerer {
                     bytes,
                     ptr_ranges,
                 );
-                if consumed == 0 {
-                    1
-                } else {
-                    consumed
-                }
+                if consumed == 0 { 1 } else { consumed }
             }
         }
     }

@@ -8427,7 +8427,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     *ty = IrType::I64;
                     changes += 1;
                     if debug {
-                        eprintln!("[VEC]   Changed IV increment from +1 to +128 (quad FMA) and promoted to I64");
+                        eprintln!(
+                            "[VEC]   Changed IV increment from +1 to +128 (quad FMA) and promoted to I64"
+                        );
                     }
                 }
             }
@@ -8653,7 +8655,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
         changes += 4;
         if debug {
-            eprintln!("[VEC]   Inserted quad FmaF64x4HoistedSIB intrinsics (SIB + hoisted broadcast, step 128)");
+            eprintln!(
+                "[VEC]   Inserted quad FmaF64x4HoistedSIB intrinsics (SIB + hoisted broadcast, step 128)"
+            );
         }
     }
 
@@ -13383,8 +13387,8 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
         lane_addresses.push((a_addr, b_addr));
     }
     lane_addresses.sort_by_key(|((_, offset), _)| *offset);
-    let a_base = lane_addresses[0].0 .0;
-    let b_base = lane_addresses[0].1 .0;
+    let a_base = lane_addresses[0].0.0;
+    let b_base = lane_addresses[0].1.0;
     let elem_size = if ty == IrType::F64 { 8 } else { 4 };
     for (lane, ((this_a, a_offset), (this_b, b_offset))) in lane_addresses.iter().enumerate() {
         let expected = lane as i64 * elem_size;

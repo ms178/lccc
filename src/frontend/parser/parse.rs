@@ -1046,9 +1046,9 @@ impl Parser {
             }
             self.advance(); // first '['
             self.advance(); // second '['
-                            // Consume until the matching ']]' pair (respecting nesting of '[' ']'
-                            // inside attribute args, e.g. [[gnu::aligned(8)]]). When depth hits
-                            // zero at a ']', consume that ']' and its partner ']', then stop.
+            // Consume until the matching ']]' pair (respecting nesting of '[' ']'
+            // inside attribute args, e.g. [[gnu::aligned(8)]]). When depth hits
+            // zero at a ']', consume that ']' and its partner ']', then stop.
             let mut depth = 1usize;
             while self.pos < self.tokens.len() {
                 match self.tokens[self.pos].kind {
@@ -1670,7 +1670,7 @@ impl Parser {
         // Save position so we can fall back
         let saved_pos = self.pos;
         self.advance(); // consume '('
-                        // Concatenate adjacent string literals: __asm__("" "name") -> "name"
+        // Concatenate adjacent string literals: __asm__("" "name") -> "name"
         let mut combined = String::new();
         let mut found_string = false;
         while let TokenKind::StringLiteral(s) = self.peek() {
@@ -1824,7 +1824,7 @@ impl Parser {
     pub(super) fn skip_label_attributes(&mut self) {
         while matches!(self.peek(), TokenKind::Attribute) {
             self.advance(); // consume __attribute__
-                            // Expect __attribute__((...)) — two levels of parens
+            // Expect __attribute__((...)) — two levels of parens
             if matches!(self.peek(), TokenKind::LParen) {
                 self.skip_balanced_parens();
             }
@@ -1901,8 +1901,8 @@ impl Parser {
                 let result_type = self.parse_abstract_declarator_suffix(ts);
                 if matches!(self.peek(), TokenKind::RParen) {
                     self.advance(); // consume )
-                                    // Save the type specifier so the lowerer can resolve typedefs
-                                    // and compute accurate alignment (parser can't resolve typedefs).
+                    // Save the type specifier so the lowerer can resolve typedefs
+                    // and compute accurate alignment (parser can't resolve typedefs).
                     self.attrs.parsed_alignas_type = Some(result_type.clone());
                     let tag_aligns = if self.struct_tag_alignments.is_empty() {
                         None
@@ -2074,11 +2074,7 @@ impl Parser {
                     }
                 }
                 // Fallback for empty struct/union or tag-only (no fields available)
-                if align == 0 {
-                    ptr_sz
-                } else {
-                    align
-                }
+                if align == 0 { ptr_sz } else { align }
             }
             TypeSpecifier::Enum(_, _, _) => 4,
             TypeSpecifier::TypedefName(_) => ptr_sz, // conservative default

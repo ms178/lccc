@@ -18,8 +18,8 @@
 //! adapt to the actual count distribution: a unit dominated by one hot
 //! function gets a high threshold, a flat unit gets a low one.
 use crate::common::fx_hash::FxHashMap;
-use crate::pgo::profile::unit_hash;
 use crate::pgo::ProfileData;
+use crate::pgo::profile::unit_hash;
 
 /// The hottest function must be at least this many times hotter than the
 /// runner-up for the profile to be considered informative (see

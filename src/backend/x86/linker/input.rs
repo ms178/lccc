@@ -8,7 +8,7 @@ use std::path::Path;
 
 use super::elf::parse_object_shared;
 use super::elf::*;
-use super::types::{x86_should_replace_extra, GlobalSymbol};
+use super::types::{GlobalSymbol, x86_should_replace_extra};
 use crate::backend::linker_common;
 
 pub(super) fn load_file(

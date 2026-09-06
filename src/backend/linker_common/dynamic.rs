@@ -9,11 +9,11 @@ use std::path::Path;
 
 use super::parse_shared::{parse_shared_library_symbols, parse_soname};
 use super::resolve_lib::resolve_lib;
-use super::symbols::{is_linker_defined_symbol, GlobalSymbolOps};
+use super::symbols::{GlobalSymbolOps, is_linker_defined_symbol};
 use super::types::{DynSymbol, Elf64Object};
 use crate::backend::elf::{
-    parse_linker_script_entries, LinkerScriptEntry, ELF_MAGIC, SHN_COMMON, STB_WEAK, STT_FILE,
-    STT_OBJECT, STT_SECTION,
+    ELF_MAGIC, LinkerScriptEntry, SHN_COMMON, STB_WEAK, STT_FILE, STT_OBJECT, STT_SECTION,
+    parse_linker_script_entries,
 };
 
 /// Match dynamic symbols from a shared library against undefined globals.

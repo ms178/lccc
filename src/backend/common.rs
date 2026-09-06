@@ -1407,7 +1407,7 @@ impl AsmOutput {
 /// String allocations from `format!()`. Usage: `emit!(state, "    mov {}, {}", src, dst)`
 #[macro_export]
 macro_rules! emit {
-    ($state:expr, $($arg:tt)*) => {
+    ($state:expr_2021, $($arg:tt)*) => {
         $state.emit_fmt(format_args!($($arg)*))
     };
 }
@@ -1844,7 +1844,7 @@ fn emit_section_group(
 
 /// Emit a visibility directive (.hidden, .protected, .internal) for a symbol if applicable.
 fn emit_visibility_directive(out: &mut AsmOutput, name: &str, visibility: &Option<String>) {
-    if let Some(ref vis) = visibility {
+    if let Some(vis) = visibility {
         match vis.as_str() {
             "hidden" => out.emit_fmt(format_args!(".hidden {}", name)),
             "protected" => out.emit_fmt(format_args!(".protected {}", name)),

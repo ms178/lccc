@@ -570,9 +570,5 @@ pub(super) fn eliminate_loop_trampolines(store: &mut LineStore, infos: &mut [Lin
 /// Rewrite an instruction to use a different register family.
 fn rewrite_instruction_register(inst: &str, old_fam: RegId, new_fam: RegId) -> Option<String> {
     let result = replace_reg_family(inst, old_fam, new_fam);
-    if result == inst {
-        None
-    } else {
-        Some(result)
-    }
+    if result == inst { None } else { Some(result) }
 }

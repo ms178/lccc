@@ -550,18 +550,17 @@ fn run(args: &[String]) -> Result<(), String> {
     // plugins. Detect it here and say so precisely, instead of letting the ELF
     // parser reject the file with a generic "not an ELF object" or — worse —
     // letting a `.o` that happens to parse produce a binary with missing code.
-    if saw_lto_plugin {
-        if let Some(bad) = inputs
+    if saw_lto_plugin
+        && let Some(bad) = inputs
             .iter()
             .find_map(|(p, _)| is_lto_bytecode(p).then(|| p.clone()))
-        {
-            return Err(format!(
-                "'{}' is LTO bytecode, which requires a linker plugin that \
-                 lccc-ld does not implement; rebuild that input without -flto \
-                 (or link it with the compiler driver)",
-                bad
-            ));
-        }
+    {
+        return Err(format!(
+            "'{}' is LTO bytecode, which requires a linker plugin that \
+             lccc-ld does not implement; rebuild that input without -flto \
+             (or link it with the compiler driver)",
+            bad
+        ));
     }
 
     // ------------------------------------------------------------------

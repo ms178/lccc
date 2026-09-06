@@ -4,7 +4,7 @@
 //! Extracted from expr.rs to keep expression lowering manageable.
 
 use super::lower::Lowerer;
-use crate::common::types::{widened_op_type, AddressSpace, CType, IrType};
+use crate::common::types::{AddressSpace, CType, IrType, widened_op_type};
 use crate::frontend::parser::ast::{BinOp, Expr, PostfixOp, UnaryOp};
 use crate::ir::reexports::{
     Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Terminator, Value,

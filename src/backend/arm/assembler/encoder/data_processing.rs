@@ -306,11 +306,7 @@ pub(crate) fn encode_movz(operands: &[Operand]) -> Result<EncodeResult, String> 
     // Check for lsl #N shift
     let hw = if operands.len() > 2 {
         if let Some(Operand::Shift { kind, amount }) = operands.get(2) {
-            if kind == "lsl" {
-                *amount / 16
-            } else {
-                0
-            }
+            if kind == "lsl" { *amount / 16 } else { 0 }
         } else {
             0
         }
@@ -344,11 +340,7 @@ pub(crate) fn encode_movk(operands: &[Operand]) -> Result<EncodeResult, String> 
 
     let hw = if operands.len() > 2 {
         if let Some(Operand::Shift { kind, amount }) = operands.get(2) {
-            if kind == "lsl" {
-                *amount / 16
-            } else {
-                0
-            }
+            if kind == "lsl" { *amount / 16 } else { 0 }
         } else {
             0
         }
@@ -382,11 +374,7 @@ pub(crate) fn encode_movn(operands: &[Operand]) -> Result<EncodeResult, String> 
 
     let hw = if operands.len() > 2 {
         if let Some(Operand::Shift { kind, amount }) = operands.get(2) {
-            if kind == "lsl" {
-                *amount / 16
-            } else {
-                0
-            }
+            if kind == "lsl" { *amount / 16 } else { 0 }
         } else {
             0
         }

@@ -25,7 +25,7 @@
 //!
 //! Correctness is a hard constraint: fast wrong codegen is worthless.
 
-use super::emit::{phys_reg_name, X86Codegen};
+use super::emit::{X86Codegen, phys_reg_name};
 use crate::common::types::{EightbyteClass, IrType};
 use crate::ir::reexports::Value;
 

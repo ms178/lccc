@@ -135,7 +135,7 @@ impl Lowerer {
                     self.is_arm(),
                 );
                 let input_operand = if is_global_reg {
-                    if let Expr::Identifier(ref var_name, _) = &out.expr {
+                    if let Expr::Identifier(var_name, _) = &out.expr {
                         let asm_reg = self
                             .get_asm_register(var_name)
                             .expect("global register variable must have an asm register");

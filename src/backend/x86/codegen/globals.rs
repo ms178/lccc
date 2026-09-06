@@ -1,6 +1,6 @@
 //! X86Codegen: global address, label address, TLS global address operations.
 
-use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name, X86Codegen};
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Operand, Value};
 

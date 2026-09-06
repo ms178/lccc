@@ -228,7 +228,9 @@ impl super::InstructionEncoder {
                     self.bytes.extend_from_slice(&[0; 8]);
                 } else {
                     return Err(format!(
-                        "symbol-difference mov immediate only supported at 32-bit width (got size {})", size));
+                        "symbol-difference mov immediate only supported at 32-bit width (got size {})",
+                        size
+                    ));
                 }
             }
             ImmediateValue::SymbolMod(_, _) => {
@@ -456,7 +458,7 @@ impl super::InstructionEncoder {
                 return Err(format!(
                     "unsupported movsx combination: {} -> {}",
                     src_size, dst_size
-                ))
+                ));
             }
         };
 
@@ -1241,11 +1243,7 @@ impl super::InstructionEncoder {
         }
         // inc (op_ext=0) and dec (op_ext=1) use FE/FF, not F6/F7
         let base_opcode = if op_ext <= 1 {
-            if size == 1 {
-                0xFE
-            } else {
-                0xFF
-            }
+            if size == 1 { 0xFE } else { 0xFF }
         } else if size == 1 {
             0xF6
         } else {

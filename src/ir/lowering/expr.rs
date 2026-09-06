@@ -315,24 +315,24 @@ impl Lowerer {
                 self.lower_conditional(cond, then_expr, else_expr)
             }
             Expr::GnuConditional(cond, else_expr, _) => self.lower_gnu_conditional(cond, else_expr),
-            Expr::Cast(ref target_type, inner, _) => self.lower_cast(target_type, inner),
-            Expr::CompoundLiteral(ref type_spec, ref init, _) => {
+            Expr::Cast(target_type, inner, _) => self.lower_cast(target_type, inner),
+            Expr::CompoundLiteral(type_spec, init, _) => {
                 self.lower_compound_literal(type_spec, init)
             }
             Expr::Sizeof(arg, _) => self.lower_sizeof(arg),
-            Expr::Alignof(ref type_spec, _) => {
+            Expr::Alignof(type_spec, _) => {
                 let align = self.alignof_type(type_spec);
                 Operand::Const(IrConst::I64(align as i64))
             }
-            Expr::AlignofExpr(ref inner_expr, _) => {
+            Expr::AlignofExpr(inner_expr, _) => {
                 let align = self.alignof_expr(inner_expr);
                 Operand::Const(IrConst::I64(align as i64))
             }
-            Expr::GnuAlignof(ref type_spec, _) => {
+            Expr::GnuAlignof(type_spec, _) => {
                 let align = self.preferred_alignof_type(type_spec);
                 Operand::Const(IrConst::I64(align as i64))
             }
-            Expr::GnuAlignofExpr(ref inner_expr, _) => {
+            Expr::GnuAlignofExpr(inner_expr, _) => {
                 let align = self.preferred_alignof_expr(inner_expr);
                 Operand::Const(IrConst::I64(align as i64))
             }
@@ -375,13 +375,7 @@ impl Lowerer {
                 });
                 Operand::Value(dest)
             }
-            Expr::BuiltinTypesCompatibleP(
-                ref type1,
-                ref type2,
-                ref qualifiers1,
-                ref qualifiers2,
-                _,
-            ) => {
+            Expr::BuiltinTypesCompatibleP(type1, type2, qualifiers1, qualifiers2, _) => {
                 let result = self.eval_types_compatible(type1, type2, qualifiers1, qualifiers2);
                 Operand::Const(IrConst::I64(result as i64))
             }

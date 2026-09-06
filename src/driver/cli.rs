@@ -1068,7 +1068,7 @@ impl Driver {
                 "-mavxneconvert" => self.enable_avxneconvert = true,
                 "-mavx10.1" | "-mavx10.1-256" | "-mavx10.1-512" | "-mavx10.2" | "-mavx10.2-256"
                 | "-mavx10.2-512" => {
-                    return Err("AVX10 code generation is not implemented".to_string())
+                    return Err("AVX10 code generation is not implemented".to_string());
                 }
                 "-mgfni" => self.enable_gfni = true,
                 "-mavxvnniint8" => self.enable_avxvnniint8 = true,
@@ -1265,7 +1265,7 @@ impl Driver {
                                 return Err(format!(
                                     "-march={} requires unimplemented AVX10/APX lowering",
                                     march
-                                ))
+                                ));
                             }
                             "native" => {
                                 // Detect the HOST CPU's features. Only
@@ -1341,7 +1341,7 @@ impl Driver {
                                 "-march={} is not implemented for target {}",
                                 march,
                                 self.target.triple()
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1360,7 +1360,7 @@ impl Driver {
                                 "-mtune={} is not implemented for target {}",
                                 tune,
                                 self.target.triple()
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1417,7 +1417,8 @@ impl Driver {
                     if bytes > 16 {
                         return Err(format!(
                             "{}: LCCC guarantees 16-byte stack alignment and cannot realign the stack to {} bytes",
-                            arg, bytes));
+                            arg, bytes
+                        ));
                     }
                     // Honour smaller boundaries on i686: the kernel's realmode
                     // code (boundary=2) otherwise pays up to 12 pad bytes per
@@ -1464,7 +1465,10 @@ impl Driver {
                     }
                 }
                 arg if arg.starts_with("-m") => {
-                    return Err(format!("unsupported machine option {}; LCCC refuses to silently ignore target-affecting -m flags", arg));
+                    return Err(format!(
+                        "unsupported machine option {}; LCCC refuses to silently ignore target-affecting -m flags",
+                        arg
+                    ));
                 }
 
                 // PGO flags (instrumented profiling)
@@ -1833,6 +1837,27 @@ impl Driver {
     pub fn add_include_path(&mut self, path: &str) {
         self.include_paths.push(path.to_string());
     }
+}
+
+/// `__STDC_VERSION__` value for a `-std=` dialect name, mirroring GCC.
+///
+/// `Some(None)` means "the dialect defines no `__STDC_VERSION__` at all"
+/// (C89/C90 predate the macro); `None` means the name is unrecognized and the
+/// default is left untouched.
+pub fn std_version_macro(std_value: &str) -> Option<Option<&'static str>> {
+    let v = match std_value {
+        "c89" | "c90" | "gnu89" | "gnu90" | "iso9899:1990" => None,
+        // The 1994 amendment is the first to define the macro.
+        "iso9899:199409" => Some("199409L"),
+        "c99" | "c9x" | "gnu99" | "gnu9x" | "iso9899:1999" | "iso9899:199x" => Some("199901L"),
+        "c11" | "c1x" | "gnu11" | "gnu1x" | "iso9899:2011" => Some("201112L"),
+        "c17" | "c18" | "gnu17" | "gnu18" | "iso9899:2017" | "iso9899:2018" => Some("201710L"),
+        "c23" | "c2x" | "gnu23" | "gnu2x" => Some("202311L"),
+        // C2y is still a draft; GCC 15 reports 202400L for it.
+        "c2y" | "gnu2y" => Some("202400L"),
+        _ => return None,
+    };
+    Some(v)
 }
 
 #[cfg(test)]
@@ -2205,10 +2230,11 @@ mod cli_tests {
             .map(|s| s.to_string())
             .collect();
         d2.parse_cli_args(&args2).ok();
-        assert!(d2
-            .linker_ordered_items
-            .iter()
-            .any(|i| i == "-Wl,--export-dynamic"));
+        assert!(
+            d2.linker_ordered_items
+                .iter()
+                .any(|i| i == "-Wl,--export-dynamic")
+        );
     }
 
     #[test]
@@ -2220,10 +2246,11 @@ mod cli_tests {
             .map(|s| s.to_string())
             .collect();
         d.parse_cli_args(&args).ok();
-        assert!(d
-            .linker_ordered_items
-            .iter()
-            .any(|i| i == "-Wl,-e,__libc_main"));
+        assert!(
+            d.linker_ordered_items
+                .iter()
+                .any(|i| i == "-Wl,-e,__libc_main")
+        );
         // -eSYMBOL compact form.
         let mut d2 = Driver::new();
         let args2: Vec<String> = ["lccc", "-emain", "x.c"]
@@ -2261,25 +2288,4 @@ mod cli_tests {
         assert!(!d.no_sse);
         assert!(d.enable_avx);
     }
-}
-
-/// `__STDC_VERSION__` value for a `-std=` dialect name, mirroring GCC.
-///
-/// `Some(None)` means "the dialect defines no `__STDC_VERSION__` at all"
-/// (C89/C90 predate the macro); `None` means the name is unrecognized and the
-/// default is left untouched.
-pub fn std_version_macro(std_value: &str) -> Option<Option<&'static str>> {
-    let v = match std_value {
-        "c89" | "c90" | "gnu89" | "gnu90" | "iso9899:1990" => None,
-        // The 1994 amendment is the first to define the macro.
-        "iso9899:199409" => Some("199409L"),
-        "c99" | "c9x" | "gnu99" | "gnu9x" | "iso9899:1999" | "iso9899:199x" => Some("199901L"),
-        "c11" | "c1x" | "gnu11" | "gnu1x" | "iso9899:2011" => Some("201112L"),
-        "c17" | "c18" | "gnu17" | "gnu18" | "iso9899:2017" | "iso9899:2018" => Some("201710L"),
-        "c23" | "c2x" | "gnu23" | "gnu2x" => Some("202311L"),
-        // C2y is still a draft; GCC 15 reports 202400L for it.
-        "c2y" | "gnu2y" => Some("202400L"),
-        _ => return None,
-    };
-    Some(v)
 }

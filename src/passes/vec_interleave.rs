@@ -1373,10 +1373,12 @@ mod tests {
         // Hold ENV_LOCK across the whole set/run/remove window: the env var
         // is process-global and every other run_locked() caller reads it.
         let _g = ENV_LOCK.lock().unwrap();
-        std::env::set_var("CCC_NO_VEC_INTERLEAVE", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("CCC_NO_VEC_INTERLEAVE", "1") };
         // Direct call: the guard above already serializes us.
         let n = run(&mut f, true);
-        std::env::remove_var("CCC_NO_VEC_INTERLEAVE");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("CCC_NO_VEC_INTERLEAVE") };
         assert_eq!(n, 0);
     }
 }

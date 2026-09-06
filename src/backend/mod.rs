@@ -340,11 +340,7 @@ impl Target {
 
     /// Pointer size in bytes for this target.
     pub(crate) fn ptr_size(&self) -> usize {
-        if self.is_32bit() {
-            4
-        } else {
-            8
-        }
+        if self.is_32bit() { 4 } else { 8 }
     }
 
     /// ELF e_machine value for this target. Relocation-type number spaces are
@@ -447,7 +443,10 @@ impl Target {
                 if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
                     raw
                 } else {
-                    x86::codegen::peephole::peephole_optimize_with_config(raw, opts.ra_config.as_ref())
+                    x86::codegen::peephole::peephole_optimize_with_config(
+                        raw,
+                        opts.ra_config.as_ref(),
+                    )
                 }
             }
             Target::I686 => {

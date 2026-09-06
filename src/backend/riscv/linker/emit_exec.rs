@@ -7,7 +7,7 @@
 
 use super::elf_read::*;
 use super::relocations::{
-    align_up, build_gnu_hash, pad_to, write_phdr, write_shdr, GlobalSym, MergedSection,
+    GlobalSym, MergedSection, align_up, build_gnu_hash, pad_to, write_phdr, write_shdr,
 };
 use super::{reloc, symbols};
 use crate::backend::linker_common;
@@ -119,11 +119,7 @@ pub fn emit_executable(
     // Estimate phdr count
     let num_phdrs = if is_static {
         let base = 6; // LOAD(RX), LOAD(RW), NOTE, GNU_EH_FRAME, GNU_STACK, RISCV_ATTR
-        if has_tls {
-            base + 1
-        } else {
-            base
-        }
+        if has_tls { base + 1 } else { base }
     } else if has_tls {
         11
     } else {

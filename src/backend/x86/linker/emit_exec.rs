@@ -8,7 +8,7 @@ use crate::common::fx_hash::FxHashMap;
 use std::collections::BTreeSet;
 
 use super::elf::*;
-use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE};
+use super::types::{BASE_ADDR, GlobalSymbol, PAGE_SIZE};
 use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
 
@@ -57,7 +57,7 @@ pub(super) fn emit_executable(
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
     let mut t_zone = std::time::Instant::now();
     macro_rules! zone {
-        ($name:expr) => {
+        ($name:expr_2021) => {
             if ld_time {
                 eprintln!(
                     "[ldtime]   emit/{:<18} {:>7.1} ms",
@@ -489,11 +489,7 @@ pub(super) fn emit_executable(
     // Static: PHDR, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), GNU_STACK, [TLS]
     // Dynamic: PHDR, INTERP, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC, GNU_STACK, [TLS]
     let mut phdr_count: u64 = if is_static {
-        if has_tls_sections {
-            7
-        } else {
-            6
-        }
+        if has_tls_sections { 7 } else { 6 }
     } else if has_tls_sections {
         9
     } else {
@@ -542,7 +538,7 @@ pub(super) fn emit_executable(
     // path was fixed.
     let mut packer = super::layout_plan::SegmentPacker::new(BASE_ADDR, PAGE_SIZE);
     macro_rules! vaddr {
-        ($off:expr) => {
+        ($off:expr_2021) => {
             packer.vaddr($off)
         };
     }
@@ -1762,7 +1758,7 @@ pub(super) fn emit_executable(
             let ep = iplt_offset as usize + i * iplt_entry_size as usize;
             let pea = iplt_addr + i as u64 * iplt_entry_size; // address of this IPLT entry
             let gea = ifunc_got_addr + i as u64 * 8; // address of IFUNC GOT entry
-                                                     // ff 25 XX XX XX XX = jmp *disp32(%rip)
+            // ff 25 XX XX XX XX = jmp *disp32(%rip)
             out[ep] = 0xff;
             out[ep + 1] = 0x25;
             w32(&mut out, ep + 2, (gea as i64 - (pea + 6) as i64) as u32);
@@ -2051,8 +2047,10 @@ pub(super) fn emit_executable(
                                     };
                                     if std::env::var("LCCC_DEBUG_GOT").is_ok() {
                                         let nb = got_slot_ordinal[gi];
-                                        eprintln!("[GOTREL] name={:?} gi={} is_plt={} nb={} gea=0x{:x} got_addr=0x{:x} p=0x{:x} addend={}",
-                                            sym.name, gi, entry.1, nb, gea, got_addr, p, a);
+                                        eprintln!(
+                                            "[GOTREL] name={:?} gi={} is_plt={} nb={} gea=0x{:x} got_addr=0x{:x} p=0x{:x} addend={}",
+                                            sym.name, gi, entry.1, nb, gea, got_addr, p, a
+                                        );
                                     }
                                     w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
                                     continue;
@@ -2124,7 +2122,8 @@ pub(super) fn emit_executable(
                         let Some(st) = seq else {
                             return Err(format!(
                                 "TLSGD relaxation failed: unrecognized code sequence for '{}' in {}",
-                                sym.name, objects[obj_idx].source_name));
+                                sym.name, objects[obj_idx].source_name
+                            ));
                         };
                         let is_dyn_tls = globals_snap
                             .get(sym.name.as_str())
@@ -2349,7 +2348,7 @@ pub(super) fn emit_executable(
     if eh_frame_hdr_size > 0 {
         sh_count += 1;
     } // .eh_frame_hdr
-      // Merged output sections (non-BSS, non-TLS, non-init/fini)
+    // Merged output sections (non-BSS, non-TLS, non-init/fini)
     for sec in output_sections.iter() {
         if sec.flags & SHF_ALLOC != 0
             && sec.sh_type != SHT_NOBITS
@@ -2396,7 +2395,7 @@ pub(super) fn emit_executable(
     if rela_iplt_size > 0 {
         sh_count += 1;
     } // .rela.iplt
-      // BSS sections (non-TLS)
+    // BSS sections (non-TLS)
     for sec in output_sections.iter() {
         if sec.sh_type == SHT_NOBITS && sec.flags & SHF_ALLOC != 0 && sec.flags & SHF_TLS == 0 {
             sh_count += 1;

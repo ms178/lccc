@@ -52,8 +52,10 @@
 //! 19-name A/B. Pred-label uses `(pre_op, header_label)` (never the
 //! original preheader). Guards C/D/E, bepre `latest_dep`, univsr skip of
 //! rotated self-loop pointer IVs, and complete-unroll Copy-INIT are in
-//! tree. Rotation STAYS opt-in (`CCC_LOOP_ROTATE=1`) until the full 474
-//! corpus is green. Kill-switch `CCC_NO_LOOP_ROTATE=1` wins.
+//! tree. Guard F rejects header work outside the cloned condition closure.
+//! Rotation STAYS opt-in (`CCC_LOOP_ROTATE=1`) while default-enable needs
+//! broader fuzz/performance evidence; kill-switch `CCC_NO_LOOP_ROTATE=1`
+//! wins.
 //!
 //! v16: the pass was DEFAULT-ON at -O2+. The v14 hardening (exit-merge-phi
 //! off-by-one fix, post-vectorize placement, conservative body guards)
@@ -67,7 +69,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value};
-use crate::passes::loop_analysis::{find_natural_loops, merge_loops_by_header, NaturalLoop};
+use crate::passes::loop_analysis::{NaturalLoop, find_natural_loops, merge_loops_by_header};
 use crate::passes::loop_unroll::{
     rename_inst_dest, subst_value_in_terminator, subst_value_with_operand,
 };
@@ -349,6 +351,34 @@ fn try_rotate_loop(
     closure.dedup();
     if closure.is_empty() {
         return false; // cond is loop-invariant — wouldn't terminate, bail
+    }
+
+    // Guard F: every non-Phi header instruction must belong to the cloned
+    // condition closure.  Rotation leaves the original header in place for
+    // the first-trip guard, but later iterations execute only the cloned
+    // closure at the latch.  A header-side-effect outside that closure would
+    // therefore run once instead of once per guard evaluation.  For example:
+    //
+    //   for (i = 0; (trace[i] = i), i < n; ++i) { ... }
+    //
+    // The Store does not feed `i < n`, so the old transform cloned only the
+    // Cmp; `trace[i]` was updated for i == 0 but not for later iterations.
+    // Reordering or separately replaying arbitrary header instructions is
+    // not sound here (they may touch memory, call, or observe sequencing), so
+    // reject the whole loop.  Phi nodes are intentionally exempt: step 6.6
+    // recreates their recurrence in the body/latch rather than cloning them.
+    if let Some((idx, inst)) = header_insts
+        .iter()
+        .enumerate()
+        .find(|(idx, inst)| !matches!(inst, Instruction::Phi { .. }) && !closure.contains(idx))
+    {
+        if debug {
+            eprintln!(
+                "[ROT] header non-Phi inst outside condition closure: idx={} {:?} — bail (Guard F, un-cloned header effect)",
+                idx, inst
+            );
+        }
+        return false;
     }
 
     // Guard E: refuse to rotate when the cloned cond consumes a phi that

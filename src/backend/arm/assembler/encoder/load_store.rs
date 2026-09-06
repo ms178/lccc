@@ -71,17 +71,9 @@ pub(crate) fn encode_ldr_str(
             // For 128-bit Q registers: shift=4, opc=11 (load) or 10 (store)
             let shift = if is_128bit { 4 } else { actual_size };
             let opc = if is_128bit {
-                if is_load {
-                    0b11
-                } else {
-                    0b10
-                }
+                if is_load { 0b11 } else { 0b10 }
             } else if is_load {
-                if is_signed {
-                    0b10
-                } else {
-                    0b01
-                }
+                if is_signed { 0b10 } else { 0b01 }
             } else {
                 0b00
             };
@@ -108,17 +100,9 @@ pub(crate) fn encode_ldr_str(
             // Unscaled offset (LDUR/STUR form)
             let imm9 = (*offset as i32) & 0x1FF;
             let opc = if is_128bit {
-                if is_load {
-                    0b11
-                } else {
-                    0b10
-                }
+                if is_load { 0b11 } else { 0b10 }
             } else if is_load {
-                if is_signed {
-                    0b10
-                } else {
-                    0b01
-                }
+                if is_signed { 0b10 } else { 0b01 }
             } else {
                 0b00
             };
@@ -135,11 +119,7 @@ pub(crate) fn encode_ldr_str(
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
             let imm9 = (*offset as i32) & 0x1FF;
             let opc = if is_128bit {
-                if is_load {
-                    0b11
-                } else {
-                    0b10
-                }
+                if is_load { 0b11 } else { 0b10 }
             } else if is_load {
                 0b01
             } else {
@@ -159,11 +139,7 @@ pub(crate) fn encode_ldr_str(
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
             let imm9 = (*offset as i32) & 0x1FF;
             let opc = if is_128bit {
-                if is_load {
-                    0b11
-                } else {
-                    0b10
-                }
+                if is_load { 0b11 } else { 0b10 }
             } else if is_load {
                 0b01
             } else {
@@ -205,11 +181,7 @@ pub(crate) fn encode_ldr_str(
                 };
 
                 let opc = if is_128bit {
-                    if is_load {
-                        0b11
-                    } else {
-                        0b10
-                    }
+                    if is_load { 0b11 } else { 0b10 }
                 } else if is_load {
                     0b01
                 } else {
@@ -251,11 +223,7 @@ pub(crate) fn encode_ldr_str(
             let rn = parse_reg_num(base).ok_or("invalid base reg")?;
             let rm = parse_reg_num(index).ok_or("invalid index reg")?;
             let opc = if is_128bit {
-                if is_load {
-                    0b11
-                } else {
-                    0b10
-                }
+                if is_load { 0b11 } else { 0b10 }
             } else if is_load {
                 0b01
             } else {
@@ -324,18 +292,10 @@ pub(crate) fn encode_ldr_str(
                 0b10u32
             } else if fp {
                 // FP: S=00, D=01 (same mapping as GP)
-                if actual_size == 0b11 {
-                    0b01
-                } else {
-                    0b00
-                }
+                if actual_size == 0b11 { 0b01 } else { 0b00 }
             } else {
                 // GP: W=00, X=01
-                if actual_size == 0b11 {
-                    0b01
-                } else {
-                    0b00
-                }
+                if actual_size == 0b11 { 0b01 } else { 0b00 }
             };
             let word = (opc << 30) | (v << 26) | (0b011 << 27) | rt;
             return Ok(EncodeResult::WordWithReloc {
@@ -401,7 +361,7 @@ pub(crate) fn encode_ldur_stur(
             return Err(format!(
                 "ldur/stur: expected memory operand, got {:?}",
                 operands[1]
-            ))
+            ));
         }
     };
 
@@ -526,7 +486,7 @@ pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String>
                     return Err(format!(
                         "unsupported ldrsw extend/shift: {:?}/{:?}",
                         extend, shift
-                    ))
+                    ));
                 }
             };
             // LDRSW reg: 10 111 0 00 10 1 Rm option S 10 Rn Rt
@@ -996,7 +956,7 @@ pub(crate) fn encode_adrp(operands: &[Operand]) -> Result<EncodeResult, String> 
             return Err(format!(
                 "adrp needs symbol operand, got {:?}",
                 operands.get(1)
-            ))
+            ));
         }
     };
 
@@ -1063,7 +1023,7 @@ pub(crate) fn encode_prfm(operands: &[Operand]) -> Result<EncodeResult, String> 
             return Err(format!(
                 "prfm: expected prefetch operation name, got {:?}",
                 operands[0]
-            ))
+            ));
         }
     };
 
@@ -1323,13 +1283,13 @@ pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<Encode
             return Err(format!(
                 "{}: memory operand must be a plain base register [Xn] (no offset/writeback)",
                 mnemonic
-            ))
+            ));
         }
         other => {
             return Err(format!(
                 "{}: expected memory operand [Xn], got {:?}",
                 mnemonic, other
-            ))
+            ));
         }
     };
 
@@ -1486,7 +1446,7 @@ pub(crate) fn encode_stop(mnemonic: &str, operands: &[Operand]) -> Result<Encode
     // A=0 (no acquire for store aliases), R from 'l' suffix (release)
     let r = if suffix.contains('l') { 1u32 } else { 0u32 };
     let rt = 31u32; // XZR/WZR - discard result
-                    // size 111000 A R 1 Rs 0 opc 00 Rn Rt
+    // size 111000 A R 1 Rs 0 opc 00 Rn Rt
     let word = (size << 30)
         | (0b111000 << 24)
         | (r << 22)

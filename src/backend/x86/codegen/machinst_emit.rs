@@ -568,7 +568,9 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                     unreachable!("vreg{id} reached FAlu emission unallocated")
                 }
                 MachOperand::Imm(v) => {
-                    unreachable!("FAlu from immediate {v} is unencodable; constants materialize via .rodata on the text path")
+                    unreachable!(
+                        "FAlu from immediate {v} is unencodable; constants materialize via .rodata on the text path"
+                    )
                 }
                 other => fmt_operand(other, OpSize::S64, out),
             };

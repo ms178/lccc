@@ -1,7 +1,7 @@
 //! RiscvCodegen: type conversion/casting operations.
 
 use super::emit::RiscvCodegen;
-use crate::backend::cast::{classify_cast, CastKind};
+use crate::backend::cast::{CastKind, classify_cast};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Operand, Value};
 

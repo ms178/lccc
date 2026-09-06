@@ -540,11 +540,7 @@ impl<'a> ExprParser<'a> {
                 self.advance(); // :
             }
             let else_val = self.parse_ternary();
-            if cond.0 != 0 {
-                then_val
-            } else {
-                else_val
-            }
+            if cond.0 != 0 { then_val } else { else_val }
         } else {
             cond
         }

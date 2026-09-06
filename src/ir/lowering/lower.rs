@@ -2030,8 +2030,8 @@ impl Lowerer {
     }
 
     /// _Float128 call argument marker: 16-byte all-SSE (single XMM in psABI).
-    pub(super) fn f128_arg_info(
-    ) -> Option<(usize, usize, Vec<crate::common::types::EightbyteClass>)> {
+    pub(super) fn f128_arg_info()
+    -> Option<(usize, usize, Vec<crate::common::types::EightbyteClass>)> {
         Some((
             16,
             16,

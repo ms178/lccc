@@ -1498,7 +1498,7 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
-    use super::{flags_effect, FlagsEffect};
+    use super::{FlagsEffect, flags_effect};
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())

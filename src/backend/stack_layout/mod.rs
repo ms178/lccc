@@ -311,7 +311,10 @@ pub fn calculate_stack_space_common(
                                 state.vector128_values.insert(dest.0);
                             }
                             if debug_protect {
-                                eprintln!("[PROTECT-COPY] Marked SSA {} as protected (copy from vector SSA {})", dest.0, src_val.0);
+                                eprintln!(
+                                    "[PROTECT-COPY] Marked SSA {} as protected (copy from vector SSA {})",
+                                    dest.0, src_val.0
+                                );
                             }
                         }
                     }
@@ -543,14 +546,13 @@ fn build_layout_context(
     let used_values = analysis::collect_used_values(func);
 
     // Detect dead parameter allocas.
-    let dead_param_allocas =
-        analysis::find_dead_param_allocas(
-            func,
-            &used_values,
-            reg_assigned,
-            callee_saved_regs,
-            ra_config,
-        );
+    let dead_param_allocas = analysis::find_dead_param_allocas(
+        func,
+        &used_values,
+        reg_assigned,
+        callee_saved_regs,
+        ra_config,
+    );
 
     // Authoritative ABI alignment of struct/union parameter allocas (the
     // Alloca.align may have been dropped by a pass; IrParam.struct_align is not).

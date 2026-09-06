@@ -120,7 +120,7 @@ fn canonical_addr_key_impl(
                 let vid = match &off_root {
                     Operand::Value(v) => v.0,
                     Operand::Const(c) => {
-                        return format!("gep({}@{:?}{})", base_key, c, scale_suffix)
+                        return format!("gep({}@{:?}{})", base_key, c, scale_suffix);
                     }
                 };
                 match defs.get(&vid) {
@@ -2055,10 +2055,12 @@ mod tests {
         ));
 
         // Merge block should have no phi
-        assert!(!func.blocks[3]
-            .instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::Phi { .. })));
+        assert!(
+            !func.blocks[3]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Phi { .. }))
+        );
     }
 
     #[test]
@@ -2418,10 +2420,12 @@ mod tests {
         );
         assert!(f.blocks[3].instructions.is_empty());
         assert!(f.blocks[4].instructions.is_empty());
-        assert!(!f.blocks[5]
-            .instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::Phi { dest: d, .. } if d.0 == 40)));
+        assert!(
+            !f.blocks[5]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Phi { dest: d, .. } if d.0 == 40))
+        );
     }
 
     #[test]
@@ -2433,11 +2437,12 @@ mod tests {
         let mut f = arm_load_diamond_loop(false);
         let converted = if_convert_function(&mut f);
         assert_eq!(converted, 0, "uncovered arm load must not be speculated");
-        assert!(!f
-            .blocks
-            .iter()
-            .flat_map(|b| &b.instructions)
-            .any(|i| matches!(i, Instruction::Select { .. })));
+        assert!(
+            !f.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .any(|i| matches!(i, Instruction::Select { .. }))
+        );
     }
 
     /// R2 regression at unit level: the canonical address key must be
@@ -2589,15 +2594,18 @@ mod tests {
             .filter(|i| matches!(i, Instruction::Select { .. }))
             .count();
         assert_eq!(selects, 2, "expected two nested Selects");
-        assert!(f
-            .blocks
-            .iter()
-            .all(|b| !matches!(b.terminator, Terminator::CondBranch { .. })));
+        assert!(
+            f.blocks
+                .iter()
+                .all(|b| !matches!(b.terminator, Terminator::CondBranch { .. }))
+        );
         // The outer pred (block 1) must hold the final nested Select.
-        assert!(f.blocks[1]
-            .instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::Select { .. })));
+        assert!(
+            f.blocks[1]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Select { .. }))
+        );
     }
 
     /// Store sinking: two predecessors store to the same IV-addressed slot;

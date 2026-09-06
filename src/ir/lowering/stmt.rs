@@ -1,7 +1,7 @@
 use super::definitions::{DeclAnalysis, FuncSig, GlobalInfo, LocalInfo};
 use super::lower::Lowerer;
 use super::structs::VlaDynCursor;
-use crate::common::types::{target_int_ir_type, AddressSpace, CType, IrType, StructLayout};
+use crate::common::types::{AddressSpace, CType, IrType, StructLayout, target_int_ir_type};
 use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, Expr, InitDeclarator,
     Initializer, InitializerItem, Stmt, StructFieldDecl, TypeSpecifier,
@@ -963,7 +963,7 @@ impl Lowerer {
                         // copy the string bytes instead of storing the pointer.
                         let is_char_array = matches!(**elem_ty, CType::Char | CType::UChar);
                         if is_char_array {
-                            if let Expr::StringLiteral(ref s, _) = e {
+                            if let Expr::StringLiteral(s, _) = e {
                                 self.emit_string_to_alloca(base, s, field_offset, arr_size);
                                 // Zero-fill remaining bytes if string is shorter than array
                                 let str_len = s.chars().count() + 1; // +1 for null terminator
@@ -1115,7 +1115,7 @@ impl Lowerer {
                     self.lower_local_struct_init(items, base, &sub_layout);
                 }
             }
-            CType::Array(ref elem_ty, arr_size_opt) => {
+            CType::Array(elem_ty, arr_size_opt) => {
                 // Check for char array initialized by a brace-wrapped string literal:
                 // e.g., struct field `char a[10]` initialized as `{"hello"}`
                 let is_char_array = matches!(**elem_ty, CType::Char | CType::UChar);
@@ -1143,7 +1143,7 @@ impl Lowerer {
                 let mut ai = 0usize;
                 for item in items {
                     // Check for index designator: [idx]=val
-                    if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+                    if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                         if let Some(idx) = self.eval_const_expr_for_designator(idx_expr) {
                             ai = idx;
                         }
@@ -1237,7 +1237,7 @@ impl Lowerer {
                 .designators
                 .iter()
                 .filter_map(|d| {
-                    if let Designator::Index(ref idx_expr) = d {
+                    if let Designator::Index(idx_expr) = d {
                         self.eval_const_expr_for_designator(idx_expr)
                     } else {
                         None

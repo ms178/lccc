@@ -1460,7 +1460,7 @@ impl InstructionEncoder {
                         _ => {
                             return Err(
                                 "sha256rnds2: explicit first operand must be %xmm0".to_string()
-                            )
+                            );
                         }
                     }
                 } else {

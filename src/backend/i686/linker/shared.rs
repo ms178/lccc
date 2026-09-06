@@ -6,11 +6,11 @@
 use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
+use super::DynStrTab;
 use super::emit::{build_plt, layout_custom_sections, layout_section, layout_tls};
 use super::gnu_hash::build_gnu_hash_32;
-use super::reloc::{resolve_got_reloc, resolve_tls_gotie, resolve_tls_ie, RelocContext};
+use super::reloc::{RelocContext, resolve_got_reloc, resolve_tls_gotie, resolve_tls_ie};
 use super::types::*;
-use super::DynStrTab;
 use crate::backend::common::{exists_with_sysroot, with_sysroot_prefix};
 use crate::backend::linker_common;
 
@@ -918,7 +918,10 @@ pub(super) fn emit_shared_library_32(
                         }
                         _ => {
                             // Silently skip unsupported relocations in shared libraries
-                            eprintln!("warning: unsupported relocation type {} for '{}' in shared library", rel_type, sym.name);
+                            eprintln!(
+                                "warning: unsupported relocation type {} for '{}' in shared library",
+                                rel_type, sym.name
+                            );
                         }
                     }
                 }
@@ -970,7 +973,7 @@ pub(super) fn emit_shared_library_32(
     gotplt_data.extend_from_slice(&dynamic_vaddr.to_le_bytes()); // GOT.PLT[0] = .dynamic
     gotplt_data.extend_from_slice(&0u32.to_le_bytes()); // GOT.PLT[1] = link_map (filled by ld.so)
     gotplt_data.extend_from_slice(&0u32.to_le_bytes()); // GOT.PLT[2] = dl_resolve (filled by ld.so)
-                                                        // GOT.PLT[3..] = PLT lazy stubs (point back to PLT[N]+6)
+    // GOT.PLT[3..] = PLT lazy stubs (point back to PLT[N]+6)
     for i in 0..num_plt {
         let plt_stub_addr = plt_vaddr + plt_header_size + (i as u32) * plt_entry_size + 6;
         gotplt_data.extend_from_slice(&plt_stub_addr.to_le_bytes());

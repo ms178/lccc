@@ -526,11 +526,7 @@ impl StructLayoutBuilder {
         // Compute storage unit offset.
         // New placement uses ABI alignment; continuation uses sizeof.
         let storage_mask = if !self.in_bitfield || straddles {
-            if field_align > 0 {
-                field_align
-            } else {
-                1
-            }
+            if field_align > 0 { field_align } else { 1 }
         } else if field_size > 0 {
             field_size
         } else {
@@ -2016,11 +2012,7 @@ impl CType {
         let r_unsigned = r.is_unsigned();
 
         if l_unsigned == r_unsigned {
-            if l_rank >= r_rank {
-                l
-            } else {
-                r
-            }
+            if l_rank >= r_rank { l } else { r }
         } else if l_unsigned && l_rank >= r_rank {
             l
         } else if r_unsigned && r_rank >= l_rank {
@@ -2084,7 +2076,7 @@ impl CType {
                     return Some(CType::Void);
                 }
                 // Both pointers: C11 6.5.15p6 rules
-                if let (CType::Pointer(ref inner_t, _), CType::Pointer(ref inner_e, _)) = (&t, &e) {
+                if let (CType::Pointer(inner_t, _), CType::Pointer(inner_e, _)) = (&t, &e) {
                     let t_is_void = matches!(inner_t.as_ref(), CType::Void);
                     let e_is_void = matches!(inner_e.as_ref(), CType::Void);
                     if t_is_void && !e_is_void {

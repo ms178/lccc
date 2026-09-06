@@ -66,7 +66,7 @@ impl Parser {
             self.consume_if(&TokenKind::Volatile);
             if matches!(self.peek(), TokenKind::LParen) {
                 self.advance(); // consume (
-                                // Collect all string literal pieces (may be concatenated)
+                // Collect all string literal pieces (may be concatenated)
                 let mut asm_str = String::new();
                 loop {
                     match self.peek() {
@@ -1172,13 +1172,8 @@ impl Parser {
                 })
             }
             Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
-                Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns).map(|v| {
-                    if v == 0 {
-                        1
-                    } else {
-                        0
-                    }
-                })
+                Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns)
+                    .map(|v| if v == 0 { 1 } else { 0 })
             }
             Expr::UnaryOp(UnaryOp::Plus, inner, _) => {
                 Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns)
@@ -1485,11 +1480,7 @@ impl Parser {
                 found_string = true;
                 self.advance();
             }
-            if found_string {
-                Some(msg)
-            } else {
-                None
-            }
+            if found_string { Some(msg) } else { None }
         } else {
             None
         };

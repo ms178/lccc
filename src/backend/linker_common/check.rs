@@ -5,7 +5,7 @@
 
 use crate::common::fx_hash::FxHashMap;
 
-use super::symbols::{is_linker_defined_symbol, GlobalSymbolOps};
+use super::symbols::{GlobalSymbolOps, is_linker_defined_symbol};
 use crate::backend::elf::STB_WEAK;
 
 /// Check for undefined symbols in the global symbol table and return an error

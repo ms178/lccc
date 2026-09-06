@@ -431,7 +431,7 @@ impl<'a> ExprTypeChecker<'a> {
                     match r {
                         CType::Pointer(_, _) => return rct,
                         CType::Array(elem, _) => {
-                            return Some(CType::Pointer(elem.clone(), AddressSpace::Default))
+                            return Some(CType::Pointer(elem.clone(), AddressSpace::Default));
                         }
                         _ => {}
                     }

@@ -69,7 +69,7 @@ impl ArmCodegen {
                     // Look up by name in operands
                     let mut found = false;
                     for (idx, op_name) in op_names.iter().enumerate() {
-                        if let Some(ref n) = op_name {
+                        if let Some(n) = op_name {
                             if n == &name {
                                 result.push_str(&Self::format_operand_static(
                                     idx,
@@ -149,7 +149,7 @@ impl ArmCodegen {
         op_imm_symbols: &[Option<String>],
     ) -> String {
         // Check for immediate symbol first (e.g., function/variable name)
-        if let Some(Some(ref sym)) = op_imm_symbols.get(idx) {
+        if let Some(Some(sym)) = op_imm_symbols.get(idx) {
             return sym.clone();
         }
         // Check for immediate value - emit raw (GCC AArch64 behavior)

@@ -1,6 +1,6 @@
 //! X86Codegen: integer/float arithmetic, unary ops, binop, copy.
 
-use super::emit::{phys_reg_name, shift_mnemonic, X86Codegen};
+use super::emit::{X86Codegen, phys_reg_name, shift_mnemonic};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
@@ -76,22 +76,14 @@ impl X86Codegen {
                 } else {
                     self.operand_to_rax(not_src);
                 }
-                if narrow {
-                    "eax".into()
-                } else {
-                    "rax".into()
-                }
+                if narrow { "eax".into() } else { "rax".into() }
             }
         };
         let other_name = match home(self, other) {
             Some(name) => name,
             None => {
                 self.operand_to_rcx(other);
-                if narrow {
-                    "ecx".into()
-                } else {
-                    "rcx".into()
-                }
+                if narrow { "ecx".into() } else { "rcx".into() }
             }
         };
 

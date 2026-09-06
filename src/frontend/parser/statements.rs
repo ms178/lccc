@@ -32,7 +32,7 @@ impl Parser {
         // Syntax: __label__ ident1, ident2, ... ;
         while matches!(self.peek(), TokenKind::GnuLabel) {
             self.advance(); // consume __label__
-                            // Parse comma-separated list of label names
+            // Parse comma-separated list of label names
             loop {
                 if let TokenKind::Identifier(name) = self.peek() {
                     local_labels.push(name.clone());
@@ -261,9 +261,9 @@ impl Parser {
                 {
                     self.advance(); // identifier
                     self.advance(); // colon
-                                    // Skip optional label attributes: `label: __attribute__((unused));`
-                                    // In GNU C, labels can have attributes (e.g., unused, hot, cold).
-                                    // We consume and discard them since they only affect diagnostics.
+                    // Skip optional label attributes: `label: __attribute__((unused));`
+                    // In GNU C, labels can have attributes (e.g., unused, hot, cold).
+                    // We consume and discard them since they only affect diagnostics.
                     self.skip_label_attributes();
                     let stmt = self.parse_label_body();
                     Stmt::Label(name_clone, Box::new(stmt), span)
@@ -349,7 +349,7 @@ impl Parser {
 
     fn parse_inline_asm(&mut self) -> Stmt {
         self.advance(); // consume 'asm' / '__asm__'
-                        // Skip optional qualifiers: volatile, goto, inline
+        // Skip optional qualifiers: volatile, goto, inline
         while matches!(self.peek(), TokenKind::Volatile)
             || matches!(self.peek(), TokenKind::Goto)
             || matches!(self.peek(), TokenKind::Inline)
@@ -409,7 +409,7 @@ impl Parser {
         // carrier only *after* concatenating adjacent literals, because a
         // multibyte character may straddle two C string-literal fragments.
         let mut byte_carrier = String::with_capacity(64);
-        while let TokenKind::StringLiteral(ref s) = self.peek() {
+        while let TokenKind::StringLiteral(s) = self.peek() {
             byte_carrier.push_str(s);
             self.advance();
         }
@@ -436,7 +436,7 @@ impl Parser {
         let name = if matches!(self.peek(), TokenKind::LBracket) {
             let open = self.peek_span();
             self.advance();
-            let n = if let TokenKind::Identifier(ref id) = self.peek() {
+            let n = if let TokenKind::Identifier(id) = self.peek() {
                 let id = id.clone();
                 self.advance();
                 Some(id)
@@ -450,10 +450,10 @@ impl Parser {
         };
 
         // Constraint string (may be concatenated)
-        let constraint = if let TokenKind::StringLiteral(ref s) = self.peek() {
+        let constraint = if let TokenKind::StringLiteral(s) = self.peek() {
             let mut full = s.clone();
             self.advance();
-            while let TokenKind::StringLiteral(ref s2) = self.peek() {
+            while let TokenKind::StringLiteral(s2) = self.peek() {
                 full.push_str(s2);
                 self.advance();
             }
@@ -480,10 +480,10 @@ impl Parser {
         if matches!(self.peek(), TokenKind::Colon | TokenKind::RParen) {
             return clobbers;
         }
-        while let TokenKind::StringLiteral(ref s) = self.peek() {
+        while let TokenKind::StringLiteral(s) = self.peek() {
             let mut full = s.clone();
             self.advance();
-            while let TokenKind::StringLiteral(ref s2) = self.peek() {
+            while let TokenKind::StringLiteral(s2) = self.peek() {
                 full.push_str(s2);
                 self.advance();
             }
@@ -502,7 +502,7 @@ impl Parser {
         if matches!(self.peek(), TokenKind::RParen) {
             return labels;
         }
-        while let TokenKind::Identifier(ref name) = self.peek() {
+        while let TokenKind::Identifier(name) = self.peek() {
             labels.push(name.clone());
             self.advance();
             if !self.consume_if(&TokenKind::Comma) {

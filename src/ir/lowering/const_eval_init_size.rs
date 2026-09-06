@@ -71,7 +71,7 @@ impl Lowerer {
         let mut max_idx = 0usize;
         let mut current_idx = 0usize;
         for item in items {
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx) = self.eval_const_expr_for_designator(idx_expr) {
                     current_idx = idx;
                 }
@@ -177,7 +177,7 @@ impl Lowerer {
 
         for item in items {
             // Check for [idx] designator (array index)
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx) = self.eval_const_expr_for_designator(idx_expr) {
                     current_idx = idx;
                     fields_consumed = 0; // Reset field counter for new struct element

@@ -13,9 +13,8 @@ use super::resolve_lib::resolve_lib;
 use super::symbols::GlobalSymbolOps;
 use super::types::Elf64Object;
 use crate::backend::elf::{
-    is_thin_archive, parse_archive_members, parse_linker_script_entries,
-    parse_thin_archive_members, read_u16, LinkerScriptEntry, ELF_MAGIC, ET_DYN, STT_FILE,
-    STT_SECTION,
+    ELF_MAGIC, ET_DYN, LinkerScriptEntry, STT_FILE, STT_SECTION, is_thin_archive,
+    parse_archive_members, parse_linker_script_entries, parse_thin_archive_members, read_u16,
 };
 
 /// Check if an archive member defines any currently-undefined, non-dynamic symbol.

@@ -4,10 +4,10 @@
 //! across all four backends (x86-64, i686, AArch64, RISC-V 64).
 
 use super::super::regalloc::{PhysReg, RaConfig};
-use std::sync::Arc;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrFunction, Value};
+use std::sync::Arc;
 
 // ── Register allocation helpers ───────────────────────────────────────────
 
@@ -444,11 +444,12 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     let alloc_result = if no_regalloc {
         super::super::regalloc::RegAllocResult {
             assignments: Default::default(),
-            accumulator_assignments: super::super::regalloc::analyze_accumulator_assignments_with_config(
-                func,
-                config.accumulator_policy,
-                ra_config,
-            ),
+            accumulator_assignments:
+                super::super::regalloc::analyze_accumulator_assignments_with_config(
+                    func,
+                    config.accumulator_policy,
+                    ra_config,
+                ),
             used_regs: Vec::new(),
             caller_save_spans: Default::default(),
             liveness: None,

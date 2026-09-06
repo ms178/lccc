@@ -753,13 +753,13 @@ pub(super) fn fold_extend_relay(store: &mut LineStore, infos: &mut [LineInfo]) -
             // Step 4: Transform.
             // Use the same sub-register for the source (al/ax from rax family=0).
             let src_name = REG_NAMES[src_sub_idx][0]; // %al or %ax
-                                                      // Unsigned extends may target the 32-bit destination because the
-                                                      // architectural 32-bit write zero-extends to the full GPR.  Signed
-                                                      // byte/word extends must target the 64-bit destination: `movsbl
-                                                      // %al,%esi` would sign-extend only to 32 bits and then zero the
-                                                      // upper half of %rsi, corrupting negative values that are live as
-                                                      // I64/long (gcc.c-torture/execute/20030218-1.c: -256 became
-                                                      // 4294967040 after `movswl %ax,%esi; movq %rsi,%rax`).
+            // Unsigned extends may target the 32-bit destination because the
+            // architectural 32-bit write zero-extends to the full GPR.  Signed
+            // byte/word extends must target the 64-bit destination: `movsbl
+            // %al,%esi` would sign-extend only to 32 bits and then zero the
+            // upper half of %rsi, corrupting negative values that are live as
+            // I64/long (gcc.c-torture/execute/20030218-1.c: -256 became
+            // 4294967040 after `movswl %ax,%esi; movq %rsi,%rax`).
             let dest = if matches!(new_op, "movsbl" | "movswl") {
                 REG_NAMES[0][dest_reg as usize]
             } else {
@@ -2994,7 +2994,7 @@ mod fp_reg_load_tests {
 
 #[cfg(test)]
 mod fp_const_hoist_tests {
-    use super::super::super::types::{classify_line, mark_nop, LineInfo, LineKind};
+    use super::super::super::types::{LineInfo, LineKind, classify_line, mark_nop};
     use super::hoist_repeated_fp_constant_loads;
     use crate::backend::peephole_common::LineStore;
 

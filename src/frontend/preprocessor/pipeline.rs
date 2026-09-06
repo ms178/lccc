@@ -11,11 +11,11 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use super::builtin_macros::define_builtin_macros;
-use super::conditionals::{evaluate_condition, ConditionalStack};
-use super::macro_defs::{parse_define, MacroDef, MacroTable};
+use super::conditionals::{ConditionalStack, evaluate_condition};
+use super::macro_defs::{MacroDef, MacroTable, parse_define};
 use super::text_processing::{
-    split_first_word, strip_line_comment, CommentSegments, LineResolver, LineResolverData,
-    LineSegments,
+    CommentSegments, LineResolver, LineResolverData, LineSegments, split_first_word,
+    strip_line_comment,
 };
 use super::utils::{is_ident_cont, is_ident_start};
 

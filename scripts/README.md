@@ -4,10 +4,11 @@ Developer and research tooling. None of these are needed to build LCCC.
 
 | Script | Purpose |
 |---|---|
-| `build_lccc_fast.sh` | Incremental `fastbuild` profile (target compiler opt-level 1, no LTO), tracking the latest stable Rust channel. Use for RA/codegen loops. |
-| `build_lccc_o1_j2.sh` | Ship-quality release: Rust opt-level 1, two Cargo jobs, thin LTO, swap active, latest stable Rust. |
+| `rust_toolchain.sh` | Shared selector: resolves the current channel from `rust-toolchain.toml` (currently stable Rust 1.98.1), while honoring an explicit bisection/reproduction override. Its behavior is covered by `tests/regression/check_rust_toolchain_selector.sh`. |
+| `build_lccc_fast.sh` | Incremental `fastbuild` profile (target compiler opt-level 1, no LTO), using the manifest-selected current Rust/Cargo release, exactly two Cargo jobs, and warnings denied by default. Use for RA/codegen loops. |
+| `build_lccc_o1_j2.sh` | Ship-quality release: Rust opt-level 1, two Cargo jobs, thin LTO, swap active, manifest-selected current Rust/Cargo release, and warnings denied by default. |
 | `ensure_swap.sh` | Idempotently verify swap or recreate/activate the disposable 8 GiB `/swapfile` after a constrained-harness root reset; both compiler build scripts invoke it. |
-| `arena_session_restore.sh` | Rehydrates swap, the persisted latest-stable Rust/Cargo toolchain, host multilib/kernel packages, git metadata and fastbuild after an Arena reset. |
+| `arena_session_restore.sh` | Rehydrates swap, the manifest-selected current Rust/Cargo toolchain, host multilib/kernel packages, git metadata and fastbuild after an Arena reset. |
 | `prepare_kernel_tree.sh` | Recreate Linux 6.18.44 with the linux-cachymod patch series and generated boot headers after a harness wipe. |
 | `build_kernel_boot.sh` | Build all x86 real-mode setup objects with LCCC (`-ffunction-sections`), link with `lccc-ld --gc-sections`, preserve non-relocation boot payloads through a build-local `KEEP` script, enforce the authentic 32 KiB ASSERTs, and require flat-image byte identity with available BFD/LLD oracles. |
 | `realmode_corpus.sh` | Compare LCCC/GCC executable text per `arch/x86/boot` C file under the real `-m16 -Os` flags. |
@@ -19,12 +20,14 @@ Developer and research tooling. None of these are needed to build LCCC.
 | `godbolt.py` | Compiler Explorer client. Fetches GCC/Clang/ICC/ICX code generation so the Intel compilers can serve as reference oracles without a local Intel toolchain. |
 | `codegen_oracle.py` | Batch local/Compiler-Explorer comparison with deterministic artifacts and architecture-aware x86 or AArch64 instruction/load/store/stack-traffic statistics; AArch64 defaults to GCC 16.1, GCC trunk, and Clang 22.1. |
 | `check_codegen_refactor_identity.py` | Byte-for-byte assembly gate for pure codegen refactors. It compiles a corpus with before/after LCCC binaries under a scrubbed default `CCC_*`/`LCCC_*` environment and honours adjacent `.flags` files; the report separately canonicalizes only LCCC PGO-generation process-ID suffixes, which are intentionally nondeterministic. |
+| `reproduce_historical_peephole_utf8.py` | Extracts and executes the exact historical UTF-8-corrupting helper. It resolves the current Rust channel from `rust-toolchain.toml` even though the intentionally historical snippet is compiled with its original Rust-2021 semantics. |
 | `aarch64_execute_suite.py` | GCC `gcc.c-torture/execute` differential runner: LCCC assembly is validated by a mandatory GAS 2.47, linked for AArch64, and executed against GCC/optional Clang under QEMU. |
 | `x86_gcc_torture.py` | Full native x86-64 GCC `gcc.c-torture/execute` matrix. Splits compilation and linking so every PASS covers LCCC object generation **and standalone `lccc-ld`**, uses GCC only as eligibility/CRT oracle, understands unconditional `dg-options`, enforces timeouts, and writes deterministic JSON/failure logs. |
-| `lccc-snapshot.sh` | Harness-wipe-resistant autosave: commit, squashed `ms178-1.patch`, series, tarball, bundle, ledger. |
+| `lccc-snapshot.sh` | Harness-wipe-resistant autosave: commits then atomically publishes a verified squashed `ms178-1.patch`, series, tarball, bundle, and ledger with SHA-256 records. Set `LCCC_BASE_REF` when re-anchoring a new session after an upstream rebase. |
 | `bench_kernels.py` | Separate-TU kernel timing harness. Supports a CPU-pinned, AB/BA-balanced `lccc-alt` compiler arm via `--lccc-alt-env NAME=VALUE`, verifies checksums, and hashes only the timed function. |
 | `benchmark_fp_memfold_ab.py` | Builds the stencil5 scalar-FP memory-fold treatment/control and retains randomized CPU-pinned paired samples plus a bootstrap interval. Results are explicitly VM screening, not PMU evidence. |
 | `benchmark_reduction_vecreg_ab.py` | Builds register- and stack-accumulator variants of the F32 sum+dot workload and retains randomized CPU-pinned paired samples with a bootstrap interval. |
+| `symstr_migrate.py` | Span-driven `String` → `SymStr` migration helper. Its diagnostic build resolves the manifest-selected Rust channel, locates the persisted Cargo proxy, and denies warnings unless explicitly opted out. |
 | `gen_lcccsimd.py`, `strip_scalar_dups.py` | SIMD intrinsic header generation helpers. |
 
 ## Why more than one oracle

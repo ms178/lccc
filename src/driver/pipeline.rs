@@ -1445,7 +1445,7 @@ impl Driver {
 
         // Apply #pragma weak directives from the preprocessor.
         for (symbol, target) in &preprocessor.weak_pragmas {
-            if let Some(ref alias_target) = target {
+            if let Some(alias_target) = target {
                 // #pragma weak symbol = alias -> create weak alias
                 module
                     .aliases

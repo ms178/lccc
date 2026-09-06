@@ -124,11 +124,7 @@ fn sanitize(s: &str) -> String {
             }
         })
         .collect();
-    if x.is_empty() {
-        "unit".into()
-    } else {
-        x
-    }
+    if x.is_empty() { "unit".into() } else { x }
 }
 
 pub fn load_profile(path: &str) -> std::io::Result<ProfileData> {

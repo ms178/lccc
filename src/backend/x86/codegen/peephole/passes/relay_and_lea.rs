@@ -286,7 +286,7 @@ pub(super) fn family_private_to(
                         .trim()
                         .starts_with('.') =>
             {
-                return false
+                return false;
             }
             LineKind::Ret if implicit_at_return(fam) => return false,
             _ => {}

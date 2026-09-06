@@ -44,15 +44,15 @@ pub use io::*;
 // archive
 #[allow(unused_imports)]
 pub use archive::{
-    is_thin_archive, parse_archive_members, parse_linker_script, parse_linker_script_entries,
-    parse_thin_archive_members, LinkerScriptEntry,
+    LinkerScriptEntry, is_thin_archive, parse_archive_members, parse_linker_script,
+    parse_linker_script_entries, parse_thin_archive_members,
 };
 
 // linker_symbols
 #[allow(unused_imports)]
 pub use linker_symbols::{
-    default_section_flags, get_standard_linker_symbols, section_index, LinkerDefinedSym,
-    LinkerSymbolAddresses,
+    LinkerDefinedSym, LinkerSymbolAddresses, default_section_flags, get_standard_linker_symbols,
+    section_index,
 };
 
 // section_flags
@@ -62,7 +62,7 @@ pub use section_flags::{parse_section_flags, well_known_section_type};
 pub use parse_string::parse_string_literal;
 
 // object_writer
-pub use object_writer::{write_relocatable_object, ElfConfig, ObjReloc, ObjSection};
+pub use object_writer::{ElfConfig, ObjReloc, ObjSection, write_relocatable_object};
 
 // numeric_labels
 #[allow(unused_imports)]
@@ -72,7 +72,7 @@ pub use numeric_labels::{
 };
 
 // symbol_table
-pub use symbol_table::{build_elf_symbol_table, ObjSymbol, SymbolTableInput};
+pub use symbol_table::{ObjSymbol, SymbolTableInput, build_elf_symbol_table};
 
 // writer_base
 pub use writer_base::ElfWriterBase;

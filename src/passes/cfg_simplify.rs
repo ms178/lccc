@@ -424,7 +424,7 @@ fn fold_constant_switches(
     let count = folds.len();
 
     // Apply folds and clean up phi nodes.
-    for (idx, taken, ref not_taken, block_label) in &folds {
+    for (idx, taken, not_taken, block_label) in &folds {
         func.blocks[*idx].terminator = Terminator::Branch(*taken);
         for nt_target in not_taken {
             if let Some(&block_idx) = label_to_idx.get(nt_target) {

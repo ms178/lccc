@@ -1011,7 +1011,7 @@ fn parse_output_section(lx: &mut Lexer) -> Result<OutputSecDef, String> {
                 return Err(format!(
                     "unexpected token before section body: {:?} (pos {})",
                     t, save
-                ))
+                ));
             }
         }
     }
@@ -1281,7 +1281,7 @@ fn parse_primary(lx: &mut Lexer) -> Result<Expr, String> {
                         return Err(format!(
                             "SEGMENT_START expects a segment name string, got {:?}",
                             t
-                        ))
+                        ));
                     }
                 };
                 expect(lx, ",")?;

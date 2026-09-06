@@ -16,18 +16,55 @@ Usage:  scripts/symstr_migrate.py [--apply] [--max-rounds N]
         (default is a dry run that just classifies the errors)
 """
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import Counter
+from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
 CARGO = ["cargo", "build", "--profile", "fastbuild", "--locked", "-j2",
          "--message-format=json-diagnostic-rendered-ansi"]
 
 
+def manifest_toolchain(repo: Path) -> str:
+    """Return the repository channel without repeating a Rust version here."""
+    manifest = repo / "rust-toolchain.toml"
+    if manifest.is_file():
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "channel":
+                channel = value.strip().strip('"').strip("'")
+                if channel:
+                    return channel
+    return "stable"
+
+
+def cargo_executable(env: dict[str, str]) -> str:
+    """Locate the persisted rustup proxy when a restore omitted it from PATH."""
+    discovered = shutil.which("cargo")
+    if discovered:
+        return discovered
+    cargo_home = Path(env.get("CARGO_HOME", Path.home() / ".cargo"))
+    persisted = cargo_home / "bin" / "cargo"
+    if persisted.is_file() and os.access(persisted, os.X_OK):
+        env["PATH"] = f"{persisted.parent}:{env.get('PATH', '')}"
+        return str(persisted)
+    return "cargo"
+
+
 def diagnostics():
     """Yield (file, byte_start, byte_end, code, message, expected, found)."""
-    p = subprocess.run(CARGO, capture_output=True, text=True)
+    env = dict(os.environ)
+    # Cargo is sometimes launched by an editor outside the repository root;
+    # make the same manifest-selected channel choice as the build scripts.
+    env.setdefault("RUSTUP_TOOLCHAIN", manifest_toolchain(ROOT))
+    if env.get("LCCC_ALLOW_WARNINGS") != "1":
+        env["RUSTFLAGS"] = f"{env.get('RUSTFLAGS', '').strip()} -D warnings".strip()
+    command = [cargo_executable(env), *CARGO[1:]]
+    p = subprocess.run(command, capture_output=True, text=True, cwd=ROOT, env=env)
     out = []
     for line in p.stdout.splitlines():
         try:
@@ -118,6 +155,9 @@ def classify(d, src):
 
 
 def main():
+    # Rust diagnostics use repository-relative paths and the edit phase opens
+    # those paths directly, so make invocation location irrelevant.
+    os.chdir(ROOT)
     apply = "--apply" in sys.argv
     max_rounds = 60
     if "--max-rounds" in sys.argv:

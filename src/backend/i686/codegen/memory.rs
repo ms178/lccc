@@ -1,6 +1,6 @@
 //! I686Codegen: memory operations (load, store, memcpy, GEP, stack).
 
-use super::emit::{phys_reg_name, I686Codegen};
+use super::emit::{I686Codegen, phys_reg_name};
 use crate::backend::generation::is_i128_type;
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{SlotAddr, StackSlot};

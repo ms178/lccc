@@ -11,7 +11,7 @@
 //! - Frame/return address intrinsics
 //! - SSE scalar float math (sqrt, fabs) for F32/F64
 
-use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_256, X86Codegen};
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_256};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::StackSlot;
 use crate::common::types::IrType;
@@ -4493,8 +4493,7 @@ impl X86Codegen {
                         name, name, scratch
                     )); // lanes {2,2,2,2}
                     self.state
-                        .emit_fmt(format_args!("    vaddss {}, %{}, %{}", scratch, name, name));
-                // (s0+s1)+(s2+s3)
+                        .emit_fmt(format_args!("    vaddss {}, %{}, %{}", scratch, name, name)); // (s0+s1)+(s2+s3)
                 } else {
                     self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
                     self.state.emit("    vaddps %xmm1, %xmm0, %xmm0"); // [s0 s1 s2 s3]

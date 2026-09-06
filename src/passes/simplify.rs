@@ -2879,6 +2879,33 @@ fn simplify_math_call(
     None
 }
 
+/// Fold calls to math functions that map to inline intrinsics (sqrt, fabs,
+/// `__fabstf2`, `__copysigntf3`, `copysignl`, ...) into `Instruction::Intrinsic`.
+///
+/// The full -O2/-O3 pipeline does this inside `try_simplify`; the cheap -O0/-O1
+/// tiers skip `simplify` entirely, so a call to `__copysigntf3` (the lowering
+/// of `__builtin_copysignf128`) would otherwise survive to the backend as an
+/// external reference and fail to link (LCCC links no libgcc). Running the
+/// same folding here makes `_Float128` math builtins work at every opt level.
+/// Semantics-preserving: the fold is a rename to the backend's own intrinsic.
+pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
+    for func in &mut module.functions {
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                if let Instruction::Call { func: callee, info } = inst {
+                    if let Some(d) = info.dest {
+                        if let Some(new_inst) =
+                            simplify_math_call(d, callee, &info.args, info.return_type)
+                        {
+                            *inst = new_inst;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5031,32 +5058,5 @@ mod tests {
             ty: IrType::I32,
         };
         assert!(simplify_default(&inst).is_none());
-    }
-}
-
-/// Fold calls to math functions that map to inline intrinsics (sqrt, fabs,
-/// `__fabstf2`, `__copysigntf3`, `copysignl`, ...) into `Instruction::Intrinsic`.
-///
-/// The full -O2/-O3 pipeline does this inside `try_simplify`; the cheap -O0/-O1
-/// tiers skip `simplify` entirely, so a call to `__copysigntf3` (the lowering
-/// of `__builtin_copysignf128`) would otherwise survive to the backend as an
-/// external reference and fail to link (LCCC links no libgcc). Running the
-/// same folding here makes `_Float128` math builtins work at every opt level.
-/// Semantics-preserving: the fold is a rename to the backend's own intrinsic.
-pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
-    for func in &mut module.functions {
-        for block in &mut func.blocks {
-            for inst in &mut block.instructions {
-                if let Instruction::Call { func: callee, info } = inst {
-                    if let Some(d) = info.dest {
-                        if let Some(new_inst) =
-                            simplify_math_call(d, callee, &info.args, info.return_type)
-                        {
-                            *inst = new_inst;
-                        }
-                    }
-                }
-            }
-        }
     }
 }

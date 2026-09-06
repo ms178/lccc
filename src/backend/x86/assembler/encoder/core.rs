@@ -213,7 +213,9 @@ impl super::InstructionEncoder {
                     }
                     Displacement::SymbolDiff(a, b) | Displacement::SymbolDiffAddend(a, b, _) => {
                         return Err(format!(
-                            "symbol-difference displacement `{} - {}` is not valid with RIP-relative addressing", a, b));
+                            "symbol-difference displacement `{} - {}` is not valid with RIP-relative addressing",
+                            a, b
+                        ));
                     }
                     Displacement::None => {
                         self.bytes.extend_from_slice(&[0, 0, 0, 0]);

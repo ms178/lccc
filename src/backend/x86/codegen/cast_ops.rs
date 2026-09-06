@@ -339,7 +339,7 @@ impl X86Codegen {
         from_ty: IrType,
         to_ty: IrType,
     ) -> bool {
-        use crate::backend::cast::{classify_cast, CastKind};
+        use crate::backend::cast::{CastKind, classify_cast};
         match classify_cast(from_ty, to_ty) {
             CastKind::Noop if from_ty.is_float() && to_ty.is_float() => {
                 // Float-to-float copy (e.g. LongDouble-as-F64): just move it.
@@ -606,7 +606,7 @@ impl X86Codegen {
         to_ty: IrType,
     ) -> bool {
         macro_rules! refuse {
-            ($why:expr) => {{
+            ($why:expr_2021) => {{
                 self.pf15_trace(concat!("refuse: ", $why));
                 self.flush_pending_widen_impl();
                 return false;
@@ -955,7 +955,7 @@ impl X86Codegen {
         dest_phys: crate::backend::regalloc::PhysReg,
     ) -> bool {
         use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
-        use crate::backend::cast::{classify_cast, CastKind};
+        use crate::backend::cast::{CastKind, classify_cast};
 
         let dest_64 = phys_reg_name(dest_phys);
         let dest_32 = phys_reg_name_32(dest_phys);

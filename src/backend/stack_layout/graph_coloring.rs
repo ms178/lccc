@@ -47,11 +47,7 @@ fn hull(a: &[(u32, u32)]) -> (u32, u32) {
         s = s.min(x);
         e = e.max(y);
     }
-    if s == u32::MAX {
-        (0, 0)
-    } else {
-        (s, e)
-    }
+    if s == u32::MAX { (0, 0) } else { (s, e) }
 }
 
 /// Closed-boundary interference over two CONVEX HULLS.

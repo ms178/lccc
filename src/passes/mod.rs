@@ -669,7 +669,7 @@ fn run_inline_phase(
     let dump_pre =
         std::env::var("CCC_DUMP_EACH_PASS").is_ok() || std::env::var("CCC_VALIDATE_SSA").is_ok();
     macro_rules! iphase_dump {
-        ($name:expr) => {
+        ($name:expr_2021) => {
             if dump_pre {
                 dump_ir_filtered(module, &format!("pre-loop {}", $name));
             }
@@ -719,7 +719,8 @@ fn run_inline_phase(
             inline::run(module);
         }
     }
-    if ra_config.dump_ir || std::env::var("CCC_DUMP_EACH_PASS").is_ok()
+    if ra_config.dump_ir
+        || std::env::var("CCC_DUMP_EACH_PASS").is_ok()
         || std::env::var("CCC_VALIDATE_SSA").is_ok()
     {
         dump_ir_filtered(module, "pre-loop after inliner");
@@ -1064,7 +1065,7 @@ pub(crate) fn run_passes(
     // inlining.
 
     macro_rules! preloop_dump {
-        ($name:expr) => {
+        ($name:expr_2021) => {
             if dump_each_pass {
                 dump_ir_filtered(module, &format!("pre-loop {}", $name));
             }
@@ -1216,7 +1217,7 @@ pub(crate) fn run_passes(
         changed.iter_mut().for_each(|c| *c = false);
 
         macro_rules! timed_pass {
-            ($name:expr, $body:expr) => {{
+            ($name:expr_2021, $body:expr_2021) => {{
                 if time_passes {
                     let t0 = std::time::Instant::now();
                     let n = $body;
@@ -1256,7 +1257,7 @@ pub(crate) fn run_passes(
         //   if_convert → copy_prop, dce (eliminated branches)
         //   dce → cfg_simplify (empty blocks)
         macro_rules! should_run {
-            ($self_idx:expr, $($upstream:expr),*) => {{
+            ($self_idx:expr_2021, $($upstream:expr_2021),*) => {{
                 prev_pass_changes[$self_idx] > 0 $(|| prev_pass_changes[$upstream] > 0)*
             }};
         }

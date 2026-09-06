@@ -551,7 +551,7 @@ impl Lowerer {
         if is_array && base_ty == IrType::Ptr && !is_pointer {
             let mut resolved = self.resolve_type_spec(type_spec);
             let mut found = false;
-            while let TypeSpecifier::Array(ref inner, _) = resolved {
+            while let TypeSpecifier::Array(inner, _) = resolved {
                 let inner_resolved = self.resolve_type_spec(inner);
                 if matches!(inner_resolved, TypeSpecifier::Array(_, _)) {
                     resolved = inner_resolved;
@@ -743,7 +743,7 @@ impl Lowerer {
         if !is_unsized {
             return;
         }
-        if let Some(ref initializer) = init {
+        if let Some(initializer) = init {
             match initializer {
                 Initializer::Expr(expr) => {
                     if da.base_ty == IrType::I8 || da.base_ty == IrType::U8 {

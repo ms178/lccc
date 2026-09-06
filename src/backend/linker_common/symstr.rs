@@ -492,7 +492,10 @@ mod tests {
         let a = SymStr::new("main");
         assert!(a == *"main");
         assert!(a == "main");
-        assert!(a == String::from("main"));
+        // Retain the owned-string comparison coverage without allocating a
+        // throwaway value solely for the assertion.
+        let owned = String::from("main");
+        assert!(a == owned);
         assert!(*"main" == a);
         assert_eq!(a.as_bytes(), b"main");
         assert_eq!(format!("{a}"), "main");

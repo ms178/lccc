@@ -565,7 +565,7 @@ impl Lowerer {
         let ptr_ranges = deduped;
         let mut elements: Vec<GlobalInit> = Vec::new();
         let mut pos = 0;
-        for (ptr_off, ref addr_init) in &ptr_ranges {
+        for (ptr_off, addr_init) in &ptr_ranges {
             push_bytes_as_elements(&mut elements, &bytes[pos..*ptr_off]);
             elements.push(addr_init.clone());
             pos = ptr_off + ptr_sz;
@@ -604,8 +604,7 @@ impl Lowerer {
                         push_string_as_elements(elements, s, field_size);
                     }
                 } else if let Expr::AddressOf(inner, _) = expr {
-                    if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref()
-                    {
+                    if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
                         // &(compound_literal) at file scope: create anonymous global
                         let addr_init = self.create_compound_literal_global(cl_type_spec, cl_init);
                         elements.push(addr_init);
@@ -616,7 +615,7 @@ impl Lowerer {
                     } else {
                         push_zero_bytes(elements, field_size);
                     }
-                } else if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = expr {
+                } else if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = expr {
                     if field_is_pointer {
                         // Compound literal initializing a pointer field (array-to-pointer decay):
                         // create anonymous global storage and emit its address
@@ -722,8 +721,7 @@ impl Lowerer {
                             &mut bytes,
                             0,
                         );
-                    } else if let CType::Array(ref inner_elem, Some(inner_size)) = inner_ty.as_ref()
-                    {
+                    } else if let CType::Array(inner_elem, Some(inner_size)) = inner_ty.as_ref() {
                         // Multi-dimensional array (e.g., unsigned char hash[2][24]):
                         // each sub-item is a braced list for one element of the outer dimension.
                         let elem_size = self.resolve_ctype_size(inner_ty);
@@ -773,7 +771,7 @@ impl Lowerer {
         let mut ai = 0usize;
         for item in items {
             // Handle index designator: [idx] = val
-            if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
                 if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
                     ai = idx;
                 }

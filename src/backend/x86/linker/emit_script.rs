@@ -17,8 +17,8 @@ use super::elf::*;
 use crate::backend::linker_common::{
     self,
     linker_script::{
-        self, eval_expr, glob_match, AssignOp, Assignment, EvalCtx, EvalError, LinkerScript,
-        OutputSecDef, SecItem, SectionsItem, SortKind,
+        self, AssignOp, Assignment, EvalCtx, EvalError, LinkerScript, OutputSecDef, SecItem,
+        SectionsItem, SortKind, eval_expr, glob_match,
     },
 };
 
@@ -1207,10 +1207,10 @@ fn link_with_script_machine(
                                 }
                             }
                             Err(EvalError::UnknownSection(s)) => {
-                                return Err(format!("section {}", s))
+                                return Err(format!("section {}", s));
                             }
                             Err(EvalError::AssertFailed(m)) => {
-                                return Err(format!("ASSERT failed: {}", m))
+                                return Err(format!("ASSERT failed: {}", m));
                             }
                         }
                     }

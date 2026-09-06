@@ -6,7 +6,7 @@
 
 use super::lower::Lowerer;
 use crate::common::fx_hash::FxHashMap;
-use crate::common::types::{target_int_ir_type, widened_op_type, AddressSpace, CType, IrType};
+use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type, widened_op_type};
 use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Expr, GenericAssociation, Initializer, Stmt, TypeSpecifier,
     UnaryOp,
@@ -159,7 +159,7 @@ impl Lowerer {
                     | "__builtin_ia32_vextractf128_ps256"
                         if self.target == crate::backend::Target::I686 =>
                     {
-                        return Some(16)
+                        return Some(16);
                     }
                     "__builtin_ia32_maxps"
                     | "__builtin_ia32_minps"
@@ -1045,11 +1045,7 @@ impl Lowerer {
             Some(IrConst::I32(v)) => v != 0,
             _ => true,
         };
-        if is_nonzero {
-            &args[1]
-        } else {
-            &args[2]
-        }
+        if is_nonzero { &args[1] } else { &args[2] }
     }
 
     // expr_is_const_qualified is defined in expr.rs as pub(super)
@@ -1131,7 +1127,7 @@ impl Lowerer {
             Expr::StringLiteral(_, _)
             | Expr::WideStringLiteral(_, _)
             | Expr::Char16StringLiteral(_, _) => IrType::Ptr,
-            Expr::Cast(ref target_type, _, _) => self.type_spec_to_ir(target_type),
+            Expr::Cast(target_type, _, _) => self.type_spec_to_ir(target_type),
             Expr::UnaryOp(UnaryOp::RealPart, inner, _)
             | Expr::UnaryOp(UnaryOp::ImagPart, inner, _) => {
                 let inner_ct = self.expr_ctype(inner);
@@ -1337,7 +1333,7 @@ impl Lowerer {
                     match rct {
                         CType::Pointer(_, _) => return Some(rct),
                         CType::Array(elem, _) => {
-                            return Some(CType::Pointer(elem, AddressSpace::Default))
+                            return Some(CType::Pointer(elem, AddressSpace::Default));
                         }
                         _ => {}
                     }
@@ -1616,7 +1612,7 @@ impl Lowerer {
                 }
                 None
             }
-            Expr::Cast(ref type_spec, _, _) => Some(self.type_spec_to_ctype(type_spec)),
+            Expr::Cast(type_spec, _, _) => Some(self.type_spec_to_ctype(type_spec)),
             Expr::MemberAccess(base_expr, field_name, _) => {
                 self.get_field_ctype(base_expr, field_name, false)
             }
@@ -1747,7 +1743,7 @@ impl Lowerer {
                         | "__builtin_ia32_minps256"
                         | "__builtin_ia32_andps256"
                         | "__builtin_ia32_cmpps256" => {
-                            return Some(CType::Vector(Box::new(CType::Float), 32))
+                            return Some(CType::Vector(Box::new(CType::Float), 32));
                         }
                         _ => {}
                     }

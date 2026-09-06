@@ -638,19 +638,24 @@ anyway (the bullet carries the *why*).
 
 ## Process & environment
 
-- **[history/session18/24/64/84]** Environment protocol (harness wipes
+- **[current, Rust-2024 migration]** Environment protocol (harness wipes
   everything between sessions): swap first (`ensure_swap.sh`; some
-  sandboxes cannot swapon — no `CAP_SYS_ADMIN`); Rust toolchain policy
-  (2026-09-06): track the LATEST STABLE channel — `rust-toolchain.toml`
-  pins the channel `stable`, never a version, and every build/restore
-  script installs `stable` under a persisted path; stable-only regressions
-  are fixed at the source instead of freezing the toolchain; apt
-  `gcc-multilib libc6-dev-i386` (m32 tests "cannot execute" ENOENT if
-  absent — environment, not code), bison/flex/bc/cpio/libelf-dev/kmod;
-  the kernel tree + 26 CachyMod patches is NOT persisted (re-extract each
-  session); `/tmp` is wiped without warning (the LK-26 reproducers
-  `/tmp/tlsinit.i` + `/tmp/offprobe.c` are gone — regen via the recorded
-  `/tmp/tlspp.sh` recipe or reconstruct from `git show afa22485`).
+  sandboxes cannot swapon — no `CAP_SYS_ADMIN`); `rust-toolchain.toml`
+  follows the current `stable` channel — never pinning a specific version —
+  while `Cargo.toml` records the tested compatibility floor
+  (`rust-version = 1.98.1`); stable-only regressions are fixed at the source
+  instead of freezing the toolchain.  Maintenance/build scripts source
+  `scripts/rust_toolchain.sh`, so the manifest is the sole channel selector;
+  explicit `LCCC_RUST_TOOLCHAIN`/`RUSTUP_TOOLCHAIN` overrides remain
+  available for a deliberate bisection or historical reproduction.  Restore
+  scripts must install the `rustfmt` and `clippy` components too. Install Rust
+  under a persisted path; apt `gcc-multilib libc6-dev-i386` (m32 tests
+  "cannot execute" ENOENT if absent — environment, not code),
+  bison/flex/bc/cpio/libelf-dev/kmod; the kernel tree + 26 CachyMod patches is
+  NOT persisted (re-extract each session); `/tmp` is wiped without warning
+  (the LK-26 reproducers `/tmp/tlsinit.i` + `/tmp/offprobe.c` are gone — regen
+  via the recorded `/tmp/tlspp.sh` recipe or reconstruct from `git show
+  afa22485`).
 - **[history/session84 / agent/SESSION_FOLLOWUP_KERNEL_BOOT]** Build recipe
   for mold-less sandboxes: `.cargo/config.toml` pins
   `clang -fuse-ld=mold`; when absent pass
@@ -665,7 +670,7 @@ anyway (the bullet carries the *why*).
   clang nor mold is installed on the current research VM, so the old pin
   forced every build either to fail or to rely on per-invocation
   environment overrides — a standing footgun. The reference recipe is now
-  simply `scripts/build_lccc_o1_j2.sh` (fastbuild, `-O1`, `-j 2`,
+  simply `scripts/build_lccc_o1_j2.sh` (release profile, Rust `-O1`, `-j 2`,
   foreground, gcc/bfd) with no environment overrides needed. mold/wild
   remain available as **differential test oracles only**
   (`tests/linker/setup_oracles.sh`, git-HEAD builds) — they are build

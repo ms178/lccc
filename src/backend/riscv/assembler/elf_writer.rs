@@ -12,12 +12,12 @@
 #![allow(dead_code)]
 
 use super::compress;
-use super::encoder::{encode_insn_directive, encode_instruction, EncodeResult, RelocType};
+use super::encoder::{EncodeResult, RelocType, encode_insn_directive, encode_instruction};
 use super::parser::{
     AsmStatement, DataValue, Directive, Operand, SizeExpr, SymbolType, Visibility,
 };
 use crate::backend::elf::{
-    self, ElfWriterBase, ObjReloc, ELFCLASS64, EM_RISCV, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
+    self, ELFCLASS64, EM_RISCV, ElfWriterBase, ObjReloc, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
     SHT_NOBITS, SHT_PROGBITS, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_HIDDEN, STV_INTERNAL,
     STV_PROTECTED,
 };
@@ -948,11 +948,7 @@ impl ElfWriter {
                 let data = match count {
                     Some(c) => {
                         let c = *c as usize;
-                        if c < data.len() {
-                            &data[..c]
-                        } else {
-                            data
-                        }
+                        if c < data.len() { &data[..c] } else { data }
                     }
                     None => data,
                 };
