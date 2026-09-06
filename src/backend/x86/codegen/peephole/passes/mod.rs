@@ -19,6 +19,7 @@
 //! - [`helpers`]: shared utilities (register rewriting, label parsing, etc.)
 
 use super::types::*;
+use crate::backend::regalloc::RaConfig;
 
 // Submodule pass implementations
 mod callee_saves;
@@ -312,15 +313,22 @@ fn line_count_estimate(asm: &str) -> usize {
 /// promotion runs on whatever text the pipeline returns — including the
 /// early-return paths (huge inputs, `-O0`) — because the AVX/SSE transition
 /// penalty it removes is independent of the optimisation level.
+/// Compatibility entry point for isolated peephole tests. Production code
+/// passes the driver-owned policy through [`peephole_optimize_with_config`].
 pub fn peephole_optimize(asm: String) -> String {
-    let mut out = peephole_optimize_inner(asm);
+    peephole_optimize_with_config(asm, &RaConfig::default())
+}
+
+/// Full peephole pipeline using the RA/codegen policy captured by the driver.
+pub(crate) fn peephole_optimize_with_config(asm: String, ra_config: &RaConfig) -> String {
+    let mut out = peephole_optimize_inner(asm, ra_config);
     if std::env::var("CCC_NO_VEX_PROMOTE").is_err() {
         let _ = vex_promote::promote_legacy_sse_to_vex(&mut out);
     }
     out
 }
 
-fn peephole_optimize_inner(mut asm: String) -> String {
+fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
     // ms178 debug: dump pre-peephole asm
     if let Ok(path) = std::env::var("CCC_DUMP_ASM") {
         let _ = std::fs::write(path, &asm);
@@ -369,7 +377,7 @@ fn peephole_optimize_inner(mut asm: String) -> String {
     // unaffected but other code with certain loop shapes was). It also does not
     // help gzip (measured slower/larger). Opt in with CCC_PEEPHOLE_PHASE4=1.
     let skip_phase4 =
-        !std::env::var("CCC_PEEPHOLE_PHASE4").is_ok() || std::env::var("CCC_NO_MACHINST").is_err(); // Phase 4 renaming is not MachInst-safe
+        std::env::var("CCC_PEEPHOLE_PHASE4").is_err() || !ra_config.no_machinst; // Phase 4 renaming is not MachInst-safe
     let skip_phase5 = std::env::var("CCC_NO_PEEPHOLE_PHASE5").is_ok();
     let skip_phase6 = std::env::var("CCC_NO_PEEPHOLE_PHASE6").is_ok();
     let skip_phase7 = std::env::var("CCC_NO_PEEPHOLE_PHASE7").is_ok();

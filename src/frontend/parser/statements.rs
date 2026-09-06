@@ -6,6 +6,7 @@
 
 use super::ast::*;
 use super::parse::Parser;
+use crate::common::encoding::narrow_string_byte_carrier_to_utf8;
 use crate::frontend::lexer::token::TokenKind;
 
 impl Parser {
@@ -402,12 +403,17 @@ impl Parser {
     }
 
     fn parse_asm_string(&mut self) -> String {
-        let mut result = String::with_capacity(64);
+        // Narrow string tokens deliberately carry one Rust char per C source
+        // byte so ordinary `char[]` initializers preserve `\\xNN` exactly.
+        // An asm template is textual output instead: decode a valid UTF-8
+        // carrier only *after* concatenating adjacent literals, because a
+        // multibyte character may straddle two C string-literal fragments.
+        let mut byte_carrier = String::with_capacity(64);
         while let TokenKind::StringLiteral(ref s) = self.peek() {
-            result.push_str(s);
+            byte_carrier.push_str(s);
             self.advance();
         }
-        result
+        narrow_string_byte_carrier_to_utf8(&byte_carrier).unwrap_or(byte_carrier)
     }
 
     fn parse_asm_operands(&mut self) -> Vec<AsmOperand> {

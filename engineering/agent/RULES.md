@@ -79,7 +79,8 @@ the evidence. Re-oracle and check gzip `longest_match` stack-mem after
     bits killed zlib-ng); scalar FP staging never uses `movaps`; mixed
     legacy-SSE/VEX inside YMM loops re-triggers the 9× AVX-SSE transition
     penalty.
-23. Do not re-enable `bytes[i] as char` in `peephole_common.rs` — it
+23. Do not re-enable raw `bytes[i] as char` reconstruction in
+    `peephole_common.rs` **or any peephole text-rewrite helper** — it
     corrupts UTF-8. Do not re-introduce `MAX_ITERATIONS` in liveness (the
     worklist dataflow is provably terminating; a cap is a silent
     miscompile). Text-peephole operands split at the **last** comma

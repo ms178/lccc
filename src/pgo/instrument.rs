@@ -1004,9 +1004,19 @@ fn dump_helper(
         src: Operand::Value(e2),
     });
     let mut b4: Vec<Instruction> = Vec::new();
+    // `pathv` is the conventional-SSA join value for the three mutually
+    // exclusive pathname sources. Keep all of its definitions as Copies;
+    // the post-phi backend accepts that established representation, whereas
+    // mixing a GlobalAddr definition with the two copies is malformed SSA.
+    let tag_path = Value(next);
+    next += 1;
     b4.push(Instruction::GlobalAddr {
-        dest: pathv,
+        dest: tag_path,
         name: tag,
+    });
+    b4.push(Instruction::Copy {
+        dest: pathv,
+        src: Operand::Value(tag_path),
     });
     let mut b5: Vec<Instruction> = Vec::new();
     b5.push(Instruction::GlobalAddr {
@@ -1282,6 +1292,8 @@ fn dump_helper(
                     next += 1;
                     let nm = Value(next);
                     next += 1;
+                    let name_ptr = Value(next);
+                    next += 1;
                     let nm2 = Value(next);
                     next += 1;
                     let fl = Value(next);
@@ -1329,7 +1341,7 @@ fn dump_helper(
                     // name = ep + 8, flags = ep + 16 (ep is the lookup result)
                     let ep2 = nm;
                     is.push(Instruction::GetElementPtr {
-                        dest: nm2,
+                        dest: name_ptr,
                         base: ep2,
                         offset: Operand::Const(IrConst::I64(8)),
                         ty: IrType::I64,
@@ -1337,7 +1349,7 @@ fn dump_helper(
                     is.push(Instruction::Load {
                         volatile: false,
                         dest: nm2,
-                        ptr: nm2,
+                        ptr: name_ptr,
                         ty: IrType::I64,
                         seg_override: crate::common::types::AddressSpace::Default,
                     });
@@ -1786,7 +1798,11 @@ fn push_helper_fn(
         is_inline: false,
         is_always_inline: false,
         is_noinline: true,
-        next_value_id,
+        // `push_helper_fn` appends alloca/load parameter plumbing after the
+        // caller-built body.  Those ids are real definitions too; publishing
+        // the pre-plumbing cursor as the cache lets a later allocator collide
+        // with them.  `next` is the first unused id after both pieces.
+        next_value_id: next,
         fp_expr_tags: Default::default(),
         next_label,
         section: None,
@@ -2039,16 +2055,6 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
     // reg_add(table, count): append {table,count} node to the registry.
     {
         let mut b = VpBuilder::new(2);
-        b.push(Instruction::ParamRef {
-            dest: Value(0),
-            param_idx: 0,
-            ty: IrType::Ptr,
-        });
-        b.push(Instruction::ParamRef {
-            dest: Value(1),
-            param_idx: 1,
-            ty: IrType::I64,
-        });
         let headp = b.v();
         b.push(Instruction::GlobalAddr {
             dest: headp,
@@ -2140,16 +2146,6 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
 
         // entry: t0..t3 loads + match compares; terminator branches to l1..l4
         let mut e = VpBuilder::new(2);
-        e.push(Instruction::ParamRef {
-            dest: Value(0),
-            param_idx: 0,
-            ty: IrType::Ptr,
-        });
-        e.push(Instruction::ParamRef {
-            dest: Value(1),
-            param_idx: 1,
-            ty: IrType::I64,
-        });
         let site = Value(0);
         let fp = Value(1);
         let mut t: Vec<Value> = Vec::new();
@@ -2402,11 +2398,6 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         );
         // Shared loop-carried value ids (allocated once, redefined by copies).
         let mut e = VpBuilder::new(1);
-        e.push(Instruction::ParamRef {
-            dest: Value(0),
-            param_idx: 0,
-            ty: IrType::I64,
-        });
         let addr = Value(0);
         let headp = e.v();
         e.push(Instruction::GlobalAddr {
@@ -2501,12 +2492,20 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         };
         // ldone: retv = &dummy (an empty slot must still yield a valid entry
         // pointer — the dump GEPs +8/+16 off the result; NULL would crash).
+        //
+        // `retv` is the conventional-SSA join value also assigned on lfound.
+        // Keep every definition of that join a Copy: the backend deliberately
+        // permits parallel-copy multi-defs after phi elimination, but a
+        // GlobalAddr + Copy sharing an id is neither canonical SSA nor a
+        // safe shape for generic SSA consumers.
         let mut u = VpBuilder::new(s.next);
         let retv = u.v();
+        let none_addr = u.v();
         u.push(Instruction::GlobalAddr {
-            dest: retv,
+            dest: none_addr,
             name: none.clone(),
         });
+        u.copy(retv, Operand::Value(none_addr));
         let blk_done = BasicBlock {
             label: ldone,
             instructions: u.is,
@@ -2549,6 +2548,82 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_profile_helpers_have_one_paramref_per_parameter_and_sound_ids() {
+        // `push_helper_fn` owns the normal alloca/ParamRef/load parameter
+        // setup.  The value-profile bodies use raw v0..vN only as placeholders
+        // that it rewrites to those loads; emitting a second ParamRef in the
+        // body creates duplicate SSA defs and used to publish a stale watermark.
+        let mut module = IrModule::new();
+        emit_value_prof_helpers(&mut module, 0x5a5a, "__unit_vp");
+        crate::passes::validate_unique_defs(&module, "backend:pre-codegen");
+
+        for func in module.functions.iter().filter(|f| !f.params.is_empty()) {
+            let mut seen = vec![0usize; func.params.len()];
+            let mut max_dest = 0u32;
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Some(dest) = inst.dest() {
+                        max_dest = max_dest.max(dest.0);
+                    }
+                    if let Instruction::ParamRef { param_idx, .. } = inst {
+                        seen[*param_idx] += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                seen,
+                vec![1; func.params.len()],
+                "{} must have exactly one canonical ParamRef per parameter",
+                func.name
+            );
+            assert!(
+                func.next_value_id > max_dest,
+                "{} published stale next_value_id {} below v{}",
+                func.name,
+                func.next_value_id,
+                max_dest
+            );
+        }
+    }
+
+    #[test]
+    fn dump_helper_uses_copy_only_join_definitions() {
+        // The runtime pathname chooses LCCC_PROFILE_FILE, LLVM_PROFILE_FILE,
+        // or the compile-time default.  It is emitted after phi elimination,
+        // so its join must be represented by the backend's copy-only
+        // conventional-SSA form rather than a mixed Copy/GlobalAddr value.
+        let mut module = IrModule::new();
+        let rec: Vec<Rec> = vec![(
+            "unit-f".to_string(),
+            "__unit_counter".to_string(),
+            vec![(1, 2, 0)],
+            0,
+            1,
+            2,
+            0,
+            3,
+        )];
+        let mut sites: FxHashMap<String, Vec<SiteRec>> = FxHashMap::default();
+        sites.insert(
+            "unit-f".to_string(),
+            vec![SiteRec {
+                ordinal: 0,
+                site: "__unit_site".to_string(),
+                sig: "I32:0".to_string(),
+            }],
+        );
+        dump_helper(
+            &mut module,
+            std::path::Path::new("unit.profraw"),
+            &rec,
+            "__unit_pgo_dump",
+            &sites,
+            "__unit_pgo_lookup",
+        );
+        crate::passes::validate_unique_defs(&module, "backend:pre-codegen");
+    }
 
     #[test]
     fn loop_backedge_is_instrumented_not_forward_edge() {

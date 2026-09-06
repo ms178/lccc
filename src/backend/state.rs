@@ -13,6 +13,7 @@ use super::common::AsmOutput;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, IrCmpOp, Operand};
+use std::sync::Arc;
 
 /// Stack slot location for a value. Interpretation varies by arch:
 /// - x86: negative offset from %rbp
@@ -124,6 +125,9 @@ pub struct CodegenState {
     pub out: AsmOutput,
     /// Set from CodegenOptions for -O0 non-SSA correctness.
     pub disable_regalloc: bool,
+    /// Immutable RA/codegen policy captured once before this invocation enters
+    /// per-function code generation.
+    pub ra_config: Arc<crate::backend::regalloc::RaConfig>,
     pub stack_offset: i64,
     pub value_locations: FxHashMap<u32, StackSlot>,
     /// Emergency spill slot offset, allocated downward from the bottom of the frame.
@@ -477,10 +481,22 @@ pub struct CodegenState {
 }
 
 impl CodegenState {
+    /// Convenience constructor for direct backend/unit-test users. The normal
+    /// driver path calls [`Self::new_with_ra_config`] with its one captured
+    /// configuration object instead.
     pub fn new() -> Self {
+        Self::new_with_ra_config(Arc::new(
+            crate::backend::regalloc::RaConfig::from_process_env(),
+        ))
+    }
+
+    pub fn new_with_ra_config(
+        ra_config: Arc<crate::backend::regalloc::RaConfig>,
+    ) -> Self {
         Self {
             out: AsmOutput::new(),
             disable_regalloc: false,
+            ra_config,
             stack_offset: 0,
             value_locations: FxHashMap::default(),
             alloca_values: FxHashSet::default(),

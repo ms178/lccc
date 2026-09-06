@@ -3480,9 +3480,12 @@ fn generate_function(
 
     cg.state().reset_for_function();
 
-    if env_flag_set("CCC_DUMP_IR")
-        && std::env::var("CCC_DUMP_IR_FUNC")
-            .map(|f| func.name.contains(&f))
+    let dump_ir = cg.state_ref().ra_config.dump_ir;
+    let dump_ir_func = cg.state_ref().ra_config.dump_ir_func.clone();
+    if dump_ir
+        && dump_ir_func
+            .as_deref()
+            .map(|filter| func.name.contains(filter))
             .unwrap_or(true)
     {
         use std::fmt::Write as _;

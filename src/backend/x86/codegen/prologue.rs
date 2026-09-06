@@ -82,7 +82,7 @@ fn va_root_is_stable(func: &IrFunction, root: u32) -> bool {
 impl X86Codegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
         // ms178 debug: dump IR per function
-        if std::env::var("CCC_DUMP_IR").is_ok() {
+        if self.state.ra_config.dump_ir {
             eprintln!("===== IR for {} =====", func.name);
             eprintln!("{:#?}", func);
             eprintln!("===== end IR =====");
@@ -96,9 +96,10 @@ impl X86Codegen {
         // unconditionally): the magic-number path may claim them, and the
         // RA model must stay exact. The X86_64 target pairs 64-bit ops in
         // addition to the 32-bit classes.
-        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs_with_config(
             func,
             crate::backend::regalloc::DivRemTarget::X86_64,
+            &self.state.ra_config,
         );
         self.divrem_tail_dests = pairs.tail_dests;
         self.divrem_head_partners = pairs.head_partners;
@@ -276,7 +277,7 @@ impl X86Codegen {
             // corpus is local-va_list printf wrappers) and closes the whole
             // re-load blind spot at once. Kill switch for bisection:
             // CCC_NO_VA_ROOT_GUARD=1 restores the pre-guard analysis.
-            if std::env::var("CCC_NO_VA_ROOT_GUARD").is_err()
+            if !self.state.ra_config.no_va_root_guard
                 && seeds.iter().any(|s| !va_root_is_stable(func, s.0))
             {
                 needs_gp = true;
@@ -284,7 +285,7 @@ impl X86Codegen {
             }
             self.vararg_gp_save = needs_gp;
             self.vararg_fp_save = needs_fp;
-            if std::env::var("CCC_DEBUG_VARARG").is_ok() {
+            if self.state.ra_config.debug_vararg {
                 eprintln!(
                     "debug vararg {}: gp={} fp={} stable={} va_ids={:?}",
                     func.name,
@@ -484,7 +485,10 @@ impl X86Codegen {
         // RCX remains reserved scratch; remaining homes follow ABI order and
         // the ordered parallel-copy emitter handles overlaps such as rcx->r8
         // while a later argument still arrives in r8.
-        if crate::backend::regalloc::x86_param_caller_homes_safe(func) {
+        if crate::backend::regalloc::x86_param_caller_homes_safe_with_config(
+            func,
+            &self.state.ra_config,
+        ) {
             let preferred = [14u8, 15, 16, 12, 13, 10, 11];
             caller_saved_regs.sort_by_key(|reg| {
                 preferred
@@ -1128,19 +1132,19 @@ impl X86Codegen {
         //          Cmp at its (possibly later) consumer; a home-less LHS only
         //          lives in %rax at the original point, so a replayed compare
         //          reads a clobbered accumulator (simd_sse2_arith SIGSEGV).
-        let never_materialized = if std::env::var_os("CCC_NO_X64_IMMED_NOHOME").is_some() {
+        let never_materialized = if self.state.ra_config.no_x64_immed_nohome {
             never_materialized
         } else {
-            let classes = std::env::var("CCC_X64_NOHOME_CLASSES")
-                .unwrap_or_else(|_| "ret,store,copy,cast,unary,binop".into());
+            let classes = self.state.ra_config.x64_nohome_classes.as_str();
             let has = |c: &str| classes == "all" || classes.split(',').any(|x| x.trim() == c);
             let skip: crate::common::fx_hash::FxHashSet<u32> =
-                crate::backend::regalloc::analyze_accumulator_assignments(
+                crate::backend::regalloc::analyze_accumulator_assignments_with_config(
                     func,
                     crate::backend::regalloc::AccumulatorPolicy {
                         operand_order: crate::backend::regalloc::AccumulatorOperandOrder::LhsFirst,
                         return_consumes_accumulator: false,
                     },
+                    &self.state.ra_config,
                 )
                 .into_iter()
                 .map(|a| a.value_id)
@@ -1328,6 +1332,7 @@ impl X86Codegen {
                     }
                     links
                 },
+                &self.state.ra_config,
             );
 
         // ── CMP-REPLAY post-RA home pruning (IS-09) ─────────────────────────
@@ -1362,7 +1367,7 @@ impl X86Codegen {
         //     never-materialized values have no home at all: reading one at
         //     the replay would consume stale register/slot state — prune.
         {
-            let ext_active = std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_none();
+            let ext_active = !self.state.ra_config.no_folded_index_liveness;
             // The RA-verified accumulator assignments: single-use values
             // whose consumer is the immediately following instruction.
             // These are exactly the values stack layout will give an
@@ -1407,7 +1412,7 @@ impl X86Codegen {
             // Cmp then materializes its boolean at its own position and the
             // select uses the ordinary materialized path (sound, no blend).
             {
-                let ext_active = std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_none();
+                let ext_active = !self.state.ra_config.no_folded_index_liveness;
                 let acc_no_home: crate::common::fx_hash::FxHashSet<u32> =
                     accumulator_assignments.iter().map(|a| a.value_id).collect();
                 let mut prune_fp: Vec<u32> = Vec::new();
@@ -1444,10 +1449,7 @@ impl X86Codegen {
         // while shrinking them. Keep it default-on selectively: functions with
         // a large static loop body use the mature backend. This is a target-
         // independent cost decision, not a function-name exception.
-        let max_loop_insts = std::env::var("CCC_MI_MAX_LOOP_INSTS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(32);
+        let max_loop_insts = self.state.ra_config.mi_max_loop_insts;
         let loop_insts = cached_liveness
             .as_ref()
             .map(|liveness| {
@@ -1466,7 +1468,7 @@ impl X86Codegen {
         // classic backend. Lets a miscompiled function be bisected without
         // touching the source (source edits perturb layout and flip layout-
         // sensitive miscompiles on/off).
-        let fn_disable = std::env::var("CCC_MI_FN_DISABLE").unwrap_or_default();
+        let fn_disable = self.state.ra_config.mi_fn_disable.clone();
         let fn_disabled = !fn_disable.is_empty()
             && fn_disable
                 .split(',')
@@ -1480,18 +1482,18 @@ impl X86Codegen {
         // CCC_NO_MACHINST side effects (it only zeroes the per-function gate,
         // so a CCC_MI_FN_FORCE'd function still flows through the MachInst
         // emitter, and the MachInst-incompatible peephole phase stays off).
-        let all_classic = std::env::var("CCC_MI_ALL_CLASSIC").is_ok();
-        let fn_force = std::env::var("CCC_MI_FN_FORCE").unwrap_or_default();
+        let all_classic = self.state.ra_config.mi_all_classic;
+        let fn_force = self.state.ra_config.mi_fn_force.clone();
         let fn_forced = !fn_force.is_empty()
             && fn_force
                 .split(',')
                 .any(|pat| !pat.is_empty() && func.name.contains(pat));
         self.machinst_function_enabled = (self.machinst_enabled
             && !all_classic
-            && (loop_insts <= max_loop_insts || std::env::var("CCC_MI_FORCE_LOOPS").is_ok())
+            && (loop_insts <= max_loop_insts || self.state.ra_config.mi_force_loops)
             && !fn_disabled)
             || fn_forced;
-        if std::env::var("CCC_MI_DEBUG").is_ok() {
+        if self.state.ra_config.mi_debug {
             eprintln!(
                 "[MI-PROFIT] fn={} loop_insts={} limit={} enabled={} fn_disabled={} fn_forced={}",
                 func.name,
@@ -1541,7 +1543,7 @@ impl X86Codegen {
         }
         let mut lcf: FxHashMap<u32, (PhysReg, u32)> = FxHashMap::default();
         let mut fcd: FxHashSet<u32> = FxHashSet::default();
-        if std::env::var("CCC_NO_LOAD_CAST_FOLD").is_err() {
+        if !self.state.ra_config.no_load_cast_fold {
             // Program-point numbering matching liveness.rs (1 per
             // instruction + 1 per terminator, in block order).
             let intervals: Vec<(u32, u32, u32)> = cached_liveness
@@ -1672,14 +1674,14 @@ impl X86Codegen {
                 }
                 pp += 1; // terminator
             }
-            if std::env::var("CCC_DEBUG_LOAD_CAST_FOLD").is_ok() && !lcf.is_empty() {
+            if self.state.ra_config.debug_load_cast_fold && !lcf.is_empty() {
                 eprintln!(
                         "[LOAD-CAST-FOLD] fn={} folds={} (candidates; each fires only if its load takes a redirecting path)",
                         func.name,
                         lcf.len()
                     );
             }
-            if std::env::var("CCC_NO_LOAD_CAST_FOLD").is_ok() {
+            if self.state.ra_config.no_load_cast_fold {
                 lcf.clear();
                 fcd.clear();
             }
@@ -1778,7 +1780,7 @@ impl X86Codegen {
         if !func.is_variadic
             && !self.func_has_calls
             && space == callee_save_reserve
-            && std::env::var_os("CCC_NO_EMPTY_LOCAL_FRAME_ELISION").is_none()
+            && !self.state.ra_config.no_empty_local_frame_elision
         {
             0
         } else {
@@ -2156,7 +2158,7 @@ impl X86Codegen {
                 let has_slot = find_param_alloca(func, i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0))
                     .is_some();
-                if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
+                if self.state.ra_config.debug_param_store {
                     let reg = self.reg_assignments.get(&paramref_dest.0);
                     eprintln!(
                         "[PRE-STORE] param {} paramref_dest={} has_slot={} reg={:?}",
@@ -2181,7 +2183,7 @@ impl X86Codegen {
                         let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 6;
                         let is_caller_saved_gpr = (10..=16).contains(&phys_reg.0);
                         let is_xmm = super::emit::is_xmm_reg(phys_reg);
-                        if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
+                        if self.state.ra_config.debug_param_store {
                             let shared =
                                 reg_to_params.get(&phys_reg.0).is_some_and(|u| u.len() > 1);
                             eprintln!(
@@ -2225,7 +2227,7 @@ impl X86Codegen {
                 }
             } else {
                 // DEBUG: dump entry block instructions for this param
-                if std::env::var("CCC_DEBUG_PARAM_STORE").is_ok() {
+                if self.state.ra_config.debug_param_store {
                     if let Some((alloca_dest, _)) = find_param_alloca(func, i) {
                         eprintln!(
                             "[PARAM-STORE] param {} has alloca dest={}, no ParamRef",
@@ -2703,7 +2705,7 @@ impl X86Codegen {
                 let src_reg = Self::reg_for_type(X86_ARG_REGS[reg_idx], ty);
                 let load_instr = Self::mov_load_for_type(ty);
                 let dest_reg = Self::load_dest_reg(ty);
-                if std::env::var_os("CCC_DEBUG_PARAMREF").is_some() {
+                if self.state.ra_config.debug_paramref {
                     eprintln!(
                         "[PARAMREF] dest=v{} param_idx={} reg_idx={} src={} ty={:?}",
                         dest.0, param_idx, reg_idx, src_reg, ty

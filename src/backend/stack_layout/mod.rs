@@ -339,6 +339,7 @@ pub fn calculate_stack_space_common(
         callee_saved_regs,
         &state.ra_accumulator_values,
         &cached_liveness,
+        &state.ra_config,
     );
 
     // Publish every explicit non-stack home through one location contract.
@@ -511,6 +512,7 @@ fn build_layout_context(
     callee_saved_regs: &[PhysReg],
     accumulator_values: &FxHashSet<u32>,
     cached_liveness: &Option<super::liveness::LivenessResult>,
+    ra_config: &super::regalloc::RaConfig,
 ) -> StackLayoutContext {
     // Build use-block map
     let mut use_blocks_map = if coalesce {
@@ -542,7 +544,13 @@ fn build_layout_context(
 
     // Detect dead parameter allocas.
     let dead_param_allocas =
-        analysis::find_dead_param_allocas(func, &used_values, reg_assigned, callee_saved_regs);
+        analysis::find_dead_param_allocas(
+            func,
+            &used_values,
+            reg_assigned,
+            callee_saved_regs,
+            ra_config,
+        );
 
     // Authoritative ABI alignment of struct/union parameter allocas (the
     // Alloca.align may have been dropped by a pass; IrParam.struct_align is not).

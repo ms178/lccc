@@ -81,28 +81,47 @@ pub(super) fn replace_reg_family(line: &str, old_id: RegId, new_id: RegId) -> St
 /// A "complete" occurrence means `old_reg` is not a prefix of a longer register
 /// name (e.g., replacing `%r8` must not match `%r8d` or `%r8b`).
 /// After `old_reg`, the next character must be a delimiter: `,`, `)`, ` `, or end-of-string.
+///
+/// Unmatched text is copied in UTF-8 slices, never as individual `u8 as char`
+/// values.  Assembly comments are normally ASCII, but inline-asm and debug
+/// text can carry UTF-8; reconstructing each high byte as Latin-1 silently
+/// recodes it even when no register replacement is made.
 pub(super) fn replace_reg_name_exact(line: &str, old_reg: &str, new_reg: &str) -> String {
-    let mut result = String::with_capacity(line.len());
+    if old_reg.is_empty() || old_reg == new_reg {
+        return line.to_owned();
+    }
+
     let bytes = line.as_bytes();
     let old_bytes = old_reg.as_bytes();
     let old_len = old_bytes.len();
-    let mut pos = 0;
+    let mut result = String::with_capacity(line.len());
+    let mut copied = 0usize;
+    let mut pos = 0usize;
+    let mut changed = false;
 
-    while pos < bytes.len() {
-        if pos + old_len <= bytes.len() && &bytes[pos..pos + old_len] == old_bytes {
-            // Check that this is a complete register name
+    while pos + old_len <= bytes.len() {
+        if &bytes[pos..pos + old_len] == old_bytes {
             let after = pos + old_len;
+            // Register spellings are ASCII, but retain valid UTF-8 slice
+            // boundaries even if this helper is ever reused for another token.
             let is_complete =
-                after >= bytes.len() || matches!(bytes[after], b',' | b')' | b' ' | b'\t' | b'\n');
-            if is_complete {
+                after == bytes.len() || matches!(bytes[after], b',' | b')' | b' ' | b'\t' | b'\n');
+            if is_complete && line.is_char_boundary(pos) && line.is_char_boundary(after) {
+                result.push_str(&line[copied..pos]);
                 result.push_str(new_reg);
-                pos += old_len;
+                copied = after;
+                pos = after;
+                changed = true;
                 continue;
             }
         }
-        result.push(bytes[pos] as char);
         pos += 1;
     }
+
+    if !changed {
+        return line.to_owned();
+    }
+    result.push_str(&line[copied..]);
     result
 }
 
@@ -572,7 +591,34 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
     true
 }
 
-// ── tests: the redefinition predicate ────────────────────────────────────────
+// ── tests: register rewriting and redefinition predicates ───────────────────
+
+#[cfg(test)]
+mod register_rewrite_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_preserves_unmatched_utf8_bytes() {
+        let input = "movq %rax, %rbx # café € 🦀";
+        let expected = "movq %rcx, %rbx # café € 🦀";
+        let rewritten = replace_reg_name_exact(input, "%rax", "%rcx");
+        assert_eq!(rewritten, expected);
+        assert_eq!(rewritten.as_bytes(), expected.as_bytes());
+
+        // The old byte-at-a-time implementation corrupted this no-match case
+        // too, because it rebuilt the entire line regardless of a match.
+        let unchanged = replace_reg_name_exact(input, "%r11", "%r10");
+        assert_eq!(unchanged.as_bytes(), input.as_bytes());
+        assert_eq!(replace_reg_family(input, 0, 1), expected);
+    }
+
+    #[test]
+    fn replacement_empty_pattern_is_a_noop() {
+        let input = "movq %rax, %rbx # café";
+        assert_eq!(replace_reg_name_exact(input, "", "%rcx"), input);
+        assert_eq!(replace_reg_name_exact(input, "%rax", "%rax"), input);
+    }
+}
 
 #[cfg(test)]
 mod writes_family_tests {

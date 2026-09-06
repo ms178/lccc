@@ -204,9 +204,10 @@ impl ArmCodegen {
         // msub, exactly GCC's shape). Constant-RHS pairs never fuse
         // (the strength reducer may claim them; the RA model must stay
         // exact).
-        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs_with_config(
             func,
             crate::backend::regalloc::DivRemTarget::AArch64,
+            &self.state.ra_config,
         );
         self.divrem_tail_dests = pairs.tail_dests;
         self.divrem_head_partners = pairs
@@ -334,6 +335,7 @@ impl ArmCodegen {
                 // the Load/Store with no IR-visible use of the index there; the
                 // allocator must keep the index live to the consumer's end.
                 crate::backend::generation::collect_folded_index_links(func),
+                &self.state.ra_config,
             );
 
         if std::env::var_os("CCC_NO_CSINC_FOLD").is_none() {

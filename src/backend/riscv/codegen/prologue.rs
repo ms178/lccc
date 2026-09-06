@@ -198,7 +198,10 @@ impl RiscvCodegen {
                 // really sits in that entry prefix (generation's lowering
                 // contract).  Belt and suspenders: refuse the pool outright
                 // otherwise.  Also re-asserts call-freeness.
-                && crate::backend::regalloc::riscv_param_caller_homes_safe(func)
+                && crate::backend::regalloc::riscv_param_caller_homes_safe_with_config(
+                    func,
+                    &self.state.ra_config,
+                )
         {
             (12..=19).map(crate::backend::regalloc::PhysReg).collect()
         } else {
@@ -218,6 +221,7 @@ impl RiscvCodegen {
                 call_arg_regs,
                 Vec::new(),
                 crate::common::fx_hash::FxHashMap::default(),
+                &self.state.ra_config,
             );
 
         self.state.ra_accumulator_values =

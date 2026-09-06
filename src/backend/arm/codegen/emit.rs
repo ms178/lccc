@@ -4,7 +4,8 @@ use crate::backend::call_abi::{CallAbiConfig, CallArgClass};
 use crate::backend::common::PtrDirective;
 use crate::backend::generation::find_param_alloca;
 use crate::backend::inline_asm::emit_inline_asm_common;
-use crate::backend::regalloc::PhysReg;
+use crate::backend::regalloc::{PhysReg, RaConfig};
+use std::sync::Arc;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::fp_contract::FpContract;
@@ -288,8 +289,12 @@ pub struct ArmCodegen {
 
 impl ArmCodegen {
     pub fn new() -> Self {
+        Self::new_with_ra_config(Arc::new(RaConfig::from_process_env()))
+    }
+
+    pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
         Self {
-            state: CodegenState::new(),
+            state: CodegenState::new_with_ra_config(ra_config),
             fp_contract: crate::common::fp_contract::FpContract::default(),
             current_frame_size: 0,
             current_return_type: IrType::I64,

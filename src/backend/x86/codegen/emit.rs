@@ -3,7 +3,8 @@ use crate::backend::call_abi::{CallAbiConfig, CallArgClass, ParamClass};
 use crate::backend::cast::FloatOp;
 use crate::backend::common::PtrDirective;
 use crate::backend::inline_asm::emit_inline_asm_common;
-use crate::backend::regalloc::PhysReg;
+use crate::backend::regalloc::{PhysReg, RaConfig};
+use std::sync::Arc;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::{
     ArchCodegen, MAX_JUMP_TABLE_RANGE, MIN_JUMP_TABLE_CASES, MIN_JUMP_TABLE_DENSITY_PERCENT,
@@ -617,34 +618,31 @@ const MI_FLOAT_ALU: u32 = 1 << 16;
 /// return home + restores), replacing the accumulator-staged text sequence.
 const MI_CALL_TYPED: u32 = 1 << 17;
 
-fn parse_machinst_disabled_kinds() -> u32 {
-    std::env::var("CCC_MI_DISABLE_KINDS")
-        .unwrap_or_default()
-        .split(',')
-        .fold(0, |mask, name| {
-            mask | match name.trim() {
-                "binop" => MI_BINOP,
-                "load" => MI_LOAD,
-                "store" => MI_STORE,
-                "copy" => MI_COPY,
-                "cmp" => MI_CMP,
-                "cast" => MI_CAST,
-                "unary" => MI_UNARY,
-                "select" => MI_SELECT,
-                "gep" => MI_GEP,
-                "alloca" => MI_ALLOCA,
-                "cast-widen" => MI_CAST_WIDEN,
-                "cast-narrow" => MI_CAST_NARROW,
-                "cast-same" => MI_CAST_SAME,
-                "cast-signed-source" => MI_CAST_SIGNED_SOURCE,
-                "cast-unsigned-source" => MI_CAST_UNSIGNED_SOURCE,
-                "float-mov" => MI_FLOAT_MOV,
-                "float-alu" => MI_FLOAT_ALU,
-                "call-typed" => MI_CALL_TYPED,
-                "all" => u32::MAX,
-                _ => 0,
-            }
-        })
+fn parse_machinst_disabled_kinds(raw: &str) -> u32 {
+    raw.split(',').fold(0, |mask, name| {
+        mask | match name.trim() {
+            "binop" => MI_BINOP,
+            "load" => MI_LOAD,
+            "store" => MI_STORE,
+            "copy" => MI_COPY,
+            "cmp" => MI_CMP,
+            "cast" => MI_CAST,
+            "unary" => MI_UNARY,
+            "select" => MI_SELECT,
+            "gep" => MI_GEP,
+            "alloca" => MI_ALLOCA,
+            "cast-widen" => MI_CAST_WIDEN,
+            "cast-narrow" => MI_CAST_NARROW,
+            "cast-same" => MI_CAST_SAME,
+            "cast-signed-source" => MI_CAST_SIGNED_SOURCE,
+            "cast-unsigned-source" => MI_CAST_UNSIGNED_SOURCE,
+            "float-mov" => MI_FLOAT_MOV,
+            "float-alu" => MI_FLOAT_ALU,
+            "call-typed" => MI_CALL_TYPED,
+            "all" => u32::MAX,
+            _ => 0,
+        }
+    })
 }
 
 fn machinst_kind_bit(inst: &crate::ir::reexports::Instruction) -> u32 {
@@ -824,8 +822,14 @@ impl X86Codegen {
     }
 
     pub fn new() -> Self {
+        Self::new_with_ra_config(Arc::new(RaConfig::from_process_env()))
+    }
+
+    pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
+        let machinst_enabled = !ra_config.no_machinst;
+        let machinst_disabled_kinds = parse_machinst_disabled_kinds(&ra_config.mi_disable_kinds);
         Self {
-            state: CodegenState::new(),
+            state: CodegenState::new_with_ra_config(ra_config),
             current_return_type: IrType::I64,
             func_ret_classes: Vec::new(),
             func_set_second_ret: false,
@@ -888,9 +892,9 @@ impl X86Codegen {
             caller_save_intervals: FxHashMap::default(),
             machinst_buf: Vec::new(),
             machinst_buf_ir: Vec::new(),
-            machinst_enabled: std::env::var("CCC_NO_MACHINST").is_err(),
+            machinst_enabled,
             machinst_function_enabled: false,
-            machinst_disabled_kinds: parse_machinst_disabled_kinds(),
+            machinst_disabled_kinds,
         }
     }
 
@@ -5798,7 +5802,7 @@ impl ArchCodegen for X86Codegen {
             .iter()
             .any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
         if has_bad {
-            if std::env::var("CCC_MI_DEBUG").is_ok() {
+            if self.state.ra_config.mi_debug {
                 eprintln!(
                     "[MI-FALLBACK] {} instructions -> default path",
                     self.machinst_buf_ir.len()
@@ -6173,7 +6177,7 @@ impl ArchCodegen for X86Codegen {
         // links wired into register allocation (prologue passes
         // collect_gep_fold_base_links).  When that extension is disabled the
         // folds must be refused too — the two are one contract.
-        if std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_some() {
+        if self.state.ra_config.no_folded_index_liveness {
             return false;
         }
         match self.reg_assignments.get(&base.0) {

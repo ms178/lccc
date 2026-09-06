@@ -2,7 +2,8 @@ use crate::backend::call_abi::{CallAbiConfig, CallArgClass};
 use crate::backend::cast::FloatOp;
 use crate::backend::common::PtrDirective;
 use crate::backend::inline_asm::emit_inline_asm_common;
-use crate::backend::regalloc::PhysReg;
+use crate::backend::regalloc::{PhysReg, RaConfig};
+use std::sync::Arc;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -152,8 +153,12 @@ pub struct RiscvCodegen {
 
 impl RiscvCodegen {
     pub fn new() -> Self {
+        Self::new_with_ra_config(Arc::new(RaConfig::from_process_env()))
+    }
+
+    pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
         Self {
-            state: CodegenState::new(),
+            state: CodegenState::new_with_ra_config(ra_config),
             current_return_type: IrType::I64,
             va_named_gp_count: 0,
             va_named_stack_bytes: 0,

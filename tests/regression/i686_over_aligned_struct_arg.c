@@ -25,18 +25,37 @@
  * libc-free; exits through the i386 ABI. */
 
 typedef struct {
-    __attribute__((aligned(32))) char p[24];
+    __attribute__((aligned(32))) unsigned char p[24];
 } A32;
 typedef struct {
-    __attribute__((aligned(16))) char p[12];
+    __attribute__((aligned(16))) unsigned char p[12];
 } A16;
+
+/* Keep this ABI probe defined under -O2/-Os: assigning an unsigned-word
+ * lvalue through a char-array member then reading it as char relies on an
+ * incompatible effective type, and GCC legitimately exploits that aliasing
+ * assumption.  The test wants the actual object representation instead. */
+static void put32le(unsigned char *p, unsigned v)
+{
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+
+static unsigned get32le(const unsigned char *p)
+{
+    return (unsigned)p[0]
+        | ((unsigned)p[1] << 8)
+        | ((unsigned)p[2] << 16)
+        | ((unsigned)p[3] << 24);
+}
 
 static A32 mk32(unsigned v)
 {
     A32 a;
-    unsigned *w = (unsigned *)a.p;
     for (int i = 0; i < 6; i++)
-        w[i] = v + i;
+        put32le(&a.p[i * 4], v + (unsigned)i);
     return a;
 }
 
@@ -45,14 +64,13 @@ static A32 mk32(unsigned v)
 int callee32(int a, int b, int c, A32 x)
 {
     (void)a; (void)b; (void)c;
-    unsigned *w = (unsigned *)x.p;
     for (int i = 0; i < 6; i++)
-        if (w[i] != 0x11000u + (unsigned)i)
+        if (get32le(&x.p[i * 4]) != 0x11000u + (unsigned)i)
             return 0;
     /* &x must alias the storage the bytes were copied into: write through
      * the address, read through the value. */
-    w[2] = 0xdeadbeefu;
-    if (x.p[8] != (char)0xef || x.p[11] != (char)0xde)
+    put32le(&x.p[8], 0xdeadbeefu);
+    if (x.p[8] != 0xefu || x.p[11] != 0xdeu)
         return 0;
     return 1;
 }
@@ -60,9 +78,8 @@ int callee32(int a, int b, int c, A32 x)
 int callee16(int a, int b, int c, A16 x)
 {
     (void)a; (void)b; (void)c;
-    unsigned *w = (unsigned *)x.p;
     for (int i = 0; i < 3; i++)
-        if (w[i] != 0x22000u + (unsigned)i)
+        if (get32le(&x.p[i * 4]) != 0x22000u + (unsigned)i)
             return 0;
     return 1;
 }
@@ -74,9 +91,8 @@ int callee16(int a, int b, int c, A16 x)
 int callee_v(int a, int b, int c, A32 x, ...)
 {
     (void)a; (void)b; (void)c;
-    unsigned *w = (unsigned *)x.p;
     for (int i = 0; i < 6; i++)
-        if (w[i] != 3000u + (unsigned)i)
+        if (get32le(&x.p[i * 4]) != 3000u + (unsigned)i)
             return 0;
     __builtin_va_list ap;
     __builtin_va_start(ap, x);
@@ -91,19 +107,17 @@ static int probe_named(void)
     /* Local aligned storage: reads through the value must see the writes
      * (the alloca-address/copy desync check). */
     A32 x = mk32(1000);
-    if (x.p[0] != 0 || x.p[5] != 5) /* mk32 writes 1000..1005 */
+    if (get32le(&x.p[0]) != 1000u || get32le(&x.p[20]) != 1005u)
         return 0;
     /* Param side: pass a fresh copy and verify every dword. */
     A32 y;
-    unsigned *w = (unsigned *)y.p;
     for (int i = 0; i < 6; i++)
-        w[i] = 0x11000u + (unsigned)i;
+        put32le(&y.p[i * 4], 0x11000u + (unsigned)i);
     if (!callee32(7, 8, 9, y))
         return 0;
     A16 s;
-    unsigned *sw = (unsigned *)s.p;
     for (int i = 0; i < 3; i++)
-        sw[i] = 0x22000u + (unsigned)i;
+        put32le(&s.p[i * 4], 0x22000u + (unsigned)i);
     if (!callee16(7, 8, 9, s))
         return 0;
     return 1;

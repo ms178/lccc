@@ -124,7 +124,12 @@ pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
                 // checked here.
             }
         }
-        if max_def >= func.next_value_id {
+        // `0` is the documented “unknown / not yet computed” sentinel. It is
+        // deliberately not a bound: several frontend-only functions have a
+        // perfectly valid v0 while retaining that sentinel until a pass needs
+        // to allocate a fresh id. Checking `v0 >= 0` here turns the validator
+        // into a false-positive machine and would make an SSA CI gate unusable.
+        if func.next_value_id != 0 && max_def >= func.next_value_id {
             panic!(
                 "SSA WATERMARK VIOLATION after phase '{}': function '{}' has \
                  def v{} >= next_value_id {} — the phase that created it did \
@@ -147,7 +152,18 @@ pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
         // (LK-27).
         if strict {
             let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+            // `CfgAnalysis::idom` deliberately uses usize::MAX for CFG-dead
+            // blocks.  A dead predecessor does not have an executable phi
+            // edge, so there is no dynamic phi use to dominance-check.  More
+            // importantly, never feed the sentinel back into `idom`: doing so
+            // used to panic the opt-in validator before it could report a real
+            // SSA defect.
+            let reachable =
+                |b: usize| -> bool { cfg.idom.get(b).is_some_and(|&idom| idom != usize::MAX) };
             let dominates = |a: usize, b: usize| -> bool {
+                if !reachable(a) || !reachable(b) {
+                    return false;
+                }
                 let mut x = b;
                 loop {
                     if x == a {
@@ -155,7 +171,13 @@ pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
                     }
                     let n = cfg.idom[x];
                     if n == x {
-                        return x == a;
+                        return false;
+                    }
+                    // `x` is reachable and every dominator of a reachable
+                    // block is reachable, but retain the guard so a malformed
+                    // analysis can never make this debug checker panic.
+                    if n == usize::MAX {
+                        return false;
                     }
                     x = n;
                 }
@@ -182,7 +204,11 @@ pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
                                 if let (Some(&db), Some(&pb)) =
                                     (def_block.get(&v.0), label_of.get(&pred.0))
                                 {
-                                    if !dominates(db, pb) {
+                                    // An unreachable predecessor executes no
+                                    // incoming edge.  Its local IR can be
+                                    // cleaned up later without imposing a
+                                    // reachable-SSA dominance constraint.
+                                    if reachable(pb) && !dominates(db, pb) {
                                         panic!(
                                             "SSA PHI-DOMINANCE VIOLATION after phase '{}': \
                                              function '{}' block {} phi v{} incoming v{} \
@@ -220,7 +246,16 @@ pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
                     crate::common::fx_hash::FxHashMap::default();
                 for (ii, inst) in block.instructions.iter().enumerate() {
                     if let Some(d) = inst.dest() {
-                        defined_here.entry(d.0).or_insert(ii);
+                        // `Alloca` is a static frame-object declaration in
+                        // LCCC: stack layout collects it function-wide and the
+                        // backend emits its storage in the prologue, not at
+                        // this instruction position. Inlined vector bodies may
+                        // therefore retain an alloca after an already-emitted
+                        // user of its address. A dynamic alloca is different —
+                        // it mutates SP at this point — and remains ordered.
+                        if !matches!(inst, Instruction::Alloca { .. }) {
+                            defined_here.entry(d.0).or_insert(ii);
+                        }
                     }
                 }
                 for (ii, inst) in block.instructions.iter().enumerate() {
@@ -624,7 +659,13 @@ pub(crate) fn restore_phi_prefix_in_function(func: &mut IrFunction) -> usize {
 }
 
 /// Run Phase 0: function inlining and post-inline optimization passes.
-fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, size_profile: bool) {
+fn run_inline_phase(
+    module: &mut IrModule,
+    disabled: &str,
+    allow_inline: bool,
+    size_profile: bool,
+    ra_config: &crate::backend::regalloc::RaConfig,
+) {
     let dump_pre =
         std::env::var("CCC_DUMP_EACH_PASS").is_ok() || std::env::var("CCC_VALIDATE_SSA").is_ok();
     macro_rules! iphase_dump {
@@ -678,8 +719,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
             inline::run(module);
         }
     }
-    if std::env::var("CCC_DUMP_IR").is_ok()
-        || std::env::var("CCC_DUMP_EACH_PASS").is_ok()
+    if ra_config.dump_ir || std::env::var("CCC_DUMP_EACH_PASS").is_ok()
         || std::env::var("CCC_VALIDATE_SSA").is_ok()
     {
         dump_ir_filtered(module, "pre-loop after inliner");
@@ -844,6 +884,7 @@ pub(crate) fn run_passes(
     fp_contract: crate::common::fp_contract::FpContract,
     x86_avx: bool,
     x86_fma: bool,
+    ra_config: &crate::backend::regalloc::RaConfig,
 ) {
     // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
@@ -871,7 +912,7 @@ pub(crate) fn run_passes(
         apply_m16_size_policy(&mut disabled, code16gcc, opt_level);
     }
     // Debug hook: dump the module IR to stderr before optimization.
-    if std::env::var("CCC_DUMP_IR").is_ok() {
+    if ra_config.dump_ir {
         eprintln!("==== IR before passes (opt_level={}) ====", opt_level);
         eprintln!("{:#?}", module);
         eprintln!("==== END IR ====");
@@ -1034,7 +1075,13 @@ pub(crate) fn run_passes(
     }
     let allow_inline = opt_level != 4 && opt_level != 5;
     preloop_dump!("lowering(pre-O2)");
-    run_inline_phase(module, &disabled, allow_inline, optimize_for_size);
+    run_inline_phase(
+        module,
+        &disabled,
+        allow_inline,
+        optimize_for_size,
+        ra_config,
+    );
     preloop_dump!("inline_phase");
     if !pass_disabled(&disabled, "fortifyfold") {
         fortify_fold::run(module, target.is_32bit());
@@ -2240,6 +2287,133 @@ pub(crate) fn run_passes(
         eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
         eprintln!("{:#?}", module);
         eprintln!("==== END IR after all passes ====");
+    }
+}
+
+#[cfg(test)]
+mod ssa_validator_tests {
+    use super::validate_unique_defs;
+    use crate::common::types::IrType;
+    use crate::ir::module::{IrFunction, IrModule};
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrConst, Operand, Terminator, Value,
+    };
+
+    fn module_with_blocks(blocks: Vec<BasicBlock>, next_value_id: u32) -> IrModule {
+        let mut func = IrFunction::new("validator_unit".to_string(), IrType::Void, vec![], false);
+        func.blocks = blocks;
+        func.next_value_id = next_value_id;
+        let mut module = IrModule::new();
+        module.functions.push(func);
+        module
+    }
+
+    fn entry(instructions: Vec<Instruction>) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        }
+    }
+
+    #[test]
+    fn unknown_zero_watermark_uses_the_documented_scan_fallback() {
+        // `0` means “not cached”, not “there are no values”.  This is the
+        // normal shape for small frontend-only functions before a mutating
+        // pass has needed to allocate a fresh id.
+        let module = module_with_blocks(
+            vec![entry(vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(7)),
+            }])],
+            0,
+        );
+        validate_unique_defs(&module, "unit:strict");
+    }
+
+    #[test]
+    #[should_panic(expected = "SSA WATERMARK VIOLATION")]
+    fn nonzero_watermark_remains_a_hard_upper_bound() {
+        let module = module_with_blocks(
+            vec![entry(vec![Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(IrConst::I32(7)),
+            }])],
+            1,
+        );
+        validate_unique_defs(&module, "unit:strict");
+    }
+
+    #[test]
+    fn static_alloca_is_a_function_frame_declaration_not_an_ordered_def() {
+        // The backend allocates a fixed Alloca in the function prologue.  An
+        // inlined vector body can consequently retain the declaration after a
+        // preceding intrinsic/store has named its address; that is not a
+        // straight-line use-before-definition.  DynAlloca remains ordered.
+        let module = module_with_blocks(
+            vec![entry(vec![
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+            ])],
+            1,
+        );
+        validate_unique_defs(&module, "unit:strict");
+    }
+
+    #[test]
+    #[should_panic(expected = "SSA ORDER VIOLATION")]
+    fn dynamic_alloca_remains_an_ordered_definition() {
+        let module = module_with_blocks(
+            vec![entry(vec![
+                Instruction::StackRestore { ptr: Value(0) },
+                Instruction::DynAlloca {
+                    dest: Value(0),
+                    size: Operand::Const(IrConst::I64(16)),
+                    align: 16,
+                },
+            ])],
+            1,
+        );
+        validate_unique_defs(&module, "unit:strict");
+    }
+
+    #[test]
+    fn unreachable_phi_predecessor_cannot_crash_the_validator() {
+        // CFG analysis represents dead blocks with usize::MAX in `idom`.
+        // Their incoming phi edges never execute, so the validator must skip
+        // the dynamic dominance relation rather than indexing idom[MAX].
+        let dead = BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(1)),
+                },
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![(Operand::Value(Value(0)), BlockId(1))],
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        };
+        let module = module_with_blocks(vec![entry(vec![]), dead], 2);
+        validate_unique_defs(&module, "unit:strict");
     }
 }
 

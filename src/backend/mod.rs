@@ -71,6 +71,9 @@ pub(crate) struct McountInstrumentation {
 /// Options that control code generation, parsed from CLI flags.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CodegenOptions {
+    /// Invocation-owned RA/codegen policy, parsed once by the driver before
+    /// any per-function backend work starts.
+    pub(crate) ra_config: std::sync::Arc<regalloc::RaConfig>,
     /// Disable register allocation for non-SSA `-O0` IR. Phi elimination can
     /// create multi-def values that the production scan must not coalesce.
     pub(crate) disable_regalloc: bool,
@@ -428,7 +431,7 @@ impl Target {
     ) -> String {
         match self {
             Target::X86_64 => {
-                let mut cg = x86::X86Codegen::new();
+                let mut cg = x86::X86Codegen::new_with_ra_config(opts.ra_config.clone());
                 cg.apply_options(opts);
                 cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
@@ -444,11 +447,11 @@ impl Target {
                 if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
                     raw
                 } else {
-                    x86::codegen::peephole::peephole_optimize(raw)
+                    x86::codegen::peephole::peephole_optimize_with_config(raw, opts.ra_config.as_ref())
                 }
             }
             Target::I686 => {
-                let mut cg = i686::I686Codegen::new();
+                let mut cg = i686::I686Codegen::new_with_ra_config(opts.ra_config.clone());
                 cg.apply_options(opts);
                 cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
@@ -475,7 +478,7 @@ impl Target {
                 }
             }
             Target::Aarch64 => {
-                let mut cg = arm::ArmCodegen::new();
+                let mut cg = arm::ArmCodegen::new_with_ra_config(opts.ra_config.clone());
                 cg.apply_options(opts);
                 cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
@@ -489,7 +492,7 @@ impl Target {
                 arm::codegen::peephole::peephole_optimize(raw)
             }
             Target::Riscv64 => {
-                let mut cg = riscv::RiscvCodegen::new();
+                let mut cg = riscv::RiscvCodegen::new_with_ra_config(opts.ra_config.clone());
                 cg.apply_options(opts);
                 cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;

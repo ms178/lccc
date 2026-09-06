@@ -98,9 +98,10 @@ impl I686Codegen {
         // q in %eax and r in %edx (emit_divrem_const_in_eax_edx), or the
         // staged `divl` at -Os: the same clobber set the RA model charges
         // any constant-divisor division with, so the model stays exact.
-        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs_with_config(
             func,
             crate::backend::regalloc::DivRemTarget::I686,
+            &self.state.ra_config,
         );
         self.divrem_tail_dests = pairs.tail_dests;
         self.divrem_head_partners = pairs.head_partners;
@@ -308,13 +309,14 @@ impl I686Codegen {
                 }
             }
             let _ = &ret_operands; // (ret_operands kept for the PIC-free path)
-            let skip = crate::backend::regalloc::analyze_accumulator_assignments(
+            let skip = crate::backend::regalloc::analyze_accumulator_assignments_with_config(
                 func,
                 crate::backend::regalloc::AccumulatorPolicy {
                     operand_order:
                         crate::backend::regalloc::AccumulatorOperandOrder::AccumulatorCentric,
                     return_consumes_accumulator: true,
                 },
+                &self.state.ra_config,
             )
             .into_iter()
             .map(|a| a.value_id)
@@ -355,6 +357,7 @@ impl I686Codegen {
                 // folds to their consumers, so the address registers survive
                 // intervening calls and accumulator staging.
                 crate::backend::generation::collect_folded_gep_links_all(func),
+                &self.state.ra_config,
             );
 
         // %ebx must be saved/restored only when it really holds the GOT base.

@@ -41,12 +41,12 @@ use super::liveness::{
     for_each_operand_in_instruction, for_each_operand_in_terminator,
     for_each_value_use_in_instruction, LiveInterval,
 };
-use super::regalloc::PhysReg;
+use super::regalloc::{PhysReg, RaConfig};
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, IrUnaryOp, Operand, Terminator};
-use std::sync::OnceLock;
+use std::sync::Arc;
 
 /// Enhanced live interval with priority, uses, and spill weight.
 ///
@@ -476,6 +476,8 @@ pub struct LinearScanAllocator {
     pub segment_mode: bool,
     pub spill_slots: FxHashMap<u32, i32>,
     pub available_regs: Vec<PhysReg>,
+    /// Immutable policy copied by Arc from the invocation-owned RaConfig.
+    pub ra_config: Arc<RaConfig>,
     pub next_spill_slot: i32,
     /// Reserved. Live-range *splitting* is an IR pre-pass (`split_ranges.rs`),
     /// not this flag. Kept so existing setters do not break.
@@ -485,19 +487,23 @@ pub struct LinearScanAllocator {
     pub next_reg_idx: usize,
 }
 
-/// Cached `CCC_NO_SEGMENT_SCAN` kill switch (RA-05 segment-aware scan).
-fn segment_scan_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CCC_NO_SEGMENT_SCAN").is_none())
-}
-
 impl LinearScanAllocator {
+    /// Test/utility constructor using the documented default policy. Normal
+    /// compilation calls [`Self::new_with_config`] with the driver-owned Arc.
     pub fn new(ranges: Vec<LiveRange>, available_regs: Vec<PhysReg>) -> Self {
+        Self::new_with_config(ranges, available_regs, &Arc::new(RaConfig::default()))
+    }
+
+    pub fn new_with_config(
+        ranges: Vec<LiveRange>,
+        available_regs: Vec<PhysReg>,
+        ra_config: &Arc<RaConfig>,
+    ) -> Self {
         // RA-05: enter segment mode only when the worklist actually carries
         // hole-aware coverage AND the kill switch is unset. Unit tests and
         // unenriched scans (Phase 2b, synthetic vector intervals) run the
         // exact fat kernel.
-        let segment_mode = segment_scan_enabled() && ranges.iter().any(|r| !r.segments.is_empty());
+        let segment_mode = !ra_config.no_segment_scan && ranges.iter().any(|r| !r.segments.is_empty());
         Self {
             ranges,
             active: Vec::new(),
@@ -508,6 +514,7 @@ impl LinearScanAllocator {
             segment_mode,
             spill_slots: FxHashMap::default(),
             available_regs,
+            ra_config: Arc::clone(ra_config),
             next_spill_slot: 0,
             enable_splitting: false,
             next_reg_idx: 0,
@@ -1041,7 +1048,7 @@ impl LinearScanAllocator {
         self.expire_old_intervals(range.start);
 
         if let Some(reg) = self.find_free_register(&range) {
-            if alloc_trace_enabled() {
+            if self.ra_config.trace_alloc {
                 for active in &self.active {
                     if let Some(&areg) = self.assignments.get(&active.range.value_id) {
                         if areg == reg
@@ -1068,7 +1075,7 @@ impl LinearScanAllocator {
             return;
         }
 
-        let mode = evict_mode();
+        let mode = self.ra_config.evict_mode;
         let victim = if mode == 5 {
             self.find_exchange_candidate(&range)
         } else {
@@ -1215,7 +1222,7 @@ impl LinearScanAllocator {
 
         self.allocate_spill_slot(evicted_vid);
 
-        if allocstats_enabled() {
+        if self.ra_config.trace_allocstats {
             eprintln!(
                 "[EVICT] val{} reg={} -> val{}[{}] fut_in={}",
                 evicted_vid,
@@ -1311,7 +1318,7 @@ impl LinearScanAllocator {
         for range in ranges {
             self.allocate_range(range);
         }
-        if std::env::var_os("CCC_VERIFY_REGALLOC").is_some() {
+        if self.ra_config.verify_regalloc {
             self.verify_handled_history();
         }
     }
@@ -1446,19 +1453,8 @@ fn next_use_after(range: &LiveRange, pos: u32) -> u32 {
     }
 }
 
-fn alloc_trace_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CCC_TRACE_ALLOC").is_some())
-}
-
-fn allocstats_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CCC_TRACE_ALLOCSTATS").is_some())
-}
-
-/// Cached `CCC_EVICT_MODE`. First parse wins for the process so a large TU
-/// cannot observe a mid-compile env change as two different allocators.
-/// Eviction policy selector (`CCC_EVICT_MODE`).
+/// Eviction policy selector (`RaConfig::evict_mode`, parsed from
+/// `CCC_EVICT_MODE` once per invocation).
 ///
 /// | mode | victim search | rank key |
 /// |------|---------------|----------|
@@ -1473,24 +1469,26 @@ fn allocstats_enabled() -> bool {
 /// [`LinearScanAllocator::select_evict_victim`]). Mode 3 remains the default
 /// until mode 6 has a measured win on the benchmark corpus; mode 5 lost gzip
 /// and stays opt-in.
-fn evict_mode() -> i32 {
-    static MODE: OnceLock<Option<i32>> = OnceLock::new();
-    let parsed = *MODE.get_or_init(|| {
-        std::env::var("CCC_EVICT_MODE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-    });
-    parsed.unwrap_or(3)
-}
 
 /// LiveInterval → LiveRange: one IR walk for defs, uses, loop depth, hints.
+/// Compatibility helper for unit tests and non-allocator analyses. The
+/// production allocator passes the invocation-owned config below.
 pub fn build_live_ranges(
     intervals: &[LiveInterval],
     loop_depth: &[u32],
     func: &IrFunction,
 ) -> Vec<LiveRange> {
+    build_live_ranges_with_config(intervals, loop_depth, func, &Arc::new(RaConfig::default()))
+}
+
+pub(crate) fn build_live_ranges_with_config(
+    intervals: &[LiveInterval],
+    loop_depth: &[u32],
+    func: &IrFunction,
+    ra_config: &Arc<RaConfig>,
+) -> Vec<LiveRange> {
     let meta = collect_range_metadata(func, loop_depth);
-    let pgo_point_weights = pgo_point_weights(func);
+    let pgo_point_weights = pgo_point_weights(func, ra_config);
     let point_depths = point_loop_depths(func, loop_depth);
 
     let mut ranges: Vec<LiveRange> = intervals
@@ -1660,7 +1658,7 @@ fn record_use(vid: u32, point: u32, bdepth: u32, meta: &mut RangeMetadata) {
 /// +4.7 % gzip-compress regression: it double-counts `10^loop_depth` and
 /// makes inner-loop temps near-unevictable (+16 slot accesses in
 /// `longest_match`).
-fn pgo_point_weights(func: &IrFunction) -> FxHashMap<u32, u64> {
+fn pgo_point_weights(func: &IrFunction, ra_config: &RaConfig) -> FxHashMap<u32, u64> {
     let mut out = FxHashMap::default();
     let Some(fp) = crate::pgo::active_profile_for_function(func) else {
         return out;
@@ -1669,7 +1667,7 @@ fn pgo_point_weights(func: &IrFunction) -> FxHashMap<u32, u64> {
     if max == 0 {
         return out;
     }
-    let max_factor = pgo_weight_max();
+    let max_factor = ra_config.pgo_weight_max;
     let span = max_factor - 1;
     let mut point = 0u32;
     for block in &func.blocks {
@@ -1687,17 +1685,6 @@ fn pgo_point_weights(func: &IrFunction) -> FxHashMap<u32, u64> {
         point = point.saturating_add(1);
     }
     out
-}
-
-fn pgo_weight_max() -> u64 {
-    static MAX: OnceLock<u64> = OnceLock::new();
-    *MAX.get_or_init(|| {
-        std::env::var("CCC_PGO_WEIGHT_MAX")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1)
-            .clamp(1, 16)
-    })
 }
 
 /// Producer→consumer hint for one instruction, or `None`.
