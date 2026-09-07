@@ -351,11 +351,22 @@ impl<'a> Scan<'a> {
             MachInst::Lea {
                 base, index, dst, ..
             } => {
-                self.touch(base, idx, RefKind::Read, false);
+                // A LEA operand can never fall back to the memory-operand
+                // substitution: `lea disp(%base), %dst` computes the ADDRESS
+                // ARITHMETIC of its register operands — substituting the
+                // base with a stack-slot memory reference would compute the
+                // address OF the slot, not the value IN it. Base, index and
+                // dst are therefore register-only positions: the allocator
+                // must home them (reload before, store after) or refuse.
+                // Marking them reg-only (the module documentation always
+                // claimed this) keeps spilled-address Lea windows on the
+                // MachInst fast path instead of tripping the
+                // has-unresolvable-vreg gate and replaying the whole window.
+                self.touch(base, idx, RefKind::Read, true);
                 if let Some((r, _)) = index {
-                    self.touch(r, idx, RefKind::Read, false);
+                    self.touch(r, idx, RefKind::Read, true);
                 }
-                self.touch(dst, idx, RefKind::PureWrite, false);
+                self.touch(dst, idx, RefKind::PureWrite, true);
             }
             MachInst::LeaSym { dst, .. } => {
                 self.touch(dst, idx, RefKind::PureWrite, false);
@@ -611,6 +622,21 @@ pub(crate) fn allocate_window(
                 return None; // read before the local def: malformed SSA window
             }
         }
+        // An ARRIVING vreg that a two-address instruction RMWs inside the
+        // window is unsound to allocate, not merely unsupported: the RMW
+        // reads the old slot image (via the reload) and overwrites the
+        // register with the modified value, but SSA semantics require
+        // post-window readers of the SOURCE value to observe the old slot
+        // image, while the RESULT value has no relay target inside this
+        // window (the spill-relay folding was never wired). Storing back
+        // corrupts the source's slot; not storing back loses the result.
+        // Refuse — the replay path handles it correctly. Unreachable from
+        // today's isel (dests without register homes never lower), so this
+        // is defense-in-depth that turns a latent miscompile class into a
+        // guaranteed-safe fallback.
+        if e.def.is_none() && e.rmw_writes > 0 {
+            return None;
+        }
         if e.needs_reg {
             reg_needed.push((*id, *e));
         }
@@ -720,8 +746,19 @@ pub(crate) fn allocate_window(
         // through the slot once the register cache is invalidated — the
         // store is what makes the register image durable. A missing use
         // count is conservatively treated as live-out.
+        //
+        // The live-out comparison counts IR-level readers, not machine-
+        // level reads: a two-address RMW's read of the dst register
+        // position is a machine artifact of the local write, not an IR use
+        // of the defined value. Without subtracting `rmw_writes`, a dest
+        // whose only real reader sits AFTER the window (e.uses == total,
+        // all "uses" being the RMW itself) would skip the store-back and
+        // leave a stale slot image for that reader. (Arriving values with
+        // RMWs are refused above, so the subtraction only ever applies to
+        // locally-defined values.)
         let wrote = e.def.is_some() || e.rmw_writes > 0;
-        let live_out = total.is_none_or(|t| e.uses < *t);
+        let ir_level_uses = e.uses - e.rmw_writes;
+        let live_out = total.is_none_or(|t| ir_level_uses < *t);
         if wrote && live_out {
             inserts.push((
                 e.last + 1,
@@ -1025,6 +1062,80 @@ mod tests {
         }
     }
 
+    /// The live-out test must count IR-level readers, not the RMW's own
+    /// machine-level read of the dst position. Here the dest's ONLY reader
+    /// sits after the window: the historical `e.uses < total` comparison
+    /// saw uses == total (the RMW itself), skipped the store-back, and left
+    /// the post-window reader with a stale slot image. The fix subtracts
+    /// `rmw_writes` (machine artifacts of the local write).
+    #[test]
+    fn rmw_only_use_outside_window_still_stores() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(11, StackSlot(-16)); // dest v
+        types.insert(11, IrType::I64);
+        uses.insert(11, 1); // the single real reader is AFTER the window
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+
+        // Staging Mov (pure write of v11 from a constant via materialized
+        // imm operand), then the two-address Alu RMW on v11.
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::Imm(7),
+                dst: MachOperand::Reg(vreg(11)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: super::super::machinst::AluOp::Add,
+                src: MachOperand::Imm(4),
+                dst: vreg(11),
+                size: OpSize::S64,
+            },
+        ];
+        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        assert_no_vregs(&out);
+        assert!(
+            out.len() == 3,
+            "the dest is live-out through its sole post-window reader; \
+             mov/alu/STORE expected, got {out:?}"
+        );
+        match out.last() {
+            Some(MachInst::Mov {
+                src: MachOperand::Reg(_),
+                dst: MachOperand::StackSlot(-16),
+                size: OpSize::S64,
+            }) => {}
+            other => panic!("last instruction must be the store-back, got {other:?}"),
+        }
+    }
+
+    /// An ARRIVING vreg that an in-window two-address instruction RMWs is
+    /// refused outright: the machine RMW reads the old slot image and
+    /// overwrites the register, but SSA readers of the SOURCE after the
+    /// window need the old image while the RESULT has no relay target.
+    /// Storing back corrupts; not storing back loses. Refusal takes the
+    /// (correct) replay path instead.
+    #[test]
+    fn arriving_rmw_is_refused() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(30, StackSlot(-24)); // arriving spilled value
+        types.insert(30, IrType::I64);
+        uses.insert(30, 2); // read here (IR src) and once after the window
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+
+        let insts = vec![MachInst::Alu {
+            op: super::super::machinst::AluOp::Add,
+            src: MachOperand::Imm(4),
+            dst: vreg(30), // RMW on an arriving vreg: must be refused
+            size: OpSize::S64,
+        }];
+        assert!(
+            allocate_window(insts, &c).is_none(),
+            "arriving vreg with in-window RMW must be refused (unsound to allocate)"
+        );
+    }
+
     /// A value fully consumed inside the window (uses == total) is DEAD
     /// afterwards: no store, no slot traffic at all beyond the reload chain.
     #[test]
@@ -1150,12 +1261,23 @@ mod tests {
         }
         let empty = FxHashSet::default();
         let c = ctx(&slots, &types, &uses, &busy, &empty);
-        let insts = vec![MachInst::Alu {
-            op: super::super::machinst::AluOp::Add,
-            src: MachOperand::Imm(1),
-            dst: vreg(40),
-            size: OpSize::S64,
-        }];
+        // Staging Mov makes v40 a locally-defined window value (the pure
+        // write); the Alu then RMWs it. An arriving vreg RMW'd in-window is
+        // refused (unsound: see `arriving_rmw_is_refused`), so the two-
+        // address idiom in real windows always carries this staging Mov.
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::StackSlot(-8),
+                dst: MachOperand::Reg(vreg(40)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: super::super::machinst::AluOp::Add,
+                src: MachOperand::Imm(1),
+                dst: vreg(40),
+                size: OpSize::S64,
+            },
+        ];
         let out = allocate_window(insts, &c).expect("allocation must succeed");
         assert_no_vregs(&out);
         let reload = out.iter().find_map(|i| match i {
@@ -1186,6 +1308,13 @@ mod tests {
         let empty = FxHashSet::default();
         let c = ctx(&slots, &types, &uses, &busy, &empty);
         let insts = vec![
+            // Staging Mov: locally defines v50 so the later RMW is the
+            // sound two-address idiom (an arriving RMW is refused).
+            MachInst::Mov {
+                src: MachOperand::StackSlot(-8),
+                dst: MachOperand::Reg(vreg(50)),
+                size: OpSize::S64,
+            },
             MachInst::Mov {
                 src: MachOperand::Mem {
                     base: vreg(50),

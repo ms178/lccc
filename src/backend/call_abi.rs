@@ -146,7 +146,7 @@ pub enum ParamClass {
     F128SseReg { reg_idx: usize },
     /// Small struct: first eightbyte INTEGER, second SSE.
     /// (`size` mirrors `CallArgClass`/`CoreArgClass` for structural consistency.)
-    #[allow(dead_code)] // size field not yet read by any backend
+    #[expect(dead_code)] // size field not yet read by any backend
     StructMixedIntSseReg {
         int_reg_idx: usize,
         fp_reg_idx: usize,
@@ -154,7 +154,7 @@ pub enum ParamClass {
     },
     /// Small struct: first eightbyte SSE, second INTEGER.
     /// (`size` mirrors `CallArgClass`/`CoreArgClass` for structural consistency.)
-    #[allow(dead_code)] // size field not yet read by any backend
+    #[expect(dead_code)] // size field not yet read by any backend
     StructMixedSseIntReg {
         fp_reg_idx: usize,
         int_reg_idx: usize,

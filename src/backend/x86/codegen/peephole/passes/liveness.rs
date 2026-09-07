@@ -215,7 +215,7 @@ fn mnemonic_is_known(t: &str) -> bool {
 
 impl FileLiveness {
     /// Compute liveness for every function in the file.
-    #[allow(clippy::needless_range_loop)]
+    #[expect(clippy::needless_range_loop)]
     pub(super) fn new(store: &LineStore, infos: &[LineInfo]) -> Self {
         let len = store.len();
         let mut lv = FileLiveness {
@@ -257,7 +257,7 @@ impl FileLiveness {
     /// and mandatory for correctness: a transform can extend the live range of
     /// the register it substitutes in, so a later query in the same pass must
     /// not see stale data.
-    #[allow(clippy::needless_range_loop)]
+    #[expect(clippy::needless_range_loop)]
     pub(super) fn refresh_at(&mut self, store: &LineStore, infos: &[LineInfo], idx: usize) {
         let len = store.len();
         let mut start = None;
@@ -292,7 +292,6 @@ impl FileLiveness {
     /// `true` when every `ret` in the range is preceded, inside its own tail
     /// block, by a write of `%rax` and by no mention of `%rdx`: the signature
     /// of a function returning one integer in the accumulator.
-    #[allow(clippy::needless_range_loop)]
     pub(super) fn returns_in_rax_only(
         store: &LineStore,
         infos: &[LineInfo],
@@ -345,7 +344,7 @@ impl FileLiveness {
         saw_ret
     }
 
-    #[allow(clippy::needless_range_loop)]
+    #[expect(clippy::needless_range_loop)]
     fn analyse_function(
         &mut self,
         store: &LineStore,
@@ -435,7 +434,6 @@ impl FileLiveness {
 
     /// Effects and successors of one instruction, or `None` when the control
     /// transfer cannot be resolved.
-    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn classify(
         &self,
         store: &LineStore,

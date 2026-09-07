@@ -593,6 +593,109 @@ impl Instruction {
         }
     }
 
+    /// Canonical classification: can this instruction write (or observably
+    /// modify) program memory?
+    ///
+    /// This is the single source of truth for memory-barrier reasoning in
+    /// the optimizer. It is an **exhaustive** match with no wildcard arm on
+    /// purpose: adding a new `Instruction` variant must fail to compile
+    /// until it is classified here. The dangerous default is "a new opcode
+    /// looks pure to every consumer of this predicate" — that exact drift
+    /// is how `VaArgStruct`, the `dest_ptr` store intrinsics, `AtomicInc`,
+    /// `PgoCounterInc`, `InitTrampoline` and `NonlocalGotoSave` once
+    /// escaped every hand-copied barrier list in the optimizer.
+    ///
+    /// Scope: "writes memory" covers writes through any pointer, va_list
+    /// state, profile-counter updates, and trampoline/nonlocal-goto buffer
+    /// initialization. It deliberately does **not** cover register-only
+    /// effects (`SetReturn*`, `SetStaticChain`), stack-pointer movement
+    /// (`DynAlloca`, `StackRestore`), or memory-ordering primitives
+    /// (`Fence`, `AtomicLoad`) — they order or move things without writing
+    /// memory bytes. Consumers that need those as relocation barriers add
+    /// them on top of this answer (see `passes::expr_sink::
+    /// is_memory_barrier`); consumers that need call refinement
+    /// (`is_pure`/`is_const`) refine upward, never below this answer.
+    pub fn may_write_memory(&self) -> bool {
+        match self {
+            // --- Value producers that never touch memory. ---
+            Instruction::Alloca { .. }
+            | Instruction::Load { .. }
+            | Instruction::BinOp { .. }
+            | Instruction::UnaryOp { .. }
+            | Instruction::Cmp { .. }
+            | Instruction::GetElementPtr { .. }
+            | Instruction::Cast { .. }
+            | Instruction::Copy { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::Phi { .. }
+            | Instruction::Select { .. }
+            | Instruction::ParamRef { .. }
+            | Instruction::StackSave { .. }
+            | Instruction::GetReturnF64Second { .. }
+            | Instruction::GetReturnF32Second { .. }
+            | Instruction::GetReturnF128Second { .. }
+            | Instruction::GetStaticChain { .. }
+            | Instruction::SetReturnF64Second { .. }
+            | Instruction::SetReturnF32Second { .. }
+            | Instruction::SetReturnF128Second { .. }
+            | Instruction::SetStaticChain { .. }
+            // --- Stack-pointer movement: no memory bytes written. ---
+            | Instruction::DynAlloca { .. }
+            | Instruction::StackRestore { .. }
+            // --- Ordering primitives: no bytes written. ---
+            | Instruction::Fence { .. }
+            | Instruction::AtomicLoad { .. } => false,
+            // --- Direct memory writes. ---
+            Instruction::Store { .. }
+            | Instruction::Memcpy { .. }
+            | Instruction::AtomicStore { .. }
+            | Instruction::AtomicRmw { .. }
+            | Instruction::AtomicInc { .. }
+            | Instruction::AtomicCmpxchg { .. }
+            // --- Calls: conservative. Even a callee marked pure/const can
+            // write its own stack scratch, and a plain call can write
+            // anywhere reachable. `is_pure`/`is_const` refinement belongs
+            // to the consumer, layered ABOVE this answer.
+            | Instruction::Call { .. }
+            | Instruction::CallIndirect { .. }
+            // --- Inline asm: arbitrary effects. ---
+            | Instruction::InlineAsm { .. }
+            // --- va_list state lives in memory. ---
+            | Instruction::VaStart { .. }
+            | Instruction::VaEnd { .. }
+            | Instruction::VaCopy { .. }
+            | Instruction::VaArg { .. }
+            | Instruction::VaArgStruct { .. }
+            // --- Profile counters are global memory. ---
+            | Instruction::PgoCounterInc { .. }
+            // --- Trampoline / saved-frame buffers are written. ---
+            | Instruction::InitTrampoline { .. }
+            | Instruction::NonlocalGotoSave { .. }
+            // --- Restores a saved frame and transfers control out of the
+            // current function; conservatively a barrier-class write. ---
+            | Instruction::NonlocalGoto { .. } => true,
+            // --- Intrinsics: the store class (VecStore*, Movnt*,
+            // Storedqu, SaveApplyArgs, ...) writes through `dest_ptr`.
+            // A small set writes through `args[0]` instead: the jump-buffer
+            // and apply-area ops. Everything else is pure compute/load.
+            // CONTRACT: a new memory-writing intrinsic op MUST be
+            // constructed with `dest_ptr: Some(..)` (or added to the
+            // args-writing list below) — that is the construction-site
+            // discipline this predicate keys on.
+            Instruction::Intrinsic { dest_ptr, op, .. } => {
+                dest_ptr.is_some()
+                    || matches!(
+                        op,
+                        IntrinsicOp::BuiltinSetjmp
+                            | IntrinsicOp::BuiltinLongjmp
+                            | IntrinsicOp::DoBuiltinApply
+                            | IntrinsicOp::RestoreApplyResult
+                    )
+            }
+        }
+    }
+
     /// Returns the result IR type of this instruction, if any.
     /// Used to determine stack slot sizes for 128-bit values.
     pub fn result_type(&self) -> Option<IrType> {

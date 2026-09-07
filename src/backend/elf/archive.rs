@@ -532,7 +532,11 @@ fn parse_symbol_table_payload(symtab: &[u8], is_64: bool) -> Result<Vec<(String,
 }
 
 /// Convenience: member names only (thin → filenames; regular → member names).
-#[allow(dead_code)]
+// Dead in production builds (no linker path needs the name-only view yet);
+// exercised by the `list_names_dispatch` test. Scope the `expect` to
+// non-test builds so the deadness assertion stays compiler-enforced for
+// shipped configurations while test builds see a genuinely called function.
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn list_archive_member_names(data: &[u8]) -> Result<Vec<String>, String> {
     if is_thin_archive(data) {
         parse_thin_archive_members(data)

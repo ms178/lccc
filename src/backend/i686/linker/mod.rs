@@ -29,7 +29,7 @@ mod reloc;
 mod sections;
 mod shared;
 mod symbols;
-#[allow(dead_code)] // ELF constants defined for completeness; not all used yet
+#[expect(dead_code)] // ELF constants defined for completeness; not all used yet
 mod types;
 
 use crate::backend::linker_common;

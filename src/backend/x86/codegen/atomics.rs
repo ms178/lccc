@@ -27,7 +27,7 @@ impl X86Codegen {
     }
 
     /// NOP-mode counter (debug): used to isolate instruction vs CFG bugs.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(super) fn emit_pgo_counter_nop_impl(&mut self, _name: &str, _offset: i64, _atomic: bool) {
         self.state.emit("    nop");
         self.state.reg_cache.invalidate_all();

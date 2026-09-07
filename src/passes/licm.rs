@@ -33,6 +33,7 @@ use super::{
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::analysis;
+use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
 
 /// Run LICM using pre-computed CFG analysis (avoids redundant analysis when
@@ -621,6 +622,21 @@ fn analyze_loop_memory(
                         }
                     }
                 }
+                // AtomicInc writes *ptr (PGO counters use it precisely
+                // because it needs no SSA dest). Same modeling as the
+                // other atomics; it was historically missing here.
+                Instruction::AtomicInc { ptr, .. } => {
+                    collect_ptr(ptr, &mut stored_allocas);
+                    if let Operand::Value(v) = ptr {
+                        if !alloca_info.alloca_values.contains(&v.0) {
+                            if let Some(&base) = value_to_base_global.get(&v.0) {
+                                stored_global_bases.insert(base);
+                            } else {
+                                has_unknown_derived_stores = true;
+                            }
+                        }
+                    }
+                }
                 Instruction::Memcpy { dest, .. } => {
                     stored_allocas.insert(dest.0);
                     if !alloca_info.alloca_values.contains(&dest.0) {
@@ -660,8 +676,70 @@ fn analyze_loop_memory(
                 } => {
                     stored_allocas.insert(dptr.0);
                 }
-                // VaStart/VaEnd/VaCopy/VaArg modify va_list state but not globals.
-                _ => {}
+                // Intrinsics that write through `args[0]` instead of
+                // `dest_ptr` (jump buffers / apply areas) or that restore
+                // a saved frame: conservative call-class barrier. They are
+                // rare enough that precision here buys nothing.
+                Instruction::Intrinsic { op, .. }
+                    if matches!(
+                        op,
+                        IntrinsicOp::BuiltinSetjmp
+                            | IntrinsicOp::BuiltinLongjmp
+                            | IntrinsicOp::DoBuiltinApply
+                            | IntrinsicOp::RestoreApplyResult
+                    ) =>
+                {
+                    has_calls = true;
+                }
+                // va_arg for structs writes dest_ptr (an alloca) and
+                // advances the va_list state (also an alloca).
+                Instruction::VaArgStruct {
+                    dest_ptr,
+                    va_list_ptr,
+                    ..
+                } => {
+                    stored_allocas.insert(dest_ptr.0);
+                    stored_allocas.insert(va_list_ptr.0);
+                }
+                // Trampoline initialization writes the 16-byte buffer
+                // alloca; non-local-goto save writes the frame struct.
+                Instruction::InitTrampoline { buffer, .. } => {
+                    stored_allocas.insert(buffer.0);
+                }
+                Instruction::NonlocalGotoSave { frame, .. } => {
+                    stored_allocas.insert(frame.0);
+                }
+                // PGO counters are globals; a nonlocal goto restores a
+                // saved frame and transfers control out of the loop.
+                Instruction::PgoCounterInc { .. } | Instruction::NonlocalGoto { .. } => {
+                    has_calls = true;
+                }
+                // VaStart/VaEnd/VaCopy/VaArg modify va_list state (an
+                // alloca), not globals — tracked so loads of the va_list
+                // itself are not hoisted above the state change.
+                Instruction::VaStart { va_list_ptr }
+                | Instruction::VaEnd { va_list_ptr }
+                | Instruction::VaArg { va_list_ptr, .. } => {
+                    stored_allocas.insert(va_list_ptr.0);
+                }
+                Instruction::VaCopy { dest_ptr, src_ptr } => {
+                    stored_allocas.insert(dest_ptr.0);
+                    stored_allocas.insert(src_ptr.0);
+                }
+                // Every remaining opcode is memory-pure. The catch-all is
+                // guarded by the canonical predicate so the model cannot
+                // drift again silently: `may_write_memory` is an
+                // exhaustive wildcard-free match in ir::instruction.rs, so
+                // a future memory-writing variant is forced to compile-time
+                // classification there — and if this LICM model ever
+                // forgets to follow, this debug assert fires in every
+                // debug/test build instead of silently miscompiling.
+                _ => {
+                    debug_assert!(
+                        !inst.may_write_memory(),
+                        "LICM loop-memory model is missing a memory-writing opcode"
+                    );
+                }
             }
         }
     }

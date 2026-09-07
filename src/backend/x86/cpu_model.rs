@@ -499,7 +499,7 @@ const SKYMONT_ARL: ECoreTune = ECoreTune {
     cluster_l2_kib: 4096,
 };
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 const fn cache(
     l1d_kib: u32,
     l1d_ways: u8,

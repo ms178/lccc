@@ -1997,7 +1997,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 /// When we see `movl -8(%ebp), %ecx`, forward to `movl %eax, %ecx` or eliminate if same reg.
 // TODO: Disabled - causes 21 regressions in FP computation tests (matrix/FP operations
 // produce wrong numerical results). Needs investigation into FP load/store forwarding patterns.
-#[allow(dead_code)]
+#[expect(dead_code)]
 fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
@@ -8524,7 +8524,7 @@ fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;

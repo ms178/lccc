@@ -283,7 +283,7 @@ impl FoldCtx<'_> {
 /// Decide the fold for one hardened call site.  All call-shape gates
 /// (result unused, flag == 1, constant NUL-free format) are checked here;
 /// `next_val` is the next free value id for a stripped-literal definition.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn classify(
     ctx: &FoldCtx,
     callee: &str,

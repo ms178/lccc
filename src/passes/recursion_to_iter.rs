@@ -409,7 +409,7 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
 
 struct CallSite {
     block_idx: usize,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     inst_idx: usize,
     dest: Value,
     arg: Operand,
@@ -741,7 +741,7 @@ mod tests {
         let has_back_edge = func.blocks.iter().any(|b| {
             matches!(&b.terminator, Terminator::Branch(target) if
                 func.blocks.iter().position(|bb| bb.label == *target)
-                    .map_or(false, |pos| pos < func.blocks.iter().position(|bb| bb.label == b.label).unwrap()))
+                    .is_some_and(|pos| pos < func.blocks.iter().position(|bb| bb.label == b.label).unwrap()))
         });
         assert!(
             has_back_edge,

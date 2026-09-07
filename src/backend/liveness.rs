@@ -1169,7 +1169,7 @@ fn extend_gep_base_liveness(
 /// masqueraded as register pressure and blocked homes for values whose real
 /// ranges are a few instructions (vsprintf number()'s `num % base` digit
 /// index measured [0..22] instead of [12..15]).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn extend_use_following_copies(
     start_id: u32,
     point: u32,
@@ -1691,7 +1691,7 @@ fn extend_intervals_from_liveness(
 /// The per-block footprints are what make multi-def (phi-eliminated) values
 /// correct: without them a latch block that re-defines and reads the value
 /// while it is dead at both boundaries was a hole (see [`BlockTouches`]).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn build_segments(
     num_blocks: usize,
     value_ids: &[u32],

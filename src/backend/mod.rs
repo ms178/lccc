@@ -1,7 +1,7 @@
 pub(crate) mod asm_expr; // Shared assembly expression evaluator (arithmetic, bitwise, parens)
 pub(crate) mod asm_preprocess; // Shared GAS preprocessing: comments, macros, rept, conditionals
 pub(crate) mod common;
-#[allow(dead_code)] // Defines ELF standard constants/helpers; not all used by every backend
+#[expect(dead_code)] // Defines ELF standard constants/helpers; not all used by every backend
 pub(crate) mod elf;
 pub(crate) mod elf_writer_common; // Shared x86/i686 assembler ELF writer
 #[cfg_attr(feature = "gcc_linker", allow(dead_code))]
