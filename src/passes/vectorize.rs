@@ -110,6 +110,48 @@ thread_local! {
     // generic vector pass being active is not evidence that both instructions
     // are legal for this particular lowering.
     static X86_STRICT_RECIP_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // x86 SIMD register-file availability for the MIDDLE END. Every vector
+    // lowering this pass emits (VecLoadI32x8, VecAndI32x8, FmaF64x4, ...)
+    // becomes an xmm/ymm instruction in the backend. The Linux kernel is built
+    // with `-mno-sse -mno-mmx -mno-sse2 -mno-avx` because it runs with
+    // CR4.OSFXSR=0 and never saves FPU state, so a single such instruction is
+    // an immediate #UD (observed: `identify_cpu` in arch/x86/kernel/cpu/common.c
+    // acquired vmovdqu/vpand from a vectorized `memset` of x86_capability).
+    // The gate therefore lives HERE, not in the backend: the backend can only
+    // refuse to *lower* a vector op, by which point the pass has already
+    // destroyed the scalar loop shape it would need to fall back to.
+    // Default is FALSE - the driver opts in per TU, so a forgotten
+    // `set_x86_simd_isa` call fails closed instead of emitting illegal code.
+    static X86_SIMD_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // AVX2 (256-bit ymm) availability, distinct from `X86_SIMD_AVAILABLE`:
+    // x86-64's project baseline is x86-64-v3, so plain `-mno-avx` must
+    // downgrade the vectorizer to 128-bit SSE2 forms rather than disable it.
+    static X86_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record the x86 SIMD ISA profile for the current translation unit.
+///
+/// `simd` gates every x86 vector lowering (xmm *or* ymm); `avx2` gates the
+/// 256-bit forms specifically. Called by `run_passes` before any vectorization
+/// entry point runs on this thread - the same per-TU refresh discipline as
+/// [`set_x86_fma_enabled`], because worker threads compile many TUs and a
+/// stale permission would leak ISA into the next one.
+///
+/// AArch64 needs no gate: its entry points pass `neon = true` and NEON is
+/// baseline ISA for every supported ARMv8/v9 target.
+pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool) {
+    X86_SIMD_AVAILABLE.with(|available| available.set(simd));
+    // AVX2 is a subset of "SIMD at all"; never let a caller assert AVX2 while
+    // SIMD itself is forbidden.
+    X86_AVX2_AVAILABLE.with(|available| available.set(avx2 && simd));
+}
+
+fn x86_simd_available() -> bool {
+    X86_SIMD_AVAILABLE.with(|available| available.get())
+}
+
+fn x86_avx2_available() -> bool {
+    X86_AVX2_AVAILABLE.with(|available| available.get())
 }
 
 /// Record whether the x86 target has FMA3. Called by `run_passes` before any
@@ -172,6 +214,22 @@ fn vectorize_with_analysis_mode(
         );
     }
 
+    // ISA gate: the x86 vector lowerings require the SIMD register file. Under
+    // `-mno-sse` / `-mno-sse2` / `-mgeneral-regs-only` the target has no xmm
+    // state at all (kernel: CR4.OSFXSR=0), so bail out before any transform
+    // rewrites the loop. `neon` entry points are AArch64, where the vector ISA
+    // is baseline and this gate does not apply.
+    if !neon && !x86_simd_available() {
+        if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
+            eprintln!(
+                "[VEC] Function {}: not vectorized: x86 SIMD disabled by ISA flags \
+                 (-mno-sse/-mno-sse2/-mgeneral-regs-only)",
+                func.name
+            );
+        }
+        return 0;
+    }
+
     if loops.is_empty() {
         return 0;
     }
@@ -223,7 +281,8 @@ fn vectorize_with_analysis_mode(
         take_reject();
         if let Some(pattern) = analyze_loop_pattern(func, loop_info, cfg) {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
-            let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
+            let use_sse2 =
+                force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok() || !x86_avx2_available();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
             // The AArch64 two-wide lowering emits both halves per iteration,
             // consuming four doubles. Use the real machine-step width for the
@@ -394,7 +453,8 @@ fn vectorize_with_analysis_mode(
             }
 
             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
-            let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
+            let use_sse2 =
+                force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok() || !x86_avx2_available();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
 
             // Same profitability gate as the matmul path (the reduction path
@@ -427,7 +487,10 @@ fn vectorize_with_analysis_mode(
             if let Some(map_pattern) = analyze_map_pattern(func, loop_info, neon) {
                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
                 // the focused SSE diagnostic override requests 128-bit code.
-                let avx2 = !neon && !force_two_wide && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
+                let avx2 = !neon
+                    && !force_two_wide
+                    && std::env::var("LCCC_FORCE_MAP_SSE").is_err()
+                    && x86_avx2_available();
                 if debug {
                     eprintln!(
                         "[VEC] Map pattern matched! Transforming to {}-bit {:?}",
@@ -442,7 +505,9 @@ fn vectorize_with_analysis_mode(
                 // intrinsics are not wired for the displacement form yet.
                 if let Some(stencil_pattern) = analyze_stencil_pattern(func, loop_info) {
                     if !neon {
-                        let avx2 = !force_two_wide && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
+                        let avx2 = !force_two_wide
+                            && std::env::var("LCCC_FORCE_MAP_SSE").is_err()
+                            && x86_avx2_available();
                         if debug {
                             eprintln!(
                                 "[VEC] Stencil pattern matched! taps={} {:?} ({}-bit)",

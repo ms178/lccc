@@ -298,6 +298,40 @@ const MAX_TRACE_CHAIN_LENGTH: usize = 20;
 /// trees where both operands themselves need recursive tracing.
 const MAX_TRACE_RECURSION_DEPTH: u32 = 10;
 
+/// Allocas at least this large are charged to a callee's aggregate-frame cost.
+/// Smaller ones are ignored: mem2reg/SROA promotes them to registers, so they
+/// cost no stack space after inlining, whereas an aggregate of this size is
+/// materialised in the frame at *every* inline site.
+const AGG_FRAME_SLOT_BYTES: usize = 16;
+
+/// `-Os`/`-Oz` veto: keep a callee outlined when inlining it would duplicate a
+/// large aggregate local frame at several call sites.
+///
+/// Instruction counts are blind to stack cost. `arch/x86/boot/tty.c`'s
+/// `kbd_pending`/`gettime` are ~15-instruction helpers that each materialise a
+/// 44-byte `struct biosregs`; inlining them into `getchar_timeout` grew it from
+/// GCC's 71 bytes to 290 bytes (4.1x), eating a sixth of the 32 KiB real-mode
+/// setup budget on a single function. An outlined body pays the frame once for
+/// all its callers, so with more than one call site outlining is the size win --
+/// which is exactly what GCC's `-Os` heuristic concludes here.
+///
+/// Scoped deliberately: callees that *must* be inlined (`always_inline`, and
+/// gnu_inline definitions, which have no out-of-line body) are exempt, as are
+/// profile-forced hot sites and single-call-site callees (where inlining is
+/// size-neutral because the outlined copy disappears).
+fn aggregate_frame_should_stay_outlined(
+    callee_data: &CalleeData,
+    pgo_force: bool,
+    size_optimized: bool,
+) -> bool {
+    size_optimized
+        && callee_data.agg_frame_bytes >= AGG_FRAME_SLOT_BYTES
+        && !callee_data.is_always_inline
+        && !callee_data.is_gnu_inline_def
+        && !callee_data.single_call_site
+        && !pgo_force
+}
+
 /// Select the best call site to inline from the given candidates.
 ///
 /// Uses a two-pass strategy:
@@ -364,26 +398,30 @@ fn select_inline_site(
         // retain the outlined wrapper so its loop owner is expanded once.
         // Attribute/section/PGO cases keep their stronger correctness or
         // profile-driven policy.
-        if multisite_loop_wrapper_should_stay_outlined(
-            callee_data,
-            callee_inst_count,
-            caller_has_section,
-            site.pgo_force,
-            size_optimized,
-        ) || nested_loop_multisite_static_should_stay_outlined(
-            callee_data,
-            callee_inst_count,
-            loop_blocks.contains(&site.block_idx),
-            caller_has_section,
-            site.pgo_force,
-            size_optimized,
-        ) || repeated_small_loop_clone_should_stay_outlined(
-            callee_data,
-            callee_inst_count,
-            caller_has_section,
-            site.pgo_force,
-            size_optimized,
-        ) {
+        if aggregate_frame_should_stay_outlined(callee_data, site.pgo_force, size_optimized)
+            || multisite_loop_wrapper_should_stay_outlined(
+                callee_data,
+                callee_inst_count,
+                caller_has_section,
+                site.pgo_force,
+                size_optimized,
+            )
+            || nested_loop_multisite_static_should_stay_outlined(
+                callee_data,
+                callee_inst_count,
+                loop_blocks.contains(&site.block_idx),
+                caller_has_section,
+                site.pgo_force,
+                size_optimized,
+            )
+            || repeated_small_loop_clone_should_stay_outlined(
+                callee_data,
+                callee_inst_count,
+                caller_has_section,
+                site.pgo_force,
+                size_optimized,
+            )
+        {
             continue;
         }
         // Static inline functions that fit within normal limits should
@@ -454,26 +492,30 @@ fn select_inline_site(
             .iter()
             .map(|b| b.instructions.len())
             .sum();
-        if multisite_loop_wrapper_should_stay_outlined(
-            callee_data,
-            callee_inst_count,
-            caller_has_section,
-            site.pgo_force,
-            size_optimized,
-        ) || nested_loop_multisite_static_should_stay_outlined(
-            callee_data,
-            callee_inst_count,
-            loop_blocks.contains(&site.block_idx),
-            caller_has_section,
-            site.pgo_force,
-            size_optimized,
-        ) || repeated_small_loop_clone_should_stay_outlined(
-            callee_data,
-            callee_inst_count,
-            caller_has_section,
-            site.pgo_force,
-            size_optimized,
-        ) {
+        if aggregate_frame_should_stay_outlined(callee_data, site.pgo_force, size_optimized)
+            || multisite_loop_wrapper_should_stay_outlined(
+                callee_data,
+                callee_inst_count,
+                caller_has_section,
+                site.pgo_force,
+                size_optimized,
+            )
+            || nested_loop_multisite_static_should_stay_outlined(
+                callee_data,
+                callee_inst_count,
+                loop_blocks.contains(&site.block_idx),
+                caller_has_section,
+                site.pgo_force,
+                size_optimized,
+            )
+            || repeated_small_loop_clone_should_stay_outlined(
+                callee_data,
+                callee_inst_count,
+                caller_has_section,
+                site.pgo_force,
+                size_optimized,
+            )
+        {
             continue;
         }
         // Cost loop-body cloning after accounting for tiny/static-inline
@@ -1809,6 +1851,16 @@ struct CalleeData {
     /// attribute-constrained inline definition. It has a valid outlined body,
     /// so profitability policy may deliberately retain a call to it.
     is_plain_static: bool,
+    /// The whole module contains exactly one call to this callee. Inlining is
+    /// then size-neutral (the outlined body disappears), so size-based vetoes
+    /// must not fire. Independent of `is_single_call_site_static`, which
+    /// additionally requires an ordinary `static` definition.
+    single_call_site: bool,
+    /// Stack bytes the callee's body forces on *every* inline site: the sum of
+    /// its non-promotable alloca sizes (see `AGG_FRAME_SLOT_BYTES`).
+    /// Instruction-count costs are blind to this, which is how a ~15-instruction
+    /// helper carrying a 44-byte `struct biosregs` still looked "small".
+    agg_frame_bytes: usize,
     /// Module-wide direct calls (including a redirected asm label) observed
     /// before inlining.  Multi-site wrappers duplicate their descendants.
     direct_call_count: usize,
@@ -2387,6 +2439,18 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         let param_struct_sizes: Vec<Option<usize>> =
             func.params.iter().map(|p| p.struct_size).collect();
 
+        // Frame bytes duplicated at every inline site. Only allocas large
+        // enough to survive mem2reg/SROA count; the rest become registers.
+        let agg_frame_bytes: usize = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|inst| match inst {
+                Instruction::Alloca { size, .. } if *size >= AGG_FRAME_SLOT_BYTES => Some(*size),
+                _ => None,
+            })
+            .sum();
+
         map.insert(
             func.name.clone(),
             CalleeData {
@@ -2422,6 +2486,8 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                     && !func.is_inline
                     && has_single_call_site
                     && !survives_via_reference,
+                single_call_site: has_single_call_site,
+                agg_frame_bytes,
                 has_loops,
                 is_recursive,
                 has_vector_intrinsics: func_has_vector_intrinsics(func),
@@ -4274,6 +4340,42 @@ mod inline_limit_tests {
         assert!(!fits_static_loop_inline_limits(128, 17, 1));
     }
     #[test]
+    fn aggregate_frame_veto_is_size_optimized_and_multisite_only() {
+        // The arch/x86/boot `struct biosregs` shape: a ~15-instruction helper
+        // that still forces 44 frame bytes on every inline site.
+        let mut callee = wrapper_policy_data(2);
+        callee.agg_frame_bytes = 44;
+        assert!(aggregate_frame_should_stay_outlined(&callee, false, true));
+
+        // -O1/-O2/-O3 optimise for speed; stack cost alone must not veto.
+        assert!(!aggregate_frame_should_stay_outlined(&callee, false, false));
+
+        // One call site: the outlined body disappears, so inlining is
+        // size-neutral and the veto must stay out of the way.
+        callee.single_call_site = true;
+        assert!(!aggregate_frame_should_stay_outlined(&callee, false, true));
+        callee.single_call_site = false;
+
+        // Callees that have no usable out-of-line body must still be inlined.
+        callee.is_always_inline = true;
+        assert!(!aggregate_frame_should_stay_outlined(&callee, false, true));
+        callee.is_always_inline = false;
+        callee.is_gnu_inline_def = true;
+        assert!(!aggregate_frame_should_stay_outlined(&callee, false, true));
+        callee.is_gnu_inline_def = false;
+
+        // A profile-forced hot site outranks the static size heuristic.
+        assert!(!aggregate_frame_should_stay_outlined(&callee, true, true));
+
+        // Below the threshold the allocas are promotable, so no frame cost.
+        callee.agg_frame_bytes = AGG_FRAME_SLOT_BYTES - 1;
+        assert!(!aggregate_frame_should_stay_outlined(&callee, false, true));
+        // At exactly the threshold the veto engages.
+        callee.agg_frame_bytes = AGG_FRAME_SLOT_BYTES;
+        assert!(aggregate_frame_should_stay_outlined(&callee, false, true));
+    }
+
+    #[test]
     fn vector_static_inline_limit() {
         assert!(fits_normal_inline_limits(150, 12, true, true, true, 6));
         assert!(fits_normal_inline_limits(199, 24, true, true, true, 6));
@@ -4297,6 +4399,8 @@ mod inline_limit_tests {
             num_params: 0,
             next_value_id: 0,
             max_block_id: 0,
+            single_call_site: false,
+            agg_frame_bytes: 0,
             is_always_inline: false,
             exceeds_normal_limits: false,
             is_static_inline: false,

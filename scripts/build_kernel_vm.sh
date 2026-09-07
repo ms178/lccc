@@ -83,6 +83,49 @@ if [[ ! -f .lccc-vm-config ]]; then
   touch .lccc-vm-config
 fi
 
+# ---- host tool preflight ----------------------------------------------------
+# bzImage's last step shells out to a host compression tool selected by
+# CONFIG_KERNEL_*. A missing one fails AFTER the whole kernel has compiled
+# (observed: `zstd: not found` at arch/x86/boot/compressed/vmlinux.bin.zst,
+# ~20 minutes into the build). Check every host tool the remaining steps need
+# up front so the failure costs seconds instead of a full build.
+preflight_host_tools() {
+  local missing=() tool sym
+  # Compression tool implied by the config (Kbuild's compressed/Makefile).
+  for sym in GZIP BZIP2 LZMA XZ LZO LZ4 ZSTD; do
+    if grep -q "^CONFIG_KERNEL_${sym}=y$" .config; then
+      case $sym in
+        GZIP) tool=gzip ;;
+        BZIP2) tool=bzip2 ;;
+        LZMA) tool=lzma ;;
+        XZ) tool=xz ;;
+        LZO) tool=lzop ;;
+        LZ4) tool=lz4 ;;
+        ZSTD) tool=zstd ;;
+      esac
+      command -v "$tool" >/dev/null 2>&1 || missing+=("$tool (CONFIG_KERNEL_$sym)")
+    fi
+  done
+  # Unconditional build-time host tools for a bzImage link.
+  # flex/bison drive kconfig, pahole drives CONFIG_DEBUG_INFO_BTF; both are
+  # host-only and both are absent on a minimal image.
+  for tool in nm objcopy ar size perl awk sed bc cpio flex bison; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  if grep -q "^CONFIG_DEBUG_INFO_BTF=y$" .config 2>/dev/null; then
+    command -v pahole >/dev/null 2>&1 || missing+=("pahole (CONFIG_DEBUG_INFO_BTF)")
+  fi
+  if ((${#missing[@]})); then
+    echo "build_kernel_vm: missing host tools: ${missing[*]}" >&2
+    echo "  These are build machines only; they are never built with LCCC." >&2
+    echo "  Debian/Ubuntu: apt-get install build-essential flex bison libelf-dev libssl-dev \\" >&2
+    echo "    zstd xz-utils lz4 lzop bzip2 binutils cpio bc kmod dwarves" >&2
+    return 1
+  fi
+  echo "preflight: host tools OK"
+}
+preflight_host_tools || exit 1
+
 start=$(date +%s)
 # Refresh include/config/auto.conf SERIALLY before the parallel build.  A
 # -j2 `bzImage` re-runs syncconfig as part of `prepare`, and when auto.conf

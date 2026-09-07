@@ -150,6 +150,16 @@ pub struct Driver {
     /// profiles must not re-enable SSE after that: GCC keeps the disable
     /// (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
     pub(super) sse_explicitly_disabled: bool,
+    /// Set by `-mno-avx`/`-mno-avx2`/`-mno-sse4.x`: the TU explicitly forbade
+    /// 256-bit VEX code. Distinct from `enable_avx2` (which records what was
+    /// explicitly *requested* and drives `__AVX2__`): LCCC's x86-64
+    /// code-generation baseline is x86-64-v3, so AVX2 is legal by default and
+    /// only an explicit denial removes it. Without this distinction a
+    /// default-flag build would silently lose every 256-bit transform.
+    pub(super) avx_explicitly_disabled: bool,
+    /// Set by `-mno-fma` (and by any AVX/SSE denial, since `vfmadd*` is
+    /// VEX-encoded and requires AVX): `vfmadd*` must not be emitted.
+    pub(super) fma_explicitly_disabled: bool,
     pub(super) skip_rax_setup: bool,
     /// -mno-80387/-mno-fp-ret-in-387: no x87 instructions or x87 FP returns.
     /// Recorded so FP codegen can fail closed on long-double paths.
@@ -427,6 +437,8 @@ impl Driver {
             cf_protection_value: None,
             no_sse: false,
             sse_explicitly_disabled: false,
+            avx_explicitly_disabled: false,
+            fma_explicitly_disabled: false,
             skip_rax_setup: false,
             no_x87: false,
             indirect_branch_thunk_inline: false,
@@ -1615,6 +1627,23 @@ impl Driver {
             self.code16gcc,
             self.fp_reassoc,
             self.fp_contract,
+            // Code-generation ISA permission (see passes::X86Isa). x86-64's
+            // baseline already contains SSE2, and the project baseline is
+            // x86-64-v3, so each subset is legal unless the TU explicitly
+            // denied it. i686 has no baseline SSE2 and its vector lowerings
+            // are x86-64 shapes, so it never vectorizes (verified: 0 xmm refs
+            // at -O2/-O3, with and without -ffast-math).
+            crate::passes::X86Isa {
+                simd: self.target == Target::X86_64 && !self.no_sse && !self.general_regs_only,
+                ymm: self.target == Target::X86_64
+                    && !self.no_sse
+                    && !self.general_regs_only
+                    && !self.avx_explicitly_disabled,
+                fma: self.target == Target::X86_64
+                    && !self.no_sse
+                    && !self.general_regs_only
+                    && !self.fma_explicitly_disabled,
+            },
             self.target == Target::X86_64
                 && self.enable_avx
                 && !self.no_sse

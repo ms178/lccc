@@ -873,6 +873,28 @@ fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32)
     }
 }
 
+/// x86 ISA permission for *code generation*, computed once per TU by the
+/// driver.
+///
+/// Deliberately distinct from the driver's `enable_*` feature bits: those
+/// record what the TU explicitly *requested* and drive the `__AVX2__`-style
+/// feature macros, which must stay GCC-accurate. LCCC's x86-64 code-generation
+/// baseline is x86-64-v3, so a subset is *legal* unless the TU forbade it with
+/// `-mno-*` / `-mgeneral-regs-only`. Conflating the two is wrong in both
+/// directions: treating "unrequested" as "illegal" strips every 256-bit
+/// transform from default-flag builds, while treating "legal by default" as
+/// "legal always" emits AVX2 into a `-mno-avx` kernel object - an immediate
+/// #UD, since the kernel runs with CR4.OSFXSR=0.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct X86Isa {
+    /// xmm register file usable at all.
+    pub simd: bool,
+    /// 256-bit ymm (AVX/AVX2) forms usable.
+    pub ymm: bool,
+    /// `vfmadd*` (FMA3, VEX-encoded) usable.
+    pub fma: bool,
+}
+
 /// Run optimization passes for the requested optimization level.
 ///
 /// `opt_level`: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
@@ -883,12 +905,19 @@ pub(crate) fn run_passes(
     code16gcc: bool,
     fp_reassoc: bool,
     fp_contract: crate::common::fp_contract::FpContract,
+    x86_isa: X86Isa,
     x86_avx: bool,
     x86_avx2: bool,
     x86_sse4_1: bool,
     x86_fma: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
+    // x86 SIMD register-file availability for the middle end. Under `-mno-sse`
+    // / `-mgeneral-regs-only` there is no xmm state on the target at all, so
+    // the vectorizer must not rewrite a single loop (see the gate in
+    // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
+    // 128-bit SSE2 instead of disabling vectorization outright.
+    vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm);
     // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
     // ignores this.
@@ -903,10 +932,12 @@ pub(crate) fn run_passes(
     // FMA3 availability for the fma/fmaf libcall fold (simplify.rs): the
     // fused form is required for the C99 single-rounding semantics, so the
     // fold must only fire when the backend can actually emit vfmadd*.
-    // x86-64's project baseline is x86-64-v3 (FMA3 always present); i686
-    // has it only under -mfma.
+    // x86-64's project baseline is x86-64-v3, so FMA3 is present *unless* the
+    // TU disabled it: `-mno-fma` clears it, and `-mno-sse` clears the whole
+    // SIMD register file (vfmadd is a VEX-encoded SSE instruction, so a
+    // kernel TU built with `-mno-sse` would #UD on the folded form).
     simplify::set_has_fma3(match target {
-        crate::backend::Target::X86_64 => true,
+        crate::backend::Target::X86_64 => x86_isa.fma,
         crate::backend::Target::I686 => x86_fma,
         crate::backend::Target::Aarch64 => true,
         _ => false,
