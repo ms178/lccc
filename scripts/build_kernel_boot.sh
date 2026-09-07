@@ -25,11 +25,19 @@ K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
 LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
 OUT=${OUT:-/tmp/bootbuild}
+# Resolve the script directory before `cd "$K"`: $0 is relative to the caller's
+# cwd, so sourcing boot_flags.sh after the cd would look inside the kernel tree.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 cd "$K"
 
-RMF="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -Wall -Wstrict-prototypes -Wno-address-of-packed-member -DSVGA_MODE=NORMAL_VGA"
-INC="-nostdinc -Iarch/x86/boot -Iarch/x86/include -Iarch/x86/include/generated -Iinclude -Iinclude/generated -Iinclude/uapi -Iarch/x86/include/uapi -Iarch/x86/include/generated/uapi -Iinclude/generated/uapi -include include/linux/compiler-version.h -include include/linux/kconfig.h -include include/linux/compiler_types.h -D__KERNEL__ -D_SETUP -DDISABLE_BRANCH_PROFILING -D__DISABLE_EXPORTS"
+# Real-mode translation-unit flags come from the shared flag module so that
+# boot_size_oracle.sh measures exactly the same command lines (an A/B size
+# comparison must never be confounded by a flag difference).
+# shellcheck source=boot_flags.sh
+. "$SCRIPT_DIR/boot_flags.sh"
+RMF="$LCCC_BOOT_CFLAGS"
+INC="$LCCC_BOOT_CPPFLAGS"
 
 mkdir -p "$OUT"
 
@@ -42,25 +50,21 @@ if [[ ! -f arch/x86/boot/cpustr.h ]]; then
 fi
 
 # ---- assemble the .S files -------------------------------------------------
-ASM_FILES=(header bioscall copy pmjump)
+ASM_FILES=("${LCCC_BOOT_ASM_FILES[@]}")
 for f in "${ASM_FILES[@]}"; do
   echo "AS   $f.S"
   "$LCCC" $INC $RMF -D__ASSEMBLY__ -c "arch/x86/boot/$f.S" -o "$OUT/$f.o"
 done
 
 # ---- compile the .c files --------------------------------------------------
-C_FILES=(a20 cmdline cpu cpuflags cpucheck early_serial_console edd main memory
-         pm printf regs string tty video video-mode version video-vga
-         video-vesa video-bios)
+C_FILES=("${LCCC_BOOT_C_FILES[@]}")
 for f in "${C_FILES[@]}"; do
   echo "CC   $f.c"
   "$LCCC" $INC $RMF -c "arch/x86/boot/$f.c" -o "$OUT/$f.o"
 done
 
 # ---- link setup.elf with lccc-ld -------------------------------------------
-SETUP_OBJS=(a20 bioscall cmdline copy cpu cpuflags cpucheck early_serial_console
-            edd header main memory pm pmjump printf regs string tty video
-            video-mode version video-vga video-vesa video-bios)
+SETUP_OBJS=("${LCCC_BOOT_OBJS[@]}")
 OBJS=()
 for o in "${SETUP_OBJS[@]}"; do OBJS+=("$OUT/$o.o"); done
 

@@ -965,6 +965,9 @@ impl Driver {
                     // (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
                     self.no_sse = true;
                     self.sse_explicitly_disabled = true;
+                    // No xmm state at all, so every VEX form is forbidden too.
+                    self.avx_explicitly_disabled = true;
+                    self.fma_explicitly_disabled = true;
                     self.enable_sse3 = false;
                     self.enable_ssse3 = false;
                     self.enable_sse4_1 = false;
@@ -1013,6 +1016,7 @@ impl Driver {
                 "-mharden-sls=none" => {}
                 "-mno-avx2" => {
                     self.enable_avx2 = false;
+                    self.avx_explicitly_disabled = true;
                     self.enable_avxvnni = false;
                     self.enable_avxvnniint8 = false;
                     self.enable_avxvnniint16 = false;
@@ -1020,11 +1024,18 @@ impl Driver {
                 "-mno-avx" => {
                     self.enable_avx = false;
                     self.enable_avx2 = false;
+                    // `vfmadd*` is VEX-encoded: no AVX means no FMA3 either
+                    // (GCC rejects -mfma -mno-avx for the same reason).
+                    self.avx_explicitly_disabled = true;
+                    self.fma_explicitly_disabled = true;
                     self.enable_avxvnni = false;
                     self.enable_vaes = false;
                     self.enable_vpclmulqdq = false;
                 }
                 "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" | "-mno-sse4.2" => {
+                    // AVX implies SSE4.2, so denying any SSE4.x denies AVX.
+                    self.avx_explicitly_disabled = true;
+                    self.fma_explicitly_disabled = true;
                     self.enable_sse3 = false;
                     self.enable_ssse3 = false;
                     self.enable_sse4_1 = false;
@@ -1099,7 +1110,10 @@ impl Driver {
                 "-mno-aes" => self.enable_aes = false,
                 "-mno-pclmul" => self.enable_pclmul = false,
                 "-mno-f16c" => self.enable_f16c = false,
-                "-mno-fma" => self.enable_fma = false,
+                "-mno-fma" => {
+                    self.enable_fma = false;
+                    self.fma_explicitly_disabled = true;
+                }
                 "-mno-bmi" => self.enable_bmi = false,
                 "-mno-bmi2" => self.enable_bmi2 = false,
                 "-mno-lzcnt" => self.enable_lzcnt = false,
@@ -1165,6 +1179,9 @@ impl Driver {
                     self.general_regs_only = true;
                     self.no_sse = true;
                     self.sse_explicitly_disabled = true;
+                    // No xmm state at all, so every VEX form is forbidden too.
+                    self.avx_explicitly_disabled = true;
+                    self.fma_explicitly_disabled = true;
                     self.enable_sse3 = false;
                     self.enable_ssse3 = false;
                     self.enable_sse4_1 = false;

@@ -43,6 +43,31 @@ TARBALL="$WORK/linux-$KVER.tar.xz"
 
 [[ -d $PKGDIR ]] || { echo "prepare_kernel_tree: PKGDIR not found: $PKGDIR" >&2; exit 1; }
 
+# `make olddefconfig`/`make prepare` need host tools that are not part of the
+# LCCC build and therefore easy to have absent on a fresh machine; failing
+# there wastes the whole download+patch phase that precedes it.  Check first.
+preflight_host_tools() {
+  local missing=() tool
+  # kconfig lexers/parsers, plus the unconditional build-time host tools.
+  for tool in make gcc ld ar nm objcopy perl awk sed bc flex bison cpio \
+              xz patch tar; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  # Compression tool implied by the package config (KERNEL_ZSTD=y upstream).
+  for tool in zstd xz lz4 lzop bzip2 gzip; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool (only if CONFIG_KERNEL_*=$tool)")
+  done
+  if ((${#missing[@]})); then
+    echo "prepare_kernel_tree: missing host tools: ${missing[*]}" >&2
+    echo "  Build machines only; never built with LCCC." >&2
+    echo "  Debian/Ubuntu: apt-get install build-essential flex bison libelf-dev \\" >&2
+    echo "    libssl-dev bc cpio kmod dwarves zstd xz-utils lz4 lzop bzip2" >&2
+    return 1
+  fi
+  echo "prepare_kernel_tree: host tools OK"
+}
+preflight_host_tools || exit 1
+
 # Already prepared?  Verify the stamp AND a canary file the snapshot truncation
 # removed last time (setup.ld); a damaged tree must regenerate, not half-work.
 if [[ -f "$KDIR/.lccc-prepared" ]] && [[ -f "$KDIR/${LCCC_PREPARED_CANARIES[0]}" ]]; then
