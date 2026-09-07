@@ -64,7 +64,7 @@ so I64 preserves semantics. The loop limit was already promoted to 2048 (byte li
 
 - `cargo test --profile fastbuild --lib`: 1306 passed, 0 failed
 - `lccc -O3 -march=x86-64-v3 -S`: verified no movslq in LBB6, cmpq, addq
-- `codegen_scoreboard.py`: 72 insns, gap 47
+- `codegen_scoreboard.py`: 72 insns, gap 47 (that tool is now `scripts/codegen_oracle.py --rank`)
 - `godbolt.py compare`: lccc 72 vs gcc 25 vs clang 438
 
 ## Remaining gaps vs GCC (25 vs 72)

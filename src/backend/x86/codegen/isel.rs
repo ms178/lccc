@@ -585,6 +585,21 @@ pub fn lower_binop(
                 });
                 divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
             }
+            // Defense-in-depth: a Phys(RDX) divisor would be destroyed by
+            // the Cqto above before the Div reads it. The Phase-2x64 wave's
+            // inclusive hazard check refuses divisor values, and the
+            // phi-coalesce propagation guard keeps it that way — but any
+            // future home-propagation path must not turn into a silent
+            // miscompile here: stage through the rcx scratch like an
+            // immediate.
+            if let MachOperand::Reg(MachReg::Phys(RDX)) = divisor_op {
+                out.push(MachInst::Mov {
+                    src: divisor_op,
+                    dst: MachOperand::Reg(MachReg::Phys(RCX)),
+                    size,
+                });
+                divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
+            }
             out.push(MachInst::Div {
                 divisor: divisor_op,
                 signed: true,
@@ -605,6 +620,16 @@ pub fn lower_binop(
             if let MachOperand::Imm(value) = divisor_op {
                 out.push(MachInst::Mov {
                     src: MachOperand::Imm(value),
+                    dst: MachOperand::Reg(MachReg::Phys(RCX)),
+                    size,
+                });
+                divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
+            }
+            // Defense-in-depth: see the signed arm — the XorRdx above
+            // destroys a Phys(RDX) divisor before the Div reads it.
+            if let MachOperand::Reg(MachReg::Phys(RDX)) = divisor_op {
+                out.push(MachInst::Mov {
+                    src: divisor_op,
                     dst: MachOperand::Reg(MachReg::Phys(RCX)),
                     size,
                 });

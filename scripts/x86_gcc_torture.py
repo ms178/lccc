@@ -13,12 +13,15 @@ Features:
   - Reference compiler validation (GCC) to establish host/test eligibility.
   - Sandbox and cross-execution support (--runner, e.g. qemu-i386).
   - JSON reporting and automated failure triage logs.
+  - Failure-focused re-runs: --from-list FILE restricts the corpus to the
+    test names listed in a previous report (one JSON `test` value per line).
 
 Examples:
   scripts/x86_gcc_torture.py --flags=-O2 -j2
   scripts/x86_gcc_torture.py --arch=i686 --flags=-O2 -j2
   scripts/x86_gcc_torture.py 20080604-1.c pr51933.c --flags=-O0,-O2,-Os
   scripts/x86_gcc_torture.py --filter '^(pr12|va-arg)' --json results.json
+  scripts/x86_gcc_torture.py --from-list failing.txt --json rerun.json
 """
 from __future__ import annotations
 
@@ -243,25 +246,77 @@ def atomic_json(path: Path, payload: object) -> None:
     temporary.replace(path)
 
 
+def read_test_list(path: Path) -> list[str]:
+    """Names from a --from-list file: one test name per line.
+
+    Blank lines and ``#`` comments are ignored; surrounding whitespace is
+    stripped.  Names are plain ``test``-field values (e.g. ``20180112-1`` or
+    ``20180112-1.c``) -- no per-test flag syntax is interpreted.
+    """
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise ValueError(f"cannot read --from-list file: {exc}") from exc
+    names: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        names.append(line)
+    return names
+
+
+def resolve_test_name(item: str, available: dict[str, Path]) -> Path | None:
+    """Resolve one --from-list entry to a suite source (or None if unknown).
+
+    Accepts the JSON ``test`` value with or without the ``.c`` suffix, and
+    (like the positional ``tests`` arguments) an explicit file path.
+    """
+    name = Path(item).name
+    if not name.endswith(".c"):
+        name += ".c"
+    path = Path(item)
+    if path.is_file():
+        return path.resolve()
+    if name in available:
+        return available[name]
+    return None
+
+
 def discover(args: argparse.Namespace) -> list[Path]:
     available = {path.name: path for path in args.suite.glob("*.c")}
+    selected: list[Path] | None = None
     if args.tests:
-        selected: list[Path] = []
+        selected = []
         missing: list[str] = []
         for item in args.tests:
-            name = Path(item).name
-            if not name.endswith(".c"):
-                name += ".c"
-            path = Path(item)
-            if path.is_file():
-                selected.append(path.resolve())
-            elif name in available:
-                selected.append(available[name])
+            path = resolve_test_name(item, available)
+            if path is not None:
+                selected.append(path)
             else:
                 missing.append(item)
         if missing:
             raise ValueError("tests not found: " + ", ".join(missing))
-    else:
+    if args.from_list:
+        picked: list[Path] = []
+        unknown: list[str] = []
+        seen: set[Path] = set()
+        for item in read_test_list(args.from_list):
+            path = resolve_test_name(item, available)
+            if path is None:
+                unknown.append(item)  # lists go stale: warn and skip, not an error
+            elif path not in seen:
+                seen.add(path)
+                picked.append(path)
+        for item in unknown:
+            print(f"warning: --from-list test not found, skipping: {item}", file=sys.stderr)
+        if selected is None:
+            selected = picked
+        else:
+            # --from-list composes with positional tests as an intersection.
+            keep = set(picked)
+            selected = [path for path in selected if path in keep]
+    if selected is None:
         selected = sorted(available.values())
     if args.filter:
         pattern = re.compile(args.filter)
@@ -275,6 +330,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("tests", nargs="*", help="exact test paths/names (default: full execute corpus)")
+    parser.add_argument(
+        "--from-list", type=Path, metavar="FILE",
+        help="run only the tests named in FILE (newline-separated JSON `test` "
+             "field values, with or without the .c suffix; blank lines and # "
+             "comments ignored; unknown names warn and are skipped; composes "
+             "as an intersection with positional tests and --filter)",
+    )
     parser.add_argument("--arch", choices=["x86_64", "i686", "i386"], default="x86_64")
     parser.add_argument("--suite", type=Path, default=DEFAULT_SUITE)
     parser.add_argument("--lccc", type=Path)
@@ -336,6 +398,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     append_args = shlex.split(args.append) if args.append else []
 
     print(f"suite:   {args.suite} ({len(sources)} sources)")
+    if args.from_list:
+        print(f"list:    {args.from_list} (partial run, {len(sources)} listed sources kept)")
     print(f"arch:    {args.arch} | runner: {args.runner or 'native'}")
     print(f"lccc:    {args.lccc}")
     if args.arch == "x86_64":
@@ -381,6 +445,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "schema": 1,
         "arch": args.arch,
         "suite": str(args.suite),
+        # Present only for --from-list partial runs so downstream evidence
+        # tooling (torture_evidence.py & friends) can see the report covers a
+        # filtered subset rather than the full corpus; full-run reports keep
+        # the exact pre-`--from-list` schema (no extra key).
+        **({"from_list": str(args.from_list)} if args.from_list else {}),
         "gcc_checkout_head": revision(args.suite.parents[3]) if len(args.suite.parents) > 3 else None,
         "lccc": str(args.lccc),
         "lccc_ld": str(args.lccc_ld),

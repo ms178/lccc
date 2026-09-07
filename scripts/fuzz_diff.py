@@ -14,6 +14,41 @@ Engines Supported:
                     every generated case under the cartesian product of the
                     repeatable `--config-env KEY=VALUE` configuration axes
                     (both compilers, compile and run, under each combo).
+  5. differential : tests/fuzz/differential_fuzz.py generator absorbed as an
+                    engine (x86-64 TU soup: fixed-width arithmetic, CFG joins,
+                    arrays, structs/bitfields, volatile, postdec, __int128;
+                    historical -march=raptorlake flags, Oz->Os on references).
+  6. phi_cfg      : tests/fuzz/phi_cfg_fuzz.py generator absorbed as an engine
+                    (loop-carried values, branch diamonds, switch joins,
+                    continue paths, postfix inc/dec for phi-web coalescing).
+  7. intcmp_thread: tests/fuzz/fuzz_intcmp_thread.py generator absorbed as an
+                    engine (merge-diamond int-phi compare shapes for the
+                    bool_thread threading pass; default seed 20260829).
+  8. m32          : forwards to tests/fuzz/m32_differential_fuzz.py (i686
+                    -m32 vs gcc -m32, nostdlib int80 exit-fold oracle).
+  9. regparm      : forwards to tests/fuzz/regparm_differential.py
+                    (-mregparm=3 ABI variant of the m32 oracle).
+ 10. slot_rmw     : forwards to tests/fuzz/slot_rmw_differential.py (i686
+                    slot read-modify-write collapse hinge hammering).
+ 11. alias_m32    : forwards to tests/fuzz/alias_fuzz_m32.py (adversarial
+                    redundant-load elimination / GVN shapes, -m32).
+ 12. alu_torture  : forwards to tests/fuzz/alu_torture_m32.py (fixed i686 ALU
+                    probe: clz/ctz/popcount/bswap, mul/div by constant, LEA;
+                    runs once per level, `--count` has no effect).
+ 13. aarch64      : forwards to tests/fuzz/aarch64_fuzz.py (lccc-arm vs
+                    aarch64-linux-gnu-gcc under qemu-aarch64; SKIPs
+                    gracefully when the cross toolchain is absent).
+
+The tests/fuzz engines use two absorption mechanisms, both preserving the
+standalone scripts byte-for-byte: generator-config engines (5-7) import the
+historical generator and evaluate its cases through this harness's oracle
+(every reference compiler at every level, GEN-BUG tripwire, repro retention);
+forwarding engines (8-13) launch the standalone differential tester - which
+owns its nostdlib/int80 or cross-compilation pipeline - and adopt its exit
+code as the verdict, exactly like the stress_suite's unroll_stress arm.  Each
+of them keeps its historical defaults (seed span, levels, gcc oracle); m32
+engines SKIP cleanly on hosts that cannot build/execute ELF32, and aarch64
+SKIPs when a cross toolchain is missing.
 
 Features:
   - Exact stdout/exit-status checksum validation across ALL selected
@@ -40,12 +75,16 @@ Examples:
   scripts/fuzz_diff.py --engine stress_suite -j2
   scripts/fuzz_diff.py --engine csmith --csmith /usr/bin/csmith --count 50
   scripts/fuzz_diff.py --engine synthetic --arch i686 --runner qemu-i386
+  scripts/fuzz_diff.py --engine differential --count 20 --seed 0
+  scripts/fuzz_diff.py --engine slot_rmw --count 2 --seed 1 --refs gcc
   scripts/fuzz_diff.py --check-engines
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import functools
+import importlib
 import itertools
 import json
 import os
@@ -61,7 +100,9 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_LCCC = REPO / "target" / "fastbuild" / "lccc"
+DEFAULT_LCCC_ARM = REPO / "target" / "fastbuild" / "lccc-arm"
 DEFAULT_REPRO_DIR = REPO / "artifacts" / "repros"
+FUZZ_DIR = REPO / "tests" / "fuzz"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,6 +289,7 @@ def evaluate_single_test(
     compile_timeout: float,
     run_timeout: float,
     env_extra: dict[str, str] | None = None,
+    ref_level_map: dict[str, str] | None = None,
 ) -> DiffResult:
     with tempfile.TemporaryDirectory(prefix=f"diff_{test_id}_") as tmpdir:
         tmp = Path(tmpdir)
@@ -260,13 +302,17 @@ def evaluate_single_test(
         primary = source_names[0]
 
         for opt in opt_levels:
+            # Some historical engines spell a size level the references do not
+            # accept (gcc has no -Oz); translate it per reference compiler while
+            # lccc keeps the requested spelling.
+            ref_opt = (ref_level_map or {}).get(opt, opt)
             # Baseline: build+run with EVERY reference compiler; all must
             # agree on (exit status, stdout, stderr) before LCCC is judged.
             ref_runs: dict[str, tuple[int, str, str]] = {}
             ref_baseline: tuple[int, str, str] | None = None
             for ref_cc in ref_compilers:
                 ref_bin = tmp / f"ref_{ref_cc.replace('/', '_')}_{opt}"
-                ref_build_cmd = [ref_cc, opt, *extra_cflags, *unit.extra_flags,
+                ref_build_cmd = [ref_cc, ref_opt, *extra_cflags, *unit.extra_flags,
                                  *source_names, "-o", str(ref_bin), "-lm"]
                 rc, out, err = run_command(ref_build_cmd, timeout=compile_timeout, cwd=tmp,
                                            env_extra=env_extra)
@@ -664,6 +710,340 @@ def run_stress_suite(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Legacy tests/fuzz engines (single entry point for every differential engine)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _import_fuzz_module(name: str):
+    """Lazily import a generator module from tests/fuzz.
+
+    Import happens only when the engine is actually selected, so
+    ``--check-engines`` and the unrelated engines stay dependency-free.
+    """
+    if str(FUZZ_DIR) not in sys.path:
+        sys.path.insert(0, str(FUZZ_DIR))
+    try:
+        return importlib.import_module(name)
+    except ImportError as exc:
+        sys.exit(f"error: legacy fuzz engine module {name!r} not importable "
+                 f"from {FUZZ_DIR}: {exc}")
+
+
+# Historical compile flags of tests/fuzz/differential_fuzz.py and
+# tests/fuzz/phi_cfg_fuzz.py (x86-64 hosted programs, warning-free compare).
+_DIFF_TU_FLAGS = ["-std=gnu11", "-w", "-march=raptorlake", "-mtune=raptorlake",
+                  "-fomit-frame-pointer"]
+# GCC accepts no -Oz; the historical testers map the lccc -Oz level to -Os on
+# the reference side (differential_fuzz.py / phi_cfg_fuzz.py `glevel`).
+_OZ_REF_ALIAS = {"Oz": "Os"}
+
+
+def _legacy_generator_pool(engine: str, module_name: str, attr: str,
+                            extra_flags: list[str]):
+    """Engine runner built from a tests/fuzz generator function.
+
+    The generator (``module.attr``) takes a case seed and returns C source
+    text; each case becomes a CompileUnit evaluated through the standard
+    differential oracle (every reference at every level, GEN-BUG tripwire,
+    failure repro retention).
+    """
+
+    def runner(count: int, seed: int, workers: int, evaluate) -> list[DiffResult]:
+        module = _import_fuzz_module(module_name)
+        generate_case = getattr(module, attr)
+
+        def generate(test_id: str) -> CompileUnit:
+            case_seed = int(test_id.rsplit("_", 1)[1])
+            return CompileUnit(files={"test.c": generate_case(case_seed)},
+                               extra_flags=list(extra_flags))
+
+        return _generate_and_evaluate(engine, count, seed, workers, evaluate, generate)
+
+    return runner
+
+
+run_differential_pool = _legacy_generator_pool(
+    "differential", "differential_fuzz", "generate", _DIFF_TU_FLAGS)
+run_phi_cfg_pool = _legacy_generator_pool(
+    "phi_cfg", "phi_cfg_fuzz", "gen", _DIFF_TU_FLAGS)
+
+
+def run_intcmp_pool(count: int, seed: int, workers: int, evaluate) -> list[DiffResult]:
+    """tests/fuzz/fuzz_intcmp_thread.py generator as an engine.
+
+    The original drives ONE rng sequentially across programs, so the sources
+    are pre-generated on the main thread (worker threads never touch shared
+    rng state) and then evaluated through the standard differential oracle.
+    """
+    module = _import_fuzz_module("fuzz_intcmp_thread")
+    rng = random.Random(seed)
+    units = [CompileUnit(files={"test.c": module.gen_program(rng, i)},
+                         extra_flags=["-w"])
+             for i in range(count)]
+    return _evaluate_prebuilt("intcmp_thread", units, workers, evaluate)
+
+
+def _evaluate_prebuilt(engine: str, units: list[CompileUnit], workers: int,
+                       evaluate) -> list[DiffResult]:
+    """Evaluate pre-generated units in the worker pool (progress dots)."""
+    results: list[DiffResult] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(evaluate, f"{engine}_{i}", unit)
+                   for i, unit in enumerate(units)]
+        done_count = 0
+        for f in concurrent.futures.as_completed(futures):
+            res = f.result()
+            results.append(res)
+            done_count += 1
+            print("." if res.status == "PASS" else "X", end="", flush=True)
+            if done_count % 50 == 0 or done_count == len(futures):
+                print(f" [{done_count}/{len(futures)}]")
+    return results
+
+
+# Forwarding engines: the standalone testers own their pipeline (nostdlib
+# int80 oracles, custom asm drivers, cross compilation + qemu) and cannot be
+# expressed as generator+flags configs; this harness launches them and adopts
+# their exit code as the verdict - the same absorption pattern the
+# stress_suite uses for scripts/unroll_stress.py.  Spec per engine: backing
+# script, whether the CLI takes a --seeds LO:HI span, and the compile-only
+# fallback config (generator module + attribute + extra -m32 compile flags)
+# used on hosts where the ELF32/int80 execution oracle is unavailable.
+_STANDALONE_FUZZ_ENGINES: dict[str, dict[str, Any]] = {
+    "m32": {"script": "m32_differential_fuzz.py", "seeds": True,
+            "gen": ("m32_differential_fuzz", "gen_c", [])},
+    "regparm": {"script": "regparm_differential.py", "seeds": True,
+                "gen": ("m32_differential_fuzz", "gen_c", ["-mregparm=3"])},
+    "slot_rmw": {"script": "slot_rmw_differential.py", "seeds": True,
+                 "gen": ("slot_rmw_differential", "gen_probe", ["-fno-pic"])},
+    "alias_m32": {"script": "alias_fuzz_m32.py", "seeds": True,
+                  "gen": ("alias_fuzz_m32", "gen", ["-mno-sse", "-mno-mmx"])},
+    "alu_torture": {"script": "alu_torture_m32.py", "seeds": False,
+                    "gen": ("alu_torture_m32", "PROBE", ["-mno-sse", "-mno-mmx"])},
+    "aarch64": {"script": "aarch64_fuzz.py", "seeds": True, "gen": None},
+}
+
+
+# Trivial i386 _start that exits 0 through int $0x80: proves the host gcc
+# can BUILD ELF32 (-m32 -nostdlib sidesteps the multilib CRT) and that the
+# binaries can actually run their int80 syscall oracle.  Sandboxed kernels
+# often link+exec ELF32 fine but BLOCK the i386 syscall gateway (SIGSYS);
+# there the standalone testers would compare two identical deaths and pass
+# vacuously, so this harness refuses to forward and falls back to
+# compile-only validation instead.
+_M32_EXIT_PROBE = "\n".join([
+    ".globl _start",
+    "_start:",
+    "    movl $1, %eax",
+    "    xorl %ebx, %ebx",
+    "    int $0x80",
+])
+_m32_host_cache: dict[str, tuple[bool, bool]] = {}
+
+
+def _m32_host_capability(gcc: str) -> tuple[bool, bool]:
+    """Probe the host's ELF32 pipeline: (can_build_m32, int80_oracle_works)."""
+    if gcc in _m32_host_cache:
+        return _m32_host_cache[gcc]
+    can_build = False
+    oracle = False
+    with tempfile.TemporaryDirectory(prefix="fuzz_diff_m32probe_") as td:
+        asm = Path(td) / "probe.s"
+        binary = Path(td) / "probe"
+        asm.write_text(_M32_EXIT_PROBE + "\n")
+        rc, _, _ = run_command([gcc, "-m32", "-nostdlib", "-no-pie",
+                                str(asm), "-o", str(binary)], timeout=60)
+        if rc == 0:
+            can_build = True
+            rc, _, _ = run_command([str(binary)], timeout=10)
+            oracle = rc == 0
+    _m32_host_cache[gcc] = (can_build, oracle)
+    return can_build, oracle
+
+
+# Historical m32 compile flag base shared by the standalone testers (their
+# per-engine extras are declared in _STANDALONE_FUZZ_ENGINES[...]["gen"]).
+_M32_COMPILE_BASE = ["-m32", "-fno-PIE", "-fomit-frame-pointer", "-w"]
+
+
+def _m32_compile_only(engine: str, lccc_path: str, ref_cc: str,
+                      opt_levels: list[str], seed: int, count: int,
+                      repro_dir: Path) -> list[DiffResult]:
+    """Compile-side fallback for m32 engines on int80-blocked hosts.
+
+    Every generated case must still compile under BOTH lccc -m32 and the
+    reference -m32 at every level (the historical flag matrix, including the
+    per-engine extras like -mregparm=3 or -fno-pic).  lccc compile failures
+    are LCCC_CRASH with the source retained; reference failures SKIP.  A
+    pass here proves the compiler side only - it is explicitly NOT a codegen
+    oracle, which is why the result message says compile-only.
+    """
+    module_name, gen_attr, extra_flags = _STANDALONE_FUZZ_ENGINES[engine]["gen"]
+    module = _import_fuzz_module(module_name)
+    generator = getattr(module, gen_attr)
+    fixed_probe = not callable(generator)  # alu_torture ships one static PROBE
+    n_cases = 1 if fixed_probe else max(1, count)
+    results: list[DiffResult] = []
+    for i in range(n_cases):
+        case_seed = seed + i
+        source = generator if fixed_probe else generator(case_seed)
+        with tempfile.TemporaryDirectory(prefix=f"m32co_{engine}_{case_seed}_") as td:
+            src = Path(td) / "case.c"
+            src.write_text(source)
+            for opt in opt_levels:
+                test_id = (f"{engine}_seed{case_seed}" if len(opt_levels) == 1 else
+                           f"{engine}_seed{case_seed}[{opt.lstrip('-')}]")
+                flags = [*_M32_COMPILE_BASE, *extra_flags, opt, "-c"]
+                rc, _, err = run_command(
+                    [ref_cc, *flags, str(src), "-o", str(Path(td) / "ref.o")],
+                    timeout=60, cwd=Path(td))
+                if rc != 0:
+                    results.append(DiffResult(
+                        test_id, "SKIP",
+                        f"reference {ref_cc} -m32 compile failed: {err.strip()[:200]}",
+                        opt_level=opt))
+                    continue
+                rc, _, err = run_command(
+                    [lccc_path, *flags, str(src), "-o", str(Path(td) / "lccc.o")],
+                    timeout=60, cwd=Path(td))
+                if rc != 0:
+                    repro_file = repro_dir / f"crash_{engine}_{case_seed}_{opt.lstrip('-')}.c"
+                    repro_dir.mkdir(parents=True, exist_ok=True)
+                    repro_file.write_text(source)
+                    results.append(DiffResult(
+                        test_id, "LCCC_CRASH",
+                        f"lccc -m32 compile error (compile-only mode): {err.strip()[:200]}",
+                        str(repro_file), opt_level=opt))
+                else:
+                    results.append(DiffResult(
+                        test_id, "PASS",
+                        "compile-only (int80 execution oracle unavailable on this host)"))
+    if not results:
+        sys.exit(f"error: compile-only fallback produced no cases for {engine}")
+    return results
+
+
+def run_standalone_engine(engine: str, lccc_path: str, ref_compilers: list[str],
+                           opt_levels: list[str], seed: int, count: int,
+                           repro_dir: Path | None = None) -> list[DiffResult]:
+    """Forward to a tests/fuzz standalone differential tester.
+
+    The standalone script keeps its own comparison pipeline and exit code
+    semantics (0 = all agree); flag translation: --lccc -> --ccc, first
+    reference -> --gcc, --seed/--count -> --seeds LO:HI, --opts -> --levels.
+    The case directory is retained only when the engine fails, so failing
+    sources stay inspectable; successful runs are cleaned up.
+
+    Host gates: aarch64 needs a cross toolchain (SKIP otherwise); the m32
+    engines need a working ELF32 build+int80 oracle - when the oracle is
+    blocked (common in containers) they fall back to compile-only
+    validation instead of reporting vacuous passes.
+    """
+    spec = _STANDALONE_FUZZ_ENGINES[engine]
+    script = FUZZ_DIR / spec["script"]
+    takes_seeds = spec["seeds"]
+    if not script.is_file():
+        sys.exit(f"error: legacy fuzz engine script not found: {script}")
+    levels = [o.lstrip("-") for o in opt_levels]
+    if not takes_seeds and count != 1:
+        print(f"note: --engine {engine} runs one fixed probe per level; "
+              f"--count has no effect")
+
+    if engine == "aarch64":
+        cross_gcc = shutil.which("aarch64-linux-gnu-gcc")
+        qemu = shutil.which("qemu-aarch64")
+        missing = [name for name, path in (("aarch64-linux-gnu-gcc", cross_gcc),
+                                           ("qemu-aarch64", qemu)) if not path]
+        if missing:
+            return [DiffResult(
+                engine, "SKIP",
+                "cross toolchain unavailable on this host: " + ", ".join(missing)
+                + "; run on a cross-equipped host or invoke the script directly")]
+        ref_cc = cross_gcc
+    else:
+        ref_cc = ref_compilers[0]
+        can_build, oracle = _m32_host_capability(ref_cc)
+        if not can_build:
+            return [DiffResult(
+                engine, "SKIP",
+                f"host gcc cannot build ELF32 ({ref_cc} -m32 multilib missing); "
+                f"the m32 engines need a 32-bit-capable host")]
+        if not oracle:
+            print(f"note: {ref_cc} builds ELF32 but the int $0x80 oracle dies on "
+                  f"this host (sandboxed syscall policy?); falling back to "
+                  f"compile-only validation for --engine {engine}", file=sys.stderr)
+            return _m32_compile_only(engine, lccc_path, ref_cc, opt_levels,
+                                     seed, count, repro_dir or DEFAULT_REPRO_DIR)
+
+    out_dir = Path(tempfile.mkdtemp(prefix=f"fuzz_diff_{engine}_"))
+    cmd = [sys.executable, str(script), "--ccc", lccc_path, "--gcc", ref_cc,
+           "--levels", ",".join(levels), "--out", str(out_dir)]
+    if takes_seeds:
+        cmd += ["--seeds", f"{seed}:{seed + max(count, 1)}"]
+    cases = max(1, count) * len(levels) if takes_seeds else len(levels)
+    timeout = max(120.0, 12.0 * cases)
+    span = f"{seed}:{seed + max(count, 1)}" if takes_seeds else "n/a"
+    print(f" forwarding to {script.name}: seeds={span}"
+          f" levels={','.join(levels)} (~{cases} case-arms, {timeout:.0f}s budget)")
+    rc, out, err = run_command(cmd, timeout=timeout)
+    tail = ((err or out) or "").strip()[-400:]
+    if rc == 0:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return [DiffResult(engine, "PASS",
+                           f"standalone engine passed ({cases} case-arms)")]
+    if rc == 124:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return [DiffResult(engine, "SKIP", "standalone engine timed out")]
+    return [DiffResult(
+        engine, "MISCOMPILE",
+        f"standalone engine failed (rc={rc}): {tail}\n"
+        f"  case directory retained: {out_dir}")]
+
+
+# Per-engine historical defaults preserved from the standalone CLIs: the
+# seed-span length (count), the initial seed, the levels, and the reference
+# oracle (the standalone testers were built against gcc alone).
+_LEGACY_ENGINE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "differential": {"count": 100, "seed": 0, "opts": "-O0,-O3,-Os", "refs": "gcc"},
+    "phi_cfg": {"count": 200, "seed": 0, "opts": "-O0,-O3,-Os", "refs": "gcc"},
+    "intcmp_thread": {"count": 150, "seed": 20260829, "opts": "-O0,-O1,-O2", "refs": "gcc"},
+    "m32": {"count": 100, "seed": 0, "opts": "-O0,-O2,-Os", "refs": "gcc"},
+    "regparm": {"count": 150, "seed": 0, "opts": "-O0,-O2,-Os", "refs": "gcc"},
+    "slot_rmw": {"count": 200, "seed": 0, "opts": "-O0,-O2,-Os", "refs": "gcc"},
+    "alias_m32": {"count": 64, "seed": 0, "opts": "-O2,-Os", "refs": "gcc"},
+    "alu_torture": {"count": 1, "seed": 0, "opts": "-O2,-Os", "refs": "gcc"},
+    "aarch64": {"count": 40, "seed": 0, "opts": "-O2,-Os", "refs": "gcc"},
+}
+
+
+# Single source of truth for --check-engines: every advertised engine maps to
+# its real runner (the standalone forwarders share one driver bound per name).
+_ENGINE_RUNNERS = {
+    "synthetic": run_synthetic_pool,
+    "csmith": run_csmith_pool,
+    "yarpgen": run_yarpgen_pool,
+    "stress_suite": run_stress_suite,
+    "differential": run_differential_pool,
+    "phi_cfg": run_phi_cfg_pool,
+    "intcmp_thread": run_intcmp_pool,
+    "m32": functools.partial(run_standalone_engine, "m32"),
+    "regparm": functools.partial(run_standalone_engine, "regparm"),
+    "slot_rmw": functools.partial(run_standalone_engine, "slot_rmw"),
+    "alias_m32": functools.partial(run_standalone_engine, "alias_m32"),
+    "alu_torture": functools.partial(run_standalone_engine, "alu_torture"),
+    "aarch64": functools.partial(run_standalone_engine, "aarch64"),
+}
+
+# Every legacy engine's backing file in tests/fuzz (verified by
+# --check-engines so a moved corpus fails loudly instead of vanishing).
+_LEGACY_ENGINE_SCRIPTS = {
+    "differential": "differential_fuzz.py",
+    "phi_cfg": "phi_cfg_fuzz.py",
+    "intcmp_thread": "fuzz_intcmp_thread.py",
+    **{engine: spec["script"] for engine, spec in _STANDALONE_FUZZ_ENGINES.items()},
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Legacy flag translation (csmith_diff.py / yarpgen_diff.py compatibility)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -743,7 +1123,7 @@ def translate_legacy_args(argv: list[str], *, default_count: int | None = None) 
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-IMPLEMENTED_ENGINES = ("synthetic", "csmith", "yarpgen", "stress_suite")
+IMPLEMENTED_ENGINES = tuple(_ENGINE_RUNNERS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -762,7 +1142,10 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Number of test iterations to generate and evaluate "
-             "(default: 50 for generator engines, 8 for stress_suite; 0 = infinite)",
+             "(default: 50 for generator engines, 8 for stress_suite; the "
+             "tests/fuzz engines default to their historical seed spans, "
+             "e.g. 200 for phi_cfg, 150 for intcmp_thread; 0 = infinite, "
+             "only for synthetic/csmith/yarpgen)",
     )
     ap.add_argument(
         "-j",
@@ -773,18 +1156,22 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--lccc",
-        default=os.environ.get("LCCC", str(DEFAULT_LCCC)),
-        help="Path to LCCC compiler binary",
+        default=None,
+        help="Path to LCCC compiler binary (default: target/fastbuild/lccc; "
+             "env LCCC; lccc-arm for --engine aarch64)",
     )
     ap.add_argument(
         "--refs",
-        default="gcc,clang",
-        help="Comma-separated reference compilers (default: gcc,clang)",
+        default=None,
+        help="Comma-separated reference compilers (default: gcc,clang; the "
+             "tests/fuzz engines default to their historical gcc oracle)",
     )
     ap.add_argument(
         "--opts",
-        default="-O0,-O1,-O2,-O3",
-        help="Comma-separated optimization levels to verify (default: -O0,-O1,-O2,-O3)",
+        default=None,
+        help="Comma-separated optimization levels to verify (default: "
+             "-O0,-O1,-O2,-O3; the tests/fuzz engines default to their "
+             "historical levels, e.g. -O0,-O3,-Os for differential)",
     )
     ap.add_argument(
         "--arch",
@@ -824,8 +1211,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--seed",
         type=int,
-        default=int(time.time()),
-        help="Initial random seed",
+        default=None,
+        help="Initial random seed (default: current time; the tests/fuzz "
+             "engines default to their historical deterministic seeds, e.g. "
+             "20260829 for intcmp_thread)",
     )
     ap.add_argument(
         "--config-env",
@@ -867,19 +1256,24 @@ def check_engines() -> int:
     This exists because the csmith/yarpgen engines once regressed to silent
     no-op stubs that reported TOTAL: 0 / exit 0 - a validation vacuum that no
     test caught.  The dispatch table below is the single source of truth; a
-    missing entry fails loudly.
+    missing entry fails loudly.  The tests/fuzz engines additionally require
+    their backing script under tests/fuzz/, so a moved or renamed corpus
+    fails here instead of silently zero-testing.
     """
-    dispatch = {
-        "synthetic": run_synthetic_pool,
-        "csmith": run_csmith_pool,
-        "yarpgen": run_yarpgen_pool,
-        "stress_suite": run_stress_suite,
-    }
+    dispatch = _ENGINE_RUNNERS
     missing = [e for e in IMPLEMENTED_ENGINES if e not in dispatch]
     if missing:
         print(f"error: engines advertised but not implemented: {', '.join(missing)}")
         return 1
-    print(f"all {len(IMPLEMENTED_ENGINES)} engines implemented: {', '.join(IMPLEMENTED_ENGINES)}")
+    missing_scripts = [e for e, s in _LEGACY_ENGINE_SCRIPTS.items()
+                       if not (FUZZ_DIR / s).is_file()]
+    if missing_scripts:
+        print("error: tests/fuzz engine scripts missing: "
+              + ", ".join(f"{e} -> {FUZZ_DIR / _LEGACY_ENGINE_SCRIPTS[e]}"
+                           for e in missing_scripts))
+        return 1
+    print(f"all {len(IMPLEMENTED_ENGINES)} engines implemented: "
+          f"{', '.join(IMPLEMENTED_ENGINES)}")
     return 0
 
 
@@ -889,16 +1283,32 @@ def main() -> int:
     if args.check_engines:
         return check_engines()
 
+    legacy = args.engine in _LEGACY_ENGINE_DEFAULTS
+
     # --count keeps its historical default of 50 for the generator engines;
-    # the stress-suite sweep defaults to 8 seeds per generator instead.
+    # the stress-suite sweep defaults to 8 seeds per generator; each
+    # tests/fuzz engine keeps the seed span of its standalone CLI.
     count = args.count
     if count is None:
-        count = 8 if args.engine == "stress_suite" else 50
+        count = _LEGACY_ENGINE_DEFAULTS.get(args.engine, {}).get(
+            "count", 8 if args.engine == "stress_suite" else 50)
     if args.engine == "stress_suite" and count < 1:
         sys.exit("error: --engine stress_suite requires a bounded --count of at least 1 "
                  "(0/negative is only meaningful for the infinite generator engines)")
+    if legacy and count < 1:
+        sys.exit(f"error: --engine {args.engine} requires a bounded --count of at least 1 "
+                 "(the historical testers sweep an explicit seed span)")
     if args.config_env and args.engine != "stress_suite":
         sys.exit("error: --config-env only applies to --engine stress_suite")
+    if args.runner and args.engine in _STANDALONE_FUZZ_ENGINES:
+        print(f"note: --runner is unused by --engine {args.engine} "
+              f"(the standalone tester manages its own execution model)", file=sys.stderr)
+
+    # Historical deterministic seeds for the tests/fuzz engines (e.g.
+    # intcmp_thread's 20260829); everything else stays time-based.
+    seed = args.seed
+    if seed is None:
+        seed = _LEGACY_ENGINE_DEFAULTS.get(args.engine, {}).get("seed", 0 if legacy else int(time.time()))
 
     # Resolve compiler paths ONCE, before any evaluation.  Test cases are
     # compiled from per-case temporary directories, so a relative --lccc or
@@ -906,11 +1316,21 @@ def main() -> int:
     # unresolvable from the tempdir (this is exactly how the CI smoke first
     # failed: `--lccc target/fastbuild/lccc` + cwd=tmpdir => ENOENT reported
     # as an LCCC_CRASH).  Everything downstream gets absolute paths.
-    if not Path(args.lccc).is_file():
-        sys.exit(f"error: LCCC binary '{args.lccc}' not found. Build first!")
-    lccc_path = str(Path(args.lccc).resolve())
+    lccc_arg = args.lccc or os.environ.get("LCCC") or ""
+    if not lccc_arg:
+        # The aarch64 engine targets the arm driver; everything else drives
+        # the x86-64 lccc (use the arm driver when it is built).
+        if args.engine == "aarch64" and DEFAULT_LCCC_ARM.is_file():
+            print(f"note: --engine aarch64 defaults to the arm driver: {DEFAULT_LCCC_ARM}")
+            lccc_arg = str(DEFAULT_LCCC_ARM)
+        else:
+            lccc_arg = str(DEFAULT_LCCC)
+    if not Path(lccc_arg).is_file():
+        sys.exit(f"error: LCCC binary '{lccc_arg}' not found. Build first!")
+    lccc_path = str(Path(lccc_arg).resolve())
 
-    ref_compilers_raw = [c.strip() for c in args.refs.split(",") if c.strip()]
+    refs_raw = args.refs or _LEGACY_ENGINE_DEFAULTS.get(args.engine, {}).get("refs", "gcc,clang")
+    ref_compilers_raw = [c.strip() for c in refs_raw.split(",") if c.strip()]
     available_refs: list[str] = []
     missing_refs: list[str] = []
     for ref in ref_compilers_raw:
@@ -927,9 +1347,10 @@ def main() -> int:
         print(f"note: reference compilers not found (skipped): "
               f"{', '.join(missing_refs)}", file=sys.stderr)
     if not available_refs:
-        sys.exit(f"error: none of the reference compilers ({args.refs}) found in PATH")
+        sys.exit(f"error: none of the reference compilers ({refs_raw}) found in PATH")
 
-    opt_levels = [o.strip() for o in args.opts.split(",") if o.strip()]
+    opts_raw = args.opts or _LEGACY_ENGINE_DEFAULTS.get(args.engine, {}).get("opts", "-O0,-O1,-O2,-O3")
+    opt_levels = [o.strip() for o in opts_raw.split(",") if o.strip()]
 
     # i686 targets need -m32 on the host references for a like-for-like oracle.
     arch_flags: list[str] = []
@@ -943,10 +1364,14 @@ def main() -> int:
     print(f" LCCC     : {lccc_path}")
     print(f" Reference: {', '.join(available_refs)}")
     print(f" Opt levels: {', '.join(opt_levels)}")
-    print(f" Workers  : {args.workers} | Count: {count or 'infinite'} | Seed: {args.seed}")
+    print(f" Workers  : {args.workers} | Count: {count or 'infinite'} | Seed: {seed}")
     print("=" * 70)
 
     repro_dir = Path(args.repro_dir)
+
+    # The differential/phi_cfg engines keep the historical Oz spelling for
+    # lccc while the references get their closest level (gcc: -Os).
+    ref_level_map = _OZ_REF_ALIAS if args.engine in ("differential", "phi_cfg") else None
 
     def evaluate(test_id: str, unit: CompileUnit) -> DiffResult:
         return evaluate_single_test(
@@ -960,6 +1385,7 @@ def main() -> int:
             repro_dir,
             args.compile_timeout,
             args.run_timeout,
+            ref_level_map=ref_level_map,
         )
 
     t0 = time.time()
@@ -968,23 +1394,32 @@ def main() -> int:
     if args.engine == "stress_suite":
         results = run_stress_suite(
             lccc_path, available_refs, opt_levels, args.runner, repro_dir,
-            args.compile_timeout, args.run_timeout, seed=args.seed,
+            args.compile_timeout, args.run_timeout, seed=seed,
             count=count, config_env=args.config_env,
         )
     elif args.engine == "synthetic":
-        results = run_synthetic_pool(count, args.seed, args.workers, evaluate)
+        results = run_synthetic_pool(count, seed, args.workers, evaluate)
     elif args.engine == "csmith":
         csmith_bin = args.csmith or os.environ.get("CSMITH", "csmith")
         results = run_csmith_pool(
-            count, args.seed, args.workers, evaluate,
+            count, seed, args.workers, evaluate,
             csmith_bin, args.include_dirs, args.compile_timeout,
         )
     elif args.engine == "yarpgen":
         yarpgen_bin = args.yarpgen or os.environ.get("YARPGEN", "yarpgen")
         results = run_yarpgen_pool(
-            count, args.seed, args.workers, evaluate,
+            count, seed, args.workers, evaluate,
             yarpgen_bin, args.compile_timeout,
         )
+    elif args.engine == "differential":
+        results = run_differential_pool(count, seed, args.workers, evaluate)
+    elif args.engine == "phi_cfg":
+        results = run_phi_cfg_pool(count, seed, args.workers, evaluate)
+    elif args.engine == "intcmp_thread":
+        results = run_intcmp_pool(count, seed, args.workers, evaluate)
+    elif args.engine in _STANDALONE_FUZZ_ENGINES:
+        results = run_standalone_engine(args.engine, lccc_path, available_refs,
+                                        opt_levels, seed, count, repro_dir)
     else:  # pragma: no cover - argparse restricts choices
         sys.exit(f"error: engine '{args.engine}' is not implemented; "
                  f"implemented engines: {', '.join(IMPLEMENTED_ENGINES)}")

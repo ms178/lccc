@@ -708,7 +708,7 @@ reach a real root) would remove the network dependency from recovery.
 * `sed -n "<line>,+Np"` with a computed range breaks on empty or multi-match
   `grep`; extract the line with `grep -n | cut -d: -f1` first.
 * `awk` instruction counting is fragile here — the system `mawk` does not
-  understand `\s`. Use a Python analyser or `scripts/codegen_scoreboard.py`.
+  understand `\s`. Use a Python analyser or `scripts/codegen_oracle.py --rank`.
 * Useful runtime bisection switches discovered: `CCC_NO_GADDR_CSE`,
   `CCC_NO_GLOBAL_ADDR_REMAT`, `CCC_NO_GEP_FOLD`, `CCC_DEBUG_GEPFOLD`,
   `CCC_NO_HOT_LOOP`, `CCC_NO_COALESCE`, `CCC_NO_PHI_COALESCE`,

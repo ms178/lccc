@@ -87,6 +87,11 @@ pub(crate) struct RaConfig {
     pub(crate) no_fp_copy_web: bool,
     /// `CCC_CALLER_SAVE_SPANNING`: enable caller-save spans (default: false).
     pub(crate) caller_save_spanning: bool,
+    /// `CCC_NO_RDX_HAZARD`: disable position-aware %rdx admission on x86-64
+    /// (the Phase-2 hazard-filtered %rdx wave) and fall back to the
+    /// whole-function exclusion whenever any body instruction clobbers %rdx
+    /// (default: false — the wave is on).
+    pub(crate) no_rdx_hazard: bool,
     /// `CCC_NO_SEGMENT_SCAN`: disable hole-aware scanning (default: false).
     pub(crate) no_segment_scan: bool,
     /// `CCC_EVICT_MODE`: eviction mode (default: 3; malformed values use 3).
@@ -250,6 +255,7 @@ impl RaConfig {
             no_map_vecreg: present("CCC_NO_MAP_VECREG"),
             no_fp_copy_web: present("CCC_NO_FP_COPY_WEB"),
             caller_save_spanning: present("CCC_CALLER_SAVE_SPANNING"),
+            no_rdx_hazard: present("CCC_NO_RDX_HAZARD"),
             no_segment_scan: present("CCC_NO_SEGMENT_SCAN"),
             evict_mode: text("CCC_EVICT_MODE")
                 .and_then(|value| value.parse::<i32>().ok())
@@ -625,9 +631,19 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
         }
         Instruction::UnaryOp { ty, .. }
         | Instruction::Cmp { ty, .. }
-        | Instruction::Store { ty, .. }
         | Instruction::Load { ty, .. } => {
             if wide(ty) {
+                RDX
+            } else {
+                NONE
+            }
+        }
+        // Store: wide values pair-stage through %rax:%rdx, and F128 stores'
+        // non-direct-slot arms (`emit_f128_store_f64_via_x87`) stage the
+        // value through `movq %rax, %rdx` (f128.rs OverAligned/Indirect/Reg
+        // arms) before the x87 sequence.
+        Instruction::Store { ty, .. } => {
+            if wide(ty) || matches!(ty, IrType::F128) {
                 RDX
             } else {
                 NONE
@@ -651,6 +667,14 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
         Instruction::AtomicCmpxchg { .. } | Instruction::AtomicStore { .. } => RDX,
         Instruction::Intrinsic { op, .. } => match op {
             IntrinsicOp::Rdtscp => RDX_RDI,
+            // GCC __builtin_apply family and __builtin_longjmp: the emitters
+            // read/write the raw %rdx (DoBuiltinApply stages arg3 into it AND
+            // performs a real `call *%r11` that the IR does not model as a
+            // call point; RestoreApplyResult/BuiltinLongjmp reload it from
+            // memory). None of these may coexist with a %rdx home.
+            IntrinsicOp::RestoreApplyResult
+            | IntrinsicOp::DoBuiltinApply
+            | IntrinsicOp::BuiltinLongjmp => RDX,
             IntrinsicOp::Rdtsc
             | IntrinsicOp::F128Copysign
             | IntrinsicOp::FmaF64x2
@@ -686,6 +710,148 @@ pub fn x86_body_fixed_scratch(func: &IrFunction) -> X86FixedScratch {
         }
     }
     acc
+}
+
+/// x86-64 program points whose emitter provably clobbers `%rdx`
+/// (PhysReg 16), in the flat liveness numbering — one point per instruction
+/// plus one per terminator, the same walk `LivenessResult` and
+/// `collect_i686_scratch_hazard_points` use, so `LiveInterval::start/end`
+/// compare directly against these points.
+///
+/// The classification is DERIVED from [`x86_inst_fixed_scratch`] (plus the
+/// `Switch`-terminator jump-table dispatch that
+/// [`x86_body_fixed_scratch`] adds) rather than re-spelled, so the
+/// allocator's view of `%rdx` clobbers can never drift from the pool gate's
+/// view — the exact "emitter and allocator disagree" defect class this
+/// repository has been burned by before (i686 divrem pairs derive from the
+/// same IR for the same reason).
+///
+/// Completeness argument (why hazard points are the ONLY `%rdx` clobbers):
+/// `%rdx` already sits in the caller-saved pool for functions with NO
+/// clobber-class instruction (prologue.rs admission gate), so every
+/// emitter outside the clobber classes is already exercised with
+/// `%rdx`-homed values in production and provably leaves `%rdx` intact
+/// (the register-direct fast paths are home-generic;
+/// `emit_save_acc_impl` switches to `%r11` when any value is `%rdx`-homed;
+/// `const_offset_fold_reg_base_ok` refuses `%rdx`/`%r11` bases; the divrem
+/// pair fusion carries an explicit `%rdx`-home screening). Call-shaped
+/// clobbers (calls, inline asm with register clobbers, memcpy, i128
+/// div/rem helper calls) are handled by `call_points`: a value live across
+/// them is never a Phase-2 (caller-saved) candidate at all.
+pub fn collect_x64_rdx_clobber_points(func: &IrFunction) -> Vec<u32> {
+    let mut points: Vec<u32> = Vec::new();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if x86_inst_fixed_scratch(inst).rdx {
+                points.push(point);
+            }
+            point += 1;
+        }
+        // Switch dispatch: `leaq .LJTI(%rip),%rdx` (or the equivalent table
+        // walk) at the terminator point.
+        if matches!(block.terminator, Terminator::Switch { .. }) {
+            points.push(point);
+        }
+        point += 1;
+    }
+    points
+}
+
+/// Whether the body touches any I128/U128 value — the conservative gate for
+/// the position-aware `%rdx` admission wave below.
+///
+/// This is VALUE-based, not instruction-shape-based: an i128 value that flows
+/// through `Copy`/`Phi` (phi-elimination materialises exactly such Copies,
+/// and `emit_copy_i128_impl` unconditionally writes the `%rax:%rdx` pair)
+/// must keep the whole body on the historical whole-function `%rdx`
+/// exclusion — a typed-field scan would miss the Copy points and let the
+/// wave home a value live across one. Detection is therefore a small
+/// fixpoint: values with a typed wide def (BinOp/UnaryOp/Cast/Load/
+/// ParamRef/Select/AtomicLoad/AtomicRmw/AtomicCmpxchg/Phi/Call result),
+/// wide-typed call-argument values, `IrConst::I128` constants, and every
+/// `Copy` destination chained from an already-wide source. Wide bodies were
+/// never production-exercised with `%rdx`-homed values (the pool gate always
+/// excluded `%rdx` there), so point-local emitter completeness is asserted,
+/// not proven, for that class; every other emitter is exercised with
+/// `%rdx` homes by the clobber-free bodies that admit `%rdx` today.
+pub fn x86_body_has_wide_ops(func: &IrFunction) -> bool {
+    let wide = |t: &IrType| matches!(t, IrType::I128 | IrType::U128);
+    let mut wide_values: FxHashSet<u32> = FxHashSet::default();
+    loop {
+        let before = wide_values.len();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::BinOp { dest, ty, .. }
+                    | Instruction::UnaryOp { dest, ty, .. }
+                    | Instruction::Load { dest, ty, .. }
+                    | Instruction::ParamRef { dest, ty, .. }
+                    | Instruction::Select { dest, ty, .. }
+                    | Instruction::AtomicLoad { dest, ty, .. }
+                    | Instruction::AtomicRmw { dest, ty, .. }
+                    | Instruction::AtomicCmpxchg { dest, ty, .. } => {
+                        if wide(ty) {
+                            wide_values.insert(dest.0);
+                        }
+                    }
+                    Instruction::Phi { dest, ty, .. } => {
+                        if wide(ty) {
+                            wide_values.insert(dest.0);
+                        }
+                    }
+                    Instruction::Cast {
+                        dest,
+                        from_ty,
+                        to_ty,
+                        ..
+                    } => {
+                        if wide(from_ty) || wide(to_ty) {
+                            wide_values.insert(dest.0);
+                        }
+                    }
+                    Instruction::Copy { dest, src } => {
+                        let src_wide = match src {
+                            Operand::Const(IrConst::I128(_)) => true,
+                            Operand::Value(v) => wide_values.contains(&v.0),
+                            _ => false,
+                        };
+                        if src_wide {
+                            wide_values.insert(dest.0);
+                        }
+                    }
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                        if let Some(dest) = info.dest {
+                            if wide(&info.return_type) {
+                                wide_values.insert(dest.0);
+                            }
+                        }
+                        for (arg, ty) in info.args.iter().zip(info.arg_types.iter()) {
+                            if wide(ty) {
+                                if let Operand::Value(v) = arg {
+                                    wide_values.insert(v.0);
+                                }
+                            }
+                        }
+                    }
+                    Instruction::Store { val, ty, .. } => {
+                        // The stored operand's static width is the store's
+                        // type: the value itself is wide.
+                        if wide(ty) {
+                            if let Operand::Value(v) = val {
+                                wide_values.insert(v.0);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if wide_values.len() == before {
+            break;
+        }
+    }
+    !wide_values.is_empty()
 }
 
 /// Companion of [`x86_param_caller_homes_safe`]: with parameters parked in
@@ -3568,6 +3734,116 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                             .collect();
                         eprintln!("[RA-W4] fn={} homes={:?}", func.name, ids);
                     }
+                }
+            }
+        }
+    }
+
+    // Phase 2-x64 (position-aware %rdx admission). The historical model
+    // dropped %rdx from the caller-saved pool for the WHOLE function
+    // whenever ANY instruction clobbers it — one cold `a % b` in a tail
+    // block cost the register supply of the entire hot loop (lz4: a single
+    // post-compression UDiv evicted %rdx while the match-search loop
+    // spilled long-lived pointers). The clobbers are position-local: %rdx
+    // is exactly as safe as any other caller-saved register for values
+    // whose live ranges provably avoid every clobber point, so this wave
+    // (mirroring the i686 ecx/edx hazard waves) recovers the register for
+    // exactly those values instead of leaving it idle.
+    //
+    // Ordering — strictly AFTER the general Phase-2 waves and BEFORE
+    // Phase 2c: %rdx homes are excluded from the const-offset GEP folds
+    // (`const_offset_fold_reg_base_ok` refuses PhysReg 10|16 bases) and
+    // from the fold-eligible register classes the general waves hand out,
+    // so %rdx must be an OVERFLOW net (only values the 6-register general
+    // waves left unhomed), never a first pick — running it first measurably
+    // stole fold-eligible homes (lz4 -3%). Before 2c because 2c's
+    // callee-saved overflow costs a push/pop pair per register while a
+    // caller-saved %rdx home is free.
+    //
+    //   * pool membership: only when %rdx is NOT already in the general
+    //     pool — a clobber-free body keeps the exact historical
+    //     single-wave allocation (and the param-home preference order), so
+    //     this wave changes codegen ONLY for functions whose %rdx was
+    //     previously excluded AND whose leftovers survive the general
+    //     waves;
+    //   * candidacy: `base_ok` (no home yet, not call-spanning,
+    //     param/riscv guards) PLUS `later_arg_values` exclusion (a value
+    //     consumed as a call argument at index >= 1 can be read after an
+    //     earlier argument's staging wrote %rdx — the contract the general
+    //     waves enforce via `no_arg_pool`) PLUS
+    //     `!overlaps_inclusive_skip_birth(iv, clobber_points)`: a value
+    //     live across a clobber point (inclusive of the point where the
+    //     clobbering instruction still READS it, e.g. a divisor staged
+    //     before `cqo` zeroes %edx) is refused, while a value BORN at the
+    //     point (the div/rem result itself) is admitted — the optimal
+    //     shape, the remainder is produced in %rdx;
+    //   * wide bodies (I128/U128 ops anywhere) keep the whole-function
+    //     exclusion: their emitters flow values through the %rax:%rdx
+    //     accumulator pair and were never production-exercised with
+    //     %rdx-homed values (the pool gate always excluded %rdx there),
+    //     so point-local emitter completeness is asserted, not proven,
+    //     for that class. Values crossing i128 helper-call divisions are
+    //     doubly excluded — those are call points.
+    if !config.ra_config.no_rdx_hazard
+        && crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64
+        && !x86_body_has_wide_ops(func)
+        && !config.caller_saved_regs.iter().any(|r| r.0 == 16)
+    {
+        let rdx_clobbers = collect_x64_rdx_clobber_points(func);
+        // Fused div/rem pair tails emit no code at their own IR point (the
+        // HEAD stored both results earlier), so a tail dest's modeled
+        // interval starts at the tail while the value is physically resident
+        // in %rdx from the head onward — another %rdx clobber strictly
+        // between head and tail (interleaved pairs) would corrupt it
+        // invisibly to the hazard filter. The accumulator analysis excludes
+        // tails for the same physical-liveness reason; so does the wave.
+        let divrem_tail_dests: FxHashSet<u32> = match divrem_target_for_current_arch() {
+            Some(t) => compute_i686_divrem_pairs_with_config(func, t, &config.ra_config).tail_dests,
+            None => FxHashSet::default(),
+        };
+        if !rdx_clobbers.is_empty() {
+            // The Phase-2 `base_ok` gates, inlined (the closure is scoped to
+            // the caller-saved block above): no home yet, not call-spanning,
+            // param restrictions honoured. Note on fold eligibility: a
+            // %rdx home is refused by `const_offset_fold_reg_base_ok`
+            // (PhysReg 10|16 exclusion) but accepted by the indexed fold
+            // (`can_indexed_addr_fold` consults register homes generically),
+            // so GEP bases trade const-offset folding for the free register —
+            // the documented ordering choice of this wave, measured neutral
+            // on the corpus.
+            let intervals: Vec<LiveInterval> = scan_ivs
+                .iter()
+                .copied()
+                .filter(|iv| {
+                    !assignments.contains_key(&iv.value_id)
+                        && !call_spanning.contains(&iv.value_id)
+                        && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
+                        && !riscv_entry_guard.contains(&iv.value_id)
+                        && !later_arg_values.contains(&iv.value_id)
+                        && !divrem_tail_dests.contains(&iv.value_id)
+                        && !overlaps_inclusive_skip_birth(iv, &rdx_clobbers)
+                })
+                .collect();
+            if config.ra_config.debug_ra_intervals {
+                let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
+                eprintln!(
+                    "[RA-P2X] fn={} rdx-hazard clobbers={} candidates={:?}",
+                    func.name,
+                    rdx_clobbers.len(),
+                    cands
+                );
+            }
+            if !intervals.is_empty() {
+                let ranges = build_gpr_ranges(&intervals);
+                let mut alloc = LinearScanAllocator::new_with_config(
+                    ranges,
+                    vec![PhysReg(16)],
+                    &config.ra_config,
+                );
+                alloc.run();
+                for (vid, r) in alloc.assignments {
+                    assignments.insert(vid, r);
+                    caller_used_regs_set.insert(r.0);
                 }
             }
         }
@@ -7438,6 +7714,9 @@ fn apply_phi_coalesce_assignments_with_config(
     callee_saved: &[PhysReg],
     ra_config: &RaConfig,
 ) {
+    // Lazily-computed %rdx clobber points for the Phase-2x64 propagation
+    // guard below (None until a %rdx-homed phi dest is actually considered).
+    let mut rdx_clobbers: Option<Vec<u32>> = None;
     for candidate in candidates {
         let phi_dest = candidate.phi_dest;
         let backedge_src = candidate.backedge_src;
@@ -7518,6 +7797,39 @@ fn apply_phi_coalesce_assignments_with_config(
                     );
                 }
                 continue;
+            }
+        }
+
+        // Phase-2x64 guard: the dest's home may be %rdx under the
+        // position-aware admission wave, whose hazard filtering the SOURCE
+        // value never passed. Propagating that home to a backedge source
+        // whose interval crosses an %rdx clobber point would hand the
+        // clobbering instruction (cqo, jump-table dispatch, atomic staging)
+        // a live victim — the exact failure the wave's own candidate filter
+        // exists to prevent for the dest. Cheap for every other shape: the
+        // point list is computed at most once and only when a %rdx home is
+        // actually in play (a clobber-free body yields an empty list, so
+        // clean %rdx homes propagate exactly as before).
+        if reg.0 == 16
+            && crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64
+        {
+            let rdx_clobbers =
+                rdx_clobbers.get_or_insert_with(|| collect_x64_rdx_clobber_points(func));
+            if let Some(&src_iv) = iv_map.get(&backedge_src) {
+                let src_live = LiveInterval {
+                    start: src_iv.0,
+                    end: src_iv.1,
+                    value_id: backedge_src,
+                };
+                if overlaps_inclusive_skip_birth(&src_live, rdx_clobbers) {
+                    if ra_config.debug_phi_coalesce {
+                        eprintln!(
+                            "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: source live across an rdx clobber point",
+                            phi_dest, backedge_src, reg.0
+                        );
+                    }
+                    continue;
+                }
             }
         }
 
@@ -8163,6 +8475,7 @@ mod ra_config_tests {
         switch!(no_map_vecreg, "CCC_NO_MAP_VECREG");
         switch!(no_fp_copy_web, "CCC_NO_FP_COPY_WEB");
         switch!(caller_save_spanning, "CCC_CALLER_SAVE_SPANNING");
+        switch!(no_rdx_hazard, "CCC_NO_RDX_HAZARD");
         switch!(no_segment_scan, "CCC_NO_SEGMENT_SCAN");
         switch!(debug_coalesce, "CCC_DEBUG_COALESCE");
         switch!(debug_coalesce_members, "CCC_DEBUG_COALESCE_MEMBERS");

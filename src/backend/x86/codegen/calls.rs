@@ -639,6 +639,22 @@ impl X86Codegen {
                         written_gpr[*int_reg_idx] = true;
                     }
                 }
+                // Register-pair classes: both the base register and its
+                // successor are written by the staging (I128RegPair loads
+                // both halves; StructByValReg stages an aligned pair).
+                // Without this marking the dynamic arg-hazard pre-spill
+                // could not see the second register of the pair as written
+                // (defense-in-depth: the RA's later_arg_values exclusion is
+                // the primary contract).
+                CallArgClass::I128RegPair { base_reg_idx }
+                | CallArgClass::StructByValReg { base_reg_idx, .. } => {
+                    if *base_reg_idx < 6 {
+                        written_gpr[*base_reg_idx] = true;
+                    }
+                    if *base_reg_idx + 1 < 6 {
+                        written_gpr[*base_reg_idx + 1] = true;
+                    }
+                }
                 _ => {}
             }
         }

@@ -2226,14 +2226,25 @@ pub(crate) fn run_passes(
     //   Small imm32 constants are deliberately NOT hoisted (they are free
     //   in-place; hoisting them burns a register and a callee-saved push —
     //   the old sieve regression the AArch64-only gate existed for).
+    // * RISC-V (RV64): the ALU emitters are register-form-only, so constants
+    //   outside imm12 pay `lui`+`addi` per iteration — RISC-V under-hoisted
+    //   exactly the way AArch64 did before fix B, because this gate (not
+    //   the in-pass model) was what silenced the pass there.
     // * i686: no-op (nothing this pass sees pays a 64-bit materialization).
     if !pass_disabled(&disabled, "intconst")
         && matches!(
             target,
-            crate::backend::Target::Aarch64 | crate::backend::Target::X86_64
+            crate::backend::Target::Aarch64
+                | crate::backend::Target::X86_64
+                | crate::backend::Target::Riscv64
         )
     {
-        int_const_hoist::set_target_aarch64(target == crate::backend::Target::Aarch64);
+        let model = match target {
+            crate::backend::Target::Aarch64 => int_const_hoist::ImmModel::Aarch64,
+            crate::backend::Target::Riscv64 => int_const_hoist::ImmModel::Riscv,
+            _ => int_const_hoist::ImmModel::X86_64,
+        };
+        int_const_hoist::set_target_model(model);
         module.for_each_function(int_const_hoist::run);
     }
 

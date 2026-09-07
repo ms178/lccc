@@ -3,7 +3,7 @@
  *
  * Every externally-visible noinline function isolates one high-value loop or
  * basic-block shape.  There is deliberately no main(): scripts/godbolt.py and
- * scripts/codegen_scoreboard.py compare each function against GCC 16.2,
+ * scripts/codegen_oracle.py --rank compare each function against GCC 16.2,
  * Clang, ICC and current ICX without benchmark-harness noise.
  *
  * Run two semantic modes:
