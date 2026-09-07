@@ -99,6 +99,41 @@ pub(crate) fn has_whole_word(text: &str, word: &str) -> bool {
 /// Accepts any ASCII whitespace (`add x0,…` and `add\tx0,…`). Multiple
 /// spaces/tabs after the mnemonic are skipped so the returned slice starts
 /// at the first operand character.
+/// Find the last comma that separates OPERANDS rather than SIB address fields.
+///
+/// An AT&T memory operand carries its own commas inside balanced parentheses —
+/// `DISP(%base,%index,scale)` — so a plain `rfind(',')` / `memrchr(',')` does
+/// NOT locate an instruction's destination operand. It locates the comma
+/// between the SIB base and its index whenever the memory operand is the LAST
+/// one, i.e. for every store and read-modify-write through an indexed address:
+///
+/// ```text
+///     movb %al, (%r10,%r12)     rfind(',')  -> ... ,%r12)   WRONG dest
+///                           ^-- the top-level comma is the one after %al
+/// ```
+///
+/// Text after that comma (`%r12)`) contains no `(`, so predicates of the form
+/// "the destination is a memory operand" silently answered *false* for indexed
+/// stores. This is the single canonical splitter for that decision; operand
+/// parsers on every AT&T backend must use it instead of re-deriving the split.
+///
+/// Parenthesis depth is tracked with `saturating_sub` so malformed input can
+/// never underflow; a `)` without a matching `(` simply stays at depth 0.
+#[inline]
+pub(crate) fn last_top_level_comma(bytes: &[u8]) -> Option<usize> {
+    let mut depth = 0u32;
+    let mut last = None;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => last = Some(idx),
+            _ => {}
+        }
+    }
+    last
+}
+
 fn operands_start(trimmed: &str) -> Option<usize> {
     let bytes = trimmed.as_bytes();
     let mut i = 0;
@@ -177,7 +212,10 @@ pub(crate) fn replace_source_reg_att(line: &str, old_reg: &str, new_reg: &str) -
     let trimmed = line.trim();
     let op_at = operands_start(trimmed)?;
     let args = &trimmed[op_at..];
-    let comma = args.rfind(',')?;
+    // Top-level split only: `movb %al, (%r10,%r12)` has its LAST comma inside
+    // the SIB address, so `rfind(',')` would treat `%r12)` as the destination
+    // and splice the source rewrite into the middle of the memory operand.
+    let comma = last_top_level_comma(args.as_bytes())?;
     splice_source_rewrite(line, trimmed, op_at, op_at + comma, old_reg, new_reg)
 }
 
@@ -375,6 +413,45 @@ mod tests {
         // dest-first helper would wrongly rewrite AT&T dest
         let wrong = replace_source_reg_in_instruction(line, "%rbx", "%rcx").unwrap();
         assert_eq!(wrong, "  addq %rax, %rcx");
+    }
+
+    #[test]
+    fn last_top_level_comma_skips_sib_address_fields() {
+        // Store through an indexed address: the LAST comma is inside the SIB,
+        // so a plain rfind(',') would report `%r12)` as the destination.
+        let l = "movb %al, (%r10,%r12)";
+        let c = last_top_level_comma(l.as_bytes()).unwrap();
+        assert_eq!(l[..c].trim(), "movb %al");
+        assert_eq!(l[c + 1..].trim(), "(%r10,%r12)");
+        // A scale field adds a third comma inside the address.
+        let l = "movq %rax, 16(%rbx,%rcx,8)";
+        let c = last_top_level_comma(l.as_bytes()).unwrap();
+        assert_eq!(l[c + 1..].trim(), "16(%rbx,%rcx,8)");
+        // Load: the destination is the register; address commas are skipped.
+        let l = "movzbl (%r10,%r12), %edx";
+        let c = last_top_level_comma(l.as_bytes()).unwrap();
+        assert_eq!(l[c + 1..].trim(), "%edx");
+        // Plain register-register form is unaffected by the depth tracking.
+        let l = "addq %rax, %rbx";
+        let c = last_top_level_comma(l.as_bytes()).unwrap();
+        assert_eq!(l[c + 1..].trim(), "%rbx");
+        // A single-operand form has NO top-level comma; rfind(',') would
+        // invent a destination out of the SIB field.
+        assert_eq!(last_top_level_comma("incl (%rbx,%rcx,4)".as_bytes()), None);
+        assert_eq!(last_top_level_comma(b""), None);
+        assert_eq!(last_top_level_comma(b"movl %eax"), None);
+        // Unbalanced parentheses must not panic or underflow the depth.
+        let _ = last_top_level_comma("movb %al, )%r10,%r12(".as_bytes());
+    }
+
+    #[test]
+    fn att_source_rewrite_keeps_indexed_memory_destination_intact() {
+        // The source region ends at the TOP-LEVEL comma, so the indexed memory
+        // destination is never spliced into.
+        let out = replace_source_reg_att("  movb %al, (%r10,%r12)", "%al", "%cl").unwrap();
+        assert_eq!(out, "  movb %cl, (%r10,%r12)");
+        // A register appearing only in the destination is not a source.
+        assert!(replace_source_reg_att("  movb %al, (%r10,%r12)", "%r12", "%r13").is_none());
     }
 
     #[test]

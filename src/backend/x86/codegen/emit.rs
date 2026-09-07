@@ -349,6 +349,28 @@ pub(super) fn shift_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
     }
 }
 
+/// Map a rotate op to its x86 32-bit and 64-bit mnemonic.
+///
+/// `rol`/`ror` are baseline x86 (8086 onwards), so — unlike `shlx`/`shrx`,
+/// which need BMI2, or `lzcnt`, which silently decodes as `bsr`/`bsf` on
+/// older parts — a rotate needs no feature gate and no `-march`.  On Intel
+/// the immediate form is a single µop with 1-cycle latency (uops.info
+/// ROL_R32_IMM: Skylake/Raptor Lake 1/1, 4-per-cycle throughput), replacing
+/// the shift/or triple's three µops and its two dependent ALU results.
+///
+/// The count is masked by hardware to 5 bits (32-bit operands) or 6 bits
+/// (64-bit), which is exactly the `amount mod W` reduction `IrBinOp`'s rotate
+/// semantics define — so the IR and the encoding agree without a fixup.
+/// Narrower operands (8/16-bit) would mask mod 32 instead and are therefore
+/// never lowered here; `bit_idioms` only recognizes 32- and 64-bit rotates.
+pub(super) fn rotate_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
+    match op {
+        IrBinOp::RotateLeft => ("roll", "rolq"),
+        IrBinOp::RotateRight => ("rorl", "rorq"),
+        _ => unreachable!("not a rotate op"),
+    }
+}
+
 /// BMI2 three-operand shift mnemonics (`shlx count, src, dst`).  One µop on
 /// every core that has BMI2 (uops.info SHLX_R64_R64_R64), count in any GPR,
 /// non-destructive; flags are left untouched, which no consumer of a
@@ -3623,6 +3645,83 @@ impl X86Codegen {
                 is_unsigned,
                 dest_value_id,
             );
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Register-direct rotate: `rol/ror $imm, %dest` for a constant count,
+    /// `rol/ror %cl, %dest` for a variable one.
+    ///
+    /// Mirrors `emit_shift_reg_direct`'s staging discipline (lhs into the
+    /// destination register, count staged so neither load clobbers the other's
+    /// source) but has no BMI2 form to prefer: `rorx` is immediate-only and
+    /// right-only, so the legacy two-operand encoding is already the best
+    /// generally available one — and unlike `shl %cl`, which costs 2–3 µops on
+    /// Intel, `rol %cl` is a single µop, so there is no throughput case for a
+    /// VEX alternative either.
+    ///
+    /// Callers must only route 32- and 64-bit rotates here: `rol`/`ror` mask
+    /// the count to 5 bits for 8/16/32-bit operands and 6 bits for 64-bit, so
+    /// an 8- or 16-bit rotate would wrap at the wrong width. `bit_idioms`
+    /// recognizes only I32/U32/I64/U64 rotates for exactly this reason.
+    pub(super) fn emit_rotate_reg_direct(
+        &mut self,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+        dest_value_id: u32,
+    ) {
+        let dest_name = phys_reg_name(dest_phys);
+        let dest_name_32 = phys_reg_name_32(dest_phys);
+        let (mnem32, mnem64) = rotate_mnemonic(op);
+        let width: i64 = if use_32bit { 32 } else { 64 };
+
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            self.operand_to_callee_reg(lhs, dest_phys);
+            // Reduce explicitly instead of leaning on the hardware mask: the
+            // emitted immediate then documents the real rotation, and a count
+            // of 0 (or any multiple of the width) folds away to the copy that
+            // already produced the value, rather than emitting a flag-writing
+            // no-op.
+            let amount = (imm as i64).rem_euclid(width);
+            if amount != 0 {
+                if use_32bit {
+                    self.state
+                        .emit_fmt(format_args!("    {mnem32} ${amount}, %{dest_name_32}"));
+                    // A rotate can move any bit into bit 31, so a signed I32
+                    // result needs the same upper-half normalization a signed
+                    // `shl` does. No-op for the unsigned types rotate idioms
+                    // actually use.
+                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    {mnem64} ${amount}, %{dest_name}"));
+                }
+            }
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+
+        // Variable count: x86 pins it to %cl. Stage the count first when its
+        // home is the destination register, so the lhs load cannot overwrite
+        // it (the same hazard `emit_shift_cl_legacy` guards).
+        let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
+        if rhs_conflicts {
+            self.operand_to_rcx(rhs);
+            self.operand_to_callee_reg(lhs, dest_phys);
+        } else {
+            self.operand_to_callee_reg(lhs, dest_phys);
+            self.operand_to_rcx(rhs);
+        }
+        if use_32bit {
+            self.state
+                .emit_fmt(format_args!("    {mnem32} %cl, %{dest_name_32}"));
+            self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+        } else {
+            self.state
+                .emit_fmt(format_args!("    {mnem64} %cl, %{dest_name}"));
         }
         self.state.reg_cache.invalidate_acc();
     }

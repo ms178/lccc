@@ -56,6 +56,73 @@ pub enum IrBinOp {
     /// cross-target canonical form for classifier chains such as Expat name
     /// scanning, instead of leaving the pattern in text peepholes.
     BitTest,
+    /// Bitwise rotate (funnel shift by a whole register): `RotateLeft(x, n)`
+    /// is `(x << n) | (x >> (W - n))` and `RotateRight(x, n)` is
+    /// `(x >> n) | (x << (W - n))`, where **W is the width of the operation's
+    /// IR type**, not the width of the container the constant folder happens
+    /// to evaluate in.  Both operands and the result are integer.
+    ///
+    /// This is the cross-target canonical form for the ARX rotate idiom that
+    /// every hash and cipher spells out portably (`ROTL32`/`ROTR` in ChaCha20,
+    /// SHA-256, MD5, BLAKE2, siphash, the kernel's `rol32`/`ror32`).  Left as
+    /// a shift/or triple it costs three instructions, two of them on the
+    /// critical path through a temporary, where x86 `rol`/`ror`, AArch64
+    /// `ror`/`extr` and RISC-V Zbb `rol`/`ror` each cost one.  Backends
+    /// without a native rotate lower it to the portable sequence, so
+    /// recognition never costs correctness — only the missed single
+    /// instruction.
+    ///
+    /// The rotate amount is taken modulo W (x86 masks the count to 5/6 bits
+    /// in hardware; the IR makes that explicit so a count of 0 or >= W folds
+    /// to the identity rather than depending on an ISA's masking rules).
+    RotateLeft,
+    RotateRight,
+}
+
+impl IrBinOp {
+    /// True for the two rotate forms, whose semantics depend on the
+    /// operation's *type width* rather than only on the operand values.
+    pub fn is_rotate(self) -> bool {
+        matches!(self, IrBinOp::RotateLeft | IrBinOp::RotateRight)
+    }
+}
+
+/// Rotate the low `bits` bits of `value` by `amount`, reducing `amount`
+/// modulo `bits`.
+///
+/// Rotates are the one integer operation whose result cannot be recovered by
+/// evaluating in a wider container and truncating afterwards: rotating
+/// `0x8000_0001` left by one gives `0x0000_0003` at 32 bits, but the 64-bit
+/// rotate yields `0x1_0000_0002`, whose low half is `0x0000_0002`.  Bits that
+/// leave the top of the *narrow* value must re-enter at its bottom, so any
+/// width-typed consumer (constant folding at I8/I16/I32, i128 lowering) must
+/// route through here with the operation's real width instead of reusing
+/// `IrBinOp::eval_i64`/`eval_i128`.
+///
+/// `bits == 0` (a `Void`-typed operation, which cannot occur in valid IR)
+/// yields 0 rather than shifting by the container width, which Rust defines as
+/// a panic in debug builds.
+pub fn rotate_within_bits(value: u128, amount: u128, bits: u32, left: bool) -> u128 {
+    if bits == 0 || bits > 128 {
+        return 0;
+    }
+    let mask = if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    let value = value & mask;
+    let amount = (amount % u128::from(bits)) as u32;
+    if amount == 0 {
+        return value;
+    }
+    // Both halves stay inside `mask`: the left shift drops the bits that the
+    // right shift brings back in, and vice versa.
+    if left {
+        ((value << amount) | (value >> (bits - amount))) & mask
+    } else {
+        ((value >> amount) | (value << (bits - amount))) & mask
+    }
 }
 
 impl IrBinOp {
@@ -96,6 +163,17 @@ impl IrBinOp {
                 // The canonical operation is produced by an i32-typed recognizer
                 // after integer promotion; evaluate it as C's `(x >> i) & 1`.
                 (((lhs as u64) >> (rhs as u32)) & 1) as i64
+            }
+            // Container-width rotate.  A narrower IR type (I8/I16/I32) MUST
+            // not be folded through here: rotating at 64 bits and truncating
+            // is not the same value (see `rotate_within_bits`).
+            // `eval_binop_const`/`fold_binop` intercept both rotate forms and
+            // pass the operation's real width instead.
+            IrBinOp::RotateLeft => {
+                rotate_within_bits(lhs as u64 as u128, rhs as u64 as u128, 64, true) as i64
+            }
+            IrBinOp::RotateRight => {
+                rotate_within_bits(lhs as u64 as u128, rhs as u64 as u128, 64, false) as i64
             }
             IrBinOp::SDiv => {
                 if rhs == 0 {
@@ -140,6 +218,13 @@ impl IrBinOp {
             IrBinOp::AShr => lhs.wrapping_shr(rhs as u32),
             IrBinOp::LShr => (lhs as u128).wrapping_shr(rhs as u32) as i128,
             IrBinOp::BitTest => (((lhs as u128) >> (rhs as u32)) & 1) as i128,
+            // Container-width (128-bit) rotate; see the note on the i64 arms —
+            // narrower IR types are folded by `fold_binop` with their own
+            // width, never through here.
+            IrBinOp::RotateLeft => rotate_within_bits(lhs as u128, rhs as u128, 128, true) as i128,
+            IrBinOp::RotateRight => {
+                rotate_within_bits(lhs as u128, rhs as u128, 128, false) as i128
+            }
             IrBinOp::SDiv => {
                 if rhs == 0 {
                     return None;

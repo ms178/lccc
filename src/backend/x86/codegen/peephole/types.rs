@@ -878,23 +878,12 @@ pub(super) fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
 }
 
 /// Find the last comma that separates operands rather than SIB address fields.
-/// x86 AT&T memory operands contain commas inside balanced parentheses, so a
-/// conventional `memrchr(',')` cannot be used to determine an instruction's
-/// destination operand.
-#[inline]
-pub(super) fn last_top_level_comma(bytes: &[u8]) -> Option<usize> {
-    let mut depth = 0u32;
-    let mut last = None;
-    for (idx, &byte) in bytes.iter().enumerate() {
-        match byte {
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            b',' if depth == 0 => last = Some(idx),
-            _ => {}
-        }
-    }
-    last
-}
+///
+/// Canonical implementation lives in [`crate::backend::peephole_common`] so
+/// every AT&T backend shares one splitter; re-exported here because the x86
+/// peephole passes reach it through the `types::*` glob. See the shared
+/// definition for the indexed-store mis-parse that motivated centralizing it.
+pub(super) use crate::backend::peephole_common::last_top_level_comma;
 
 /// Fast i32 parse for stack offsets like "-8", "-24", "0", etc.
 /// Falls back to 0 on unparseable inputs (should not happen with valid asm).

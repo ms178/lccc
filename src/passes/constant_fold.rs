@@ -1056,6 +1056,21 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
                 (((lhs as u64) >> (rhs as u32)) & 1) as i64
             }
         }
+        // Width-typed rotate.  `is_32bit` is deliberately NOT the discriminator
+        // here: an I8/U8 or I16/U16 rotate must wrap at 8/16 bits, and the
+        // 64-bit case at 64.  `rotate_within_bits` masks the value to the
+        // operation width first, so the sign extension `truncate_i64` applied
+        // to a signed operand is dropped rather than rotated in.
+        IrBinOp::RotateLeft | IrBinOp::RotateRight => {
+            let bits = (ty.size() * 8) as u32;
+            let rotated = crate::ir::ops::rotate_within_bits(
+                lhs as u64 as u128,
+                rhs as u64 as u128,
+                bits,
+                op == IrBinOp::RotateLeft,
+            );
+            return Some(ty.truncate_i64(rotated as i64));
+        }
     })
 }
 

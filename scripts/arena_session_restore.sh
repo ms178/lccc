@@ -6,10 +6,13 @@
 # The harness snapshot restores /home/user contents but: drops /opt (rustup),
 # drops /swapfile, drops /tmp, drops target/ (excluded dir name), strips +x
 # from worktree files, truncates the ~55k-file kernel tree (10k-file cap),
-# and removes .git/config (credential-path exclusion). The persisted
-# /home/user/.cargo and /home/user/.rustup trees are the canonical toolchain
-# location. This script restores every piece idempotently so a new session is
-# one command from productive work.
+# and can remove .git ENTIRELY -- not just .git/config as the credential-path
+# exclusion implies (observed 2026-09-07: no .git at all, so every git
+# invocation died with "fatal: not a git repository"). Step 4 recovers that
+# case. The persisted /home/user/.cargo and /home/user/.rustup trees are the
+# canonical toolchain location, but they can come back incomplete, so step 2
+# re-resolves the channel rather than trusting them. This script restores every
+# piece idempotently so a new session is one command from productive work.
 #
 # Usage: scripts/arena_session_restore.sh [--with-kernel]
 # ============================================================================
@@ -74,9 +77,36 @@ fi
 log "m32 oracle: $(gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/dev/null && echo OK || echo FAIL)"
 
 # ---- 4. git: remote + identity + executable bits ------------------------------
+# The harness snapshot excludes sensitive credential paths, and in practice it can
+# drop the ENTIRE .git directory rather than just .git/config. Everything below
+# (and every snapshot) then dies with "fatal: not a git repository", so recover
+# the repository first.
+#
+# Recovery keeps the restored worktree byte-for-byte and rebuilds only the index,
+# so uncommitted work reappears as ordinary modifications against latest
+# upstream. artifacts/lccc.bundle is NOT a reliable source: it is written from a
+# --depth 200 clone, so it is thin and `git fetch` from it fails with
+# "did not send all necessary objects". Clone upstream instead -- which also
+# re-bases the session onto current main for free.
+if [[ ! -d .git ]]; then
+    log 'RECOVERY: .git is missing entirely (not just .git/config)'
+    tmp_git="$(mktemp -d)/lccc"
+    if git clone --depth 200 -q https://github.com/ms178/lccc.git "$tmp_git"; then
+        mv "$tmp_git/.git" ./.git
+        # MIXED reset: rebuilds the index from HEAD and leaves the worktree
+        # alone. NEVER `git checkout -- .` / `git reset --hard` here -- either
+        # one destroys the uncommitted work this script exists to protect.
+        git reset -q
+        log "recovered: HEAD=$(git rev-parse --short HEAD) ($(git rev-list --count HEAD ^origin/main 2>/dev/null || echo 0) local commits)"
+        log "recovered: $(git status --porcelain | wc -l) worktree changes preserved as modifications"
+    else
+        log 'RECOVERY FAILED: could not clone upstream; worktree is intact but git is unavailable'
+    fi
+    rm -rf "$(dirname "$tmp_git")" 2>/dev/null || true
+fi
 if ! git remote get-url origin >/dev/null 2>&1; then
     log 're-adding origin remote (snapshot drops .git/config)'
-    git remote add origin https://github.com/ms178/lccc.git
+    git remote add origin https://github.com/ms178/lccc.git 2>/dev/null || true
 fi
 git config user.name  'LCCC Agent' 2>/dev/null || true
 git config user.email 'agent@lccc.local' 2>/dev/null || true

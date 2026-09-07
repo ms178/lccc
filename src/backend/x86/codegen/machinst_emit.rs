@@ -324,6 +324,19 @@ fn shift_mnemonic(op: ShiftOp, size: OpSize) -> &'static str {
         (ShiftOp::Sar, OpSize::S16) => "sarw",
         (ShiftOp::Sar, OpSize::S32) => "sarl",
         (ShiftOp::Sar, OpSize::S64) => "sarq",
+        // `rol`/`ror` exist at every operand size.  The narrow forms are only
+        // ever reachable if a producer other than `bit_idioms` creates one:
+        // x86 masks the count mod 32 below 64 bits, so an 8- or 16-bit rotate
+        // would wrap at the wrong width.  `bit_idioms` recognizes 32- and
+        // 64-bit rotates only, which keeps IR and hardware semantics equal.
+        (ShiftOp::Rol, OpSize::S8) => "rolb",
+        (ShiftOp::Rol, OpSize::S16) => "rolw",
+        (ShiftOp::Rol, OpSize::S32) => "roll",
+        (ShiftOp::Rol, OpSize::S64) => "rolq",
+        (ShiftOp::Ror, OpSize::S8) => "rorb",
+        (ShiftOp::Ror, OpSize::S16) => "rorw",
+        (ShiftOp::Ror, OpSize::S32) => "rorl",
+        (ShiftOp::Ror, OpSize::S64) => "rorq",
     }
 }
 
@@ -732,6 +745,12 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 (ShiftOp::Shl, _) => "shlxl",
                 (ShiftOp::Shr, _) => "shrxl",
                 (ShiftOp::Sar, _) => "sarxl",
+                // BMI2 has no left rotate and no register-count rotate at all
+                // (`rorx` is immediate-only, right-only).  `try_lower_shiftx`
+                // rejects both rotate ops, so a ShiftX never carries one.
+                (ShiftOp::Rol, _) | (ShiftOp::Ror, _) => {
+                    unreachable!("ShiftX has no rotate form; isel must not select one")
+                }
             };
             // shlx has no 8/16-bit form; isel only selects S32/S64.
             let sz = if *size == OpSize::S64 {

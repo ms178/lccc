@@ -326,11 +326,38 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
 
 /// Conservative "this instruction writes memory" test: any instruction whose
 /// LAST operand is a memory reference, plus the string/atomic families.
+///
+/// The destination operand MUST be located with [`last_top_level_comma`], not
+/// `rfind(',')`. An AT&T memory operand carries its own commas inside balanced
+/// parentheses (`DISP(%base,%index,scale)`), so the last comma of a store to an
+/// indexed address is the one separating the SIB base from its index — and the
+/// text after it (`%r12)`) contains no `(`. The naive split therefore reported
+/// "does not write memory" for EVERY store through an indexed address.
+///
+/// That is a miscompile, not a lost optimization: this predicate is the guard
+/// that stops [`reuse_redundant_loads`] from replacing a load with a copy of an
+/// older load of the same address. With the guard blind to indexed stores, the
+/// reload after a swap was rewritten to reuse the pre-store value:
+///
+/// ```asm
+///     movzbl (%r10,%r12), %edx      # t = gh.s[i]
+///     movzbl (%r10,%r13), %eax      # v = gh.s[j]
+///     movb   %al, (%r10,%r12)       # gh.s[i] = v      <- invisible to rfind
+///     movb   %dl, (%r10,%r13)       # gh.s[j] = t
+///     movzbl (%r10,%r12), %r8d      # reload gh.s[i]   -> became `movl %edx,%r8d`
+///     addl   %ebp, %r8d             # t += <stale t> instead of the swapped byte
+/// ```
+///
+/// The bug stayed dormant while every such address was materialized
+/// rip-relative (`gh+2(%rip)`), because [`load_operand`] rejects `%rip`
+/// operands and so the rewrite never became eligible. Hoisting a shared
+/// `GlobalAddr` base into a register — a legitimate, profitable mid-end
+/// transform — exposed it. Regression: `pic_indexed_store_static_global.c`.
 fn line_writes_memory(t: &str) -> bool {
     if t.starts_with("lock") || t.starts_with("rep") || t.starts_with("movs") && !t.contains('%') {
         return true;
     }
-    let Some(comma) = t.rfind(',') else {
+    let Some(comma) = last_top_level_comma(t.as_bytes()) else {
         // Single-operand forms that write memory (`incl (%rax)`, `negq (%rax)`).
         return t.contains('(') && !t.starts_with("lea") && !t.starts_with("j");
     };
@@ -1024,6 +1051,94 @@ mod tests {
         assert!(
             !out.contains("imulq $1717986919, %rax, %rsi"),
             "stale-scratch miscompile: {out}"
+        );
+    }
+
+    // ── indexed-address store detection ─────────────────────────────────────
+    //
+    // `rfind(',')` locates the SIB comma inside `(%base,%index)`, so the
+    // "does this line write memory?" guard answered FALSE for every store
+    // through an indexed address. That let `reuse_redundant_loads` replace a
+    // post-store reload with a copy of the pre-store value — the miscompile
+    // behind tests/regression/pic_indexed_store_static_global.c.
+
+    #[test]
+    fn line_writes_memory_detects_indexed_stores() {
+        // The regression itself: the LAST comma is inside the SIB address.
+        assert!(line_writes_memory("movb %al, (%r10,%r12)"));
+        assert!(line_writes_memory("movq %rax, (%r10,%r12,8)"));
+        assert!(line_writes_memory("movl %eax, 16(%rbx,%rcx,4)"));
+        assert!(line_writes_memory("movw %ax, -4(%rdi,%rsi)"));
+        // Read-modify-write through an indexed address.
+        assert!(line_writes_memory("addl %eax, (%rbx,%rcx)"));
+        assert!(line_writes_memory("incl (%rbx,%rcx,4)"));
+        // Forms that were already classified correctly must stay correct.
+        assert!(line_writes_memory("movq %rax, -8(%rbp)"));
+        assert!(line_writes_memory("movb %al, (%rdi)"));
+        assert!(line_writes_memory("incl (%rax)"));
+        assert!(line_writes_memory("lock cmpxchgq %rcx, (%rdx,%r8)"));
+        // Loads READ memory: their destination is a register, so the last
+        // top-level comma is followed by that register, not by an address.
+        assert!(!line_writes_memory("movzbl (%r10,%r12), %edx"));
+        assert!(!line_writes_memory("movq 8(%rbx,%rcx,2), %rax"));
+        assert!(!line_writes_memory("leaq (%rax,%rcx), %rdx"));
+        assert!(!line_writes_memory("movl %eax, %ebx"));
+        assert!(!line_writes_memory("cmpq $32, %r8"));
+    }
+
+    #[test]
+    fn reload_after_indexed_store_is_not_replaced_by_the_stale_load() {
+        // Exact shape of the miscompiled s-box swap loop:
+        //     t = s[i]; v = s[j]; s[i] = v; s[j] = t; t += s[i];
+        // The trailing load of (%r13,%rsi) must survive — the two stores wrote
+        // that address, so the pre-store value in %r9d is stale.
+        let out = run(concat!(
+            "hash_final:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    movzbl (%r13,%rsi), %r9d\n",
+            "    movl %r9d, %ebp\n",
+            "    movzbl (%r13,%rdx), %eax\n",
+            "    movb %al, (%r13,%rsi)\n",
+            "    movb %r9b, (%r13,%rdx)\n",
+            "    movzbl (%r13,%rsi), %r10d\n",
+            "    movl %ebp, %r8d\n",
+            "    addl %r10d, %r8d\n",
+            "    addq $1, %r15\n",
+            "    cmpq $32, %r15\n",
+            "    jb .LBB1\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movzbl (%r13,%rsi), %r10d"),
+            "post-store reload was replaced by the stale value: {out}"
+        );
+        assert!(
+            !out.contains("movl %r9d, %r10d"),
+            "stale-value copy substituted for the reload: {out}"
+        );
+    }
+
+    #[test]
+    fn reuse_still_fires_when_no_store_intervenes() {
+        // The optimization must survive the fix: two loads of the same indexed
+        // address with nothing writing memory in between are still folded away
+        // (into a register copy, which copy-propagation may then absorb).
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%r13,%rsi), %r9d\n",
+            "    movl %r9d, %ebp\n",
+            "    movzbl (%r13,%rsi), %r10d\n",
+            "    addl %r10d, %ebp\n",
+            "    movl %ebp, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            !out.contains("movzbl (%r13,%rsi), %r10d"),
+            "redundant load was not eliminated: {out}"
         );
     }
 }

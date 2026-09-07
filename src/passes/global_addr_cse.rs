@@ -114,8 +114,25 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 /// GPR flood, stack-slot relay). Such bases are ordinary CSE candidates: GVN
 /// unifies the `GA + idx*stride` GEPs into one, IVSR produces a single
 /// marching pointer, and field offsets fold into displacements at the uses.
+/// Both consumers of this set MUST see the same answer, and they are not
+/// interchangeable uses of one classification:
+///
+/// * `global_addr_cse` uses it to decide whether same-symbol address webs may
+///   be merged and hoisted — a pure instruction-placement question.
+/// * GVN keys `ExprKey::GlobalAddr { site_local }` on it. A site-local value
+///   carries its own `dest` id in the key, which makes the key unique and so
+///   *prevents* value-number unification. Withdrawing site-locality therefore
+///   also lets GVN give two same-symbol addresses the same value number, which
+///   then flows into `ExprKey::Gep { base, offset }` and into Load CSE.
+///
+/// If the two disagree, one pass merges webs the other still numbers apart.
 pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
     let mut globals = FxHashSet::default();
+    // How many times each symbol's address is materialized in this function,
+    // and which symbol each GlobalAddr dest names. Used by the duplicate-base
+    // merge gate below.
+    let mut sym_occurrences: FxHashMap<String, u32> = FxHashMap::default();
+    let mut value_symbol: FxHashMap<u32, String> = FxHashMap::default();
     let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
     let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
     let mut indexed_bases = Vec::new();
@@ -166,8 +183,10 @@ pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
                 *def_count.entry(dest.0).or_insert(0) += 1;
             }
             match inst {
-                Instruction::GlobalAddr { dest, .. } => {
+                Instruction::GlobalAddr { dest, name } => {
                     globals.insert(dest.0);
+                    *sym_occurrences.entry(name.clone()).or_insert(0) += 1;
+                    value_symbol.insert(dest.0, name.clone());
                 }
                 Instruction::Copy {
                     dest,
@@ -247,6 +266,33 @@ pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
             current = next;
         }
     }
+    // A site-local base is exempt from CSE so its live range stays as short
+    // as possible and cannot evict the natural index register. That trade
+    // only exists when the symbol is materialized ONCE: with two or more
+    // occurrences there is no single-use live range left to protect, only
+    // duplicate materializations to delete.
+    //
+    // The addressing form the exemption was written to preserve —
+    // absolute `sym(,%idx,scale)` — is not one this backend can select in
+    // any code model: x86-64 emits zero such operands under -O2 PIC,
+    // -fno-pic -fno-pie and -fno-pie alike, because a RIP-relative base
+    // cannot also carry an index. A variable-index global access therefore
+    // pays a base register (or a rematerialized `leaq sym(%rip)`) no
+    // matter where the base lives, so merging is a strict instruction-count
+    // win — and inside a loop it removes per-iteration work.
+    //
+    // lz4's match-search loop rematerialized `hash_table` twice and
+    // `src_data` once every iteration (the register allocator remats each
+    // unmerged IR value separately at its own use), where GCC hoists one
+    // base per symbol; gzip_crc32 materialized `gzip_crc_data` three times
+    // in three consecutive instructions.
+    out.retain(|v| {
+        value_symbol
+            .get(v)
+            .and_then(|n| sym_occurrences.get(n).copied())
+            .map(|count| count < 2)
+            .unwrap_or(true)
+    });
     out
 }
 
@@ -1218,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn variable_index_global_addrs_remain_site_local() {
+    fn duplicate_variable_index_global_addrs_merge() {
         let mut func = empty_func();
         func.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -1249,15 +1295,50 @@ mod tests {
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
         });
-        assert_eq!(run(&mut func), 0);
+        // Two materializations of the same symbol feeding variable-index GEPs:
+        // there is no single-use live range left to protect, only a duplicate
+        // `leaq sym(%rip)` to delete, so they merge into one web. Classified
+        // BEFORE run: the duplicate gate must withdraw site-locality for both.
+        // (After the merge a single occurrence remains, which is site-local
+        // again by definition -- there is nothing left to CSE.)
+        assert!(classify_site_local_indexed(&func).is_empty());
+        assert_eq!(run(&mut func), 1);
         assert_eq!(
             func.blocks[0]
                 .instructions
                 .iter()
                 .filter(|i| matches!(i, Instruction::GlobalAddr { .. }))
                 .count(),
-            2
+            1
         );
+    }
+
+    #[test]
+    fn single_variable_index_global_addr_stays_site_local() {
+        // The contract the duplicate merge must not break: with ONE occurrence
+        // the base is rematerialized at its only use, so keeping it site-local
+        // preserves the shortest live range and cannot evict the index register.
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "table".to_string(),
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Value(Value(9)),
+                    ty: IrType::Ptr,
+                },
+                load(3, 2),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(classify_site_local_indexed(&func).len(), 1);
     }
 
     #[test]
@@ -1283,7 +1364,7 @@ mod tests {
                 load(4, 3),
                 Instruction::GlobalAddr {
                     dest: Value(5),
-                    name: "table".to_string(),
+                    name: "table_b".to_string(),
                 },
                 Instruction::Cast {
                     dest: Value(6),

@@ -621,7 +621,11 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
             Instruction::BinOp { op, .. } => {
                 use crate::ir::reexports::IrBinOp::*;
                 match op {
-                    AShr | LShr | Shl | BitTest => saw_shift = true,
+                    // Rotates belong to the shift family for this test: a
+                    // bit-iteration latch that rotates its induction value is
+                    // still a pure bit loop, and classifying it as `other_arith`
+                    // would veto a complete unroll that is profitable.
+                    AShr | LShr | Shl | BitTest | RotateLeft | RotateRight => saw_shift = true,
                     And | Or | Xor => saw_and = true,
                     Add | Sub | Mul | SDiv | UDiv | SRem | URem => other_arith = true,
                 }

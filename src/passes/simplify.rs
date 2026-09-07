@@ -2083,6 +2083,30 @@ fn simplify_binop(
                 });
             }
         }
+        IrBinOp::RotateLeft | IrBinOp::RotateRight => {
+            // A rotate permutes the operand's bits, which makes it the one
+            // shift-family operation whose zero *amount* genuinely is an
+            // identity -- contrast the BitTest arm above, where a zero index
+            // still selects bit zero and folding it was a miscompile.  The
+            // amount reduces modulo the operation width (exactly what the
+            // x86/AArch64/RISC-V count masks do), so `rotl(x, 32)` on an I32
+            // folds to `x` instead of surviving as a rotation the backend
+            // would still spend an instruction on.
+            if lhs_zero {
+                return Some(Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::zero(ty)),
+                });
+            }
+            if let Operand::Const(c) = rhs
+                && let Some(amount) = c.to_i128()
+            {
+                let bits = (ty.size() * 8) as i128;
+                if bits > 0 && amount.rem_euclid(bits) == 0 {
+                    return Some(Instruction::Copy { dest, src: *lhs });
+                }
+            }
+        }
     }
 
     // Commutative operand canonicalization: for commutative operations

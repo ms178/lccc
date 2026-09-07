@@ -935,7 +935,16 @@ impl I686Codegen {
         // are finalized lazily (see direct_reg_src_ref); the peephole folds
         // them after materialization.
         self.operand_to_eax(lhs);
-        let var_shift = matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr);
+        // `rol`/`ror` take their variable count from %cl exactly like the
+        // shifts, so they share the staging that pins the rhs there.
+        let var_shift = matches!(
+            op,
+            IrBinOp::Shl
+                | IrBinOp::AShr
+                | IrBinOp::LShr
+                | IrBinOp::RotateLeft
+                | IrBinOp::RotateRight
+        );
         let div_like = matches!(
             op,
             IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
@@ -980,6 +989,32 @@ impl I686Codegen {
             IrBinOp::Shl => self.state.emit("    shll %cl, %eax"),
             IrBinOp::AShr => self.state.emit("    sarl %cl, %eax"),
             IrBinOp::LShr => self.state.emit("    shrl %cl, %eax"),
+            IrBinOp::RotateLeft | IrBinOp::RotateRight => {
+                // i386 `rol`/`ror` are baseline ISA (no feature gate, unlike
+                // BMI2's `rorx`), and the hardware count mask is mod 32 — the
+                // same reduction the IR's rotate semantics define for a
+                // 32-bit operand.  This is the single-instruction form of the
+                // `ROTL32`/`ROTR` triple that every hash and the kernel's
+                // preboot decompressor spell out portably.
+                let mnem = if op == IrBinOp::RotateLeft {
+                    "roll"
+                } else {
+                    "rorl"
+                };
+                match Self::const_as_imm32(rhs) {
+                    Some(imm) => {
+                        let amount = (imm as i64).rem_euclid(32);
+                        if amount != 0 {
+                            self.state.out.emit_instr_imm_reg(
+                                &format!("    {mnem}"),
+                                amount,
+                                "eax",
+                            );
+                        }
+                    }
+                    None => self.state.emit(&format!("    {mnem} %cl, %eax")),
+                }
+            }
             IrBinOp::BitTest => {
                 // i686 BT stores the selected bit directly in CF and masks the
                 // index modulo 32, exactly matching `(base >> index) & 1` on
