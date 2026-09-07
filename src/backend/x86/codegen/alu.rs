@@ -584,18 +584,20 @@ impl X86Codegen {
         // the HEAD's own dest is slotless.
         let rem_slotless = rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
         let div_slotless = div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
-        // store_rdx(rem) writes %rax iff rem is HOMED in %rdx... impossible
-        // here: %rdx (PhysReg 16) is excluded from allocation in any function
-        // containing division (prologue). store_rax(div) writes %rdx iff the
-        // quotient is HOMED in %rdx — same exclusion. Keep the screening
-        // shape for defence against future allocator changes.
+        // store_rdx(rem) writes %rax iff rem is HOMED in %rdx; store_rax(div)
+        // writes %rdx iff the quotient is HOMED in %rdx. REACHABLE since the
+        // position-aware %rdx admission wave (regalloc Phase 2-x64): a div/rem
+        // result born exactly at the clobber point is admitted into %rdx —
+        // the natural output register. The deadlock screening below is
+        // load-bearing, not defensive: the slotless/rdx combinations and the
+        // store-order dependencies must keep refusing to fuse.
         let rdx_phys = crate::backend::regalloc::PhysReg(16);
         let rem_in_rdx = rem_home == Some(rdx_phys);
         let div_in_rdx = div_home == Some(rdx_phys);
-        let _ = rem_in_rdx; // cannot occur; see comment above
 
-        // Deadlock screening (mirrors the i686 fusion; with %rdx excluded
-        // from allocation only the slotless combinations can trigger).
+        // Deadlock / ordering screening (mirrors the i686 fusion). The
+        // rdx-homed combinations are reachable via the Phase-2x64 wave; the
+        // slotless ones via accumulator-flow values.
         if (rem_in_rdx && div_in_rdx)
             || (rem_slotless && div_in_rdx)
             || (div_slotless && rem_in_rdx)

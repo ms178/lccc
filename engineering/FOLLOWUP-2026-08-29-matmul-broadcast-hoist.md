@@ -103,7 +103,8 @@ Backend x86 lowering:
   - lccc 96 insns, gcc16.2 25 insns, clang 438 insns.
   - Still behind GCC (GCC uses tighter SIB and less LEA overhead), but broadcast hoist
     removes 8 insns per iteration (4 loads + 4 broadcasts) and reduces memory traffic.
-- `scripts/codegen_scoreboard.py .../matmul.c`: gap 71 vs best (gcc=25), loads 36, stores 7, vec 12.
+- `scripts/codegen_scoreboard.py .../matmul.c`: gap 71 vs best (gcc=25), loads 36, stores 7, vec 12
+  (that tool is now `scripts/codegen_oracle.py --rank`).
 
 ## Next steps
 

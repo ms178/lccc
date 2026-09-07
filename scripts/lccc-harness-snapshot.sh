@@ -143,7 +143,7 @@ import json,glob,os
 print(json.dumps({os.path.basename(f): open(f, encoding='utf-8', errors='replace').read() for f in sorted(glob.glob('*.md'))}))" ) | atomic_write "$GEN/docs.json"
 
 # 5b. Codegen evidence table for the web console (optional; produced by
-#     scripts/codegen_scoreboard.py --json or hand-curated per session).
+#     scripts/codegen_oracle.py --rank --json or hand-curated per session).
 ev=${LCCC_EVIDENCE_JSON:-engineering/evidence/session/evidence.json}
 if [[ -f "$ev" ]]; then
   atomic_write "$GEN/evidence.json" < "$ev"
@@ -151,10 +151,12 @@ elif [[ ! -f "$GEN/evidence.json" ]]; then
   printf '{"generated":"n/a","rows":[],"notes":[]}\n' | atomic_write "$GEN/evidence.json"
 fi
 
-# 5c. Session benchmark before/after table for the web console.  Produced by
-#     scripts/bench_worst10.py --emit-web (schema: title, generated_utc, note,
-#     before[], after[] with name/lccc_ms/gcc_ms/ratio/status).  A stub keeps
-#     the bundle type-checking before the first measurement lands.
+# 5c. Session benchmark before/after table for the web console.  Produced
+#     from tests/benchmark/run_benchmarks.py --json evidence (ranked with
+#     scripts/bench_rank.py) or hand-curated per session (schema: title,
+#     generated_utc, note, before[], after[] with name/lccc_ms/gcc_ms/
+#     ratio/status).  A stub keeps the bundle type-checking before the first
+#     measurement lands.
 bj=${LCCC_BENCH_JSON:-engineering/evidence/session/bench.json}
 if [[ -f "$bj" ]]; then
   atomic_write "$GEN/bench.json" < "$bj"

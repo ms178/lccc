@@ -134,6 +134,41 @@ pub(crate) fn last_top_level_comma(bytes: &[u8]) -> Option<usize> {
     last
 }
 
+/// Split an AT&T operand list at its TOP-LEVEL commas: the whole-operand
+/// form of [`last_top_level_comma`]. A memory operand carries its own commas
+/// inside balanced parentheses — `DISP(%base,%index,scale)` — so a naive
+/// `split(',')` shreds SIB addresses into phantom operands. Backends must
+/// use this splitter (or the last-comma form above) rather than re-deriving
+/// the walk; the shared implementation is what keeps the x86-64 and i686
+/// operand views from drifting apart.
+///
+/// The input is the operand list AFTER the mnemonic (leading whitespace is
+/// tolerated; each part retains its surrounding whitespace). Semantics match
+/// the historical i686 walkers exactly: the depth counter is a plain `i32`
+/// that may go negative on malformed (unbalanced) input, which suppresses
+/// further splits — the conservative direction.
+pub(crate) fn split_top_level_commas(operands: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for ch in operands.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 => parts.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+    }
+    parts.push(cur);
+    parts
+}
+
 fn operands_start(trimmed: &str) -> Option<usize> {
     let bytes = trimmed.as_bytes();
     let mut i = 0;

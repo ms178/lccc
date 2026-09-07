@@ -19,7 +19,7 @@ Aliases are pinned where a fixed release exists. ``icx`` deliberately resolves
 through Compiler Explorer's ``cicxlatest`` channel; every comparison manifest
 records the resolved id/name so a future rerun cannot silently claim it used the
 same compiler.  Assembly is requested in AT&T syntax to match LCCC and permit
-operand-side load/store analysis in codegen_scoreboard.py.
+operand-side load/store analysis in codegen_oracle.py (compare and --rank).
 """
 from __future__ import annotations
 

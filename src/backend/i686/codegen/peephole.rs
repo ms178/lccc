@@ -465,8 +465,12 @@ fn parse_ebp_offset_in_line(s: &str) -> i32 {
 /// Parse the destination register of a generic instruction.
 /// For two-operand instructions (AT&T syntax), the destination is the last operand.
 fn parse_dest_reg(s: &str) -> RegId {
-    // Find the last %reg
-    if let Some(comma) = s.rfind(',') {
+    // Find the last %reg. The comma split must be TOP-LEVEL: a SIB memory
+    // operand carries commas of its own (`4(%eax,%ebx,2)`), and a raw
+    // `rfind(',')` would mis-locate the destination of `movl %eax, 4(%esi,%edi,2)`
+    // inside the address (the x86-64 `line_writes_memory` defect class,
+    // fixed there with the same shared helper).
+    if let Some(comma) = crate::backend::peephole_common::last_top_level_comma(s.as_bytes()) {
         let after = s[comma + 1..].trim();
         if after.starts_with('%') && !after.contains('(') {
             return register_family(after);
@@ -1468,7 +1472,10 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     } = infos[j].kind
                     {
                         if sreg == REG_EAX {
-                            let comma = src_line.rfind(',').unwrap();
+                            let comma = crate::backend::peephole_common::last_top_level_comma(
+                                src_line.as_bytes(),
+                            )
+                            .expect("guarded movl $imm,%eax shape");
                             let imm_txt = src_line[5..comma].trim(); // "$X"
                             let imm_val: Option<i64> = imm_txt[1..].parse().ok();
                             let imm_out = match (size, imm_val) {
@@ -1600,7 +1607,15 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                 cnt += 1;
                             }
                             if dead {
-                                let comma = src_line.rfind(',').unwrap();
+                                // Top-level comma: the guard above pinned the
+                                // shape to `movl $X, %eax` / `leal M(%r), %eax`
+                                // (register destination), but a SIB source such
+                                // as `leal 4(%esi,%edi), %eax` still contains
+                                // nested commas — split at the top level.
+                                let comma = crate::backend::peephole_common::last_top_level_comma(
+                                    src_line.as_bytes(),
+                                )
+                                .expect("guarded reg-destination shape");
                                 let head = &src_line[..comma]; // "movl $X" or "leal M(%r)"
                                 let fused = format!("    {}, {}", head, reg32_name(mdst));
                                 store.replace(i, fused);
@@ -2727,7 +2742,11 @@ fn rewrite_alu_slot_source(s: &str, slot: i32, src_reg: RegId) -> Option<String>
 fn line_reads_dest_source(s: &str, reg: RegId) -> bool {
     let mn = s.split_whitespace().next().unwrap_or("");
     if mn.starts_with("mov") || mn.starts_with("lea") || mn.starts_with("set") {
-        if let Some(comma) = s.rfind(',') {
+        // Top-level comma: for `movl %ebx, (%esi,%eax)` a raw `rfind(',')`
+        // lands inside the SIB address and hides the index-register READ
+        // from this source-part check — the exact defect class the x86-64
+        // `line_writes_memory` fix closed with the same shared helper.
+        if let Some(comma) = crate::backend::peephole_common::last_top_level_comma(s.as_bytes()) {
             return line_references_reg(&s[..comma], reg);
         }
         // A comma-less mov-prefixed line is a string primitive (`movsl`),
@@ -2932,24 +2951,7 @@ fn replace_att_operand_reg(
 
     // Split the operand list on TOP-LEVEL commas: a memory operand contains
     // commas of its own (`4(%eax,%ebx,2)`).
-    let mut parts: Vec<String> = Vec::new();
-    let mut depth = 0i32;
-    let mut cur = String::new();
-    for ch in operands.chars() {
-        match ch {
-            '(' => {
-                depth += 1;
-                cur.push(ch);
-            }
-            ')' => {
-                depth -= 1;
-                cur.push(ch);
-            }
-            ',' if depth == 0 => parts.push(std::mem::take(&mut cur)),
-            _ => cur.push(ch),
-        }
-    }
-    parts.push(cur);
+    let mut parts = crate::backend::peephole_common::split_top_level_commas(operands);
 
     // A single operand is read-modify-write (incl/neg/not/bswap…), a branch
     // target, or a stack slot — EXCEPT for the single-operand forms whose one
@@ -3052,24 +3054,7 @@ fn replace_att_reg_with_text(
     if operands.is_empty() {
         return None;
     }
-    let mut parts: Vec<String> = Vec::new();
-    let mut depth = 0i32;
-    let mut cur = String::new();
-    for ch in operands.chars() {
-        match ch {
-            '(' => {
-                depth += 1;
-                cur.push(ch);
-            }
-            ')' => {
-                depth -= 1;
-                cur.push(ch);
-            }
-            ',' if depth == 0 => parts.push(std::mem::take(&mut cur)),
-            _ => cur.push(ch),
-        }
-    }
-    parts.push(cur);
+    let mut parts = crate::backend::peephole_common::split_top_level_commas(operands);
 
     let last = parts.len() - 1;
     let mut hit = false;

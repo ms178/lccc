@@ -350,9 +350,11 @@ impl X86Codegen {
         let mut has_indirect_call = false;
         let mut has_calls = false;
         let mut has_i128_ops = false;
-        let mut has_gep = false; // GEP → indirect stores → emit_save_acc uses rdx
+        // has_gep / has_select were historically consumed here to steer
+        // %rdx scratch selection; `emit_save_acc_impl` now switches to %r11
+        // dynamically (checking actual %rdx homes) and the Select emitter
+        // never touched %rdx, so both flags are dead — kept out of the scan.
         let mut has_switch = false; // Switch → jump tables use rdx
-        let mut has_select = false; // Select → cmov path uses rdx
         let mut has_i32_widening = false; // Cast from I32/U32 to I64/pointer → needs sign-ext
         for block in &func.blocks {
             for inst in &block.instructions {
@@ -412,12 +414,6 @@ impl X86Codegen {
                             has_i128_ops = true;
                         }
                     }
-                    Instruction::GetElementPtr { .. } => {
-                        has_gep = true;
-                    }
-                    Instruction::Select { .. } => {
-                        has_select = true;
-                    }
                     _ => {}
                 }
             }
@@ -437,10 +433,15 @@ impl X86Codegen {
         // as caller-saved only when no instruction implicitly clobbers it —
         // division (rdx:rax), i128 ops (rax:rdx pair), switch jump tables
         // (rdx as dispatch), cmpxchg-loop RMWs / cmpxchg / atomic stores,
-        // fixed-scratch intrinsics. rdi (PhysReg 14) leaves the pool when a
-        // cmpxchg-loop RMW or rdtscp is present (operand parked in %rdi).
-        // GEP indirect stores and Select cmov paths use %r11 when rdx is
-        // allocated.
+        // F128 stores, fixed-scratch intrinsics (rdtsc/rdtscp, the
+        // __builtin_apply family, __builtin_longjmp). rdi (PhysReg 14)
+        // leaves the pool when a cmpxchg-loop RMW or rdtscp is present
+        // (operand parked in %rdi). For clobber-CONTAINING (non-wide)
+        // bodies the RA's Phase-2x64 wave additionally admits rdx per-value
+        // at clobber-free live ranges (regalloc.rs; CCC_NO_RDX_HAZARD
+        // restores this whole-function exclusion for A/B). GEP indirect
+        // stores stage the accumulator through %r11 whenever any value is
+        // actually %rdx-homed (`emit_save_acc_impl`, dynamic).
         let fixed = crate::backend::regalloc::x86_body_fixed_scratch(func);
         if fixed.rdi {
             caller_saved_regs.retain(|r| r.0 != 14);
@@ -1304,6 +1305,36 @@ impl X86Codegen {
                 },
                 &self.state.ra_config,
             );
+
+        // ── PF-07 post-RA demotion (dead-materialisation cleanup) ─────────
+        // A promoted indexed-symbol base that the RA could not actually home
+        // is pure dead weight as materialised: its indexed consumers refuse
+        // the register-base fold (`can_indexed_addr_fold` consults register
+        // homes only) and take the per-access `leaq sym(%rip)` symbol arm
+        // regardless, while the GlobalAddr emission (kept alive only by the
+        // promotion) writes the base once into %rax and stores it to a spill
+        // slot that no consumer ever reads — two dead instructions and 8
+        // dead frame bytes per such base (lz4 main: the hash_table/src_data
+        // pair at block 0, slot 64). Demote it back to the
+        // never-materialized set: every consumer of a pre-promotion set
+        // member is foldable/rematable by construction (the set IS the
+        // foldable ∪ rematerializable union), so this restores exactly the
+        // pre-promotion code shape for that value and deletes the dead pair.
+        // Bases that DID win a register home keep the hoisted shape — that
+        // is the entire point of PF-07.
+        {
+            let unhomed: Vec<u32> = self
+                .state
+                .promoted_global_addr_homes
+                .iter()
+                .copied()
+                .filter(|v| !self.reg_assignments.contains_key(v))
+                .collect();
+            for v in unhomed {
+                self.state.promoted_global_addr_homes.remove(&v);
+                self.state.never_materialized_values.insert(v);
+            }
+        }
 
         // ── MachInst window-allocator busy map ──────────────────────────────
         // Per-GPR live spans of every main-RA home, for the window allocator:

@@ -17,15 +17,35 @@ use super::loop_analysis;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::cell::Cell;
 
+/// Target immediate-encoding model that drives the hoist decision. One
+/// constructor per backend the pass runs on (see the driver gate in
+/// `passes/mod.rs`); `i686` is deliberately excluded — nothing this pass
+/// sees pays a 64-bit materialization there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ImmModel {
+    /// x86-64: 64-bit instructions sign-extend imm32 (only the signed range
+    /// is free at 64-bit width); 32-bit instructions take the imm32 bit
+    /// pattern verbatim (the whole u32 range is free).
+    X86_64,
+    /// AArch64: add/sub/cmp take imm12 (0..=4095) / cmn (-4095..=-1);
+    /// mul has no immediate form at all.
+    Aarch64,
+    /// RISC-V (RV64): no ALU immediate reaches this pass's operand forms
+    /// beyond imm12 — every integer constant materializes through `li`
+    /// (register-form-only emitters), and `li` itself is one `addi` inside
+    /// [-2048, 2047] and a `lui`+`addi` pair outside it.
+    Riscv,
+}
+
 thread_local! {
-    /// Whether the current target is AArch64 (imm12 immediate model).
-    static AARCH64: Cell<bool> = const { Cell::new(false) };
+    /// Current target immediate-encoding model.
+    static MODEL: Cell<ImmModel> = const { Cell::new(ImmModel::X86_64) };
 }
 
 /// Record the current target for the immediate-encoding model. Called by
 /// the driver before the pass runs.
-pub(crate) fn set_target_aarch64(is_aarch64: bool) {
-    AARCH64.with(|c| c.set(is_aarch64));
+pub(crate) fn set_target_model(model: ImmModel) {
+    MODEL.with(|c| c.set(model));
 }
 use crate::common::types::IrType;
 use crate::ir::analysis;
@@ -118,6 +138,11 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 ///   *verbatim*, so the unsigned half `[2^31, 2^32)` is free too and must not
 ///   be hoisted. This covers essentially every hash multiplier in existence
 ///   (0x9E3779B1, 0x85EBCA77, 0xCC9E2D51, 0x1B873593).
+/// * RISC-V (RV64): the ALU emitters are register-form-only, so every
+///   constant pays a `li` materialization per iteration; inside imm12
+///   ([-2048, 2047]) `li` is a single `addi` (free in place), outside it a
+///   `lui`+`addi` pair (hoist — the RISC-V analogue of AArch64's under-hoist
+///   before fix B: RISC-V previously never ran this pass at all).
 ///
 /// `imm32_exact` says the consuming instruction encodes a *verbatim* imm32 bit
 /// pattern (x86-64 32-bit ALU/imul/cmp forms) rather than sign-extending it.
@@ -131,6 +156,31 @@ fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u
         Operand::Const(IrConst::I64(v)) => *v,
         _ => return None,
     };
+    let model = MODEL.with(|c| c.get());
+    if model == ImmModel::Riscv {
+        // RISC-V: the backend stages EVERY integer constant through `li`
+        // (the ALU emitters are register-form only — there is no imm32
+        // bit-pattern relaxation and no position without materialization),
+        // so the only cost axis is `li`'s own expansion: imm12 is a single
+        // `addi` (free in place — hoisting such a constant trades a free
+        // one-instruction materialization for a register live across the
+        // whole loop, the exact x86 "one movl is cheaper" rule), while
+        // anything outside imm12 costs `lui`+`addi` on EVERY iteration —
+        // the movz/movk-class per-iteration waste this pass exists to
+        // remove. The `needs_reg`/`imm32_exact` axes are x86/AArch64
+        // distinctions that do not exist here: the rule is uniform across
+        // operand positions.
+        //
+        // PREMISE: "one addi is free" holds relative to the CURRENT
+        // register-form-only emitters. If the RISC-V backend ever grows
+        // `addi`/`andi`/`slti` immediate folds (like x86's imm32 forms), an
+        // in-place imm12 becomes strictly cheaper than a hoisted register
+        // even in short loops — revisit this arm then.
+        if (-2048..=2047).contains(&v) {
+            return None; // `li` = one addi — free in place
+        }
+        return Some(v as u64);
+    }
     // Operand positions with no immediate encoding at all (div/rem on every
     // target; mul on AArch64) pay a register materialization even for small
     // constants — except that on x86-64 a div-by-constant is expanded by
@@ -138,7 +188,7 @@ fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u
     // time this pass sees the loop, small divisors are gone. Constants that
     // survive here are the real per-iteration movabs/movz materializations.
     if !needs_reg {
-        if AARCH64.with(|c| c.get()) {
+        if model == ImmModel::Aarch64 {
             // AArch64 add/sub/cmp take imm12 (0..=4095, optionally shifted
             // left by 12) and cmn covers the small negative range; everything
             // else pays movz/movk *per iteration*.
@@ -171,7 +221,7 @@ fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u
                 return None; // x86-64 imm32 encodable
             }
         }
-    } else if AARCH64.with(|c| !c.get()) && v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+    } else if model == ImmModel::X86_64 && v >= i32::MIN as i64 && v <= i32::MAX as i64 {
         // x86-64 div/rem: only out-of-i32 constants force movabsq; an imm32
         // constant costs one movl — cheaper than a hoisted register's
         // prologue pressure in short loops.
@@ -192,7 +242,11 @@ fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool, bo
         } => {
             let needs_reg = match op {
                 IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => true,
-                IrBinOp::Mul => AARCH64.with(|c| c.get()),
+                // AArch64 `mul` has no immediate form while its neighbours
+                // take imm12, so a small constant is a materialization ONLY
+                // at that position. RISC-V has no immediate forms anywhere
+                // (uniform `li` staging), so `mul` is not special there.
+                IrBinOp::Mul => MODEL.with(|c| c.get()) == ImmModel::Aarch64,
                 _ => false,
             };
             // Shift counts are a separate encoding (imm8 / %cl) and never take
@@ -251,11 +305,20 @@ mod tests {
     use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, Terminator};
 
     /// Run `f` with the AArch64 immediate model enabled, then restore the
-    /// previous setting (the flag is a thread-local shared with other passes).
+    /// previous setting (the model is a thread-local shared with other passes).
     fn with_aarch64<R>(f: impl FnOnce() -> R) -> R {
-        let prev = AARCH64.with(|c| c.replace(true));
+        let prev = MODEL.with(|c| c.replace(ImmModel::Aarch64));
         let r = f();
-        AARCH64.with(|c| c.set(prev));
+        MODEL.with(|c| c.set(prev));
+        r
+    }
+
+    /// Run `f` with the RISC-V immediate model enabled, then restore the
+    /// previous setting.
+    fn with_riscv<R>(f: impl FnOnce() -> R) -> R {
+        let prev = MODEL.with(|c| c.replace(ImmModel::Riscv));
+        let r = f();
+        MODEL.with(|c| c.set(prev));
         r
     }
 
@@ -482,6 +545,70 @@ mod tests {
         with_aarch64(|| {
             let mut func = make_op_loop(IrBinOp::Mul, IrType::U32, IrConst::I64(3));
             assert_eq!(run(&mut func), 1);
+        });
+    }
+
+    // ---- RISC-V: the third immediate model --------------------------------
+
+    /// imm12 is `li` = one `addi` — as cheap as the position can get at any
+    /// operand form, so it must stay in place (the x86 "one movl is cheaper"
+    /// rule transposed).
+    #[test]
+    fn riscv_leaves_imm12_range_alone() {
+        with_riscv(|| {
+            for k in [0i64, 1, 100, 2047, -1, -2048] {
+                let mut func = make_op_loop(IrBinOp::Add, IrType::I64, IrConst::I64(k));
+                assert_eq!(run(&mut func), 0, "imm12 constant {k} was hoisted");
+                assert!(matches!(mul_rhs(&func), Operand::Const(_)));
+            }
+        });
+    }
+
+    /// 2048 is the first value whose `li` expands to lui+addi — the per-iteration
+    /// waste this pass exists to remove. Same constant, negative side.
+    #[test]
+    fn riscv_hoists_just_past_imm12() {
+        with_riscv(|| {
+            for k in [2048i64, -2049, 10_000_000] {
+                let mut func = make_op_loop(IrBinOp::Add, IrType::I64, IrConst::I64(k));
+                assert_eq!(run(&mut func), 1, "out-of-imm12 constant {k} not hoisted");
+                assert!(matches!(mul_rhs(&func), Operand::Value(_)));
+            }
+        });
+    }
+
+    /// The x86-64 imm32 bit-pattern relaxation must NOT leak into RISC-V:
+    /// 0x9E3779B1 has no single-`addi` encoding and must hoist there even
+    /// from a 32-bit multiply.
+    #[test]
+    fn riscv_hoists_the_x86_bitpattern_constant() {
+        with_riscv(|| {
+            let mut func = make_op_loop(IrBinOp::Mul, IrType::U32, IrConst::I64(0x9E37_79B1));
+            assert_eq!(run(&mut func), 1);
+            assert!(matches!(mul_rhs(&func), Operand::Value(_)));
+        });
+    }
+
+    /// `mul` is NOT a needs_reg position on RISC-V (no immediate forms exist
+    /// anywhere, so a small constant at a mul position costs the same one
+    /// `addi` as at an add position) — an imm12 multiplier stays in place.
+    #[test]
+    fn riscv_mul_imm12_operand_stays_an_immediate() {
+        with_riscv(|| {
+            let mut func = make_op_loop(IrBinOp::Mul, IrType::U32, IrConst::I64(3));
+            assert_eq!(run(&mut func), 0);
+            assert!(matches!(mul_rhs(&func), Operand::Const(_)));
+        });
+    }
+
+    /// The model is uniform across operand positions: an out-of-imm12 constant
+    /// hoists from a div/rem (needs_reg) position exactly as from an add.
+    #[test]
+    fn riscv_hoists_out_of_imm12_divisor() {
+        with_riscv(|| {
+            let mut func = make_op_loop(IrBinOp::UDiv, IrType::I64, IrConst::I64(100_000));
+            assert_eq!(run(&mut func), 1);
+            assert!(matches!(mul_rhs(&func), Operand::Value(_)));
         });
     }
 }

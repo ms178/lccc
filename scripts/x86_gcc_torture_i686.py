@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper forwarding to scripts/x86_gcc_torture.py --arch=i686."""
+"""Compatibility wrapper forwarding to scripts/x86_gcc_torture.py --arch=i686.
+
+All runner flags (including --from-list for failure-focused partial re-runs)
+are forwarded unchanged; see x86_gcc_torture.py --help for the full surface.
+"""
 import sys
 from pathlib import Path
 

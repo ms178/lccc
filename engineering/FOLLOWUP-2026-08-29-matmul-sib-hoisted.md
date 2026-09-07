@@ -122,7 +122,7 @@ With disp folding, chunks 1..3 become `32(%rbx,%r10)` etc, no leaq.
 - `cargo test --profile fastbuild`: 1306 passed, 0 failed (was 1304)
 - `target/fastbuild/lccc -O3 -march=x86-64-v3 -S` verified SIB disp form
 - `scripts/godbolt.py compare ... --function matmul`: lccc 74 vs gcc 25 vs clang 438
-- `scripts/codegen_scoreboard.py`: gap 49 vs 71 before
+- `scripts/codegen_scoreboard.py`: gap 49 vs 71 before (that tool is now `scripts/codegen_oracle.py --rank`)
 
 ## Remaining gaps vs GCC (25 vs 74)
 

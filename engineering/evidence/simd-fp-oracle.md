@@ -8,8 +8,10 @@
 **Target used for screening:** x86-64-v3, AT&T syntax
 
 This document records the reproducible static-code audit introduced by
-`tests/benchmark/patterns/simd_fp_oracle.c`, `scripts/godbolt.py`, and
-`scripts/codegen_scoreboard.py`.  It is deliberately not a claim that LCCC is
+`tests/benchmark/patterns/simd_fp_oracle.c`, `scripts/godbolt.py`, and the
+whole-corpus ranking now shipped as `scripts/codegen_oracle.py --rank`
+(absorbed from the former `scripts/codegen_scoreboard.py`, same gaps JSON
+schema and metric semantics).  It is deliberately not a claim that LCCC is
 faster than another compiler: instruction counts and mnemonic heuristics are
 triage signals, not cycle counts.  The research VM exposes no hardware PMU, so
 Raptor Lake performance claims must wait for counter-backed measurements on the
@@ -28,7 +30,7 @@ that an old ID is still current.  This audit resolved:
 | latest ICX | `cicxlatest` |
 
 `godbolt.py compare` records both the requested alias and resolved compiler
-metadata.  The scoreboard requests AT&T syntax explicitly; parser/cache schema
+metadata.  The oracle requests AT&T syntax explicitly; parser/cache schema
 versions are included in the cache key so old Intel-syntax or misparsed results
 cannot be reused silently.  Quoted ELF function labels are supported.
 
@@ -51,12 +53,14 @@ The corpus is standalone C so the identical source reaches LCCC and all four
 remote compilers.  Strict and permissive FP modes are separate experiments:
 
 ```sh
-python3 scripts/codegen_scoreboard.py \
+python3 scripts/codegen_oracle.py --rank \
   tests/benchmark/patterns/simd_fp_oracle.c \
-  --flags '-O3 -march=x86-64-v3' --json strict.json
+  --oracles gcc,clang,icc,icx --flags '-O3 -march=x86-64-v3' \
+  --json strict.json
 
-python3 scripts/codegen_scoreboard.py \
+python3 scripts/codegen_oracle.py --rank \
   tests/benchmark/patterns/simd_fp_oracle.c \
+  --oracles gcc,clang,icc,icx \
   --flags '-O3 -march=x86-64-v3 -ffast-math -ffp-contract=fast' \
   --json fast.json
 ```

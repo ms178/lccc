@@ -14,7 +14,8 @@ ROI rank: **P0** this week (testable) · **P1** this month · **P2** after
 P0/P1 · **P3** research.
 
 Harnesses: `scripts/kernel_count.py` (per-function counts vs system GCC),
-`scripts/peephole_ab.py` (whole-corpus A/B **with behaviour comparison**),
+`scripts/perf_ab.py --metric insns --preset peephole_skip` (whole-corpus A/B
+**with behaviour comparison**; absorbed the deleted `scripts/peephole_ab.py`),
 `scripts/godbolt.py` (scoreboard oracle), `.github/scripts/ci-codegen-gate.py`
 (structural CI gate).
 
