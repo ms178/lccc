@@ -96,6 +96,14 @@ pub enum ShiftOp {
     Shl,
     Shr, // logical shift right
     Sar, // arithmetic shift right
+    /// Rotate left.  Same two-address `dst = dst ROT amount` shape as the
+    /// shifts, so it shares `MachInst::Shift`, its %cl staging and the
+    /// allocator's hazard model.  Unlike `shlx`/`shrx` there is no VEX
+    /// three-operand form to prefer (`rorx` is immediate-only and right-only),
+    /// so `ShiftX` must never be selected for these two.
+    Rol,
+    /// Rotate right; see `Rol`.
+    Ror,
 }
 
 /// Condition code for Jcc, SetCC, CMov.

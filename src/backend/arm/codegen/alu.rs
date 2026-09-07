@@ -658,6 +658,38 @@ impl ArmCodegen {
                     self.state.emit("    asr w0, w1, w2");
                 }
                 IrBinOp::LShr => self.state.emit("    lsr w0, w1, w2"),
+                IrBinOp::RotateLeft | IrBinOp::RotateRight => {
+                    // AArch64 has a native rotate: EXTR with Rn == Rm is a
+                    // rotate by an immediate, ROR (register) rotates by a
+                    // register.  Both mask the count modulo the register
+                    // width, which is precisely the reduction the IR's rotate
+                    // semantics define, so no fixup is needed.  A left rotate
+                    // by n is a right rotate by (32 - n); `neg` + ROR gets
+                    // that for a variable count because ROR reduces its count
+                    // mod 32.  w3 is this path's existing scratch (see SRem's
+                    // `msub w0, w3, w2, w1`).
+                    let left = op == IrBinOp::RotateLeft;
+                    match Self::const_as_imm12(rhs) {
+                        Some(imm) => {
+                            let amount = (imm as i64).rem_euclid(32);
+                            let extr = if left { (32 - amount) % 32 } else { amount };
+                            if extr == 0 {
+                                self.state.emit("    mov w0, w1");
+                            } else {
+                                self.state
+                                    .emit_fmt(format_args!("    extr w0, w1, w1, #{extr}"));
+                            }
+                        }
+                        None => {
+                            if left {
+                                self.state.emit("    neg w3, w2");
+                                self.state.emit("    ror w0, w1, w3");
+                            } else {
+                                self.state.emit("    ror w0, w1, w2");
+                            }
+                        }
+                    }
+                }
                 IrBinOp::BitTest => {
                     // AArch64 has no BT. UBFX extracts a 1-bit field when the
                     // index is an in-range immediate; variable and 64-bit cases
@@ -698,6 +730,31 @@ impl ArmCodegen {
                 IrBinOp::Shl => self.state.emit("    lsl x0, x1, x2"),
                 IrBinOp::AShr => self.state.emit("    asr x0, x1, x2"),
                 IrBinOp::LShr => self.state.emit("    lsr x0, x1, x2"),
+                IrBinOp::RotateLeft | IrBinOp::RotateRight => {
+                    // 64-bit counterpart of the w-register case above; EXTR's
+                    // immediate is 6 bits and ROR reduces mod 64.
+                    let left = op == IrBinOp::RotateLeft;
+                    match Self::const_as_imm12(rhs) {
+                        Some(imm) => {
+                            let amount = (imm as i64).rem_euclid(64);
+                            let extr = if left { (64 - amount) % 64 } else { amount };
+                            if extr == 0 {
+                                self.state.emit("    mov x0, x1");
+                            } else {
+                                self.state
+                                    .emit_fmt(format_args!("    extr x0, x1, x1, #{extr}"));
+                            }
+                        }
+                        None => {
+                            if left {
+                                self.state.emit("    neg x3, x2");
+                                self.state.emit("    ror x0, x1, x3");
+                            } else {
+                                self.state.emit("    ror x0, x1, x2");
+                            }
+                        }
+                    }
+                }
                 IrBinOp::BitTest => {
                     if let Some(imm) = Self::const_as_imm12(rhs) {
                         if (0..63).contains(&imm) {

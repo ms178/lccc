@@ -44,6 +44,7 @@ bench_*
 # leaving a corpus nobody could execute.
 !scripts/bench_kernels.py
 !scripts/bench_iv_widen_ab.sh
+!scripts/bench_rank.py
 
 # Benchmark / test output
 /test-results/

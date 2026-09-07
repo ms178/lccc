@@ -730,6 +730,17 @@ impl X86Codegen {
                 self.emit_shift_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest.0);
                 return;
             }
+            if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
+                // 8/16-bit operands would rotate at the wrong width (the
+                // hardware count mask is mod 32 below 64 bits), and
+                // `use_32bit` is false for them, so they take the generic
+                // path. `bit_idioms` never produces them; this keeps the
+                // backend honest if a future producer does.
+                if use_32bit || ty == IrType::I64 || ty == IrType::U64 {
+                    self.emit_rotate_reg_direct(op, lhs, rhs, dest_phys, use_32bit, dest.0);
+                    return;
+                }
+            }
             if op == IrBinOp::BitTest {
                 if self.emit_bit_test_reg_direct(lhs, rhs, dest_phys, use_32bit) {
                     return;
@@ -790,6 +801,53 @@ impl X86Codegen {
                 "    movzbq %al, %rax"
             });
             self.store_rax_to(dest);
+            return;
+        }
+
+        if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight)
+            && (use_32bit || ty == IrType::I64 || ty == IrType::U64)
+        {
+            // Accumulator rotate. The constant form keeps the immediate and
+            // never touches %rcx; the variable form needs the count in %cl,
+            // which is where the generic path below would stage it anyway.
+            if use_32bit {
+                self.operand_to_eax(lhs);
+            } else {
+                self.operand_to_rax(lhs);
+            }
+            let (mnem32, mnem64) = super::emit::rotate_mnemonic(op);
+            let width: i64 = if use_32bit { 32 } else { 64 };
+            match Self::const_as_imm32(rhs) {
+                Some(imm) => {
+                    let amount = (imm as i64).rem_euclid(width);
+                    if amount != 0 {
+                        if use_32bit {
+                            self.state
+                                .emit_fmt(format_args!("    {mnem32} ${amount}, %eax"));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    {mnem64} ${amount}, %rax"));
+                        }
+                    }
+                }
+                None => {
+                    self.operand_to_rcx(rhs);
+                    if use_32bit {
+                        self.state.emit_fmt(format_args!("    {mnem32} %cl, %eax"));
+                    } else {
+                        self.state.emit_fmt(format_args!("    {mnem64} %cl, %rax"));
+                    }
+                }
+            }
+            self.state.reg_cache.invalidate_acc();
+            if use_32bit {
+                // Normalize the upper half for a signed 32-bit result: the
+                // rotate can place any bit at bit 31. No-op when unsigned.
+                self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                self.store_eax_to(dest);
+            } else {
+                self.store_rax_to(dest);
+            }
             return;
         }
 
@@ -1233,6 +1291,14 @@ impl X86Codegen {
                 }
             }
             IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
+            // Rotates are emitted above (register-direct or accumulator). The
+            // only way to reach this arm is an 8- or 16-bit rotate, which the
+            // hardware count mask would wrap at 32 instead of at the operand
+            // width; `bit_idioms` recognizes only I32/U32/I64/U64 rotates, so
+            // this stays unreachable rather than silently mis-rotating.
+            IrBinOp::RotateLeft | IrBinOp::RotateRight => {
+                unreachable!("rotate handled above; narrow rotates are not producible")
+            }
         }
 
         self.state.reg_cache.invalidate_acc();

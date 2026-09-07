@@ -114,6 +114,37 @@ impl RiscvCodegen {
             return;
         }
 
+        if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
+            // RV64I has no rotate: `rol`/`ror` are Zbb, and this backend does
+            // not yet model Z-extension availability, so emit the portable
+            // funnel shift.  It needs no scratch beyond the three registers
+            // this path already stages into, because the second half's count
+            // is `W - n` and `sll`/`srl` take their count from the low
+            // lg2(XLEN) bits of the register -- so `-n` already IS `W - n`
+            // modulo W and `neg` supplies the complement in one instruction.
+            // t1 (the source) stays live until both halves are computed.
+            let (first, second) = match (op, use_32bit) {
+                (IrBinOp::RotateLeft, true) => ("sllw", "srlw"),
+                (IrBinOp::RotateRight, true) => ("srlw", "sllw"),
+                (IrBinOp::RotateLeft, false) => ("sll", "srl"),
+                (IrBinOp::RotateRight, false) => ("srl", "sll"),
+                _ => unreachable!("guarded by the matches! above"),
+            };
+            self.state.emit_fmt(format_args!("    {first} t0, t1, t2"));
+            self.state.emit("    neg t2, t2");
+            self.state.emit_fmt(format_args!("    {second} t2, t1, t2"));
+            self.state.emit("    or t0, t0, t2");
+            if use_32bit {
+                // `*w` forms sign-extend their 32-bit result; the canonical
+                // rotate value is the unsigned bit pattern, so normalize the
+                // same way the BitTest path above does.
+                self.state.emit("    slli t0, t0, 32");
+                self.state.emit("    srli t0, t0, 32");
+            }
+            self.store_t0_to(dest);
+            return;
+        }
+
         let mnemonic = match (op, use_32bit) {
             (IrBinOp::Add, false) => "add",
             (IrBinOp::Add, true) => "addw",
@@ -139,6 +170,9 @@ impl RiscvCodegen {
             (IrBinOp::LShr, false) => "srl",
             (IrBinOp::LShr, true) => "srlw",
             (IrBinOp::BitTest, _) => unreachable!("BitTest handled above"),
+            (IrBinOp::RotateLeft, _) | (IrBinOp::RotateRight, _) => {
+                unreachable!("rotate handled above")
+            }
         };
         self.state
             .emit_fmt(format_args!("    {} t0, t1, t2", mnemonic));

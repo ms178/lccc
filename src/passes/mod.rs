@@ -895,6 +895,21 @@ pub(crate) struct X86Isa {
     pub fma: bool,
 }
 
+/// Widest rotate (in bits) `target` can lower to a single native instruction
+/// sequence, or 0 when the target should keep the portable shift/or triple.
+///
+/// Every backend has a rotate lowering, but i686 sends I64/U64 arithmetic
+/// through its paired-register path (`emit_i128_binop`) instead of the 32-bit
+/// ALU path that owns `rol`/`ror`, so only its 32-bit form is wired.
+fn target_rotate_bits(target: crate::backend::Target) -> u32 {
+    match target {
+        crate::backend::Target::X86_64
+        | crate::backend::Target::Aarch64
+        | crate::backend::Target::Riscv64 => 64,
+        crate::backend::Target::I686 => 32,
+    }
+}
+
 /// Run optimization passes for the requested optimization level.
 ///
 /// `opt_level`: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
@@ -1599,10 +1614,11 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
 
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+            let max_rotate_bits = target_rotate_bits(target);
             let n = timed_pass!(
                 "bit_idioms",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    bit_idioms::recognize_function(func, enable_bit_reverse)
+                    bit_idioms::recognize_function(func, enable_bit_reverse, max_rotate_bits)
                 })
             );
             cur_pass_changes[3] += n;
@@ -1762,10 +1778,11 @@ pub(crate) fn run_passes(
         // The pass is idempotent and remains behind the normal disable switch.
         if !pass_disabled(&disabled, "bit_idioms") {
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+            let max_rotate_bits = target_rotate_bits(target);
             let n = timed_pass!(
                 "bit_idioms_post_ifconv",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    bit_idioms::recognize_function(func, enable_bit_reverse)
+                    bit_idioms::recognize_function(func, enable_bit_reverse, max_rotate_bits)
                 })
             );
             total_changes += n;

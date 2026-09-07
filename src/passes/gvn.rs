@@ -1107,6 +1107,16 @@ fn find_noalias_params(func: &IrFunction) -> FxHashSet<usize> {
         .collect()
 }
 
+/// GVN's view of the site-local indexed classification. A site-local GlobalAddr
+/// carries its own dest id in `ExprKey::GlobalAddr`, which keeps its value
+/// number distinct; merging duplicate materializations therefore changes GVN's
+/// aliasing and Load-CSE decisions, not just address placement. This must stay
+/// in lockstep with `global_addr_cse`'s use of the same set — if the two passes
+/// disagree, one merges address webs the other still numbers apart.
+fn gvn_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
+    super::global_addr_cse::classify_site_local_indexed(func)
+}
+
 pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &GvnContext) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 || function_uses_128(func) {
@@ -1124,7 +1134,7 @@ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &Gvn
             volatile,
             context,
             super::global_addr_cse::classify_must_materialize(func),
-            super::global_addr_cse::classify_site_local_indexed(func),
+            gvn_site_local_indexed(func),
             nonescaping,
             noalias,
         );
@@ -1151,7 +1161,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
     let escaped = find_escaped_param_allocas(func);
     let volatile = find_volatile_allocas(func);
     let must_mat = super::global_addr_cse::classify_must_materialize(func);
-    let site_local = super::global_addr_cse::classify_site_local_indexed(func);
+    let site_local = gvn_site_local_indexed(func);
     let nonescaping = find_nonescaping_allocas(func);
     let noalias = find_noalias_params(func);
     if num_blocks == 1 {
@@ -2942,7 +2952,23 @@ mod tests {
     }
 
     #[test]
-    fn gvn_keeps_variable_index_global_addrs_site_local() {
+    fn gvn_merges_duplicate_variable_index_global_addrs() {
+        // GVN's side of the duplicate-merge policy. `ExprKey::GlobalAddr`
+        // carries the value's own dest id when the value is SITE-LOCAL, which
+        // makes the key unique and so blocks value-number unification. Two
+        // materializations of the same symbol feeding variable-index GEPs are
+        // not site-local — `classify_site_local_indexed`'s duplicate gate
+        // withdraws the exemption because there is no single-use live range
+        // left to protect — so GVN must give them one value number and drop
+        // the second.
+        //
+        // The absolute `sym(,%idx,scale)` form site-locality existed to protect
+        // is unselectable on x86-64 in every code model: a RIP-relative base
+        // cannot also carry an index, so a variable-index global access pays a
+        // base register no matter where the base lives. Merging is therefore a
+        // strict instruction-count win, and inside a loop it removes
+        // per-iteration work (lz4's match search rematerialized `hash_table`
+        // twice and `src_data` once every iteration).
         let func = make_func(
             vec![BasicBlock {
                 label: BlockId(0),
@@ -2973,15 +2999,109 @@ mod tests {
             }],
             10,
         );
+        // Not site-local, so GVN unifies them.
+        assert!(crate::passes::global_addr_cse::classify_site_local_indexed(&func).is_empty());
         let mut module = make_module(func);
         let _ = module.for_each_function(run_gvn_function);
+        let instrs = &module.functions[0].blocks[0].instructions;
         assert_eq!(
-            module.functions[0].blocks[0]
-                .instructions
+            instrs
                 .iter()
                 .filter(|i| matches!(i, Instruction::GlobalAddr { .. }))
                 .count(),
-            2
+            1,
+            "duplicate same-symbol GlobalAddr survived GVN: {instrs:?}"
+        );
+        // Both GEPs must resolve to the ONE surviving base, or the merge
+        // dropped an address rather than unifying it. GVN expresses the
+        // unification as a `Copy` from the canonical value (copy-propagation
+        // removes it later), so follow copy chains instead of demanding the
+        // literal dest id.
+        let mut canonical: FxHashMap<u32, u32> = FxHashMap::default();
+        for i in instrs {
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(Value(s)),
+            } = i
+            {
+                canonical.insert(dest.0, *s);
+            }
+        }
+        let resolve = |mut v: u32| {
+            for _ in 0..instrs.len() + 1 {
+                match canonical.get(&v) {
+                    Some(&next) => v = next,
+                    None => break,
+                }
+            }
+            v
+        };
+        let bases: Vec<u32> = instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::GetElementPtr { base: Value(b), .. } => Some(resolve(*b)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bases.len(), 2, "{instrs:?}");
+        assert_eq!(
+            bases[0], bases[1],
+            "GEPs resolve to different bases: {instrs:?}"
+        );
+        assert_eq!(
+            bases[0], 1,
+            "merged base is not the surviving GlobalAddr: {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn gvn_keeps_single_variable_index_global_addr_site_local() {
+        // The contract the duplicate merge must not break, at GVN level: with
+        // exactly ONE occurrence the base is rematerialized at its only use, so
+        // it stays site-local. Its `ExprKey` then carries the dest id, keeping
+        // the value number distinct, and GVN must leave the GlobalAddr in place
+        // with the GEP still referring to that same dest.
+        let func = make_func(
+            vec![BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(1),
+                        name: "table".to_string(),
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(2),
+                        base: Value(1),
+                        offset: Operand::Value(Value(9)),
+                        ty: IrType::Ptr,
+                    },
+                ],
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+            }],
+            10,
+        );
+        assert_eq!(
+            crate::passes::global_addr_cse::classify_site_local_indexed(&func).len(),
+            1,
+            "a single-use variable-index base must stay site-local"
+        );
+        let mut module = make_module(func);
+        let _ = module.for_each_function(run_gvn_function);
+        let instrs = &module.functions[0].blocks[0].instructions;
+        assert!(
+            matches!(
+                &instrs[0],
+                Instruction::GlobalAddr { dest: Value(1), name } if name == "table"
+            ),
+            "site-local GlobalAddr was moved or renumbered: {instrs:?}"
+        );
+        assert!(
+            matches!(
+                &instrs[1],
+                Instruction::GetElementPtr { base: Value(1), .. }
+            ),
+            "GEP no longer reads the site-local base: {instrs:?}"
         );
     }
 }

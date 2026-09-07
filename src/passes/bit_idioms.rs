@@ -89,6 +89,155 @@ fn shift(
     (const_u64(rhs) == Some(amount)).then_some(lhs)
 }
 
+/// One half of a rotate: `value` shifted by `amount` with the shift kind the
+/// caller asked for.  Unlike `shift`, the amount is returned as an `Operand`
+/// rather than matched against a constant, because the complementary half of a
+/// run-time rotate is a live `W - n` subtraction, not a literal.
+fn shift_any(
+    opnd: Operand,
+    wanted: IrBinOp,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand)> {
+    let (lhs, rhs, _) = binop(opnd, wanted, defs)?;
+    Some((lhs, rhs))
+}
+
+/// Is `opnd` the expression `width - other`?  The complementary half of a
+/// variable-count rotate is spelled exactly this way (`ROTL32(v, n)` expands
+/// to `(v << n) | (v >> (32 - n))`), and recognizing it lets the rotate keep
+/// `n` directly so the subtraction dies with its last use.
+fn is_width_minus(opnd: Operand, other: Operand, width: u64, defs: &[Option<Instruction>]) -> bool {
+    let Some((lhs, rhs, _)) = binop(opnd, IrBinOp::Sub, defs) else {
+        return false;
+    };
+    const_u64(peel(lhs, defs)) == Some(width) && same(rhs, other, defs)
+}
+
+/// Recognize the portable rotate idiom; returns `(value, amount, is_left)`.
+///
+/// For a width-`W` integer `x` the two source spellings are
+///
+/// ```c
+/// #define ROTL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+/// #define ROTR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+/// ```
+///
+/// They appear verbatim in ChaCha20/Salsa20, SHA-1/SHA-256/SHA-512, MD5,
+/// BLAKE2, SipHash, RC5, Speck, in the Linux kernel's `rol32`/`ror32`/
+/// `rol64`/`ror64`, and in zlib-ng's and zstd's hash/xxh paths.  Left as a
+/// shift/or triple each rotate costs three instructions and two dependent ALU
+/// results; x86 `rol`/`ror`, AArch64 `ror`/`extr` and RISC-V's funnel shift
+/// all do the same work in one (RISC-V in four, but still without the
+/// temporary the triple's `or` needs).
+///
+/// Both `Or` operand orders are matched, and the complementary amount may be a
+/// literal the frontend already folded (`>> 16`) or a live `W - n`, so constant
+/// and run-time rotation amounts are both recognized.
+///
+/// Two deliberate restrictions:
+///
+/// * The right-shift half must be *logical*.  With an arithmetic shift the sign
+///   bit is replicated rather than wrapped around, so the expression is not a
+///   rotate and folding it would be a miscompile.
+/// * Only 32- and 64-bit types are recognized.  C's integer promotions already
+///   run a narrower rotate at `int` width, and the x86 hardware count mask is
+///   mod 32 for every operand size below 64 bits, so an 8- or 16-bit `rol`
+///   would wrap at the wrong width.
+///
+/// Direction is chosen to match what the reference compilers emit, so oracle
+/// diffs stay readable: for a run-time amount the direction whose count is the
+/// *direct* value (not the `W - n` subtraction) wins, which also makes that
+/// subtraction dead; for two constants the smaller amount wins, reproducing
+/// GCC's `ror $7` for `(x >> 7) | (x << 25)` and its `rol $12` for
+/// `(x << 12) | (x >> 20)`.
+fn match_rotate(
+    result: Operand,
+    max_bits: u32,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand, bool)> {
+    let (a, b, ty) = binop(result, IrBinOp::Or, defs)?;
+    let width = match ty {
+        IrType::I32 | IrType::U32 => 32u64,
+        IrType::I64 | IrType::U64 => 64u64,
+        // Narrower and wider types are deliberately not recognized; see the
+        // function comment for the count-mask and promotion reasons.
+        _ => return None,
+    };
+    // Per-target capability: i686 routes I64/U64 arithmetic through its
+    // paired-register path rather than the 32-bit ALU path that owns the
+    // native `rol`/`ror` lowering, so it only advertises 32-bit rotates.
+    if width > u64::from(max_bits) {
+        return None;
+    }
+
+    // The two halves in either `Or` order.
+    let (shl, lshr) = match (
+        shift_any(a, IrBinOp::Shl, defs),
+        shift_any(b, IrBinOp::LShr, defs),
+    ) {
+        (Some(shl), Some(lshr)) => (shl, lshr),
+        _ => match (
+            shift_any(b, IrBinOp::Shl, defs),
+            shift_any(a, IrBinOp::LShr, defs),
+        ) {
+            (Some(shl), Some(lshr)) => (shl, lshr),
+            _ => return None,
+        },
+    };
+    let (shl_val, shl_amt) = shl;
+    let (lshr_val, lshr_amt) = lshr;
+    if !same(shl_val, lshr_val, defs) {
+        return None;
+    }
+
+    // The halves must be complementary: either both amounts are constants
+    // summing to the width, or one is literally `width - the_other`.
+    let (amount, is_left) = match (
+        const_u64(peel(shl_amt, defs)),
+        const_u64(peel(lshr_amt, defs)),
+    ) {
+        (Some(left), Some(right)) => {
+            if left.wrapping_add(right) != width || left == 0 || right == 0 {
+                return None;
+            }
+            if left <= right {
+                (shl_amt, true)
+            } else {
+                (lshr_amt, false)
+            }
+        }
+        // Exactly one amount folded to a constant: the other must still be the
+        // explicit `width - amount` subtraction (a frontend that folded one
+        // side usually folds both, but an unfolded `32 - 16` does occur after
+        // inlining), otherwise the halves are not complementary.
+        (Some(_), None) => {
+            if !is_width_minus(lshr_amt, shl_amt, width, defs) {
+                return None;
+            }
+            (shl_amt, true)
+        }
+        (None, Some(_)) => {
+            if !is_width_minus(shl_amt, lshr_amt, width, defs) {
+                return None;
+            }
+            (lshr_amt, false)
+        }
+        (None, None) => {
+            // Both amounts dynamic: accept either complement direction, but
+            // only one of them needs to hold.
+            if is_width_minus(lshr_amt, shl_amt, width, defs) {
+                (shl_amt, true)
+            } else if is_width_minus(shl_amt, lshr_amt, width, defs) {
+                (lshr_amt, false)
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some((peel(shl_val, defs), amount, is_left))
+}
+
 fn select(
     opnd: Operand,
     defs: &[Option<Instruction>],
@@ -382,7 +531,20 @@ fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<
     Some(peel(value, defs))
 }
 
-pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool) -> usize {
+/// `enable_bit_reverse` gates the idiom whose native lowering is target
+/// specific (AArch64 `rbit`).
+///
+/// `max_rotate_bits` is the widest rotate the target can lower natively, or 0
+/// to disable recognition entirely: x86-64 `rol`/`ror`, AArch64 `ror`/`extr`
+/// and the RISC-V funnel shift all handle 64 bits, while i686's paired-register
+/// route for I64 arithmetic means only its 32-bit ALU path is wired.  Passing
+/// the capability instead of a boolean keeps a backend from ever receiving a
+/// node it cannot lower.
+pub(crate) fn recognize_function(
+    func: &mut IrFunction,
+    enable_bit_reverse: bool,
+    max_rotate_bits: u32,
+) -> usize {
     let mut defs = vec![None; func.max_value_id() as usize + 1];
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -421,10 +583,22 @@ pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool
                     op: IrBinOp::Or,
                     ty,
                     ..
-                } if *ty == IrType::U32 || *ty == IrType::I32 => {
+                } if matches!(*ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64) => {
                     let dest = *dest;
-                    if enable_bit_reverse {
-                        if let Some(src) = match_bit_reverse32(Operand::Value(dest), &defs) {
+                    let ty = *ty;
+                    let is_32bit = ty == IrType::U32 || ty == IrType::I32;
+                    // Bit reversal and byte swap are strictly MORE specific than
+                    // a rotate: bswap32's final stage is literally
+                    // `(y >> 16) | (y << 16)`, which is a rotate by 16.  Trying
+                    // the rotate first would strip that stage out from under
+                    // `match_bswap32_network` and turn a one-instruction `bswap`
+                    // back into the five-instruction network, so both specific
+                    // matchers run first and bail out of this iteration when
+                    // either fires.
+                    if is_32bit {
+                        if enable_bit_reverse
+                            && let Some(src) = match_bit_reverse32(Operand::Value(dest), &defs)
+                        {
                             block.instructions[index] = Instruction::UnaryOp {
                                 dest,
                                 op: IrUnaryOp::BitReverse,
@@ -435,13 +609,32 @@ pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool
                             index += consumed;
                             continue;
                         }
+                        if let Some(src) = match_bswap32_network(Operand::Value(dest), &defs) {
+                            block.instructions[index] = Instruction::UnaryOp {
+                                dest,
+                                op: IrUnaryOp::Bswap,
+                                src,
+                                ty: IrType::U32,
+                            };
+                            changes += 1;
+                            index += consumed;
+                            continue;
+                        }
                     }
-                    if let Some(src) = match_bswap32_network(Operand::Value(dest), &defs) {
-                        block.instructions[index] = Instruction::UnaryOp {
+                    if max_rotate_bits > 0
+                        && let Some((value, amount, is_left)) =
+                            match_rotate(Operand::Value(dest), max_rotate_bits, &defs)
+                    {
+                        block.instructions[index] = Instruction::BinOp {
                             dest,
-                            op: IrUnaryOp::Bswap,
-                            src,
-                            ty: IrType::U32,
+                            op: if is_left {
+                                IrBinOp::RotateLeft
+                            } else {
+                                IrBinOp::RotateRight
+                            },
+                            lhs: value,
+                            rhs: amount,
+                            ty,
                         };
                         changes += 1;
                     }

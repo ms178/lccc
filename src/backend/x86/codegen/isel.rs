@@ -252,11 +252,18 @@ fn binop_to_alu(op: IrBinOp) -> Option<AluOp> {
 }
 
 /// Map IrBinOp to ShiftOp.
+///
+/// Rotates are included because their machine shape is identical to a shift's
+/// (`dst = dst OP amount`, count from %cl when variable), so they reuse the
+/// same staging, the same two-address hazard handling and the same allocator
+/// model instead of needing a parallel path.
 fn binop_to_shift(op: IrBinOp) -> Option<ShiftOp> {
     match op {
         IrBinOp::Shl => Some(ShiftOp::Shl),
         IrBinOp::LShr => Some(ShiftOp::Shr),
         IrBinOp::AShr => Some(ShiftOp::Sar),
+        IrBinOp::RotateLeft => Some(ShiftOp::Rol),
+        IrBinOp::RotateRight => Some(ShiftOp::Ror),
         _ => None,
     }
 }
@@ -1175,6 +1182,12 @@ fn try_lower_shiftx(
     ra: &FxHashMap<u32, PhysReg>,
     out: &mut Vec<MachInst>,
 ) -> bool {
+    // BMI2's three-operand forms cover only the three shifts: there is no
+    // rotate-left and no register-count rotate (`rorx` takes an immediate and
+    // rotates right).  Rotates must fall through to the `rol/ror %cl` path.
+    if matches!(shift_op, ShiftOp::Rol | ShiftOp::Ror) {
+        return false;
+    }
     let mode = shlx_mode();
     if mode == ShlxMode::Never || !matches!(size, OpSize::S32 | OpSize::S64) {
         return false;
