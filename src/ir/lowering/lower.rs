@@ -1734,7 +1734,7 @@ impl Lowerer {
                     return self.emit_sso_swap_unit_16(val, ty);
                 }
             }
-            #[allow(unreachable_code)]
+            #[expect(unreachable_code)]
             (ty.to_unsigned(), val.clone())
         };
         match unit_bytes {
@@ -1852,7 +1852,7 @@ impl Lowerer {
     /// Some((size, align, classes)) for SSE-class 16-byte args, None for
     /// scalar args. `ret_classes` is the return eightbyte classification.
     /// `ret_is_f128` marks a single-XMM _Float128 return.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn emit_softfloat_call(
         &mut self,
         name: &str,

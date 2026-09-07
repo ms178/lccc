@@ -3163,7 +3163,7 @@ fn deduplicate_vector_loads(func: &mut IrFunction, loop_blocks: &FxHashSet<usize
 /// Returns `(init_zero_value, vec_sum_value, change_count)`.  The caller must
 /// process accumulators in DESCENDING `add_idx` order: inserting/removing
 /// instructions at a higher index never shifts a lower one still to patch.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn rewrite_reduction_body(
     func: &mut IrFunction,
     header_idx: usize,
@@ -4267,7 +4267,7 @@ fn analyze_map_pattern(
 /// Recognizes, bounded by `depth`: stream loads, loop-invariant scalars,
 /// FP Add/Sub/Mul/Div, integer Add/Mul, and FP Sqrt intrinsics. IV-derived
 /// values and anything defined in the loop outside this grammar fail closed.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn parse_map_expr(
     func: &IrFunction,
     loop_blocks: &FxHashSet<usize>,
@@ -4629,7 +4629,7 @@ fn parse_map_expr(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn parse_map_operand(
     func: &IrFunction,
     loop_blocks: &FxHashSet<usize>,
@@ -5793,7 +5793,7 @@ fn transform_stencil_vector(
 
 /// Mirror one scalar expression node of the stencil body in the vector
 /// domain. See the stencil section comment for the exactness contract.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn emit_stencil_expr(
     func: &mut IrFunction,
     pattern: &StencilPattern,
@@ -5857,7 +5857,7 @@ fn emit_stencil_expr(
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn emit_recursive(
         node: Value,
         func: &mut IrFunction,
@@ -6987,7 +6987,7 @@ fn strict_i32_operand_is_clonable(
 /// loop-local operation is cloned per lane, preserving its precise scalar C
 /// semantics (notably the sign/bias sequence that represents signed `/ 2`).
 /// Only values defined before the preheader may be referenced unchanged.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn strict_i32_dag_is_clonable(
     func: &IrFunction,
     cfg: &CfgAnalysis,
@@ -7069,7 +7069,7 @@ fn strict_i32_dag_is_clonable(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn clone_strict_i32_operand_for_lane(
     func: &IrFunction,
     body_idx: usize,
@@ -7099,7 +7099,7 @@ fn clone_strict_i32_operand_for_lane(
 /// lane index.  This helper deliberately has no "best effort" fallback: an
 /// unexpected instruction means the prevalidation contract regressed and the
 /// whole transform is abandoned before committing its CFG edits.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn clone_strict_i32_dag_for_lane(
     func: &IrFunction,
     body_idx: usize,
@@ -13543,7 +13543,7 @@ struct AliasCheck {
 /// element (`rem_start`), so no clone of the original loop is needed.  The
 /// vector header's phis are re-pointed from the preheader to the last guard
 /// block, which becomes their entry predecessor.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn emit_alias_guards(
     func: &mut IrFunction,
     preheader_idx: usize,

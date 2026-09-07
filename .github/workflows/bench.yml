@@ -55,6 +55,13 @@ jobs:
 
       - name: Run complete benchmark corpus
         run: |
+          # GitHub's default Linux shell for `run:` steps is `bash -e`
+          # WITHOUT pipefail: a failing left-hand side of a pipeline is
+          # masked by `tee`'s success.  ci-bench.py --strict is a GATE
+          # (compile failure, runtime failure, output mismatch, missing
+          # compiler), so the pipe must propagate it — same contract as
+          # the regression gate in ci.yml.
+          set -o pipefail
           # ci-bench.py delegates to tests/benchmark/run_benchmarks.py. With
           # no --only selection this is the complete checked-in corpus:
           # synthetic kernels plus every pinned workload-derived kernel.
@@ -72,6 +79,21 @@ jobs:
         if: always()
         run: cat bench-summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
+      # MS-01a codegen-quality gate. The runtime gate above can only catch
+      # what the timed benchmarks measure; this one pins static, noise-free
+      # codegen metrics (insns / stackmem / pushes / ymm / fma) for the six
+      # golden workloads against .github/scripts/ci-codegen-baseline.json
+      # with per-workload tolerance bands. It was written for bench.yml but
+      # never wired (the v3 audit found it orphaned — the workflow only ran
+      # ci-bench.py); wiring it now closes the "runtime-only gate" hole the
+      # audit flagged. Baseline refreshes go through --update-baseline in
+      # the PR that lands the improvement, per the gate's header contract.
+      - name: Codegen quality gate (golden workloads)
+        run: |
+          set -o pipefail
+          python3 .github/scripts/ci-codegen-gate.py \
+            --lccc target/release/lccc 2>&1 | tee codegen-gate.txt
+
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v7
@@ -82,3 +104,4 @@ jobs:
             bench-summary.md
             bench-terminal.txt
             bench-artifacts/
+            codegen-gate.txt

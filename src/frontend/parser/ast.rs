@@ -781,9 +781,9 @@ pub enum TypeSpecifier {
     Decimal32,
     Decimal64,
     Decimal128,
-    #[allow(dead_code)] // Matched in type resolution but not currently emitted by parser
+    #[expect(dead_code)] // Matched in type resolution but not currently emitted by parser
     Signed,
-    #[allow(dead_code)] // Matched in type resolution but not currently emitted by parser
+    #[expect(dead_code)] // Matched in type resolution but not currently emitted by parser
     Unsigned,
     UnsignedChar,
     UnsignedShort,

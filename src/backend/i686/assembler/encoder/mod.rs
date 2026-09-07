@@ -121,7 +121,7 @@ pub const R_386_TLS_IE: u32 = 15;
 pub const R_386_TLS_GD: u32 = 18;
 pub const R_386_TLS_LDM: u32 = 19;
 pub const R_386_TLS_LDO_32: u32 = 32;
-#[allow(dead_code)] // ELF standard constant; not yet emitted by assembler but used by linker
+#[expect(dead_code)] // ELF standard constant; not yet emitted by assembler but used by linker
 pub const R_386_TLS_GOTIE: u32 = 16;
 pub const R_386_32S: u32 = 38; // R_386_TLS_LE (negative offset from TP)
 

@@ -75,7 +75,7 @@
 //! `LCCC_DEBUG_VECTORIZE=1` / `LCCC_WHY_NOT_VECTORIZE=1`.
 //!
 //! Pass name for CCC_DISABLE_PASSES: "vec_interleave".
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 use crate::backend::x86::cpu_model::{ReductionOp, ReductionShape, X86Tune};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;

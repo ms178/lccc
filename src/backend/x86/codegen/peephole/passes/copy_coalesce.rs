@@ -57,7 +57,7 @@ use super::relay_and_lea::{
 /// High-byte register names that cannot survive a family rename.
 const HIGH_BYTE: &[&str] = &["%ah", "%bh", "%ch", "%dh"];
 
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop)]
 pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);

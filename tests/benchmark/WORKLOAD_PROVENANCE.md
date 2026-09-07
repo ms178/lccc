@@ -33,7 +33,7 @@ these test-source licenses do not relicense the compiler/runtime.
 | `linux_rbtree` | `packages/linux-cachymod-6.18/PKGBUILD`, `lib/rbtree.c` | `lib/rbtree.c`, `tools/lib/rbtree.c` | GPL-2.0-or-later | `rbtree.c` kernel implementation | Intrusive pointer-tagged parent/color Red-Black tree insertion, balance rotations, and tree search. |
 | `zstd_count` | `packages/zstd/PKGBUILD`, `lib/compress/zstd_compress_internal.h` | `lib/compress/zstd_compress_internal.h`, `ZSTD_count` | BSD-3-Clause / GPL-2.0 | `zstd_compress_internal.h`: ZSTD 1.5.7 | Unaligned 64-bit XOR and `__builtin_ctzll` trailing zero count matching loop. |
 | `lz4_compress` | `packages/lz4/PKGBUILD`, `lib/lz4.c` | `lib/lz4.c`, `LZ4_compress_fast` core | BSD-2-Clause | `lz4.c`: LZ4 1.10.0 | Hash-table sliding window 4-byte matching, token output, and literal run encoding. |
-| `glibc_strstr` | `toolchain-stable/glibc/PKGBUILD`, `string/str-two-way.h` | `string/str-two-way.h`, `string/strstr.c` | LGPL-2.1-or-later | `str-two-way.h` | Crochemore-Perrin Two-Way substring matching with shift table. |
+| `glibc_strstr` | `toolchain-stable/glibc/PKGBUILD`, `string/str-two-way.h` | `string/str-two-way.h`, `string/strstr.c` | LGPL-2.1-or-later | `str-two-way.h` | Boyer–Moore–Horspool bad-character shift scan — glibc's `two_way_short_needle` short-needle path (right-to-left scan + 256-entry shift table); the full Crochemore-Perrin factorization is NOT part of the extracted kernel. |
 
 ## Archive retrieval record
 

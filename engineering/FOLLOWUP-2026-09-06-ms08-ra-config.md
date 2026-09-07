@@ -23,6 +23,26 @@ The environment remains the intentionally backwards-compatible *construction* su
 
 There are **73 distinct literal inputs** in the centralized parser: 56 presence switches, 15 textual inputs, and three numeric inputs, with `CCC_TRACE_ALLOCSTATS` intentionally serving both a presence flag and a text filter. Each field declaration in `src/backend/regalloc.rs` records the name, polarity, and default. The old `CCC_NO_*` names remain literal parser inputs rather than being translated or renamed.
 
+## Scope boundary (2026-09-07 v3 audit)
+
+The "sole parser and owner" claim above is accurate for the register-allocation
+policy surface it was audited for. It deliberately does **not** cover the
+stack-layout/slot-sizing axes, which still read the process environment at
+their historical pass-time sites:
+
+- `stack_layout/slot_assignment.rs` — `CCC_NO_SMALL_SLOTS` (compact-value
+  collection, small-slot sizing, width partitioning) and `CCC_NO_TIER2_GRAPH`
+  (tier-2 graph-coloring opt-out);
+- `stack_layout/mod.rs` (`calculate_stack_space_common`) — `CCC_NO_SLOT_COALESCE`;
+- `stack_layout/copy_coalescing.rs` — a `LazyLock`-cached env read for its
+  historical knob.
+
+Those sites are A/B measurement axes by design (the regression suite's
+small-slot differential flips `CCC_NO_SMALL_SLOTS` per invocation of a
+fresh process, so the pass-time read is deterministic in every mode that
+matters). Folding them into `RaConfig` remains a possible follow-up, but
+it is a behavior-preserving refactor of a working surface, not a defect.
+
 Standalone/unit-test compatibility helpers use `RaConfig::default()` and direct standalone backend constructors capture their own configuration. That avoids process-global `OnceLock` state in tests. The production driver path is the one that matters for the one-object-per-invocation contract and always passes its captured `Arc` explicitly.
 
 ## Why this is behavior-preserving

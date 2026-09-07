@@ -9,6 +9,11 @@ Engines Supported:
   2. csmith       : Csmith random C program generator (if installed).
   3. yarpgen      : YARPGen LLVM/GCC/CCC differential generator (if installed).
   4. stress_suite : Internal suite of specialized stress test generators.
+                    Sweeps `--count` seeds (seed..seed+count-1, default 8)
+                    per generator instead of one fixed seed, and evaluates
+                    every generated case under the cartesian product of the
+                    repeatable `--config-env KEY=VALUE` configuration axes
+                    (both compilers, compile and run, under each combo).
 
 Features:
   - Exact stdout/exit-status checksum validation across ALL selected
@@ -16,6 +21,9 @@ Features:
   - Multi-threaded worker pool with per-iteration timeout and memory bounds.
   - Automatic isolation and reproducer preservation into `artifacts/repros/`.
   - Multi-architecture support: x86_64, i686, aarch64, riscv64 (with qemu runners).
+  - Generator-bug tripwire: when a reference AND lccc die by the SAME signal,
+    the generated program itself is invalid; the case is reported as GEN-BUG
+    and counted as a failure instead of being silently SKIPped.
   - JSON output summary for automated CI gates.
   - `--check-engines` wiring self-test: every advertised engine must be a real
     implementation; an unimplemented engine is a hard error, never a silent
@@ -38,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import itertools
 import json
 import os
 import random
@@ -144,7 +153,10 @@ class SyntheticCGenerator:
 @dataclass
 class DiffResult:
     test_id: str
-    status: str  # "PASS", "MISCOMPILE", "LCCC_CRASH", "REF_CRASH", "TIMEOUT", "SKIP"
+    # PASS | MISCOMPILE | LCCC_CRASH | GEN-BUG | SKIP
+    # (GEN-BUG: the generated program itself dies by a signal under both the
+    # reference and lccc - a generator bug, counted as a failure.)
+    status: str
     message: str
     source_path: str | None = None
     lccc_stdout: str = ""
@@ -160,8 +172,17 @@ class CompileUnit:
     keep_dir: Path | None = None  # when set, the case dir must be preserved
 
 
-def run_command(cmd: list[str], timeout: float = 30.0, cwd: Path | None = None) -> tuple[int, str, str]:
+def run_command(
+    cmd: list[str],
+    timeout: float = 30.0,
+    cwd: Path | None = None,
+    env_extra: dict[str, str] | None = None,
+) -> tuple[int, str, str]:
     """Run a command with a timeout.
+
+    `env_extra` (when given) is merged over the inherited environment; the
+    stress-suite config axes use it so a whole evaluation - reference and
+    lccc, compile and run - happens under one declared configuration.
 
     The child runs in its own process group so that a timeout kills the whole
     group: generated stress programs spawn their own children, and an orphaned
@@ -170,6 +191,10 @@ def run_command(cmd: list[str], timeout: float = 30.0, cwd: Path | None = None) 
     their parent and polluted a benchmark run).
     """
     import signal
+    env = None
+    if env_extra:
+        env = dict(os.environ)
+        env.update(env_extra)
     try:
         p = subprocess.Popen(
             cmd,
@@ -179,6 +204,7 @@ def run_command(cmd: list[str], timeout: float = 30.0, cwd: Path | None = None) 
             encoding="utf-8",
             errors="replace",
             cwd=cwd,
+            env=env,
             start_new_session=True,  # new process group = we can kill the tree
         )
         try:
@@ -199,6 +225,17 @@ def run_command(cmd: list[str], timeout: float = 30.0, cwd: Path | None = None) 
         return -1, "", str(e)
 
 
+def _signal_name(rc: int) -> str:
+    """Human description of a death-by-signal subprocess returncode."""
+    if rc >= 0:
+        return f"exit {rc}"
+    try:
+        import signal
+        return f"signal {signal.Signals(-rc).name} ({-rc})"
+    except ValueError:
+        return f"signal {-rc}"
+
+
 def evaluate_single_test(
     test_id: str,
     unit: CompileUnit,
@@ -210,6 +247,7 @@ def evaluate_single_test(
     repro_dir: Path,
     compile_timeout: float,
     run_timeout: float,
+    env_extra: dict[str, str] | None = None,
 ) -> DiffResult:
     with tempfile.TemporaryDirectory(prefix=f"diff_{test_id}_") as tmpdir:
         tmp = Path(tmpdir)
@@ -230,15 +268,44 @@ def evaluate_single_test(
                 ref_bin = tmp / f"ref_{ref_cc.replace('/', '_')}_{opt}"
                 ref_build_cmd = [ref_cc, opt, *extra_cflags, *unit.extra_flags,
                                  *source_names, "-o", str(ref_bin), "-lm"]
-                rc, out, err = run_command(ref_build_cmd, timeout=compile_timeout, cwd=tmp)
+                rc, out, err = run_command(ref_build_cmd, timeout=compile_timeout, cwd=tmp,
+                                           env_extra=env_extra)
                 if rc != 0:
                     return DiffResult(test_id, "SKIP", f"reference {ref_cc} build failed: {err.strip()}",
                                       opt_level=opt)
                 ref_run_cmd = ([runner] if runner else []) + [str(ref_bin)]
-                ref_rc, ref_out, ref_err = run_command(ref_run_cmd, timeout=run_timeout)
+                ref_rc, ref_out, ref_err = run_command(ref_run_cmd, timeout=run_timeout,
+                                                       env_extra=env_extra)
                 if ref_rc == 124:
                     return DiffResult(test_id, "SKIP", f"reference {ref_cc} timed out", opt_level=opt)
                 if ref_rc != 0:
+                    if ref_rc < 0:
+                        # Generator-bug tripwire: the reference died by signal.
+                        # If lccc dies by the SAME signal, the generated program
+                        # itself crashes everywhere - a generator bug that must
+                        # be reported (GEN-BUG, a failure), never a silent SKIP.
+                        sig_bin = tmp / f"lccc_sigprobe_{opt}"
+                        sig_build_cmd = [lccc_path, opt, *extra_cflags, *unit.extra_flags,
+                                         *source_names, "-o", str(sig_bin), "-lm"]
+                        b_rc, _, _ = run_command(sig_build_cmd, timeout=compile_timeout, cwd=tmp,
+                                                 env_extra=env_extra)
+                        if b_rc == 0:
+                            sig_run_cmd = ([runner] if runner else []) + [str(sig_bin)]
+                            l_rc, _, _ = run_command(sig_run_cmd, timeout=run_timeout,
+                                                     env_extra=env_extra)
+                            if l_rc == ref_rc:
+                                repro_file = repro_dir / f"genbug_{test_id}_{opt}.c"
+                                repro_dir.mkdir(parents=True, exist_ok=True)
+                                repro_file.write_text(unit.files[primary])
+                                return DiffResult(
+                                    test_id,
+                                    "GEN-BUG",
+                                    f"reference {ref_cc} and lccc both died by "
+                                    f"{_signal_name(ref_rc)}: the generated case itself "
+                                    f"crashes (generator bug)",
+                                    str(repro_file),
+                                    opt_level=opt,
+                                )
                     return DiffResult(test_id, "SKIP",
                                       f"reference {ref_cc} non-zero exit ({ref_rc})", opt_level=opt)
                 run_tuple = (ref_rc, ref_out, ref_err)
@@ -256,7 +323,8 @@ def evaluate_single_test(
             lccc_bin = tmp / f"lccc_{opt}"
             lccc_build_cmd = [lccc_path, opt, *extra_cflags, *unit.extra_flags,
                               *source_names, "-o", str(lccc_bin), "-lm"]
-            rc, out, err = run_command(lccc_build_cmd, timeout=compile_timeout, cwd=tmp)
+            rc, out, err = run_command(lccc_build_cmd, timeout=compile_timeout, cwd=tmp,
+                                       env_extra=env_extra)
             if rc != 0:
                 repro_file = repro_dir / f"crash_{test_id}_{opt}.c"
                 repro_dir.mkdir(parents=True, exist_ok=True)
@@ -270,7 +338,8 @@ def evaluate_single_test(
                 )
 
             lccc_run_cmd = ([runner] if runner else []) + [str(lccc_bin)]
-            lccc_rc, lccc_out, lccc_err = run_command(lccc_run_cmd, timeout=run_timeout)
+            lccc_rc, lccc_out, lccc_err = run_command(lccc_run_cmd, timeout=run_timeout,
+                                                      env_extra=env_extra)
 
             if lccc_rc != ref_baseline[0] or lccc_out != ref_baseline[1] or lccc_err != ref_baseline[2]:
                 repro_file = repro_dir / f"miscompile_{test_id}_{opt}.c"
@@ -458,6 +527,35 @@ def _generate_and_evaluate(engine: str, count: int, seed: int, workers: int, eva
 # Stress suite engine
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _stress_config_combos(config_env: list[str]) -> list[tuple[str, dict[str, str]]]:
+    """Expand repeatable --config-env KEY=VALUE declarations into config combos.
+
+    Every distinct KEY contributes one axis: unset (the default), or set to
+    any of the values it was declared with.  The result is the cartesian
+    product over those axes - including the empty combination (labelled
+    "default") - so two single-valued keys reproduce the slot-stress 4-way
+    layout matrix: default | K1 | K2 | K1+K2.  Each combo is applied as its
+    own environment for BOTH compilers (reference and lccc), at compile
+    time and at run time.
+    """
+    if not config_env:
+        return [("default", {})]
+    axes: dict[str, list[str]] = {}
+    for kv in config_env:
+        k, sep, v = kv.partition("=")
+        if not sep or not k:
+            sys.exit(f"error: invalid --config-env {kv!r}; expected KEY=VALUE")
+        if v not in axes.setdefault(k, []):
+            axes[k].append(v)
+    combos: list[tuple[str, dict[str, str]]] = []
+    keys = list(axes)
+    for choice in itertools.product(*([None, *axes[k]] for k in keys)):
+        env = {k: v for k, v in zip(keys, choice) if v is not None}
+        label = "+".join(f"{k}={v}" for k, v in env.items()) if env else "default"
+        combos.append((label, env))
+    return combos
+
+
 def run_stress_suite(
     lccc_path: str,
     ref_compilers: list[str],
@@ -467,22 +565,37 @@ def run_stress_suite(
     compile_timeout: float,
     run_timeout: float,
     seed: int = 0,
+    count: int = 8,
+    config_env: list[str] | None = None,
 ) -> list[DiffResult]:
     """Runs repository generator scripts to produce specialized stress test cases.
 
     Two script families are driven:
 
     * generator scripts that emit a random C program on stdout
-      (``gen_fp_stress.py SEED``, ``gen_gep_chain_stress.py``,
-      ``gen_slot_stress.py``) - each program is differentially evaluated
-      against every reference compiler at every optimization level;
+      (``gen_fp_stress.py SEED``, ``gen_gep_chain_stress.py SEED``,
+      ``gen_slot_stress.py SEED``) - each generator is driven for ``count``
+      seeds (``seed`` .. ``seed+count-1``) so a run sweeps the generators'
+      shape space instead of probing one fixed seed, and every generated
+      program is differentially evaluated against every reference compiler
+      at every optimization level;
     * self-contained differential testers that own their own comparison
       (``unroll_stress.py --lccc ...``) - invoked directly, their exit code
       becomes the result.
+
+    When ``config_env`` declares configuration axes (repeatable
+    KEY=VALUE), every generated case is additionally evaluated under each
+    cartesian-product combination (see ``_stress_config_combos``), both
+    compilers compiled and run under that environment.
     """
     results: list[DiffResult] = []
+    combos = _stress_config_combos(config_env or [])
+    if len(combos) > 1:
+        print(f" stress config matrix ({len(combos)} combos): "
+              + ", ".join(label for label, _ in combos))
 
-    def evaluate_stress(test_id: str, unit: CompileUnit) -> DiffResult:
+    def evaluate_stress(test_id: str, unit: CompileUnit,
+                        env_extra: dict[str, str]) -> DiffResult:
         return evaluate_single_test(
             test_id,
             unit,
@@ -494,34 +607,36 @@ def run_stress_suite(
             repro_dir,
             compile_timeout,
             run_timeout,
+            env_extra=env_extra,
         )
 
-    # (name, script, argv-builder) for stdout generators.
+    # (name, script) for stdout generators; each takes the case seed as argv[1].
     generators = [
-        ("gen_fp_stress", REPO / "scripts" / "gen_fp_stress.py",
-         lambda: [str(seed)]),
-        ("gen_gep_stress", REPO / "scripts" / "gen_gep_chain_stress.py",
-         lambda: []),
-        ("gen_slot_stress", REPO / "scripts" / "gen_slot_stress.py",
-         lambda: []),
+        ("gen_fp_stress", REPO / "scripts" / "gen_fp_stress.py"),
+        ("gen_gep_stress", REPO / "scripts" / "gen_gep_chain_stress.py"),
+        ("gen_slot_stress", REPO / "scripts" / "gen_slot_stress.py"),
     ]
-    for name, script_path, argv_builder in generators:
+    for name, script_path in generators:
         if not script_path.exists():
             continue
-        with tempfile.TemporaryDirectory(prefix=f"stress_{name}_") as tmp:
-            gen_cmd = [sys.executable, str(script_path), *argv_builder()]
-            rc, code, err = run_command(gen_cmd, cwd=Path(tmp), timeout=compile_timeout)
-            if rc != 0 or not code.strip():
-                # Some scripts output files rather than stdout
-                generated_files = list(Path(tmp).glob("*.c"))
-                if generated_files:
-                    code = generated_files[0].read_text()
-                else:
-                    results.append(DiffResult(name, "SKIP", f"generator failed: {err}"))
+        for i in range(count):
+            case_seed = seed + i
+            test_id = f"{name}_seed{case_seed}"
+            with tempfile.TemporaryDirectory(prefix=f"stress_{name}_{case_seed}_") as tmp:
+                gen_cmd = [sys.executable, str(script_path), str(case_seed)]
+                rc, code, err = run_command(gen_cmd, cwd=Path(tmp), timeout=compile_timeout)
+                if rc != 0 or not code.strip():
+                    # Some scripts output files rather than stdout
+                    generated_files = list(Path(tmp).glob("*.c"))
+                    code = generated_files[0].read_text() if generated_files else ""
+                if not code.strip():
+                    results.append(DiffResult(test_id, "SKIP", f"generator failed: {err}"))
                     continue
 
-            res = evaluate_stress(name, CompileUnit(files={"test.c": code}))
-            results.append(res)
+            unit = CompileUnit(files={"test.c": code})
+            for label, combo_env in combos:
+                combo_id = test_id if len(combos) == 1 else f"{test_id}[{label}]"
+                results.append(evaluate_stress(combo_id, unit, combo_env))
 
     # Self-contained differential tester: its own exit code is the verdict.
     # Bounded sample (12 configurations in one TU = 3 compile+run arms); the
@@ -645,8 +760,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--count",
         type=int,
-        default=50,
-        help="Number of test iterations to generate and evaluate (default: 50; 0 = infinite)",
+        default=None,
+        help="Number of test iterations to generate and evaluate "
+             "(default: 50 for generator engines, 8 for stress_suite; 0 = infinite)",
     )
     ap.add_argument(
         "-j",
@@ -712,6 +828,20 @@ def parse_args() -> argparse.Namespace:
         help="Initial random seed",
     )
     ap.add_argument(
+        "--config-env",
+        dest="config_env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="stress_suite only, repeatable: declare a configuration axis. "
+             "Every generated stress case is additionally evaluated under each "
+             "cartesian-product combination of the declared axes (the empty "
+             "combination is the default environment), with BOTH the reference "
+             "and lccc compiling and running under it. Two axes "
+             "K1=V --config-env K2=V yield: default, K1, K2, K1+K2 "
+             "(the slot-stress 4-way layout matrix)",
+    )
+    ap.add_argument(
         "--compile-timeout",
         type=float,
         default=30.0,
@@ -759,6 +889,17 @@ def main() -> int:
     if args.check_engines:
         return check_engines()
 
+    # --count keeps its historical default of 50 for the generator engines;
+    # the stress-suite sweep defaults to 8 seeds per generator instead.
+    count = args.count
+    if count is None:
+        count = 8 if args.engine == "stress_suite" else 50
+    if args.engine == "stress_suite" and count < 1:
+        sys.exit("error: --engine stress_suite requires a bounded --count of at least 1 "
+                 "(0/negative is only meaningful for the infinite generator engines)")
+    if args.config_env and args.engine != "stress_suite":
+        sys.exit("error: --config-env only applies to --engine stress_suite")
+
     # Resolve compiler paths ONCE, before any evaluation.  Test cases are
     # compiled from per-case temporary directories, so a relative --lccc or
     # --refs path that validated fine against the launcher's CWD would be
@@ -802,7 +943,7 @@ def main() -> int:
     print(f" LCCC     : {lccc_path}")
     print(f" Reference: {', '.join(available_refs)}")
     print(f" Opt levels: {', '.join(opt_levels)}")
-    print(f" Workers  : {args.workers} | Count: {args.count or 'infinite'} | Seed: {args.seed}")
+    print(f" Workers  : {args.workers} | Count: {count or 'infinite'} | Seed: {args.seed}")
     print("=" * 70)
 
     repro_dir = Path(args.repro_dir)
@@ -828,19 +969,20 @@ def main() -> int:
         results = run_stress_suite(
             lccc_path, available_refs, opt_levels, args.runner, repro_dir,
             args.compile_timeout, args.run_timeout, seed=args.seed,
+            count=count, config_env=args.config_env,
         )
     elif args.engine == "synthetic":
-        results = run_synthetic_pool(args.count, args.seed, args.workers, evaluate)
+        results = run_synthetic_pool(count, args.seed, args.workers, evaluate)
     elif args.engine == "csmith":
         csmith_bin = args.csmith or os.environ.get("CSMITH", "csmith")
         results = run_csmith_pool(
-            args.count, args.seed, args.workers, evaluate,
+            count, args.seed, args.workers, evaluate,
             csmith_bin, args.include_dirs, args.compile_timeout,
         )
     elif args.engine == "yarpgen":
         yarpgen_bin = args.yarpgen or os.environ.get("YARPGEN", "yarpgen")
         results = run_yarpgen_pool(
-            args.count, args.seed, args.workers, evaluate,
+            count, args.seed, args.workers, evaluate,
             yarpgen_bin, args.compile_timeout,
         )
     else:  # pragma: no cover - argparse restricts choices
@@ -848,8 +990,12 @@ def main() -> int:
                  f"implemented engines: {', '.join(IMPLEMENTED_ENGINES)}")
 
     elapsed = time.time() - t0
+    # FAIL_STATUSES: any of these makes the harness exit 1.  GEN-BUG is a
+    # failure (a generated case that dies by the same signal under the
+    # reference and lccc is an invalid oracle, never a silent SKIP).
+    fail_statuses = ("MISCOMPILE", "LCCC_CRASH", "GEN-BUG")
     pass_cnt = sum(1 for r in results if r.status == "PASS")
-    fail_cnt = sum(1 for r in results if r.status in ("MISCOMPILE", "LCCC_CRASH"))
+    fail_cnt = sum(1 for r in results if r.status in fail_statuses)
     skip_cnt = sum(1 for r in results if r.status == "SKIP")
 
     print("\n" + "=" * 70)
@@ -863,7 +1009,7 @@ def main() -> int:
     if fail_cnt > 0:
         print("\nFailures:")
         for r in results:
-            if r.status in ("MISCOMPILE", "LCCC_CRASH"):
+            if r.status in fail_statuses:
                 print(f"  [{r.status}] {r.test_id} ({r.opt_level}): {r.message}")
                 if r.source_path:
                     print(f"    Reproducer saved at: {r.source_path}")

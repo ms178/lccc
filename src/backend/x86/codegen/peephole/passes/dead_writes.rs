@@ -101,7 +101,7 @@ pub(super) fn eliminate_dead_pure_writes(store: &LineStore, infos: &mut [LineInf
 /// to reach it is to fall through the preceding instruction. Such a label
 /// starts a block dominated by its predecessor, so a value cached before it is
 /// still valid after it.
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop)]
 fn label_is_fallthrough_only(store: &LineStore, infos: &[LineInfo], label_idx: usize) -> bool {
     let t = infos[label_idx].trimmed(store.get(label_idx));
     let Some(name) = t.strip_suffix(':') else {

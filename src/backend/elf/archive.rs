@@ -532,7 +532,7 @@ fn parse_symbol_table_payload(symtab: &[u8], is_64: bool) -> Result<Vec<(String,
 }
 
 /// Convenience: member names only (thin → filenames; regular → member names).
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub fn list_archive_member_names(data: &[u8]) -> Result<Vec<String>, String> {
     if is_thin_archive(data) {
         parse_thin_archive_members(data)

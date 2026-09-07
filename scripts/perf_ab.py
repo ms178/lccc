@@ -189,8 +189,22 @@ def build_binary(
     extra_env: dict[str, str],
     flags: list[str],
 ) -> tuple[bool, str]:
-    """Compile one benchmark binary."""
-    env = dict(os.environ)
+    """Compile one benchmark binary.
+
+    The compile environment is scrubbed of ambient ``CCC_*``/``LCCC_*``
+    variables before ``extra_env`` is applied.  Without the scrub, a stray
+    developer-shell knob (e.g. an exported ``CCC_NO_PEEPHOLE`` left over
+    from a debugging session) would silently hobble BOTH arms — the
+    baseline for A and the delta for B — and skew every ratio while the
+    harness reports a clean run.  The A/B question this tool answers is
+    "configuration B vs the default configuration", so both sides must
+    start from the same clean baseline.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not (k.startswith("CCC_") or k.startswith("LCCC_"))
+    }
     env.update(extra_env)
     cmd = [compiler, *flags, str(src), "-o", out]
     if "gcc" in compiler or "clang" in compiler or "icx" in compiler:

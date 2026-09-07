@@ -62,7 +62,7 @@ pub struct AssemblerConfig {
 ///
 /// The `command` and `extra_args` fields are only used when linking via GCC
 /// (`gcc_linker` feature). The built-in linker dispatches by `expected_elf_machine`.
-#[allow(dead_code)] // `command`/`extra_args` fields only read under gcc_linker feature
+#[expect(dead_code)] // `command`/`extra_args` fields only read under gcc_linker feature
 pub struct LinkerConfig {
     /// The linker command (e.g., "gcc", "aarch64-linux-gnu-gcc")
     pub command: &'static str,
@@ -417,7 +417,7 @@ fn link_with_gcc(
 /// dynamic linker path, etc. This struct captures all those differences
 /// so a single generic function can handle all backends.
 #[cfg(not(feature = "gcc_linker"))]
-#[allow(dead_code)] // Some fields (emulation, dynamic_linker, etc.) are stored for documentation/future use
+#[expect(dead_code)] // Some fields (emulation, dynamic_linker, etc.) are stored for documentation/future use
 struct DirectLdArchConfig {
     /// Human-readable architecture name for error messages (e.g., "x86-64", "RISC-V")
     arch_name: &'static str,
@@ -2215,9 +2215,9 @@ fn emit_int_data(out: &mut AsmOutput, val: i64, ty: IrType, ptr_dir: PtrDirectiv
 pub fn emit_string_bytes(out: &mut AsmOutput, s: &str) {
     // Chunk output into lines of at most 32 bytes each to avoid
     // extremely long lines that can cause parser performance issues.
-    let mut count = 0;
+    let mut count: usize = 0;
     for c in s.chars() {
-        if count % 32 == 0 {
+        if count.is_multiple_of(32) {
             if count > 0 {
                 out.buf.push('\n');
             }

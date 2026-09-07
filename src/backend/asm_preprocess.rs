@@ -27,7 +27,7 @@ pub enum CommentStyle {
     /// like `@function`, `@object`, `@progbits`, `@nobits`, `@tls_object`, `@note`)
     /// Currently the ARM assembler uses its own strip_comment; this variant will
     /// be used when ARM migrates to the shared preprocessor.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     SlashSlashAndAt,
 }
 

@@ -42,7 +42,7 @@ struct IvsrPointerIV {
     /// The backedge increment GEP's destination value (`%ptr_next = GEP(%ptr, stride)`).
     increment_gep_dest: Value,
     /// Block where the phi resides.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     header_block: BlockId,
 }
 
@@ -54,7 +54,7 @@ struct PtrUse {
     /// Accumulated byte displacement for this specific use (init_offset + intermediate GEP offsets).
     offset: i64,
     /// Value ID used as pointer operand in the Load/Store.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     use_val_id: u32,
 }
 

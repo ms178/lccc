@@ -16,65 +16,46 @@
 # root to every folded access; if it does not, the register allocator recycles
 # `p`'s register inside the inlined body and the access dereferences garbage.
 #
+# COMPATIBILITY WRAPPER: forwards to scripts/fuzz_diff.py --engine
+# stress_suite, which drives gen_gep_chain_stress.py for seeds first..last
+# and differentially evaluates every case against the reference at every
+# requested optimisation level.  A case where GCC AND lccc die by the same
+# signal is a generator bug: it is reported GEN-BUG and fails the run, the
+# same tripwire the pre-consolidation script had (never a pass, never a
+# silent skip).  Exit status is 1 on any MISCOMPILE / LCCC_CRASH / GEN-BUG.
+#
 # Usage: run_gep_chain_stress.sh [first-seed] [last-seed] [opt-levels...]
 # Environment:
 #   LCCC_BIN  compiler under test (default target/fastbuild/lccc)
 #   GCC_BIN   oracle compiler     (default gcc)
 # ============================================================================
-set -uo pipefail
+set -euo pipefail
 
 REPO=${LCCC_REPO:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 LCCC=${LCCC_BIN:-$REPO/target/fastbuild/lccc}
 GCC=${GCC_BIN:-gcc}
+
 FIRST=${1:-1}
 LAST=${2:-40}
-shift 2 2>/dev/null || true
+if [[ $# -ge 2 ]]; then
+    shift 2
+else
+    shift $# 2>/dev/null || true
+fi
 OPTS=${*:--O1 -O2 -O3 -Os}
 
-WORK=$(mktemp -d /tmp/gepchain-stress.XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
-
-pass=0; fail=0; skip=0
-failed_cases=()
-
-for seed in $(seq "$FIRST" "$LAST"); do
-    "$REPO/scripts/gen_gep_chain_stress.py" "$seed" > "$WORK/case.c" || continue
-    for opt in $OPTS; do
-        if ! $GCC "$opt" "$WORK/case.c" -o "$WORK/ref" >"$WORK/gcc.err" 2>&1; then
-            skip=$((skip+1)); echo "SKIP seed=$seed $opt (gcc rejected the case)"
-            continue
-        fi
-        "$WORK/ref" > "$WORK/ref.out" 2>&1
-        rc_ref=$?
-        if ! $LCCC "$opt" "$WORK/case.c" -o "$WORK/tst" >"$WORK/lccc.err" 2>&1; then
-            fail=$((fail+1))
-            failed_cases+=("seed=$seed $opt (compile)")
-            echo "FAIL seed=$seed $opt: lccc compile error"
-            head -5 "$WORK/lccc.err"
-            continue
-        fi
-        "$WORK/tst" > "$WORK/tst.out" 2>&1
-        rc_tst=$?
-        if [ "$rc_ref" -eq 139 ] && [ "$rc_tst" -eq 139 ]; then
-            # Both segfault: a generator bug, not a compiler bug. Never a pass.
-            fail=$((fail+1))
-            failed_cases+=("seed=$seed $opt (both SIGSEGV: generator bug)")
-            echo "FAIL seed=$seed $opt: both SIGSEGV (generator bug)"
-        elif ! cmp -s "$WORK/ref.out" "$WORK/tst.out" || [ "$rc_ref" -ne "$rc_tst" ]; then
-            fail=$((fail+1))
-            failed_cases+=("seed=$seed $opt")
-            echo "FAIL seed=$seed $opt (rc ref=$rc_ref tst=$rc_tst)"
-            diff "$WORK/ref.out" "$WORK/tst.out" | head -6
-        else
-            pass=$((pass+1))
-        fi
-    done
-done
-
-echo "================================================================"
-echo "gep-chain stress: PASS=$pass FAIL=$fail SKIP=$skip"
-if [ "$fail" -gt 0 ]; then
-    printf 'failed: %s\n' "${failed_cases[*]}"
+COUNT=$(( LAST - FIRST + 1 ))
+if (( COUNT < 1 )); then
+    # Matches the pre-consolidation `seq first last` behaviour: an empty seed
+    # range runs zero cases and succeeds.
+    echo "gep-chain stress: empty seed range $FIRST..$LAST (nothing to do)"
+    exit 0
 fi
-echo "================================================================"
-[ "$fail" -eq 0 ]
+
+exec python3 "$REPO/scripts/fuzz_diff.py" \
+    --engine stress_suite \
+    --lccc "$LCCC" \
+    --refs "$GCC" \
+    --seed "$FIRST" \
+    --count "$COUNT" \
+    --opts="${OPTS// /,}"

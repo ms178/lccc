@@ -165,7 +165,7 @@ pub(crate) fn replace_source_reg_in_instruction(
 /// `addq %rax, %rbx`: dest is the last comma-separated operand. Sources
 /// are everything before that comma. `pushq %rax` (no comma) returns
 /// `None` — the single operand is both source and dest.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) fn replace_source_reg_att(line: &str, old_reg: &str, new_reg: &str) -> Option<String> {
     if old_reg.is_empty() || old_reg == new_reg {
         return None;

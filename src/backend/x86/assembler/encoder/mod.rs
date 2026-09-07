@@ -35,7 +35,7 @@ pub struct Relocation {
 }
 
 // ELF x86-64 relocation types (standard constants; not all emitted by assembler yet)
-#[allow(dead_code)] // ELF standard constant, defined for reference/future use
+#[expect(dead_code)] // ELF standard constant, defined for reference/future use
 pub const R_X86_64_NONE: u32 = 0;
 pub const R_X86_64_64: u32 = 1;
 pub const R_X86_64_PC32: u32 = 2;
@@ -43,7 +43,7 @@ pub const R_X86_64_PC32: u32 = 2;
 /// `.quad sym - .`; the kernel's __jump_table and static_call sites rely
 /// on the full-width delta (no ±2 GiB truncation like PC32).
 pub const R_X86_64_PC64: u32 = 24;
-#[allow(dead_code)] // ELF standard constant, defined for reference/future use
+#[expect(dead_code)] // ELF standard constant, defined for reference/future use
 pub const R_X86_64_GOT32: u32 = 3;
 pub const R_X86_64_PLT32: u32 = 4;
 pub const R_X86_64_32: u32 = 10;
@@ -57,7 +57,7 @@ pub const R_X86_64_GOTPCRELX: u32 = 41;
 pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 pub const R_X86_64_TPOFF32: u32 = 23;
 pub const R_X86_64_GOTTPOFF: u32 = 22;
-#[allow(dead_code)] // ELF standard constant, defined for reference/future use
+#[expect(dead_code)] // ELF standard constant, defined for reference/future use
 pub const R_X86_64_TPOFF64: u32 = 18;
 // Internal-only: 8-bit PC-relative relocation for jrcxz/loop (never emitted to ELF)
 pub const R_X86_64_PC8_INTERNAL: u32 = 0x8000_0001;
