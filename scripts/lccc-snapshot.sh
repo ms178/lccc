@@ -82,9 +82,93 @@ else
   BASE=$(git rev-parse HEAD)
 fi
 
+# Refuse to commit a snapshot whose staged diff deletes tracked files or
+# changes file modes, unless LCCC_SNAPSHOT_ALLOW_STRUCTURAL=1.
+#
+# Both are near-invisible accidents in this harness, and both have shipped:
+#
+#   * The harness wipes storage between turns and the restore strips exec
+#     bits, so a following `git add -A` stages 100755 -> 100644 for every
+#     script in the tree. Seventy-six mode-only hunks once made a 521-line
+#     patch weigh 104 KiB.
+#   * Five tracked files match patterns in this repo's own .gitignore
+#     (`core.*` covers src/backend/{x86,i686}/assembler/encoder/core.rs;
+#     `test_*` covers tests/integration/test_progressive.py and
+#     tests/test_ivsr_indexed{.c,_before.s}). Once a wipe removes them,
+#     `git add -A` stages the deletion and -- because ignored paths are
+#     omitted from `git status` -- the tree reports CLEAN, so the loss stays
+#     invisible until the published patch deletes two backend encoders.
+#
+# A published patch that deletes tracked files or drops exec bits is a
+# restoration accident here, not an edit, so fail closed and keep the
+# previous snapshot. Set LCCC_SNAPSHOT_ALLOW_STRUCTURAL=1 for a snapshot that
+# genuinely removes or re-modes files.
+# Refuse to publish against a stale base.
+#
+# `.base_ref` pins the upstream commit the deliverable is diffed from. After a
+# rebase onto a newer upstream main it still names the OLD main, so the patch
+# silently absorbs every upstream commit in between: a 6-file / 38 KiB series
+# once published as 21 files / 143 KiB because PR #438's aggregate-SROA work
+# was diffed as if it were ours. Nothing in the pipeline noticed, because the
+# extra content is a legitimate diff -- it is just not this series.
+#
+# The invariant is cheap: the recorded base must be the merge base of HEAD and
+# the fetched upstream main. When `origin/main` is unavailable (offline) the
+# check is skipped rather than guessed. LCCC_SNAPSHOT_ALLOW_STALE_BASE=1
+# overrides for a deliberate historical base.
+snapshot_guard_base_is_merge_base() {
+  if [[ ${LCCC_SNAPSHOT_ALLOW_STALE_BASE:-0} == 1 ]]; then
+    return 0
+  fi
+  local upstream mb
+  upstream=$(git rev-parse --verify --quiet origin/main) || return 0
+  mb=$(git merge-base "$HEAD_SHA" "$upstream" 2>/dev/null) || return 0
+  if [[ $mb != "$BASE" ]]; then
+    printf 'snapshot guard: base %s is not the merge base of HEAD and origin/main (%s)\n' \
+      "${BASE:0:12}" "${mb:0:12}" >&2
+    printf '  The deliverable would absorb upstream commits as if they were ours.\n' >&2
+    printf '  After a rebase, re-anchor:  printf %%s\\n %s > %s\n' "$mb" "$BASE_REF_FILE" >&2
+    return 1
+  fi
+  return 0
+}
+
+snapshot_guard_staged_diff() {
+  if [[ ${LCCC_SNAPSHOT_ALLOW_STRUCTURAL:-0} == 1 ]]; then
+    echo "snapshot guard: structural changes explicitly allowed" >&2
+    return 0
+  fi
+  local deleted modes bad=0
+  deleted=$(git diff --cached --name-status | awk '$1 ~ /^D/ { print "    " $2 }')
+  modes=$(git diff --cached --summary | grep 'mode change' | sed 's/^/    /')
+  if [[ -n $deleted ]]; then
+    echo "snapshot guard: staged diff DELETES tracked files:" >&2
+    printf '%s\n' "$deleted" >&2
+    bad=1
+  fi
+  if [[ -n $modes ]]; then
+    echo "snapshot guard: staged diff changes file modes:" >&2
+    printf '%s\n' "$modes" | head -5 >&2
+    echo "    ($(printf '%s\n' "$modes" | wc -l) in total)" >&2
+    bad=1
+  fi
+  if ((bad)); then
+    cat >&2 <<'MSG'
+  This is almost always a harness wipe: restore the paths and their modes
+  before snapshotting, e.g.
+      git checkout <upstream-main> -- <paths>
+      git ls-files -s <paths>            # confirm 100755 where expected
+  Note that ignored-but-tracked paths never reappear via `git add -A`.
+MSG
+    return 1
+  fi
+  return 0
+}
+
 if ! git diff --quiet || ! git diff --cached --quiet || \
    [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
   git add -A
+  snapshot_guard_staged_diff || exit 1
   git -c user.name='LCCC Agent' -c user.email='agent@lccc.local' \
       commit -m "$slug: $desc"
 fi
@@ -94,6 +178,7 @@ if ! git merge-base --is-ancestor "$BASE" "$HEAD_SHA"; then
   printf 'snapshot base %s is not an ancestor of HEAD %s\n' "$BASE" "$HEAD_SHA" >&2
   exit 1
 fi
+snapshot_guard_base_is_merge_base || exit 1
 
 # Publish a requested/new base atomically only after it has been verified
 # against the committed snapshot head. The per-entry ledger note below makes a

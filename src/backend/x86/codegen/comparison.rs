@@ -72,8 +72,10 @@ pub(crate) fn compute_cmp_replay_scan(
                 continue;
             }
             // Locate the single use: a same-block Select or the
-            // block-terminator CondBranch.
-            let mut used_by_select = false;
+            // block-terminator CondBranch. `consumer_idx` is the position the
+            // compare will actually be re-emitted at -- the Select's index, or
+            // past the last instruction for the terminator.
+            let mut select_idx: Option<usize> = None;
             for (jj, other) in insts.iter().enumerate() {
                 if jj == ii {
                     continue;
@@ -84,11 +86,12 @@ pub(crate) fn compute_cmp_replay_scan(
                 } = other
                 {
                     if v.0 == cdest {
-                        used_by_select = true;
+                        select_idx = Some(jj);
                         break;
                     }
                 }
             }
+            let used_by_select = select_idx.is_some();
             let mut used_by_branch = false;
             if !used_by_select {
                 if let crate::ir::reexports::Terminator::CondBranch {
@@ -100,6 +103,32 @@ pub(crate) fn compute_cmp_replay_scan(
                         used_by_branch = true;
                     }
                 }
+            }
+            if !used_by_select && !used_by_branch {
+                continue;
+            }
+            // REPLAY REDEFINITION GUARD. The replay re-reads the compare's
+            // operands at the consumer position, so it is only sound if
+            // nothing between the Cmp and the consumer redefines them. The
+            // `operand_links` contract below stops the *allocator* from
+            // handing the register to a later value, but it says nothing about
+            // an IR-level redefinition of the same value: a phi-elimination
+            // latch copy absorbed into this block writes the loop-carried
+            // operand in place, and the replay would then compare the NEXT
+            // iteration's value. Emit the Cmp at its own position instead --
+            // one extra instruction, always correct.
+            let consumer_idx = select_idx.unwrap_or(insts.len());
+            let operand_ids: [Option<u32>; 2] = [&clhs, &crhs].map(|op| match op {
+                Operand::Value(v) => Some(v.0),
+                Operand::Const(_) => None,
+            });
+            let redefined_before_consumer = operand_ids.iter().flatten().any(|&vid| {
+                insts[ii + 1..consumer_idx]
+                    .iter()
+                    .any(|other| other.dest().is_some_and(|d| d.0 == vid))
+            });
+            if redefined_before_consumer {
+                continue;
             }
             // FP-SELECT blend (S05): a float Cmp consumed ONLY by a Select
             // emits no boolean — the select re-derives the VEX blend mask
@@ -131,14 +160,12 @@ pub(crate) fn compute_cmp_replay_scan(
             if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
                 continue;
             }
-            if used_by_select || used_by_branch {
-                for op in [&clhs, &crhs] {
-                    if let Operand::Value(v) = op {
-                        operand_links.entry(v.0).or_default().push(cdest);
-                    }
+            for op in [&clhs, &crhs] {
+                if let Operand::Value(v) = op {
+                    operand_links.entry(v.0).or_default().push(cdest);
                 }
-                replay.insert(cdest, (cop, clhs, crhs, cty));
             }
+            replay.insert(cdest, (cop, clhs, crhs, cty));
         }
     }
     CmpReplayScan {
@@ -1624,5 +1651,96 @@ impl X86Codegen {
         self.state.emit("    cmovneq %rcx, %rax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::fx_hash::FxHashMap;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value,
+    };
+
+    fn blk(label: u32, instructions: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            source_spans: Vec::new(),
+            terminator: term,
+        }
+    }
+
+    fn cmp7(lhs: u32) -> Instruction {
+        Instruction::Cmp {
+            dest: Value(7),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(lhs)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I32,
+        }
+    }
+
+    fn cp(d: u32, s: u32) -> Instruction {
+        Instruction::Copy {
+            dest: Value(d),
+            src: Operand::Value(Value(s)),
+        }
+    }
+
+    fn scan(body: Vec<Instruction>) -> CmpReplayScan {
+        let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
+        f.blocks = vec![
+            blk(0, body, {
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(7)),
+                    true_label: BlockId(0),
+                    false_label: BlockId(1),
+                }
+            }),
+            blk(1, Vec::new(), Terminator::Return(None)),
+        ];
+        f.next_value_id = 100;
+        let mut use_counts = FxHashMap::default();
+        use_counts.insert(7u32, 1u32);
+        compute_cmp_replay_scan(&f, &use_counts, &FxHashMap::default())
+    }
+
+    #[test]
+    fn replays_a_compare_whose_operands_survive_to_the_branch() {
+        assert!(scan(vec![cmp7(5), cp(42, 9)]).replay.contains_key(&7));
+    }
+
+    /// The compare-replay re-reads its operands at the consumer position. A
+    /// phi-elimination latch copy absorbed into the block redefines the operand
+    /// in between, so the replay would branch on the NEXT iteration's value.
+    /// `operand_links` keeps the allocator from reassigning the register; it
+    /// cannot stop an IR-level redefinition of the same value. This is the
+    /// ra09_selfop_xor miscompile at -O3.
+    #[test]
+    fn refuses_to_replay_when_an_operand_is_redefined_first() {
+        assert!(!scan(vec![cmp7(5), cp(5, 9)]).replay.contains_key(&7));
+    }
+
+    #[test]
+    fn refuses_to_replay_when_the_rhs_is_redefined_first() {
+        let body = vec![
+            Instruction::Cmp {
+                dest: Value(7),
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(Value(5)),
+                rhs: Operand::Value(Value(6)),
+                ty: IrType::I32,
+            },
+            cp(6, 9),
+        ];
+        assert!(!scan(body).replay.contains_key(&7));
+    }
+
+    /// A redefinition after the consumer is on the next iteration's path and
+    /// cannot affect this replay.
+    #[test]
+    fn replays_when_the_redefinition_is_the_compare_itself() {
+        assert!(scan(vec![cp(5, 9), cmp7(5)]).replay.contains_key(&7));
     }
 }
