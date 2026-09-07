@@ -34,6 +34,26 @@
 //! block. This corrupts values used on other paths. To fix this, we split
 //! the critical edge by inserting a new trampoline block that contains only
 //! the phi copies and branches unconditionally to the target.
+//!
+//! Self-loop latch absorption:
+//! The critical-edge rule above is over-broad for a *backedge into the block
+//! that holds the phis*. Such a block is its own predecessor, so it always has
+//! at least two successors (itself plus the loop exits) and the rule always
+//! fires, even though the copies it protects belong to the loop's own
+//! induction values. The result is a copy-only latch block and one extra
+//! unconditional branch per iteration -- precisely the cost loop rotation is
+//! meant to remove, reintroduced one pass later.
+//!
+//! Splitting is only *needed* when a copy destination is observable on one of
+//! the block's other outgoing edges. So instead of splitting unconditionally,
+//! the backedge copies are buffered and then validated as a parallel copy
+//! (`self_loop_copies_can_hoist`). If every destination is invisible outside
+//! the block and the copies commute, they are appended to the block itself and
+//! the latch disappears. If any destination escapes, the trampoline is built
+//! exactly as before, so the transform is strictly a refinement of the old
+//! behaviour. Rotation makes this fire in practice: rotating lifts the exit
+//! value into a distinct SSA value, so the accumulator the exit phi reads is
+//! no longer a phi destination. Set `CCC_NO_PHI_SELFLOOP_HOIST=1` to disable.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{
@@ -286,6 +306,10 @@ struct PhiElimCtx<'a> {
     multi_succ: Vec<bool>,
     is_indirect_branch: Vec<bool>,
     pred_copies: FxHashMap<usize, Vec<Instruction>>,
+    /// Backedge copies for blocks that are their own phi target, buffered so
+    /// they can be validated as a whole before deciding between absorbing them
+    /// into the block and splitting the edge. Indexed by block.
+    self_loop_copies: Vec<Vec<Instruction>>,
     target_copies: Vec<Vec<Instruction>>,
     trampolines: Vec<TrampolineBlock>,
     trampoline_map: FxHashMap<(usize, BlockId), usize>,
@@ -308,6 +332,7 @@ fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
             .map(|b| matches!(&b.terminator, Terminator::IndirectBranch { .. }))
             .collect(),
         pred_copies: FxHashMap::default(),
+        self_loop_copies: vec![Vec::new(); func.blocks.len()],
         target_copies: vec![Vec::new(); func.blocks.len()],
         trampolines: Vec::new(),
         trampoline_map: FxHashMap::default(),
@@ -333,6 +358,7 @@ fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
         }
     }
 
+    resolve_self_loop_copies(func, &mut ctx);
     apply_phi_transformations(func, &mut ctx);
     func.next_value_id = ctx.next_value;
 }
@@ -513,6 +539,36 @@ fn build_edge_copies(
     copies
 }
 
+/// Where copies travelling along the edge `pred_idx -> target_block_id` land.
+enum CopyPlacement {
+    /// Appended to the predecessor, before its terminator. Safe when the
+    /// predecessor has a single successor: the copies cannot run on any path
+    /// other than the one to the phi's block.
+    Predecessor,
+    /// Buffered for self-loop latch absorption. Decided later, once every phi
+    /// contributing to the same backedge has been seen.
+    SelfLoop,
+    /// A freshly split block carrying only these copies.
+    Trampoline,
+}
+
+fn classify_placement(
+    ctx: &PhiElimCtx,
+    pred_idx: usize,
+    target_block_id: BlockId,
+) -> CopyPlacement {
+    if !ctx.multi_succ[pred_idx] || ctx.is_indirect_branch[pred_idx] {
+        // No critical edge to split: the predecessor reaches the target and
+        // nothing else. (An indirect branch is left alone because its target
+        // set is not a single edge we can split.)
+        return CopyPlacement::Predecessor;
+    }
+    match ctx.label_to_idx.get(&target_block_id) {
+        Some(&target_idx) if target_idx == pred_idx => CopyPlacement::SelfLoop,
+        _ => CopyPlacement::Trampoline,
+    }
+}
+
 /// Place a single copy instruction, using trampolines for critical edges.
 fn place_copy(
     ctx: &mut PhiElimCtx,
@@ -520,17 +576,21 @@ fn place_copy(
     target_block_id: BlockId,
     copy_inst: Instruction,
 ) {
-    if ctx.multi_succ[pred_idx] && !ctx.is_indirect_branch[pred_idx] {
-        let tramp_idx = get_or_create_trampoline(
-            &mut ctx.trampoline_map,
-            &mut ctx.trampolines,
-            pred_idx,
-            target_block_id,
-            ctx.next_block_id,
-        );
-        ctx.trampolines[tramp_idx].copies.push(copy_inst);
-    } else {
-        ctx.pred_copies.entry(pred_idx).or_default().push(copy_inst);
+    match classify_placement(ctx, pred_idx, target_block_id) {
+        CopyPlacement::Predecessor => {
+            ctx.pred_copies.entry(pred_idx).or_default().push(copy_inst);
+        }
+        CopyPlacement::SelfLoop => ctx.self_loop_copies[pred_idx].push(copy_inst),
+        CopyPlacement::Trampoline => {
+            let tramp_idx = get_or_create_trampoline(
+                &mut ctx.trampoline_map,
+                &mut ctx.trampolines,
+                pred_idx,
+                target_block_id,
+                ctx.next_block_id,
+            );
+            ctx.trampolines[tramp_idx].copies.push(copy_inst);
+        }
     }
 }
 
@@ -544,17 +604,257 @@ fn place_copies(
     if copies.is_empty() {
         return;
     }
-    if ctx.multi_succ[pred_idx] && !ctx.is_indirect_branch[pred_idx] {
-        let tramp_idx = get_or_create_trampoline(
-            &mut ctx.trampoline_map,
-            &mut ctx.trampolines,
-            pred_idx,
-            target_block_id,
-            ctx.next_block_id,
-        );
-        ctx.trampolines[tramp_idx].copies.extend(copies);
-    } else {
-        ctx.pred_copies.entry(pred_idx).or_default().extend(copies);
+    match classify_placement(ctx, pred_idx, target_block_id) {
+        CopyPlacement::Predecessor => {
+            ctx.pred_copies.entry(pred_idx).or_default().extend(copies);
+        }
+        CopyPlacement::SelfLoop => ctx.self_loop_copies[pred_idx].extend(copies),
+        CopyPlacement::Trampoline => {
+            let tramp_idx = get_or_create_trampoline(
+                &mut ctx.trampoline_map,
+                &mut ctx.trampolines,
+                pred_idx,
+                target_block_id,
+                ctx.next_block_id,
+            );
+            ctx.trampolines[tramp_idx].copies.extend(copies);
+        }
+    }
+}
+
+/// Whether self-loop latch absorption is enabled.
+fn self_loop_hoist_enabled() -> bool {
+    std::env::var("CCC_NO_PHI_SELFLOOP_HOIST").as_deref() != Ok("1")
+}
+
+/// Reads performed by each block, split into instruction reads and terminator
+/// reads. The split matters because absorbed copies are appended *after* the
+/// last instruction but *before* the terminator.
+struct BlockUses {
+    /// For each value, the blocks whose *instructions* read it.
+    ///
+    /// A phi's incoming operands are attributed to the block holding the phi
+    /// rather than to the predecessor the edge comes from. That is
+    /// deliberately conservative: it can only turn a hoist down, never let an
+    /// unsound one through, and it avoids modelling per-edge liveness.
+    instr_readers: FxHashMap<u32, FxHashSet<usize>>,
+    /// For each value, the blocks whose *terminator* reads it.
+    ///
+    /// Kept separate from `instr_readers` because absorbed copies are appended
+    /// after the last instruction but before the terminator, so the two have
+    /// different consequences. Terminator reads must not be folded into
+    /// `instr_readers`: a value consumed straight from a predecessor by another
+    /// block's terminator (typically `Return(v)`) would then look like it never
+    /// left the self-loop block.
+    term_readers: FxHashMap<u32, FxHashSet<usize>>,
+}
+
+impl BlockUses {
+    fn from_blocks(blocks: &[BasicBlock]) -> Self {
+        let mut instr_readers: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
+        let mut term_readers: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
+        for (idx, block) in blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                inst.for_each_used_value(|v| {
+                    instr_readers.entry(v).or_default().insert(idx);
+                });
+            }
+            block.terminator.for_each_used_value(|v| {
+                term_readers.entry(v).or_default().insert(idx);
+            });
+        }
+        Self {
+            instr_readers,
+            term_readers,
+        }
+    }
+
+    /// True when `value` is read only by `block_idx`'s own instructions (or not
+    /// at all), i.e. it is invisible to every other block.
+    fn only_read_within(&self, value: u32, block_idx: usize) -> bool {
+        match self.instr_readers.get(&value) {
+            None => true,
+            Some(blocks) => blocks.len() == 1 && blocks.contains(&block_idx),
+        }
+    }
+
+    /// True when no terminator anywhere reads `value`.
+    fn no_terminator_reads(&self, value: u32) -> bool {
+        !self.term_readers.contains_key(&value)
+    }
+}
+
+/// Decide, for one self-loop backedge, whether its phi copies can be appended
+/// to the block itself instead of being moved into a split latch block.
+///
+/// The copies run at the end of `block` on *every* path out of it, so they are
+/// safe exactly when overwriting their destinations is unobservable everywhere
+/// except the backedge. Three conditions are checked, and all three are
+/// necessary:
+///
+/// 1. The backedge is still present in the terminator. Without it the block is
+///    not a self-loop and the buffered copies would simply be wrong.
+/// 2. No destination is read by any terminator. For the block's own terminator
+///    this is an ordering constraint -- the copies are inserted before it, so a
+///    terminator reading a destination would branch on the new value. For every
+///    other block's terminator it is the same escape condition as (3), and it
+///    has to be checked separately because a value can travel straight from
+///    this block into another block's `Return` or branch condition without any
+///    instruction in between reading it.
+/// 3. No destination is read by any other block's instructions. Reads inside the
+///    block are fine because they all precede the appended copies; reads
+///    elsewhere are reached through a non-backedge edge where the copies also
+///    executed.
+///
+/// Separately, the copies must form a *commuting* parallel copy: no destination
+/// may also be a source. Sequentialising a non-commuting set (a swap, or a
+/// shift chain) changes its meaning, and the existing temporary machinery in
+/// `emit_multi_phi_copies` is what handles those.
+///
+/// A fourth condition is about *profit*, not correctness. Absorbing appends the
+/// copies immediately before the terminator. If the block's branch condition is
+/// a `Cmp` in this block and one of the copies redefines an operand of it, the
+/// copy lands between that `Cmp` and its consumer, so the x86 emitter's
+/// compare-replay must decline (see the redefinition guard in
+/// `x86/codegen/comparison.rs`) and emit the compare at its own position rather
+/// than fusing it into the branch. That costs an operand reload on every
+/// iteration -- more than the removed branch is worth -- so the absorption is
+/// skipped in exactly that shape and kept wherever removing the latch pays.
+fn self_loop_copies_can_hoist(
+    block: &BasicBlock,
+    copies: &[Instruction],
+    uses: &BlockUses,
+    block_idx: usize,
+) -> bool {
+    if copies.is_empty() {
+        return false;
+    }
+
+    // Condition 1.
+    let self_label = block.label;
+    let has_self_edge = match &block.terminator {
+        Terminator::Branch(t) => *t == self_label,
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => *true_label == self_label || *false_label == self_label,
+        // A switch can carry the backedge too, in a case arm or as the default.
+        // Conditions 2 and 3 below are terminator-shape independent, and a
+        // destination that no other block reads is unobservable on however many
+        // edges leave the block, so a switch needs no special handling beyond
+        // finding the self edge.
+        Terminator::Switch { cases, default, .. } => {
+            *default == self_label || cases.iter().any(|&(_, t)| t == self_label)
+        }
+        Terminator::Return(_) | Terminator::Unreachable | Terminator::IndirectBranch { .. } => {
+            false
+        }
+    };
+    if !has_self_edge {
+        return false;
+    }
+
+    let mut dests: FxHashSet<u32> = FxHashSet::default();
+    let mut srcs: FxHashSet<u32> = FxHashSet::default();
+    for copy in copies {
+        let Instruction::Copy { dest, src } = copy else {
+            return false;
+        };
+        // A repeated destination means the set is not a parallel copy.
+        if !dests.insert(dest.0) {
+            return false;
+        }
+        if let Operand::Value(v) = src {
+            srcs.insert(v.0);
+        }
+    }
+
+    // Commuting check.
+    if dests.iter().any(|d| srcs.contains(d)) {
+        return false;
+    }
+
+    for &dest in &dests {
+        // Conditions 2 and 3: the destination must be invisible everywhere
+        // except this block's own instructions.
+        if !uses.no_terminator_reads(dest) || !uses.only_read_within(dest, block_idx) {
+            return false;
+        }
+    }
+
+    // Condition 4 (profit): keep the branch condition fusable.
+    if let Terminator::CondBranch {
+        cond: Operand::Value(cond),
+        ..
+    } = &block.terminator
+    {
+        for inst in &block.instructions {
+            let Instruction::Cmp { dest, lhs, rhs, .. } = inst else {
+                continue;
+            };
+            if dest.0 != cond.0 {
+                continue;
+            }
+            let touched = [lhs, rhs].iter().any(|op| match op {
+                Operand::Value(v) => dests.contains(&v.0),
+                Operand::Const(_) => false,
+            });
+            if touched {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Resolve every buffered self-loop backedge: absorb the copies into the block
+/// when that is provably safe, otherwise split the edge as before.
+fn resolve_self_loop_copies(func: &IrFunction, ctx: &mut PhiElimCtx) {
+    if ctx.self_loop_copies.iter().all(Vec::is_empty) {
+        return;
+    }
+    let enabled = self_loop_hoist_enabled();
+    let uses = BlockUses::from_blocks(&func.blocks);
+    let buffered = std::mem::take(&mut ctx.self_loop_copies);
+    let debug = std::env::var("LCCC_DEBUG_PHI_HOIST").is_ok();
+
+    for (block_idx, copies) in buffered.into_iter().enumerate() {
+        if copies.is_empty() {
+            continue;
+        }
+        let target_block_id = func.blocks[block_idx].label;
+        let hoist = enabled
+            && self_loop_copies_can_hoist(&func.blocks[block_idx], &copies, &uses, block_idx);
+        if debug {
+            let dests: Vec<String> = copies
+                .iter()
+                .map(|c| match c {
+                    Instruction::Copy { dest, src } => format!("v{}={:?}", dest.0, src),
+                    _ => "?".to_string(),
+                })
+                .collect();
+            eprintln!(
+                "[PHI] self-loop block {}: {} ({} copies: {})",
+                target_block_id.0,
+                if hoist { "absorb" } else { "split" },
+                copies.len(),
+                dests.join(", ")
+            );
+        }
+        if hoist {
+            ctx.pred_copies.entry(block_idx).or_default().extend(copies);
+        } else {
+            let tramp_idx = get_or_create_trampoline(
+                &mut ctx.trampoline_map,
+                &mut ctx.trampolines,
+                block_idx,
+                target_block_id,
+                ctx.next_block_id,
+            );
+            ctx.trampolines[tramp_idx].copies.extend(copies);
+        }
     }
 }
 
@@ -628,6 +928,199 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blk(label: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: insts,
+            source_spans: Vec::new(),
+            terminator: term,
+        }
+    }
+
+    fn cp(d: u32, s: u32) -> Instruction {
+        Instruction::Copy {
+            dest: Value(d),
+            src: Operand::Value(Value(s)),
+        }
+    }
+
+    fn cmp9(lhs: u32) -> Instruction {
+        Instruction::Cmp {
+            dest: Value(9),
+            op: crate::ir::reexports::IrCmpOp::Ne,
+            lhs: Operand::Value(Value(lhs)),
+            rhs: Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+            ty: crate::common::types::IrType::I32,
+        }
+    }
+
+    fn cond(cond: u32, t: u32, f: u32) -> Terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(Value(cond)),
+            true_label: BlockId(t),
+            false_label: BlockId(f),
+        }
+    }
+
+    /// The shape latch absorption exists for: a rotated loop whose
+    /// next-iteration values are distinct SSA values computed last.
+    fn rotated_loop() -> Vec<BasicBlock> {
+        vec![
+            blk(1, vec![cp(13, 10), cp(15, 11), cp(7, 13)], cond(9, 1, 2)),
+            blk(2, vec![cp(8, 7)], Terminator::Return(None)),
+        ]
+    }
+
+    fn hoists(blocks: &[BasicBlock], block_idx: usize, copies: &[Instruction]) -> bool {
+        let uses = BlockUses::from_blocks(blocks);
+        self_loop_copies_can_hoist(&blocks[block_idx], copies, &uses, block_idx)
+    }
+
+    #[test]
+    fn absorbs_block_local_commuting_copies() {
+        let blocks = rotated_loop();
+        assert!(hoists(&blocks, 0, &[cp(10, 13), cp(11, 15)]));
+    }
+
+    #[test]
+    fn rejects_when_a_destination_is_read_by_another_block() {
+        let mut blocks = rotated_loop();
+        // v10 (the induction value) escapes to the exit block.
+        blocks[1].instructions.push(cp(8, 10));
+        assert!(!hoists(&blocks, 0, &[cp(10, 13), cp(11, 15)]));
+    }
+
+    #[test]
+    fn rejects_when_the_own_terminator_reads_a_destination() {
+        let mut blocks = rotated_loop();
+        blocks[0].terminator = cond(10, 1, 2);
+        assert!(!hoists(&blocks, 0, &[cp(10, 13), cp(11, 15)]));
+    }
+
+    /// A value can flow straight into another block's terminator with no
+    /// instruction reading it in between; folding terminator reads into the
+    /// instruction-read map hides exactly this and miscompiles.
+    #[test]
+    fn rejects_when_another_blocks_terminator_reads_a_destination() {
+        let mut blocks = rotated_loop();
+        blocks[1].terminator = Terminator::Return(Some(Operand::Value(Value(10))));
+        assert!(!hoists(&blocks, 0, &[cp(10, 13), cp(11, 15)]));
+    }
+
+    #[test]
+    fn rejects_non_commuting_copies() {
+        let blocks = rotated_loop();
+        // A swap: each destination is also a source, so sequentialising changes
+        // the meaning.
+        assert!(!hoists(&blocks, 0, &[cp(10, 11), cp(11, 10)]));
+    }
+
+    /// A destination read that follows its source's definition is still safe to
+    /// absorb: the copies are appended after every instruction, so the read
+    /// sees the old value. What makes it safe *downstream* is the compare-replay
+    /// redefinition guard in `x86/codegen/comparison.rs`, which refuses to
+    /// re-emit a compare past a redefinition of its operand. Absorbing here is
+    /// what exposed that latent backend bug (ra09_selfop_xor at -O3).
+    #[test]
+    fn absorbs_when_a_destination_is_read_after_its_source_is_defined() {
+        let blocks = vec![
+            blk(1, vec![cp(13, 10), cp(7, 10)], cond(9, 1, 2)),
+            blk(2, Vec::new(), Terminator::Return(None)),
+        ];
+        assert!(hoists(&blocks, 0, &[cp(10, 13)]));
+    }
+
+    /// Reads at or before the source's own definition are inputs to it, so they
+    /// precede the source and cannot overlap its live range.
+    #[test]
+    fn allows_a_destination_read_by_its_sources_own_definition() {
+        let blocks = rotated_loop();
+        assert!(hoists(&blocks, 0, &[cp(10, 13)]));
+    }
+
+    #[test]
+    fn rejects_a_repeated_destination() {
+        let blocks = rotated_loop();
+        assert!(!hoists(&blocks, 0, &[cp(10, 13), cp(10, 15)]));
+    }
+
+    #[test]
+    fn rejects_without_a_self_edge() {
+        let mut blocks = rotated_loop();
+        blocks[0].terminator = Terminator::Branch(BlockId(2));
+        assert!(!hoists(&blocks, 0, &[cp(10, 13)]));
+    }
+
+    #[test]
+    fn absorbs_a_source_defined_outside_the_block() {
+        let blocks = rotated_loop();
+        // A loop-invariant source is the normal case for a bound or step value;
+        // the copies still execute only at the block tail, so the destinations
+        // are exactly as observable as before.
+        assert!(hoists(&blocks, 0, &[cp(10, 99)]));
+    }
+
+    /// Absorbing between a `Cmp` and the branch that consumes it forfeits
+    /// compare-replay fusion when a copy redefines one of its operands, which
+    /// costs an operand reload per iteration.
+    #[test]
+    fn rejects_when_a_copy_would_split_a_compare_from_its_branch() {
+        let blocks = vec![
+            blk(1, vec![cp(13, 10), cmp9(10)], cond(9, 1, 2)),
+            blk(2, Vec::new(), Terminator::Return(None)),
+        ];
+        assert!(!hoists(&blocks, 0, &[cp(10, 13)]));
+    }
+
+    /// A compare whose operands the copies do not touch keeps its fusion, so
+    /// the absorption still pays.
+    #[test]
+    fn absorbs_when_the_compare_operands_are_untouched() {
+        let blocks = vec![
+            blk(1, vec![cp(13, 10), cmp9(13)], cond(9, 1, 2)),
+            blk(2, Vec::new(), Terminator::Return(None)),
+        ];
+        assert!(hoists(&blocks, 0, &[cp(10, 13)]));
+    }
+
+    #[test]
+    fn absorbs_a_constant_source() {
+        use crate::ir::reexports::IrConst;
+        let blocks = vec![
+            blk(1, vec![cp(7, 10)], cond(9, 1, 2)),
+            blk(2, Vec::new(), Terminator::Return(None)),
+        ];
+        let copies = [Instruction::Copy {
+            dest: Value(10),
+            src: Operand::Const(IrConst::I32(0)),
+        }];
+        assert!(hoists(&blocks, 0, &copies));
+    }
+
+    #[test]
+    fn rejects_an_empty_copy_set() {
+        let blocks = rotated_loop();
+        assert!(!hoists(&blocks, 0, &[]));
+    }
+
+    #[test]
+    fn finds_a_self_edge_in_a_switch_arm() {
+        let blocks = vec![
+            blk(
+                1,
+                vec![cp(13, 10)],
+                Terminator::Switch {
+                    val: Operand::Value(Value(9)),
+                    cases: vec![(0, BlockId(1)), (1, BlockId(2))],
+                    default: BlockId(2),
+                    ty: crate::common::types::IrType::I32,
+                },
+            ),
+            blk(2, Vec::new(), Terminator::Return(None)),
+        ];
+        assert!(hoists(&blocks, 0, &[cp(10, 13)]));
+    }
 
     #[test]
     fn test_no_conflicts_independent_phis() {

@@ -128,6 +128,19 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
     // latch_ops used externally, plus the cloned-closure header-phi
     // reference collapse) before flipping the default again.
     //
+    //
+    // 2026-09-07 UPDATE — the 15 miscompiles above are no longer reproducible.
+    // On main 2d1db59 (which includes PR #437 "Harden optimizer memory
+    // barriers and x86 allocation safety") `CCC_LOOP_ROTATE=1` runs
+    // scripts/run_regression_suite.sh at PASS=651 FAIL=0 with 0 AB-diff
+    // failures, and so does `CCC_LOOP_ROTATE=1
+    // CCC_LOOP_ROTATE_IGNORE_PRESSURE=1`, i.e. with Guard G disabled and every
+    // high-pressure loop rotated. The list above is kept as the historical
+    // record of what v16 hit; it is not a current blocker. What still blocks a
+    // default flip is (a) the profitability question Guard G answers and (b)
+    // the absence of a fuzz sweep on this revision -- the regression suite is
+    // a fixed corpus, not a generator.
+    //
     // Opt-in: `CCC_LOOP_ROTATE=1` (also true/yes/on). Empty, `0`, `false`,
     // `no`, `off`, or unset => the pass is a no-op. A previous `is_err()`
     // check treated `CCC_LOOP_ROTATE=` (empty) as enabled — a silent
@@ -192,6 +205,67 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
         }
     }
     total
+}
+
+/// GPRs the target can spare for loop-carried state, for Guard G.
+///
+/// Keyed on the target's ELF e_machine because that is what the backend's
+/// register pools are built from. `ABI_RESERVED` covers the stack pointer,
+/// the fixed scratch register the fixed-GPR model needs, and argument/return
+/// staging; those are never available to hold a loop-carried value across the
+/// body. Unknown targets take the most conservative pool so a new backend
+/// fails closed rather than rotating into a spill storm.
+fn rotation_pressure_budget() -> usize {
+    const ABI_RESERVED: usize = 4;
+    const EM_386: u16 = 3;
+    const EM_X86_64: u16 = 62;
+    const EM_AARCH64: u16 = 183;
+    const EM_RISCV: u16 = 243;
+    match crate::common::types::target_elf_machine() {
+        EM_X86_64 => 16usize.saturating_sub(ABI_RESERVED),
+        EM_386 => 8usize.saturating_sub(ABI_RESERVED),
+        EM_AARCH64 => 31usize.saturating_sub(ABI_RESERVED),
+        // RISC-V has 32 registers but x0 is hardwired to zero.
+        EM_RISCV => 31usize.saturating_sub(ABI_RESERVED),
+        _ => 8usize.saturating_sub(ABI_RESERVED),
+    }
+}
+
+/// How many of the loop's header phis have a use outside the loop body.
+///
+/// Those are precisely the values that need an exit phi after rotation (see
+/// Guard G). Terminator operands are enumerated as well as instruction
+/// operands: a live-out IV is very often consumed by an outside block's
+/// `CondBranch`, and ignoring terminators would under-count and let the
+/// pressure guard miss exactly the IV-heavy shapes it exists for.
+fn live_out_loop_carried_count(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    phi_info: &[(u32, IrType, (BlockId, Operand), Operand)],
+) -> usize {
+    if phi_info.is_empty() {
+        return 0;
+    }
+    let dests: FxHashSet<u32> = phi_info.iter().map(|&(d, _, _, _)| d).collect();
+    let mut live_out: FxHashSet<u32> = FxHashSet::default();
+    for (bi, blk) in func.blocks.iter().enumerate() {
+        if lp.body.contains(&bi) {
+            continue;
+        }
+        for inst in &blk.instructions {
+            inst.for_each_used_value(|v| {
+                if dests.contains(&v) {
+                    live_out.insert(v);
+                }
+            });
+        }
+        blk.terminator.for_each_used_value(|v| {
+            if dests.contains(&v) {
+                live_out.insert(v);
+            }
+        });
+    }
+    live_out.len()
 }
 
 /// Try to rotate one natural loop. Returns true if the transform was applied.
@@ -593,6 +667,46 @@ fn try_rotate_loop(
                 return false;
             }
             _ => {}
+        }
+    }
+
+    // Guard G: register-pressure profitability.
+    //
+    // Rotation is not free at the machine level.  After rotation the loop exit
+    // is reachable from TWO edges -- the 0-trip guard and the latch -- so every
+    // loop-carried value that is live OUT of the loop needs an exit phi
+    // merging its preheader init with the body's last definition.  That keeps
+    // the body's last definition live from its definition point to the exit,
+    // i.e. rotation extends one live range across the whole loop body per
+    // live-out value.  A value read only inside the loop pays nothing new (its
+    // header phi already spanned the loop); the live-out set is exactly the
+    // set whose backedge value previously died at the backedge.
+    //
+    // When that set exceeds the registers the target can spare, the allocator
+    // pays for the extension with spills *inside the hot loop*, which costs
+    // far more than the one compare rotation removes from the entry path.
+    // Measured (x86-64, -O2, `scripts/perf_ab.py`, 5 interleaved reps):
+    //   arith_loop        32 live-out ints -> hot loop 113 -> 149 insns,
+    //                     stack traffic 22 -> 47 spill/reloads, 24.9% SLOWER
+    //   sha256_transform  state in memory, few live-out -> 27.1% FASTER
+    // A global on/off switch cannot express that trade; the live-out count
+    // against the register budget can.  Without this guard the two effects
+    // cancel to a 0.998 geomean over the corpus -- a wash that hides both a
+    // 27% win and a 25% regression.
+    //
+    // A/B escape hatch for isolating the guard itself:
+    // `CCC_LOOP_ROTATE_IGNORE_PRESSURE=1`.
+    if !env_flag_truthy("CCC_LOOP_ROTATE_IGNORE_PRESSURE") {
+        let live_out = live_out_loop_carried_count(func, lp, &phi_info);
+        let budget = rotation_pressure_budget();
+        if live_out > budget {
+            if debug {
+                eprintln!(
+                    "[ROT] {} loop-carried values live out of the loop, budget {} — bail (Guard G, register pressure)",
+                    live_out, budget
+                );
+            }
+            return false;
         }
     }
 

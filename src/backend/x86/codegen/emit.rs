@@ -1244,6 +1244,23 @@ impl X86Codegen {
     /// to slot-resident operands at build time — so the slot is always the
     /// correct, stable source here.
     pub(super) fn emit_int_cmp_replay_insn(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        // DIRECT-HOME FAST PATH. Staging both operands through %rax/%rcx is
+        // only necessary when an operand has no register home to read. When it
+        // does, that home is already valid here: `operand_links` extends a
+        // register-homed operand's interval to this consumer position (see the
+        // IS-09 block in prologue.rs), and the redefinition guard in
+        // `compute_cmp_replay_scan` guarantees no instruction between the Cmp
+        // and here rewrote the value. Comparing in place is therefore sound and
+        // removes one move per operand per execution -- and it removes the
+        // orphaned `mov %rdx,%rax` that a later peephole left behind when it
+        // rewrote the staged compare back onto the operand homes.
+        let lhs_homed = self.operand_reg(lhs).is_some_and(|r| !is_xmm_reg(r));
+        let rhs_homed = matches!(rhs, Operand::Const(_))
+            || self.operand_reg(rhs).is_some_and(|r| !is_xmm_reg(r));
+        if lhs_homed && rhs_homed {
+            self.emit_int_cmp_insn_typed(lhs, rhs, ty);
+            return;
+        }
         let (cmp_instr, _test_instr, acc_reg) = cmp_width_info(ty);
         let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
         // Load lhs from its slot with the TYPE-AWARE width. A raw `movq` slot
