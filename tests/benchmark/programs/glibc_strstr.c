@@ -1,12 +1,21 @@
 /*
- * Workload-derived kernel: glibc two-way string search (LGPL-2.1-or-later).
+ * Workload-derived kernel: glibc-derived string search (LGPL-2.1-or-later).
  *
- * Extracted from GNU C Library (glibc) string/str-two-way.h.
- * The Crochemore-Perrin Two-Way algorithm provides linear-time string
- * matching without dynamic memory allocation, used in libc's strstr/memmem.
+ * Simplified from GNU C Library (glibc) string/str-two-way.h
+ * (`two_way_short_needle`): this kernel keeps the short-needle branch's
+ * RIGHT-TO-LEFT character scan with a 256-entry bad-character shift
+ * table — i.e. the Boyer–Moore–Horspool scheme that glibc's two-way
+ * implementation falls back to for short needles — and drops the
+ * critical-factorization (two-way memory) machinery that handles long
+ * or periodic needles.
  *
- * This kernel stresses branchy character scanning, loop nesting, periodic
- * factor shifts, and pointer arithmetic.
+ * Attribution note (2026-09-07 audit): the file previously claimed the
+ * full Crochemore-Perrin Two-Way algorithm; the extracted code is the
+ * Horspool-style short-needle path only. The provenance table is
+ * corrected to match the code.
+ *
+ * This kernel stresses branchy character scanning, loop nesting, shift
+ * table lookups, and pointer arithmetic.
  */
 #include <stdio.h>
 

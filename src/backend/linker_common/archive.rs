@@ -233,7 +233,7 @@ pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
 ///
 /// Currently unused: x86 and ARM linkers have their own `load_file` implementations.
 /// This generic version will be used as those linkers migrate to shared infrastructure.
-#[allow(dead_code)] // Planned shared infrastructure; x86/ARM linkers will migrate to this
+#[expect(dead_code)] // Planned shared infrastructure; x86/ARM linkers will migrate to this
 pub fn load_file_elf64<G: GlobalSymbolOps>(
     path: &str,
     objects: &mut Vec<Elf64Object>,

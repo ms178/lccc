@@ -87,26 +87,28 @@ fn sink_loads_enabled() -> bool {
 }
 
 fn is_memory_barrier(inst: &Instruction) -> bool {
-    match inst {
-        Instruction::Store { .. }
-        | Instruction::Memcpy { .. }
-        | Instruction::Call { .. }
-        | Instruction::CallIndirect { .. }
-        | Instruction::InlineAsm { .. }
-        | Instruction::AtomicStore { .. }
-        | Instruction::AtomicLoad { .. }
-        | Instruction::AtomicRmw { .. }
-        | Instruction::AtomicCmpxchg { .. }
-        | Instruction::Fence { .. }
-        | Instruction::VaStart { .. }
-        | Instruction::VaEnd { .. }
-        | Instruction::VaCopy { .. }
-        | Instruction::VaArg { .. }
-        | Instruction::DynAlloca { .. }
-        | Instruction::StackRestore { .. } => true,
-        Instruction::Load { volatile, .. } => *volatile,
-        _ => false,
+    // Canonical memory-writer predicate (exhaustive at the `Instruction`
+    // level: new opcodes fail to compile there until classified). This
+    // delegation closed the historical misses — `VaArgStruct`, the
+    // `dest_ptr` store intrinsics (VecStore*/Movnt*/Storedqu/...),
+    // `AtomicInc`, `PgoCounterInc`, `InitTrampoline`, `NonlocalGotoSave`,
+    // `NonlocalGoto` — each of which could previously be crossed by a
+    // sunk load (miscompile class: scalar load sunk past a vector store).
+    if inst.may_write_memory() {
+        return true;
     }
+    // Movement hazards that write no memory but still forbid relocation:
+    // an atomic load orders later atomic writes; a fence orders
+    // everything; DynAlloca/StackRestore change which stack addresses are
+    // valid to hold; a volatile load is an observable event (C11 5.1.2.3).
+    matches!(
+        inst,
+        Instruction::AtomicLoad { .. }
+            | Instruction::Fence { .. }
+            | Instruction::DynAlloca { .. }
+            | Instruction::StackRestore { .. }
+            | Instruction::Load { volatile: true, .. }
+    )
 }
 
 /// Whitelist of relocatable opcodes. A new opcode must be considered
@@ -688,7 +690,7 @@ fn strictly_improves_live_range(before: LiveRangeCost, after: LiveRangeCost) -> 
 /// Try at most one atomic chain per round.  The accepted mutation invalidates
 /// every def/use index and program point, so returning immediately is both
 /// simpler and safer; the outer expression-sink fixpoint rebuilds all facts.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn try_sink_atomic_chain(
     func: &mut IrFunction,
     cfg: &analysis::CfgAnalysis,

@@ -1769,7 +1769,7 @@ fn hint_from_instruction(inst: &Instruction) -> Option<(u32, u32)> {
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, u32> {
     let mut hints = FxHashMap::default();
     for block in &func.blocks {
@@ -1782,7 +1782,7 @@ fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, u32> {
     hints
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 fn collect_uses_for_values(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
     collect_range_metadata(func, &[]).uses
 }

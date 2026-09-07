@@ -696,7 +696,7 @@ impl X86Codegen {
     /// Leaves the records untouched on any mismatch — a lone pending is
     /// NEVER silently dropped here (its widening move would otherwise
     /// never be emitted and the consumer would read garbage).
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn take_pending_widen_pair(
         &mut self,
         lhs: &Operand,
@@ -779,7 +779,6 @@ impl X86Codegen {
     ///     the same per-extension opcode sets (a negative constant can
     ///     never compare against a zero-extended value; unsigned opcodes
     ///     on sign-extended operands are refused, as above).
-    #[allow(clippy::type_complexity)]
     pub(super) fn narrow_cmp_operands_impl(
         &mut self,
         dest: u32,

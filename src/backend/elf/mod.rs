@@ -34,7 +34,7 @@ mod writer_base;
 pub use constants::*;
 
 // string_table
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use string_table::StringTable;
 
 // io
@@ -42,14 +42,14 @@ pub use string_table::StringTable;
 pub use io::*;
 
 // archive
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use archive::{
     LinkerScriptEntry, is_thin_archive, parse_archive_members, parse_linker_script,
     parse_linker_script_entries, parse_thin_archive_members,
 };
 
 // linker_symbols
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use linker_symbols::{
     LinkerDefinedSym, LinkerSymbolAddresses, default_section_flags, get_standard_linker_symbols,
     section_index,
@@ -65,7 +65,7 @@ pub use parse_string::parse_string_literal;
 pub use object_writer::{ElfConfig, ObjReloc, ObjSection, write_relocatable_object};
 
 // numeric_labels
-#[allow(unused_imports)]
+#[expect(unused_imports)]
 pub use numeric_labels::{
     is_numeric_label, parse_numeric_ref, resolve_numeric_labels, resolve_numeric_name,
     resolve_numeric_refs_in_expr,

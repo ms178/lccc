@@ -167,7 +167,7 @@ pub(super) enum ExtKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(clippy::upper_case_acronyms)] // x86 mnemonic suffix conventions (SLQ = movslq)
+#[expect(clippy::upper_case_acronyms)] // x86 mnemonic suffix conventions (SLQ = movslq)
 pub(super) enum MoveSize {
     Q,   // movq  (64-bit)
     L,   // movl  (32-bit)

@@ -165,7 +165,11 @@ pub(crate) fn replace_source_reg_in_instruction(
 /// `addq %rax, %rbx`: dest is the last comma-separated operand. Sources
 /// are everything before that comma. `pushq %rax` (no comma) returns
 /// `None` — the single operand is both source and dest.
-#[allow(dead_code)]
+// Dead in production builds (the x86 peephole rewrites destinations only);
+// exercised by the `att_replaces_only_sources` test. Scope the `expect` to
+// non-test builds so the deadness assertion stays compiler-enforced for
+// shipped configurations while test builds see a genuinely called function.
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn replace_source_reg_att(line: &str, old_reg: &str, new_reg: &str) -> Option<String> {
     if old_reg.is_empty() || old_reg == new_reg {
         return None;

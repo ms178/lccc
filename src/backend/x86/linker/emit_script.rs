@@ -830,7 +830,7 @@ pub fn link_with_script_i386(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn link_with_script_machine(
     objects: &[Object],
     script_src: &str,
@@ -3620,7 +3620,7 @@ fn link_with_script_machine(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn write_script_phdr(
     machine: ScriptMachine,
     out: &mut [u8],
@@ -3694,7 +3694,7 @@ fn script_sym_entry(
     Ok(entry)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn write_script_shdr(
     machine: ScriptMachine,
     out: &mut Vec<u8>,

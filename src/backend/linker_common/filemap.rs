@@ -175,7 +175,7 @@ impl FileMap {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.as_slice().is_empty()
     }
 
     /// True when the bytes came from a mapping rather than a copy.

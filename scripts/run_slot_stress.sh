@@ -19,13 +19,22 @@
 # (CCC_TIER2_GRAPH=1 is accepted but is a historical no-op alias — Tier-2 is
 # the default configuration now.)
 #
+# COMPATIBILITY WRAPPER: forwards to scripts/fuzz_diff.py --engine
+# stress_suite, which drives gen_slot_stress.py for seeds first..last and
+# evaluates every generated case under the four-way CCC layout matrix declared
+# via the repeatable --config-env axes (both compilers, compile and run, under
+# each combination).  A case where GCC AND lccc die by the same signal is a
+# generator bug (GEN-BUG, a failure — never a pass).  Exit status is 1 on any
+# MISCOMPILE / LCCC_CRASH / GEN-BUG.
+#
 # Usage: run_slot_stress.sh [first-seed] [last-seed] [opt-levels...]
 # ============================================================================
-set -uo pipefail
+set -euo pipefail
 
 REPO=${LCCC_REPO:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 LCCC=${LCCC_BIN:-$REPO/target/fastbuild/lccc}
 GCC=${GCC_BIN:-gcc}
+
 FIRST=${1:-1}
 # Default range 1..45: the pre-existing -O2 VLA-store miscompile documented in
 # engineering/BUG-2026-09-03-O2-vla-store-miscompile.md (seed 32) is FIXED
@@ -33,49 +42,27 @@ FIRST=${1:-1}
 # range that used to expose it.  Verified 720/720 across seeds 1..45 at
 # -O1/-O2/-O3/-Os in all four layout configurations.
 LAST=${2:-45}
-shift 2 2>/dev/null || true
-OPTS=${*:-"-O1 -O2 -O3 -Os"}
-
-WORK=$(mktemp -d /tmp/slot-stress.XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
-
-pass=0; fail=0; skip=0
-failed_cases=()
-
-for seed in $(seq "$FIRST" "$LAST"); do
-    "$REPO/scripts/gen_slot_stress.py" "$seed" > "$WORK/case.c" || continue
-    for opt in $OPTS; do
-        if ! $GCC "$opt" "$WORK/case.c" -o "$WORK/ref" >"$WORK/gcc.err" 2>&1; then
-            skip=$((skip+1)); echo "SKIP seed=$seed $opt (gcc rejected the case)"; continue
-        fi
-        expected=$("$WORK/ref" 2>&1); exp_rc=$?
-        while IFS='|' read -r label envs; do
-            out=$(env $envs "$LCCC" "$opt" "$WORK/case.c" -o "$WORK/lcc" 2>"$WORK/lccc.err")
-            if [[ $? -ne 0 ]]; then
-                fail=$((fail+1)); failed_cases+=("seed=$seed $opt $label: COMPILE FAIL")
-                echo "FAIL seed=$seed $opt $label: compiler error: $(head -2 "$WORK/lccc.err" | tr '\n' ' ')"
-                continue
-            fi
-            got=$("$WORK/lcc" 2>&1); rc=$?
-            if [[ "$got" != "$expected" || $rc -ne $exp_rc ]]; then
-                fail=$((fail+1)); failed_cases+=("seed=$seed $opt $label")
-                echo "FAIL seed=$seed $opt $label: got '$got' (rc=$rc) want '$expected' (rc=$exp_rc)"
-            else
-                pass=$((pass+1))
-            fi
-        done <<'CFG'
-default|
-no-tier2|CCC_NO_TIER2_GRAPH=1
-no-small-slots|CCC_NO_SMALL_SLOTS=1
-no-tier2+no-small|CCC_NO_TIER2_GRAPH=1 CCC_NO_SMALL_SLOTS=1
-CFG
-    done
-done
-
-echo "================================================================"
-echo "slot stress: PASS=$pass FAIL=$fail SKIP=$skip  (seeds $FIRST..$LAST, opts: $OPTS)"
-if [[ $fail -gt 0 ]]; then
-    printf 'failing case: %s\n' "${failed_cases[@]}"
-    exit 1
+if [[ $# -ge 2 ]]; then
+    shift 2
+else
+    shift $# 2>/dev/null || true
 fi
-exit 0
+OPTS=${*:--O1 -O2 -O3 -Os}
+
+COUNT=$(( LAST - FIRST + 1 ))
+if (( COUNT < 1 )); then
+    # Matches the pre-consolidation `seq first last` behaviour: an empty seed
+    # range runs zero cases and succeeds.
+    echo "slot stress: empty seed range $FIRST..$LAST (nothing to do)"
+    exit 0
+fi
+
+exec python3 "$REPO/scripts/fuzz_diff.py" \
+    --engine stress_suite \
+    --lccc "$LCCC" \
+    --refs "$GCC" \
+    --seed "$FIRST" \
+    --count "$COUNT" \
+    --opts="${OPTS// /,}" \
+    --config-env CCC_NO_TIER2_GRAPH=1 \
+    --config-env CCC_NO_SMALL_SLOTS=1

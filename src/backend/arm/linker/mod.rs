@@ -25,7 +25,7 @@
 //! - `emit_shared`: Shared library (.so) emission
 //! - `emit_static`: Static executable emission
 
-#[allow(dead_code)] // Re-exports ELF constants/types; not all constants used by every linker path
+#[expect(dead_code)] // Re-exports ELF constants/types; not all constants used by every linker path
 pub mod elf;
 mod emit_dynamic;
 mod emit_shared;

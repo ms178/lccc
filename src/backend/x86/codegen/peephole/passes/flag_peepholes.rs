@@ -1175,7 +1175,7 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
 /// Width rule: a 32-bit logical op zero-extends, so ZF is identical for the
 /// 64-bit test, but SF is not (bit 31 vs bit 63). When the widths differ the
 /// fold is therefore only applied if every consumer of the flags tests ZF.
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop)]
 pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
@@ -1301,7 +1301,7 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
 /// consumer sees. LCCC's codegen (like GCC's and LLVM's) never keeps flags live
 /// across a join, and this check turns that convention into a verified
 /// precondition instead of an assumption.
-#[allow(clippy::needless_range_loop)]
+#[expect(clippy::needless_range_loop)]
 fn flags_are_block_local(
     store: &LineStore,
     infos: &[LineInfo],

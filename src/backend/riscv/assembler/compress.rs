@@ -15,7 +15,7 @@
 /// This only handles instructions without relocations; instructions with pending
 /// relocations are not candidates for compression.
 // Binary literals use groupings matching RISC-V compressed instruction format fields.
-#[allow(clippy::unusual_byte_groupings)]
+#[expect(clippy::unusual_byte_groupings)]
 pub fn try_compress_rv64(word: u32) -> Option<u16> {
     let opcode = word & 0x7F;
     let rd = (word >> 7) & 0x1F;

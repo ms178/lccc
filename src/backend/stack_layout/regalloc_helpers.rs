@@ -144,7 +144,7 @@ fn collect_abi_reg_hints(
     hints
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn run_regalloc_and_merge_clobbers_ex(
     func: &IrFunction,
     available_regs: Vec<PhysReg>,

@@ -27,7 +27,11 @@ pub enum CommentStyle {
     /// like `@function`, `@object`, `@progbits`, `@nobits`, `@tls_object`, `@note`)
     /// Currently the ARM assembler uses its own strip_comment; this variant will
     /// be used when ARM migrates to the shared preprocessor.
-    #[allow(dead_code)]
+    // Dead in production builds (nothing constructs it yet); kept live by the
+    // `strip_comment` test matrix. `expect` therefore applies only outside
+    // `cfg(test)` so the deadness assertion stays compiler-enforced in every
+    // shipped configuration while test builds see a genuinely used variant.
+    #[cfg_attr(all(not(test), not(feature = "gcc_assembler")), expect(dead_code))]
     SlashSlashAndAt,
 }
 

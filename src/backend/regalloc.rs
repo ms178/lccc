@@ -688,10 +688,6 @@ pub fn x86_body_fixed_scratch(func: &IrFunction) -> X86FixedScratch {
     acc
 }
 
-pub fn x86_body_implicitly_clobbers_rdx(func: &IrFunction) -> bool {
-    x86_body_fixed_scratch(func).rdx
-}
-
 /// Companion of [`x86_param_caller_homes_safe`]: with parameters parked in
 /// their incoming registers for the whole body, an inline-expanded
 /// `memcpy`/`memset` (which clobbers %rdi/%rsi/%rcx/%rax/%xmm0/%xmm1) is
@@ -813,10 +809,17 @@ pub(crate) fn x86_param_caller_homes_safe_with_config(
     // allocator's back. Reproduced: `(uint8_t)p2` read from %dl after an
     // `idivq`'s cqto zeroed it — every truncation of the param silently
     // wrong (stress intexpr seed 1, O1 rt+cf, got 65533 expected 65532).
-    // Mirror the prologue's rdx-allocation exclusion (see
-    // x86_body_implicitly_clobbers_rdx): when the body can clobber %rdx,
-    // params fall back to the ordinary spill-home path.
-    if x86_body_implicitly_clobbers_rdx(func) {
+    // Mirror the prologue's allocation exclusions (see
+    // x86_body_fixed_scratch): when the body can clobber %rdx OR %rdi,
+    // params fall back to the ordinary spill-home path.  The %rdi half
+    // matters for future-proofing: today every rdi clobberer
+    // (cmpxchg-loop RMWs, rdtscp) is an RDX_RDI pair, so the historical
+    // rdx-only gate happened to catch them transitively — but the prologue
+    // already removes %rdi from the pool independently, and a future
+    // rdi-only scratch would otherwise silently destroy a param parked in
+    // %rdi.  The gate now consumes the full model the prologue consumes.
+    let caller_home_scratch = x86_body_fixed_scratch(func);
+    if caller_home_scratch.rdx || caller_home_scratch.rdi {
         return false;
     }
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -4210,7 +4213,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     })
                     .collect();
                 if config.ra_config.debug_ra_intervals {
-                    #[allow(unused_mut)]
+                    #[expect(unused_mut)]
                     let mut unassigned: Vec<String> = scan_ivs
                         .iter()
                         .filter(|iv| {

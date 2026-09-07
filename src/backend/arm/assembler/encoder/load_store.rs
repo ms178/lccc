@@ -81,7 +81,7 @@ pub(crate) fn encode_ldr_str(
             // Check if offset is aligned and fits in 12-bit unsigned field
             let abs_offset = *offset as u64;
             let align = 1u64 << shift;
-            if *offset >= 0 && abs_offset % align == 0 {
+            if *offset >= 0 && abs_offset.is_multiple_of(align) {
                 let imm12 = (abs_offset / align) as u32;
                 if imm12 < 4096 {
                     // Unsigned offset form: size 111 V 01 opc imm12 Rn Rt
@@ -419,7 +419,7 @@ pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String>
             // LDRSW: size=10 111 V=0 01 opc=10 -> unsigned offset
             // Actually: 10 111 0 01 10 imm12 Rn Rt
             let abs_offset = *offset as u64;
-            if *offset >= 0 && abs_offset % 4 == 0 {
+            if *offset >= 0 && abs_offset.is_multiple_of(4) {
                 let imm12 = (abs_offset / 4) as u32;
                 if imm12 < 4096 {
                     let word = ((0b10 << 30) | (0b111 << 27))
@@ -523,7 +523,7 @@ pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResul
         let shift = size;
         let abs_offset = *offset as u64;
         let align = 1u64 << shift;
-        if *offset >= 0 && abs_offset % align == 0 {
+        if *offset >= 0 && abs_offset.is_multiple_of(align) {
             let imm12 = (abs_offset / align) as u32;
             if imm12 < 4096 {
                 let word = ((size << 30) | (0b111 << 27))
