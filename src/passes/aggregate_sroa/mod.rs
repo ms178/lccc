@@ -33,6 +33,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{Instruction, IrConst, IrFunction, IrModule, Operand, Value};
 
+mod split;
+
 /// Size in bytes of a scalar IR type. Mirrors `mem2reg::promote::ir_type_size`.
 fn ty_size(ty: IrType) -> i64 {
     match ty {
@@ -875,6 +877,12 @@ fn run_function(func: &mut IrFunction) -> usize {
             plan.drop_allocas.insert(r);
         }
     }
+
+    // ── 4. Split constant-offset aggregates into per-field allocas ─────────
+    // Runs last so forms 1-3 get first refusal on any object they can express
+    // as a copy; `split::run_function` refuses everything they claimed, so no
+    // instruction is ever planned twice.
+    changed += split::run_function(func, &s, &mut plan, &mut next);
 
     // ── Apply the plan ──────────────────────────────────────────────────────
     for &(bi, ii, v) in &plan.load_ptr {
