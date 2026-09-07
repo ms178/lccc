@@ -1527,10 +1527,12 @@ fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8) 
             // displacement-form memory operands like `movq 8(%r13), %r13`
             // (or `movl 4(%r13), %r13d`), which the old `(%r13)`-substring
             // checks missed (`8(%r13)` does not contain `(r13)`). Such a
-            // line READS the family, so it must block the fold.
-            let src_part = td[..td.rfind(',').unwrap_or(td.len())].to_string();
-            let fam_in_src = src_part.contains(&format!("%{}", name64))
-                || src_part.contains(&format!("%{}", name32));
+            // line READS the family, so it must block the fold. The check must
+            // cover EVERY width spelling of the family, not just the 64-/32-bit
+            // names: `movzbl %al, %eax` reads %rax through `%al` and a
+            // name64/name32 substring test does not see it.
+            let src_part = &td[..td.rfind(',').unwrap_or(td.len())];
+            let fam_in_src = line_refs_gp_family(src_part, fam);
             let mov_store =
                 (td.starts_with("mov") || td.starts_with("movabs") || td.starts_with("lea"))
                     && !fam_in_src;
@@ -1917,6 +1919,66 @@ fn try_fold_mem_op_with_sib(
     Some(new_instr)
 }
 
+/// Does `td` (a trimmed asm line) REDEFINE the whole GP family `fam` from a
+/// value that cannot depend on the family's previous contents?
+///
+/// This is the question every "the old value is dead from here on" scan has to
+/// ask, and the classifier's answer is not sufficient: `LineInfo::dest_reg`
+/// names the *destination* of an AT&T two-address ALU op, but such an op reads
+/// that destination too. `xorl %r11d, %r8d` therefore "writes" %r8 while being
+/// the last consumer of the value a fold is about to destroy — treating it as a
+/// kill is a silent miscompilation (found on add-xor-rotate/ARX chains, where
+/// the folded `addl 28(%rsp), %r8d` clobbered a still-live rotate result that a
+/// later `xorl %r11d, %r8d` reads).
+///
+/// Accepted kills, and nothing else:
+///   * `mov*` / `lea` writing the 32- or 64-bit register name as its sole
+///     destination token (a 32-bit write zero-extends, so it does retire the
+///     old 64-bit value), provided no *source* mentions the family at any
+///     width — `movq 8(%r13), %r13` reads it through the base register,
+///     `movzbl %al, %eax` reads it as the source byte;
+///   * the `xorl/xorq %R, %R` zeroing idiom, whose result is value-independent.
+///
+/// Rejected (deliberately, as "may read"): RMW ALU/shift ops, `not/neg/inc/dec/
+/// bswap`, `cmov*` (the old value survives the not-taken edge), `setcc` and
+/// byte/word `mov` (partial writes), `pop`, and anything unclassified.
+fn pure_family_write(td: &str, fam: RegId) -> bool {
+    use super::super::types::REG_NAMES;
+    let fam_us = fam as usize;
+    if fam_us >= REG_NAMES[0].len() {
+        return false;
+    }
+    let name64 = REG_NAMES[0][fam_us];
+    let name32 = REG_NAMES[1][fam_us];
+    if td == format!("xorl {0}, {0}", name32) || td == format!("xorq {0}, {0}", name64) {
+        return true;
+    }
+    let Some(sp) = td.find(' ') else {
+        return false;
+    };
+    let head = &td[..sp];
+    // `lea` computes from its sources; `mov*` (including the zero/sign-
+    // extending forms) writes its destination unconditionally.
+    if !(head.starts_with("mov") || head.starts_with("lea")) {
+        return false;
+    }
+    let Some(comma) = td.rfind(',') else {
+        return false; // no explicit destination operand at all
+    };
+    // String moves (`movsq`, `rep movsb`, ...) and vector `movdqa`-family forms
+    // never carry a bare GP register as their final operand, so requiring the
+    // destination token to be exactly the 32-/64-bit register name excludes
+    // them; byte/word destinations are excluded the same way (partial write)
+    // and so is any memory destination such as `movl $0, (%r8)`.
+    let dest = td[comma + 1..].trim();
+    if dest != name32 && dest != name64 {
+        return false;
+    }
+    // A source may still read the family: `movq 8(%r13), %r13`,
+    // `movzbl %al, %eax`, `leaq (%r8,%r8,2), %r8`.
+    !line_refs_gp_family(&td[..comma], fam as u8)
+}
+
 // ── Accumulator ALU + store folding ─────────────────────────────────────────
 //
 // Folds the pattern:
@@ -2083,7 +2145,19 @@ pub(super) fn fold_accumulator_alu_store(store: &mut LineStore, infos: &mut [Lin
             }
             match infos[n].kind {
                 LineKind::LoadRbp { reg, .. } if reg == src_family => break,
-                LineKind::Other { dest_reg } if dest_reg == src_family => break,
+                LineKind::Other { dest_reg } if dest_reg == src_family => {
+                    // DEST != DEAD. The classifier reports the destination of a
+                    // two-address ALU op, which ALSO reads it: `xorl %r11d, %r8d`
+                    // is the last consumer of the value this fold destroys, not a
+                    // redefinition of it. Only a full, value-independent write
+                    // retires the old value; anything else is a use.
+                    let tn = infos[n].trimmed(store.get(n));
+                    if pure_family_write(tn, src_family) {
+                        break;
+                    }
+                    src_safe = false;
+                    break;
+                }
                 _ => {
                     // Any other reference to the source family is a READ of
                     // the value the fold is about to destroy (or an
@@ -6692,5 +6766,139 @@ mod windowed_liveness_tests {
         let changed = fold_rotate_idiom(&mut store, &mut infos);
         assert!(changed, "flag kill before any reader must still fold");
         assert!(text_of(&store).contains("rolq $3, %rsi"));
+    }
+}
+
+#[cfg(test)]
+mod acc_fold_src_kill_tests {
+    //! `fold_accumulator_alu_store` retargets the ALU op onto the copy's SOURCE
+    //! register, so it may only fire when nothing reads that register again.
+    //! The kill test used to ask "is the source family this line's classified
+    //! destination?", which a two-address ALU op answers with a lie:
+    //! `xorl %r11d, %r8d` writes %r8 *and reads it*, and it was the last
+    //! consumer of the value being destroyed. Real-world symptom: ARX /
+    //! ChaCha20 add-xor-rotate chains at `-O2` came out low by exactly bit 10
+    //! (`artifacts/repros/rot16_arx_scalar_-O2_min.c`).
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fold_accumulator_alu_store(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn rmw_of_source_register_blocks_the_fold() {
+        let asm = "\
+    movl %r8d, %eax
+    addl 28(%rsp), %eax
+    movl %eax, 16(%rsp)
+    xorl 16(%rsp), %r14d
+    xorl %r11d, %r8d
+";
+        let out = run(asm);
+        assert!(
+            out.contains(&"movl %r8d, %eax".to_string())
+                && out.contains(&"addl 28(%rsp), %eax".to_string()),
+            "fold destroyed a live %r8:\\n{}",
+            out.join("\n")
+        );
+    }
+
+    #[test]
+    fn pure_write_of_source_register_still_folds() {
+        // Same three lines, but %r8 is redefined by a stack load before any
+        // read: the old value is genuinely dead, and refusing here would give
+        // up the instruction the pass exists to save.
+        let asm = "\
+    movl %r8d, %eax
+    addl 28(%rsp), %eax
+    movl %eax, 16(%rsp)
+    movl 24(%rsp), %r8d
+    xorl %r11d, %r8d
+";
+        let out = run(asm);
+        assert!(
+            out.contains(&"addl 28(%rsp), %r8d".to_string())
+                && !out.contains(&"movl %r8d, %eax".to_string()),
+            "fold should have fired:\\n{}",
+            out.join("\n")
+        );
+    }
+
+    #[test]
+    fn zeroing_idiom_counts_as_a_kill() {
+        let asm = "\
+    movl %r8d, %eax
+    addl 28(%rsp), %eax
+    movl %eax, 16(%rsp)
+    xorl %r8d, %r8d
+    xorl %r11d, %r8d
+";
+        let out = run(asm);
+        assert!(
+            out.contains(&"addl 28(%rsp), %r8d".to_string()),
+            "`xorl %r8d, %r8d` discards the old value, so the fold is legal:\\n{}",
+            out.join("\n")
+        );
+    }
+
+    #[test]
+    fn partial_or_indexed_writes_of_source_block_the_fold() {
+        // A byte/word write leaves the rest of the family alive, and a mov whose
+        // own address reads the family reads it before redefining it.
+        for writer in [
+            "movb $3, %r8b",
+            "movw $3, %r8w",
+            "movl 4(%r8), %r8d",
+            "movzbl %r8b, %r8d",
+            "cmovel %edx, %r8d",
+            "notl %r8d",
+            "addl %edx, %r8d",
+            "popq %r8",
+        ] {
+            let asm = format!(
+                "\
+    movl %r8d, %eax
+    addl 28(%rsp), %eax
+    movl %eax, 16(%rsp)
+    {writer}
+    xorl %r11d, %r8d
+"
+            );
+            let out = run(&asm);
+            assert!(
+                out.contains(&"movl %r8d, %eax".to_string()),
+                "`{writer}` is not a full redefinition of %r8, so the fold must \
+                 refuse:\\n{}",
+                out.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn read_beyond_the_barrier_still_blocks_the_fold() {
+        // The scan is block-local by design: a branch means %r8 may be read on
+        // another edge, so the fold cannot be proven safe.
+        let asm = "\
+    movl %r8d, %eax
+    addl 28(%rsp), %eax
+    movl %eax, 16(%rsp)
+    jmp .L1
+.L1:
+    xorl %r11d, %r8d
+";
+        let out = run(asm);
+        assert!(
+            out.contains(&"movl %r8d, %eax".to_string()),
+            "fold must not cross a barrier:\\n{}",
+            out.join("\n")
+        );
     }
 }
