@@ -2955,23 +2955,59 @@ impl X86Codegen {
                     args[2].clone()
                 };
 
-                let c_name = if let Some(r) = self.operand_reg(&args[0]) {
-                    super::emit::phys_reg_name(r)
-                } else {
-                    self.operand_to_reg(&args[0], "rax");
-                    "rax"
+                // Intrinsic-scratch pool (the caller-saved GP registers
+                // the emitter may clobber around intrinsics; see the
+                // FmaF64x4 scratch contract above). A reload fallback must
+                // never land on a register already holding one of this
+                // instruction's own operands: the C row base homed in %rsi
+                // while a spilled j-offset reloaded into the fixed %rsi
+                // scratch emitted `vmovupd (%rsi,%rsi)` — address 2*offset —
+                // and miscompiled remainder-shaped FMA loops (segfault at
+                // 2*j). Probe every operand's home up front so each reload
+                // avoids all of them, not just the names resolved earlier.
+                let c_home = self.operand_reg(&args[0]).map(super::emit::phys_reg_name);
+                let b_home = self.operand_reg(&args[1]).map(super::emit::phys_reg_name);
+                let off_home = self
+                    .operand_reg(&off_operand)
+                    .map(super::emit::phys_reg_name);
+                let homes = [c_home, b_home, off_home];
+                let pool = ["rax", "rcx", "rdx", "rsi", "rdi"];
+                let home_taken = |r: &str| homes.iter().any(|h| *h == Some(r));
+                let c_name = match c_home {
+                    Some(name) => name,
+                    None => {
+                        let r = pool
+                            .iter()
+                            .find(|r| !home_taken(r))
+                            .copied()
+                            .expect("five-reg scratch pool, at most two operand homes");
+                        self.operand_to_reg(&args[0], r);
+                        r
+                    }
                 };
-                let b_name = if let Some(r) = self.operand_reg(&args[1]) {
-                    super::emit::phys_reg_name(r)
-                } else {
-                    self.operand_to_reg(&args[1], "rdx");
-                    "rdx"
+                let b_name = match b_home {
+                    Some(name) => name,
+                    None => {
+                        let r = pool
+                            .iter()
+                            .find(|r| !home_taken(r) && **r != c_name)
+                            .copied()
+                            .expect("five-reg scratch pool, at most two operand homes");
+                        self.operand_to_reg(&args[1], r);
+                        r
+                    }
                 };
-                let off_name = if let Some(r) = self.operand_reg(&off_operand) {
-                    super::emit::phys_reg_name(r)
-                } else {
-                    self.operand_to_reg(&off_operand, "rsi");
-                    "rsi"
+                let off_name = match off_home {
+                    Some(name) => name,
+                    None => {
+                        let r = pool
+                            .iter()
+                            .find(|r| !home_taken(r) && **r != c_name && **r != b_name)
+                            .copied()
+                            .expect("five-reg scratch pool, at most two operand homes");
+                        self.operand_to_reg(&off_operand, r);
+                        r
+                    }
                 };
 
                 if disp == 0 {
