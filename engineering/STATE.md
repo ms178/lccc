@@ -36,6 +36,33 @@ The benchmark corpus contains **39 deterministic workloads** (33 historical + 6 
 - **Aggregate LCCC / GCC Geometric Mean:** **`0.8598`** (LCCC faster overall than GCC 14.2 across the 39 benchmarks).
 - **Aggregate LCCC / Fastest Ref Geometric Mean:** **`0.8936`**.
 - **Correctness:** **39 / 39 (100%)** bit-identical to reference compilers.
+- 2026-09-08 re-measurement after OP-05c/OP-05d (`--reps 3`, so indicative
+  rather than certified — re-run at `--reps 7+` on a quiesced machine before
+  quoting): LCCC/GCC geometric mean **`0.7597`**, correctness still 39/39.
+
+### Elementwise map lowering — hot-loop density (2026-09-08)
+
+Loop kernels must be ranked by **steady-state instructions per input byte**
+(`scripts/hot_loop_metric.py`), never by `codegen_oracle.py`'s static
+whole-function `insns` column: a compiler that refuses to vectorize emits
+one tight scalar loop and "wins" that column while doing 32× less work per
+instruction.  `/home/user/work/casefold.c`, `-O3 -march=x86-64-v3`:
+
+| kernel | LCCC | GCC 16.2 | Clang 23.1 | ICC | ICX |
+|---|---|---|---|---|---|
+| `fold_lower` | **0.3125** | 1.2500 | 0.2422 (4× unrolled) | 2.0000 | 0.6250 |
+| `fold_upper` | **0.3125** | 1.2500 | 0.2422 (4× unrolled) | 1.3750 | 0.6250 |
+| `clamp_bytes` | 0.2500 | 0.1875 | 0.1172 (4× unrolled) | 0.4375 | 0.3750 |
+| `classify_alpha` | **0.3125** (was scalar) | 0.3125 | 0.2109 (4× unrolled) | 4.2500 | 0.5625 |
+
+LCCC wins or ties every non-unrolled competitor: 2.0× vs ICX and 4.0× vs
+GCC on the case folds, 1.8× vs ICX and level with GCC on the classifier,
+1.5× vs ICX on the clamp.  Clang's remaining lead everywhere is 4× unrolling
+of identical per-element work — see the follow-up doc's TODO 3.2/3.3.
+
+The `isalpha` classifier now lowers to three packed instructions
+(`vpor` c|32, `vpaddb` bias, `vpcmpgtb`) via the single-bit window union plus
+the range fusion; it used to be a scalar loop.
 
 ---
 

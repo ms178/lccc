@@ -702,6 +702,275 @@ fn clone_addr_chain_into_merge(
 }
 
 /// Single pass of if-conversion. Returns number of diamonds converted.
+/// A short-circuit branch chain that can be folded into ONE branch.
+struct IfCombine {
+    /// The block holding the first `CondBranch`.
+    pred_idx: usize,
+    /// The single-predecessor block holding the second `CondBranch`.
+    inner_idx: usize,
+    /// `true` for `&&` (the two branches share their FALSE target),
+    /// `false` for `||` (they share their TRUE target).
+    is_and: bool,
+    /// First condition (already in `pred`).
+    outer_cond: Operand,
+    /// Second condition (computed by `inner`).
+    inner_cond: Operand,
+    /// Instructions to hoist out of `inner` into `pred`.
+    hoist: Vec<Instruction>,
+    /// Targets of the folded branch.
+    new_true: BlockId,
+    new_false: BlockId,
+    /// The label that loses one of its two incoming edges.
+    shared: BlockId,
+    /// The label whose incoming edge moves from `inner` to `pred`.
+    retargeted: BlockId,
+}
+
+/// Fold a two-level short-circuit condition chain into a single branch on a
+/// bitwise `and`/`or` (GCC calls this `tree-ssa-ifcombine`).
+///
+/// C's `&&` and `||` lower to a branch chain, and if-conversion only sees
+/// diamonds and triangles, so a chain is converted at most one level deep.
+/// `((c>='a' && c<='z') || (c>='A' && c<='Z')) ? 1 : 0` therefore came out
+/// half converted: the second conjunction became two `Select`s, while the
+/// first stayed a branch chain and blocked vectorization of the whole loop
+/// (`BAIL: internal condbranch`).
+///
+/// The shapes, with `preds(inner) == {pred}`:
+///
+/// ```text
+///   AND                              OR
+///   pred: br %a, inner, F            pred: br %a, T, inner
+///   inner: <insts> br %b, X, F       inner: <insts> br %b, T, Y
+///   =>                               =>
+///   pred: <insts> %c = and %a, %b    pred: <insts> %c = or %a, %b
+///         br %c, X, F                      br %c, T, Y
+/// ```
+///
+/// Soundness, every clause fail-closed:
+///
+/// 1. **`inner` has exactly one predecessor, `pred`.**  Hoisting its
+///    instructions into `pred` then changes no other path, and deleting the
+///    `pred -> inner` edge makes `inner` unreachable rather than merely
+///    less used.
+/// 2. **`inner` is side-effect free and non-trapping** (`is_side_effect_free`
+///    excludes loads, stores, calls and trapping arithmetic), so executing
+///    it when `%a` is false is unobservable.  Note the chain evaluates `%b`
+///    eagerly, which is exactly what C's short-circuit semantics forbid
+///    OBSERVING -- and an expression with no side effects and no traps has
+///    nothing to observe.
+/// 3. **Both conditions are `Cmp` results**, hence 0 or 1.  This is what
+///    makes the BITWISE `and`/`or` equal to the logical connective: for
+///    arbitrary integers `3 && 4` is true while `3 & 4` is 0.  Constants 0/1
+///    are accepted for the same reason.
+/// 4. **`inner` has no phis** (it has one predecessor, so any phi would be
+///    degenerate, but a degenerate phi still needs rewriting -- reject
+///    instead of guessing).
+/// 5. **The shared target's phis agree on both edges.**  `shared` currently
+///    has an edge from `pred` (condition false) and one from `inner`
+///    (condition true, second false); after folding only one edge remains,
+///    so a phi that distinguishes them cannot be preserved.  Equal incoming
+///    values are fine and are the common case (the frontend threads values
+///    through `Copy`, not phis).
+/// 6. **The retargeted block's phis are relabelled** from `inner` to `pred`.
+///    Values they name that were defined in `inner` are still in scope: the
+///    hoist moved those definitions into `pred`, which dominates everything
+///    `inner` dominated.
+///
+/// Termination: each application removes one `CondBranch` from the function,
+/// and the caller's fixpoint loop re-derives the CFG each round.
+fn detect_if_combine(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<IfCombine> {
+    let Terminator::CondBranch {
+        cond: outer_cond,
+        true_label,
+        false_label,
+    } = &ctx.func.blocks[pred_idx].terminator
+    else {
+        return None;
+    };
+    let (true_idx, false_idx) = (
+        *ctx.label_to_idx.get(true_label)?,
+        *ctx.label_to_idx.get(false_label)?,
+    );
+
+    // `&&` puts the chain on the TRUE edge, `||` on the FALSE edge.
+    for (is_and, inner_idx) in [(true, true_idx), (false, false_idx)] {
+        if inner_idx == pred_idx {
+            continue;
+        }
+        let inner = &ctx.func.blocks[inner_idx];
+        // (1) single predecessor
+        if ctx.preds.row(inner_idx) != [pred_idx as u32] {
+            continue;
+        }
+        // (4) no phis
+        if inner
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Phi { .. }))
+        {
+            continue;
+        }
+        // (2) speculatable
+        if !is_side_effect_free(inner) {
+            continue;
+        }
+        let Terminator::CondBranch {
+            cond: inner_cond,
+            true_label: it,
+            false_label: if_,
+        } = &inner.terminator
+        else {
+            continue;
+        };
+        // The chain must rejoin the outer branch's OTHER target.
+        let (shared, retargeted) = if is_and {
+            // pred: br %a, inner, F ; inner: br %b, X, F
+            if if_ != false_label {
+                continue;
+            }
+            (*false_label, *it)
+        } else {
+            // pred: br %a, T, inner ; inner: br %b, T, Y
+            if it != true_label {
+                continue;
+            }
+            (*true_label, *if_)
+        };
+        // A self-loop or a fold that collapses both targets is cfg_simplify's
+        // job, not ours.
+        if shared == retargeted || retargeted == ctx.func.blocks[inner_idx].label {
+            continue;
+        }
+        // (3) both conditions must be 0/1
+        if !is_boolean_condition(ctx, outer_cond) || !is_boolean_condition(ctx, inner_cond) {
+            continue;
+        }
+        // (5) the shared block's phis must not distinguish the two edges
+        let pred_label = ctx.func.blocks[pred_idx].label;
+        let inner_label = ctx.func.blocks[inner_idx].label;
+        let shared_idx = *ctx.label_to_idx.get(&shared)?;
+        let mut phis_agree = true;
+        for inst in &ctx.func.blocks[shared_idx].instructions {
+            let Instruction::Phi { incoming, .. } = inst else {
+                break; // phis are a prefix
+            };
+            let from_pred = incoming
+                .iter()
+                .find(|(_, l)| *l == pred_label)
+                .map(|(v, _)| v);
+            let from_inner = incoming
+                .iter()
+                .find(|(_, l)| *l == inner_label)
+                .map(|(v, _)| v);
+            if let (Some(a), Some(b)) = (from_pred, from_inner) {
+                if a != b {
+                    phis_agree = false;
+                    break;
+                }
+            }
+        }
+        if !phis_agree {
+            continue;
+        }
+        let (new_true, new_false) = if is_and {
+            (retargeted, shared)
+        } else {
+            (shared, retargeted)
+        };
+        return Some(IfCombine {
+            pred_idx,
+            inner_idx,
+            is_and,
+            outer_cond: outer_cond.clone(),
+            inner_cond: inner_cond.clone(),
+            hoist: ctx.func.blocks[inner_idx].instructions.clone(),
+            new_true,
+            new_false,
+            shared,
+            retargeted,
+        });
+    }
+    None
+}
+
+/// Is `op` provably 0 or 1?  Only then is a bitwise `and`/`or` the logical
+/// connective (see `detect_if_combine` clause 3).
+fn is_boolean_condition(ctx: &IfConvCtx<'_>, op: &Operand) -> bool {
+    match op {
+        Operand::Const(c) => matches!(c.to_i64(), Some(0) | Some(1)),
+        Operand::Value(v) => {
+            let root = ctx.resolve(v);
+            matches!(ctx.defs.get(&root.0), Some(Instruction::Cmp { .. }))
+        }
+    }
+}
+
+fn apply_if_combine(func: &mut IrFunction, c: &IfCombine, next_val: &mut u32) -> bool {
+    // Re-verify the shape against the live function: the caller may have
+    // applied an earlier combine that touched these blocks.
+    let pred_label = func.blocks[c.pred_idx].label;
+    let inner_label = func.blocks[c.inner_idx].label;
+    if !matches!(&func.blocks[c.pred_idx].terminator,
+        Terminator::CondBranch { true_label, false_label, .. }
+            if (c.is_and && *true_label == inner_label && *false_label == c.shared)
+                || (!c.is_and && *false_label == inner_label && *true_label == c.shared))
+    {
+        return false;
+    }
+
+    let combined = Value(*next_val);
+    *next_val += 1;
+    let ty = IrType::I32;
+    let mut hoisted = c.hoist.clone();
+    hoisted.push(Instruction::BinOp {
+        dest: combined,
+        op: if c.is_and { IrBinOp::And } else { IrBinOp::Or },
+        lhs: c.outer_cond.clone(),
+        rhs: c.inner_cond.clone(),
+        ty,
+    });
+    func.blocks[c.pred_idx].instructions.extend(hoisted);
+    func.blocks[c.pred_idx].terminator = Terminator::CondBranch {
+        cond: Operand::Value(combined),
+        true_label: c.new_true,
+        false_label: c.new_false,
+    };
+
+    // The retargeted block's phi edges now come from `pred`.
+    if let Some(&ri) = build_label_map_once(func).get(&c.retargeted) {
+        for inst in &mut func.blocks[ri].instructions {
+            let Instruction::Phi { incoming, .. } = inst else {
+                break;
+            };
+            for (_, label) in incoming.iter_mut() {
+                if *label == inner_label {
+                    *label = pred_label;
+                }
+            }
+        }
+    }
+    // The shared block loses its edge from `inner` (clause 5 proved the
+    // remaining edge carries the same values).
+    if let Some(&si) = build_label_map_once(func).get(&c.shared) {
+        for inst in &mut func.blocks[si].instructions {
+            let Instruction::Phi { incoming, .. } = inst else {
+                break;
+            };
+            incoming.retain(|(_, label)| *label != inner_label);
+        }
+    }
+    // `inner` is now unreachable; leave the empty shell for cfg_simplify
+    // rather than renumbering blocks mid-pass.
+    func.blocks[c.inner_idx].instructions.clear();
+    func.blocks[c.inner_idx].terminator = Terminator::Branch(c.shared);
+    true
+}
+
+fn build_label_map_once(func: &IrFunction) -> FxHashMap<BlockId, usize> {
+    analysis::build_label_map(func)
+}
+
 fn if_convert_once(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks < 3 {
@@ -722,6 +991,78 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     // defs are the ones the detectors will actually see.
     let ctx = IfConvCtx::build(func);
 
+    // Fold short-circuit branch chains first: each fold turns a two-level
+    // chain into ONE branch, which is what exposes the diamond/triangle the
+    // detectors below can convert.  Without this the second level survives
+    // as an internal conditional branch and blocks vectorization of the
+    // whole loop.
+    // If-combine is restricted to NATURAL-LOOP BODIES, deliberately.
+    //
+    // Folding `a && b` into `and(a, b)` converts a control dependence into a
+    // data dependence.  That trade pays where the resulting straight-line
+    // block can be vectorized or where the branch is unpredictable -- i.e.
+    // inside loops.  Outside them it is a net loss, because it destroys the
+    // path-sensitivity that correlated-value propagation and range folding
+    // rely on: on the false edge of `var <= 0` a signed `var` is known
+    // positive, which is what proves `(unsigned)(var - 1) < UINT_MAX` and
+    // deletes an unreachable `link_failure()` call
+    // (`tests/regression/path_range_var_minus_one_uintmax.c`, reduced from
+    // gcc.c-torture/execute/20041114-1.c).  Merging the two conditions into
+    // one branch erases the edge that carried the fact, and the call
+    // survives to link time.
+    //
+    // GCC resolves the same conflict by ordering (`ifcombine` runs after
+    // VRP); scoping to loop bodies is the equivalent guarantee here and is
+    // independent of how many times the pass pipeline re-enters this pass.
+    let loop_body_blocks: FxHashSet<usize> = {
+        let cfg = analysis::CfgAnalysis::build(func);
+        crate::passes::loop_analysis::find_natural_loops(
+            num_blocks, &cfg.preds, &cfg.succs, &cfg.idom,
+        )
+        .into_iter()
+        .flat_map(|l| l.body.into_iter())
+        .collect()
+    };
+    let cands: Vec<IfCombine> = (0..num_blocks)
+        .filter(|i| loop_body_blocks.contains(i))
+        .filter_map(|i| detect_if_combine(&ctx, i))
+        .collect();
+    if !cands.is_empty() {
+        // `ctx` borrows `func`; drop it before mutating.
+        drop(ctx);
+        let mut combines = 0usize;
+        let mut next_val = func.next_value_id;
+        let mut touched: crate::common::fx_hash::FxHashSet<usize> =
+            crate::common::fx_hash::FxHashSet::default();
+        for cand in &cands {
+            if touched.contains(&cand.pred_idx) || touched.contains(&cand.inner_idx) {
+                continue;
+            }
+            if apply_if_combine(func, cand, &mut next_val) {
+                touched.insert(cand.pred_idx);
+                touched.insert(cand.inner_idx);
+                combines += 1;
+            }
+        }
+        func.next_value_id = next_val;
+        if combines > 0 {
+            // The CFG changed; let the caller's fixpoint loop rebuild it
+            // before looking for diamonds.
+            return rewrites + combines;
+        }
+        // Nothing applied (all candidates were stale): fall through.
+        return rewrites + if_convert_diamonds(func);
+    }
+    drop(ctx);
+    rewrites + if_convert_diamonds(func)
+}
+
+/// Diamond/triangle conversion proper, split out so the if-combine phase can
+/// rebuild the analysis context before calling it.
+fn if_convert_diamonds(func: &mut IrFunction) -> usize {
+    let num_blocks = func.blocks.len();
+    let ctx = IfConvCtx::build(func);
+
     // Collect diamond candidates
     let mut diamonds: Vec<DiamondInfo> = Vec::new();
 
@@ -734,8 +1075,9 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     }
 
     if diamonds.is_empty() {
-        return rewrites;
+        return 0;
     }
+    drop(ctx);
 
     // Apply conversions. Track modified blocks to avoid applying overlapping diamonds
     // (e.g., nested ternaries where converting one invalidates another).
@@ -764,7 +1106,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     // (they'll have no instructions and just an unconditional branch)
     // This is handled by the CFG simplification pass that runs after us.
 
-    converted + rewrites
+    converted
 }
 
 /// Information about a detected diamond pattern.
