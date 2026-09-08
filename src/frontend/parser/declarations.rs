@@ -186,6 +186,7 @@ impl Parser {
         let no_instrument = self.attrs.parsing_no_instrument();
         let is_pure = self.attrs.parsing_pure();
         let is_const_attr = self.attrs.parsing_const_attr();
+        let is_cold = self.attrs.parsing_cold();
 
         // Build per-declarator attributes struct from the collected flags
         let mut decl_attrs = DeclAttributes::default();
@@ -200,6 +201,7 @@ impl Parser {
         decl_attrs.set_no_instrument(no_instrument);
         decl_attrs.set_pure(is_pure);
         decl_attrs.set_const_attr(is_const_attr);
+        decl_attrs.set_cold(is_cold);
         decl_attrs.alias_target = alias_target;
         decl_attrs.visibility = visibility;
         decl_attrs.section = section;
@@ -329,6 +331,7 @@ impl Parser {
                 attrs.set_noreturn(decl_attrs.is_noreturn());
                 attrs.set_pure(decl_attrs.is_pure());
                 attrs.set_const_attr(decl_attrs.is_const_attr());
+                attrs.set_cold(decl_attrs.is_cold());
                 attrs.section = decl_attrs.section;
                 attrs.visibility = decl_attrs.visibility;
                 attrs.symver = decl_attrs.symver;
@@ -645,6 +648,9 @@ impl Parser {
         if self.attrs.parsing_const_attr() {
             last_decl.attrs.set_const_attr(true);
         }
+        if self.attrs.parsing_cold() {
+            last_decl.attrs.set_cold(true);
+        }
         if self.attrs.parsing_error_attr() {
             last_decl.attrs.set_error_attr(true);
         }
@@ -656,6 +662,7 @@ impl Parser {
         self.attrs.set_noreturn(false);
         self.attrs.set_pure(false);
         self.attrs.set_const_attr(false);
+        self.attrs.set_cold(false);
         self.attrs.parsing_cleanup_fn = None;
         self.attrs.set_used(false);
         self.attrs.set_fastcall(false);

@@ -769,7 +769,7 @@ impl I686Codegen {
         op: IrBinOp,
         lhs: &Operand,
         rhs: &Operand,
-        _ty: IrType,
+        ty: IrType,
     ) {
         // Same-block div/rem pair fusion (compute_i686_divrem_pairs). The
         // TAIL of a pair emits nothing — its result was stored by the HEAD's
@@ -996,23 +996,42 @@ impl I686Codegen {
                 // 32-bit operand.  This is the single-instruction form of the
                 // `ROTL32`/`ROTR` triple that every hash and the kernel's
                 // preboot decompressor spell out portably.
-                let mnem = if op == IrBinOp::RotateLeft {
-                    "roll"
-                } else {
-                    "rorl"
+                // Width-aware: the truncation-aware `bit_idioms` pattern
+                // produces sub-word rotates for this target
+                // (`target_min_rotate_bits(I686) == 8`), and `rolb`/`rolw`
+                // rotate at the operand width with an effective count of
+                // `(count & 31) mod width` — exact at every sub-word width,
+                // the same lowering x86-64 uses. An unconditional `roll`
+                // would drag the zeroed upper bits through the value and
+                // miscompile every I8/I16 rotate.
+                //
+                // Sub-word values stage into %eax with NO zero-extension
+                // guarantee (register homes and slots carry full 32-bit
+                // histories), so normalize with movzbl/movzwl first: unlike
+                // add/shift, a rotate feeds the upper bits back into the
+                // result, and garbage there corrupts even the low byte.
+                let left = op == IrBinOp::RotateLeft;
+                let (mnem, acc, width): (&str, &str, i64) = match ty {
+                    IrType::I8 | IrType::U8 => {
+                        self.state.emit("    movzbl %al, %eax");
+                        (if left { "rolb" } else { "rorb" }, "al", 8)
+                    }
+                    IrType::I16 | IrType::U16 => {
+                        self.state.emit("    movzwl %ax, %eax");
+                        (if left { "rolw" } else { "rorw" }, "ax", 16)
+                    }
+                    _ => (if left { "roll" } else { "rorl" }, "eax", 32),
                 };
                 match Self::const_as_imm32(rhs) {
                     Some(imm) => {
-                        let amount = (imm as i64).rem_euclid(32);
+                        let amount = (imm as i64).rem_euclid(width);
                         if amount != 0 {
-                            self.state.out.emit_instr_imm_reg(
-                                &format!("    {mnem}"),
-                                amount,
-                                "eax",
-                            );
+                            self.state
+                                .out
+                                .emit_instr_imm_reg(&format!("    {mnem}"), amount, acc);
                         }
                     }
-                    None => self.state.emit(&format!("    {mnem} %cl, %eax")),
+                    None => self.state.emit(&format!("    {mnem} %cl, %{acc}")),
                 }
             }
             IrBinOp::BitTest => {

@@ -38,7 +38,11 @@ jobs:
       # the benchmarked compiler comes from one shared, cache-friendly
       # profile definition instead of a release-profile opt-level override.
       # The profile only affects the speed of the compiler BINARY, never the
-      # code it generates for the timed C workloads.
+      # code it generates for the timed C workloads: lccc is deterministic,
+      # so the fastbuild binary emits byte-identical assembly to a release
+      # one, and thin LTO would only burn CI minutes (it serializes codegen
+      # and disables incremental compilation) without changing a single
+      # measured number.
       - name: Build LCCC
         run: ./scripts/build_lccc_fast.sh
 
@@ -94,6 +98,9 @@ jobs:
       # ci-bench.py); wiring it now closes the "runtime-only gate" hole the
       # audit flagged. Baseline refreshes go through --update-baseline in
       # the PR that lands the improvement, per the gate's header contract.
+      - name: Gate self-test (stackmem accounting)
+        run: python3 .github/scripts/test_ci_codegen_gate.py
+
       - name: Codegen quality gate (golden workloads)
         run: |
           set -o pipefail

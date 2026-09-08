@@ -28,6 +28,11 @@
 //! * Nobody aligns anything at -Os (GCC -Os emits zero `.p2align`).
 //! * Under PGO, alignment is reserved for blocks the profile says are hot
 //!   (`pgo::layout` records those); cold loops receive no padding.
+//! * Two static-mode refinements save padding that cannot pay off: loops
+//!   whose header compare proves at most 4 trips, and functions the
+//!   frontend marked cold (a `.text.unlikely`-style section) — neither
+//!   can amortize the padding bytes, so neither is padded. An explicit
+//!   `-falign-loops=N` is still honored everywhere.
 //!
 //! lccc adopts exactly this split, with one deliberate improvement in
 //! controllability over GCC: `-fno-align-loops` also suppresses the
@@ -44,7 +49,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::instruction::{BasicBlock, Instruction, Terminator};
+use crate::ir::instruction::{BasicBlock, Instruction, Operand, Terminator};
 use crate::ir::reexports::IrFunction;
 use crate::passes::loop_analysis;
 
@@ -206,6 +211,17 @@ fn align_function(
     pgo_map: &FxHashSet<u32>,
     map: &mut FxHashMap<u32, Vec<AlignDirective>>,
 ) {
+    // Cold functions (`__attribute__((cold))`, which the frontend lowers to
+    // a `.text.unlikely`-style section) are never hot by construction:
+    // aligning their loops pads the cold path for a hot benefit that can
+    // never materialize.
+    if func
+        .section
+        .as_deref()
+        .is_some_and(|s| s.contains("unlikely"))
+    {
+        return;
+    }
     // Natural loops on the final CFG: robust to layout order, and the loop
     // BODY set is needed to classify vector loops.
     let cfg_analysis = crate::ir::analysis::CfgAnalysis::build(func);
@@ -395,7 +411,11 @@ fn block_has_vector_insn(block: &BasicBlock) -> bool {
 
 /// Visible constant trip bound of a counted loop from its *header exit*
 /// comparison: `Some(n)` when the compare feeding the header's conditional
-/// branch is `iv < Const(n)` (or the mirrored `Const(n) > iv` form).
+/// branch proves at most `n` iterations — `iv < Const(n)`, `iv <=
+/// Const(n)` (bound `n + 1`), `iv != Const(n)` over the overwhelmingly
+/// common forward induction (exactly `n` trips, matching GCC/Clang, which
+/// leave constant-trip-4-or-less `!=` loops unaligned), or the mirrored
+/// `Const(n) > iv` / `Const(n) >= iv` / `Const(n) != iv` forms.
 ///
 /// Comparisons that do not feed the header terminator are ignored — a stray
 /// constant compare inside the header must not disqualify alignment. The
@@ -403,6 +423,11 @@ fn block_has_vector_insn(block: &BasicBlock) -> bool {
 /// vectorized main loop whose bound was scaled by the vector width keeps
 /// the scaled bound, and a remainder loop divided down keeps its own, which
 /// is exactly what alignment payback depends on.
+///
+/// Only a non-negative integer constant bound disqualifies: `iv < -5` from
+/// an unknown start proves nothing (pad as usual). The exclusion only ever
+/// suppresses padding — it can cost front-end cycles on a misjudged hot
+/// loop, but it can never affect correctness.
 fn header_constant_trip_bound(func: &IrFunction, header_idx: usize) -> Option<i64> {
     use crate::ir::ops::IrCmpOp;
     use crate::ir::reexports::Operand;
@@ -425,21 +450,31 @@ fn header_constant_trip_bound(func: &IrFunction, header_idx: usize) -> Option<i6
             }
             let (limit, flipped) = match rhs {
                 Operand::Const(c) => (c, false),
-                // The mirrored form `Const(n) > iv` bounds the trip too.
+                // The mirrored `Const(n) > iv` / `Const(n) >= iv` /
+                // `Const(n) != iv` forms bound the trip too.
                 Operand::Value(_) => match lhs {
                     Operand::Const(c) => (c, true),
                     _ => continue,
                 },
             };
             let limit = limit.to_i64()?;
-            let is_lt = match op {
-                IrCmpOp::Slt | IrCmpOp::Ult => !flipped,
-                IrCmpOp::Sgt | IrCmpOp::Ugt => flipped,
+            // A negative limit proves nothing from an unknown start (pad as
+            // usual); the caller only excludes small bounds anyway.
+            if limit < 0 {
+                continue;
+            }
+            // Ordering exits bound the trip above; `<=`/`>=` run one past
+            // the limit. Lower-bound-only shapes (`iv > n`, `iv >= n`,
+            // `n <= iv`, `n < iv`) and non-ordering exits prove nothing.
+            let bound = match op {
+                IrCmpOp::Slt | IrCmpOp::Ult if !flipped => limit,
+                IrCmpOp::Sgt | IrCmpOp::Ugt if flipped => limit,
+                IrCmpOp::Sle | IrCmpOp::Ule if !flipped => limit.saturating_add(1),
+                IrCmpOp::Sge | IrCmpOp::Uge if flipped => limit.saturating_add(1),
+                IrCmpOp::Ne => limit,
                 _ => continue,
             };
-            if is_lt {
-                return Some(limit);
-            }
+            return Some(bound);
         }
     }
     None

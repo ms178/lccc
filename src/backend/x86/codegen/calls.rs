@@ -942,6 +942,33 @@ impl X86Codegen {
                 }
                 CallArgClass::IntReg { reg_idx } => {
                     let target_reg = X86_ARG_REGS[reg_idx];
+                    // Rematerializable call argument: a GlobalAddr root with
+                    // no home (neither a register assignment nor a stack
+                    // slot) rebuilds by LEA. Stage it DIRECTLY into the
+                    // argument register — routing through operand_to_rax
+                    // would emit a LEA-into-%rax plus mov relay that the
+                    // peephole cannot fold through the call barrier. Same
+                    // def lookup as value_to_reg_inner's rebuild (the name is
+                    // cloned to end the immutable borrow before emitting);
+                    // TLS/GOT/absolute forms are handled by the shared
+                    // helper, which also owns cache hygiene.
+                    if let Operand::Value(v) = arg {
+                        if !self.reg_assignments.contains_key(&v.0)
+                            && self.state.get_slot(v.0).is_none()
+                        {
+                            let gaddr_name = self.get_defining_instruction(v.0).and_then(|inst| {
+                                if let Instruction::GlobalAddr { name, .. } = inst {
+                                    Some(name.clone())
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some(name) = gaddr_name {
+                                self.emit_global_addr_into_reg(&name, target_reg);
+                                continue;
+                            }
+                        }
+                    }
                     // Register-direct: callee-saved regs and constants bypass rax.
                     // Skip when it would create a round-trip (e.g., rdi→rbx→rdi)
                     // that the peephole would eliminate along with the param store.

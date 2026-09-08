@@ -1870,6 +1870,35 @@ pub fn build_rematerializable_global_addr_set_for(
                             && op_is_root(lhs, id)
                             && !op_is_root(rhs, id)
                     }
+                    Instruction::Call { func, info } => {
+                        // A call argument that is a bare GlobalAddr root: the
+                        // x86 call emitter rebuilds home-less GlobalAddrs
+                        // (operand_to_rax funnels into value_to_reg's LEA
+                        // rebuild; IntReg stages LEA directly into the
+                        // argument register), so spilling the address across
+                        // the call is pure waste — a store plus a reload the
+                        // callee-saved file or the slot need not carry.
+                        // Admitted only when the call REACHES the generic
+                        // emitter: inline-expanded memcpy/memset bypass it
+                        // (their expansion reads homed operands), and
+                        // sret/fastcall take unaudited argument paths.
+                        // used_values for Call is args-only, so reaching this
+                        // arm proves the root is used as an argument value.
+                        !info.is_sret
+                            && !info.is_fastcall
+                            && inline_memcpy_len(func.as_str(), &info.args, info.is_variadic)
+                                .is_none()
+                            && x86_inline_memset_len(func.as_str(), &info.args, info.is_variadic)
+                                .is_none()
+                    }
+                    Instruction::CallIndirect { func_ptr, info } => {
+                        // Same audit as Call: indirect-call arguments stage
+                        // through the identical IntReg/Stack paths. The root
+                        // must not be the call TARGET — only argument
+                        // positions are audited (indirect calls never inline-
+                        // expand, so no memcpy/memset exclusion applies).
+                        !info.is_sret && !info.is_fastcall && !op_uses_root(func_ptr, id)
+                    }
                     _ => false,
                 };
                 if !allowed {
@@ -5808,5 +5837,175 @@ mod conditional_increment_tests {
         }
         instructions.push(select());
         assert!(detect(&function_with(instructions)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod remat_call_arg_tests {
+    use super::*;
+    use crate::ir::reexports::CallInfo;
+
+    fn function_with_global_addr_call(
+        args: Vec<Operand>,
+        func: &str,
+        is_sret: bool,
+        is_fastcall: bool,
+    ) -> IrFunction {
+        let mut function = IrFunction::new("remat_test".to_string(), IrType::I32, vec![], false);
+        function.blocks.push(BasicBlock {
+            label: crate::ir::reexports::BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "g".to_string(),
+                },
+                Instruction::Call {
+                    func: func.to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(1)),
+                        args,
+                        arg_types: vec![IrType::Ptr],
+                        return_type: IrType::I32,
+                        is_variadic: false,
+                        num_fixed_args: 1,
+                        is_sret,
+                        is_fastcall,
+                        ..Default::default()
+                    },
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+        function.next_value_id = 8;
+        function
+    }
+
+    fn global_addr_map() -> FxHashMap<u32, String> {
+        let mut map = FxHashMap::default();
+        map.insert(0, "g".to_string());
+        map
+    }
+
+    #[test]
+    fn call_arg_use_is_rematerializable() {
+        // glibc_memcmp's glibc_left: a bare GlobalAddr passed as a call
+        // argument must join the remat set so the x86 call emitter LEAs it
+        // straight into the argument register instead of spilling it.
+        let func =
+            function_with_global_addr_call(vec![Operand::Value(Value(0))], "callee", false, false);
+        let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
+        assert!(set.contains(&0));
+    }
+
+    #[test]
+    fn memcpy_shaped_call_is_excluded() {
+        // Fixed-size memcpy bypasses the generic call emitter via inline
+        // expansion, which reads homed operands: the root must keep a home.
+        let func = function_with_global_addr_call(
+            vec![
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(8)),
+            ],
+            "memcpy",
+            false,
+            false,
+        );
+        let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
+        assert!(!set.contains(&0));
+    }
+
+    #[test]
+    fn memset_exclusion_mirrors_backend_policy() {
+        // The set must agree EXACTLY with the x86 inline-memset predicate:
+        // excluded iff the backend would inline-expand (which bypasses the
+        // remat-capable call emitter). The policy itself is CPU-row
+        // dependent, so the test pins the wiring, not the row.
+        let args = vec![
+            Operand::Value(Value(0)),
+            Operand::Const(IrConst::I32(0)),
+            Operand::Const(IrConst::I64(16)),
+        ];
+        let func = function_with_global_addr_call(args.clone(), "memset", false, false);
+        let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
+        let inlined = x86_inline_memset_len("memset", &args, false).is_some();
+        assert_eq!(set.contains(&0), !inlined);
+    }
+
+    #[test]
+    fn sret_and_fastcall_calls_are_excluded() {
+        for (is_sret, is_fastcall) in [(true, false), (false, true)] {
+            let func = function_with_global_addr_call(
+                vec![Operand::Value(Value(0))],
+                "callee",
+                is_sret,
+                is_fastcall,
+            );
+            let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
+            assert!(
+                !set.contains(&0),
+                "sret={is_sret} fastcall={is_fastcall} must stay homed"
+            );
+        }
+    }
+
+    #[test]
+    fn indirect_call_args_allowed_target_excluded() {
+        // Indirect-call arguments stage through the same IntReg/Stack paths
+        // as direct calls, but the call TARGET is not an audited position.
+        let mut function = IrFunction::new("remat_test".to_string(), IrType::I32, vec![], false);
+        function.blocks.push(BasicBlock {
+            label: crate::ir::reexports::BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "g".to_string(),
+                },
+                Instruction::CallIndirect {
+                    func_ptr: Operand::Value(Value(1)),
+                    info: CallInfo {
+                        dest: Some(Value(2)),
+                        args: vec![Operand::Value(Value(0))],
+                        arg_types: vec![IrType::Ptr],
+                        return_type: IrType::I32,
+                        ..Default::default()
+                    },
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+        });
+        function.next_value_id = 8;
+        let set = build_rematerializable_global_addr_set_for(&function, &global_addr_map());
+        assert!(set.contains(&0));
+
+        let mut target_use = function;
+        if let Instruction::CallIndirect { func_ptr, .. } =
+            &mut target_use.blocks[0].instructions[1]
+        {
+            *func_ptr = Operand::Value(Value(0));
+        }
+        let set = build_rematerializable_global_addr_set_for(&target_use, &global_addr_map());
+        assert!(!set.contains(&0));
+    }
+
+    #[test]
+    fn terminator_use_still_excluded() {
+        // Returning the address keeps it out of the set (the pre-existing
+        // terminator veto is unaffected by the call-argument widening).
+        let mut function = IrFunction::new("remat_test".to_string(), IrType::Ptr, vec![], false);
+        function.blocks.push(BasicBlock {
+            label: crate::ir::reexports::BlockId(0),
+            instructions: vec![Instruction::GlobalAddr {
+                dest: Value(0),
+                name: "g".to_string(),
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: Vec::new(),
+        });
+        function.next_value_id = 8;
+        let set = build_rematerializable_global_addr_set_for(&function, &global_addr_map());
+        assert!(!set.contains(&0));
     }
 }

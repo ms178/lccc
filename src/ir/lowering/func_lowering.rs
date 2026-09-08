@@ -970,7 +970,16 @@ impl Lowerer {
             next_value_id: next_val,
             fp_expr_tags: std::mem::take(&mut self.fp_expr_tags),
             next_label,
-            section: func.attrs.section.clone(),
+            // `__attribute__((cold))` without an explicit `section(...)`
+            // goes to `.text.unlikely`, matching GCC's cold partition.
+            // Downstream consumers key on the section name (e.g. the
+            // loop-alignment pass skips unlikely-section functions, whose
+            // padding could never be amortized).
+            section: func
+                .attrs
+                .section
+                .clone()
+                .or_else(|| func.attrs.is_cold().then(|| ".text.unlikely".to_string())),
             visibility: func.attrs.visibility.clone(),
             is_weak: func.attrs.is_weak(),
             is_used: func.attrs.is_used(),

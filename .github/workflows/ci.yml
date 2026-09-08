@@ -105,6 +105,34 @@ jobs:
             -j 2 \
             --json regression-results.json 2>&1 | tee regression-results.log
 
+      # Correctness gate over the benchmark corpus (INF-BENCHGATE-1): the
+      # workload-derived kernels are the largest programs in the tree and
+      # exercise loop shapes the regression corpus does not. An IV-widening
+      # miscompile once passed all 563 regression tests and only this
+      # compile-run-diff oracle (no timing, ~minutes) caught it. Compare
+      # every kernel against GCC at -O0/-O1/-O2/-O3: a level-specific
+      # miscompile is still a miscompile.
+      - name: Benchmark output gate (workload kernels vs GCC oracle)
+        run: bash scripts/check_benchmark_outputs.sh
+
+      # Differential correctness gate (vectorizer + codegen vs GCC oracle):
+      # the casefile that caught the `v<0 ? 0-(v+1) : v` abs-fold
+      # miscompile AFTER it had passed the regression corpus, cargo test,
+      # and the benchmark-output gate. Each case compiles under lccc and
+      # GCC at aggressive vectorization flags and diffs stdout: a level-
+      # or flag-specific miscompile is still a miscompile.
+      - name: Differential correctness gate (lccc vs GCC oracle)
+        run: LCCC_BIN=target/fastbuild/lccc python3 tests/correctness/run_correctness.py
+
+      # Emitted-assembly contract for the hot-loop alignment policy: every
+      # vector loop carries the bounded `.p2align 5,,15` + `.p2align 4`
+      # cascade, every scalar loop the `.p2align 4,,10` + `.p2align 3`
+      # cascade, and constant-trip-<=4 loops (`<`, `<=`, `!=`, mirrored)
+      # reach codegen AND stay unpadded. Asserts both directions, so a
+      # missing tier fails and so does an unexpected one.
+      - name: Loop-alignment contract gate (emitted assembly)
+        run: python3 scripts/check_loop_alignment.py --lccc target/fastbuild/lccc
+
       # The result artifact is retained already, but GitHub's public job view
       # hides raw logs/artifacts from anonymous triage. Turn each result into a
       # normal check annotation so the failing test and phase stay visible.

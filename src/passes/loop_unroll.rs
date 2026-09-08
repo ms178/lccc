@@ -299,7 +299,7 @@ fn analyze_loop(
     }
 
     // 3. A unique preheader must exist.
-    loop_analysis::find_preheader(header, &lp.body, &cfg.preds)?;
+    let preheader = loop_analysis::find_preheader(header, &lp.body, &cfg.preds)?;
 
     // 4. body_work = body \ {header, latch}; must be non-empty.
     let body_work: Vec<usize> = lp
@@ -591,6 +591,28 @@ fn analyze_loop(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // 11b. Foreign-edge soundness: `do_unroll` synthesizes exit phis for
+    //     loop-carried values, and every FOREIGN predecessor of the exit
+    //     (any exit pred other than the header — usually a zero-trip
+    //     bypass, but possibly a jump from anywhere above the loop)
+    //     receives the header phi's ENTRY operand: the value each carried
+    //     value holds before the loop runs. The entry operand is used at
+    //     the end of the preheader, so its definition dominates the
+    //     preheader; requiring the preheader to dominate every foreign
+    //     predecessor closes the chain to the exit edge transitively. A
+    //     foreign edge the preheader does not dominate (jump threading,
+    //     Duff's-device dispatch, a `goto` into the merge) would read a
+    //     value no path defined — that loop simply stays rolled.
+    if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
+        let dom = loop_analysis::DominanceChecker::new(cfg.num_blocks, &cfg.idom);
+        for &p in cfg.preds.row(exit_bi) {
+            let p = p as usize;
+            if p != header && !dom.dominates(preheader, p) {
+                return None;
             }
         }
     }
@@ -3358,11 +3380,15 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
         // incoming for every one of them or it is malformed (the verifier
         // reports "phi vN has no incoming for predecessor BlockId(M)").
         //
-        // On those edges the loop never ran, so the live value is exactly the
-        // one that reached the exit before the unroll: `dest` itself (the
-        // header phi's SSA name, which on a non-loop path still holds its
-        // pre-loop definition).  That is the same operand used for the header
-        // edge, so reuse it.
+        // On those edges the loop never ran, so the live value is the one
+        // the header phi carries at loop ENTRY: its non-latch incoming
+        // (the preheader operand).  The header phi itself is NOT sound
+        // here — it is defined in the header, which no foreign path
+        // executes, so an incoming naming it makes the join read a
+        // register no path defined (the def-dominates-use verifier
+        // rejects exactly this shape).  The entry operand is defined at
+        // the end of the preheader, which dominates every foreign
+        // predecessor of the exit.
         let foreign_preds: Vec<BlockId> = {
             let exit_label = func.blocks[exit_idx].label;
             let ec_set: FxHashSet<BlockId> = ec_labels.iter().copied().collect();
@@ -3377,10 +3403,28 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                 .collect()
         };
 
+        // Entry-edge (non-latch) operand of every header phi in `need`:
+        // the value each carried value holds before the loop runs.  A
+        // single-entry loop — the only shape this unroller admits — has
+        // exactly one; anything else has no sound foreign-edge operand
+        // and skips synthesis rather than guessing.
+        let mut entry_ops: FxHashMap<u32, Operand> = FxHashMap::default();
+        for inst in &func.blocks[c.header].instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                let mut non_latch = incoming.iter().filter(|(_, l)| *l != latch_label);
+                if let (Some((op, _)), None) = (non_latch.next(), non_latch.next()) {
+                    entry_ops.insert(dest.0, op.clone());
+                }
+            }
+        }
+
         for (dest, edges, pty) in &need {
             if existing.contains_key(&dest.0) {
                 continue; // Step 5 already threaded this phi's edges
             }
+            let Some(entry_op) = entry_ops.get(&dest.0) else {
+                continue; // no unique entry operand; no sound foreign edge
+            };
             let new_phi = Value(next_val);
             next_val += 1;
             let mut incoming: Vec<(Operand, BlockId)> =
@@ -3390,7 +3434,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                 incoming.push((ev.clone(), ec_labels[j]));
             }
             for fp in &foreign_preds {
-                incoming.push((Operand::Value(*dest), *fp));
+                incoming.push((entry_op.clone(), *fp));
             }
             func.blocks[exit_idx].instructions.insert(
                 0,
@@ -3594,13 +3638,23 @@ mod tests {
     fn make_counting_loop(n_val: i32) -> IrFunction {
         let mut func = IrFunction::new("loop_test".to_string(), IrType::Void, vec![], false);
 
-        // B0: preheader — init i = 0
+        // B0: preheader — init i = 0; materialize the array base the
+        // body GEPs use. The base is loop-invariant and defined outside,
+        // so it must have a defining instruction here or the verifier's
+        // def-dominates-use check (rightly) reports every cloned GEP as
+        // reading an undefined value.
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![Instruction::Copy {
-                dest: Value(0),
-                src: Operand::Const(IrConst::I32(0)),
-            }],
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(10),
+                    name: "arr".to_string(),
+                },
+            ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
         });
@@ -3903,20 +3957,50 @@ mod tests {
         assert!(violations.is_empty());
     }
 
-    /// A latch-defined value that ESCAPES the latch (here: feeding the
-    /// function return) would be read once-per-unroll-factor stale after
-    /// `do_unroll` rethreads the back edge. Such loops must be rejected too.
+    /// A latch-defined value that ESCAPES the latch would be read
+    /// once-per-unroll-factor stale after `do_unroll` rethreads the back
+    /// edge (`do_unroll` never clones the latch and only retargets the IV
+    /// itself). Such loops must be rejected too.
+    ///
+    /// The escape is spelled in LCSSA form — the latch def feeds a header
+    /// phi on the back edge, and the exit returns the phi — because a
+    /// while-shape latch def used directly outside the loop is inherently
+    /// non-dominated (the header's exit edge bypasses the latch) and
+    /// therefore malformed SSA that the def-dominates-use check rightly
+    /// rejects. The phi-edge spelling is well-formed (a phi incoming's def
+    /// need only dominate its own predecessor) while escaping exactly the
+    /// same way: the direct `latch_value_escapes` assertion below pins the
+    /// gate predicate itself, so the rejection assertion cannot pass
+    /// vacuously.
     #[test]
     fn escaping_latch_def_blocks_partial_unroll() {
         let mut func = make_counting_loop(40);
-        // Latch: %20 = Copy %5 (the incremented IV); return %20 from exit.
+        // Latch: %20 = Copy %5 (the incremented IV).
         func.blocks[3].instructions.push(Instruction::Copy {
             dest: Value(20),
             src: Operand::Value(Value(5)),
         });
-        func.blocks[4].terminator = Terminator::Return(Some(Operand::Value(Value(20))));
-        func.next_value_id = 21;
+        // Header: %21 = phi(const 0 [preheader], %20 [latch]); the exit
+        // returns %21, so the latch def escapes through the phi.
+        func.blocks[1].instructions.insert(
+            1,
+            Instruction::Phi {
+                dest: Value(21),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                    (Operand::Value(Value(20)), BlockId(3)),
+                ],
+            },
+        );
+        func.blocks[4].terminator = Terminator::Return(Some(Operand::Value(Value(21))));
+        func.next_value_id = 22;
 
+        // The gate predicate itself fires for the LCSSA escape.
+        assert!(
+            latch_value_escapes(&func, 3, 20),
+            "latch def reaching the header phi must count as escaping"
+        );
         let blocks_before = func.blocks.len();
         unroll_loops(&mut func);
         assert_eq!(
