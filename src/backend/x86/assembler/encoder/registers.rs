@@ -463,7 +463,12 @@ fn is_mixed_width_mnemonic(m: &str) -> bool {
         "movmsk",
         "vmovmsk",
         "crc32",
-        "bt",
+        // `bt`/`bts`/`btr`/`btc` are NOT mixed-width: the bit-index register
+        // and the bit-base register share one operand size (GAS: "register
+        // type mismatch for `bt'" on `btl %rcx, %r8d`, "incorrect register
+        // `%r8' used with `l' suffix" on `btl $31, %r8`).  The former
+        // exemption let the BitTest emitter's `btl $31, %r8` through and hid
+        // it from every GAS-oracle build.
         "shld",
         "shrd",
         "vperm",

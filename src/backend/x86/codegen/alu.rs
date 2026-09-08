@@ -414,12 +414,23 @@ impl X86Codegen {
                 .filter(|v| *v >= i32::MIN as i64 && *v <= i32::MAX as i64),
             _ => None,
         };
+        // BT's base operand must be spelled at the instruction's width: a
+        // 32-bit `btl` names `%r8d`, never `%r8`.  The old `btl $31, %r8`
+        // was accepted by the builtin assembler (which encoded the intended
+        // 32-bit form) but GAS 2.44 rejects it ("incorrect register `%r8'
+        // used with `l' suffix") — every `-fno-integrated-as` / `.s`-oracle
+        // build of a BitTest died.
+        let dest_w = if use_32bit {
+            super::emit::phys_reg_name_32(dest_phys)
+        } else {
+            dest64
+        };
         if let Some(imm) = const_index {
             let width = if use_32bit { 32 } else { 64 };
             let bit = (imm as u32) % width;
             let bt = if use_32bit { "btl" } else { "btq" };
             self.state
-                .emit_fmt(format_args!("    {bt} ${bit}, %{dest64}"));
+                .emit_fmt(format_args!("    {bt} ${bit}, %{dest_w}"));
         } else {
             // BT's bit index is an ordinary r/m operand — it has no fixed
             // count register (that restriction belongs to variable shifts,
@@ -442,13 +453,13 @@ impl X86Codegen {
                         super::emit::phys_reg_name(reg)
                     };
                     self.state
-                        .emit_fmt(format_args!("    {bt} %{idx}, %{dest64}"));
+                        .emit_fmt(format_args!("    {bt} %{idx}, %{dest_w}"));
                 }
                 _ => {
                     self.operand_to_rcx(index);
                     let src = if use_32bit { "ecx" } else { "rcx" };
                     self.state
-                        .emit_fmt(format_args!("    {bt} %{src}, %{dest64}"));
+                        .emit_fmt(format_args!("    {bt} %{src}, %{dest_w}"));
                 }
             }
         }

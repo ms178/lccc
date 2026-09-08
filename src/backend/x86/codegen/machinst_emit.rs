@@ -526,9 +526,15 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 // exactly). GCC's register-copy form for doubles is the
                 // same vmovapd.
                 (MachOperand::Reg(_), MachOperand::Reg(_)) => {
-                    let packed = match size {
-                        OpSize::S32 => "vmovaps",
-                        _ => "vmovapd",
+                    // Legacy SSE (`-mno-avx`): `movaps`/`movapd` has the same
+                    // full-register, rename-eliminated semantics; only the
+                    // VEX prefix differs.
+                    let avx = super::super::isa::current().avx;
+                    let packed = match (size, avx) {
+                        (OpSize::S32, true) => "vmovaps",
+                        (OpSize::S32, false) => "movaps",
+                        (_, true) => "vmovapd",
+                        (_, false) => "movapd",
                     };
                     let src_str = fmt(src);
                     let dst_str = fmt(dst);
@@ -564,11 +570,16 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             dst,
             size,
         } => {
-            let base = match op {
-                FAluOp::Add => "vadd",
-                FAluOp::Sub => "vsub",
-                FAluOp::Mul => "vmul",
-                FAluOp::Div => "vdiv",
+            let avx = super::super::isa::current().avx;
+            let base = match (op, avx) {
+                (FAluOp::Add, true) => "vadd",
+                (FAluOp::Sub, true) => "vsub",
+                (FAluOp::Mul, true) => "vmul",
+                (FAluOp::Div, true) => "vdiv",
+                (FAluOp::Add, false) => "add",
+                (FAluOp::Sub, false) => "sub",
+                (FAluOp::Mul, false) => "mul",
+                (FAluOp::Div, false) => "div",
             };
             let mnem = match size {
                 OpSize::S32 => format!("{base}ss"),
@@ -599,9 +610,35 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                     unreachable!("vreg{id} reached FAlu emission unallocated (dst)")
                 }
             };
-            out.emit_fmt(format_args!(
-                "    {mnem} {src2_str}, %{src1_str}, %{dst_str}"
-            ));
+            if avx {
+                out.emit_fmt(format_args!(
+                    "    {mnem} {src2_str}, %{src1_str}, %{dst_str}"
+                ));
+                return;
+            }
+            // Legacy two-operand SSE: `op src2, %dst` is destructive, so the
+            // 3-operand shape is legalised exactly like the text path's
+            // `emit_fp_op3`.  `dst` is an allocator register (xmm2..xmm15),
+            // never the xmm0 scratch used for the non-commutative relay.
+            let commutative = matches!(op, FAluOp::Add | FAluOp::Mul);
+            let movap = match size {
+                OpSize::S32 => "movaps",
+                _ => "movapd",
+            };
+            let src2_is_dst = src2_str.strip_prefix('%') == Some(dst_str);
+            if src1_str == dst_str {
+                out.emit_fmt(format_args!("    {mnem} {src2_str}, %{dst_str}"));
+            } else if src2_is_dst && commutative {
+                out.emit_fmt(format_args!("    {mnem} %{src1_str}, %{dst_str}"));
+            } else if src2_is_dst {
+                debug_assert!(dst_str != "xmm0" && src1_str != "xmm0");
+                out.emit_fmt(format_args!("    {movap} %{src1_str}, %xmm0"));
+                out.emit_fmt(format_args!("    {mnem} %{dst_str}, %xmm0"));
+                out.emit_fmt(format_args!("    {movap} %xmm0, %{dst_str}"));
+            } else {
+                out.emit_fmt(format_args!("    {movap} %{src1_str}, %{dst_str}"));
+                out.emit_fmt(format_args!("    {mnem} {src2_str}, %{dst_str}"));
+            }
         }
 
         MachInst::Alu { op, src, dst, size } => {

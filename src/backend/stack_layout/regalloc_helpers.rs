@@ -307,6 +307,10 @@ pub fn run_regalloc_and_merge_clobbers_ex(
                             | O::F128Neg
                             | O::F128Copysign
                             | O::VecMulI64x2
+                            // Legacy-SSE2 lowering of the hoisted 2-wide
+                            // matmul group needs a third scratch (product,
+                            // hoisted factor, unaligned C addend).
+                            | O::FmaF64x2Hoisted
                     )
                 } else {
                     false

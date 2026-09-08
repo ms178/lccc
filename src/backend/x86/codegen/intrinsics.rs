@@ -2681,15 +2681,36 @@ impl X86Codegen {
                     // AVX->SSE state transition (~70 cycles on Intel). VEX-128
                     // zeroes the upper bits by definition, so no transition can
                     // occur. See scripts/check_avx_sse_transitions.py.
-                    self.state
-                        .emit_fmt(format_args!("    vmovsd (%{}), %xmm1", a_name)); // xmm1 = A scalar
-                    self.state.emit("    vunpcklpd %xmm1, %xmm1, %xmm1"); // xmm1 = {A, A}
-                    self.state
-                        .emit_fmt(format_args!("    vmovupd (%{}), %xmm0", c_name)); // xmm0 = {C[j], C[j+1]}
-                    self.state
-                        .emit_fmt(format_args!("    vfmadd231pd (%{}), %xmm1, %xmm0", b_name));
-                    self.state
-                        .emit_fmt(format_args!("    vmovupd %xmm0, (%{})", c_name)); // store back
+                    if self.isa.fma {
+                        self.state
+                            .emit_fmt(format_args!("    vmovsd (%{}), %xmm1", a_name)); // xmm1 = A scalar
+                        self.state.emit("    vunpcklpd %xmm1, %xmm1, %xmm1"); // xmm1 = {A, A}
+                        self.state
+                            .emit_fmt(format_args!("    vmovupd (%{}), %xmm0", c_name)); // xmm0 = {C[j], C[j+1]}
+                        self.state
+                            .emit_fmt(format_args!("    vfmadd231pd (%{}), %xmm1, %xmm0", b_name));
+                        self.state
+                            .emit_fmt(format_args!("    vmovupd %xmm0, (%{})", c_name)); // store back
+                    } else {
+                        // Legacy SSE2 (`-mno-avx` / `-march=x86-64`): separate
+                        // mulpd + addpd (two roundings, i.e. exactly the
+                        // scalar semantics under the default
+                        // -ffp-contract=off).  B and C are loaded with
+                        // `movupd` because neither 2×F64 row slice has a
+                        // proven 16-byte alignment and the memory operand of
+                        // `mulpd`/`addpd m128` faults on misalignment.
+                        self.state
+                            .emit_fmt(format_args!("    movsd (%{}), %xmm1", a_name));
+                        self.state.emit("    unpcklpd %xmm1, %xmm1");
+                        self.state
+                            .emit_fmt(format_args!("    movupd (%{}), %xmm0", b_name));
+                        self.state.emit("    mulpd %xmm1, %xmm0");
+                        self.state
+                            .emit_fmt(format_args!("    movupd (%{}), %xmm1", c_name));
+                        self.state.emit("    addpd %xmm1, %xmm0");
+                        self.state
+                            .emit_fmt(format_args!("    movupd %xmm0, (%{})", c_name));
+                    }
 
                     self.state.reg_cache.invalidate_all();
                 }
@@ -2725,12 +2746,36 @@ impl X86Codegen {
                         self.value_to_reg(c_ptr, "rax");
                         "rax"
                     };
-                    self.state
-                        .emit_fmt(format_args!("    vmovupd (%{}), %ymm0", c_name));
-                    self.state
-                        .emit_fmt(format_args!("    vfmadd231pd (%{}), %ymm1, %ymm0", b_name));
-                    self.state
-                        .emit_fmt(format_args!("    vmovupd %ymm0, (%{})", c_name));
+                    if self.isa.fma && self.isa.ymm {
+                        self.state
+                            .emit_fmt(format_args!("    vmovupd (%{}), %ymm0", c_name));
+                        self.state
+                            .emit_fmt(format_args!("    vfmadd231pd (%{}), %ymm1, %ymm0", b_name));
+                        self.state
+                            .emit_fmt(format_args!("    vmovupd %ymm0, (%{})", c_name));
+                    } else {
+                        // Legacy SSE2: two 2-lane mul+add pairs per group.
+                        // The broadcast factor {A, A} lives in %xmm1
+                        // (BroadcastLoadF64 legacy form) and must survive
+                        // both halves and every iteration, the product needs
+                        // a register (%xmm0) and so does the C addend: SSE2
+                        // has no unaligned memory-source arithmetic and
+                        // neither slice is provably 16-byte aligned.  The
+                        // third register is %xmm2, which the allocator
+                        // withholds from any function containing this
+                        // intrinsic (regalloc_helpers `clobbers_xmm2`, the
+                        // same contract as VecMulI64x2 / Pblendvb128).
+                        for half in [0u32, 16] {
+                            self.state
+                                .emit_fmt(format_args!("    movupd {}(%{}), %xmm0", half, b_name));
+                            self.state.emit("    mulpd %xmm1, %xmm0");
+                            self.state
+                                .emit_fmt(format_args!("    movupd {}(%{}), %xmm2", half, c_name));
+                            self.state.emit("    addpd %xmm2, %xmm0");
+                            self.state
+                                .emit_fmt(format_args!("    movupd %xmm0, {}(%{})", half, c_name));
+                        }
+                    }
                     self.state.reg_cache.invalidate_all();
                 }
             }
@@ -2835,8 +2880,15 @@ impl X86Codegen {
                 // Load scalar F64 from pointer and broadcast to ymm1.
                 // Placed before the vectorized j-loop.
                 self.operand_to_reg(&args[0], "rcx");
-                self.state.emit("    vmovsd (%rcx), %xmm1");
-                self.state.emit("    vbroadcastsd %xmm1, %ymm1");
+                if self.isa.fma && self.isa.ymm {
+                    self.state.emit("    vmovsd (%rcx), %xmm1");
+                    self.state.emit("    vbroadcastsd %xmm1, %ymm1");
+                } else {
+                    // Legacy SSE2 consumer (FmaF64x2Hoisted) reads {A, A}
+                    // from %xmm1.
+                    self.state.emit("    movsd (%rcx), %xmm1");
+                    self.state.emit("    unpcklpd %xmm1, %xmm1");
+                }
             }
             IntrinsicOp::FmaF64x4SIB => {
                 self.flush_pending_vec_store_impl();
@@ -3230,6 +3282,29 @@ impl X86Codegen {
                     if !loaded_home {
                         self.avx_store_dest(d);
                     }
+                }
+            }
+            IntrinsicOp::VecLoadWidenI32ToI64x2 => {
+                // Two I32 lanes sign-extended to two I64 lanes (the SSE2
+                // half of the widening `long += int[i]` reduction; the AVX2
+                // form is `vpmovsxdq`).  SSE4.1's `pmovsxdq` is not in the
+                // baseline ISA, so build the extension from SSE2 primitives:
+                //   movq      mem, %xmm0     ; xmm0 = {a, b, 0, 0} (I32 lanes)
+                //   movdqa    %xmm0, %xmm1
+                //   psrad     $31, %xmm1     ; xmm1 = {sa, sb, 0, 0} (sign words)
+                //   punpckldq %xmm1, %xmm0   ; xmm0 = {a, sa, b, sb} = {sext a, sext b}
+                // Before this arm existed the op reached the emitter only via
+                // LCCC_FORCE_SSE2 and ICEd ("unhandled intrinsic op"); with the
+                // ISA gate selecting the 128-bit vectoriser for -mno-avx /
+                // baseline TUs it is a mainstream path.
+                let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
+                self.state.emit_fmt(format_args!("    movq {}, %xmm0", mem));
+                self.state.emit("    movdqa %xmm0, %xmm1");
+                self.state.emit("    psrad $31, %xmm1");
+                self.state.emit("    punpckldq %xmm1, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.sse_store_dest(d, "xmm0");
                 }
             }
             IntrinsicOp::VecLoadI64x2 => {
@@ -4852,8 +4927,15 @@ impl X86Codegen {
             // Generic SIMD family (512-bit + FP): emitted by intrinsics_simd.rs.
             _ => {
                 if !self.emit_simd_op(dest, op, dest_ptr, args) {
-                    eprintln!(
-                        "ccc: internal: unhandled intrinsic op {:?} (dest_ptr={}, args={})",
+                    // A silently skipped intrinsic leaves its destination
+                    // uninitialised and the object file "successfully"
+                    // compiled — the worst failure mode a compiler has.  The
+                    // driver maps this panic to `ccc: internal error` and a
+                    // non-zero exit (lib.rs compiler_main), so the build
+                    // stops here instead of at run time.
+                    panic!(
+                        "unhandled intrinsic op {:?} (dest_ptr={}, args={}) — no x86-64 lowering \
+                         for this operation under the active ISA; this is a compiler bug",
                         op,
                         dest_ptr.is_some(),
                         args.len()

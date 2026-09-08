@@ -165,10 +165,24 @@ impl X86Codegen {
                         // the low lane, so the upper-bit difference is
                         // unobservable; the vectorizer's packed pairs never
                         // route through this scalar helper.
-                        self.state.emit_fmt(format_args!(
-                            "    v{} %{}, %{}, %{}",
-                            mov_instr, name, name, reg
-                        ));
+                        // Without AVX the full-width `movaps`/`movapd`
+                        // (GCC's spelling) gives the same dependency-free
+                        // copy: it writes all of `reg` and reads only the
+                        // source; scalar consumers ignore the upper lanes.
+                        if self.isa.avx {
+                            self.state.emit_fmt(format_args!(
+                                "    v{} %{}, %{}, %{}",
+                                mov_instr, name, name, reg
+                            ));
+                        } else {
+                            let movap = if ty == IrType::F64 {
+                                "movapd"
+                            } else {
+                                "movaps"
+                            };
+                            self.state
+                                .emit_fmt(format_args!("    {} %{}, %{}", movap, name, reg));
+                        }
                     }
                     return;
                 }
@@ -269,10 +283,7 @@ impl X86Codegen {
         // `reg` already holds the other operand (dot-product: mul into
         // xmm2 then `s=0 + p` xorpd'd the product away).
         let emit_vop = |this: &mut Self, src2: &str, src1: &str| {
-            this.state.emit_fmt(format_args!(
-                "    {}{} {}, %{}, %{}",
-                mnemonic, suffix, src2, src1, reg
-            ));
+            this.emit_fp_op3(mnemonic, suffix, src2, src1, reg, commutative);
         };
 
         if dest_holds_lhs && dest_holds_rhs {
@@ -282,13 +293,13 @@ impl X86Codegen {
         }
         if dest_holds_lhs {
             // dest already has lhs: dest = lhs op rhs.
-            self.emit_fp_src2_then_vop(rhs, ty, reg, mnemonic, suffix);
+            self.emit_fp_src2_then_vop(rhs, ty, reg, mnemonic, suffix, commutative);
             self.state.reg_cache.invalidate_acc();
             return true;
         }
         if dest_holds_rhs && commutative {
             // dest already has rhs: dest = rhs op lhs == lhs op rhs.
-            self.emit_fp_src2_then_vop(lhs, ty, reg, mnemonic, suffix);
+            self.emit_fp_src2_then_vop(lhs, ty, reg, mnemonic, suffix, commutative);
             self.state.reg_cache.invalidate_acc();
             return true;
         }
@@ -322,7 +333,7 @@ impl X86Codegen {
         // lhs-homed case applies; the rhs-homed commutative case swaps.
         if let Some(l) = lhs_home {
             // src1 = lhs (in a register); src2 = rhs via the mem/const folder.
-            self.emit_fp_src2_then_vop_with_src1(rhs, ty, reg, mnemonic, suffix, l);
+            self.emit_fp_src2_then_vop_with_src1(rhs, ty, reg, mnemonic, suffix, l, commutative);
             self.state.reg_cache.invalidate_acc();
             return true;
         }
@@ -330,7 +341,15 @@ impl X86Codegen {
             if let Some(r) = rhs_home {
                 // commutative: dest = rhs op lhs == lhs op rhs.
                 // src1 = rhs (register), src2 = lhs (mem/const).
-                self.emit_fp_src2_then_vop_with_src1(lhs, ty, reg, mnemonic, suffix, r);
+                self.emit_fp_src2_then_vop_with_src1(
+                    lhs,
+                    ty,
+                    reg,
+                    mnemonic,
+                    suffix,
+                    r,
+                    commutative,
+                );
                 self.state.reg_cache.invalidate_acc();
                 return true;
             }
@@ -343,7 +362,7 @@ impl X86Codegen {
         // exactly this reason at -O2. Only -fno-signed-zeros may fold it,
         // which LCCC does not plumb into codegen yet.
         self.load_fp_to_reg(lhs, ty, reg);
-        self.emit_fp_src2_then_vop(rhs, ty, reg, mnemonic, suffix);
+        self.emit_fp_src2_then_vop(rhs, ty, reg, mnemonic, suffix, commutative);
         self.state.reg_cache.invalidate_acc();
         true
     }
@@ -363,12 +382,10 @@ impl X86Codegen {
         mnemonic: &str,
         suffix: &str,
         src1: &'static str,
+        commutative: bool,
     ) {
         let vop = |this: &mut Self, src2: String| {
-            this.state.emit_fmt(format_args!(
-                "    {}{} {}, %{}, %{}",
-                mnemonic, suffix, src2, src1, dest
-            ));
+            this.emit_fp_op3(mnemonic, suffix, &src2, src1, dest, commutative);
         };
         match src {
             Operand::Value(v) => {
@@ -412,12 +429,10 @@ impl X86Codegen {
         dest: &str,
         mnemonic: &str,
         suffix: &str,
+        commutative: bool,
     ) {
         let vop = |this: &mut Self, src2: String| {
-            this.state.emit_fmt(format_args!(
-                "    {}{} {}, %{}, %{}",
-                mnemonic, suffix, src2, dest, dest
-            ));
+            this.emit_fp_op3(mnemonic, suffix, &src2, dest, dest, commutative);
         };
         match src {
             Operand::Value(v) => {
@@ -465,6 +480,47 @@ impl X86Codegen {
         ty: IrType,
         inst: &str,
     ) {
+        // `inst` is the VEX spelling (`vsqrtsd`); without AVX the legacy
+        // two-operand `sqrtsd %src, %dst` is used.  The legacy form is a
+        // merging op on the destination's upper lanes exactly like `movsd`,
+        // so the source-direct read-in-place path is still the right shape
+        // (one instruction, no staging copy).
+        if !self.isa.avx {
+            let legacy = inst.strip_prefix('v').unwrap_or(inst);
+            if let Some(d) = dest {
+                if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                    if is_xmm_reg(reg) {
+                        let dname = phys_reg_name(reg);
+                        if let Operand::Value(sv) = arg {
+                            if let Some(&sreg) = self.reg_assignments.get(&sv.0) {
+                                if is_xmm_reg(sreg) && sreg != reg {
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} %{}, %{}",
+                                        legacy,
+                                        phys_reg_name(sreg),
+                                        dname
+                                    ));
+                                    self.state.reg_cache.invalidate_acc();
+                                    return;
+                                }
+                            }
+                        }
+                        self.load_fp_to_reg(arg, ty, dname);
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %{}", legacy, dname, dname));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+            }
+            self.load_fp_to_xmm0(arg, ty);
+            self.state
+                .emit_fmt(format_args!("    {} %xmm0, %xmm0", legacy));
+            if let Some(d) = dest {
+                self.store_xmm0_fp_dest(d, ty);
+            }
+            return;
+        }
         if let Some(d) = dest {
             if let Some(&reg) = self.reg_assignments.get(&d.0) {
                 if is_xmm_reg(reg) {
@@ -497,8 +553,17 @@ impl X86Codegen {
                         }
                     }
                     self.load_fp_to_reg(arg, ty, dname);
-                    self.state
-                        .emit_fmt(format_args!("    {} %{}, %{}", inst, dname, dname));
+                    // VEX scalar unaries are three-operand only: the middle
+                    // operand supplies the upper lanes.  The old two-operand
+                    // spelling `vsqrtsd %d, %d` is not valid AT&T syntax —
+                    // GAS 2.44 rejects it ("number of operands mismatch") and
+                    // the builtin assembler silently encoded it as
+                    // `vsqrtsd %d, %xmm0, %d`, i.e. with a spurious upper-lane
+                    // dependency on %xmm0.
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}, %{}",
+                        inst, dname, dname, dname
+                    ));
                     self.state.reg_cache.invalidate_acc();
                     return;
                 }
@@ -506,7 +571,7 @@ impl X86Codegen {
         }
         self.load_fp_to_xmm0(arg, ty);
         self.state
-            .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
+            .emit_fmt(format_args!("    {} %xmm0, %xmm0, %xmm0", inst));
         if let Some(d) = dest {
             self.store_xmm0_fp_dest(d, ty);
         }
@@ -527,6 +592,57 @@ impl X86Codegen {
         ty: IrType,
         imm: u8,
     ) {
+        // The simplify fold that produces RoundScalarF* is gated on
+        // `set_has_round_insn` (SSE4.1), so reaching here without SSE4.1 is
+        // a pipeline bug, not a user-visible condition.
+        debug_assert!(
+            self.isa.sse41,
+            "RoundScalar intrinsic reached the x86 emitter without SSE4.1"
+        );
+        if !self.isa.avx {
+            // Legacy SSE4.1 `roundsd $imm, %src, %dst` (two operands + imm8).
+            let legacy = if ty == IrType::F32 {
+                "roundss"
+            } else {
+                "roundsd"
+            };
+            if let Some(d) = dest {
+                if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                    if is_xmm_reg(reg) {
+                        let dname = phys_reg_name(reg);
+                        if let Operand::Value(sv) = arg {
+                            if let Some(&sreg) = self.reg_assignments.get(&sv.0) {
+                                if is_xmm_reg(sreg) && sreg != reg {
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} ${}, %{}, %{}",
+                                        legacy,
+                                        imm,
+                                        phys_reg_name(sreg),
+                                        dname
+                                    ));
+                                    self.state.reg_cache.invalidate_acc();
+                                    return;
+                                }
+                            }
+                        }
+                        self.load_fp_to_reg(arg, ty, dname);
+                        self.state.emit_fmt(format_args!(
+                            "    {} ${}, %{}, %{}",
+                            legacy, imm, dname, dname
+                        ));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+            }
+            self.load_fp_to_xmm0(arg, ty);
+            self.state
+                .emit_fmt(format_args!("    {} ${}, %xmm0, %xmm0", legacy, imm));
+            if let Some(d) = dest {
+                self.store_xmm0_fp_dest(d, ty);
+            }
+            return;
+        }
         let inst = if ty == IrType::F32 {
             "vroundss"
         } else {
@@ -598,6 +714,27 @@ impl X86Codegen {
         };
         let abs_label = self.state.get_fp_const_label(abs_mask);
         let sign_label = self.state.get_fp_const_label(sign_mask);
+        if !self.isa.avx {
+            // Legacy SSE: the bit ops are destructive two-operand forms, so
+            // both inputs are staged into the xmm0/xmm1 scratch pair first
+            // (movsd/movss from an XMM home is a single merging move).  The
+            // pool constants are `.p2align 4` (emit_fp_const_pool), as the
+            // aligned memory operand of `andpd m128` requires.
+            let (andl, orl) = (&andp[1..], &orp[1..]);
+            self.load_fp_to_reg(y, ty, "xmm1");
+            self.state
+                .emit_fmt(format_args!("    {} {}(%rip), %xmm1", andl, sign_label));
+            self.load_fp_to_xmm0(x, ty);
+            self.state
+                .emit_fmt(format_args!("    {} {}(%rip), %xmm0", andl, abs_label));
+            self.state
+                .emit_fmt(format_args!("    {} %xmm1, %xmm0", orl));
+            if let Some(d) = dest {
+                self.store_xmm0_fp_dest(d, ty);
+            }
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
         // Source-direct: masks are non-destructive 3-operand VEX ops, so
         // XMM-homed operands are read in place (no movsd staging copies) —
         // sign bits land in scratch xmm1, magnitude in scratch xmm0.
@@ -704,7 +841,7 @@ impl X86Codegen {
 
         let mnemonic = self.emit_float_binop_mnemonic_impl(op);
         let suffix = if ty == IrType::F64 { "sd" } else { "ss" };
-        let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
+        let commutative = matches!(op, FloatOp::Add | FloatOp::Mul);
 
         // Load LHS to %xmm0 (register-allocated XMM home first, then slot,
         // then GPR round-trip for constants / homless values).
@@ -721,10 +858,7 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
                 }
-                self.state.emit_fmt(format_args!(
-                    "    {}{} %xmm1, %xmm0, %xmm0",
-                    mnemonic, suffix
-                ));
+                self.emit_fp_op3(mnemonic, suffix, "%xmm1", "xmm0", "xmm0", commutative);
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
@@ -735,10 +869,7 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
                 }
-                self.state.emit_fmt(format_args!(
-                    "    {}{} %xmm1, %xmm0, %xmm0",
-                    mnemonic, suffix
-                ));
+                self.emit_fp_op3(mnemonic, suffix, "%xmm1", "xmm0", "xmm0", commutative);
             }
             Operand::Value(v) => {
                 // XMM register direct: if RHS is in xmm3-xmm7 (register allocator
@@ -747,20 +878,21 @@ impl X86Codegen {
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     if is_xmm_reg(reg) {
                         let src_name = phys_reg_name(reg);
-                        self.state.emit_fmt(format_args!(
-                            "    {}{} %{}, %xmm0, %xmm0",
-                            mnemonic, suffix, src_name
-                        ));
+                        self.emit_fp_op3(
+                            mnemonic,
+                            suffix,
+                            &format!("%{}", src_name),
+                            "xmm0",
+                            "xmm0",
+                            commutative,
+                        );
                         self.store_xmm0_fp_dest(dest, ty);
                         return;
                     }
                 }
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot.0);
-                    self.state.emit_fmt(format_args!(
-                        "    {}{} {}, %xmm0, %xmm0",
-                        mnemonic, suffix, sr
-                    ));
+                    self.emit_fp_op3(mnemonic, suffix, &sr, "xmm0", "xmm0", commutative);
                 } else {
                     self.operand_to_rcx(rhs);
                     if ty == IrType::F32 {
@@ -768,10 +900,7 @@ impl X86Codegen {
                     } else {
                         self.state.emit("    movq %rcx, %xmm1");
                     }
-                    self.state.emit_fmt(format_args!(
-                        "    {}{} %xmm1, %xmm0, %xmm0",
-                        mnemonic, suffix
-                    ));
+                    self.emit_fp_op3(mnemonic, suffix, "%xmm1", "xmm0", "xmm0", commutative);
                 }
             }
             _ => {
@@ -781,10 +910,7 @@ impl X86Codegen {
                 } else {
                     self.state.emit("    movq %rcx, %xmm1");
                 }
-                self.state.emit_fmt(format_args!(
-                    "    {}{} %xmm1, %xmm0, %xmm0",
-                    mnemonic, suffix
-                ));
+                self.emit_fp_op3(mnemonic, suffix, "%xmm1", "xmm0", "xmm0", commutative);
             }
         }
 
@@ -797,12 +923,82 @@ impl X86Codegen {
         unreachable!("x86 emit_float_binop_impl should not be called directly");
     }
 
+    /// Scalar FP arithmetic mnemonic stem for the current ISA: `vadd` (VEX
+    /// 3-operand) under AVX, `add` (legacy SSE 2-operand) otherwise.  Every
+    /// emission goes through [`Self::emit_fp_op3`], which turns the
+    /// 3-operand shape into a legal legacy sequence when needed.
     pub(super) fn emit_float_binop_mnemonic_impl(&self, op: FloatOp) -> &'static str {
-        match op {
-            FloatOp::Add => "vadd",
-            FloatOp::Sub => "vsub",
-            FloatOp::Mul => "vmul",
-            FloatOp::Div => "vdiv",
+        match (op, self.isa.avx) {
+            (FloatOp::Add, true) => "vadd",
+            (FloatOp::Sub, true) => "vsub",
+            (FloatOp::Mul, true) => "vmul",
+            (FloatOp::Div, true) => "vdiv",
+            (FloatOp::Add, false) => "add",
+            (FloatOp::Sub, false) => "sub",
+            (FloatOp::Mul, false) => "mul",
+            (FloatOp::Div, false) => "div",
+        }
+    }
+
+    /// Emit `dest = src1 OP src2` for a scalar FP op.
+    ///
+    /// * AVX: the non-destructive `v{op}{suffix} src2, %src1, %dest`.
+    /// * Legacy SSE (`-mno-avx`, `-march=x86-64`, kernel): the two-operand
+    ///   `{op}{suffix} src2, %dest` is destructive, so
+    ///   - `src1 == dest` → one instruction;
+    ///   - `src2 == %dest` and OP commutative → `{op} %src1, %dest`;
+    ///   - `src2 == %dest`, non-commutative → compute in scratch `%xmm0`
+    ///     (`movap? %src1, %xmm0; {op} %dest, %xmm0; movap? %xmm0, %dest`);
+    ///     `dest` is an allocator register (xmm2+) so it never aliases the
+    ///     scratch — asserted below;
+    ///   - otherwise `movap? %src1, %dest; {op} src2, %dest`.  The copy is
+    ///     a full-width `movaps`/`movapd` (GCC's choice): unlike the merging
+    ///     `movsd` it does not read `dest`'s previous contents, so no false
+    ///     loop-carried dependence is introduced; the upper lanes hold
+    ///     garbage, which scalar consumers never read.
+    ///
+    /// `src2` is a complete AT&T operand (`%xmm3`, `-8(%rbp)`, `.LC0(%rip)`);
+    /// `src1` and `dest` are bare register names.
+    pub(super) fn emit_fp_op3(
+        &mut self,
+        mnemonic: &str,
+        suffix: &str,
+        src2: &str,
+        src1: &str,
+        dest: &str,
+        commutative: bool,
+    ) {
+        if self.isa.avx {
+            self.state.emit_fmt(format_args!(
+                "    {}{} {}, %{}, %{}",
+                mnemonic, suffix, src2, src1, dest
+            ));
+            return;
+        }
+        let legacy = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
+        let movap = if suffix == "ss" { "movaps" } else { "movapd" };
+        let src2_is_dest = src2.strip_prefix('%') == Some(dest);
+        if src1 == dest {
+            self.state
+                .emit_fmt(format_args!("    {}{} {}, %{}", legacy, suffix, src2, dest));
+        } else if src2_is_dest && commutative {
+            self.state.emit_fmt(format_args!(
+                "    {}{} %{}, %{}",
+                legacy, suffix, src1, dest
+            ));
+        } else if src2_is_dest {
+            debug_assert!(dest != "xmm0" && src1 != "xmm0");
+            self.state
+                .emit_fmt(format_args!("    {} %{}, %xmm0", movap, src1));
+            self.state
+                .emit_fmt(format_args!("    {}{} %{}, %xmm0", legacy, suffix, dest));
+            self.state
+                .emit_fmt(format_args!("    {} %xmm0, %{}", movap, dest));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    {} %{}, %{}", movap, src1, dest));
+            self.state
+                .emit_fmt(format_args!("    {}{} {}, %{}", legacy, suffix, src2, dest));
         }
     }
 
@@ -1061,15 +1257,27 @@ impl X86Codegen {
                             // `movaps` was rejected here for full-register
                             // partial-dependency reasons; the VEX scalar form
                             // has neither defect: it reads only the source.
-                            let mv = if ty == IrType::F32 {
-                                "vmovss"
+                            if self.isa.avx {
+                                let mv = if ty == IrType::F32 {
+                                    "vmovss"
+                                } else {
+                                    "vmovsd"
+                                };
+                                self.state.emit_fmt(format_args!(
+                                    "    {} %{}, %{}, %{}",
+                                    mv, name, name, xmm
+                                ));
                             } else {
-                                "vmovsd"
-                            };
-                            self.state.emit_fmt(format_args!(
-                                "    {} %{}, %{}, %{}",
-                                mv, name, name, xmm
-                            ));
+                                // Legacy: full-width movaps/movapd reads only
+                                // the source (no merge), same as GCC -mno-avx.
+                                let mv = if ty == IrType::F32 {
+                                    "movaps"
+                                } else {
+                                    "movapd"
+                                };
+                                self.state
+                                    .emit_fmt(format_args!("    {} %{}, %{}", mv, name, xmm));
+                            }
                         }
                     } else {
                         let gpr = phys_reg_name(reg);

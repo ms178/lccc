@@ -515,6 +515,10 @@ pub struct X86Codegen {
     pub(super) tune: crate::backend::x86::cpu_model::X86Tune,
     /// True when the target has AVX2; gates YMM constant-size copies.
     pub(super) avx2_enabled: bool,
+    /// Code-generation ISA permission for the current TU (VEX / SSE4.1 /
+    /// FMA3 / ymm).  Every text emitter consults this instead of assuming
+    /// the x86-64-v3 baseline; see `backend::x86::isa`.
+    pub(super) isa: super::super::isa::X86Isa,
     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
     pub(super) avx512_enabled: bool,
     /// -Os/-Oz: prefer the shorter sequence over the faster one (codegen-side
@@ -939,6 +943,7 @@ impl X86Codegen {
             bmi2_enabled: false,
             tune: crate::backend::x86::cpu_model::X86Tune::GENERIC,
             avx2_enabled: false,
+            isa: super::super::isa::X86Isa::default(),
             avx512_enabled: false,
             optimize_for_size: false,
             skip_i32_sext: false,
@@ -1058,11 +1063,17 @@ impl X86Codegen {
         } else {
             super::isel::ShlxMode::Never
         });
-        self.avx2_enabled = opts.avx2;
-        self.avx512_enabled = opts.avx512;
+        self.avx2_enabled = opts.avx2 && opts.isa.ymm;
+        self.avx512_enabled = opts.avx512 && opts.isa.ymm;
+        self.isa = opts.isa;
+        // Publish for the emitters without `&self` (MachInst, peepholes).
+        super::super::isa::set_current(opts.isa);
         self.state.emit_cfi = opts.emit_cfi;
         self.fp_contract = opts.fp_contract;
-        self.fma_enabled = opts.fma;
+        // FMA3 contraction follows the permission, not the request bit: the
+        // baseline-v3 default grants it, `-mno-fma`/`-mno-avx`/`-march=x86-64`
+        // deny it (vfmadd* is VEX-only).
+        self.fma_enabled = opts.isa.fma;
         self.optimize_for_size = opts.optimize_for_size;
     }
 

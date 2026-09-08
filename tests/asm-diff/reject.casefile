@@ -101,3 +101,15 @@ tzcntq %r8d, %r9d
 bsfq %r8d, %r9
 bsfq %r8, %r9d
 bsfl %r8, %r9
+;;; vex_scalar_unary_two_operand reject
+.text
+vsqrtsd %xmm1, %xmm2
+vsqrtss %xmm1, %xmm2
+vsqrtsd (%rax), %xmm2
+vsqrtss %xmm3, %xmm3
+;;; bt_suffix_width_mismatch reject
+.text
+btl $31, %r8
+btl %ecx, %r8
+btq $31, %r8d
+btl $5, %rax

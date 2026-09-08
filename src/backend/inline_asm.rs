@@ -160,6 +160,13 @@ pub trait InlineAsmEmitter {
         all_output_regs: &[&str],
     );
 
+    /// Whether GCC's `%v` mnemonic prefix expands to `v` (the TU may use
+    /// VEX encodings) or to nothing.  Only the x86-64 backend with AVX
+    /// answers `true`.
+    fn asm_vex_prefix_enabled(&self) -> bool {
+        false
+    }
+
     /// Comment markers emitted around the substituted inline-asm body
     /// (`Some((open, close))`), or `None` to emit no markers.
     ///
@@ -568,13 +575,23 @@ pub fn emit_inline_asm_common_impl(
             operand_types,
             goto_labels,
         );
-        // Strip GNU-as mnemonic hint prefixes (glibc math uses `%vstmxcsr` /
-        // `%vldmxcsr` and `%xbegin`): GCC removes the `%v`/`%x` when emitting
-        // the assembly; GAS 2.47 rejects them in the final .s (GAS-oracle:
-        // "junk after expression"). `%x` is kept when it starts a register
-        // (%xmm0..); no register name starts with `%v`.
+        // GCC mnemonic-prefix modifiers (glibc math uses `%vstmxcsr`,
+        // `%vldmxcsr`, `%vdivss %1, %d0` and `%xbegin`):
+        //   `%v` prints `v` when the TU has AVX and nothing otherwise (i386
+        //        `print_operand` case 'v': "print VEX prefix if TARGET_AVX"),
+        //        so one template yields `vdivss …` or `divss …`;
+        //   `%x` prints nothing on x86 (it is the "print operand in
+        //        V4SFmode" hint; a bare `%x` before a mnemonic is a no-op).
+        // GAS rejects both spellings in the final .s ("junk after
+        // expression").  `%x` is kept when it starts a register (%xmm0..);
+        // no register name starts with `%v`.  The `%d` duplicate modifier
+        // follows the same AVX switch (see x86_common::emit_operand_common).
         let stripped = if resolved.starts_with("%v") {
-            resolved.replacen("%v", "", 1)
+            if emitter.asm_vex_prefix_enabled() {
+                resolved.replacen("%v", "v", 1)
+            } else {
+                resolved.replacen("%v", "", 1)
+            }
         } else if resolved.starts_with("%x")
             && !resolved.starts_with("%xmm")
             && !resolved.starts_with("%ymm")

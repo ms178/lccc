@@ -92,11 +92,19 @@ impl I686Codegen {
                 let _ = write!(result, "(%{})", op_regs[idx]);
             }
         } else {
-            // Register operand — apply size modifier, default is 32-bit
+            // Register operand — apply size modifier, default is 32-bit.
+            // `%d` (GCC "duplicate") prints the register twice at its
+            // natural width (see x86_common::emit_operand_common).
             let effective_mod = modifier
+                .filter(|m| *m != 'd')
                 .or_else(|| Self::i686_default_modifier_for_type(op_types.get(idx).copied()));
+            let reg = Self::format_i686_reg(&op_regs[idx], effective_mod);
             result.push('%');
-            result.push_str(&Self::format_i686_reg(&op_regs[idx], effective_mod));
+            result.push_str(&reg);
+            if modifier == Some('d') {
+                result.push_str(", %");
+                result.push_str(&reg);
+            }
         }
     }
 

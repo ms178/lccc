@@ -2004,25 +2004,17 @@ impl InstructionEncoder {
             "vpgatherqq" => self.encode_avx_gather(ops, 0x91, 1),
             "vcvtss2sd" => self.encode_avx_scalar_3op(ops, 0x5A, 2),
             "vsqrtpd" => self.encode_avx_2op_0f(ops, 0x51, 1),
-            // Scalar sqrt (VEX.LIG.F2/F3.0F 51): nbody/ICX use vsqrtsd.
-            // Both forms are architectural: the 2-op legacy compat form and
-            // the VEX.NDS 3-op form (dst = sqrt(src2), upper bits from
-            // vvvv) — the 3-op form is what breaks loop-carried false
-            // dependencies when dst != src (see emit_fp_scalar_unary).
-            "vsqrtsd" => {
-                if ops.len() == 3 {
-                    self.encode_avx_scalar_3op(ops, 0x51, 3)
-                } else {
-                    self.encode_avx_2op_0f(ops, 0x51, 3)
-                } // F2
-            }
-            "vsqrtss" => {
-                if ops.len() == 3 {
-                    self.encode_avx_scalar_3op(ops, 0x51, 2)
-                } else {
-                    self.encode_avx_2op_0f(ops, 0x51, 2)
-                } // F3
-            }
+            // Scalar sqrt (VEX.NDS.LIG.F2/F3.0F 51): three operands only —
+            // dst = sqrt(src2), upper lanes from vvvv (src1).  The scalar
+            // VEX form has NO two-operand spelling (SDM Vol.2B SQRTSD: only
+            // `VSQRTSD xmm1, xmm2, xmm3/m64`); GAS rejects `vsqrtsd %a, %d`
+            // ("number of operands mismatch").  The former compat arm
+            // encoded that spelling with vvvv=0, i.e. `vsqrtsd %a, %xmm0,
+            // %d` — a hidden upper-lane dependency on %xmm0 in every sqrt
+            // loop (and a divergence from every external assembler).
+            // Rejecting it here keeps the builtin assembler an honest oracle.
+            "vsqrtsd" => self.encode_avx_scalar_3op(ops, 0x51, 3), // F2
+            "vsqrtss" => self.encode_avx_scalar_3op(ops, 0x51, 2), // F3
             "vaddps" => self.encode_avx_3op_np(ops, 0x58),
             "vsubps" => self.encode_avx_3op_np(ops, 0x5C),
             "vmulps" => self.encode_avx_3op_np(ops, 0x59),

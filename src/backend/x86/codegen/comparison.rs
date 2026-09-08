@@ -1300,6 +1300,14 @@ impl X86Codegen {
         false_val: &Operand,
         ty: IrType,
     ) -> bool {
+        // VEX only: the OQ predicates 13/14/17/18 exist solely in the
+        // 32-predicate VEX encoding, and `blendvpd` without VEX is SSE4.1
+        // with an implicit %xmm0 mask.  Under legacy SSE the caller's
+        // ucomisd + setcc/branch path is used instead (GCC does the same at
+        // -mno-avx).
+        if !self.isa.avx {
+            return false;
+        }
         // vcmpsd predicate per the ucomisd-setcc semantics:
         //   * Eq  → EQ_OQ (0):  ordered equal, NaN → false  (setnp&sete)
         //   * Ne  → NEQ_UQ (4): unordered OR not-equal, NaN → true (setp|setne)
