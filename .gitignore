@@ -7,9 +7,11 @@
 /target-sroa/
 **/*.rs.bk
 
-# Crash dumps
-core
-core.*
+# Crash dumps (root-anchored: a bare `core.*` also matched
+# src/backend/*/assembler/encoder/core.rs and made fresh clones
+# unable to `git add` the tracked encoder sources)
+/core
+/core.*
 
 # CCC submodule build
 /ccc/target/
@@ -45,6 +47,9 @@ bench_*
 !scripts/bench_kernels.py
 !scripts/bench_iv_widen_ab.sh
 !scripts/bench_rank.py
+# Likewise the codegen-gate self-test is CI source, not a scratch test
+# binary: without this negation `test_*` swallows it.
+!.github/scripts/test_ci_codegen_gate.py
 
 # Benchmark / test output
 /test-results/

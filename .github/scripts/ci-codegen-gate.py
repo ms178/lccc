@@ -67,32 +67,49 @@ TOLERANCES = {
 
 INSN_RE = re.compile(r"^\s+([a-z0-9]+)[\s]")
 MEM_RE = re.compile(r"[-0-9(]*\((?:%rbp|%rsp)\)")
+# A `N(%rbp)` operand is stack traffic only when rbp is the frame pointer.
+# In FPO functions rbp is an ordinary callee-saved GPR (and a *good* one for
+# pointers: `8(%rbp)` needs no SIB byte while `8(%r12)` does), so `8(%rbp)`
+# there is a heap/data dereference, not a spill. Count a function as
+# rbp-as-GPR only on positive proof — a pure-write instruction targeting
+# rbp/ebp (loads, LEAs, self-xor). The pattern is deliberately narrow: a
+# missed writer merely keeps counting (today's behavior, a false positive at
+# worst), while the whitelist can never fire on a true frame-pointer
+# function (rbp is reserved there, so no GPR write to it exists) — the
+# exclusion can therefore never mask a real spill. `movq %rsp,%rbp` is the
+# frame-pointer setup itself and is excluded from the proof.
+RBP_GPR_WRITE_RE = re.compile(
+    r"^\s+(?:movq|movl|movabsq|movsbq|movswq|movslq|movzbq|movzwq|leaq)"
+    r"\s+[^,]+,\s*%[re]?bp\b"
+    r"|^\s+(?:xorl|xorq)\s+%[re]?bp,\s*%[re]?bp\b"
+)
+RBP_SETUP_RE = re.compile(r"^\s+movq\s+%rsp,\s*%rbp\b")
+RBP_REF_RE = re.compile(r"\(%[re]?bp\)")
+RSP_REF_RE = re.compile(r"\(%rsp\)")
 YMM_RE = re.compile(r"^\s+(?:v[a-z]+)\s+[^#]*%ymm")
 FMA_RE = re.compile(r"^\s+(?:vfmadd|vfnmadd|vfmsub|vfnmsub)[a-z0-9]*\s")
 
 
-def function_body_metrics(asm: str) -> dict:
-    """Aggregate metrics over function bodies only (between .type @function
-    and the next .size/.section)."""
-    m = {"insns": 0, "stackmem": 0, "pushes": 0, "moves": 0, "ymm": 0, "fma": 0}
-    in_func = False
-    for line in asm.splitlines():
-        s = line.strip()
-        if s.startswith(".type") and "@function" in s:
-            in_func = True
-            continue
-        if s == ".size" or (s.startswith(".section") and in_func):
-            in_func = False
-            continue
-        if not in_func:
-            continue
+def score_chunk(lines: list, m: dict) -> None:
+    """Score one function body. `N(%rbp)` operands count as stack traffic
+    unless the body proves rbp is a GPR (see RBP_GPR_WRITE_RE)."""
+    rbp_is_gpr = any(
+        RBP_GPR_WRITE_RE.search(l) and not RBP_SETUP_RE.search(l) for l in lines
+    )
+    for line in lines:
         mi = INSN_RE.match(line)
         if not mi:
             continue
         op = mi.group(1)
         m["insns"] += 1
         if MEM_RE.search(line):
-            m["stackmem"] += 1
+            # FPO rbp-deref (pointer/array traffic through the rbp GPR) is
+            # not stack traffic. A line mentioning (%rsp) still counts (a
+            # mixed line is conservative: real slot traffic is never dropped).
+            if not (
+                rbp_is_gpr and RBP_REF_RE.search(line) and not RSP_REF_RE.search(line)
+            ):
+                m["stackmem"] += 1
         if op.startswith("push"):
             m["pushes"] += 1
         if op in ("mov", "movq", "movl", "movw", "movb", "vmovsd", "vmovss"):
@@ -102,6 +119,35 @@ def function_body_metrics(asm: str) -> dict:
             m["ymm"] += 1
         if FMA_RE.match(line):
             m["fma"] += 1
+
+
+def function_body_metrics(asm: str) -> dict:
+    """Aggregate metrics over function bodies only (between .type @function
+    and the next .type/.size/.section). Bodies are scored per-function so
+    the rbp-as-GPR proof stays function-local."""
+    m = {"insns": 0, "stackmem": 0, "pushes": 0, "moves": 0, "ymm": 0, "fma": 0}
+    chunk: list = []
+    in_func = False
+
+    def flush():
+        if chunk:
+            score_chunk(chunk, m)
+            chunk.clear()
+
+    for line in asm.splitlines():
+        s = line.strip()
+        if s.startswith(".type") and "@function" in s:
+            flush()
+            in_func = True
+            continue
+        if s == ".size" or (s.startswith(".section") and in_func):
+            flush()
+            in_func = False
+            continue
+        if not in_func:
+            continue
+        chunk.append(line)
+    flush()
     return m
 
 

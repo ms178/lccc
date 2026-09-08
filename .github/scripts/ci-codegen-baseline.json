@@ -1,30 +1,30 @@
 {
   "gzip_crc32": {
-    "insns": 83,
+    "insns": 81,
     "stackmem": 0,
     "pushes": 6,
-    "moves": 21,
+    "moves": 20,
     "ymm": 0,
     "fma": 0
   },
   "zlib_ng_adler32": {
-    "insns": 241,
-    "stackmem": 5,
+    "insns": 240,
+    "stackmem": 4,
     "pushes": 6,
     "moves": 72,
     "ymm": 0,
     "fma": 0
   },
   "expat_xml_scan": {
-    "insns": 206,
-    "stackmem": 22,
+    "insns": 204,
+    "stackmem": 20,
     "pushes": 6,
     "moves": 43,
     "ymm": 0,
     "fma": 0
   },
   "sqlite_varint": {
-    "insns": 327,
+    "insns": 326,
     "stackmem": 11,
     "pushes": 7,
     "moves": 90,
@@ -32,18 +32,18 @@
     "fma": 0
   },
   "glibc_memcmp": {
-    "insns": 235,
-    "stackmem": 27,
+    "insns": 226,
+    "stackmem": 28,
     "pushes": 11,
-    "moves": 61,
+    "moves": 56,
     "ymm": 0,
     "fma": 0
   },
   "hash_table": {
-    "insns": 155,
+    "insns": 157,
     "stackmem": 0,
     "pushes": 9,
-    "moves": 49,
+    "moves": 50,
     "ymm": 0,
     "fma": 0
   },

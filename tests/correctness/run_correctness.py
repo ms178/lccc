@@ -909,6 +909,44 @@ int main(void){
   return 0;
 }
 """, ["-O3", "-mno-avx2"], None),
+
+    # ── Exact abs fold: `v<0 ? -v : v` → max(v, -v) ──
+    # Positive shapes (the fold MUST fire and stay bit-exact, INT_MIN
+    # included: -INT_MIN wraps to INT_MIN and max(INT_MIN,INT_MIN) is
+    # INT_MIN, identical to the ternary): slt, sle, and abs nested in a
+    # larger expression. Anti-miscompile shapes (must NOT fold): the true
+    # arm negating anything other than the compared value — `0-(v+1)`,
+    # or negating a different lane `w<0 ? 0-v : w` — plus `!=` (not a
+    # lt/le predicate). The small-n sweeps exercise the remainder-loop
+    # mirrors of the same shapes. Differential by construction.
+    ("vectorize_abs_fold_subtrahend", r"""
+#include <stdio.h>
+#include <string.h>
+static void t_abs  (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<0 ? -v : v;}}
+static void t_absle(const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<=0 ? -v : v;}}
+static void t_absadd(const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= (v<0?-v:v)+k;}}
+static void t_negsucc(const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<0 ? 0-(v+1) : v;}}
+static void t_negother(const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){int v=a[i];int w=c[i];b[i]= w<0 ? 0-v : w;}}
+static void t_nezero(const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v!=0 ? -v : v;}}
+#define N 2051
+static int a[N]; static int c[N]; static int b[N];
+static unsigned h(const void*p,int bytes){const unsigned char*q=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=q[i];x*=16777619u;}return x;}
+int main(void){
+  unsigned s=777;
+  for(int i=0;i<N;i++){ s=s*1664525u+1013904223u; a[i]=(int)s; c[i]=(int)(s>>3); }
+  a[0]=-2147483647-1; a[1]=2147483647; a[2]=0; a[3]=-1; a[4]=1; a[5]=-2;
+  c[0]=-2147483647-1; c[1]=0; c[2]=-3;
+  memset(b,0xAB,sizeof b); t_abs(a,b,N); printf("abs %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_absle(a,b,N); printf("absle %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_absadd(a,b,N,-11); printf("absadd %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_negsucc(a,b,N); printf("negsucc %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_negother(a,c,b,N); printf("negother %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_nezero(a,b,N); printf("nezero %08x\n",h(b,sizeof b));
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_abs(a,b,n); printf("a%d %08x\n",n,h(b,n*4)); }
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_negsucc(a,b,n); printf("s%d %08x\n",n,h(b,n*4)); }
+  return 0;
+}
+""", ["-O3", "-march=x86-64-v3"], None),
 ]
 
 # Multi-file test (handled specially)

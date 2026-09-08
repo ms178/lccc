@@ -64,6 +64,35 @@ fn is_alignment_directive(trimmed: &str) -> bool {
         || trimmed.starts_with(".balign")
 }
 
+/// True for the debug-marker directives (`.loc`, `.file`): inert text
+/// markers that carry no code, no control flow, and no register/flag
+/// semantics. They must not fragment a block (boundary scan) and must not
+/// pose as a terminator or as dirt (terminator scan, cleanliness): a `.loc`
+/// between a guard's branch and the next label is as transparent as the
+/// `.p2align` the alignment pass emits there. They DO stay in the block
+/// hash and identity (see below): merging blocks with different line
+/// attribution would lie to the debugger.
+fn is_debug_marker_directive(trimmed: &str) -> bool {
+    trimmed.starts_with(".loc") || trimmed.starts_with(".file")
+}
+
+/// True for lines that carry no block identity: NOPs and
+/// alignment-directive padding. Skipped by the block hash and the
+/// text-identity comparison, so blocks that differ ONLY in padding hash
+/// and compare equal and become mergeable (their padding is semantically
+/// null; the surviving copy keeps its own, and the deleted copy's
+/// directives stay verbatim to pad whatever follows the removed range).
+/// Debug markers are DELIBERATELY hashed: identical code at different
+/// source lines must not merge, or `-g` stepping attributes the wrong
+/// lines. `.cfi_*` stays a block terminator (function-scoped unwind
+/// metadata that must survive merging verbatim).
+fn line_is_identity_transparent(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
+    if infos[j].is_nop() {
+        return true;
+    }
+    infos[j].kind == LineKind::Directive && is_alignment_directive(infos[j].trimmed(store.get(j)))
+}
+
 /// Does this instruction set the EFLAGS (condition flags)?
 fn sets_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
     match infos[i].kind {
@@ -210,10 +239,13 @@ fn block_is_clean(store: &LineStore, infos: &[LineInfo], start: usize, end: usiz
         if infos[j].is_nop() {
             continue;
         }
-        if infos[j].kind == LineKind::Directive
-            && is_alignment_directive(infos[j].trimmed(store.get(j)))
-        {
-            continue;
+        if infos[j].kind == LineKind::Directive {
+            // Padding and debug markers define nothing: the exit register
+            // state stays path-independent with them inside the block.
+            let dl = infos[j].trimmed(store.get(j));
+            if is_alignment_directive(dl) || is_debug_marker_directive(dl) {
+                continue;
+            }
         }
         match infos[j].kind {
             LineKind::Label | LineKind::Directive => return false,
@@ -308,10 +340,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                             // blocks entered only by fall-through acquired an
                             // empty predecessor set and merged unsoundly.
                             let dl = infos[end].trimmed(store.get(end));
-                            if dl.starts_with(".loc")
-                                || dl.starts_with(".file")
-                                || is_alignment_directive(dl)
-                            {
+                            if is_debug_marker_directive(dl) || is_alignment_directive(dl) {
                                 end += 1;
                                 continue;
                             }
@@ -366,10 +395,15 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             }
             // Alignment directives are now inside the block range; the
             // terminator is the last real instruction, never the padding.
-            if infos[k].kind == LineKind::Directive
-                && is_alignment_directive(infos[k].trimmed(store.get(k)))
-            {
-                continue;
+            // Debug markers are skipped the same way: a `.loc` trailing a
+            // block otherwise poses as a `Directive` terminator and invents
+            // a fall-through edge the block's real terminator (e.g. an
+            // unconditional jump) does not have.
+            if infos[k].kind == LineKind::Directive {
+                let dl = infos[k].trimmed(store.get(k));
+                if is_alignment_directive(dl) || is_debug_marker_directive(dl) {
+                    continue;
+                }
             }
             block_terminator[bidx] = infos[k].kind;
             break;
@@ -483,13 +517,15 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         }
     }
 
-    // Phase 2: Hash each block's content.
+    // Phase 2: Hash each block's content. Padding (NOPs, alignment
+    // directives) is not identity: blocks that differ only in padding
+    // share a hash and become merge candidates.
     let mut block_hashes: FxHashMap<(u64, u32), Vec<usize>> = FxHashMap::default();
     for (idx, &(start, end, _, func_id)) in blocks.iter().enumerate() {
         let mut hasher = 0u64;
         let mut instr_count = 0u32;
         for j in (start + 1)..end {
-            if infos[j].is_nop() {
+            if line_is_identity_transparent(store, infos, j) {
                 continue;
             }
             let line = store.get(j);
@@ -620,7 +656,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         let canonical_preds = preds.get(&canonical_label).cloned().unwrap_or_default();
 
         let canonical_instrs: Vec<String> = ((*can_start + 1)..*can_end)
-            .filter(|&j| !infos[j].is_nop())
+            .filter(|&j| !line_is_identity_transparent(store, infos, j))
             .map(|j| store.get(j).to_string())
             .collect();
 
@@ -670,7 +706,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             }
 
             let other_instrs: Vec<String> = ((other_start + 1)..other_end)
-                .filter(|&j| !infos[j].is_nop())
+                .filter(|&j| !line_is_identity_transparent(store, infos, j))
                 .map(|j| store.get(j).to_string())
                 .collect();
 
@@ -1004,5 +1040,109 @@ mod tests {
         // One canonical block survives; the duplicate is redirected.
         let defs = out.matches("call ext_a").count();
         assert_eq!(defs, 1, "expected 1 surviving call block:\n{out}");
+    }
+
+    /// Blocks that differ ONLY in alignment-directive padding hash and
+    /// compare equal and merge: padding is semantically null. The deleted
+    /// copy's directives stay verbatim (they pad the surviving successor's
+    /// label), so the padding count is unchanged by the merge.
+    #[test]
+    fn blocks_differing_only_in_padding_still_merge() {
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    testl %edi, %edi\n",
+            "    jne .LBB1\n",
+            "    jmp .LBB2\n",
+            ".LBB1:\n",
+            "    movl $1, %eax\n",
+            "    addl $2, %eax\n",
+            "    addl $3, %eax\n",
+            "    addl $4, %eax\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    movl $1, %eax\n",
+            "    addl $2, %eax\n",
+            "    addl $3, %eax\n",
+            "    addl $4, %eax\n",
+            "    ret\n",
+            ".p2align 4,,10\n",
+            ".p2align 3\n",
+            ".LBB3:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert_eq!(
+            out.matches("movl $1, %eax").count(),
+            1,
+            "padding-only difference blocked the merge:\n{out}"
+        );
+        assert_eq!(
+            out.matches(".p2align 4,,10").count(),
+            1,
+            "deleted copy's padding was not preserved verbatim:\n{out}"
+        );
+        assert!(out.contains(".LBB3:\n"), "successor label lost:\n{out}");
+    }
+
+    /// A trailing `.loc` must not pose as the block terminator: the block
+    /// above still ends in `jmp`, so it has no fall-through edge. Treating
+    /// the marker as a `Directive` terminator invents a fall-through edge
+    /// into the layout successor, the two blocks' fall-through successors
+    /// differ, and the merge is wrongly skipped. (The markers also must not
+    /// count as dirt: exactly one copy survives, on the canonical block.)
+    #[test]
+    fn trailing_debug_markers_do_not_fake_fallthrough() {
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    testl %edi, %edi\n",
+            "    jne .LBB1\n",
+            "    jmp .LBB2\n",
+            ".LBB1:\n",
+            "    movl $1, %eax\n",
+            "    addl $2, %eax\n",
+            "    addl $3, %eax\n",
+            "    addl $4, %eax\n",
+            "    jmp .LBB3\n",
+            "    .loc 1 10 0\n",
+            ".LBB2:\n",
+            "    movl $1, %eax\n",
+            "    addl $2, %eax\n",
+            "    addl $3, %eax\n",
+            "    addl $4, %eax\n",
+            "    jmp .LBB3\n",
+            "    .loc 1 10 0\n",
+            ".LBB3:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert_eq!(
+            out.matches("movl $1, %eax").count(),
+            1,
+            "trailing .loc blocked the merge (faked fall-through edge?):\n{out}"
+        );
+        assert_eq!(
+            out.matches(".loc 1 10 0").count(),
+            1,
+            "debug marker was not preserved exactly once:\n{out}"
+        );
+    }
+
+    /// Direct classification contract: debug markers vs padding vs code.
+    #[test]
+    fn debug_marker_and_padding_classification() {
+        use super::{is_alignment_directive, is_debug_marker_directive};
+        assert!(is_debug_marker_directive(".loc 1 10 0"));
+        assert!(is_debug_marker_directive(".file 1 \"x.c\""));
+        assert!(!is_debug_marker_directive(".p2align 4,,10"));
+        assert!(!is_debug_marker_directive(".cfi_def_cfa_offset 8"));
+        assert!(!is_debug_marker_directive("movl $1, %eax"));
+        assert!(is_alignment_directive(".p2align 4,,10"));
+        assert!(is_alignment_directive(".p2align 3"));
+        assert!(is_alignment_directive(".align 16"));
+        assert!(is_alignment_directive(".balign 8"));
+        assert!(!is_alignment_directive(".loc 1 2 0"));
+        assert!(!is_alignment_directive("movl $1, %eax"));
     }
 }

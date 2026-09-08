@@ -733,13 +733,24 @@ impl X86Codegen {
                 return;
             }
             if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
-                // 8/16-bit operands would rotate at the wrong width (the
-                // hardware count mask is mod 32 below 64 bits), and
-                // `use_32bit` is false for them, so they take the generic
-                // path. `bit_idioms` never produces them; this keeps the
-                // backend honest if a future producer does.
-                if use_32bit || ty == IrType::I64 || ty == IrType::U64 {
-                    self.emit_rotate_reg_direct(op, lhs, rhs, dest_phys, use_32bit, dest.0);
+                // All integer widths lower natively: `rolb`/`rolw`/`roll`/
+                // `rolq` rotate at the operand width (the hardware count is
+                // `(count & 31) mod width` below 64 bits — measured, and what
+                // GCC relies on for bare `rolw %cl`), and the truncation-
+                // aware `bit_idioms` pattern produces the sub-word forms.
+                if matches!(
+                    ty,
+                    IrType::I8
+                        | IrType::U8
+                        | IrType::I16
+                        | IrType::U16
+                        | IrType::I32
+                        | IrType::U32
+                        | IrType::I64
+                        | IrType::U64
+                        | IrType::Ptr
+                ) {
+                    self.emit_rotate_reg_direct(op, lhs, rhs, dest_phys, ty, dest.0);
                     return;
                 }
             }
@@ -806,49 +817,101 @@ impl X86Codegen {
             return;
         }
 
-        if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight)
-            && (use_32bit || ty == IrType::I64 || ty == IrType::U64)
-        {
-            // Accumulator rotate. The constant form keeps the immediate and
-            // never touches %rcx; the variable form needs the count in %cl,
-            // which is where the generic path below would stage it anyway.
-            if use_32bit {
-                self.operand_to_eax(lhs);
-            } else {
-                self.operand_to_rax(lhs);
+        if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
+            // Accumulator rotate for every integer width. The constant form
+            // keeps the immediate and never touches %rcx; the variable form
+            // needs the count in %cl (staged low-32 by `operand_to_cl`).
+            // Sub-word values stage into %eax with their typed load so the
+            // zero-extension discipline holds through the rotate, and the
+            // 4-byte `store_eax_to` keeps it in the (>=4-byte) slot.
+            let width: i64 = match ty {
+                IrType::I8 | IrType::U8 => 8,
+                IrType::I16 | IrType::U16 => 16,
+                IrType::I32 | IrType::U32 => 32,
+                IrType::I64 | IrType::U64 | IrType::Ptr => 64,
+                _ => 64,
+            };
+            let acc_typed: &str = match width {
+                8 => "al",
+                16 => "ax",
+                32 => "eax",
+                _ => "rax",
+            };
+            let narrow_load: Option<&str> = match width {
+                8 => Some("movzbl"),
+                16 => Some("movzwl"),
+                _ => None,
+            };
+            // Stage the lhs into the accumulator at its own width.
+            match narrow_load {
+                Some(load) => {
+                    let staged = match lhs {
+                        Operand::Value(v)
+                            if self
+                                .dest_reg(v)
+                                .is_some_and(|r| !super::emit::is_xmm_reg(r)) =>
+                        {
+                            let src =
+                                super::emit::typed_phys_reg_name(self.dest_reg(v).unwrap(), ty);
+                            self.state
+                                .emit_fmt(format_args!("    {} %{}, %eax", load, src));
+                            true
+                        }
+                        Operand::Value(v)
+                            if !self.state.is_alloca(v.0)
+                                && self.dest_reg(v).is_none()
+                                && self.state.get_slot(v.0).is_some() =>
+                        {
+                            let slot = self.state.get_slot(v.0).unwrap();
+                            let sref = self.slot_ref(slot.0);
+                            self.state
+                                .emit_fmt(format_args!("    {} {}, %eax", load, sref));
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !staged {
+                        // Constants and exotic sources: generic staging then
+                        // re-establish the zero-extension in place.
+                        self.operand_to_eax(lhs);
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %eax", load, acc_typed));
+                    }
+                }
+                None => {
+                    if width == 32 {
+                        self.operand_to_eax(lhs);
+                    } else {
+                        self.operand_to_rax(lhs);
+                    }
+                }
             }
-            let (mnem32, mnem64) = super::emit::rotate_mnemonic(op);
-            let width: i64 = if use_32bit { 32 } else { 64 };
+            let mnem = super::emit::rotate_mnemonic_width(op, width as u32);
             match Self::const_as_imm32(rhs) {
                 Some(imm) => {
                     let amount = (imm as i64).rem_euclid(width);
                     if amount != 0 {
-                        if use_32bit {
-                            self.state
-                                .emit_fmt(format_args!("    {mnem32} ${amount}, %eax"));
-                        } else {
-                            self.state
-                                .emit_fmt(format_args!("    {mnem64} ${amount}, %rax"));
-                        }
+                        self.state
+                            .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
                     }
                 }
                 None => {
-                    self.operand_to_rcx(rhs);
-                    if use_32bit {
-                        self.state.emit_fmt(format_args!("    {mnem32} %cl, %eax"));
-                    } else {
-                        self.state.emit_fmt(format_args!("    {mnem64} %cl, %rax"));
-                    }
+                    self.operand_to_cl(rhs);
+                    self.state
+                        .emit_fmt(format_args!("    {} %cl, %{}", mnem, acc_typed));
                 }
             }
             self.state.reg_cache.invalidate_acc();
-            if use_32bit {
-                // Normalize the upper half for a signed 32-bit result: the
-                // rotate can place any bit at bit 31. No-op when unsigned.
-                self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
-                self.store_eax_to(dest);
-            } else {
+            if width == 64 {
                 self.store_rax_to(dest);
+            } else {
+                if width == 32 {
+                    // Normalize the upper half for a signed 32-bit result:
+                    // the rotate can place any bit at bit 31. No-op when
+                    // unsigned. Sub-word results keep zero-extended homes.
+                    self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                }
+                self.store_eax_to(dest);
             }
             return;
         }
@@ -1293,13 +1356,11 @@ impl X86Codegen {
                 }
             }
             IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
-            // Rotates are emitted above (register-direct or accumulator). The
-            // only way to reach this arm is an 8- or 16-bit rotate, which the
-            // hardware count mask would wrap at 32 instead of at the operand
-            // width; `bit_idioms` recognizes only I32/U32/I64/U64 rotates, so
-            // this stays unreachable rather than silently mis-rotating.
+            // Rotates of every integer width are emitted above
+            // (register-direct or accumulator, both width-aware); this arm
+            // is structurally dead for well-typed IR.
             IrBinOp::RotateLeft | IrBinOp::RotateRight => {
-                unreachable!("rotate handled above; narrow rotates are not producible")
+                unreachable!("rotate handled above (register-direct or accumulator)")
             }
         }
 

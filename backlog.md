@@ -96,11 +96,60 @@ predicate arithmetic (`reach[B] = OR over preds of reach[P] AND edge_cond`),
 after which `range_fold` and `set_membership` work unmodified. **Split the
 critical edge on the last member first.**
 
-### RA-PRESSURE-1 · Register pressure and copy webs — 1.43–1.49×
-*Evidence:* `spectral_norm` 1.491, `struct_copy` 1.463, `arith_loop` 1.430.
+### RA-PRESSURE-1 · Register pressure and copy webs — 1.43–1.49× (chacha20: 2.85×)
+*Evidence:* `spectral_norm` 1.491, `struct_copy` 1.463, `arith_loop` 1.430,
+`chacha20_block` 2.85× (2026-09-07, after the rotate fold — what remains is
+pure register-allocation staging: 178 movs in the hot function vs GCC's 65).
 
 Lifetime demotion spills whole live ranges instead of splitting them.
-**Done when:** live-range splitting at the demotion point; `arith_loop` ≤1.15×.
+
+**chacha20 mechanism (diagnosed 2026-09-07):** the loop-spanning x-value
+coalesce webs (preheader copy + header phi + latch update, 16 of them)
+occupy every register the pool offers; every quarter-round temp is
+single-use, and the spiller prices an interval at `uses.len()`, so cost 1
+always loses to a phi web — all ~60 in-loop temporaries stack-homed and
+the loop body runs through `%eax` staging. GCC spills a few x-values at
+round boundaries and keeps the temps in registers.
+
+**2026-09-07 progress — loop-span admission cap (implemented, default
+OFF):** liveness exports per-loop linearized `[header, latch]` extents;
+`mark_loop_spanning` measures each loop's block-local PEAK concurrency
+and total weighted cost; the allocator caps loop-spanning admission at
+`pool − peak` (knob `CCC_RA_LOOP_SPAN_RESERVE`, 0 = byte-identical old
+behaviour) with a pigeonhole gate, a cost bar, and a recurrence guard
+(once-per-pass spans must not be demoted — arith_loop lost 9.7% to
+exactly that despite winning the frequency count). Measured in-window:
+chacha20 +29%, sha256 +27% armed at 3. The VM throttled 60× later in the
+session (a fixed binary: 0.809 s → 49.8 s), so the default-on census is
+open — see `engineering/FOLLOWUP-2026-09-07-ARX-CHACHA-RA.md` §3 for the
+full record, including why the GEP-base/coalesce-web priority boosts
+must stay OUT of the main waves (they reorder the scan: sha256 −56%).
+
+**2026-09-08 — RA-PRESSURE-2 landed (default ON, knob-independent):**
+`mark_loop_spanning` now computes a web-wide `span_recurrence` flag (a
+non-phi member's def consuming another member = the carried chain itself:
+arith_loop's accumulators, sha256's a..h schedule) and
+`span_exposed_uses` (in-loop reads whose consumer is latency-exposed vs
+folded addressing). Two always-on mechanisms replace the default-cap
+question: (1) knob-independent invariant demotion — spans with no in-loop
+read demote at admission under the same pigeonhole gate, gated on the
+profile having been measured (`span_marked`); (2) the span-pressure
+valve — a non-span incoming at an exhausted pool evicts the steal-safe,
+non-recurrence, ≤2-future-use active span (Braun–Hack MIN). Plus the
+machinst window pool gains rax/rcx (interference-tracked per window;
+`Raw` blocks the pool for div). Result: chacha20 220→155-insn loop,
+0.327→0.258 s (GCC -O2 0.240, was 2.85× → now 1.07×); corpus min/5
+paired: sha256 −4.9%, fannkuch −4.2%, spectral −3.3%, crc32 −2.0%,
+adler32 −1.1%, arith −0.7%, memcmp/expat/matmul flat, nbody +1%,
+lz4 unmeasurable (6–12 ms bimodal in this sandbox; identical asm
+through GCC). The `CCC_RA_LOOP_SPAN_RESERVE` knob remains (now with the
+recurrence + exposed-use ceilings baked into `worth_capping`).
+
+**Done when:** ultimately live-range splitting at the demotion point
+(RA-06 `split_high_pressure_ranges` exists but measured a net LOSS on
+chacha as-is); `arith_loop` ≤1.15×; beat-ICX on chacha (vectorized QR,
+see RA-PRESSURE-3 below) — the remaining 7% to GCC and the ICX gap are
+loop-carried x-value forwarding latency, not instruction count.
 
 ### PF-ADLER-1 · Accumulator recurrence — 1.24×
 *Evidence:* `zlib_ng_adler32` 50.2 ms vs GCC 39.6 ms. Oracle at
@@ -142,6 +191,22 @@ is emissive: alloca-homed parameters and stack-passed arguments. Any
 replacement must preserve the pinned rule that the fallback reads the
 parameter's **incoming** register even when a caller-saved pre-store of a
 *different* parameter aliased that register name.
+
+### MI-ROTATE-1 · Rotate idiom follow-ups
+Upstream #440 landed `IrBinOp::RotateLeft/RotateRight` (variable amounts,
+all four backends, MachInst path) and 2026-09-07 fixed its cast-peeling
+soundness holes — three live -O2 miscompiles, locked by
+`tests/regression/bit_idiom_soundness.c`. Still open:
+1. **Sub-word rotates whose complements meet only at the narrow width.**
+   `(x16 << 8) | (x16 >> 8)` arrives promoted to i32 with counts 8+8 —
+   not complementary at 32 — and needs the truncation-aware pattern
+   (match the consuming `Cast(i32→u16)`, rewrite to a narrow rotate,
+   DCE the or-chain). The complement-at-promoted-width shape
+   `(w << 8) | (w >> 24)` already folds correctly as a u32 rotate of the
+   extended value.
+2. **Rotate-count staging polish**: the variable form materialises the
+   count as `movslq %esi,%rdx; mov %edx,%ecx` — harmless (count consumed
+   mod W) but sloppy.
 
 ### MI-ENCODE-1 · Encoding-level differential
 The suite has seven layers and 36 tests, including **execution** against GAS
@@ -188,6 +253,7 @@ bfd 2.47.
 
 | Item | Outcome |
 |---|---|
+| **chacha20 / ARX pipelines** | **10.014× → 2.85× vs GCC.** Stacked fixes: (1) the aggregate-SROA split ran *before* constant folding and copy propagation, so unrolled GEP offsets were still value *names* and every access looked variable — the split modeled nothing and the whole `u32 x[16]` state lived in stack slots. Fold+copyprop before the split, and unroll at `-O2`. (2) Native rotates: upstream #440 landed `IrBinOp::RotateLeft/RotateRight` (variable amounts, all backends) — merged **without a single test run**, and this session found and fixed three live cast-peeling miscompiles in it (rotate zext/sext halves; SWAR popcount and CLZ chains through truncating casts), plus the matcher ordering that keeps bswap-network recognition ahead of the rotate fold. 32 shift/or pairs became 32 `rol`, matching GCC's rotate count; `sha256_transform` rides the same fixes (2.757× → 2.03×). (3) Paired old-vs-new A/B: no other benchmark moved (matmul 0.995, lz4 1.000, bitops 1.001, nbody 0.977) |
 | **IV widening** | Fired **only for byte arrays**: the addressing analysis accepted `Cast -> GEP` but not `Cast -> Shl(const) -> GEP`, which is the scaling chain for every wider element type. Now transparent to constant scales (`Shl`/`Mul`); variable scales deliberately excluded. Same-window A/B: `sieve` **−21.6%**, `nbody` −3.0%, plus small gains on `arith_loop`/`sqlite_varint`; also unblocks vectorization of int/long reductions |
 | **Block layout** | RPO linearization cost **19%** on adler32 (55.8 vs 46.9 ms) by discarding the order earlier passes produced. Now starts from the existing order and fixes only contiguity: adler32 −15.6%, sqlite_varint −4.4%, memchr's 1.39×-vs-GCC win preserved. The pass had carried this cost since long before it was loop-aware |
 | IR structural violations | 396 → **0** configs at all six opt levels; `CCC_VERIFY_IR` a permanent suite gate |

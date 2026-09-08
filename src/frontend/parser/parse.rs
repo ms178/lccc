@@ -143,6 +143,10 @@ pub(super) mod parsed_attr_flag {
     /// Tracked separately from `CONST` because `Declaration::is_const()`
     /// describes the pointee for pointer declarators.
     pub const POINTER_CONST: u32 = 1 << 22;
+    /// `__attribute__((cold))` encountered — the function is unlikely to
+    /// execute (error paths, fatal handlers). Lowers to the `.text.unlikely`
+    /// section unless an explicit `section(...)` overrides it.
+    pub const COLD: u32 = 1 << 23;
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -290,6 +294,10 @@ impl ParsedDeclAttrs {
     pub fn parsing_const_attr(&self) -> bool {
         self.flags & parsed_attr_flag::CONST_ATTR != 0
     }
+    #[inline]
+    pub fn parsing_cold(&self) -> bool {
+        self.flags & parsed_attr_flag::COLD != 0
+    }
 
     // --- flag setters ---
 
@@ -385,6 +393,10 @@ impl ParsedDeclAttrs {
     pub fn set_const_attr(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::CONST_ATTR, v)
     }
+    #[inline]
+    pub fn set_cold(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::COLD, v)
+    }
 
     #[inline]
     fn set_flag(&mut self, mask: u32, v: bool) {
@@ -435,6 +447,7 @@ impl std::fmt::Debug for ParsedDeclAttrs {
                 &self.parsing_transparent_union(),
             )
             .field("parsing_fastcall", &self.parsing_fastcall())
+            .field("parsing_cold", &self.parsing_cold())
             .field("parsing_alias_target", &self.parsing_alias_target)
             .field("parsing_visibility", &self.parsing_visibility)
             .field("parsing_section", &self.parsing_section)
@@ -1317,6 +1330,10 @@ impl Parser {
             }
             "const" | "__const__" => {
                 self.attrs.set_const_attr(true);
+                self.advance();
+            }
+            "cold" | "__cold__" => {
+                self.attrs.set_cold(true);
                 self.advance();
             }
             // __attribute__((no_instrument_function)) — skip the mcount/__fentry__

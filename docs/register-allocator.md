@@ -98,6 +98,52 @@ a special case onto an unchanged *global* order; under a consistent
 position-relative order a dead victim is simply the cheapest one, and the
 profitability guard is expressed in the same currency as the ranking.
 
+### Loop-spanning ranges (RA-PRESSURE-1/2)
+
+A range whose envelope covers a whole back-edge-derived loop extent is a
+**span**: a coalesced phi web or a long-lived value that holds a register
+across the entire body. Three mechanisms price their registers against the
+body's block-local work, in admission order:
+
+1. **Invariant demotion** (knob-independent). A span with *no read inside
+   any loop it spans* (`span_has_in_loop_use == false`, only trusted when
+   `mark_loop_spanning` measured it — `span_marked`) is pure loss to keep
+   in a register when spans alone could saturate the pool
+   (`total_spans >= available_regs.len()`): every reload is outside the
+   loop. It is admitted straight to memory; the pre-header and latch
+   materializations fold into the spill slot.
+2. **Admission cap** (`loop_span_reserve`, 0 disables). When spans
+   outnumber the registers left after the reserve, a span is demoted at
+   admission iff it is cheap to demote: `!span_recurrence`,
+   `span_exposed_uses <= 2` (latency-exposed in-loop reads per pass —
+   memory-operand folding removes the instruction but not the
+   store-to-load forwarding latency), and remaining weighted use below the
+   bar built from the loop's shorts. Under the cap a span may take a free
+   register but never evicts.
+3. **Span-pressure valve** (RA-PRESSURE-2, knob-independent). When a
+   *non-span* range arrives at an exhausted pool, it may evict an active
+   span that is steal-safe, not recurrence-carried, and has at most
+   `MAX_VALVE_SPAN_FUTURE_USES` (2) remaining use points — fewest future
+   uses first, ties to the farthest next use (Braun–Hack MIN). This is the
+   position-aware form of the cap: spans are demoted exactly where
+   short-range pressure is real, never wholesale, and the eviction stops
+   itself once the freed registers reach steady-state turnover.
+
+**Recurrence** (`span_recurrence`) is the discriminator that separates the
+shapes the cap and valve may demote: a web is recurrence-carried when some
+non-phi member's defining instruction consumes another member of the same
+web (`acc2 = Add(acc1, …)` — arith_loop's accumulators, sha256's a..h
+schedule). Demoting such a web puts the spill store→reload on the carried
+dependence chain itself (measured +9.7% arith_loop, +16% sha256 at reserve
+3). A web whose members are all defined from non-member values
+(chacha20's state words: the body computes through fresh block-local SSA
+versions; the web only carries the latch result) amortizes demotion across
+independent chains.
+
+Measured (2026-09-08, paired A/B, min/5): chacha20 −13%, sha256 −4.9%,
+fannkuch −4.2%, spectral −3.3%, crc32 −2.0%, adler32 −1.1%, arith −0.7%,
+memcmp/expat/matmul flat.
+
 ### Reserved registers
 
 The ABI **static-chain** register (`%r10` on x86-64, `%ecx` on i686) is

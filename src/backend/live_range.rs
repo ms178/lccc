@@ -42,7 +42,7 @@ use super::liveness::{
     for_each_value_use_in_instruction,
 };
 use super::regalloc::{PhysReg, RaConfig};
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, IrUnaryOp, Operand, Terminator};
@@ -65,6 +65,11 @@ use std::sync::Arc;
 ///   `liveness.segments` (coalesce-owner unions for phi webs).
 /// - `use_weights` / `suffix_cost`: the **position-relative cost model**
 ///   (see [`LiveRange::remaining_cost`]).
+/// - `spans_loop`: the fat envelope covers a natural loop's whole
+///   `[header_start, latch_end]` extent — the register is held for the
+///   entire loop body, every iteration (phi webs, loop-invariant bases).
+///   Set by [`mark_loop_spanning`]; drives the allocator's loop-span
+///   admission cap.
 #[derive(Debug, Clone)]
 pub struct LiveRange {
     pub value_id: u32,
@@ -106,6 +111,69 @@ pub struct LiveRange {
     /// hand-built ranges (unit tests, synthetic vector intervals, phase-2b
     /// span ranges) are bit-identical.
     pub use_weights: Vec<u64>,
+    pub spans_loop: bool,
+    /// When `spans_loop`: the measured peak concurrency of block-local
+    /// ranges inside the spanned loop(s) — the number of registers the
+    /// admission cap reserves for them. Set by [`mark_loop_spanning`].
+    pub span_reserve: u32,
+    /// When `spans_loop`: the spill-cost bar below which capping this span
+    /// in favour of the loop's block-local ranges pays off — the shorts'
+    /// total weighted cost divided by their peak concurrency, i.e. the
+    /// traffic one reserved register buys for them. A span whose own
+    /// remaining cost exceeds the bar is worth more than that and is left
+    /// to the ordinary cost-model path. 0 = no bar (cap by count alone).
+    pub span_cost_bar: u64,
+    /// True when this range (or, for a coalesced web, any member) has at
+    /// least one recorded use point inside a loop extent it spans. A span
+    /// without in-loop reads gets zero benefit from holding its register
+    /// across the loop — every reload is outside, staged once — so under
+    /// the admission cap it is demoted first, before the register-count
+    /// check, and its slot goes to spans (or block-local shorts) that do
+    /// read in-loop. chacha20_core's two loop-invariant pointer spans sat
+    /// on callee-saved registers for the whole 10-round loop while 12
+    /// state webs were demoted.
+    pub span_has_in_loop_use: bool,
+    /// In-loop use points per pass (web-wide, max over spanned loops) —
+    /// the span's reload density inside the loop it spans. Feeds the
+    /// admission ceiling: a span read many times per pass pays that many
+    /// spill-reload round-trips (folded loads still pay store-to-load
+    /// forwarding latency when the reads sit on the loop's serial chain —
+    /// sha256's a..h state, read 6x per pass, measured +16% when demoted),
+    /// while a sparsely-read span (chacha20's state words, 1-2x per pass,
+    /// reads on independent column chains) amortizes.
+    pub span_in_loop_uses: u32,
+    /// In-loop use points per pass whose consumer context is
+    /// latency-exposed (ALU/compare/call sources rather than folded
+    /// addressing bases) — see `mark_loop_spanning`. This is the admission
+    /// signal that separates profitable demotion from chain-stalling
+    /// demotion: sha256's state words (6 exposed reads on a fully serial
+    /// round chain) must keep their registers, chacha20's (1-2 exposed
+    /// reads on independent column chains) amortize, fannkuch's array
+    /// bases (0 exposed — every read is a GEP/Load fold) demote freely.
+    pub span_exposed_uses: u32,
+    /// True when the coalesced web is loop-recurrence-carried: some
+    /// non-phi member's defining instruction consumes another member of
+    /// the same web (`acc2 = Add(acc1, ..)` — arith_loop's accumulators,
+    /// sha256's a..h schedule). Demoting such a web places the
+    /// spill store → reload on the carried dependence chain itself, where
+    /// the store-to-load forwarding latency is paid once per iteration on
+    /// the critical path (measured +9.7% arith_loop, +16% sha256 at
+    /// reserve 3 before this flag existed). A web whose members are all
+    /// defined from NON-member values (chacha20's state: the body computes
+    /// through fresh block-local SSA versions, the web only carries the
+    /// latch result) amortizes demotion across independent chains.
+    ///
+    /// The phi itself is exempt from the check: a phi web is by
+    /// construction {phi} ∪ {backedge sources}, so the phi's incoming
+    /// operands are always members and say nothing about recurrence.
+    pub span_recurrence: bool,
+    /// Set by `mark_loop_spanning` once it has measured this range's
+    /// in-loop use profile. Hand-built ranges (tests) leave it false,
+    /// which the invariant-demotion gate reads as "not analyzed" and
+    /// treats conservatively: the pigeonhole demotion only fires on
+    /// profiles that were actually computed, never on an unmeasured
+    /// `span_has_in_loop_use == false`.
+    pub span_marked: bool,
     /// Suffix sums of `use_weights`: `suffix_cost[i] == Σ_{j≥i} use_weights[j]`,
     /// with a terminating `0`. Length is `use_weights.len() + 1` whenever
     /// `use_weights` is non-empty. Makes [`LiveRange::remaining_cost`] a
@@ -147,6 +215,14 @@ impl LiveRange {
             segments: Vec::new(),
             use_weights: Vec::new(),
             suffix_cost: Vec::new(),
+            spans_loop: false,
+            span_reserve: 0,
+            span_cost_bar: 0,
+            span_has_in_loop_use: false,
+            span_in_loop_uses: 0,
+            span_exposed_uses: 0,
+            span_recurrence: false,
+            span_marked: false,
             cost_boost: 1,
             occupancy_len: 0,
         }
@@ -413,6 +489,257 @@ pub(crate) fn loop_depth_weight(loop_depth: u32) -> u64 {
     10u64.pow(loop_depth.min(4) as u32)
 }
 
+/// Flag ranges whose fat envelope covers a whole natural loop extent
+/// (`[header_start, latch_end]`, see `LivenessResult::loop_extents`).
+///
+/// Such a range occupies its register for the entire loop body on every
+/// iteration; a block-local range only occupies its few instructions. The
+/// distinction is what the loop-span admission cap trades on: when
+/// loop-spanning ranges outnumber the capped pool, excess ones spill at
+/// admission so the short ranges do not lose every register to them.
+pub(crate) fn mark_loop_spanning(
+    ranges: &mut [LiveRange],
+    loop_extents: &[(u32, u32)],
+    coalesce_member_of: &FxHashMap<u32, u32>,
+    func: &IrFunction,
+) {
+    // Def instruction per value id, and the set of operands each def
+    // consumes, for the recurrence test below.
+    let mut def_uses: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut def_is_phi: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Some(dest) = inst.dest() else { continue };
+            let mut ops: Vec<u32> = Vec::new();
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    ops.push(v.0);
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| ops.push(v.0));
+            if matches!(inst, Instruction::Phi { .. }) {
+                def_is_phi.insert(dest.0);
+            }
+            def_uses.insert(dest.0, ops);
+        }
+    }
+    // (point -> vids consumed there as the folding-friendly address or
+    // base of the access itself). Every other use context — ALU source,
+    // compare operand, select arm, call argument, phi materialization —
+    // is latency-exposed: the spilled reload's store-to-load forwarding
+    // delay lands on the dependence chain that consumes the value, while
+    // an addressing base folds into the memory access and its reload
+    // overlaps the load pipeline.
+    let mut folded_at: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
+    {
+        let mut point = 0u32;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let folded: Option<u32> = match inst {
+                    Instruction::GetElementPtr { base, .. } => Some(base.0),
+                    Instruction::Load { ptr, .. } => Some(ptr.0),
+                    Instruction::Store { ptr, .. } => Some(ptr.0),
+                    Instruction::AtomicLoad {
+                        ptr: Operand::Value(v),
+                        ..
+                    }
+                    | Instruction::AtomicStore {
+                        ptr: Operand::Value(v),
+                        ..
+                    } => Some(v.0),
+                    _ => None,
+                };
+                if let Some(vid) = folded {
+                    folded_at.entry(point).or_default().insert(vid);
+                }
+                point = point.saturating_add(1);
+            }
+            point = point.saturating_add(1);
+        }
+    }
+    if loop_extents.is_empty() {
+        return;
+    }
+    // Per loop: the peak number of simultaneously-live BLOCK-LOCAL ranges
+    // (born and dying strictly inside the loop). That is exactly how many
+    // registers the loop's short ranges can profitably use — they expire
+    // within a few instructions and the same register then serves the next
+    // one, so the peak, not the count, is the requirement. A loop whose
+    // body has no short-range pressure (the working set is loop-carried
+    // state, e.g. arith_loop's 32 live-out ints) measures a peak near zero
+    // and its spans keep the pool, which is what makes the cap safe to
+    // leave on universally.
+    let mut peaks: Vec<u32> = Vec::with_capacity(loop_extents.len());
+    // Per extent: peak concurrency AND the shorts' total weighted cost —
+    // the latter prices what one reserved register buys for them (their
+    // cost divided by their peak). A span is only demoted in their favour
+    // when it is worth less than that.
+    let mut bars: Vec<u64> = Vec::with_capacity(loop_extents.len());
+    for &(header_start, latch_end) in loop_extents {
+        let mut events: Vec<(u32, i32)> = Vec::new();
+        let mut shorts_cost = 0u64;
+        for r in ranges.iter() {
+            if r.start >= header_start && r.end <= latch_end {
+                events.push((r.start, 1));
+                events.push((r.end.saturating_add(1), -1));
+                shorts_cost = shorts_cost.saturating_add(r.total_cost());
+            }
+        }
+        events.sort_unstable();
+        let mut live = 0i32;
+        let mut peak = 0i32;
+        for (_, delta) in events {
+            live += delta;
+            peak = peak.max(live);
+        }
+        let peak = peak.max(0) as u32;
+        peaks.push(peak);
+        bars.push(shorts_cost.saturating_div(peak.max(1) as u64).max(1));
+    }
+    // A range that covers a whole loop extent holds its register for the
+    // entire body; its reserve is the (max) measured peak of the loops it
+    // spans. Nested loops: the outer extent's strictly-inside set includes
+    // the inner loop's short ranges, so the outer span's reserve is at
+    // least the inner pressure — conservative in the right direction.
+    // Web-wide use-point list per leader: a phi web's reads are recorded on
+    // the members' ranges, so the leader's own `uses` under-count it.
+    let mut members_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (&member, &owner) in coalesce_member_of {
+        if member != owner {
+            members_of.entry(owner).or_default().push(member);
+        }
+    }
+    // Per value id: does its own range have a use inside ANY measured loop
+    // extent, and how many of its uses fall inside the extents? Computed
+    // once up front (read-only pass) so the mutation loop below can ask
+    // about web members without re-borrowing `ranges`.
+    let mut any_use_in_extent: FxHashMap<u32, bool> = FxHashMap::default();
+    let mut uses_in_extents: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut exposed_in_extents: FxHashMap<u32, u32> = FxHashMap::default();
+    for r in ranges.iter() {
+        let mut n = 0u32;
+        let mut exposed = 0u32;
+        let mut last_point: Option<u32> = None;
+        for &u in &r.uses {
+            if loop_extents.iter().any(|&(hs, le)| u >= hs && u <= le) {
+                n += 1;
+                if last_point != Some(u)
+                    && !folded_at
+                        .get(&u)
+                        .is_some_and(|vids| vids.contains(&r.value_id))
+                {
+                    exposed += 1;
+                }
+            }
+            last_point = Some(u);
+        }
+        if n > 0 {
+            any_use_in_extent.insert(r.value_id, true);
+            uses_in_extents.insert(r.value_id, n);
+            exposed_in_extents.insert(r.value_id, exposed);
+        }
+    }
+    for range in ranges.iter_mut() {
+        let mut spans = false;
+        let mut reserve = 0u32;
+        let mut bar = 0u64;
+        let mut in_loop_use = false;
+        for (((header_start, latch_end), peak), b) in loop_extents.iter().zip(&peaks).zip(&bars) {
+            if range.start <= *header_start && range.end >= *latch_end {
+                spans = true;
+                reserve = reserve.max(*peak);
+                bar = bar.max(*b);
+                // (the leader's own in-extent uses are summarized in
+                // `any_use_in_extent`, consulted after the extent loop)
+            }
+        }
+        // Web-wide: a member's read inside any extent the LEADER spans
+        // counts (the member's range shares the leader's fat envelope).
+        let mut in_loop_uses = uses_in_extents.get(&range.value_id).copied().unwrap_or(0);
+        let mut exposed_uses = exposed_in_extents
+            .get(&range.value_id)
+            .copied()
+            .unwrap_or(0);
+        if let Some(members) = members_of.get(&range.value_id) {
+            for &m in members {
+                in_loop_uses =
+                    in_loop_uses.saturating_add(uses_in_extents.get(&m).copied().unwrap_or(0));
+                exposed_uses =
+                    exposed_uses.saturating_add(exposed_in_extents.get(&m).copied().unwrap_or(0));
+            }
+        }
+        if !in_loop_use {
+            in_loop_use = in_loop_uses > 0;
+        }
+        // Recurrence test: does any non-phi member's def consume a member?
+        let mut recurrence = false;
+        {
+            let mut members: Vec<u32> = vec![range.value_id];
+            if let Some(ms) = members_of.get(&range.value_id) {
+                members.extend_from_slice(ms);
+            }
+            for &m in &members {
+                if def_is_phi.contains(&m) {
+                    continue;
+                }
+                if let Some(ops) = def_uses.get(&m) {
+                    if ops.iter().any(|o| members.contains(o)) {
+                        recurrence = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if spans {
+            range.spans_loop = true;
+            range.span_in_loop_uses = in_loop_uses;
+            range.span_exposed_uses = exposed_uses;
+            range.span_recurrence = recurrence;
+            range.span_marked = true;
+            range.span_reserve = reserve.max(1);
+            range.span_cost_bar = bar;
+            range.span_has_in_loop_use = in_loop_use;
+        }
+    }
+}
+
+/// Ceiling on latency-exposed in-loop reads per pass for a span to be
+/// demotable at admission (see the admission-cap comment in
+/// `allocate_range`).
+const MAX_SPAN_EXPOSED_USES: u32 = 2;
+
+/// Ceiling on a span's remaining future-use points for it to be evictable
+/// by the span-pressure valve (see `find_span_valve_victim`).
+const MAX_VALVE_SPAN_FUTURE_USES: u32 = 2;
+
+/// Floor on a span's remaining future-use points for it to be evictable
+/// by the valve: a span with NO future use must expire on its own (free —
+/// expiry never spills) rather than be evicted (try_evict unconditionally
+/// allocates a spill slot and the backend stores a dead value). Firing
+/// for dead spans measured pure harm on gzip_crc32 (+5 insns, +2 pushes
+/// from 2 dead-span evictions); the win cases all evict live spans.
+const MIN_VALVE_SPAN_FUTURE_USES: u32 = 1;
+
+/// Ceiling on the incoming range's use points for the valve to fire for
+/// it. The valve's contract is turnover: the freed register must be one
+/// that short ranges cycle through within a few instructions. A long
+/// incoming (measured: sqlite's 67-point 10-use range) holds the stolen
+/// register for its whole life — no turnover, just theft plus the
+/// downstream cascade. Every win-case fire (chacha20: 14/14) serves an
+/// incoming with 1–2 uses; dead (0-use) incomings never fire either,
+/// since spilling a dead def costs a store while evicting for it costs
+/// the span's store plus its reloads.
+const MAX_VALVE_INCOMING_USES: usize = 2;
+
+/// Ceiling on the incoming range's point span (`end - start`) for the
+/// valve to fire for it. Use count alone does not capture holding time:
+/// a 1-use range whose use sits 58 points past its def (measured:
+/// sqlite's v143 [52,110]) pins the stolen register for 58 points —
+/// again no turnover. Every win-case incoming spans at most 11 points
+/// (chacha20), so 16 keeps all of them with headroom while rejecting
+/// the 58-point escapee.
+const MAX_VALVE_INCOMING_LEN: u32 = 16;
+
 #[inline]
 fn debug_assert_uses_sorted(uses: &[u32]) {
     debug_assert!(
@@ -484,6 +811,9 @@ pub struct LinearScanAllocator {
     /// Rotation cursor: consecutive unhinted assignments start at different
     /// registers to expose ILP on Raptor Lake's extra integer ports.
     pub next_reg_idx: usize,
+    /// Loop-spanning ranges in the original worklist (see the admission
+    /// cap in [`LinearScanAllocator::allocate_range`]).
+    pub total_spans: usize,
 }
 
 impl LinearScanAllocator {
@@ -504,6 +834,7 @@ impl LinearScanAllocator {
         // exact fat kernel.
         let segment_mode =
             !ra_config.no_segment_scan && ranges.iter().any(|r| !r.segments.is_empty());
+        let total_spans = ranges.iter().filter(|r| r.spans_loop).count();
         Self {
             ranges,
             active: Vec::new(),
@@ -518,6 +849,7 @@ impl LinearScanAllocator {
             next_spill_slot: 0,
             enable_splitting: false,
             next_reg_idx: 0,
+            total_spans,
         }
     }
 
@@ -1047,6 +1379,104 @@ impl LinearScanAllocator {
     pub fn allocate_range(&mut self, range: LiveRange) {
         self.expire_old_intervals(range.start);
 
+        // Loop-span admission cap (RA-PRESSURE-1). A loop-spanning range
+        // holds its register for the whole body of a loop on every
+        // iteration, while block-local ranges expire within a few
+        // instructions and free the register for the next one. In a
+        // whole-range linear scan the spans arrive first (earliest start)
+        // and a short range can never outbid a span's remaining-use cost,
+        // so uncapped, the spans saturate the pool and EVERY short range
+        // in the loop is staged through memory (measured: chacha20's ~60
+        // quarter-round temporaries, 178 movs vs GCC's 65). The cap keeps
+        // `loop_span_reserve` registers for the short ranges by spilling
+        // excess spans at admission; a span under the cap may still take
+        // any FREE register, but never evicts — evicting a short range to
+        // make room for a span is exactly the theft the cap prevents, and
+        // span-vs-span eviction is zero-sum (it only moves the spill).
+        //
+        // Cost bar: the measured per-register value of the loop's
+        // block-local ranges (their weighted cost over their peak). A span
+        // whose remaining cost is at or above the bar is worth more than
+        // what a reserved register buys the shorts, and takes the ordinary
+        // path instead — this is what keeps pointer-carrier loops (matmul:
+        // few, hot, in-inner-loop-used spans) at their old allocation
+        // while ARX-shaped loops (chacha20: 16 sparsely-used webs vs ~60
+        // single-use temporaries) get the reserve.
+        //
+        // Seeded occupancy from earlier waves is not counted against the
+        // cap (the seed carries no value identity); the arg-staging waves
+        // that seed the main scan hold few registers for long.
+        if range.spans_loop && self.ra_config.loop_span_reserve > 0 {
+            // Measured per-loop requirement, clamped by the policy knob:
+            // the knob is a ceiling (and 0 disables), the measurement is
+            // the loop's own block-local peak concurrency.
+            let reserve = (range.span_reserve as usize).min(self.ra_config.loop_span_reserve);
+            let allowed = self.available_regs.len().saturating_sub(reserve);
+            // In-loop-useless spans are demoted first, before the count
+            // check: their reloads all sit outside the loop (staged once,
+            // cold), so a register held across the body buys them nothing.
+            // This must run ahead of the free-register path below, which
+            // would otherwise home the earliest-arriving spans
+            // (function-entry pointers) and push the actually-read webs
+            // out of the pool.
+            if range.span_marked && !range.span_has_in_loop_use && self.total_spans > allowed {
+                self.allocate_spill_slot(range.value_id);
+                return;
+            }
+            // Pigeonhole gate: when the worklist's spans fit inside the
+            // allowed count, capping could only demote a span that would
+            // have been homed anyway — the exact loss measured on matmul
+            // (outer-loop base pointers, few spans, uses inside the inner
+            // loop) and expat (byte-classifier chains). The cap only has
+            // work to do when spans OUTNUMBER the allowed registers,
+            // which is also precisely when someone must spill.
+            // Like-for-like: the bar is built from the shorts' plain
+            // weighted-use totals, so the span's side of the comparison
+            // must not include the coalesce/GEB policy boosts either
+            // (those exist to protect it in EVICTION, and including them
+            // here made every bumped web look too expensive to cap and
+            // silently disabled the reserve).
+            // Admission ceiling (measured 2026-09-08): a span read more
+            // than `MAX_SPAN_LOOP_USES` times per pass through the loop it
+            // spans must keep its register even when the bar would demote
+            // it. Each in-loop read of a demoted span is a spill-reload:
+            // memory-operand folding removes the instruction but NOT the
+            // store-to-load forwarding latency, and on a loop whose body
+            // is one serial dependence chain (sha256's a..h schedule,
+            // read 6x per pass — measured +16% at reserve 3) that latency
+            // is paid on the chain, once per read. A sparsely-read span
+            // (chacha20's state words: 1-2 reads per pass, on four
+            // independent column chains where the reload overlaps other
+            // work) amortizes the forwarding and the freed register buys
+            // the loop's single-use temporaries their in-place chain.
+            // The retired 2026-09-07 frequency FLOOR (>= 3 uses required
+            // to demote) had this test backwards for both shapes: it
+            // blocked chacha20's 1-2-read webs while admitting sha256's
+            // 6-read ones.
+            let worth_capping = !range.span_recurrence
+                && range.span_exposed_uses <= MAX_SPAN_EXPOSED_USES
+                && (range.span_cost_bar == 0
+                    || range.remaining_cost(range.start) < range.span_cost_bar);
+            if self.total_spans > allowed && worth_capping {
+                if self.loop_spanned_register_count() >= allowed {
+                    self.allocate_spill_slot(range.value_id);
+                    return;
+                }
+                // Under the cap: a span may take a FREE register but never
+                // evicts — evicting a short range to make room for a span
+                // is exactly the theft the cap prevents, and span-vs-span
+                // eviction is zero-sum (it only moves the spill).
+                if let Some(reg) = self.find_free_register(&range) {
+                    self.commit_assignment(range, reg);
+                    return;
+                }
+                self.allocate_spill_slot(range.value_id);
+                return;
+            }
+            // Spans fit: ordinary path (free register or cost-model
+            // eviction) with no admission restriction.
+        }
+
         if let Some(reg) = self.find_free_register(&range) {
             if self.ra_config.trace_alloc {
                 for active in &self.active {
@@ -1081,6 +1511,75 @@ impl LinearScanAllocator {
             return;
         }
 
+        // ── In-loop-useless span demotion (pressure-gated) ────────────
+        // The pool is exhausted (no free register was found above) and
+        // the incoming is a span with NO read inside any loop it spans:
+        // spilling it now costs only cold outside-the-loop reloads,
+        // while evicting a hot active to serve it would stage hot
+        // reloads through memory. Every loop extent is a natural loop
+        // (back-edge-derived), so cold straight-line code never demotes.
+        // Proven pressure is REQUIRED here: demoting on the old static
+        // `total_spans >= pool` proxy measured pure harm on glibc_memcmp
+        // (+2 stackmem — a loop-useless address span spilled although
+        // the loop body had room for it). chacha20_core's two
+        // loop-invariant pointer spans still demote here because their
+        // loop IS pressured; when it is not, the span homes freely and
+        // ordinary cost-model eviction (it is the cheapest victim) frees
+        // it later if pressure ever arrives.
+        if range.spans_loop && range.span_marked && !range.span_has_in_loop_use {
+            self.allocate_spill_slot(range.value_id);
+            return;
+        }
+
+        // ── Span-pressure valve (RA-PRESSURE-2) ─────────────────────────
+        // A non-span range arriving at an exhausted pool may evict an
+        // active loop-spanning range whose remaining reads are few and
+        // which is not recurrence-carried. This is the position-aware
+        // form of the admission cap: spans are demoted only at points of
+        // real short/mid-range pressure, only as many as the pool needs
+        // to reach steady-state turnover (each eviction frees a register
+        // that shorts then cycle through), and never the webs whose
+        // store→reload would sit on the loop's carried chain. Spans
+        // arriving later still see the freed registers; nothing is
+        // pre-emptively demoted.
+        // `no_span_valve` (CCC_NO_SPAN_VALVE, and always set for the
+        // Phase-2c leftover scan) disables the valve: the leftovers are
+        // disproportionately loop state that already lost to temps once,
+        // and must not lose to them again. The valve also only fires for
+        // SHORT live incomings (1–2 uses spanning at most 16 points):
+        // turnover requires shorts, and a dead incoming must never
+        // trigger an eviction. And it only
+        // fires under SPAN-LOCK (every active interval is a span):
+        // span-theft is only justified when ordinary eviction has
+        // nothing BUT spans to victimize (shorts fully starved);
+        // otherwise evicting an ordinary short serves the incoming
+        // without storing and reloading a span, and firing only
+        // perturbs the scan (measured: +5 insns/+2 pushes on crc32,
+        // +6 stackmem on adler32 from non-locked fires).
+        if !range.spans_loop
+            && !self.ra_config.no_span_valve
+            && !range.uses.is_empty()
+            && range.uses.len() <= MAX_VALVE_INCOMING_USES
+            && range.end.saturating_sub(range.start) <= MAX_VALVE_INCOMING_LEN
+            && self.pool_is_span_locked()
+        {
+            if let Some(evict_idx) = self.find_span_valve_victim(&range) {
+                let incoming_id = range.value_id;
+                if self.try_evict(evict_idx, range) {
+                    return;
+                }
+                // Unreachable in practice: the search checked every
+                // refusal condition try_evict re-tests (steal safety
+                // against this very incoming, no mutation in between, and
+                // an active interval always holds its register). If a
+                // future guard ever diverges, the safe fallback is to
+                // spill the incoming — never to continue with a moved
+                // value.
+                self.allocate_spill_slot(incoming_id);
+                return;
+            }
+        }
+
         let mode = self.ra_config.evict_mode;
         let victim = if mode == 5 {
             self.find_exchange_candidate(&range)
@@ -1101,6 +1600,67 @@ impl LinearScanAllocator {
         // type-checker if the signature ever changes.
         // (try_evict takes `range` by value; on failure it must not
         // consume — see try_evict.)
+    }
+
+    /// True when every active interval is a loop-spanning range: the pool
+    /// is span-locked and ordinary eviction can only victimize spans.
+    /// (The pool is never empty on the valve path — it runs only when no
+    /// free register was found — so the vacuous-true case is unreachable;
+    /// the explicit guard documents that instead of relying on it.)
+    fn pool_is_span_locked(&self) -> bool {
+        !self.active.is_empty() && self.active.iter().all(|a| a.range.spans_loop)
+    }
+
+    /// Span-pressure valve victim: the active, steal-safe, non-recurrence
+    /// loop-spanning range with the fewest future use points at the
+    /// incoming's start, provided that count is within
+    /// `MIN_VALVE_SPAN_FUTURE_USES..=MAX_VALVE_SPAN_FUTURE_USES`. Ties
+    /// break to the farthest next use (Braun–Hack MIN: the victim whose
+    /// register is least urgently needed). Falls through to the ordinary
+    /// eviction when no span qualifies — today's behavior for every loop
+    /// whose spans carry recurrences or still have reads to serve
+    /// (sha256's schedule, fannkuch's counters, matmul's base pointers).
+    fn find_span_valve_victim(&self, incoming: &LiveRange) -> Option<usize> {
+        let mut best_idx: Option<usize> = None;
+        let mut best_future = u32::MAX;
+        let mut best_next_use = 0u32;
+        for (idx, interval) in self.active.iter().enumerate() {
+            if !interval.range.spans_loop || interval.range.span_recurrence {
+                continue;
+            }
+            if !self.register_steal_is_safe(interval.range.value_id, incoming) {
+                continue;
+            }
+            // The valve must not break the admission cap's accounting: a
+            // span homed under an armed cap holds one of the allowed
+            // slots; evicting it merely frees the slot earlier. No span
+            // under the cap is ever evicted BY a span (the cap forbids
+            // span-vs-span eviction); the valve only ever hands a span's
+            // register to a non-span.
+            let fut = Self::future_uses(&interval.range, incoming.start);
+            if fut < MIN_VALVE_SPAN_FUTURE_USES || fut > MAX_VALVE_SPAN_FUTURE_USES {
+                continue;
+            }
+            let nxt = next_use_after(&interval.range, incoming.start);
+            if fut < best_future || (fut == best_future && nxt > best_next_use) {
+                best_idx = Some(idx);
+                best_future = fut;
+                best_next_use = nxt;
+            }
+        }
+        best_idx
+    }
+
+    /// Distinct registers currently held by loop-spanning active ranges —
+    /// the quantity the admission cap limits.
+    fn loop_spanned_register_count(&self) -> usize {
+        let mut regs: Vec<PhysReg> = Vec::new();
+        for interval in &self.active {
+            if interval.range.spans_loop && !regs.contains(&interval.phys_reg) {
+                regs.push(interval.phys_reg);
+            }
+        }
+        regs.len()
     }
 
     fn commit_assignment(&mut self, range: LiveRange, reg: PhysReg) {
@@ -1726,6 +2286,22 @@ fn hint_from_instruction(inst: &Instruction) -> Option<(u32, u32)> {
                     | IrBinOp::Or
                     | IrBinOp::Xor
                     | IrBinOp::Mul
+                    // Two-address read-modify-write forms on every target
+                    // this backend ships: x86 legacy `shl/sar/shr/rol/ror
+                    // %cl, %r` and the AArch64/RISC-V register forms all
+                    // read the lhs in the dest register. ARX chains
+                    // (chacha20/sha256: add → xor → rol) re-enter the same
+                    // register at every link — the rotate was the missing
+                    // hint that split each chain at `rol` and forced the
+                    // accumulator round-trip (movq %rax,%r11 in the loop).
+                    // Same die-at-birth gating as the ALU ops above: the
+                    // share is only accepted when the lhs's final use is
+                    // this instruction.
+                    | IrBinOp::Shl
+                    | IrBinOp::AShr
+                    | IrBinOp::LShr
+                    | IrBinOp::RotateLeft
+                    | IrBinOp::RotateRight
             ) =>
         {
             Some((dest.0, lhs.0))
@@ -1791,6 +2367,431 @@ fn collect_uses_for_values(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
 mod tests {
     use super::*;
 
+    // ── loop-span admission cap (RA-PRESSURE-1) ────────────────────────────
+
+    fn empty_fn() -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        f.blocks.push(crate::ir::reexports::BasicBlock {
+            label: crate::ir::reexports::BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        f
+    }
+
+    fn spanned(id: u32, start: u32, end: u32, uses: Vec<u32>, priority: u64) -> LiveRange {
+        let mut r = lr(id, start, end, uses, priority);
+        r.spans_loop = true;
+        r.span_reserve = 1;
+        r
+    }
+
+    #[test]
+    fn loop_span_cap_demotes_cheap_spans_for_block_local_shorts() {
+        // The bar decides, not a use-count floor: a span whose remaining
+        // weighted use is worth less than one register of the loop's
+        // block-local shorts (bar 10 vs rem 2) is demoted at admission so
+        // the shorts get the register. This is the chacha20_core shape —
+        // 16 sparsely-read state webs vs ~60 single-use quarter-round
+        // temporaries — where the retired frequency floor (>= 3 in-loop
+        // uses) blocked every demotion: the webs record only 1-2 uses per
+        // pass because the in-body reads hit the short SSA versions, not
+        // the carried web.
+        let mut cheap_span = spanned(1, 0, 900, vec![100, 900], 300);
+        cheap_span.span_cost_bar = 10;
+        let short = lr(2, 120, 130, vec![125], 10);
+        let mut cfg = RaConfig::default();
+        cfg.loop_span_reserve = 1;
+        let mut alloc = LinearScanAllocator::new_with_config(
+            vec![short, cheap_span],
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(cfg),
+        );
+        alloc.run();
+        // The span arrived first (start 0) but is demoted at admission;
+        // the short range is then homed.
+        assert!(!alloc.assignments.contains_key(&1));
+        assert!(alloc.assignments.contains_key(&2));
+    }
+
+    #[test]
+    fn loop_span_bar_protects_expensive_spans() {
+        // A span whose remaining use outweighs the shorts' per-register
+        // value (bar 10 vs rem 50) keeps the ordinary path and outbids the
+        // short range on cost — the arith_loop shape that motivated the
+        // retired frequency guard, now protected by the bar instead.
+        let mut expensive = spanned(1, 0, 900, (100..150).collect(), 300);
+        expensive.span_cost_bar = 10;
+        let short = lr(2, 120, 130, vec![125], 10);
+        let mut cfg = RaConfig::default();
+        cfg.loop_span_reserve = 1;
+        let mut alloc = LinearScanAllocator::new_with_config(
+            vec![short, expensive],
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(cfg),
+        );
+        alloc.run();
+        assert!(alloc.assignments.contains_key(&1));
+        assert!(!alloc.assignments.contains_key(&2));
+    }
+
+    #[test]
+    fn mark_loop_spanning_measures_the_block_local_peak() {
+        // Loop extent [100, 500]. Two chains of short ranges inside:
+        // v1..v3 overlap pairwise (peak 2), v4 runs alone after them.
+        // The spanning web must be flagged with reserve == 2.
+        // v2, v3, v4 are all live together on [180, 200] (peak 3); v5
+        // runs alone after them.
+        let mut ranges = vec![
+            lr(1, 10, 900, vec![10, 900], 40), // spans the loop
+            lr(2, 110, 200, vec![150], 10),
+            lr(3, 150, 260, vec![200], 10),
+            lr(4, 180, 300, vec![250], 10),
+            lr(5, 400, 480, vec![450], 10),
+        ];
+        mark_loop_spanning(
+            &mut ranges,
+            &[(100, 500)],
+            &FxHashMap::default(),
+            &empty_fn(),
+        );
+        let web = ranges.iter().find(|r| r.value_id == 1).unwrap();
+        assert!(web.spans_loop);
+        assert_eq!(web.span_reserve, 3);
+        for id in 2..=5 {
+            let r = ranges.iter().find(|r| r.value_id == id).unwrap();
+            assert!(!r.spans_loop);
+            assert_eq!(r.span_reserve, 0);
+        }
+        // A loop with no block-local pressure: the span keeps a reserve of
+        // 1 (the floor), i.e. effectively no cap beyond one register.
+        let mut ranges = vec![lr(1, 10, 900, vec![10, 900], 40)];
+        mark_loop_spanning(
+            &mut ranges,
+            &[(100, 500)],
+            &FxHashMap::default(),
+            &empty_fn(),
+        );
+        assert_eq!(ranges[0].span_reserve, 1);
+    }
+
+    #[test]
+    fn mark_loop_spanning_covers_only_whole_extents() {
+        let mut ranges = vec![
+            lr(1, 10, 400, vec![10, 400], 40),   // covers [50,390]
+            lr(2, 100, 110, vec![105], 10),      // strictly inside the loop
+            lr(3, 380, 420, vec![385, 415], 20), // enters the tail, no header
+            lr(4, 5, 45, vec![40], 10),          // ends before the latch
+        ];
+        mark_loop_spanning(
+            &mut ranges,
+            &[(50, 390)],
+            &FxHashMap::default(),
+            &empty_fn(),
+        );
+        let flag =
+            |rs: &[LiveRange], id: u32| rs.iter().find(|r| r.value_id == id).unwrap().spans_loop;
+        // Only the range whose envelope covers the whole loop extent spans.
+        assert!(flag(&ranges, 1));
+        assert!(!flag(&ranges, 2));
+        assert!(!flag(&ranges, 3));
+        assert!(!flag(&ranges, 4));
+        // Empty extent list marks nothing.
+        let mut x = vec![lr(9, 0, 100, vec![1], 1)];
+        mark_loop_spanning(&mut x, &[], &FxHashMap::default(), &empty_fn());
+        assert!(!x[0].spans_loop);
+    }
+
+    #[test]
+    fn loop_span_cap_spills_excess_spans_and_keeps_short_reserve() {
+        // Pool of 4, reserve 1: at most 3 loop-spanning ranges may hold
+        // registers; the 4th span spills at admission, and a short range
+        // arriving later can still take the register the excess span did
+        // not consume.
+        let ranges = vec![
+            spanned(1, 0, 900, vec![100, 900], 300),
+            spanned(2, 0, 900, vec![100, 900], 300),
+            spanned(3, 0, 900, vec![100, 900], 300),
+            spanned(4, 0, 900, vec![100, 900], 300),
+            lr(5, 120, 130, vec![125], 10),
+            lr(6, 200, 210, vec![205], 10),
+        ];
+        let mut cfg = RaConfig::default();
+        cfg.loop_span_reserve = 1;
+        let mut alloc = LinearScanAllocator::new_with_config(
+            ranges,
+            vec![PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4)],
+            &std::sync::Arc::new(cfg),
+        );
+        alloc.run();
+        let homed_spans = (1..=4)
+            .filter(|id| alloc.assignments.contains_key(id))
+            .count();
+        assert_eq!(homed_spans, 3, "cap must spill the 4th loop-spanning range");
+        // Both short ranges are homed: they expire quickly and reuse the
+        // register the spilled span left free.
+        assert!(alloc.assignments.contains_key(&5));
+        assert!(alloc.assignments.contains_key(&6));
+    }
+
+    #[test]
+    fn loop_span_cap_inactive_when_spans_fit() {
+        // Two spans, pool 4, reserve 1: allowed = 3 >= total_spans = 2,
+        // so the pigeonhole gate keeps the cap off and the spans are homed
+        // by the ordinary path.
+        let ranges = vec![
+            spanned(1, 0, 900, vec![100, 900], 300),
+            spanned(2, 0, 900, vec![100, 900], 300),
+        ];
+        let mut cfg = RaConfig::default();
+        cfg.loop_span_reserve = 1;
+        let mut alloc = LinearScanAllocator::new_with_config(
+            ranges,
+            vec![PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4)],
+            &std::sync::Arc::new(cfg),
+        );
+        alloc.run();
+        assert_eq!(alloc.assignments.len(), 2);
+    }
+
+    #[test]
+    fn loop_span_cap_zero_disables() {
+        // reserve = 0: every span may home (pre-cap behaviour).
+        let ranges = vec![
+            spanned(1, 0, 900, vec![100, 900], 300),
+            spanned(2, 0, 900, vec![100, 900], 300),
+            spanned(3, 0, 900, vec![100, 900], 300),
+            spanned(4, 0, 900, vec![100, 900], 300),
+        ];
+        let mut cfg = RaConfig::default();
+        cfg.loop_span_reserve = 0;
+        let mut alloc = LinearScanAllocator::new_with_config(
+            ranges,
+            vec![PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4)],
+            &std::sync::Arc::new(cfg),
+        );
+        alloc.run();
+        assert_eq!(alloc.assignments.len(), 4);
+    }
+
+    #[test]
+    fn loop_span_never_evicts_a_short_range() {
+        // A short range sits in the only register. A high-cost span arrives:
+        // with the cap active it must NOT evict the short range (that is
+        // the theft the cap prevents) — it spills instead.
+        let ranges = vec![
+            lr(1, 10, 20, vec![15], 5),
+            spanned(2, 0, 900, vec![100, 900], 300),
+        ];
+        let mut cfg = RaConfig::default();
+        cfg.loop_span_reserve = 1;
+        let mut alloc = LinearScanAllocator::new_with_config(
+            ranges,
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(cfg),
+        );
+        alloc.run();
+        assert!(
+            alloc.assignments.contains_key(&1),
+            "short range keeps its home"
+        );
+        assert!(
+            !alloc.assignments.contains_key(&2),
+            "span must not evict it"
+        );
+        assert!(alloc.spill_slots.contains_key(&2));
+    }
+
+    // ── span-pressure valve (RA-PRESSURE-2) ─────────────────────────────
+
+    fn valve_span(id: u32, uses: Vec<u32>) -> LiveRange {
+        // A span measured by mark_loop_spanning: in-loop reads, no
+        // recurrence, cheap enough to demote under pressure.
+        let mut r = spanned(id, 0, 900, uses, 60);
+        r.span_marked = true;
+        r.span_has_in_loop_use = true;
+        r
+    }
+
+    #[test]
+    fn valve_gives_exhausted_short_a_nonrecurrent_span() {
+        // chacha20's shape: the span holds the only register; a block-local
+        // short arrives with the pool exhausted. The valve hands the span's
+        // register over — the span's remaining single read folds into a
+        // memory operand, while the short would otherwise pay an acc
+        // round-trip every pass.
+        let ranges = vec![
+            valve_span(1, vec![100, 900]),
+            lr(2, 120, 130, vec![125], 20),
+        ];
+        let mut alloc = LinearScanAllocator::new_with_config(
+            ranges,
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(RaConfig::default()),
+        );
+        alloc.run();
+        assert!(
+            !alloc.assignments.contains_key(&1),
+            "span demoted by the valve"
+        );
+        assert!(
+            alloc.assignments.contains_key(&2),
+            "short takes the register"
+        );
+        assert!(alloc.spill_slots.contains_key(&1));
+    }
+
+    #[test]
+    fn valve_protects_recurrence_carried_spans() {
+        // arith_loop's shape: the span IS the carried chain (its next value
+        // is computed from itself). Demoting it puts the spill store→reload
+        // on the chain itself. The valve must refuse and fall through to
+        // the ordinary path, which spills the weaker incoming short.
+        let mut span = valve_span(1, vec![100, 900]);
+        span.span_recurrence = true;
+        let ranges = vec![span, lr(2, 120, 130, vec![125], 20)];
+        let mut alloc = LinearScanAllocator::new_with_config(
+            ranges,
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(RaConfig::default()),
+        );
+        alloc.run();
+        assert!(
+            alloc.assignments.contains_key(&1),
+            "carried span keeps its home"
+        );
+        assert!(!alloc.assignments.contains_key(&2));
+    }
+
+    #[test]
+    fn valve_ignores_spans_with_too_many_future_uses() {
+        // sha256's shape: the span still has several reads to serve inside
+        // the loop. Evicting it trades N folded reloads for one short's
+        // register — the valve's ceiling refuses, ordinary eviction decides.
+        let ranges = vec![
+            valve_span(1, (100..140).collect()),
+            lr(2, 120, 130, vec![125], 20),
+        ];
+        let mut alloc = LinearScanAllocator::new_with_config(
+            ranges,
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(RaConfig::default()),
+        );
+        alloc.run();
+        assert!(
+            alloc.assignments.contains_key(&1),
+            "read-rich span keeps its home"
+        );
+        assert!(!alloc.assignments.contains_key(&2));
+    }
+
+    #[test]
+    fn valve_prefers_the_fewest_future_uses_then_farthest_next_use() {
+        // Two steal-safe spans, one with a single remaining read at 880 and
+        // one with two remaining reads (300, 880). The valve must pick the
+        // single-read span: fewer folded reloads, same register gained.
+        let ranges = vec![
+            valve_span(1, vec![100, 300, 880]),
+            valve_span(2, vec![100, 880]),
+            lr(3, 120, 130, vec![125], 20),
+        ];
+        let mut alloc = LinearScanAllocator::new_with_config(
+            ranges,
+            vec![PhysReg(1), PhysReg(2)],
+            &std::sync::Arc::new(RaConfig::default()),
+        );
+        alloc.run();
+        assert!(
+            !alloc.assignments.contains_key(&2),
+            "1-future-use span demoted"
+        );
+        assert!(
+            alloc.assignments.contains_key(&1),
+            "2-future-use span keeps its home"
+        );
+        assert!(
+            alloc.assignments.contains_key(&3),
+            "short takes the freed register"
+        );
+    }
+
+    #[test]
+    fn valve_never_fires_for_a_span_incoming() {
+        // The valve is the shorts' lever only: a span arriving at an
+        // exhausted pool must not use it to steal another span's register
+        // (zero-sum churn).
+        let ranges = vec![valve_span(1, vec![100, 900]), {
+            let mut later = valve_span(2, vec![100, 900]);
+            later.start = 50;
+            later
+        }];
+        let mut alloc = LinearScanAllocator::new_with_config(
+            ranges,
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(RaConfig::default()),
+        );
+        alloc.run();
+        // Span 2 arrives second at the exhausted pool; without the valve
+        // for spans, the ordinary path keeps the earlier span homed.
+        assert!(alloc.assignments.contains_key(&1));
+    }
+
+    #[test]
+    fn mark_loop_spanning_detects_web_recurrence() {
+        // An accumulator web: the phi (v1) collects v2, and v2's defining
+        // instruction reads v1 — the classic `acc = acc + x` recurrence.
+        // A chacha-style web: the phi (v3) collects v4, but v4 is defined
+        // from values outside the web.
+        let mut f = empty_fn();
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{BlockId, Instruction, IrBinOp, Operand, Value};
+        f.blocks[0].instructions = vec![
+            Instruction::Phi {
+                dest: Value(1),
+                ty: IrType::I32,
+                incoming: vec![(Operand::Value(Value(2)), BlockId(0))],
+            },
+            Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(9)),
+                ty: IrType::I32,
+            },
+            Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::I32,
+                incoming: vec![(Operand::Value(Value(4)), BlockId(0))],
+            },
+            Instruction::BinOp {
+                dest: Value(4),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(7)),
+                rhs: Operand::Value(Value(8)),
+                ty: IrType::I32,
+            },
+        ];
+        // coalesce_member_of is member -> web leader.
+        let member_of: FxHashMap<u32, u32> = [(2u32, 1u32), (4u32, 3u32)].into_iter().collect();
+        let mut ranges = vec![
+            lr(1, 0, 900, vec![10, 900], 60),
+            lr(3, 0, 900, vec![10, 900], 60),
+        ];
+        mark_loop_spanning(&mut ranges, &[(100, 500)], &member_of, &f);
+        let acc = ranges.iter().find(|r| r.value_id == 1).unwrap();
+        let independent = ranges.iter().find(|r| r.value_id == 3).unwrap();
+        assert!(
+            acc.span_recurrence,
+            "acc web self-reference must be detected"
+        );
+        assert!(
+            !independent.span_recurrence,
+            "body-computed web is not carried"
+        );
+        assert!(acc.span_marked && independent.span_marked);
+    }
+
     /// Regression: put_dec Wave-4 (vsprintf.c). v39 [41,42] takes %r10-class
     /// PhysReg(10) by rotation (seeded spans [(13,20),(48,50)] leave it free
     /// there); v50 [42,50] (segments [(42,49)], closed) follows v39. The
@@ -1846,6 +2847,14 @@ mod tests {
             segments: Vec::new(),
             use_weights: Vec::new(),
             suffix_cost: Vec::new(),
+            spans_loop: false,
+            span_reserve: 0,
+            span_cost_bar: 0,
+            span_has_in_loop_use: false,
+            span_in_loop_uses: 0,
+            span_exposed_uses: 0,
+            span_recurrence: false,
+            span_marked: false,
             cost_boost: 1,
             occupancy_len: 0,
         };

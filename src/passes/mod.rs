@@ -911,6 +911,19 @@ fn target_rotate_bits(target: crate::backend::Target) -> u32 {
     }
 }
 
+/// Narrowest rotate the target lowers natively.  x86 `rolb`/`rolw` rotate at
+/// the operand width — the hardware count is `(count & 31) mod width`, so the
+/// sub-word forms are exact — while AArch64 (`ror`/`extr`) and RISC-V
+/// (`rol`/`ror`, Zbb) only rotate at the full register width.  This gates the
+/// truncation-aware narrow-rotate pattern so those backends never receive a
+/// sub-word rotate node.
+fn target_min_rotate_bits(target: crate::backend::Target) -> u32 {
+    match target {
+        crate::backend::Target::X86_64 | crate::backend::Target::I686 => 8,
+        crate::backend::Target::Aarch64 | crate::backend::Target::Riscv64 => 32,
+    }
+}
+
 /// Run optimization passes for the requested optimization level.
 ///
 /// `opt_level`: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
@@ -1231,9 +1244,14 @@ pub(crate) fn run_passes(
     // which deleted live SIMD copies), and dead aggregate allocas are dropped
     // only after re-checking the final instruction stream.
     if std::env::var("CCC_DISABLE_AGGREGATE_SROA").is_err() {
+        // Constant-fold AND copy-propagate before the split, mirroring the
+        // post-unroll sequence: SROA only models GEPs whose offset OPERAND
+        // is a literal constant, so folded `Copy Const` defs must also be
+        // substituted into the uses before the split sees them.
+        constant_fold::run(module);
+        copy_prop::run(module);
         aggregate_sroa::run(module);
         crate::ir::mem2reg::promote_allocas_with_params(module);
-        constant_fold::run(module);
         copy_prop::run(module);
         module.for_each_function(dce::eliminate_dead_code);
     }
@@ -1378,7 +1396,7 @@ pub(crate) fn run_passes(
         // Vector bodies contain Vec* intrinsics which `is_cloneable_pure`
         // rejects, so rotation bails on vectorized loops and only fires on
         // the residual scalar counted loops the vectorizer left alone.
-        if iter == 0 && opt_level >= 3 && !optimize_for_size && !dis.unroll {
+        if iter == 0 && opt_level >= 2 && !optimize_for_size && !dis.unroll {
             let n = timed_pass!(
                 "loop_unroll",
                 run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops)
@@ -1386,9 +1404,21 @@ pub(crate) fn run_passes(
             total_changes += n;
             total_changes_excl_dce += n;
             if n > 0 && std::env::var("CCC_DISABLE_AGGREGATE_SROA").is_err() {
+                // Constant-fold AND copy-propagate BEFORE the split: the
+                // unroller substitutes the IV with literals, leaving
+                // `Cast(Const)`/`Shl(Const, Const)` chains whose defs fold
+                // to `Copy Const` — but the GEP offsets still NAME those
+                // values until copy-propagation substitutes the constants
+                // into the operands, and aggregate SROA only models GEPs
+                // whose offset operand is a LITERAL constant. Fold →
+                // copyprop → split turns every cloned access into
+                // `GEP base, Const(k)`; the old order (split first) left
+                // chacha20's `u32 x[16]` unsplit, so the whole ARX state
+                // lived in stack slots at the backend (10x vs GCC).
+                constant_fold::run(module);
+                copy_prop::run(module);
                 aggregate_sroa::run(module);
                 crate::ir::mem2reg::promote_allocas_with_params(module);
-                constant_fold::run(module);
                 copy_prop::run(module);
                 module.for_each_function(dce::eliminate_dead_code);
             }
@@ -1616,10 +1646,16 @@ pub(crate) fn run_passes(
 
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
+            let min_rotate_bits = target_min_rotate_bits(target);
             let n = timed_pass!(
                 "bit_idioms",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    bit_idioms::recognize_function(func, enable_bit_reverse, max_rotate_bits)
+                    bit_idioms::recognize_function(
+                        func,
+                        enable_bit_reverse,
+                        max_rotate_bits,
+                        min_rotate_bits,
+                    )
                 })
             );
             cur_pass_changes[3] += n;
@@ -1780,10 +1816,16 @@ pub(crate) fn run_passes(
         if !pass_disabled(&disabled, "bit_idioms") {
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
+            let min_rotate_bits = target_min_rotate_bits(target);
             let n = timed_pass!(
                 "bit_idioms_post_ifconv",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    bit_idioms::recognize_function(func, enable_bit_reverse, max_rotate_bits)
+                    bit_idioms::recognize_function(
+                        func,
+                        enable_bit_reverse,
+                        max_rotate_bits,
+                        min_rotate_bits,
+                    )
                 })
             );
             total_changes += n;

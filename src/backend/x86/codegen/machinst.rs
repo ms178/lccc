@@ -517,12 +517,38 @@ pub const RDI: PhysReg = PhysReg(14);
 pub const RSI: PhysReg = PhysReg(15);
 
 /// All GPR registers that the MachInst allocator can assign to virtual registers.
-/// Excludes rax (0) and rcx (7) which are reserved as scratch.
+///
+/// rax (0) and rcx (7) are included: the window allocator's interference
+/// model already records every physical-register touch per instruction
+/// (accumulator-staged defs carry Phys(rax) operands, shift counts are
+/// staged through Phys(rcx), the division forms block the whole pool via
+/// `Raw`), and windows never contain calls, so a scratch assignment to
+/// rax/rcx is sound exactly when no recorded touch overlaps the scratch's
+/// live interval — the same test every other register passes. In ARX
+/// loops the two extra scratch registers are the difference between
+/// promoting the quarter-round temporaries and failing the whole window
+/// (chacha20_core: 12 concurrently-live version chains against a pool
+/// eaten by main-RA homes).
 pub const MACHINST_ALLOCATABLE_GPRS: &[PhysReg] = &[
     // Callee-saved (survive calls):
-    RBX, R12, R13, R14, R15, RBP,
+    RBX,
+    R12,
+    R13,
+    R14,
+    R15,
+    RBP,
     // Caller-saved (destroyed by calls, only for non-call-spanning values):
-    R11, R10, R8, R9, RDI, RSI, RDX,
+    R11,
+    R10,
+    R8,
+    R9,
+    RDI,
+    RSI,
+    RDX,
+    // Function-scratch (never main-RA homed; interference-tracked per
+    // window): rax, rcx.
+    PhysReg(0),
+    PhysReg(7),
 ];
 
 /// The six SysV AMD64 integer argument registers, in ABI order:
