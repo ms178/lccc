@@ -371,6 +371,25 @@ pub(super) fn rotate_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
     }
 }
 
+/// Rotate mnemonic at an explicit operand width: `rolb`/`rolw`/`roll`/`rolq`
+/// (and the `ror` family).  Sub-word rotates are exact on x86: the hardware
+/// count for 8/16-bit operands is `(count & 31) mod width`, so `rolw` by 16
+/// is the identity and by 17 a rotate of one (measured on SKL/ADL/Zen
+/// behaviour, and what GCC relies on when it emits bare `rolw %cl`).
+pub(super) fn rotate_mnemonic_width(op: IrBinOp, width: u32) -> &'static str {
+    match (op, width) {
+        (IrBinOp::RotateLeft, 8) => "rolb",
+        (IrBinOp::RotateLeft, 16) => "rolw",
+        (IrBinOp::RotateLeft, 32) => "roll",
+        (IrBinOp::RotateLeft, 64) => "rolq",
+        (IrBinOp::RotateRight, 8) => "rorb",
+        (IrBinOp::RotateRight, 16) => "rorw",
+        (IrBinOp::RotateRight, 32) => "rorl",
+        (IrBinOp::RotateRight, 64) => "rorq",
+        _ => unreachable!("not a rotate op"),
+    }
+}
+
 /// BMI2 three-operand shift mnemonics (`shlx count, src, dst`).  One µop on
 /// every core that has BMI2 (uops.info SHLX_R64_R64_R64), count in any GPR,
 /// non-destructive; flags are left untouched, which no consumer of a
@@ -476,8 +495,9 @@ pub struct X86Codegen {
     /// Repeated-lane full-width vector constants: (lane_value, lane_bytes,
     /// total_bytes) -> label. Used directly as memory operands (e.g. the
     /// 0x80000000 sign bias of the unsigned packed compare, consumed by
-    /// vpxor/pxor, which accept unaligned memory). Shares the label counter
-    /// and the .rodata flush with `vec_const_labels`.
+    /// vpxor/pxor — each entry is 16-byte aligned at flush time, which the
+    /// legacy-SSE consumers require). Shares the label counter and the
+    /// .rodata flush with `vec_const_labels`.
     pub(super) lane_const_labels: crate::common::fx_hash::FxHashMap<(u64, u8, u8), String>,
     /// True when the target has BMI1; enables scalar ANDN fusion.
     pub(super) bmi1_enabled: bool,
@@ -1066,8 +1086,9 @@ impl X86Codegen {
     /// `total_bytes / lane_bytes` times — a FULL-WIDTH vector constant for
     /// direct memory-operand use (vpxor BIAS(%rip), %ymm0, %ymm0), as
     /// opposed to the broadcast scalars of `vec_const_rip_operand`.
-    /// Consumers must use mnemonics that tolerate unaligned memory
-    /// (vpxor/pxor do; vpxorpd would require 32-byte alignment).
+    /// Every entry is emitted 16-byte aligned (see the flush below), which
+    /// is what makes the legacy-SSE `pxor mem, %xmm` consumers safe — only
+    /// the VEX forms tolerate unaligned memory.
     pub(super) fn lane_const_rip_operand(
         &mut self,
         lane_value: u64,
@@ -1122,14 +1143,14 @@ impl X86Codegen {
                     .emit_fmt(format_args!("    .long {}", *value as i32)),
             }
         }
-        // Lane constants are emitted BEFORE the scalar broadcast entries and
+        // Lane constants are emitted AFTER the scalar broadcast entries, and
         // each gets its own 16-byte alignment: the 128-bit lane constants are
         // consumed by LEGACY-SSE memory forms (`pxor mem, %xmm`) which fault
-        // on unaligned operands, and the 1/2/4/8-byte scalar entries emitted
-        // below would otherwise drag the pool off the 16-byte grid. (The
-        // 256-bit lane constants are only read by VEX forms — alignment
-        // unnecessary — but aligning them too costs at most a few bytes of
-        // .rodata and keeps the policy uniform.)
+        // on unaligned operands, and the mixed-width scalar entries above
+        // would otherwise leave the pool off the 16-byte grid. (The 256-bit
+        // lane constants are only read by VEX forms — alignment unnecessary
+        // there — but aligning them too costs at most a few bytes of .rodata
+        // and keeps the policy uniform.)
         let mut lanes: Vec<(&(u64, u8, u8), &String)> = self.lane_const_labels.iter().collect();
         lanes.sort_by_key(|(k, _)| (k.2, k.1, k.0));
         for ((value, lane_bytes, total_bytes), label) in lanes {
@@ -2516,6 +2537,196 @@ impl X86Codegen {
     /// This is the key optimization: instead of loading to rax, pushing, loading
     /// the other operand to rax, moving rax->rcx, then popping rax, we load
     /// directly to rcx with a single instruction.
+    /// Stage a variable shift/rotate count into `%ecx`, low 32 bits only.
+    ///
+    /// x86 consumes run-time counts from `%cl` and masks them at the operand
+    /// width (`(count & 31) mod width` below 64 bits, `count & 63` at 64), so
+    /// count bits above bit 5 can never affect the result — whatever the
+    /// count's type.  A 32-bit move of the count's low word is therefore
+    /// always exact and replaces the generic 64-bit staging (which for an
+    /// I64-typed count rematerialises it with a sign-extending load into a
+    /// scratch and then copies: `movslq %esi,%rdx; mov %edx,%ecx` — two
+    /// moves and an intermediate register) with a single `movl`.
+    ///
+    /// Unlike `operand_to_rcx`, this must NOT record the value in the `%rcx`
+    /// register cache: the register holds only the count's low word, not the
+    /// full 64-bit value a later `operand_to_rcx` consumer would expect.
+    /// The previous `%rcx` cache entry (if any) is invalidated instead.
+    pub(super) fn operand_to_cl(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(_) => {
+                // Immediates have no staging cost; the const path of
+                // operand_to_rcx is already minimal and keeps its cache
+                // bookkeeping.
+                self.operand_to_rcx(op);
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.state.reg_cache.sec_has(v.0, is_alloca) {
+                    // Already staged in %rcx by an earlier consumer; %cl is
+                    // ready regardless of which bits the cache entry claims.
+                    return;
+                }
+                // Register home: one 32-bit move. XMM homes (bit-punned
+                // counts) fall through to the generic path.
+                if let Some(reg) = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .copied()
+                    .filter(|&r| !is_xmm_reg(r))
+                {
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, %ecx", phys_reg_name_32(reg)));
+                    self.state.reg_cache.invalidate_sec();
+                    return;
+                }
+                // Stack home: every value slot is at least four bytes, and a
+                // 4-byte load captures the count's low word exactly. Allocas
+                // are excluded: their slot holds the storage, not the value
+                // (the address), so folding would read the first element.
+                if !is_alloca && let Some(slot) = self.state.get_slot(v.0) {
+                    let sref = self.slot_ref(slot.0);
+                    self.state.emit_fmt(format_args!("    movl {}, %ecx", sref));
+                    self.state.reg_cache.invalidate_sec();
+                    return;
+                }
+                // No home and no slot of its own. A count only needs its low
+                // bits — `(count & 31) mod width` below 64 bits, `count & 63`
+                // at 64 — and every integer cast (zext/sext/trunc/bitcast)
+                // preserves them. Chase the def chain through Copy and
+                // integer casts to a value with a home or slot and move THAT
+                // low word; this turns the generic remat of an I64-typed
+                // count (`movslq %esi,%rdx; mov %edx,%rcx`) into one
+                // `movl %esi,%ecx`.
+                let mut cur = *v;
+                for _ in 0..32 {
+                    let next = self
+                        .get_defining_instruction(cur.0)
+                        .and_then(|inst| match inst {
+                            crate::ir::reexports::Instruction::Copy { src, .. } => {
+                                Some(src.clone())
+                            }
+                            crate::ir::reexports::Instruction::Cast {
+                                src,
+                                from_ty,
+                                to_ty,
+                                ..
+                            } if from_ty.is_integer() && to_ty.is_integer() => Some(src.clone()),
+                            _ => None,
+                        });
+                    match next {
+                        Some(Operand::Value(next_v)) => {
+                            if let Some(reg) = self
+                                .reg_assignments
+                                .get(&next_v.0)
+                                .copied()
+                                .filter(|&r| !is_xmm_reg(r))
+                            {
+                                self.state.emit_fmt(format_args!(
+                                    "    movl %{}, %ecx",
+                                    phys_reg_name_32(reg)
+                                ));
+                                self.state.reg_cache.invalidate_sec();
+                                return;
+                            }
+                            if !self.state.is_alloca(next_v.0)
+                                && let Some(slot) = self.state.get_slot(next_v.0)
+                            {
+                                let sref = self.slot_ref(slot.0);
+                                self.state.emit_fmt(format_args!("    movl {}, %ecx", sref));
+                                self.state.reg_cache.invalidate_sec();
+                                return;
+                            }
+                            cur = next_v;
+                        }
+                        Some(Operand::Const(c)) => {
+                            // A constant reached through casts: reuse the
+                            // const staging (its cache bookkeeping is fine).
+                            self.operand_to_rcx(&Operand::Const(c));
+                            return;
+                        }
+                        _ => break,
+                    }
+                }
+                // Rematerialisable values (GlobalAddr) and anything else
+                // exotic: the generic path loads the value's low word into
+                // %rcx, which is exact for count purposes.
+                self.operand_to_rcx(op);
+            }
+        }
+    }
+
+    /// Load a sub-word (I8/U8/I16/U16) operand into `target` at its own
+    /// width, zero-extended into the 32-bit register — the canonical home
+    /// form the narrow-value discipline uses (`CastKind::IntNarrow` emits
+    /// `movzwl`/`movzbl` for exactly this invariant).  Wider operands take
+    /// the generic 64-bit path.
+    ///
+    /// `rolw`/`rolb` only write the low 16/8 bits of the register, so a
+    /// zero-extended input keeps the home zero-extended after the rotate —
+    /// no normalisation is ever needed after this staging.
+    pub(super) fn operand_to_callee_reg_narrow(
+        &mut self,
+        op: &Operand,
+        target: PhysReg,
+        ty: IrType,
+    ) {
+        let (load, target_typed) = match ty {
+            IrType::I8 | IrType::U8 => ("movzbl", typed_phys_reg_name(target, ty)),
+            IrType::I16 | IrType::U16 => ("movzwl", typed_phys_reg_name(target, ty)),
+            _ => {
+                self.operand_to_callee_reg(op, target);
+                return;
+            }
+        };
+        let target_32 = phys_reg_name_32(target);
+        match op {
+            Operand::Const(_) => {
+                // Narrow constants materialise zero-extended at their own
+                // width: mask the sign-extended i64 view of the const down
+                // to the type's bits (an I16 const of -1 stages as 0xffff,
+                // not 0xffffffff).
+                if let Some(val) = Self::const_as_imm32(op) {
+                    let masked = if matches!(ty, IrType::I8 | IrType::U8) {
+                        val as u8 as i64
+                    } else {
+                        val as u16 as i64
+                    };
+                    self.emit_imm_to_gpr(masked, phys_reg_name(target), target_32);
+                } else {
+                    self.operand_to_callee_reg(op, target);
+                }
+            }
+            Operand::Value(v) => {
+                if let Some(reg) = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .copied()
+                    .filter(|&r| !is_xmm_reg(r))
+                {
+                    let src_typed = typed_phys_reg_name(reg, ty);
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, %{}", load, src_typed, target_32));
+                } else if !self.state.is_alloca(v.0)
+                    && let Some(slot) = self.state.get_slot(v.0)
+                {
+                    let sref = self.slot_ref(slot.0);
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %{}", load, sref, target_32));
+                } else {
+                    // Exotic source (accumulator-staged, rematerialisable,
+                    // XMM-homed): generic 64-bit staging, then re-establish
+                    // the zero-extension invariant in place.
+                    self.operand_to_callee_reg(op, target);
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}",
+                        load, target_typed, target_32
+                    ));
+                }
+            }
+        }
+    }
+
     pub(super) fn operand_to_rcx(&mut self, op: &Operand) {
         match op {
             Operand::Const(c) => {
@@ -3744,16 +3955,25 @@ impl X86Codegen {
         lhs: &Operand,
         rhs: &Operand,
         dest_phys: PhysReg,
-        use_32bit: bool,
+        ty: IrType,
         dest_value_id: u32,
     ) {
         let dest_name = phys_reg_name(dest_phys);
         let dest_name_32 = phys_reg_name_32(dest_phys);
-        let (mnem32, mnem64) = rotate_mnemonic(op);
-        let width: i64 = if use_32bit { 32 } else { 64 };
+        let width: i64 = match ty {
+            IrType::I8 | IrType::U8 => 8,
+            IrType::I16 | IrType::U16 => 16,
+            IrType::I32 | IrType::U32 => 32,
+            IrType::I64 | IrType::U64 | IrType::Ptr => 64,
+            _ => unreachable!("rotate of non-integer type"),
+        };
+        let mnem = rotate_mnemonic_width(op, width as u32);
+        let dest_typed = typed_phys_reg_name(dest_phys, ty);
 
         if let Some(imm) = Self::const_as_imm32(rhs) {
-            self.operand_to_callee_reg(lhs, dest_phys);
+            // Sub-word sources load with their typed form so the home stays
+            // zero-extended; 32/64-bit sources keep the generic staging.
+            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
             // Reduce explicitly instead of leaning on the hardware mask: the
             // emitted immediate then documents the real rotation, and a count
             // of 0 (or any multiple of the width) folds away to the copy that
@@ -3761,17 +3981,15 @@ impl X86Codegen {
             // no-op.
             let amount = (imm as i64).rem_euclid(width);
             if amount != 0 {
-                if use_32bit {
-                    self.state
-                        .emit_fmt(format_args!("    {mnem32} ${amount}, %{dest_name_32}"));
+                self.state
+                    .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, dest_typed));
+                if width == 32 {
                     // A rotate can move any bit into bit 31, so a signed I32
                     // result needs the same upper-half normalization a signed
                     // `shl` does. No-op for the unsigned types rotate idioms
-                    // actually use.
+                    // actually use. Sub-word results keep their zero-extended
+                    // homes: `rolw`/`rolb` only write the low bits.
                     self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
-                } else {
-                    self.state
-                        .emit_fmt(format_args!("    {mnem64} ${amount}, %{dest_name}"));
                 }
             }
             self.state.reg_cache.invalidate_acc();
@@ -3783,19 +4001,16 @@ impl X86Codegen {
         // it (the same hazard `emit_shift_cl_legacy` guards).
         let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
         if rhs_conflicts {
-            self.operand_to_rcx(rhs);
-            self.operand_to_callee_reg(lhs, dest_phys);
+            self.operand_to_cl(rhs);
+            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
         } else {
-            self.operand_to_callee_reg(lhs, dest_phys);
-            self.operand_to_rcx(rhs);
+            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
+            self.operand_to_cl(rhs);
         }
-        if use_32bit {
-            self.state
-                .emit_fmt(format_args!("    {mnem32} %cl, %{dest_name_32}"));
+        self.state
+            .emit_fmt(format_args!("    {} %cl, %{}", mnem, dest_typed));
+        if width == 32 {
             self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
-        } else {
-            self.state
-                .emit_fmt(format_args!("    {mnem64} %cl, %{dest_name}"));
         }
         self.state.reg_cache.invalidate_acc();
     }
@@ -3818,11 +4033,11 @@ impl X86Codegen {
         let (mnem32, mnem64) = shift_mnemonic(op);
         let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
         if rhs_conflicts {
-            self.operand_to_rcx(rhs);
+            self.operand_to_cl(rhs);
             self.operand_to_callee_reg(lhs, dest_phys);
         } else {
             self.operand_to_callee_reg(lhs, dest_phys);
-            self.operand_to_rcx(rhs);
+            self.operand_to_cl(rhs);
         }
         if use_32bit {
             self.state

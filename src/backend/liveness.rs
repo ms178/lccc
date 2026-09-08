@@ -55,6 +55,13 @@ pub struct LivenessResult {
     pub call_points: Vec<u32>,
     /// Loop nesting depth per block. Length is always `func.blocks.len()`.
     pub block_loop_depth: Vec<u32>,
+    /// Linearized `[header_start, latch_end]` extent of every natural loop
+    /// (one entry per distinct back-edge target, latch end = the latest
+    /// block end among that header's back-edge sources). A live range whose
+    /// fat envelope covers such an extent holds its register for the whole
+    /// body of the loop, on every iteration — the property the register
+    /// allocator's loop-span admission cap keys on (RA-PRESSURE-1).
+    pub loop_extents: Vec<(u32, u32)>,
     /// Inclusive start point of each block. Length = `func.blocks.len()`.
     pub block_starts: Vec<u32>,
     /// Inclusive terminator point of each block. Length = `func.blocks.len()`.
@@ -383,6 +390,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
             segments: Vec::new(),
             call_points: Vec::new(),
             block_loop_depth: Vec::new(),
+            loop_extents: Vec::new(),
             block_starts: Vec::new(),
             block_ends: Vec::new(),
             num_points: 0,
@@ -428,6 +436,24 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let predecessors = invert_cfg(&successors, num_blocks);
     let (back_edges, postorder) = analyze_forward_cfg(&successors, num_blocks);
     let block_loop_depth = compute_loop_depth(&predecessors, &back_edges, num_blocks);
+
+    // Natural-loop extents in linearized program points. One entry per
+    // distinct back-edge target; the latch end is the latest block end of
+    // any back-edge source into that header (a shared header with several
+    // latches is one loop to a register allocator).
+    let mut loop_extents: Vec<(u32, u32)> = Vec::new();
+    for &(tail, header) in &back_edges {
+        if header >= num_blocks || tail >= num_blocks {
+            continue;
+        }
+        let hs = ps.block_start_points[header];
+        let te = ps.block_end_points[tail];
+        match loop_extents.iter_mut().find(|e| e.0 == hs) {
+            Some(e) => e.1 = e.1.max(te),
+            None => loop_extents.push((hs, te)),
+        }
+    }
+    loop_extents.sort_unstable();
 
     let (live_in, live_out) = run_backward_dataflow(
         num_blocks,
@@ -509,6 +535,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         segments,
         call_points: ps.call_points,
         block_loop_depth,
+        loop_extents,
         block_starts: ps.block_start_points,
         block_ends: ps.block_end_points,
         num_points: ps.num_points,

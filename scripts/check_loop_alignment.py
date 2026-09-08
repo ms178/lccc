@@ -13,7 +13,11 @@ IR) for the oracle-derived directive contract:
     worst case, degrading to the ICX/Clang 16-byte form;
   * a loop whose header exit comparison proves a constant trip count <= 4
     is left unaligned (GCC and Clang leave constant-trip-3 loops alone:
-    the one-shot padding cannot pay back over at most four iterations);
+    the one-shot padding cannot pay back over at most four iterations) —
+    for `<`, `<=` (bound one past the limit), `!=`, and the mirrored
+    `Const(n) > iv` / `Const(n) >= iv` / `Const(n) != iv` forms, but only
+    when the compare feeds the header terminator (a stray constant
+    compare in the header must not disqualify alignment);
   * a scalar loop header is preceded by the bounded cascade
     ``.p2align 4,,10`` + ``.p2align 3`` (16 bytes when <= 10 padding bytes
     are needed, otherwise 8) — GCC's ASM_OUTPUT_MAX_SKIP_ALIGN shape;
@@ -115,7 +119,61 @@ int tiny_trip_call(const int *restrict a) {
 """,
         "scalar",
     ),
+    (
+        # `<=` variant: `j <= 3` runs 4 iterations (bound one past the
+        # limit), still within the <= 4 exclusion. Same opaque-call
+        # unroll shield as tiny_trip_call.
+        "tiny_trip_le",
+        """
+extern int weigh(int v);
+int tiny_trip_le(const int *restrict a) {
+    int acc = 0;
+    for (int j = 0; j <= 3; j++)
+        acc += weigh(a[j]);
+    return acc;
+}
+""",
+        "scalar",
+    ),
+    (
+        # `!=` variant: `j != 3` over the forward induction runs exactly
+        # 3 iterations (GCC/Clang leave these unaligned too).
+        "tiny_trip_ne",
+        """
+extern int weigh(int v);
+int tiny_trip_ne(const int *restrict a) {
+    int acc = 0;
+    for (int j = 0; j != 3; j++)
+        acc += weigh(a[j]);
+    return acc;
+}
+""",
+        "scalar",
+    ),
+    (
+        # Mirrored form: `3 > j` bounds the trip exactly like `j < 3`.
+        "tiny_trip_mirror",
+        """
+extern int weigh(int v);
+int tiny_trip_mirror(const int *restrict a) {
+    int acc = 0;
+    for (int j = 0; 3 > j; j++)
+        acc += weigh(a[j]);
+    return acc;
+}
+""",
+        "scalar",
+    ),
 ]
+
+# Corpus cases whose loops must reach codegen AND stay unpadded: the
+# constant-trip-<=4 exclusion asserted in the negative direction.
+TINY_TRIP_NO_PAD = frozenset({
+    "tiny_trip_call",
+    "tiny_trip_le",
+    "tiny_trip_ne",
+    "tiny_trip_mirror",
+})
 
 VEC_MNEMONIC = re.compile(r"^\s*v[a-z]|^\s*movdq[au]|^\s*movdqa|^\s*p[a-z]")
 LABEL_DEF = re.compile(r"^(\.L\S+):")
@@ -350,7 +408,7 @@ def run(lccc: Path, verbose: bool) -> int:
             for tgt, dirs in loops.items():
                 if kind == "vector":
                     want = [".p2align 5,,15", ".p2align 4"]
-                elif fname == "tiny_trip_call":
+                elif fname in TINY_TRIP_NO_PAD:
                     # A constant trip count <= 4 must suppress padding
                     # entirely (the exclusion is the CONTRACT, not an
                     # accident): assert the negative direction too.

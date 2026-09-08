@@ -7,9 +7,11 @@
 /target-sroa/
 **/*.rs.bk
 
-# Crash dumps
-core
-core.*
+# Crash dumps (root-anchored: a bare `core.*` also matched
+# src/backend/*/assembler/encoder/core.rs and made fresh clones
+# unable to `git add` the tracked encoder sources)
+/core
+/core.*
 
 # CCC submodule build
 /ccc/target/

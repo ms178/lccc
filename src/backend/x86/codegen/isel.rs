@@ -549,14 +549,20 @@ pub fn lower_binop(
             // would overwrite the count before it is copied to %rcx.  Copy
             // the count out first in that case; otherwise keep lhs first so
             // a count already sitting in %rcx is not clobbered.
+            //
+            // The count stages at S32 whatever the operand width: every
+            // consumer (`shl/shlx/rol %cl`, masked at the operand width)
+            // uses only the count's low bits, and a 32-bit move avoids the
+            // 64-bit reload of an I64-typed count (movslq into a scratch
+            // plus a copy: `movslq %esi,%rdx; mov %edx,%rcx`).
             let count_home_is_dst = matches!(rhs, Operand::Value(v)
                 if v.0 != dest.0 && value_to_reg(v, ra) == dst && matches!(dst, MachReg::Phys(_)));
             if count_home_is_dst {
-                emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
+                emit_mov_operand_r(rhs, MachReg::Phys(RCX), OpSize::S32, ra, out);
                 emit_mov_operand_r(lhs, dst, size, ra, out);
             } else {
                 emit_mov_operand_r(lhs, dst, size, ra, out);
-                emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
+                emit_mov_operand_r(rhs, MachReg::Phys(RCX), OpSize::S32, ra, out);
             }
             out.push(MachInst::Shift {
                 op: shift_op,
@@ -1240,7 +1246,10 @@ fn try_lower_shiftx(
         return false;
     }
     let count = if needs_rcx {
-        emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
+        // S32 staging: shlx/shrx/sarx mask the count at the operand width,
+        // so only its low bits matter and a 32-bit move avoids the 64-bit
+        // reload of an I64-typed count (see the legacy Shift path).
+        emit_mov_operand_r(rhs, MachReg::Phys(RCX), OpSize::S32, ra, out);
         MachReg::Phys(RCX)
     } else {
         MachReg::Phys(count_home.expect("checked"))

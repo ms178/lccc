@@ -20,14 +20,14 @@ pub enum ExternalDecl {
 /// specifiers (static, inline, extern) and GCC __attribute__((...)) syntax.
 ///
 /// Boolean attributes are stored as a packed bitfield (`flags`) for memory
-/// efficiency — 13 booleans collapse from 13 bytes into 2 bytes. Accessor
+/// efficiency — 17 booleans collapse from 17 bytes into 4 bytes. Accessor
 /// methods provide the same API as the old struct fields.
 ///
 /// Non-boolean attributes (`section`, `visibility`) remain as `Option<String>`.
 #[derive(Clone, Default)]
 pub struct FunctionAttributes {
     /// Packed boolean flags — see `FuncAttrFlag` constants.
-    flags: u16,
+    flags: u32,
     /// __attribute__((section("..."))) - place in specific ELF section
     pub section: Option<String>,
     /// __attribute__((visibility("hidden"|"default"|...)))
@@ -41,36 +41,40 @@ pub struct FunctionAttributes {
 /// Each attribute occupies one bit, allowing cheap test/set/clear operations.
 /// New attributes can be added by defining the next power-of-two constant.
 pub mod func_attr_flag {
-    pub const STATIC: u16 = 1 << 0;
-    pub const INLINE: u16 = 1 << 1;
+    pub const STATIC: u32 = 1 << 0;
+    pub const INLINE: u32 = 1 << 1;
     /// `extern` storage class on the function definition.
-    pub const EXTERN: u16 = 1 << 2;
+    pub const EXTERN: u32 = 1 << 2;
     /// `__attribute__((gnu_inline))` — forces GNU89 inline semantics.
-    pub const GNU_INLINE: u16 = 1 << 3;
+    pub const GNU_INLINE: u32 = 1 << 3;
     /// `__attribute__((always_inline))` — must always be inlined.
-    pub const ALWAYS_INLINE: u16 = 1 << 4;
+    pub const ALWAYS_INLINE: u32 = 1 << 4;
     /// `__attribute__((noinline))` — must never be inlined.
-    pub const NOINLINE: u16 = 1 << 5;
+    pub const NOINLINE: u32 = 1 << 5;
     /// `__attribute__((constructor))` — run before main.
-    pub const CONSTRUCTOR: u16 = 1 << 6;
+    pub const CONSTRUCTOR: u32 = 1 << 6;
     /// `__attribute__((destructor))` — run after main.
-    pub const DESTRUCTOR: u16 = 1 << 7;
+    pub const DESTRUCTOR: u32 = 1 << 7;
     /// `__attribute__((weak))` — emit as a weak symbol.
-    pub const WEAK: u16 = 1 << 8;
+    pub const WEAK: u32 = 1 << 8;
     /// `__attribute__((used))` — prevent dead code elimination.
-    pub const USED: u16 = 1 << 9;
+    pub const USED: u32 = 1 << 9;
     /// `__attribute__((fastcall))` — i386 fastcall convention (first 2 int args in ecx/edx).
-    pub const FASTCALL: u16 = 1 << 10;
+    pub const FASTCALL: u32 = 1 << 10;
     /// `__attribute__((naked))` — emit no prologue/epilogue; function body is pure asm.
-    pub const NAKED: u16 = 1 << 11;
+    pub const NAKED: u32 = 1 << 11;
     /// `__attribute__((noreturn))` or `_Noreturn` — function never returns.
-    pub const NORETURN: u16 = 1 << 12;
+    pub const NORETURN: u32 = 1 << 12;
     /// `__attribute__((no_instrument_function))` — skip mcount/__fentry__ prologue.
-    pub const NO_INSTRUMENT: u16 = 1 << 13;
+    pub const NO_INSTRUMENT: u32 = 1 << 13;
     /// `__attribute__((pure))` — read-only memory access, no observable side effects.
-    pub const PURE: u16 = 1 << 14;
+    pub const PURE: u32 = 1 << 14;
     /// `__attribute__((const))` — no memory access, no observable side effects.
-    pub const CONST_ATTR: u16 = 1 << 15;
+    pub const CONST_ATTR: u32 = 1 << 15;
+    /// `__attribute__((cold))` — the function is unlikely to execute; the
+    /// lowerer places it in `.text.unlikely` unless `section(...)` says
+    /// otherwise, and the loop-alignment pass skips its loops.
+    pub const COLD: u32 = 1 << 16;
 }
 
 impl FunctionAttributes {
@@ -145,6 +149,10 @@ impl FunctionAttributes {
     pub fn is_const_attr(&self) -> bool {
         self.flags & func_attr_flag::CONST_ATTR != 0
     }
+    #[inline]
+    pub fn is_cold(&self) -> bool {
+        self.flags & func_attr_flag::COLD != 0
+    }
 
     // --- flag setters ---
 
@@ -212,9 +220,13 @@ impl FunctionAttributes {
     pub fn set_const_attr(&mut self, v: bool) {
         self.set_flag(func_attr_flag::CONST_ATTR, v)
     }
+    #[inline]
+    pub fn set_cold(&mut self, v: bool) {
+        self.set_flag(func_attr_flag::COLD, v)
+    }
 
     #[inline]
-    fn set_flag(&mut self, mask: u16, v: bool) {
+    fn set_flag(&mut self, mask: u32, v: bool) {
         if v {
             self.flags |= mask;
         } else {
@@ -239,6 +251,7 @@ impl std::fmt::Debug for FunctionAttributes {
             .field("is_fastcall", &self.is_fastcall())
             .field("is_naked", &self.is_naked())
             .field("is_noreturn", &self.is_noreturn())
+            .field("is_cold", &self.is_cold())
             .field("section", &self.section)
             .field("visibility", &self.visibility)
             .finish()
@@ -594,6 +607,9 @@ pub mod decl_attr_flag {
     pub const PURE: u16 = 1 << 9;
     /// `__attribute__((const))` — no memory access, no observable side effects.
     pub const CONST_ATTR: u16 = 1 << 10;
+    /// `__attribute__((cold))` — the function is unlikely to execute.
+    /// Meaningful on functions only; ignored for variables like GCC.
+    pub const COLD: u16 = 1 << 11;
 }
 
 impl DeclAttributes {
@@ -643,6 +659,10 @@ impl DeclAttributes {
     pub fn is_const_attr(&self) -> bool {
         self.flags & decl_attr_flag::CONST_ATTR != 0
     }
+    #[inline]
+    pub fn is_cold(&self) -> bool {
+        self.flags & decl_attr_flag::COLD != 0
+    }
 
     // --- flag setters ---
 
@@ -689,6 +709,10 @@ impl DeclAttributes {
     #[inline]
     pub fn set_const_attr(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::CONST_ATTR, v)
+    }
+    #[inline]
+    pub fn set_cold(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::COLD, v)
     }
 
     #[inline]

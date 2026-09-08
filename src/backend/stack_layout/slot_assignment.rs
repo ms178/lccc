@@ -1324,7 +1324,7 @@ pub(super) fn finalize_deferred_slots(
         // values are 8-aligned only relative to an 8-aligned base. With a
         // 4-mod-8 base, finalize's alignment rounding shifts wide slots onto
         // small slots' bytes (rot() v11/v14 overlap).
-        let mut aligned_nls = if max_align > 8 {
+        let aligned_nls = if max_align > 8 {
             crate::common::types::align_up(non_local_space as usize, max_align as usize) as i64
         } else {
             (non_local_space + 7) & !7

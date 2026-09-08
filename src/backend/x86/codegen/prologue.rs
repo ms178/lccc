@@ -1139,7 +1139,43 @@ impl X86Codegen {
                             Instruction::Cast { src, .. } => mark(src, "cast"),
                             Instruction::UnaryOp { src, .. } => mark(src, "unary"),
                             Instruction::Copy { src, .. } => mark(src, "copy"),
-                            Instruction::BinOp { lhs, .. } => mark(lhs, "binop"),
+                            // RMW split (2026-09-08): a value consumed as the
+                            // LHS of a two-address read-modify-write integer
+                            // BinOp (the ops with follow hints: Add/Sub/And/
+                            // Or/Xor/Mul/Shl/AShr/LShr/RotateLeft/RotateRight)
+                            // is classified "rmw", NOT "binop". The follow
+                            // machinery can home such a value for FREE on the
+                            // dying producer's register and the consumer then
+                            // re-enters the same register in place — the ARX
+                            // gold shape (chacha20: addl/xorl/roll chains with
+                            // zero movs, 153- vs 220-insn loop). The
+                            // accumulator carrier can only tie that (consumer
+                            // reg-direct: movq %rax,%dst copy) or lose it
+                            // (chained acc). The accumulator stays the right
+                            // carrier only for consumers that cannot consume
+                            // in place: div/rem/BitTest (rax-resident, no
+                            // follow hint) keep the legacy "binop" class.
+                            // Selectable for bisection via
+                            // CCC_X64_NOHOME_CLASSES=...,rmw.
+                            Instruction::BinOp { lhs, op, ty, .. } => {
+                                let rmw = ty.is_integer()
+                                    && !matches!(ty, IrType::I128 | IrType::U128)
+                                    && matches!(
+                                        op,
+                                        IrBinOp::Add
+                                            | IrBinOp::Sub
+                                            | IrBinOp::And
+                                            | IrBinOp::Or
+                                            | IrBinOp::Xor
+                                            | IrBinOp::Mul
+                                            | IrBinOp::Shl
+                                            | IrBinOp::AShr
+                                            | IrBinOp::LShr
+                                            | IrBinOp::RotateLeft
+                                            | IrBinOp::RotateRight
+                                    );
+                                mark(lhs, if rmw { "rmw" } else { "binop" });
+                            }
                             Instruction::Cmp { lhs, .. } => mark(lhs, "cmp"),
                             _ => {}
                         }
