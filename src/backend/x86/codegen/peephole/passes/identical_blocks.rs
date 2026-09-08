@@ -37,6 +37,33 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 //      merged blocks and all their predecessors to be "clean" (single-entry,
 //      no internal labels), so the register values at entry are path-independent.
 
+/// True for the alignment directives (`.p2align`, `.align`, `.balign`, any
+/// argument forms). These are LAYOUT annotations, not code: they neither
+/// define registers nor flags nor split semantic basic blocks. The block
+/// model must treat them as transparent — a `.p2align` between a guard's
+/// `jae` and the loop-head label historically severed the fall-through
+/// edge (the adjacency test `X.end == B.start` failed with the directive
+/// line in between), leaving loop-preheader blocks with an EMPTY recorded
+/// predecessor set. Two such "orphaned" blocks then satisfied the
+/// identical-predecessors merge condition (empty == empty) and one was
+/// deleted — while its guard still fell through into it at runtime. The
+/// surviving loop then ran with uninitialized pointer/counter/accumulator
+/// registers (reproducer: tests/regression/vectorize_int_map_lanes.c at
+/// -O2 -march=x86-64-v3 with hot-loop alignment; SIGSEGV in `vmovdqu
+/// %ymm0,(%rdi)` inside `fill`, 20/20 runs).
+/// Pseudo predecessor label for a function's entry region (`func_id`).
+/// A NUL byte can never appear in a real assembler label, so the pseudo
+/// label cannot collide with any block label.
+fn entry_pseudo_label(func_id: u32) -> String {
+    format!("\u{0}fn{func_id}")
+}
+
+fn is_alignment_directive(trimmed: &str) -> bool {
+    trimmed.starts_with(".p2align")
+        || trimmed.starts_with(".align")
+        || trimmed.starts_with(".balign")
+}
+
 /// Does this instruction set the EFLAGS (condition flags)?
 fn sets_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
     match infos[i].kind {
@@ -159,6 +186,11 @@ fn block_is_flag_dependent(
         if infos[j].is_nop() {
             continue;
         }
+        if infos[j].kind == LineKind::Directive
+            && is_alignment_directive(infos[j].trimmed(store.get(j)))
+        {
+            continue;
+        }
         if sets_flags(store, infos, j) {
             flags_set = true;
         } else if reads_flags(store, infos, j) && !flags_set {
@@ -171,9 +203,16 @@ fn block_is_flag_dependent(
 /// True if the block is a clean, single-entry straight-line basic block: it has
 /// no internal label (other than its own entry label) and no directives that
 /// would split it, so its register state at exit is path-independent.
+/// Alignment directives are transparent layout annotations (see
+/// `is_alignment_directive`): padding inside a block defines nothing.
 fn block_is_clean(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
     for j in (start + 1)..end {
         if infos[j].is_nop() {
+            continue;
+        }
+        if infos[j].kind == LineKind::Directive
+            && is_alignment_directive(infos[j].trimmed(store.get(j)))
+        {
             continue;
         }
         match infos[j].kind {
@@ -189,6 +228,11 @@ fn block_is_clean(store: &LineStore, infos: &[LineInfo], start: usize, end: usiz
 fn block_has_flag_use(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
     for j in (start + 1)..end {
         if infos[j].is_nop() {
+            continue;
+        }
+        if infos[j].kind == LineKind::Directive
+            && is_alignment_directive(infos[j].trimmed(store.get(j)))
+        {
             continue;
         }
         if reads_flags(store, infos, j) || sets_flags(store, infos, j) {
@@ -210,17 +254,33 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     let mut blocks: Vec<(usize, usize, String, u32)> = Vec::new(); // (start_line, end_line, label_name, func_id)
     let mut block_of_line: Vec<isize> = vec![-1; len]; // line -> block index (or -1)
     let mut current_func_id: u32 = 0;
+    // Per-line function id and the line where each function's region starts.
+    // The lines before a function's first .LBB block (its entry region) are
+    // not modeled as a block, so edges from there — explicit jumps AND the
+    // positional fall-through — were invisible to the predecessor model.
+    // Blocks entered only from the entry region then carried an EMPTY
+    // predecessor set, and "empty == empty" let the merge delete one while
+    // its entry still reached it at runtime. Both edge kinds are now
+    // attributed to a per-function pseudo label (NUL-prefixed: a real label
+    // can never contain NUL, so it cannot collide).
+    let mut func_id_of_line: Vec<u32> = vec![0; len];
+    let mut func_boundary: FxHashMap<u32, usize> = FxHashMap::default();
     let mut i = 0;
     while i < len {
         if infos[i].kind == LineKind::Directive {
             let line = infos[i].trimmed(store.get(i));
             if line == ".cfi_startproc" {
                 current_func_id += 1;
+                func_boundary.insert(current_func_id, i);
             }
         }
         if infos[i].kind == LineKind::Label {
             let label = infos[i].trimmed(store.get(i));
             if let Some(label_name) = label.strip_suffix(':') {
+                if !label_name.starts_with(".L") {
+                    current_func_id += 1;
+                    func_boundary.insert(current_func_id, i);
+                }
                 if label_name.starts_with(".LBB") {
                     let start = i;
                     let mut end = i + 1;
@@ -240,8 +300,18 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                             // merge (then delete) epilogue blocks it shouldn't
                             // (gzip -g -O2: treat_file lost its epilogue+ret
                             // and fell through into create_outfile -> SIGSEGV).
+                            // Alignment directives are equally inert for
+                            // control flow: they are padding annotations for
+                            // the FOLLOWING label. Stopping the block at them
+                            // severed the fall-through edge (X.end landed on
+                            // the directive, not on the successor's label), so
+                            // blocks entered only by fall-through acquired an
+                            // empty predecessor set and merged unsoundly.
                             let dl = infos[end].trimmed(store.get(end));
-                            if dl.starts_with(".loc") || dl.starts_with(".file") {
+                            if dl.starts_with(".loc")
+                                || dl.starts_with(".file")
+                                || is_alignment_directive(dl)
+                            {
                                 end += 1;
                                 continue;
                             }
@@ -252,6 +322,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                     let bidx = blocks.len() as isize;
                     for k in start..end {
                         block_of_line[k] = bidx;
+                        func_id_of_line[k] = current_func_id;
                     }
                     blocks.push((start, end, label_name.to_string(), current_func_id));
                     i = end;
@@ -271,6 +342,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                 }
             }
         }
+        func_id_of_line[i] = current_func_id;
         i += 1;
     }
 
@@ -290,6 +362,13 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     for (bidx, &(start, end, _, _)) in blocks.iter().enumerate() {
         for k in (start + 1..end).rev() {
             if infos[k].is_nop() {
+                continue;
+            }
+            // Alignment directives are now inside the block range; the
+            // terminator is the last real instruction, never the padding.
+            if infos[k].kind == LineKind::Directive
+                && is_alignment_directive(infos[k].trimmed(store.get(k)))
+            {
                 continue;
             }
             block_terminator[bidx] = infos[k].kind;
@@ -315,6 +394,12 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                             .entry(target.clone())
                             .or_default()
                             .insert(src_label.clone());
+                    } else {
+                        // Jump from a function's entry region: attribute it
+                        // to that function's pseudo entry label. The edge is
+                        // an explicit (rewritable) jump.
+                        let pseudo = entry_pseudo_label(func_id_of_line[i]);
+                        preds.entry(target.clone()).or_default().insert(pseudo);
                     }
                 }
             }
@@ -322,6 +407,14 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     }
     // Fall-through edges: block X (end == B.start, terminator not an
     // unconditional jmp/ret) falls through into block B.
+    // A block entered this way can NEVER be selected as the merge
+    // duplicate: its entry edge is positional (the predecessor simply
+    // continues into the next line) and no branch rewrite can redirect
+    // it. Predecessor SETS record label names only, not edge kinds, so
+    // "identical preds" does not by itself prove the deleted block's
+    // entries are all rewritable jumps (P can jump to the canonical and
+    // fall through into the duplicate, making both pred sets {P}).
+    let mut fallthrough_entries: FxHashSet<String> = FxHashSet::default();
     for bi in 0..blocks.len() {
         let b_start = blocks[bi].0;
         let b_label = blocks[bi].2.clone();
@@ -342,8 +435,50 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                         // X falls through into B (CondJmp or plain fall-through).
                         let x_label = blocks[xi].2.clone();
                         preds.entry(b_label.clone()).or_default().insert(x_label);
+                        fallthrough_entries.insert(b_label.clone());
                     }
                 }
+            }
+        }
+    }
+    // Fall-through from a function's ENTRY REGION into its first block: the
+    // region before the first .LBB label is positional predecessor code that
+    // no block models. If its last instruction is not an unconditional
+    // transfer, control flows into the first block — record the pseudo
+    // predecessor AND a fall-through entry (the edge cannot be rewritten).
+    {
+        let mut seen_func: FxHashSet<u32> = FxHashSet::default();
+        for &(start, _, ref bl, fid) in &blocks {
+            if !seen_func.insert(fid) {
+                continue;
+            }
+            // Only when no real block immediately precedes it (a same-function
+            // predecessor is handled by the loop above).
+            let preceded_by_block = blocks.iter().any(|&(ps, pe, _, _)| pe == start);
+            if preceded_by_block {
+                continue;
+            }
+            let region_start = func_boundary.get(&fid).copied().unwrap_or(0);
+            let mut last_insn: Option<LineKind> = None;
+            for k in (region_start..start).rev() {
+                if infos[k].is_nop() || infos[k].kind == LineKind::Label {
+                    continue;
+                }
+                if infos[k].kind == LineKind::Directive {
+                    // .cfi_*/.loc/.file/alignment lines carry no code.
+                    continue;
+                }
+                last_insn = Some(infos[k].kind);
+                break;
+            }
+            let flows_in = !matches!(
+                last_insn,
+                Some(LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret)
+            );
+            if flows_in {
+                let pseudo = entry_pseudo_label(fid);
+                preds.entry(bl.clone()).or_default().insert(pseudo);
+                fallthrough_entries.insert(bl.clone());
             }
         }
     }
@@ -506,6 +641,24 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             if canonical_preds != other_preds {
                 continue;
             }
+            // SOUNDNESS (defense in depth): never merge a block whose recorded
+            // predecessor set is EMPTY. An empty set means either genuinely
+            // dead code (merging is pointless) or — as happened with
+            // alignment directives severing fall-through edges — an entry the
+            // edge model could not see. The identical-predecessors guarantee
+            // only holds when the model sees every edge, so empty is treated
+            // as "unknown", never as "unreachable".
+            if canonical_preds.is_empty() {
+                continue;
+            }
+            // SOUNDNESS: the DELETED block must not have a fall-through
+            // entry: that edge is positional and survives the merge
+            // unredirected, so the predecessor would fall into the removed
+            // text. (The canonical block keeps its position, so a
+            // fall-through entry on the canonical side is fine.)
+            if fallthrough_entries.contains(other_label.as_str()) {
+                continue;
+            }
             // SOUNDNESS: never merge/eliminate a jump-table target, a
             // flag-dependent block, a non-clean block, or one with a non-clean
             // predecessor.
@@ -533,6 +686,17 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                 redirects.insert(other_label.clone(), canonical_label.clone());
                 for j in other_start..other_end {
                     if !infos[j].is_nop() {
+                        // Alignment directives inside the deleted range pad
+                        // the FOLLOWING block's label (the block scan only
+                        // traverses them because they are transparent), and
+                        // that block survives the merge. Dropping the padding
+                        // would silently unalign a loop header the layout
+                        // pass deliberately aligned, so it is kept verbatim.
+                        if infos[j].kind == LineKind::Directive
+                            && is_alignment_directive(infos[j].trimmed(store.get(j)))
+                        {
+                            continue;
+                        }
                         mark_nop(&mut infos[j]);
                         changed = true;
                     }
@@ -577,6 +741,115 @@ mod tests {
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
+    }
+
+    /// Alignment directives must not sever fall-through edges in the block
+    /// model. A `.p2align` between a guard's conditional branch and the
+    /// loop-preheader label used to stop the block scan, so the preheader's
+    /// recorded predecessor set came out EMPTY; two such preheaders then
+    /// satisfied "identical predecessors" (empty == empty) and one was
+    /// deleted — while its guard still fell through into it at runtime,
+    /// leaving the surviving loop with uninitialized pointer/counter
+    /// registers. Reproduces tests/regression/vectorize_int_map_lanes.c
+    /// at -O2 -march=x86-64-v3 with hot-loop alignment (SIGSEGV in
+    /// `vmovdqu %ymm0,(%rdi)`, 20/20 runs before the fix).
+    #[test]
+    fn alignment_directive_does_not_sever_fallthrough_entry() {
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    xorl %ecx, %ecx\n",
+            "    cmpl $25, %r15d\n",
+            "    jae .LBB3\n",
+            ".p2align 4,,10\n",
+            ".p2align 3\n",
+            ".LBB1:\n",
+            "    movq %rbx, %rdi\n",
+            "    movl $0xa5a5a5a5, %eax\n",
+            "    vmovd %eax, %xmm0\n",
+            "    vpbroadcastd %xmm0, %ymm0\n",
+            "    movl $32, %ecx\n",
+            ".LBB2:\n",
+            "    vmovdqu %ymm0, (%rdi)\n",
+            "    vmovdqu %ymm0, 32(%rdi)\n",
+            "    addq $64, %rdi\n",
+            "    decl %ecx\n",
+            "    jne .LBB2\n",
+            ".LBB3:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            "g:\n",
+            ".cfi_startproc\n",
+            "    xorl %ecx, %ecx\n",
+            "    cmpl $25, %r15d\n",
+            "    jae .LBB7\n",
+            ".p2align 4,,10\n",
+            ".p2align 3\n",
+            ".LBB5:\n",
+            "    movq %rbx, %rdi\n",
+            "    movl $0xa5a5a5a5, %eax\n",
+            "    vmovd %eax, %xmm0\n",
+            "    vpbroadcastd %xmm0, %ymm0\n",
+            "    movl $32, %ecx\n",
+            ".LBB6:\n",
+            "    vmovdqu %ymm0, (%rdi)\n",
+            "    vmovdqu %ymm0, 32(%rdi)\n",
+            "    addq $64, %rdi\n",
+            "    decl %ecx\n",
+            "    jne .LBB6\n",
+            ".LBB7:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        // Both fall-through-entered preheader blocks must survive: their
+        // entry edges are positional and cannot be redirected to a merge.
+        assert!(
+            out.matches("movq %rbx, %rdi").count() == 2,
+            "a fall-through-entered preheader was merged away:\n{out}"
+        );
+        assert!(
+            out.matches("vpbroadcastd %xmm0, %ymm0").count() == 2,
+            "a fall-through-entered broadcast was merged away:\n{out}"
+        );
+        // The alignment directives must survive too (they pad the surviving
+        // loop headers).
+        assert!(
+            out.matches(".p2align 4,,10").count() == 2,
+            "loop-head alignment padding was dropped:\n{out}"
+        );
+    }
+
+    /// A block entered only by explicit JUMPS from the same predecessor as
+    /// the canonical candidate remains mergeable — the redirect rewrites
+    /// every entry edge. This is the positive control for the fix above:
+    /// the pass must keep merging sound cases, not stop entirely.
+    #[test]
+    fn jump_entered_identical_blocks_still_merge() {
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    testl %edi, %edi\n",
+            "    jne .LBB1\n",
+            "    jmp .LBB2\n",
+            ".LBB1:\n",
+            "    movl $1, %eax\n",
+            "    addl $2, %eax\n",
+            "    addl $3, %eax\n",
+            "    addl $4, %eax\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    movl $1, %eax\n",
+            "    addl $2, %eax\n",
+            "    addl $3, %eax\n",
+            "    addl $4, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert_eq!(
+            out.matches("movl $1, %eax").count(),
+            1,
+            "jump-entered identical blocks did not merge:\n{out}"
+        );
     }
 
     /// x86-64 absolute jump tables (`.quad .LBBn` in `.Ljt_0`) must protect

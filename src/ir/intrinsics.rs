@@ -1395,6 +1395,29 @@ impl IntrinsicOp {
         (self.produces_vector_value() && !matches!(self, IntrinsicOp::VecStoreI64x2))
     }
 
+    /// True when this intrinsic moves or computes SIMD data: the `Vec*`
+    /// family the loop vectorizers emit plus the explicit-SIMD
+    /// (`Loadu256`/`Paddb256`/…) family from `<lccc/simd.h>`. The loop
+    /// alignment pass uses this to give vector-loop headers the stronger
+    /// 32-byte treatment.
+    pub fn is_vector_op(&self) -> bool {
+        // `VecStore*` write memory and produce no value, so neither
+        // produces_vector_value() nor vector_result_width() covers them;
+        // they are listed explicitly.
+        self.produces_vector_value()
+            || self.vector_result_width().is_some()
+            || matches!(
+                self,
+                IntrinsicOp::VecStoreI32x4
+                    | IntrinsicOp::VecStoreI32x8
+                    | IntrinsicOp::VecStoreF32x8
+                    | IntrinsicOp::VecStoreF32x4
+                    | IntrinsicOp::VecStoreF64x4
+                    | IntrinsicOp::VecStoreF64x2
+                    | IntrinsicOp::VecStoreI64x2
+            )
+    }
+
     /// Returns true if this intrinsic produces a 128/256-bit vector value
     /// (as opposed to a scalar).  These values cannot live in a GPR; backends
     /// either home them on the stack or allocate SIMD registers for them.
