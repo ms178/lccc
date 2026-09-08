@@ -207,7 +207,8 @@ pub(crate) fn substitute_x86_asm_operands(
             }
             // Check for x86 size/format modifiers:
             //   k (32), w (16), b (8-low), h (8-high), q (64), l (32-alt),
-            //   c (raw constant), P (raw symbol), a (address)
+            //   c (raw constant), P (raw symbol), a (address), d (duplicate),
+            //   x / t / g (vector register as xmm / ymm / zmm)
             // But 'l' followed by '[' may be a goto label reference %l[name]
             let mut modifier = None;
             if chars[i] == 'l'
@@ -270,7 +271,7 @@ pub(crate) fn substitute_x86_asm_operands(
                 }
             } else if matches!(
                 chars[i],
-                'k' | 'w' | 'b' | 'h' | 'q' | 'l' | 'c' | 'a' | 'n' | 'd'
+                'k' | 'w' | 'b' | 'h' | 'q' | 'l' | 'c' | 'a' | 'n' | 'd' | 'x' | 't' | 'g'
             ) && i + 1 < chars.len()
                 && (chars[i + 1].is_ascii_digit() || chars[i + 1] == '[')
             {
@@ -385,14 +386,42 @@ pub(crate) fn emit_operand_common(
     op_imm_values: &[Option<i64>],
     op_imm_symbols: &[Option<String>],
 ) -> bool {
-    // GCC's 'd' modifier duplicates the operand (glibc math-inline-asm.h uses
-    // VARGPREFIX "%d" -> `%vdivss %1, %d0` with a "+x" operand): emit the
-    // operand in its plain register form.
-    let modifier = if modifier == Some('d') {
-        None
-    } else {
-        modifier
-    };
+    // GCC's 'd' modifier (i386 `print_operand` case 'd', "duplicate operand
+    // for AVX instruction") prints a REGISTER operand twice, separated by
+    // ", ", when the TU has AVX — that is how glibc's math-inline-asm.h turns
+    // the two-operand template `%vdivss %1, %d0` into the three-operand VEX
+    // form `vdivss %xmm1, %xmm0, %xmm0`.  Without AVX the operand is printed
+    // once (`divss %xmm1, %xmm0`); the ISA decision is made by the caller,
+    // which rewrites `%dN` to `%N` before the template reaches this parser
+    // (see `X86Codegen::substitute_template_line`), so a `'d'` seen here
+    // always duplicates.  Memory and immediate operands print once.
+    // Measured against gcc 16.2 -mavx: `# %d0` with "+r"(long) →
+    // `%rax, %ax` (GCC's second copy is a HImode quirk of the RTL printer;
+    // no instruction consumes it — lccc prints the natural width twice),
+    // "+x"(float) → `%xmm0, %xmm0`, "m" → `(%rdi)`; without -mavx →
+    // `%rax`.  The old implementation printed the register once in every
+    // mode, producing `vdivss %xmm1, %xmm0` — a spelling GAS rejects
+    // ("number of operands mismatch") that only the builtin assembler's
+    // leniency kept alive.
+    if modifier == Some('d') {
+        if op_is_memory[idx] {
+            result.push_str(&op_mem_addrs[idx]);
+            return true;
+        }
+        let has_symbol = op_imm_symbols.get(idx).and_then(|s| s.as_ref());
+        let has_imm = op_imm_values.get(idx).and_then(|v| v.as_ref());
+        if let Some(sym) = has_symbol {
+            let _ = write!(result, "${}", sym);
+            return true;
+        }
+        if let Some(imm) = has_imm {
+            let _ = write!(result, "${}", imm);
+            return true;
+        }
+        // Register: caller formats it at the operand's natural width and
+        // then duplicates (see `emit_operand_with_modifier`).
+        return false;
+    }
     let is_raw = matches!(modifier, Some('c') | Some('P'));
     let is_neg = modifier == Some('n');
     let has_symbol = op_imm_symbols.get(idx).and_then(|s| s.as_ref());

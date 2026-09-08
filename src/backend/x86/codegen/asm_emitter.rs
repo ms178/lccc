@@ -32,6 +32,10 @@ impl InlineAsmEmitter for X86Codegen {
         Some(("#APP", "#NO_APP"))
     }
 
+    fn asm_vex_prefix_enabled(&self) -> bool {
+        self.isa.avx
+    }
+
     // TODO: ARM and RISC-V backends should also support multi-alternative constraint
     // parsing (e.g., "rm", "ri") similar to the x86 implementation below. Currently
     // they only recognize single-alternative constraints.
@@ -632,6 +636,15 @@ impl InlineAsmEmitter for X86Codegen {
             }
         }
 
+        // `%dN` duplicates the operand only for an AVX TU (GCC i386
+        // `print_operand` 'd'); without AVX it is the plain operand.
+        let line_owned;
+        let line = if !self.isa.avx && line.contains("%d") {
+            line_owned = strip_duplicate_modifier(line);
+            line_owned.as_str()
+        } else {
+            line
+        };
         Self::substitute_x86_asm_operands(
             line,
             &op_regs,
@@ -1010,5 +1023,49 @@ impl X86Codegen {
         if needs_preserve {
             self.state.out.emit_instr_reg("    popq", &scratch);
         }
+    }
+}
+
+/// Rewrite every `%dN` / `%d[name]` operand reference to `%N` / `%[name]`
+/// (GCC's duplicate modifier is a no-op without AVX).  `%%d` (an escaped
+/// percent followed by a literal `d`) and register names such as `%dl`,
+/// `%dx`, `%dil` are left alone: only a modifier followed by a digit or `[`
+/// is an operand reference.
+pub(crate) fn strip_duplicate_modifier(line: &str) -> String {
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if i + 1 < b.len() && b[i + 1] == b'%' {
+                out.push_str("%%");
+                i += 2;
+                continue;
+            }
+            if i + 2 < b.len()
+                && b[i + 1] == b'd'
+                && (b[i + 2].is_ascii_digit() || b[i + 2] == b'[')
+            {
+                out.push('%');
+                i += 2;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod duplicate_modifier_tests {
+    use super::strip_duplicate_modifier;
+
+    #[test]
+    fn strips_only_operand_references() {
+        assert_eq!(strip_duplicate_modifier("vdivss %1, %d0"), "vdivss %1, %0");
+        assert_eq!(strip_duplicate_modifier("# %d[x] %d12"), "# %[x] %12");
+        assert_eq!(strip_duplicate_modifier("movb %dl, %%dl"), "movb %dl, %%dl");
+        assert_eq!(strip_duplicate_modifier("%%d0 %dx"), "%%d0 %dx");
     }
 }

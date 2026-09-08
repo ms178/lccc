@@ -988,3 +988,13 @@ vaddps %xmm9, %xmm2, %xmm3
 vmulps %xmm9, %xmm2, %xmm3
 vaddpd %xmm9, %xmm2, %xmm3
 vmulpd %xmm9, %xmm2, %xmm3
+
+;;; vex_scalar_sqrt_three_operand
+.text
+vsqrtsd %xmm1, %xmm2, %xmm3
+vsqrtss %xmm1, %xmm2, %xmm3
+vsqrtsd %xmm3, %xmm3, %xmm3
+vsqrtss %xmm0, %xmm0, %xmm0
+vsqrtsd (%rax), %xmm2, %xmm3
+vsqrtss 8(%rdi,%rcx,4), %xmm12, %xmm13
+vsqrtsd %xmm9, %xmm10, %xmm11

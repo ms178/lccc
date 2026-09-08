@@ -1,5 +1,6 @@
 mod alu;
 mod asm_emitter;
+pub(crate) use asm_emitter::strip_duplicate_modifier;
 mod atomics;
 mod calls;
 mod cast_ops;

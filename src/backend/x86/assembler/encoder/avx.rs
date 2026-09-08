@@ -1444,15 +1444,19 @@ impl super::InstructionEncoder {
         opcode: u8,
         pp: u8,
     ) -> Result<(), String> {
-        // GNU as also accepts the 2-operand form `vdivss src, dst`, which
-        // implies dst == src2 (glibc math-inline-asm.h: `%vdivss %1, %d0`).
-        let ops: &[Operand] = if ops.len() == 2 {
-            &[ops[0].clone(), ops[1].clone(), ops[1].clone()]
-        } else {
-            ops
-        };
+        // The VEX scalar arithmetic forms are three-operand ONLY (SDM: `VADDSD
+        // xmm1, xmm2, xmm3/m64`); GAS rejects `vaddsd %a, %d` with "number of
+        // operands mismatch".  A former leniency here rewrote that spelling to
+        // `%a, %d, %d`, which let two real defects survive unseen: the FP
+        // emitter's `vsqrtsd %d, %d` (encoded with vvvv=0, i.e. a hidden
+        // dependency on %xmm0) and the inline-asm `%d` duplicate modifier
+        // printing its operand once (glibc's `%vdivss %1, %d0`).  Both are
+        // fixed at the source; the assembler is an oracle again.
         if ops.len() != 3 {
-            return Err("AVX scalar 3-op requires 2 or 3 operands".to_string());
+            return Err(format!(
+                "AVX scalar op requires 3 operands, got {} (the VEX scalar forms have no two-operand spelling)",
+                ops.len()
+            ));
         }
         let l = 0; // LIG - always 128-bit for scalar
 

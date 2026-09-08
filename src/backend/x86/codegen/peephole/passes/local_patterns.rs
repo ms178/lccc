@@ -15,6 +15,7 @@
 
 use super::super::types::*;
 use super::flag_peepholes::flags_dead_after;
+use super::fp_liveness::FpLiveness;
 use super::helpers::{
     extract_jump_target, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
     is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family, writes_family,
@@ -2248,6 +2249,9 @@ fn is_32bit_eax_consumer(trimmed: &str) -> bool {
 pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
+    // Frame-slot / XMM liveness oracle for Pattern E (built lazily: most
+    // files never reach that pattern).
+    let mut lv: Option<FpLiveness> = None;
     let mut i = 0;
 
     while i < len {
@@ -2354,6 +2358,9 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                                     format!("    movsd {}(%{}), {}", offset, base, xmm_str);
                                 replace_line(store, &mut infos[i], i, new_text);
                                 mark_nop(&mut infos[j]);
+                                if let Some(o) = lv.as_mut() {
+                                    o.refresh_at(store, infos, i);
+                                }
                                 changed = true;
                                 i += 1;
                                 continue;
@@ -2400,6 +2407,9 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                                     format!("    movsd {}, {}(%{})", src_xmm, offset, base);
                                 mark_nop(&mut infos[i]);
                                 replace_line(store, &mut infos[j], j, new_text);
+                                if let Some(o) = lv.as_mut() {
+                                    o.refresh_at(store, infos, i);
+                                }
                                 changed = true;
                                 i = j + 1;
                                 continue;
@@ -2426,9 +2436,20 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
             if j < len {
                 let line_j = infos[j].trimmed(store.get(j));
                 if line_j == "movq %rax, %xmm0" || line_j == "movq %rax, %xmm1" {
-                    // Verify stack slot O is not read between j+1 and block end.
-                    if rbp_offset_dead_after(store, infos, j + 1, len, offset as i64) {
+                    // The slot must be dead after the store on EVERY path —
+                    // including the loop back-edge (patE.c: the home slot of
+                    // a loop-carried double is read at the loop top of the
+                    // next iteration, textually ABOVE this store).  The old
+                    // forward text scan could not see that reader.
+                    let base = if infos[i].trimmed(store.get(i)).contains("(%rsp)") {
+                        4
+                    } else {
+                        5
+                    };
+                    let oracle = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+                    if oracle.slot_dead_after(i, base, offset, 8) {
                         mark_nop(&mut infos[i]);
+                        oracle.refresh_at(store, infos, i);
                         changed = true;
                         // Don't advance i past j; let Pattern D fire next iteration.
                         i += 1;
@@ -2468,6 +2489,9 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                             let new_text = format!("    movsd (%{}), {}", ptr_reg, xmm_str);
                             replace_line(store, &mut infos[i], i, new_text);
                             mark_nop(&mut infos[j]);
+                            if let Some(o) = lv.as_mut() {
+                                o.refresh_at(store, infos, i);
+                            }
                             changed = true;
                             i = j + 1;
                             continue;
@@ -2522,6 +2546,9 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                                             mark_nop(&mut infos[j]);
                                             mark_nop(&mut infos[k]);
                                             mark_nop(&mut infos[l]);
+                                            if let Some(o) = lv.as_mut() {
+                                                o.refresh_at(store, infos, i);
+                                            }
                                             changed = true;
                                             i = l + 1;
                                             continue;
@@ -2554,6 +2581,7 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
 pub(super) fn fold_ptr_deref_through_stack(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
+    let mut lv: Option<FpLiveness> = None;
     let mut i = 0;
 
     while i < len {
@@ -2653,19 +2681,19 @@ pub(super) fn fold_ptr_deref_through_stack(store: &mut LineStore, infos: &mut [L
                                 || t.starts_with("divsd "))
                                 && t.contains(&offset_str)
                             {
-                                // Check O(%rbp) not read again after K.
-                                if rbp_offset_dead_after(
-                                    store,
-                                    infos,
-                                    k + 1,
-                                    len,
-                                    i64::from(offset),
-                                ) {
+                                // The slot must be dead after K on EVERY
+                                // path (patE2.c: the loop top re-reads it
+                                // through the back edge) — CFG-aware oracle.
+                                let oracle =
+                                    lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+                                let base_fam = if base == "rsp" { 4 } else { 5 };
+                                if oracle.slot_dead_after(k, base_fam, offset, 8) {
                                     let new_text =
                                         format!("    {}", t.replace(&offset_str, &ptr_mem));
                                     mark_nop(&mut infos[i]);
                                     mark_nop(&mut infos[j]);
                                     replace_line(store, &mut infos[k], k, new_text);
+                                    oracle.refresh_at(store, infos, k);
                                     changed = true;
                                     found = true;
                                 }
@@ -2714,6 +2742,7 @@ pub(super) fn eliminate_fp_spill_around_load(
 ) -> bool {
     let len = store.len();
     let mut changed = false;
+    let mut lv: Option<FpLiveness> = None;
     let mut i = 0;
 
     while i < len {
@@ -2746,12 +2775,26 @@ pub(super) fn eliminate_fp_spill_around_load(
                             continue;
                         }
                         let t = infos[j].trimmed(store.get(j));
-                        if t.starts_with('j') || t.starts_with("call") || t.starts_with("ret") {
+                        if infos[j].is_barrier() || infos[j].pinned {
                             break;
                         }
                         if t.contains("%xmm1") {
                             xmm1_clear = false;
                             break;
+                        }
+                        // Any OTHER access to the spill slot inside the gap
+                        // (a reader such as `mulsd O(%rbp)`, or a
+                        // redefinition such as `movq %rax, O(%rbp)`) means
+                        // the store is not a pure spill of the value L
+                        // reloads: abort.  t2.c: `mulsd -112(%rbp)` read the
+                        // slot and `movq %rax, -112(%rbp)` redefined it
+                        // between I and L; the old scan saw neither.
+                        if j != k_pos && t.contains(mem_operand) {
+                            let expected_l = format!("addsd {}, %xmm0", mem_operand);
+                            if t != expected_l {
+                                xmm1_clear = false;
+                                break;
+                            }
                         }
 
                         // Find K: "movsd <something>, %xmm0" (load overwriting xmm0)
@@ -2773,30 +2816,57 @@ pub(super) fn eliminate_fp_spill_around_load(
                     }
 
                     if k_pos > 0 && l_pos > 0 && xmm1_clear {
-                        // Verify the spill slot is dead after L.
-                        if rbp_offset_dead_after(store, infos, l_pos + 1, len, offset) {
-                            // Also verify xmm1 is dead after L.
-                            let mut after_l = l_pos + 1;
-                            while after_l < len && infos[after_l].is_nop() {
-                                after_l += 1;
-                            }
-                            let xmm1_dead_after = if after_l >= len {
-                                true
-                            } else {
-                                let t = infos[after_l].trimmed(store.get(after_l));
-                                !t.contains("%xmm1")
-                            };
+                        // The spill slot must be dead after L and %xmm1 must
+                        // be dead after L, on every path (CFG-aware oracle:
+                        // the old one-line lookahead for %xmm1 and the
+                        // forward text scan for the slot were both blind to
+                        // loop back-edges and to calls).
+                        let oracle = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+                        let base = if mem_operand.ends_with("(%rsp)") {
+                            4
+                        } else {
+                            5
+                        };
+                        if oracle.slot_dead_after(l_pos, base, offset as i32, 8) {
+                            let xmm1_dead_after =
+                                oracle.xmm_dead_after(store, infos, l_pos, 1, &[k_pos, l_pos]);
 
                             if xmm1_dead_after {
-                                // NOP I (the spill store).
-                                mark_nop(&mut infos[i]);
-                                // Change K: "movsd ..., %xmm0" → "movsd ..., %xmm1"
-                                let line_k = infos[k_pos].trimmed(store.get(k_pos));
-                                let new_k = format!("    {}", line_k.replace(", %xmm0", ", %xmm1"));
-                                replace_line(store, &mut infos[k_pos], k_pos, new_k);
+                                // Two rewrites, chosen by what the gap
+                                // (K, L) does with %xmm0:
+                                //
+                                //  * gap never names %xmm0 → ROLE SWAP:
+                                //    K loads into %xmm1 instead, %xmm0 keeps
+                                //    V, L becomes `addsd %xmm1, %xmm0`
+                                //    (V + X; addition commutes).  Zero
+                                //    extra instructions.
+                                //  * gap computes on %xmm0 (f3: `roundsd`
+                                //    between K and L) → RELAY: I becomes
+                                //    `movapd %xmm0, %xmm1` (V parked in
+                                //    %xmm1), K and the gap stay as they
+                                //    are, L adds %xmm1.  The old pass
+                                //    applied the role swap here too and
+                                //    computed on V instead of X.
+                                let gap_uses_xmm0 = (k_pos + 1..l_pos).any(|g| {
+                                    !infos[g].is_nop()
+                                        && infos[g].trimmed(store.get(g)).contains("%xmm0")
+                                });
+                                if gap_uses_xmm0 {
+                                    let new_i = "    movapd %xmm0, %xmm1".to_string();
+                                    replace_line(store, &mut infos[i], i, new_i);
+                                } else {
+                                    // NOP I (the spill store).
+                                    mark_nop(&mut infos[i]);
+                                    // Change K: "movsd ..., %xmm0" → "movsd ..., %xmm1"
+                                    let line_k = infos[k_pos].trimmed(store.get(k_pos));
+                                    let new_k =
+                                        format!("    {}", line_k.replace(", %xmm0", ", %xmm1"));
+                                    replace_line(store, &mut infos[k_pos], k_pos, new_k);
+                                }
                                 // Change L: "addsd O(%rbp), %xmm0" → "addsd %xmm1, %xmm0"
                                 let new_l = "    addsd %xmm1, %xmm0".to_string();
                                 replace_line(store, &mut infos[l_pos], l_pos, new_l);
+                                oracle.refresh_at(store, infos, i);
                                 changed = true;
                                 i = l_pos + 1;
                                 continue;
@@ -2830,6 +2900,7 @@ pub(super) fn promote_loop_invariant_fp_load(
 ) -> bool {
     let len = store.len();
     let mut changed = false;
+    let mut lv: Option<FpLiveness> = None;
 
     // Find loop back-edges: jmp to a label that appears before the jmp.
     let mut i = 0;
@@ -2920,11 +2991,20 @@ pub(super) fn promote_loop_invariant_fp_load(
                 continue;
             }
 
-            // Check xmm2 is not used anywhere in [header..=i].
+            // %xmm2 must be free across the whole loop: not mentioned in
+            // [header..=i] AND not clobbered there.  Every XMM register is
+            // caller-saved, so a `call` in the loop body destroys the
+            // promoted copy on every iteration (hoistH.c: `sin(t)` inside
+            // the loop → the loop read a dead %xmm2).  Inline asm is
+            // opaque for the same reason.
             let mut xmm2_used = false;
             for chk in header..=i {
                 if infos[chk].is_nop() {
                     continue;
+                }
+                if matches!(infos[chk].kind, LineKind::Call | LineKind::InlineAsm) {
+                    xmm2_used = true;
+                    break;
                 }
                 let ct = infos[chk].trimmed(store.get(chk));
                 if ct.contains("%xmm2") {
@@ -2978,12 +3058,63 @@ pub(super) fn promote_loop_invariant_fp_load(
             }
 
             if let Some(ph_pos) = preheader_store {
-                // Replace preheader store: "movq %rax, -O(%rbp)" → "movq %rax, %xmm2"
-                let new_ph = "    movq %rax, %xmm2".to_string();
-                replace_line(store, &mut infos[ph_pos], ph_pos, new_ph);
+                // Soundness (CFG-aware oracle; the old pass rewrote
+                // unconditionally and miscompiled fp_param_wide / hoistH):
+                //
+                //  1. The preheader store must DOMINATE every execution of
+                //     the body load and nothing may enter the loop behind
+                //     its back: the store falls through into the header
+                //     (only nops/directives between them) and every branch
+                //     to any label of [header..=i] originates inside
+                //     [header..=i].  (`continue` branches to the header are
+                //     inside; a `goto` into the loop is not.)
+                //  2. %xmm2 must be dead after the preheader store in the
+                //     ORIGINAL program (it is about to be overwritten
+                //     there) — a later reader outside the loop would see
+                //     the hoisted value instead.
+                //  3. After redirecting the body load to %xmm2 the slot must
+                //     be dead after the preheader store: no other reader
+                //     (a second load in the loop, a read after the loop,
+                //     a read on another path) may remain.  Checked on the
+                //     tentatively rewritten text; reverted when it fails.
+                let mut nxt = ph_pos + 1;
+                while nxt < header
+                    && (infos[nxt].is_nop()
+                        || matches!(infos[nxt].kind, LineKind::Directive | LineKind::Empty))
+                {
+                    nxt += 1;
+                }
+                if nxt != header || !loop_is_single_entry(store, infos, header, i) {
+                    continue;
+                }
+                let oracle = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+                if !oracle.xmm_dead_after(store, infos, ph_pos, 2, &[ph_pos, pos]) {
+                    continue;
+                }
+                let ph_text = infos[ph_pos].trimmed(store.get(ph_pos));
+                let base = if ph_text.contains("(%rsp)") { 4 } else { 5 };
+                let old_body = store.get(pos).to_string();
                 // Replace body load: "movsd -O(%rbp), %xmm0" → "movapd %xmm2, %xmm0"
-                let new_body = "    movapd %xmm2, %xmm0".to_string();
-                replace_line(store, &mut infos[pos], pos, new_body);
+                replace_line(
+                    store,
+                    &mut infos[pos],
+                    pos,
+                    "    movapd %xmm2, %xmm0".to_string(),
+                );
+                oracle.refresh_at(store, infos, pos);
+                if !oracle.slot_dead_after(ph_pos, base, numeric_offset, 8) {
+                    replace_line(store, &mut infos[pos], pos, old_body);
+                    oracle.refresh_at(store, infos, pos);
+                    continue;
+                }
+                // Replace preheader store: "movq %rax, -O(%rbp)" → "movq %rax, %xmm2"
+                replace_line(
+                    store,
+                    &mut infos[ph_pos],
+                    ph_pos,
+                    "    movq %rax, %xmm2".to_string(),
+                );
+                oracle.refresh_at(store, infos, ph_pos);
                 changed = true;
                 break; // Only promote one per loop for now.
             }
@@ -3151,52 +3282,6 @@ fn rax_elidable_after(store: &LineStore, infos: &[LineInfo], mut at: usize, len:
         at += 1;
     }
     true // reached block end with no read before a write
-}
-
-/// Returns true if the rbp offset `offset` is dead (not read before being
-/// written or before a control-flow boundary) starting at instruction `start`.
-/// Scans up to 32 instructions forward; stops at any jump/call.
-fn rbp_offset_dead_after(
-    store: &LineStore,
-    infos: &[LineInfo],
-    start: usize,
-    len: usize,
-    offset: i64,
-) -> bool {
-    // The slot must not be read anywhere AFTER this store in the WHOLE
-    // function — not just in the current block. A block boundary (jmp/jcc/
-    // ret) does NOT prove the slot dead: a later block may load the same
-    // slot (e.g. a register-allocated F64 whose home slot is only spilled
-    // once and read in two different blocks). Killing the store then leaves
-    // the later block reading stale data (miscompile). Scanning the whole
-    // remaining text is conservative and sound: a later StoreRbp to the same
-    // offset re-validates the slot, any other mention is treated as a read.
-    let offset_str_rbp = format!("{}(%rbp)", offset);
-    let offset_str_rsp = format!("{}(%rsp)", offset);
-    let mut i = start;
-    let mut count = 0;
-    while i < len && count < 2048 {
-        if infos[i].is_nop() {
-            i += 1;
-            continue;
-        }
-        let t = infos[i].trimmed(store.get(i));
-        // A later write to the same offset (StoreRbp) re-validates the slot.
-        if let LineKind::StoreRbp { offset: o, .. } = infos[i].kind {
-            if i64::from(o) == offset {
-                return true;
-            }
-        }
-        // Any other mention of the offset (a load, an address operand) means
-        // the slot must stay valid — do NOT eliminate the store.
-        if t.contains(&offset_str_rbp) || t.contains(&offset_str_rsp) {
-            return false;
-        }
-        i += 1;
-        count += 1;
-    }
-    // No read found anywhere in the remaining function text → dead.
-    true
 }
 
 // ── rcx address-register copy elimination (Pattern G) ────────────────────────
@@ -6429,6 +6514,7 @@ pub(super) fn fold_scalar_fp_memory_into_vex_op(
 ) -> bool {
     let len = store.len();
     let mut changed = false;
+    let mut lv = FpLiveness::new(store, infos);
     let mut i = 0;
 
     while i + 1 < len {
@@ -6501,37 +6587,13 @@ pub(super) fn fold_scalar_fp_memory_into_vex_op(
             continue;
         }
 
-        // Deadness of %D after j: no later ACTIVE line in this basic block
-        // mentions it. Labels/branches/calls end the scan conservatively
-        // (a call could return to a path that reads D... no — calls end the
-        // BLOCK context; treat the block as ended).
-        let mut dead = true;
-        let mut k = j + 1;
-        let mut scanned = 0;
-        while k < len && scanned < 64 {
-            if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Empty | LineKind::Directive) {
-                k += 1;
-                continue;
-            }
-            if matches!(
-                infos[k].kind,
-                LineKind::Label
-                    | LineKind::Jmp
-                    | LineKind::JmpIndirect
-                    | LineKind::CondJmp
-                    | LineKind::Call
-                    | LineKind::Ret
-            ) {
-                break;
-            }
-            if infos[k].trimmed(store.get(k)).contains(&d_full) {
-                dead = false;
-                break;
-            }
-            scanned += 1;
-            k += 1;
-        }
-        if !dead {
+        // %D must be dead after j on every path — CFG-aware oracle.  The
+        // block-local forward scan this replaced was blind to the loop
+        // back-edge (lc2.c `f`: %D was the loop-carried `prev`, read at the
+        // loop top of the next iteration) and to legacy destructive
+        // consumers in -O0 code (patE.c).
+        let d_num: u32 = dst_d[3..].parse().unwrap_or(u32::MAX);
+        if !lv.xmm_dead_after(store, infos, j, d_num, &[i, j]) {
             i += 1;
             continue;
         }
@@ -6547,6 +6609,7 @@ pub(super) fn fold_scalar_fp_memory_into_vex_op(
             j,
             replacement,
         );
+        lv.refresh_at(store, infos, i);
         changed = true;
         i = j;
     }
@@ -7181,4 +7244,53 @@ mod staged_imm_alu_tests {
             out.join("\n")
         );
     }
+}
+
+/// True when no branch from outside `[header, latch]` targets a label
+/// inside it: the loop can only be entered by falling through into
+/// `header`, so the fall-through predecessor dominates the whole loop.
+fn loop_is_single_entry(
+    store: &LineStore,
+    infos: &[LineInfo],
+    header: usize,
+    latch: usize,
+) -> bool {
+    let mut labels: Vec<&str> = Vec::new();
+    for n in header..=latch {
+        if !infos[n].is_nop() && infos[n].kind == LineKind::Label {
+            if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
+                labels.push(name);
+            }
+        }
+    }
+    let len = store.len();
+    for n in 0..len {
+        if n >= header && n <= latch {
+            continue;
+        }
+        if infos[n].is_nop() {
+            continue;
+        }
+        match infos[n].kind {
+            LineKind::Jmp | LineKind::CondJmp => {
+                let t = infos[n].trimmed(store.get(n));
+                let target = t.split_whitespace().nth(1).unwrap_or("");
+                if labels.contains(&target) {
+                    return false;
+                }
+            }
+            LineKind::JmpIndirect | LineKind::InlineAsm => return false,
+            LineKind::Directive => {
+                // Jump tables: `.quad .LBBn` / `.long .LBBn-...` entries.
+                let t = infos[n].trimmed(store.get(n));
+                if t.starts_with(".quad ") || t.starts_with(".long ") {
+                    if labels.iter().any(|l| t.contains(l)) {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }

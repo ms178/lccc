@@ -91,11 +91,19 @@ impl X86Codegen {
                 let _ = write!(result, "(%{})", op_regs[idx]);
             }
         } else {
-            // Register operand — apply size modifier, default is 64-bit
-            let effective_mod =
-                modifier.or_else(|| Self::default_modifier_for_type(op_types.get(idx).copied()));
+            // Register operand — apply size modifier, default is 64-bit.
+            // `%d` (GCC "duplicate") carries no width of its own: the
+            // register is printed at its natural width, twice.
+            let effective_mod = modifier
+                .filter(|m| *m != 'd')
+                .or_else(|| Self::default_modifier_for_type(op_types.get(idx).copied()));
+            let reg = Self::format_x86_reg(&op_regs[idx], effective_mod);
             result.push('%');
-            result.push_str(&Self::format_x86_reg(&op_regs[idx], effective_mod));
+            result.push_str(&reg);
+            if modifier == Some('d') {
+                result.push_str(", %");
+                result.push_str(&reg);
+            }
         }
     }
 
@@ -119,9 +127,20 @@ impl X86Codegen {
     /// Modifiers: k (32-bit), w (16-bit), b (8-bit low), h (8-bit high), q (64-bit), l (32-bit alt)
     /// XMM registers (xmm0-xmm15) have no size variants and are returned as-is.
     pub(super) fn format_x86_reg<'a>(reg: &'a str, modifier: Option<char>) -> Cow<'a, str> {
-        // XMM registers don't have size variants
-        if reg.starts_with("xmm") {
-            return Cow::Borrowed(reg);
+        // Vector registers: `%x` / `%t` / `%g` select the xmm / ymm / zmm
+        // spelling of the same register (GCC i386 `print_reg` V4SF / V8SF /
+        // V16SF modes); every other modifier leaves the name alone.
+        if let Some(num) = reg
+            .strip_prefix("xmm")
+            .or_else(|| reg.strip_prefix("ymm"))
+            .or_else(|| reg.strip_prefix("zmm"))
+        {
+            return match modifier {
+                Some('x') => Cow::Owned(format!("xmm{num}")),
+                Some('t') => Cow::Owned(format!("ymm{num}")),
+                Some('g') => Cow::Owned(format!("zmm{num}")),
+                _ => Cow::Borrowed(reg),
+            };
         }
         // x87 FPU stack registers don't have size variants
         if reg.starts_with("st(") || reg == "st" {

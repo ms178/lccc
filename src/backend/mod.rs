@@ -167,6 +167,10 @@ pub(crate) struct CodegenOptions {
     /// Whether the target has AVX-512F (from -mavx512f / -march=*avx512*).
     /// Enables the 1-uop EVEX GPR-source vpbroadcast for scalar->vector splats.
     pub(crate) avx512: bool,
+    /// x86-64 code-generation ISA permission (single source of truth for
+    /// every VEX / SSE4.1 / FMA3 / ymm emission decision in the backend; see
+    /// `x86::isa`).  `NONE` on non-x86-64 targets.
+    pub(crate) isa: x86::isa::X86Isa,
     /// Whether to suppress linker relaxation (-mno-relax, RISC-V only).
     /// When true, the codegen emits `.option norelax` at the top of the
     /// assembly output, which prevents the GNU assembler from generating

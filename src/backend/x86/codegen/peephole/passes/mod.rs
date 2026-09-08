@@ -30,6 +30,7 @@ mod dead_code;
 mod dead_writes;
 mod epilogue_merge;
 mod flag_peepholes;
+mod fp_liveness;
 mod frame_compact;
 mod helpers;
 mod identical_blocks;
@@ -502,6 +503,29 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         .collect();
     let sk = |name: &str| -> bool { skip_set.contains(name) };
 
+    // CCC_PEEPHOLE_TRACE=<dir>: write the assembly text after every phase-1
+    // sub-pass that reported a change, as <dir>/<seq>-p<iter>-<pass>.s.  The
+    // skip-set bisection (`CCC_PEEPHOLE_SKIP`) gives MISLEADING culprits when
+    // passes enable one another — the pass that fires only because an
+    // earlier one rewrote its input shows up as the "cause".  The trace is
+    // the reliable instrument: assemble+run consecutive dumps and the first
+    // one that breaks the program names the faulty rewrite
+    // (`scripts/peephole_trace_bisect.py` automates it).  Zero cost unset.
+    let trace_dir = std::env::var_os("CCC_PEEPHOLE_TRACE").map(std::path::PathBuf::from);
+    let mut trace_seq = 0u32;
+    let mut trace =
+        |name: &str, iter: usize, changed: bool, store: &LineStore, infos: &[LineInfo]| {
+            if !changed {
+                return;
+            }
+            if let Some(dir) = &trace_dir {
+                let _ = std::fs::create_dir_all(dir);
+                let path = dir.join(format!("{:03}-p{}-{}.s", trace_seq, iter, name));
+                let _ = std::fs::write(path, store.build_result(|i| infos[i].is_nop()));
+                trace_seq += 1;
+            }
+        };
+
     // Phase 1: Iterative cheap local passes.
     let mut changed = true;
     let mut pass_count = 0;
@@ -517,109 +541,294 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         } else {
             local_patterns::combined_local_pass(&mut store, &mut infos)
         };
+        trace(
+            "combined_local_pass",
+            pass_count,
+            local_changed,
+            &store,
+            &infos,
+        );
         changed |= local_changed;
         if !sk("lea_mem_sib") {
-            changed |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
+                trace("fold_lea_into_memory_op", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("lea_all_uses") {
-            changed |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
+                trace("fold_lea_all_uses_in_block", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("staged_imm_alu") {
-            changed |= local_patterns::fold_staged_imm_into_alu(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_staged_imm_into_alu(&mut store, &mut infos);
+                trace("fold_staged_imm_into_alu", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("fuse_movq_ext") {
-            changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+            {
+                let c = local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+                trace("fuse_movq_ext_truncation", pass_count, c, &store, &infos);
+                changed |= c;
+            }
             // VEX 3-operand exploitation: `movsd %A,%D; vOP %S,%D,%D` ->
             // `vOP %S,%A,%D`. Removes the 2-operand-ISA staging copy the
             // scalar FP emitters insert before every binary op.
-            changed |= local_patterns::fuse_mov_scalar_fp_into_vex_op(&mut store, &mut infos);
+            {
+                let c = local_patterns::fuse_mov_scalar_fp_into_vex_op(&mut store, &mut infos);
+                trace(
+                    "fuse_mov_scalar_fp_into_vex_op",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
             // Memory-source half: fold a dead staged load into a commutative
             // scalar VEX op's memory operand slot.
-            changed |= local_patterns::fold_scalar_fp_memory_into_vex_op(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_scalar_fp_memory_into_vex_op(&mut store, &mut infos);
+                trace(
+                    "fold_scalar_fp_memory_into_vex_op",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("fp_roundtrips") {
-            changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+            {
+                let c = local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+                trace("eliminate_fp_xmm_roundtrips", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("fp_mem_fold") {
-            changed |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+            {
+                let c = memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+                trace("fold_fp_memory_operands", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("fp_reg_mem_fold") {
-            changed |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
+            {
+                let c = memory_fold::fold_fp_register_loads(&mut store, &mut infos);
+                trace("fold_fp_register_loads", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         // Fold a single-use scalar FP load into an adjacent FMA3-231 memory
         // src2 slot (dot-product inner shape; function-wide liveness proof).
         if !sk("fma_mem_fold") {
-            changed |= memory_fold::fold_fma_memory_src2(&mut store, &mut infos);
+            {
+                let c = memory_fold::fold_fma_memory_src2(&mut store, &mut infos);
+                trace("fold_fma_memory_src2", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         // Constant-accumulator FMA shaping: 213-form with a just-loaded
         // multiplier becomes the 132 form with the load folded into the
         // memory slot, and repeated %xmm0 zeroings die block-locally.
         if !sk("fma132_zero") {
-            changed |= memory_fold::fold_zero_addend_fma213_to_132(&mut store, &mut infos);
-            changed |= memory_fold::eliminate_redundant_xmm0_zeroing(&mut store, &mut infos);
+            {
+                let c = memory_fold::fold_zero_addend_fma213_to_132(&mut store, &mut infos);
+                trace(
+                    "fold_zero_addend_fma213_to_132",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+            {
+                let c = memory_fold::eliminate_redundant_xmm0_zeroing(&mut store, &mut infos);
+                trace(
+                    "eliminate_redundant_xmm0_zeroing",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         // Repeated RIP-relative loads of the same FP pool constant become a
         // single register materialization (leaf functions only; harvested
         // NOP slot must dominate all uses by fall-through).
         if !sk("fp_const_hoist") {
-            changed |= memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos);
+            {
+                let c = memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos);
+                trace(
+                    "hoist_repeated_fp_constant_loads",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         // Opt-in (CCC_PEEPHOLE_RELAY=1): fuses load+dead-copy relays; known
         // masked interaction with expat test_multichar_cdata_utf16 under the
         // full pass mix — root cause still open, so keep it off by default.
         if std::env::var("CCC_PEEPHOLE_RELAY").is_ok() && !sk("load_copy_relay") {
-            changed |= memory_fold::fold_load_copy_relay(&mut store, &mut infos);
+            {
+                let c = memory_fold::fold_load_copy_relay(&mut store, &mut infos);
+                trace("fold_load_copy_relay", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("rcx_copy") {
-            changed |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+            {
+                let c = local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+                trace("eliminate_rcx_address_copy", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("ptr_deref") {
-            changed |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
+                trace(
+                    "fold_ptr_deref_through_stack",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("fp_spill") {
-            changed |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
+            {
+                let c = local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
+                trace(
+                    "eliminate_fp_spill_around_load",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("fuse_copy_op") {
-            changed |= local_patterns::fuse_copy_and_operation(&mut store, &mut infos);
+            {
+                let c = local_patterns::fuse_copy_and_operation(&mut store, &mut infos);
+                trace("fuse_copy_and_operation", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("fp_hoist") {
-            changed |= local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos);
+            {
+                let c = local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos);
+                trace(
+                    "promote_loop_invariant_fp_load",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("dead_signext") {
-            changed |= local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos);
+            {
+                let c = local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos);
+                trace(
+                    "eliminate_dead_sign_extensions",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("dead_leaq") {
-            changed |= local_patterns::eliminate_redundant_leaq(&store, &mut infos);
+            {
+                let c = local_patterns::eliminate_redundant_leaq(&store, &mut infos);
+                trace("eliminate_redundant_leaq", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         // Symbol-LEA CSE for every GPR and generic load->ALU memory-operand
         // fusion (any addressing mode, liveness-proved dead scratch); see
         // load_op_fuse.rs for the soundness argument.
         if !sk("symbol_lea_cse") {
-            changed |= load_op_fuse::eliminate_redundant_symbol_lea(&store, &mut infos);
+            {
+                let c = load_op_fuse::eliminate_redundant_symbol_lea(&store, &mut infos);
+                trace(
+                    "eliminate_redundant_symbol_lea",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("recurrence_inplace") {
-            changed |= load_op_fuse::fold_recurrence_update(&mut store, &mut infos);
+            {
+                let c = load_op_fuse::fold_recurrence_update(&mut store, &mut infos);
+                trace("fold_recurrence_update", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("copy_dying_operand") {
-            changed |= load_op_fuse::fold_copy_into_dying_operand(&mut store, &mut infos);
+            {
+                let c = load_op_fuse::fold_copy_into_dying_operand(&mut store, &mut infos);
+                trace(
+                    "fold_copy_into_dying_operand",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("load_alu_fuse") {
-            changed |= load_op_fuse::fuse_load_into_alu(&mut store, &mut infos);
+            {
+                let c = load_op_fuse::fuse_load_into_alu(&mut store, &mut infos);
+                trace("fuse_load_into_alu", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         // Generic move-relay elimination and windowed lea->memory folding.
         // Both are block-local; see relay_and_lea.rs for the two deadness
         // proofs (block-local write-before-read, whole-function uniqueness).
         if !sk("move_relay") {
-            changed |= relay_and_lea::eliminate_move_relays(&mut store, &mut infos);
+            {
+                let c = relay_and_lea::eliminate_move_relays(&mut store, &mut infos);
+                trace("eliminate_move_relays", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("lea_load_window") {
-            changed |= relay_and_lea::fold_lea_into_load(&mut store, &mut infos);
+            {
+                let c = relay_and_lea::fold_lea_into_load(&mut store, &mut infos);
+                trace("fold_lea_into_load", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         // Flags-aware cleanups: copy+add -> lea (also removes a flags write
         // from between a comparison and its consumer), the setcc/movzbl/test
         // boolean round-trip in front of a cmov, and copy+mask -> movzx.
         if !sk("producer_retarget") {
-            changed |= relay_and_lea::retarget_producer_into_copy(&mut store, &mut infos);
+            {
+                let c = relay_and_lea::retarget_producer_into_copy(&mut store, &mut infos);
+                trace("retarget_producer_into_copy", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         // Loop-latch shape the two passes above decline: the copy dest is
         // live across the back edge and the producer reg is read after the
@@ -627,16 +836,32 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         // `lea D(%rA), %rA` with a liveness-proved, rollback-guarded rename
         // of the following %rB reads.
         if !sk("lea_base_fold") {
-            changed |= relay_and_lea::fold_copy_into_lea_base(&mut store, &mut infos);
+            {
+                let c = relay_and_lea::fold_copy_into_lea_base(&mut store, &mut infos);
+                trace("fold_copy_into_lea_base", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("copy_add_lea") {
-            changed |= flag_peepholes::fold_copy_add_into_lea(&mut store, &mut infos);
+            {
+                let c = flag_peepholes::fold_copy_add_into_lea(&mut store, &mut infos);
+                trace("fold_copy_add_into_lea", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("copy_shift_lea") {
-            changed |= flag_peepholes::fold_copy_shift_into_lea(&mut store, &mut infos);
+            {
+                let c = flag_peepholes::fold_copy_shift_into_lea(&mut store, &mut infos);
+                trace("fold_copy_shift_into_lea", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("setcc_cmov") {
-            changed |= flag_peepholes::fold_setcc_test_cmov(&mut store, &mut infos);
+            {
+                let c = flag_peepholes::fold_setcc_test_cmov(&mut store, &mut infos);
+                trace("fold_setcc_test_cmov", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         // Sound dead-write elimination (LEAs, widened copies, setCC) and
         // repeated-load reuse; both use the relay/lea deadness proofs.
@@ -644,46 +869,126 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         // source family when the source dies at the copy (kills the parameter
         // shuffle the allocator emits at every function entry).
         if !sk("copy_coalesce") {
-            changed |= copy_coalesce::coalesce_register_copies(&mut store, &mut infos);
+            {
+                let c = copy_coalesce::coalesce_register_copies(&mut store, &mut infos);
+                trace("coalesce_register_copies", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("dead_pure_writes") {
-            changed |= dead_writes::eliminate_dead_pure_writes(&store, &mut infos);
+            {
+                let c = dead_writes::eliminate_dead_pure_writes(&store, &mut infos);
+                trace("eliminate_dead_pure_writes", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("load_test_cmp") {
-            changed |= dead_writes::fold_load_test_into_cmp(&mut store, &mut infos);
+            {
+                let c = dead_writes::fold_load_test_into_cmp(&mut store, &mut infos);
+                trace("fold_load_test_into_cmp", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("acc_roundtrip") {
-            changed |= dead_writes::fold_accumulator_roundtrip(&mut store, &mut infos);
+            {
+                let c = dead_writes::fold_accumulator_roundtrip(&mut store, &mut infos);
+                trace("fold_accumulator_roundtrip", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("load_reuse") {
-            changed |= dead_writes::reuse_redundant_loads(&mut store, &mut infos);
+            {
+                let c = dead_writes::reuse_redundant_loads(&mut store, &mut infos);
+                trace("reuse_redundant_loads", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("self_test") {
-            changed |= flag_peepholes::eliminate_redundant_self_test(&store, &mut infos);
+            {
+                let c = flag_peepholes::eliminate_redundant_self_test(&store, &mut infos);
+                trace(
+                    "eliminate_redundant_self_test",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("narrow_signext") {
-            changed |= flag_peepholes::narrow_dead_sign_extension(&mut store, &mut infos);
+            {
+                let c = flag_peepholes::narrow_dead_sign_extension(&mut store, &mut infos);
+                trace("narrow_dead_sign_extension", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("copy_mask_movz") {
-            changed |= flag_peepholes::fold_copy_and_mask_into_movz(&mut store, &mut infos);
+            {
+                let c = flag_peepholes::fold_copy_and_mask_into_movz(&mut store, &mut infos);
+                trace(
+                    "fold_copy_and_mask_into_movz",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("copy_mask_test") {
-            changed |= flag_peepholes::fold_copy_and_mask_into_test(&mut store, &mut infos);
+            {
+                let c = flag_peepholes::fold_copy_and_mask_into_test(&mut store, &mut infos);
+                trace(
+                    "fold_copy_and_mask_into_test",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("base_index") {
-            changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_base_index_addressing(&mut store, &mut infos);
+                trace("fold_base_index_addressing", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("acc_alu") {
-            changed |= local_patterns::fold_accumulator_alu_store(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_accumulator_alu_store(&mut store, &mut infos);
+                trace("fold_accumulator_alu_store", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("phi_coalesce") {
-            changed |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+            {
+                let c = local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+                trace(
+                    "coalesce_phi_register_copies",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("signext_move") {
-            changed |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+            {
+                let c = local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+                trace("fuse_signext_and_move", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("inc_chain") {
-            changed |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
+            {
+                let c = local_patterns::collapse_increment_chain(&mut store, &mut infos);
+                trace("collapse_increment_chain", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         // add_signext (fuse_add_sign_extend) REMOVED: it rewrote
         // `addl %X,%X; movslq %X,%DST` into `addl %X,%DSTd`, which (a) reads
@@ -695,32 +1000,92 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         // A sound fusion saves nothing (still needs init + sext), so the
         // pass is deleted rather than gated.
         if !sk("copy_shift_back") {
-            changed |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_copy_shift_copyback(&mut store, &mut infos);
+                trace("fold_copy_shift_copyback", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("xor_move_fold") {
-            changed |= local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos);
+                trace(
+                    "fold_zero_extended_xor_moves",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("rotate_idiom") {
-            changed |= local_patterns::fold_rotate_idiom(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_rotate_idiom(&mut store, &mut infos);
+                trace("fold_rotate_idiom", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("vec_self_move") {
-            changed |= local_patterns::eliminate_vector_self_moves(&mut store, &mut infos);
+            {
+                let c = local_patterns::eliminate_vector_self_moves(&mut store, &mut infos);
+                trace("eliminate_vector_self_moves", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("cascaded_shifts") {
-            changed |= local_patterns::fold_cascaded_shifts(&mut store, &mut infos);
+            {
+                let c = local_patterns::fold_cascaded_shifts(&mut store, &mut infos);
+                trace("fold_cascaded_shifts", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         if !sk("gpr_hoist") {
-            changed |= local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+            {
+                let c = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+                trace(
+                    "hoist_loop_invariant_gpr_load",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("fp_broadcast") {
-            changed |= local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
+            {
+                let c = local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
+                trace(
+                    "hoist_loop_invariant_fp_broadcast",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if local_changed || pass_count == 0 {
             if !sk("push_pop") {
-                changed |= push_pop::eliminate_push_pop_pairs(&store, &mut infos);
+                {
+                    let c = push_pop::eliminate_push_pop_pairs(&store, &mut infos);
+                    trace("eliminate_push_pop_pairs", pass_count, c, &store, &infos);
+                    changed |= c;
+                }
             }
             if !sk("binop_push_pop") {
-                changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
+                {
+                    let c = push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
+                    trace(
+                        "eliminate_binop_push_pop_pattern",
+                        pass_count,
+                        c,
+                        &store,
+                        &infos,
+                    );
+                    changed |= c;
+                }
             }
         }
         if let Some(s) = iter_start {
@@ -1350,10 +1715,16 @@ mod tests {
 
     #[test]
     fn test_fp_register_name_boundary_xmm1_vs_xmm10() {
+        // `%xmm1` is redefined by the memory-source load before `ret`
+        // (a two-double return materialisation), so the value loaded at
+        // the top is dead after the `vaddsd` — PROVIDED the `%xmm10`
+        // mention in between is not mistaken for `%xmm1`.
         let asm = [
             "    movsd (%rdi), %xmm1",
             "    vaddsd %xmm1, %xmm4, %xmm4",
             "    movsd %xmm10, %xmm11",
+            "    movapd %xmm4, %xmm0",
+            "    movsd (%rsi), %xmm1",
             "    ret",
         ]
         .join("\n")

@@ -16,6 +16,7 @@
 //! rcx=1, rdx=2) to avoid breaking live register values.
 
 use super::super::types::*;
+use super::fp_liveness::FpLiveness;
 use super::helpers::{
     implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, writes_family,
 };
@@ -205,16 +206,9 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
 /// state can change between them.  Source==destination is rejected because the
 /// removed load also supplies the destructive destination's old value.
 pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-    fn mentions_xmm(line: &str, reg: &str) -> bool {
-        line.match_indices(reg).any(|(at, _)| {
-            line.as_bytes()
-                .get(at + reg.len())
-                .is_none_or(|b| !b.is_ascii_digit())
-        })
-    }
-
     let len = store.len();
     let mut changed = false;
+    let mut lv = FpLiveness::new(store, infos);
     let mut i = 0;
     while i + 1 < len {
         if infos[i].is_nop() || infos[i + 1].is_nop() {
@@ -277,57 +271,26 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
 
-        // The source value must have no later use. Stop at `.size`; crossing a
-        // label is harmless for this intentionally whole-function proof.  One
-        // refinement: when the next mention fully overwrites the register,
-        // the loaded value is dead at that point — every later mention refers
-        // to the new value — so the fold stays sound when the allocator
-        // reuses the register for an unrelated value later on.  The overwrite
-        // only PROVES the value dead for code reached after it: a branch
-        // between the consumer and the overwrite lets a path skip the
-        // overwrite, so a reader textually past it can still observe the
-        // loaded value (see is_cf_transfer).  The kill is therefore accepted
-        // only across a control-flow-free straight-line stretch.
-        // A Call is an OPAQUE READER of %xmm0-%xmm7 (the SysV FP argument
-        // registers): when the loaded value is itself an argument of the
-        // call, the caller reads it implicitly and the read leaves no
-        // textual trace ("call foo" mentions no register — the argument
-        // move is a self-move the builder elided).  Deleting the load
-        // would feed the call a stale register, so the kill proof stops
-        // at a call for the argument registers.  %xmm8-%xmm15 are
-        // callee-saved and never argument registers, and compiled code
-        // never reads a callee-saved register before defining it, so the
-        // scan keeps walking there.  (The sibling folds carry the same
-        // veto; unreachable through the current per-use constant
-        // materialization, pinned as defense in depth.)
-        let src_is_arg_reg = src_reg
+        // The loaded value must be dead after the consumer.  Proven by the
+        // CFG-aware XMM dataflow (`FpLiveness`): loop back-edges, calls
+        // (implicit readers of %xmm0-%xmm7, clobbers of everything) and
+        // merge-form redefinitions are all modelled.  The textual "first
+        // later mention is a full overwrite" proof this replaced was blind
+        // to back-edges — `lc.c`: the folded register was the loop-carried
+        // `prev`, read at the top of the NEXT iteration (miscompile).
+        // Without an analysable CFG the fallback is textual uniqueness of
+        // the register in the whole function (any-CFG-sound), never a
+        // forward scan.
+        let src_n = src_reg
             .strip_prefix("%xmm")
             .and_then(|d| d.parse::<u32>().ok())
-            .is_some_and(|n| n <= 7);
-        let mut later_mention = false;
-        for k in (i + 2)..len {
-            if infos[k].is_nop() {
-                continue;
-            }
-            let t = infos[k].trimmed(store.get(k));
-            if t.starts_with(".size ") {
-                break;
-            }
-            if src_is_arg_reg && infos[k].kind == LineKind::Call {
-                later_mention = true;
-                break;
-            }
-            if mentions_xmm(t, src_reg) {
-                let straight =
-                    !(i + 2..k).any(|m| !infos[m].is_nop() && is_cf_transfer(infos[m].kind));
-                later_mention = !(is_pure_xmm_overwrite(t, src_reg) && straight);
-                break;
-            }
-        }
-        if later_mention {
+            .unwrap_or(u32::MAX);
+        if !lv.xmm_dead_after(store, infos, i + 1, src_n, &[i, i + 1]) {
             i += 1;
             continue;
         }
+        // No other mention of the register between the load and the
+        // consumer besides the consumer itself (adjacent by construction).
 
         let replacement = if arith_op.starts_with('v') {
             format!("    {} {}, {}, {}", arith_op, mem, ops[1], ops[2])
@@ -336,6 +299,7 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
         };
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[i + 1], i + 1, replacement);
+        lv.refresh_at(store, infos, i);
         changed = true;
         i += 2;
     }
@@ -1401,6 +1365,7 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
 
     let len = store.len();
     let mut changed = false;
+    let mut lv = FpLiveness::new(store, infos);
     let mut i = 0;
     while i + 1 < len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -1465,46 +1430,18 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
             continue;
         }
 
-        // ── liveness: the load and the FMA consume exactly two mentions;
-        //    the first mention past them must fully overwrite the register
-        //    (killing the loaded value) or be absent.  No intervening call
-        //    for xmm0-xmm7 (calls read %xmm0-%xmm7 implicitly as the FP
-        //    argument registers). ──────────────────────────────────────────────────
-        let reg_token = format!("%xmm{}", n);
-        let mut total = 0;
-        let mut vetoed = false;
-        let mut k = i;
-        while k < len {
-            let t = infos[k].trimmed(store.get(k));
-            if t == ".cfi_endproc" {
-                break;
-            }
-            if !infos[k].is_nop() {
-                if n <= 7 && k != i && k != j && infos[k].kind == LineKind::Call {
-                    vetoed = true;
-                    break;
-                }
-                let m = mentions_token(t, &reg_token);
-                if m > 0 && total == 2 {
-                    // First mention past load+consumer: sound only when it
-                    // rewrites the whole register (everything after it then
-                    // uses the new value) AND every path from the consumer
-                    // reaches it — a control-flow transfer in between lets a
-                    // branch skip the overwrite while a reader past the merge
-                    // still observes the loaded value (is_cf_transfer).
-                    let straight =
-                        !(j + 1..k).any(|h| !infos[h].is_nop() && is_cf_transfer(infos[h].kind));
-                    vetoed = !(is_pure_xmm_overwrite(t, &reg_token) && straight);
-                    break;
-                }
-                total += m;
-                if total > 2 {
-                    break;
-                }
-            }
-            k += 1;
+        // ── liveness: the loaded register must be dead after the FMA on
+        //    every path (CFG-aware; a loop-top reader through the back edge,
+        //    a call reading it as an FP argument, or a merge-form
+        //    redefinition all keep it live).  The FMA must not read the
+        //    register through another operand slot either (`ops[1]`/`ops[2]`
+        //    naming it means the load feeds two inputs — folding one leaves
+        //    the other undefined). ───────────────────────────────────────
+        if xmm_num(ops[1]) == Some(n) || xmm_num(ops[2]) == Some(n) {
+            i += 1;
+            continue;
         }
-        if vetoed || total != 2 {
+        if !lv.xmm_dead_after(store, infos, j, n, &[i, j]) {
             i += 1;
             continue;
         }
@@ -1516,6 +1453,7 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
             j,
             format!("    {}{} {}, {}, {}", fop, width, addr, ops[1], ops[2]),
         );
+        lv.refresh_at(store, infos, i);
         changed = true;
         i = j + 1;
     }
@@ -1882,6 +1820,7 @@ pub(super) fn fold_zero_addend_fma213_to_132(
 
     let len = store.len();
     let mut changed = false;
+    let mut lv = FpLiveness::new(store, infos);
     let mut i = 0;
     while i + 2 < len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -1943,43 +1882,10 @@ pub(super) fn fold_zero_addend_fma213_to_132(
             continue;
         }
 
-        // ── liveness: the FMA must be the LAST reader of the loaded value.
-        //    The load/FMA adjacency already proves nothing reads %xmmB in
-        //    between; after the FMA, the first mention of %xmmB must be a
-        //    pure full-width overwrite (the register reused for another
-        //    value — the later definition is what any subsequent reader
-        //    sees) or absent entirely.  Any read — including a read-
-        //    modify-write whose destination merely happens to be %xmmB —
-        //    vetoes the fold. ─────────────────────────────────────────────
-        let mut ok_after = true;
-        let mut m = k + 1;
-        while m < len {
-            let t = infos[m].trimmed(store.get(m));
-            if t == ".cfi_endproc" {
-                break;
-            }
-            // Same call-as-argument-reader contract as the other FP folds:
-            // a Call implicitly reads %xmm1-%xmm7 when the loaded value is
-            // passed to it (self-move-elided argument staging is invisible
-            // to this textual scan).  %xmm0 is excluded by construction —
-            // it is the zeroing register itself.
-            if b <= 7 && !infos[m].is_nop() && infos[m].kind == LineKind::Call {
-                ok_after = false;
-                break;
-            }
-            if !infos[m].is_nop() && mentions_token(t, &b_tok) > 0 {
-                // Pure redefinition kills the loaded value only for code it
-                // dominates; a branch between the FMA and the redefinition
-                // lets the other path read the loaded multiplier past the
-                // merge (is_cf_transfer).
-                let straight =
-                    !(k + 1..m).any(|h| !infos[h].is_nop() && is_cf_transfer(infos[h].kind));
-                ok_after = is_pure_xmm_overwrite(t, &b_tok) && straight;
-                break;
-            }
-            m += 1;
-        }
-        if !ok_after {
+        // ── liveness: the FMA must be the LAST reader of the loaded value
+        //    (%xmmB) on every path — CFG-aware dataflow, same contract as
+        //    fold_fma_memory_src2. ─────────────────────────────────────────
+        if !lv.xmm_dead_after(store, infos, k, b, &[i, k]) {
             i += 1;
             continue;
         }
@@ -1991,6 +1897,7 @@ pub(super) fn fold_zero_addend_fma213_to_132(
             k,
             format!("    vfmadd132{} {}, %xmm0, {}", width, addr, ops[2]),
         );
+        lv.refresh_at(store, infos, i);
         changed = true;
         i = k + 1;
     }
@@ -2521,14 +2428,28 @@ mod fma_mem_fold_tests {
         );
     }
 
-    /// A call after the pair can implicitly read %xmm0-%xmm7 (variadic FP
-    /// arguments) — veto for registers in the argument range.
+    /// A call after the pair reads the FP argument registers its census
+    /// (`movb $N, %al`, emitted by lccc for every call with FP arguments)
+    /// names — veto for the loaded register when it is inside that range.
     #[test]
     fn refuses_when_call_intervenes_for_arg_reg() {
         let (changed, _) = run("    movsd (%rsi), %xmm5\n\
              \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
+             \x20   movb $6, %al\n\
              \x20   call printf\n");
-        assert!(!changed, "call may read %xmm5 as variadic arg");
+        assert!(!changed, "call reads %xmm5 as its sixth FP argument");
+    }
+
+    /// A census below the register's index proves the call does not read
+    /// it: the fold stays enabled.
+    #[test]
+    fn folds_past_call_whose_census_excludes_the_register() {
+        let (changed, out) = run("    movsd (%rsi), %xmm5\n\
+             \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
+             \x20   movb $2, %al\n\
+             \x20   call printf\n");
+        assert!(changed, "two FP arguments: %xmm5 is not read: {out:?}");
+        assert_eq!(out[0], "vfmadd231sd (%rsi), %xmm3, %xmm8");
     }
 
     /// Same shape with a register outside the argument range: xmm11 is
@@ -2784,9 +2705,13 @@ mod fma132_reuse_tests {
         let (changed, out) = run("    movsd (%rsi), %xmm1\n\
              \x20   xorpd %xmm0, %xmm0\n\
              \x20   vfmadd213sd %xmm0, %xmm1, %xmm2\n\
+             \x20   movb $2, %al\n\
              \x20   call foo\n\
              \x20   vmovapd %xmm3, %xmm1\n");
-        assert!(!changed, "the call may read %xmm1 as its argument: {out:?}");
+        assert!(
+            !changed,
+            "the call reads %xmm1 as its second argument: {out:?}"
+        );
     }
 
     /// The veto is call-specific: a non-call line in the stretch leaves
@@ -2848,9 +2773,22 @@ mod fp_reg_load_tests {
     fn refuses_when_call_reads_loaded_arg_register() {
         let (changed, out) = run("    movsd (%rsi), %xmm0\n\
              \x20   vaddsd %xmm0, %xmm5, %xmm5\n\
+             \x20   movb $1, %al\n\
              \x20   call foo\n\
              \x20   vmovapd %xmm1, %xmm0\n");
-        assert!(!changed, "the call may read %xmm0 as its argument: {out:?}");
+        assert!(!changed, "the call reads %xmm0 as its argument: {out:?}");
+    }
+
+    /// No census, no staging: a GP-only call reads no XMM register, so a
+    /// value parked in an argument register survives it as dead.
+    #[test]
+    fn folds_past_gp_only_call() {
+        let (changed, out) = run("    movsd (%rsi), %xmm0\n\
+             \x20   vaddsd %xmm0, %xmm5, %xmm5\n\
+             \x20   movq %rbx, %rdi\n\
+             \x20   call foo\n\
+             \x20   vmovapd %xmm1, %xmm0\n");
+        assert!(changed, "GP-only call does not read %xmm0: {out:?}");
     }
 
     /// Same stretch with a non-call line in place of the call: the fold

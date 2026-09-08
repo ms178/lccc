@@ -2752,6 +2752,22 @@ fn has_fma3() -> bool {
     HAS_FMA3.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the target can lower `RoundScalarF{32,64}` inline (x86-64:
+/// SSE4.1 `roundsd`; i686: x87 `frndint`; AArch64: `frint*`).  Without it
+/// the floor/ceil/trunc/rint/nearbyint calls must stay libcalls — the
+/// x86-64 emitter has no SSE2-only rounding sequence, and inventing one
+/// (2^52 magic-number add/sub) changes results for |x| ≥ 2^52 and for
+/// signalling NaNs, which the libm implementation gets right.
+static HAS_ROUND_INSN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_has_round_insn(enabled: bool) {
+    HAS_ROUND_INSN.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn has_round_insn() -> bool {
+    HAS_ROUND_INSN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Ternary math functions mapping to single-instruction intrinsics.
 /// fma/fmaf REQUIRE the fused form (single rounding, C99 F.10.10.1);
 /// converting the libcall is not just faster, it is what makes glibc's own
@@ -2791,6 +2807,15 @@ fn simplify_math_call(
     for &(name, intrinsic_op) in UNARY_INTRINSICS {
         if func == name {
             if args.len() != 1 {
+                return None;
+            }
+            // Directed rounding needs an inline lowering on the target
+            // (see set_has_round_insn); otherwise keep the libm call.
+            if matches!(
+                intrinsic_op,
+                IntrinsicOp::RoundScalarF64(_) | IntrinsicOp::RoundScalarF32(_)
+            ) && !has_round_insn()
+            {
                 return None;
             }
             return Some(Instruction::Intrinsic {

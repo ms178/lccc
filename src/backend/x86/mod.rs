@@ -3,6 +3,7 @@
 pub(crate) mod assembler;
 pub(crate) mod codegen;
 pub(crate) mod cpu_model;
+pub(crate) mod isa;
 #[cfg_attr(feature = "gcc_linker", allow(dead_code))]
 // Built-in linker unused when gcc handles linking
 pub mod linker;

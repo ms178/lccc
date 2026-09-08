@@ -999,6 +999,7 @@ impl Driver {
                     // No xmm state at all, so every VEX form is forbidden too.
                     self.avx_explicitly_disabled = true;
                     self.fma_explicitly_disabled = true;
+                    self.sse41_explicitly_disabled = true;
                     self.enable_sse3 = false;
                     self.enable_ssse3 = false;
                     self.enable_sse4_1 = false;
@@ -1063,13 +1064,24 @@ impl Driver {
                     self.enable_vaes = false;
                     self.enable_vpclmulqdq = false;
                 }
-                "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" | "-mno-sse4.2" => {
-                    // AVX implies SSE4.2, so denying any SSE4.x denies AVX.
+                "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" => {
+                    // SSE4.1 ⊃ SSSE3 ⊃ SSE3 and AVX ⊃ SSE4.2 ⊃ SSE4.1, so
+                    // denying any of these denies SSE4.1 *and* AVX/FMA.
+                    self.sse41_explicitly_disabled = true;
                     self.avx_explicitly_disabled = true;
                     self.fma_explicitly_disabled = true;
                     self.enable_sse3 = false;
                     self.enable_ssse3 = false;
                     self.enable_sse4_1 = false;
+                    self.enable_sse4_2 = false;
+                    self.enable_avx = false;
+                    self.enable_avx2 = false;
+                }
+                "-mno-sse4.2" => {
+                    // AVX implies SSE4.2, so denying SSE4.2 denies AVX/FMA;
+                    // SSE4.1 stays legal (GCC: -mno-sse4.2 keeps -msse4.1).
+                    self.avx_explicitly_disabled = true;
+                    self.fma_explicitly_disabled = true;
                     self.enable_sse4_2 = false;
                     self.enable_avx = false;
                     self.enable_avx2 = false;
@@ -1080,7 +1092,10 @@ impl Driver {
                 "-maes" => self.enable_aes = true,
                 "-mpclmul" => self.enable_pclmul = true,
                 "-mf16c" => self.enable_f16c = true,
-                "-mfma" => self.enable_fma = true,
+                "-mfma" => {
+                    self.enable_fma = true;
+                    self.fma_explicitly_disabled = false;
+                }
                 "-mbmi" => self.enable_bmi = true,
                 "-mbmi2" => self.enable_bmi2 = true,
                 "-mlzcnt" => self.enable_lzcnt = true,
@@ -1168,11 +1183,15 @@ impl Driver {
                     // Explicit ISA enable wins over a prior `-mno-sse` (GCC).
                     self.no_sse = false;
                     self.sse_explicitly_disabled = false;
+                    self.sse41_explicitly_disabled = false;
+                    self.avx_explicitly_disabled = false;
                     self.enable_x86_avx2_profile();
                 }
                 "-mavx" => {
                     self.no_sse = false;
                     self.sse_explicitly_disabled = false;
+                    self.sse41_explicitly_disabled = false;
+                    self.avx_explicitly_disabled = false;
                     self.enable_avx = true;
                     self.enable_sse4_2 = true;
                     self.enable_sse4_1 = true;
@@ -1180,12 +1199,14 @@ impl Driver {
                     self.enable_sse3 = true;
                 }
                 "-msse4.2" => {
+                    self.sse41_explicitly_disabled = false;
                     self.enable_sse4_2 = true;
                     self.enable_sse4_1 = true;
                     self.enable_ssse3 = true;
                     self.enable_sse3 = true;
                 }
                 "-msse4.1" | "-msse4" => {
+                    self.sse41_explicitly_disabled = false;
                     self.enable_sse4_1 = true;
                     self.enable_ssse3 = true;
                     self.enable_sse3 = true;
@@ -1213,6 +1234,7 @@ impl Driver {
                     // No xmm state at all, so every VEX form is forbidden too.
                     self.avx_explicitly_disabled = true;
                     self.fma_explicitly_disabled = true;
+                    self.sse41_explicitly_disabled = true;
                     self.enable_sse3 = false;
                     self.enable_ssse3 = false;
                     self.enable_sse4_1 = false;
@@ -1234,6 +1256,9 @@ impl Driver {
                         // Remembered for the tuning-row fallback
                         // (cpu_model::resolve: -mtune > -march > generic).
                         self.x86_march = Some(march.to_string());
+                        // An explicit profile is the code-generation ceiling
+                        // (GCC-exact); only the absent-flag default is v3.
+                        self.x86_march_explicit = true;
                     }
                     match self.target {
                         Target::Riscv64 => self.riscv_march = Some(march.to_string()),

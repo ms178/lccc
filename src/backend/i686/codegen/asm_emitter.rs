@@ -519,6 +519,10 @@ impl InlineAsmEmitter for I686Codegen {
             }
         }
 
+        // i686 code is never compiled with AVX in lccc: GCC's `%dN`
+        // duplicate modifier is the plain operand here.
+        let line_owned = crate::backend::x86::codegen::strip_duplicate_modifier(line);
+        let line = line_owned.as_str();
         Self::substitute_i686_asm_operands(
             line,
             &op_regs,

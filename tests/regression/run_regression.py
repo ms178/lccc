@@ -87,6 +87,21 @@ class Result:
     phases: list[str] = field(default_factory=list)
 
 
+def split_flags_for_gcc(flags: str, src: str) -> list[str]:
+    """Order ``flags`` and ``src`` the way GNU ld resolves archives.
+
+    ``-lm`` (and any ``-l``/``-Wl,`` linker input) must FOLLOW the object
+    that references it: ``gcc -lm foo.c`` drops libm before ``foo.o`` needs
+    it and fails with "undefined reference to sin".  lccc's driver defers
+    libraries itself, which is why every ``-lm`` test used to be silently
+    reported as SKIP-COMPARE instead of being checked against GCC.
+    """
+    words = flags.split()
+    libs = [w for w in words if w.startswith(("-l", "-Wl,"))]
+    rest = [w for w in words if not w.startswith(("-l", "-Wl,"))]
+    return [*rest, src, *libs]
+
+
 def unavailable_i386_interpreter(binary: Path, flags: str) -> bool:
     """Whether a successful -m32 link cannot run only due to the host image."""
     if "-m32" not in flags.split():
@@ -173,7 +188,7 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path) -> Result:
         return [str(lccc), "-I", gcc_include, *flags.split(), src, "-o", str(out)]
 
     def gcc_cmd(flags: str) -> list[str]:
-        return [gcc, *flags.split(), src, "-o", str(out)]
+        return [gcc, *split_flags_for_gcc(flags, src), "-o", str(out)]
 
     if "@PROFDIR@" in test.flags:
         # PGO roundtrip: generate -> train -> use. The use build must be
@@ -257,7 +272,7 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path) -> Result:
 
     gcc_start = time.monotonic()
     gcc_out = workdir / (test.name + ".gcc")
-    rc, so_g, se_g = run_checked([gcc, *test.flags.split(), src, "-o", str(gcc_out)],
+    rc, so_g, se_g = run_checked([gcc, *split_flags_for_gcc(test.flags, src), "-o", str(gcc_out)],
                                  env=env, cwd=workdir)
     if rc != 0:
         # Not a valid oracle for this test — count as pass without compare.

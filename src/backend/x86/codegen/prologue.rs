@@ -2073,6 +2073,29 @@ impl X86Codegen {
             }
         }
 
+        // Publish the XMM return-register set so the late text peephole's FP
+        // liveness oracle (`fp_liveness.rs`) knows exactly which of
+        // `%xmm0`/`%xmm1` every `ret` of this function reads, instead of
+        // inferring it from the epilogue's tail block (which a shared
+        // epilogue reached by `jmp` defeats).  The marker is a GNU-as
+        // comment; a function without it keeps the tail-block inference.
+        let ret_xmm_mask = ret_xmm_mask(
+            func.return_type,
+            &func.ret_eightbyte_classes,
+            func.ret_is_f128_sse,
+            func.blocks.iter().any(|b| {
+                b.instructions.iter().any(|inst| {
+                    matches!(
+                        inst,
+                        Instruction::SetReturnF64Second { .. }
+                            | Instruction::SetReturnF32Second { .. }
+                    )
+                })
+            }),
+        );
+        self.state
+            .emit_fmt(format_args!("    # LCCC_RET_XMM {}", ret_xmm_mask));
+
         if func.is_variadic {
             let base = self.reg_save_area_offset;
 
@@ -3159,4 +3182,53 @@ fn gaddr_def_block(func: &IrFunction, mut v: u32, gmap: &FxHashMap<u32, String>)
         v = next?;
     }
     None
+}
+
+/// SysV AMD64 XMM return-register set of a function, as a bit mask over
+/// `%xmm0` (bit 0) and `%xmm1` (bit 1).
+///
+/// * scalar `float`/`double`/`_Decimal32`/`_Decimal64`, `_Float128`,
+///   `_Complex float` (packed into `%xmm0`), and every aggregate whose
+///   eightbyte classification puts exactly one SSE eightbyte in `%xmm0`
+///   → `1`;
+/// * `_Complex double` and two-SSE-eightbyte aggregates (`struct {double
+///   a, b;}`) → `3`;
+/// * everything else (integer, pointer, `void`, x87 `long double`, sret,
+///   INTEGER+INTEGER aggregates, `_Complex long double`) → `0`.
+///
+/// `ret_eightbyte_classes` is the two-entry classification of a 9–16 byte
+/// aggregate return (`[Sse, Integer]` puts eightbyte 0 in `%xmm0` and
+/// eightbyte 1 in `%rax`; `[Integer, Sse]` puts eightbyte 1 in `%xmm0` —
+/// SSE eightbytes are numbered from `%xmm0` in order, see
+/// `emit_return_i128_to_regs_impl`).  `sets_second` marks a body that
+/// routes the imaginary half / high eightbyte through
+/// `SetReturnF64Second`/`SetReturnF32Second` (i.e. writes `%xmm1`).
+pub(super) fn ret_xmm_mask(
+    return_type: IrType,
+    ret_eightbyte_classes: &[EightbyteClass],
+    ret_is_f128_sse: bool,
+    sets_second: bool,
+) -> u32 {
+    if ret_is_f128_sse {
+        return 1;
+    }
+    let mut mask = match return_type {
+        IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64 => 1,
+        IrType::I128 | IrType::U128 => {
+            let n_sse = ret_eightbyte_classes
+                .iter()
+                .filter(|c| **c == EightbyteClass::Sse)
+                .count();
+            match n_sse {
+                0 => 0,
+                1 => 1,
+                _ => 3,
+            }
+        }
+        _ => 0,
+    };
+    if sets_second {
+        mask |= 3; // imaginary half in %xmm1, real half in %xmm0
+    }
+    mask
 }

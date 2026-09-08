@@ -874,27 +874,12 @@ fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32)
     }
 }
 
-/// x86 ISA permission for *code generation*, computed once per TU by the
-/// driver.
-///
-/// Deliberately distinct from the driver's `enable_*` feature bits: those
-/// record what the TU explicitly *requested* and drive the `__AVX2__`-style
-/// feature macros, which must stay GCC-accurate. LCCC's x86-64 code-generation
-/// baseline is x86-64-v3, so a subset is *legal* unless the TU forbade it with
-/// `-mno-*` / `-mgeneral-regs-only`. Conflating the two is wrong in both
-/// directions: treating "unrequested" as "illegal" strips every 256-bit
-/// transform from default-flag builds, while treating "legal by default" as
-/// "legal always" emits AVX2 into a `-mno-avx` kernel object - an immediate
-/// #UD, since the kernel runs with CR4.OSFXSR=0.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct X86Isa {
-    /// xmm register file usable at all.
-    pub simd: bool,
-    /// 256-bit ymm (AVX/AVX2) forms usable.
-    pub ymm: bool,
-    /// `vfmadd*` (FMA3, VEX-encoded) usable.
-    pub fma: bool,
-}
+/// x86-64 code-generation ISA permission for the translation unit being
+/// compiled — the same struct the backend consumes (`backend::x86::isa`),
+/// so the middle end and the emitters can never disagree about what is
+/// legal.  See that module for the policy (x86-64-v3 default, explicit
+/// `-march` is the ceiling, `-mno-*` denials are sticky).
+pub(crate) use crate::backend::x86::isa::X86Isa;
 
 /// Widest rotate (in bits) `target` can lower to a single native instruction
 /// sequence, or 0 when the target should keep the portable shift/or triple.
@@ -946,17 +931,17 @@ pub(crate) fn run_passes(
     // the vectorizer must not rewrite a single loop (see the gate in
     // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
     // 128-bit SSE2 instead of disabling vectorization outright.
-    vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm);
+    vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41);
     // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
     // ignores this.
-    vectorize::set_x86_fma_enabled(x86_fma && target == crate::backend::Target::X86_64);
+    vectorize::set_x86_fma_enabled(x86_isa.fma && target == crate::backend::Target::X86_64);
     // PERF-41's strict computed-reciprocal prefix uses VPINSRD (SSE4.1) plus
     // AVX2 packed conversion/division.  Do not infer this from generic x86
     // vectorization or from AVX alone; the pass must fail closed for a target
     // which has not explicitly enabled both required ISA subsets.
     vectorize::set_x86_strict_recip_avx2_enabled(
-        target == crate::backend::Target::X86_64 && x86_avx2 && x86_sse4_1,
+        target == crate::backend::Target::X86_64 && x86_avx2 && x86_sse4_1 && x86_isa.ymm,
     );
     // FMA3 availability for the fma/fmaf libcall fold (simplify.rs): the
     // fused form is required for the C99 single-rounding semantics, so the
@@ -969,6 +954,15 @@ pub(crate) fn run_passes(
         crate::backend::Target::X86_64 => x86_isa.fma,
         crate::backend::Target::I686 => x86_fma,
         crate::backend::Target::Aarch64 => true,
+        _ => false,
+    });
+    // SSE4.1 directed rounding (`roundsd`/`vroundsd`) for the floor/ceil/
+    // trunc/rint/nearbyint libcall fold.  x86-64 needs the ISA bit; i686
+    // lowers the intrinsic through x87 `frndint` and AArch64 through
+    // `frint*`, both baseline.
+    simplify::set_has_round_insn(match target {
+        crate::backend::Target::X86_64 => x86_isa.sse41,
+        crate::backend::Target::I686 | crate::backend::Target::Aarch64 => true,
         _ => false,
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();

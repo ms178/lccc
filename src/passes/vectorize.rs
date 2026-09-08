@@ -127,6 +127,10 @@ thread_local! {
     // x86-64's project baseline is x86-64-v3, so plain `-mno-avx` must
     // downgrade the vectorizer to 128-bit SSE2 forms rather than disable it.
     static X86_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // SSE4.1 availability for the 128-bit lowerings that have no SSE2
+    // spelling (`pmulld`).  `-mno-avx` alone keeps it (x86-64-v2 hardware);
+    // `-march=x86-64` / `-mno-sse4.1` clear it.
+    static X86_SSE41_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Record the x86 SIMD ISA profile for the current translation unit.
@@ -139,11 +143,19 @@ thread_local! {
 ///
 /// AArch64 needs no gate: its entry points pass `neon = true` and NEON is
 /// baseline ISA for every supported ARMv8/v9 target.
-pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool) {
+pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool, sse41: bool) {
     X86_SIMD_AVAILABLE.with(|available| available.set(simd));
     // AVX2 is a subset of "SIMD at all"; never let a caller assert AVX2 while
     // SIMD itself is forbidden.
     X86_AVX2_AVAILABLE.with(|available| available.set(avx2 && simd));
+    X86_SSE41_AVAILABLE.with(|available| available.set(sse41 && simd));
+}
+
+/// SSE4.1 availability on the 128-bit path: `pmulld` (VecMulI32x4) has no
+/// SSE2 encoding, so an I32 multiply map/dot under `-mno-sse4.1` /
+/// `-march=x86-64` must not be vectorised.
+fn x86_sse41_available() -> bool {
+    X86_SSE41_AVAILABLE.with(|available| available.get())
 }
 
 fn x86_simd_available() -> bool {
@@ -12677,13 +12689,25 @@ fn transform_reduction_sse2(
                 Some(IntrinsicOp::VecMulI64x2),
                 IntrinsicOp::VecHorizontalAddI64x2,
             ),
-            IrType::I32 => (
-                4u64,
-                IntrinsicOp::LoadI32x4,
-                IntrinsicOp::AddI32x4,
-                Some(IntrinsicOp::VecMulI32x4),
-                IntrinsicOp::HorizontalAddI32x4,
-            ),
+            IrType::I32 => {
+                // VecMulI32x4 lowers to `pmulld` (SSE4.1; the SSE2 `pmuludq`
+                // pair would need two extra shuffles per multiply, which
+                // loses to the scalar `imul` chain).  An I32 dot product on
+                // an SSE2-only TU therefore stays scalar.
+                if pattern.kind == ReductionKind::DotProduct && !neon && !x86_sse41_available() {
+                    if debug {
+                        eprintln!("[VEC-RED] I32 dot product needs SSE4.1 pmulld; ISA denies it");
+                    }
+                    return 0;
+                }
+                (
+                    4u64,
+                    IntrinsicOp::LoadI32x4,
+                    IntrinsicOp::AddI32x4,
+                    Some(IntrinsicOp::VecMulI32x4),
+                    IntrinsicOp::HorizontalAddI32x4,
+                )
+            }
             IrType::I64 => (
                 2u64,
                 IntrinsicOp::VecLoadI64x2,
@@ -14060,6 +14084,174 @@ fn transform_map_vector(
         }
     }
 
+    let broadcast_op = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => IntrinsicOp::VecBroadcastF64x4,
+        (IrType::F64, false) => IntrinsicOp::VecBroadcastF64x2,
+        (IrType::F32, true) => IntrinsicOp::VecBroadcastF32x8,
+        (IrType::F32, false) => IntrinsicOp::VecBroadcastF32x4,
+        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecBroadcastI32x8,
+        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecBroadcastI32x4,
+        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecBroadcastI64x2,
+        _ => return 0,
+    };
+
+    let load_op = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => IntrinsicOp::VecLoadF64x4,
+        (IrType::F64, false) => IntrinsicOp::VecLoadF64x2,
+        (IrType::F32, true) => IntrinsicOp::VecLoadF32x8,
+        (IrType::F32, false) => IntrinsicOp::VecLoadF32x4,
+        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecLoadI32x8,
+        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecLoadI32x4,
+        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecLoadI64x2,
+        _ => return 0,
+    };
+    let store_op = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => IntrinsicOp::VecStoreF64x4,
+        (IrType::F64, false) => IntrinsicOp::VecStoreF64x2,
+        (IrType::F32, true) => IntrinsicOp::VecStoreF32x8,
+        (IrType::F32, false) => IntrinsicOp::VecStoreF32x4,
+        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecStoreI32x8,
+        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecStoreI32x4,
+        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecStoreI64x2,
+        _ => return 0,
+    };
+    let bin_op = |op: &IrBinOp| -> Option<IntrinsicOp> {
+        match (pattern.elem_ty, avx2, op) {
+            (IrType::F64, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddF64x4),
+            (IrType::F64, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddF64x2),
+            (IrType::F64, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF64x4),
+            (IrType::F64, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF64x2),
+            (IrType::F64, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF64x4),
+            (IrType::F64, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF64x2),
+            (IrType::F64, true, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF64x4),
+            (IrType::F64, false, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF64x2),
+            (IrType::F32, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddF32x8),
+            (IrType::F32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddF32x4),
+            (IrType::F32, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF32x8),
+            (IrType::F32, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF32x4),
+            (IrType::F32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF32x8),
+            (IrType::F32, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF32x4),
+            (IrType::F32, true, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF32x8),
+            (IrType::F32, false, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x8),
+            // `pmulld` is SSE4.1: no SSE2 spelling of a 4-lane I32 multiply.
+            (IrType::I32 | IrType::U32, false, IrBinOp::Mul) if x86_sse41_available() => {
+                Some(IntrinsicOp::VecMulI32x4)
+            }
+            (IrType::I32 | IrType::U32, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x4),
+            (IrType::I64 | IrType::U64, _, IrBinOp::Add) => Some(IntrinsicOp::VecAddI64x2),
+            (IrType::I64 | IrType::U64, _, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI64x2),
+            (IrType::I64 | IrType::U64, _, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI64x2),
+            _ => None,
+        }
+    };
+    // Sqrt is only available for FP element types; integer trees never
+    // contain Sqrt (the parser gates it), so `None` is fine there.
+    let sqrt_op = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => Some(IntrinsicOp::VecSqrtF64x4),
+        (IrType::F64, false) => Some(IntrinsicOp::VecSqrtF64x2),
+        (IrType::F32, true) => Some(IntrinsicOp::VecSqrtF32x8),
+        (IrType::F32, false) => Some(IntrinsicOp::VecSqrtF32x4),
+        _ => None,
+    };
+    let madd_op = if fp_contract == FpContract::Fast && avx2 && x86_fma_enabled() {
+        match pattern.elem_ty {
+            IrType::F64 => Some(IntrinsicOp::VecMaddF64x4),
+            IrType::F32 => Some(IntrinsicOp::VecMaddF32x8),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // Packed compare lowers to vcmpps/vcmppd (cmpps/cmppd on the SSE path);
+    // the predicate immediate is the encoder's EQ_OQ/LT_OS/LE_OS/NEQ_UQ
+    // subset — the parser normalized GT/GE by operand swap.
+    let cmp_op = |op: &IrCmpOp| -> Option<(IntrinsicOp, i32)> {
+        let vec_op = match (pattern.elem_ty, avx2) {
+            (IrType::F64, true) => IntrinsicOp::VecCmpF64x4,
+            (IrType::F64, false) => IntrinsicOp::VecCmpF64x2,
+            (IrType::F32, true) => IntrinsicOp::VecCmpF32x8,
+            (IrType::F32, false) => IntrinsicOp::VecCmpF32x4,
+            (IrType::I32, true) | (IrType::U32, true) => IntrinsicOp::VecCmpI32x8,
+            (IrType::I32, false) | (IrType::U32, false) => IntrinsicOp::VecCmpI32x4,
+            _ => return None,
+        };
+        // FP immediates are the vcmpps EQ_OQ/LT_OS/LE_OS/NEQ_UQ encodings;
+        // integer immediates follow the VecCmpI32x8 vocabulary (the
+        // numbering echoes vcmpps, +4 selects the unsigned bias path).
+        let imm = match op {
+            IrCmpOp::Eq => 0,  // EQ_OQ / ==
+            IrCmpOp::Slt => 1, // LT_OS / < signed
+            IrCmpOp::Sle => 2, // LE_OS / <= signed
+            IrCmpOp::Ne => 4,  // NEQ_UQ / !=
+            IrCmpOp::Ult => 5, // < unsigned (sign-bias expansion)
+            IrCmpOp::Ule => 6, // <= unsigned
+            _ => return None,
+        };
+        Some((vec_op, imm))
+    };
+    let blendv_op = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => Some(IntrinsicOp::VecBlendvF64x4),
+        (IrType::F64, false) => Some(IntrinsicOp::VecBlendvF64x2),
+        (IrType::F32, true) => Some(IntrinsicOp::VecBlendvF32x8),
+        (IrType::F32, false) => Some(IntrinsicOp::VecBlendvF32x4),
+        (IrType::I32, true) | (IrType::U32, true) => Some(IntrinsicOp::VecBlendvI32x8),
+        (IrType::I32, false) | (IrType::U32, false) => Some(IntrinsicOp::VecBlendvI32x4),
+        _ => None,
+    };
+    let minmax_op = |is_max: bool| -> Option<IntrinsicOp> {
+        match (pattern.elem_ty, avx2, is_max) {
+            (IrType::F64, true, false) => Some(IntrinsicOp::VecMinF64x4),
+            (IrType::F64, false, false) => Some(IntrinsicOp::VecMinF64x2),
+            (IrType::F32, true, false) => Some(IntrinsicOp::VecMinF32x8),
+            (IrType::F32, false, false) => Some(IntrinsicOp::VecMinF32x4),
+            (IrType::F64, true, true) => Some(IntrinsicOp::VecMaxF64x4),
+            (IrType::F64, false, true) => Some(IntrinsicOp::VecMaxF64x2),
+            (IrType::F32, true, true) => Some(IntrinsicOp::VecMaxF32x8),
+            (IrType::F32, false, true) => Some(IntrinsicOp::VecMaxF32x4),
+            // Signed dword min/max exist as single AVX2 instructions
+            // (vpminsd/vpmaxsd); the exact ternary fold produces them.
+            // Unsigned lanes would need vpminud/vpmaxud (not modeled) and
+            // the SSE2 baseline lacks dword min/max entirely — both fail
+            // closed through map_tree_ops_available.
+            (IrType::I32, true, false) => Some(IntrinsicOp::VecMinI32x8),
+            (IrType::I32, true, true) => Some(IntrinsicOp::VecMaxI32x8),
+            _ => None,
+        }
+    };
+
+    // Fail-closed BEFORE any mutation: every operation the tree needs must
+    // have a lowering.  This check used to sit AFTER the exit-compare
+    // rewrite (`IV < limit/width`) and the byte-IV phi had been committed, so
+    // a tree with one unlowerable node (an I32 multiply on an SSE2-only TU:
+    // `pmulld` is SSE4.1) left a *scalar* loop running `limit/width`
+    // iterations — a silent miscompile (vectorize_isa_gate.c
+    // `add_scaled` under `-march=x86-64` processed 16 of 64 elements).
+    // A mid-transform bail also leaves `func.next_value_id` stale and
+    // corrupts every later pass (bit_idioms indexed out of bounds).
+    if !map_tree_ops_available(
+        &pattern.expr,
+        &bin_op,
+        sqrt_op,
+        &cmp_op,
+        &minmax_op,
+        blendv_op,
+    ) {
+        if debug {
+            eprintln!("[VEC-MAP]   Tree requires an op with no vector lowering");
+        }
+        return 0;
+    }
+
     // Build the exact scalar remainder BEFORE touching the function: if the
     // scalar mirror cannot be produced nothing has been mutated and the loop
     // simply stays scalar.  The blocks are committed (appended + exit edge
@@ -14252,159 +14444,6 @@ fn transform_map_vector(
     changes += 2;
 
     let dst_address = (dst_base, Operand::Value(byte_iv));
-
-    let broadcast_op = match (pattern.elem_ty, avx2) {
-        (IrType::F64, true) => IntrinsicOp::VecBroadcastF64x4,
-        (IrType::F64, false) => IntrinsicOp::VecBroadcastF64x2,
-        (IrType::F32, true) => IntrinsicOp::VecBroadcastF32x8,
-        (IrType::F32, false) => IntrinsicOp::VecBroadcastF32x4,
-        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecBroadcastI32x8,
-        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecBroadcastI32x4,
-        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecBroadcastI64x2,
-        _ => return 0,
-    };
-
-    let load_op = match (pattern.elem_ty, avx2) {
-        (IrType::F64, true) => IntrinsicOp::VecLoadF64x4,
-        (IrType::F64, false) => IntrinsicOp::VecLoadF64x2,
-        (IrType::F32, true) => IntrinsicOp::VecLoadF32x8,
-        (IrType::F32, false) => IntrinsicOp::VecLoadF32x4,
-        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecLoadI32x8,
-        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecLoadI32x4,
-        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecLoadI64x2,
-        _ => return 0,
-    };
-    let store_op = match (pattern.elem_ty, avx2) {
-        (IrType::F64, true) => IntrinsicOp::VecStoreF64x4,
-        (IrType::F64, false) => IntrinsicOp::VecStoreF64x2,
-        (IrType::F32, true) => IntrinsicOp::VecStoreF32x8,
-        (IrType::F32, false) => IntrinsicOp::VecStoreF32x4,
-        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecStoreI32x8,
-        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecStoreI32x4,
-        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecStoreI64x2,
-        _ => return 0,
-    };
-    let bin_op = |op: &IrBinOp| -> Option<IntrinsicOp> {
-        match (pattern.elem_ty, avx2, op) {
-            (IrType::F64, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddF64x4),
-            (IrType::F64, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddF64x2),
-            (IrType::F64, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF64x4),
-            (IrType::F64, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF64x2),
-            (IrType::F64, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF64x4),
-            (IrType::F64, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF64x2),
-            (IrType::F64, true, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF64x4),
-            (IrType::F64, false, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF64x2),
-            (IrType::F32, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddF32x8),
-            (IrType::F32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddF32x4),
-            (IrType::F32, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF32x8),
-            (IrType::F32, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF32x4),
-            (IrType::F32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF32x8),
-            (IrType::F32, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF32x4),
-            (IrType::F32, true, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF32x8),
-            (IrType::F32, false, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF32x4),
-            (IrType::I32 | IrType::U32, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x8),
-            (IrType::I32 | IrType::U32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x4),
-            (IrType::I32 | IrType::U32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x8),
-            (IrType::I32 | IrType::U32, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x4),
-            (IrType::I32 | IrType::U32, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x8),
-            (IrType::I32 | IrType::U32, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x4),
-            (IrType::I32 | IrType::U32, true, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x8),
-            (IrType::I32 | IrType::U32, false, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x4),
-            (IrType::I32 | IrType::U32, true, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x8),
-            (IrType::I32 | IrType::U32, false, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x4),
-            (IrType::I32 | IrType::U32, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x8),
-            (IrType::I32 | IrType::U32, false, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x4),
-            (IrType::I64 | IrType::U64, _, IrBinOp::Add) => Some(IntrinsicOp::VecAddI64x2),
-            (IrType::I64 | IrType::U64, _, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI64x2),
-            (IrType::I64 | IrType::U64, _, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI64x2),
-            _ => None,
-        }
-    };
-    // Sqrt is only available for FP element types; integer trees never
-    // contain Sqrt (the parser gates it), so `None` is fine there.
-    let sqrt_op = match (pattern.elem_ty, avx2) {
-        (IrType::F64, true) => Some(IntrinsicOp::VecSqrtF64x4),
-        (IrType::F64, false) => Some(IntrinsicOp::VecSqrtF64x2),
-        (IrType::F32, true) => Some(IntrinsicOp::VecSqrtF32x8),
-        (IrType::F32, false) => Some(IntrinsicOp::VecSqrtF32x4),
-        _ => None,
-    };
-    let madd_op = if fp_contract == FpContract::Fast && avx2 && x86_fma_enabled() {
-        match pattern.elem_ty {
-            IrType::F64 => Some(IntrinsicOp::VecMaddF64x4),
-            IrType::F32 => Some(IntrinsicOp::VecMaddF32x8),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    // Packed compare lowers to vcmpps/vcmppd (cmpps/cmppd on the SSE path);
-    // the predicate immediate is the encoder's EQ_OQ/LT_OS/LE_OS/NEQ_UQ
-    // subset — the parser normalized GT/GE by operand swap.
-    let cmp_op = |op: &IrCmpOp| -> Option<(IntrinsicOp, i32)> {
-        let vec_op = match (pattern.elem_ty, avx2) {
-            (IrType::F64, true) => IntrinsicOp::VecCmpF64x4,
-            (IrType::F64, false) => IntrinsicOp::VecCmpF64x2,
-            (IrType::F32, true) => IntrinsicOp::VecCmpF32x8,
-            (IrType::F32, false) => IntrinsicOp::VecCmpF32x4,
-            (IrType::I32, true) | (IrType::U32, true) => IntrinsicOp::VecCmpI32x8,
-            (IrType::I32, false) | (IrType::U32, false) => IntrinsicOp::VecCmpI32x4,
-            _ => return None,
-        };
-        // FP immediates are the vcmpps EQ_OQ/LT_OS/LE_OS/NEQ_UQ encodings;
-        // integer immediates follow the VecCmpI32x8 vocabulary (the
-        // numbering echoes vcmpps, +4 selects the unsigned bias path).
-        let imm = match op {
-            IrCmpOp::Eq => 0,  // EQ_OQ / ==
-            IrCmpOp::Slt => 1, // LT_OS / < signed
-            IrCmpOp::Sle => 2, // LE_OS / <= signed
-            IrCmpOp::Ne => 4,  // NEQ_UQ / !=
-            IrCmpOp::Ult => 5, // < unsigned (sign-bias expansion)
-            IrCmpOp::Ule => 6, // <= unsigned
-            _ => return None,
-        };
-        Some((vec_op, imm))
-    };
-    let blendv_op = match (pattern.elem_ty, avx2) {
-        (IrType::F64, true) => Some(IntrinsicOp::VecBlendvF64x4),
-        (IrType::F64, false) => Some(IntrinsicOp::VecBlendvF64x2),
-        (IrType::F32, true) => Some(IntrinsicOp::VecBlendvF32x8),
-        (IrType::F32, false) => Some(IntrinsicOp::VecBlendvF32x4),
-        (IrType::I32, true) | (IrType::U32, true) => Some(IntrinsicOp::VecBlendvI32x8),
-        (IrType::I32, false) | (IrType::U32, false) => Some(IntrinsicOp::VecBlendvI32x4),
-        _ => None,
-    };
-    let minmax_op = |is_max: bool| -> Option<IntrinsicOp> {
-        match (pattern.elem_ty, avx2, is_max) {
-            // Signed dword min/max exist as single AVX2 instructions
-            // (vpminsd/vpmaxsd); the exact ternary fold produces them.
-            // Unsigned lanes would need vpminud/vpmaxud (not modeled) and
-            // the SSE2 baseline lacks dword min/max entirely — both fail
-            // closed through map_tree_ops_available.
-            (IrType::I32, true, false) => Some(IntrinsicOp::VecMinI32x8),
-            (IrType::I32, true, true) => Some(IntrinsicOp::VecMaxI32x8),
-            (IrType::F64, true, false) => Some(IntrinsicOp::VecMinF64x4),
-            (IrType::F64, false, false) => Some(IntrinsicOp::VecMinF64x2),
-            (IrType::F32, true, false) => Some(IntrinsicOp::VecMinF32x8),
-            (IrType::F32, false, false) => Some(IntrinsicOp::VecMinF32x4),
-            (IrType::F64, true, true) => Some(IntrinsicOp::VecMaxF64x4),
-            (IrType::F64, false, true) => Some(IntrinsicOp::VecMaxF64x2),
-            (IrType::F32, true, true) => Some(IntrinsicOp::VecMaxF32x8),
-            (IrType::F32, false, true) => Some(IntrinsicOp::VecMaxF32x4),
-            _ => None,
-        }
-    };
-
-    // Fail-closed BEFORE any mutation: every operation the tree needs must
-    // have a lowering. A mid-transform bail after the preheader/byte-IV
-    // rewrite would leave `func.next_value_id` stale and corrupt every
-    // later pass (bit_idioms indexed out of bounds on exactly this).
-    if !map_tree_ops_available(&expr, &bin_op, sqrt_op, &cmp_op, &minmax_op, blendv_op) {
-        if debug {
-            eprintln!("[VEC-MAP]   Tree requires an op with no vector lowering");
-        }
-        return 0;
-    }
 
     // Replace the scalar store with only the packed operations present in the
     // source expression.  DCE removes the now-unreachable scalar dataflow.

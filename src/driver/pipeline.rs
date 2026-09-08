@@ -169,6 +169,17 @@ pub struct Driver {
     /// Set by `-mno-fma` (and by any AVX/SSE denial, since `vfmadd*` is
     /// VEX-encoded and requires AVX): `vfmadd*` must not be emitted.
     pub(super) fma_explicitly_disabled: bool,
+    /// Set by `-mno-sse4.1` / `-mno-sse4` / `-mno-ssse3` / `-mno-sse3`
+    /// (each of which denies SSE4.1 as well): no SSE4.1 encodings (`pmulld`,
+    /// `roundsd`, `blendvpd`, `pmovsx*`, …).  Separate from
+    /// `avx_explicitly_disabled` because `-mno-avx` alone keeps SSE4.1 legal
+    /// (x86-64-v2 hardware).
+    pub(super) sse41_explicitly_disabled: bool,
+    /// An explicit x86 `-march=` was seen.  Under an explicit profile the
+    /// requested feature set (`enable_*`) is the *ceiling* (GCC semantics);
+    /// without one the code-generation baseline is x86-64-v3 and only
+    /// explicit `-mno-*` denials remove subsets.  See `backend::x86::isa`.
+    pub(super) x86_march_explicit: bool,
     pub(super) skip_rax_setup: bool,
     /// -mno-80387/-mno-fp-ret-in-387: no x87 instructions or x87 FP returns.
     /// Recorded so FP codegen can fail closed on long-double paths.
@@ -451,6 +462,8 @@ impl Driver {
             sse_explicitly_disabled: false,
             avx_explicitly_disabled: false,
             fma_explicitly_disabled: false,
+            sse41_explicitly_disabled: false,
+            x86_march_explicit: false,
             skip_rax_setup: false,
             no_x87: false,
             indirect_branch_thunk_inline: false,
@@ -1639,23 +1652,12 @@ impl Driver {
             self.code16gcc,
             self.fp_reassoc,
             self.fp_contract,
-            // Code-generation ISA permission (see passes::X86Isa). x86-64's
-            // baseline already contains SSE2, and the project baseline is
-            // x86-64-v3, so each subset is legal unless the TU explicitly
-            // denied it. i686 has no baseline SSE2 and its vector lowerings
-            // are x86-64 shapes, so it never vectorizes (verified: 0 xmm refs
-            // at -O2/-O3, with and without -ffast-math).
-            crate::passes::X86Isa {
-                simd: self.target == Target::X86_64 && !self.no_sse && !self.general_regs_only,
-                ymm: self.target == Target::X86_64
-                    && !self.no_sse
-                    && !self.general_regs_only
-                    && !self.avx_explicitly_disabled,
-                fma: self.target == Target::X86_64
-                    && !self.no_sse
-                    && !self.general_regs_only
-                    && !self.fma_explicitly_disabled,
-            },
+            // Code-generation ISA permission — one struct shared with the
+            // backend (see backend::x86::isa for the policy). i686 has no
+            // baseline SSE2 and its vector lowerings are x86-64 shapes, so it
+            // never vectorizes (verified: 0 xmm refs at -O2/-O3, with and
+            // without -ffast-math).
+            self.x86_isa(),
             self.target == Target::X86_64
                 && self.enable_avx
                 && !self.no_sse
@@ -2189,6 +2191,7 @@ impl Driver {
             popcnt: self.enable_popcnt,
             avx2: self.enable_avx2,
             avx512: self.enable_avx512f,
+            isa: self.x86_isa(),
             no_relax: self.riscv_no_relax,
             debug_info: self.debug_info,
             function_sections: self.function_sections,
@@ -2210,6 +2213,27 @@ impl Driver {
             &opts,
             source_manager.as_ref(),
         );
+        // `-mno-sse` / `-mgeneral-regs-only` (x86-64): the xmm register file
+        // is architecturally off-limits — the kernel runs with CR4.OSFXSR
+        // clear and every SSE instruction is #UD.  lccc's FP lowering has no
+        // x87 fallback on x86-64, so any floating-point VALUE that reaches
+        // codegen in such a TU produces SSE code.  GCC refuses these TUs
+        // ("SSE register return/argument with SSE disabled"); silently
+        // emitting `movsd` into a -mno-sse kernel object is a boot-time #UD.
+        // The final text is the one choke point that sees every emitter
+        // (codegen, MachInst, peephole), so the check is made here.
+        if self.target == Target::X86_64 && (self.no_sse || self.general_regs_only) {
+            if let Some((func, line)) = first_sse_reference(&asm) {
+                return Err(format!(
+                    "{}: in function '{}': floating-point operation requires SSE, \
+                     but SSE is disabled (-mno-sse / -mgeneral-regs-only); \
+                     x86-64 lccc has no x87 lowering for it (offending instruction: `{}`)",
+                    input_file,
+                    func,
+                    line.trim()
+                ));
+            }
+        }
         if time_phases {
             eprintln!(
                 "[TIME] codegen: {:.3}s ({} bytes asm)",
@@ -2237,5 +2261,106 @@ impl Driver {
 impl Default for Driver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// First instruction line of `asm` that names an SSE/AVX register, with the
+/// enclosing function's symbol.  Inline-asm bodies (`#APP` … `#NO_APP`) are
+/// the user's own responsibility and are skipped; comments and directives
+/// never count.
+fn first_sse_reference(asm: &str) -> Option<(String, String)> {
+    let mut func = String::from("<toplevel>");
+    let mut in_app = false;
+    for line in asm.lines() {
+        let t = line.trim_start();
+        if t.starts_with("#APP") {
+            in_app = true;
+            continue;
+        }
+        if t.starts_with("#NO_APP") {
+            in_app = false;
+            continue;
+        }
+        if in_app || t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if t.starts_with('.') {
+            if let Some(rest) = t.strip_prefix(".type ") {
+                if rest.trim_end().ends_with("@function") {
+                    if let Some(name) = rest.split(',').next() {
+                        func = name.trim().to_string();
+                    }
+                }
+            }
+            continue;
+        }
+        if t.ends_with(':') {
+            continue;
+        }
+        if t.contains("%xmm") || t.contains("%ymm") || t.contains("%zmm") {
+            return Some((func, line.to_string()));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod sse_reference_tests {
+    use super::first_sse_reference;
+
+    #[test]
+    fn finds_first_sse_line_with_function_name() {
+        let asm = ".type f, @function\nf:\n    movq %rdi, %rax\n    ret\n\
+                   .type g, @function\ng:\n    # LCCC_RET_XMM 1\n    movsd (%rdi), %xmm0\n    ret\n";
+        let (f, l) = first_sse_reference(asm).unwrap();
+        assert_eq!(f, "g");
+        assert_eq!(l.trim(), "movsd (%rdi), %xmm0");
+    }
+
+    #[test]
+    fn inline_asm_and_comments_are_exempt() {
+        let asm = ".type f, @function\nf:\n#APP\n    movaps %xmm0, %xmm1\n#NO_APP\n\
+                   # note: %xmm0\n    ret\n";
+        assert!(first_sse_reference(asm).is_none());
+    }
+}
+
+impl Driver {
+    /// x86-64 code-generation ISA permission for this translation unit.
+    ///
+    /// Policy (`backend::x86::isa`):
+    /// * no explicit `-march`: project baseline x86-64-v3, minus explicit
+    ///   `-mno-*` denials;
+    /// * explicit `-march=<level|cpu|native>`: the requested feature set is
+    ///   the ceiling (GCC-exact), explicit denials still apply;
+    /// * `-mno-sse` / `-mgeneral-regs-only`: nothing (the register file is
+    ///   off-limits; the kernel runs with CR4.OSFXSR/OSXSAVE clear).
+    ///
+    /// Non-x86-64 targets get [`X86Isa::NONE`]; i686 keeps its own SSE2
+    /// handling through `no_sse` and never reaches the x86-64 emitters.
+    pub(crate) fn x86_isa(&self) -> crate::backend::x86::isa::X86Isa {
+        use crate::backend::x86::isa::X86Isa;
+        if self.target != Target::X86_64 || self.no_sse || self.general_regs_only {
+            return X86Isa::NONE;
+        }
+        let ceiling = if self.x86_march_explicit {
+            X86Isa {
+                simd: true,
+                sse41: self.enable_sse4_1,
+                avx: self.enable_avx,
+                ymm: self.enable_avx2,
+                fma: self.enable_fma,
+            }
+        } else {
+            X86Isa::V3
+        };
+        X86Isa {
+            simd: true,
+            sse41: ceiling.sse41 && !self.sse41_explicitly_disabled,
+            avx: ceiling.avx && !self.avx_explicitly_disabled,
+            ymm: ceiling.ymm && !self.avx_explicitly_disabled,
+            fma: ceiling.fma && !self.fma_explicitly_disabled,
+        }
+        .normalized()
     }
 }
