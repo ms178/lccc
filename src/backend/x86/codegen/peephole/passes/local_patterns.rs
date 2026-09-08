@@ -5946,6 +5946,144 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
     changed
 }
 
+/// Fold an immediate staged through a register into its single ALU consumer:
+///
+/// ```text
+///     movl $1, %ecx            addl $1, %eax
+///     addl %ecx, %eax    →
+///     (dead %ecx after)       (mov deleted)
+/// ```
+///
+/// The register allocator sometimes homes a small constant into a register
+/// one instruction before its only use; in the s1 unrolled map body this
+/// stages `+1` four times per iteration (`movl $1, %ecx; addl %ecx, %eax`),
+/// costing a mov and a false dependency in every copy where GCC emits the
+/// immediate form directly.
+///
+/// Soundness:
+/// * The pair must be adjacent (only deleted/blank lines may separate them)
+///   so no intervening instruction can observe or clobber the staged value.
+/// * The consumer's first operand names the staged register EXACTLY at the
+///   mov's width, and the remaining operand text does not mention the family
+///   in any width (a memory operand using the staged register as base or
+///   index would change meaning when the defining mov disappears).
+/// * The immediate is a plain decimal integer that fits the imm32 ALU form
+///   (`movq $imm, %r64` sign-extends to 64 bits, so the 64-bit form also
+///   requires the i32 range).
+/// * The staged family is provably dead after the consumer, using the shared
+///   three-proof liveness contract (exact dataflow when the function is
+///   analysable; block-local write-before-read; whole-function textual
+///   uniqueness) — see `relay_and_lea`'s module header.
+///
+/// Flags are preserved exactly: the consumer keeps the same opcode and
+/// operands, only the source operand switches from register to immediate,
+/// and the deleted mov never wrote flags.
+pub(super) fn fold_staged_imm_into_alu(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    use super::relay_and_lea::{line_refs_family, provably_dead_lv};
+
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        // Match: `movl $IMM, %r32` / `movq $IMM, %r64`.
+        let line_i = infos[i].trimmed(store.get(i));
+        let (width_row, suffix, after_imm) = if let Some(r) = line_i.strip_prefix("movl $") {
+            (1usize, 'l', r)
+        } else if let Some(r) = line_i.strip_prefix("movq $") {
+            (0usize, 'q', r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((imm_str, dst)) = after_imm.split_once(", %") else {
+            i += 1;
+            continue;
+        };
+        let dst = dst.trim();
+        // Plain decimal immediate only: hex, symbols, and expressions are
+        // rejected (their immediate forms may not exist or may relocate).
+        let imm: i64 = match imm_str.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                i += 1;
+                continue;
+            }
+        };
+        // Both `addl $imm` (imm32) and `addq $imm` (sign-extended imm32)
+        // require the value to fit a signed 32-bit immediate.
+        if !(-0x8000_0000i64..=0x7fff_ffffi64).contains(&imm) {
+            i += 1;
+            continue;
+        }
+        let fam = get_dest_reg(&infos[i]);
+        // The mov's destination must be the plain family register at the
+        // mov's own width — no partial rewrites for exotic addressing.
+        let expected = REG_NAMES[width_row][fam as usize];
+        if dst != &expected[1..] || !is_valid_gp_reg(fam) {
+            i += 1;
+            continue;
+        }
+
+        // Find the consumer: the next active line (deleted/blank only
+        // may separate the pair).
+        let mut j = i + 1;
+        while j < len && (infos[j].is_nop() || matches!(infos[j].kind, LineKind::Empty)) {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+        let line_j = infos[j].trimmed(store.get(j));
+        // Match `add/sub/and/or/xor{suffix} %FAM, REST`.
+        let alu_ops = ["add", "sub", "and", "or", "xor"];
+        let suffix_byte = suffix as u8;
+        let op = alu_ops
+            .iter()
+            .find(|op| line_j.starts_with(**op) && line_j.as_bytes().get(op.len()) == Some(&suffix_byte));
+        let Some(op) = op else {
+            i += 1;
+            continue;
+        };
+        let body = line_j[op.len() + 1..].trim_start();
+        // First operand must be exactly the staged register: `%FAM,`.
+        let staged_full = format!("%{},", &expected[1..]);
+        let Some(rest) = body.strip_prefix(&staged_full) else {
+            i += 1;
+            continue;
+        };
+        let rest = rest.trim_start();
+        // The remainder (the consumer's destination, register or memory)
+        // must not mention the staged family in any width.
+        if rest.is_empty() || line_refs_family(rest, fam) {
+            i += 1;
+            continue;
+        }
+        // The staged family must die at the consumer.
+        if !provably_dead_lv(&lv, store, infos, j, fam, &[i, j]) {
+            i += 1;
+            continue;
+        }
+        // Rewrite: delete the staging mov, immediate-ize the consumer.
+        let replacement = format!("    {}{} ${}, {}", op, suffix, imm_str, rest);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, replacement);
+        lv.refresh_at(store, infos, j);
+        changed = true;
+        // Continue scanning from the rewritten consumer.
+        i = j;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod redundant_leaq_tests {
     use super::*;
@@ -6898,6 +7036,151 @@ mod acc_fold_src_kill_tests {
         assert!(
             out.contains(&"movl %r8d, %eax".to_string()),
             "fold must not cross a barrier:\\n{}",
+            out.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod staged_imm_alu_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let mut store = store;
+        fold_staged_imm_into_alu(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn folds_unrolled_map_staging() {
+        // The s1 unrolled-body shape, with the CFI delimiters real compiler
+        // output always carries: `+1` staged through %ecx four times. Pairs
+        // 1-3 die by block-local write-before-read (the next copy's staging
+        // mov is a full rewrite of the family); the last pair dies by
+        // whole-function textual uniqueness once the others are rewritten.
+        let asm = "\
+.cfi_startproc
+.LBB3:
+    movl (%rsi, %r10), %eax
+    imull $3, %eax, %eax
+    movl $1, %ecx
+    addl %ecx, %eax
+    movl %eax, (%rdi, %r10)
+    movl 4(%rsi, %r11, 4), %eax
+    imull $3, %eax, %eax
+    movl $1, %ecx
+    addl %ecx, %eax
+    movl %eax, 4(%rdi, %r11, 4)
+    addq $1, %r9
+    cmpq %r8, %r9
+    jl .LBB3
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            !out.iter().any(|l| l.contains("movl $1, %ecx")),
+            "staging movs must be folded:\n{}",
+            out.join("\n")
+        );
+        assert_eq!(
+            out.iter().filter(|l| *l == "addl $1, %eax").count(),
+            2,
+            "both consumers must take the immediate form:\n{}",
+            out.join("\n")
+        );
+    }
+
+    #[test]
+    fn without_cfi_only_write_before_read_pairs_fold() {
+        // A bare fragment (no .cfi_startproc): whole-function reasoning is
+        // unavailable, so only the pair whose next family event is a full
+        // rewrite (proof 1) folds. The final pair before the back edge must
+        // conservatively survive — this documents the soundness contract,
+        // not a missed optimization: real compiler output always carries
+        // the CFI delimiters.
+        let asm = "\
+.LBB3:
+    movl $1, %ecx
+    addl %ecx, %eax
+    movl %eax, (%rdi)
+    movl $1, %ecx
+    addl %ecx, %eax
+    movl %eax, 4(%rdi)
+    jl .LBB3
+";
+        let out = run(asm);
+        assert_eq!(
+            out.iter().filter(|l| *l == "addl $1, %eax").count(),
+            1,
+            "only the write-before-read pair folds:\n{}",
+            out.join("\n")
+        );
+        assert_eq!(
+            out.iter().filter(|l| *l == "movl $1, %ecx").count(),
+            1,
+            "the back-edge pair must survive without function context:\n{}",
+            out.join("\n")
+        );
+    }
+
+    #[test]
+    fn keeps_staging_when_reg_read_later() {
+        // %ecx is read after the consumer (whole-function textual proof
+        // fails; the read is in the same straight-line block).
+        let asm = "\
+    movl $1, %ecx
+    addl %ecx, %eax
+    movl %ecx, %edx
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "movl $1, %ecx"),
+            "staging must survive a later read:\n{}",
+            out.join("\n")
+        );
+    }
+
+    #[test]
+    fn keeps_staging_when_consumer_uses_reg_in_address() {
+        // The consumer's memory operand uses the staged register as index.
+        let asm = "\
+    movl $4, %ecx
+    addl %ecx, (%rdi, %rcx, 4)
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "movl $4, %ecx"),
+            "staging must survive when the family appears in the address:\n{}",
+            out.join("\n")
+        );
+    }
+
+    #[test]
+    fn folds_64bit_pair() {
+        let asm = "\
+.cfi_startproc
+    movq $8, %r11
+    addq %r11, %r9
+    cmpq %r8, %r9
+    jl .LBB3
+.cfi_endproc
+";
+        let out = run(asm);
+        assert!(
+            out.iter().any(|l| *l == "addq $8, %r9"),
+            "64-bit pair must fold:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("movq $8, %r11")),
+            "staging mov must be deleted:\n{}",
             out.join("\n")
         );
     }

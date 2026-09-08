@@ -4111,9 +4111,22 @@ fn generate_function(
             cg.state().sse_last_store_slot = None;
             cg.state().sse_last_store_val = None;
             cg.state().sse_last_store_reg = false;
-            if crate::pgo::block_align_active() {
-                if let Some(log2) = crate::pgo::block_align(block.label.0) {
-                    cg.state().emit_fmt(format_args!(".p2align {}", log2));
+            // Loop-header / hot-join alignment directives decided by
+            // passes::loop_align (post-layout, oracle-calibrated policy;
+            // empty on -O0/-Os builds).
+            if crate::passes::loop_align::directives_active() {
+                if let Some(directives) = crate::passes::loop_align::directives(block.label.0) {
+                    for d in &directives {
+                        match d.max_skip {
+                            Some(max_skip) => cg.state().emit_fmt(format_args!(
+                                ".p2align {},,{}",
+                                d.log2, max_skip
+                            )),
+                            None => {
+                                cg.state().emit_fmt(format_args!(".p2align {}", d.log2))
+                            }
+                        }
+                    }
                 }
             }
             cg.state().out.emit_block_label(block.label.0);

@@ -282,6 +282,12 @@ pub fn record_block_aligns(map: FxHashMap<u32, u8>) {
 pub fn block_align(label: u32) -> Option<u8> {
     BLOCK_ALIGNS.lock().unwrap().get(&label).copied()
 }
+/// The labels the profile marked as hot alignment candidates (loop headers
+/// and join points). `passes::loop_align` consumes this set as its hotness
+/// input when a profile is in use.
+pub fn block_align_keys() -> crate::common::fx_hash::FxHashSet<u32> {
+    BLOCK_ALIGNS.lock().unwrap().keys().copied().collect()
+}
 /// True when profile-driven block alignment is engaged (used by codegen to
 /// skip the map lookups on plain builds).
 pub fn block_align_active() -> bool {

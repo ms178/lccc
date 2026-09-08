@@ -524,6 +524,9 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         if !sk("lea_all_uses") {
             changed |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
         }
+        if !sk("staged_imm_alu") {
+            changed |= local_patterns::fold_staged_imm_into_alu(&mut store, &mut infos);
+        }
         if !sk("fuse_movq_ext") {
             changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             // VEX 3-operand exploitation: `movsd %A,%D; vOP %S,%D,%D` ->

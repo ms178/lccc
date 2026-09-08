@@ -43,6 +43,7 @@ pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_carried_forward;
+pub(crate) mod loop_align;
 pub(crate) mod loop_invert;
 pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_rotate;

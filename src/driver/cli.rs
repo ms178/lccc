@@ -14,6 +14,7 @@ use super::pipeline::{CliDefine, CompileMode, Driver};
 use crate::backend::Target;
 use crate::common::error::ColorMode;
 use crate::common::fp_contract::FpContract;
+use crate::passes::loop_align::AlignControl;
 
 /// Compare dotted version strings numerically ("16.1.1" > "9.5.0").
 ///
@@ -42,6 +43,36 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 impl Driver {
+    /// Parse the value of `-falign-*=N[:M]`: a power-of-two byte alignment
+    /// with an optional max-skip (`.p2align` third operand). Returns `None`
+    /// for anything GCC would reject at option processing.
+    fn parse_align_spec(value: &str) -> Option<AlignControl> {
+        let (align_str, skip_str) = match value.split_once(':') {
+            Some((a, s)) => (a, Some(s)),
+            None => (value, None),
+        };
+        let align: u32 = align_str.trim().parse().ok()?;
+        // GCC rejects non-power-of-two and absurd alignments here.
+        if !align.is_power_of_two() || align > 1 << 16 {
+            return None;
+        }
+        let max_skip = match skip_str {
+            None => None,
+            Some(s) => {
+                let m: u32 = s.trim().parse().ok()?;
+                if m > align {
+                    // A max-skip at or above the alignment can never skip;
+                    // accept it (GAS semantics) but normalize away the
+                    // no-op clause so the directive list stays canonical.
+                    None
+                } else {
+                    Some(m)
+                }
+            }
+        };
+        Some(AlignControl::Custom { align, max_skip })
+    }
+
     fn enable_x86_avx_profile(&mut self) {
         // Explicit `-mno-sse` is sticky against `-march=` CPU profiles (GCC).
         // Do not set AVX/SSE feature bits either: `avx2_enabled` would otherwise
@@ -1586,6 +1617,36 @@ impl Driver {
                 }
                 "-fomit-frame-pointer" => self.omit_frame_pointer = true,
                 "-fno-omit-frame-pointer" => self.omit_frame_pointer = false,
+                // ── Code alignment control ─────────────────────────────────
+                // GCC grammar: -falign-loops[=N[:M]] / -fno-align-loops, with
+                // N a power-of-two byte alignment and M an optional max-skip
+                // (the third .p2align operand). A bare -falign-loops selects
+                // the -O-level default rather than a fixed value.
+                "-falign-loops" => self.align_loops = AlignControl::Auto,
+                "-fno-align-loops" => self.align_loops = AlignControl::Off,
+                "-falign-jumps" => self.align_jumps = AlignControl::Auto,
+                "-fno-align-jumps" => self.align_jumps = AlignControl::Off,
+                "-falign-functions" => self.align_functions = AlignControl::Auto,
+                "-fno-align-functions" => self.align_functions = AlignControl::Off,
+                arg if arg.starts_with("-falign-loops=")
+                    || arg.starts_with("-falign-jumps=")
+                    || arg.starts_with("-falign-functions=") =>
+                {
+                    let (kind, value) = arg.split_once('=').unwrap();
+                    match Self::parse_align_spec(value) {
+                        Some(control) => match kind {
+                            "-falign-loops" => self.align_loops = control,
+                            "-falign-jumps" => self.align_jumps = control,
+                            _ => self.align_functions = control,
+                        },
+                        None => {
+                            return Err(format!(
+                                "invalid argument to {kind}: alignment must be a power of 2 \
+                                 optionally followed by ':max-skip' (e.g. 32:8), got {value}"
+                            ));
+                        }
+                    }
+                }
                 "-fno-asynchronous-unwind-tables" | "-fno-unwind-tables" => {
                     self.no_unwind_tables = true
                 }

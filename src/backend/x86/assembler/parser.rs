@@ -30,8 +30,23 @@ pub enum AsmItem {
     Size(String, SizeExpr),
     /// Label definition: `name:`
     Label(String),
-    /// Alignment: `.align N`
-    Align(u32),
+    /// Alignment: `.align N`, `.p2align N[, fill][, max-skip]`.
+    ///
+    /// `align` is the byte alignment (already exponent-expanded for
+    /// `.p2align`; can reach 2^63 for GAS-clamped exponents). `fill`
+    /// overrides the section's default padding: omitted or `0x90` in an
+    /// executable section means optimal multi-byte NOPs (GAS tc-i386
+    /// behavior); any other byte pads verbatim. `max_skip` suppresses the
+    /// padding entirely when more than that many bytes would be needed
+    /// (GAS `.p2align 4,,10` semantics). The section's `sh_addralign` is
+    /// raised regardless — GAS records the alignment even when the
+    /// max-skip test refuses to pad (verified against binutils 2.44/2.47:
+    /// `.byte 1; .p2align 4,,1` yields no padding and addralign 16).
+    Align {
+        align: u64,
+        fill: Option<u8>,
+        max_skip: Option<u64>,
+    },
     /// Emit bytes: `.byte val, val, ...` (can contain label expressions)
     Byte(Vec<DataValue>),
     /// Emit 16-bit values: `.short val, ...` (can be symbol references)
@@ -575,15 +590,81 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         ".type" => parse_type_directive(args),
         ".size" => parse_size_directive(args),
         ".align" | ".p2align" | ".balign" => {
-            let val_str = args.split(',').next().unwrap_or("1").trim();
-            let val: u32 =
-                parse_integer_expr(val_str).map_err(|_| format!("bad alignment: {}", args))? as u32;
-            // .p2align is power-of-2, .align/.balign on x86 gas is byte count
-            if directive == ".p2align" {
-                Ok(AsmItem::Align(1 << val))
+            // GAS grammar (read.c, verified against binutils 2.47):
+            //   `.p2align EXP [, fill [, max-skip]]` — exponent form; an
+            //   out-of-range exponent (negative or > 63) clamps to 63 with a
+            //   warning and the directive is ACCEPTED.
+            //   `.align`/`.balign COUNT [, fill [, max-skip]]` — byte-count
+            //   form on x86 GAS; a negative or non-power-of-two count is an
+            //   ERROR ("alignment not a power of 2"), and a count above 2^63
+            //   clamps like the exponent form.
+            // An empty middle field (`.p2align 4,,10`) selects the default
+            // fill. The fill is silently truncated to a byte (`.p2align 4,300`
+            // pads with 0x2c).
+            let mut fields = args.split(',');
+            let align_field = fields.next().unwrap_or("").trim();
+            let align_val: i64 = parse_integer_expr(align_field)
+                .map_err(|_| format!("bad alignment: {args}"))?;
+            let align: u64 = if directive == ".p2align" {
+                let exp: u32 = if !(0..=63).contains(&align_val) {
+                    // GAS clamps rather than rejecting.
+                    63
+                } else {
+                    align_val as u32
+                };
+                1u64 << exp
             } else {
-                Ok(AsmItem::Align(val))
+                if align_val < 0 {
+                    return Err(format!("alignment not a power of 2: {args}"));
+                }
+                let count = align_val as u64;
+                if !count.is_power_of_two() {
+                    // Zero is GAS-legal (no alignment requested).
+                    if count == 0 {
+                        1
+                    } else {
+                        return Err(format!("alignment not a power of 2: {args}"));
+                    }
+                } else {
+                    count
+                }
+            };
+            let parse_field = |raw: Option<&str>, what: &str| -> Result<Option<i64>, String> {
+                match raw {
+                    None => Ok(None),
+                    Some(f) => {
+                        let f = f.trim();
+                        if f.is_empty() {
+                            Ok(None) // `.p2align 4,,10`: default fill
+                        } else {
+                            parse_integer_expr(f)
+                                .map(Some)
+                                .map_err(|_| format!("bad {what}: {args}"))
+                        }
+                    }
+                }
+            };
+            let mut fill_val = parse_field(fields.next(), "alignment fill")?;
+            let skip_val = parse_field(fields.next(), "alignment max-skip")?;
+            if fields.next().is_some_and(|f| !f.trim().is_empty()) {
+                return Err(format!("too many alignment arguments: {args}"));
             }
+            if let Some(f) = fill_val {
+                // GAS silently truncates the fill to a byte.
+                fill_val = Some(f & 0xff);
+            }
+            let max_skip = match skip_val {
+                None => None,
+                Some(s) if s < 0 => {
+                    return Err(format!("alignment max-skip must be non-negative: {args}"))
+                }
+                Some(s) => Some(s as u64),
+            };
+            Ok(AsmItem::Align {
+                align,
+                fill: fill_val.map(|f| f as u8),
+                max_skip,
+            })
         }
         ".org" => {
             // `.org new-lc, fill` -- the fill byte is optional and defaults to

@@ -56,6 +56,15 @@ pub struct Driver {
     /// Whether size optimization is requested (-Os or -Oz).
     /// Used to define __OPTIMIZE_SIZE__ predefined macro.
     pub(super) optimize_size: bool,
+    /// `-falign-loops[=N[:M]]` / `-fno-align-loops` control of loop-header
+    /// padding (Auto = follow the -O level policy).
+    pub(super) align_loops: crate::passes::loop_align::AlignControl,
+    /// `-falign-jumps[=N[:M]]` / `-fno-align-jumps` control of hot join
+    /// point padding under PGO.
+    pub(super) align_jumps: crate::passes::loop_align::AlignControl,
+    /// `-falign-functions[=N[:M]]` / `-fno-align-functions` control of
+    /// function-entry alignment.
+    pub(super) align_functions: crate::passes::loop_align::AlignControl,
     /// Permit transformations that reassociate floating-point operations.
     /// False by default: ordinary -O levels preserve source evaluation order.
     /// Enabled explicitly by -ffast-math/-fassociative-math.
@@ -393,6 +402,9 @@ impl Driver {
             opt_level: 2,    // All levels run the same optimizations; default to max
             optimize: false, // Only set to true when user explicitly passes -O1 or higher
             optimize_size: false,
+            align_loops: crate::passes::loop_align::AlignControl::Auto,
+            align_jumps: crate::passes::loop_align::AlignControl::Auto,
+            align_functions: crate::passes::loop_align::AlignControl::Auto,
             fp_reassoc: false,
             // Contraction default for C: FAST, matching GCC's C default
             // (-ffp-contract=fast). The previous Off default claimed to match
@@ -2046,6 +2058,22 @@ impl Driver {
         if let Some(profile) = crate::pgo::get_pgo_profile() {
             crate::pgo::layout::layout_module(&mut module, profile, &pgo_unit);
         }
+
+        // Hot-loop alignment is decided here: post-optimization,
+        // post-label-renumber, post-PGO-layout — the block order is now the
+        // emission order. The recorded directives are consumed by codegen
+        // immediately before each block label. With a profile in use, the
+        // PGO hotness map recorded by pgo::layout gates which loops pad.
+        crate::passes::loop_align::align_module(
+            &module,
+            &crate::passes::loop_align::LoopAlignConfig {
+                opt_level: self.opt_level,
+                size_opt: self.optimize_size,
+                pgo_active: crate::pgo::get_pgo_profile().is_some(),
+                loops: self.align_loops,
+                jumps: self.align_jumps,
+            },
+        );
         if std::env::var_os("LCCC_NO_SCHEDULE").is_none()
             && std::env::var_os("LCCC_SCHEDULE").is_some()
         {}
@@ -2136,10 +2164,18 @@ impl Driver {
             // GCC/Clang align function entries to 16 bytes at -O1..-O3 and
             // leave them unaligned at -Os/-Oz. Emitted as a real `.p2align` so
             // section alignment keeps following GNU as semantics.
-            function_alignment: if self.opt_level >= 1 && self.opt_level <= 3 {
-                16
-            } else {
-                0
+            // `-falign-functions[=N]`/`-fno-align-functions` override: a
+            // custom alignment must be a power of two (validated at parse).
+            function_alignment: match self.align_functions {
+                crate::passes::loop_align::AlignControl::Off => 0,
+                crate::passes::loop_align::AlignControl::Custom { align, .. } => align,
+                crate::passes::loop_align::AlignControl::Auto => {
+                    if self.opt_level >= 1 && self.opt_level <= 3 {
+                        16
+                    } else {
+                        0
+                    }
+                }
             },
             skip_rax_setup: self.skip_rax_setup,
             no_sse: self.no_sse,

@@ -1171,32 +1171,14 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
 
 /// Emit a sequence of allocated MachInsts as AT&T assembly.
 pub fn emit_machinsts(insts: &[MachInst], out: &mut AsmOutput) {
-    // Raptor Lake Optimization: Identify loop headers (labels targeted by backward branches)
-    // and align them to 32-byte boundaries (.p2align 5) to maximize instruction fetch and
-    // uOP cache port bandwidth!
-    let mut defined_labels = crate::common::fx_hash::FxHashSet::default();
-    let mut loop_headers = crate::common::fx_hash::FxHashSet::default();
-
+    // Loop-header alignment is NOT done here. MachInst windows are
+    // straight-line sequences flushed before calls and at block ends, and
+    // `MachInst::Label` is never constructed by any lowering, so the
+    // backward-branch scan this function used to run could never fire.
+    // Loop alignment is owned by `passes::loop_align`, which decides on the
+    // final block layout (hotness-gated, flag-controlled, GAS max-skip
+    // aware) and is consumed by the block-label emitter in generation.rs.
     for inst in insts {
-        match inst {
-            MachInst::Label(name) => {
-                defined_labels.insert(name.clone());
-            }
-            MachInst::Jmp { target } | MachInst::Jcc { target, .. } => {
-                if defined_labels.contains(target) {
-                    loop_headers.insert(target.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    for inst in insts {
-        if let MachInst::Label(name) = inst {
-            if loop_headers.contains(name) {
-                out.emit("    .p2align 5");
-            }
-        }
         emit_machinst(inst, out);
     }
 }

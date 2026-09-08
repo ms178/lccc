@@ -211,6 +211,60 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
 
 // ── Eligibility analysis ──────────────────────────────────────────────────────
 
+/// Would executing this instruction fewer times than the source program
+/// specifies change observable behavior? This is execution-count semantics,
+/// stricter than DCE's "unused ⇒ droppable": a Store of a dead value is
+/// still a store, and a `pure` call whose result is unused still executes
+/// (and may not return). The unrolled latch runs once per unroll factor,
+/// so ANY of these disqualify the loop from partial unrolling.
+fn latch_inst_is_side_effecting(inst: &Instruction) -> bool {
+    match inst {
+        // Every store counts: its memory write is observable regardless of
+        // whether the stored value is otherwise live.
+        Instruction::Store { .. } => true,
+        Instruction::Load { volatile, .. } => *volatile,
+        Instruction::Call { .. }
+        | Instruction::CallIndirect { .. }
+        | Instruction::InlineAsm { .. }
+        | Instruction::AtomicRmw { .. }
+        | Instruction::AtomicCmpxchg { .. }
+        | Instruction::AtomicLoad { .. }
+        | Instruction::AtomicStore { .. }
+        | Instruction::DynAlloca { .. }
+        | Instruction::Alloca { .. } => true,
+        _ => false,
+    }
+}
+
+/// Is `val` — defined in block `latch_idx` — used by any instruction,
+/// terminator, or phi in a DIFFERENT block? After partial unrolling the
+/// latch executes once per unroll factor, so such a use would observe a
+/// value that is k-1 iterations stale.
+fn latch_value_escapes(func: &IrFunction, latch_idx: usize, val: u32) -> bool {
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if bi == latch_idx {
+            continue;
+        }
+        let mut escapes = false;
+        for inst in &block.instructions {
+            inst.for_each_used_value(|id| {
+                if id == val {
+                    escapes = true;
+                }
+            });
+        }
+        block.terminator.for_each_used_value(|id| {
+            if id == val {
+                escapes = true;
+            }
+        });
+        if escapes {
+            return true;
+        }
+    }
+    false
+}
+
 fn analyze_loop(
     func: &IrFunction,
     lp: &loop_analysis::NaturalLoop,
@@ -459,6 +513,31 @@ fn analyze_loop(
     let latch_label = func.blocks[latch].label;
     let (iv_phi, iv_ty, iv_step, latch_iv_incr_idx) =
         find_iv_in_loop(func, header, latch, latch_label)?;
+
+    // 7b. The latch must be pure IV bookkeeping. `do_unroll` NEVER clones
+    //     the latch: after unrolling by k it executes once per k source
+    //     iterations (the clones jump straight back to it). A side-effecting
+    //     instruction in the latch would run 1/k as often as the source
+    //     semantics require, and a latch-defined value escaping the latch
+    //     (other than the IV increment itself, which Step 4 retargets in
+    //     place) would be the stale once-per-k copy at every use. Both
+    //     silently miscompile: a perfect-nest row-sum whose result store
+    //     (`out[i] = s`) sits in the outer latch computed k-1 of every k
+    //     rows and stored only row i's sum — odd rows kept their previous
+    //     contents (tests/regression/outer_loop_shapes.c, kernel s4).
+    for (idx, inst) in func.blocks[latch].instructions.iter().enumerate() {
+        if idx == latch_iv_incr_idx {
+            continue;
+        }
+        if latch_inst_is_side_effecting(inst) {
+            return None;
+        }
+        if let Some(dest) = inst.dest() {
+            if latch_value_escapes(func, latch, dest.0) {
+                return None;
+            }
+        }
+    }
 
     // 8. Detect the exit condition from the header's CondBranch.
     let (
@@ -3759,6 +3838,95 @@ mod tests {
                     .join("\n")
             );
         }
+    }
+
+    /// Regression: a loop whose LATCH carries a side effect must never be
+    /// partially unrolled.
+    ///
+    /// `do_unroll` clones only `body_work`; the latch executes once per
+    /// unroll factor, shared by all clones. The perfect-nest row-sum
+    ///
+    /// ```c
+    /// for (i = 0; i < n; i++) { int s = 0;
+    ///     for (j = 0; j < 8; j++) s += a[i*8+j];
+    ///     out[i] = s; }        // ← store lands in the OUTER latch
+    /// ```
+    ///
+    /// after inner-loop full unrolling has exactly that shape, and partial
+    /// unrolling of the outer loop made it compute k-1 of every k row sums
+    /// while storing only row i's — odd rows kept their previous contents
+    /// (tests/regression/outer_loop_shapes.c, kernel s4; 20/20 deterministic).
+    #[test]
+    fn side_effecting_latch_blocks_partial_unroll() {
+        // Positive control: the same loop with the store in the BODY is a
+        // normal partial-unroll candidate.
+        let mut plain = make_counting_loop(40);
+        let blocks_before = plain.blocks.len();
+        unroll_loops(&mut plain);
+        assert!(
+            plain.blocks.len() > blocks_before,
+            "plain counting loop (store in body) should partially unroll"
+        );
+
+        // Move the store from the body into the latch — the miscompiled
+        // shape. The loop must be left untouched.
+        let mut func = make_counting_loop(40);
+        let store = func.blocks[2]
+            .instructions
+            .pop()
+            .expect("body ends with the store");
+        assert!(matches!(store, Instruction::Store { .. }));
+        func.blocks[3].instructions.insert(0, store);
+
+        let blocks_before = func.blocks.len();
+        let header_term_before = format!("{:?}", func.blocks[1].terminator);
+        let latch_before = format!("{:?}", func.blocks[3].instructions);
+        unroll_loops(&mut func);
+
+        assert_eq!(
+            func.blocks.len(),
+            blocks_before,
+            "side-effecting latch must disqualify partial unrolling"
+        );
+        assert_eq!(
+            format!("{:?}", func.blocks[3].instructions),
+            latch_before,
+            "latch must be untouched"
+        );
+        assert_eq!(
+            format!("{:?}", func.blocks[1].terminator),
+            header_term_before,
+            "header must be untouched"
+        );
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&func, "unroll_loops", &mut violations);
+        assert!(violations.is_empty());
+    }
+
+    /// A latch-defined value that ESCAPES the latch (here: feeding the
+    /// function return) would be read once-per-unroll-factor stale after
+    /// `do_unroll` rethreads the back edge. Such loops must be rejected too.
+    #[test]
+    fn escaping_latch_def_blocks_partial_unroll() {
+        let mut func = make_counting_loop(40);
+        // Latch: %20 = Copy %5 (the incremented IV); return %20 from exit.
+        func.blocks[3].instructions.push(Instruction::Copy {
+            dest: Value(20),
+            src: Operand::Value(Value(5)),
+        });
+        func.blocks[4].terminator = Terminator::Return(Some(Operand::Value(Value(20))));
+        func.next_value_id = 21;
+
+        let blocks_before = func.blocks.len();
+        unroll_loops(&mut func);
+        assert_eq!(
+            func.blocks.len(),
+            blocks_before,
+            "escaping latch-defined value must disqualify partial unrolling"
+        );
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&func, "unroll_loops", &mut violations);
+        assert!(violations.is_empty());
     }
 
     /// Regression: complete unrolling must repair the EXIT block's phi
