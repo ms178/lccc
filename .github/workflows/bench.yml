@@ -33,8 +33,14 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-cargo-bench-deps-${{ hashFiles('**/Cargo.lock') }}
 
+      # Build with the project's `fastbuild` Cargo profile (opt-level 1,
+      # no LTO, incremental) — the same profile every other CI job uses, so
+      # the benchmarked compiler comes from one shared, cache-friendly
+      # profile definition instead of a release-profile opt-level override.
+      # The profile only affects the speed of the compiler BINARY, never the
+      # code it generates for the timed C workloads.
       - name: Build LCCC
-        run: ./scripts/build_lccc_o1_j2.sh
+        run: ./scripts/build_lccc_fast.sh
 
       - name: Detect GCC include path
         id: gcc
@@ -49,7 +55,7 @@ jobs:
           GCC_INC: ${{ steps.gcc.outputs.inc }}
         run: |
           echo "Compiling rec2iter correctness test..."
-          target/release/lccc -I"$GCC_INC" -O2 -o /tmp/fib_rec2iter tests/fib_rec2iter.c
+          target/fastbuild/lccc -I"$GCC_INC" -O2 -o /tmp/fib_rec2iter tests/fib_rec2iter.c
           echo "Running (includes fib(90) — impossible without rec2iter)..."
           /tmp/fib_rec2iter
 
@@ -66,7 +72,7 @@ jobs:
           # no --only selection this is the complete checked-in corpus:
           # synthetic kernels plus every pinned workload-derived kernel.
           python3 .github/scripts/ci-bench.py \
-            --lccc target/release/lccc \
+            --lccc target/fastbuild/lccc \
             --compilers lccc,gcc \
             --reps 9 \
             --warmup 1 \
@@ -92,7 +98,7 @@ jobs:
         run: |
           set -o pipefail
           python3 .github/scripts/ci-codegen-gate.py \
-            --lccc target/release/lccc 2>&1 | tee codegen-gate.txt
+            --lccc target/fastbuild/lccc 2>&1 | tee codegen-gate.txt
 
       - name: Upload benchmark results
         if: always()

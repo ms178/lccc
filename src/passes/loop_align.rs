@@ -17,7 +17,10 @@
 //!   unconditionally (`.p2align 5` / `.p2align 4` / `.p2align 3` cascade —
 //!   a plain 32-byte alignment), *even under `-fno-align-loops`*: the
 //!   vectorizer owns that alignment. Clang aligns loop headers to 16; ICX
-//!   uses `.p2align 4, 0x90`.
+//!   uses `.p2align 4, 0x90`. lccc takes the 32-byte intent bounded at 15
+//!   padding bytes with a 16-byte fallback (see `vector_loop_cascade`):
+//!   the DSB win whenever the offset is within reach, at most half of
+//!   GCC's worst-case padding.
 //! * GCC 16.2 aligns scalar loop headers with a bounded cascade:
 //!   `.p2align 4,,10` followed by `.p2align 3` — 16 bytes when at most 10
 //!   padding bytes are needed, otherwise at least 8 bytes. This is the
@@ -121,14 +124,32 @@ impl LoopAlignConfig {
         ]
     }
 
-    /// The vector-loop directive: 32 bytes, no skip clause — GCC 16.2 emits
-    /// exactly this (as a 5/4/3 cascade that gas reduces to plain 32) for
-    /// every vectorized loop header.
-    fn vector_loop() -> AlignDirective {
-        AlignDirective {
-            log2: 5,
-            max_skip: None,
-        }
+    /// The vector-loop cascade: try 32 bytes when at most 15 padding bytes
+    /// are needed, otherwise 16 bytes unbounded (at most 15 more).
+    ///
+    /// GCC 16.2 pads every vectorized loop header to 32 bytes with no skip
+    /// clause at all — worst case 31 bytes of one-shot NOP padding. ICX and
+    /// Clang 23.1 both stop at 16 bytes. The bounded cascade takes GCC's
+    /// 32-byte intent whenever the natural offset is within one 16-byte
+    /// quantum of it (the common case after ordinary layout), and degrades
+    /// to exactly the ICX/Clang 16-byte alignment otherwise, capping the
+    /// code-size cost at 15 bytes instead of 31. On the DSB (32-byte uop
+    /// windows inside 64-byte lines) the 32-byte tier gives a loop head a
+    /// fresh window; the 16-byte fallback never shares a decoder fetch
+    /// window with the preheader's tail.
+    fn vector_loop_cascade() -> [AlignDirective; 2] {
+        [
+            AlignDirective {
+                log2: 5,
+                max_skip: Some(15),
+            },
+            // Padding to a 16-byte boundary never exceeds 15 bytes, so a
+            // max-skip clause here could never fire; emit the plain form.
+            AlignDirective {
+                log2: 4,
+                max_skip: None,
+            },
+        ]
     }
 }
 
@@ -264,6 +285,21 @@ fn align_function(
             if cfg.pgo_active && !pgo_map.contains(&header_label) {
                 continue;
             }
+            // Constant tiny-trip loops stay unaligned (GCC and Clang both
+            // leave `for (i = 0; i < 3; i++)` alone): padding executes once
+            // but the loop body runs at most `bound` times, so the fetch
+            // savings cannot pay back the padding. Only a *visible* constant
+            // bound disqualifies — a loop with a dynamic bound is aligned
+            // even when its runtime trip count happens to be small. A custom
+            // `-falign-loops=N` is an explicit user contract and overrides
+            // the exclusion.
+            if !matches!(cfg.loops, AlignControl::Custom { .. }) {
+                if let Some(bound) = header_constant_trip_bound(func, lp.header) {
+                    if bound <= 4 {
+                        continue;
+                    }
+                }
+            }
             let directives = match cfg.loops {
                 AlignControl::Custom { align, max_skip } => custom_directives(align, max_skip),
                 _ => {
@@ -273,7 +309,7 @@ fn align_function(
                             .is_some_and(|b| block_has_vector_insn(b))
                     });
                     if vector_body {
-                        vec![LoopAlignConfig::vector_loop()]
+                        LoopAlignConfig::vector_loop_cascade().to_vec()
                     } else {
                         LoopAlignConfig::scalar_loop_cascade().to_vec()
                     }
@@ -355,4 +391,56 @@ fn block_has_vector_insn(block: &BasicBlock) -> bool {
         .instructions
         .iter()
         .any(|inst| matches!(inst, Instruction::Intrinsic { op, .. } if op.is_vector_op()))
+}
+
+/// Visible constant trip bound of a counted loop from its *header exit*
+/// comparison: `Some(n)` when the compare feeding the header's conditional
+/// branch is `iv < Const(n)` (or the mirrored `Const(n) > iv` form).
+///
+/// Comparisons that do not feed the header terminator are ignored — a stray
+/// constant compare inside the header must not disqualify alignment. The
+/// bound measured here is the *runtime* iteration count of THIS loop: a
+/// vectorized main loop whose bound was scaled by the vector width keeps
+/// the scaled bound, and a remainder loop divided down keeps its own, which
+/// is exactly what alignment payback depends on.
+fn header_constant_trip_bound(func: &IrFunction, header_idx: usize) -> Option<i64> {
+    use crate::ir::ops::IrCmpOp;
+    use crate::ir::reexports::Operand;
+
+    let header = func.blocks.get(header_idx)?;
+    let exit_cond = match &header.terminator {
+        Terminator::CondBranch { cond, .. } => match cond {
+            Operand::Value(v) => Some(*v),
+            _ => None,
+        },
+        _ => None,
+    }?;
+    for inst in &header.instructions {
+        if let Instruction::Cmp {
+            dest, op, lhs, rhs, ..
+        } = inst
+        {
+            if *dest != exit_cond {
+                continue;
+            }
+            let (limit, flipped) = match rhs {
+                Operand::Const(c) => (c, false),
+                // The mirrored form `Const(n) > iv` bounds the trip too.
+                Operand::Value(_) => match lhs {
+                    Operand::Const(c) => (c, true),
+                    _ => continue,
+                },
+            };
+            let limit = limit.to_i64()?;
+            let is_lt = match op {
+                IrCmpOp::Slt | IrCmpOp::Ult => !flipped,
+                IrCmpOp::Sgt | IrCmpOp::Ugt => flipped,
+                _ => continue,
+            };
+            if is_lt {
+                return Some(limit);
+            }
+        }
+    }
+    None
 }

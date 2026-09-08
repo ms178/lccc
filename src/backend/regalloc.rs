@@ -5548,6 +5548,27 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::Dpwssd128
             | O::Dpwssds128 => Some(3),
 
+            // Packed compares: lhs, rhs are vector args; the trailing
+            // operand is the predicate CONSTANT (never a Value, but keep
+            // the count at 2 so a malformed IR cannot smuggle a vector
+            // read past the audit).
+            O::VecCmpF32x8
+            | O::VecCmpF32x4
+            | O::VecCmpF64x4
+            | O::VecCmpF64x2
+            | O::VecCmpI32x8
+            | O::VecCmpI32x4 => Some(2),
+
+            // Lane-mask selects: [false, true, mask] — all three are vector
+            // reads resolved through the register cache by the AVX/SSE
+            // blendv emitters.
+            O::VecBlendvF32x8
+            | O::VecBlendvF32x4
+            | O::VecBlendvF64x4
+            | O::VecBlendvF64x2
+            | O::VecBlendvI32x8
+            | O::VecBlendvI32x4 => Some(3),
+
             // Binary vector inputs.  Palignr/Pblendw/Pclmul/GFNI append an
             // immediate after this two-vector prefix; variable shifts really
             // do consume their count operand as a 128-bit vector.
@@ -5690,6 +5711,8 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecMulF64x4
                 | O::VecMulF32x4
                 | O::VecMulF32x8
+                | O::VecMinI32x8
+                | O::VecMaxI32x8
                 | O::VecFmaF64x4
                 | O::VecFmaF32x8
                 | O::VecHorizontalAddF64x2
@@ -6176,7 +6199,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // (I32x8) lets the Copy-web connect the backedge so the accumulator
             // stays register-homed (no per-iter stack round-trip, which made
             // the vectorized find_max SLOWER than scalar).
-            O::VecBroadcastI32x8 | O::VecMaxI32x8 => Some(5),
+            O::VecBroadcastI32x8 | O::VecMaxI32x8 | O::VecMinI32x8 => Some(5),
             O::VecZeroI32x4 | O::VecLoadI32x4 | O::VecAddI32x4 | O::VecMulI32x4 => Some(6),
             O::VecZeroI64x2 | O::VecLoadI64x2 | O::VecAddI64x2 | O::VecMulI64x2 => Some(7),
             // v12 Fix C: the widening reductions PRODUCE an I64x2 dest (the
@@ -6224,6 +6247,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // accumulator (read+write); the horizontal max reduces
                     // it. Both lowerings confine scratch to xmm0/xmm1.
                     | O::VecMaxI32x8
+                    | O::VecMinI32x8
                     | O::VecHorizontalMaxI32x8
                     | O::VecMaskedAddI32x8
             ),
@@ -6309,6 +6333,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // their horizontal reduce — lowerings
                                 // confine scratch to xmm0/xmm1, exempt them.
                                 | O::VecMaxI32x8
+                                | O::VecMinI32x8
                                 | O::VecHorizontalMaxI32x8
                                 | O::VecHorizontalMaxI32x4
                                 | O::VecSmaxI32x4
@@ -6500,7 +6525,18 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinF64x4
                     | O::VecMaxF64x4
             ),
-            3 => matches!(op, O::VecMulI32x8 | O::VecAddI32x8),
+            3 => matches!(
+                op,
+                O::VecMulI32x8
+                    | O::VecAddI32x8
+                    // Conditional-map consumers: a broadcast invariant is
+                    // the compare rhs / blend true-arm (clamp shapes).
+                    | O::VecCmpI32x8
+                    | O::VecBlendvI32x8
+                    // Integer min/max maps: the broadcast is a clamp bound.
+                    | O::VecMinI32x8
+                    | O::VecMaxI32x8
+            ),
             4 => matches!(
                 op,
                 O::VecMulF32x4
@@ -6525,7 +6561,10 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinF64x2
                     | O::VecMaxF64x2
             ),
-            6 => matches!(op, O::VecMulI32x4 | O::VecAddI32x4),
+            6 => matches!(
+                op,
+                O::VecMulI32x4 | O::VecAddI32x4 | O::VecCmpI32x4 | O::VecBlendvI32x4
+            ),
             _ => false,
         }
     };
@@ -6632,6 +6671,31 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecBlendvF64x2
             | O::VecMinF64x2
             | O::VecMaxF64x2 => Some(5),
+            // Integer map intermediates (class numbering mirrors the
+            // broadcast collector): dword lanes, AVX2 8-wide and SSE2
+            // 4-wide. Conditional-map results (compare masks, blends)
+            // included — their emitters resolve every vector operand
+            // through the register cache.
+            O::VecLoadI32x8
+            | O::VecSubI32x8
+            | O::VecAddI32x8
+            | O::VecMulI32x8
+            | O::VecAndI32x8
+            | O::VecOrI32x8
+            | O::VecXorI32x8
+            | O::VecCmpI32x8
+            | O::VecBlendvI32x8
+            | O::VecMinI32x8
+            | O::VecMaxI32x8 => Some(3),
+            O::VecLoadI32x4
+            | O::VecSubI32x4
+            | O::VecAddI32x4
+            | O::VecMulI32x4
+            | O::VecAndI32x4
+            | O::VecOrI32x4
+            | O::VecXorI32x4
+            | O::VecCmpI32x4
+            | O::VecBlendvI32x4 => Some(6),
             _ => None,
         }
     };
@@ -6684,6 +6748,32 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinF64x2
                     | O::VecMaxF64x2
                     | O::VecStoreF64x2
+            ),
+            3 => matches!(
+                op,
+                O::VecAddI32x8
+                    | O::VecMulI32x8
+                    | O::VecSubI32x8
+                    | O::VecAndI32x8
+                    | O::VecOrI32x8
+                    | O::VecXorI32x8
+                    | O::VecCmpI32x8
+                    | O::VecBlendvI32x8
+                    | O::VecMinI32x8
+                    | O::VecMaxI32x8
+                    | O::VecStoreI32x8
+            ),
+            6 => matches!(
+                op,
+                O::VecAddI32x4
+                    | O::VecMulI32x4
+                    | O::VecSubI32x4
+                    | O::VecAndI32x4
+                    | O::VecOrI32x4
+                    | O::VecXorI32x4
+                    | O::VecCmpI32x4
+                    | O::VecBlendvI32x4
+                    | O::VecStoreI32x4
             ),
             _ => false,
         }

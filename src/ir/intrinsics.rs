@@ -393,6 +393,31 @@ pub enum IntrinsicOp {
     VecBlendvF64x4,
     /// Lane-mask select (see `VecBlendvF32x8`) - SSE2 2×F64.
     VecBlendvF64x2,
+    /// Packed INTEGER compare: `dest[i] = (a[i] PRED b[i]) ? -1 : 0` per
+    /// dword lane, with `args = [lhs, rhs, imm]` mirroring the FP compare
+    /// argument shape. The immediate encodes the predicate (and, for the
+    /// unsigned forms, the sign-bias expansion the emitter applies):
+    ///   0 = eq, 1 = lt.s, 2 = le.s, 4 = ne,
+    ///   5 = lt.u, 6 = le.u
+    /// (the numbering echoes the vcmpps immediates; gt/ge never occur —
+    /// the map parser normalizes them by operand swap). Signed lanes lower
+    /// to vpcmpeqd/vpcmpgtd; unsigned lanes bias both operands with
+    /// `xor 0x80000000` (a monotone map on the unsigned order) and then
+    /// use the signed compare. AVX2 8×I32/U32.
+    VecCmpI32x8,
+    /// Packed integer compare (see `VecCmpI32x8`) - SSE2 4×I32/U32
+    /// (pcmpeqd/pcmpgtd; le/ne invert through a self-compare all-ones).
+    VecCmpI32x4,
+    /// Lane-mask select on integer dword lanes: `dest[i] = mask[i] ?
+    /// true[i] : false[i]` with `args = [false_vec, true_vec, mask]`.
+    /// vblendvps is a BITWISE dword select driven by each mask lane's
+    /// sign bit — the data bits are copied verbatim, so it is exact for
+    /// I32/U32 payloads. AVX2 8×I32/U32.
+    VecBlendvI32x8,
+    /// Lane-mask select (see `VecBlendvI32x8`) - SSE2 4×I32/U32, lowered
+    /// to the integer-domain `pand/pandn/por` triple (no SSE4.1, no
+    /// float-domain bypass delay).
+    VecBlendvI32x4,
     /// Widening reduction step: dest(I64x2 accumulator) += sign-extend of
     /// 4×I32 loaded from (base, byte_offset). One intrinsic = load 4 I32s,
     /// widen lanes 0..1 and 2..3 to two I64x2 halves, add both into the
@@ -518,6 +543,11 @@ pub enum IntrinsicOp {
     /// reduction matches the scalar max bit-for-bit (same property NEON's
     /// smax relies on for the I32x4 path).
     VecMaxI32x8,
+    /// AVX2 lane-wise signed min: %dest_vec = min(%src1_vec, %src2_vec) per
+    /// lane, 8×I32 (vpminsd). args[0] = src1, args[1] = src2; dest = result.
+    /// The map vectorizer's integer min/max fold produces it from exact
+    /// ternary shapes (`l < r ? l : r` and friends — no FP special cases).
+    VecMinI32x8,
     /// AVX2 horizontal signed max: %scalar = max over all 8 I32 lanes of the
     /// source vector. x86 has no single smaxv; the lowering folds the 8 lanes
     /// with vextracti128 + vpmaxsd + vpshufd + vpmaxsd pairs, ending in vmovd
@@ -1251,6 +1281,7 @@ impl IntrinsicOp {
             | VecBroadcastF32x8 | VecZeroF32x8
             | VecMinF32x8 | VecMaxF32x8 | VecCmpF32x8 | VecBlendvF32x8
             | VecMinF64x4 | VecMaxF64x4 | VecCmpF64x4 | VecBlendvF64x4
+            | VecCmpI32x8 | VecBlendvI32x8 | VecMinI32x8
             // Newly wired AVX/AVX2 ops (previously scalar header loops)
             | Pmulld256 | Psubd256 | Paddq256 | Psubq256 | Pandn256
             | Pcmpeqd256 | Pcmpeqq256 | Pcmpgtd256 | Pcmpgtq256
@@ -1313,6 +1344,7 @@ impl IntrinsicOp {
             | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4
             | VecMinF32x4 | VecMaxF32x4 | VecCmpF32x4 | VecBlendvF32x4
             | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
+            | VecCmpI32x4 | VecBlendvI32x4
             | VecWidenAddI32x4ToI64x2
             | VecWidenMaskedAddI32x4ToI64x2
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
@@ -1381,6 +1413,7 @@ impl IntrinsicOp {
             IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
             IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4
             | IntrinsicOp::VecMaxI32x8
+            | IntrinsicOp::VecMinI32x8
             | IntrinsicOp::VecHorizontalMaxI32x8
         ) ||
         // The modern vectorizer's value-producing families (splats, zeros,
@@ -1440,6 +1473,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecAddF64x2
                 | IntrinsicOp::VecAddI32x8
                 | IntrinsicOp::VecMaxI32x8
+                | IntrinsicOp::VecMinI32x8
                 | IntrinsicOp::VecAddI32x4
                 | IntrinsicOp::VecSubI32x8
                 | IntrinsicOp::VecSubI32x4
@@ -1514,6 +1548,10 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecBlendvF32x4
                 | IntrinsicOp::VecBlendvF64x4
                 | IntrinsicOp::VecBlendvF64x2
+                | IntrinsicOp::VecCmpI32x8
+                | IntrinsicOp::VecCmpI32x4
+                | IntrinsicOp::VecBlendvI32x8
+                | IntrinsicOp::VecBlendvI32x4
         )
     }
 }
@@ -1667,6 +1705,8 @@ mod vector_result_width_tests {
             "VecBlendvF32x4" => IntrinsicOp::VecBlendvF32x4,
             "VecBlendvF32x8" => IntrinsicOp::VecBlendvF32x8,
             "VecBlendvF64x2" => IntrinsicOp::VecBlendvF64x2,
+            "VecBlendvI32x4" => IntrinsicOp::VecBlendvI32x4,
+            "VecBlendvI32x8" => IntrinsicOp::VecBlendvI32x8,
             "VecBlendvF64x4" => IntrinsicOp::VecBlendvF64x4,
             "VecBroadcastF32x4" => IntrinsicOp::VecBroadcastF32x4,
             "VecBroadcastF32x8" => IntrinsicOp::VecBroadcastF32x8,
@@ -1677,6 +1717,8 @@ mod vector_result_width_tests {
             "VecBroadcastI64x2" => IntrinsicOp::VecBroadcastI64x2,
             "VecCmpF32x4" => IntrinsicOp::VecCmpF32x4,
             "VecCmpF32x8" => IntrinsicOp::VecCmpF32x8,
+            "VecCmpI32x4" => IntrinsicOp::VecCmpI32x4,
+            "VecCmpI32x8" => IntrinsicOp::VecCmpI32x8,
             "VecCmpF64x2" => IntrinsicOp::VecCmpF64x2,
             "VecCmpF64x4" => IntrinsicOp::VecCmpF64x4,
             "VecDivF32x4" => IntrinsicOp::VecDivF32x4,
@@ -1712,6 +1754,7 @@ mod vector_result_width_tests {
             "VecMaxF64x2" => IntrinsicOp::VecMaxF64x2,
             "VecMaxF64x4" => IntrinsicOp::VecMaxF64x4,
             "VecMaxI32x8" => IntrinsicOp::VecMaxI32x8,
+            "VecMinI32x8" => IntrinsicOp::VecMinI32x8,
             "VecMinF32x4" => IntrinsicOp::VecMinF32x4,
             "VecMinF32x8" => IntrinsicOp::VecMinF32x8,
             "VecMinF64x2" => IntrinsicOp::VecMinF64x2,

@@ -950,6 +950,29 @@ fn instruction_corpus() -> Vec<MachInst> {
     v
 }
 
+/// Unique scratch directory for an assembly/execution probe.
+///
+/// Probes from DIFFERENT tests run concurrently under `cargo test`'s default
+/// thread pool. The historical naming — `lccc-machinst-exec-{pid}-{body.len()}`
+/// — mapped two concurrently running probes whose generated bodies happened
+/// to have the same byte length onto the SAME directory, and whichever probe
+/// finished first `remove_dir_all`ed it out from under the other: the
+/// assembler then died with `can't create .../f.o: No such file or directory`
+/// and the test panicked. The flake was invisible at low `-j`/test-thread
+/// counts and reproducible on busy CI runners (more test threads), where it
+/// turned a green suite red non-deterministically.
+///
+/// Uniqueness here is process id (across test binaries) plus a
+/// monotonically increasing per-process counter (across concurrent tests and
+/// retries), so no two probes can ever share a directory; `tag` keeps the
+/// directory name diagnosable in `/tmp`.
+fn probe_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBE_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = PROBE_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("lccc-{tag}-{}-{n}", std::process::id()))
+}
+
 /// Locate an assembler, preferring the project's pinned **GAS 2.47**.
 ///
 /// The differential is only as authoritative as the assembler behind it: a
@@ -1056,7 +1079,7 @@ fn every_emitted_instruction_is_accepted_by_the_real_assembler() {
     }
     src.push_str("    ret\n");
 
-    let dir = std::env::temp_dir().join(format!("lccc-machinst-{}", std::process::id()));
+    let dir = probe_dir("machinst");
     let _ = std::fs::create_dir_all(&dir);
     let s_path = dir.join("probe.s");
     let o_path = dir.join("probe.o");
@@ -1456,7 +1479,7 @@ _machinst_fuzz:
         "expected a substantial corpus, got {kept} lines"
     );
 
-    let dir = std::env::temp_dir().join(format!("lccc-machinst-fuzz-{}", std::process::id()));
+    let dir = probe_dir("machinst-fuzz");
     let _ = std::fs::create_dir_all(&dir);
     let s_path = dir.join("fuzz.s");
     let o_path = dir.join("fuzz.o");
@@ -1562,11 +1585,7 @@ fn run_emitted(body: &str, inputs: &[(i64, i64)]) -> Option<Vec<i64>> {
         return None;
     }
 
-    let dir = std::env::temp_dir().join(format!(
-        "lccc-machinst-exec-{}-{}",
-        std::process::id(),
-        body.len()
-    ));
+    let dir = probe_dir("machinst-exec");
     let _ = std::fs::create_dir_all(&dir);
     let s_path = dir.join("f.s");
     let c_path = dir.join("m.c");
@@ -1791,7 +1810,7 @@ fn a_symbol_address_is_the_real_address_when_executed() {
     {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("lccc-leasym-{}", std::process::id()));
+    let dir = probe_dir("leasym");
     let _ = std::fs::create_dir_all(&dir);
     let (s_path, c_path, o_path, bin) = (
         dir.join("f.s"),
@@ -4020,7 +4039,7 @@ mod float_const_stores {
             eprintln!("skipping: no assembler available");
             return;
         };
-        let dir = std::env::temp_dir().join(format!("machinst_fconst_{}", std::process::id()));
+        let dir = probe_dir("machinst-fconst");
         let _ = std::fs::create_dir_all(&dir);
         let s_path = dir.join("fconst.s");
         let o_path = dir.join("fconst.o");

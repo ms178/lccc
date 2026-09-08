@@ -826,6 +826,89 @@ int main(void) {
     return 0;
 }
 ''', [], None),
+
+    # ── Conditional-map vectorization (integer lane compares + selects) ──
+    # Exercises the packed integer compare (vpcmpeqd/vpcmpgtd, unsigned via
+    # 0x80000000 sign-bias), the lane-mask selects (vblendvps / pand-pandn-por),
+    # the exact integer min/max fold (vpminsd/vpmaxsd), the FP selects, and the
+    # remainder-loop mirrors, across every predicate shape and signedness.
+    # Differential by construction: both compilers print result hashes.
+    ("vectorize_int_conditional_map", r"""
+#include <stdio.h>
+#include <string.h>
+static void t_slt (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v<k ? v*5-3 : v+k;}}
+static void t_sle (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v<=k ? v*5-3 : v+k;}}
+static void t_sgt (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v>k ? v*5-3 : v+k;}}
+static void t_sge (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v>=k ? v*5-3 : v+k;}}
+static void t_eq  (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v==k ? v*5-3 : v+k;}}
+static void t_ne  (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v!=k ? v*5-3 : v+k;}}
+static void t_ult (const unsigned*a,unsigned*b,unsigned n,unsigned k){for(unsigned i=0;i<n;i++){unsigned v=a[i];b[i]= v<k ? v*5u-3u : v+k;}}
+static void t_ule (const unsigned*a,unsigned*b,unsigned n,unsigned k){for(unsigned i=0;i<n;i++){unsigned v=a[i];b[i]= v<=k ? v*5u-3u : v+k;}}
+static void t_ugt (const unsigned*a,unsigned*b,unsigned n,unsigned k){for(unsigned i=0;i<n;i++){unsigned v=a[i];b[i]= v>k ? v*5u-3u : v+k;}}
+static void t_uge (const unsigned*a,unsigned*b,unsigned n,unsigned k){for(unsigned i=0;i<n;i++){unsigned v=a[i];b[i]= v>=k ? v*5u-3u : v+k;}}
+static void t_clamp(const int*a,int*b,int n,int lo,int hi){for(int i=0;i<n;i++){int v=a[i];b[i]= v<lo?lo:(v>hi?hi:v);}}
+static void t_min  (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v<k ? v : k;}}
+static void t_max  (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v>k ? v : k;}}
+static void t_nested(const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= (v<k ? v+1 : v-1) * (v>k?2:3);}}
+static void t_bits (const int*a,int*b,int n,int m){for(int i=0;i<n;i++){int v=a[i];b[i]= (v&m) ? (v|m) : (v^m);}}
+static void t_abs  (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<0 ? -v : v;}}
+static void t_fsel (const double*a,double*b,int n,double k){for(int i=0;i<n;i++){double v=a[i];b[i]= v<k ? v*2.0 : v+1.0;}}
+#define N 2051
+static int a[N]; static unsigned ua[N]; static double da[N];
+static int b[N]; static unsigned ub[N]; static double db[N];
+static unsigned h(const void*p,int bytes){const unsigned char*c=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=c[i];x*=16777619u;}return x;}
+typedef void (*ifn)(const int*,int*,int,int);
+typedef void (*ufn)(const unsigned*,unsigned*,unsigned,unsigned);
+int main(void){
+  unsigned s=12345;
+  for(int i=0;i<N;i++){ s=s*1664525u+1013904223u; a[i]=(int)s; ua[i]=s; da[i]=(double)(int)s/977.0; }
+  int ks[]={-7,0,1,17,2147483647,-2147483647-1,100000};
+  unsigned uk[]={0u,1u,17u,4294967295u,2147483648u,100000u};
+  ifn fns[]={t_slt,t_sle,t_sgt,t_sge,t_eq,t_ne};
+  for(int j=0;j<7;j++) for(int q=0;q<6;q++){ memset(b,0xAB,sizeof b); fns[q](a,b,N,ks[j]); printf("s%d %08x\n", q, h(b,sizeof b)); }
+  ufn ufns[]={t_ult,t_ule,t_ugt,t_uge};
+  for(int j=0;j<6;j++) for(int q=0;q<4;q++){ memset(ub,0xAB,sizeof ub); ufns[q](ua,ub,N,uk[j]); printf("u%d %08x\n", q, h(ub,sizeof ub)); }
+  memset(b,0xAB,sizeof b); t_clamp(a,b,N,-100,100); printf("clamp %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_clamp(a,b,N,50,-50); printf("clampsw %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_min(a,b,N,17); printf("min %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_max(a,b,N,-17); printf("max %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_nested(a,b,N,33); printf("nested %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_bits(a,b,N,0xF0); printf("bits %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_abs(a,b,N); printf("abs %08x\n",h(b,sizeof b));
+  memset(db,0xAB,sizeof db); t_fsel(da,db,N,3.5); printf("fsel %016llx\n",(unsigned long long)h(db,sizeof db));
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_clamp(a,b,n,-3,7); printf("n%d %08x\n",n,h(b,n*4)); }
+  for(int n=2047;n<=2051;n++){ memset(b,0xAB,sizeof b); t_ult(a,(int*)ub,n,12345); printf("m%d %08x\n",n,h(ub,n*4)); }
+  return 0;
+}
+""", ["-O3", "-march=x86-64-v3"], None),
+
+    # Same kernels on the SSE2 4-lane baseline: exercises the pand/pandn/por
+    # blend, the legacy pcmpgtd orientations, and the 16-byte-aligned
+    # lane-constant / vector-slot requirements of the legacy encodings.
+    ("vectorize_int_conditional_map_sse2", r"""
+#include <stdio.h>
+#include <string.h>
+static void t_slt (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v<k ? v*5-3 : v+k;}}
+static void t_ult (const unsigned*a,unsigned*b,unsigned n,unsigned k){for(unsigned i=0;i<n;i++){unsigned v=a[i];b[i]= v<k ? v*5u-3u : v+k;}}
+static void t_clamp(const int*a,int*b,int n,int lo,int hi){for(int i=0;i<n;i++){int v=a[i];b[i]= v<lo?lo:(v>hi?hi:v);}}
+static void t_fsel (const double*a,double*b,int n,double k){for(int i=0;i<n;i++){double v=a[i];b[i]= v<k ? v*2.0 : v+1.0;}}
+#define N 2051
+static int a[N]; static unsigned ua[N]; static double da[N];
+static int b[N]; static unsigned ub[N]; static double db[N];
+static unsigned h(const void*p,int bytes){const unsigned char*c=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=c[i];x*=16777619u;}return x;}
+int main(void){
+  unsigned s=12345;
+  for(int i=0;i<N;i++){ s=s*1664525u+1013904223u; a[i]=(int)s; ua[i]=s; da[i]=(double)(int)s/977.0; }
+  int ks[]={-7,0,1,17,2147483647,-2147483647-1,100000};
+  for(int j=0;j<7;j++){ memset(b,0xAB,sizeof b); t_slt(a,b,N,ks[j]); printf("s %08x\n", h(b,sizeof b)); }
+  unsigned uk[]={0u,1u,17u,4294967295u,2147483648u,100000u};
+  for(int j=0;j<6;j++){ memset(ub,0xAB,sizeof ub); t_ult(ua,ub,N,uk[j]); printf("u %08x\n", h(ub,sizeof ub)); }
+  memset(b,0xAB,sizeof b); t_clamp(a,b,N,-100,100); printf("clamp %08x\n",h(b,sizeof b));
+  memset(db,0xAB,sizeof db); t_fsel(da,db,N,3.5); printf("fsel %016llx\n",(unsigned long long)h(db,sizeof db));
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_clamp(a,b,n,-3,7); printf("n%d %08x\n",n,h(b,n*4)); }
+  return 0;
+}
+""", ["-O3", "-mno-avx2"], None),
 ]
 
 # Multi-file test (handled specially)
