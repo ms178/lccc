@@ -6,9 +6,14 @@ Programmatic verification of the hot-loop alignment policy decided by
 shapes with the local compiler, then checks the EMITTED ASSEMBLY (not the
 IR) for the oracle-derived directive contract:
 
-  * a loop whose body contains SIMD instructions is preceded by an
-    unconditional 32-byte alignment (``.p2align 5``) — GCC 16.2 emits
-    exactly this for every vectorized loop header;
+  * a loop whose body contains SIMD instructions is preceded by the bounded
+    vector cascade ``.p2align 5,,15`` + ``.p2align 4`` (32 bytes when at
+    most 15 padding bytes are needed, else 16) — GCC 16.2's 32-byte
+    vector-loop alignment with the padding cost capped at half of GCC's
+    worst case, degrading to the ICX/Clang 16-byte form;
+  * a loop whose header exit comparison proves a constant trip count <= 4
+    is left unaligned (GCC and Clang leave constant-trip-3 loops alone:
+    the one-shot padding cannot pay back over at most four iterations);
   * a scalar loop header is preceded by the bounded cascade
     ``.p2align 4,,10`` + ``.p2align 3`` (16 bytes when <= 10 padding bytes
     are needed, otherwise 8) — GCC's ASM_OUTPUT_MAX_SKIP_ALIGN shape;
@@ -90,6 +95,22 @@ unsigned scalar_hash(const unsigned *restrict k, int n) {
     for (int i = 0; i < n; i++)
         h = (h ^ k[i]) * 16777619u;
     return h;
+}
+""",
+        "scalar",
+    ),
+    (
+        # Constant trip 3 with an opaque call in the body: the call keeps
+        # the unroller from dissolving the loop, so a genuinely tiny loop
+        # reaches codegen and must stay UNPADDED (GCC/Clang parity).
+        "tiny_trip_call",
+        """
+extern int weigh(int v);
+int tiny_trip_call(const int *restrict a) {
+    int acc = 0;
+    for (int j = 0; j < 3; j++)
+        acc += weigh(a[j]);
+    return acc;
 }
 """,
         "scalar",
@@ -328,7 +349,12 @@ def run(lccc: Path, verbose: bool) -> int:
             )
             for tgt, dirs in loops.items():
                 if kind == "vector":
-                    want = [".p2align 5"]
+                    want = [".p2align 5,,15", ".p2align 4"]
+                elif fname == "tiny_trip_call":
+                    # A constant trip count <= 4 must suppress padding
+                    # entirely (the exclusion is the CONTRACT, not an
+                    # accident): assert the negative direction too.
+                    want = []
                 else:
                     want = [".p2align 4,,10", ".p2align 3"]
                 check(

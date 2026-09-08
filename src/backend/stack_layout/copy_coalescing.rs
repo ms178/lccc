@@ -1668,6 +1668,7 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // stored to a slot every iteration (a dead 256-bit store that
             // made the vectorized find_max SLOWER than scalar).
             | O::VecMaxI32x8
+            | O::VecMinI32x8
             | O::VecBroadcastI32x8
             | O::VecBroadcastF32x8
             | O::VecMulF32x8
@@ -1753,6 +1754,17 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecOrI32x4
             | O::VecXorI32x8
             | O::VecXorI32x4
+            // Integer conditional-map results (compare masks, blends):
+            // same SSA-scratch-pair contract as the ops above.
+            | O::VecCmpI32x8
+            | O::VecCmpI32x4
+            | O::VecBlendvI32x8
+            | O::VecBlendvI32x4
+            // Integer min/max map results: with the exact ternary fold
+            // these now feed VecStore like the lane ops above (previously
+            // only the reduction path consumed VecMaxI32x8).
+            | O::VecMinI32x8
+            | O::VecMaxI32x8
     )
 }
 
@@ -1901,6 +1913,10 @@ pub(crate) fn is_cache_aware_3op(op: &crate::ir::intrinsics::IntrinsicOp) -> boo
             | O::VecBlendvF32x4
             | O::VecBlendvF64x4
             | O::VecBlendvF64x2
+            | O::VecCmpI32x8
+            | O::VecCmpI32x4
+            | O::VecBlendvI32x8
+            | O::VecBlendvI32x4
     )
 }
 
@@ -1916,7 +1932,8 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecMulF32x8
         | O::VecAddI32x8
         | O::VecMulI32x8
-        | O::VecMaxI32x8 => Some(true),
+        | O::VecMaxI32x8
+        | O::VecMinI32x8 => Some(true),
         O::VecSubF64x4 | O::VecSubF32x8 | O::VecDivF64x4 | O::VecDivF32x8 => Some(false),
         // Packed min/max are NON-commutative (MINPS/MAXPS return the second
         // source on unordered/equal lanes), so a fold is only order-safe in
