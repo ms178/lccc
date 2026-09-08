@@ -225,8 +225,11 @@ struct AlignMarker {
 
 #[derive(Clone, Debug)]
 enum AlignMarkerKind {
-    /// .balign N — pad to N-byte boundary.
-    Align(u32),
+    /// A `.p2align`/`.balign` chain: consecutive alignment directives that
+    /// GAS evaluates sequentially against the moving offset (e.g. GCC's
+    /// `.p2align 4,,10` + `.p2align 3` or lccc's bounded loop-header
+    /// chains). Post-relaxation fixup replays the whole chain jointly.
+    AlignChain(Vec<crate::backend::x86::assembler::parser::AlignTierSpec>),
     /// .org label + offset — advance to a fixed position, filling with `fill`.
     ///
     /// `fill` is load-bearing: GAS pads `.org` with its fill byte (default 0)
@@ -938,7 +941,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
             | AsmItem::OptionDirective(_)
             | AsmItem::Symver(_, _, _)
             | AsmItem::Empty
-            | AsmItem::Align(_)
+            | AsmItem::Align { .. }
+            | AsmItem::AlignChain { .. }
             | AsmItem::Org(_, _, _) => {}
             _ => self.last_item_was_insn = false,
         }
@@ -1027,30 +1031,23 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
                 self.ensure_symbol(name, sec_idx, offset);
             }
-            AsmItem::Align(n) => {
-                let after_insn = self.last_item_was_insn;
+            AsmItem::Align {
+                align,
+                fill,
+                max_skip,
+            } => {
+                let tier = crate::backend::x86::assembler::parser::AlignTierSpec {
+                    align: *align,
+                    fill: *fill,
+                    max_skip: *max_skip,
+                };
                 if let Some(sec_idx) = self.current_section {
-                    let section = &mut self.sections[sec_idx];
-                    let align = *n as u64;
-                    if align > section.alignment {
-                        section.alignment = align;
-                    }
-                    let current = section.data.len() as u64;
-                    let aligned = (current + align - 1) & !(align - 1);
-                    let padding = (aligned - current) as usize;
-                    // Record alignment marker for post-relaxation fixup
-                    if padding > 0 && align > 1 {
-                        section.align_markers.push(AlignMarker {
-                            offset: current as usize,
-                            padding,
-                            kind: AlignMarkerKind::Align(*n),
-                            after_insn,
-                        });
-                    }
-                    let is_exec = section.flags & SHF_EXECINSTR != 0;
-                    section
-                        .data
-                        .extend_from_slice(&section_padding(padding, is_exec, after_insn));
+                    self.apply_align_chain(sec_idx, &[tier]);
+                }
+            }
+            AsmItem::AlignChain { tiers } => {
+                if let Some(sec_idx) = self.current_section {
+                    self.apply_align_chain(sec_idx, tiers);
                 }
             }
             AsmItem::Byte(vals) => {
@@ -3097,6 +3094,79 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
     }
 
+    /// Evaluate a `.p2align` chain exactly as GAS does: sequentially, each
+    /// tier against the offset its predecessors left, skipping tiers whose
+    /// max-skip cap cannot be met. Returns the concatenated padding bytes and
+    /// the offset the chain started at. `after_insn` describes the item that
+    /// preceded the chain (only the first tier's NOP ladder may use it; later
+    /// tiers follow padding, which is data, so they get the plain-0x90-first
+    /// ladder GAS uses after data).
+    fn evaluate_align_chain(
+        &self,
+        sec_idx: usize,
+        start_offset: usize,
+        tiers: &[crate::backend::x86::assembler::parser::AlignTierSpec],
+        after_insn: bool,
+    ) -> Vec<u8> {
+        let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
+        let mut current = start_offset;
+        let mut out: Vec<u8> = Vec::new();
+        let mut first_tier = true;
+        for tier in tiers {
+            let a = tier.align as usize;
+            if a <= 1 {
+                first_tier = false;
+                continue;
+            }
+            let end = (current + a - 1) & !(a - 1);
+            let pad = end - current;
+            if let Some(max) = tier.max_skip {
+                if pad > max as usize {
+                    // GAS max-skip: the tier does nothing at all.
+                    first_tier = false;
+                    continue;
+                }
+            }
+            let tier_after_insn = after_insn && first_tier;
+            let bytes = match tier.fill {
+                Some(byte) => vec![byte; pad],
+                None => section_padding(pad, is_exec, tier_after_insn),
+            };
+            current += bytes.len();
+            out.extend_from_slice(&bytes);
+            first_tier = false;
+        }
+        out
+    }
+
+    /// Apply an alignment chain at the section's current end: bump the
+    /// section alignment, emit the padding, and record one marker covering
+    /// the whole chain so post-relaxation fixup can replay it jointly.
+    fn apply_align_chain(
+        &mut self,
+        sec_idx: usize,
+        tiers: &[crate::backend::x86::assembler::parser::AlignTierSpec],
+    ) {
+        let after_insn = self.last_item_was_insn;
+        let section = &mut self.sections[sec_idx];
+        for tier in tiers {
+            if tier.align as u64 > section.alignment {
+                section.alignment = tier.align as u64;
+            }
+        }
+        let start = section.data.len();
+        let bytes = self.evaluate_align_chain(sec_idx, start, tiers, after_insn);
+        if !bytes.is_empty() {
+            self.sections[sec_idx].align_markers.push(AlignMarker {
+                offset: start,
+                padding: bytes.len(),
+                kind: AlignMarkerKind::AlignChain(tiers.to_vec()),
+                after_insn,
+            });
+            self.sections[sec_idx].data.extend_from_slice(&bytes);
+        }
+    }
+
     fn fixup_alignment_markers(&mut self, sec_idx: usize) {
         if self.sections[sec_idx].align_markers.is_empty() {
             return;
@@ -3106,8 +3176,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
         self.sections[sec_idx]
             .align_markers
             .sort_by_key(|m| m.offset);
-
-        let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
 
         let mut marker_idx = 0;
         loop {
@@ -3119,23 +3187,30 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 .kind
                 .clone();
 
-            let needed_end = match &kind {
-                AlignMarkerKind::Align(align) => {
-                    let a = *align as usize;
-                    if a <= 1 {
-                        marker_idx += 1;
-                        continue;
-                    }
-                    (current_offset + a - 1) & !(a - 1)
+            // Re-derive the padding this marker needs at the post-relaxation
+            // offset, plus the exact bytes to regenerate it with.
+            let existing_padding = self.sections[sec_idx].align_markers[marker_idx].padding;
+            let (needed_padding, new_bytes): (usize, Vec<u8>) = match &kind {
+                // Replay the whole chain jointly from the moved offset; each
+                // tier is re-checked against its own max-skip cap, which is
+                // what GAS's sequential evaluation would do at this offset.
+                AlignMarkerKind::AlignChain(tiers) => {
+                    let after_insn =
+                        self.sections[sec_idx].align_markers[marker_idx].after_insn;
+                    let bytes =
+                        self.evaluate_align_chain(sec_idx, current_offset, tiers, after_insn);
+                    let len = bytes.len();
+                    (len, bytes)
                 }
                 AlignMarkerKind::Org {
                     label,
                     addend,
-                    fill: _,
+                    fill,
                 } => {
-                    if label.is_empty() {
+                    let needed_end = if label.is_empty() {
                         *addend as usize
-                    } else if let Some(&(l_sec, l_off)) = self.label_positions.get(label.as_str()) {
+                    } else if let Some(&(l_sec, l_off)) = self.label_positions.get(label.as_str())
+                    {
                         if l_sec == sec_idx {
                             (l_off as i64 + *addend) as usize
                         } else {
@@ -3145,12 +3220,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     } else {
                         marker_idx += 1;
                         continue;
-                    }
+                    };
+                    let pad = needed_end.saturating_sub(current_offset);
+                    (pad, vec![*fill; pad])
                 }
             };
-
-            let needed_padding = needed_end.saturating_sub(current_offset);
-            let existing_padding = self.sections[sec_idx].align_markers[marker_idx].padding;
 
             if needed_padding != existing_padding {
                 // Regenerate the ENTIRE padding run rather than splicing the
@@ -3161,15 +3235,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // length.
                 let start = current_offset;
                 let old_end = start + existing_padding;
-                let after_insn = self.sections[sec_idx].align_markers[marker_idx].after_insn;
-                // `.org` / org-style `.fill LABEL+N-.` pad with the fill
-                // byte, not multi-byte NOPs, even in an executable section.
-                let new_bytes = match &kind {
-                    AlignMarkerKind::Org { fill, .. } => vec![*fill; needed_padding],
-                    AlignMarkerKind::Align(_) => {
-                        section_padding(needed_padding, is_exec, after_insn)
-                    }
-                };
                 debug_assert_eq!(new_bytes.len(), needed_padding);
                 if old_end <= self.sections[sec_idx].data.len() {
                     self.sections[sec_idx]

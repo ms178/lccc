@@ -874,12 +874,21 @@ pub(super) fn assign_tier3_block_local_slots(
         // path's alignment note).
         for blv in block_local_values {
             let bs = block_space.entry(blv.block_idx).or_insert(0);
-            let before = if blv.slot_size >= 8 {
+            // 16/32-byte vector slots are 16-byte aligned in the pool:
+            // legacy-SSE memory-form consumers (andnpd/pandn/memfolds) read
+            // vector homes directly and fault on unaligned operands.
+            let vec_align = blv.slot_size >= 16;
+            let before = if vec_align {
+                (*bs + 15) & !15
+            } else if blv.slot_size >= 8 {
                 (*bs + 7) & !7
             } else {
                 *bs
             };
-            let (_, new_space) = assign_slot(before, blv.slot_size, 0);
+            let (_, new_space) =
+                assign_slot(before, blv.slot_size, if vec_align { 16 } else { 0 });
+            // new_space already includes the closure's FPO shift for the
+            // align-16 entries, so the bs advance absorbs it exactly.
             *bs = new_space.max(before + blv.slot_size);
             if new_space > *max_block_local_space {
                 *max_block_local_space = new_space;
@@ -887,12 +896,38 @@ pub(super) fn assign_tier3_block_local_slots(
             deferred_slots.push(DeferredSlot {
                 dest_id: blv.dest_id,
                 size: blv.slot_size,
-                align: 0,
+                align: if vec_align { 16 } else { 0 },
                 block_offset: before,
             });
         }
         return;
     }
+
+    // Probe the arch closure's FPO alignment shift ONCE (x86 FPO returns
+    // -24 for a 16-byte/16-aligned probe allocation, everything else -16 or
+    // a positive slot): 16/32-byte deferred entries map with align=16 and
+    // their finalize-time +8 address shift must be pre-absorbed here by
+    // advancing the block space past the shifted window, exactly like the
+    // single-block coalescable-alloca path already does via assign_slot's
+    // new_space.
+    let fpo_vec_shift = {
+        let probe = assign_slot(0, 16, 16).0;
+        if probe < 0 {
+            (-16 - probe).max(0)
+        } else {
+            0
+        }
+    };
+    // Effective window of a deferred entry: align-16 entries sit +shift
+    // into their pool reservation (the finalize mapping rounds the END up
+    // and shifts by the same amount).
+    let window = |off: i64, size: i64| -> (i64, i64) {
+        if size >= 16 {
+            (off + fpo_vec_shift, size)
+        } else {
+            (off, size)
+        }
+    };
 
     // Pre-compute per-block last-use and definition instruction indices.
     let block_local_set: FxHashSet<u32> = block_local_values.iter().map(|v| v.dest_id).collect();
@@ -1070,14 +1105,34 @@ pub(super) fn assign_tier3_block_local_slots(
             } else {
                 &mut free_4
             };
-            let offset = if can_reuse && free_list.len() > 0 {
+            let mut reused_offset: Option<i64> = None;
+            if can_reuse && free_list.len() > 0 {
                 let reused = free_list.pop().unwrap();
-                if debug_protect {
-                    eprintln!(
-                        "[PROTECT-T3] SSA {} reused block-local slot {}",
-                        dest_id, reused
-                    );
+                // OCCUPANCY CHECK — the exact-size free lists are not
+                // cross-checked, so an entry can be STALE: the offset may
+                // have been re-allocated to a value from a DIFFERENT size
+                // list that is still live (free_16 keeps offset O after its
+                // 16-byte owner expired; an 8-byte value then takes O from
+                // free_8 and is live when a later 16-byte value pops O from
+                // free_16 again). Reuse only when no active entry's WINDOW
+                // overlaps this one's; otherwise fall through to a fresh
+                // pool slot (the stale entry is dropped, not re-pushed).
+                let (rstart, rsize) = window(reused, slot_size);
+                let overlaps_active = active.iter().any(|&(_, aoff, asz)| {
+                    let (astart, asize) = window(aoff, asz);
+                    rstart < astart + asize && astart < rstart + rsize
+                });
+                if !overlaps_active {
+                    if debug_protect {
+                        eprintln!(
+                            "[PROTECT-T3] SSA {} reused block-local slot {}",
+                            dest_id, reused
+                        );
+                    }
+                    reused_offset = Some(reused);
                 }
+            }
+            let offset = if let Some(reused) = reused_offset {
                 reused
             } else {
                 // Natural alignment inside the pool is what keeps the final
@@ -1087,12 +1142,23 @@ pub(super) fn assign_tier3_block_local_slots(
                 // shifting it ONTO the following small slot's bytes (the
                 // rot() v11/v14 [40,48) vs [44,48) overlap). Reused offsets
                 // are already size-aligned by construction.
-                let off = if slot_size >= 8 && block_peak % 8 != 0 {
+                //
+                // 16/32-byte vector slots additionally align to 16 (see the
+                // fallback path note): legacy-SSE memory-form consumers of a
+                // vector home require it. Reused 16-class offsets inherit
+                // the alignment because every 16-class slot entered the
+                // free list from this same 16-aligned placement.
+                let off = if slot_size >= 16 {
+                    (block_peak + 15) & !15
+                } else if slot_size >= 8 && block_peak % 8 != 0 {
                     (block_peak + 7) & !7
                 } else {
                     block_peak
                 };
-                block_peak = off + slot_size;
+                // Absorb the FPO address shift into the block space so the
+                // NEXT entry's reservation starts past this entry's shifted
+                // window (mirrors assign_slot's new_space bookkeeping).
+                block_peak = off + slot_size + if slot_size >= 16 { fpo_vec_shift } else { 0 };
                 if debug_protect && !can_reuse {
                     eprintln!(
                         "[PROTECT-T3] SSA {} is protected, forced new slot at offset {}",
@@ -1108,7 +1174,10 @@ pub(super) fn assign_tier3_block_local_slots(
             deferred_slots.push(DeferredSlot {
                 dest_id,
                 size: slot_size,
-                align: 0,
+                // >=16 entries carry align=16: the closure's FPO +8 makes
+                // their final ADDRESS 16-aligned; the pool advance above
+                // pre-absorbs the shift, so the mapping stays collision-free.
+                align: if slot_size >= 16 { 16 } else { 0 },
                 block_offset: offset,
             });
         }
@@ -1186,7 +1255,10 @@ pub(super) fn assign_tier2_liveness_packed_slots(
     // therefore never the default.
     if !coalesce || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some() || has_builtin_setjmp(func) {
         for mbv in multi_block_values {
-            let (slot, new_space) = assign_slot(*non_local_space, mbv.slot_size, 0);
+            // Vector slots (16/32 bytes) are 16-aligned — see the Tier-3
+            // note; the same legacy-SSE memory-form consumers apply.
+            let align = if mbv.slot_size >= 16 { 16 } else { 0 };
+            let (slot, new_space) = assign_slot(*non_local_space, mbv.slot_size, align);
             state.value_locations.insert(mbv.dest_id, StackSlot(slot));
             *non_local_space = new_space;
         }
@@ -1231,9 +1303,25 @@ pub(super) fn finalize_deferred_slots(
         // Find the maximum alignment required by any deferred slot and align
         // non_local_space to it. This prevents alignment rounding in assign_slot
         // from causing adjacent slots to overlap when nls is not aligned.
+        // 16/32-byte deferred slots (vector temps) demand a 16-aligned base:
+        // their pool offsets are 0 mod 16 (see the Tier-3 allocator), so a
+        // 0-mod-16 base makes every final ADDRESS 16-aligned — the
+        // legacy-SSE memory-form consumers of vector homes require exactly
+        // that. ds.align itself stays 0: the deferred mapping is positional
+        // and must never trigger the arch closure's >=16 address shift (on
+        // x86 FPO that shift slides a slot's extent 8 bytes onto its pool
+        // neighbour's bytes).
         let max_align = deferred_slots
             .iter()
-            .map(|ds| if ds.align > 0 { ds.align } else { 8 })
+            .map(|ds| {
+                if ds.align > 0 {
+                    ds.align
+                } else if ds.size >= 16 {
+                    16
+                } else {
+                    8
+                }
+            })
             .max()
             .unwrap_or(8);
         // ALWAYS 8-align the deferred-region base: Tier-2 small slots leave
@@ -1241,11 +1329,19 @@ pub(super) fn finalize_deferred_slots(
         // values are 8-aligned only relative to an 8-aligned base. With a
         // 4-mod-8 base, finalize's alignment rounding shifts wide slots onto
         // small slots' bytes (rot() v11/v14 overlap).
-        let aligned_nls = if max_align > 8 {
+        let mut aligned_nls = if max_align > 8 {
             crate::common::types::align_up(non_local_space as usize, max_align as usize) as i64
         } else {
             (non_local_space + 7) & !7
         };
+        // NOTE: the base must stay 0 mod 16 (NOT shifted by the closure's
+        // FPO +8). The deferred mapping is only self-consistent when
+        // round_up(B + o + s, a) == B + round_up(o + s, a) for every entry,
+        // which requires B == 0 mod a; each align-16 entry's per-slot FPO
+        // shift is then exactly absorbed by the +shift advance its
+        // allocation site already baked into the block-space sequence
+        // (site-607 allocas always did this; the Tier-3 pool/fallback do it
+        // via the same probed shift).
         if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
             eprintln!(
                 "[SLOTS]   block-region base aligned_nls={} max_block_local_space={} n_deferred={}",

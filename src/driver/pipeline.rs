@@ -363,6 +363,10 @@ pub struct Driver {
     pub(super) preferred_stack_bytes: u8,
     /// Whether to omit the frame pointer (-fomit-frame-pointer).
     pub(super) omit_frame_pointer: bool,
+    /// Loop-header alignment request from -falign-loops[=N[:max]] /
+    /// -fno-align-loops. Distinct from "not given" so -fno-align-loops wins
+    /// over the -O2/-O3 default-on policy.
+    pub(super) align_loops: AlignLoopsFlag,
     /// Whether to suppress .eh_frame unwind table generation
     /// (-fno-asynchronous-unwind-tables / -fno-unwind-tables).
     pub(super) no_unwind_tables: bool,
@@ -381,6 +385,20 @@ pub struct Driver {
     /// PGO: counter update mode ("single" default, or "atomic"
     /// from -fprofile-update=atomic).
     pub(super) pgo_update: Option<String>,
+}
+
+/// `-falign-loops` request state (see `Driver::align_loops`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum AlignLoopsFlag {
+    /// Flag not given: use the -O2/-O3 default tiered policy.
+    #[default]
+    Unset,
+    /// Bare `-falign-loops`: same as Unset, but marks an explicit request.
+    Default,
+    /// `-fno-align-loops`: disable loop alignment entirely.
+    Off,
+    /// `-falign-loops=N[:max]`: one uniform bounded chain for every loop.
+    Chain(u8, Option<u32>),
 }
 
 impl Driver {
@@ -527,6 +545,7 @@ impl Driver {
             regparm: 0,
             preferred_stack_bytes: 16,
             omit_frame_pointer: false,
+            align_loops: AlignLoopsFlag::Unset,
             no_unwind_tables: false,
             raw_args: Vec::new(),
             pthread: false,
@@ -2140,6 +2159,32 @@ impl Driver {
                 16
             } else {
                 0
+            },
+            // Hot-loop alignment: default-on at -O2/-O3 (matching GCC/Clang/
+            // ICX/ICC), off at -O0/-O1 and in size-optimized builds. An
+            // explicit -falign-loops=N[:max] overrides the tiered default
+            // with one uniform chain; -fno-align-loops forces it off.
+            // x86-family targets only: this is where the oracle evidence and
+            // the assembler's bounded-.p2align support both live.
+            align_loops: if matches!(
+                self.target,
+                crate::backend::Target::X86_64 | crate::backend::Target::I686
+            ) && self.opt_level >= 2
+                && self.opt_level <= 3
+                && !self.optimize_size
+            {
+                match self.align_loops {
+                    AlignLoopsFlag::Off => None,
+                    AlignLoopsFlag::Chain(log2, max_skip) => Some(
+                        crate::backend::loop_align::LoopAlignPolicy::uniform(log2, max_skip),
+                    ),
+                    // Unset or explicit bare -falign-loops: tiered default.
+                    AlignLoopsFlag::Unset | AlignLoopsFlag::Default => {
+                        Some(crate::backend::loop_align::LoopAlignPolicy::default_x86())
+                    }
+                }
+            } else {
+                None
             },
             skip_rax_setup: self.skip_rax_setup,
             no_sse: self.no_sse,

@@ -15,6 +15,7 @@ pub(crate) mod cast; // Cast and float operation classification
 pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
 pub(crate) mod generation; // Module/function/instruction dispatch
 pub(crate) mod inline_asm; // InlineAsmEmitter trait and shared framework
+pub(crate) mod loop_align; // Hot-loop alignment policy and analysis (bounded .p2align chains)
 pub(crate) mod stack_layout; // Stack layout: slot assignment, alloca coalescing, regalloc helpers
 pub(crate) mod state; // CodegenState, StackSlot, SlotAddr
 pub(crate) mod traits; // ArchCodegen trait with default implementations
@@ -111,6 +112,10 @@ pub(crate) struct CodegenOptions {
     /// Byte alignment for function entry labels (`.p2align log2`). 0 = none.
     /// GCC/Clang use 16 at -O1..-O3 and none at -Os/-Oz.
     pub(crate) function_alignment: u32,
+    /// Hot-loop alignment policy (`-falign-loops`). `None` disables loop
+    /// alignment entirely (also the default at -O0/-O1/-Os/-Oz). See
+    /// `backend::loop_align` for the measured tier design.
+    pub(crate) align_loops: Option<crate::backend::loop_align::LoopAlignPolicy>,
     /// -mskip-rax-setup: omit the `xorl %eax,%eax` / `movb $n,%al` reporting the
     /// number of live SSE argument registers to a variadic callee. Only honoured
     /// together with `no_sse`, where no such register can be in use.

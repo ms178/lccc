@@ -4100,6 +4100,17 @@ fn generate_function(
     let mut last_debug_line: u32 = 0;
     cg.state().current_program_point = 0;
 
+    // Hot-loop alignment analysis (heuristic, no-profile builds): bounded
+    // .p2align chains in front of loop headers. PGO builds keep the
+    // profile-driven map below — profile data already knows which loops are
+    // hot, and re-deriving that heuristically would only fight it.
+    let loop_aligns = if crate::pgo::block_align_active() {
+        None
+    } else {
+        cg.loop_alignment_policy()
+            .and_then(|policy| crate::backend::loop_align::analyze_function(func, policy))
+    };
+
     for (block_idx, block) in func.blocks.iter().enumerate() {
         if Some(block.label) != entry_label {
             cg.state().reg_cache.invalidate_all();
@@ -4114,6 +4125,13 @@ fn generate_function(
             if crate::pgo::block_align_active() {
                 if let Some(log2) = crate::pgo::block_align(block.label.0) {
                     cg.state().emit_fmt(format_args!(".p2align {}", log2));
+                }
+            } else if let Some(plan) = loop_aligns
+                .as_ref()
+                .and_then(|analysis| analysis.plan_for(block.label.0))
+            {
+                for tier in &plan.tiers {
+                    cg.state().emit_fmt(format_args!("    {}", tier.directive()));
                 }
             }
             cg.state().out.emit_block_label(block.label.0);

@@ -9,6 +9,19 @@ use crate::backend::asm_preprocess::{self, CommentStyle};
 use crate::backend::elf;
 use std::fmt;
 
+/// One tier of a `.p2align N[, fill[, max]]` directive (see `AsmItem::Align`
+/// and `AsmItem::AlignChain`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlignTierSpec {
+    /// Byte boundary (already converted from the `.p2align` exponent).
+    pub align: u32,
+    /// Explicit single-byte fill value; `None` = GAS default (NOPs in
+    /// executable sections, zeroes elsewhere).
+    pub fill: Option<u8>,
+    /// Maximum padding bytes; `None` pads unboundedly.
+    pub max_skip: Option<u32>,
+}
+
 /// A parsed assembly item (one per line, roughly).
 #[derive(Debug, Clone)]
 pub enum AsmItem {
@@ -30,8 +43,27 @@ pub enum AsmItem {
     Size(String, SizeExpr),
     /// Label definition: `name:`
     Label(String),
-    /// Alignment: `.align N`
-    Align(u32),
+    /// Alignment: `.align N[, fill[, max]]`
+    Align {
+        /// Byte boundary (already converted from the `.p2align` exponent).
+        align: u32,
+        /// Explicit single-byte fill value. `None` means GAS's default: NOP
+        /// sequences in executable sections, zeroes elsewhere.
+        fill: Option<u8>,
+        /// Maximum padding bytes; `None` pads unboundedly. When padding to the
+        /// boundary would exceed this cap, no alignment happens at all.
+        max_skip: Option<u32>,
+    },
+    /// A run of consecutive alignment directives with nothing but blank lines
+    /// between them. GAS evaluates such a chain sequentially — each directive
+    /// sees the offset its predecessors left — and compilers rely on that for
+    /// bounded fallback chains (`.p2align 5,,15` + `.p2align 4,,15`,
+    /// GCC's `.p2align 4,,10` + `.p2align 3`). Keeping the run as one item
+    /// lets the ELF writer and its post-relaxation fixup re-evaluate the
+    /// whole chain jointly instead of re-deriving one tier in isolation.
+    AlignChain {
+        tiers: Vec<AlignTierSpec>,
+    },
     /// Emit bytes: `.byte val, val, ...` (can contain label expressions)
     Byte(Vec<DataValue>),
     /// Emit 16-bit values: `.short val, ...` (can be symbol references)
@@ -434,7 +466,63 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
         }
     }
 
-    Ok(items)
+    // Merge runs of consecutive alignment directives (blank lines between
+    // them are transparent) into a single chain item. GAS evaluates such
+    // runs sequentially against the moving offset; compilers emit them as
+    // bounded fallback chains (GCC `.p2align 4,,10` + `.p2align 3`, lccc's
+    // own `.p2align 5,,15` + `.p2align 4,,15`). One item per chain is what
+    // lets the ELF writer re-evaluate the whole chain jointly after jump
+    // relaxation instead of re-deriving one tier against a stale offset.
+    let mut merged: Vec<AsmItem> = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            AsmItem::Align {
+                align,
+                fill,
+                max_skip,
+            } => {
+                let tier = AlignTierSpec {
+                    align,
+                    fill,
+                    max_skip,
+                };
+                // A chain stays open across blank lines: they emit no bytes.
+                while matches!(merged.last(), Some(AsmItem::Empty)) {
+                    merged.pop();
+                }
+                match merged.last_mut() {
+                    Some(AsmItem::AlignChain { tiers }) => tiers.push(tier),
+                    Some(AsmItem::Align { .. }) => {
+                        let first = match merged.pop() {
+                            Some(AsmItem::Align {
+                                align,
+                                fill,
+                                max_skip,
+                            }) => AlignTierSpec {
+                                align,
+                                fill,
+                                max_skip,
+                            },
+                            _ => unreachable!("matched an Align tail"),
+                        };
+                        merged.push(AsmItem::AlignChain {
+                            tiers: vec![first, tier],
+                        });
+                    }
+                    _ => merged.push(AsmItem::Align {
+                        align,
+                        fill,
+                        max_skip,
+                    }),
+                }
+            }
+            // Blank lines are kept verbatim; the Align arm pops them when a
+            // chain continues through them.
+            _ => merged.push(item),
+        }
+    }
+
+    Ok(merged)
 }
 
 /// Strip trailing comment from a line using x86 comment style (`#`).
@@ -575,15 +663,54 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         ".type" => parse_type_directive(args),
         ".size" => parse_size_directive(args),
         ".align" | ".p2align" | ".balign" => {
-            let val_str = args.split(',').next().unwrap_or("1").trim();
+            // `.p2align alignment[, fill[, max]]` (and `.align`/`.balign` with
+            // the same trailing operands, measured in bytes on x86 GAS).
+            //
+            // Operand 2 (`fill`) selects the padding byte. It is only honored
+            // as a single byte: the word/longword variants `.p2alignw/l` are
+            // a different directive family. GAS ignores `fill` in executable
+            // sections only when it is omitted (NOPs are emitted instead);
+            // an explicit fill (ICX emits `.p2align 4, 0x90`) is used
+            // verbatim, so honoring it keeps lccc byte-compatible with
+            // compiler-produced assembly.
+            //
+            // Operand 3 (`max`) is the maximum number of padding bytes: if
+            // reaching the boundary would skip more, GAS performs no
+            // alignment at all. This is the form GCC/Clang emit for bounded
+            // loop alignment (`.p2align 4,,10`), so without it lccc silently
+            // mis-assembles their output by padding unboundedly.
+            let mut parts = args.split(',');
+            let val_str = parts.next().unwrap_or("1").trim();
             let val: u32 =
                 parse_integer_expr(val_str).map_err(|_| format!("bad alignment: {}", args))? as u32;
+            // Trailing operands may be empty placeholders (`,,15`), which GAS
+            // treats as "default" for that operand.
+            let fill = parts
+                .next()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    parse_integer_expr(s).map_err(|_| format!("bad alignment fill: {}", s))
+                })
+                .transpose()?
+                .map(|v: i64| v as u8);
+            let max_skip = parts
+                .next()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    parse_integer_expr(s)
+                        .map_err(|_| format!("bad alignment max-skip: {}", s))
+                })
+                .transpose()?
+                .map(|v: i64| v.max(0) as u32);
             // .p2align is power-of-2, .align/.balign on x86 gas is byte count
-            if directive == ".p2align" {
-                Ok(AsmItem::Align(1 << val))
-            } else {
-                Ok(AsmItem::Align(val))
-            }
+            let boundary = if directive == ".p2align" { 1u32 << val } else { val };
+            Ok(AsmItem::Align {
+                align: boundary,
+                fill,
+                max_skip,
+            })
         }
         ".org" => {
             // `.org new-lc, fill` -- the fill byte is optional and defaults to

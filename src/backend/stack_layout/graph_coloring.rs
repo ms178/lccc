@@ -166,7 +166,10 @@ pub(super) fn color_stack_slots(
     let mut no_segments: Vec<u32> = Vec::new();
     for &(value, size) in multi_block_values {
         if state.protected_slot_values.contains(&value) || !segments.contains_key(&value) {
-            let (slot, new_space) = assign_slot(*non_local_space, size, 0);
+            // 16/32-byte vector slots are 16-aligned: legacy-SSE memory-form
+            // consumers (andnpd/pandn/memfolds) read vector homes directly.
+            let align = if size >= 16 { 16 } else { 0 };
+            let (slot, new_space) = assign_slot(*non_local_space, size, align);
             state.value_locations.insert(value, StackSlot(slot));
             *non_local_space = new_space;
             if !segments.contains_key(&value) && !state.protected_slot_values.contains(&value) {
@@ -241,7 +244,8 @@ pub(super) fn color_stack_slots(
                 continue;
             }
 
-            let (slot, new_space) = assign_slot(*non_local_space, *size, 0);
+            let align = if *size >= 16 { 16 } else { 0 };
+            let (slot, new_space) = assign_slot(*non_local_space, *size, align);
             *non_local_space = new_space;
             state.value_locations.insert(value, StackSlot(slot));
             colors.push((slot, live.clone()));

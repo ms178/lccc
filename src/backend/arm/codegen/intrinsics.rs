@@ -1077,6 +1077,7 @@ impl ArmCodegen {
             | IntrinsicOp::VecMaddF32x8
             | IntrinsicOp::VecMaddF64x4
             | IntrinsicOp::VecMaxI32x8
+            | IntrinsicOp::VecMinI32x8
             | IntrinsicOp::VecMulF32x8
             | IntrinsicOp::VecMulI32x8
             | IntrinsicOp::VecSqrtF32x8

@@ -453,6 +453,8 @@ pub struct X86Codegen {
     /// Whether SSE is disabled (-mno-sse). When true, variadic prologues skip
     /// XMM saves and va_start sets fp_offset to overflow immediately.
     pub(super) function_alignment: u32,
+    /// Hot-loop alignment policy (`-falign-loops`); None disables the pass.
+    pub(super) align_loops: Option<crate::backend::loop_align::LoopAlignPolicy>,
     pub(super) skip_rax_setup: bool,
     /// The current function contains a Call/CallIndirect. With frame-pointer
     /// omission a frame-less (raw_space == 0) function still needs an 8-byte
@@ -473,6 +475,12 @@ pub struct X86Codegen {
     /// flushed to .rodata by emit_vector_const_rodata after the function body.
     pub(super) vec_const_labels: crate::common::fx_hash::FxHashMap<(u64, u8), String>,
     pub(super) vec_const_counter: u32,
+    /// Repeated-lane full-width vector constants: (lane_value, lane_bytes,
+    /// total_bytes) -> label. Used directly as memory operands (e.g. the
+    /// 0x80000000 sign bias of the unsigned packed compare, consumed by
+    /// vpxor/pxor, which accept unaligned memory). Shares the label counter
+    /// and the .rodata flush with `vec_const_labels`.
+    pub(super) lane_const_labels: crate::common::fx_hash::FxHashMap<(u64, u8, u8), String>,
     /// True when the target has BMI1; enables scalar ANDN fusion.
     pub(super) bmi1_enabled: bool,
     /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
@@ -899,6 +907,7 @@ impl X86Codegen {
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
             function_alignment: 0,
+            align_loops: None,
             skip_rax_setup: false,
             func_has_calls: false,
             fp_contract: crate::common::fp_contract::FpContract::default(),
@@ -906,6 +915,7 @@ impl X86Codegen {
             no_sse: false,
             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
             vec_const_counter: 0,
+            lane_const_labels: crate::common::fx_hash::FxHashMap::default(),
             bmi1_enabled: false,
             lzcnt_enabled: false,
             popcnt_enabled: false,
@@ -1015,6 +1025,7 @@ impl X86Codegen {
         self.set_mcount(opts.mcount);
         self.set_cf_protection_branch(opts.cf_protection_branch);
         self.function_alignment = opts.function_alignment;
+        self.align_loops = opts.align_loops.clone();
         self.skip_rax_setup = opts.skip_rax_setup;
         self.set_no_sse(opts.no_sse);
         self.set_code_model_kernel(opts.code_model_kernel);
@@ -1055,9 +1066,42 @@ impl X86Codegen {
         format!("{}(%rip)", label)
     }
 
+    /// Reserve (or reuse) a .rodata label holding `lane_value` repeated
+    /// `total_bytes / lane_bytes` times — a FULL-WIDTH vector constant for
+    /// direct memory-operand use (vpxor BIAS(%rip), %ymm0, %ymm0), as
+    /// opposed to the broadcast scalars of `vec_const_rip_operand`.
+    /// Consumers must use mnemonics that tolerate unaligned memory
+    /// (vpxor/pxor do; vpxorpd would require 32-byte alignment).
+    pub(super) fn lane_const_rip_operand(
+        &mut self,
+        lane_value: u64,
+        lane_bytes: u8,
+        total_bytes: u8,
+    ) -> String {
+        debug_assert!(
+            total_bytes % lane_bytes == 0 && lane_bytes <= 8,
+            "lane const must tile the vector exactly"
+        );
+        let label = match self
+            .lane_const_labels
+            .get(&(lane_value, lane_bytes, total_bytes))
+        {
+            Some(l) => l.clone(),
+            None => {
+                let id = self.vec_const_counter;
+                self.vec_const_counter += 1;
+                let l = format!(".Lvc{}", id);
+                self.lane_const_labels
+                    .insert((lane_value, lane_bytes, total_bytes), l.clone());
+                l
+            }
+        };
+        format!("{}(%rip)", label)
+    }
+
     /// Emit the per-function vector-constant pool entries to .rodata.
     pub(super) fn emit_vector_const_rodata_impl(&mut self) {
-        if self.vec_const_labels.is_empty() {
+        if self.vec_const_labels.is_empty() && self.lane_const_labels.is_empty() {
             return;
         }
         let sect = self.state.current_text_section.clone();
@@ -1082,6 +1126,40 @@ impl X86Codegen {
                     .emit_fmt(format_args!("    .long {}", *value as i32)),
             }
         }
+        // Lane constants are emitted BEFORE the scalar broadcast entries and
+        // each gets its own 16-byte alignment: the 128-bit lane constants are
+        // consumed by LEGACY-SSE memory forms (`pxor mem, %xmm`) which fault
+        // on unaligned operands, and the 1/2/4/8-byte scalar entries emitted
+        // below would otherwise drag the pool off the 16-byte grid. (The
+        // 256-bit lane constants are only read by VEX forms — alignment
+        // unnecessary — but aligning them too costs at most a few bytes of
+        // .rodata and keeps the policy uniform.)
+        let mut lanes: Vec<(&(u64, u8, u8), &String)> = self.lane_const_labels.iter().collect();
+        lanes.sort_by_key(|(k, _)| (k.2, k.1, k.0));
+        for ((value, lane_bytes, total_bytes), label) in lanes {
+            // `.p2align 4`, NOT `.align 4`: on x86 ELF `.align N` is an
+            // N-BYTE requirement (not a power-of-two exponent), and 4 would
+            // leave legacy-SSE `pxor mem, %xmm` consumers faulting.
+            self.state.emit(".p2align 4");
+            self.state.out.emit_named_label(label);
+            let count = total_bytes / lane_bytes;
+            let directive = match lane_bytes {
+                1 => ".byte",
+                2 => ".short",
+                8 => ".quad",
+                _ => ".long",
+            };
+            let v = match lane_bytes {
+                1 => *value as u8 as i64,
+                2 => *value as u16 as i64,
+                8 => *value as i64,
+                _ => *value as u32 as i64,
+            };
+            for _ in 0..count {
+                self.state
+                    .emit_fmt(format_args!("    {} {}", directive, v));
+            }
+        }
         self.state
             .emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
         // Keep the counter monotonic across functions so every .LvcN label is
@@ -1089,6 +1167,7 @@ impl X86Codegen {
         // which is flushed together). Resetting per function would emit
         // duplicate .rodata labels that resolve to the wrong width.
         self.vec_const_labels.clear();
+        self.lane_const_labels.clear();
     }
 
     /// Format a stack slot reference as "offset(%rbp)" or "offset(%rsp)" depending
@@ -6645,6 +6724,10 @@ impl ArchCodegen for X86Codegen {
             0 | 1 => None,
             n => Some(n.trailing_zeros()),
         }
+    }
+
+    fn loop_alignment_policy(&self) -> Option<&crate::backend::loop_align::LoopAlignPolicy> {
+        self.align_loops.as_ref()
     }
 
     // All remaining methods delegate to self.method_name_impl(args...)

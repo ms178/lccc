@@ -4443,6 +4443,90 @@ fn parse_map_expr(
                 allow_ext_fp_ops,
             )?)))
         }
+        Instruction::UnaryOp {
+            op, src, ty, ..
+        } if !ty.is_float() && *ty == *elem_ty && allow_ext_fp_ops => {
+            // Integer unary maps: Neg is exactly Sub(0, x) in two's
+            // complement (vpsubd), BitNot is exactly Xor(x, -1) (vpxor
+            // against an all-ones broadcast). Dword lanes only, like the
+            // other integer map ops; everything else fails closed.
+            if !matches!(ty, IrType::I32 | IrType::U32) {
+                return None;
+            }
+            let inner = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                src,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            match op {
+                IrUnaryOp::Neg => Some(MapExpr::BinOp(
+                    IrBinOp::Sub,
+                    Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(0)))),
+                    Box::new(inner),
+                )),
+                IrUnaryOp::Not => Some(MapExpr::BinOp(
+                    IrBinOp::Xor,
+                    Box::new(inner),
+                    Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(-1)))),
+                )),
+                _ => return None,
+            }
+        }
+        Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } if !ty.is_float() && *ty == *elem_ty && allow_ext_fp_ops => {
+            // Integer conditional maps (clamp / classify / saturate shapes).
+            // Dword lanes only: the packed integer compare emitters cover
+            // I32/U32 (VecCmpI32x8 AVX2, VecCmpI32x4 SSE2); narrower or
+            // wider element types fail closed and keep the loop scalar.
+            if !matches!(ty, IrType::I32 | IrType::U32) {
+                return None;
+            }
+            // Normalize gt/ge by operand swap — exact for either
+            // signedness — leaving the eq/lt/le vocabulary the emitters
+            // implement (per signedness, plus ne via mask inversion).
+            let (norm_op, norm_lhs, norm_rhs) = match op {
+                IrCmpOp::Eq
+                | IrCmpOp::Ne
+                | IrCmpOp::Slt
+                | IrCmpOp::Sle
+                | IrCmpOp::Ult
+                | IrCmpOp::Ule => (*op, lhs.clone(), rhs.clone()),
+                IrCmpOp::Sgt => (IrCmpOp::Slt, rhs.clone(), lhs.clone()),
+                IrCmpOp::Sge => (IrCmpOp::Sle, rhs.clone(), lhs.clone()),
+                IrCmpOp::Ugt => (IrCmpOp::Ult, rhs.clone(), lhs.clone()),
+                IrCmpOp::Uge => (IrCmpOp::Ule, rhs.clone(), lhs.clone()),
+            };
+            let l = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                &norm_lhs,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            let r = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                &norm_rhs,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            Some(MapExpr::Cmp(norm_op, Box::new(l), Box::new(r)))
+        }
         Instruction::Cmp {
             op, lhs, rhs, ty, ..
         } if ty.is_float() && *ty == *elem_ty && allow_ext_fp_ops => {
@@ -4504,7 +4588,13 @@ fn parse_map_expr(
             else {
                 return None;
             };
-            if !(ty.is_float() && *ty == *elem_ty) {
+            if !(*ty == *elem_ty
+                && (ty.is_float() || matches!(ty, IrType::I32 | IrType::U32)))
+            {
+                // FP conditions: packed compare emitters. I32/U32
+                // conditions: the integer conditional-map path
+                // (VecCmpI32x8/x4 + VecBlendvI32x8/x4). Anything else
+                // (byte/word lanes, 64-bit lanes) fails closed.
                 return None;
             }
             let t = parse_map_operand(
@@ -4553,7 +4643,14 @@ fn parse_map_expr(
             // Non-strict `<=`/`>=` forms differ from MIN/MAX on +0/-0 (and
             // `<= ? r : l` also on NaN) and keep the exact compare+blend
             // lowering.
-            let fold = match op {
+            // The packed MIN/MAX fold is FP-only: the op table has no
+            // integer minmax (the SSE2 baseline lacks dword pminsd/pmaxsd),
+            // and integers need no fold — cmp+blendv IS their exact
+            // lowering, with none of the NaN/+0/-0 special cases.
+            let fold = if !elem_ty.is_float() {
+                None
+            } else {
+                match op {
                 IrCmpOp::Slt => {
                     let l = parse_map_operand(
                         func,
@@ -4663,6 +4760,7 @@ fn parse_map_expr(
                     }
                 }
                 _ => None,
+                }
             };
             if let Some(folded) = fold {
                 return Some(folded);
@@ -13062,6 +13160,98 @@ fn transform_reduction_sse2(
     changes
 }
 
+/// Exact integer min/max fold, applied post-parse on signed dword lanes with
+/// AVX2 available. The parser keeps integer ternaries as `Select(Cmp, t, f)`
+/// (its MinMax fold is FP-only — the packed MIN/MAX contract analysis there
+/// is about NaN/+0/-0, none of which exist for integers); this rewrite then
+/// recovers the single-instruction form for the shapes vpminsd/vpmaxsd match
+/// exactly:
+///
+///   l <  r ? l : r   ->  min(l, r)      l <= r ? l : r   ->  min(l, r)
+///   l <  r ? r : l   ->  max(r, l)      l <= r ? r : l   ->  max(r, l)
+///
+/// (gt/ge forms were already normalized to lt/le with swapped operands by
+/// the Cmp parser arm, so only the lt/le cond shapes can occur here.)
+/// Non-matching shapes are returned unchanged and keep the exact
+/// compare+blendv lowering. Children are folded first, so nested clamps
+/// (`v < lo ? lo : (v > hi ? hi : v)`) fold both levels.
+fn fold_int_minmax(expr: &MapExpr) -> MapExpr {
+    match expr {
+        MapExpr::Select(cond, t, f) => {
+            let t = Box::new(fold_int_minmax(t));
+            let f = Box::new(fold_int_minmax(f));
+            // Exact abs fold: `l < 0 ? -l : l` (and its `<=` variant) is
+            // max(l, -l) lane for lane — for l >= 0 the ternary takes l and
+            // max(l, -l) = l; for l < 0 it takes -l and max(l, -l) = -l
+            // (both operands negative). INT_MIN: -l wraps to INT_MIN, and
+            // max(INT_MIN, INT_MIN) = INT_MIN — identical to the ternary.
+            // Lowers to vpmaxsd + vpsubd.
+            if let MapExpr::Cmp(op, l, r) = &**cond {
+                let is_neg = |e: &MapExpr| {
+                    matches!(
+                        e,
+                        MapExpr::BinOp(IrBinOp::Sub, lhs, _)
+                            if **lhs == MapExpr::Invariant(Operand::Const(IrConst::I32(0)))
+                    )
+                };
+                if matches!(op, IrCmpOp::Slt | IrCmpOp::Sle)
+                    && **r == MapExpr::Invariant(Operand::Const(IrConst::I32(0)))
+                    && is_neg(t.as_ref())
+                    && f.as_ref() == l.as_ref()
+                {
+                    let l2 = (**l).clone();
+                    let neg_l = MapExpr::BinOp(
+                        IrBinOp::Sub,
+                        Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(0)))),
+                        Box::new(l2.clone()),
+                    );
+                    return MapExpr::MinMax {
+                        is_max: true,
+                        l: l.clone(),
+                        r: Box::new(neg_l),
+                    };
+                }
+            }
+            if let MapExpr::Cmp(op, l, r) = &**cond {
+                if matches!(op, IrCmpOp::Slt | IrCmpOp::Sle) {
+                    if *t == **l && *f == **r {
+                        // cond ? l : r with cond = l PRED r: true on the
+                        // PRED-satisfying lanes, so the result is the
+                        // smaller (PRED-true) operand exactly.
+                        return MapExpr::MinMax {
+                            is_max: false,
+                            l: l.clone(),
+                            r: r.clone(),
+                        };
+                    }
+                    if *t == **r && *f == **l {
+                        // cond ? r : l: the PRED-true operand when it holds,
+                        // l otherwise — the larger operand either way.
+                        return MapExpr::MinMax {
+                            is_max: true,
+                            l: r.clone(),
+                            r: l.clone(),
+                        };
+                    }
+                }
+            }
+            MapExpr::Select(cond.clone(), t, f)
+        }
+        MapExpr::BinOp(op, l, r) => MapExpr::BinOp(
+            *op,
+            Box::new(fold_int_minmax(l)),
+            Box::new(fold_int_minmax(r)),
+        ),
+        MapExpr::Cmp(op, l, r) => MapExpr::Cmp(
+            *op,
+            Box::new(fold_int_minmax(l)),
+            Box::new(fold_int_minmax(r)),
+        ),
+        MapExpr::Sqrt(x) => MapExpr::Sqrt(Box::new(fold_int_minmax(x))),
+        other => other.clone(),
+    }
+}
+
 /// Transform a legal one-source store loop to packed 128/256-bit form.  The
 /// optional scale and offset operations stay optional: copies become exactly
 /// load/store, while scale/add/affine maps emit only their source operations.
@@ -13136,8 +13326,24 @@ fn transform_map_vector(
     // redirected) only after the packed body is in place.  (Redirecting the
     // exit edge first and bailing later left a dangling branch into the
     // next function's labels.)
+    // Integer exact min/max (AVX2 vpminsd/vpmaxsd): on signed dword lanes
+    // every strict AND non-strict ternary shape folds exactly — integers
+    // have none of the NaN/+0/-0 special cases that constrain the FP fold
+    // to strict predicates. Post-parse, so the analyzer stays
+    // target-independent. The fold is only APPLIED when its lowering
+    // exists (avx2 && I32); otherwise the tree keeps its exact
+    // compare+blendv form, which has a lowering on every x86 baseline.
+    // The SAME folded tree drives the packed body, the ops-availability
+    // check, and the scalar remainder mirror, so all three stay
+    // lane-exact with respect to each other.
+    let expr = if avx2 && pattern.elem_ty == IrType::I32 {
+        fold_int_minmax(&pattern.expr)
+    } else {
+        pattern.expr.clone()
+    };
+
     let Some(remainder) =
-        build_map_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label)
+        build_map_remainder_loop(func, pattern, &expr, vec_width, &mut next_val_id, &mut next_label)
     else {
         if debug {
             eprintln!("[VEC-MAP]   Scalar remainder mirror unavailable; bailing");
@@ -13396,13 +13602,20 @@ fn transform_map_vector(
             (IrType::F64, false) => IntrinsicOp::VecCmpF64x2,
             (IrType::F32, true) => IntrinsicOp::VecCmpF32x8,
             (IrType::F32, false) => IntrinsicOp::VecCmpF32x4,
+            (IrType::I32, true) | (IrType::U32, true) => IntrinsicOp::VecCmpI32x8,
+            (IrType::I32, false) | (IrType::U32, false) => IntrinsicOp::VecCmpI32x4,
             _ => return None,
         };
+        // FP immediates are the vcmpps EQ_OQ/LT_OS/LE_OS/NEQ_UQ encodings;
+        // integer immediates follow the VecCmpI32x8 vocabulary (the
+        // numbering echoes vcmpps, +4 selects the unsigned bias path).
         let imm = match op {
-            IrCmpOp::Eq => 0,  // EQ_OQ
-            IrCmpOp::Slt => 1, // LT_OS
-            IrCmpOp::Sle => 2, // LE_OS
-            IrCmpOp::Ne => 4,  // NEQ_UQ
+            IrCmpOp::Eq => 0,  // EQ_OQ / ==
+            IrCmpOp::Slt => 1, // LT_OS / < signed
+            IrCmpOp::Sle => 2, // LE_OS / <= signed
+            IrCmpOp::Ne => 4,  // NEQ_UQ / !=
+            IrCmpOp::Ult => 5, // < unsigned (sign-bias expansion)
+            IrCmpOp::Ule => 6, // <= unsigned
             _ => return None,
         };
         Some((vec_op, imm))
@@ -13412,10 +13625,19 @@ fn transform_map_vector(
         (IrType::F64, false) => Some(IntrinsicOp::VecBlendvF64x2),
         (IrType::F32, true) => Some(IntrinsicOp::VecBlendvF32x8),
         (IrType::F32, false) => Some(IntrinsicOp::VecBlendvF32x4),
+        (IrType::I32, true) | (IrType::U32, true) => Some(IntrinsicOp::VecBlendvI32x8),
+        (IrType::I32, false) | (IrType::U32, false) => Some(IntrinsicOp::VecBlendvI32x4),
         _ => None,
     };
     let minmax_op = |is_max: bool| -> Option<IntrinsicOp> {
         match (pattern.elem_ty, avx2, is_max) {
+            // Signed dword min/max exist as single AVX2 instructions
+            // (vpminsd/vpmaxsd); the exact ternary fold produces them.
+            // Unsigned lanes would need vpminud/vpmaxud (not modeled) and
+            // the SSE2 baseline lacks dword min/max entirely — both fail
+            // closed through map_tree_ops_available.
+            (IrType::I32, true, false) => Some(IntrinsicOp::VecMinI32x8),
+            (IrType::I32, true, true) => Some(IntrinsicOp::VecMaxI32x8),
             (IrType::F64, true, false) => Some(IntrinsicOp::VecMinF64x4),
             (IrType::F64, false, false) => Some(IntrinsicOp::VecMinF64x2),
             (IrType::F32, true, false) => Some(IntrinsicOp::VecMinF32x8),
@@ -13433,7 +13655,7 @@ fn transform_map_vector(
     // rewrite would leave `func.next_value_id` stale and corrupt every
     // later pass (bit_idioms indexed out of bounds on exactly this).
     if !map_tree_ops_available(
-        &pattern.expr,
+        &expr,
         &bin_op,
         sqrt_op,
         &cmp_op,
@@ -13466,7 +13688,7 @@ fn transform_map_vector(
             next_val_id,
             changes: &mut changes,
         };
-        let Some(current) = ctx.emit(&pattern.expr) else {
+        let Some(current) = ctx.emit(&expr) else {
             if debug {
                 eprintln!("[VEC-MAP]   Tree emission failed");
             }
@@ -13816,6 +14038,7 @@ fn add_phi_incoming(
 fn build_map_remainder_loop(
     func: &IrFunction,
     pattern: &MapPattern,
+    expr: &MapExpr,
     vec_width: u64,
     next_val_id: &mut u32,
     next_label: &mut u32,
@@ -13940,7 +14163,7 @@ fn build_map_remainder_loop(
     // the identical scalar operation — lane-exact by construction.
     let mut next_val_local = *next_val_id;
     let scalar_result = emit_map_scalar_tree(
-        &pattern.expr,
+        &expr,
         &src_bases,
         pattern,
         Operand::Value(offset_v),

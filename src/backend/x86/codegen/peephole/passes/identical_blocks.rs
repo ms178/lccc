@@ -14,6 +14,20 @@
 //! the other path's inputs. We therefore require that two blocks share the
 //! EXACT SAME SET of predecessor blocks before merging. Identical predecessors
 //! guarantee identical live-in state, so the merge is semantics-preserving.
+//!
+//! KNOWN LIMITATION (pred visibility): the predecessor scan only attributes
+//! edges whose source lies inside a tracked `.LBB` block. Code in function
+//! entry regions (before the first `.LBB` label) and after non-`.LBB` local
+//! labels (`.Lmset_loop_*` memset islands, `.Lvc*` pools, …) is untracked, so
+//! jumps from there contribute NO predecessor. Two blocks whose in-edges are
+//! all invisible therefore compare equal on EMPTY predecessor sets and can
+//! still merge. That is the pass's working mode for entry-adjacent dispatch
+//! (see test non_jump_table_blocks_still_merge) and is only sound because such
+//! blocks' register state at the jump sites usually coincides; a general fix
+//! needs entry-region/island tracking in the block scan. Alignment directives
+//! between blocks no longer erase fall-through edges (see is_inert_directive),
+//! which was the one case where the erasure was a pure analysis bug rather
+//! than an inherent limitation.
 
 use super::super::types::*;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -36,6 +50,45 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 //      differ from its state on the edge to the other. We therefore require the
 //      merged blocks and all their predecessors to be "clean" (single-entry,
 //      no internal labels), so the register values at entry are path-independent.
+
+/// Directives that are inert for control-flow and register-state analysis:
+/// they emit no semantically relevant instructions into the text stream
+/// (`.p2align`/`.balign`/`.align` emit NOP padding; `.loc`/`.file` emit
+/// debug metadata). A block boundary scan must treat them as transparent,
+/// exactly like NOP lines — breaking a block at such a directive silently
+/// ERASES the fall-through edge between the two blocks around it, and the
+/// predecessor analysis then believes the following block has no
+/// predecessors at all.
+///
+/// Observed miscompile (vectorize_int_map_lanes, -O3 -march=x86-64-v3): the
+/// loop-header alignment pass emits `.p2align 4` between a loop guard's
+/// conditional branch and the preheader label; identical_blocks lost the
+/// fall-through edge, saw 25 byte-identical memset preheaders with EMPTY
+/// predecessor sets, merged them, and every merged-away preheader NOPed its
+/// `rdi`/`rcx`/`ymm0` setup straight into the store loop → SIGSEGV.
+///
+/// `.cfi_*` is deliberately NOT in this set: unwind directives are
+/// function-scoped metadata that must survive block merging verbatim, and
+/// no lccc codegen path emits them between `.LBB` blocks. Keeping them as
+/// block terminators preserves the pre-existing (and tested) behavior.
+fn is_inert_directive(trimmed: &str) -> bool {
+    trimmed.starts_with(".loc")
+        || trimmed.starts_with(".file")
+        || trimmed.starts_with(".p2align")
+        || trimmed.starts_with(".balign")
+        || trimmed.starts_with(".align")
+}
+
+/// A line inside a block range that carries no block semantics: a NOP or an
+/// inert directive. Every content consumer below (boundary scan, terminator
+/// scan, hash, text identity, cleanliness) skips exactly these, so a block's
+/// identity never depends on its padding.
+fn line_is_transparent(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
+    if infos[j].is_nop() {
+        return true;
+    }
+    infos[j].kind == LineKind::Directive && is_inert_directive(infos[j].trimmed(store.get(j)))
+}
 
 /// Does this instruction set the EFLAGS (condition flags)?
 fn sets_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
@@ -173,7 +226,10 @@ fn block_is_flag_dependent(
 /// would split it, so its register state at exit is path-independent.
 fn block_is_clean(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
     for j in (start + 1)..end {
-        if infos[j].is_nop() {
+        // Transparent lines (NOPs, inert directives) carry no block
+        // semantics: they cannot branch or define a label, so they do not
+        // affect the single-entry straight-line property.
+        if line_is_transparent(store, infos, j) {
             continue;
         }
         match infos[j].kind {
@@ -240,8 +296,11 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                             // merge (then delete) epilogue blocks it shouldn't
                             // (gzip -g -O2: treat_file lost its epilogue+ret
                             // and fell through into create_outfile -> SIGSEGV).
+                            // The same is true for alignment directives (see
+                            // is_inert_directive): breaking the block there
+                            // erases the fall-through edge to the next block.
                             let dl = infos[end].trimmed(store.get(end));
-                            if dl.starts_with(".loc") || dl.starts_with(".file") {
+                            if is_inert_directive(dl) {
                                 end += 1;
                                 continue;
                             }
@@ -285,11 +344,14 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     //   - X falls through into B (X.end == B.start and X's last non-NOP
     //     instruction is not an unconditional jmp / ret).
     let mut preds: FxHashMap<String, FxHashSet<String>> = FxHashMap::default();
-    // Determine the block-terminating instruction per block.
+    // Determine the block-terminating instruction per block. Inert
+    // directives are skipped: a `ret` followed by `.cfi_endproc` (or an
+    // aligned block's trailing `.p2align`) must still classify as a Ret /
+    // real terminator, not as a fall-through-capable Directive line.
     let mut block_terminator: Vec<LineKind> = vec![LineKind::Empty; blocks.len()];
     for (bidx, &(start, end, _, _)) in blocks.iter().enumerate() {
         for k in (start + 1..end).rev() {
-            if infos[k].is_nop() {
+            if line_is_transparent(store, infos, k) {
                 continue;
             }
             block_terminator[bidx] = infos[k].kind;
@@ -354,7 +416,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         let mut hasher = 0u64;
         let mut instr_count = 0u32;
         for j in (start + 1)..end {
-            if infos[j].is_nop() {
+            if line_is_transparent(store, infos, j) {
                 continue;
             }
             let line = store.get(j);
@@ -485,7 +547,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         let canonical_preds = preds.get(&canonical_label).cloned().unwrap_or_default();
 
         let canonical_instrs: Vec<String> = ((*can_start + 1)..*can_end)
-            .filter(|&j| !infos[j].is_nop())
+            .filter(|&j| !line_is_transparent(store, infos, j))
             .map(|j| store.get(j).to_string())
             .collect();
 
@@ -517,7 +579,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
             }
 
             let other_instrs: Vec<String> = ((other_start + 1)..other_end)
-                .filter(|&j| !infos[j].is_nop())
+                .filter(|&j| !line_is_transparent(store, infos, j))
                 .map(|j| store.get(j).to_string())
                 .collect();
 
@@ -532,10 +594,15 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
 
                 redirects.insert(other_label.clone(), canonical_label.clone());
                 for j in other_start..other_end {
-                    if !infos[j].is_nop() {
-                        mark_nop(&mut infos[j]);
-                        changed = true;
+                    if line_is_transparent(store, infos, j) {
+                        // Inert directives survive the merge: a trailing
+                        // `.p2align` pads the LIVE successor's label, and
+                        // deleting it would silently defeat that block's
+                        // alignment.
+                        continue;
                     }
+                    mark_nop(&mut infos[j]);
+                    changed = true;
                 }
             }
         }
@@ -731,5 +798,74 @@ mod tests {
         // One canonical block survives; the duplicate is redirected.
         let defs = out.matches("call ext_a").count();
         assert_eq!(defs, 1, "expected 1 surviving call block:\n{out}");
+    }
+
+    /// Alignment directives between a fall-through predecessor and a block
+    /// must not erase the fall-through edge from the predecessor analysis.
+    /// This is the exact shape of the loop-header alignment miscompile
+    /// (vectorize_int_map_lanes at -O3 -march=x86-64-v3), reduced to ONE
+    /// function so func_id separation cannot mask it: `.p2align 4` between
+    /// each guard block's branch and its preheader label made the
+    /// byte-identical memset preheaders all show EMPTY predecessor sets;
+    /// they merged, and the merged-away copies NOPed their rdi/rcx/ymm0
+    /// setup straight into the store loop → SIGSEGV. Boundary transparency
+    /// (is_inert_directive) records the fall-through edge through the
+    /// `.p2align`, so the preheaders' predecessor sets differ ({.LBB1} vs
+    /// {.LBB5}) and no merge may happen.
+    #[test]
+    fn identical_blocks_p2align_between_blocks_preserves_fallthrough() {
+        let out = run(concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    xorl %r15d, %r15d\n",
+            ".LBB1:\n",
+            "    cmpq $2, %rdi\n",
+            "    jae .LBB5\n",
+            "    .p2align 4\n",
+            ".LBB2:\n",
+            "    movq %rbx, %rdi\n",
+            "    movl $0xa5a5a5a5, %eax\n",
+            "    vmovd %eax, %xmm0\n",
+            "    vpbroadcastd %xmm0, %ymm0\n",
+            "    movq $32, %rcx\n",
+            ".Lmset_loop_0:\n",
+            "    vmovdqu %ymm0, (%rdi)\n",
+            "    addq $64, %rdi\n",
+            "    decq %rcx\n",
+            "    jne .Lmset_loop_0\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    cmpq $3, %rsi\n",
+            "    jae .LBB9\n",
+            "    .p2align 4\n",
+            ".LBB6:\n",
+            "    movq %rbx, %rdi\n",
+            "    movl $0xa5a5a5a5, %eax\n",
+            "    vmovd %eax, %xmm0\n",
+            "    vpbroadcastd %xmm0, %ymm0\n",
+            "    movq $32, %rcx\n",
+            ".Lmset_loop_1:\n",
+            "    vmovdqu %ymm0, (%rdi)\n",
+            "    addq $64, %rdi\n",
+            "    decq %rcx\n",
+            "    jne .Lmset_loop_1\n",
+            "    ret\n",
+            ".LBB9:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        // Both preheader blocks must survive with their setup intact.
+        assert_eq!(
+            out.matches("vpbroadcastd %xmm0, %ymm0").count(),
+            2,
+            "a memset preheader was merged away through the .p2align gap:\n{out}"
+        );
+        assert_eq!(out.matches("movl $0xa5a5a5a5, %eax").count(), 2, "{out}");
+        // The trip-count setup may be narrowed (movq→movl) by other passes;
+        // only its survival matters here.
+        assert!(
+            out.matches("movl $32, %ecx").count() + out.matches("movq $32, %rcx").count() == 2,
+            "{out}"
+        );
     }
 }

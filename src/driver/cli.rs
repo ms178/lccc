@@ -10,7 +10,7 @@
 //! ignored (matching GCC's behavior for unrecognized `-f` and `-m` flags),
 //! which is critical for build system compatibility.
 
-use super::pipeline::{CliDefine, CompileMode, Driver};
+use super::pipeline::{AlignLoopsFlag, CliDefine, CompileMode, Driver};
 use crate::backend::Target;
 use crate::common::error::ColorMode;
 use crate::common::fp_contract::FpContract;
@@ -1586,6 +1586,39 @@ impl Driver {
                 }
                 "-fomit-frame-pointer" => self.omit_frame_pointer = true,
                 "-fno-omit-frame-pointer" => self.omit_frame_pointer = false,
+                // -falign-loops[=N[:max]] / -fno-align-loops: hot-loop header
+                // alignment (bounded .p2align chains, see backend::loop_align).
+                // GCC-compatible subset: N is a byte boundary (power of two),
+                // optionally capped by a max-skip. Bare -falign-loops uses the
+                // compiler's default tiered policy; the explicit form forces
+                // one uniform chain.
+                "-falign-loops" => self.align_loops = AlignLoopsFlag::Default,
+                "-fno-align-loops" => self.align_loops = AlignLoopsFlag::Off,
+                s if s.starts_with("-falign-loops=") => {
+                    // N is a byte boundary (GCC semantics: -falign-loops=16
+                    // means 16 bytes), optionally capped by :max padding
+                    // bytes. Convert to log2 for the policy layer.
+                    let spec = &s["-falign-loops=".len()..];
+                    let mut parts = spec.split(':');
+                    let bytes: Option<u32> = parts
+                        .next()
+                        .and_then(|n| n.parse::<u32>().ok())
+                        .filter(|n| n.is_power_of_two() && *n <= 4096);
+                    match bytes {
+                        Some(bytes) => {
+                            let log2 = bytes.trailing_zeros() as u8;
+                            let max_skip = parts
+                                .next()
+                                .map(|m| m.trim())
+                                .filter(|m| !m.is_empty())
+                                .and_then(|m| m.parse::<u32>().ok());
+                            self.align_loops = AlignLoopsFlag::Chain(log2, max_skip);
+                        }
+                        None => {
+                            return Err(format!("invalid argument to {}", s));
+                        }
+                    }
+                }
                 "-fno-asynchronous-unwind-tables" | "-fno-unwind-tables" => {
                     self.no_unwind_tables = true
                 }

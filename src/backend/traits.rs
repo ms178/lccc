@@ -2348,6 +2348,13 @@ pub trait ArchCodegen {
         None
     }
 
+    /// Hot-loop alignment policy, or None when the target does not align
+    /// loop headers. The x86 backend overrides it from CodegenOptions
+    /// (`-falign-loops`, default-on at -O2/-O3).
+    fn loop_alignment_policy(&self) -> Option<&crate::backend::loop_align::LoopAlignPolicy> {
+        None
+    }
+
     fn function_type_directive(&self) -> &'static str {
         "@function"
     }

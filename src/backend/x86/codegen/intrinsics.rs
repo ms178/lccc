@@ -17,6 +17,16 @@ use crate::backend::state::StackSlot;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
 
+/// Mnemonic domain for the SSE2-baseline lane-mask select (see
+/// `emit_sse_blendv_128`): the FP payloads use the legacy PS/PD encodings
+/// (domain-matched), integer payloads use pand/pandn/por (integer domain,
+/// no float-bypass delay on the lane data).
+pub(super) enum BlendvDomain {
+    Ps,
+    Pd,
+    Int,
+}
+
 impl X86Codegen {
     /// Load a float operand into %xmm0. Handles both Value operands (from stack)
     /// and float constants (loaded via their bit pattern into rax first).
@@ -3774,8 +3784,31 @@ impl X86Codegen {
             }
             IntrinsicOp::VecBlendvF32x4 | IntrinsicOp::VecBlendvF64x2 => {
                 if let Some(d) = dest {
-                    let ps = matches!(op, IntrinsicOp::VecBlendvF32x4);
-                    self.emit_sse_blendv_128(d, args, ps);
+                    let domain = if matches!(op, IntrinsicOp::VecBlendvF32x4) {
+                        BlendvDomain::Ps
+                    } else {
+                        BlendvDomain::Pd
+                    };
+                    self.emit_sse_blendv_128(d, args, domain);
+                }
+            }
+            IntrinsicOp::VecBlendvI32x8 => {
+                if let Some(d) = dest {
+                    // vblendvps is a bitwise dword-lane select keyed on the
+                    // mask lane's sign bit — payload bits are copied
+                    // verbatim, so the FP mnemonic is exact on I32/U32.
+                    self.emit_avx_blendv_256(d, args, "vblendvps");
+                }
+            }
+            IntrinsicOp::VecBlendvI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sse_blendv_128_int(d, args);
+                }
+            }
+            IntrinsicOp::VecCmpI32x8 | IntrinsicOp::VecCmpI32x4 => {
+                if let Some(d) = dest {
+                    let avx2 = matches!(op, IntrinsicOp::VecCmpI32x8);
+                    self.emit_int_cmp(d, args, avx2);
                 }
             }
             IntrinsicOp::VecSqrtF64x4 | IntrinsicOp::VecSqrtF32x8 => {
@@ -3905,6 +3938,14 @@ impl X86Codegen {
                     self.emit_avx_binary_256(d, args, "vpmaxsd", true);
                 }
             }
+            IntrinsicOp::VecMinI32x8 => {
+                // Lane-wise signed min of two 8×I32 vectors (vpminsd). The
+                // map vectorizer's integer min/max fold lowers exact integer
+                // ternaries to it (clamp shapes: vpmaxsd + vpminsd).
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpminsd", true);
+                }
+            }
             IntrinsicOp::VecBroadcastI32x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
@@ -3929,6 +3970,19 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecStoreI32x4 => {
+                // Register-home source: store straight from the assigned XMM
+                // register (mirrors the FP stores; see VecStoreI32x8).
+                let src = self.vec_store_source_128(&args[0]);
+                if src != "xmm0" {
+                    if let Operand::Value(v) = &args[0] {
+                        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                            self.state.pending_vec_store = None;
+                        }
+                    }
+                    self.state.invalidate_vec_peephole();
+                    self.emit_vec_store_addr(args, dest_ptr, "movdqu", src);
+                    return;
+                }
                 // Peek register residency BEFORE invalidating the peephole.
                 let in_reg = matches!(&args[0], Operand::Value(v)
                     if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
@@ -3953,6 +4007,22 @@ impl X86Codegen {
                 self.emit_vec_store_addr(args, dest_ptr, "movdqu", "xmm0");
             }
             IntrinsicOp::VecStoreI32x8 => {
+                // Register-home source: store straight from the assigned YMM
+                // register (no slot round trip), exactly like the FP stores.
+                // Without this, an RA-homed source (e.g. an integer min/max
+                // result) stored stale %ymm0 contents — the deferred-scratch
+                // discipline only keeps unhomed results in %ymm0.
+                let src = self.vec_store_source_256(&args[0]);
+                if src != "ymm0" {
+                    if let Operand::Value(v) = &args[0] {
+                        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                            self.state.pending_vec_store = None;
+                        }
+                    }
+                    self.state.invalidate_vec_peephole();
+                    self.emit_vec_store_addr(args, dest_ptr, "vmovdqu", src);
+                    return;
+                }
                 // Peek register residency BEFORE invalidating the peephole —
                 // otherwise every map/store pair pays a dead vmovdqu round-trip.
                 let in_reg = matches!(&args[0], Operand::Value(v)
@@ -5119,6 +5189,138 @@ impl X86Codegen {
         self.sse_store_dest(dest, "xmm0");
     }
 
+    /// Packed INTEGER compare on dword lanes (the map vectorizer's
+    /// conditional-map path): `dest[i] = (a[i] PRED b[i]) ? -1 : 0` with
+    /// `args = [a, b, imm]` and the immediate vocabulary of `VecCmpI32x8`:
+    /// 0=eq, 1=lt.s, 2=le.s, 4=ne, 5=lt.u, 6=le.u. `avx2` selects the
+    /// 8-lane VEX encoding, else the SSE2 4-lane legacy encoding.
+    ///
+    /// Both RAW operands are resolved into registers first (the discipline
+    /// of the FP compare emitters), so aliasing a==b and deferred-cache
+    /// hits stay correct; only then is any biasing applied. The unsigned
+    /// predicates XOR 0x80000000 into both operands — a monotone remap of
+    /// the unsigned order onto the signed one — with the bias read from a
+    /// full-width .rodata constant through vpxor/pxor (both tolerate
+    /// unaligned memory). le/ne invert the primary mask by xoring with an
+    /// all-ones built in the (then dead) second scratch register.
+    pub(super) fn emit_int_cmp(&mut self, dest: &Value, args: &[Operand], avx2: bool) {
+        assert!(args.len() == 3, "int cmp: expects lhs, rhs, predicate");
+        let imm = match &args[2] {
+            Operand::Const(c) => c.to_i64().unwrap_or(-1),
+            _ => unreachable!("int cmp: predicate must be a constant immediate"),
+        };
+        let unsigned = matches!(imm, 5 | 6);
+        let invert = matches!(imm, 2 | 4 | 6);
+        let eq = matches!(imm, 0 | 4);
+        self.state.invalidate_vec_peephole();
+        if avx2 {
+            // b: RA home, or staged in the reserved second scratch.
+            let b = match self.vec_home_256(&args[1]) {
+                Some(reg) => reg,
+                None => {
+                    self.avx_load_arg_to(&args[1], "ymm1");
+                    "%ymm1".to_string()
+                }
+            };
+            self.avx_load_arg(&args[0]); // a -> %ymm0
+            // AT&T 3-operand order is `op src2, src1, dst` with
+            // dst = src1 OP src2, so the SECOND operand is the GREATER-side
+            // source of vpcmpgtd:
+            //   lt  wants b > a  ->  `vpcmpgtd a, b, dst` (a in %ymm0 first)
+            //   le  wants !(a>b) ->  `vpcmpgtd b, a, dst` (then inverted)
+            // eq is commutative and shares either orientation.
+            if unsigned {
+                let bias = self.lane_const_rip_operand(0x8000_0000, 4, 32);
+                // a' = a ^ bias in place; b' = b ^ bias into %ymm1 (a home
+                // is never written; a staged copy is this emitter's own
+                // private temporary, dead after the compare).
+                self.state
+                    .emit_fmt(format_args!("    vpxor {}, %ymm0, %ymm0", bias));
+                self.state
+                    .emit_fmt(format_args!("    vpxor {}, {}, %ymm1", bias, b));
+                if eq {
+                    self.state
+                        .emit_fmt(format_args!("    vpcmpeqd %ymm1, %ymm0, %ymm0"));
+                } else if invert {
+                    // le.u: !(a' > b')  [src1 = a' = %ymm0]
+                    self.state
+                        .emit_fmt(format_args!("    vpcmpgtd %ymm1, %ymm0, %ymm0"));
+                } else {
+                    // lt.u: b' > a'  [src1 = b' = %ymm1]
+                    self.state
+                        .emit_fmt(format_args!("    vpcmpgtd %ymm0, %ymm1, %ymm0"));
+                }
+            } else if eq {
+                self.state
+                    .emit_fmt(format_args!("    vpcmpeqd {}, %ymm0, %ymm0", b));
+            } else if invert {
+                // le.s: !(a > b)  [src1 = a = %ymm0]
+                self.state
+                    .emit_fmt(format_args!("    vpcmpgtd {}, %ymm0, %ymm0", b));
+            } else {
+                // lt.s: b > a  [src1 = b, src2 = a = %ymm0]
+                self.state
+                    .emit_fmt(format_args!("    vpcmpgtd %ymm0, {}, %ymm0", b));
+            }
+            if invert {
+                self.state
+                    .emit_fmt(format_args!("    vpcmpeqd %ymm1, %ymm1, %ymm1"));
+                self.state
+                    .emit_fmt(format_args!("    vpxor %ymm1, %ymm0, %ymm0"));
+            }
+            self.state.vec_last_store_reg = false;
+            self.avx_store_dest(dest);
+        } else {
+            // SSE2 legacy two-operand forms (`op src, dst` = dst OP src):
+            // the destination register must carry the GREATER-side operand
+            // of pcmpgtd — b for lt (b > a), a for le (a > b, then the
+            // inversion). eq is commutative. The unsigned bias uses pxor's
+            // memory form (unaligned-safe); a homed operand is copied to
+            // %xmm1 because the home must not be clobbered.
+            let lt_loads_b_first = eq || !invert;
+            let (dst_arg, src_arg) = if lt_loads_b_first {
+                (&args[1], &args[0]) // b -> %xmm0, a homed/staged
+            } else {
+                (&args[0], &args[1]) // a -> %xmm0, b homed/staged
+            };
+            let src = match self.vec_home_128(src_arg) {
+                Some(reg) => reg,
+                None => {
+                    self.sse_load_arg(src_arg, "xmm1");
+                    "%xmm1".to_string()
+                }
+            };
+            self.sse_load_arg(dst_arg, "xmm0");
+            if unsigned {
+                let bias = self.lane_const_rip_operand(0x8000_0000, 4, 16);
+                // Bias both: the dst in place, the src into %xmm1.
+                self.state
+                    .emit_fmt(format_args!("    pxor {}, %xmm0", bias));
+                if src == "%xmm1" {
+                    self.state
+                        .emit_fmt(format_args!("    pxor {}, %xmm1", bias));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    movdqa {}, %xmm1", src));
+                    self.state
+                        .emit_fmt(format_args!("    pxor {}, %xmm1", bias));
+                }
+                let mn = if eq { "pcmpeqd" } else { "pcmpgtd" };
+                self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", mn));
+            } else {
+                let mn = if eq { "pcmpeqd" } else { "pcmpgtd" };
+                // %xmm0 holds the greater-side operand (b for lt, a for
+                // le); the src is the other side: dst > src.
+                self.state.emit_fmt(format_args!("    {} {}, %xmm0", mn, src));
+            }
+            if invert {
+                self.state.emit_fmt(format_args!("    pcmpeqd %xmm1, %xmm1"));
+                self.state.emit_fmt(format_args!("    pxor %xmm1, %xmm0"));
+            }
+            self.sse_store_dest(dest, "xmm0");
+        }
+    }
+
     /// Lane-mask select (AVX): `args = [false_vec, true_vec, mask]`,
     /// `vblendvps mask, true(reg/mem), false(reg), dst`.  The false vector
     /// streams through %ymm0; the mask and the true vector are read from
@@ -5199,13 +5401,39 @@ impl X86Codegen {
     ///   orps xmm1, xmm0
     /// The false vector is read from its home / slot / fold as the
     /// `andnps` memory or register source, so only %xmm0/%xmm1 are written.
-    pub(super) fn emit_sse_blendv_128(&mut self, dest: &Value, args: &[Operand], ps: bool) {
+    ///
+    /// `domain` picks the mnemonic triple: PS/PD for the FP lanes (legacy
+    /// encodings, domain-aligned with the payload) and INT for integer
+    /// payloads (pand/pandn/por — integer domain, no float-bypass delay).
+    pub(super) fn emit_sse_blendv_128(
+        &mut self,
+        dest: &Value,
+        args: &[Operand],
+        domain: BlendvDomain,
+    ) {
         assert!(args.len() == 3, "blendv128: expects false, true, mask");
-        let (and, andn, or) = if ps {
-            ("andps", "andnps", "orps")
-        } else {
-            ("andpd", "andnpd", "orpd")
+        let (and, andn, or) = match domain {
+            BlendvDomain::Ps => ("andps", "andnps", "orps"),
+            BlendvDomain::Pd => ("andpd", "andnpd", "orpd"),
+            BlendvDomain::Int => ("pand", "pandn", "por"),
         };
+        self.emit_sse_blendv_128_mnemonics(dest, args, and, andn, or);
+    }
+
+    /// Integer-domain lane-mask select (SSE2): pand/pandn/por — see
+    /// `emit_sse_blendv_128`.
+    pub(super) fn emit_sse_blendv_128_int(&mut self, dest: &Value, args: &[Operand]) {
+        self.emit_sse_blendv_128_mnemonics(dest, args, "pand", "pandn", "por");
+    }
+
+    fn emit_sse_blendv_128_mnemonics(
+        &mut self,
+        dest: &Value,
+        args: &[Operand],
+        and: &str,
+        andn: &str,
+        or: &str,
+    ) {
         // No leading flush: a deferred mask still held in %xmm0 must keep
         // its cache hit (the mask load below consumes it in place).  The
         // mask/true loads then commit or consume any other pending store,
