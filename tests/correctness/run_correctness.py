@@ -38,6 +38,109 @@ def c(code, text):
 
 # Each test: (name, source_code, extra_compile_flags, expected_exit_code)
 # If expected_exit_code is None, we just check LCCC output == GCC output
+# Shared source for the packed-compare predicate matrix.  The AVX2 and
+# SSE2 entries below compile the SAME program at different ISA baselines
+# so the two emitter families (three-operand VEX vs two-operand legacy)
+# are held to one reference output and can never drift apart.
+_CMP_PREDICATE_MATRIX_SRC = r"""
+#include <stdio.h>
+#include <string.h>
+#define N 1033
+
+/* ---- 32-bit lanes, constant right-hand side ------------------------- */
+static void d_eq (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v==7  ? v+1000 : v-1000;}}
+static void d_ne (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v!=7  ? v+1000 : v-1000;}}
+static void d_lt (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<7   ? v+1000 : v-1000;}}
+static void d_le (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<=7  ? v+1000 : v-1000;}}
+static void d_gt (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v>7   ? v+1000 : v-1000;}}
+static void d_ge (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v>=7  ? v+1000 : v-1000;}}
+static void d_ultc(const unsigned*a,unsigned*b,int n){for(int i=0;i<n;i++){unsigned v=a[i];b[i]= v<3000000000u ? v+7u : v-7u;}}
+static void d_ulec(const unsigned*a,unsigned*b,int n){for(int i=0;i<n;i++){unsigned v=a[i];b[i]= v<=3000000000u ? v+7u : v-7u;}}
+/* the negation of a fused window: exercises `ne` on a mask-producing tree */
+static void d_nz (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v!=0 ? -v : v;}}
+
+/* ---- 32-bit lanes, two streams (both operands register-homed) ------- */
+static void s_eq (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]==c[i] ? a[i]+5 : c[i]-5;}}
+static void s_ne (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]!=c[i] ? a[i]+5 : c[i]-5;}}
+static void s_lt (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]<c[i]  ? a[i]+5 : c[i]-5;}}
+static void s_le (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]<=c[i] ? a[i]+5 : c[i]-5;}}
+static void s_gt (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]>c[i]  ? a[i]+5 : c[i]-5;}}
+static void s_ge (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]>=c[i] ? a[i]+5 : c[i]-5;}}
+static void s_ult(const unsigned*a,const unsigned*c,unsigned*b,int n){for(int i=0;i<n;i++){b[i]= a[i]<c[i]  ? a[i]+5u : c[i]-5u;}}
+static void s_ule(const unsigned*a,const unsigned*c,unsigned*b,int n){for(int i=0;i<n;i++){b[i]= a[i]<=c[i] ? a[i]+5u : c[i]-5u;}}
+
+/* ---- 8-bit lanes, constant rhs (OP-05d byte demotion) --------------- */
+static void y_eq (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v==7  ? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+static void y_ne (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v!=7  ? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+static void y_lt (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v<200 ? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+static void y_le (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v<=200? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+static void y_gt (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v>200 ? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+static void y_ge (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v>=200? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+/* signed char: the signed byte compare path, negative constants */
+static void z_lt (const signed char*a,signed char*b,int n){for(int i=0;i<n;i++){signed char v=a[i];b[i]= v< -40 ? (signed char)(v+7) : (signed char)(v-7);}}
+static void z_le (const signed char*a,signed char*b,int n){for(int i=0;i<n;i++){signed char v=a[i];b[i]= v<=-40 ? (signed char)(v+7) : (signed char)(v-7);}}
+static void z_ne (const signed char*a,signed char*b,int n){for(int i=0;i<n;i++){signed char v=a[i];b[i]= v!=-40 ? (signed char)(v+7) : (signed char)(v-7);}}
+
+/* ---- 8-bit lanes, two streams --------------------------------------- */
+static void w_ne (const unsigned char*a,const unsigned char*c,unsigned char*b,int n){for(int i=0;i<n;i++){b[i]= a[i]!=c[i] ? a[i] : c[i];}}
+static void w_le (const unsigned char*a,const unsigned char*c,unsigned char*b,int n){for(int i=0;i<n;i++){b[i]= a[i]<=c[i] ? a[i] : c[i];}}
+
+static int ia[N], ic[N], ib[N];
+static unsigned ua[N], uc[N], ub[N];
+static unsigned char ya[N], yc[N], yb[N];
+static signed char za[N], zb[N];
+
+static unsigned h(const void*p,int bytes){const unsigned char*q=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=q[i];x*=16777619u;}return x;}
+
+int main(void){
+  unsigned s=20260908u;
+  for(int i=0;i<N;i++){
+    s=s*1664525u+1013904223u;
+    ia[i]=(int)(s%17)-8; ic[i]=(int)((s>>8)%17)-8;
+    ua[i]=s; uc[i]=s>>3;
+    ya[i]=(unsigned char)(i<256?i:s); yc[i]=(unsigned char)(s>>5);
+    za[i]=(signed char)(i<256?i:s);
+  }
+  /* pin the interesting points at low indices so short trip counts see them */
+  ia[0]=7; ia[1]=6; ia[2]=8; ia[3]=0; ia[4]=-1; ia[5]=-2147483647-1; ia[6]=2147483647;
+  ic[0]=7; ic[1]=7; ic[2]=-2147483647-1; ic[3]=2147483647;
+  ua[0]=0u; ua[1]=1u; ua[2]=2999999999u; ua[3]=3000000000u; ua[4]=3000000001u; ua[5]=4294967295u;
+  uc[0]=0u; uc[1]=4294967295u; uc[2]=3000000000u;
+  ya[0]=0; ya[1]=7; ya[2]=8; ya[3]=199; ya[4]=200; ya[5]=201; ya[6]=255;
+  yc[0]=0; yc[1]=7; yc[2]=255; yc[3]=200;
+  za[0]=-128; za[1]=-41; za[2]=-40; za[3]=-39; za[4]=0; za[5]=127;
+
+#define RUNI(f)  do{ memset(ib,0xAB,sizeof ib); f(ia,ib,N);        printf(#f " %08x\n", h(ib,sizeof ib)); }while(0)
+#define RUNU(f)  do{ memset(ub,0xAB,sizeof ub); f(ua,ub,N);        printf(#f " %08x\n", h(ub,sizeof ub)); }while(0)
+#define RUNS(f)  do{ memset(ib,0xAB,sizeof ib); f(ia,ic,ib,N);     printf(#f " %08x\n", h(ib,sizeof ib)); }while(0)
+#define RUNSU(f) do{ memset(ub,0xAB,sizeof ub); f(ua,uc,ub,N);     printf(#f " %08x\n", h(ub,sizeof ub)); }while(0)
+#define RUNY(f)  do{ memset(yb,0xAB,sizeof yb); f(ya,yb,N);        printf(#f " %08x\n", h(yb,sizeof yb)); }while(0)
+#define RUNZ(f)  do{ memset(zb,0xAB,sizeof zb); f(za,zb,N);        printf(#f " %08x\n", h(zb,sizeof zb)); }while(0)
+#define RUNW(f)  do{ memset(yb,0xAB,sizeof yb); f(ya,yc,yb,N);     printf(#f " %08x\n", h(yb,sizeof yb)); }while(0)
+
+  RUNI(d_eq); RUNI(d_ne); RUNI(d_lt); RUNI(d_le); RUNI(d_gt); RUNI(d_ge); RUNI(d_nz);
+  RUNU(d_ultc); RUNU(d_ulec);
+  RUNS(s_eq); RUNS(s_ne); RUNS(s_lt); RUNS(s_le); RUNS(s_gt); RUNS(s_ge);
+  RUNSU(s_ult); RUNSU(s_ule);
+  RUNY(y_eq); RUNY(y_ne); RUNY(y_lt); RUNY(y_le); RUNY(y_gt); RUNY(y_ge);
+  RUNZ(z_lt); RUNZ(z_le); RUNZ(z_ne);
+  RUNW(w_ne); RUNW(w_le);
+
+  /* Trip-count sweep: packed body, scalar remainder, empty loop -- for one
+     kernel of every emitter path (dword const / dword stream / byte const /
+     byte stream / signed byte / unsigned biased). */
+  for(int n=0;n<=40;n++){
+    memset(ib,0xAB,sizeof ib); d_ne(ia,ib,n);      printf("t%d.a %08x\n", n, h(ib,n*4));
+    memset(ib,0xAB,sizeof ib); s_le(ia,ic,ib,n);   printf("t%d.b %08x\n", n, h(ib,n*4));
+    memset(yb,0xAB,sizeof yb); y_ne(ya,yb,n);      printf("t%d.c %08x\n", n, h(yb,n));
+    memset(yb,0xAB,sizeof yb); w_le(ya,yc,yb,n);   printf("t%d.d %08x\n", n, h(yb,n));
+    memset(zb,0xAB,sizeof zb); z_ne(za,zb,n);      printf("t%d.e %08x\n", n, h(zb,n));
+    memset(ub,0xAB,sizeof ub); d_ulec(ua,ub,n);    printf("t%d.f %08x\n", n, h(ub,n*4));
+  }
+  return 0;
+}
+"""
+
 TESTS = [
     # ── Integer edge cases ──────────────────────────────────────────────
     ("int_overflow_signed", r'''
@@ -998,6 +1101,48 @@ int main(void){
     # scratch-collision miscompile (a C-row home in %rsi clobbered by the
     # spilled j-offset's fixed %rsi reload → `vmovupd (%rsi,%rsi)`,
     # segfault at 2*j; see engineering/FOLLOWUP-2026-09-08-S04 §4).
+    # ── Packed integer COMPARE PREDICATE MATRIX (emit_int_cmp contract).
+    #
+    # x86 has only `pcmpeq` and `pcmpgt` below AVX-512, so `emit_int_cmp`
+    # synthesises the other predicates: `le`/`ne` need an inversion against
+    # an all-ones vector, and the unsigned forms need a sign-biased copy of
+    # BOTH operands.  Each of those is a separate emitter path, and each path
+    # exists twice more -- once for 32-bit lanes and once for the 8-bit lanes
+    # of OP-05d, and once again for the register-to-register "all-homed"
+    # three-operand VEX form versus the %ymm0/%ymm1 staging form.
+    #
+    # This case pins every cell of that matrix.  It is not decoration: the
+    # all-homed fast path shipped guarded by `(eq || !invert)` where it
+    # needed `!invert`, so `ne` (which is `eq` PLUS an inversion) fell into
+    # the `eq` arm and emitted a bare `vpcmpeqd`.  `v != 0 ? -v : v` then
+    # computed `v == 0 ? -v : v`.  Every one of the 720 regression tests
+    # passed, because none of them used a `!=` mask on a vectorizable map at
+    # AVX2.
+    #
+    # Coverage per lane width: the six predicates the vectorizer can emit
+    # (eq, ne, lt.s, le.s, and the unsigned lt/le that reach the biased
+    # path), each in BOTH operand orders (so the `gt`/`ge` normalisation
+    # swap is exercised), each against a loop-invariant constant AND against
+    # a second stream (a second stream keeps both compare operands in
+    # registers, which is what selects the all-homed path).  Both arms of
+    # every select are distinguishable, so a dropped inversion changes the
+    # hash rather than cancelling out.
+    #
+    # Data covers the signed extremes, zero, +-1, and the unsigned wrap
+    # boundary, so a predicate that is only wrong on one side of the sign
+    # bit still shows up.  The n=0..40 sweep runs each kernel through the
+    # packed body, the scalar remainder and the empty loop.
+    ("vectorize_cmp_predicate_matrix", _CMP_PREDICATE_MATRIX_SRC,
+     ["-O3", "-march=x86-64-v3"], None),
+
+    # Same matrix at the SSE2 baseline: the 128-bit emitter is a separate
+    # code path (two-operand forms, `pcmpeq`/`pcmpgt` with an in-place
+    # destination, `movdqa` staging) and has its own inversion and
+    # sign-bias sequences.  VF is 4/16 instead of 8/32, so the remainder
+    # sweep also lands on different boundaries.
+    ("vectorize_cmp_predicate_matrix_sse2", _CMP_PREDICATE_MATRIX_SRC,
+     ["-O3", "-march=x86-64"], None),
+
     ("vectorize_fma_remainder_257", r"""
 #include <stdio.h>
 #include <string.h>

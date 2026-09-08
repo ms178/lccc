@@ -36,6 +36,44 @@ The benchmark corpus contains **39 deterministic workloads** (33 historical + 6 
 - **Aggregate LCCC / GCC Geometric Mean:** **`0.8598`** (LCCC faster overall than GCC 14.2 across the 39 benchmarks).
 - **Aggregate LCCC / Fastest Ref Geometric Mean:** **`0.8936`**.
 - **Correctness:** **39 / 39 (100%)** bit-identical to reference compilers.
+- 2026-09-08 re-measurement after OP-05c/OP-05d (`--reps 3`, so indicative
+  rather than certified — re-run at `--reps 7+` on a quiesced machine before
+  quoting): LCCC/GCC geometric mean **`0.7597`**, correctness still 39/39.
+
+### Elementwise map lowering — hot-loop density (2026-09-08)
+
+Loop kernels must be ranked by **steady-state instructions per input byte**
+(`scripts/hot_loop_metric.py`), never by `codegen_oracle.py`'s static
+whole-function `insns` column: a compiler that refuses to vectorize emits
+one tight scalar loop and "wins" that column while doing 32× less work per
+instruction.  `/home/user/work/casefold.c`, `-O3 -march=x86-64-v3`:
+
+| kernel | LCCC | GCC 16.2 | Clang 23.1 | ICC | ICX |
+|---|---|---|---|---|---|
+| `fold_lower` | **0.2812** (9 / 32 B) | 1.2500 | 0.2422 (4× unrolled) | 2.0000 | 0.6250 |
+| `fold_upper` | **0.2812** | 1.2500 | 0.2422 (4× unrolled) | 1.3750 | 0.6250 |
+| `clamp_bytes` | **0.1875** (6 / 32 B) | 0.1875 | 0.1172 (4× unrolled) | 0.4375 | 0.3750 |
+| `classify_alpha` | **0.2500** (8 / 32 B, was scalar) | 0.3125 | 0.2109 (4× unrolled) | 4.2500 | 0.5625 |
+| `short` clamp (16-bit) | **0.2188** (7 / 32 B) | — | — | — | — |
+| `int` clamp (32-bit) | **0.2188** (7 / 32 B) | — | — | — | — |
+
+LCCC beats every non-unrolled competitor on every kernel: 2.2× vs ICX and
+4.4× vs GCC on the case folds, 2.3× vs ICX and 1.25× vs GCC on the
+classifier, 2.0× vs ICX and level with GCC on the clamp.  Clang's remaining
+lead everywhere is 4× unrolling of identical per-element work — the single
+open item (follow-up doc TODO 3.1), projected to flip the case fold and the
+classifier once done.
+
+**Measure loop kernels with `scripts/hot_loop_metric.py`, and run
+`scripts/ci_local.sh` before every push** — it mirrors all sixteen gates of
+the `test`, `bench` and `clippy` jobs.  Two CI failures this program were
+caused by validating against a subset: an AVX2 `!=` mask miscompile that only
+the differential oracle saw, and a +24% instruction-count regression that
+only the codegen-quality gate (in `bench.yml`, not `ci.yml`) saw.
+
+The `isalpha` classifier now lowers to three packed instructions
+(`vpor` c|32, `vpaddb` bias, `vpcmpgtb`) via the single-bit window union plus
+the range fusion; it used to be a scalar loop.
 
 ---
 
