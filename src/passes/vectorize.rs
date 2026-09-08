@@ -3663,6 +3663,20 @@ enum MapExpr {
         l: Box<MapExpr>,
         r: Box<MapExpr>,
     },
+    /// Lane-mask conjunction (`&&`) / disjunction (`||`) of two compare
+    /// masks — the if-converted shape of a short-circuit condition feeding a
+    /// ternary: `c1 ? (c2 ? t : f) : f` with a shared false arm folds to
+    /// `Select(MaskConj(and, c1, c2), t, f)` (shared TRUE arm → `or`).
+    /// Integer dword lanes only (the mask AND/OR reuses the packed integer
+    /// And/Or the arithmetic path already emits). Both sides are compares or
+    /// nested conjunctions — side-effect-free by construction, so the
+    /// non-short-circuit AND/OR is exact. Emitted as one blendv over the
+    /// combined mask instead of two chained blends.
+    MaskConj {
+        is_and: bool,
+        l: Box<MapExpr>,
+        r: Box<MapExpr>,
+    },
 }
 
 impl MapExpr {
@@ -3674,6 +3688,7 @@ impl MapExpr {
             MapExpr::Cmp(_, l, r) => 1 + l.node_count() + r.node_count(),
             MapExpr::Select(c, t, f) => 1 + c.node_count() + t.node_count() + f.node_count(),
             MapExpr::MinMax { l, r, .. } => 1 + l.node_count() + r.node_count(),
+            MapExpr::MaskConj { l, r, .. } => 1 + l.node_count() + r.node_count(),
         }
     }
 }
@@ -3791,6 +3806,22 @@ impl<'a> MapEmitCtx<'a> {
                     op: blendv_op,
                     dest_ptr: None,
                     args: vec![Operand::Value(fv), Operand::Value(tv), Operand::Value(cv)],
+                });
+                Some(dest)
+            }
+            MapExpr::MaskConj { is_and, l, r } => {
+                // Both children emit compare masks (all-ones / all-zeros per
+                // lane); AND/OR of masks is the lane-exact && / ||.
+                let lv = self.emit(l)?;
+                let rv = self.emit(r)?;
+                let mask_op = if *is_and { &IrBinOp::And } else { &IrBinOp::Or };
+                let vec_op = (self.bin_op)(mask_op)?;
+                let dest = self.fresh();
+                self.vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: vec_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(lv), Operand::Value(rv)],
                 });
                 Some(dest)
             }
@@ -4232,7 +4263,12 @@ fn analyze_map_pattern(
         }
         parsed?
     };
-    const MAP_MAX_NODES: usize = 12;
+    // 16 admits the recovered `&&`/`||` mask shapes (a two-compare
+    // range-fold ternary parses to exactly 12 nodes; a three-condition
+    // chain to 16) while still bounding pathological trees. The budget
+    // guards compile time only: the emit cache is a linear scan, so cost
+    // is O(nodes^2) with a trivially small constant.
+    const MAP_MAX_NODES: usize = 16;
     if expr.node_count() > MAP_MAX_NODES {
         set_reject("map expression tree too large");
         return None;
@@ -4780,6 +4816,42 @@ fn parse_map_expr(
             if !matches!(cond_expr, MapExpr::Cmp(_, _, _)) {
                 return None;
             }
+            // Short-circuit condition recovery: if_convert lowers
+            // `(c1 && c2) ? t : f` into NESTED selects over the shared arm —
+            // `c1 ? (c2 ? t : f) : f` — and `(c1 || c2) ? t : f` into
+            // `c1 ? t : (c2 ? t : f)`. Recover the single-blend form: one
+            // AND/OR-combined mask, one blendv (the SSE2-oracle lowering —
+            // GCC's `pand` + one `pblendvb`), instead of two chained blends.
+            // Hand-written selects with the same shared-arm shape are
+            // semantically identical, so the fold needs no provenance check.
+            let is_mask =
+                |e: &MapExpr| matches!(e, MapExpr::Cmp(_, _, _) | MapExpr::MaskConj { .. });
+            if let MapExpr::Select(inner_cond, inner_t, inner_f) = &t {
+                if is_mask(inner_cond) && is_mask(&cond_expr) && **inner_f == f {
+                    return Some(MapExpr::Select(
+                        Box::new(MapExpr::MaskConj {
+                            is_and: true,
+                            l: Box::new(cond_expr),
+                            r: inner_cond.clone(),
+                        }),
+                        inner_t.clone(),
+                        Box::new(f),
+                    ));
+                }
+            }
+            if let MapExpr::Select(inner_cond, inner_t, inner_f) = &f {
+                if is_mask(inner_cond) && is_mask(&cond_expr) && **inner_t == t {
+                    return Some(MapExpr::Select(
+                        Box::new(MapExpr::MaskConj {
+                            is_and: false,
+                            l: Box::new(cond_expr),
+                            r: inner_cond.clone(),
+                        }),
+                        Box::new(t),
+                        inner_f.clone(),
+                    ));
+                }
+            }
             Some(MapExpr::Select(
                 Box::new(cond_expr),
                 Box::new(t),
@@ -4859,6 +4931,12 @@ fn map_tree_ops_available(
                 && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
                 && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
         }
+        MapExpr::MaskConj { is_and, l, r } => {
+            // The mask AND/OR rides the packed integer And/Or op table.
+            bin_op(if *is_and { &IrBinOp::And } else { &IrBinOp::Or }).is_some()
+                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+        }
     }
 }
 
@@ -4869,6 +4947,9 @@ fn expr_uses_stream(expr: &MapExpr, stream: usize) -> bool {
         MapExpr::BinOp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
         MapExpr::Sqrt(x) => expr_uses_stream(x, stream),
         MapExpr::Cmp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
+        MapExpr::MaskConj { l, r, .. } => {
+            expr_uses_stream(l, stream) || expr_uses_stream(r, stream)
+        }
         MapExpr::Select(c, t, f) => {
             expr_uses_stream(c, stream)
                 || expr_uses_stream(t, stream)
@@ -8585,6 +8666,16 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
         return 0;
     }
 
+    // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
+    // remainder must be able to reference every base with a dominating
+    // definition (see fma_remainder_references_sound).
+    if !fma_remainder_references_sound(func, pattern) {
+        if debug {
+            eprintln!("[VEC] remainder references not dominance-safe; skipping loop");
+        }
+        return 0;
+    }
+
     // Keep track of the next available Value and BlockId
     let mut next_val_id = func.next_value_id;
     let mut next_label = func.next_label;
@@ -9187,6 +9278,16 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     let mut changes = 0;
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
+
+    // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
+    // remainder must be able to reference every base with a dominating
+    // definition (see fma_remainder_references_sound).
+    if !fma_remainder_references_sound(func, pattern) {
+        if debug {
+            eprintln!("[VEC] remainder references not dominance-safe; skipping loop");
+        }
+        return 0;
+    }
 
     // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
     // remainder must be able to reference every base with a dominating
@@ -9904,8 +10005,9 @@ enum RemainderRefPlan {
     UseOriginal(Value),
     /// The definition lies inside the loop but is a pure, non-trapping,
     /// loop-invariant chain (`GlobalAddr` / `LabelAddr` / `Copy` / `Cast` /
-    /// integer `Add/Sub/Mul/And/Or/Xor/Shl/AShr/LShr` over constants and
-    /// other such values). The chain is cloned into the vector-exit block,
+    /// `GetElementPtr` / integer `Add/Sub/Mul/And/Or/Xor/Shl/AShr/LShr`
+    /// over constants and other such values). The chain is cloned into the
+    /// vector-exit block,
     /// which dominates the whole remainder. `chain` items are in dependency
     /// order, each still naming its ORIGINAL dest and operands; the builder
     /// assigns fresh dests and rewrites in-chain operands.
@@ -10023,6 +10125,32 @@ fn plan_invariant_chain(
         Instruction::Copy { src, .. } => {
             plan_operand_chain(func, src, loop_blocks, chain, depth, done)?;
             chain.push((v, Instruction::Copy { dest: v, src: *src }));
+        }
+        Instruction::GetElementPtr {
+            base, offset, ty, ..
+        } => {
+            // `dest = base + offset` is pure address arithmetic: it cannot
+            // trap, has no side effects, and a clone recomputes the exact
+            // address on every path that reaches it. The matmul-style
+            // lowering materializes the row base (`&C[i]`) as an in-loop
+            // GEP over loop-invariant operands; without this arm the
+            // dominance gate declines the whole transform (missed FMA
+            // vectorization, observed 3.1x on matmul at -O2). Both
+            // operands are planned first so the chain stays deps-first.
+            match plan_remainder_reference_inner(func, *base, loop_blocks, depth + 1, done)? {
+                RemainderRefPlan::UseOriginal(_) => {}
+                RemainderRefPlan::Rematerialize { chain: more, .. } => chain.extend(more),
+            }
+            plan_operand_chain(func, offset, loop_blocks, chain, depth, done)?;
+            chain.push((
+                v,
+                Instruction::GetElementPtr {
+                    dest: v,
+                    base: *base,
+                    offset: *offset,
+                    ty: *ty,
+                },
+            ));
         }
         Instruction::Cast {
             src,
@@ -10144,6 +10272,14 @@ fn materialize_remainder_reference(
                         }
                     }
                 });
+                // `GetElementPtr::base` is a raw `Value`, not an `Operand`,
+                // so `for_each_operand_mut` never visits it; rewrite it
+                // against the same clone map by hand.
+                if let Instruction::GetElementPtr { base, .. } = &mut inst {
+                    if let Some(&nb) = clones.get(&base.0) {
+                        *base = nb;
+                    }
+                }
                 set_cloned_dest(&mut inst, fresh);
                 clones.insert(orig_dest.0, fresh);
                 result = fresh;
@@ -10154,7 +10290,7 @@ fn materialize_remainder_reference(
     }
 }
 
-/// Rename a cloned instruction's dest. The planner only emits the five
+/// Rename a cloned instruction's dest. The planner only emits the six
 /// pure shapes; any other instruction here is a planner/builder
 /// disagreement and must stop the build rather than mis-name a definition.
 fn set_cloned_dest(inst: &mut Instruction, dest: Value) {
@@ -10163,7 +10299,8 @@ fn set_cloned_dest(inst: &mut Instruction, dest: Value) {
         | Instruction::LabelAddr { dest: d, .. }
         | Instruction::Copy { dest: d, .. }
         | Instruction::Cast { dest: d, .. }
-        | Instruction::BinOp { dest: d, .. } => *d = dest,
+        | Instruction::BinOp { dest: d, .. }
+        | Instruction::GetElementPtr { dest: d, .. } => *d = dest,
         _ => unreachable!("set_cloned_dest: instruction shape the planner never emits"),
     }
 }
@@ -13746,6 +13883,11 @@ fn fold_int_minmax(expr: &MapExpr) -> MapExpr {
             // into abs(v) — a silent wrong answer (the subtrahend `v + 1`
             // is not `v`).
             if let MapExpr::Cmp(op, l, r) = &**cond {
+                // Exact abs fold, with the subtrahend CHECKED: `l < 0 ? -l
+                // : l` is max(l, -l) lane for lane ONLY when the true arm
+                // negates `l` itself. Matching `Sub(0, _)` by its lhs alone
+                // misfolds `v < 0 ? 0 - (v + 1) : v` into abs(v) — a silent
+                // wrong answer (the subtrahend `v + 1` is not `v`).
                 let is_neg_of = |e: &MapExpr, target: &MapExpr| {
                     matches!(
                         e,
@@ -14988,6 +15130,45 @@ fn emit_map_scalar_tree(
                 lhs,
                 rhs,
                 ty: pattern.elem_ty,
+            });
+            Some(Operand::Value(dest))
+        }
+        MapExpr::MaskConj { is_and, l, r } => {
+            // Non-short-circuit mirror of `c1 && c2` / `c1 || c2`: both
+            // sides are compares (side-effect-free by construction), so the
+            // bitwise AND/OR of the two 0/1 boolean values is exact.
+            // Compare results are zero-extended setcc values; the 32-bit
+            // AND/OR of two such values stays a clean 0/1.
+            let lv = emit_map_scalar_tree(
+                l,
+                src_bases,
+                pattern,
+                byte_offset.clone(),
+                remainder_insts,
+                next_val_id,
+            )?;
+            let rv = emit_map_scalar_tree(
+                r,
+                src_bases,
+                pattern,
+                byte_offset,
+                remainder_insts,
+                next_val_id,
+            )?;
+            let (Operand::Value(lv), Operand::Value(rv)) = (lv, rv) else {
+                return None;
+            };
+            let dest = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            remainder_insts.push(Instruction::BinOp {
+                dest,
+                op: if *is_and { IrBinOp::And } else { IrBinOp::Or },
+                lhs: Operand::Value(lv),
+                rhs: Operand::Value(rv),
+                ty: IrType::I32,
             });
             Some(Operand::Value(dest))
         }

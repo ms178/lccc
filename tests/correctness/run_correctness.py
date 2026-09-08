@@ -947,6 +947,74 @@ int main(void){
   return 0;
 }
 """, ["-O3", "-march=x86-64-v3"], None),
+
+    # ── Mask conjunction/disjunction in maps: `(c1 && c2) ? t : f` and
+    # `(c1 || c2) ? t : f` over compare masks fold to one packed And/Or
+    # of the two masks and a single blend, instead of two chained
+    # selects (two blends). Positive shapes: range fold (&& of two
+    # compares against constants), the || negated-range form, and eq||eq
+    # over lane values. Anti-shapes: `0-(v+1)` under an && (must not be
+    # abs-folded — the true arm is not the negation of the compared
+    # value), and a nested select whose arms are NOT shared (the fold
+    # must not fuse them; the result stays a plain nested select or the
+    # scalar mirror, either way bit-exact). The n=0..33 sweeps exercise
+    # the remainder-loop scalar mirrors of every shape.
+    ("vectorize_mask_conj", r"""
+#include <stdio.h>
+#include <string.h>
+static void t_range (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v>=65 && v<=90) ? v+32 : v;}}
+static void t_orneg  (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v<65 || v>90) ? v : v+32;}}
+static void t_eqor   (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v==32 || v==9) ? 45 : v;}}
+static void t_absin  (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v<0 && v<-1) ? 0-(v+1) : v;}}
+static void t_noshare(const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<10 ? (v<5 ? v+1 : v+2) : v+3;}}
+static void t_ornest (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v>0 || (v<-100 && v>-200)) ? v*2 : v;}}
+#define N 2051
+static int a[N]; static int b[N];
+static unsigned h(const void*p,int bytes){const unsigned char*q=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=q[i];x*=16777619u;}return x;}
+int main(void){
+  unsigned s=424242;
+  for(int i=0;i<N;i++){ s=s*1664525u+1013904223u; a[i]=(int)(s%251)-125; }
+  a[0]=64; a[1]=65; a[2]=90; a[3]=91; a[4]=32; a[5]=9; a[6]=45; a[7]=-2147483647-1; a[8]=2147483647; a[9]=0;
+  memset(b,0xAB,sizeof b); t_range(a,b,N); printf("range %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_orneg(a,b,N); printf("orneg %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_eqor(a,b,N); printf("eqor %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_absin(a,b,N); printf("absin %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_noshare(a,b,N); printf("noshare %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_ornest(a,b,N); printf("ornest %08x\n",h(b,sizeof b));
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_range(a,b,n); printf("r%d %08x\n",n,h(b,n*4)); }
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_orneg(a,b,n); printf("o%d %08x\n",n,h(b,n*4)); }
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_absin(a,b,n); printf("i%d %08x\n",n,h(b,n*4)); }
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_noshare(a,b,n); printf("x%d %08x\n",n,h(b,n*4)); }
+  return 0;
+}
+""", ["-O3", "-march=x86-64-v3"], None),
+
+    # ── FMA-transform remainder coverage: N=257/259 leave tail columns
+    # after the 4-wide vector loop; the scalar remainder must recompute
+    # the same row bases the vector body used (the remainder-reference
+    # planner rematerializes the in-loop GEP chain into the vector-exit
+    # block). Two instances in one program: the second covers the
+    # inlined-transform shape that exposed the FmaF64x4HoistedSIB
+    # scratch-collision miscompile (a C-row home in %rsi clobbered by the
+    # spilled j-offset's fixed %rsi reload → `vmovupd (%rsi,%rsi)`,
+    # segfault at 2*j; see engineering/FOLLOWUP-2026-09-08-S04 §4).
+    ("vectorize_fma_remainder_257", r"""
+#include <stdio.h>
+#include <string.h>
+static double C1[257][257], A1[257][257], B1[257][257];
+static double C2[259][259], A2[259][259], B2[259][259];
+static void mm1(void){ for (int i=0;i<257;i++) for (int k=0;k<257;k++) for (int j=0;j<257;j++) C1[i][j] += A1[i][k]*B1[k][j]; }
+static void mm2(void){ for (int i=0;i<259;i++) for (int k=0;k<259;k++) for (int j=0;j<259;j++) C2[i][j] += A2[i][k]*B2[k][j]; }
+static unsigned h(const void*p,int bytes){const unsigned char*q=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=q[i];x*=16777619u;}return x;}
+int main(void){
+  for(int i=0;i<257;i++) for(int j=0;j<257;j++){ A1[i][j]=(double)(((i*31+j*7)%13)-6); B1[i][j]=(double)(((i*5+j*11)%11)-5); C1[i][j]=(double)((i+j)%7); }
+  for(int i=0;i<259;i++) for(int j=0;j<259;j++){ A2[i][j]=(double)(((i*13+j*3)%17)-8); B2[i][j]=(double)(((i*7+j*5)%19)-9); C2[i][j]=(double)((i+2*j)%5); }
+  mm1(); mm2();
+  printf("m1 %08x\n", h(C1, sizeof C1));
+  printf("m2 %08x\n", h(C2, sizeof C2));
+  return 0;
+}
+""", ["-O2"], None),
 ]
 
 # Multi-file test (handled specially)
