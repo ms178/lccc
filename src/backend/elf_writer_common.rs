@@ -225,8 +225,17 @@ struct AlignMarker {
 
 #[derive(Clone, Debug)]
 enum AlignMarkerKind {
-    /// .balign N — pad to N-byte boundary.
-    Align(u32),
+    /// .balign N — pad to N-byte boundary. `fill`/`max_skip` mirror the
+    /// `AsmItem::Align` fields: an explicit non-`0x90` fill byte pads
+    /// verbatim, and a max-skip that the recomputed padding would exceed
+    /// suppresses the padding entirely (GAS `.p2align N,,M`). Both must be
+    /// re-evaluated here because jump relaxation shifts the offset this
+    /// marker lands on.
+    Align {
+        align: u64,
+        fill: Option<u8>,
+        max_skip: Option<u64>,
+    },
     /// .org label + offset — advance to a fixed position, filling with `fill`.
     ///
     /// `fill` is load-bearing: GAS pads `.org` with its fill byte (default 0)
@@ -938,7 +947,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             | AsmItem::OptionDirective(_)
             | AsmItem::Symver(_, _, _)
             | AsmItem::Empty
-            | AsmItem::Align(_)
+            | AsmItem::Align { .. }
             | AsmItem::Org(_, _, _) => {}
             _ => self.last_item_was_insn = false,
         }
@@ -1027,30 +1036,89 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
                 self.ensure_symbol(name, sec_idx, offset);
             }
-            AsmItem::Align(n) => {
+            AsmItem::Align {
+                align,
+                fill,
+                max_skip,
+            } => {
                 let after_insn = self.last_item_was_insn;
                 if let Some(sec_idx) = self.current_section {
                     let section = &mut self.sections[sec_idx];
-                    let align = *n as u64;
+                    let align = (*align).max(1);
+                    // GAS computes the alignment in signed arithmetic: an
+                    // exponent of 63 (or one clamped to it — negative or > 63
+                    // inputs warn and assume 63) makes 1<<63 negative
+                    // internally, so the alignment is neither recorded on the
+                    // section nor padded. A nonzero offset with such an
+                    // alignment errors on the jump-over-NOP reach instead
+                    // (verified: `.p2align 63` at offset 0 -> addralign 1;
+                    // `.byte 1; .p2align 63` -> error, binutils 2.47).
+                    if align >= 1u64 << 63 {
+                        if section.data.len() as u64 != 0 {
+                            return Err(format!(
+                                "jump over nop padding out of range (align {align})"
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    // GAS records the alignment on the section even when the
+                    // max-skip test then refuses to pad (binutils 2.44:
+                    // `.byte 1; .p2align 4,,1` -> no padding, addralign 16),
+                    // so the bump happens before the skip decision.
                     if align > section.alignment {
                         section.alignment = align;
                     }
                     let current = section.data.len() as u64;
-                    let aligned = (current + align - 1) & !(align - 1);
-                    let padding = (aligned - current) as usize;
-                    // Record alignment marker for post-relaxation fixup
-                    if padding > 0 && align > 1 {
+                    let aligned = current.div_ceil(align) * align;
+                    let mut padding = (aligned - current) as usize;
+                    if let Some(skip) = max_skip {
+                        if padding as u64 > *skip {
+                            padding = 0;
+                        }
+                    }
+                    // GAS refuses pathological alignment padding instead of
+                    // materializing it: executable sections cap at the
+                    // jump-over-NOP rel32 reach ("jump over nop padding out
+                    // of range"), data sections die on the fill. Padding that
+                    // cannot fit a 32-bit byte count is never legitimate in a
+                    // real object, so the writer rejects it uniformly.
+                    if padding as u64 > 0xFFFF_FFFF {
+                        return Err(format!(
+                            "alignment padding of {padding} bytes too large (align {align})"
+                        ));
+                    }
+                    // Record an alignment marker for post-relaxation fixup
+                    // whenever an alignment is requested — INCLUDING the
+                    // padding == 0 case. Jump relaxation only ever shrinks
+                    // code, which moves this offset DOWN and can turn a
+                    // satisfied alignment into one that needs padding; a
+                    // marker recorded only for material padding would leave
+                    // the label unaligned after relaxation (the same hazard
+                    // the `.org` path already documents at its recording
+                    // site). The fixup re-evaluates the max-skip decision
+                    // against the relaxed offset.
+                    if align > 1 {
                         section.align_markers.push(AlignMarker {
                             offset: current as usize,
                             padding,
-                            kind: AlignMarkerKind::Align(*n),
+                            kind: AlignMarkerKind::Align {
+                                align,
+                                fill: *fill,
+                                max_skip: *max_skip,
+                            },
                             after_insn,
                         });
                     }
                     let is_exec = section.flags & SHF_EXECINSTR != 0;
-                    section
-                        .data
-                        .extend_from_slice(&section_padding(padding, is_exec, after_insn));
+                    let pad_bytes = match fill {
+                        // 0x90 in an executable section keeps GAS's optimal
+                        // multi-byte NOP padding (tc-i386 treats the default
+                        // fill specially); any other byte pads verbatim.
+                        Some(f) if is_exec && *f != 0x90 => vec![*f; padding],
+                        Some(f) if !is_exec => vec![*f; padding],
+                        _ => section_padding(padding, is_exec, after_insn),
+                    };
+                    section.data.extend_from_slice(&pad_bytes);
                 }
             }
             AsmItem::Byte(vals) => {
@@ -3120,13 +3188,15 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 .clone();
 
             let needed_end = match &kind {
-                AlignMarkerKind::Align(align) => {
-                    let a = *align as usize;
+                AlignMarkerKind::Align { align, .. } => {
+                    let a = *align;
                     if a <= 1 {
                         marker_idx += 1;
                         continue;
                     }
-                    (current_offset + a - 1) & !(a - 1)
+                    // Overflow-safe round-up (an alignment of 2^63 from a
+                    // GAS-clamped exponent makes the mask form wrap).
+                    (current_offset as u64).div_ceil(a) * a
                 }
                 AlignMarkerKind::Org {
                     label,
@@ -3134,10 +3204,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     fill: _,
                 } => {
                     if label.is_empty() {
-                        *addend as usize
+                        *addend as u64
                     } else if let Some(&(l_sec, l_off)) = self.label_positions.get(label.as_str()) {
                         if l_sec == sec_idx {
-                            (l_off as i64 + *addend) as usize
+                            (l_off as i64 + *addend) as u64
                         } else {
                             marker_idx += 1;
                             continue;
@@ -3149,7 +3219,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
             };
 
-            let needed_padding = needed_end.saturating_sub(current_offset);
+            let mut needed_padding = needed_end.saturating_sub(current_offset as u64) as usize;
+            // Re-evaluate the max-skip against the RELAXED offset: the skip
+            // decision is a function of the padding actually required at the
+            // final layout, not the pre-relaxation one.
+            if let AlignMarkerKind::Align {
+                max_skip: Some(skip),
+                ..
+            } = &kind
+            {
+                if needed_padding as u64 > *skip {
+                    needed_padding = 0;
+                }
+            }
             let existing_padding = self.sections[sec_idx].align_markers[marker_idx].padding;
 
             if needed_padding != existing_padding {
@@ -3164,11 +3246,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let after_insn = self.sections[sec_idx].align_markers[marker_idx].after_insn;
                 // `.org` / org-style `.fill LABEL+N-.` pad with the fill
                 // byte, not multi-byte NOPs, even in an executable section.
+                // An `.align` with an explicit non-`0x90` fill byte pads
+                // verbatim (GAS tc-i386 keeps multi-byte NOPs only for the
+                // default/0x90 fill in executable sections).
                 let new_bytes = match &kind {
                     AlignMarkerKind::Org { fill, .. } => vec![*fill; needed_padding],
-                    AlignMarkerKind::Align(_) => {
-                        section_padding(needed_padding, is_exec, after_insn)
-                    }
+                    AlignMarkerKind::Align { fill, .. } => match fill {
+                        Some(f) if is_exec && *f != 0x90 => vec![*f; needed_padding],
+                        Some(f) if !is_exec => vec![*f; needed_padding],
+                        _ => section_padding(needed_padding, is_exec, after_insn),
+                    },
                 };
                 debug_assert_eq!(new_bytes.len(), needed_padding);
                 if old_end <= self.sections[sec_idx].data.len() {
