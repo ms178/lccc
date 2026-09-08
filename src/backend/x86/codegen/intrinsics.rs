@@ -17,6 +17,20 @@ use crate::backend::state::StackSlot;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
 
+/// Element width selector for the packed integer compare emitter.
+///
+/// x86 gives `pcmpeq`/`pcmpgt` a suffix per element width and provides NO
+/// unsigned form below AVX-512, so both widths share one implementation that
+/// differs only in the mnemonic suffix and in the per-lane sign-bias
+/// constant used to remap the unsigned order onto the signed one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum IntCmpLane {
+    /// 32-bit lanes: `pcmpeqd` / `pcmpgtd`, bias 0x8000_0000.
+    Dword,
+    /// 8-bit lanes: `pcmpeqb` / `pcmpgtb`, bias 0x80 in every byte.
+    Byte,
+}
+
 /// Mnemonic domain for the SSE2-baseline lane-mask select (see
 /// `emit_sse_blendv_128`): the FP payloads use the legacy PS/PD encodings
 /// (domain-matched), integer payloads use pand/pandn/por (integer domain,
@@ -3259,6 +3273,12 @@ impl X86Codegen {
                             let name = phys_reg_name_256(reg);
                             self.state
                                 .emit_fmt(format_args!("    vmovupd {}, %{}", mem, name));
+                            // A 256-bit load writes the full YMM: the upper
+                            // halves are dirty and the function epilogue owes
+                            // a `vzeroupper` (this arm used to skip the flag,
+                            // so a loop whose ONLY 256-bit op was a homed load
+                            // left the AVX-SSE transition penalty in place).
+                            self.state.dirty_upper_ymm = true;
                             self.state.vector_values.insert(d.0);
                             self.state.vec_live_regs.insert(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
@@ -3354,18 +3374,44 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecLoadI32x8 => {
-                // Defer-aware store; reuse register-allocated base/offset.
-                // Commit a pending deferred %ymm0 result before clobbering
-                // the scratch register (see VecLoadF64x4).  An optional
-                // third argument is a constant displacement (vec_interleave
-                // interleave slices), folded into the SIB operand.
-                self.flush_pending_vec_store_impl();
+                // Load straight into the destination's YMM home when it has
+                // one: the generic path stages through %ymm0 and pays a
+                // `vmovdqa` per iteration.  The FP twin (VecLoadF64x4) has
+                // always done this; the integer form had not, which cost one
+                // register copy in every integer map/reduction loop.
                 let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
-                self.state
-                    .emit_fmt(format_args!("    vmovdqu {}, %ymm0", mem));
+                let mut loaded_home = false;
+                if let Some(d) = dest {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let name = phys_reg_name_256(reg);
+                            self.state
+                                .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
+                            self.state.dirty_upper_ymm = true;
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(name);
+                            loaded_home = true;
+                        }
+                    }
+                }
+                if !loaded_home {
+                    // Defer-aware store; reuse register-allocated base/offset.
+                    // Commit a pending deferred %ymm0 result before clobbering
+                    // the scratch register (see VecLoadF64x4).  An optional
+                    // third argument is a constant displacement (vec_interleave
+                    // interleave slices), folded into the SIB operand.
+                    self.flush_pending_vec_store_impl();
+                    self.state
+                        .emit_fmt(format_args!("    vmovdqu {}, %ymm0", mem));
+                }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    self.avx_store_dest(d);
+                    if !loaded_home {
+                        self.avx_store_dest(d);
+                    }
                 }
             }
             IntrinsicOp::VecLoadI32x4 => {
@@ -3919,7 +3965,81 @@ impl X86Codegen {
             IntrinsicOp::VecCmpI32x8 | IntrinsicOp::VecCmpI32x4 => {
                 if let Some(d) = dest {
                     let avx2 = matches!(op, IntrinsicOp::VecCmpI32x8);
-                    self.emit_int_cmp(d, args, avx2);
+                    self.emit_int_cmp(d, args, avx2, IntCmpLane::Dword);
+                }
+            }
+            // ---- Byte-lane (I8/U8) map ops -------------------------------
+            //
+            // 32 elements per YMM instead of the 8 an `int`-promoted tree
+            // gets.  Each of these reuses the SAME defer-aware helper as its
+            // dword twin, so the all-homed three-operand VEX fast paths, the
+            // VLFOLD memory folding and the deferred-store discipline apply
+            // unchanged.
+            IntrinsicOp::VecCmpI8x32 | IntrinsicOp::VecCmpI8x16 => {
+                if let Some(d) = dest {
+                    let avx2 = matches!(op, IntrinsicOp::VecCmpI8x32);
+                    self.emit_int_cmp(d, args, avx2, IntCmpLane::Byte);
+                }
+            }
+            IntrinsicOp::VecAddI8x32 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpaddb", true);
+                }
+            }
+            IntrinsicOp::VecAddI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "paddb");
+                }
+            }
+            // Subtract is NON-commutative: `dest = src1 - src2`, and only the
+            // src2 slot may carry a folded memory operand.
+            IntrinsicOp::VecSubI8x32 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpsubb", false);
+                }
+            }
+            IntrinsicOp::VecSubI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "psubb");
+                }
+            }
+            // Unsigned byte min/max are SSE2 baseline instructions (unlike
+            // the dword forms, which need SSE4.1), so the byte clamp idiom
+            // lowers to two instructions on EVERY x86-64 target.
+            IntrinsicOp::VecMinU8x32 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpminub", true);
+                }
+            }
+            IntrinsicOp::VecMinU8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pminub");
+                }
+            }
+            IntrinsicOp::VecMaxU8x32 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpmaxub", true);
+                }
+            }
+            IntrinsicOp::VecMaxU8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pmaxub");
+                }
+            }
+            // `vpblendvb` consults the sign bit of EVERY BYTE; the dword
+            // blend (`vblendvps`) would smear one mask bit across four bytes
+            // and is therefore never a legal substitute here.
+            IntrinsicOp::VecBlendvI8x32 => {
+                if let Some(d) = dest {
+                    self.emit_avx_blendv_256(d, args, "vpblendvb");
+                }
+            }
+            // The 128-bit bitwise select `(t & m) | (f & ~m)` is exact for a
+            // byte mask as well (it is a per-BIT select), so the existing
+            // SSE2 lowering serves the byte width with no SSE4.1 dependency.
+            IntrinsicOp::VecBlendvI8x16 => {
+                if let Some(d) = dest {
+                    self.emit_sse_blendv_128_int(d, args);
                 }
             }
             IntrinsicOp::VecSqrtF64x4 | IntrinsicOp::VecSqrtF32x8 => {
@@ -5223,6 +5343,69 @@ impl X86Codegen {
             .map(|r| format!("%{}", phys_reg_name_256(r)))
     }
 
+    /// YMM home names for a whole operand list plus a destination, or `None`
+    /// if ANY of them is not register-homed.
+    ///
+    /// This is the admission test for the "all-homed" three-operand VEX fast
+    /// paths: when every source and the destination own an XMM family, the
+    /// operation can be computed register-to-register with no `%ymm0/%ymm1`
+    /// staging and no home-store copy at all.  Two properties make it sound:
+    ///
+    /// * `avx_store_dest` NEVER defers a register-homed destination -- it
+    ///   emits the `vmovdqa %ymm0, %ymmN` immediately -- so a homed value's
+    ///   home always holds its current contents.  There is no staleness
+    ///   window to check.
+    /// * A value whose load was elided into a pending VLFOLD memory operand
+    ///   has no materialised register contents, so it is rejected here and
+    ///   the caller's slow path materialises it.
+    ///
+    /// Returns the destination home last, so callers destructure
+    /// `[src.., dest]`.
+    fn all_vec_homes_256(&self, srcs: &[&Operand], dest: &Value) -> Option<Vec<String>> {
+        let pending_fold = self
+            .state
+            .pending_vec_memfold
+            .as_ref()
+            .map(|(pv, _, _)| *pv);
+        let mut out = Vec::with_capacity(srcs.len() + 1);
+        for s in srcs {
+            let Operand::Value(v) = s else {
+                return None;
+            };
+            if pending_fold == Some(v.0) {
+                return None;
+            }
+            out.push(self.vec_home_256(s)?);
+        }
+        if pending_fold == Some(dest.0) {
+            return None;
+        }
+        let &reg = self.reg_assignments.get(&dest.0)?;
+        if !is_xmm_reg(reg) {
+            return None;
+        }
+        out.push(format!("%{}", phys_reg_name_256(reg)));
+        Some(out)
+    }
+
+    /// Bookkeeping shared by every all-homed fast path: the destination now
+    /// lives in `dest_name` and no scratch staging is outstanding.
+    fn note_vec_dest_in_home(&mut self, dest: &Value, dest_name: &str) {
+        let name: &'static str = phys_reg_name_256(
+            self.reg_assignments
+                .get(&dest.0)
+                .copied()
+                .expect("all-homed fast path requires a destination home"),
+        );
+        debug_assert_eq!(format!("%{}", name), dest_name);
+        self.state.dirty_upper_ymm = true;
+        self.state.vec_live_regs.insert(dest.0, name);
+        self.state.vec_last_store_val = Some(dest.0);
+        self.state.vec_last_store_reg = true;
+        self.state.vec_last_store_reg_name = Some(name);
+        self.state.reg_cache.invalidate_acc();
+    }
+
     /// Same as `vec_home_256` with the XMM view (128-bit paths).
     fn vec_home_128(&self, arg: &Operand) -> Option<String> {
         let Operand::Value(v) = arg else {
@@ -5321,7 +5504,13 @@ impl X86Codegen {
     /// full-width .rodata constant through vpxor/pxor (both tolerate
     /// unaligned memory). le/ne invert the primary mask by xoring with an
     /// all-ones built in the (then dead) second scratch register.
-    pub(super) fn emit_int_cmp(&mut self, dest: &Value, args: &[Operand], avx2: bool) {
+    pub(super) fn emit_int_cmp(
+        &mut self,
+        dest: &Value,
+        args: &[Operand],
+        avx2: bool,
+        lane: IntCmpLane,
+    ) {
         assert!(args.len() == 3, "int cmp: expects lhs, rhs, predicate");
         let imm = match &args[2] {
             Operand::Const(c) => c.to_i64().unwrap_or(-1),
@@ -5330,8 +5519,46 @@ impl X86Codegen {
         let unsigned = matches!(imm, 5 | 6);
         let invert = matches!(imm, 2 | 4 | 6);
         let eq = matches!(imm, 0 | 4);
+        // Lane-derived spelling.  The dword and byte compares are the SAME
+        // algorithm -- only the mnemonic suffix and the sign-bias constant
+        // differ -- so they share one implementation instead of two copies
+        // that can drift (the unsigned bias is the subtle part: it must be
+        // the sign bit OF EACH LANE, i.e. 0x80 replicated per byte, not one
+        // 0x8000_0000 word).
+        let (sfx, bias_lane, bias_lane_bytes) = match lane {
+            IntCmpLane::Dword => ("d", 0x8000_0000u64, 4u8),
+            IntCmpLane::Byte => ("b", 0x8080_8080u64, 4u8),
+        };
         self.state.invalidate_vec_peephole();
         if avx2 {
+            // All-homed three-operand VEX form for the two predicates that
+            // need NO auxiliary register: `eq` (vpcmpeqd) and signed `lt`
+            // (vpcmpgtd with the operands in greater-side-first order).  The
+            // `le`/`ne` forms need an all-ones scratch for the inversion and
+            // the unsigned forms need a biased copy of both operands, so they
+            // keep the staging path.
+            //
+            // This is the predicate the unsigned range-mask fusion (OP-05c)
+            // emits, so the classifier idiom's compare costs exactly one
+            // instruction here instead of one compare plus two register
+            // copies.
+            if !unsigned && (eq || !invert) {
+                if let Some(homes) = self.all_vec_homes_256(&[&args[0], &args[1]], dest) {
+                    let (a, b, d) = (&homes[0], &homes[1], &homes[2]);
+                    if eq {
+                        self.state
+                            .emit_fmt(format_args!("    vpcmpeq{} {}, {}, {}", sfx, b, a, d));
+                    } else {
+                        // lt.s: dst = b > a, and AT&T `vpcmpgtd src2, src1, dst`
+                        // computes `src1 > src2`, so `b` is the FIRST source.
+                        self.state
+                            .emit_fmt(format_args!("    vpcmpgt{} {}, {}, {}", sfx, a, b, d));
+                    }
+                    self.note_vec_dest_in_home(dest, d);
+                    return;
+                }
+            }
+
             // b: RA home, or staged in the reserved second scratch.
             let b = match self.vec_home_256(&args[1]) {
                 Some(reg) => reg,
@@ -5348,7 +5575,7 @@ impl X86Codegen {
             //   le  wants !(a>b) ->  `vpcmpgtd b, a, dst` (then inverted)
             // eq is commutative and shares either orientation.
             if unsigned {
-                let bias = self.lane_const_rip_operand(0x8000_0000, 4, 32);
+                let bias = self.lane_const_rip_operand(bias_lane, bias_lane_bytes, 32);
                 // a' = a ^ bias in place; b' = b ^ bias into %ymm1 (a home
                 // is never written; a staged copy is this emitter's own
                 // private temporary, dead after the compare).
@@ -5358,27 +5585,27 @@ impl X86Codegen {
                     .emit_fmt(format_args!("    vpxor {}, {}, %ymm1", bias, b));
                 if eq {
                     self.state
-                        .emit_fmt(format_args!("    vpcmpeqd %ymm1, %ymm0, %ymm0"));
+                        .emit_fmt(format_args!("    vpcmpeq{} %ymm1, %ymm0, %ymm0", sfx));
                 } else if invert {
                     // le.u: !(a' > b')  [src1 = a' = %ymm0]
                     self.state
-                        .emit_fmt(format_args!("    vpcmpgtd %ymm1, %ymm0, %ymm0"));
+                        .emit_fmt(format_args!("    vpcmpgt{} %ymm1, %ymm0, %ymm0", sfx));
                 } else {
                     // lt.u: b' > a'  [src1 = b' = %ymm1]
                     self.state
-                        .emit_fmt(format_args!("    vpcmpgtd %ymm0, %ymm1, %ymm0"));
+                        .emit_fmt(format_args!("    vpcmpgt{} %ymm0, %ymm1, %ymm0", sfx));
                 }
             } else if eq {
                 self.state
-                    .emit_fmt(format_args!("    vpcmpeqd {}, %ymm0, %ymm0", b));
+                    .emit_fmt(format_args!("    vpcmpeq{} {}, %ymm0, %ymm0", sfx, b));
             } else if invert {
                 // le.s: !(a > b)  [src1 = a = %ymm0]
                 self.state
-                    .emit_fmt(format_args!("    vpcmpgtd {}, %ymm0, %ymm0", b));
+                    .emit_fmt(format_args!("    vpcmpgt{} {}, %ymm0, %ymm0", sfx, b));
             } else {
                 // lt.s: b > a  [src1 = b, src2 = a = %ymm0]
                 self.state
-                    .emit_fmt(format_args!("    vpcmpgtd %ymm0, {}, %ymm0", b));
+                    .emit_fmt(format_args!("    vpcmpgt{} %ymm0, {}, %ymm0", sfx, b));
             }
             if invert {
                 self.state
@@ -5410,7 +5637,7 @@ impl X86Codegen {
             };
             self.sse_load_arg(dst_arg, "xmm0");
             if unsigned {
-                let bias = self.lane_const_rip_operand(0x8000_0000, 4, 16);
+                let bias = self.lane_const_rip_operand(bias_lane, bias_lane_bytes, 16);
                 // Bias both: the dst in place, the src into %xmm1.
                 self.state
                     .emit_fmt(format_args!("    pxor {}, %xmm0", bias));
@@ -5423,16 +5650,29 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    pxor {}, %xmm1", bias));
                 }
-                let mn = if eq { "pcmpeqd" } else { "pcmpgtd" };
+                let mn = if eq {
+                    format!("pcmpeq{sfx}")
+                } else {
+                    format!("pcmpgt{sfx}")
+                };
                 self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", mn));
             } else {
-                let mn = if eq { "pcmpeqd" } else { "pcmpgtd" };
+                let mn = if eq {
+                    format!("pcmpeq{sfx}")
+                } else {
+                    format!("pcmpgt{sfx}")
+                };
                 // %xmm0 holds the greater-side operand (b for lt, a for
                 // le); the src is the other side: dst > src.
                 self.state
                     .emit_fmt(format_args!("    {} {}, %xmm0", mn, src));
             }
             if invert {
+                // `pcmpeqd %r, %r` is the canonical all-ones idiom and is
+                // lane-agnostic: every lane compares equal to itself, so the
+                // result is all-ones whatever the element width.  No byte
+                // spelling is needed (and `pcmpeqd` is the form the
+                // microarchitecture recognises as a zeroing/ones idiom).
                 self.state
                     .emit_fmt(format_args!("    pcmpeqd %xmm1, %xmm1"));
                 self.state.emit_fmt(format_args!("    pxor %xmm1, %xmm0"));
@@ -5460,6 +5700,19 @@ impl X86Codegen {
         }
         let mask_home = self.vec_home_256(&args[2]);
         let true_home = self.vec_home_256(&args[1]);
+        // All-homed three-operand VEX form: `blendv %mask, %true, %false, %dst`
+        // with zero staging.  This is the shape the conditional-map vectorizer
+        // produces once its compare and both arms are register-allocated; the
+        // generic path below would spend a `vmovdqa` moving the false arm into
+        // %ymm0 and another moving the result back out, i.e. two register
+        // copies per loop iteration on the critical path.
+        if let Some(homes) = self.all_vec_homes_256(&[&args[0], &args[1], &args[2]], dest) {
+            let (f, t, m, d) = (&homes[0], &homes[1], &homes[2], &homes[3]);
+            self.state
+                .emit_fmt(format_args!("    {} {}, {}, {}, {}", inst, m, t, f, d));
+            self.note_vec_dest_in_home(dest, d);
+            return;
+        }
         // The false vector streams through %ymm0 (src1 of vblendv) and is
         // loaded exactly once per arm.  Its load is also what commits any
         // unrelated pending deferred store before a memory source below

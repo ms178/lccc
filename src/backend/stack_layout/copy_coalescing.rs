@@ -1590,6 +1590,14 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
         op,
         O::Pcmpeqb128
             | O::Pcmpeqd128
+            // Byte-lane SSE map ops are two-operand forms
+            // (`paddb`/`psubb`/`pminub`/`pmaxub`), so a deferred load in
+            // %xmm0 folds into the destination operand exactly like the
+            // dword twins below.
+            | O::VecAddI8x16
+            | O::VecSubI8x16
+            | O::VecMinU8x16
+            | O::VecMaxU8x16
             | O::Psubusb128
             | O::Psubsb128
             | O::Por128
@@ -1669,6 +1677,15 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // made the vectorized find_max SLOWER than scalar).
             | O::VecMaxI32x8
             | O::VecMinI32x8
+            // Byte-lane arithmetic mirrors the dword policy above: the
+            // AVX2 forms fold a deferred load into the three-operand VEX
+            // encoding.  Cmp/Blendv are deliberately absent (like their
+            // dword twins) because their emitters read every operand
+            // through the register cache, never raw from a slot.
+            | O::VecAddI8x32
+            | O::VecSubI8x32
+            | O::VecMinU8x32
+            | O::VecMaxU8x32
             | O::VecBroadcastI32x8
             | O::VecBroadcastF32x8
             | O::VecMulF32x8
@@ -1694,7 +1711,20 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
         op,
-        O::VecLoadF64x2
+        // Byte-lane map ops (OP-05d) all define a vector SSA value.
+        O::VecAddI8x32
+            | O::VecSubI8x32
+            | O::VecCmpI8x32
+            | O::VecMinU8x32
+            | O::VecMaxU8x32
+            | O::VecBlendvI8x32
+            | O::VecAddI8x16
+            | O::VecSubI8x16
+            | O::VecCmpI8x16
+            | O::VecMinU8x16
+            | O::VecMaxU8x16
+            | O::VecBlendvI8x16
+            | O::VecLoadF64x2
             | O::VecLoadF64x4
             | O::VecLoadI32x4
             | O::VecLoadI32x8
@@ -1945,6 +1975,12 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         // packed min/max contract above.
         O::VecAndI32x8 | O::VecOrI32x8 | O::VecXorI32x8 => Some(true),
         O::VecSubI32x8 => Some(false),
+        // Byte lanes: `vpaddb` and the unsigned byte min/max are
+        // commutative (integer min/max has none of the FP
+        // unordered/signed-zero asymmetry, so either operand may carry
+        // the folded memory source); `vpsubb` is `src1 - src2`.
+        O::VecAddI8x32 | O::VecMinU8x32 | O::VecMaxU8x32 => Some(true),
+        O::VecSubI8x32 => Some(false),
         _ => None,
     }
 }
