@@ -1154,6 +1154,10 @@ mod tests {
         // Values: 0..7 params/consts are referenced by ids below.
         // 1 = a base ptr, 2 = b base ptr, 3 = n (I32), 4 = zero vec,
         // 5 = acc phi, 6 = iv phi, 7 = limit, 8 = cast64, 9 = fma, 10 = iv+32.
+        // The base pointers and the trip count are DEFINED in the entry
+        // block: the verifier's def-dominates-use check requires every
+        // referenced value to have a definition (the old fixture only
+        // alluded to them in a comment).
         let mut f = IrFunction::new("dot".to_string(), IrType::F64, vec![], false);
         let e = BlockId(0);
         let h = BlockId(1);
@@ -1161,12 +1165,26 @@ mod tests {
         let x = BlockId(3);
         f.blocks.push(BasicBlock {
             label: e,
-            instructions: vec![Instruction::Intrinsic {
-                dest: Some(Value(4)),
-                op: IntrinsicOp::VecZeroF64x4,
-                dest_ptr: None,
-                args: vec![],
-            }],
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "a".to_string(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(2),
+                    name: "b".to_string(),
+                },
+                Instruction::Copy {
+                    dest: Value(3),
+                    src: Operand::Const(IrConst::I32(4096)),
+                },
+                Instruction::Intrinsic {
+                    dest: Some(Value(4)),
+                    op: IntrinsicOp::VecZeroF64x4,
+                    dest_ptr: None,
+                    args: vec![],
+                },
+            ],
             terminator: Terminator::Branch(h),
             source_spans: Vec::new(),
         });

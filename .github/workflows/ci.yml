@@ -105,6 +105,16 @@ jobs:
             -j 2 \
             --json regression-results.json 2>&1 | tee regression-results.log
 
+      # Correctness gate over the benchmark corpus (INF-BENCHGATE-1): the
+      # workload-derived kernels are the largest programs in the tree and
+      # exercise loop shapes the regression corpus does not. An IV-widening
+      # miscompile once passed all 563 regression tests and only this
+      # compile-run-diff oracle (no timing, ~minutes) caught it. Compare
+      # every kernel against GCC at -O0/-O1/-O2/-O3: a level-specific
+      # miscompile is still a miscompile.
+      - name: Benchmark output gate (workload kernels vs GCC oracle)
+        run: bash scripts/check_benchmark_outputs.sh
+
       # The result artifact is retained already, but GitHub's public job view
       # hides raw logs/artifacts from anonymous triage. Turn each result into a
       # normal check annotation so the failing test and phase stay visible.

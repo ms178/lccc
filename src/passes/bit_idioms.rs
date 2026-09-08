@@ -39,8 +39,44 @@ fn peel(mut op: Operand, defs: &[Option<Instruction>]) -> Operand {
     op
 }
 
+/// Peel through `Copy` chains only.  The generic `peel` also crosses
+/// integer casts, which is correct only for matchers whose operation is
+/// cast-transparent.  A rotate is not: its two halves must consume the SAME
+/// SSA value at the SAME width, and `zext(x)`/`sext(x)`/`trunc(x)` are all
+/// different values even though they peel to the same root.  Matching a
+/// `(zext(x) << n) | (sext(x) >> (W - n))` as a rotate of `x` silently drops
+/// the extension half and miscompiles (observed: `(z << 16) | ((uint32_t)s
+/// >> 16)` with `z = (uint32_t)(uint8_t)a`, `s = (int32_t)(int8_t)a` folded
+/// to `rol a, 16`, losing the `0xffff` sign half).
+fn peel_copies(mut op: Operand, defs: &[Option<Instruction>]) -> Operand {
+    for _ in 0..32 {
+        let Operand::Value(v) = op else { break };
+        match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::Copy { src, .. }) => op = *src,
+            _ => break,
+        }
+    }
+    op
+}
+
 fn same(a: Operand, b: Operand, defs: &[Option<Instruction>]) -> bool {
     match (peel(a, defs), peel(b, defs)) {
+        (Operand::Value(a), Operand::Value(b)) => a == b,
+        (Operand::Const(a), Operand::Const(b)) => a.to_i128() == b.to_i128(),
+        _ => false,
+    }
+}
+
+/// Value identity: both operands must name the SAME SSA value, modulo
+/// `Copy` chains.  Unlike `same`, this does NOT cross integer casts --
+/// `zext(x)`, `sext(x)` and `trunc(x)` all peel to `x` but are different
+/// values, and an idiom whose halves (or whose input and its uses) run
+/// through different casts is not the idiom.  Every identity check in the
+/// matchers below that guards a VALUE uses this; cast-peeling remains
+/// correct only where constants or shift AMOUNTS are extracted (amounts are
+/// taken modulo the width, so a cast of a small count is harmless).
+fn same_value(a: Operand, b: Operand, defs: &[Option<Instruction>]) -> bool {
+    match (peel_copies(a, defs), peel_copies(b, defs)) {
         (Operand::Value(a), Operand::Value(b)) => a == b,
         (Operand::Const(a), Operand::Const(b)) => a.to_i128() == b.to_i128(),
         _ => false,
@@ -97,9 +133,9 @@ fn shift_any(
     opnd: Operand,
     wanted: IrBinOp,
     defs: &[Option<Instruction>],
-) -> Option<(Operand, Operand)> {
-    let (lhs, rhs, _) = binop(opnd, wanted, defs)?;
-    Some((lhs, rhs))
+) -> Option<(Operand, Operand, IrType)> {
+    let (lhs, rhs, ty) = binop(opnd, wanted, defs)?;
+    Some((lhs, rhs, ty))
 }
 
 /// Is `opnd` the expression `width - other`?  The complementary half of a
@@ -170,23 +206,36 @@ fn match_rotate(
         return None;
     }
 
-    // The two halves in either `Or` order.
-    let (shl, lshr) = match (
-        shift_any(a, IrBinOp::Shl, defs),
-        shift_any(b, IrBinOp::LShr, defs),
-    ) {
-        (Some(shl), Some(lshr)) => (shl, lshr),
-        _ => match (
-            shift_any(b, IrBinOp::Shl, defs),
-            shift_any(a, IrBinOp::LShr, defs),
+    // The two halves in either `Or` order.  Each shift must run at the
+    // OR's own width: `binop` peels the OR's operands through casts before
+    // matching the shift defs, and a shift found that way (e.g. a u32 shift
+    // widened by `(uint64_t)(x << n)` for a u64 OR) computes at a different
+    // width than the rotate would, so the amounts cannot be checked against
+    // `width` at all.  Only same-width halves are a rotate.
+    let halves = [
+        (a, b),
+        (b, a),
+    ];
+    let mut matched = None;
+    for (x, y) in halves {
+        if let (Some(shl), Some(lshr)) = (
+            shift_any(x, IrBinOp::Shl, defs),
+            shift_any(y, IrBinOp::LShr, defs),
         ) {
-            (Some(shl), Some(lshr)) => (shl, lshr),
-            _ => return None,
-        },
-    };
-    let (shl_val, shl_amt) = shl;
-    let (lshr_val, lshr_amt) = lshr;
-    if !same(shl_val, lshr_val, defs) {
+            matched = Some((shl, lshr));
+            break;
+        }
+    }
+    let ((shl_val, shl_amt, shl_ty), (lshr_val, lshr_amt, lshr_ty)) = matched?;
+    if shl_ty != ty || lshr_ty != ty {
+        return None;
+    }
+    // The halves must read the SAME SSA value at that width.  Cast-peeling
+    // is unsound here (`zext(x)` and `sext(x)` peel to one root but are
+    // different values), so only `Copy` chains are transparent; the
+    // returned rotate source is the value the shifts actually consume.
+    let value = peel_copies(shl_val, defs);
+    if value != peel_copies(lshr_val, defs) {
         return None;
     }
 
@@ -235,7 +284,167 @@ fn match_rotate(
         }
     };
 
-    Some((peel(shl_val, defs), amount, is_left))
+    Some((value, amount, is_left))
+}
+
+/// Width in bits of the sub-word integer types, or `None` for wider ones.
+fn narrow_width_bits(ty: IrType) -> Option<u64> {
+    match ty {
+        IrType::I8 | IrType::U8 => Some(8),
+        IrType::I16 | IrType::U16 => Some(16),
+        _ => None,
+    }
+}
+
+/// Prove that `opnd`'s bits at positions `[width, 32)` are zero.
+///
+/// The truncation-aware narrow-rotate pattern needs this twice: the two
+/// promoted halves are exact at the narrow width only when the shared source
+/// carries nothing above it.  `AShr` on such a value is `LShr` (the sign bit
+/// it would replicate is provably zero), which is what makes the
+/// C-promotion spelling of the idiom — `(uint16_t)((v << 8) | (v >> 8))`
+/// where both shifts run on the *signed* `int` promotion of `v` — fold.
+///
+/// Only definitions that *construct* the zero-extension are accepted
+/// (`peel_copies` first, so `Copy` webs are transparent):
+///
+/// * a widening cast from an unsigned type no wider than `width` — the
+///   extension fills with zeros (`CastKind::IntWiden` zero-extends exactly
+///   when `from_ty` is unsigned);
+/// * `And` with the full low-`width` mask on either side;
+/// * a constant below `2^width`.
+///
+/// Anything else — `sext` of a narrow value, a phi, a load — is refused:
+/// an unprovable pattern stays unfolded, never miscompiles.
+fn high_bits_zero(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> bool {
+    let v = peel_copies(opnd, defs);
+    if let Some(c) = const_u64(v) {
+        return c < (1u64 << width);
+    }
+    let Operand::Value(id) = v else {
+        return false;
+    };
+    match defs.get(id.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::Cast { from_ty, to_ty, .. }) => {
+            to_ty.size() > from_ty.size()
+                && from_ty.is_unsigned()
+                && (from_ty.size() as u64) * 8 <= width
+        }
+        Some(Instruction::BinOp {
+            op: IrBinOp::And,
+            lhs,
+            rhs,
+            ..
+        }) => {
+            let mask = (1u64 << width) - 1;
+            const_u64(peel(*lhs, defs)) == Some(mask) || const_u64(peel(*rhs, defs)) == Some(mask)
+        }
+        _ => false,
+    }
+}
+
+/// Truncation-aware narrow rotate.
+///
+/// C runs all 8/16-bit arithmetic at `int` width, so a narrow rotate arrives
+/// promoted: the complements meet only at the NARROW width, and the result is
+/// consumed by a truncation back to it:
+///
+/// ```c
+/// uint16_t rol16_sw(uint16_t v)  { return (uint16_t)((v << 8) | (v >> 8)); }
+/// uint16_t rol16_var(uint16_t v, int c)
+///                                 { return (uint16_t)((v << c) | (v >> (16 - c))); }
+/// ```
+///
+/// The IR shape is `Trunc_W(Or_{32}(Shl_{32}(x, a), Shr_{32}(x, b)))` with
+/// `a + b == W` and `x` provably zero above bit `W` (see [`high_bits_zero`]).
+/// Both shift kinds are accepted on the right half: the promotion of an
+/// unsigned narrow value shifts a signed `int`, arriving as `AShr`, but the
+/// proof makes it exact.
+///
+/// Value identity follows the post-beb28b4c discipline: the halves must read
+/// the SAME SSA value (Copy chains transparent, casts opaque) at the Or's own
+/// width.
+///
+/// The rewrite is exact for every count the IR defines: constant counts in
+/// `[1, W-1]`; run-time counts in `[0, W]` (0 and W both degenerate to the
+/// identity — `Shl(x, 0)` contributes `x` and `Shr(x, W)` contributes zero
+/// under the proof — matching `rol` by `c mod W`).  The x86 hardware count
+/// for 8/16-bit rotates is `(count & 31) mod W` (measured: `rolw` by 16 is
+/// the identity, by 17 a rotate of 1), i.e. exactly count-mod-width, so the
+/// backend needs no masking.
+///
+/// Returns `(value, amount, is_left)` like [`match_rotate`], where `value`
+/// is the *wide* source — the driver emits `Rol_W(Trunc(value), amount)`.
+fn match_narrow_rotate(
+    or_src: Operand,
+    narrow: u64,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand, bool)> {
+    let (a, b, ty) = binop(or_src, IrBinOp::Or, defs)?;
+    if !matches!(ty, IrType::I32 | IrType::U32) {
+        return None;
+    }
+    // The two halves in either `Or` order, the right half as LShr or AShr.
+    let mut matched = None;
+    for (x, y) in [(a, b), (b, a)] {
+        if let (Some(shl), Some(shr)) = (
+            shift_any(x, IrBinOp::Shl, defs),
+            shift_any(y, IrBinOp::LShr, defs).or_else(|| shift_any(y, IrBinOp::AShr, defs)),
+        ) {
+            matched = Some((shl, shr));
+            break;
+        }
+    }
+    let ((shl_val, shl_amt, shl_ty), (shr_val, shr_amt, shr_ty)) = matched?;
+    if shl_ty != ty || shr_ty != ty {
+        return None;
+    }
+    let value = peel_copies(shl_val, defs);
+    if value != peel_copies(shr_val, defs) {
+        return None;
+    }
+    if !high_bits_zero(value, narrow, defs) {
+        return None;
+    }
+    // Complementary at the NARROW width, with the same constant / live
+    // `W - n` spellings (and the same direction choice) as `match_rotate`.
+    let (amount, is_left) = match (
+        const_u64(peel(shl_amt, defs)),
+        const_u64(peel(shr_amt, defs)),
+    ) {
+        (Some(left), Some(right)) => {
+            if left + right != narrow || left == 0 || right == 0 {
+                return None;
+            }
+            if left <= right {
+                (shl_amt, true)
+            } else {
+                (shr_amt, false)
+            }
+        }
+        (Some(_), None) => {
+            if !is_width_minus(shr_amt, shl_amt, narrow, defs) {
+                return None;
+            }
+            (shl_amt, true)
+        }
+        (None, Some(_)) => {
+            if !is_width_minus(shl_amt, shr_amt, narrow, defs) {
+                return None;
+            }
+            (shr_amt, false)
+        }
+        (None, None) => {
+            if is_width_minus(shr_amt, shl_amt, narrow, defs) {
+                (shl_amt, true)
+            } else if is_width_minus(shl_amt, shr_amt, narrow, defs) {
+                (shr_amt, false)
+            } else {
+                return None;
+            }
+        }
+    };
+    Some((value, amount, is_left))
 }
 
 fn select(
@@ -304,7 +513,7 @@ fn is_incremented(
     amount: u64,
     defs: &[Option<Instruction>],
 ) -> bool {
-    if add_const(true_val, amount, defs).is_some_and(|base| same(base, false_val, defs)) {
+    if add_const(true_val, amount, defs).is_some_and(|base| same_value(base, false_val, defs)) {
         return true;
     }
     match (
@@ -351,7 +560,7 @@ fn match_popcount32(result: Operand, defs: &[Option<Instruction>]) -> Option<Ope
     }
     let shifted = commutative_const(subtracted, IrBinOp::And, 0x5555_5555, defs)?;
     let shifted_base = shift(shifted, IrBinOp::LShr, 1, defs)?;
-    same(original, shifted_base, defs).then_some(peel(original, defs))
+    same_value(original, shifted_base, defs).then_some(peel_copies(original, defs))
 }
 
 /// Match the common binary-search implementation of 32-bit count-leading-zeros.
@@ -383,22 +592,22 @@ fn match_clz32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand>
         if value_ty != IrType::U32 && value_ty != IrType::I32 {
             return None;
         }
-        if !same(count_cond, value_cond, defs) {
+        if !same_value(count_cond, value_cond, defs) {
             return None;
         }
         if !shift(value_true, IrBinOp::Shl, amount, defs)
-            .is_some_and(|base| same(base, value_false, defs))
+            .is_some_and(|base| same_value(base, value_false, defs))
         {
             return None;
         }
         let compared = unsigned_le_const(value_cond, threshold, defs)?;
-        if !same(compared, value_false, defs) {
+        if !same_value(compared, value_false, defs) {
             return None;
         }
         count = count_false;
         working = value_false;
     }
-    (const_u64(peel(count, defs)) == Some(0)).then_some(peel(working, defs))
+    (const_u64(peel(count, defs)) == Some(0)).then_some(peel_copies(working, defs))
 }
 
 /// Match the six-stage portable 64-bit `__ffs` tree used by Linux:
@@ -441,16 +650,16 @@ fn match_ctz64(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand>
         if value_ty != IrType::I64 && value_ty != IrType::U64 {
             return None;
         }
-        if !same(count_cond, value_cond, defs) {
+        if !same_value(count_cond, value_cond, defs) {
             return None;
         }
         if !shift(value_true, IrBinOp::LShr, amount, defs)
-            .is_some_and(|base| same(base, value_false, defs))
+            .is_some_and(|base| same_value(base, value_false, defs))
         {
             return None;
         }
         if !equal_zero_mask(count_cond, mask, defs)
-            .is_some_and(|base| same(base, value_false, defs))
+            .is_some_and(|base| same_value(base, value_false, defs))
         {
             return None;
         }
@@ -458,7 +667,7 @@ fn match_ctz64(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand>
         count = count_false;
     }
 
-    (const_u64(peel(count, defs)) == Some(0)).then_some(peel(working, defs))
+    (const_u64(peel(count, defs)) == Some(0)).then_some(peel_copies(working, defs))
 }
 
 fn match_shift_pair(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
@@ -467,7 +676,7 @@ fn match_shift_pair(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) ->
         shift(a, IrBinOp::LShr, amount, defs),
         shift(b, IrBinOp::Shl, amount, defs),
     ) {
-        if same(x, y, defs) {
+        if same_value(x, y, defs) {
             return Some(x);
         }
     }
@@ -475,7 +684,7 @@ fn match_shift_pair(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) ->
         shift(b, IrBinOp::LShr, amount, defs),
         shift(a, IrBinOp::Shl, amount, defs),
     ) {
-        if same(x, y, defs) {
+        if same_value(x, y, defs) {
             return Some(x);
         }
     }
@@ -498,7 +707,7 @@ fn match_bswap32_network(result: Operand, defs: &[Option<Instruction>]) -> Optio
         let original = shift(right_shifted, IrBinOp::LShr, 8, defs)?;
         let left_masked = shift(left, IrBinOp::Shl, 8, defs)?;
         let left_original = commutative_const(left_masked, IrBinOp::And, 0x00ff_00ff, defs)?;
-        same(original, left_original, defs).then_some(peel(original, defs))
+        same_value(original, left_original, defs).then_some(peel_copies(original, defs))
     };
     match_halves(a, b).or_else(|| match_halves(b, a))
 }
@@ -518,7 +727,7 @@ fn match_masked_swap_stage(
         let original = shift(shifted, IrBinOp::LShr, amount, defs)?;
         let masked = shift(left, IrBinOp::Shl, amount, defs)?;
         let left_original = commutative_const(masked, IrBinOp::And, mask, defs)?;
-        same(original, left_original, defs).then_some(peel(original, defs))
+        same_value(original, left_original, defs).then_some(peel_copies(original, defs))
     };
     match_halves(a, b).or_else(|| match_halves(b, a))
 }
@@ -528,7 +737,7 @@ fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<
     for (amount, mask) in [(4, 0x0f0f_0f0f), (2, 0x3333_3333), (1, 0x5555_5555)] {
         value = match_masked_swap_stage(value, amount, mask, defs)?;
     }
-    Some(peel(value, defs))
+    Some(peel_copies(value, defs))
 }
 
 /// `enable_bit_reverse` gates the idiom whose native lowering is target
@@ -540,10 +749,17 @@ fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<
 /// route for I64 arithmetic means only its 32-bit ALU path is wired.  Passing
 /// the capability instead of a boolean keeps a backend from ever receiving a
 /// node it cannot lower.
+///
+/// `min_rotate_bits` is the NARROWEST rotate the target can lower natively:
+/// x86 `rolb`/`rolw` rotate at the operand width (hardware count is
+/// `(count & 31) mod width`), but AArch64 and RISC-V only rotate at the full
+/// register width, so their sub-word idioms must stay in shift form.  It gates
+/// the truncation-aware narrow-rotate pattern.
 pub(crate) fn recognize_function(
     func: &mut IrFunction,
     enable_bit_reverse: bool,
     max_rotate_bits: u32,
+    min_rotate_bits: u32,
 ) -> usize {
     let mut defs = vec![None; func.max_value_id() as usize + 1];
     for block in &func.blocks {
@@ -560,6 +776,65 @@ pub(crate) fn recognize_function(
         let mut index = 0;
         while index < block.instructions.len() {
             let mut consumed = 1;
+
+            // Shift/rotate count canonicalization: forward integer casts and
+            // Copies on the COUNT operand. Every backend consumes a variable
+            // count masked at the shift's own width (x86 `%cl` with
+            // `(count & 31) mod width`; AArch64/RISC-V register shifts mask
+            // at the operand width), and every integer cast preserves the
+            // count's low bits, so `Rol(x, (i64)c)` is exactly `Rol(x, c)`.
+            // Forwarding deletes the cast's last use (DCE retires it) and
+            // lets the count stage with one 32-bit move instead of a 64-bit
+            // extension dance (`movslq %esi,%rdx; mov %edx,%rcx`). GCC's
+            // equivalent is folding the extension into the count's single
+            // use.
+            //
+            // Runs before the match so the idiom arms below see the
+            // canonicalized amounts (a `32 - (i64)n` complement matches
+            // against a plain `n` on both halves after forwarding).
+            if let Instruction::BinOp { op, rhs, .. } = &block.instructions[index] {
+                if matches!(
+                    op,
+                    IrBinOp::Shl
+                        | IrBinOp::LShr
+                        | IrBinOp::AShr
+                        | IrBinOp::RotateLeft
+                        | IrBinOp::RotateRight
+                ) {
+                    let start = *rhs;
+                    let mut forwarded = start;
+                    let mut hops = 0;
+                    let mut changed_here = false;
+                    while hops < 8 {
+                        hops += 1;
+                        let Operand::Value(v) = forwarded else { break };
+                        let next = match defs.get(v.0 as usize).and_then(Option::as_ref) {
+                            Some(Instruction::Cast {
+                                src,
+                                from_ty,
+                                to_ty,
+                                ..
+                            }) if from_ty.is_integer() && to_ty.is_integer() => Some(*src),
+                            Some(Instruction::Copy { src, .. }) => Some(*src),
+                            _ => None,
+                        };
+                        match next {
+                            Some(next_src) => {
+                                forwarded = next_src;
+                                changed_here = true;
+                            }
+                            None => break,
+                        }
+                    }
+                    if changed_here {
+                        if let Instruction::BinOp { rhs, .. } = &mut block.instructions[index] {
+                            *rhs = forwarded;
+                        }
+                        changes += 1;
+                    }
+                }
+            }
+
             match &block.instructions[index] {
                 Instruction::BinOp {
                     dest,
@@ -726,6 +1001,60 @@ pub(crate) fn recognize_function(
                         changes += 1;
                     }
                 }
+                // Truncation-aware narrow rotate: the promoted halves'
+                // complements meet at the truncation's width, not the Or's.
+                // Targets without sub-word rotates (`min_rotate_bits` above
+                // the narrow width) never take this arm, so their backends
+                // cannot receive a node they cannot lower.
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } if matches!(from_ty, IrType::I32 | IrType::U32)
+                    && narrow_width_bits(*to_ty).is_some_and(|w| {
+                        w >= u64::from(min_rotate_bits) && min_rotate_bits > 0
+                    }) =>
+                {
+                    let dest = *dest;
+                    let src = *src;
+                    let from_ty = *from_ty;
+                    let to_ty = *to_ty;
+                    let narrow = narrow_width_bits(to_ty).unwrap();
+                    if let Some((value, amount, is_left)) =
+                        match_narrow_rotate(src, narrow, &defs)
+                    {
+                        // Trunc the shared source down to the rotate's own
+                        // width, then rotate there.  The Or/Shl/Shr chain
+                        // loses this consumer; DCE retires it when nothing
+                        // else reads it (multiple consumers just keep the
+                        // chain — the rewrite never touches it).
+                        let trunc = crate::ir::reexports::Value(next_value_id);
+                        next_value_id = next_value_id.saturating_add(1);
+                        block.instructions[index] = Instruction::Cast {
+                            dest: trunc,
+                            src: value,
+                            from_ty,
+                            to_ty,
+                        };
+                        block.instructions.insert(
+                            index + 1,
+                            Instruction::BinOp {
+                                dest,
+                                op: if is_left {
+                                    IrBinOp::RotateLeft
+                                } else {
+                                    IrBinOp::RotateRight
+                                },
+                                lhs: Operand::Value(trunc),
+                                rhs: amount,
+                                ty: to_ty,
+                            },
+                        );
+                        changes += 1;
+                        consumed = 2;
+                    }
+                }
                 _ => {}
             }
             index += consumed;
@@ -782,5 +1111,419 @@ mod tests {
     fn rejects_near_miss_swar_popcount32() {
         let defs = swar_defs(0x3333_3331);
         assert!(match_popcount32(Operand::Value(Value(12)), &defs).is_none());
+    }
+
+    /// Build `Or(Shl(shl_src, c1), LShr(lshr_src, c2))` at `ty`; ids 1..4.
+    fn rotate_defs(
+        ty: IrType,
+        shl_src: Operand,
+        lshr_src: Operand,
+        c1: i64,
+        c2: i64,
+    ) -> Vec<Option<Instruction>> {
+        let value = |id| Operand::Value(Value(id));
+        let constant = |n| Operand::Const(IrConst::I64(n));
+        let mut defs = vec![None; 5];
+        defs[1] = Some(Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::Shl,
+            lhs: shl_src,
+            rhs: constant(c1),
+            ty,
+        });
+        defs[2] = Some(Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::LShr,
+            lhs: lshr_src,
+            rhs: constant(c2),
+            ty,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Or,
+            lhs: value(1),
+            rhs: value(2),
+            ty,
+        });
+        defs
+    }
+
+    #[test]
+    fn recognizes_rotate_both_operand_orders() {
+        let v = |id| Operand::Value(Value(id));
+        // Or(Shl(x, 12), LShr(x, 20)) — shl on the lhs, smaller count wins.
+        let defs = rotate_defs(IrType::U32, v(0), v(0), 12, 20);
+        let (value, amount, is_left) =
+            match_rotate(Operand::Value(Value(3)), 64, &defs).unwrap();
+        assert_eq!(value, v(0));
+        assert_eq!(amount, Operand::Const(IrConst::I64(12)));
+        assert!(is_left);
+
+        // Swapped OR operands: still the rotate by 12.
+        let mut defs = rotate_defs(IrType::U32, v(0), v(0), 12, 20);
+        if let Some(Instruction::BinOp { lhs, rhs, .. }) = defs[3].as_mut() {
+            std::mem::swap(lhs, rhs);
+        }
+        let (value, _, _) = match_rotate(Operand::Value(Value(3)), 64, &defs).unwrap();
+        assert_eq!(value, v(0));
+
+        // Larger shl count: direction flips to the rotate-right view.
+        let defs = rotate_defs(IrType::U32, v(0), v(0), 25, 7);
+        let (_, amount, is_left) = match_rotate(Operand::Value(Value(3)), 64, &defs).unwrap();
+        assert_eq!(amount, Operand::Const(IrConst::I64(7)));
+        assert!(!is_left);
+    }
+
+    #[test]
+    fn recognizes_rotate_64_bit_and_extreme_counts() {
+        let v = |id| Operand::Value(Value(id));
+        for c in [1u64, 63, 33, 40] {
+            let defs =
+                rotate_defs(IrType::U64, v(0), v(0), c as i64, (64 - c) as i64);
+            let (value, amount, is_left) =
+                match_rotate(Operand::Value(Value(3)), 64, &defs).unwrap();
+            assert_eq!(value, v(0));
+            // The smaller count wins, matching the reference compilers'
+            // spelling choice: rol $1, not ror $63.
+            let small = c.min(64 - c);
+            assert_eq!(amount, Operand::Const(IrConst::I64(small as i64)));
+            assert_eq!(is_left, c < 64 - c);
+        }
+        // i686 advertises 32-bit rotates only.
+        let defs = rotate_defs(IrType::U64, v(0), v(0), 33, 31);
+        assert!(match_rotate(Operand::Value(Value(3)), 32, &defs).is_none());
+    }
+
+    #[test]
+    fn recognizes_variable_amount_rotate() {
+        let v = |id| Operand::Value(Value(id));
+        let constant = |n| Operand::Const(IrConst::I64(n));
+        // Or(Shl(x, n), LShr(x, Sub(32, n)))
+        let mut defs = vec![None; 6];
+        defs[1] = Some(Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::Shl,
+            lhs: v(0),
+            rhs: v(4),
+            ty: IrType::U32,
+        });
+        defs[2] = Some(Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::Sub,
+            lhs: constant(32),
+            rhs: v(4),
+            ty: IrType::U32,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::LShr,
+            lhs: v(0),
+            rhs: v(2),
+            ty: IrType::U32,
+        });
+        defs[4] = Some(Instruction::BinOp {
+            dest: Value(4),
+            op: IrBinOp::Or,
+            lhs: v(1),
+            rhs: v(3),
+            ty: IrType::U32,
+        });
+        let (value, amount, is_left) =
+            match_rotate(Operand::Value(Value(4)), 64, &defs).unwrap();
+        assert_eq!(value, v(0));
+        assert_eq!(amount, v(4));
+        assert!(is_left);
+    }
+
+    #[test]
+    fn rejects_non_complementary_rotate_counts() {
+        let v = |id| Operand::Value(Value(id));
+        // 5 + 20 != 32.
+        let defs = rotate_defs(IrType::U32, v(0), v(0), 5, 20);
+        assert!(match_rotate(Operand::Value(Value(3)), 64, &defs).is_none());
+        // Degenerate full-width shift (C1 == W) with C2 == 0.
+        let defs = rotate_defs(IrType::U32, v(0), v(0), 32, 0);
+        assert!(match_rotate(Operand::Value(Value(3)), 64, &defs).is_none());
+        // Arithmetic right shift half: not a rotate.
+        let mut defs = rotate_defs(IrType::U32, v(0), v(0), 12, 20);
+        if let Some(Instruction::BinOp { op, .. }) = defs[2].as_mut() {
+            *op = IrBinOp::AShr;
+        }
+        assert!(match_rotate(Operand::Value(Value(3)), 64, &defs).is_none());
+    }
+
+    #[test]
+    fn rejects_rotate_with_differing_sources() {
+        let v = |id| Operand::Value(Value(id));
+        let defs = rotate_defs(IrType::U32, v(0), v(9), 5, 27);
+        assert!(match_rotate(Operand::Value(Value(3)), 64, &defs).is_none());
+    }
+
+    #[test]
+    fn rejects_rotate_across_width_mismatch() {
+        let v = |id| Operand::Value(Value(id));
+        // The shifts run at u32 under a u64 OR: the amounts cannot be
+        // checked against the OR's width, so this must not fold.
+        let mut defs = rotate_defs(IrType::U64, v(0), v(0), 12, 20);
+        if let Some(Instruction::BinOp { ty, .. }) = defs[1].as_mut() {
+            *ty = IrType::U32;
+        }
+        if let Some(Instruction::BinOp { ty, .. }) = defs[2].as_mut() {
+            *ty = IrType::U32;
+        }
+        assert!(match_rotate(Operand::Value(Value(3)), 64, &defs).is_none());
+    }
+
+    #[test]
+    fn rejects_rotate_halves_through_different_casts_of_one_root() {
+        // Or(Shl(zext(a), 16), LShr(sext(a), 16)): both halves peel to `a`
+        // but zext/sext are different 32-bit values.  Folding this to a
+        // rotate of anything silently drops the sign half — this is the
+        // regression test for the cast-peeling soundness hole.
+        let v = |id| Operand::Value(Value(id));
+        let mut defs = vec![None; 7];
+        defs[1] = Some(Instruction::Cast {
+            dest: Value(1),
+            src: v(0),
+            from_ty: IrType::I8,
+            to_ty: IrType::U32,
+        });
+        defs[2] = Some(Instruction::Cast {
+            dest: Value(2),
+            src: v(0),
+            from_ty: IrType::I8,
+            to_ty: IrType::I32,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Shl,
+            lhs: v(1),
+            rhs: Operand::Const(IrConst::I64(16)),
+            ty: IrType::U32,
+        });
+        defs[4] = Some(Instruction::BinOp {
+            dest: Value(4),
+            op: IrBinOp::LShr,
+            lhs: v(2),
+            rhs: Operand::Const(IrConst::I64(16)),
+            ty: IrType::U32,
+        });
+        defs[5] = Some(Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Or,
+            lhs: v(3),
+            rhs: v(4),
+            ty: IrType::U32,
+        });
+        assert!(match_rotate(Operand::Value(Value(5)), 64, &defs).is_none());
+    }
+
+    #[test]
+    fn recognizes_rotate_through_one_shared_cast() {
+        // Both halves read the SAME cast value: a rotate of the extended
+        // value.  The fold must fire and keep the cast as the source (the
+        // rotate runs at the cast's width), not peel to the narrow root.
+        let v = |id| Operand::Value(Value(id));
+        let mut defs = vec![None; 7];
+        defs[1] = Some(Instruction::Cast {
+            dest: Value(1),
+            src: v(0),
+            from_ty: IrType::U16,
+            to_ty: IrType::U32,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Shl,
+            lhs: v(1),
+            rhs: Operand::Const(IrConst::I64(8)),
+            ty: IrType::U32,
+        });
+        defs[4] = Some(Instruction::BinOp {
+            dest: Value(4),
+            op: IrBinOp::LShr,
+            lhs: v(1),
+            rhs: Operand::Const(IrConst::I64(24)),
+            ty: IrType::U32,
+        });
+        defs[5] = Some(Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Or,
+            lhs: v(3),
+            rhs: v(4),
+            ty: IrType::U32,
+        });
+        let (value, _, is_left) = match_rotate(Operand::Value(Value(5)), 64, &defs).unwrap();
+        assert_eq!(value, v(1)); // the cast, not the u16 root
+        assert!(is_left);
+    }
+
+    /// IR shape of `(uint16_t)((v << 8) | (v >> 8))` after integer
+    /// promotion: both halves shift the SAME zext of the u16 value at i32,
+    /// the right half arrives as AShr (the promoted type is signed), and a
+    /// truncation consumes the Or.
+    fn narrow_rotate_defs(
+        right_op: IrBinOp,
+        shr_amt: Operand,
+        value: Operand,
+    ) -> Vec<Option<Instruction>> {
+        let mut defs = vec![None; 7];
+        defs[1] = Some(Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::Shl,
+            lhs: value,
+            rhs: Operand::Const(IrConst::I64(8)),
+            ty: IrType::I32,
+        });
+        defs[2] = Some(Instruction::BinOp {
+            dest: Value(2),
+            op: right_op,
+            lhs: value,
+            rhs: shr_amt,
+            ty: IrType::I32,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Or,
+            lhs: v(1),
+            rhs: v(2),
+            ty: IrType::I32,
+        });
+        defs
+    }
+
+    fn v(id: u32) -> Operand {
+        Operand::Value(Value(id))
+    }
+
+    fn zext_u16(id: u32) -> Instruction {
+        Instruction::Cast {
+            dest: Value(id),
+            src: v(id - 1),
+            from_ty: IrType::U16,
+            to_ty: IrType::I32,
+        }
+    }
+
+    #[test]
+    fn recognizes_narrow_rotate_constant_ashr() {
+        // `(uint16_t)((v << 8) | (v >> 8))`: complements meet only at 16;
+        // the promoted right shift is AShr but the zext proof makes it exact.
+        let mut defs = narrow_rotate_defs(IrBinOp::AShr, Operand::Const(IrConst::I64(8)), v(5));
+        defs[5] = Some(zext_u16(5));
+        let (value, amount, is_left) = match_narrow_rotate(v(3), 16, &defs).unwrap();
+        assert_eq!(value, v(5)); // the zext, not the u16 root
+        assert_eq!(const_u64(peel(amount, &defs)), Some(8));
+        assert!(is_left);
+    }
+
+    #[test]
+    fn recognizes_narrow_rotate_variable_count() {
+        // `(uint16_t)((v << c) | (v >> (16 - c)))`: the complement is the
+        // live `16 - c` subtraction, matched at the NARROW width.
+        let mut defs = vec![None; 8];
+        defs[1] = Some(Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::Sub,
+            lhs: Operand::Const(IrConst::I64(16)),
+            rhs: v(4),
+            ty: IrType::I32,
+        });
+        defs[2] = Some(Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::Shl,
+            lhs: v(5),
+            rhs: v(4),
+            ty: IrType::I32,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::LShr,
+            lhs: v(5),
+            rhs: v(1),
+            ty: IrType::I32,
+        });
+        defs[6] = Some(Instruction::BinOp {
+            dest: Value(6),
+            op: IrBinOp::Or,
+            lhs: v(2),
+            rhs: v(3),
+            ty: IrType::I32,
+        });
+        defs[5] = Some(zext_u16(5));
+        let (value, amount, is_left) = match_narrow_rotate(v(6), 16, &defs).unwrap();
+        assert_eq!(value, v(5));
+        assert_eq!(amount, v(4)); // the direct count, not the subtraction
+        assert!(is_left);
+    }
+
+    #[test]
+    fn rejects_narrow_rotate_without_high_bits_proof() {
+        // Same shape but the source is a SEXT of an i16: bits above 16 are
+        // the sign replication, not zero, so the narrow pattern must not
+        // fire (the AShr half is not an LShr of the low word).
+        let mut defs = narrow_rotate_defs(IrBinOp::AShr, Operand::Const(IrConst::I64(8)), v(5));
+        defs[5] = Some(Instruction::Cast {
+            dest: Value(5),
+            src: v(4),
+            from_ty: IrType::I16,
+            to_ty: IrType::I32,
+        });
+        assert!(match_narrow_rotate(v(3), 16, &defs).is_none());
+    }
+
+    #[test]
+    fn rejects_narrow_rotate_wrong_complement() {
+        // 8 + 12 != 16: not complementary at the narrow width either.
+        let mut defs = narrow_rotate_defs(IrBinOp::LShr, Operand::Const(IrConst::I64(12)), v(5));
+        defs[5] = Some(zext_u16(5));
+        assert!(match_narrow_rotate(v(3), 16, &defs).is_none());
+        // 8 + 24 complements at 32, not 16: that is the WIDE rotate's shape
+        // (already handled by `match_rotate`), never a narrow one.
+        let mut defs = narrow_rotate_defs(IrBinOp::LShr, Operand::Const(IrConst::I64(24)), v(5));
+        defs[5] = Some(zext_u16(5));
+        assert!(match_narrow_rotate(v(3), 16, &defs).is_none());
+    }
+
+    #[test]
+    fn rejects_narrow_rotate_differing_sources() {
+        // The halves read different zexts of one root: different values, no
+        // fold (the post-beb28b4c identity discipline).
+        let mut defs = narrow_rotate_defs(IrBinOp::LShr, Operand::Const(IrConst::I64(8)), v(5));
+        defs[5] = Some(zext_u16(5));
+        defs[6] = Some(zext_u16(6));
+        if let Some(Instruction::BinOp { lhs, .. }) = defs[2].as_mut() {
+            *lhs = v(6);
+        }
+        assert!(match_narrow_rotate(v(3), 16, &defs).is_none());
+    }
+
+    #[test]
+    fn high_bits_zero_accepts_mask_and_rejects_sext() {
+        let mut defs = vec![None; 4];
+        defs[1] = Some(Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::And,
+            lhs: v(0),
+            rhs: Operand::Const(IrConst::I64(0xffff)),
+            ty: IrType::I32,
+        });
+        assert!(high_bits_zero(v(1), 16, &defs));
+        assert!(!high_bits_zero(v(1), 8, &defs)); // mask covers 16, not 8
+        defs[2] = Some(Instruction::Cast {
+            dest: Value(2),
+            src: v(0),
+            from_ty: IrType::I16,
+            to_ty: IrType::I32,
+        });
+        assert!(!high_bits_zero(v(2), 16, &defs)); // sext: not zeros above 16
+        defs[3] = Some(Instruction::Cast {
+            dest: Value(3),
+            src: v(0),
+            from_ty: IrType::U8,
+            to_ty: IrType::I32,
+        });
+        assert!(high_bits_zero(v(3), 16, &defs)); // zext of u8: zeros above 8 ⊇ above 16
+        assert!(high_bits_zero(Operand::Const(IrConst::I64(0x1234)), 16, &defs));
+        assert!(!high_bits_zero(Operand::Const(IrConst::I64(0x12345)), 16, &defs));
     }
 }

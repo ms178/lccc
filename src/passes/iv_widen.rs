@@ -2492,13 +2492,23 @@ mod tests {
         cmp: Option<Instruction>,
     ) -> IrFunction {
         let mut func = IrFunction::new(name.to_string(), IrType::I32, vec![], false);
-        // B0 preheader: init i = 3 (value 0)
+        // B0 preheader: init i = 3 (value 0); materialize the array base
+        // `gep_inst` hardcodes as Value(50). A base with no defining
+        // instruction is an undefined-use violation under the
+        // def-dominates-use verifier, so the fixture must define it where
+        // the tests claim it lives ("loop-invariant, defined outside").
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![Instruction::Copy {
-                dest: Value(0),
-                src: Operand::Const(IrConst::I32(3)),
-            }],
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(3)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(50),
+                    name: "arr".to_string(),
+                },
+            ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
         });
@@ -3604,12 +3614,21 @@ mod tests {
         // B0 preheader → B1 (header == latch: phi, exit cmp, add, back-edge),
         // B2 exit.
         let mut func = IrFunction::new("self".to_string(), IrType::I32, vec![], false);
+        // Preheader also defines the GEP's array base (v50): the base is
+        // loop-invariant, and without a defining instruction the verifier
+        // reports the GEP as an undefined-value use.
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![Instruction::Copy {
-                dest: Value(0),
-                src: Operand::Const(IrConst::I32(0)),
-            }],
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(50),
+                    name: "arr".to_string(),
+                },
+            ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
         });
@@ -3684,26 +3703,93 @@ mod tests {
     /// reading the post-increment value widens like any other use.
     #[test]
     fn test_post_increment_gep() {
-        // Body GEP reads the latch result (value 5) via a widening cast.
-        let body = vec![
-            Instruction::Cast {
-                dest: Value(10),
-                src: Operand::Value(Value(5)),
-                from_ty: IrType::I32,
-                to_ty: IrType::I64,
+        // Post-increment addressing: the GEP reads the INCREMENTED value
+        // (value 5, the step result), not the phi.  The only
+        // dominance-legal CFG for that is a rotated self-loop — header
+        // == latch, with the step computed in the block before the use —
+        // so the fixture is a single-block loop (the shape loop rotation
+        // produces for `while (...) { use(*p); p++; }`-style code).  The
+        // original fixture read the latch's value from a separate body
+        // block: a use before any executing path computes it, invalid
+        // SSA the def-dominates-use verifier rejects.
+        let mut func = IrFunction::new("postinc".to_string(), IrType::I32, vec![], false);
+        // B0 preheader: init i = 3, plus the array base the GEP uses.
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(3)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(50),
+                    name: "arr".to_string(),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B1: phi, step, widening cast of the STEP, GEP, guard.
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(1)),
+                    ],
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(10),
+                    src: Operand::Value(Value(5)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                gep_inst(11, 10, IrType::I8),
+                Instruction::Cmp {
+                    dest: Value(99),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(64)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(99)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
             },
-            gep_inst(11, 10, IrType::I8),
-        ];
-        let mut func = counting_loop("postinc", IrType::I32, IrBinOp::Add, body, None);
+            source_spans: Vec::new(),
+        });
+        // B2: exit.
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 100;
         check(&mut func, 1);
+        // The step was widened in place...
         assert!(matches!(
-            &func.blocks[3].instructions[0],
+            &func.blocks[1].instructions[1],
             Instruction::BinOp {
                 ty: IrType::I64,
                 ..
             }
         ));
-        assert!(func.blocks[2].instructions.iter().any(
+        // ...and the post-increment GEP survived, still addressed by the
+        // (now wide) step value.
+        assert!(func.blocks[1].instructions.iter().any(
             |i| matches!(i, Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 5)
         ));
     }

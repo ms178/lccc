@@ -96,6 +96,29 @@ pub(crate) struct RaConfig {
     pub(crate) no_segment_scan: bool,
     /// `CCC_EVICT_MODE`: eviction mode (default: 3; malformed values use 3).
     pub(crate) evict_mode: i32,
+    /// `CCC_RA_LOOP_SPAN_RESERVE`: CEILING on the registers the main scan
+    /// reserves for block-local ranges by capping how many registers
+    /// loop-spanning ranges may hold at once (default: 0 = OFF). The
+    /// effective reserve per loop is that loop's measured peak block-local
+    /// range concurrency, clamped to this ceiling. Armed with 3 the cap
+    /// measured chacha20 +29% and sha256 +27% (ARX loops: many single-use
+    /// temporaries starved by loop-spanning webs) with arith_loop -10%
+    /// (once-per-pass recurrence slots must not be demoted) and scattered
+    /// -3..-5%; the net geomean was inside the noise band, so the default
+    /// stays off until a stable-machine census (and the calibration noted
+    /// in the RA-PRESSURE-1 follow-up) ratifies a default. The knob also
+    /// arms the GEP-base and coalesce-web cost corrections in the main
+    /// waves, so cap-off is byte-identical to the pre-cap allocator.
+    /// Rationale (RA-PRESSURE-1): a whole-range linear scan assigns
+    /// loop-spanning webs first (earliest start), and a single-use
+    /// block-local temp can never outbid a web's remaining-use cost, so
+    /// once the webs saturate the pool every temp in the loop is staged
+    /// through memory (chacha20: 178 movs vs GCC's 65, all ~60 QR temps
+    /// slot-homed). The cap enforces the pigeonhole up front: when there
+    /// are more webs than pool−K, the excess webs spill at admission and
+    /// K registers stay available for the temps, which expire and free
+    /// them again within a few instructions.
+    pub(crate) loop_span_reserve: usize,
     /// `CCC_PGO_WEIGHT_MAX`: PGO multiplier cap (default: 1; clamped to 1..=16).
     pub(crate) pgo_weight_max: u64,
 
@@ -260,6 +283,7 @@ impl RaConfig {
             evict_mode: text("CCC_EVICT_MODE")
                 .and_then(|value| value.parse::<i32>().ok())
                 .unwrap_or(3),
+            loop_span_reserve: number("CCC_RA_LOOP_SPAN_RESERVE", 0),
             pgo_weight_max: text("CCC_PGO_WEIGHT_MAX")
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(1)
@@ -3337,9 +3361,31 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             &safe_folded_index_homes,
             &config.ra_config,
         );
+        // NOTE on the policy boosts: the loop-span admission cap prices
+        // candidates with the ranges' own weighted-use costs, and neither
+        // the GEP-base nor the coalesce-web boost is applied here. Both
+        // boosts change `priority`, which is the scan's secondary SORT
+        // KEY — inflating webs or bases in the main waves reorders the
+        // whole allocation (measured: expat -30%, adler32 -23%,
+        // arith_loop -12% from the GEP-base boost alone; sha256 -56% from
+        // the coalesce boost), and every one of those losses dwarfs the
+        // cap's wins. The 2c leftover phase keeps its own copies, where
+        // the re-ranking is confined to spare registers.
         // RA-05: hole-aware coverage for the scan's interference tests.
         // Values without segment data keep their fat semantics.
         attach_scan_segments(&mut ranges, &liveness, &coalesce_member_of);
+        // RA-PRESSURE-1: flag ranges whose fat envelope covers a whole
+        // natural loop — they hold their register for the entire body on
+        // every iteration and are subject to the admission cap. The
+        // member map carries the web-wide in-loop-use flag: a leader's
+        // own `uses` under-count a phi web exactly the way its priority
+        // does.
+        live_range::mark_loop_spanning(
+            &mut ranges,
+            &liveness.loop_extents,
+            &coalesce_member_of,
+            func,
+        );
         ranges
     };
 
@@ -8523,6 +8569,7 @@ mod ra_config_tests {
         assert_eq!(defaults.hot_web_steal, 3);
         assert_eq!(defaults.evict_mode, 3);
         assert_eq!(defaults.pgo_weight_max, 1);
+        assert_eq!(defaults.loop_span_reserve, 0);
         assert_eq!(
             defaults.x64_nohome_classes,
             "ret,store,copy,cast,unary,binop"
@@ -8544,6 +8591,7 @@ mod ra_config_tests {
         let configured = from(&[
             ("CCC_LOOP_PIN", "7"),
             ("CCC_HOT_WEB_STEAL", "9"),
+            ("CCC_RA_LOOP_SPAN_RESERVE", "2"),
             ("CCC_EVICT_MODE", "6"),
             ("CCC_PGO_WEIGHT_MAX", "99"),
             ("CCC_X64_NOHOME_CLASSES", "ret,cast"),
@@ -8564,6 +8612,7 @@ mod ra_config_tests {
         assert_eq!(configured.loop_pin, 7);
         assert_eq!(configured.hot_web_steal, 9);
         assert_eq!(configured.evict_mode, 6);
+        assert_eq!(configured.loop_span_reserve, 2);
         assert_eq!(configured.pgo_weight_max, 16);
         assert_eq!(configured.x64_nohome_classes, "ret,cast");
         assert_eq!(configured.mi_max_loop_insts, 41);
@@ -8587,12 +8636,14 @@ mod ra_config_tests {
             ("CCC_LOOP_PIN", "not-a-number"),
             ("CCC_HOT_WEB_STEAL", "-1"),
             ("CCC_EVICT_MODE", "bad"),
+            ("CCC_RA_LOOP_SPAN_RESERVE", "not-a-number"),
             ("CCC_PGO_WEIGHT_MAX", "0"),
             ("CCC_MI_MAX_LOOP_INSTS", "bad"),
         ]);
         assert_eq!(malformed.loop_pin, 2);
         assert_eq!(malformed.hot_web_steal, 3);
         assert_eq!(malformed.evict_mode, 3);
+        assert_eq!(malformed.loop_span_reserve, 0);
         assert_eq!(malformed.pgo_weight_max, 1);
         assert_eq!(malformed.mi_max_loop_insts, MI_MAX_LOOP_INSTS_DEFAULT);
 

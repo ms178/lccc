@@ -5447,6 +5447,20 @@ fn transform_stencil_vector(
 ) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0usize;
+
+    // DOMINANCE PRECONDITION -- before any IR is touched. The scalar
+    // remainder AND, when alias versioning is required, the preheader
+    // guard both reference src_base/dst_base outside the loop body; bases
+    // defined inside the body must be rematerializable or the loop is
+    // skipped whole.
+    if plan_remainder_reference(func, pattern.src_base, &pattern.loop_blocks).is_none()
+        || plan_remainder_reference(func, pattern.dst_base, &pattern.loop_blocks).is_none()
+    {
+        if debug {
+            eprintln!("[VEC-STENCIL] bases not dominance-safe; skipping loop");
+        }
+        return 0;
+    }
     let vec_width: u64 = match (pattern.elem_ty, avx2) {
         (IrType::F64, true) => 4,
         (IrType::F64, false) => 2,
@@ -5828,13 +5842,35 @@ fn transform_stencil_vector(
     if pattern.needs_alias_guard {
         let disp_min = pattern.taps.iter().map(|t| t.disp_bytes).min().unwrap_or(0);
         let disp_max = pattern.taps.iter().map(|t| t.disp_bytes).max().unwrap_or(0);
+        // The guard executes in the PREHEADER, before the loop body runs.
+        // A base defined inside the body (the `arr[i]` lowering) would be
+        // read before its definition on every path; rematerialize the pure
+        // chain here — the entry gate proved the plans exist.
+        let mut guard_prefix: Vec<Instruction> = Vec::new();
+        let dst_base_g = plan_remainder_reference(
+            func,
+            pattern.dst_base,
+            &pattern.loop_blocks,
+        )
+        .map(|plan| materialize_remainder_reference(plan, &mut guard_prefix, &mut next_val_id))
+        .expect("stencil dst_base lost its dominance plan; gate mismatch");
+        let src_base_g = plan_remainder_reference(
+            func,
+            pattern.src_base,
+            &pattern.loop_blocks,
+        )
+        .map(|plan| materialize_remainder_reference(plan, &mut guard_prefix, &mut next_val_id))
+        .expect("stencil src_base lost its dominance plan; gate mismatch");
+        // Clones first, guard code after: both append before the
+        // preheader's terminator.
+        func.blocks[preheader_idx].instructions.append(&mut guard_prefix);
         changes += emit_alias_guards(
             func,
             preheader_idx,
-            pattern.dst_base,
+            dst_base_g,
             pattern.dst_disp,
             &[AliasCheck {
-                src_base: pattern.src_base,
+                src_base: src_base_g,
                 disp_min,
                 disp_max,
             }],
@@ -6256,6 +6292,21 @@ fn build_stencil_remainder_loop(
     let i_rem_cmp_lhs = Value(*next_val_id);
     *next_val_id += 1;
 
+    // Dominance materialization: `src_base`/`dst_base` come from the
+    // original GEPs and may be defined inside the loop body (the `arr[i]`
+    // lowering puts `GlobalAddr arr` there). The remainder runs on
+    // zero-trip paths AND on the alias guard's fail edge, which jumps to
+    // the remainder header and bypasses the vector exit entirely — so any
+    // in-loop pure chain is rematerialized into the remainder HEADER (the
+    // one block every entry executes), never the vector exit. A base that
+    // cannot be soundly referenced declines this loop (returning None
+    // bails before any mutation).
+    let mut header_prefix: Vec<Instruction> = Vec::new();
+    let src_base = plan_remainder_reference(func, pattern.src_base, &pattern.loop_blocks)
+        .map(|plan| materialize_remainder_reference(plan, &mut header_prefix, next_val_id))?;
+    let dst_base = plan_remainder_reference(func, pattern.dst_base, &pattern.loop_blocks)
+        .map(|plan| materialize_remainder_reference(plan, &mut header_prefix, next_val_id))?;
+
     // Remainder start element = iv_start + (vector-iv − iv_start) * width.
     // The header phi at vector-loop exit holds the next unprocessed scalar
     // IV under unit stepping; the byte-parallel lanes cover the width-fold
@@ -6296,30 +6347,35 @@ fn build_stencil_remainder_loop(
     // Remainder header: the ORIGINAL compare shape (iv + cmp_k) op limit.
     let rem_header_block = BasicBlock {
         label: rem_header_label,
-        instructions: vec![
-            Instruction::Phi {
+        instructions: {
+            // Phi first, then the materialized base chains (they execute
+            // on every entry — vector exit, guard fail edge, latch), then
+            // the compare.
+            let mut insts = vec![Instruction::Phi {
                 dest: i_rem_iv,
                 ty: pattern.iv_ty,
                 incoming: vec![
                     (Operand::Value(i_rem_start), vec_exit_label),
                     (Operand::Value(i_rem_iv_next), rem_latch_label),
                 ],
-            },
-            Instruction::BinOp {
+            }];
+            insts.extend(header_prefix);
+            insts.push(Instruction::BinOp {
                 dest: i_rem_cmp_lhs,
                 op: IrBinOp::Add,
                 lhs: Operand::Value(i_rem_iv),
                 rhs: Operand::Const(int_const(pattern.cmp_k)),
                 ty: pattern.iv_ty,
-            },
-            Instruction::Cmp {
+            });
+            insts.push(Instruction::Cmp {
                 dest: i_rem_cmp,
                 op: pattern.exit_cmp_op,
                 lhs: Operand::Value(i_rem_cmp_lhs),
                 rhs: pattern.limit.clone(),
                 ty: pattern.iv_ty,
-            },
-        ],
+            });
+            insts
+        },
         terminator: Terminator::CondBranch {
             cond: Operand::Value(i_rem_cmp),
             true_label: rem_body_label,
@@ -6370,7 +6426,7 @@ fn build_stencil_remainder_loop(
         });
         body_insts.push(Instruction::GetElementPtr {
             dest: gep_v,
-            base: pattern.src_base,
+            base: src_base,
             offset: Operand::Value(offset_v),
             ty: pattern.elem_ty,
         });
@@ -6408,7 +6464,7 @@ fn build_stencil_remainder_loop(
     });
     body_insts.push(Instruction::GetElementPtr {
         dest: dst_gep_v,
-        base: pattern.dst_base,
+        base: dst_base,
         offset: Operand::Value(dst_offset),
         ty: pattern.elem_ty,
     });
@@ -8074,11 +8130,20 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
 
 /// Extract base pointers for C and B arrays from the pattern's GEP values.
 /// Returns (c_base, a_ptr, b_base) for use in remainder loop.
+/// Pre-mutation gate for the FMA transforms: every value their scalar
+/// remainder references (C base, B base, broadcast A pointer) must have a
+/// dominance-sound plan. See `plan_remainder_reference`.
+fn fma_remainder_references_sound(func: &IrFunction, pattern: &VectorizablePattern) -> bool {
+    let (c_base, a_ptr, b_base) = extract_base_pointers(func, pattern);
+    plan_remainder_reference(func, c_base, &pattern.loop_blocks).is_some()
+        && plan_remainder_reference(func, a_ptr, &pattern.loop_blocks).is_some()
+        && plan_remainder_reference(func, b_base, &pattern.loop_blocks).is_some()
+}
+
 fn extract_base_pointers(
     func: &IrFunction,
     pattern: &VectorizablePattern,
-) -> (Value, Value, Value) {
-    let mut c_base = None;
+) -> (Value, Value, Value) {    let mut c_base = None;
     let mut b_base = None;
 
     // Scan all loop blocks to find GEP instructions that define c_gep and b_gep
@@ -8123,6 +8188,23 @@ fn insert_remainder_loop(
 
     // Extract base pointers for arrays
     let (c_base, a_ptr, b_base) = extract_base_pointers(func, pattern);
+
+    // Dominance materialization: extracted bases may be defined inside the
+    // loop body (the `arr[i]` lowering materializes `GlobalAddr arr`
+    // there), while the remainder also runs on zero-trip paths. The
+    // transform entries gate on `fma_remainder_references_sound` before
+    // touching IR, so these plans cannot fail; an expectation failure here
+    // means a caller skipped the gate and must stop the build rather than
+    // emit a use no path defines.
+    let mut vec_exit_prefix: Vec<Instruction> = Vec::new();
+    let mut plan_or_die = |v: Value| -> Value {
+        let plan = plan_remainder_reference(func, v, &pattern.loop_blocks)
+            .expect("fma remainder base lost its dominance plan; caller skipped the gate");
+        materialize_remainder_reference(plan, &mut vec_exit_prefix, next_val_id)
+    };
+    let c_base = plan_or_die(c_base);
+    let a_ptr = plan_or_die(a_ptr);
+    let b_base = plan_or_die(b_base);
 
     // Allocate new block IDs
     let vec_exit_label = BlockId(*next_label);
@@ -8238,7 +8320,11 @@ fn insert_remainder_loop(
 
     let vec_exit_block = BasicBlock {
         label: vec_exit_label,
-        instructions: vec![rem_start_inst],
+        instructions: {
+            let mut insts = vec_exit_prefix;
+            insts.push(rem_start_inst);
+            insts
+        },
         terminator: Terminator::Branch(remainder_header_label),
         source_spans: vec![],
     };
@@ -8395,6 +8481,18 @@ fn insert_remainder_loop(
 fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let mut changes = 0;
+
+    // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
+    // remainder must be able to reference every base with a dominating
+    // definition (see fma_remainder_references_sound).
+    if !fma_remainder_references_sound(func, pattern) {
+        if debug {
+            eprintln!("[VEC] remainder references not dominance-safe; skipping loop");
+        }
+        return 0;
+    }
 
     // Keep track of the next available Value and BlockId
     let mut next_val_id = func.next_value_id;
@@ -8996,6 +9094,18 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
 fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let mut changes = 0;
+
+    // DOMINANCE PRECONDITION -- before any IR is touched: the scalar
+    // remainder must be able to reference every base with a dominating
+    // definition (see fma_remainder_references_sound).
+    if !fma_remainder_references_sound(func, pattern) {
+        if debug {
+            eprintln!("[VEC] remainder references not dominance-safe; skipping loop");
+        }
+        return 0;
+    }
 
     // Keep track of the next available Value and BlockId
     let mut next_val_id = func.next_value_id;
@@ -9683,6 +9793,240 @@ fn reduction_gep_base(func: &IrFunction, body_idx: usize, gep: Value) -> Value {
     gep
 }
 
+// ---------------------------------------------------------------------------
+// Remainder-reference dominance
+//
+// The scalar remainder loop a vectorizer appends after the vector loop runs
+// even when the vector body made zero iterations, and every value it
+// references must be defined on every path that reaches it — the SSA
+// def-dominates-use invariant. The remainder is a *clone* of loop-body
+// addressing, and the canonical `arr[i]` lowering materializes
+// `GlobalAddr arr` *inside the body block*, so a naive clone references a
+// value whose definition the zero-trip path never executes. The IR verifier
+// (`passes::verify`, def-dominates-use) rejects that shape; the binary only
+// worked because downstream consumers happened to tolerate it.
+// ---------------------------------------------------------------------------
+
+/// How a cloned remainder loop may soundly reference a value.
+enum RemainderRefPlan {
+    /// The definition lies outside the loop and already dominates the exit.
+    UseOriginal(Value),
+    /// The definition lies inside the loop but is a pure, non-trapping,
+    /// loop-invariant chain (`GlobalAddr` / `LabelAddr` / `Copy` / `Cast` /
+    /// integer `Add/Sub/Mul/And/Or/Xor/Shl/AShr/LShr` over constants and
+    /// other such values). The chain is cloned into the vector-exit block,
+    /// which dominates the whole remainder. `chain` items are in dependency
+    /// order, each still naming its ORIGINAL dest and operands; the builder
+    /// assigns fresh dests and rewrites in-chain operands.
+    Rematerialize {
+        original: Value,
+        chain: Vec<(Value, Instruction)>,
+    },
+}
+
+/// Plan how a cloned remainder loop may reference `v`.
+///
+/// * `None` — no sound reference exists (no definition at all, or an
+///   in-loop definition that is not a pure invariant chain). The caller
+///   must decline the transform: a missed optimization, never a miscompile.
+/// * `Some(UseOriginal)` — `v` is defined outside the loop. Dominance of
+///   the exit follows from the pre-transform IR being dominance-legal: the
+///   original loop body used `v`, so its definition dominates the body;
+///   every path into the body passes the loop header, so the definition
+///   dominates the header; the vector exit's only predecessor is the
+///   header, so it dominates the exit and every remainder block.
+///
+/// Divisions and remainders are deliberately NOT clonable: the clone would
+/// execute even on zero-trip paths where the original never ran, and an
+/// invariant zero divisor would then trap where the source program did not.
+fn plan_remainder_reference(
+    func: &IrFunction,
+    v: Value,
+    loop_blocks: &FxHashSet<usize>,
+) -> Option<RemainderRefPlan> {
+    let mut found: Option<(usize, &Instruction)> = None;
+    'find: for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if inst.dest() == Some(v) {
+                found = Some((bi, inst));
+                break 'find;
+            }
+        }
+    }
+    let (def_block, inst) = found?;
+    if !loop_blocks.contains(&def_block) {
+        return Some(RemainderRefPlan::UseOriginal(v));
+    }
+    let mut chain = Vec::new();
+    plan_invariant_chain(func, v, inst, loop_blocks, &mut chain)?;
+    Some(RemainderRefPlan::Rematerialize {
+        original: v,
+        chain,
+    })
+}
+
+/// Append the clonable node `v = inst`, plus its operand chains, to `chain`.
+fn plan_invariant_chain(
+    func: &IrFunction,
+    v: Value,
+    inst: &Instruction,
+    loop_blocks: &FxHashSet<usize>,
+    chain: &mut Vec<(Value, Instruction)>,
+) -> Option<()> {
+    match inst {
+        Instruction::GlobalAddr { name, .. } => {
+            chain.push((v, Instruction::GlobalAddr {
+                dest: v,
+                name: name.clone(),
+            }));
+        }
+        Instruction::LabelAddr { label, .. } => {
+            chain.push((v, Instruction::LabelAddr {
+                dest: v,
+                label: *label,
+            }));
+        }
+        Instruction::Copy { src, .. } => {
+            plan_operand_chain(func, src, loop_blocks, chain)?;
+            chain.push((v, Instruction::Copy {
+                dest: v,
+                src: *src,
+            }));
+        }
+        Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        } => {
+            plan_operand_chain(func, src, loop_blocks, chain)?;
+            chain.push((v, Instruction::Cast {
+                dest: v,
+                src: *src,
+                from_ty: *from_ty,
+                to_ty: *to_ty,
+            }));
+        }
+        Instruction::BinOp {
+            op,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } => {
+            // Address chains are integer/pointer arithmetic that cannot
+            // trap on any input. Divisions and FP ops are rejected (a clone
+            // executes on paths the original never did; see above).
+            let intish = matches!(
+                ty,
+                IrType::I8
+                    | IrType::I16
+                    | IrType::I32
+                    | IrType::I64
+                    | IrType::U8
+                    | IrType::U16
+                    | IrType::U32
+                    | IrType::U64
+                    | IrType::Ptr
+            );
+            let non_trapping = matches!(
+                op,
+                IrBinOp::Add
+                    | IrBinOp::Sub
+                    | IrBinOp::Mul
+                    | IrBinOp::And
+                    | IrBinOp::Or
+                    | IrBinOp::Xor
+                    | IrBinOp::Shl
+                    | IrBinOp::AShr
+                    | IrBinOp::LShr
+            );
+            if !intish || !non_trapping {
+                return None;
+            }
+            plan_operand_chain(func, lhs, loop_blocks, chain)?;
+            plan_operand_chain(func, rhs, loop_blocks, chain)?;
+            chain.push((v, Instruction::BinOp {
+                dest: v,
+                op: *op,
+                lhs: *lhs,
+                rhs: *rhs,
+                ty: *ty,
+            }));
+        }
+        // Phi (loop-carried state), Load, Alloca (a clone is a second,
+        // distinct object), Call, Intrinsic, atomics: not rematerializable.
+        _ => return None,
+    }
+    Some(())
+}
+
+fn plan_operand_chain(
+    func: &IrFunction,
+    op: &Operand,
+    loop_blocks: &FxHashSet<usize>,
+    chain: &mut Vec<(Value, Instruction)>,
+) -> Option<()> {
+    match op {
+        Operand::Const(_) => Some(()),
+        Operand::Value(w) => match plan_remainder_reference(func, *w, loop_blocks)? {
+            RemainderRefPlan::UseOriginal(_) => Some(()),
+            RemainderRefPlan::Rematerialize { chain: more, .. } => {
+                chain.extend(more);
+                Some(())
+            }
+        },
+    }
+}
+
+/// Apply a plan: append any rematerialized instructions to `into` (the
+/// vector-exit block under construction) and return the value the remainder
+/// must reference.
+fn materialize_remainder_reference(
+    plan: RemainderRefPlan,
+    into: &mut Vec<Instruction>,
+    next_val_id: &mut u32,
+) -> Value {
+    match plan {
+        RemainderRefPlan::UseOriginal(v) => v,
+        RemainderRefPlan::Rematerialize { original, chain } => {
+            let mut clones: FxHashMap<u32, Value> = FxHashMap::default();
+            let mut result = original;
+            for (orig_dest, mut inst) in chain {
+                let fresh = Value(*next_val_id);
+                *next_val_id += 1;
+                inst.for_each_operand_mut(|op| {
+                    if let Operand::Value(w) = op {
+                        if let Some(&nw) = clones.get(&w.0) {
+                            *op = Operand::Value(nw);
+                        }
+                    }
+                });
+                set_cloned_dest(&mut inst, fresh);
+                clones.insert(orig_dest.0, fresh);
+                result = fresh;
+                into.push(inst);
+            }
+            result
+        }
+    }
+}
+
+/// Rename a cloned instruction's dest. The planner only emits the five
+/// pure shapes; any other instruction here is a planner/builder
+/// disagreement and must stop the build rather than mis-name a definition.
+fn set_cloned_dest(inst: &mut Instruction, dest: Value) {
+    match inst {
+        Instruction::GlobalAddr { dest: d, .. }
+        | Instruction::LabelAddr { dest: d, .. }
+        | Instruction::Copy { dest: d, .. }
+        | Instruction::Cast { dest: d, .. }
+        | Instruction::BinOp { dest: d, .. } => *d = dest,
+        _ => unreachable!("set_cloned_dest: instruction shape the planner never emits"),
+    }
+}
+
+
 /// Repair uses of the loop counter that ESCAPE a vectorized loop.
 ///
 /// # The defect
@@ -9835,6 +10179,114 @@ fn rewrite_terminator_use(term: &mut Terminator, old: Value, new: Value) {
     }
 }
 
+/// Base pointer the scalar remainder must address array A through.
+///
+/// Normally the vector body GEP's base operand. Max reductions access
+/// through a marching-pointer phi; the remainder must address relative to
+/// the phi's PREHEADER incoming — the pointer at element c — NOT the phi
+/// itself: as an SSA value read in vec_exit, the phi holds the
+/// END-of-vector-loop pointer, so using it double-counts the vector
+/// coverage (observed: reads at element ~2x the intended index,
+/// out-of-bounds for large n).
+fn reduction_array_a_base(func: &IrFunction, pattern: &ReductionPattern) -> Value {
+    let body_block = &func.blocks[pattern.body_idx];
+    let mut base = None;
+    for inst in &body_block.instructions {
+        if let Instruction::GetElementPtr { dest, base: b, .. } = inst {
+            if *dest == pattern.array_a_gep {
+                base = Some(*b);
+                break;
+            }
+        }
+    }
+    if base.is_none() && pattern.kind == ReductionKind::Max {
+        let latch_label = func.blocks[pattern.latch_idx].label;
+        for inst in &func.blocks[pattern.header_idx].instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest == pattern.array_a_gep {
+                    for (op, lbl) in incoming {
+                        if *lbl != latch_label {
+                            if let Operand::Value(v) = op {
+                                base = Some(*v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let result = base.unwrap_or(pattern.array_a_gep);
+    if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
+        eprintln!(
+            "[VEC-RED] array_a_base = Value({}), array_a_gep = Value({})",
+            result.0, pattern.array_a_gep.0
+        );
+    }
+    result
+}
+
+/// Pre-mutation gate: can the scalar remainder reference every value it
+/// needs with a dominating definition? Runs before the vector loop rewrite
+/// begins, so `false` simply skips the loop (missed optimization, never a
+/// miscompile). Mirrors exactly the references `insert_reduction_remainder_
+/// loop` will materialize.
+fn reduction_remainder_references_sound(func: &IrFunction, pattern: &ReductionPattern) -> bool {
+    if plan_remainder_reference(
+        func,
+        reduction_array_a_base(func, pattern),
+        &pattern.loop_blocks,
+    )
+    .is_none()
+    {
+        return false;
+    }
+    if let Some(gep) = pattern.array_b_gep {
+        if plan_remainder_reference(
+            func,
+            reduction_gep_base(func, pattern.body_idx, gep),
+            &pattern.loop_blocks,
+        )
+        .is_none()
+        {
+            return false;
+        }
+    }
+    for sec in &pattern.seconds {
+        if plan_remainder_reference(
+            func,
+            reduction_gep_base(func, pattern.body_idx, sec.array_a_gep),
+            &pattern.loop_blocks,
+        )
+        .is_none()
+        {
+            return false;
+        }
+        if let Some(gep) = sec.array_b_gep {
+            if plan_remainder_reference(
+                func,
+                reduction_gep_base(func, pattern.body_idx, gep),
+                &pattern.loop_blocks,
+            )
+            .is_none()
+            {
+                return false;
+            }
+        }
+    }
+    // The loop limit and a guard's RHS must be outside-loop invariants (the
+    // vector loop's own legality depends on that); anything else is a shape
+    // the detector does not model.
+    let invariant = |op: &Operand| match op {
+        Operand::Const(_) => true,
+        Operand::Value(v) => matches!(
+            plan_remainder_reference(func, *v, &pattern.loop_blocks),
+            Some(RemainderRefPlan::UseOriginal(_))
+        ),
+    };
+    invariant(&pattern.limit)
+        && pattern.guard_rhs.as_ref().is_none_or(|op| invariant(op))
+}
+
 fn insert_reduction_remainder_loop(
     func: &mut IrFunction,
     pattern: &ReductionPattern,
@@ -9863,61 +10315,97 @@ fn insert_reduction_remainder_loop(
         _ => return 0,
     };
 
-    // Extract base pointers for arrays from the GEP instructions
-    let array_a_base = {
-        let body_block = &func.blocks[pattern.body_idx];
-        let mut base = None;
-        for inst in &body_block.instructions {
-            if let Instruction::GetElementPtr { dest, base: b, .. } = inst {
-                if *dest == pattern.array_a_gep {
-                    base = Some(*b);
-                    break;
-                }
-            }
-        }
-        // Max reductions access through a marching-pointer phi. The remainder
-        // must address relative to the phi's PREHEADER incoming — the pointer
-        // at element c — NOT the phi itself: as an SSA value read in
-        // vec_exit, the phi holds the END-of-vector-loop pointer, so using
-        // it double-counts the vector coverage (observed: reads at element
-        // ~2x the intended index, out-of-bounds for large n).
-        if base.is_none() && pattern.kind == ReductionKind::Max {
-            let latch_label = func.blocks[pattern.latch_idx].label;
-            for inst in &func.blocks[pattern.header_idx].instructions {
-                if let Instruction::Phi { dest, incoming, .. } = inst {
-                    if *dest == pattern.array_a_gep {
-                        for (op, lbl) in incoming {
-                            if *lbl != latch_label {
-                                if let Operand::Value(v) = op {
-                                    base = Some(*v);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let result = base.unwrap_or(pattern.array_a_gep);
-        if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
-            eprintln!(
-                "[VEC-RED] array_a_base = Value({}), array_a_gep = Value({})",
-                result.0, pattern.array_a_gep.0
-            );
-        }
-        result
-    };
+    // Extract base pointers for arrays from the GEP instructions.
+    let array_a_base = reduction_array_a_base(func, pattern);
 
-    let array_b_base = pattern.array_b_gep.and_then(|gep| {
-        let body_block = &func.blocks[pattern.body_idx];
-        for inst in &body_block.instructions {
-            if let Instruction::GetElementPtr { dest, base, .. } = inst {
-                if *dest == gep {
-                    return Some(*base);
-                }
+    let array_b_base = pattern.array_b_gep.map(|gep| {
+        reduction_gep_base(func, pattern.body_idx, gep)
+    });
+
+    // ── Dominance materialization (BEFORE any mutation) ────────────────────
+    //
+    // The bases extracted above may be defined INSIDE the loop body (the
+    // canonical `arr[i]` lowering puts `GlobalAddr arr` there). The
+    // remainder runs on zero-trip paths where the body never executed, so
+    // every base it references must be rematerialized into the vector exit
+    // — or the transform declined. Planning here, before Step 1 redirects
+    // the header, keeps the bail-out side-effect free.
+    let mut vec_exit_prefix: Vec<Instruction> = Vec::new();
+    let array_a_base = match plan_remainder_reference(func, array_a_base, &pattern.loop_blocks) {
+        Some(plan) => materialize_remainder_reference(plan, &mut vec_exit_prefix, next_val_id),
+        None => {
+            if debug {
+                eprintln!("[VEC-RED] remainder base A not dominance-safe; declining");
+            }
+            return 0;
+        }
+    };
+    let array_b_base = array_b_base.and_then(|base| {
+        plan_remainder_reference(func, base, &pattern.loop_blocks)
+            .map(|plan| materialize_remainder_reference(plan, &mut vec_exit_prefix, next_val_id))
+    });
+    // The loop limit and a guard's RHS feed the remainder's compare. The
+    // vector loop already requires them loop-invariant; require the
+    // dominating (outside-loop) form rather than rematerializing, so a
+    // surprising shape declines instead of guessing.
+    let invariant_operand = |op: &Operand| -> bool {
+        match op {
+            Operand::Const(_) => true,
+            Operand::Value(v) => {
+                matches!(
+                    plan_remainder_reference(func, *v, &pattern.loop_blocks),
+                    Some(RemainderRefPlan::UseOriginal(_))
+                )
             }
         }
-        Some(gep)
-    });
+    };
+    if !invariant_operand(&pattern.limit) {
+        if debug {
+            eprintln!("[VEC-RED] loop limit not outside-loop invariant; declining");
+        }
+        return 0;
+    }
+    if !pattern.guard_rhs.as_ref().is_none_or(|op| invariant_operand(op)) {
+        if debug {
+            eprintln!("[VEC-RED] guard RHS not outside-loop invariant; declining");
+        }
+        return 0;
+    }
+    // Extra accumulators: same discipline, resolved now so the chains land
+    // in the vector exit before any remainder GEP names them.
+    let extras_bases = pattern
+        .seconds
+        .iter()
+        .map(|sec| {
+            let a = match plan_remainder_reference(
+                func,
+                reduction_gep_base(func, pattern.body_idx, sec.array_a_gep),
+                &pattern.loop_blocks,
+            ) {
+                Some(plan) => {
+                    materialize_remainder_reference(plan, &mut vec_exit_prefix, next_val_id)
+                }
+                None => return None,
+            };
+            let b = sec.array_b_gep.and_then(|gep| {
+                plan_remainder_reference(
+                    func,
+                    reduction_gep_base(func, pattern.body_idx, gep),
+                    &pattern.loop_blocks,
+                )
+                .map(|plan| {
+                    materialize_remainder_reference(plan, &mut vec_exit_prefix, next_val_id)
+                })
+            });
+            Some((a, b))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(extras_bases) = extras_bases else {
+        if debug {
+            eprintln!("[VEC-RED] secondary accumulator base not dominance-safe; declining");
+        }
+        return 0;
+    };
 
     // Allocate new block IDs
     let vec_exit_label = BlockId(*next_label);
@@ -10088,8 +10576,12 @@ fn insert_reduction_remainder_loop(
         } else {
             (pattern.accumulator_phi, Vec::new())
         };
-        let mut instructions = Vec::with_capacity(16);
+        let mut instructions = Vec::with_capacity(16 + vec_exit_prefix.len());
         instructions.append(&mut prefix);
+        // Dominance-safe base rematerializations planned above (the clone
+        // instructions themselves are pure and order-independent of the
+        // horizontal reductions that follow).
+        instructions.append(&mut vec_exit_prefix);
         // Horizontal reduction: scalar_sum = reduce(vec_accumulator)
         // Use the accumulator PHI (not vec_sum_value) so that when the
         // vectorized loop has 0 iterations, we reduce the initial zero
@@ -10403,9 +10895,13 @@ fn insert_reduction_remainder_loop(
 
     // Extra accumulators' scalar chains (multi-reduction).  Same shape as the
     // primary; the analyzer guarantees element_type == accumulator_type here,
-    // so no per-element casts are needed.
-    for (sec, acc) in seconds.iter().zip(extras.iter()) {
-        let base_a = reduction_gep_base(func, pattern.body_idx, sec.array_a_gep);
+    // so no per-element casts are needed. Bases were dominance-materialized
+    // above (extras_bases is index-aligned with `seconds`/`extras`).
+    for ((_sec, acc), (base_a, base_b)) in seconds
+        .iter()
+        .zip(extras.iter())
+        .zip(extras_bases.iter())
+    {
         remainder_body_instructions.extend_from_slice(&[
             Instruction::BinOp {
                 dest: acc.offset_a,
@@ -10416,7 +10912,7 @@ fn insert_reduction_remainder_loop(
             },
             Instruction::GetElementPtr {
                 dest: acc.gep_rem_a,
-                base: base_a,
+                base: *base_a,
                 offset: Operand::Value(acc.offset_a),
                 ty: pattern.element_type,
             },
@@ -10442,11 +10938,7 @@ fn insert_reduction_remainder_loop(
                 });
             }
             ReductionKind::DotProduct => {
-                let base_b = reduction_gep_base(
-                    func,
-                    pattern.body_idx,
-                    sec.array_b_gep.unwrap_or(sec.array_a_gep),
-                );
+                let base_b = (*base_b).unwrap_or(*base_a);
                 remainder_body_instructions.extend_from_slice(&[
                     Instruction::BinOp {
                         dest: acc.offset_b,
@@ -10556,6 +11048,15 @@ fn transform_reduction_avx2(
     pattern: &ReductionPattern,
     fp_contract: crate::common::fp_contract::FpContract,
 ) -> usize {
+    // DOMINANCE PRECONDITION -- checked BEFORE any IR is touched. The
+    // scalar remainder references values whose definitions must dominate
+    // it; a loop whose bases cannot be soundly referenced is skipped whole.
+    if !reduction_remainder_references_sound(func, pattern) {
+        if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
+            eprintln!("[VEC-RED] remainder references not dominance-safe; skipping loop");
+        }
+        return 0;
+    }
     // CONTIGUITY PRECONDITION -- checked BEFORE any IR is touched.
     //
     // The element-index scheme scales each GEP's byte offset by the vector
@@ -11829,6 +12330,15 @@ fn transform_reduction_sse2(
 ) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
+
+    // DOMINANCE PRECONDITION -- before any IR is touched (see the AVX2
+    // twin for the rationale).
+    if !reduction_remainder_references_sound(func, pattern) {
+        if debug {
+            eprintln!("[VEC-RED] remainder references not dominance-safe; skipping loop");
+        }
+        return 0;
+    }
 
     // Keep track of the next available Value and BlockId
     let mut next_val_id = func.next_value_id;
@@ -13130,6 +13640,44 @@ fn transform_map_vector(
         return 0;
     };
 
+    // The alias guard runs in the PREHEADER, but the GEP bases it compares
+    // may be defined in the loop body (canonical `arr[i]` lowering puts
+    // `GlobalAddr` there); a preheader use of a body-defined value breaks
+    // def-dominates-use. Plan a sound preheader reference for every base
+    // the guard reads BEFORE any mutation: an outside-loop definition is
+    // used as-is (it dominates the body, hence the header, hence this
+    // block, the header's unique predecessor); an in-loop pure invariant
+    // chain is rematerialized into the preheader at the guard call site;
+    // anything else (phi/load/call-defined base) forces a decline — a
+    // missed optimization, never a miscompile, since without the distance
+    // check the packed body would reorder loads ahead of stores.
+    let mut guard_dst_plan: Option<RemainderRefPlan> = None;
+    let mut guard_src_plans: Vec<Option<RemainderRefPlan>> =
+        (0..src_bases.len()).map(|_| None).collect();
+    if !pattern.guarded_streams.is_empty() {
+        let Some(plan) = plan_remainder_reference(func, dst_base, &pattern.loop_blocks) else {
+            if debug {
+                eprintln!(
+                    "[VEC-MAP]   Guard destination base has no sound preheader reference; declining"
+                );
+            }
+            return 0;
+        };
+        guard_dst_plan = Some(plan);
+        for &i in &pattern.guarded_streams {
+            let Some(plan) = plan_remainder_reference(func, src_bases[i], &pattern.loop_blocks)
+            else {
+                if debug {
+                    eprintln!(
+                        "[VEC-MAP]   Guarded stream base has no sound preheader reference; declining"
+                    );
+                }
+                return 0;
+            };
+            guard_src_plans[i] = Some(plan);
+        }
+    }
+
     // Build the exact scalar remainder BEFORE touching the function: if the
     // scalar mirror cannot be produced nothing has been mutated and the loop
     // simply stays scalar.  The blocks are committed (appended + exit edge
@@ -13514,15 +14062,41 @@ fn transform_map_vector(
 
     // Loop versioning for streams that may alias the destination.
     if !pattern.guarded_streams.is_empty() {
+        // Materialize the preheader references planned above. The
+        // rematerialized chains are appended to the preheader BEFORE the
+        // guard chain `emit_alias_guards` appends to the same block, so the
+        // clones dominate every use. At this call site the window is
+        // `elem_size * vec_width >= 2 * elem_size`, so the effective-check
+        // pre-filter inside never drops every check and a materialized base
+        // is never dead. (Two plans may name the same original value, e.g.
+        // the two `GlobalAddr` instructions canonical lowering emits for an
+        // in-place `rd[i] = f(rd[i])`; both clones are pure and
+        // independently used.)
+        let mut guard_prefix = Vec::new();
+        let dst_base_g = materialize_remainder_reference(
+            guard_dst_plan.expect("planned when guarded_streams is non-empty"),
+            &mut guard_prefix,
+            &mut next_val_id,
+        );
         let checks: Vec<AliasCheck> = pattern
             .guarded_streams
             .iter()
-            .map(|&i| AliasCheck {
-                src_base: src_bases[i],
-                disp_min: 0,
-                disp_max: 0,
+            .map(|&i| {
+                let base_g = materialize_remainder_reference(
+                    guard_src_plans[i].take().expect("planned when guarded"),
+                    &mut guard_prefix,
+                    &mut next_val_id,
+                );
+                AliasCheck {
+                    src_base: base_g,
+                    disp_min: 0,
+                    disp_max: 0,
+                }
             })
             .collect();
+        if !guard_prefix.is_empty() {
+            func.blocks[preheader_idx].instructions.extend(guard_prefix);
+        }
         let zero = match pattern.iv_ty {
             IrType::I32 | IrType::U32 => IrConst::I32(0),
             _ => IrConst::I64(0),
@@ -13530,7 +14104,7 @@ fn transform_map_vector(
         changes += emit_alias_guards(
             func,
             preheader_idx,
-            dst_base,
+            dst_base_g,
             0,
             &checks,
             elem_size as i64 * vec_width as i64,
@@ -13837,6 +14411,26 @@ fn build_map_remainder_loop(
     let dst_base = dst_base?;
     let src_bases: Vec<Value> = src_bases.into_iter().collect::<Option<Vec<_>>>()?;
 
+    // Dominance materialization: extracted bases may be defined inside the
+    // loop (the `arr[i]` lowering puts `GlobalAddr arr` in the body). The
+    // remainder runs on zero-trip paths AND on the alias guard's fail
+    // edge, which jumps to the remainder header and bypasses the vector
+    // exit entirely — so each base is either used as-is (defined outside
+    // the loop ⇒ dominates the loop preheader, hence every remainder
+    // entry) or rematerialized into the remainder HEADER (the one block
+    // every entry executes); anything else declines this loop.
+    let mut header_prefix: Vec<Instruction> = Vec::new();
+    let dst_base = plan_remainder_reference(func, dst_base, &pattern.loop_blocks)
+        .map(|plan| materialize_remainder_reference(plan, &mut header_prefix, next_val_id))?;
+    let src_bases: Vec<Value> = src_bases
+        .into_iter()
+        .map(|base| {
+            plan_remainder_reference(func, base, &pattern.loop_blocks).map(|plan| {
+                materialize_remainder_reference(plan, &mut header_prefix, next_val_id)
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+
     let vec_exit_label = BlockId(*next_label);
     *next_label += 1;
     let remainder_header_label = BlockId(*next_label);
@@ -13868,6 +14462,9 @@ fn build_map_remainder_loop(
         _ => IrConst::I64(1),
     };
 
+    // The vector exit carries only the resume-IV computation: any
+    // rematerialized base chains live in the remainder header, where the
+    // alias guard's fail edge joins, so every entry dominates their defs.
     let vec_exit_block = BasicBlock {
         label: vec_exit_label,
         instructions: vec![Instruction::BinOp {
@@ -13883,23 +14480,28 @@ fn build_map_remainder_loop(
 
     let remainder_header_block = BasicBlock {
         label: remainder_header_label,
-        instructions: vec![
-            Instruction::Phi {
+        instructions: {
+            // Phi first, then the materialized base chains (they execute on
+            // every entry — vector exit, guard fail edge, latch), then the
+            // compare.
+            let mut insts = vec![Instruction::Phi {
                 dest: i_rem_iv,
                 ty: pattern.iv_ty,
                 incoming: vec![
                     (Operand::Value(i_rem_start), vec_exit_label),
                     (Operand::Value(i_rem_iv_next), remainder_latch_label),
                 ],
-            },
-            Instruction::Cmp {
+            }];
+            insts.extend(header_prefix);
+            insts.push(Instruction::Cmp {
                 dest: i_rem_cmp,
                 op: pattern.exit_cmp_op,
                 lhs: Operand::Value(i_rem_iv),
                 rhs: pattern.limit.clone(),
                 ty: pattern.iv_ty,
-            },
-        ],
+            });
+            insts
+        },
         terminator: Terminator::CondBranch {
             cond: Operand::Value(i_rem_cmp),
             true_label: remainder_body_label,

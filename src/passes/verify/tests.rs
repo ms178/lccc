@@ -7,6 +7,7 @@
 use super::*;
 use crate::common::types::IrType;
 use crate::ir::reexports::*;
+use crate::common::types::AddressSpace;
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -54,6 +55,16 @@ fn v(n: u32) -> Operand {
     Operand::Value(Value(n))
 }
 
+/// `vN = 0` — the minimal definition, for fixtures that need their uses
+/// dominated. Every value a well-formed function consumes must be defined
+/// somewhere; check 8 rejects uses of undefined value ids.
+fn def(n: u32) -> Instruction {
+    Instruction::Copy {
+        dest: Value(n),
+        src: c0(),
+    }
+}
+
 fn br(t: u32) -> Terminator {
     Terminator::Branch(BlockId(t))
 }
@@ -95,9 +106,11 @@ fn assert_reports(f: &IrFunction, needle: &str) {
 
 #[test]
 fn a_well_formed_diamond_with_a_phi_is_clean() {
-    // 0 -> {1, 2} -> 3, with a phi merging both arms.
+    // 0 -> {1, 2} -> 3, with a phi merging both arms. v9 (the branch
+    // condition) and v11 (the arm-2 incoming) are defined in the entry,
+    // which dominates every use.
     let f = func_of(vec![
-        blk(0, vec![], condbr(9, 1, 2)),
+        blk(0, vec![def(9), def(11)], condbr(9, 1, 2)),
         blk(1, vec![], br(3)),
         blk(2, vec![], br(3)),
         blk(3, vec![phi(10, vec![(c0(), 1), (v(11), 2)])], ret()),
@@ -108,8 +121,9 @@ fn a_well_formed_diamond_with_a_phi_is_clean() {
 #[test]
 fn a_self_loop_phi_naming_its_own_block_is_clean() {
     // A rotated loop body is its own predecessor; that must not be flagged.
+    // v11 is defined in the entry, which dominates the self edge's block.
     let f = func_of(vec![
-        blk(0, vec![], br(1)),
+        blk(0, vec![def(9), def(11)], br(1)),
         blk(
             1,
             vec![phi(10, vec![(c0(), 0), (v(11), 1)])],
@@ -308,8 +322,10 @@ fn the_loop_rotate_stale_guard_label_is_caught() {
     );
 
     // And the corrected shape -- init labelled with the guard -- is clean.
+    // The conditions (v4, v73) and the latch value (v16) are defined in the
+    // entry block, so every use is dominated.
     let fixed = func_of(vec![
-        blk(6, vec![], br(7)),
+        blk(6, vec![def(4), def(16), def(73)], br(7)),
         blk(7, vec![phi(22, vec![(c0(), 6)])], condbr(4, 8, 10)),
         blk(
             8,
@@ -319,4 +335,335 @@ fn the_loop_rotate_stale_guard_label_is_caught() {
         blk(10, vec![], ret()),
     ]);
     assert_clean(&fixed);
+}
+
+// ── def-dominates-use (checks 7 & 8) ────────────────────────────────────────
+
+#[test]
+fn a_use_before_its_definition_in_the_same_block_is_reported() {
+    // v9 is consumed by the instruction that precedes its definition: the
+    // block-level dominance holds, but the textual order does not.
+    let f = func_of(vec![blk(
+        0,
+        vec![
+            Instruction::Copy {
+                dest: Value(10),
+                src: v(9),
+            },
+            def(9),
+        ],
+        ret(),
+    )]);
+    assert_reports(&f, "does not dominate its use");
+}
+
+#[test]
+fn a_definition_in_one_diamond_arm_does_not_dominate_the_join() {
+    // v11 exists only on the left path; the join consumes it regardless.
+    let f = func_of(vec![
+        blk(0, vec![def(9)], condbr(9, 1, 2)),
+        blk(1, vec![def(11)], br(3)),
+        blk(2, vec![], br(3)),
+        blk(
+            3,
+            vec![Instruction::Copy {
+                dest: Value(12),
+                src: v(11),
+            }],
+            ret(),
+        ),
+    ]);
+    assert_reports(&f, "does not dominate its use");
+}
+
+#[test]
+fn a_definition_in_the_entry_dominates_arms_and_join() {
+    // Same diamond with the definition hoisted to the entry: clean.
+    let f = func_of(vec![
+        blk(0, vec![def(9), def(11)], condbr(9, 1, 2)),
+        blk(1, vec![], br(3)),
+        blk(2, vec![], br(3)),
+        blk(
+            3,
+            vec![Instruction::Copy {
+                dest: Value(12),
+                src: v(11),
+            }],
+            ret(),
+        ),
+    ]);
+    assert_clean(&f);
+}
+
+#[test]
+fn a_phi_incoming_whose_value_does_not_dominate_its_edge_is_reported() {
+    // The phi takes v12 "from arm 2", but v12 is defined in arm 1, which
+    // does not dominate arm 2. This is the shape phi elimination would
+    // silently satisfy from whatever register happens to be live.
+    let f = func_of(vec![
+        blk(0, vec![def(9)], condbr(9, 1, 2)),
+        blk(1, vec![def(11), def(12)], br(3)),
+        blk(2, vec![], br(3)),
+        blk(3, vec![phi(10, vec![(v(11), 1), (v(12), 2)])], ret()),
+    ]);
+    assert_reports(&f, "does not dominate");
+}
+
+#[test]
+fn a_loop_carried_phi_fed_from_the_latch_is_clean() {
+    // v11 is defined in the body and consumed by the header phi on the
+    // latch edge: the header dominates the body, so the def dominates the
+    // edge-end where the value is copied.
+    let f = func_of(vec![
+        blk(0, vec![def(9)], br(1)),
+        blk(
+            1,
+            vec![phi(10, vec![(c0(), 0), (v(11), 2)])],
+            condbr(9, 2, 3),
+        ),
+        blk(2, vec![def(11)], br(1)),
+        blk(3, vec![], ret()),
+    ]);
+    assert_clean(&f);
+}
+
+#[test]
+fn a_phi_result_used_later_in_its_own_block_is_clean() {
+    let f = func_of(vec![
+        blk(0, vec![def(9), def(11)], br(1)),
+        blk(
+            1,
+            vec![
+                phi(10, vec![(c0(), 0), (v(11), 1)]),
+                Instruction::Copy {
+                    dest: Value(12),
+                    src: v(10),
+                },
+            ],
+            condbr(9, 1, 2),
+        ),
+        blk(2, vec![], ret()),
+    ]);
+    assert_clean(&f);
+}
+
+#[test]
+fn a_use_of_an_undefined_value_is_reported() {
+    let f = func_of(vec![blk(
+        0,
+        vec![Instruction::Copy {
+            dest: Value(10),
+            src: v(99),
+        }],
+        ret(),
+    )]);
+    assert_reports(&f, "use of undefined value v99");
+}
+
+#[test]
+fn a_value_defined_twice_is_reported() {
+    let f = func_of(vec![blk(0, vec![def(10), def(10)], ret())]);
+    assert_reports(&f, "v10 defined more than once");
+}
+
+#[test]
+fn a_use_of_a_value_defined_only_in_an_unreachable_block_is_reported() {
+    // Block 1 is never entered, so on every executed path the join reads an
+    // uninitialised register. The report names the dead *definition*.
+    let f = func_of(vec![
+        blk(0, vec![], br(2)),
+        blk(1, vec![def(11)], br(2)),
+        blk(
+            2,
+            vec![Instruction::Copy {
+                dest: Value(12),
+                src: v(11),
+            }],
+            ret(),
+        ),
+    ]);
+    assert_reports(&f, "defined in unreachable block");
+}
+
+#[test]
+fn a_terminator_use_of_a_non_dominating_definition_is_reported() {
+    // Block 2 is reachable directly from the entry, so the definition in
+    // block 1 does not dominate block 2's terminator condition.
+    let f = func_of(vec![
+        blk(0, vec![def(9)], condbr(9, 1, 2)),
+        blk(1, vec![def(11)], br(2)),
+        blk(2, vec![], condbr(11, 3, 3)),
+        blk(3, vec![], ret()),
+    ]);
+    assert_reports(&f, "does not dominate its use");
+}
+
+#[test]
+fn dominance_over_a_two_level_loop_nest_is_exact() {
+    // Entry -> outer header -> inner header -> inner latch -> inner header
+    //                    ^                          |
+    //                    +------- outer latch ------+
+    // The outer header dominates everything below it; the inner body's
+    // definition feeds the inner header's phi, and an entry definition is
+    // used after the nest. All uses are dominated: clean.
+    let f = func_of(vec![
+        blk(0, vec![def(9), def(20)], br(1)),
+        // outer header: j = phi(0, j')
+        blk(1, vec![phi(21, vec![(c0(), 0), (v(30), 4)])], br(2)),
+        // inner header: i = phi(0, i')
+        blk(2, vec![phi(22, vec![(c0(), 1), (v(23), 3)])], condbr(9, 3, 4)),
+        // inner body + latch: i' = i + 1 shape (copy stands in)
+        blk(3, vec![def(23), def(24)], br(2)),
+        // outer latch: j' = j + 1 shape, branch back
+        blk(4, vec![def(30)], condbr(9, 1, 5)),
+        blk(
+            5,
+            vec![Instruction::Copy {
+                dest: Value(31),
+                src: v(20),
+            }],
+            ret(),
+        ),
+    ]);
+    assert_clean(&f);
+}
+
+#[test]
+fn a_definition_inside_the_inner_loop_does_not_dominate_after_the_nest() {
+    // Same nest, except the exit uses v24, which is defined only in the
+    // inner body: the outer header does not dominate it... in fact the
+    // inner header DOES dominate the inner body, and the exit is dominated
+    // by the outer header, which is *above* the inner body. The use after
+    // the nest is therefore not dominated by the inner-body def.
+    let f = func_of(vec![
+        blk(0, vec![def(9)], br(1)),
+        blk(1, vec![phi(21, vec![(c0(), 0), (v(30), 4)])], br(2)),
+        blk(2, vec![phi(22, vec![(c0(), 1), (v(23), 3)])], condbr(9, 3, 4)),
+        blk(3, vec![def(23), def(24)], br(2)),
+        blk(4, vec![def(30)], condbr(9, 1, 5)),
+        blk(
+            5,
+            vec![Instruction::Copy {
+                dest: Value(31),
+                src: v(24),
+            }],
+            ret(),
+        ),
+    ]);
+    assert_reports(&f, "does not dominate its use");
+}
+
+#[test]
+fn an_inline_asm_output_is_a_definition_dominating_later_uses() {
+    // `dest()` returns None for InlineAsm, yet the output slots are SSA
+    // definitions that later instructions read directly. The verifier must
+    // model them as defs (and must NOT count the output slots as uses).
+    let asm = Instruction::InlineAsm {
+        template: "cpuid".to_string(),
+        outputs: vec![("=a".to_string(), Value(11), None)],
+        inputs: vec![("1".to_string(), c0(), None)],
+        clobbers: vec![],
+        operand_types: vec![],
+        goto_labels: vec![],
+        input_symbols: vec![],
+        seg_overrides: vec![],
+    };
+    let f = func_of(vec![blk(
+        0,
+        vec![
+            asm,
+            Instruction::Copy {
+                dest: Value(12),
+                src: v(11),
+            },
+        ],
+        ret(),
+    )]);
+    assert_clean(&f);
+}
+
+#[test]
+fn a_use_of_an_asm_output_before_the_asm_is_reported() {
+    let asm = Instruction::InlineAsm {
+        template: "cpuid".to_string(),
+        outputs: vec![("=a".to_string(), Value(11), None)],
+        inputs: vec![("1".to_string(), c0(), None)],
+        clobbers: vec![],
+        operand_types: vec![],
+        goto_labels: vec![],
+        input_symbols: vec![],
+        seg_overrides: vec![],
+    };
+    let f = func_of(vec![blk(
+        0,
+        vec![
+            Instruction::Copy {
+                dest: Value(12),
+                src: v(11),
+            },
+            asm,
+        ],
+        ret(),
+    )]);
+    assert_reports(&f, "does not dominate its use");
+}
+
+#[test]
+fn a_read_write_asm_output_naming_an_alloca_is_a_memory_home_not_a_redefinition() {
+    // `asm("..." : "+a"(x))` names x's stack home: the Alloca stays the
+    // single definition, the asm slot is a pointer use, and the later Load
+    // reads the written-back value. This is the asm_alternative_length_
+    // template shape.
+    let asm = Instruction::InlineAsm {
+        template: "movq %rax, %rax".to_string(),
+        outputs: vec![("+a".to_string(), Value(0), None)],
+        inputs: vec![("a".to_string(), Operand::Value(Value(2)), None)],
+        clobbers: vec![],
+        operand_types: vec![],
+        goto_labels: vec![],
+        input_symbols: vec![],
+        seg_overrides: vec![],
+    };
+    let f = func_of(vec![blk(
+        0,
+        vec![
+            Instruction::Alloca {
+                dest: Value(0),
+                ty: IrType::U64,
+                size: 8,
+                align: 0,
+                volatile: false,
+                semantic_volatile: false,
+            },
+            Instruction::ParamRef {
+                dest: Value(1),
+                param_idx: 0,
+                ty: IrType::U64,
+            },
+            Instruction::Store {
+                val: Operand::Value(Value(1)),
+                ptr: Value(0),
+                ty: IrType::U64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::Load {
+                dest: Value(2),
+                ptr: Value(0),
+                ty: IrType::U64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            asm,
+            Instruction::Load {
+                dest: Value(3),
+                ptr: Value(0),
+                ty: IrType::U64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        ],
+        Terminator::Return(Some(Operand::Value(Value(3)))),
+    )]);
+    assert_clean(&f);
 }

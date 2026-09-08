@@ -332,6 +332,9 @@ pub(super) fn run_function(
                     {
                         if !cst {
                             c.variable = true;
+                            if dbg_on() {
+                                eprintln!("[split] VARIABLE load root v{} at block {} inst {}", root, bi, ii);
+                            }
                         }
                         c.refuse = true;
                         continue;
@@ -371,6 +374,9 @@ pub(super) fn run_function(
                     {
                         if !cst {
                             c.variable = true;
+                            if dbg_on() {
+                                eprintln!("[split] VARIABLE store root v{} at block {} inst {}", root, bi, ii);
+                            }
                         }
                         c.refuse = true;
                         continue;

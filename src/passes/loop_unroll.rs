@@ -3279,11 +3279,15 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
         // incoming for every one of them or it is malformed (the verifier
         // reports "phi vN has no incoming for predecessor BlockId(M)").
         //
-        // On those edges the loop never ran, so the live value is exactly the
-        // one that reached the exit before the unroll: `dest` itself (the
-        // header phi's SSA name, which on a non-loop path still holds its
-        // pre-loop definition).  That is the same operand used for the header
-        // edge, so reuse it.
+        // On those edges the loop never ran, so the live value is the one
+        // the header phi carries at loop ENTRY: its non-latch incoming
+        // (the preheader operand).  The header phi itself is NOT sound
+        // here — it is defined in the header, which no foreign path
+        // executes, so an incoming naming it makes the join read a
+        // register no path defined (the def-dominates-use verifier
+        // rejects exactly this shape).  The entry operand is defined at
+        // the end of the preheader, which dominates every foreign
+        // predecessor of the exit.
         let foreign_preds: Vec<BlockId> = {
             let exit_label = func.blocks[exit_idx].label;
             let ec_set: FxHashSet<BlockId> = ec_labels.iter().copied().collect();
@@ -3298,10 +3302,33 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                 .collect()
         };
 
+        // Entry-edge (non-latch) operand of every header phi in `need`:
+        // the value each carried value holds before the loop runs.  A
+        // single-entry loop — the only shape this unroller admits — has
+        // exactly one; anything else has no sound foreign-edge operand
+        // and skips synthesis rather than guessing.
+        let mut entry_ops: FxHashMap<u32, Operand> = FxHashMap::default();
+        for inst in &func.blocks[c.header].instructions {
+            if let Instruction::Phi {
+                dest,
+                incoming,
+                ..
+            } = inst
+            {
+                let mut non_latch = incoming.iter().filter(|(_, l)| *l != latch_label);
+                if let (Some((op, _)), None) = (non_latch.next(), non_latch.next()) {
+                    entry_ops.insert(dest.0, op.clone());
+                }
+            }
+        }
+
         for (dest, edges, pty) in &need {
             if existing.contains_key(&dest.0) {
                 continue; // Step 5 already threaded this phi's edges
             }
+            let Some(entry_op) = entry_ops.get(&dest.0) else {
+                continue; // no unique entry operand; no sound foreign edge
+            };
             let new_phi = Value(next_val);
             next_val += 1;
             let mut incoming: Vec<(Operand, BlockId)> =
@@ -3311,7 +3338,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                 incoming.push((ev.clone(), ec_labels[j]));
             }
             for fp in &foreign_preds {
-                incoming.push((Operand::Value(*dest), *fp));
+                incoming.push((entry_op.clone(), *fp));
             }
             func.blocks[exit_idx].instructions.insert(
                 0,
@@ -3515,13 +3542,23 @@ mod tests {
     fn make_counting_loop(n_val: i32) -> IrFunction {
         let mut func = IrFunction::new("loop_test".to_string(), IrType::Void, vec![], false);
 
-        // B0: preheader — init i = 0
+        // B0: preheader — init i = 0; materialize the array base the
+        // body GEPs use. The base is loop-invariant and defined outside,
+        // so it must have a defining instruction here or the verifier's
+        // def-dominates-use check (rightly) reports every cloned GEP as
+        // reading an undefined value.
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![Instruction::Copy {
-                dest: Value(0),
-                src: Operand::Const(IrConst::I32(0)),
-            }],
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(10),
+                    name: "arr".to_string(),
+                },
+            ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
         });
