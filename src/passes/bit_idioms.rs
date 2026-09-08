@@ -752,6 +752,31 @@ fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<
 /// `(count & 31) mod width`), but AArch64 and RISC-V only rotate at the full
 /// register width, so their sub-word idioms must stay in shift form.  It gates
 /// the truncation-aware narrow-rotate pattern.
+/// True when `op`'s value provably fits in `bits` bits (zero-extended into
+/// the carrying type), so `op & (2^bits - 1) == op`.
+///
+/// Provable shapes: an unsigned narrow constant, a widening `Cast` whose
+/// SOURCE type is an unsigned narrow integer (a zero-extension of a value in
+/// `[0, 2^bits)`), and a direct `Load` of an unsigned narrow type. A cast
+/// from a SIGNED narrow type sign-extends and can be negative in the wide
+/// domain — refused.
+fn fits_low_bits(op: Operand, bits: u32, defs: &[Option<Instruction>]) -> bool {
+    let mask = (1u64 << bits) - 1;
+    match op {
+        Operand::Const(_) => const_u64(op).is_some_and(|v| v <= mask),
+        Operand::Value(v) => match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::Cast { src, from_ty, .. }) => {
+                let from_ok = matches!((from_ty, bits), (IrType::U8, 8) | (IrType::U16, 16));
+                from_ok && fits_low_bits(*src, bits, defs)
+            }
+            Some(Instruction::Load { ty, .. }) => {
+                matches!((ty, bits), (IrType::U8, 8) | (IrType::U16, 16))
+            }
+            _ => false,
+        },
+    }
+}
+
 pub(crate) fn recognize_function(
     func: &mut IrFunction,
     enable_bit_reverse: bool,
@@ -759,17 +784,44 @@ pub(crate) fn recognize_function(
     min_rotate_bits: u32,
 ) -> usize {
     let mut defs = vec![None; func.max_value_id() as usize + 1];
-    for block in &func.blocks {
-        for inst in &block.instructions {
+    // (block index, instruction index) of each value's defining instruction,
+    // for in-place rewrites of the PRODUCER while visiting the consumer.
+    let mut def_loc = vec![None; func.max_value_id() as usize + 1];
+    // Total read counts (operands + address uses + terminator operands), for
+    // single-use proofs when repurposing a producer's operation.
+    let mut use_counts = vec![0u32; func.max_value_id() as usize + 1];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
             if let Some(dest) = inst.dest() {
                 defs[dest.0 as usize] = Some(inst.clone());
+                def_loc[dest.0 as usize] = Some((bi, ii));
             }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    use_counts[v.0 as usize] += 1;
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                use_counts[v.0 as usize] += 1;
+            });
         }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                use_counts[v.0 as usize] += 1;
+            }
+        });
     }
 
     let mut changes = 0;
     let mut next_value_id = func.max_value_id().saturating_add(1);
-    for block in &mut func.blocks {
+    // Deferred cross-block rewrites (mask distribution): the producer and
+    // consumer may live in different blocks; both mutations are applied
+    // after the scan ends so no &mut borrow of `func.blocks` overlaps the
+    // loop's. Entries: (producer block, producer index, new producer
+    // instruction, consumer block, consumer index, new consumer
+    // instruction).
+    let mut pending_masks: Vec<(usize, usize, Instruction, usize, usize, Instruction)> = Vec::new();
+    for (block_bi, block) in func.blocks.iter_mut().enumerate() {
         let mut index = 0;
         while index < block.instructions.len() {
             let mut consumed = 1;
@@ -828,6 +880,97 @@ pub(crate) fn recognize_function(
                             *rhs = forwarded;
                         }
                         changes += 1;
+                    }
+                }
+            }
+
+            // Mask distribution over a zero-extended operand:
+            // `(a ^ b) & 0xff` -> `(a & 0xff) ^ b` when b is a zero-extended
+            // byte (same for `|`, and for 0xffff/`movzwl`). See
+            // `fits_low_bits` for the range proof. The rewrite moves the mask
+            // onto the recurrence operand — where x86 lowers it to a
+            // rename-eliminable cross-register movz that only READS the
+            // recurrence register — and off the xor result, where the mask
+            // always executes on the loop-carried chain (`and $255` or a
+            // same-register movz, both uneliminable).
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::And,
+                lhs: Operand::Value(x),
+                rhs: mask_op @ Operand::Const(_),
+                ty,
+                ..
+            } = &block.instructions[index]
+            {
+                let dest = *dest;
+                let x = *x;
+                let mask_op = *mask_op;
+                let ty = *ty;
+                let bits = match const_u64(mask_op) {
+                    Some(0xff) => 8,
+                    Some(0xffff) => 16,
+                    _ => 0,
+                };
+                if bits != 0
+                    && matches!(ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64)
+                    && use_counts.get(x.0 as usize).copied() == Some(1)
+                {
+                    let xor = defs.get(x.0 as usize).and_then(Option::as_ref).cloned();
+                    if let Some(Instruction::BinOp {
+                        op: op @ (IrBinOp::Xor | IrBinOp::Or),
+                        lhs: Operand::Value(a),
+                        rhs: Operand::Value(b),
+                        ty: x_ty,
+                        ..
+                    }) = xor
+                    {
+                        let a = a;
+                        let b = b;
+                        let op = op;
+                        let x_ty = x_ty;
+                        if x_ty == ty {
+                            let a_fits = fits_low_bits(Operand::Value(a), bits, &defs);
+                            let b_fits = fits_low_bits(Operand::Value(b), bits, &defs);
+                            // Exactly one side carries the narrow value; the
+                            // other receives the mask. Both fitting is
+                            // already optimal as-is (both and-free), and
+                            // masking either side would only add work.
+                            if a_fits != b_fits {
+                                let (masked, narrow) = if b_fits { (a, b) } else { (b, a) };
+                                // Rewrite the producer: xor/or -> and-with-mask;
+                                // rewrite the consumer: and -> xor/or.
+                                if let Some((pbi, pii)) =
+                                    def_loc.get(x.0 as usize).copied().flatten()
+                                {
+                                    if matches!(
+                                        defs.get(x.0 as usize),
+                                        Some(Some(Instruction::BinOp { dest: d, .. })) if *d == x
+                                    ) {
+                                        pending_masks.push((
+                                            pbi,
+                                            pii,
+                                            Instruction::BinOp {
+                                                dest: x,
+                                                op: IrBinOp::And,
+                                                lhs: Operand::Value(masked),
+                                                rhs: mask_op,
+                                                ty,
+                                            },
+                                            block_bi,
+                                            index,
+                                            Instruction::BinOp {
+                                                dest,
+                                                op,
+                                                lhs: Operand::Value(x),
+                                                rhs: Operand::Value(narrow),
+                                                ty,
+                                            },
+                                        ));
+                                        changes += 1;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1057,6 +1200,32 @@ pub(crate) fn recognize_function(
         }
     }
     func.next_value_id = next_value_id.max(func.next_value_id);
+    for (pbi, pii, new_prod, cbi, cii, new_cons) in pending_masks {
+        let x_dest = match &new_prod {
+            Instruction::BinOp { dest, .. } => *dest,
+            _ => unreachable!("mask distribution producer is always a BinOp"),
+        };
+        let c_dest = match &new_cons {
+            Instruction::BinOp { dest, .. } => *dest,
+            _ => unreachable!("mask distribution consumer is always a BinOp"),
+        };
+        if let Some(pb) = func.blocks.get_mut(pbi) {
+            if matches!(
+                pb.instructions.get(pii),
+                Some(Instruction::BinOp { dest: d, .. }) if *d == x_dest
+            ) {
+                pb.instructions[pii] = new_prod;
+            }
+        }
+        if let Some(cb) = func.blocks.get_mut(cbi) {
+            if matches!(
+                cb.instructions.get(cii),
+                Some(Instruction::BinOp { dest: d, .. }) if *d == c_dest
+            ) {
+                cb.instructions[cii] = new_cons;
+            }
+        }
+    }
     changes
 }
 

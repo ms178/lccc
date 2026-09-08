@@ -1459,7 +1459,21 @@ impl X86Codegen {
                             if acc_no_home.contains(&v.0) {
                                 return false;
                             }
-                            !self.state.never_materialized_values.contains(&v.0)
+                            // No slot, no register home, not an
+                            // accumulator assignment: the value has NO
+                            // readable location at the replay position,
+                            // which sits far from its def. The
+                            // historical fall-through trusted "every
+                            // non-never-materialized value gets a spill
+                            // slot" — false for skip-set members the RA
+                            // refused an accumulator assignment and
+                            // never spilled (loop_rotate_pressure_gate:
+                            // an inlined recurrence's exit value reached
+                            // the replayed compare through exactly this
+                            // hole and the cmov read a reused register).
+                            // Prune: the Cmp materializes its boolean at
+                            // its own position, which is always correct.
+                            false
                         }
                     }
                 };

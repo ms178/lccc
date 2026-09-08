@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "source": "tests/benchmark/programs/chacha20_block.c",
+  "source_sha256": "43d5ea728d902af8451fa6ae02e75bd7bd27eb9b79953c6fdfc09b65cf0ef875",
+  "function": null,
+  "remote_flags": "-O3 -march=x86-64-v3",
+  "local_flags": "-O3 -march=x86-64-v3",
+  "oracles": [
+    {
+      "key": "lccc",
+      "id": "target/fastbuild/lccc",
+      "name": "local LCCC",
+      "flags": "-O3 -march=x86-64-v3",
+      "instructions": 474
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": "",
+      "flags": "-O3 -march=x86-64-v3",
+      "instructions": 310
+    },
+    {
+      "key": "cclang2310",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang",
+      "flags": "-O3 -march=x86-64-v3",
+      "instructions": 257
+    },
+    {
+      "key": "icx",
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel",
+      "flags": "-O3 -march=x86-64-v3",
+      "instructions": 193
+    }
+  ]
+}
