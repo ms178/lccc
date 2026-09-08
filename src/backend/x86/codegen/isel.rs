@@ -385,6 +385,51 @@ pub fn lower_binop(
 
     // ── Simple ALU operations (two-address form) ─────────────────────
     if let Some(alu_op) = binop_to_alu(op) {
+        // `x & 0xff` / `x & 0xffff` with a register-homed LHS and a
+        // destination register distinct from it lowers to a CROSS-
+        // REGISTER zero-extension (movzbl/movzwl) rather than
+        // `and $imm`: the truncating mask is the classic table-index
+        // idiom (`table[(crc ^ byte) & 0xff]`), and the result register
+        // feeds a scaled AGU operand on the loop-carried chain. A cross-
+        // register movz is eliminated at rename on Ice Lake+ (the byte
+        // copy is resolved in the renamer, removing a full execution
+        // cycle from the recurrence), while `and $imm` — and a SAME-
+        // register movz, which cannot be renamed onto a distinct
+        // physical register — always execute (2026-09-08 A/B on
+        // Ice Lake-SP: gzip_crc32's kernel loop measured 168 ms with
+        // `and $0xff`, 150 ms with `movzbl %al,%edi`, identical
+        // instruction counts and dependence depth otherwise; GCC 16.2
+        // emits the movz form). Only fired when dst differs from the
+        // LHS home for exactly that reason.
+        if op == IrBinOp::And && matches!(size, OpSize::S32 | OpSize::S64) {
+            let mask = match rhs {
+                Operand::Const(c) => Some(const_to_i64(c)),
+                _ => None,
+            };
+            let from = match mask {
+                Some(0xff) => Some(OpSize::S8),
+                Some(0xffff) => Some(OpSize::S16),
+                _ => None,
+            };
+            if let (Some(from), Operand::Value(lv)) = (from, lhs) {
+                let lhs_home = value_to_reg(lv, ra);
+                if matches!(lhs_home, MachReg::Phys(_))
+                    && matches!(dst, MachReg::Phys(_))
+                    && dst != lhs_home
+                {
+                    // movzbl/movzwl name the destination at 32 bits and
+                    // the machine zero-extends the full register, so the
+                    // result equals the masked value at every width.
+                    out.push(MachInst::Movzx {
+                        src: MachOperand::Reg(lhs_home),
+                        dst,
+                        from_size: from,
+                        to_size: OpSize::S32,
+                    });
+                    return true;
+                }
+            }
+        }
         if op == IrBinOp::Mul {
             if let Some(imm) = const_as_imm32_size(rhs, size) {
                 if let Some(scale) = lea_scale_for_mul(imm) {

@@ -133,6 +133,24 @@ pub struct LiveRange {
     /// on callee-saved registers for the whole 10-round loop while 12
     /// state webs were demoted.
     pub span_has_in_loop_use: bool,
+    /// Largest body size (latch_end - header_start, in instruction
+    /// positions) among the loop extents this range spans. Demoting a
+    /// span whose in-loop reads are exposed costs a reload per read per
+    /// iteration; whether that is amortizable depends on how much other
+    /// work the loop body contains. Used by the structural admission
+    /// cap's arming decision.
+    pub span_max_extent_len: u32,
+    /// True when EVERY use of this range is an addressing fold point
+    /// (GEP/Load/Store base recorded in `folded_at`): the value never
+    /// feeds an ALU operand. Such a range's register holds a base that
+    /// memory operands consume; it is not part of the loop's
+    /// register-bound arithmetic pressure, and spilling it merely moves
+    /// the base into an addressing reload. Pressure models and the
+    /// span-pressure valve must ignore it: counting fold-only bases as
+    /// loop pressure armed the structural cap for zlib_ng_adler32's
+    /// foldable byte loads (18 "shorts" that never needed 18 registers)
+    /// and demoted its marching pointer for nothing.
+    pub fold_only_uses: bool,
     /// In-loop use points per pass (web-wide, max over spanned loops) —
     /// the span's reload density inside the loop it spans. Feeds the
     /// admission ceiling: a span read many times per pass pays that many
@@ -219,6 +237,8 @@ impl LiveRange {
             span_reserve: 0,
             span_cost_bar: 0,
             span_has_in_loop_use: false,
+            span_max_extent_len: 0,
+            fold_only_uses: false,
             span_in_loop_uses: 0,
             span_exposed_uses: 0,
             span_recurrence: false,
@@ -569,6 +589,26 @@ pub(crate) fn mark_loop_spanning(
     // state, e.g. arith_loop's 32 live-out ints) measures a peak near zero
     // and its spans keep the pool, which is what makes the cap safe to
     // leave on universally.
+    // Fold-only ranges: every use is an addressing fold point. Computed
+    // before the peaks pass because pressure must exclude them (a base
+    // consumed exclusively by memory operands is not register-bound
+    // arithmetic pressure; its spill becomes an addressing reload).
+    let mut fold_only: FxHashSet<u32> = FxHashSet::default();
+    for r in ranges.iter() {
+        let mut all_uses_folded = !r.uses.is_empty();
+        for &u in &r.uses {
+            if !folded_at
+                .get(&u)
+                .is_some_and(|vids| vids.contains(&r.value_id))
+            {
+                all_uses_folded = false;
+                break;
+            }
+        }
+        if all_uses_folded {
+            fold_only.insert(r.value_id);
+        }
+    }
     let mut peaks: Vec<u32> = Vec::with_capacity(loop_extents.len());
     // Per extent: peak concurrency AND the shorts' total weighted cost —
     // the latter prices what one reserved register buys for them (their
@@ -580,8 +620,37 @@ pub(crate) fn mark_loop_spanning(
         let mut shorts_cost = 0u64;
         for r in ranges.iter() {
             if r.start >= header_start && r.end <= latch_end {
-                events.push((r.start, 1));
-                events.push((r.end.saturating_add(1), -1));
+                // Fold-only bases (every use an addressing fold) are not
+                // register-bound pressure: a spill turns them into an
+                // addressing reload, not a dependence-chain stall, and
+                // their consumers can often absorb the slot directly.
+                // Counting them made adler32's unrolled byte loads look
+                // like 18 registers of demand.
+                if fold_only.contains(&r.value_id) {
+                    continue;
+                }
+                // Segment-aware concurrency: the allocator assigns by
+                // real live segments (RA-05), not fat envelopes, and a
+                // peak computed on fat envelopes wildly overcounts
+                // interleaved short lifetimes — an unrolled
+                // load-add-chain's 16 byte temporaries share registers
+                // through their holes and never occupy 16 registers at
+                // once, but their envelopes all overlap the loop body
+                // (zlib_ng_adler32 measured a fake peak of 18 against a
+                // 14-register pool, arming the structural cap for
+                // nothing). Fat ranges (no segment data) contribute
+                // their whole envelope, exactly as before.
+                if r.segments.is_empty() {
+                    events.push((r.start, 1));
+                    events.push((r.end.saturating_add(1), -1));
+                } else {
+                    for &(seg_start, seg_end) in &r.segments {
+                        if seg_start >= header_start && seg_end <= latch_end {
+                            events.push((seg_start, 1));
+                            events.push((seg_end.saturating_add(1), -1));
+                        }
+                    }
+                }
                 shorts_cost = shorts_cost.saturating_add(r.total_cost());
             }
         }
@@ -621,13 +690,12 @@ pub(crate) fn mark_loop_spanning(
         let mut exposed = 0u32;
         let mut last_point: Option<u32> = None;
         for &u in &r.uses {
+            let folded_here = folded_at
+                .get(&u)
+                .is_some_and(|vids| vids.contains(&r.value_id));
             if loop_extents.iter().any(|&(hs, le)| u >= hs && u <= le) {
                 n += 1;
-                if last_point != Some(u)
-                    && !folded_at
-                        .get(&u)
-                        .is_some_and(|vids| vids.contains(&r.value_id))
-                {
+                if last_point != Some(u) && !folded_here {
                     exposed += 1;
                 }
             }
@@ -643,12 +711,14 @@ pub(crate) fn mark_loop_spanning(
         let mut spans = false;
         let mut reserve = 0u32;
         let mut bar = 0u64;
+        let mut max_extent_len = 0u32;
         let mut in_loop_use = false;
         for (((header_start, latch_end), peak), b) in loop_extents.iter().zip(&peaks).zip(&bars) {
             if range.start <= *header_start && range.end >= *latch_end {
                 spans = true;
                 reserve = reserve.max(*peak);
                 bar = bar.max(*b);
+                max_extent_len = max_extent_len.max(latch_end.saturating_sub(*header_start));
                 // (the leader's own in-extent uses are summarized in
                 // `any_use_in_extent`, consulted after the extent loop)
             }
@@ -690,6 +760,7 @@ pub(crate) fn mark_loop_spanning(
                 }
             }
         }
+        range.fold_only_uses = fold_only.contains(&range.value_id);
         if spans {
             range.spans_loop = true;
             range.span_in_loop_uses = in_loop_uses;
@@ -698,6 +769,7 @@ pub(crate) fn mark_loop_spanning(
             range.span_marked = true;
             range.span_reserve = reserve.max(1);
             range.span_cost_bar = bar;
+            range.span_max_extent_len = max_extent_len;
             range.span_has_in_loop_use = in_loop_use;
         }
     }
@@ -707,6 +779,13 @@ pub(crate) fn mark_loop_spanning(
 /// demotable at admission (see the admission-cap comment in
 /// `allocate_range`).
 const MAX_SPAN_EXPOSED_USES: u32 = 2;
+
+/// Ceiling on a span's remaining weighted cost for it to be demotable
+/// under structural auto-arming or evictable by the span-pressure valve.
+/// The measured separation among ADMISSION demotees: chacha20's ARX webs
+/// cost 11-21 while every workload that must not lose its spans costs
+/// 110-1100 (zlib_ng_adler32's checksum webs) — two orders of magnitude.
+const MAX_SPAN_REMCOST: u64 = 100;
 
 /// Ceiling on a span's remaining future-use points for it to be evictable
 /// by the span-pressure valve (see `find_span_valve_victim`).
@@ -1406,11 +1485,94 @@ impl LinearScanAllocator {
         // Seeded occupancy from earlier waves is not counted against the
         // cap (the seed carries no value identity); the arg-staging waves
         // that seed the main scan hold few registers for long.
-        if range.spans_loop && self.ra_config.loop_span_reserve > 0 {
+        // In-loop-useless spans, pigeonhole-gated and independent of the
+        // reserve knob: when the worklist's spans alone could fill the
+        // pool, a register held across a whole loop by a value with NO
+        // read inside any loop it spans is pure loss — every reload is
+        // outside the loop (staged once, cold), while the register is
+        // denied to the loop's block-local ranges and to the machinst
+        // window allocator's scratch pool for the entire body. Every
+        // loop extent is a natural loop (back-edge-derived), so this is
+        // automatically heat-gated: cold straight-line code never
+        // demotes. chacha20_core's two loop-invariant pointer spans sat
+        // on callee-saved registers for the whole 10-round loop.
+        if range.spans_loop
+            && range.span_marked
+            && !range.span_has_in_loop_use
+            && self.total_spans >= self.available_regs.len()
+            // Under the explicit knob the historical contract demotes
+            // every in-loop-useless span; under structural auto-arming
+            // the same MAX_SPAN_REMCOST ceiling as worth_capping applies
+            // — an in-loop-useless span can still be expensive to stage
+            // once at its cold reload sites (zlib_ng_adler32's inlined
+            // NMAX loop: the loop-invariant pointers cost 110-1100 and
+            // demoting them bought nothing, +7 stack slots and +12%
+            // runtime measured 2026-09-08; chacha20's two pointer spans
+            // cost 10-20 and their demotion is part of the ARX win).
+            && (self.ra_config.loop_span_reserve > 0
+                || range.remaining_cost(range.start) <= MAX_SPAN_REMCOST)
+        {
+            self.allocate_spill_slot(range.value_id);
+            return;
+        }
+        // Structural auto-arming: the admission cap runs even with the
+        // policy knob at 0 when the span's own measurement shows a loop
+        // whose block-local shorts could fill the ENTIRE pool on their
+        // own — the absolute pigeonhole: with more shorts wanting
+        // registers simultaneously than registers exist, some
+        // per-iteration spill is forced no matter what the spans do, and
+        // demoting the excess spans up front (position-independent,
+        // priced by the exposed-use model) is strictly better than
+        // letting the scan's arrival order decide who spills
+        // positionally. This is the mechanism that carries the ARX
+        // shape: chacha20's quarter-round loop measures 17 concurrent
+        // register-bound shorts against a 14-register pool, so its 16
+        // loop-spanning state webs are capped at admission and the
+        // shorts cycle through the freed registers (456 vs 491 insns).
+        // Below the absolute threshold nothing changes: the shorts fit
+        // alongside the spans with room to spare (adler32's byte loop at
+        // reserve 9 and 4 after fold-only exclusion, crc32, varint —
+        // measured: demoting there only added reload traffic, +17
+        // stackmem in the golden gate), and the historical knob remains
+        // available as an explicit override.
+        // Amortization floor: a demoted span's exposed reloads are paid
+        // once per read PER ITERATION, so the trade only clears when the
+        // loop body has enough other work for them to amortize against.
+        // zlib_ng_adler32's inlined check loop (reserve 18 after fat-
+        // envelope overcounting was fixed, body ~25 positions) demoted
+        // its pointers and paid +14 stackmem in the golden gate for
+        // shorts that were never register-starved in the first place;
+        // chacha20's quarter-round body (~150 positions) pays ~24
+        // reloads against ~600 instructions of register-hungry ARX work
+        // and wins massively. 96 positions is the empirical line between
+        // those two bodies — roughly a full LSD/DSB delivery window.
+        const STRUCTURAL_MIN_EXTENT_LEN: u32 = 96;
+        let structural_pressure = range.spans_loop
+            && self.ra_config.loop_span_reserve == 0
+            // STRICT pigeonhole: the loop's block-local shorts, on their
+            // own, outnumber the whole pool. When they merely FILL it
+            // (zlib_ng_adler32's NMAX loop: peak 10 against 10) the scan
+            // can home every short once the spans sort themselves out,
+            // and pre-demoting spans only moves who spills (measured:
+            // +7 stack slots, runtime flat). When they EXCEED it
+            // (chacha20's interleaved quarter-round chains: peak 17
+            // against 14) some short spills no matter what, and the
+            // cap's cheap-first demotion is what hands the registers to
+            // the shorts instead of the arrival order (chacha20 771ms ->
+            // 442ms measured on 4f4f417d).
+            && (range.span_reserve as usize) > self.available_regs.len()
+            && range.span_max_extent_len >= STRUCTURAL_MIN_EXTENT_LEN;
+        if range.spans_loop && (self.ra_config.loop_span_reserve > 0 || structural_pressure) {
             // Measured per-loop requirement, clamped by the policy knob:
             // the knob is a ceiling (and 0 disables), the measurement is
-            // the loop's own block-local peak concurrency.
-            let reserve = (range.span_reserve as usize).min(self.ra_config.loop_span_reserve);
+            // the loop's own block-local peak concurrency. Under
+            // structural auto-arming the knob is absent and the
+            // measurement IS the reserve.
+            let reserve = if self.ra_config.loop_span_reserve > 0 {
+                (range.span_reserve as usize).min(self.ra_config.loop_span_reserve)
+            } else {
+                range.span_reserve as usize
+            };
             let allowed = self.available_regs.len().saturating_sub(reserve);
             // In-loop-useless spans are demoted first, before the count
             // check: their reloads all sit outside the loop (staged once,
@@ -1453,8 +1615,35 @@ impl LinearScanAllocator {
             // to demote) had this test backwards for both shapes: it
             // blocked chacha20's 1-2-read webs while admitting sha256's
             // 6-read ones.
+            // Absolute demotion ceiling under auto-arming (2026-09-08):
+            // the bar alone cannot separate the ARX shape from the
+            // unrolled-accumulator shape, because the bar is DERIVED from
+            // the same loop's shorts — an unrolled byte-load chain's
+            // single-use temporaries carry huge weighted costs, so the
+            // bar grows with exactly the loop that should not be
+            // demoted (zlib_ng_adler32's inlined NMAX loop: bar 7750,
+            // its checksum webs cost 110-1100, and demoting them bought
+            // nothing — the loop's shorts were never register-starved;
+            // it merely paid their reload traffic as +14 stack slots).
+            // chacha20's ARX state webs cost 11-21 against bar 89 — a
+            // ~50x separation no relative bar can express. Under
+            // auto-arming (no explicit knob) a span is demotable only
+            // when its whole remaining weighted cost is trivial; the
+            // explicit knob keeps the bar-only contract.
+            let structural_arm = self.ra_config.loop_span_reserve == 0;
+            let absolute_remcost_ok =
+                !structural_arm || range.remaining_cost(range.start) <= MAX_SPAN_REMCOST;
             let worth_capping = !range.span_recurrence
                 && range.span_exposed_uses <= MAX_SPAN_EXPOSED_USES
+                // A FOLDED in-loop read (in-loop use count above the
+                // exposed count) must keep its register: spilling does
+                // not produce a priced reload, it DESTROYS the memory-
+                // operand fold and stages the base into a register
+                // before every use — unpriced, per-iteration cost. This
+                // is the adler32 marching-pointer lesson from the valve
+                // experiments, applied at admission where it belongs.
+                && range.span_exposed_uses >= range.span_in_loop_uses
+                && absolute_remcost_ok
                 && (range.span_cost_bar == 0
                     || range.remaining_cost(range.start) < range.span_cost_bar);
             if self.total_spans > allowed && worth_capping {
@@ -1568,13 +1757,6 @@ impl LinearScanAllocator {
                 if self.try_evict(evict_idx, range) {
                     return;
                 }
-                // Unreachable in practice: the search checked every
-                // refusal condition try_evict re-tests (steal safety
-                // against this very incoming, no mutation in between, and
-                // an active interval always holds its register). If a
-                // future guard ever diverges, the safe fallback is to
-                // spill the incoming — never to continue with a moved
-                // value.
                 self.allocate_spill_slot(incoming_id);
                 return;
             }
@@ -1767,12 +1949,7 @@ impl LinearScanAllocator {
     }
 
     /// Evict `active[evict_idx]`, give its register to `incoming`.
-    ///
-    /// Returns false and leaves state unchanged if the victim has no
-    /// assignment or the steal is unsound. On success the victim is
-    /// demoted to a spill slot and moved to `handled`.
-    ///
-    /// `swap_remove` reorders `active`; order is not semantic.
+
     fn try_evict(&mut self, evict_idx: usize, incoming: LiveRange) -> bool {
         if evict_idx >= self.active.len() {
             return false;
@@ -2646,8 +2823,10 @@ mod tests {
     fn valve_protects_recurrence_carried_spans() {
         // arith_loop's shape: the span IS the carried chain (its next value
         // is computed from itself). Demoting it puts the spill store→reload
-        // on the chain itself. The valve must refuse and fall through to
-        // the ordinary path, which spills the weaker incoming short.
+        // on the chain itself. The ordinary path keeps the carried span
+        // homed and spills the weaker incoming short (the removed
+        // positional valve never demoted these either; the admission cap's
+        // recurrence guard carries the same invariant).
         let mut span = valve_span(1, vec![100, 900]);
         span.span_recurrence = true;
         let ranges = vec![span, lr(2, 120, 130, vec![125], 20)];
@@ -2665,10 +2844,10 @@ mod tests {
     }
 
     #[test]
-    fn valve_ignores_spans_with_too_many_future_uses() {
+    fn ordinary_path_keeps_read_rich_spans_homed() {
         // sha256's shape: the span still has several reads to serve inside
         // the loop. Evicting it trades N folded reloads for one short's
-        // register — the valve's ceiling refuses, ordinary eviction decides.
+        // register — the ordinary cost path keeps it homed.
         let ranges = vec![
             valve_span(1, (100..140).collect()),
             lr(2, 120, 130, vec![125], 20),
@@ -2851,6 +3030,8 @@ mod tests {
             span_reserve: 0,
             span_cost_bar: 0,
             span_has_in_loop_use: false,
+            fold_only_uses: false,
+            span_max_extent_len: 0,
             span_in_loop_uses: 0,
             span_exposed_uses: 0,
             span_recurrence: false,
