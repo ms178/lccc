@@ -174,7 +174,11 @@ impl ArmCodegen {
                 "    csel {}, {}, {}, ne",
                 accumulator, t_name, f_name
             ));
-            self.store_x0_to(dest);
+            // Keep the accumulator entry when `dest` has no durable
+            // home (see store_x0_to_and_release) and skip the shared
+            // invalidate below, which would orphan the value.
+            self.store_x0_to_and_release(dest);
+            return;
         }
         self.state.reg_cache.invalidate_acc();
     }
@@ -220,7 +224,11 @@ impl ArmCodegen {
                 "    csel {}, {}, {}, {}",
                 accumulator, t_name, f_name, cc
             ));
-            self.store_x0_to(dest);
+            // Keep the accumulator entry when `dest` has no durable
+            // home (see store_x0_to_and_release) and skip the shared
+            // invalidate below, which would orphan the value.
+            self.store_x0_to_and_release(dest);
+            return;
         }
         self.state.reg_cache.invalidate_acc();
     }
@@ -312,7 +320,11 @@ impl ArmCodegen {
                 "    csinc {}, {}, {}, {}",
                 accumulator, base_reg, base_reg, condition
             ));
-            self.store_x0_to(dest);
+            // Keep the accumulator entry when `dest` has no durable
+            // home (see store_x0_to_and_release) and skip the shared
+            // invalidate below, which would orphan the value.
+            self.store_x0_to_and_release(dest);
+            return;
         }
         self.state.reg_cache.invalidate_acc();
     }

@@ -1,7 +1,9 @@
 // Benchmark 3: Matrix multiplication (memory/cache + arithmetic)
 #include <stdio.h>
 
+#ifndef N
 #define N 256
+#endif
 
 static double A[N][N], B[N][N], C[N][N];
 

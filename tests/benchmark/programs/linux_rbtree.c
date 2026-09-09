@@ -10,8 +10,12 @@
  */
 #include <stdio.h>
 
+#ifndef NODE_COUNT
 #define NODE_COUNT 16384U
+#endif
+#ifndef LOOKUP_ROUNDS
 #define LOOKUP_ROUNDS 8U
+#endif
 
 typedef unsigned long uintptr;
 typedef unsigned long long u64;

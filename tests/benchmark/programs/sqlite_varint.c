@@ -14,8 +14,12 @@
  */
 #include <stdio.h>
 
+#ifndef VALUE_COUNT
 #define VALUE_COUNT (1U << 18)
+#endif
+#ifndef PASSES
 #define PASSES 24U
+#endif
 #define SLOT_2_0 0x001fc07fU
 #define SLOT_4_2_0 0xf01fc07fU
 

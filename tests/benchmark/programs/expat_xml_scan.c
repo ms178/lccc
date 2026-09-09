@@ -17,8 +17,12 @@
  */
 #include <stdio.h>
 
+#ifndef XML_SIZE
 #define XML_SIZE (1UL << 20)
+#endif
+#ifndef PASSES
 #define PASSES 64U
+#endif
 
 static unsigned char expat_xml_data[XML_SIZE];
 

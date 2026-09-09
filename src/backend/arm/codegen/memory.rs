@@ -118,8 +118,7 @@ impl ArmCodegen {
         };
         self.state
             .emit_fmt(format_args!("    {} {}, {}", instr, reg, addr));
-        self.store_x0_to(dest);
-        self.state.reg_cache.invalidate_acc();
+        self.store_x0_to_and_release(dest);
         true
     }
 

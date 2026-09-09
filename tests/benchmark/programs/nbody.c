@@ -2,7 +2,15 @@
 #include <stdio.h>
 #include <math.h>
 
+#ifndef NBODIES
 #define NBODIES 5
+#endif
+// Step count, overridable so the cross-backend execution oracle can run this
+// under qemu-user (5,000,000 steps is 12 s native and 300 s+ under TCG).
+// The default is unchanged, so benchmark timings and baselines are unaffected.
+#ifndef STEPS
+#define STEPS 5000000
+#endif
 #define PI 3.141592653589793
 #define SOLAR_MASS (4 * PI * PI)
 #define DAYS_PER_YEAR 365.24
@@ -78,7 +86,7 @@ int main(void) {
     bodies[0].vz = -pz / SOLAR_MASS;
 
     printf("%.9f\n", energy());
-    advance(0.01, 5000000);
+    advance(0.01, STEPS);
     printf("%.9f\n", energy());
     return 0;
 }

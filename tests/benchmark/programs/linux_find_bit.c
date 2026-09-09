@@ -18,9 +18,13 @@
 #include <stdio.h>
 
 #define BITS_PER_LONG (sizeof(unsigned long) * 8UL)
+#ifndef WORD_COUNT
 #define WORD_COUNT (1UL << 14)
+#endif
 #define BIT_COUNT (WORD_COUNT * BITS_PER_LONG)
+#ifndef PASSES
 #define PASSES 1024U
+#endif
 
 static unsigned long linux_bitmap_a[WORD_COUNT];
 static unsigned long linux_bitmap_b[WORD_COUNT];

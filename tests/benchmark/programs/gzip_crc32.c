@@ -12,8 +12,12 @@
  */
 #include <stdio.h>
 
+#ifndef DATA_SIZE
 #define DATA_SIZE (1UL << 20)
+#endif
+#ifndef PASSES
 #define PASSES 64U
+#endif
 
 static unsigned char gzip_crc_data[DATA_SIZE];
 
