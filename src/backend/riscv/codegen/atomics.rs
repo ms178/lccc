@@ -55,6 +55,12 @@ impl RiscvCodegen {
             IrType::I32 => {
                 state.emit("    sext.w t0, t0");
             }
+            IrType::U32 => {
+                // AMO.W/LR.W sign-extend their result on RV64; unsigned IR
+                // values require explicit zero-extension.
+                state.emit("    slli t0, t0, 32");
+                state.emit("    srli t0, t0, 32");
+            }
             _ => {}
         }
     }
@@ -543,6 +549,11 @@ impl RiscvCodegen {
             self.emit_subword_atomic_cmpxchg(ty, aq_rl, returns_bool);
         } else {
             let suffix = Self::amo_width_suffix(ty);
+            if matches!(ty, IrType::I32 | IrType::U32) {
+                // LR.W sign-extends on RV64. Compare the expected value in the
+                // same representation, including unsigned values >= 2^31.
+                self.state.emit("    sext.w t2, t2");
+            }
 
             let loop_label = self.state.fresh_label("cas_loop");
             let fail_label = self.state.fresh_label("cas_fail");
@@ -566,6 +577,9 @@ impl RiscvCodegen {
                 self.state.emit("    li t0, 0");
             }
             self.state.emit_fmt(format_args!("{}:", done_label));
+        }
+        if !returns_bool {
+            Self::sign_extend_riscv(&mut self.state, ty);
         }
         self.store_t0_to(dest);
     }
@@ -596,15 +610,23 @@ impl RiscvCodegen {
                 self.state.emit("    fence r, rw");
             }
         } else {
-            let suffix = Self::amo_width_suffix(ty);
-            let lr_suffix = match ordering {
-                AtomicOrdering::Relaxed | AtomicOrdering::Release => "",
-                AtomicOrdering::Acquire => ".aq",
-                AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => ".aqrl",
-            };
-            self.state
-                .emit_fmt(format_args!("    lr.{}{} t0, (t0)", suffix, lr_suffix));
-            Self::sign_extend_riscv(&mut self.state, ty);
+            // Naturally aligned XLEN/word loads are already single-copy atomic.
+            // LR would unnecessarily create a reservation and is not required
+            // for an atomic load; fences supply the requested ordering.
+            if matches!(ordering, AtomicOrdering::SeqCst) {
+                self.state.emit("    fence rw, rw");
+            }
+            match ty {
+                IrType::I32 => self.state.emit("    lw t0, 0(t0)"),
+                IrType::U32 => self.state.emit("    lwu t0, 0(t0)"),
+                _ => self.state.emit("    ld t0, 0(t0)"),
+            }
+            if matches!(
+                ordering,
+                AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
+            ) {
+                self.state.emit("    fence r, rw");
+            }
         }
         self.store_t0_to(dest);
     }
@@ -635,12 +657,23 @@ impl RiscvCodegen {
                 self.state.emit("    fence rw, rw");
             }
         } else {
-            let aq_rl = Self::amo_ordering(ordering);
-            let suffix = Self::amo_width_suffix(ty);
-            self.state.emit_fmt(format_args!(
-                "    amoswap.{}{} zero, t1, (t0)",
-                suffix, aq_rl
-            ));
+            // Naturally aligned word/doubleword stores are atomic. Match the
+            // standard RVWMO mapping instead of paying for an AMOSWAP whose
+            // old value is discarded.
+            if matches!(
+                ordering,
+                AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
+            ) {
+                self.state.emit("    fence rw, w");
+            }
+            if matches!(ty, IrType::I32 | IrType::U32) {
+                self.state.emit("    sw t1, 0(t0)");
+            } else {
+                self.state.emit("    sd t1, 0(t0)");
+            }
+            if matches!(ordering, AtomicOrdering::SeqCst) {
+                self.state.emit("    fence rw, rw");
+            }
         }
     }
 

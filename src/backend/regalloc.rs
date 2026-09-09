@@ -692,11 +692,13 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
                 NONE
             }
         }
-        // `lock xadd` / `xchg` / test-and-set run on rax+rcx only; every
-        // other RMW is a cmpxchg loop with old in rax, new in rdx and the
-        // operand value in rdi.
+        // `lock xadd` / `xchg` / test-and-set run on rax+rcx only; bitwise
+        // RMWs use a cmpxchg loop with old in rax, new in rdx and the operand
+        // value in rdi.
         Instruction::AtomicRmw { op, .. } => match op {
-            AtomicRmwOp::Add | AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => NONE,
+            AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => {
+                NONE
+            }
             _ => RDX_RDI,
         },
         // cmpxchg: desired in rdx. Atomic store: value in rdx.

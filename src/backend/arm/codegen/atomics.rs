@@ -5,6 +5,18 @@ use crate::common::types::IrType;
 use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, Operand, Value};
 
 impl ArmCodegen {
+    /// Canonicalize an exclusive-operation result in X0 to the IR type.
+    fn canonicalize_atomic_x0_result(&mut self, ty: IrType) {
+        match ty {
+            IrType::I8 => self.state.emit("    sxtb x0, w0"),
+            IrType::I16 => self.state.emit("    sxth x0, w0"),
+            IrType::I32 => self.state.emit("    sxtw x0, w0"),
+            // Byte/halfword loads and every W-register write already clear
+            // the upper bits for unsigned types.
+            _ => {}
+        }
+    }
+
     pub(super) fn emit_atomic_rmw_impl(
         &mut self,
         dest: &Value,
@@ -16,8 +28,10 @@ impl ArmCodegen {
     ) {
         self.operand_to_x0(ptr);
         self.state.emit("    mov x1, x0");
-        self.operand_to_x0(val);
-        self.state.emit("    mov x2, x0");
+        if !matches!(op, AtomicRmwOp::TestAndSet) {
+            self.operand_to_x0(val);
+            self.state.emit("    mov x2, x0");
+        }
 
         let (ldxr, stxr, reg_prefix) = Self::exclusive_instrs(ty, ordering);
         let val_reg = format!("{}2", reg_prefix);
@@ -39,10 +53,10 @@ impl ArmCodegen {
             AtomicRmwOp::TestAndSet => {
                 let label_id = self.state.next_label_id();
                 let loop_label = format!(".Latomic_{}", label_id);
+                self.state.emit("    mov w3, #1");
                 self.state.emit_fmt(format_args!("{}:", loop_label));
                 self.state
                     .emit_fmt(format_args!("    {} {}, [x1]", ldxr, old_reg));
-                self.state.emit("    mov w3, #1");
                 self.state
                     .emit_fmt(format_args!("    {} w4, w3, [x1]", stxr));
                 self.state
@@ -60,6 +74,9 @@ impl ArmCodegen {
                 self.state
                     .emit_fmt(format_args!("    cbnz w4, {}", loop_label));
             }
+        }
+        if !matches!(op, AtomicRmwOp::TestAndSet) {
+            self.canonicalize_atomic_x0_result(ty);
         }
         self.store_x0_to(dest);
     }
@@ -81,6 +98,13 @@ impl ArmCodegen {
         self.state.emit("    mov x3, x0");
         self.operand_to_x0(expected);
         self.state.emit("    mov x2, x0");
+        // LDXRB/LDXRH zero-extend, so compare the expected value at the
+        // atomic object's width rather than against a sign-extended source.
+        match ty {
+            IrType::I8 | IrType::U8 => self.state.emit("    and w2, w2, #0xff"),
+            IrType::I16 | IrType::U16 => self.state.emit("    uxth w2, w2"),
+            _ => {}
+        }
 
         let (ldxr, stxr, reg_prefix) = Self::exclusive_instrs(ty, success_ordering);
         let old_reg = format!("{}0", reg_prefix);
@@ -114,6 +138,9 @@ impl ArmCodegen {
             self.state.emit("    clrex");
         }
         self.state.emit_fmt(format_args!("{}:", done_label));
+        if !returns_bool {
+            self.canonicalize_atomic_x0_result(ty);
+        }
         self.store_x0_to(dest);
     }
 
@@ -145,12 +172,7 @@ impl ArmCodegen {
         };
         self.state
             .emit_fmt(format_args!("    {} {}, [x0]", instr, dest_reg));
-        match ty {
-            IrType::I8 => self.state.emit("    sxtb x0, w0"),
-            IrType::I16 => self.state.emit("    sxth x0, w0"),
-            IrType::I32 => self.state.emit("    sxtw x0, w0"),
-            _ => {}
-        }
+        self.canonicalize_atomic_x0_result(ty);
         self.store_x0_to(dest);
     }
 
@@ -190,8 +212,11 @@ impl ArmCodegen {
         match ordering {
             AtomicOrdering::Relaxed => {}
             AtomicOrdering::Acquire => self.state.emit("    dmb ishld"),
-            AtomicOrdering::Release => self.state.emit("    dmb ishst"),
-            AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => self.state.emit("    dmb ish"),
+            // A C release fence orders earlier loads as well as stores before
+            // a following publishing store; DMB ISHST would omit load->store.
+            AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => {
+                self.state.emit("    dmb ish")
+            }
         }
     }
 }
