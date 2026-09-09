@@ -460,6 +460,15 @@ fn emit_multi_phi_copies(
             None => continue,
         };
         let edge_copies = build_edge_copies(phis, &phi_temps, &phi_src_maps, pred_label);
+        if std::env::var_os("CCC_DEBUG_PHIELIM").is_some() {
+            eprintln!(
+                "[PHIELIM] block {} phis={:?} pred {} copies={:?}",
+                target_block_id.0,
+                phis.iter().map(|p| p.dest.0).collect::<Vec<_>>(),
+                pred_label.0,
+                edge_copies
+            );
+        }
         place_copies(ctx, pred_idx, target_block_id, edge_copies);
     }
 }

@@ -198,6 +198,11 @@ pub struct CodegenState {
     /// two-operand VEX arithmetic intrinsic (`compute_vector_memfold_values`).
     /// The load is not emitted; the consumer folds its source memory operand.
     pub vector_memfold_values: FxHashSet<u32>,
+    /// Subset of `vector_memfold_values` whose consumer is a plain
+    /// two-operand 256-bit binary (`emit_avx_binary_256`).  Only these may be
+    /// elided when the load's destination carries a register home; see
+    /// `compute_vector_memfold_homed_ok`.
+    pub vector_memfold_homed_ok: FxHashSet<u32>,
     /// The elided load awaiting its consumer: (value id, memory operand,
     /// load mnemonic for materialisation). Consumed by `emit_avx_binary_256`
     /// as a memory operand, or by `avx_load_arg_to` as a real load; the
@@ -515,6 +520,7 @@ impl CodegenState {
             sse_last_store_reg_name: None,
             vector_defer_values: FxHashSet::default(),
             vector_memfold_values: FxHashSet::default(),
+            vector_memfold_homed_ok: FxHashSet::default(),
             pending_vec_memfold: None,
             pending_vec_store: None,
             x87_pending: None,

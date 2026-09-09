@@ -2264,6 +2264,46 @@ impl Default for Driver {
     }
 }
 
+impl Driver {
+    /// x86-64 code-generation ISA permission for this translation unit.
+    ///
+    /// Policy (`backend::x86::isa`):
+    /// * no explicit `-march`: project baseline x86-64-v3, minus explicit
+    ///   `-mno-*` denials;
+    /// * explicit `-march=<level|cpu|native>`: the requested feature set is
+    ///   the ceiling (GCC-exact), explicit denials still apply;
+    /// * `-mno-sse` / `-mgeneral-regs-only`: nothing (the register file is
+    ///   off-limits; the kernel runs with CR4.OSFXSR/OSXSAVE clear).
+    ///
+    /// Non-x86-64 targets get [`X86Isa::NONE`]; i686 keeps its own SSE2
+    /// handling through `no_sse` and never reaches the x86-64 emitters.
+    pub(crate) fn x86_isa(&self) -> crate::backend::x86::isa::X86Isa {
+        use crate::backend::x86::isa::X86Isa;
+        if self.target != Target::X86_64 || self.no_sse || self.general_regs_only {
+            return X86Isa::NONE;
+        }
+        let ceiling = if self.x86_march_explicit {
+            X86Isa {
+                simd: true,
+                sse41: self.enable_sse4_1,
+                avx: self.enable_avx,
+                ymm: self.enable_avx2,
+                fma: self.enable_fma,
+            }
+        } else {
+            X86Isa::V3
+        };
+        X86Isa {
+            simd: true,
+            sse41: ceiling.sse41 && !self.sse41_explicitly_disabled,
+            avx: ceiling.avx && !self.avx_explicitly_disabled,
+            ymm: ceiling.ymm && !self.avx_explicitly_disabled,
+            fma: ceiling.fma && !self.fma_explicitly_disabled,
+        }
+        .normalized()
+    }
+}
+
 /// First instruction line of `asm` that names an SSE/AVX register, with the
 /// enclosing function's symbol.  Inline-asm bodies (`#APP` … `#NO_APP`) are
 /// the user's own responsibility and are skipped; comments and directives
@@ -2322,45 +2362,5 @@ mod sse_reference_tests {
         let asm = ".type f, @function\nf:\n#APP\n    movaps %xmm0, %xmm1\n#NO_APP\n\
                    # note: %xmm0\n    ret\n";
         assert!(first_sse_reference(asm).is_none());
-    }
-}
-
-impl Driver {
-    /// x86-64 code-generation ISA permission for this translation unit.
-    ///
-    /// Policy (`backend::x86::isa`):
-    /// * no explicit `-march`: project baseline x86-64-v3, minus explicit
-    ///   `-mno-*` denials;
-    /// * explicit `-march=<level|cpu|native>`: the requested feature set is
-    ///   the ceiling (GCC-exact), explicit denials still apply;
-    /// * `-mno-sse` / `-mgeneral-regs-only`: nothing (the register file is
-    ///   off-limits; the kernel runs with CR4.OSFXSR/OSXSAVE clear).
-    ///
-    /// Non-x86-64 targets get [`X86Isa::NONE`]; i686 keeps its own SSE2
-    /// handling through `no_sse` and never reaches the x86-64 emitters.
-    pub(crate) fn x86_isa(&self) -> crate::backend::x86::isa::X86Isa {
-        use crate::backend::x86::isa::X86Isa;
-        if self.target != Target::X86_64 || self.no_sse || self.general_regs_only {
-            return X86Isa::NONE;
-        }
-        let ceiling = if self.x86_march_explicit {
-            X86Isa {
-                simd: true,
-                sse41: self.enable_sse4_1,
-                avx: self.enable_avx,
-                ymm: self.enable_avx2,
-                fma: self.enable_fma,
-            }
-        } else {
-            X86Isa::V3
-        };
-        X86Isa {
-            simd: true,
-            sse41: ceiling.sse41 && !self.sse41_explicitly_disabled,
-            avx: ceiling.avx && !self.avx_explicitly_disabled,
-            ymm: ceiling.ymm && !self.avx_explicitly_disabled,
-            fma: ceiling.fma && !self.fma_explicitly_disabled,
-        }
-        .normalized()
     }
 }
