@@ -118,6 +118,9 @@ gate "strict-computed-recip-codegen" fast \
 gate "machinst-window-alloc" fast \
     bash tests/regression/check_machinst_window_alloc_wide_copy.sh
 
+gate "i686-atomics" fast \
+    bash tests/regression/check_i686_atomics.sh
+
 if [ -x target/fastbuild/lccc-ld ]; then
     gate "linker-fuzz" fast env \
         LCCC_LD="$PWD/target/fastbuild/lccc-ld" FUZZ_N=128 FUZZ_SEED=20260906 \

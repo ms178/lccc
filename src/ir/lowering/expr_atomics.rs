@@ -215,7 +215,16 @@ impl Lowerer {
                 ty: IrType::I8,
                 ordering,
             });
-            return Some(Operand::Value(dest));
+            // AtomicRmw exposes the previous byte, while GCC's
+            // __atomic_test_and_set contract returns _Bool. Normalize every
+            // nonzero previous representation to exactly one.
+            let was_set = self.emit_cmp_val(
+                IrCmpOp::Ne,
+                Operand::Value(dest),
+                Operand::Const(IrConst::I8(0)),
+                IrType::I8,
+            );
+            return Some(Operand::Value(was_set));
         }
         if name == "__atomic_clear" && args.len() >= 2 {
             let ptr = self.lower_expr(&args[0]);
