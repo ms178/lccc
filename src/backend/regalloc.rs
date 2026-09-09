@@ -4828,6 +4828,44 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     };
 
     if !config.xmm_regs.is_empty() {
+        // Destructive-form pre-allocation for SSE-128 vector chains: values
+        // produced by a two-operand SSE intrinsic whose first operand dies
+        // at that very instruction (ARX rounds, integer/FP chains routed
+        // through emit_sse_binary_128), plus those dying operands.  They
+        // are homed here in instruction order — a register recycles at the
+        // dying operand, so the in-place emitter paths (`op %src, %dst`,
+        // `pshufb %mask, %dst`, `pshufd $i, %src, %dst`) fire with zero
+        // staging movdqas.  The f64 scan below then fills the remaining
+        // registers for everything else (FP scalars, broadcasts, loads,
+        // copy webs).
+        let mut sse_chain_regs: FxHashSet<u8> = FxHashSet::default();
+        let mut sse_chain_alloc: FxHashSet<u32> = FxHashSet::default();
+        if x86_fp_pool {
+            let sse_chain_values = collect_sse128_chain_values(func);
+            if !sse_chain_values.is_empty() {
+                let mut sse_chain_pool: Vec<PhysReg> = config
+                    .xmm_regs
+                    .iter()
+                    .filter(|r| r.0 >= 21)
+                    .copied()
+                    .collect();
+                sse_chain_pool.retain(|r| !assignments.values().any(|a| a.0 == r.0));
+                if !sse_chain_pool.is_empty() {
+                    let coalesced = allocate_vector_registers_destructive(
+                        func,
+                        &sse_chain_values,
+                        &sse_chain_pool,
+                        &|vid: u32| assignments.contains_key(&vid),
+                        call_points,
+                    );
+                    sse_chain_alloc = coalesced.iter().map(|&(v, _)| v).collect();
+                    for (vid, reg) in coalesced {
+                        sse_chain_regs.insert(reg.0);
+                        assignments.insert(vid, reg);
+                    }
+                }
+            }
+        }
         let mut real_use: FxHashSet<u32> = FxHashSet::default();
         if arm_fp_pool || x86_fp_pool {
             for block in &func.blocks {
@@ -4883,6 +4921,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| iv.end > iv.start)
             .filter(|iv| !assignments.contains_key(&iv.value_id))
             .filter(|iv| !call_spanning.contains(&iv.value_id))
+            // The destructive-form pre-allocation above already homed the
+            // SSE-128 chain values; never double-book them.
+            .filter(|iv| !(x86_fp_pool && sse_chain_alloc.contains(&iv.value_id)))
             .filter(|iv| !(arm_fp_pool || x86_fp_pool) || real_use.contains(&iv.value_id))
             .filter(|iv| {
                 vector_values.contains(&iv.value_id) || f64_value_set.contains(&iv.value_id)
@@ -4965,11 +5006,18 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             // webs spanning mutually exclusive arms get the same treatment
             // as the GPR scan.
             attach_scan_segments(&mut f64_ranges, &liveness, &coalesce_member_of);
-            let mut xmm_allocator = LinearScanAllocator::new_with_config(
-                f64_ranges,
-                config.xmm_regs.clone(),
-                &config.ra_config,
-            );
+            let scan_pool: Vec<PhysReg> = if x86_fp_pool {
+                config
+                    .xmm_regs
+                    .iter()
+                    .filter(|r| !sse_chain_regs.contains(&r.0))
+                    .copied()
+                    .collect()
+            } else {
+                config.xmm_regs.clone()
+            };
+            let mut xmm_allocator =
+                LinearScanAllocator::new_with_config(f64_ranges, scan_pool, &config.ra_config);
             xmm_allocator.run();
             for (&vid, &reg) in &xmm_allocator.assignments {
                 assignments.insert(vid, reg);
@@ -4986,7 +5034,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         if !config.ra_config.no_vecreg {
             let vec_candidates = collect_vecreg_candidates(func);
             if !vec_candidates.is_empty() {
-                let mut vec_pool: Vec<PhysReg> = (21..=25).map(PhysReg).collect();
+                // The vector pool is the target's XMM family minus xmm2
+                // (implicit scratch for a handful of intrinsic emitters)
+                // minus everything earlier scans already claimed.  x86-64
+                // therefore gets xmm3..xmm15; i686 and other targets shrink
+                // with their own `xmm_regs`.
+                let mut vec_pool: Vec<PhysReg> = config
+                    .xmm_regs
+                    .iter()
+                    .filter(|r| r.0 >= 21)
+                    .copied()
+                    .collect();
                 vec_pool.retain(|r| !assignments.values().any(|a| a.0 == r.0));
                 if !vec_pool.is_empty() {
                     let vec_intervals =
@@ -4997,6 +5055,18 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         .filter(|iv| !spans_any_call(iv, call_points))
                         .collect();
                     if !vec_intervals.is_empty() {
+                        // The vecreg-ALLOCA scheme keeps its original
+                        // LinearScanAllocator over the SYNTHETIC intervals:
+                        // those values mirror 16-byte stack slots, and the
+                        // synthetic interval construction (loop-region
+                        // growth, split-layout merging) is the soundness
+                        // contract for when a slot's register mirror may be
+                        // recycled.  PR #455 replaced this with the raw
+                        // linear-span destructive allocator and silently
+                        // miscompiled user-level __m128i code (the
+                        // simd_sse2_arith corpus); the destructive form is
+                        // reserved for the SSE-128 CHAIN values above,
+                        // which own no slots.
                         let vec_ranges = live_range::build_live_ranges_with_config(
                             &vec_intervals,
                             &liveness.block_loop_depth,
@@ -5596,7 +5666,15 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::Pinsrw128
             | O::Pinsrd128
             | O::Pinsrb128
-            | O::Pinsrq128 => Some(1),
+            | O::Pinsrq128
+            | O::VecRolI32x4
+            | O::VecShufdI32x4
+            // Horizontal counting exit: one vector operand, scalar result.
+            | O::VecHorizontalAddI64x4 => Some(1),
+            // Byte-predicate counting binaries: two vector operands each
+            // (`vpsadbw a, b`, `vpaddq a, b`).
+            | O::VecSadbwU8x32
+            | O::VecAddI64x4 => Some(2),
 
             // Three genuine vector inputs (no scalar operand in the prefix).
             O::Pblendvb128
@@ -5624,7 +5702,23 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecCmpF64x4
             | O::VecCmpF64x2
             | O::VecCmpI32x8
-            | O::VecCmpI32x4 => Some(2),
+            | O::VecCmpI32x4
+            // Byte-lane compares: same [a, b, imm] shape as the dword
+            // form — two vector reads plus a constant predicate.
+            | O::VecCmpI8x32
+            | O::VecCmpI8x16
+            // Word-lane compares (OP-05g): same shape again.
+            | O::VecCmpI16x16
+            | O::VecCmpI16x8 => Some(2),
+
+            // ARX lane family additions (PR455 RA port; Rol/Shufd are
+            // already counted in the Some(1) arm above): the byte shuffle
+            // reads two vectors (data + mask), the pack's four inputs are
+            // scalars, and the lane extract reads one vector arg.
+            O::VecShufbI32x4 => Some(2),
+            O::VecPackI32x4 => Some(0),
+            O::VecExtractLaneI32x4 => Some(1),
+
 
             // Lane-mask selects: [false, true, mask] — all three are vector
             // reads resolved through the register cache by the AVX/SSE
@@ -5634,7 +5728,11 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecBlendvF64x4
             | O::VecBlendvF64x2
             | O::VecBlendvI32x8
-            | O::VecBlendvI32x4 => Some(3),
+            | O::VecBlendvI32x4
+            | O::VecBlendvI8x32
+            | O::VecBlendvI8x16
+            | O::VecBlendvI16x16
+            | O::VecBlendvI16x8 => Some(3),
 
             // Binary vector inputs.  Palignr/Pblendw/Pclmul/GFNI append an
             // immediate after this two-vector prefix; variable shifts really
@@ -5772,6 +5870,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecAddF64x4
                 | O::VecAddI32x4
                 | O::VecAddI32x8
+                | O::VecAddI8x32
                 | O::VecAddF32x4
                 | O::VecAddF32x8
                 | O::VecMulF64x2
@@ -5780,6 +5879,39 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecMulF32x8
                 | O::VecMinI32x8
                 | O::VecMaxI32x8
+                | O::VecSubI8x32
+                | O::VecCmpI8x32
+                | O::VecMinU8x32
+                | O::VecMaxU8x32
+                | O::VecBlendvI8x32
+                | O::VecAddI8x16
+                | O::VecSubI8x16
+                | O::VecCmpI8x16
+                | O::VecMinU8x16
+                | O::VecMaxU8x16
+                | O::VecBlendvI8x16
+                | O::VecMinI8x32
+                | O::VecMaxI8x32
+                | O::VecBroadcastI8x32
+                | O::VecBroadcastI8x16
+                | O::VecAddI16x16
+                | O::VecSubI16x16
+                | O::VecMulI16x16
+                | O::VecCmpI16x16
+                | O::VecMinI16x16
+                | O::VecMaxI16x16
+                | O::VecMinU16x16
+                | O::VecMaxU16x16
+                | O::VecBlendvI16x16
+                | O::VecAddI16x8
+                | O::VecSubI16x8
+                | O::VecMulI16x8
+                | O::VecCmpI16x8
+                | O::VecMinI16x8
+                | O::VecMaxI16x8
+                | O::VecBlendvI16x8
+                | O::VecBroadcastI16x16
+                | O::VecBroadcastI16x8
                 | O::VecFmaF64x4
                 | O::VecFmaF32x8
                 | O::VecHorizontalAddF64x2
@@ -6015,6 +6147,306 @@ fn synthetic_vec_intervals(
         }
     }
     result
+}
+
+/// Values belonging to SSE-128 two-operand chains: for every intrinsic in
+/// the SSE-128 arithmetic family (routed through `emit_sse_binary_128` or
+/// the ARX shuffle/rotate emitters) whose first operand's last mention is
+/// the defining instruction itself, both the destination and the dying
+/// operand are collected.  Homing exactly these in instruction order lets
+/// a register recycle at the dying operand; everything else keeps the
+/// existing scans.
+fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    let is_sse128_arith = |op: &O| {
+        matches!(
+            op,
+            O::VecAddI32x4
+                | O::VecSubI32x4
+                | O::VecMulI32x4
+                | O::VecAndI32x4
+                | O::VecOrI32x4
+                | O::VecXorI32x4
+                | O::VecAddI64x2
+                | O::VecSubI64x2
+                | O::VecAddI8x16
+                | O::VecSubI8x16
+                | O::VecMinU8x16
+                | O::VecMaxU8x16
+                | O::VecAddF32x4
+                | O::VecSubF32x4
+                | O::VecMulF32x4
+                | O::VecDivF32x4
+                | O::VecMinF32x4
+                | O::VecMaxF32x4
+                | O::VecAddF64x2
+                | O::VecSubF64x2
+                | O::VecMulF64x2
+                | O::VecDivF64x2
+                | O::VecMinF64x2
+                | O::VecMaxF64x2
+                | O::VecRolI32x4
+                | O::VecShufdI32x4
+                | O::VecShufbI32x4
+        )
+    };
+
+    // Mention points (same scheme as the destructive allocator).
+    let mut last_at: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    last_at.insert(v.0, point);
+                }
+            });
+            if let Instruction::Intrinsic {
+                dest: Some(d),
+                args,
+                ..
+            } = inst
+            {
+                last_at.insert(d.0, point);
+                for a in args {
+                    if let Operand::Value(v) = a {
+                        last_at.insert(v.0, point);
+                    }
+                }
+            }
+            point += 1;
+        }
+        point += 1; // terminator
+    }
+
+    let mut out: FxHashSet<u32> = FxHashSet::default();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(d),
+                args,
+                op,
+                ..
+            } = inst
+            {
+                if is_sse128_arith(op) && !args.is_empty() {
+                    if let Operand::Value(a0) = &args[0] {
+                        let same_as_a1 = matches!(&args[1.min(args.len() - 1)], Operand::Value(v) if v.0 == a0.0);
+                        if !same_as_a1 {
+                            // Home the chain DEST and its first operand
+                            // unconditionally: each gets its own register
+                            // whenever one is free for its (linear,
+                            // over-approximating) span -- overlapping
+                            // spans never share, so adding candidates is
+                            // always sound.  A first operand whose last
+                            // mention IS this instruction additionally
+                            // earns a death hint in the pass below, which
+                            // recycles its register into the destination
+                            // (the in-place form).  Restricting the
+                            // collection to dying operands (PR #455's
+                            // original form) left loop-header role values
+                            // -- alive to a loop-exit materialisation --
+                            // unhomed, and the block-edge phi copy then
+                            // lowered to a per-iteration slot store+reload
+                            // pair (measured: 26 of 74 instructions in the
+                            // ChaCha double round were that roundtrip).
+                            out.insert(d.0);
+                            out.insert(a0.0);
+                            // The second operand when it is a value
+                            // (pshufb's loop-invariant MASK, a second
+                            // stream): homed with its own register for its
+                            // span, so a loop body reads it from the
+                            // register instead of reloading its slot at
+                            // every use (measured: 4 mask reloads per
+                            // double round).  Const operands (rotate
+                            // amounts, compare predicates) stay out.
+                            if let Operand::Value(a1) = &args[1] {
+                                out.insert(a1.0);
+                            }
+                        }
+                    }
+                }
+            }
+            point += 1;
+        }
+        point += 1; // terminator
+    }
+    out
+}
+
+/// Destructive-form vector register allocation (see the call site for the
+/// rationale).  Uses linear first/last mention spans — the same point
+/// scheme as `synthetic_vec_intervals` — with one crucial difference:
+/// values mentioned in a single block keep their raw span, so a register
+/// recycles at a dying operand's last use and in-place chains form.  Values
+/// mentioned in more than one loop-region block keep the conservative
+/// whole-region envelope (split layouts, cross-iteration liveness), exactly
+/// like the previous whole-region scan.
+///
+/// Soundness: `sse_load_arg` only ever reads a home at a use point (or a
+/// block boundary, where the home content is re-established by the phi Copy
+/// lowering), and two candidates share a register only when their linear
+/// spans do not overlap; a dying first operand is allowed to meet its
+/// consumer exactly at the shared instruction (that IS the in-place form).
+/// Linear spans over-approximate every execution path's liveness, so an
+/// overlap is never missed — only (conservatively) invented.
+fn allocate_vector_registers_destructive(
+    func: &IrFunction,
+    candidates: &FxHashSet<u32>,
+    pool: &[PhysReg],
+    taken: &dyn Fn(u32) -> bool,
+    call_points: &[u32],
+) -> Vec<(u32, PhysReg)> {
+    // Pass 1: linear mention points (one point per instruction, one per
+    // terminator — the same scheme as `synthetic_vec_intervals`).
+    let mut first_at: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut last_at: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let mut note =
+                |v: u32, first_at: &mut FxHashMap<u32, u32>, last_at: &mut FxHashMap<u32, u32>| {
+                    if candidates.contains(&v) {
+                        first_at.entry(v).or_insert(point);
+                        last_at.insert(v, point);
+                    }
+                };
+            match inst {
+                Instruction::Intrinsic {
+                    dest: Some(d),
+                    args,
+                    ..
+                } => {
+                    note(d.0, &mut first_at, &mut last_at);
+                    for a in args {
+                        if let Operand::Value(v) = a {
+                            note(v.0, &mut first_at, &mut last_at);
+                        }
+                    }
+                }
+                _ => {
+                    for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            note(v.0, &mut first_at, &mut last_at);
+                        }
+                    });
+                }
+            }
+            point += 1;
+        }
+        point += 1; // terminator
+    }
+
+    // Pass 2: death hints.  At the instruction defining `d`, the first
+    // operand `a0` whose LAST mention is this very instruction dies here —
+    // the textbook destructive-form coalescing candidate.
+    let mut death_hint: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(d),
+                args,
+                ..
+            } = inst
+            {
+                if candidates.contains(&d.0) && !args.is_empty() {
+                    if let Operand::Value(a0) = &args[0] {
+                        if candidates.contains(&a0.0)
+                            && last_at.get(&a0.0) == Some(&point)
+                            && !matches!(&args[1.min(args.len() - 1)], Operand::Value(v) if v.0 == a0.0)
+                        {
+                            death_hint.entry(d.0).or_insert(a0.0);
+                        }
+                    }
+                }
+            }
+            point += 1;
+        }
+        point += 1; // terminator
+    }
+
+    // Effective span per candidate: the raw linear first..last mention
+    // span.  Linear spans over-approximate every execution path's liveness
+    // (including backedge wrap-around: a backedge value's phi mention
+    // precedes its defining latch point, so its span covers the loop), so
+    // an overlap is never missed — two candidates share a register only
+    // when their spans are disjoint.  Cross-block values keep raw spans as
+    // well: the phi Copy lowering re-establishes a home at block
+    // boundaries, so a register may recycle at a dying operand even inside
+    // a loop.
+    let mut span: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
+    for &v in candidates {
+        if taken(v) {
+            continue;
+        }
+        let Some(&f) = first_at.get(&v) else {
+            continue;
+        };
+        let l = last_at.get(&v).copied().unwrap_or(f);
+        // Caller-saved pool registers cannot hold a value across a call.
+        if spans_any_call(
+            &LiveInterval {
+                value_id: v,
+                start: f,
+                end: l,
+            },
+            call_points,
+        ) {
+            continue;
+        }
+        span.insert(v, (f, l));
+    }
+
+    // Linear allocation in first-mention order.  `free_from` per register
+    // holds the end of its current holder's span; a register is available
+    // for a value born at `f` when `free_from <= f` (boundary sharing is
+    // the in-place form: the previous holder's last mention IS this value's
+    // defining instruction).
+    let mut order: Vec<u32> = span
+        .keys()
+        .copied()
+        .filter(|v| first_at.contains_key(v))
+        .collect();
+    order.sort_by_key(|v| (first_at[v], last_at[v]));
+
+    let mut free_from: FxHashMap<u8, u32> = pool.iter().map(|r| (r.0, 0u32)).collect();
+    let mut assigned: Vec<(u32, PhysReg)> = Vec::new();
+    let mut assigned_map: FxHashMap<u32, PhysReg> = FxHashMap::default();
+    for v in order {
+        let (_, e) = span[&v];
+        let birth = first_at[&v];
+        // Prefer the dying first operand's register when its holder span
+        // ends no later than this value's birth.
+        let mut preference: Option<u8> = None;
+        if let Some(&a0) = death_hint.get(&v) {
+            if let Some(&reg) = assigned_map.get(&a0) {
+                if free_from.get(&reg.0).copied().unwrap_or(u32::MAX) <= birth {
+                    preference = Some(reg.0);
+                }
+            }
+        }
+        let chosen = if let Some(rn) = preference {
+            pool.iter().find(|r| r.0 == rn).copied()
+        } else {
+            // Free registers only; prefer the one that became free most
+            // recently (LRU) to preserve long-free registers for long
+            // spans.
+            pool.iter()
+                .filter(|r| free_from.get(&r.0).copied().unwrap_or(u32::MAX) <= birth)
+                .max_by_key(|r| free_from.get(&r.0).copied().unwrap_or(0))
+                .copied()
+        };
+        if let Some(reg) = chosen {
+            free_from.insert(reg.0, e);
+            assigned_map.insert(v, reg);
+            assigned.push((v, reg));
+        }
+        // No free register: the value keeps its fallback home (stack slot,
+        // staged through xmm0/xmm1 by the generic emitters).
+    }
+    assigned
 }
 
 /// `src → dest` Copy edges. Shared by the three copy-web collectors so
@@ -6268,6 +6700,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // the vectorized find_max SLOWER than scalar).
             O::VecBroadcastI32x8 | O::VecMaxI32x8 | O::VecMinI32x8 => Some(5),
             O::VecZeroI32x4 | O::VecLoadI32x4 | O::VecAddI32x4 | O::VecMulI32x4 => Some(6),
+            // ARX lane ops (rotate/shuffle): class 6 (I32x4 family).
+            O::VecRolI32x4 | O::VecShufdI32x4 | O::VecXorI32x4 => Some(6),
             O::VecZeroI64x2 | O::VecLoadI64x2 | O::VecAddI64x2 | O::VecMulI64x2 => Some(7),
             // v12 Fix C: the widening reductions PRODUCE an I64x2 dest (the
             // new accumulator). Classifying them as class 7 lets the Copy-web
@@ -6284,6 +6718,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // mirroring the widening-masked path's xmm0/xmm1 discipline).
             O::VecMaskedAddI32x8 => Some(5),
             O::VecLoadWidenI32ToI64x2 => Some(7),
+            // The byte-predicate counting reduction family (I64x4):
+            // `vpsadbw` produces the four group counts, `vpaddq` updates
+            // the u64x4 accumulator, and the zero seeds it.  Class 8 so
+            // the Copy-web can home the loop-carried accumulator.
+            O::VecSadbwU8x32 | O::VecAddI64x4 | O::VecZeroI64x4 => Some(8),
             _ => None,
         }
     };
@@ -6321,6 +6760,18 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             6 => matches!(
                 op,
                 O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4
+                    // ARX lane ops: their emitters resolve a homed source
+                    // through %xmm0/%xmm1 scratch without writing the home
+                    // (movdqa in, shifts/por on scratch), so a register-homed
+                    // I32x4 value stays live across them.
+                    | O::VecRolI32x4
+                    | O::VecShufdI32x4
+                    | O::VecXorI32x4
+                    // The ARX pass's exit materialization consumes the
+                    // loop-carried state through a 128-bit store; the
+                    // register-home store path (vec_store_source_128)
+                    // reads the homed register directly.
+                    | O::VecStoreI32x4
             ),
             7 => matches!(
                 op,
@@ -6335,6 +6786,14 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // verification fixpoint does not evict the accumulator.
                     | O::VecWidenAddI32x4ToI64x2
                     | O::VecWidenMaskedAddI32x4ToI64x2
+            ),
+            // I64x4 counting family: the sad partials are consumed by the
+            // accumulator add, and the accumulator itself by the horizontal
+            // exit — both read their sources through the home-aware
+            // emitters (`emit_avx_binary_256` / the horizontal chain).
+            8 => matches!(
+                op,
+                O::VecAddI64x4 | O::VecHorizontalAddI64x4 | O::VecSadbwU8x32
             ),
             _ => false,
         }
@@ -6405,6 +6864,27 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecHorizontalMaxI32x4
                                 | O::VecSmaxI32x4
                                 | O::VecLoadWidenI32ToI64x2
+                                // Byte-predicate counting loops carry the
+                                // map-family byte ops (compare masks, the
+                                // `& 1` and, blends) AROUND the I64x4
+                                // accumulator. They are not accumulator
+                                // producers, exactly like the broadcast/
+                                // store twins above; without this
+                                // exemption the poison check evicts the
+                                // counting accumulator to a stack slot
+                                // (one 32-byte round-trip per iteration).
+                                | O::VecCmpI8x32
+                                | O::VecAndI32x8
+                                | O::VecOrI32x8
+                                | O::VecXorI32x8
+                                | O::VecAddI8x32
+                                | O::VecSubI8x32
+                                | O::VecBlendvI8x32
+                                | O::VecMinU8x32
+                                | O::VecMaxU8x32
+                                | O::VecMinI8x32
+                                | O::VecMaxI8x32
+                                | O::VecBroadcastI8x32
                         ) =>
                 {
                     return FxHashSet::default();
@@ -6552,10 +7032,10 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
         match op {
             O::VecBroadcastF32x8 => Some(1),
             O::VecBroadcastF64x4 => Some(2),
-            O::VecBroadcastI32x8 => Some(3),
+            O::VecBroadcastI32x8 | O::VecBroadcastI8x32 | O::VecBroadcastI16x16 => Some(3),
             O::VecBroadcastF32x4 => Some(4),
             O::VecBroadcastF64x2 => Some(5),
-            O::VecBroadcastI32x4 => Some(6),
+            O::VecBroadcastI32x4 | O::VecBroadcastI8x16 | O::VecBroadcastI16x8 => Some(6),
             _ => None,
         }
     };
@@ -6603,6 +7083,37 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     // Integer min/max maps: the broadcast is a clamp bound.
                     | O::VecMinI32x8
                     | O::VecMaxI32x8
+                    // Bitwise lane maps: the broadcast is the operand of
+                    // `x & K` / `x | K` / `x ^ K`, including the `mask & K`
+                    // the select strength reduction produces.  These were
+                    // missing, so a broadcast feeding a `vpand` was not
+                    // recognised as a map broadcast, got no register home,
+                    // and was re-read from the STACK every iteration.
+                    | O::VecAndI32x8
+                    | O::VecOrI32x8
+                    | O::VecXorI32x8
+                    | O::VecSubI32x8
+                    // Byte-lane maps share the 256-bit integer class:
+                    // same YMM register file, same VecLoad/StoreI32x8
+                    // endpoints, only the lane width of the ALU differs.
+                    | O::VecAddI8x32
+                    | O::VecSubI8x32
+                    | O::VecCmpI8x32
+                    | O::VecMinU8x32
+                    | O::VecMaxU8x32
+                    | O::VecBlendvI8x32
+| O::VecMinI8x32
+                    | O::VecMaxI8x32
+                    // Word lanes (OP-05g) share the 256-bit integer class: same YMM file, same VecLoad/StoreI32x8 endpoints.
+                    | O::VecAddI16x16
+                    | O::VecSubI16x16
+                    | O::VecMulI16x16
+                    | O::VecCmpI16x16
+                    | O::VecMinI16x16
+                    | O::VecMaxI16x16
+                    | O::VecMinU16x16
+                    | O::VecMaxU16x16
+                    | O::VecBlendvI16x16
             ),
             4 => matches!(
                 op,
@@ -6630,7 +7141,34 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
             ),
             6 => matches!(
                 op,
-                O::VecMulI32x4 | O::VecAddI32x4 | O::VecCmpI32x4 | O::VecBlendvI32x4
+                O::VecMulI32x4
+                    | O::VecAddI32x4
+                    | O::VecCmpI32x4
+                    | O::VecBlendvI32x4
+                    // Bitwise lane maps: the broadcast is the operand of
+                    // `x & K` / `x | K` / `x ^ K`, including the `mask & K`
+                    // the select strength reduction produces.  These were
+                    // missing, so a broadcast feeding a `vpand` was not
+                    // recognised as a map broadcast, got no register home,
+                    // and was re-read from the STACK every iteration.
+                    | O::VecAndI32x4
+                    | O::VecOrI32x4
+                    | O::VecXorI32x4
+                    | O::VecSubI32x4
+                    | O::VecAddI8x16
+                    | O::VecSubI8x16
+                    | O::VecCmpI8x16
+                    | O::VecMinU8x16
+                    | O::VecMaxU8x16
+                    | O::VecBlendvI8x16
+                    // Word lanes (OP-05g) share the 128-bit integer class.
+                    | O::VecAddI16x8
+                    | O::VecSubI16x8
+                    | O::VecMulI16x8
+                    | O::VecCmpI16x8
+                    | O::VecMinI16x8
+                    | O::VecMaxI16x8
+                    | O::VecBlendvI16x8
             ),
             _ => false,
         }
@@ -6753,7 +7291,25 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecCmpI32x8
             | O::VecBlendvI32x8
             | O::VecMinI32x8
-            | O::VecMaxI32x8 => Some(3),
+            | O::VecMaxI32x8
+            | O::VecAddI8x32
+            | O::VecSubI8x32
+            | O::VecCmpI8x32
+            | O::VecMinU8x32
+            | O::VecMaxU8x32
+            | O::VecBlendvI8x32
+            | O::VecMinI8x32
+            | O::VecMaxI8x32
+            // Word lanes (OP-05g) share the 256-bit integer class: same YMM file, same VecLoad/StoreI32x8 endpoints.
+            | O::VecAddI16x16
+            | O::VecSubI16x16
+            | O::VecMulI16x16
+            | O::VecCmpI16x16
+            | O::VecMinI16x16
+            | O::VecMaxI16x16
+            | O::VecMinU16x16
+            | O::VecMaxU16x16
+            | O::VecBlendvI16x16 => Some(3),
             O::VecLoadI32x4
             | O::VecSubI32x4
             | O::VecAddI32x4
@@ -6762,7 +7318,26 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecOrI32x4
             | O::VecXorI32x4
             | O::VecCmpI32x4
-            | O::VecBlendvI32x4 => Some(6),
+            | O::VecBlendvI32x4
+            | O::VecAddI8x16
+            | O::VecSubI8x16
+            | O::VecCmpI8x16
+            | O::VecMinU8x16
+            | O::VecMaxU8x16
+            | O::VecBlendvI8x16
+            | O::VecAddI16x8
+            | O::VecSubI16x8
+            | O::VecMulI16x8
+            | O::VecCmpI16x8
+            | O::VecMinI16x8
+            | O::VecMaxI16x8
+            | O::VecBlendvI16x8
+            // ARX lane ops (vec_arx loops): rotate/shuffle results are
+            // in-body intermediates whose consumers are the other ARX
+            // lane ops (and the latch Copy — that consumer is covered by
+            // the reduction collector's copy web instead).
+            | O::VecRolI32x4
+            | O::VecShufdI32x4 => Some(6),
             _ => None,
         }
     };
@@ -6828,6 +7403,24 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecBlendvI32x8
                     | O::VecMinI32x8
                     | O::VecMaxI32x8
+                    | O::VecAddI8x32
+                    | O::VecSubI8x32
+                    | O::VecCmpI8x32
+                    | O::VecMinU8x32
+                    | O::VecMaxU8x32
+                    | O::VecBlendvI8x32
+                    | O::VecMinI8x32
+                    | O::VecMaxI8x32
+                    // Word lanes (OP-05g) share the 256-bit integer class: same YMM file, same VecLoad/StoreI32x8 endpoints.
+                    | O::VecAddI16x16
+                    | O::VecSubI16x16
+                    | O::VecMulI16x16
+                    | O::VecCmpI16x16
+                    | O::VecMinI16x16
+                    | O::VecMaxI16x16
+                    | O::VecMinU16x16
+                    | O::VecMaxU16x16
+                    | O::VecBlendvI16x16
                     | O::VecStoreI32x8
             ),
             6 => matches!(
@@ -6840,6 +7433,24 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecXorI32x4
                     | O::VecCmpI32x4
                     | O::VecBlendvI32x4
+                    | O::VecAddI8x16
+                    | O::VecSubI8x16
+                    | O::VecCmpI8x16
+                    | O::VecMinU8x16
+                    | O::VecMaxU8x16
+                    | O::VecBlendvI8x16
+                    | O::VecAddI16x8
+                    | O::VecSubI16x8
+                    | O::VecMulI16x8
+                    | O::VecCmpI16x8
+                    | O::VecMinI16x8
+                    | O::VecMaxI16x8
+                    | O::VecBlendvI16x8
+                    // ARX lane ops: scratch-only emitters (xmm0/xmm1 pair,
+                    // the source home is never written) — a register-homed
+                    // value stays live across them.
+                    | O::VecRolI32x4
+                    | O::VecShufdI32x4
                     | O::VecStoreI32x4
             ),
             _ => false,

@@ -154,12 +154,24 @@ pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool, sse41: bool) {
 /// SSE4.1 availability on the 128-bit path: `pmulld` (VecMulI32x4) has no
 /// SSE2 encoding, so an I32 multiply map/dot under `-mno-sse4.1` /
 /// `-march=x86-64` must not be vectorised.
+pub(crate) fn x86_sse41_available_pub() -> bool {
+    x86_sse41_available()
+}
+
 fn x86_sse41_available() -> bool {
     X86_SSE41_AVAILABLE.with(|available| available.get())
 }
 
 fn x86_simd_available() -> bool {
     X86_SIMD_AVAILABLE.with(|available| available.get())
+}
+
+/// XMM-register-file availability for passes that emit SSE-shaped
+/// intrinsics directly (the ARX lane vectorizers): the whole ARX scheme
+/// lives in the 128-bit SSE2 XMM file, so a target built `-mno-sse` /
+/// `-mgeneral-regs-only` must not rewrite a single loop.
+pub(crate) fn x86_simd_available_pub() -> bool {
+    x86_simd_available()
 }
 
 fn x86_avx2_available() -> bool {
@@ -350,6 +362,28 @@ fn vectorize_with_analysis_mode(
             // products 0, 1, 2, 3 into the scalar accumulator in that order.
             total_changes += changes;
             continue;
+        } else if !neon
+            && !force_two_wide
+            && std::env::var("LCCC_FORCE_SSE2").is_err()
+            && x86_avx2_available()
+            && let Some(count_pattern) = analyze_byte_count_loop(func, loop_info, cfg)
+        {
+            // Byte-predicate counting reduction (`c += pred(s[i])`): the
+            // strlen/memchr/ctype-classifier family.  AVX2-only by
+            // construction (`vpsadbw` over 32 byte lanes); the analysis
+            // fails closed for every shape the packed form cannot express
+            // exactly, and the loop keeps its scalar form on those paths.
+            let n = transform_byte_count_reduction(func, &count_pattern);
+            if n > 0 {
+                if debug {
+                    eprintln!(
+                        "[VEC] Byte-count reduction matched! {} changes (loop {})",
+                        n, idx
+                    );
+                }
+                total_changes += n;
+                continue;
+            }
         } else if let Some(red_pattern) = analyze_reduction_pattern(
             func,
             loop_info,
@@ -3722,6 +3756,16 @@ struct MapEmitCtx<'a> {
     /// Every emitted node, keyed by its tree shape: identical subexpressions
     /// (reused loads, shared compares) emit exactly once — free CSE keeps
     /// e.g. a clamp tree at one load instead of three.
+    /// Byte lanes broadcast through the dword splat, so a constant operand
+    /// must be replicated into all four bytes at broadcast time.  See the
+    /// `MapExpr::Invariant` arm for why this cannot live in the tree.
+    /// Element size in bytes when the lane is NARROWER than the dword
+    /// broadcast (1 or 2), so a constant operand must be replicated across
+    /// the dword at broadcast time.  `None` on dword/FP paths.
+    narrow_const_bytes: Option<u32>,
+    /// Real narrow splat for RUNTIME invariants (`vpbroadcastb`/`vpbroadcastw`
+    /// or the SSE2 unpack chains).  `None` on dword/FP paths.
+    byte_broadcast_op: Option<IntrinsicOp>,
     node_cache: Vec<(String, Value)>,
     preheader_insts: Vec<Instruction>,
     vec_insts: Vec<Instruction>,
@@ -3765,12 +3809,36 @@ impl<'a> MapEmitCtx<'a> {
             MapExpr::Invariant(operand) => {
                 // Broadcasts live in the PREHEADER so they are hoisted out
                 // of the packed loop (register-allocated once).
+                //
+                // Byte lanes splat through the DWORD broadcast, so a
+                // constant must be replicated into all four bytes here --
+                // and ONLY here.  Replication is a property of THIS
+                // lowering, not of the expression: the scalar remainder
+                // mirror evaluates the very same `MapExpr` at the element
+                // type, where a replicated constant breaks every non-ring
+                // node (`min(0xF0F0F0F0, c)` is not `min(240, c)` -- a real
+                // miscompile the byte clamp gate caught).  Keeping the
+                // semantic tree replication-free is what lets both
+                // consumers stay exact.
                 let dest = self.fresh();
+                let (op, operand) = match (self.narrow_const_bytes, operand) {
+                    (Some(nb), Operand::Const(c)) => (
+                        self.broadcast_op,
+                        Operand::Const(IrConst::I32(replicate_narrow(c.to_i64()?, nb))),
+                    ),
+                    // A RUNTIME byte invariant cannot be pre-replicated, so
+                    // it needs the real byte splat (`vpbroadcastb`, or the
+                    // SSE2 unpack chain).  Constants keep the dword splat:
+                    // it is one instruction fewer and shares the existing
+                    // constant-pool cache.
+                    (Some(_), other) => (self.byte_broadcast_op?, other.clone()),
+                    (None, other) => (self.broadcast_op, other.clone()),
+                };
                 self.preheader_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
-                    op: self.broadcast_op,
+                    op,
                     dest_ptr: None,
-                    args: vec![operand.clone()],
+                    args: vec![operand],
                 });
                 Some(dest)
             }
@@ -4116,9 +4184,21 @@ fn analyze_map_pattern(
         for inst in &func.blocks[block_idx].instructions {
             match inst {
                 Instruction::Load { dest, ptr, ty, .. } => {
-                    // Packed I32/U32/F32/F64 all have native forms.
-                    if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
-                        || load_infos.len() >= MAP_MAX_STREAMS
+                    // Packed I32/U32/F32/F64 all have native forms; I8/U8
+                    // enters through the byte-lane demotion path (OP-05d),
+                    // which re-parses the promoted 32-bit tree and proves it
+                    // byte-exact before any narrow op is emitted.
+                    if !matches!(
+                        *ty,
+                        IrType::I32
+                            | IrType::U32
+                            | IrType::F32
+                            | IrType::F64
+                            | IrType::I8
+                            | IrType::U8
+                            | IrType::I16
+                            | IrType::U16
+                    ) || load_infos.len() >= MAP_MAX_STREAMS
                     {
                         if debug {
                             eprintln!("[VEC-MAP] BAIL: bad load ty/streams");
@@ -4128,8 +4208,17 @@ fn analyze_map_pattern(
                     load_infos.push((block_idx, *dest, *ptr, *ty));
                 }
                 Instruction::Store { val, ptr, ty, .. } => {
-                    if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
-                        || store_info.is_some()
+                    if !matches!(
+                        *ty,
+                        IrType::I32
+                            | IrType::U32
+                            | IrType::F32
+                            | IrType::F64
+                            | IrType::I8
+                            | IrType::U8
+                            | IrType::I16
+                            | IrType::U16
+                    ) || store_info.is_some()
                     {
                         if debug {
                             eprintln!("[VEC-MAP] BAIL: bad store ty/dup");
@@ -4195,13 +4284,9 @@ fn analyze_map_pattern(
         return None;
     }
 
-    let elem_size = match elem_ty {
-        IrType::F64 | IrType::I64 | IrType::U64 => 8,
-        IrType::F32 | IrType::I32 | IrType::U32 => 4,
-        _ => {
-            set_reject("map element type not vectorizable");
-            return None;
-        }
+    let Some(elem_size) = map_elem_size(&elem_ty) else {
+        set_reject("map element type not vectorizable");
+        return None;
     };
     // The destination GEP must be indexed by the IV (canonical unit stride).
     if !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived, elem_size) {
@@ -4263,8 +4348,46 @@ fn analyze_map_pattern(
             allow_ext_fp_ops,
         )
     };
+    let narrow_lane = matches!(elem_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
     let expr = if load_dests.len() == 1 && store_val == load_dests[0] {
+        // Plain copy: the stored value IS the loaded byte/word, with no
+        // promotion in between.  Lane width is irrelevant to a copy.
         MapExpr::Load(0)
+    } else if narrow_lane {
+        // ---- OP-05d: byte lanes -----------------------------------------
+        //
+        // C's integer promotions have already fragmented the source: the
+        // arithmetic runs at `int`, the selects run at `unsigned char`, and
+        // `zext`/`trunc` casts stitch the two together (see
+        // `parse_byte_map_expr` for the exact IR shape and the proof that
+        // evaluating the whole thing in 8-bit lanes is EQUAL, not merely
+        // close).  A dedicated parser walks that mixed tree, discharges the
+        // range side conditions the compares need, and hands back a pure
+        // byte-lane expression.
+        let leaf_tys: Vec<(Value, IrType)> = load_infos
+            .iter()
+            .map(|&(_, dest, _, ty)| (dest, ty))
+            .collect();
+        let parsed = parse_byte_map_expr(
+            func,
+            &loop_info.body,
+            &leaf_tys,
+            &is_invariant,
+            store_val,
+            0,
+            elem_size,
+        );
+        if debug {
+            eprintln!(
+                "[VEC-MAP]   byte parse store_val={} -> {:?}",
+                store_val.0, parsed
+            );
+        }
+        let Some((byte_expr, _)) = parsed else {
+            set_reject("byte map: tree is not byte-exact");
+            return None;
+        };
+        byte_expr
     } else {
         let parsed = parse_tree(store_val, 0);
         if debug {
@@ -4274,6 +4397,16 @@ fn analyze_map_pattern(
             );
         }
         parsed?
+    };
+    // Canonicalise unsigned constant-bounded masks into the biased signed
+    // form (OP-05c).  This runs BEFORE the node budget so a fused range mask
+    // is charged its post-rewrite size: the classifier idiom shrinks from 7
+    // nodes to 4, which lets deeper trees through the same budget.  Integer
+    // lanes only -- `map_lane_bits` returns `None` for FP element types and
+    // the tree is left untouched.
+    let expr = match map_lane_bits(&elem_ty) {
+        Some(bits) => fold_unsigned_range_masks(&expr, bits),
+        None => expr,
     };
     // 16 admits the recovered `&&`/`||` mask shapes (a two-compare
     // range-fold ternary parses to exactly 12 nodes; a three-condition
@@ -4905,6 +5038,1412 @@ fn parse_map_operand(
     )
 }
 
+// ===========================================================================
+// Byte-predicate COUNTING reduction (the strlen/memchr/ctype family)
+// ===========================================================================
+//
+// `c += pred(s[i])` over a byte stream — the single most common parser
+// loop after the elementwise map.  It has no store, so the map vectorizer
+// never sees it, and the sum-reduction analysis rejects the added value
+// (a boolean tree, not a load).  Without this transform the loop stays
+// SCALAR while GCC/Clang lower it to the classic
+// `vpcmpeqb`-mask + `vpand` + `vpsadbw` + `vpaddq` form.
+//
+// Packed lowering (AVX2, 32 byte lanes per trip):
+//
+// ```text
+//     mask    = <byte-lane predicate tree>       (reuses the OP-05d parser)
+//     bits    = mask & 0x01..01                  (0/1 per byte lane)
+//     groups  = vpsadbw(bits, 0)                 (four u64 group counts)
+//     acc     = vpaddq(acc, groups)              (u64x4 loop carrier)
+//     exit    = vextracti128+vpaddq+vpshufd+vpaddq+movq  (horizontal)
+// ```
+//
+// The tree is first normalised so every 0/1-valued `Select(m, 1, 0)` and
+// `Select(m, 0, 1)` becomes `m & 1`: in the PACKED world a compare mask is
+// all-ones/all-zeros per lane, so `m & 1` is exactly the lane's 0/1; in the
+// SCALAR world a setcc is 0/1, so `m & 1` is the setcc.  The rewrite is
+// therefore exact in BOTH interpreter worlds — no packed-only caveat —
+// and it deletes a `vpblendvb` (two uops) from every classifier kernel.
+//
+// The accumulator runs in u64x4 even when the source accumulator is `int`:
+// the true count cannot exceed the element count, and the mod-2^32
+// truncation at the end reproduces the wrapping `int` sum exactly (C
+// signed overflow is UB; the wrapped value is the only observable
+// behaviour a wrapping machine could produce).
+
+/// Does this tree evaluate to 0 or 1 in the SCALAR interpreter (the
+/// remainder/exit world)?  Cmp yields a setcc (0/1), a boolean-select's
+/// value comes from its 0/1 arms, `and`/`or` of 0/1 values stays 0/1, and
+/// the constants 0 and 1 are themselves.  Everything else — a load, a
+/// non-0/1 constant, arithmetic — fails closed.
+fn is_scalar_zero_one_tree(expr: &MapExpr) -> bool {
+    match expr {
+        MapExpr::Cmp(..) | MapExpr::MaskConj { .. } => true,
+        MapExpr::Select(_c, t, f) => is_scalar_zero_one_tree(t) && is_scalar_zero_one_tree(f),
+        MapExpr::BinOp(op, l, r) => {
+            matches!(op, IrBinOp::And | IrBinOp::Or)
+                && is_scalar_zero_one_tree(l)
+                && is_scalar_zero_one_tree(r)
+        }
+        MapExpr::Invariant(o) => match o {
+            Operand::Const(c) => matches!(c.to_i64(), Some(0) | Some(1)),
+            _ => false,
+        },
+        MapExpr::Sqrt(_) | MapExpr::MinMax { .. } | MapExpr::Load(_) => false,
+    }
+}
+
+/// Rewrite every 0/1-valued select to mask arithmetic, bottom-up:
+/// `Select(m, 1, 0)` and `Select(m, 0, 1)` become `m & 1` (exact in both
+/// interpreter worlds — see the section comment), and any other
+/// `Select(m, 0, 1)`-shaped tail with constant arms 0/1 reduces likewise.
+fn rewrite_zero_one_selects(expr: MapExpr) -> MapExpr {
+    let rebuilt = match expr {
+        MapExpr::Select(c, t, f) => MapExpr::Select(
+            Box::new(rewrite_zero_one_selects(*c)),
+            Box::new(rewrite_zero_one_selects(*t)),
+            Box::new(rewrite_zero_one_selects(*f)),
+        ),
+        MapExpr::BinOp(op, l, r) => MapExpr::BinOp(
+            op,
+            Box::new(rewrite_zero_one_selects(*l)),
+            Box::new(rewrite_zero_one_selects(*r)),
+        ),
+        MapExpr::Cmp(op, l, r) => MapExpr::Cmp(
+            op,
+            Box::new(rewrite_zero_one_selects(*l)),
+            Box::new(rewrite_zero_one_selects(*r)),
+        ),
+        MapExpr::MaskConj { is_and, l, r } => MapExpr::MaskConj {
+            is_and,
+            l: Box::new(rewrite_zero_one_selects(*l)),
+            r: Box::new(rewrite_zero_one_selects(*r)),
+        },
+        other => other,
+    };
+    if let MapExpr::Select(c, t, f) = &rebuilt {
+        let const01 = |e: &MapExpr| -> Option<i64> {
+            match e {
+                MapExpr::Invariant(Operand::Const(c)) => c.to_i64().filter(|v| *v == 0 || *v == 1),
+                _ => None,
+            }
+        };
+        if let (Some(tv), Some(fv)) = (const01(t), const01(f)) {
+            if (tv == 1 && fv == 0) || (tv == 0 && fv == 1) {
+                // `m ? 1 : 0` == `m ? 0 : 1` == `m & 1` for mask/setcc m.
+                let konst = if tv == 1 { t.clone() } else { f.clone() };
+                return MapExpr::BinOp(IrBinOp::And, c.clone(), konst);
+            }
+        }
+    }
+    rebuilt
+}
+
+/// The recognised loop shape, with every value the transform needs.
+struct ByteCountPattern {
+    header_idx: usize,
+    body_idx: usize,
+    latch_idx: usize,
+    exit_idx: usize,
+    loop_blocks: FxHashSet<usize>,
+    iv: Value,
+    iv_ty: IrType,
+    limit: Operand,
+    /// The accepted exit predicate (Slt or Ult — the analyzer refuses
+    /// everything else); the remainder loop must reuse EXACTLY it.
+    exit_cmp_op: IrCmpOp,
+    /// `(block, instruction index)` of `acc' = add acc, V`.
+    add_site: (usize, usize),
+    acc_phi: Value,
+    /// The source accumulator's IR type (the phi's type).
+    acc_ty: IrType,
+    /// The preheader incoming of the accumulator phi (a constant or an
+    /// outside value); it is re-added at the exit materialisation.
+    acc_init: Operand,
+    /// The 0/1-valued byte-lane predicate tree that was added.
+    tree: MapExpr,
+    /// Stream bases for `MapEmitCtx` + the remainder mirror.
+    src_bases: Vec<Value>,
+    /// The element type of the byte streams (I8 or U8).
+    elem_ty: IrType,
+    leaf_tys: Vec<(Value, IrType)>,
+}
+
+/// Fresh SSA id from a mutable counter (the counting transform's local
+/// allocator; `fresh` as a closure would borrow the counter for the whole
+/// function body).
+fn count_fresh(nid: &mut u32) -> Value {
+    let v = Value(*nid);
+    *nid += 1;
+    v
+}
+
+/// Dest of an instruction, if it has one (the local twin of the vec_arx
+/// helper; kept private to this pass's section).
+fn count_inst_dest(inst: &Instruction) -> Option<Value> {
+    match inst {
+        Instruction::BinOp { dest, .. }
+        | Instruction::UnaryOp { dest, .. }
+        | Instruction::Cmp { dest, .. }
+        | Instruction::Cast { dest, .. }
+        | Instruction::Copy { dest, .. }
+        | Instruction::Select { dest, .. }
+        | Instruction::Load { dest, .. }
+        | Instruction::GetElementPtr { dest, .. }
+        | Instruction::GlobalAddr { dest, .. }
+        | Instruction::Phi { dest, .. } => Some(*dest),
+        _ => None,
+    }
+}
+
+/// Detect `acc = phi(init, acc'); acc' = acc + V` where `V` is a 0/1
+/// byte-lane predicate over contiguous IV-indexed byte loads, on a
+/// straight-line counted loop.  Fail-closed on every deviation.
+/// Is the GEP byte-stream offset (already resolved through in-loop
+/// Copy/Cast chains by `find_reduction_byte_iv`) the loop IV itself?
+/// Casts/copies of the IV anywhere in the function count (the frontend
+/// widens I32 IVs to I64 per use); any BinOp-derived value does not.
+fn byte_stream_offset_is_iv(func: &IrFunction, off: Value, iv: Value) -> bool {
+    let mut cur = off;
+    for _ in 0..8 {
+        if cur == iv {
+            return true;
+        }
+        let mut next = None;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if inst.dest() == Some(cur) {
+                    match inst {
+                        Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => {
+                            if let Operand::Value(v) = src {
+                                next = Some(*v);
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+        }
+        match next {
+            Some(v) => cur = v,
+            None => return false,
+        }
+    }
+    false
+}
+
+fn analyze_byte_count_loop(
+    func: &IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+    _cfg: &CfgAnalysis,
+) -> Option<ByteCountPattern> {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let header_idx = loop_info.header;
+    let loop_blocks: FxHashSet<usize> = loop_info.body.iter().copied().collect();
+
+    // Straight-line discipline: only the header may branch conditionally
+    // (the exit test).  Any internal conditional makes the accumulator
+    // update conditional — a masked-count shape this transform does not
+    // model — and fails closed, exactly like the sum reduction.
+    if loop_blocks.iter().copied().any(|b| {
+        b != header_idx && matches!(func.blocks[b].terminator, Terminator::CondBranch { .. })
+    }) {
+        return None;
+    }
+
+    let Some(exit_idx) = find_exit(func, loop_info) else {
+        return None;
+    };
+    let Some(latch_idx) = find_latch(func, loop_info) else {
+        return None;
+    };
+
+    // IV discovery (the reduction discipline): the header phi feeding the
+    // exit comparison.
+    let latch_label = func.blocks[latch_idx].label;
+    let mut iv = None;
+    for inst in &func.blocks[header_idx].instructions {
+        let Instruction::Phi { dest, incoming, .. } = inst else {
+            continue;
+        };
+        if incoming.len() != 2 {
+            continue;
+        }
+        let mut derived = FxHashSet::default();
+        derived.insert(*dest);
+        for cand in &func.blocks[header_idx].instructions {
+            if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = cand {
+                if matches!(src, Operand::Value(v) if derived.contains(v)) {
+                    derived.insert(*dest);
+                }
+            }
+        }
+        if func.blocks[header_idx].instructions.iter().any(|c| {
+            matches!(c, Instruction::Cmp { lhs, .. } if matches!(lhs, Operand::Value(v) if derived.contains(v)))
+        }) {
+            iv = Some(*dest);
+            break;
+        }
+    }
+    let iv = iv?;
+    let Some(iv_phi) = func.blocks[header_idx]
+        .instructions
+        .iter()
+        .find_map(|i| matches!(i, Instruction::Phi { dest, .. } if *dest == iv).then_some(i))
+    else {
+        return None;
+    };
+    let Instruction::Phi {
+        ty: iv_ty,
+        incoming: iv_incoming,
+        ..
+    } = iv_phi
+    else {
+        return None;
+    };
+    let iv_ty = *iv_ty;
+    if !matches!(iv_ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
+        return None; // narrow IV: same wrap hazard as the sum reduction
+    }
+    // The IV must start at ZERO and step by exactly +1.  Two reasons,
+    // both load-bearing:
+    //
+    //   * the packed body's byte offset is a fresh 0-based IV (the
+    //     transform never models a non-zero start), so any other start
+    //     reads the wrong elements;
+    //   * the transform's OWN scalar-remainder loop has a Value (not 0)
+    //     resume index -- without the zero-init requirement the next
+    //     pipeline round re-matches the remainder as a fresh counting
+    //     loop and double-transforms it (observed: the remainder start
+    //     was re-scaled by 32 and the tail dropped).
+    let mut iv_init = None;
+    let mut iv_back = None;
+    for (op, lbl) in iv_incoming.iter() {
+        if *lbl == latch_label {
+            iv_back = Some(op.clone());
+        } else {
+            iv_init = Some(op.clone());
+        }
+    }
+    let (Some(iv_init), Some(iv_back)) = (iv_init, iv_back) else {
+        return None;
+    };
+    match &iv_init {
+        Operand::Const(c) if c.to_i64() == Some(0) => {}
+        _ => return None,
+    }
+    let step_val = match &iv_back {
+        Operand::Value(v) => *v,
+        _ => return None, // constant backedge: not an induction step
+    };
+    let iv_step_ok = 'step: {
+        for &b in &loop_blocks {
+            for inst in &func.blocks[b].instructions {
+                if let Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ty,
+                } = inst
+                {
+                    if *dest != step_val || *ty != iv_ty {
+                        continue;
+                    }
+                    let lhs_iv = matches!(lhs, Operand::Value(v) if *v == iv);
+                    let rhs_iv = matches!(rhs, Operand::Value(v) if *v == iv);
+                    let lhs_one = matches!(lhs, Operand::Const(c) if c.to_i64() == Some(1));
+                    let rhs_one = matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1));
+                    if (lhs_iv && rhs_one) || (lhs_one && rhs_iv) {
+                        break 'step true;
+                    }
+                }
+            }
+        }
+        false
+    };
+    if !iv_step_ok {
+        return None;
+    }
+
+    // Limit: the exit compare's non-IV side.
+    let mut iv_derived = FxHashSet::default();
+    iv_derived.insert(iv);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &loop_blocks {
+            for inst in &func.blocks[b].instructions {
+                if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = inst
+                {
+                    if let Operand::Value(v) = src {
+                        if iv_derived.contains(v) && iv_derived.insert(*dest) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut limit = None;
+    let mut exit_cmp_op = None;
+    for &b in &loop_blocks {
+        for inst in &func.blocks[b].instructions {
+            if let Instruction::Cmp {
+                dest, op, lhs, rhs, ..
+            } = inst
+            {
+                let l_is_iv = matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
+                let r_is_iv = matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
+                if l_is_iv == r_is_iv {
+                    continue;
+                }
+                // The compare's block must reach the exit edge.
+                let drives_exit = matches!(&func.blocks[b].terminator,
+                    Terminator::CondBranch { cond, .. } if matches!(cond, Operand::Value(v) if v.0 == dest.0));
+                if !drives_exit {
+                    continue;
+                }
+                if l_is_iv {
+                    limit = Some(rhs.clone());
+                    exit_cmp_op = Some(*op);
+                } else {
+                    // `limit <= iv` spelling: refuse unless we can normalise.
+                    // Only the `iv OP limit` vocabulary with iv on the left
+                    // and Slt/Ult is accepted (the overwhelmingly common
+                    // counted-loop shape; anything else fails closed).
+                    match op {
+                        IrCmpOp::Sgt | IrCmpOp::Ugt
+                            if iv_ty == IrType::U64
+                                || !matches!(
+                                    iv_ty,
+                                    IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64
+                                ) =>
+                        {
+                            return None;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+        }
+    }
+    let limit = limit?;
+    let exit_cmp_op = exit_cmp_op?;
+    if !matches!(exit_cmp_op, IrCmpOp::Slt | IrCmpOp::Ult) {
+        return None;
+    }
+    // A U32/U64 constant limit whose I64 reinterpretation is negative is
+    // >= 2^31 / 2^63: the `limit / 32` division below would truncate it
+    // negative and empty the vector loop (count 0 instead of ~4e9).
+    // Fail closed on that shape.
+    if matches!(iv_ty, IrType::U32 | IrType::U64) {
+        if let Operand::Const(c) = &limit {
+            if c.to_i64().is_some_and(|n| n < 0) {
+                return None;
+            }
+        }
+    }
+
+    // The counting accumulator: `acc' = add acc, V` in the body.
+    let mut add_site = None;
+    let mut acc_phi = None;
+    'outer: for &b in &loop_blocks {
+        for (ii, inst) in func.blocks[b].instructions.iter().enumerate() {
+            let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let (acc, _v) = if let (Operand::Value(l), Operand::Value(_r)) = (lhs, rhs) {
+                (l, _r)
+            } else if let (Operand::Value(_l), Operand::Value(r)) = (lhs, rhs) {
+                (r, _l)
+            } else {
+                continue;
+            };
+            // `acc` must be the header phi whose backedge is this add.
+            if let Some(phi) = func.blocks[header_idx].instructions.iter().find_map(|i| {
+                if let Instruction::Phi { dest, incoming, .. } = i {
+                    if *dest == *acc && incoming.len() == 2 {
+                        return Some(incoming.clone());
+                    }
+                }
+                None
+            }) {
+                let backedge_ok = phi.iter().any(|(v, lbl)| {
+                    *lbl == latch_label && matches!(v, Operand::Value(vv) if vv.0 == dest.0)
+                });
+                if backedge_ok {
+                    add_site = Some((b, ii));
+                    acc_phi = Some(*acc);
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let (add_block, add_idx) = add_site?;
+    let acc_phi = acc_phi?;
+    // The accumulator phi's type (I32 or I64 family) and preheader incoming.
+    let (acc_ty, acc_init) = {
+        let phi = func.blocks[header_idx].instructions.iter().find_map(|i| {
+            if let Instruction::Phi {
+                dest, ty, incoming, ..
+            } = i
+            {
+                if *dest == acc_phi {
+                    return Some((*ty, incoming.clone()));
+                }
+            }
+            None
+        })?;
+        let init = phi
+            .1
+            .iter()
+            .find(|(_, lbl)| *lbl != latch_label)
+            .map(|(v, _)| v.clone())
+            .unwrap_or(Operand::Const(IrConst::I32(0)));
+        (phi.0, init)
+    };
+    if !matches!(
+        acc_ty,
+        IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64
+    ) {
+        return None;
+    }
+    // The added value operand (the non-acc side of the add).
+    let added_val = {
+        let inst = &func.blocks[add_block].instructions[add_idx];
+        let Instruction::BinOp { lhs, rhs, .. } = inst else {
+            return None;
+        };
+        match (lhs, rhs) {
+            (Operand::Value(l), Operand::Value(r)) if *l == acc_phi => *r,
+            (Operand::Value(l), Operand::Value(r)) if *r == acc_phi => *l,
+            _ => return None,
+        }
+    };
+
+    // Byte-load stream discovery: contiguous IV-indexed I8/U8 loads.
+    let mut leaf_tys: Vec<(Value, IrType)> = Vec::new();
+    let mut src_geps: Vec<Value> = Vec::new();
+    for &b in &loop_blocks {
+        for inst in &func.blocks[b].instructions {
+            if let Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                volatile: false,
+                ..
+            } = inst
+            {
+                if !matches!(ty, IrType::I8 | IrType::U8) || leaf_tys.len() >= 8 {
+                    continue;
+                }
+                if let Instruction::GetElementPtr { dest: g, base, .. } =
+                    &func.blocks[b].instructions.iter().find(
+                        |i| matches!(i, Instruction::GetElementPtr { dest, .. } if *dest == *ptr),
+                    )?
+                {
+                    // Contiguity: the GEP offset must be the IV itself
+                    // (through Copy/Cast chains only).  A BinOp-derived
+                    // offset (`s[2*i]`, `s[i+7]`) addresses a different
+                    // stream than the packed body's fresh 0-based byte IV
+                    // -- without this check the vector body reads
+                    // contiguous elements from base+0 regardless of the
+                    // real stride or start.
+                    let Some((_sbase, idx_val)) = find_reduction_byte_iv(func, &loop_blocks, *g, 1)
+                    else {
+                        continue;
+                    };
+                    if !byte_stream_offset_is_iv(func, idx_val, iv) {
+                        continue;
+                    }
+                    let _ = base;
+                    leaf_tys.push((*dest, *ty));
+                    src_geps.push(*ptr);
+                }
+            }
+        }
+    }
+    if leaf_tys.is_empty() {
+        if debug {
+            eprintln!("[VEC-CNT] no byte streams; declining");
+        }
+        return None;
+    }
+    let elem_ty = leaf_tys[0].1;
+
+    // Parse the added value as a byte-lane tree over those streams.
+    let is_invariant = |op: &Operand| -> bool {
+        match op {
+            Operand::Const(_) => true,
+            Operand::Value(v) => !loop_blocks.iter().any(|&b| {
+                func.blocks[b].instructions.iter().any(|i| {
+                    count_inst_dest(i) == Some(*v)
+                        || matches!(i, Instruction::Phi { dest, .. } if *dest == *v)
+                })
+            }),
+        }
+    };
+    let Some((tree, _range)) = parse_byte_map_expr(
+        func,
+        &loop_blocks,
+        &leaf_tys,
+        &is_invariant,
+        added_val,
+        0,
+        1,
+    ) else {
+        if debug {
+            eprintln!("[VEC-CNT] added value is not a byte-exact tree; declining");
+        }
+        return None;
+    };
+    if !is_scalar_zero_one_tree(&tree) {
+        if debug {
+            eprintln!("[VEC-CNT] added value is not provably 0/1; declining");
+        }
+        return None;
+    }
+
+    // Stream bases for emission.
+    let mut src_bases = Vec::with_capacity(src_geps.len());
+    for &g in &src_geps {
+        let base = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| {
+                if let Instruction::GetElementPtr { dest, base, .. } = i {
+                    if *dest == g {
+                        return Some(*base);
+                    }
+                }
+                None
+            })?;
+        src_bases.push(base);
+    }
+
+    Some(ByteCountPattern {
+        header_idx,
+        body_idx: add_block,
+        latch_idx,
+        exit_idx,
+        loop_blocks,
+        iv,
+        iv_ty,
+        limit,
+        exit_cmp_op,
+        add_site: (add_block, add_idx),
+        acc_phi,
+        acc_ty,
+        acc_init,
+        tree,
+        src_bases,
+        elem_ty,
+        leaf_tys,
+    })
+}
+
+/// Emit the packed counting body and remainder.  AVX2-only by construction
+/// (`vpsadbw` over 32 byte lanes); every other target keeps the scalar loop.
+fn transform_byte_count_reduction(func: &mut IrFunction, p: &ByteCountPattern) -> usize {
+    let mut next_val_id = func.next_value_id;
+    let changes = transform_byte_count_reduction_inner(func, p, &mut next_val_id);
+    func.next_value_id = next_val_id;
+    changes
+}
+
+fn transform_byte_count_reduction_inner(
+    func: &mut IrFunction,
+    p: &ByteCountPattern,
+    next_val_id: &mut u32,
+) -> usize {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    const VEC_WIDTH: i64 = 32;
+    let mut changes = 0usize;
+
+    // Preheader: the unique non-loop predecessor branching to the header.
+    let header_label = func.blocks[p.header_idx].label;
+    let mut preheader_idx = None;
+    for (i, b) in func.blocks.iter().enumerate() {
+        if p.loop_blocks.contains(&i) {
+            continue;
+        }
+        if matches!(&b.terminator, Terminator::Branch(l) if *l == header_label) {
+            preheader_idx = Some(i);
+            break;
+        }
+    }
+    let Some(preheader_idx) = preheader_idx else {
+        return 0;
+    };
+    let preheader_label = func.blocks[preheader_idx].label;
+    let latch_label = func.blocks[p.latch_idx].label;
+
+    // Normalise the tree: 0/1 selects → `m & 1`, then make the top level
+    // an `& 1` over a mask producer (idempotence-aware).
+    let tree = rewrite_zero_one_selects(p.tree.clone());
+    let already_and_one = match &tree {
+        MapExpr::BinOp(IrBinOp::And, _, r) => {
+            matches!(r.as_ref(), MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1))
+        }
+        _ => false,
+    };
+    let count_tree = if already_and_one {
+        tree
+    } else {
+        MapExpr::BinOp(
+            IrBinOp::And,
+            Box::new(tree),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(1)))),
+        )
+    };
+    // Range fusion on the mask side (windows, single-bit unions, signed
+    // classifiers, complement windows) — the same canonicalisation the map
+    // path applies, for the same two-instruction compares.
+    let count_tree = fold_unsigned_range_masks(&count_tree, 8);
+
+    // Ops wiring (byte-lane AVX2 arms, mirroring `transform_map_vector`).
+    let bin_op = |op: &IrBinOp| -> Option<IntrinsicOp> {
+        match op {
+            IrBinOp::Add => Some(IntrinsicOp::VecAddI8x32),
+            IrBinOp::Sub => Some(IntrinsicOp::VecSubI8x32),
+            IrBinOp::And => Some(IntrinsicOp::VecAndI32x8),
+            IrBinOp::Or => Some(IntrinsicOp::VecOrI32x8),
+            IrBinOp::Xor => Some(IntrinsicOp::VecXorI32x8),
+            _ => None,
+        }
+    };
+    let cmp_op = |op: &IrCmpOp| -> Option<(IntrinsicOp, i32)> {
+        let imm = match op {
+            IrCmpOp::Eq => 0,
+            IrCmpOp::Slt => 1,
+            IrCmpOp::Sle => 2,
+            IrCmpOp::Ne => 4,
+            IrCmpOp::Ult => 5,
+            IrCmpOp::Ule => 6,
+            _ => return None,
+        };
+        Some((IntrinsicOp::VecCmpI8x32, imm))
+    };
+    let blendv_op = Some(IntrinsicOp::VecBlendvI8x32);
+    let minmax_op = |is_max: bool| -> Option<IntrinsicOp> {
+        match is_max {
+            false => Some(IntrinsicOp::VecMinU8x32),
+            true => Some(IntrinsicOp::VecMaxU8x32),
+        }
+    };
+    if !map_tree_ops_available(&count_tree, &bin_op, None, &cmp_op, &minmax_op, blendv_op) {
+        if debug {
+            eprintln!("[VEC-CNT] tree has no lowering; declining");
+        }
+        return 0;
+    }
+
+    // ---- Pre-mutation remainder construction ----------------------------
+    // Every bail-out below this point would leave the function partially
+    // rewritten (the exact defect class the ARX audit pinned on PR #455).
+    // The scalar-remainder mirror is therefore EMITTED here, before the
+    // first mutation, and only then does the transform start mutating.
+    // All value ids and labels the exit/remainder needs are allocated up
+    // front so the emission is final, not provisional.
+    let h = count_fresh(&mut *next_val_id);
+    let rem_start = count_fresh(&mut *next_val_id);
+    let rem_iv = count_fresh(&mut *next_val_id);
+    let rem_iv_next = count_fresh(&mut *next_val_id);
+    let rem_cmp = count_fresh(&mut *next_val_id);
+    let r_acc = count_fresh(&mut *next_val_id);
+    let r_acc_next = count_fresh(&mut *next_val_id);
+    let rem_one = match p.iv_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(1),
+        _ => IrConst::I64(1),
+    };
+    let iv_width_const = match p.iv_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(VEC_WIDTH as i32),
+        _ => IrConst::I64(VEC_WIDTH),
+    };
+    let exit_label = func.blocks[p.exit_idx].label;
+    let vec_exit_label = {
+        let l = BlockId(func.next_label);
+        func.next_label += 1;
+        l
+    };
+    let rem_header_label = {
+        let l = BlockId(func.next_label);
+        func.next_label += 1;
+        l
+    };
+    let rem_body_label = {
+        let l = BlockId(func.next_label);
+        func.next_label += 1;
+        l
+    };
+    let rem_latch_label = {
+        let l = BlockId(func.next_label);
+        func.next_label += 1;
+        l
+    };
+    // The byte offset for addressing: cast narrow IVs to I64.
+    let rem_byte_off = count_fresh(&mut *next_val_id);
+    let mut rem_body_insts: Vec<Instruction> = Vec::new();
+    if matches!(p.iv_ty, IrType::I32 | IrType::U32) {
+        rem_body_insts.push(Instruction::Cast {
+            dest: rem_byte_off,
+            src: Operand::Value(rem_iv),
+            from_ty: p.iv_ty,
+            to_ty: IrType::I64,
+        });
+    }
+    let byte_off_op = if matches!(p.iv_ty, IrType::I32 | IrType::U32) {
+        Operand::Value(rem_byte_off)
+    } else {
+        Operand::Value(rem_iv)
+    };
+    // Emit the scalar mirror of the count tree (the both-worlds-exact
+    // `And(tree, 1)` discipline: a 0/1 value in the scalar world equals
+    // the original predicate).  Failing here is pre-mutation: clean
+    // decline.
+    let mut mirror_next = *next_val_id;
+    let scalar_v = emit_scalar_count_tree(
+        &count_tree,
+        &p.src_bases,
+        p.elem_ty,
+        byte_off_op,
+        &mut rem_body_insts,
+        &mut mirror_next,
+    );
+    *next_val_id = mirror_next;
+    let Some(scalar_v) = scalar_v else {
+        if debug {
+            eprintln!("[VEC-CNT] scalar mirror emission failed; declining");
+        }
+        return 0;
+    };
+    // Widen the 0/1 value to the I64 remainder accumulator.
+    let wide_v = count_fresh(&mut *next_val_id);
+    rem_body_insts.push(Instruction::Cast {
+        dest: wide_v,
+        src: scalar_v,
+        from_ty: p.elem_ty,
+        to_ty: IrType::I64,
+    });
+    rem_body_insts.push(Instruction::BinOp {
+        dest: r_acc_next,
+        op: IrBinOp::Add,
+        lhs: Operand::Value(r_acc),
+        rhs: Operand::Value(wide_v),
+        ty: IrType::I64,
+    });
+
+    // Limit → floor(limit / 32) in the preheader (constant fold or shift).
+    let int_const = |n: i64| match p.iv_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(n as i32),
+        _ => IrConst::I64(n),
+    };
+    let divided_limit = match &p.limit {
+        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / VEC_WIDTH as i32)),
+        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / VEC_WIDTH)),
+        Operand::Value(limit_val) => {
+            let shift = VEC_WIDTH.trailing_zeros() as i64;
+            let quotient = count_fresh(&mut *next_val_id);
+            let shift_inst = Instruction::BinOp {
+                dest: quotient,
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(*limit_val),
+                rhs: Operand::Const(int_const(shift)),
+                ty: p.iv_ty,
+            };
+            func.blocks[preheader_idx].instructions.push(shift_inst);
+            changes += 1;
+            Operand::Value(quotient)
+        }
+        _ => return 0,
+    };
+
+    // Rewrite the exit compare to the divided limit.
+    for &b in &p.loop_blocks {
+        for inst in &mut func.blocks[b].instructions {
+            if let Instruction::Cmp { lhs, rhs, .. } = inst {
+                let l_is_iv = matches!(lhs, Operand::Value(v) if v.0 == p.iv.0);
+                if l_is_iv {
+                    *rhs = divided_limit.clone();
+                    changes += 1;
+                }
+            }
+        }
+    }
+
+    // The byte IV (mirrors the map transform).
+    let byte_iv = count_fresh(&mut *next_val_id);
+    let byte_iv_next = count_fresh(&mut *next_val_id);
+    let phi_pos = func.blocks[p.header_idx]
+        .instructions
+        .iter()
+        .position(|i| !matches!(i, Instruction::Phi { .. }))
+        .unwrap_or(func.blocks[p.header_idx].instructions.len());
+    func.blocks[p.header_idx].instructions.insert(
+        phi_pos,
+        Instruction::Phi {
+            dest: byte_iv,
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Const(IrConst::I64(0)), preheader_label),
+                (Operand::Value(byte_iv_next), latch_label),
+            ],
+        },
+    );
+    func.blocks[p.latch_idx]
+        .instructions
+        .push(Instruction::BinOp {
+            dest: byte_iv_next,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(byte_iv),
+            rhs: Operand::Const(IrConst::I64(VEC_WIDTH)),
+            ty: IrType::I64,
+        });
+    changes += 2;
+
+    // The zero vector for `vpsadbw`'s second operand lives in the preheader
+    // (register-allocated once); the `& 1` constant rides the tree's own
+    // `Invariant` broadcast, so no separate ones vector is needed.
+    let zero_vec = count_fresh(&mut *next_val_id);
+    func.blocks[preheader_idx]
+        .instructions
+        .push(Instruction::Intrinsic {
+            dest: Some(zero_vec),
+            op: IntrinsicOp::VecZeroI32x8,
+            dest_ptr: None,
+            args: vec![],
+        });
+    changes += 1;
+
+    // Emit the packed body through `MapEmitCtx`, replacing the scalar add.
+    let acc_sum = count_fresh(&mut *next_val_id);
+    {
+        let mut preheader_insts: Vec<Instruction> = Vec::new();
+        let mut vec_insts: Vec<Instruction> = Vec::new();
+        let mut ctx = MapEmitCtx {
+            src_bases: &p.src_bases,
+            byte_iv,
+            load_op: IntrinsicOp::VecLoadI32x8,
+            broadcast_op: IntrinsicOp::VecBroadcastI32x8,
+            sqrt_op: None,
+            madd_op: None,
+            bin_op: &bin_op,
+            cmp_op: &cmp_op,
+            minmax_op: &minmax_op,
+            blendv_op,
+            narrow_const_bytes: Some(1),
+            byte_broadcast_op: Some(IntrinsicOp::VecBroadcastI8x32),
+            node_cache: Vec::new(),
+            preheader_insts: Vec::new(),
+            vec_insts: Vec::new(),
+            next_val_id: *next_val_id,
+            changes: &mut changes,
+        };
+        let _ = &mut preheader_insts;
+        let _ = &mut vec_insts;
+        // The emitted tree ALWAYS ends in `& 1` (the wrap above made sure
+        // of it), so its result is directly the 0/1 byte-lane vector.
+        let sad_src = match ctx.emit(&count_tree) {
+            Some(m) => m,
+            None => return 0,
+        };
+        let sad_v = count_fresh(&mut ctx.next_val_id);
+        ctx.vec_insts.push(Instruction::Intrinsic {
+            dest: Some(sad_v),
+            op: IntrinsicOp::VecSadbwU8x32,
+            dest_ptr: None,
+            args: vec![Operand::Value(sad_src), Operand::Value(zero_vec)],
+        });
+        ctx.vec_insts.push(Instruction::Intrinsic {
+            dest: Some(acc_sum),
+            op: IntrinsicOp::VecAddI64x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(p.acc_phi), Operand::Value(sad_v)],
+        });
+        *ctx.changes += ctx.vec_insts.len() + ctx.preheader_insts.len();
+        *next_val_id = ctx.next_val_id;
+        let pre = std::mem::take(&mut ctx.preheader_insts);
+        let body = std::mem::take(&mut ctx.vec_insts);
+        func.blocks[preheader_idx].instructions.extend(pre);
+        // Replace the scalar add with the packed chain IN ORDER (splice:
+        // repeated `insert(ai+1, ..)` would reverse the chain).
+        let (ab, ai) = p.add_site;
+        // Unreachable-by-construction: the chain lowers `And(tree, 1)`,
+        // which emits at least the And, the sadbw and the accumulator add.
+        // Fail loudly rather than silently returning mid-mutation (which
+        // would leave the function half-rewritten).
+        let Some(first) = body.first() else {
+            unreachable!("counting chain is never empty: And(tree,1) lowers to >= 3 instructions");
+        };
+        let rest: Vec<Instruction> = body.iter().skip(1).cloned().collect();
+        let add_inst = &mut func.blocks[ab].instructions[ai];
+        *add_inst = first.clone();
+        func.blocks[ab].instructions.splice(ai + 1..ai + 1, rest);
+    }
+
+    // Rewire the accumulator phi: entry → zero vector, backedge → acc_sum.
+    for inst in &mut func.blocks[p.header_idx].instructions {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            if *dest == p.acc_phi {
+                for (val, lbl) in incoming.iter_mut() {
+                    if *lbl == latch_label {
+                        *val = Operand::Value(acc_sum);
+                    } else {
+                        *val = Operand::Value(zero_vec);
+                    }
+                }
+                changes += 1;
+            }
+        }
+    }
+
+    // Exit materialisation: the horizontal sum lives in the VECTOR-EXIT
+    // block (it must dominate the remainder-header phi edge that consumes
+    // it; the old exit block does not — the remainder header is its
+    // sibling).  Every id/label it needs was allocated and the scalar
+    // mirror emitted BEFORE the first mutation (see the pre-mutation
+    // section above); from here on the transform cannot bail out.
+
+    // Retarget ONLY the loop-internal edges that entered the old exit --
+    // with the straight-line discipline that is exactly the header's exit
+    // edge -- to the vector-exit block, which computes the resume index
+    // then joins the remainder header.  Non-loop predecessors (the loop
+    // guard's bypass edge, or any unrelated jump sharing the exit block)
+    // keep their original edge: on those paths the loop never ran and the
+    // accumulator keeps its entry value, which the exit phi below merges.
+    // Retargeting THEM would drag control through `h = hadd(acc_phi)` and
+    // the remainder, whose values do not dominate those paths.
+    for (bi, b) in func.blocks.iter_mut().enumerate() {
+        if !p.loop_blocks.contains(&bi) {
+            continue;
+        }
+        if let Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } = &mut b.terminator
+        {
+            if *true_label == exit_label {
+                *true_label = vec_exit_label;
+            }
+            if *false_label == exit_label {
+                *false_label = vec_exit_label;
+            }
+        }
+        if let Terminator::Branch(l) = &mut b.terminator {
+            if *l == exit_label {
+                *l = vec_exit_label;
+            }
+        }
+    }
+
+    let vec_exit_block = BasicBlock {
+        label: vec_exit_label,
+        instructions: vec![
+            Instruction::Intrinsic {
+                dest: Some(h),
+                op: IntrinsicOp::VecHorizontalAddI64x4,
+                dest_ptr: None,
+                args: vec![Operand::Value(p.acc_phi)],
+            },
+            Instruction::BinOp {
+                dest: rem_start,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(p.iv),
+                rhs: Operand::Const(iv_width_const),
+                ty: p.iv_ty,
+            },
+        ],
+        terminator: Terminator::Branch(rem_header_label),
+        source_spans: vec![],
+    };
+    func.blocks.push(vec_exit_block);
+    changes += 1;
+
+    // Remainder header: r_acc phi (entry: h) + iv phi + compare.
+    let mut rem_header_insts = vec![
+        Instruction::Phi {
+            dest: r_acc,
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Value(h), vec_exit_label),
+                (Operand::Value(r_acc_next), rem_latch_label),
+            ],
+        },
+        Instruction::Phi {
+            dest: rem_iv,
+            ty: p.iv_ty,
+            incoming: vec![
+                (Operand::Value(rem_start), vec_exit_label),
+                (Operand::Value(rem_iv_next), rem_latch_label),
+            ],
+        },
+        Instruction::Cmp {
+            dest: rem_cmp,
+            // Reuse EXACTLY the accepted exit predicate: a U32 IV needs
+            // Ult (an Slt on a value >= 2^31 reads negative and runs
+            // away), an I32 IV needs Slt.  The analyzer guarantees this
+            // is one of the two.
+            op: p.exit_cmp_op,
+            lhs: Operand::Value(rem_iv),
+            rhs: p.limit.clone(),
+            ty: p.iv_ty,
+        },
+    ];
+    let _ = &mut rem_header_insts;
+    let rem_header_block = BasicBlock {
+        label: rem_header_label,
+        instructions: rem_header_insts,
+        terminator: Terminator::CondBranch {
+            cond: Operand::Value(rem_cmp),
+            true_label: rem_body_label,
+            false_label: exit_label,
+        },
+        source_spans: vec![],
+    };
+    func.blocks.push(rem_header_block);
+
+    // Remainder body: the pre-mutation-emitted scalar mirror (see the
+    // construction site above) plus the accumulator update.
+    let rem_body_block = BasicBlock {
+        label: rem_body_label,
+        instructions: rem_body_insts,
+        terminator: Terminator::Branch(rem_latch_label),
+        source_spans: vec![],
+    };
+    func.blocks.push(rem_body_block);
+
+    let rem_latch_block = BasicBlock {
+        label: rem_latch_label,
+        instructions: vec![Instruction::BinOp {
+            dest: rem_iv_next,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(rem_iv),
+            rhs: Operand::Const(rem_one),
+            ty: p.iv_ty,
+        }],
+        terminator: Terminator::Branch(rem_header_label),
+        source_spans: vec![],
+    };
+    func.blocks.push(rem_latch_block);
+
+    // Final value: an exit-block phi merging r_acc (the remainder edge)
+    // with 0 (every non-loop edge -- the loop guard's bypass and any
+    // unrelated jump sharing the block: on those paths neither the vector
+    // loop nor the remainder contributed), then + acc_init, narrowed back
+    // to the accumulator's SOURCE type so every outside use keeps its
+    // original typing.  The phi is inserted with the block's other phis
+    // (phi-first discipline); the cast/add follow them.
+    let exit_block_phis = func.blocks[p.exit_idx]
+        .instructions
+        .iter()
+        .take_while(|i| matches!(i, Instruction::Phi { .. }))
+        .count();
+    // Non-loop, non-remainder predecessors of the exit block (the loop
+    // guard's bypass edge, plus any unrelated jump sharing the block).
+    // The new remainder blocks (vec_exit / rem_header / rem_body /
+    // rem_latch) are excluded by label: rem_header's false edge IS the
+    // remainder's exit and carries r_acc.
+    let new_block_labels: FxHashSet<u32> = [
+        vec_exit_label.0,
+        rem_header_label.0,
+        rem_body_label.0,
+        rem_latch_label.0,
+    ]
+    .into_iter()
+    .collect();
+    let exit_lbl = func.blocks[p.exit_idx].label;
+    let other_preds: Vec<BlockId> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(bi, b)| {
+            !p.loop_blocks.contains(bi)
+                && *bi != p.exit_idx
+                && !new_block_labels.contains(&b.label.0)
+                && match &b.terminator {
+                    Terminator::Branch(l) => *l == exit_lbl,
+                    Terminator::CondBranch {
+                        true_label,
+                        false_label,
+                        ..
+                    } => *true_label == exit_lbl || *false_label == exit_lbl,
+                    _ => false,
+                }
+        })
+        .map(|(_, b)| b.label)
+        .collect();
+    let total_wide = count_fresh(&mut *next_val_id);
+    let init_wide = count_fresh(&mut *next_val_id);
+    let init_op = p.acc_init.clone();
+    // Insert position: after the block's existing phis (phi-first
+    // discipline), advanced past anything this transform adds.
+    let mut pos = exit_block_phis;
+    let acc_on_exit: Operand = if other_preds.is_empty() {
+        // Single-predecessor exit (unguarded loop): r_acc is the value.
+        Operand::Value(r_acc)
+    } else {
+        // Merge: 0 on every path that did not go through the remainder
+        // (acc_init is added separately below), r_acc on the remainder
+        // edge.  Both are I64.
+        let exit_phi = count_fresh(&mut *next_val_id);
+        let mut incoming = Vec::with_capacity(other_preds.len() + 1);
+        for lbl in &other_preds {
+            incoming.push((Operand::Const(IrConst::I64(0)), *lbl));
+        }
+        incoming.push((Operand::Value(r_acc), rem_header_label));
+        func.blocks[p.exit_idx].instructions.insert(
+            pos,
+            Instruction::Phi {
+                dest: exit_phi,
+                ty: IrType::I64,
+                incoming,
+            },
+        );
+        pos += 1;
+        changes += 1;
+        Operand::Value(exit_phi)
+    };
+    func.blocks[p.exit_idx].instructions.insert(
+        pos,
+        Instruction::Cast {
+            dest: init_wide,
+            src: init_op,
+            from_ty: p.acc_ty,
+            to_ty: IrType::I64,
+        },
+    );
+    pos += 1;
+    func.blocks[p.exit_idx].instructions.insert(
+        pos,
+        Instruction::BinOp {
+            dest: total_wide,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(init_wide),
+            rhs: acc_on_exit,
+            ty: IrType::I64,
+        },
+    );
+    changes += 2;
+    let total = if p.acc_ty == IrType::I64 || p.acc_ty == IrType::U64 {
+        total_wide
+    } else {
+        let t = count_fresh(&mut *next_val_id);
+        func.blocks[p.exit_idx].instructions.insert(
+            2,
+            Instruction::Cast {
+                dest: t,
+                src: Operand::Value(total_wide),
+                from_ty: IrType::I64,
+                to_ty: p.acc_ty,
+            },
+        );
+        changes += 1;
+        t
+    };
+    // Rewrite outside uses of the accumulator phi to `total`.
+    let updates = rewrite_accumulator_uses_outside_loop(func, &p.loop_blocks, p.acc_phi.0, total);
+    changes += updates;
+
+    if debug {
+        eprintln!(
+            "[VEC-CNT] fn={} loop H{}: counting reduction, {} changes",
+            func.name, p.header_idx, changes
+        );
+    }
+    changes
+}
+
+/// Scalar mirror of the counting tree for the remainder loop: one GEP+load
+/// per stream reference, the identical scalar ops for the tree nodes, and
+/// the `& 1` top (whose scalar meaning is exactly the source 0/1 value).
+fn emit_scalar_count_tree(
+    expr: &MapExpr,
+    src_bases: &[Value],
+    elem_ty: IrType,
+    byte_offset: Operand,
+    insts: &mut Vec<Instruction>,
+    next_val_id: &mut u32,
+) -> Option<Operand> {
+    let fresh = |nid: &mut u32| {
+        let v = Value(*nid);
+        *nid += 1;
+        v
+    };
+    match expr {
+        MapExpr::Load(stream) => {
+            let gep = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            let load = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            insts.push(Instruction::GetElementPtr {
+                dest: gep,
+                base: src_bases[*stream],
+                offset: byte_offset.clone(),
+                ty: elem_ty,
+            });
+            insts.push(Instruction::Load {
+                volatile: false,
+                dest: load,
+                ptr: gep,
+                ty: elem_ty,
+                seg_override: AddressSpace::Default,
+            });
+            Some(Operand::Value(load))
+        }
+        MapExpr::Invariant(o) => Some(o.clone()),
+        MapExpr::Cmp(op, l, r) => {
+            let lv = emit_scalar_count_tree(
+                l,
+                src_bases,
+                elem_ty,
+                byte_offset.clone(),
+                insts,
+                next_val_id,
+            )?;
+            let rv = emit_scalar_count_tree(
+                r,
+                src_bases,
+                elem_ty,
+                byte_offset.clone(),
+                insts,
+                next_val_id,
+            )?;
+            let d = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            insts.push(Instruction::Cmp {
+                dest: d,
+                op: *op,
+                lhs: lv,
+                rhs: rv,
+                ty: elem_ty,
+            });
+            Some(Operand::Value(d))
+        }
+        MapExpr::BinOp(op, l, r) => {
+            let lv = emit_scalar_count_tree(
+                l,
+                src_bases,
+                elem_ty,
+                byte_offset.clone(),
+                insts,
+                next_val_id,
+            )?;
+            let rv = emit_scalar_count_tree(
+                r,
+                src_bases,
+                elem_ty,
+                byte_offset.clone(),
+                insts,
+                next_val_id,
+            )?;
+            let d = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            insts.push(Instruction::BinOp {
+                dest: d,
+                op: *op,
+                lhs: lv,
+                rhs: rv,
+                ty: elem_ty,
+            });
+            Some(Operand::Value(d))
+        }
+        MapExpr::MaskConj { is_and, l, r } => {
+            let lv = emit_scalar_count_tree(
+                l,
+                src_bases,
+                elem_ty,
+                byte_offset.clone(),
+                insts,
+                next_val_id,
+            )?;
+            let rv = emit_scalar_count_tree(
+                r,
+                src_bases,
+                elem_ty,
+                byte_offset.clone(),
+                insts,
+                next_val_id,
+            )?;
+            let d = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            insts.push(Instruction::BinOp {
+                dest: d,
+                op: if *is_and { IrBinOp::And } else { IrBinOp::Or },
+                lhs: lv,
+                rhs: rv,
+                ty: elem_ty,
+            });
+            Some(Operand::Value(d))
+        }
+        MapExpr::Select(c, t, f) => {
+            let cv = emit_scalar_count_tree(
+                c,
+                src_bases,
+                elem_ty,
+                byte_offset.clone(),
+                insts,
+                next_val_id,
+            )?;
+            let tv = emit_scalar_count_tree(
+                t,
+                src_bases,
+                elem_ty,
+                byte_offset.clone(),
+                insts,
+                next_val_id,
+            )?;
+            let fv = emit_scalar_count_tree(
+                f,
+                src_bases,
+                elem_ty,
+                byte_offset.clone(),
+                insts,
+                next_val_id,
+            )?;
+            let d = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            insts.push(Instruction::Select {
+                cond: cv,
+                true_val: tv,
+                false_val: fv,
+                dest: d,
+                ty: elem_ty,
+            });
+            Some(Operand::Value(d))
+        }
+        MapExpr::Sqrt(_) | MapExpr::MinMax { .. } => None,
+    }
+}
+
 /// Every BinOp/Sqrt/Cmp/Select/MinMax node in the tree must have a lowering
 /// before the transform starts mutating the function (fail-closed
 /// pre-validation).
@@ -4950,6 +6489,1496 @@ fn map_tree_ops_available(
                 && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
         }
     }
+}
+
+// ===========================================================================
+// Unsigned range-mask fusion (OP-05c)
+// ===========================================================================
+//
+// x86 has NO packed unsigned integer compare below AVX-512.  `emit_int_cmp`
+// therefore expands `a <u b` into a monotone sign-bias remap
+// (`vpxor` both operands with 0x8000_0000) followed by `vpcmpgtd`, and the
+// `<=` forms add an all-ones materialisation plus a `vpxor` inversion:
+// FIVE instructions and two extra live vector constants for ONE predicate.
+// The classifier idiom the C source actually writes -- `lo <= c && c <= hi`
+// -- pays that twice and then ANDs, i.e. ELEVEN instructions.
+//
+// The identity below collapses the whole shape to TWO instructions at any
+// lane width, with a single dependent chain and two hoisted constants.
+//
+// Let the lane be W bits, SB = 2^(W-1), and let all arithmetic below be the
+// two's-complement wrapping arithmetic that packed integer add implements.
+// For any lane value X and constants 0 <= lo <= hi < 2^W:
+//
+//     lo <=u X <=u hi
+//   <=>  (X - lo) mod 2^W  <=u  R,             R := hi - lo          (1)
+//   <=>  signed((X - lo) + SB)  <=s  R - SB                          (2)
+//   <=>  signed(X + bias)       <s   T,                              (3)
+//        bias := (SB - lo) mod 2^W,   T := R + 1 - SB
+//
+// (1) is the classic range-check reassociation: subtracting `lo` maps the
+//     admitted window onto [0, R] and every other value onto (R, 2^W).
+// (2) holds because `u |-> signed(u + SB)` is exactly `u - SB` for EVERY
+//     u in [0, 2^W): it is the order isomorphism from the unsigned order to
+//     the signed order (add SB, reinterpret).  It is a bijection, so the
+//     comparison is preserved, not merely implied.
+// (3) rewrites `<=s c` as `<s c + 1`; `T` is representable as a signed
+//     W-bit integer iff R <= 2^W - 2, which is why R = 2^W - 1 (an
+//     always-true predicate) is rejected instead of fused.
+//
+// `signed(X + bias) <s T` is precisely `Cmp(Slt, Add(X, bias), T)`, i.e. one
+// `vpaddd`/`vpaddb` plus one `vpcmpgtd`/`vpcmpgtb`, both of which every
+// integer lane width already lowers.  The rewrite therefore needs no new
+// intrinsic, no new emitter, and no new encoding -- it is a pure
+// canonicalisation of the expression tree, which is also why it is exact by
+// construction rather than by emitter convention.
+//
+// The same identity subsumes SINGLE-sided unsigned constant compares
+// (`X <u k` is `0 <=u X <=u k-1`), replacing the 3-to-5 instruction bias
+// expansion with the same two instructions.
+
+/// One side of a recovered unsigned range test on a shared subexpression.
+enum RangeBound {
+    /// `X >=u lo`
+    Lower(u64),
+    /// `X <=u hi`
+    Upper(u64),
+}
+
+/// Element size in BYTES for every type the elementwise map vectorizer can
+/// carry.  This is the single authority: `analyze_map_pattern` uses it to
+/// validate the GEP stride and `transform_map_vector` uses it to re-derive
+/// the same stride when it rebuilds the byte induction variable.  The two
+/// used to compute it independently, and the transform's copy said `4` for
+/// every non-`F64` type -- silently wrong for I64/U64 (8 bytes) and for the
+/// byte lanes added by OP-05d.
+fn map_elem_size(elem_ty: &IrType) -> Option<u32> {
+    match elem_ty {
+        IrType::F64 | IrType::I64 | IrType::U64 => Some(8),
+        IrType::F32 | IrType::I32 | IrType::U32 => Some(4),
+        IrType::I8 | IrType::U8 => Some(1),
+        IrType::I16 | IrType::U16 => Some(2),
+        _ => None,
+    }
+}
+
+/// Lane width in bits for the integer element types the map vectorizer
+/// admits.  Non-integer (or unsupported) types return `None` and disable
+/// every rewrite in this section.
+fn map_lane_bits(elem_ty: &IrType) -> Option<u32> {
+    match elem_ty {
+        IrType::I8 | IrType::U8 => Some(8),
+        IrType::I16 | IrType::U16 => Some(16),
+        IrType::I32 | IrType::U32 => Some(32),
+        _ => None,
+    }
+}
+
+/// Constant lane value of an `Invariant` leaf, truncated to the lane width.
+///
+/// Truncation is the correct reading: the leaf is broadcast into W-bit lanes,
+/// so only its low W bits are observable.  A non-constant invariant (a
+/// runtime scalar) has no compile-time value and disables the rewrite.
+fn map_const_lane(expr: &MapExpr, bits: u32) -> Option<u64> {
+    let MapExpr::Invariant(Operand::Const(c)) = expr else {
+        return None;
+    };
+    let raw = c.to_i64()? as u64;
+    Some(if bits >= 64 {
+        raw
+    } else {
+        raw & ((1u64 << bits) - 1)
+    })
+}
+
+/// Classify a compare node as an unsigned bound on a shared subexpression:
+/// returns `(X, bound)` when the node is `X REL const` or `const REL X` with
+/// an unsigned predicate.
+///
+/// The parser has already normalised `Ugt`/`Uge` into `Ult`/`Ule` by operand
+/// swap, so only those two predicates occur.  The `+1` / `-1` edge
+/// adjustments are done in the lane's modular domain and fail closed when
+/// they would wrap: `X <u 0` and `X >u MAX` are unsatisfiable, and folding
+/// them to an empty range here would be a silent constant-false that the
+/// caller cannot distinguish from "not fusible".
+fn classify_unsigned_bound<'a>(expr: &'a MapExpr, bits: u32) -> Option<(&'a MapExpr, RangeBound)> {
+    let MapExpr::Cmp(op, l, r) = expr else {
+        return None;
+    };
+    let max = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    match op {
+        // `k <= X`  =>  X >=u k
+        IrCmpOp::Ule if map_const_lane(l, bits).is_some() => {
+            Some((r.as_ref(), RangeBound::Lower(map_const_lane(l, bits)?)))
+        }
+        // `X <= k`  =>  X <=u k
+        IrCmpOp::Ule if map_const_lane(r, bits).is_some() => {
+            Some((l.as_ref(), RangeBound::Upper(map_const_lane(r, bits)?)))
+        }
+        // `k < X`   =>  X >=u k+1   (unsatisfiable when k == MAX)
+        IrCmpOp::Ult if map_const_lane(l, bits).is_some() => {
+            let k = map_const_lane(l, bits)?;
+            if k == max {
+                return None;
+            }
+            Some((r.as_ref(), RangeBound::Lower(k + 1)))
+        }
+        // `X < k`   =>  X <=u k-1   (unsatisfiable when k == 0)
+        IrCmpOp::Ult if map_const_lane(r, bits).is_some() => {
+            let k = map_const_lane(r, bits)?;
+            if k == 0 {
+                return None;
+            }
+            Some((l.as_ref(), RangeBound::Upper(k - 1)))
+        }
+        _ => None,
+    }
+}
+
+/// Recover the closed unsigned window a mask tests, if it tests one.
+///
+/// Handles both spellings the frontend can produce:
+///   * `MaskConj { is_and: true, .. }` over a lower and an upper bound --
+///     the `lo <= c && c <= hi` classifier;
+///   * a single bound, which is the degenerate window `0 ..= hi` or
+///     `lo ..= MAX`.
+///
+/// Returns `(subject, lo, hi)`.  The subject is returned UNFOLDED so the
+/// caller can decide whether to fold it or wrap it (the single-bit union
+/// below wraps it in an `Or`).
+fn extract_window<'a>(expr: &'a MapExpr, bits: u32) -> Option<(&'a MapExpr, u64, u64)> {
+    let max = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let smax = if bits >= 64 {
+        u64::MAX / 2
+    } else {
+        (1u64 << (bits - 1)) - 1
+    };
+    if let MapExpr::MaskConj { is_and: true, l, r } = expr {
+        // Unsigned-unsigned first (the classic classifier); the SIGNED and
+        // MIXED spellings follow per `compose_conj_window`'s case table —
+        // `char`-typed subjects (signed on x86) reach the single-bit union
+        // through exactly those windows.  Each tuple names the classifier
+        // for the l and r side; which side CONTRIBUTES the lower/upper
+        // bound decides the compose flags inside the match.
+        for (cls_l, cls_r, l_is_signed, r_is_signed) in [
+            (
+                classify_unsigned_bound as fn(&MapExpr, u32) -> Option<(&MapExpr, RangeBound)>,
+                classify_unsigned_bound as fn(&MapExpr, u32) -> Option<(&MapExpr, RangeBound)>,
+                false,
+                false,
+            ),
+            (
+                classify_signed_bound as fn(&MapExpr, u32) -> Option<(&MapExpr, RangeBound)>,
+                classify_signed_bound as fn(&MapExpr, u32) -> Option<(&MapExpr, RangeBound)>,
+                true,
+                true,
+            ),
+            (
+                classify_signed_bound as fn(&MapExpr, u32) -> Option<(&MapExpr, RangeBound)>,
+                classify_unsigned_bound as fn(&MapExpr, u32) -> Option<(&MapExpr, RangeBound)>,
+                true,
+                false,
+            ),
+            (
+                classify_unsigned_bound as fn(&MapExpr, u32) -> Option<(&MapExpr, RangeBound)>,
+                classify_signed_bound as fn(&MapExpr, u32) -> Option<(&MapExpr, RangeBound)>,
+                false,
+                true,
+            ),
+        ] {
+            let (Some((xl, bl)), Some((xr, br))) = (cls_l(l, bits), cls_r(r, bits)) else {
+                continue;
+            };
+            if xl != xr {
+                continue;
+            }
+            let window = match (bl, br) {
+                (RangeBound::Lower(lo), RangeBound::Upper(hi)) => {
+                    compose_conj_window(lo, hi, l_is_signed, r_is_signed, bits)
+                }
+                (RangeBound::Upper(hi), RangeBound::Lower(lo)) => {
+                    compose_conj_window(lo, hi, r_is_signed, l_is_signed, bits)
+                }
+                _ => None,
+            };
+            if let Some((lo, hi)) = window {
+                return Some((xl, lo, hi));
+            }
+        }
+        return None;
+    }
+    if let Some((x, bound)) = classify_unsigned_bound(expr, bits) {
+        return Some(match bound {
+            RangeBound::Lower(lo) => (x, lo, max),
+            RangeBound::Upper(hi) => (x, 0, hi),
+        });
+    }
+    // Signed single bound: LOWER is the window `[k, smax]`; UPPER admits
+    // the negative half and is not a window.
+    if let Some((x, bound)) = classify_signed_bound(expr, bits) {
+        if let RangeBound::Lower(lo) = bound {
+            return Some((x, lo, smax));
+        }
+    }
+    None
+}
+
+/// Collapse the union of two windows that differ by exactly one bit into a
+/// SINGLE window test on a bit-forced subject (OP-05e).
+///
+/// This is the `isalpha` / case-insensitive-class idiom that pervades
+/// parsers (`expat`, `curl`, SQLite, every tokenizer):
+///
+/// ```text
+///     c in ['A','Z'] or c in ['a','z']   ==   (c | 32) in ['a','z']
+/// ```
+///
+/// **Identity.**  Let `B` be a power of two, `W1 = [lo, hi]` a window in
+/// which bit `B` is clear at every point, and `W2 = [lo|B, hi|B]`.  Then
+///
+/// ```text
+///     x in W1 U W2   <=>   (x | B) in W2
+/// ```
+///
+/// *Proof.*  (=>) If `x in W1` then bit `B` is clear in `x`, so
+/// `x | B = x + B in [lo+B, hi+B] = W2`.  If `x in W2` then bit `B` is
+/// already set, so `x | B = x in W2`.
+/// (<=) Suppose `x | B in W2`.  Write `y = (x | B) - B`, which clears bit
+/// `B`; from `x | B in [lo+B, hi+B]` we get `y in [lo, hi] = W1`.  Now `x`
+/// is either `y` (bit `B` clear in `x`) -- so `x in W1` -- or `y | B` (bit
+/// `B` set) -- so `x in W2`.  QED.
+///
+/// The precondition "bit `B` is clear throughout `W1`" is checked as
+/// `lo & B == 0` and `lo | (B-1) >= hi`, i.e. `lo` and `hi` lie in the same
+/// `B`-aligned block and that block has bit `B` clear.  Without it the
+/// union is not expressible this way: e.g. `[30, 34] U [62, 66]` contains
+/// points whose bit 5 is already set, and OR-ing would map them outside.
+///
+/// Payoff: the classifier drops from two fused windows plus a `vpor`
+/// (5 packed instructions) to one `vpor` plus one fused window
+/// (3 instructions), and it needs one broadcast constant fewer.
+fn fold_single_bit_window_union(l: &MapExpr, r: &MapExpr, bits: u32) -> Option<MapExpr> {
+    let (xl, lo1, hi1) = extract_window(l, bits)?;
+    let (xr, lo2, hi2) = extract_window(r, bits)?;
+    if xl != xr {
+        return None;
+    }
+    // Order the two windows so `w1` is the one with the bit clear.
+    let (lo_a, hi_a, lo_b, hi_b) = if lo1 <= lo2 {
+        (lo1, hi1, lo2, hi2)
+    } else {
+        (lo2, hi2, lo1, hi1)
+    };
+    // The offset between the windows must be a single bit ...
+    let delta = lo_b.checked_sub(lo_a)?;
+    if delta == 0 || !delta.is_power_of_two() || hi_b.checked_sub(hi_a)? != delta {
+        return None;
+    }
+    let b = delta;
+    // ... which must be clear at every point of the lower window, and the
+    // upper window must be exactly the lower one with that bit set.
+    if lo_a & b != 0 || (lo_a | (b - 1)) < hi_a {
+        return None;
+    }
+    if lo_a | b != lo_b || hi_a | b != hi_b {
+        return None;
+    }
+    // Guard the lane width: `b` must be representable in a lane.
+    if bits < 64 && b >= (1u64 << bits) {
+        return None;
+    }
+    let subject = fold_unsigned_range_masks(xl, bits);
+    let forced = MapExpr::BinOp(
+        IrBinOp::Or,
+        Box::new(subject),
+        Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(b as i32)))),
+    );
+    build_range_mask(&forced, lo_b, hi_b, bits)
+}
+
+/// Build `Cmp(Slt, Add(x, bias), T)` for the window `lo ..= hi` per identity
+/// (3).  Returns `None` when the window is empty, when it covers the whole
+/// lane domain (an always-true mask `T` cannot encode), or when the lane
+/// width is not one the broadcast constants can carry.
+fn build_range_mask(x: &MapExpr, lo: u64, hi: u64, bits: u32) -> Option<MapExpr> {
+    if lo > hi || bits == 0 || bits > 32 {
+        return None;
+    }
+    let modulus = 1u64 << bits;
+    let sign_bit = 1u64 << (bits - 1);
+    let span = hi - lo;
+    // R == 2^W - 1 is the always-true predicate; `T = R + 1 - SB` would be
+    // `+SB`, which is not a signed W-bit value.  Leave it to the scalar
+    // path rather than emit a mask that is off by one lane value.
+    if span >= modulus - 1 {
+        return None;
+    }
+    let bias = (sign_bit.wrapping_sub(lo)) & (modulus - 1);
+    let threshold = (span + 1).wrapping_sub(sign_bit) & (modulus - 1);
+    // The constants are the LANE values, sign-extended from W bits into the
+    // `I32` carrier.  They are deliberately NOT byte-replicated: the scalar
+    // remainder mirror evaluates this tree at the element type (where the
+    // wrapping add and the signed compare are already the right width), and
+    // `MapEmitCtx` replicates when -- and only when -- it emits the packed
+    // broadcast.
+    let to_lane_const = |v: u64| -> Operand {
+        let sext = if v & sign_bit != 0 {
+            (v | !(modulus - 1)) as i64
+        } else {
+            v as i64
+        };
+        Operand::Const(IrConst::I32(sext as i32))
+    };
+    Some(MapExpr::Cmp(
+        IrCmpOp::Slt,
+        Box::new(MapExpr::BinOp(
+            IrBinOp::Add,
+            Box::new(x.clone()),
+            Box::new(MapExpr::Invariant(to_lane_const(bias))),
+        )),
+        Box::new(MapExpr::Invariant(to_lane_const(threshold))),
+    ))
+}
+
+/// Build the mask for the COMPLEMENT of the window `lo ..= hi`: the set
+/// `X <u lo || X >u hi` (which is exactly what the OR-conjunction
+/// `(X < K1) || (X > K2)` with `K1 = lo`, `K2 = hi` tests).
+///
+/// In the bias/threshold domain of `build_range_mask`, in-window is
+/// `t' <s T` with `t' = X + bias` (mod 2^W).  The complement is
+///
+/// ```text
+///     outside  =  t' >=s T   ==   t' >s (T - 1)
+/// ```
+///
+/// and `t' >s (T-1)` is ONE `vpcmpgt` — no inversion constant, no second
+/// compare.  `T - 1 = span - SB` is representable as a signed W-bit value
+/// for every admitted span (span <= 2^W - 2, so T-1 <= 2^(W-1) - 2, and
+/// T-1 >= -SB), and is emitted lane-carried exactly like `T`.
+///
+/// Gates mirror `build_range_mask`: empty windows, whole-domain
+/// complements (span == 2^W - 1: the complement of the EMPTY set is the
+/// whole domain, which has no two-instruction form) and lane widths the
+/// constants cannot carry all fail closed.  The emitted predicate is
+/// `Slt(T-1, t')` — spelled with the CONSTANT on the left so it lands in
+/// the packed emitters' `lt.s` immediate (their `vpcmpgt` orientation
+/// computes `t' >s (T-1)`, which IS `t' >=s T`, the outside test) without
+/// needing a `gt` vocabulary entry.
+fn build_complement_range_mask(x: &MapExpr, lo: u64, hi: u64, bits: u32) -> Option<MapExpr> {
+    if lo > hi || bits == 0 || bits > 32 {
+        return None;
+    }
+    let modulus = 1u64 << bits;
+    let sign_bit = 1u64 << (bits - 1);
+    let span = hi - lo;
+    // span == modulus - 1 is the whole domain; its complement (the empty
+    // set) has no cheaper form than the fused window itself negated, and a
+    // span of modulus - 2 would make the complement a single lane value —
+    // representable, so it stays admitted (the caller's Select keeps its
+    // meaning either way).
+    if span >= modulus - 1 {
+        return None;
+    }
+    let bias = (sign_bit.wrapping_sub(lo)) & (modulus - 1);
+    let threshold = (span + 1).wrapping_sub(sign_bit) & (modulus - 1);
+    // `T - 1` in the lane's modular domain, sign-extended into I32.
+    let t_minus_1 = threshold.wrapping_sub(1) & (modulus - 1);
+    let to_lane_const = |v: u64| -> Operand {
+        let sext = if v & sign_bit != 0 {
+            (v | !(modulus - 1)) as i64
+        } else {
+            v as i64
+        };
+        Operand::Const(IrConst::I32(sext as i32))
+    };
+    Some(MapExpr::Cmp(
+        IrCmpOp::Slt,
+        Box::new(MapExpr::Invariant(to_lane_const(t_minus_1))),
+        Box::new(MapExpr::BinOp(
+            IrBinOp::Add,
+            Box::new(x.clone()),
+            Box::new(MapExpr::Invariant(to_lane_const(bias))),
+        )),
+    ))
+}
+
+/// Classify a compare node as a SIGNED bound with a NON-NEGATIVE constant:
+/// the parser normalises `gt`/`ge` into the `lt`/`le` vocabulary, so only
+/// `Sle`/`Slt` occur, and the constant must sit in `[0, smax]`.
+///
+/// The lane-domain set each classified side admits:
+///   * signed LOWER  `k <=s X` (k >= 0): `[k, smax]` — EXCLUDES the
+///     negative half (a negative X fails `k <=s X` for every k >= 0);
+///   * signed UPPER  `X <=s k` (k >= 0): `negHalf ∪ [0, k]` — ADMITS the
+///     negative half (every negative X satisfies `X <=s k`).
+///
+/// A signed upper bound is therefore only composable with a lower bound
+/// that excludes the negative half (itself, or the unsigned lower bound
+/// crossed with the smax cap — see `compose_conj_window`); a signed LOWER
+/// bound caps every window at `smax`.  Constants outside `[0, smax]` fail
+/// closed: negative-constant signed windows are real but rarer, and the
+/// case analysis for them is not written.
+fn classify_signed_bound<'a>(expr: &'a MapExpr, bits: u32) -> Option<(&'a MapExpr, RangeBound)> {
+    let MapExpr::Cmp(op, l, r) = expr else {
+        return None;
+    };
+    let smax = if bits >= 64 {
+        i64::MAX as u64
+    } else {
+        (1u64 << (bits - 1)) - 1
+    };
+    let nonneg = |e: &MapExpr| -> Option<u64> { map_const_lane(e, bits).filter(|&k| k <= smax) };
+    match op {
+        // `k <=s X`  =>  X in [k, smax]
+        IrCmpOp::Sle if nonneg(l).is_some() => Some((r.as_ref(), RangeBound::Lower(nonneg(l)?))),
+        // `X <=s k`  =>  X in negHalf ∪ [0, k]
+        IrCmpOp::Sle if nonneg(r).is_some() => Some((l.as_ref(), RangeBound::Upper(nonneg(r)?))),
+        // `k <s X`  =>  X in [k+1, smax]  (empty when k == smax)
+        IrCmpOp::Slt if nonneg(l).is_some() => {
+            let k = nonneg(l)?;
+            if k == smax {
+                return None;
+            }
+            Some((r.as_ref(), RangeBound::Lower(k + 1)))
+        }
+        // `X <s k`  =>  X in negHalf ∪ [0, k-1]  (empty when k == 0)
+        IrCmpOp::Slt if nonneg(r).is_some() => {
+            let k = nonneg(r)?;
+            if k == 0 {
+                return None;
+            }
+            Some((l.as_ref(), RangeBound::Upper(k - 1)))
+        }
+        _ => None,
+    }
+}
+
+/// Compose the window a LOWER/UPPER bound pair on the SAME subject admits.
+///
+/// `lower_signed` marks a signed lower bound (admits `[lo, smax]`, i.e. the
+/// window is capped at `smax`); `upper_signed` marks a signed upper bound
+/// (admits `negHalf ∪ [0, hi]`).  The compositions, all verified over the
+/// lane domain:
+///
+/// * unsigned lower + unsigned upper: `[lo, hi]` (the classic window).
+/// * signed lower + ANY upper: `[lo, min(hi, smax)]` — the signed lower
+///   bound already excludes the negative half, and it caps the upper end
+///   at `smax`.
+/// * unsigned lower + SIGNED upper: REFUSED.  Both sides admit the
+///   negative half, so the conjunction is `negHalf ∪ [lo, hi]` — not a
+///   window.  (This is the one combination that looks fusible but is
+///   not, and getting it wrong would silently admit every negative
+///   value.)
+///
+/// Returns `None` when the pair is not composable or the window is empty.
+fn compose_conj_window(
+    lower: u64,
+    upper: u64,
+    lower_signed: bool,
+    upper_signed: bool,
+    bits: u32,
+) -> Option<(u64, u64)> {
+    if !lower_signed && upper_signed {
+        return None;
+    }
+    let smax = if bits >= 64 {
+        u64::MAX / 2
+    } else {
+        (1u64 << (bits - 1)) - 1
+    };
+    let hi = if lower_signed { upper.min(smax) } else { upper };
+    if lower > hi {
+        return None;
+    }
+    Some((lower, hi))
+}
+
+/// Rewrite unsigned constant-bounded compare masks into the two-instruction
+/// biased signed form (identity (3) above).
+///
+/// Applied bottom-up so a fused conjunction is itself visible to an enclosing
+/// rewrite.  Three shape families are recognised:
+///
+/// * `MaskConj{and, lower, upper}` on a *structurally identical* subject `X`
+///   -- the `lo <= c && c <= hi` classifier -- becomes one range mask.
+///   Structural identity is the right test here: the emit cache keys nodes by
+///   their tree shape, so two equal subtrees are guaranteed to be the same
+///   SSA value in the emitted code.
+/// * the SIGNED twins (`lo <=s X && X <=s hi` with non-negative constants,
+///   including the mixed signed-lower/unsigned-upper spelling), via
+///   `classify_signed_bound` + `compose_conj_window`: negative values fail
+///   the signed lower bound, and the two orders agree on non-negatives, so
+///   the conjunction admits exactly the unsigned window `[lo, hi]`.
+/// * the COMPLEMENT window `MaskConj{or, X < K1, X > K2}` (the negated
+///   classifier), via `build_complement_range_mask`: the negation of a
+///   fused window costs the same one add + one compare, through the
+///   `>=s` / `>s (T-1)` identity.
+/// * a leftover single-sided unsigned constant compare, which is the
+///   degenerate range `0 ..= hi` resp. `lo ..= MAX`.
+///
+/// Everything else is returned structurally unchanged.
+fn fold_unsigned_range_masks(expr: &MapExpr, bits: u32) -> MapExpr {
+    match expr {
+        MapExpr::MaskConj { is_and, l, r } => {
+            // The window fusion MUST be attempted on the UNFOLDED children:
+            // folding a child first rewrites `Cmp(Ule, k, X)` into the biased
+            // `Cmp(Slt, Add(X, b), T)`, which no longer classifies as an
+            // unsigned bound, so the conjunction would never be recognised
+            // and the idiom would keep four instructions instead of two.
+            if *is_and {
+                if let (Some((xl, bl)), Some((xr, br))) = (
+                    classify_unsigned_bound(l, bits),
+                    classify_unsigned_bound(r, bits),
+                ) {
+                    if xl == xr {
+                        let window = match (bl, br) {
+                            (RangeBound::Lower(lo), RangeBound::Upper(hi)) => Some((lo, hi)),
+                            (RangeBound::Upper(hi), RangeBound::Lower(lo)) => Some((lo, hi)),
+                            // Two bounds of the same kind are an intersection
+                            // of half-lines, not a window; the tighter one
+                            // wins, but that is a different (and rarer)
+                            // rewrite -- leave it to the generic path.
+                            _ => None,
+                        };
+                        if let Some((lo, hi)) = window {
+                            // `xl` is a child of an unfolded compare, so fold
+                            // it here to keep the bottom-up guarantee.
+                            let subject = fold_unsigned_range_masks(xl, bits);
+                            if let Some(fused) = build_range_mask(&subject, lo, hi, bits) {
+                                return fused;
+                            }
+                        }
+                    }
+                }
+                // SIGNED classifier idioms over `int`/`short` arrays:
+                // `lo <=s X && X <=s hi` with both constants non-negative
+                // admits exactly the unsigned window [lo, hi] (a negative
+                // X fails the signed lower bound, and the unsigned and
+                // signed orders agree on non-negatives).  GCC folds this
+                // shape (`(unsigned)(c - lo) <= hi - lo`); without this
+                // arm the SIGNED classifier stays two compares + a pand
+                // while GCC pays one add + one compare.  Mixed
+                // signed/unsigned sides are composable only per
+                // `compose_conj_window`'s case table.
+                if let (Some((xl, bl)), Some((xr, br))) = (
+                    classify_signed_bound(l, bits),
+                    classify_signed_bound(r, bits),
+                ) {
+                    if xl == xr {
+                        let window = match (bl, br) {
+                            (RangeBound::Lower(lo), RangeBound::Upper(hi)) => {
+                                compose_conj_window(lo, hi, true, true, bits)
+                            }
+                            (RangeBound::Upper(hi), RangeBound::Lower(lo)) => {
+                                compose_conj_window(lo, hi, true, true, bits)
+                            }
+                            _ => None,
+                        };
+                        if let Some((lo, hi)) = window {
+                            let subject = fold_unsigned_range_masks(xl, bits);
+                            if let Some(fused) = build_range_mask(&subject, lo, hi, bits) {
+                                return fused;
+                            }
+                        }
+                    }
+                }
+                // MIXED: signed lower + unsigned upper (compose_conj_window
+                // caps at smax).  The remaining mixed pair (unsigned lower +
+                // signed upper) is refused by the same table.
+                if let (Some((xl, bl)), Some((xr, br))) = (
+                    classify_signed_bound(l, bits),
+                    classify_unsigned_bound(r, bits),
+                ) {
+                    if xl == xr {
+                        let window = match (bl, br) {
+                            (RangeBound::Lower(lo), RangeBound::Upper(hi)) => {
+                                compose_conj_window(lo, hi, true, false, bits)
+                            }
+                            _ => None,
+                        };
+                        if let Some((lo, hi)) = window {
+                            let subject = fold_unsigned_range_masks(xl, bits);
+                            if let Some(fused) = build_range_mask(&subject, lo, hi, bits) {
+                                return fused;
+                            }
+                        }
+                    }
+                }
+                if let (Some((xl, bl)), Some((xr, br))) = (
+                    classify_unsigned_bound(l, bits),
+                    classify_signed_bound(r, bits),
+                ) {
+                    if xl == xr {
+                        // Composable only as unsigned-UPPER (l) + signed
+                        // LOWER (r): `[lo, min(hi, smax)]`.  The mirror
+                        // shape — unsigned lower + SIGNED upper — admits
+                        // the negative half on both sides and is refused
+                        // by `compose_conj_window`.
+                        let window = match (bl, br) {
+                            (RangeBound::Upper(hi), RangeBound::Lower(lo)) => {
+                                compose_conj_window(lo, hi, true, false, bits)
+                            }
+                            _ => None,
+                        };
+                        if let Some((lo, hi)) = window {
+                            let subject = fold_unsigned_range_masks(xl, bits);
+                            if let Some(fused) = build_range_mask(&subject, lo, hi, bits) {
+                                return fused;
+                            }
+                        }
+                    }
+                }
+            }
+            // Union of two windows separated by a single bit (OP-05e): the
+            // `isalpha` idiom.  Like the AND case this must run on the
+            // UNFOLDED children, because a folded window is no longer
+            // recognisable as a bound pair.
+            if !*is_and {
+                if let Some(fused) = fold_single_bit_window_union(l, r, bits) {
+                    return fused;
+                }
+                // COMPLEMENT window: `(X < K1) || (X > K2)` is the complement
+                // of `[K1, K2]` when both bounds are on the same subject.
+                // In the bias/threshold domain of `build_range_mask`,
+                // in-window is `t' <s T`, so OUTSIDE is exactly
+                // `t' >=s T  ==  t' >s (T - 1)` — one `vpadd` plus one
+                // `vpcmpgt`, no inversion constant, no second compare.
+                // Signed complement sides with non-negative constants admit
+                // the same union (the negative half lands in the
+                // `X >s K2` side unsigned-terms: `negHalf ∪ [K2+1, smax]` =
+                // `[K2+1, MAX]`), so both classifier families are tried.
+                for classifier in [
+                    classify_unsigned_bound as fn(&MapExpr, u32) -> Option<(&MapExpr, RangeBound)>,
+                    classify_signed_bound as fn(&MapExpr, u32) -> Option<(&MapExpr, RangeBound)>,
+                ] {
+                    let left = classifier(l, bits);
+                    let right = classifier(r, bits);
+                    if let (Some((xl, bl)), Some((xr, br))) = (left, right) {
+                        if xl != xr {
+                            continue;
+                        }
+                        // The OR must be `X <= K1-1` OR `K2+1 <= X`, with the
+                        // gap `[K1, K2]` non-empty (K1 <= K2).
+                        let window = match (bl, br) {
+                            (RangeBound::Upper(hi_c), RangeBound::Lower(lo_c)) => {
+                                Some((hi_c, lo_c))
+                            }
+                            (RangeBound::Lower(lo_c), RangeBound::Upper(hi_c)) => {
+                                Some((hi_c, lo_c))
+                            }
+                            _ => None,
+                        };
+                        let Some((hi_c, lo_c)) = window else {
+                            continue;
+                        };
+                        // Complement window [K1, K2] = [hi_c + 1, lo_c - 1],
+                        // non-empty iff hi_c + 1 <= lo_c - 1.
+                        if hi_c + 1 > lo_c.wrapping_sub(1) || hi_c >= lo_c {
+                            continue;
+                        }
+                        if let Some(fused) =
+                            build_complement_range_mask(xl, hi_c + 1, lo_c - 1, bits)
+                        {
+                            return fused;
+                        }
+                    }
+                }
+            }
+            MapExpr::MaskConj {
+                is_and: *is_and,
+                l: Box::new(fold_unsigned_range_masks(l, bits)),
+                r: Box::new(fold_unsigned_range_masks(r, bits)),
+            }
+        }
+        MapExpr::Cmp(op, l, r) => {
+            let folded = MapExpr::Cmp(
+                *op,
+                Box::new(fold_unsigned_range_masks(l, bits)),
+                Box::new(fold_unsigned_range_masks(r, bits)),
+            );
+            let max = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            if let Some((x, bound)) = classify_unsigned_bound(&folded, bits) {
+                let (lo, hi) = match bound {
+                    RangeBound::Lower(lo) => (lo, max),
+                    RangeBound::Upper(hi) => (0, hi),
+                };
+                if let Some(fused) = build_range_mask(x, lo, hi, bits) {
+                    return fused;
+                }
+            }
+            // SIGNED single bound: a signed LOWER bound with a non-negative
+            // constant admits exactly `[k, smax]` (negatives fail it), which
+            // is a window; a signed single UPPER bound admits
+            // `negHalf ∪ [0, k]` and is NOT one -- refuse it rather than
+            // emit a mask that silently includes every negative value.
+            if let Some((x, bound)) = classify_signed_bound(&folded, bits) {
+                let smax = if bits >= 64 {
+                    u64::MAX / 2
+                } else {
+                    (1u64 << (bits - 1)) - 1
+                };
+                if let RangeBound::Lower(lo) = bound {
+                    if let Some(fused) = build_range_mask(x, lo, smax, bits) {
+                        return fused;
+                    }
+                }
+            }
+            folded
+        }
+        MapExpr::BinOp(op, l, r) => {
+            // `and`/`or` of two MASKS is a mask conjunction, not lane
+            // arithmetic.  The if-combine pass (`tree-ssa-ifcombine`'s
+            // analogue in `passes/if_convert.rs`) folds a short-circuit
+            // branch chain into exactly this shape -- `%46 = and %25, %29`
+            // over two compares -- and the two forms are interchangeable in
+            // BOTH consumers: the packed emitter lowers `MaskConj` to the
+            // same `vpand`/`vpor` it would emit for the `BinOp`, and the
+            // scalar remainder mirror lowers it to the same bitwise op on
+            // the two 0/1 setcc values.
+            //
+            // Canonicalising to `MaskConj` is what lets the window fusion
+            // below SEE the conjunction: `lo <= c && c <= hi` spelled as a
+            // bitwise `and` would otherwise keep two independent compares
+            // (10 packed instructions) instead of fusing into two.
+            let lf = fold_unsigned_range_masks(l, bits);
+            let rf = fold_unsigned_range_masks(r, bits);
+            let is_mask = |e: &MapExpr| matches!(e, MapExpr::Cmp(..) | MapExpr::MaskConj { .. });
+            if matches!(op, IrBinOp::And | IrBinOp::Or) && is_mask(&lf) && is_mask(&rf) {
+                // Re-enter the MaskConj arm so a freshly exposed conjunction
+                // is fused in the same pass rather than the next one.
+                return fold_unsigned_range_masks(
+                    &MapExpr::MaskConj {
+                        is_and: matches!(op, IrBinOp::And),
+                        l: Box::new(l.as_ref().clone()),
+                        r: Box::new(r.as_ref().clone()),
+                    },
+                    bits,
+                );
+            }
+            MapExpr::BinOp(*op, Box::new(lf), Box::new(rf))
+        }
+        MapExpr::Sqrt(x) => MapExpr::Sqrt(Box::new(fold_unsigned_range_masks(x, bits))),
+        MapExpr::Select(c, t, f) => MapExpr::Select(
+            Box::new(fold_unsigned_range_masks(c, bits)),
+            Box::new(fold_unsigned_range_masks(t, bits)),
+            Box::new(fold_unsigned_range_masks(f, bits)),
+        ),
+        MapExpr::MinMax { is_max, l, r } => MapExpr::MinMax {
+            is_max: *is_max,
+            l: Box::new(fold_unsigned_range_masks(l, bits)),
+            r: Box::new(fold_unsigned_range_masks(r, bits)),
+        },
+        MapExpr::Load(_) | MapExpr::Invariant(_) => expr.clone(),
+    }
+}
+
+// ===========================================================================
+// Byte-lane demotion for elementwise maps (OP-05d)
+// ===========================================================================
+//
+// C's integer promotions destroy byte parallelism.  `dst[i] = tolower(src[i])`
+// is written over `unsigned char`, but the abstract machine widens every
+// operand to `int`, so the IR the frontend produces is a 32-bit expression
+// bracketed by a zero-extension and a truncation:
+//
+//     %c   = load u8, src[i]
+//     %w   = zext %c to u32
+//     %m   = <32-bit predicate over %w>
+//     %r   = select %m, add(%w, 32), %w
+//     %t   = trunc %r to u8
+//            store %t, dst[i]
+//
+// Vectorizing that tree AS WRITTEN gives 8 elements per YMM and forces a
+// widen/narrow sandwich around every step.  GCC 14/16 do exactly this:
+// `vpmovzxbw`/`vpmovzxwd` up, dword compares, `vpackusdw`/`vpackuswb` and
+// `vpermq` back down -- roughly forty instructions per 32 bytes.
+//
+// Evaluating the SAME tree in 8-bit lanes gives 32 elements per YMM and needs
+// no conversion at all.  The transformation is legal because truncation to 8
+// bits is a RING HOMOMORPHISM from Z/2^32 onto Z/2^8:
+//
+//     trunc8(a + b) = trunc8(a) + trunc8(b)      (mod 2^8)
+//     trunc8(a - b) = trunc8(a) - trunc8(b)
+//     trunc8(a & b) = trunc8(a) & trunc8(b)      (likewise | and ^)
+//
+// so for any tree built from those operations the low byte of the result
+// depends ONLY on the low bytes of the leaves.  The store keeps just that low
+// byte, so the narrow evaluation is not an approximation -- it is equal.
+//
+// Two node kinds are NOT homomorphic and need a side condition:
+//
+//   * `Cmp` reads the whole value, not its low byte.  A byte compare agrees
+//     with the wide compare exactly when both operands are representable in
+//     the byte domain the predicate uses: [0, 255] for unsigned predicates,
+//     [-128, 127] for signed ones (equality accepts either, since it only
+//     needs the low byte to determine the wide value uniquely).
+//   * `MinMax` is a select over a compare and inherits the same condition;
+//     `vpminub`/`vpmaxub` additionally fix the byte order as UNSIGNED, so
+//     both operands must lie in [0, 255] -- where signed and unsigned wide
+//     comparisons coincide anyway, which is what makes the fold exact.
+//
+// Both conditions are discharged by a small interval analysis over the WIDE
+// values: a zero-extended `u8` load is [0, 255], a sign-extended `i8` load is
+// [-128, 127], constants are singletons, and the arithmetic nodes propagate
+// intervals.  Anything the analysis cannot bound fails closed and the loop
+// keeps its dword (or scalar) form.
+//
+// Deliberate exclusions, each with a concrete reason:
+//   * Multiply -- x86 has no packed byte multiply at any width.
+//   * Shifts   -- x86 has no packed byte shift; a lowering would need a word
+//                 shift plus a mask, which is no longer a one-instruction op.
+//   * Non-constant loop invariants -- broadcasting one would need
+//                 `vpbroadcastb` from a GPR; constants replicate into the
+//                 existing dword broadcast for free (see `replicate_byte`).
+
+/// Inclusive interval of the WIDE (promoted) value a demoted node can take.
+/// `None` means "unbounded / unknown", which fails every side condition.
+type WideRange = Option<(i64, i64)>;
+
+/// [0, 255] -- the range of a zero-extended byte.
+const U8_RANGE: (i64, i64) = (0, 255);
+/// [-128, 127] -- the range of a sign-extended byte.
+const I8_RANGE: (i64, i64) = (-128, 127);
+
+/// The unsigned and signed domains of an `n`-BYTE narrow lane.
+///
+/// The whole demotion argument is width-parametric: truncation to `8n` bits
+/// is a ring homomorphism for exactly the same reason at every `n`, and the
+/// compare side conditions are the same two domains one width up.  Keeping
+/// the widths in one place is what let 16-bit lanes (OP-05g) reuse the byte
+/// machinery verbatim instead of growing a second copy of it.
+fn narrow_domains(elem_bytes: u32) -> ((i64, i64), (i64, i64)) {
+    let bits = elem_bytes * 8;
+    let umax = (1i64 << bits) - 1;
+    let smax = (1i64 << (bits - 1)) - 1;
+    ((0, umax), (-smax - 1, smax))
+}
+/// The value of a lane mask: all-ones (-1) or all-zeros (0).
+const MASK_RANGE: (i64, i64) = (-1, 0);
+
+fn range_within(r: WideRange, bound: (i64, i64)) -> bool {
+    matches!(r, Some((lo, hi)) if lo >= bound.0 && hi <= bound.1)
+}
+
+/// A byte constant replicated across all four bytes of an `I32` broadcast
+/// lane.  `VecBroadcastI32x{4,8}` splats a dword; splatting `b*0x01010101`
+/// fills every BYTE lane with `b`, so the byte path needs no `vpbroadcastb`
+/// and no new intrinsic for constant operands.
+fn replicate_byte(v: i64) -> i32 {
+    replicate_narrow(v, 1)
+}
+
+/// A narrow constant replicated across all four bytes of an `I32` broadcast
+/// lane: `b * 0x01010101` for byte lanes, `w * 0x00010001` for word lanes.
+/// `VecBroadcastI32x{4,8}` splats a dword, so the replicated pattern fills
+/// every NARROW lane with the value -- which is why constant operands need
+/// no `vpbroadcastb`/`vpbroadcastw`.
+fn replicate_narrow(v: i64, elem_bytes: u32) -> i32 {
+    match elem_bytes {
+        1 => (((v as u64 & 0xFF) as u32) * 0x0101_0101) as i32,
+        2 => (((v as u64 & 0xFFFF) as u32) * 0x0001_0001) as i32,
+        _ => v as i32,
+    }
+}
+
+/// Interval arithmetic on the wide domain.  Every operation saturates into
+/// `None` rather than wrapping, so a lost bound can only make the analysis
+/// more conservative.
+fn range_binop(op: IrBinOp, l: WideRange, r: WideRange) -> WideRange {
+    let (ll, lh) = l?;
+    let (rl, rh) = r?;
+    match op {
+        IrBinOp::Add => Some((ll.checked_add(rl)?, lh.checked_add(rh)?)),
+        IrBinOp::Sub => Some((ll.checked_sub(rh)?, lh.checked_sub(rl)?)),
+        // Bitwise results are only bounded when both operands are known
+        // non-negative; then the result cannot exceed the largest operand
+        // rounded up to a full mask of ones.
+        IrBinOp::And if ll >= 0 && rl >= 0 => Some((0, lh.min(rh))),
+        IrBinOp::Or | IrBinOp::Xor if ll >= 0 && rl >= 0 => {
+            let m = lh.max(rh);
+            // Smallest all-ones mask covering `m` (m < 2^64 always holds here
+            // because both bounds came from checked arithmetic).
+            let bits = 64 - (m as u64).leading_zeros();
+            Some((
+                0,
+                if bits >= 63 {
+                    return None;
+                } else {
+                    (1i64 << bits) - 1
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Byte predicate corresponding to a wide predicate, given that both
+/// operands are known non-negative and below 256.
+///
+/// All values are in [0, 255], so the wide SIGNED order, the wide UNSIGNED
+/// order and the byte UNSIGNED order are the same total order.  Mapping every
+/// predicate onto its unsigned form is therefore exact -- and it is also the
+/// form `fold_unsigned_range_masks` can fuse.
+fn byte_predicate_unsigned(op: IrCmpOp) -> IrCmpOp {
+    match op {
+        IrCmpOp::Slt | IrCmpOp::Ult => IrCmpOp::Ult,
+        IrCmpOp::Sle | IrCmpOp::Ule => IrCmpOp::Ule,
+        IrCmpOp::Sgt | IrCmpOp::Ugt => IrCmpOp::Ugt,
+        IrCmpOp::Sge | IrCmpOp::Uge => IrCmpOp::Uge,
+        IrCmpOp::Eq => IrCmpOp::Eq,
+        IrCmpOp::Ne => IrCmpOp::Ne,
+    }
+}
+
+/// Normalise a predicate into the EQ/LT/LE/NE subset the packed compare
+/// emitters accept as an immediate, swapping the operands for the GT/GE
+/// forms.  Returns `(op, swap_operands)`.
+fn normalize_cmp_for_lanes(op: IrCmpOp) -> (IrCmpOp, bool) {
+    match op {
+        IrCmpOp::Eq | IrCmpOp::Ne | IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Ult | IrCmpOp::Ule => {
+            (op, false)
+        }
+        IrCmpOp::Sgt => (IrCmpOp::Slt, true),
+        IrCmpOp::Sge => (IrCmpOp::Sle, true),
+        IrCmpOp::Ugt => (IrCmpOp::Ult, true),
+        IrCmpOp::Uge => (IrCmpOp::Ule, true),
+    }
+}
+
+/// Parse the expression feeding a BYTE store into a byte-lane `MapExpr`,
+/// together with the interval its value can take in the WIDE domain.
+///
+/// # Why a separate parser
+///
+/// C's integer promotions do not produce a clean "extend, compute wide,
+/// truncate" bracket.  For `if (c >= 'A' && c <= 'Z') c += 32;` over
+/// `unsigned char`, the frontend + if-conversion emit a MIXED tree:
+///
+///     %16 = load u8                       ; the byte itself
+///     %18 = zext %16 to i32               ; promotion, used only by the
+///     %20 = cmp sge i32 %18, 65           ;   compares and the add
+///     %24 = cmp sle i32 %18, 90
+///     %28 = add i32 %18, 32
+///     %29 = trunc %28 to u8               ; truncation of the ADD ONLY
+///     %40 = select u8 %24, %29, %16       ; selects run at BYTE type,
+///     %41 = select u8 %20, %40, %16       ;   over the RAW load
+///            store u8 %41
+///
+/// The narrow load is a direct operand of both selects, the promotion feeds
+/// only the arithmetic, and the truncation sits in the middle of the tree
+/// rather than at its root.  Parsing "the wide tree" is therefore not even
+/// well defined; the parser has to walk the mixed graph and treat the width
+/// casts as what they are in 8-bit lanes: NO-OPS.
+///
+/// # Why that is exact
+///
+/// Truncation to 8 bits is a ring homomorphism Z/2^32 -> Z/2^8, so for the
+/// ring operations (`+`, `-`, `&`, `|`, `^`) the low byte of the result
+/// depends only on the low bytes of the operands.  A widening cast does not
+/// change the mathematical value at all, and the final store keeps only the
+/// low byte -- hence every ring node, every width cast and every select can
+/// be evaluated on bytes with an EQUAL result.
+///
+/// The two node kinds that read more than the low byte are `Cmp` and the
+/// `MinMax` folded out of a select-over-compare.  Both are discharged with
+/// the interval carried alongside each node:
+///
+/// * both operands in [0, 255]  -> the wide signed order, the wide unsigned
+///   order and the byte unsigned order coincide; emit the UNSIGNED byte
+///   predicate (see `byte_predicate_unsigned`).
+/// * both operands in [-128, 127] -> the value is representable in `i8`, and
+///   `x |-> x mod 256` is an order isomorphism from that window onto the
+///   byte domain for BOTH the signed and the unsigned byte order; keep the
+///   predicate as written.
+/// * otherwise -> refuse, and the loop keeps its scalar form.
+///
+/// Multiplies and shifts are refused outright: x86 has no packed byte
+/// multiply and no packed byte shift at any vector width, so there is no
+/// one-instruction lowering to demote to.
+fn parse_byte_map_expr(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    leaf_tys: &[(Value, IrType)],
+    is_invariant: &dyn Fn(&Operand) -> bool,
+    value: Value,
+    depth: usize,
+    elem_bytes: u32,
+) -> Option<(MapExpr, WideRange)> {
+    let (u_dom, s_dom) = narrow_domains(elem_bytes);
+    // The width casts make byte trees taller than their dword equivalents
+    // (one cast per promotion, one per truncation), so the depth guard is
+    // looser than `parse_map_expr`'s 6.  The node-count cap in the caller is
+    // still the primary size limit.
+    if depth > 10 {
+        return None;
+    }
+    if let Some(idx) = leaf_tys.iter().position(|(d, _)| *d == value) {
+        let range = match leaf_tys[idx].1 {
+            IrType::U8 | IrType::U16 => u_dom,
+            IrType::I8 | IrType::I16 => s_dom,
+            _ => return None,
+        };
+        return Some((MapExpr::Load(idx), Some(range)));
+    }
+    let (_, inst) = find_inst_in_loop(func, loop_blocks, value)?;
+    match inst {
+        Instruction::Copy { src, .. } => parse_byte_map_operand(
+            func,
+            loop_blocks,
+            leaf_tys,
+            is_invariant,
+            src,
+            depth + 1,
+            elem_bytes,
+        ),
+        Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        } => {
+            if !from_ty.is_integer() || !to_ty.is_integer() {
+                return None;
+            }
+            let (e, r) = parse_byte_map_operand(
+                func,
+                loop_blocks,
+                leaf_tys,
+                is_invariant,
+                src,
+                depth + 1,
+                elem_bytes,
+            )?;
+            if to_ty.size() >= from_ty.size() {
+                // Widening (zext/sext): value-preserving, hence the identity
+                // on the narrow lane.  The interval is unchanged.
+                Some((e, r))
+            } else if to_ty.size() == elem_bytes as usize {
+                // Truncation to the LANE width: the identity on the lane, and
+                // the result's interval is that width's domain (C defines
+                // `(unsigned char)x` as `x mod 256`, and so on one width up).
+                let range = match to_ty {
+                    IrType::U8 | IrType::U16 => u_dom,
+                    IrType::I8 | IrType::I16 => s_dom,
+                    _ => return None,
+                };
+                Some((e, Some(range)))
+            } else {
+                // A truncation to any OTHER width is not the identity on this
+                // lane; there is nothing to demote to.
+                None
+            }
+        }
+        Instruction::BinOp { op, lhs, rhs, .. } => {
+            // `Mul` is admitted at 16-bit lanes only: `pmullw` keeps the low
+            // half (a ring homomorphism, exactly like the additive ops),
+            // while x86 has NO packed byte multiply at any vector width.
+            let ring_ok = matches!(
+                op,
+                IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+            ) || (elem_bytes == 2 && matches!(op, IrBinOp::Mul));
+            if !ring_ok {
+                return None;
+            }
+            let (l, lr) = parse_byte_map_operand(
+                func,
+                loop_blocks,
+                leaf_tys,
+                is_invariant,
+                lhs,
+                depth + 1,
+                elem_bytes,
+            )?;
+            let (r, rr) = parse_byte_map_operand(
+                func,
+                loop_blocks,
+                leaf_tys,
+                is_invariant,
+                rhs,
+                depth + 1,
+                elem_bytes,
+            )?;
+            // `and`/`or` of two lane masks is a mask conjunction (the shape
+            // if-combine produces for `a && b`).  Modelling it as arithmetic
+            // would lose the mask range and make any enclosing `Select`
+            // reject it -- and would hide the window from the range fusion.
+            if matches!(op, IrBinOp::And | IrBinOp::Or)
+                && lr == Some(MASK_RANGE)
+                && rr == Some(MASK_RANGE)
+            {
+                return Some((
+                    MapExpr::MaskConj {
+                        is_and: matches!(op, IrBinOp::And),
+                        l: Box::new(l),
+                        r: Box::new(r),
+                    },
+                    Some(MASK_RANGE),
+                ));
+            }
+            Some((
+                MapExpr::BinOp(*op, Box::new(l), Box::new(r)),
+                range_binop(*op, lr, rr),
+            ))
+        }
+        Instruction::Cmp { op, lhs, rhs, .. } => {
+            let (l, lr) = parse_byte_map_operand(
+                func,
+                loop_blocks,
+                leaf_tys,
+                is_invariant,
+                lhs,
+                depth + 1,
+                elem_bytes,
+            )?;
+            let (r, rr) = parse_byte_map_operand(
+                func,
+                loop_blocks,
+                leaf_tys,
+                is_invariant,
+                rhs,
+                depth + 1,
+                elem_bytes,
+            )?;
+            let byte_op = if range_within(lr, u_dom) && range_within(rr, u_dom) {
+                byte_predicate_unsigned(*op)
+            } else if range_within(lr, s_dom) && range_within(rr, s_dom) {
+                *op
+            } else {
+                return None;
+            };
+            let (norm_op, swap) = normalize_cmp_for_lanes(byte_op);
+            let (a, b) = if swap { (r, l) } else { (l, r) };
+            Some((
+                MapExpr::Cmp(norm_op, Box::new(a), Box::new(b)),
+                Some(MASK_RANGE),
+            ))
+        }
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
+            let (cond_expr, cond_range) = parse_byte_map_operand(
+                func,
+                loop_blocks,
+                leaf_tys,
+                is_invariant,
+                cond,
+                depth + 1,
+                elem_bytes,
+            )?;
+            // The condition must be a lane mask (all-ones / all-zeros).  A
+            // boolean carried as 0/1 would select on bit 0 only, which no
+            // blend instruction does.
+            if cond_range != Some(MASK_RANGE) {
+                return None;
+            }
+            let (t, tr) = parse_byte_map_operand(
+                func,
+                loop_blocks,
+                leaf_tys,
+                is_invariant,
+                true_val,
+                depth + 1,
+                elem_bytes,
+            )?;
+            let (f, fr) = parse_byte_map_operand(
+                func,
+                loop_blocks,
+                leaf_tys,
+                is_invariant,
+                false_val,
+                depth + 1,
+                elem_bytes,
+            )?;
+            let union = match (tr, fr) {
+                (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+                _ => None,
+            };
+            // Short-circuit recovery, mirroring the dword parser: if-conversion
+            // lowers `(c1 && c2) ? t : f` into nested selects over a shared
+            // arm.  Recovering the single mask is what lets the range fusion
+            // (OP-05c) see `lo <= c && c <= hi` as ONE window instead of two
+            // independent compares.
+            let is_mask = |e: &MapExpr| matches!(e, MapExpr::Cmp(..) | MapExpr::MaskConj { .. });
+            if let MapExpr::Select(inner_cond, inner_t, inner_f) = &t {
+                if is_mask(inner_cond) && is_mask(&cond_expr) && **inner_f == f {
+                    return Some((
+                        MapExpr::Select(
+                            Box::new(MapExpr::MaskConj {
+                                is_and: true,
+                                l: Box::new(cond_expr),
+                                r: inner_cond.clone(),
+                            }),
+                            inner_t.clone(),
+                            Box::new(f),
+                        ),
+                        union,
+                    ));
+                }
+            }
+            if let MapExpr::Select(inner_cond, inner_t, inner_f) = &f {
+                if is_mask(inner_cond) && is_mask(&cond_expr) && **inner_t == t {
+                    return Some((
+                        MapExpr::Select(
+                            Box::new(MapExpr::MaskConj {
+                                is_and: false,
+                                l: Box::new(cond_expr),
+                                r: inner_cond.clone(),
+                            }),
+                            Box::new(t),
+                            inner_f.clone(),
+                        ),
+                        union,
+                    ));
+                }
+            }
+            // Exact unsigned min/max fold.  `vpminub`/`vpmaxub` need both
+            // operands inside [0, 255]; there the wide and byte unsigned
+            // orders coincide, which is exactly the condition the compare
+            // arm above already checked when it produced the mask.
+            if let MapExpr::Cmp(cmp_op, cl, cr) = &cond_expr {
+                let unsigned_domain = range_within(tr, u_dom) && range_within(fr, u_dom);
+                if unsigned_domain && matches!(cmp_op, IrCmpOp::Ult | IrCmpOp::Ule) {
+                    // `(a < b) ? a : b` == min(a, b); `(a < b) ? b : a` == max.
+                    if **cl == t && **cr == f {
+                        return Some((
+                            MapExpr::MinMax {
+                                is_max: false,
+                                l: Box::new(t),
+                                r: Box::new(f),
+                            },
+                            union,
+                        ));
+                    }
+                    if **cl == f && **cr == t {
+                        return Some((
+                            MapExpr::MinMax {
+                                is_max: true,
+                                l: Box::new(t),
+                                r: Box::new(f),
+                            },
+                            union,
+                        ));
+                    }
+                }
+            }
+            Some((
+                MapExpr::Select(Box::new(cond_expr), Box::new(t), Box::new(f)),
+                union,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// If `v` is the integer promotion of a byte-typed value, return that byte
+/// value together with the range the promotion guarantees.
+///
+/// Searched over the WHOLE function, not just the loop: a loop-invariant
+/// promotion is hoisted to the preheader (or is a parameter cast in the
+/// entry block) precisely because it does not vary.
+fn invariant_byte_promotion(
+    func: &IrFunction,
+    v: Value,
+    elem_bytes: u32,
+) -> Option<(Value, (i64, i64))> {
+    let (u_dom, s_dom) = narrow_domains(elem_bytes);
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::Cast {
+                dest,
+                src: Operand::Value(src),
+                from_ty,
+                to_ty,
+            } = inst
+            else {
+                continue;
+            };
+            if *dest != v || !matches!(to_ty, IrType::I32 | IrType::U32) {
+                continue;
+            }
+            // The promotion must be FROM the lane width; a `u8 -> i32`
+            // promotion says nothing usable about a 16-bit lane.
+            if from_ty.size() != elem_bytes as usize {
+                return None;
+            }
+            return match from_ty {
+                IrType::U8 | IrType::U16 => Some((*src, u_dom)),
+                IrType::I8 | IrType::I16 => Some((*src, s_dom)),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Operand-level entry point for `parse_byte_map_expr`.
+///
+/// Constants replicate into all four bytes of a dword broadcast lane, which
+/// is why the byte path needs no `vpbroadcastb`.  A NON-constant loop
+/// invariant would need one, so it fails closed -- the loop then keeps its
+/// (correct, still vectorized) dword form.
+fn parse_byte_map_operand(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    leaf_tys: &[(Value, IrType)],
+    is_invariant: &dyn Fn(&Operand) -> bool,
+    operand: &Operand,
+    depth: usize,
+    elem_bytes: u32,
+) -> Option<(MapExpr, WideRange)> {
+    if let Operand::Const(c) = operand {
+        // The constant keeps its VALUE (it is emphatically not replicated
+        // into a byte pattern here: the scalar remainder mirror evaluates
+        // this same tree at the element type, and `MapEmitCtx` replicates
+        // only when it materialises the packed broadcast).
+        //
+        // Its CARRIER type is canonicalised to `I32`, though.  C's integer
+        // promotions leave the same literal spelled at different widths in
+        // different positions -- `16` arrives as `I32` inside the promoted
+        // compare and as `I64` in the select arm -- and the min/max and
+        // short-circuit folds below match subtrees STRUCTURALLY.  Without
+        // canonicalisation `(c < 16) ? 16 : c` fails to fold into
+        // `max(16, c)` purely because the two 16s have different carriers,
+        // and the clamp idiom silently stays scalar.
+        let v = c.to_i64()?;
+        let canonical = match i32::try_from(v) {
+            Ok(narrow) => Operand::Const(IrConst::I32(narrow)),
+            Err(_) => operand.clone(),
+        };
+        return Some((MapExpr::Invariant(canonical), Some((v, v))));
+    }
+    let Operand::Value(v) = operand else {
+        return None;
+    };
+    if is_invariant(operand) {
+        // A runtime loop invariant is splatted with `vpbroadcastb` (OP-05f).
+        //
+        // Its wide range is unknown in general, but the common case is a
+        // PROMOTED byte parameter -- `zext u8 %k to i32` -- and recovering
+        // that promotion gives the invariant the same [0,255] / [-128,127]
+        // range a byte stream gets.  Without it, `c < threshold` with a
+        // runtime `unsigned char` threshold fails the compare side
+        // condition and the whole loop stays scalar, which is precisely the
+        // shape image and codec code writes.
+        //
+        // The narrow value is used as the splat source: `vpbroadcastb` reads
+        // one byte, so broadcasting the pre-promotion value is both correct
+        // and one instruction shorter than broadcasting the extension.
+        if let Some((narrow, range)) = invariant_byte_promotion(func, *v, elem_bytes) {
+            return Some((MapExpr::Invariant(Operand::Value(narrow)), Some(range)));
+        }
+        return Some((MapExpr::Invariant(operand.clone()), None));
+    }
+    parse_byte_map_expr(
+        func,
+        loop_blocks,
+        leaf_tys,
+        is_invariant,
+        *v,
+        depth,
+        elem_bytes,
+    )
+}
+
+/// Strength-reduce a lane select whose arms differ by a CONSTANT into mask
+/// arithmetic: `m ? x + k : x`  ==>  `x + (m & k)`.
+///
+/// `m` is all-ones or all-zeros per lane, so `m & k` is `k` or `0` and the
+/// add reproduces the select exactly.  The payoff is microarchitectural:
+/// `vpand` + `vpaddb` are two single-uop instructions on p015, whereas
+/// `vpblendvb` is TWO uops on every Intel core through Raptor Lake (and on
+/// Zen it is a 2-cycle op).  The rewrite also shortens the dependency chain,
+/// because the `vpand` depends only on the mask while the blend depends on
+/// the already-computed sum.
+///
+/// The commuted spelling (`m ? x : x + k`) is covered by folding it into the
+/// complementary form only when the mask is a `Cmp`, which the caller
+/// guarantees; here it is left alone rather than inverting a predicate the
+/// emitters may not have.
+fn strength_reduce_mask_select(expr: &MapExpr) -> MapExpr {
+    let rebuilt = match expr {
+        MapExpr::BinOp(op, l, r) => MapExpr::BinOp(
+            *op,
+            Box::new(strength_reduce_mask_select(l)),
+            Box::new(strength_reduce_mask_select(r)),
+        ),
+        MapExpr::Cmp(op, l, r) => MapExpr::Cmp(
+            *op,
+            Box::new(strength_reduce_mask_select(l)),
+            Box::new(strength_reduce_mask_select(r)),
+        ),
+        MapExpr::Select(c, t, f) => MapExpr::Select(
+            Box::new(strength_reduce_mask_select(c)),
+            Box::new(strength_reduce_mask_select(t)),
+            Box::new(strength_reduce_mask_select(f)),
+        ),
+        MapExpr::MinMax { is_max, l, r } => MapExpr::MinMax {
+            is_max: *is_max,
+            l: Box::new(strength_reduce_mask_select(l)),
+            r: Box::new(strength_reduce_mask_select(r)),
+        },
+        MapExpr::MaskConj { is_and, l, r } => MapExpr::MaskConj {
+            is_and: *is_and,
+            l: Box::new(strength_reduce_mask_select(l)),
+            r: Box::new(strength_reduce_mask_select(r)),
+        },
+        MapExpr::Sqrt(x) => MapExpr::Sqrt(Box::new(strength_reduce_mask_select(x))),
+        MapExpr::Load(_) | MapExpr::Invariant(_) => expr.clone(),
+    };
+    let MapExpr::Select(cond, t, f) = &rebuilt else {
+        return rebuilt;
+    };
+    // `m ? x + k : x`  ->  `x + (m & k)`   (k constant, x shared)
+    // `m ? x - k : x`  ->  `x - (m & k)`
+    //
+    // Subtraction is included because the case-fold pair is written both
+    // ways in real code (`c += 32` to lower-case, `c -= 32` to upper-case);
+    // only the SUBTRAHEND may be the constant, since `k - x` does not have
+    // the shared-operand shape.
+    if let MapExpr::BinOp(arith, a_l, a_r) = t.as_ref() {
+        if matches!(arith, IrBinOp::Add | IrBinOp::Sub) {
+            let commutative = matches!(arith, IrBinOp::Add);
+            let mut pairs = vec![(a_l, a_r)];
+            if commutative {
+                pairs.push((a_r, a_l));
+            }
+            for (var, konst) in pairs {
+                if var.as_ref() == f.as_ref()
+                    && matches!(konst.as_ref(), MapExpr::Invariant(Operand::Const(_)))
+                {
+                    return MapExpr::BinOp(
+                        *arith,
+                        f.clone(),
+                        Box::new(MapExpr::BinOp(IrBinOp::And, cond.clone(), konst.clone())),
+                    );
+                }
+            }
+        }
+    }
+    // `m ? k : 0` — the classifier shape — is just `m & k`.
+    if let (MapExpr::Invariant(Operand::Const(_)), MapExpr::Invariant(Operand::Const(zero))) =
+        (t.as_ref(), f.as_ref())
+    {
+        if zero.to_i64() == Some(0) {
+            return MapExpr::BinOp(IrBinOp::And, cond.clone(), t.clone());
+        }
+    }
+    rebuilt
 }
 
 fn expr_uses_stream(expr: &MapExpr, stream: usize) -> bool {
@@ -6867,7 +9896,7 @@ fn offset_is_canonical_unit_stride(
     iv_derived: &FxHashSet<Value>,
     elem_size: u32,
 ) -> bool {
-    if elem_size < 2 || !elem_size.is_power_of_two() {
+    if elem_size == 0 || !elem_size.is_power_of_two() {
         return false;
     }
     // Small iterative worklist instead of recursion: the chains are short
@@ -6875,9 +9904,12 @@ fn offset_is_canonical_unit_stride(
     let mut cur = v;
     for _ in 0..8 {
         if cur == iv || iv_derived.contains(&cur) {
-            // A raw iv/cast-of-iv offset (no mul/shl) is a one-byte stride,
-            // which is not the canonical elem_size shape for elem_size >= 2.
-            return false;
+            // A raw iv/cast-of-iv offset carries a ONE-BYTE stride.  For
+            // byte element types that IS the canonical unit-stride shape
+            // (`&p[i]` needs no scaling when sizeof(elem) == 1); for wider
+            // elements it is a non-contiguous access the packed load would
+            // misread, so it stays rejected.
+            return elem_size == 1;
         }
         let mut def: Option<&Instruction> = None;
         for block in &func.blocks {
@@ -6923,6 +9955,9 @@ fn offset_is_canonical_unit_stride(
                 rhs: Operand::Value(a),
                 ..
             } => {
+                // `elem_size == 1` never reaches here through a legitimate
+                // shape (the raw-IV case returned above); an explicit `i * 1`
+                // would also be accepted, which is harmless and exact.
                 return c.to_i64() == Some(elem_size as i64)
                     && scaled_operand_is_iv(func, *a, iv, iv_derived);
             }
@@ -8218,6 +11253,16 @@ fn find_reduction_byte_iv(
                             _ => {}
                         }
                     }
+                }
+                // Byte elements need NO scaling: `&p[i]` with sizeof(elem)
+                // == 1 has the index itself as the byte offset.  There is no
+                // shl/mul to find, so the canonical shape is the resolved
+                // offset value.  (`offset_is_canonical_unit_stride` has
+                // already proven that value is the induction variable or a
+                // widening cast of it; this function only recovers the base
+                // and the unscaled index.)
+                if elem_size == 1 {
+                    return Some((*base, resolved_off));
                 }
                 // Offset exists but is not a clean shl/mul by elem_size.
                 return None;
@@ -13895,6 +16940,24 @@ fn fold_int_minmax(expr: &MapExpr) -> MapExpr {
         MapExpr::Select(cond, t, f) => {
             let t = Box::new(fold_int_minmax(t));
             let f = Box::new(fold_int_minmax(f));
+            // The CONDITION's operands must be folded too, not just the arms.
+            //
+            // A nested clamp -- `if (v < lo) v = lo; if (v > hi) v = hi;` --
+            // lowers to `Select(Cmp(P, hi, INNER), hi, INNER)` where INNER is
+            // itself a foldable select.  Folding only the arms rewrites the
+            // `f` copy of INNER into a `MinMax` while the `cond` copy stays a
+            // `Select`, so the `*f == **r` test below compares two different
+            // shapes, the outer fold is missed, AND the emit cache (which
+            // keys on tree shape) can no longer share the two copies: the
+            // body ends up computing the inner clamp TWICE, once as
+            // `vpmaxsb` and once as `vpcmpgt`+`vpblendv`, with the extra live
+            // value spilling to the stack.  Measured on the byte clamp: 16
+            // instructions per 32 bytes instead of 9.
+            //
+            // Folding the condition first makes the rewrite confluent: every
+            // occurrence of a subexpression reaches the same normal form, so
+            // the outer pattern matches and the cache shares.
+            let cond = Box::new(fold_int_minmax(cond));
             // Exact abs fold: `l < 0 ? -l : l` (and its `<=` variant) is
             // max(l, -l) lane for lane — for l >= 0 the ternary takes l and
             // max(l, -l) = l; for l < 0 it takes -l and max(l, -l) = -l
@@ -13906,7 +16969,7 @@ fn fold_int_minmax(expr: &MapExpr) -> MapExpr {
             // `Sub(0, _)` by its lhs alone misfolds `v < 0 ? 0-(v+1) : v`
             // into abs(v) — a silent wrong answer (the subtrahend `v + 1`
             // is not `v`).
-            if let MapExpr::Cmp(op, l, r) = &**cond {
+            if let MapExpr::Cmp(op, l, r) = cond.as_ref() {
                 // Exact abs fold, with the subtrahend CHECKED: `l < 0 ? -l
                 // : l` is max(l, -l) lane for lane ONLY when the true arm
                 // negates `l` itself. Matching `Sub(0, _)` by its lhs alone
@@ -13938,7 +17001,7 @@ fn fold_int_minmax(expr: &MapExpr) -> MapExpr {
                     };
                 }
             }
-            if let MapExpr::Cmp(op, l, r) = &**cond {
+            if let MapExpr::Cmp(op, l, r) = cond.as_ref() {
                 if matches!(op, IrCmpOp::Slt | IrCmpOp::Sle) {
                     if *t == **l && *f == **r {
                         // cond ? l : r with cond = l PRED r: true on the
@@ -13961,7 +17024,7 @@ fn fold_int_minmax(expr: &MapExpr) -> MapExpr {
                     }
                 }
             }
-            MapExpr::Select(cond.clone(), t, f)
+            MapExpr::Select(cond, t, f)
         }
         MapExpr::BinOp(op, l, r) => MapExpr::BinOp(
             *op,
@@ -13989,13 +17052,13 @@ fn transform_map_vector(
 ) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
-    let vec_width: u64 = match (pattern.elem_ty, avx2) {
-        (IrType::F64, true) => 4,
-        (IrType::F64, false) => 2,
-        (IrType::I64 | IrType::U64, _) => 2,
-        (_, true) => 8,
-        (_, false) => 4,
+    // Lanes per packed operation = register width / element size.  Byte
+    // lanes are the whole point of OP-05d: 32 elements per YMM instead of
+    // the 8 an `int`-promoted tree would get.
+    let Some(elem_size) = map_elem_size(&pattern.elem_ty) else {
+        return 0;
     };
+    let vec_width: u64 = u64::from(if avx2 { 32 / elem_size } else { 16 / elem_size });
 
     // A zero-iteration vector loop plus scalar remainder only adds overhead.
     if matches!(&pattern.limit, Operand::Const(c)
@@ -14030,7 +17093,6 @@ fn transform_map_vector(
         return 0;
     };
 
-    let elem_size = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
     let mut src_bases = Vec::with_capacity(pattern.src_geps.len());
     for &src_gep in &pattern.src_geps {
         let Some((base, _)) =
@@ -14092,6 +17154,23 @@ fn transform_map_vector(
         (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecBroadcastI32x8,
         (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecBroadcastI32x4,
         (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecBroadcastI64x2,
+        // Byte lanes broadcast through the DWORD splat: the demotion pass
+        // rewrote every byte constant into `b * 0x01010101`
+        // (`replicate_byte`), so splatting that dword fills all 32 byte
+        // lanes with `b`.  No `vpbroadcastb` op is needed, and the constant
+        // pool entry is shared with the dword path's cache.  Runtime (non
+        // constant) invariants were already rejected by the demotion
+        // analysis, precisely because they would need a real byte splat.
+        // Byte lanes: a CONSTANT splats through the dword broadcast (the
+        // demotion replicates it to `b * 0x01010101` at emit time), while a
+        // RUNTIME invariant needs a real `vpbroadcastb`.  `MapEmitCtx`
+        // selects between the two per operand -- see `byte_broadcast_op`.
+        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, true) => {
+            IntrinsicOp::VecBroadcastI32x8
+        }
+        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, false) => {
+            IntrinsicOp::VecBroadcastI32x4
+        }
         _ => return 0,
     };
 
@@ -14103,6 +17182,11 @@ fn transform_map_vector(
         (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecLoadI32x8,
         (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecLoadI32x4,
         (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecLoadI64x2,
+        // Byte lanes reuse the dword move: `vmovdqu`/`movdqu` transfer raw
+        // bits with no lane semantics, so a separate byte-named load op
+        // would be the identical instruction under a different name.
+        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, true) => IntrinsicOp::VecLoadI32x8,
+        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, false) => IntrinsicOp::VecLoadI32x4,
         _ => return 0,
     };
     let store_op = match (pattern.elem_ty, avx2) {
@@ -14113,6 +17197,8 @@ fn transform_map_vector(
         (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecStoreI32x8,
         (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecStoreI32x4,
         (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecStoreI64x2,
+        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, true) => IntrinsicOp::VecStoreI32x8,
+        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, false) => IntrinsicOp::VecStoreI32x4,
         _ => return 0,
     };
     let bin_op = |op: &IrBinOp| -> Option<IntrinsicOp> {
@@ -14151,6 +17237,40 @@ fn transform_map_vector(
             (IrType::I64 | IrType::U64, _, IrBinOp::Add) => Some(IntrinsicOp::VecAddI64x2),
             (IrType::I64 | IrType::U64, _, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI64x2),
             (IrType::I64 | IrType::U64, _, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI64x2),
+            // ---- Byte lanes (OP-05d) --------------------------------------
+            // Add/Sub have dedicated byte encodings; And/Or/Xor are bit-exact
+            // at every lane width, so they reuse the dword ops rather than
+            // duplicating three identical instructions under byte names.
+            // Multiply is ABSENT on purpose: x86 has no packed byte multiply,
+            // and `map_tree_ops_available` turns this `None` into a clean
+            // bail that leaves the loop scalar instead of miscompiling it.
+            (IrType::I8 | IrType::U8, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddI8x32),
+            (IrType::I8 | IrType::U8, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI8x16),
+            (IrType::I8 | IrType::U8, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI8x32),
+            (IrType::I8 | IrType::U8, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI8x16),
+            (IrType::I8 | IrType::U8, true, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x8),
+            (IrType::I8 | IrType::U8, false, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x4),
+            (IrType::I8 | IrType::U8, true, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x8),
+            (IrType::I8 | IrType::U8, false, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x4),
+            (IrType::I8 | IrType::U8, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x8),
+            (IrType::I8 | IrType::U8, false, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x4),
+            // ---- Word lanes (OP-05g) --------------------------------------
+            // Words, unlike bytes, DO have a packed multiply (`pmullw`,
+            // low half, exact for both signednesses), so `Mul` is admitted.
+            // Shifts are still absent (`psrlw` exists but the demotion has no
+            // shift rule yet -- see the follow-up doc).
+            (IrType::I16 | IrType::U16, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddI16x16),
+            (IrType::I16 | IrType::U16, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI16x8),
+            (IrType::I16 | IrType::U16, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI16x16),
+            (IrType::I16 | IrType::U16, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI16x8),
+            (IrType::I16 | IrType::U16, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI16x16),
+            (IrType::I16 | IrType::U16, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI16x8),
+            (IrType::I16 | IrType::U16, true, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x8),
+            (IrType::I16 | IrType::U16, false, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x4),
+            (IrType::I16 | IrType::U16, true, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x8),
+            (IrType::I16 | IrType::U16, false, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x4),
+            (IrType::I16 | IrType::U16, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x8),
+            (IrType::I16 | IrType::U16, false, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x4),
             _ => None,
         }
     };
@@ -14183,6 +17303,10 @@ fn transform_map_vector(
             (IrType::F32, false) => IntrinsicOp::VecCmpF32x4,
             (IrType::I32, true) | (IrType::U32, true) => IntrinsicOp::VecCmpI32x8,
             (IrType::I32, false) | (IrType::U32, false) => IntrinsicOp::VecCmpI32x4,
+            (IrType::I8, true) | (IrType::U8, true) => IntrinsicOp::VecCmpI8x32,
+            (IrType::I8, false) | (IrType::U8, false) => IntrinsicOp::VecCmpI8x16,
+            (IrType::I16, true) | (IrType::U16, true) => IntrinsicOp::VecCmpI16x16,
+            (IrType::I16, false) | (IrType::U16, false) => IntrinsicOp::VecCmpI16x8,
             _ => return None,
         };
         // FP immediates are the vcmpps EQ_OQ/LT_OS/LE_OS/NEQ_UQ encodings;
@@ -14206,6 +17330,17 @@ fn transform_map_vector(
         (IrType::F32, false) => Some(IntrinsicOp::VecBlendvF32x4),
         (IrType::I32, true) | (IrType::U32, true) => Some(IntrinsicOp::VecBlendvI32x8),
         (IrType::I32, false) | (IrType::U32, false) => Some(IntrinsicOp::VecBlendvI32x4),
+        // `vpblendvb` consults ONE SIGN BIT PER BYTE; the dword blend would
+        // smear a byte mask across four lanes, so the byte width needs its
+        // own op (the 128-bit form falls back to the lane-agnostic bitwise
+        // select, which is exact for any mask granularity).
+        (IrType::I8, true) | (IrType::U8, true) => Some(IntrinsicOp::VecBlendvI8x32),
+        (IrType::I8, false) | (IrType::U8, false) => Some(IntrinsicOp::VecBlendvI8x16),
+        // A word compare sets all 16 bits of its lane, so both bytes of every
+        // lane carry the same sign bit and `vpblendvb` is exact at word
+        // granularity; the 128-bit form is the per-bit bitwise select.
+        (IrType::I16, true) | (IrType::U16, true) => Some(IntrinsicOp::VecBlendvI16x16),
+        (IrType::I16, false) | (IrType::U16, false) => Some(IntrinsicOp::VecBlendvI16x8),
         _ => None,
     };
     let minmax_op = |is_max: bool| -> Option<IntrinsicOp> {
@@ -14225,6 +17360,35 @@ fn transform_map_vector(
             // closed through map_tree_ops_available.
             (IrType::I32, true, false) => Some(IntrinsicOp::VecMinI32x8),
             (IrType::I32, true, true) => Some(IntrinsicOp::VecMaxI32x8),
+            // Unsigned byte min/max are SSE2 BASELINE instructions, so the
+            // byte clamp idiom lowers to two instructions on every x86-64
+            // target -- no SSE4.1 gate, unlike the dword forms.  The
+            // demotion analysis has already proven both operands lie in
+            // [0, 255], which is exactly where the unsigned byte order and
+            // the wide order agree.
+            (IrType::U8, true, false) => Some(IntrinsicOp::VecMinU8x32),
+            (IrType::U8, false, false) => Some(IntrinsicOp::VecMinU8x16),
+            (IrType::U8, true, true) => Some(IntrinsicOp::VecMaxU8x32),
+            (IrType::U8, false, true) => Some(IntrinsicOp::VecMaxU8x16),
+            // Signed byte min/max (OP-05f).  `vpminsb`/`vpmaxsb` are
+            // SSE4.1/AVX2, so only the 256-bit path has them; the 128-bit
+            // baseline returns `None` and `map_tree_ops_available` keeps the
+            // compare+blend form, which is exact on every x86-64 target.
+            //
+            // The element type decides the ORDER: an `i8` stream's leaves
+            // range over [-128, 127] and the demotion only forms a MinMax
+            // after proving both operands lie in the type's own domain, so
+            // `I8` means the signed instruction and `U8` the unsigned one.
+            (IrType::I8, true, false) => Some(IntrinsicOp::VecMinI8x32),
+            (IrType::I8, true, true) => Some(IntrinsicOp::VecMaxI8x32),
+            // Signed word min/max are SSE2 BASELINE, so both widths have
+            // them; the unsigned pair is SSE4.1 and therefore AVX2-only.
+            (IrType::I16, true, false) => Some(IntrinsicOp::VecMinI16x16),
+            (IrType::I16, false, false) => Some(IntrinsicOp::VecMinI16x8),
+            (IrType::I16, true, true) => Some(IntrinsicOp::VecMaxI16x16),
+            (IrType::I16, false, true) => Some(IntrinsicOp::VecMaxI16x8),
+            (IrType::U16, true, false) => Some(IntrinsicOp::VecMinU16x16),
+            (IrType::U16, true, true) => Some(IntrinsicOp::VecMaxU16x16),
             _ => None,
         }
     };
@@ -14268,17 +17432,34 @@ fn transform_map_vector(
     // The SAME folded tree drives the packed body, the ops-availability
     // check, and the scalar remainder mirror, so all three stay
     // lane-exact with respect to each other.
-    let expr = if avx2 && pattern.elem_ty == IrType::I32 {
+    // The min/max fold is applied only where a lowering EXISTS: `vpminsd`
+    // for I32 and `vpminsb` for I8, both AVX2.  At the SSE2 baseline (and
+    // for U8, whose unsigned fold the byte parser already performs with the
+    // range proof in hand) the tree keeps its compare+blend form, which has
+    // a lowering on every x86-64 target.  Folding where the op is missing
+    // would make `map_tree_ops_available` bail the whole loop back to
+    // scalar -- strictly worse than the blend.
+    let expr = if avx2 && matches!(pattern.elem_ty, IrType::I32 | IrType::I8 | IrType::I16) {
         fold_int_minmax(&pattern.expr)
     } else {
         pattern.expr.clone()
     };
 
+    // Reserve the byte IV's SSA ids up front: the remainder mirror names it
+    // (it recovers its resume index from the byte offset, not from the
+    // element counter -- see OP-06 below), and the mirror is built before the
+    // packed loop is touched so a failure leaves the function untouched.
+    let byte_iv = Value(next_val_id);
+    next_val_id += 1;
+    let byte_iv_next = Value(next_val_id);
+    next_val_id += 1;
     let Some(remainder) = build_map_remainder_loop(
         func,
         pattern,
         &expr,
         vec_width,
+        byte_iv,
+        elem_size,
         &mut next_val_id,
         &mut next_label,
     ) else {
@@ -14410,10 +17591,6 @@ fn transform_map_vector(
     // unsigned exit semantics and for scalar-remainder recovery; the byte IV
     // gives both memory streams one SIB/NEON indexed address with no per-
     // iteration cast, multiply, or GEP materialization.
-    let byte_iv = Value(next_val_id);
-    next_val_id += 1;
-    let byte_iv_next = Value(next_val_id);
-    next_val_id += 1;
     let preheader_label = func.blocks[preheader_idx].label;
     let latch_label = func.blocks[pattern.latch_idx].label;
     let phi_pos = func.blocks[pattern.header_idx]
@@ -14443,7 +17620,180 @@ fn transform_map_vector(
         });
     changes += 2;
 
+    // ---- OP-06: fuse the two induction variables ------------------------
+    //
+    // The loop now carries BOTH an element counter (the source IV, bounded by
+    // floor(limit / VF)) and the byte offset created above, and they are
+    // exactly proportional: `byte_iv == iv * VF * elem_size`.  Every packed
+    // map body therefore paid two `add`s and compared the one that is NOT
+    // used for addressing:
+    //
+    //     addq $1,  %r9      ; element counter
+    //     addq $32, %r11     ; byte offset
+    //     cmpq %r8, %r9
+    //
+    // GCC emits one.  Retargeting the exit test onto the byte IV makes the
+    // counter dead inside the loop, and DCE removes its phi and its `add`.
+    //
+    // Soundness.  The counter runs over `0 ..< T` where `T = floor(limit/VF)`
+    // (the rewrite just above), so the byte IV runs over `0, S, ..., (T-1)*S`
+    // with `S = VF * elem_size` and the loop must continue exactly while
+    // `byte_iv < T * S`.  `T * S` is loop-invariant and is materialised in
+    // the preheader.  The comparison is UNSIGNED on I64: both operands are
+    // non-negative by construction (a byte offset and a count of iterations
+    // times a positive stride), and unsigned avoids any question about the
+    // product's sign near the top of the range.
+    //
+    // The transform is applied only when `T * S` cannot overflow I64, which
+    // for a constant limit is checked exactly and for a dynamic limit is
+    // guaranteed by construction: `T <= limit` and the loop already indexes
+    // `limit * elem_size` bytes of real memory, so `T * S <= limit *
+    // elem_size` fits in the address space.
+    let stride_bytes = i64::from(elem_size) * vec_width as i64;
+    let fused_iv = {
+        // The exit comparison lives in the loop and tests an IV-derived value
+        // against `divided_limit`.  Find it; if its shape is not the one the
+        // rewrite above produced, leave both IVs alone (fail closed).
+        let mut site: Option<(usize, usize, bool)> = None; // (block, inst, iv_on_lhs)
+        for &block_idx in &pattern.loop_blocks {
+            for (ii, inst) in func.blocks[block_idx].instructions.iter().enumerate() {
+                if let Instruction::Cmp { lhs, rhs, .. } = inst {
+                    let l_iv = matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
+                    let r_iv = matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
+                    if l_iv && *rhs == divided_limit {
+                        site = Some((block_idx, ii, true));
+                    } else if r_iv && *lhs == divided_limit {
+                        site = Some((block_idx, ii, false));
+                    }
+                }
+            }
+        }
+        site
+    };
+    if let Some((cmp_block, cmp_idx, iv_on_lhs)) = fused_iv {
+        // Materialise `T * S` in the preheader.
+        let byte_limit = match &divided_limit {
+            Operand::Const(c) => c
+                .to_i64()
+                .and_then(|t| t.checked_mul(stride_bytes))
+                .map(|n| Operand::Const(IrConst::I64(n))),
+            Operand::Value(t) => {
+                // widen the (possibly 32-bit) count to I64, then scale
+                let widened = if matches!(pattern.iv_ty, IrType::I32 | IrType::U32) {
+                    let w = Value(next_val_id);
+                    next_val_id += 1;
+                    func.blocks[preheader_idx]
+                        .instructions
+                        .push(Instruction::Cast {
+                            dest: w,
+                            src: Operand::Value(*t),
+                            from_ty: pattern.iv_ty,
+                            to_ty: IrType::I64,
+                        });
+                    w
+                } else {
+                    *t
+                };
+                let scaled = Value(next_val_id);
+                next_val_id += 1;
+                func.blocks[preheader_idx]
+                    .instructions
+                    .push(Instruction::BinOp {
+                        dest: scaled,
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(widened),
+                        rhs: Operand::Const(IrConst::I64(stride_bytes)),
+                        ty: IrType::I64,
+                    });
+                Some(Operand::Value(scaled))
+            }
+        };
+        if let Some(byte_limit) = byte_limit {
+            // SIGNEDNESS IS LOAD-BEARING and must follow the source
+            // predicate.  For a signed loop (`int i; i < n`) the trip count
+            // `T = floor(n / VF)` is NEGATIVE when `n` is, and the loop must
+            // then run zero times.  A signed byte compare reproduces that
+            // exactly (`byte_iv >= 0 > T * S` is false on the first test); an
+            // unsigned one reads the negative limit as an enormous positive
+            // bound and runs away off the end of the array -- a segfault the
+            // `affine_map_vectorization` gate caught immediately.
+            //
+            // For an unsigned source predicate the count is non-negative by
+            // construction and the unsigned compare is the faithful one.
+            //
+            // `<=` needs no adjustment either way: `byte_iv` takes the values
+            // `0, S, ..., T*S`, which is exactly the T+1 trips `i <= T` means.
+            let (lt_op, gt_op) = match pattern.exit_cmp_op {
+                IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => {
+                    (IrCmpOp::Ult, IrCmpOp::Ugt)
+                }
+                _ => (IrCmpOp::Slt, IrCmpOp::Sgt),
+            };
+            let inclusive = matches!(
+                pattern.exit_cmp_op,
+                IrCmpOp::Ule | IrCmpOp::Sle | IrCmpOp::Uge | IrCmpOp::Sge
+            );
+            if let Instruction::Cmp {
+                op, lhs, rhs, ty, ..
+            } = &mut func.blocks[cmp_block].instructions[cmp_idx]
+            {
+                *ty = IrType::I64;
+                if iv_on_lhs {
+                    *op = if inclusive {
+                        if lt_op == IrCmpOp::Ult {
+                            IrCmpOp::Ule
+                        } else {
+                            IrCmpOp::Sle
+                        }
+                    } else {
+                        lt_op
+                    };
+                    *lhs = Operand::Value(byte_iv);
+                    *rhs = byte_limit;
+                } else {
+                    // `limit > iv` in the source spelling: keep the operand
+                    // order so the branch polarity the header depends on is
+                    // unchanged, and mirror the predicate.
+                    *op = if inclusive {
+                        if gt_op == IrCmpOp::Ugt {
+                            IrCmpOp::Uge
+                        } else {
+                            IrCmpOp::Sge
+                        }
+                    } else {
+                        gt_op
+                    };
+                    *lhs = byte_limit;
+                    *rhs = Operand::Value(byte_iv);
+                }
+                changes += 1;
+            }
+        }
+    }
+
     let dst_address = (dst_base, Operand::Value(byte_iv));
+
+    // Mask-arithmetic strength reduction (see `strength_reduce_mask_select`)
+    // is a PACKED-ONLY lowering: it treats a compare result as an all-ones
+    // lane mask, which is what `vpcmpgt*` produces but NOT what a scalar
+    // compare produces (a scalar `setcc` yields 0/1, so `mask & k` would
+    // collapse to 0).  The scalar remainder mirror was therefore built from
+    // `expr`; only the packed body below sees the rewritten tree.
+    //
+    // The rewrite trades a `Select` for an `And`, so the op-availability
+    // gate is re-run on the result: if the target lacks the bitwise lane op
+    // the packed body simply keeps the blend form.
+    let packed_expr = match map_lane_bits(&pattern.elem_ty) {
+        Some(_) => {
+            let reduced = strength_reduce_mask_select(&expr);
+            if map_tree_ops_available(&reduced, &bin_op, sqrt_op, &cmp_op, &minmax_op, blendv_op) {
+                reduced
+            } else {
+                expr.clone()
+            }
+        }
+        None => expr.clone(),
+    };
 
     // Replace the scalar store with only the packed operations present in the
     // source expression.  DCE removes the now-unreachable scalar dataflow.
@@ -14459,13 +17809,26 @@ fn transform_map_vector(
             cmp_op: &cmp_op,
             minmax_op: &minmax_op,
             blendv_op,
+            narrow_const_bytes: map_elem_size(&pattern.elem_ty).filter(|_| {
+                matches!(
+                    pattern.elem_ty,
+                    IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
+                )
+            }),
+            byte_broadcast_op: match (pattern.elem_ty, avx2) {
+                (IrType::I8 | IrType::U8, true) => Some(IntrinsicOp::VecBroadcastI8x32),
+                (IrType::I8 | IrType::U8, false) => Some(IntrinsicOp::VecBroadcastI8x16),
+                (IrType::I16 | IrType::U16, true) => Some(IntrinsicOp::VecBroadcastI16x16),
+                (IrType::I16 | IrType::U16, false) => Some(IntrinsicOp::VecBroadcastI16x8),
+                _ => None,
+            },
             node_cache: Vec::new(),
             preheader_insts: Vec::new(),
             vec_insts: Vec::new(),
             next_val_id,
             changes: &mut changes,
         };
-        let Some(current) = ctx.emit(&expr) else {
+        let Some(current) = ctx.emit(&packed_expr) else {
             if debug {
                 eprintln!("[VEC-MAP]   Tree emission failed");
             }
@@ -14843,6 +18206,8 @@ fn build_map_remainder_loop(
     pattern: &MapPattern,
     expr: &MapExpr,
     vec_width: u64,
+    byte_iv: Value,
+    elem_size: u32,
     next_val_id: &mut u32,
     next_label: &mut u32,
 ) -> Option<RemainderLoop> {
@@ -14916,17 +18281,50 @@ fn build_map_remainder_loop(
     // The vector exit carries only the resume-IV computation: any
     // rematerialized base chains live in the remainder header, where the
     // alias guard's fail edge joins, so every entry dominates their defs.
-    let vec_exit_block = BasicBlock {
-        label: vec_exit_label,
-        instructions: vec![Instruction::BinOp {
-            dest: i_rem_start,
-            op: IrBinOp::Mul,
-            lhs: Operand::Value(pattern.iv),
-            rhs: Operand::Const(iv_width_const),
-            ty: pattern.iv_ty,
-        }],
-        terminator: Terminator::Branch(remainder_header_label),
-        source_spans: vec![],
+    // OP-06: recover the resume index from the BYTE IV, not the element
+    // counter.
+    //
+    // The packed loop's exit test is retargeted onto the byte offset, so the
+    // element counter has no other reader; deriving the resume index from it
+    // here would keep it -- and its per-iteration `add` -- alive for nothing.
+    // At the vector exit `byte_iv == T * VF * elem_size` and the remainder
+    // resumes at element `T * VF`, i.e. `byte_iv / elem_size`.  `elem_size`
+    // is a power of two, so that is a shift, and nothing at all for bytes.
+    let vec_exit_block = {
+        let mut insts = Vec::with_capacity(2);
+        let shift = elem_size.trailing_zeros();
+        let resume_i64 = if shift == 0 {
+            byte_iv
+        } else {
+            let v = fresh();
+            insts.push(Instruction::BinOp {
+                dest: v,
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(byte_iv),
+                rhs: Operand::Const(IrConst::I64(i64::from(shift))),
+                ty: IrType::I64,
+            });
+            v
+        };
+        if matches!(pattern.iv_ty, IrType::I32 | IrType::U32) {
+            insts.push(Instruction::Cast {
+                dest: i_rem_start,
+                src: Operand::Value(resume_i64),
+                from_ty: IrType::I64,
+                to_ty: pattern.iv_ty,
+            });
+        } else {
+            insts.push(Instruction::Copy {
+                dest: i_rem_start,
+                src: Operand::Value(resume_i64),
+            });
+        }
+        BasicBlock {
+            label: vec_exit_label,
+            instructions: insts,
+            terminator: Terminator::Branch(remainder_header_label),
+            source_spans: vec![],
+        }
     };
 
     let remainder_header_block = BasicBlock {
@@ -14973,7 +18371,12 @@ fn build_map_remainder_loop(
     } else {
         i_rem_iv
     };
-    let elem_bytes = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
+    // MUST agree with `analyze_map_pattern`'s stride check and with the
+    // packed loop's byte induction variable.  This used to be a local
+    // `if F64 { 8 } else { 4 }`, which silently produced scale-4 addressing
+    // for I64/U64 elements and for the byte lanes of OP-05d -- the remainder
+    // then read past the end of the array.
+    let elem_bytes = i64::from(map_elem_size(&pattern.elem_ty)?);
     remainder_insts.push(Instruction::BinOp {
         dest: offset_v,
         op: IrBinOp::Mul,
@@ -15277,7 +18680,33 @@ fn emit_map_scalar_tree(
                 *next_val_id += 1;
                 v
             };
-            let cmp_op = if *is_max { IrCmpOp::Sgt } else { IrCmpOp::Slt };
+            // The comparison's SIGNEDNESS must match the packed op the
+            // vector body will emit, or the mirror and the packed loop
+            // disagree on exactly the values whose sign bit is set.
+            //
+            //   * dword lanes fold to `vpminsd`/`vpmaxsd` (SIGNED), which is
+            //     what `fold_int_minmax` proved exact;
+            //   * byte lanes fold to `vpminub`/`vpmaxub` (UNSIGNED) -- the
+            //     only byte min/max in the SSE2 baseline -- and the byte
+            //     demotion only forms a `MinMax` after proving both operands
+            //     lie in [0, 255], where the unsigned order is the right one.
+            //
+            // Emitting `Slt` for a byte clamp made `min(240, 16)` return 240
+            // in the scalar remainder (as `i8`, 240 is -16), which the
+            // byte-clamp gate catches at trip count 1.
+            // `U8` lanes fold to the UNSIGNED `vpminub`/`vpmaxub` (the only
+            // byte min/max in the SSE2 baseline); `I8` lanes fold to the
+            // SIGNED `vpminsb`/`vpmaxsb` (AVX2); everything wider folds to
+            // the signed dword forms.  The mirror must use the SAME order or
+            // the tail disagrees with the body on exactly the values whose
+            // top bit is set.
+            let unsigned_lane = matches!(pattern.elem_ty, IrType::U8 | IrType::U16);
+            let cmp_op = match (*is_max, unsigned_lane) {
+                (true, false) => IrCmpOp::Sgt,
+                (false, false) => IrCmpOp::Slt,
+                (true, true) => IrCmpOp::Ugt,
+                (false, true) => IrCmpOp::Ult,
+            };
             remainder_insts.push(Instruction::Cmp {
                 dest: cmp_dest,
                 op: cmp_op,
@@ -15490,6 +18919,91 @@ pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
     vectorize_function_mode(func, false, FpContract::default(), false)
 }
 
+/// Pre-unroll CONST-TRIP map vectorization.
+///
+/// The complete unroller (Phase 2b, iter 0) runs BEFORE the Phase 2b-vec
+/// vectorizer and steals every constant-trip elementwise loop (limit <= 16),
+/// leaving 16 scalar copies where ONE packed op per iteration is strictly
+/// better (4x lanes, 1/4 the memory ops).  This focused entry takes exactly
+/// the map-shaped const-trip 5..=16 loops FIRST (the map transform itself
+/// declines trips <= the vector width); the unroller then either unrolls the
+/// remaining vector iterations (trip <= 4 — the ideal no-branch shape) or
+/// leaves them rolled.
+pub(crate) fn vectorize_const_trip_map_loops(
+    func: &mut IrFunction,
+    fp_contract: FpContract,
+) -> usize {
+    // Same scoped legality gates as the main vectorizer: a DynAlloca breaks
+    // the transform's fixed-address assumptions, volatile accesses are
+    // observable and must keep their scalar width/order.
+    if func.blocks.iter().any(|block| {
+        block
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::DynAlloca { .. }))
+    }) {
+        return 0;
+    }
+    if func_has_volatile_loop_access(func) {
+        return 0;
+    }
+    if std::env::var("CCC_NO_MAP_VEC").is_ok() {
+        return 0;
+    }
+    // Same diamond pre-conversion as the main vectorizer (see there).
+    crate::passes::if_convert::if_convert_function(func);
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let mut total = 0usize;
+    // Re-analyze after every successful transform: the rewrite invalidates
+    // block indices/labels for the remaining candidates.
+    for round in 0..16 {
+        let mut changed = 0usize;
+        let cfg = CfgAnalysis::build(func);
+        let loops = loop_analysis::find_merged_natural_loops(
+            cfg.num_blocks,
+            &cfg.preds,
+            &cfg.succs,
+            &cfg.idom,
+        );
+        for lp in &loops {
+            if lp.body.len() > 4 {
+                continue; // the unroller's tiny/general 2-3-block window
+            }
+            let Some(pattern) = analyze_map_pattern(func, lp, false) else {
+                continue;
+            };
+            if !matches!(&pattern.limit, Operand::Const(c)
+                if c.to_i64().is_some_and(|t| (5..=16).contains(&t)))
+            {
+                continue;
+            }
+            let avx2 = std::env::var("LCCC_FORCE_MAP_SSE").is_err()
+                && std::env::var("LCCC_FORCE_SSE2").is_err()
+                && x86_avx2_available();
+            let n = transform_map_vector(func, &pattern, avx2, fp_contract);
+            if n > 0 {
+                if debug {
+                    eprintln!(
+                        "[VEC-MAP-EARLY] fn={} loop H{}: {} changes (pre-unroll const-trip map)",
+                        func.name, lp.header, n
+                    );
+                }
+                changed += n;
+                break;
+            }
+        }
+        total += changed;
+        if changed == 0 {
+            break;
+        }
+        let _ = round;
+    }
+    if total > 0 {
+        crate::passes::dce::eliminate_dead_code(func);
+    }
+    total
+}
+
 /// `-ffp-contract=fast` without `-fassociative-math`: FP reductions keep
 /// their scalar-order legality gate (reassociation still off), but map
 /// expression trees may contract mul+add into fused madd — the same
@@ -15553,6 +19067,37 @@ fn vectorize_function_mode(
         return 0;
     }
 
+    // Diamond/if-chain pre-conversion: the map parser bails on any internal
+    // `CondBranch` ("BAIL: internal condbranch"), and the short-circuit
+    // classifier chains (`(a && b) || (c && d) ? x : y`) only become
+    // select trees after `if_convert`'s diamond conversion AND its
+    // loop-scoped if-combine run.  The fold is LEVEL-BY-LEVEL (each round
+    // collapses one `&&`/`||` level of the chain, then the ternary's
+    // triangle converts on the next), so a single call is not enough for
+    // the deeper chains — run to a fixpoint (bounded) so the vectorizer is
+    // self-sufficient regardless of how many pipeline iterations preceded
+    // this call.  The rounds' changes COUNT toward the return value: the
+    // driver's fixpoint must not stop on an iteration that only folded
+    // branches (single-function translation units otherwise never reach
+    // the vectorizable shape).
+    let mut preconv = 0usize;
+    // Rounds needed for the deepest classifier chain: each `&&`/`||` level
+    // is one if-combine round (and each round RETURNS before the diamond
+    // phase), the ternary's diamond converts on its own round, and the
+    // nested-select recovery may expose one more level after that.
+    // `simplify_cfg` runs BETWEEN rounds, exactly as the pass driver does:
+    // without it the fold trajectory differs (empty blocks are not merged,
+    // the merge/latch structure never reaches the diamond-convertible
+    // shape) and the loop converges to a still-branchy form.
+    for _ in 0..16 {
+        let n = crate::passes::if_convert::if_convert_function(func)
+            + crate::passes::cfg_simplify::simplify_cfg(func);
+        preconv += n;
+        if n == 0 {
+            break;
+        }
+    }
+
     let slp_changes = if fp_reassoc && enable_fixed_slp {
         transform_fixed_distance_slp(func)
     } else {
@@ -15568,7 +19113,7 @@ fn vectorize_function_mode(
     let cfg = CfgAnalysis::build(func);
     let loop_changes =
         vectorize_with_analysis_mode(func, &cfg, false, false, fp_reassoc, fp_contract);
-    let changes = slp_changes + loop_changes;
+    let changes = preconv + slp_changes + loop_changes;
 
     // The transforms replace the scalar accumulation with vector intrinsics but
     // leave the orphaned scalar load/mul/GEP/offset chain behind for the global
@@ -16181,5 +19726,1118 @@ mod map_fp_select_tests {
             }
             other => panic!("expected outer Select, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod range_mask_fusion_tests {
+    use super::*;
+
+    fn load() -> MapExpr {
+        MapExpr::Load(0)
+    }
+    fn konst(v: i32) -> MapExpr {
+        MapExpr::Invariant(Operand::Const(IrConst::I32(v)))
+    }
+    fn cmp(op: IrCmpOp, l: MapExpr, r: MapExpr) -> MapExpr {
+        MapExpr::Cmp(op, Box::new(l), Box::new(r))
+    }
+    fn conj(l: MapExpr, r: MapExpr) -> MapExpr {
+        MapExpr::MaskConj {
+            is_and: true,
+            l: Box::new(l),
+            r: Box::new(r),
+        }
+    }
+
+    /// Interpret the fused mask `Cmp(Slt, Add(x, bias), T)` on a concrete
+    /// lane value, in exactly the modular arithmetic the packed instructions
+    /// implement: wrapping add on W bits, then a SIGNED compare of the
+    /// W-bit results.
+    fn eval_fused(fused: &MapExpr, x: u64, bits: u32) -> bool {
+        let modulus = 1u64 << bits;
+        let sign_bit = 1u64 << (bits - 1);
+        let to_signed = |v: u64| -> i64 {
+            let v = v & (modulus - 1);
+            if v & sign_bit != 0 {
+                v as i64 - modulus as i64
+            } else {
+                v as i64
+            }
+        };
+        let MapExpr::Cmp(IrCmpOp::Slt, lhs, rhs) = fused else {
+            panic!("expected a signed-lt mask, got {fused:?}");
+        };
+        let MapExpr::BinOp(IrBinOp::Add, subject, bias) = lhs.as_ref() else {
+            panic!("expected a biased subject, got {lhs:?}");
+        };
+        assert_eq!(**subject, load(), "subject must be preserved verbatim");
+        let bias = map_const_lane(bias, bits).expect("bias must be a constant");
+        let threshold = map_const_lane(rhs, bits).expect("threshold must be a constant");
+        to_signed(x.wrapping_add(bias)) < to_signed(threshold)
+    }
+
+    /// EXHAUSTIVE proof at W = 8: for every window `lo..=hi` and every lane
+    /// value, the fused mask agrees with the unsigned range predicate it
+    /// replaces.  8 bits means 256*256*256/2 ≈ 8.4M checks — cheap, and it
+    /// covers every wrap, every sign-bit crossing and every edge the 32-bit
+    /// derivation relies on (the identity is width-parametric, so an
+    /// exhaustive 8-bit proof is a proof of the algebra at every width).
+    #[test]
+    fn fused_mask_matches_unsigned_range_exhaustively_at_8_bits() {
+        let bits = 8u32;
+        for lo in 0u64..256 {
+            for hi in lo..256 {
+                let Some(fused) = build_range_mask(&load(), lo, hi, bits) else {
+                    // The only admissible refusal is the full domain, whose
+                    // threshold is not a signed 8-bit value.
+                    assert_eq!(
+                        (lo, hi),
+                        (0, 255),
+                        "fusion refused a representable window {lo}..={hi}"
+                    );
+                    continue;
+                };
+                for x in 0u64..256 {
+                    assert_eq!(
+                        eval_fused(&fused, x, bits),
+                        lo <= x && x <= hi,
+                        "window {lo}..={hi}, x={x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The whole-domain window must be refused, not silently mis-encoded.
+    #[test]
+    fn full_domain_window_is_refused() {
+        assert!(build_range_mask(&load(), 0, u32::MAX as u64, 32).is_none());
+        assert!(build_range_mask(&load(), 0, 255, 8).is_none());
+        // ... but one value short of the full domain is fine.
+        assert!(build_range_mask(&load(), 0, 254, 8).is_some());
+        assert!(build_range_mask(&load(), 1, 255, 8).is_some());
+    }
+
+    /// Empty windows (`lo > hi`) are never fused: an empty range is a
+    /// constant-false mask, which is a different (and unimplemented)
+    /// rewrite, not a range test.
+    #[test]
+    fn empty_window_is_refused() {
+        assert!(build_range_mask(&load(), 90, 65, 32).is_none());
+    }
+
+    /// `c >= 'A' && c <= 'Z'` — the ASCII case-fold classifier.  All four
+    /// spellings the C source can take (`>=`/`>` and `<=`/`<`, in either
+    /// operand order) must land on the SAME fused mask.
+    #[test]
+    fn ascii_classifier_spellings_all_fuse_identically() {
+        let bits = 32u32;
+        let canonical = build_range_mask(&load(), 65, 90, bits).unwrap();
+        let shapes = [
+            // c >= 65 && c <= 90   (parser normalises Uge to Ule with swap)
+            conj(
+                cmp(IrCmpOp::Ule, konst(65), load()),
+                cmp(IrCmpOp::Ule, load(), konst(90)),
+            ),
+            // c > 64 && c < 91
+            conj(
+                cmp(IrCmpOp::Ult, konst(64), load()),
+                cmp(IrCmpOp::Ult, load(), konst(91)),
+            ),
+            // operand order of the && swapped
+            conj(
+                cmp(IrCmpOp::Ule, load(), konst(90)),
+                cmp(IrCmpOp::Ult, konst(64), load()),
+            ),
+            // mixed strictness
+            conj(
+                cmp(IrCmpOp::Ule, konst(65), load()),
+                cmp(IrCmpOp::Ult, load(), konst(91)),
+            ),
+        ];
+        for (i, shape) in shapes.iter().enumerate() {
+            assert_eq!(
+                fold_unsigned_range_masks(shape, bits),
+                canonical,
+                "spelling #{i} did not fuse to the canonical window"
+            );
+        }
+    }
+
+    /// A single-sided unsigned compare is the degenerate half-line window and
+    /// must also collapse to the two-instruction form.
+    #[test]
+    fn single_sided_unsigned_compares_fuse() {
+        let bits = 32u32;
+        assert_eq!(
+            fold_unsigned_range_masks(&cmp(IrCmpOp::Ule, load(), konst(1000)), bits),
+            build_range_mask(&load(), 0, 1000, bits).unwrap()
+        );
+        assert_eq!(
+            fold_unsigned_range_masks(&cmp(IrCmpOp::Ult, load(), konst(1000)), bits),
+            build_range_mask(&load(), 0, 999, bits).unwrap()
+        );
+        assert_eq!(
+            fold_unsigned_range_masks(&cmp(IrCmpOp::Ule, konst(7), load()), bits),
+            build_range_mask(&load(), 7, u32::MAX as u64, bits).unwrap()
+        );
+    }
+
+    /// Unsatisfiable edge adjustments (`X <u 0`, `X >u MAX`) must be left
+    /// alone rather than folded into a wrapped, always-true window.
+    #[test]
+    fn unsatisfiable_edges_are_left_alone() {
+        let bits = 32u32;
+        let lt_zero = cmp(IrCmpOp::Ult, load(), konst(0));
+        assert_eq!(fold_unsigned_range_masks(&lt_zero, bits), lt_zero);
+        let gt_max = cmp(IrCmpOp::Ult, konst(-1), load()); // -1 == u32::MAX lane
+        assert_eq!(fold_unsigned_range_masks(&gt_max, bits), gt_max);
+    }
+
+    /// Signed predicates already lower to a single `vpcmpgtd`; the fusion
+    /// must not touch them (and must not treat a signed bound as unsigned).
+    #[test]
+    fn signed_predicates_are_untouched() {
+        let bits = 32u32;
+        let signed_conj = conj(
+            cmp(IrCmpOp::Sle, konst(65), load()),
+            cmp(IrCmpOp::Sle, load(), konst(90)),
+        );
+        assert_eq!(fold_unsigned_range_masks(&signed_conj, bits), signed_conj);
+    }
+
+    /// Two bounds on DIFFERENT subjects are not a window.
+    #[test]
+    fn different_subjects_do_not_fuse() {
+        let bits = 32u32;
+        let mixed = conj(
+            cmp(IrCmpOp::Ule, konst(65), MapExpr::Load(0)),
+            cmp(IrCmpOp::Ule, MapExpr::Load(1), konst(90)),
+        );
+        // Each side still folds as its own half-line, but no window forms.
+        let folded = fold_unsigned_range_masks(&mixed, bits);
+        assert!(
+            matches!(folded, MapExpr::MaskConj { .. }),
+            "expected the conjunction to survive, got {folded:?}"
+        );
+    }
+
+    /// Non-integer element types disable the rewrite entirely.
+    #[test]
+    fn fp_lanes_have_no_lane_width() {
+        assert_eq!(map_lane_bits(&IrType::F32), None);
+        assert_eq!(map_lane_bits(&IrType::F64), None);
+        assert_eq!(map_lane_bits(&IrType::U8), Some(8));
+        assert_eq!(map_lane_bits(&IrType::U32), Some(32));
+    }
+}
+
+#[cfg(test)]
+mod byte_lane_demotion_tests {
+    use super::*;
+
+    /// `x mod 256` read as an unsigned byte.
+    fn lo(v: i64) -> u8 {
+        (v as u64 & 0xFF) as u8
+    }
+
+    /// The ring homomorphism the whole demotion rests on: truncation to 8
+    /// bits commutes with `+`, `-`, `&`, `|` and `^` over the ENTIRE 32-bit
+    /// domain.  Checked on a dense pseudo-random sample plus every boundary
+    /// pair, because this identity is the load-bearing one -- if it were
+    /// false anywhere, every byte map would be a miscompile.
+    #[test]
+    fn truncation_is_a_ring_homomorphism() {
+        let interesting: Vec<i64> = {
+            let mut v: Vec<i64> = vec![
+                0,
+                1,
+                2,
+                127,
+                128,
+                129,
+                255,
+                256,
+                257,
+                -1,
+                -2,
+                -127,
+                -128,
+                -129,
+                -255,
+                -256,
+                32767,
+                -32768,
+                i32::MAX as i64,
+                i32::MIN as i64,
+            ];
+            // Deterministic bulk: an LCG over the full i32 range.
+            let mut x: u32 = 0x1234_5678;
+            for _ in 0..400 {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                v.push(x as i32 as i64);
+            }
+            v
+        };
+        for &a in &interesting {
+            for &b in &interesting {
+                let (wa, wb) = (a as i32, b as i32);
+                assert_eq!(lo(wa.wrapping_add(wb) as i64), lo(a).wrapping_add(lo(b)));
+                assert_eq!(lo(wa.wrapping_sub(wb) as i64), lo(a).wrapping_sub(lo(b)));
+                assert_eq!(lo((wa & wb) as i64), lo(a) & lo(b));
+                assert_eq!(lo((wa | wb) as i64), lo(a) | lo(b));
+                assert_eq!(lo((wa ^ wb) as i64), lo(a) ^ lo(b));
+            }
+        }
+    }
+
+    /// The side condition for compares, verified exhaustively over both
+    /// admitted byte domains.
+    ///
+    /// * in [0, 255] the wide SIGNED, wide UNSIGNED and byte UNSIGNED orders
+    ///   all coincide, so mapping any predicate onto its unsigned form is
+    ///   exact;
+    /// * in [-128, 127] the map `x |-> x mod 256` is an order isomorphism for
+    ///   BOTH byte orders, so the predicate is kept as written.
+    #[test]
+    fn compare_side_conditions_hold_exhaustively() {
+        // Domain 1: [0, 255] -> unsigned byte predicate.
+        for a in 0i64..256 {
+            for b in 0i64..256 {
+                let (ba, bb) = (lo(a), lo(b));
+                assert_eq!(a < b, ba < bb, "signed wide vs unsigned byte lt");
+                assert_eq!(a <= b, ba <= bb);
+                assert_eq!(a == b, ba == bb);
+                // The unsigned WIDE order agrees too (both operands >= 0).
+                assert_eq!((a as u64) < (b as u64), ba < bb);
+            }
+        }
+        // Domain 2: [-128, 127] -> predicate unchanged, both signednesses.
+        for a in -128i64..128 {
+            for b in -128i64..128 {
+                let (ba, bb) = (lo(a) as i8, lo(b) as i8);
+                assert_eq!(a < b, ba < bb, "signed wide vs signed byte lt");
+                assert_eq!(a <= b, ba <= bb);
+                assert_eq!(a == b, ba == bb);
+                // Unsigned: x |-> x mod 2^k is an order isomorphism from
+                // [-2^(k-1), 2^(k-1)) onto the unsigned byte order.
+                let (ua, ub) = ((a as u32) as u64, (b as u32) as u64);
+                assert_eq!(ua < ub, lo(a) < lo(b), "unsigned wide vs unsigned byte");
+            }
+        }
+    }
+
+    /// `vpminub`/`vpmaxub` are exact precisely on [0, 255] -- and NOT outside
+    /// it, which is why the fold demands that range.  This pins the direction
+    /// of the bug the byte clamp gate caught: a signed byte min of (240, 16)
+    /// is 240, an unsigned one is 16.
+    #[test]
+    fn unsigned_byte_minmax_is_exact_only_inside_the_unsigned_domain() {
+        for a in 0i64..256 {
+            for b in 0i64..256 {
+                assert_eq!(a.min(b) as u8, lo(a).min(lo(b)));
+                assert_eq!(a.max(b) as u8, lo(a).max(lo(b)));
+            }
+        }
+        // The counterexample the signed lowering would produce.
+        assert_eq!((lo(240) as i8).min(lo(16) as i8) as u8, 240);
+        assert_eq!(lo(240).min(lo(16)), 16);
+    }
+
+    #[test]
+    fn replicate_byte_fills_every_lane() {
+        assert_eq!(replicate_byte(32) as u32, 0x2020_2020);
+        assert_eq!(replicate_byte(240) as u32, 0xF0F0_F0F0);
+        assert_eq!(replicate_byte(-1) as u32, 0xFFFF_FFFF);
+        assert_eq!(replicate_byte(0) as u32, 0);
+        // Only the low byte matters: a wide constant replicates its residue.
+        assert_eq!(replicate_byte(0x1234_5678) as u32, 0x7878_7878);
+        assert_eq!(replicate_byte(-102) as u32, 0x9A9A_9A9A);
+    }
+
+    #[test]
+    fn map_elem_size_covers_every_admitted_element_type() {
+        assert_eq!(map_elem_size(&IrType::U8), Some(1));
+        assert_eq!(map_elem_size(&IrType::I8), Some(1));
+        assert_eq!(map_elem_size(&IrType::I32), Some(4));
+        assert_eq!(map_elem_size(&IrType::U32), Some(4));
+        assert_eq!(map_elem_size(&IrType::F32), Some(4));
+        assert_eq!(map_elem_size(&IrType::F64), Some(8));
+        assert_eq!(map_elem_size(&IrType::I64), Some(8));
+        assert_eq!(map_elem_size(&IrType::U64), Some(8));
+        // 16-bit lanes landed with OP-05g.
+        assert_eq!(map_elem_size(&IrType::I16), Some(2));
+        assert_eq!(map_elem_size(&IrType::U16), Some(2));
+        // Still not vectorizable as a map element type.
+        assert_eq!(map_elem_size(&IrType::Ptr), None);
+        assert_eq!(map_elem_size(&IrType::Void), None);
+    }
+
+    /// The interval analysis must saturate to "unknown" rather than wrap; a
+    /// wrapped bound would let an out-of-domain compare through.
+    #[test]
+    fn range_arithmetic_saturates_instead_of_wrapping() {
+        let huge = Some((i64::MAX - 1, i64::MAX));
+        assert_eq!(range_binop(IrBinOp::Add, huge, huge), None);
+        assert_eq!(
+            range_binop(IrBinOp::Add, Some((0, 255)), Some((0, 255))),
+            Some((0, 510))
+        );
+        assert_eq!(
+            range_binop(IrBinOp::Sub, Some((0, 255)), Some((10, 20))),
+            Some((-20, 245))
+        );
+        // Bitwise bounds need non-negative operands.
+        assert_eq!(
+            range_binop(IrBinOp::And, Some((0, 255)), Some((0, 15))),
+            Some((0, 15))
+        );
+        assert_eq!(
+            range_binop(IrBinOp::And, Some((-1, 5)), Some((0, 15))),
+            None
+        );
+        assert_eq!(
+            range_binop(IrBinOp::Or, Some((0, 255)), Some((0, 15))),
+            Some((0, 255))
+        );
+        // Multiplication and the shifts are refused outright (no packed byte
+        // instruction exists for them).
+        assert_eq!(range_binop(IrBinOp::Mul, Some((0, 1)), Some((0, 1))), None);
+        assert_eq!(range_binop(IrBinOp::Shl, Some((0, 1)), Some((0, 1))), None);
+        // An unknown input poisons the result.
+        assert_eq!(range_binop(IrBinOp::Add, None, Some((0, 1))), None);
+    }
+
+    /// The width-parametric domains must agree with the hand-written byte
+    /// constants and extend correctly to 16 and 32 bits.
+    #[test]
+    fn narrow_domains_are_width_parametric() {
+        assert_eq!(narrow_domains(1), (U8_RANGE, I8_RANGE));
+        assert_eq!(narrow_domains(2), ((0, 65535), (-32768, 32767)));
+        assert_eq!(
+            narrow_domains(4),
+            ((0, 4294967295), (-2147483648, 2147483647))
+        );
+        for nb in [1u32, 2, 4] {
+            let (u, sgn) = narrow_domains(nb);
+            let bits = nb * 8;
+            assert_eq!(u.0, 0);
+            assert_eq!(u.1, (1i64 << bits) - 1);
+            assert_eq!(sgn.0, -(1i64 << (bits - 1)));
+            assert_eq!(sgn.1, (1i64 << (bits - 1)) - 1);
+            // The two domains overlap exactly on the non-negative signed half.
+            assert_eq!(u.1 - sgn.1, sgn.1 + 1);
+        }
+    }
+
+    /// `replicate_narrow` must tile the dword broadcast exactly at each
+    /// narrow width, and must depend only on the low bits of its input.
+    #[test]
+    fn replicate_narrow_tiles_the_broadcast_lane() {
+        assert_eq!(replicate_narrow(32, 1) as u32, 0x2020_2020);
+        assert_eq!(replicate_narrow(0x1234_5678, 1) as u32, 0x7878_7878);
+        assert_eq!(replicate_narrow(0x1234, 2) as u32, 0x1234_1234);
+        assert_eq!(replicate_narrow(0x1234_5678, 2) as u32, 0x5678_5678);
+        assert_eq!(replicate_narrow(-1, 2) as u32, 0xFFFF_FFFF);
+        // The byte helper is the n == 1 case, not a second implementation.
+        for v in [-1i64, 0, 1, 127, 128, 255, 256, 0x7FFF_FFFF] {
+            assert_eq!(replicate_byte(v), replicate_narrow(v, 1));
+        }
+    }
+
+    #[test]
+    fn range_within_rejects_partial_overlap_and_unknown() {
+        assert!(range_within(Some((0, 255)), U8_RANGE));
+        assert!(!range_within(Some((0, 256)), U8_RANGE));
+        assert!(!range_within(Some((-1, 255)), U8_RANGE));
+        assert!(range_within(Some((-128, 127)), I8_RANGE));
+        assert!(!range_within(Some((-129, 127)), I8_RANGE));
+        assert!(!range_within(None, U8_RANGE));
+    }
+
+    /// Every GT/GE spelling must normalise into the EQ/LT/LE/NE subset the
+    /// packed compare emitters accept as an immediate; leaving a `Sgt` in the
+    /// tree would reach `cmp_op` and bail the whole loop.
+    #[test]
+    fn predicate_normalization_covers_the_emitter_vocabulary() {
+        for op in [
+            IrCmpOp::Eq,
+            IrCmpOp::Ne,
+            IrCmpOp::Slt,
+            IrCmpOp::Sle,
+            IrCmpOp::Sgt,
+            IrCmpOp::Sge,
+            IrCmpOp::Ult,
+            IrCmpOp::Ule,
+            IrCmpOp::Ugt,
+            IrCmpOp::Uge,
+        ] {
+            let (norm, _swap) = normalize_cmp_for_lanes(op);
+            assert!(
+                matches!(
+                    norm,
+                    IrCmpOp::Eq
+                        | IrCmpOp::Ne
+                        | IrCmpOp::Slt
+                        | IrCmpOp::Sle
+                        | IrCmpOp::Ult
+                        | IrCmpOp::Ule
+                ),
+                "{op:?} normalised to {norm:?}, which no packed compare encodes"
+            );
+            // Unsigned mapping never changes a predicate's strictness.
+            let u = byte_predicate_unsigned(op);
+            assert_eq!(
+                matches!(op, IrCmpOp::Eq | IrCmpOp::Ne),
+                matches!(u, IrCmpOp::Eq | IrCmpOp::Ne)
+            );
+        }
+    }
+
+    /// `m ? x + k : x` must become `x + (m & k)`, and `m ? k : 0` must become
+    /// `m & k`; anything else must be left structurally alone.
+    #[test]
+    fn mask_select_strength_reduction() {
+        let x = MapExpr::Load(0);
+        let k = MapExpr::Invariant(Operand::Const(IrConst::I32(32)));
+        let zero = MapExpr::Invariant(Operand::Const(IrConst::I32(0)));
+        let mask = MapExpr::Cmp(
+            IrCmpOp::Slt,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(7)))),
+        );
+
+        let sel = MapExpr::Select(
+            Box::new(mask.clone()),
+            Box::new(MapExpr::BinOp(
+                IrBinOp::Add,
+                Box::new(x.clone()),
+                Box::new(k.clone()),
+            )),
+            Box::new(x.clone()),
+        );
+        assert_eq!(
+            strength_reduce_mask_select(&sel),
+            MapExpr::BinOp(
+                IrBinOp::Add,
+                Box::new(x.clone()),
+                Box::new(MapExpr::BinOp(
+                    IrBinOp::And,
+                    Box::new(mask.clone()),
+                    Box::new(k.clone())
+                ))
+            )
+        );
+
+        // Commuted addend (`k + x`) reduces identically.
+        let sel_comm = MapExpr::Select(
+            Box::new(mask.clone()),
+            Box::new(MapExpr::BinOp(
+                IrBinOp::Add,
+                Box::new(k.clone()),
+                Box::new(x.clone()),
+            )),
+            Box::new(x.clone()),
+        );
+        assert!(matches!(
+            strength_reduce_mask_select(&sel_comm),
+            MapExpr::BinOp(IrBinOp::Add, ..)
+        ));
+
+        // Classifier shape `m ? k : 0` -> `m & k`.
+        let classify = MapExpr::Select(Box::new(mask.clone()), Box::new(k.clone()), Box::new(zero));
+        assert_eq!(
+            strength_reduce_mask_select(&classify),
+            MapExpr::BinOp(IrBinOp::And, Box::new(mask.clone()), Box::new(k.clone()))
+        );
+
+        // Non-constant / non-matching arms are untouched.
+        let untouched = MapExpr::Select(Box::new(mask), Box::new(MapExpr::Load(1)), Box::new(x));
+        assert_eq!(strength_reduce_mask_select(&untouched), untouched);
+    }
+}
+
+#[cfg(test)]
+mod window_union_tests {
+    use super::*;
+
+    fn load() -> MapExpr {
+        MapExpr::Load(0)
+    }
+    fn konst(v: i32) -> MapExpr {
+        MapExpr::Invariant(Operand::Const(IrConst::I32(v)))
+    }
+    fn window(lo: i32, hi: i32) -> MapExpr {
+        MapExpr::MaskConj {
+            is_and: true,
+            l: Box::new(MapExpr::Cmp(
+                IrCmpOp::Ule,
+                Box::new(konst(lo)),
+                Box::new(load()),
+            )),
+            r: Box::new(MapExpr::Cmp(
+                IrCmpOp::Ule,
+                Box::new(load()),
+                Box::new(konst(hi)),
+            )),
+        }
+    }
+
+    /// Evaluate a fused mask `Cmp(Slt, Add(subject, bias), T)` where the
+    /// subject may itself be `Or(Load, B)`, in the modular arithmetic the
+    /// packed instructions implement.
+    fn eval(expr: &MapExpr, x: u64, bits: u32) -> bool {
+        let modulus = 1u64 << bits;
+        let sign_bit = 1u64 << (bits - 1);
+        let to_signed = |v: u64| -> i64 {
+            let v = v & (modulus - 1);
+            if v & sign_bit != 0 {
+                v as i64 - modulus as i64
+            } else {
+                v as i64
+            }
+        };
+        fn value(e: &MapExpr, x: u64, mask: u64) -> u64 {
+            match e {
+                MapExpr::Load(_) => x,
+                MapExpr::Invariant(Operand::Const(c)) => (c.to_i64().unwrap() as u64) & mask,
+                MapExpr::BinOp(IrBinOp::Or, l, r) => (value(l, x, mask) | value(r, x, mask)) & mask,
+                MapExpr::BinOp(IrBinOp::Add, l, r) => {
+                    value(l, x, mask).wrapping_add(value(r, x, mask)) & mask
+                }
+                other => panic!("unexpected node {other:?}"),
+            }
+        }
+        let MapExpr::Cmp(IrCmpOp::Slt, lhs, rhs) = expr else {
+            panic!("expected a fused signed-lt mask, got {expr:?}");
+        };
+        to_signed(value(lhs, x, modulus - 1)) < to_signed(value(rhs, x, modulus - 1))
+    }
+
+    /// EXHAUSTIVE proof of the single-bit union identity at W = 8:
+    /// for every power-of-two bit and every admissible lower window, the
+    /// fused `(x | B) in W2` mask agrees with `x in W1 or x in W2` on every
+    /// one of the 256 lane values.
+    #[test]
+    fn single_bit_union_matches_the_union_exhaustively_at_8_bits() {
+        let bits = 8u32;
+        let mut proved = 0usize;
+        for b_log in 0..8u32 {
+            let b = 1u64 << b_log;
+            for lo in 0u64..256 {
+                for hi in lo..256 {
+                    // Precondition: bit `b` clear throughout [lo, hi], and the
+                    // shifted window inside the domain.
+                    if lo & b != 0 || (lo | (b - 1)) < hi || hi | b > 255 {
+                        continue;
+                    }
+                    let (lo2, hi2) = (lo | b, hi | b);
+                    let Some(fused) = fold_single_bit_window_union(
+                        &window(lo as i32, hi as i32),
+                        &window(lo2 as i32, hi2 as i32),
+                        bits,
+                    ) else {
+                        continue; // refused (e.g. whole-domain threshold)
+                    };
+                    for x in 0u64..256 {
+                        let want = (lo..=hi).contains(&x) || (lo2..=hi2).contains(&x);
+                        assert_eq!(
+                            eval(&fused, x, bits),
+                            want,
+                            "B={b} W1=[{lo},{hi}] W2=[{lo2},{hi2}] x={x}"
+                        );
+                    }
+                    proved += 1;
+                }
+            }
+        }
+        assert!(proved > 200, "only {proved} unions exercised");
+    }
+
+    /// The precondition is not decorative: a window in which the bit is
+    /// already set somewhere, or two windows not separated by exactly one
+    /// bit, must be REFUSED rather than mis-folded.
+    #[test]
+    fn union_fold_refuses_when_the_precondition_fails() {
+        let bits = 8u32;
+        // Bit 5 is set inside [30, 34] (32, 33, 34), so OR-ing is not a
+        // bijection onto the upper window.
+        assert!(fold_single_bit_window_union(&window(30, 34), &window(62, 66), bits).is_none());
+        // Separation is 3, not a power of two.
+        assert!(fold_single_bit_window_union(&window(1, 2), &window(4, 5), bits).is_none());
+        // Separation is a power of two but the windows have different widths.
+        assert!(fold_single_bit_window_union(&window(64, 90), &window(96, 120), bits).is_none());
+        // Different subjects.
+        let other = MapExpr::MaskConj {
+            is_and: true,
+            l: Box::new(MapExpr::Cmp(
+                IrCmpOp::Ule,
+                Box::new(konst(97)),
+                Box::new(MapExpr::Load(1)),
+            )),
+            r: Box::new(MapExpr::Cmp(
+                IrCmpOp::Ule,
+                Box::new(MapExpr::Load(1)),
+                Box::new(konst(122)),
+            )),
+        };
+        assert!(fold_single_bit_window_union(&window(65, 90), &other, bits).is_none());
+    }
+
+    /// The ASCII alpha class is the motivating case: `[A-Z] u [a-z]` must
+    /// collapse to one window on `c | 32`, in either operand order.
+    #[test]
+    fn ascii_alpha_class_collapses_to_one_window() {
+        for bits in [8u32, 32] {
+            let upper = window(65, 90);
+            let lower = window(97, 122);
+            let a = fold_single_bit_window_union(&upper, &lower, bits)
+                .expect("[A-Z] u [a-z] must fold");
+            let b = fold_single_bit_window_union(&lower, &upper, bits)
+                .expect("operand order must not matter");
+            assert_eq!(a, b);
+            // The subject must be `Load | 32`.
+            let MapExpr::Cmp(IrCmpOp::Slt, lhs, _) = &a else {
+                panic!("expected a fused mask, got {a:?}");
+            };
+            let MapExpr::BinOp(IrBinOp::Add, subject, _) = lhs.as_ref() else {
+                panic!("expected a biased subject");
+            };
+            assert_eq!(
+                **subject,
+                MapExpr::BinOp(IrBinOp::Or, Box::new(load()), Box::new(konst(32)))
+            );
+        }
+        // And end to end through the driver, at byte width.
+        let folded = fold_unsigned_range_masks(
+            &MapExpr::MaskConj {
+                is_and: false,
+                l: Box::new(window(97, 122)),
+                r: Box::new(window(65, 90)),
+            },
+            8,
+        );
+        for x in 0u64..256 {
+            let want = (65..=90).contains(&x) || (97..=122).contains(&x);
+            assert_eq!(eval(&folded, x, 8), want, "x={x}");
+        }
+    }
+
+    /// `and`/`or` of two masks spelled as bitwise `BinOp` (what if-combine
+    /// produces) must canonicalise to `MaskConj` so the window fusion can
+    /// see it.
+    #[test]
+    fn bitwise_mask_ops_canonicalise_to_mask_conjunctions() {
+        let bits = 8u32;
+        let lo_bound = MapExpr::Cmp(IrCmpOp::Ule, Box::new(konst(65)), Box::new(load()));
+        let hi_bound = MapExpr::Cmp(IrCmpOp::Ule, Box::new(load()), Box::new(konst(90)));
+        let as_bitwise = MapExpr::BinOp(
+            IrBinOp::And,
+            Box::new(lo_bound.clone()),
+            Box::new(hi_bound.clone()),
+        );
+        assert_eq!(
+            fold_unsigned_range_masks(&as_bitwise, bits),
+            fold_unsigned_range_masks(&window(65, 90), bits),
+            "bitwise `and` of two bounds must fuse exactly like MaskConj"
+        );
+        // A bitwise op on NON-mask operands stays arithmetic.
+        let arith = MapExpr::BinOp(IrBinOp::And, Box::new(load()), Box::new(konst(15)));
+        assert_eq!(fold_unsigned_range_masks(&arith, bits), arith);
+    }
+}
+
+#[cfg(test)]
+mod map_expr_interpreter_tests {
+    //! Differential model of the TWO independent `MapExpr` interpreters.
+    //!
+    //! `transform_map_vector` hands the same tree to two consumers that share
+    //! no code: `MapEmitCtx` lowers it to packed intrinsics, and
+    //! `emit_map_scalar_tree` mirrors it into the scalar remainder loop.  When
+    //! they disagree, the program computes one answer for the first
+    //! `n - n % VF` elements and a different one for the tail — a bug shape
+    //! that trip-count sweeps catch only if the sweep happens to straddle the
+    //! boundary with the offending value present.
+    //!
+    //! Three of the five defects in this area were exactly that disagreement:
+    //!   * the mirror used a SIGNED min/max where the packed byte path emits
+    //!     unsigned `vpminub`/`vpmaxub`;
+    //!   * byte constants were replicated in the tree, which is right for the
+    //!     dword broadcast and wrong for the mirror's element-typed ops;
+    //!   * the mirror's element size was hardcoded to 4.
+    //!
+    //! This module models both interpreters at the semantic level and asserts
+    //! they agree on randomly generated trees over the full input domain.  It
+    //! is deliberately a MODEL rather than a call into the emitters: the
+    //! emitters need a register allocator and a `CodegenState`, while the
+    //! disagreements above were all semantic, and a semantic model can be
+    //! exhaustive where an end-to-end test can only sample.
+    use super::*;
+
+    /// Semantics of a `MapExpr` node under a given lane width, evaluated the
+    /// way the PACKED path does: every operation wraps at the lane width, a
+    /// compare yields an all-ones lane mask, and unsigned min/max order the
+    /// lane as unsigned.
+    fn eval_packed(e: &MapExpr, lanes: &[i64], bits: u32) -> i64 {
+        let modulus = 1i64 << bits;
+        let mask = modulus - 1;
+        let sign = 1i64 << (bits - 1);
+        let sx = |v: i64| -> i64 {
+            let v = v & mask;
+            if v & sign != 0 { v - modulus } else { v }
+        };
+        let ux = |v: i64| -> i64 { v & mask };
+        match e {
+            MapExpr::Load(i) => sx(lanes[*i]),
+            MapExpr::Invariant(Operand::Const(c)) => sx(c.to_i64().unwrap()),
+            MapExpr::Invariant(_) => unreachable!("model covers constants only"),
+            MapExpr::BinOp(op, l, r) => {
+                let (a, b) = (eval_packed(l, lanes, bits), eval_packed(r, lanes, bits));
+                sx(match op {
+                    IrBinOp::Add => a.wrapping_add(b),
+                    IrBinOp::Sub => a.wrapping_sub(b),
+                    IrBinOp::And => a & b,
+                    IrBinOp::Or => a | b,
+                    IrBinOp::Xor => a ^ b,
+                    other => unreachable!("model covers ring ops only, got {other:?}"),
+                })
+            }
+            MapExpr::Cmp(op, l, r) => {
+                let (a, b) = (eval_packed(l, lanes, bits), eval_packed(r, lanes, bits));
+                let t = match op {
+                    IrCmpOp::Eq => a == b,
+                    IrCmpOp::Ne => a != b,
+                    IrCmpOp::Slt => a < b,
+                    IrCmpOp::Sle => a <= b,
+                    IrCmpOp::Sgt => a > b,
+                    IrCmpOp::Sge => a >= b,
+                    IrCmpOp::Ult => (ux(a) as u64) < (ux(b) as u64),
+                    IrCmpOp::Ule => (ux(a) as u64) <= (ux(b) as u64),
+                    IrCmpOp::Ugt => (ux(a) as u64) > (ux(b) as u64),
+                    IrCmpOp::Uge => (ux(a) as u64) >= (ux(b) as u64),
+                };
+                if t { -1 } else { 0 }
+            }
+            MapExpr::MaskConj { is_and, l, r } => {
+                let (a, b) = (eval_packed(l, lanes, bits), eval_packed(r, lanes, bits));
+                if *is_and { a & b } else { a | b }
+            }
+            MapExpr::Select(c, t, f) => {
+                if eval_packed(c, lanes, bits) != 0 {
+                    eval_packed(t, lanes, bits)
+                } else {
+                    eval_packed(f, lanes, bits)
+                }
+            }
+            MapExpr::MinMax { is_max, l, r } => {
+                let (a, b) = (eval_packed(l, lanes, bits), eval_packed(r, lanes, bits));
+                // Byte lanes lower to the UNSIGNED vpminub/vpmaxub; wider
+                // lanes to the signed vpminsd/vpmaxsd.
+                if bits == 8 {
+                    let (ua, ub) = (ux(a) as u64, ux(b) as u64);
+                    sx(if *is_max { ua.max(ub) } else { ua.min(ub) } as i64)
+                } else if *is_max {
+                    a.max(b)
+                } else {
+                    a.min(b)
+                }
+            }
+            MapExpr::Sqrt(_) => unreachable!("integer model"),
+        }
+    }
+
+    /// Semantics of the SCALAR REMAINDER MIRROR: the same tree evaluated with
+    /// element-typed operations, where a compare yields 0/1 (a `setcc`) and
+    /// the result is truncated to the element type by the store.
+    fn eval_mirror(e: &MapExpr, lanes: &[i64], bits: u32) -> i64 {
+        let modulus = 1i64 << bits;
+        let mask = modulus - 1;
+        let sign = 1i64 << (bits - 1);
+        let sx = |v: i64| -> i64 {
+            let v = v & mask;
+            if v & sign != 0 { v - modulus } else { v }
+        };
+        let ux = |v: i64| -> i64 { v & mask };
+        match e {
+            MapExpr::Load(i) => sx(lanes[*i]),
+            MapExpr::Invariant(Operand::Const(c)) => sx(c.to_i64().unwrap()),
+            MapExpr::Invariant(_) => unreachable!("model covers constants only"),
+            MapExpr::BinOp(op, l, r) => {
+                let (a, b) = (eval_mirror(l, lanes, bits), eval_mirror(r, lanes, bits));
+                sx(match op {
+                    IrBinOp::Add => a.wrapping_add(b),
+                    IrBinOp::Sub => a.wrapping_sub(b),
+                    IrBinOp::And => a & b,
+                    IrBinOp::Or => a | b,
+                    IrBinOp::Xor => a ^ b,
+                    other => unreachable!("model covers ring ops only, got {other:?}"),
+                })
+            }
+            // A scalar compare is a 0/1 boolean, NOT an all-ones mask.  This
+            // asymmetry is the whole point of the module: any tree that uses
+            // a compare as a VALUE rather than as a `Select`/`MaskConj`
+            // condition makes the two interpreters disagree, and the
+            // vectorizer must never build one.
+            MapExpr::Cmp(op, l, r) => {
+                let (a, b) = (eval_mirror(l, lanes, bits), eval_mirror(r, lanes, bits));
+                let t = match op {
+                    IrCmpOp::Eq => a == b,
+                    IrCmpOp::Ne => a != b,
+                    IrCmpOp::Slt => a < b,
+                    IrCmpOp::Sle => a <= b,
+                    IrCmpOp::Sgt => a > b,
+                    IrCmpOp::Sge => a >= b,
+                    IrCmpOp::Ult => (ux(a) as u64) < (ux(b) as u64),
+                    IrCmpOp::Ule => (ux(a) as u64) <= (ux(b) as u64),
+                    IrCmpOp::Ugt => (ux(a) as u64) > (ux(b) as u64),
+                    IrCmpOp::Uge => (ux(a) as u64) >= (ux(b) as u64),
+                };
+                i64::from(t)
+            }
+            MapExpr::MaskConj { is_and, l, r } => {
+                let (a, b) = (eval_mirror(l, lanes, bits), eval_mirror(r, lanes, bits));
+                if *is_and { a & b } else { a | b }
+            }
+            MapExpr::Select(c, t, f) => {
+                if eval_mirror(c, lanes, bits) != 0 {
+                    eval_mirror(t, lanes, bits)
+                } else {
+                    eval_mirror(f, lanes, bits)
+                }
+            }
+            MapExpr::MinMax { is_max, l, r } => {
+                let (a, b) = (eval_mirror(l, lanes, bits), eval_mirror(r, lanes, bits));
+                if bits == 8 {
+                    let (ua, ub) = (ux(a) as u64, ux(b) as u64);
+                    sx(if *is_max { ua.max(ub) } else { ua.min(ub) } as i64)
+                } else if *is_max {
+                    a.max(b)
+                } else {
+                    a.min(b)
+                }
+            }
+            MapExpr::Sqrt(_) => unreachable!("integer model"),
+        }
+    }
+
+    /// A tree is SAFE for the two-interpreter contract iff every `Cmp` and
+    /// `MaskConj` appears only in a condition position.  This is the
+    /// invariant the parsers must maintain, and the property that makes the
+    /// 0/1-vs-all-ones asymmetry unobservable.
+    fn masks_only_in_conditions(e: &MapExpr) -> bool {
+        fn is_mask(e: &MapExpr) -> bool {
+            matches!(e, MapExpr::Cmp(..) | MapExpr::MaskConj { .. })
+        }
+        fn cond_ok(e: &MapExpr) -> bool {
+            match e {
+                MapExpr::Cmp(_, l, r) => !is_mask(l) && !is_mask(r) && walk(l) && walk(r),
+                MapExpr::MaskConj { l, r, .. } => cond_ok(l) && cond_ok(r),
+                _ => false,
+            }
+        }
+        fn walk(e: &MapExpr) -> bool {
+            match e {
+                MapExpr::Load(_) | MapExpr::Invariant(_) => true,
+                MapExpr::BinOp(_, l, r) | MapExpr::MinMax { l, r, .. } => {
+                    !is_mask(l) && !is_mask(r) && walk(l) && walk(r)
+                }
+                MapExpr::Select(c, t, f) => {
+                    cond_ok(c) && !is_mask(t) && !is_mask(f) && walk(t) && walk(f)
+                }
+                MapExpr::Cmp(..) | MapExpr::MaskConj { .. } => cond_ok(e),
+                MapExpr::Sqrt(x) => walk(x),
+            }
+        }
+        walk(e)
+    }
+
+    /// Deterministic tree generator (xorshift, no external crates).
+    struct Gen(u64);
+    impl Gen {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn pick(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn konst(&mut self, bits: u32) -> MapExpr {
+            let m = (1i64 << bits) - 1;
+            let v = (self.next() as i64) & m;
+            MapExpr::Invariant(Operand::Const(IrConst::I32(v as i32)))
+        }
+        fn value(&mut self, depth: u32, streams: usize, bits: u32) -> MapExpr {
+            if depth == 0 {
+                return if self.pick(2) == 0 {
+                    MapExpr::Load(self.pick(streams as u64) as usize)
+                } else {
+                    self.konst(bits)
+                };
+            }
+            match self.pick(6) {
+                0 => MapExpr::Load(self.pick(streams as u64) as usize),
+                1 => self.konst(bits),
+                2 => {
+                    let op = [
+                        IrBinOp::Add,
+                        IrBinOp::Sub,
+                        IrBinOp::And,
+                        IrBinOp::Or,
+                        IrBinOp::Xor,
+                    ][self.pick(5) as usize];
+                    let l = self.value(depth - 1, streams, bits);
+                    let r = self.value(depth - 1, streams, bits);
+                    MapExpr::BinOp(op, Box::new(l), Box::new(r))
+                }
+                3 => {
+                    let c = self.cond(depth - 1, streams, bits);
+                    let t = self.value(depth - 1, streams, bits);
+                    let f = self.value(depth - 1, streams, bits);
+                    MapExpr::Select(Box::new(c), Box::new(t), Box::new(f))
+                }
+                4 => {
+                    let l = self.value(depth - 1, streams, bits);
+                    let r = self.value(depth - 1, streams, bits);
+                    MapExpr::MinMax {
+                        is_max: self.pick(2) == 0,
+                        l: Box::new(l),
+                        r: Box::new(r),
+                    }
+                }
+                _ => {
+                    let l = self.value(depth - 1, streams, bits);
+                    MapExpr::BinOp(IrBinOp::Add, Box::new(l), Box::new(self.konst(bits)))
+                }
+            }
+        }
+        fn cond(&mut self, depth: u32, streams: usize, bits: u32) -> MapExpr {
+            if depth > 0 && self.pick(3) == 0 {
+                let l = self.cond(depth - 1, streams, bits);
+                let r = self.cond(depth - 1, streams, bits);
+                return MapExpr::MaskConj {
+                    is_and: self.pick(2) == 0,
+                    l: Box::new(l),
+                    r: Box::new(r),
+                };
+            }
+            let op = [
+                IrCmpOp::Eq,
+                IrCmpOp::Ne,
+                IrCmpOp::Slt,
+                IrCmpOp::Sle,
+                IrCmpOp::Ult,
+                IrCmpOp::Ule,
+            ][self.pick(6) as usize];
+            let l = self.value(depth.saturating_sub(1), streams, bits);
+            let r = self.value(depth.saturating_sub(1), streams, bits);
+            MapExpr::Cmp(op, Box::new(l), Box::new(r))
+        }
+    }
+
+    /// The two interpreters must agree on every generated tree, at every lane
+    /// width, over an input domain that includes both signed extremes.
+    #[test]
+    fn packed_and_mirror_interpreters_agree_on_random_trees() {
+        for bits in [8u32, 32] {
+            let mut g = Gen(0x2026_0908_dead_beef ^ u64::from(bits));
+            let mut checked = 0usize;
+            for _ in 0..3000 {
+                let streams = 1 + (g.pick(2) as usize);
+                let tree = g.value(3, streams, bits);
+                if !masks_only_in_conditions(&tree) {
+                    continue;
+                }
+                let m = (1i64 << bits) - 1;
+                let sign = 1i64 << (bits - 1);
+                for t in 0..24u64 {
+                    let mut lanes = [0i64; 2];
+                    for (k, slot) in lanes.iter_mut().enumerate() {
+                        let raw = match t % 8 {
+                            0 => 0,
+                            1 => 1,
+                            2 => m,
+                            3 => sign,
+                            4 => sign - 1,
+                            5 => sign + 1,
+                            _ => (g.next() as i64) & m,
+                        } + k as i64;
+                        let v = raw & m;
+                        *slot = if v & sign != 0 { v - (1i64 << bits) } else { v };
+                    }
+                    assert_eq!(
+                        eval_packed(&tree, &lanes, bits),
+                        eval_mirror(&tree, &lanes, bits),
+                        "packed/mirror divergence at {bits}-bit lanes\n  tree  = {tree:?}\n  lanes = {lanes:?}"
+                    );
+                }
+                checked += 1;
+            }
+            assert!(
+                checked > 500,
+                "only {checked} trees exercised at {bits} bits; the generator regressed"
+            );
+        }
+    }
+
+    /// The contract this module rests on, made explicit: a mask used as a
+    /// VALUE really does make the two interpreters disagree.  If this ever
+    /// starts passing, `masks_only_in_conditions` has become vacuous and the
+    /// test above no longer proves anything.
+    #[test]
+    fn a_mask_used_as_a_value_provably_diverges() {
+        let bad = MapExpr::BinOp(
+            IrBinOp::Add,
+            Box::new(MapExpr::Cmp(
+                IrCmpOp::Slt,
+                Box::new(MapExpr::Load(0)),
+                Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(5)))),
+            )),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(0)))),
+        );
+        assert!(!masks_only_in_conditions(&bad));
+        let lanes = [1i64, 0];
+        assert_ne!(
+            eval_packed(&bad, &lanes, 32),
+            eval_mirror(&bad, &lanes, 32),
+            "the 0/1-vs-all-ones asymmetry must be observable, or the guard is vacuous"
+        );
+    }
+
+    /// Every tree the range fusion and the strength reduction produce must
+    /// still satisfy the condition-position invariant — the strength
+    /// reduction in particular rewrites `Select(m, x+k, x)` into
+    /// `x + (m & k)`, which puts a mask under an `And`.  That is legal ONLY
+    /// because the reduction is applied to the packed tree alone; this test
+    /// pins that separation.
+    #[test]
+    fn strength_reduction_output_is_packed_only() {
+        let mask = MapExpr::Cmp(
+            IrCmpOp::Slt,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(5)))),
+        );
+        let sel = MapExpr::Select(
+            Box::new(mask),
+            Box::new(MapExpr::BinOp(
+                IrBinOp::Add,
+                Box::new(MapExpr::Load(0)),
+                Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(32)))),
+            )),
+            Box::new(MapExpr::Load(0)),
+        );
+        assert!(
+            masks_only_in_conditions(&sel),
+            "the pattern tree (which the mirror sees) must be mirror-safe"
+        );
+        let reduced = strength_reduce_mask_select(&sel);
+        assert_ne!(reduced, sel, "the reduction must fire on this shape");
+        assert!(
+            !masks_only_in_conditions(&reduced),
+            "the reduced tree uses a mask as a value; if it were ever handed \
+             to the scalar mirror the tail would compute `x + (0 or 1) & k`"
+        );
     }
 }

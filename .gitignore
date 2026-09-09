@@ -90,3 +90,4 @@ zlib-ng-validation/
 /scripts/qemu_icount_plugin/qemu-plugin.h
 /scripts/qemu_icount_plugin/*.so
 ms178-1.patch
+tool-results/

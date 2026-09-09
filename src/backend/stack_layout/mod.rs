@@ -125,6 +125,7 @@ struct StackLayoutContext {
     /// VLFOLD: 256-bit vector loads elided in favour of a folded memory
     /// operand in their adjacent consumer (`compute_vector_memfold_values`).
     vector_memfold_values: FxHashSet<u32>,
+    vector_memfold_homed_ok: FxHashSet<u32>,
     x87_defer_values: FxHashSet<u32>,
     /// Values that appear as incoming operands in Phi instructions.
     /// These must NOT be classified as block-local (Tier 3) because phi
@@ -363,6 +364,7 @@ pub fn calculate_stack_space_common(
     // use is the adjacent intrinsic's args[0]/args[1] load).
     state.vector_defer_values = ctx.vector_defer_values.clone();
     state.vector_memfold_values = ctx.vector_memfold_values.clone();
+    state.vector_memfold_homed_ok = ctx.vector_memfold_homed_ok.clone();
     // i686 x87 top-of-stack deferral: F64 binop results consumed exactly once
     // by the adjacent F64 binop (the x87 twin of the vector deferral above;
     // backends that never set x87_pending ignore it).
@@ -644,6 +646,7 @@ fn build_layout_context(
     // VLFOLD candidates first: the defer analysis treats an elided load as
     // transparent between a deferred def and its consumer.
     let vector_memfold_values = copy_coalescing::compute_vector_memfold_values(func);
+    let vector_memfold_homed_ok = copy_coalescing::compute_vector_memfold_homed_ok(func);
     let vector_defer_values =
         copy_coalescing::compute_vector_defer_values(func, &vector_memfold_values);
     let x87_defer_values = copy_coalescing::compute_x87_defer_values(func);
@@ -785,6 +788,7 @@ fn build_layout_context(
         immediately_consumed,
         vector_defer_values,
         vector_memfold_values,
+        vector_memfold_homed_ok,
         x87_defer_values,
         phi_incoming_values,
         memcpy_value_sizes,
