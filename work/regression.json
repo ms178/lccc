@@ -1,0 +1,20 @@
+{
+  "passed": 722,
+  "failed": 1,
+  "skipped_compare": 9,
+  "skipped_run": 2,
+  "total": 734,
+  "elapsed_s": 73.1,
+  "lccc": "/home/user/lccc/target/fastbuild/lccc",
+  "failures": [
+    {
+      "name": "fp_liveness_ptr_deref_alias_negative",
+      "detail": "output differs from gcc (gcc rc=0):\nlccc:'3 1\\n'\ngcc:'3 3\\n'",
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:fail"
+      ]
+    }
+  ]
+}

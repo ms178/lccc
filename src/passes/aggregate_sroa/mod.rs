@@ -460,20 +460,45 @@ fn run_function(func: &mut IrFunction) -> usize {
                         // only scan (speedtest1 --testset json SIGSEGV).
                         let src_call_private =
                             s.alloca_size.contains_key(&sr) && !any_escape(&s.escapes, &s.gep, sr);
+                        // A store whose pointer value differs from the source
+                        // is only proven no-alias when the source is a *private*
+                        // (non-escaping) alloca reachable only through its own
+                        // value. Otherwise two distinct pointer values (e.g. two
+                        // function parameters passed the same address, as in
+                        //   u64 bits; memcpy(&bits,p,8); *q=0; memcpy(&d,&bits,8);
+                        // with p==q) may still alias, and forwarding must not
+                        // read the source after the write. This is the
+                        // memcpy-rewrite soundness hole exposed by the
+                        // constant-size __builtin_memcpy lowering (2026-09-09).
+                        // Prove whether an intervening memory write may modify the
+                        // copy source. A write to a *private* (non-escaping)
+                        // alloca cannot touch any other object, and a private
+                        // alloca source cannot be touched by a write through any
+                        // other pointer value. Otherwise two distinct pointer
+                        // values (e.g. two params passed the same address) may
+                        // still alias, so the source must be considered dirty.
+                        let is_private = |root: u32| -> bool {
+                            s.alloca_size.contains_key(&root)
+                                && !any_escape(&s.escapes, &s.gep, root)
+                        };
+                        let may_write_source = |pr: u32| -> bool {
+                            pr == sr                // same value (or same GEP root)
+                                || !(src_call_private || is_private(pr))
+                        };
                         let mut src_dirty = false;
                         for k in (mi + 1)..ii {
                             if let Some(inst_k) = block.instructions.get(k) {
                                 match inst_k {
                                     Instruction::Store { ptr, .. } => {
                                         let (pr, _) = resolve(&s.gep, ptr.0);
-                                        if pr == sr {
+                                        if may_write_source(pr) {
                                             src_dirty = true;
                                             break;
                                         }
                                     }
                                     Instruction::Memcpy { dest, .. } => {
                                         let (pr, _) = resolve(&s.gep, dest.0);
-                                        if pr == sr {
+                                        if may_write_source(pr) {
                                             src_dirty = true;
                                             break;
                                         }

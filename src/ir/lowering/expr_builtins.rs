@@ -349,6 +349,54 @@ impl Lowerer {
                         arg_types[i] = param_ty;
                     }
                 }
+                // -----------------------------------------------------------------
+                // Constant-size `__builtin_memcpy` / `__builtin_mempcpy`.  The
+                // libc forwarding below would emit a real `call memcpy`, but a copy
+                // of compile-time-constant size is better modelled by the native IR
+                // `Memcpy` instruction: the backend inlines small copies, and the
+                // SROA / store-load-forwarding passes can then forward a load out of
+                // the destination (read64's `__builtin_memcpy(&v, p, 8); return v`
+                // collapses to a single unaligned load) instead of leaving a
+                // store-to-temp + reload in every hot loop that does an unaligned
+                // 64-bit read.  This fires ONLY for the *builtin* spelling, which by
+                // construction names the libc function; a plain `memcpy(...)` call
+                // (which could be a user-provided function of that name) stays a
+                // call, preserving exact user semantics.  `memmove` is never
+                // rewritten because its overlap contract is different.
+                //
+                // SOUNDNESS for the native Memcpy: C `memcpy` already has the
+                // no-overlap precondition (overlap is UB), which is exactly the
+                // contract `Instruction::Memcpy` assumes, so lowering a valid
+                // `memcpy` to it is value-preserving.  The result of `memcpy` is the
+                // destination pointer, so on success we yield that operand directly.
+                if libc_name == "memcpy" && arg_vals.len() == 3 {
+                    // The size argument is promoted to `size_t` (U64) by the
+                    // libc-alias cast above, so even a literal `8` lowers to a
+                    // ZExt/Cast *value*, not a `Const`.  Const-evaluate the
+                    // source expression directly rather than inspecting the
+                    // lowered operand.
+                    let size = match self.eval_const_expr(&args[2]) {
+                        Some(IrConst::I64(v)) if v > 0 => v as usize,
+                        Some(IrConst::I32(v)) if v > 0 => v as usize,
+                        Some(IrConst::I128(v)) if v > 0 && v <= usize::MAX as i128 => v as usize,
+                        _ => 0,
+                    };
+                    if size > 0 {
+                        if let (Operand::Value(dp), Operand::Value(sp)) =
+                            (&arg_vals[0], &arg_vals[1])
+                        {
+                            let dp = *dp;
+                            let sp = *sp;
+                            self.emit(Instruction::Memcpy {
+                                dest: dp,
+                                src: sp,
+                                size,
+                            });
+                            // `__builtin_memcpy` returns its destination.
+                            return Some(Operand::Value(dp));
+                        }
+                    }
+                }
                 let dest = self.fresh_value();
                 // The builtin is callable without a prior libc prototype
                 // (`__builtin_printf("%g", f)` in a TU that never includes
