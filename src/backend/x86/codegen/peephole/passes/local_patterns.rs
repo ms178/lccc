@@ -2639,6 +2639,19 @@ pub(super) fn fold_ptr_deref_through_stack(store: &mut LineStore, infos: &mut [L
                             break;
                         }
 
+                        // SOUNDNESS (fp_liveness_ptr_deref_alias_negative): an
+                        // intermediate store to memory through a data register —
+                        // LineKind::Other with no register destination, e.g.
+                        // `movq $0, (%rsi)` — may write `(*ptr)`, the memory the
+                        // fold would re-read at K.  Folding the slot load into
+                        // `(%ptr)` is valid only while `(%ptr)` still holds the
+                        // value loaded at I and stored at J; any intervening
+                        // memory write can invalidate it (p and q may alias).
+                        // Bail so the slot read is kept.
+                        if matches!(infos[k].kind, LineKind::Other { dest_reg: REG_NONE }) {
+                            break;
+                        }
+
                         // Check if ptr register is modified (appears as destination).
                         let ptr_with_pct = format!("%{}", ptr_reg);
                         if t.ends_with(&format!(", {}", ptr_with_pct)) {
