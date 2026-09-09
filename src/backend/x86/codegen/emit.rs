@@ -3367,66 +3367,41 @@ impl X86Codegen {
         }
     }
 
-    /// Emit a cmpxchg-based loop for atomic sub/and/or/xor/nand.
-    /// Expects: rax = operand val, rcx = ptr address.
-    /// After: rax = old value.
+    /// Emit a CMPXCHG loop for atomic AND/OR/XOR/NAND.
+    /// Expects RAX = operand and RCX = address; returns the old value in RAX.
     pub(super) fn emit_x86_atomic_op_loop(&mut self, ty: IrType, op: &str) {
-        // Save val to rdi (using rdi instead of r8 to free r8 for register allocation)
-        self.state.emit("    movq %rax, %rdi"); // rdi = val
-        // Load old value
-        let load_instr = Self::mov_load_for_type(ty);
+        self.state.emit("    movq %rax, %rdi");
+
+        let load = Self::mov_load_for_type(ty);
         let load_dest = Self::load_dest_reg(ty);
         self.state
-            .emit_fmt(format_args!("    {} (%rcx), {}", load_instr, load_dest));
-        // Loop: rax = old, compute new = op(old, val), try cmpxchg
-        let label_id = self.state.next_label_id();
-        let loop_label = format!(".Latomic_loop_{}", label_id);
+            .emit_fmt(format_args!("    {} (%rcx), {}", load, load_dest));
+
+        let loop_label = format!(".Latomic_loop_{}", self.state.next_label_id());
         self.state.out.emit_named_label(&loop_label);
-        // rdx = rax (old)
         self.state.emit("    movq %rax, %rdx");
-        // Apply operation: rdx = op(rdx, rdi)
-        let size_suffix = Self::type_suffix(ty);
-        let rdx_reg = Self::reg_for_type("rdx", ty);
-        let r8_reg = match ty {
-            IrType::I8 | IrType::U8 => "dil",
-            IrType::I16 | IrType::U16 => "di",
-            IrType::I32 | IrType::U32 => "edi",
-            _ => "rdi",
-        };
+
+        // Truncation commutes with these bitwise operations. Compute in full
+        // registers to avoid partial-register writes and operand-size prefixes;
+        // only CMPXCHG accesses the user's object at its declared width.
         match op {
-            "sub" => self.state.emit_fmt(format_args!(
-                "    sub{} %{}, %{}",
-                size_suffix, r8_reg, rdx_reg
-            )),
-            "and" => self.state.emit_fmt(format_args!(
-                "    and{} %{}, %{}",
-                size_suffix, r8_reg, rdx_reg
-            )),
-            "or" => self.state.emit_fmt(format_args!(
-                "    or{} %{}, %{}",
-                size_suffix, r8_reg, rdx_reg
-            )),
-            "xor" => self.state.emit_fmt(format_args!(
-                "    xor{} %{}, %{}",
-                size_suffix, r8_reg, rdx_reg
-            )),
+            "and" => self.state.emit("    andq %rdi, %rdx"),
+            "or" => self.state.emit("    orq %rdi, %rdx"),
+            "xor" => self.state.emit("    xorq %rdi, %rdx"),
             "nand" => {
-                self.state.emit_fmt(format_args!(
-                    "    and{} %{}, %{}",
-                    size_suffix, r8_reg, rdx_reg
-                ));
-                self.state
-                    .emit_fmt(format_args!("    not{} %{}", size_suffix, rdx_reg));
+                self.state.emit("    andq %rdi, %rdx");
+                self.state.emit("    notq %rdx");
             }
-            _ => {}
+            _ => unreachable!("unsupported x86 atomic loop operation: {op}"),
         }
-        // Try cmpxchg: if [rcx] == rax (old), set [rcx] = rdx (new), else rax = [rcx]
+
+        let suffix = Self::type_suffix(ty);
+        let candidate = Self::reg_for_type("rdx", ty);
         self.state.emit_fmt(format_args!(
             "    lock cmpxchg{} %{}, (%rcx)",
-            size_suffix, rdx_reg
+            suffix, candidate
         ));
         self.state.out.emit_jcc_label("    jne", &loop_label);
-        // rax = old value on success
     }
 
     /// Load i128 operands for binary ops: lhs → rax:rdx, rhs → rcx:rsi.
