@@ -6,7 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifndef N
 #define N 65536
+#endif
 
 static float input_a[N];
 static float input_b[N];

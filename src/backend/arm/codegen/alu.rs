@@ -7,6 +7,58 @@ use crate::common::types::IrType;
 use crate::ir::reexports::{IrBinOp, Operand, Value};
 
 impl ArmCodegen {
+    /// True when `op` is a value whose **only** current home is the
+    /// accumulator.
+    ///
+    /// Such a value has no callee-saved register assignment and no stack slot:
+    /// the skip-slot optimisation keeps an immediately-consumed value in x0 and
+    /// never spills it. Any emission that writes x0 therefore destroys it
+    /// irrecoverably — `operand_to_x0` would have nowhere left to reload from.
+    fn operand_lives_only_in_acc(&self, op: &Operand) -> bool {
+        let Operand::Value(v) = op else {
+            return false;
+        };
+        // `acc_has` is keyed by (value, is_alloca); consult both spellings so
+        // an alloca/non-alloca disagreement in the cache cannot hide a value
+        // that really is sitting in x0.
+        self.state.reg_cache.acc_has(v.0, false)
+            || self.state.reg_cache.acc_has(v.0, true)
+    }
+
+    /// Stage several operands into their scratch registers, **accumulator-
+    /// resident operands first**.
+    ///
+    /// Every staging route for a register-less operand goes through x0
+    /// (`operand_to_x0` followed by `mov <scratch>, x0`). If two operands need
+    /// staging and one of them already lives only in x0, staging the other one
+    /// first destroys it: the value has no register assignment and no stack
+    /// slot, so the reload has to give up. That is exactly how
+    /// `sha256_transform`'s checksum lost its `state[3]` term —
+    /// `eor x0, x1, x2, lsl #16` was emitted with `x2` materialised as zero
+    /// (BUG-2026-09-09, AArch64 silent miscompile).
+    ///
+    /// x0 can hold at most one value, so at most one operand is
+    /// accumulator-resident; ordering it first is both necessary and
+    /// sufficient. The sort is stable, so in the common case (nothing is
+    /// accumulator-resident, or the resident operand is already first) the
+    /// emitted code is byte-identical to the previous behaviour.
+    fn stage_operands_acc_first(
+        &mut self,
+        pairs: &[(&Operand, &'static str)],
+        materialize: &mut dyn FnMut(&mut Self, &Operand, &'static str) -> String,
+    ) -> Vec<String> {
+        let mut order: Vec<usize> = (0..pairs.len()).collect();
+        order.sort_by_key(|&i| !self.operand_lives_only_in_acc(pairs[i].0));
+        let mut regs: Vec<Option<String>> = vec![None; pairs.len()];
+        for i in order {
+            let (op, scratch) = pairs[i];
+            regs[i] = Some(materialize(self, op, scratch));
+        }
+        regs.into_iter()
+            .map(|r| r.expect("stage_operands_acc_first stages every operand exactly once"))
+            .collect()
+    }
+
     pub(super) fn emit_shifted_logical_impl(
         &mut self,
         shift_op: IrBinOp,
@@ -23,7 +75,7 @@ impl ArmCodegen {
         let width = if use_32bit { 32 } else { 64 };
         debug_assert!(amount < width);
 
-        let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
+        let mut materialize = |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
             // FP-homed integer values must stage through the scratch GPR:
             // callee_saved_name panics on FP register indices (the session-29
             // ICE class). operand_to_x0 handles the fmov correctly.
@@ -41,8 +93,18 @@ impl ArmCodegen {
                 scratch.to_string()
             }
         };
-        let other_reg = materialize(self, other, if use_32bit { "w1" } else { "x1" });
-        let shifted_reg = materialize(self, shift_lhs, if use_32bit { "w2" } else { "x2" });
+        // BUG-2026-09-09: stage whichever operand currently lives only in x0
+        // FIRST. Materialising `other` first clobbers x0, and when `shift_lhs`
+        // is the skip-slot result of the immediately preceding instruction it
+        // has no register and no slot to reload from.
+        let scratch_other = if use_32bit { "w1" } else { "x1" };
+        let scratch_shifted = if use_32bit { "w2" } else { "x2" };
+        let staged = self.stage_operands_acc_first(
+            &[(other, scratch_other), (shift_lhs, scratch_shifted)],
+            &mut materialize,
+        );
+        let other_reg = staged[0].clone();
+        let shifted_reg = staged[1].clone();
         let output = if let Some(reg) = self.dest_reg(dest) {
             if use_32bit {
                 callee_saved_name_32(reg)
@@ -81,7 +143,8 @@ impl ArmCodegen {
             ty,
             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
         );
-        let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
+        let mut materialize =
+            |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
             if let Some(reg) = this.operand_reg(op) {
                 if use_32bit {
                     callee_saved_name_32(reg).to_string()
@@ -106,9 +169,20 @@ impl ArmCodegen {
                 scratch.to_string()
             }
         };
-        let lhs_reg = materialize(self, lhs, if use_32bit { "w1" } else { "x1" });
-        let rhs_reg = materialize(self, rhs, if use_32bit { "w2" } else { "x2" });
-        let acc_reg = materialize(self, acc, if use_32bit { "w3" } else { "x3" });
+        // Same invariant as `emit_shifted_logical_impl`: an operand that lives
+        // only in the accumulator must be captured before another operand's
+        // staging writes x0 (BUG-2026-09-09 bug class).
+        let staged = self.stage_operands_acc_first(
+            &[
+                (lhs, if use_32bit { "w1" } else { "x1" }),
+                (rhs, if use_32bit { "w2" } else { "x2" }),
+                (acc, if use_32bit { "w3" } else { "x3" }),
+            ],
+            &mut materialize,
+        );
+        let lhs_reg = staged[0].clone();
+        let rhs_reg = staged[1].clone();
+        let acc_reg = staged[2].clone();
         if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
             let output = if use_32bit {
                 callee_saved_name_32(dest_phys)
@@ -145,7 +219,8 @@ impl ArmCodegen {
             ty,
             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
         );
-        let mut materialize = |this: &mut Self, op: &Operand, scratch: &str| -> String {
+        let mut materialize =
+            |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
             // FP-homed integer values stage through the scratch GPR
             // (callee_saved_name panics on FP indices; session-29 class).
             if let Some(reg) = this.operand_reg(op).filter(|r| !is_arm_fp_phys(*r)) {
@@ -170,9 +245,17 @@ impl ArmCodegen {
                 scratch.to_string()
             }
         };
-        let lhs_reg = materialize(self, lhs, if use_32bit { "w1" } else { "x1" });
-        let rhs_reg = materialize(self, rhs, if use_32bit { "w2" } else { "x2" });
-        let acc_reg = materialize(self, acc, if use_32bit { "w3" } else { "x3" });
+        let staged = self.stage_operands_acc_first(
+            &[
+                (lhs, if use_32bit { "w1" } else { "x1" }),
+                (rhs, if use_32bit { "w2" } else { "x2" }),
+                (acc, if use_32bit { "w3" } else { "x3" }),
+            ],
+            &mut materialize,
+        );
+        let lhs_reg = staged[0].clone();
+        let rhs_reg = staged[1].clone();
+        let acc_reg = staged[2].clone();
         if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
             let output = if use_32bit {
                 callee_saved_name_32(dest_phys)

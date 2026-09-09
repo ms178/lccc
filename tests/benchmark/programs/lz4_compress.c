@@ -11,10 +11,14 @@
  */
 #include <stdio.h>
 
+#ifndef SRC_SIZE
 #define SRC_SIZE (1UL << 19)
+#endif
 #define HASH_LOG 14
 #define HASH_SIZE (1U << HASH_LOG)
+#ifndef PASSES
 #define PASSES 24U
+#endif
 
 typedef unsigned char u8;
 typedef unsigned short u16;

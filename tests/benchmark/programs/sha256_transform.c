@@ -10,8 +10,12 @@
  */
 #include <stdio.h>
 
+#ifndef BLOCK_COUNT
 #define BLOCK_COUNT (1U << 17)
+#endif
+#ifndef PASSES
 #define PASSES 8U
+#endif
 
 typedef unsigned int u32;
 typedef unsigned long long u64;

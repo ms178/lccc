@@ -19,9 +19,15 @@
  */
 #include <stdio.h>
 
+#ifndef HAYSTACK_LEN
 #define HAYSTACK_LEN (1UL << 19)
+#endif
+#ifndef QUERY_COUNT
 #define QUERY_COUNT 2048U
+#endif
+#ifndef PASSES
 #define PASSES 8U
+#endif
 
 typedef unsigned char u8;
 typedef unsigned long long u64;

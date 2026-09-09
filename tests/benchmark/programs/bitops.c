@@ -1,7 +1,9 @@
 // Bit manipulation benchmark (popcount, clz, bit twiddling)
 #include <stdio.h>
 
+#ifndef N
 #define N 50000000
+#endif
 
 static int popcount32(unsigned int x) {
     x = x - ((x >> 1) & 0x55555555);

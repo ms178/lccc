@@ -19,8 +19,12 @@
  */
 #include <stdio.h>
 
+#ifndef PASSES
 #define PASSES 200000U
+#endif
+#ifndef LANES
 #define LANES 64
+#endif
 
 static __thread unsigned long tls_slots[LANES + 2];
 

@@ -2,7 +2,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifndef N
 #define N 1000000
+#endif
 
 static int arr[N];
 

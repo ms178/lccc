@@ -1847,6 +1847,17 @@ impl ArchCodegen for I686Codegen {
         self.reg_assignments.contains_key(&vid)
     }
 
+    fn emit_acc_save(&mut self) -> i64 {
+        // 32-bit mode: `pushq`/`popq` are not encodable, so the push width
+        // follows the pointer size (4 bytes).
+        self.state.emit("    pushl %eax");
+        4
+    }
+
+    fn emit_acc_restore(&mut self) {
+        self.state.emit("    popl %eax");
+    }
+
     fn flush_x87_pending(&mut self) {
         self.flush_x87_pending_copy();
     }

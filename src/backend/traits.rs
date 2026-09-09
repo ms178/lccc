@@ -1238,6 +1238,33 @@ pub trait ArchCodegen {
     fn emit_tls_global_addr(&mut self, dest: &Value, name: &str);
 
     /// Emit a get-element-pointer (base + offset).
+    /// Emit the target's accumulator **save** sequence and return the stack
+    /// pointer delta it applied.
+    ///
+    /// Codegen occasionally has to emit an instruction in the middle of a
+    /// pending operation whose value lives *only* in the accumulator — no
+    /// register assignment, no stack slot (the skip-slot optimisation). The
+    /// emission clobbers the accumulator, so the value must be preserved
+    /// across it. See `rematerialize_skipped_indexed` in `generation.rs`.
+    ///
+    /// This is deliberately a per-target hook and NOT a string constant in the
+    /// shared driver: `pushq %rax` is x86-only text, and hard-coding it emitted
+    /// x86 mnemonics into AArch64 and RISC-V assembly, where the assembler
+    /// rejected them (`unsupported instruction: pushq %rax`, BUG-2026-09-09).
+    ///
+    /// The returned delta is added to `state.out.rsp_frame_size` by the caller
+    /// so every sp-relative slot reference emitted while the accumulator is
+    /// spilled stays correct; targets whose slot emitters use a frame pointer
+    /// ignore the field, exactly as the x86 RBP-frame path does.
+    ///
+    /// The sequence must be flags-neutral so a pending fused-Cmp handshake
+    /// cannot be disturbed.
+    fn emit_acc_save(&mut self) -> i64;
+
+    /// Emit the target's accumulator **restore** sequence, undoing
+    /// `emit_acc_save`. The caller reverses the `rsp_frame_size` delta.
+    fn emit_acc_restore(&mut self);
+
     fn emit_gep(&mut self, dest: &Value, base: &Value, offset: &Operand) {
         // Optimized path for constant offsets: avoid loading offset into acc
         // and adding via secondary register. Instead, directly compute

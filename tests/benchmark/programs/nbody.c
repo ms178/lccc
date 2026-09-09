@@ -2,7 +2,9 @@
 #include <stdio.h>
 #include <math.h>
 
+#ifndef NBODIES
 #define NBODIES 5
+#endif
 #define PI 3.141592653589793
 #define SOLAR_MASS (4 * PI * PI)
 #define DAYS_PER_YEAR 365.24

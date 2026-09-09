@@ -3,8 +3,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef TABLE_SIZE
 #define TABLE_SIZE 65536
+#endif
+#ifndef NUM_OPS
 #define NUM_OPS 2000000
+#endif
 
 typedef struct Entry { unsigned int key; int value; struct Entry *next; } Entry;
 

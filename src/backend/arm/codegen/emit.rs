@@ -1037,10 +1037,31 @@ impl ArmCodegen {
         offset <= max_offset && offset % access_size == 0
     }
 
+    /// Bias a frame-slot offset by any outstanding stack-pointer adjustment.
+    ///
+    /// `emit_acc_save` lowers sp by 16 for the duration of an emission that
+    /// would otherwise clobber the accumulator. Every slot is addressed
+    /// sp-relative (or x19-relative, where x19 was captured from the *unshifted*
+    /// sp), so offsets computed inside that window must be biased by the same
+    /// delta. Frames that address through x29 (dynamic alloca) are unaffected
+    /// by a push and must NOT be biased.
+    ///
+    /// The field is zero everywhere else, so this is a no-op outside the
+    /// protected window and existing codegen is unchanged.
+    #[inline]
+    fn slot_offset(&self, offset: i64) -> i64 {
+        if self.state.has_dyn_alloca {
+            offset
+        } else {
+            offset + self.state.out.rsp_frame_size
+        }
+    }
+
     /// Emit store to [base, #offset], handling large offsets.
     /// For large frames with x19 as frame base register, tries x19-relative addressing
     /// before falling back to the expensive movz+movk+add sequence.
     pub(super) fn emit_store_to_sp(&mut self, reg: &str, offset: i64, instr: &str) {
+        let offset = self.slot_offset(offset);
         // When DynAlloca is present, use x29 (frame pointer) as base.
         let base = if self.state.has_dyn_alloca {
             "x29"
@@ -1079,6 +1100,7 @@ impl ArmCodegen {
     /// Emit load from [base, #offset], handling large offsets.
     /// For large frames with x19 as frame base register, tries x19-relative addressing.
     pub(super) fn emit_load_from_sp(&mut self, reg: &str, offset: i64, instr: &str) {
+        let offset = self.slot_offset(offset);
         let base = if self.state.has_dyn_alloca {
             "x29"
         } else {
@@ -1130,6 +1152,7 @@ impl ArmCodegen {
     /// Emit `stp reg1, reg2, [base, #offset]` handling large offsets.
     /// Uses x19 frame base for large frames when possible.
     pub(super) fn emit_stp_to_sp(&mut self, reg1: &str, reg2: &str, offset: i64) {
+        let offset = self.slot_offset(offset);
         let base = if self.state.has_dyn_alloca {
             "x29"
         } else {
@@ -1163,6 +1186,7 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_ldp_from_sp(&mut self, reg1: &str, reg2: &str, offset: i64) {
+        let offset = self.slot_offset(offset);
         let base = if self.state.has_dyn_alloca {
             "x29"
         } else {
@@ -1197,6 +1221,7 @@ impl ArmCodegen {
     /// Emit `add dest, sp, #offset` handling large offsets.
     /// Uses x19 frame base when available, falls back to x17 scratch.
     pub(super) fn emit_add_sp_offset(&mut self, dest: &str, offset: i64) {
+        let offset = self.slot_offset(offset);
         let base = if self.state.has_dyn_alloca {
             "x29"
         } else {
@@ -1512,8 +1537,28 @@ impl ArmCodegen {
                     // Value has no slot or register but is in the accumulator cache
                     // (skip-slot optimization: immediately-consumed values stay in x0).
                 } else {
-                    self.state.emit("    mov x0, #0");
-                    self.state.reg_cache.invalidate_acc();
+                    // There is no location left to reload this value from: it has
+                    // no callee-saved register, no stack slot, and it is not in
+                    // the accumulator.  x0 was clobbered while this value's only
+                    // home was x0.
+                    //
+                    // This used to emit `mov x0, #0`, which turned the loss into
+                    // a *silent miscompile*: `sha256_transform`'s checksum lost its
+                    // `state[3]` term on AArch64 and produced a wrong digest that
+                    // still passed the kernel's own known-answer self-check
+                    // (BUG-2026-09-09).  A wrong binary is worse than a stopped
+                    // compile, so this is now a hard internal error — the driver
+                    // reports it as `ccc: internal error`.
+                    //
+                    // The staging order that used to reach here is fixed in
+                    // `stage_operands_acc_first` (see alu.rs); reaching this point
+                    // means a new path clobbers the accumulator too early.
+                    panic!(
+                        "AArch64: value v{} has no register assignment, no stack slot, and \
+                         is not in the accumulator — its only home was x0 and x0 was \
+                         clobbered (BUG-2026-09-09). Refusing to emit a materialised zero.",
+                        v.0
+                    );
                 }
             }
         }
@@ -1535,6 +1580,27 @@ impl ArmCodegen {
             self.emit_store_to_sp("x0", slot.0, "str");
         }
         self.state.reg_cache.set_acc(dest.0, false);
+    }
+
+    /// `store_x0_to` followed by dropping the accumulator entry — but ONLY
+    /// when the value actually reached a durable home.
+    ///
+    /// When `dest` has neither a register assignment nor a stack slot, x0 is
+    /// its sole home: invalidating the accumulator there orphans the value,
+    /// and the next `operand_to_x0(dest)` has nothing left to reload it from
+    /// (it used to emit `mov x0, #0` and silently miscompile). `fannkuch.c`
+    /// at -Os reached exactly that state through `emit_load_indexed_impl`,
+    /// whose `ldrsw x0, […]` produced a value with no other home.
+    ///
+    /// Use this (not `store_x0_to` + `invalidate_acc`) wherever the caller
+    /// treats x0 as pure scratch after the store.
+    pub(super) fn store_x0_to_and_release(&mut self, dest: &Value) {
+        let homed = self.reg_assignments.contains_key(&dest.0)
+            || self.state.get_slot(dest.0).is_some();
+        self.store_x0_to(dest);
+        if homed {
+            self.state.reg_cache.invalidate_acc();
+        }
     }
 
     // --- 128-bit integer helpers ---
@@ -2503,6 +2569,26 @@ const ARM_TMP_REGS: [&str; 8] = ["x9", "x10", "x11", "x12", "x13", "x14", "x15",
 impl ArchCodegen for ArmCodegen {
     fn is_value_reg_assigned(&self, vid: u32) -> bool {
         self.reg_assignments.contains_key(&vid)
+    }
+
+    fn emit_acc_save(&mut self) -> i64 {
+        // AArch64 has no push. The pre-indexed store is a single instruction
+        // that both lowers sp and stores x0, and it does not touch the flags,
+        // so a pending fused-Cmp handshake survives. 16 bytes keeps sp 16-byte
+        // aligned as AAPCS64 requires.
+        //
+        // NOTE: this moves sp by 16, so the caller bumps `out.rsp_frame_size`
+        // for the duration. Slot references only need to honour that field
+        // when they are sp-based (`emit_load_from_sp` / `emit_store_to_sp` /
+        // `emit_alloca_addr`); frames that address through x29 (dynamic
+        // alloca) or the x19 frame base are unaffected by a push, exactly as
+        // the x86 RBP-frame case is.
+        self.state.emit("    str x0, [sp, #-16]!");
+        16
+    }
+
+    fn emit_acc_restore(&mut self) {
+        self.state.emit("    ldr x0, [sp], #16");
     }
 
     fn fp_contract(&self) -> crate::common::fp_contract::FpContract {

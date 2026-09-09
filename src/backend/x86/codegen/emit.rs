@@ -5401,6 +5401,17 @@ impl ArchCodegen for X86Codegen {
         self.reg_assignments.contains_key(&vid)
     }
 
+    fn emit_acc_save(&mut self) -> i64 {
+        // push/pop are the cheapest flags-neutral accumulator save on x86 and
+        // are a single instruction each way. 8 bytes in 64-bit mode.
+        self.state.emit("    pushq %rax");
+        8
+    }
+
+    fn emit_acc_restore(&mut self) {
+        self.state.emit("    popq %rax");
+    }
+
     /// x86 override: stage `dest`/`src` into `%rdi`/`%rsi` as a parallel
     /// copy (the generic default routes both through `%rcx` sequentially and
     /// swaps them when the homes cross — regression `memcpy_param_home_swap`).
