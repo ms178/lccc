@@ -516,3 +516,47 @@ now matches gcc as well.
 `struct_copy` -O1/-Os mismatches the reference but also fails with
 `LCCC_NO_PEEPHOLE=1`, so it is a pre-existing codegen defect outside the
 peephole — not a regression from this work, and still open.
+
+### 9.9 Cross-pollination: x86's copy coalescer ported to ARM (the real win)
+x86 had whole-function register-copy coalescing
+(`x86/codegen/peephole/passes/copy_coalesce.rs`); **ARM and RISC-V had
+nothing** — ARM functions paid for an entry shuffle the x86 backend deletes.
+Measurement first (`/tmp/count_shuffle.py`): **567** entry-run `mov xD, xS`
+copies across the corpus, 75 of them with a source that appears nowhere else.
+
+Ported as `coalesce_entry_copies` in the ARM peephole, with AArch64 legality
+rules (x86's are x86-specific):
+
+1. The copy sits in the straight-line entry run (no label/branch/call/ret before
+   it), so earlier lines run once and cannot be re-entered by a back edge.
+2. `src` is mentioned nowhere else in the function — no later clobber, no other
+   live range disturbed. A parameter's arrival in `src` is implicit, not a
+   mention.
+3. After the copy, `dst` has no unrenamable reader/writer: no implicit operand
+   (`classify_implicit_operands_a64`), no `ret` when `dst < 8` (x0-x7 carry the
+   return value), and no call while the value lives in a caller-saved register
+   **and is still used afterwards** (refined from a blanket "no call": a call
+   with no mention of `dst` after it is harmless).
+4. No `Other` (unmodelled mnemonic). `MemOther` is allowed: it names every
+   register it touches, pre/post-indexed writeback included.
+
+| build | -Os | -O2 |
+|---|---|---|
+| buggy baseline (miscompiles) | 10677 | 11248 |
+| conservative label bail (NAK'd) | 10703 | 11279 |
+| + exact CFG rule + dead-copy deletion | 10690 | 11265 |
+| **+ ARM copy coalescing (shipped)** | **10675** | **11253** |
+
+lccc-arm is now **28 (-Os) / 26 (-O2) instructions smaller than the NAK'd
+conservative build** — 54 total — and within +2/+5 of the miscompiling
+baseline, i.e. the entire "regression" is now paid for by a *new* optimisation
+rather than by giving one up. Spot-checked against aarch64 gcc at -O2/-Os:
+glibc_memcmp, zlib_ng_adler32, zstd_count, fannkuch, sieve, gzip_crc32,
+expat_xml_scan all match.
+
+### 9.10 zstd added to the golden workloads
+`zstd_count.c` is now a golden workload in
+`.github/scripts/ci-codegen-gate.py` with a baseline entry
+(`insns 131, moves 34, pushes 7, stackmem 0`). It earned its place: it is the
+workload that caught the loop-carried copy bug (§9.8 hole 4), and the x86 boot
+path decompresses with zstd, so it ties the golden set to the kernel work.
