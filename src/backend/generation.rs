@@ -4894,27 +4894,23 @@ fn remat_indexed_acc_safe(
         }
         Operand::Const(_) => false,
     };
-    // The acc register name and push/pop width are per-pointer-size: the
-    // protection helper is shared by the x86-64 and i686 codegen drivers
-    // (generation.rs is arch-agnostic), and `pushq %rax` is not encodable
-    // in 32-bit mode. The push shifts %rsp for the duration of the remat,
-    // so on RSP-relative frames the slot-reference bookkeeping must shift
-    // with it (slot_ref emits `(rsp_frame_size + off)(%rsp)`); on RBP
-    // frames the field is unused and the bump is a no-op.
-    let (slot, push_acc, pop_acc) = if crate::common::types::target_ptr_size() == 8 {
-        (8i64, "    pushq %rax", "    popq %rax")
-    } else {
-        (4i64, "    pushl %eax", "    popl %eax")
-    };
+    // The save/restore idiom is per-target, not per-pointer-size: this helper
+    // is arch-agnostic, and hard-coding `pushq %rax` here emitted x86 text
+    // into AArch64 and RISC-V assembly, where the assembler rejected it with
+    // "unsupported instruction: pushq %rax" (BUG-2026-09-09). Each backend
+    // supplies its own flags-neutral sequence and the stack-pointer delta it
+    // applies; sp-relative slot references emitted inside the window honour
+    // `out.rsp_frame_size`, and frame-pointer-based ones ignore it.
+    let mut slot = 0i64;
     if protected {
-        cg.state().emit(push_acc);
+        slot = cg.emit_acc_save();
         cg.state().out.rsp_frame_size += slot;
     }
     remat(cg);
     if protected {
         cg.state().out.rsp_frame_size -= slot;
         if let Operand::Value(v) = val {
-            cg.state().emit(pop_acc);
+            cg.emit_acc_restore();
             let is_alloca = cg.state_ref().is_alloca(v.0);
             cg.state().reg_cache.set_acc(v.0, is_alloca);
         }

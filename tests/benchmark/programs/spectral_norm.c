@@ -2,7 +2,9 @@
 #include <stdio.h>
 #include <math.h>
 
+#ifndef N
 #define N 2000
+#endif
 
 static double A(int i, int j) {
     return 1.0 / ((i + j) * (i + j + 1) / 2 + i + 1);

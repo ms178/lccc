@@ -2,7 +2,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef N
 #define N 2000000
+#endif
 
 typedef struct {
     double x, y, z;

@@ -6472,8 +6472,20 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 if (128..=65535).contains(&imm_text) {
                     let i1 = next_non_nop(infos, i + 1);
                     if i1 < fend && is_order_cond_jcc(trimmed(store, &infos[i1], i1)) {
-                        if let Some(def_idx) = canonical_16_def(store, infos, i, r, fstart) {
-                            let r16 = low_subreg_name(reg32_name(r), 2).unwrap_or("%ax");
+                        if let Some(_def_idx) = canonical_16_def(store, infos, i, r, fstart) {
+                            // Refuse the rewrite when the register has no
+                            // 16-bit form (%esp).  Falling back to %ax here
+                            // silently compared an UNRELATED register: it
+                            // turned expat's `c < 0x80` name-scan test into a
+                            // test of the pointer's low bits, so every
+                            // character took the UTF-8 path and the scanner
+                            // returned 0 (BUG-2026-09-09). A missed
+                            // size optimization costs two bytes; a wrong
+                            // register costs correctness.
+                            let Some(r16) = low_subreg_name(reg32_name(r), 2) else {
+                                i += 1;
+                                continue;
+                            };
                             let new_cmp = format!("    cmpw ${}, {}", imm_text, r16);
                             store.replace(i, new_cmp);
                             infos[i] = classify_line(store.get(i));
@@ -7067,14 +7079,25 @@ fn parse_widened_slot_load<'a>(s: &'a str, disp: i32) -> Option<(&'a str, i32, &
 /// encodable set only (al/cl/dl/bl and ax/cx/dx/bx; sil/dil/bpl need REX).
 fn low_subreg_name(reg32: &str, width: i32) -> Option<&'static str> {
     match (reg32, width) {
+        // 8-bit: only the four low-byte-accessible registers exist without a
+        // REX prefix in 32-bit mode. %spl/%bpl/%sil/%dil are 64-bit-only, so
+        // a caller asking for them must refuse its rewrite rather than emit
+        // text the assembler would reject.
         ("%eax", 1) => Some("%al"),
         ("%ecx", 1) => Some("%cl"),
         ("%edx", 1) => Some("%dl"),
         ("%ebx", 1) => Some("%bl"),
+        // 16-bit: every GPR except the stack pointer has a word form in
+        // 32-bit mode (%ax/%cx/%dx/%bx/%bp/%si/%di). %esp is deliberately
+        // absent — narrowing a compare or a load onto the stack pointer is
+        // never a rewrite any caller here should make.
         ("%eax", 2) => Some("%ax"),
         ("%ecx", 2) => Some("%cx"),
         ("%edx", 2) => Some("%dx"),
         ("%ebx", 2) => Some("%bx"),
+        ("%ebp", 2) => Some("%bp"),
+        ("%esi", 2) => Some("%si"),
+        ("%edi", 2) => Some("%di"),
         _ => None,
     }
 }

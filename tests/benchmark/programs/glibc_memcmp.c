@@ -18,8 +18,12 @@
  */
 #include <stdio.h>
 
+#ifndef WORD_COUNT
 #define WORD_COUNT (1UL << 13)
+#endif
+#ifndef PASSES
 #define PASSES 4096U
+#endif
 
 static unsigned long glibc_left[WORD_COUNT];
 static unsigned long glibc_right[WORD_COUNT];

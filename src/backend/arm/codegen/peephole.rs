@@ -721,6 +721,326 @@ fn is_function_boundary(line: &str) -> bool {
     line.ends_with(':') && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
 }
 
+/// Minimal control-flow graph over one function's linear instruction list.
+///
+/// `propagate_address_aliases` deletes `mov xD, xS` only when no path can read
+/// `xD` before the instruction that overwrites it.  Textually that is
+/// undecidable — a redefinition in another block may or may not dominate the
+/// readers — which is why the earlier rule "never cross a label" was both
+/// wrong to remove and costly to keep: it discarded every legal fold that
+/// spans a block, ~0.3% of instructions corpus-wide.
+///
+/// This CFG answers the question exactly, so the fold fires in every case where
+/// it is legal (notably loop-carried redefinitions, where the redefinition sits
+/// in the loop body and dominates all readers) and is rejected everywhere it is
+/// not (a reader on a path that never ran the redefinition).
+struct Cfg {
+    block_of: Vec<usize>,
+    succs: Vec<Vec<usize>>,
+    /// Dominator bitsets: `dom[b]` has bit `d` set iff `d` dominates `b`.
+    dom: Vec<Vec<u64>>,
+    words: usize,
+}
+
+impl Cfg {
+    /// Build the CFG and its dominator sets.  `None` when the function contains
+    /// control flow that cannot be resolved statically (an indirect `br xN`, or
+    /// a branch whose label is not in this function): callers must then fall
+    /// back to the conservative answer.
+    fn build(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Cfg> {
+        if n == 0 {
+            return None;
+        }
+        let mut block_of = vec![0usize; n];
+        let mut starts = vec![0usize];
+        for i in 0..n {
+            // A block also ends after any control transfer, not just before a
+            // label: earlier peephole passes can leave a branch in the middle
+            // of a label-delimited run, and an edge that is not in `succs` is
+            // an edge the query cannot see — it would answer "no read" for
+            // blocks that are in fact reachable, and delete a live copy.
+            let after_transfer = i != 0
+                && matches!(
+                    kinds[i - 1],
+                    LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret
+                );
+            if i != 0 && (kinds[i] == LineKind::Label || after_transfer) {
+                starts.push(i);
+            }
+            block_of[i] = starts.len() - 1;
+        }
+        let nb = starts.len();
+        let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
+        for i in 0..n {
+            if kinds[i] == LineKind::Label {
+                label_block.insert(lines[i].trim().trim_end_matches(':'), block_of[i]);
+            }
+        }
+        let end = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { n } };
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for b in 0..nb {
+            let e = end(b);
+            let mut t = e;
+            while t > starts[b] && kinds[t - 1] == LineKind::Nop {
+                t -= 1;
+            }
+            if t == starts[b] {
+                if b + 1 < nb {
+                    succs[b].push(b + 1);
+                }
+                continue;
+            }
+            let last = t - 1;
+            // A label inside the block body cannot happen (labels start
+            // blocks), so `last` is the block's only control transfer.
+            let target_of = |text: &str| -> Option<usize> {
+                let name = text.split_whitespace().next_back()?;
+                label_block.get(name).copied()
+            };
+            match kinds[last] {
+                LineKind::Ret => {}
+                LineKind::Branch => {
+                    let text = lines[last].trim();
+                    if text.starts_with("br ") {
+                        return None; // indirect branch: unknown target
+                    }
+                    match target_of(text) {
+                        Some(tb) => succs[b].push(tb),
+                        None => return None,
+                    }
+                }
+                LineKind::CondBranch | LineKind::CmpBranch => {
+                    match target_of(lines[last].trim()) {
+                        Some(tb) => succs[b].push(tb),
+                        None => return None,
+                    }
+                    if b + 1 < nb {
+                        succs[b].push(b + 1);
+                    }
+                }
+                _ => {
+                    if b + 1 < nb {
+                        succs[b].push(b + 1);
+                    }
+                }
+            }
+        }
+        // Reachability from the entry block.
+        let mut reachable = vec![false; nb];
+        reachable[0] = true;
+        let mut stack = vec![0usize];
+        while let Some(b) = stack.pop() {
+            for &s in &succs[b] {
+                if !reachable[s] {
+                    reachable[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        // Iterative dominators over reachable blocks (bitsets).
+        let words = (nb + 63) / 64;
+        let mut dom: Vec<Vec<u64>> = vec![vec![!0u64; words]; nb];
+        dom[0].iter_mut().for_each(|w| *w = 0);
+        if words > 0 {
+            dom[0][0] = 1; // block 0 dominates itself
+        }
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for b in 0..nb {
+            if !reachable[b] {
+                continue;
+            }
+            for &s in &succs[b] {
+                if reachable[s] {
+                    preds[s].push(b);
+                }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 0..nb {
+                if b == 0 || !reachable[b] {
+                    continue;
+                }
+                let mut newd = vec![!0u64; words];
+                let mut first = true;
+                for &p in &preds[b] {
+                    if first {
+                        newd.copy_from_slice(&dom[p]);
+                        first = false;
+                    } else {
+                        for w in 0..words {
+                            newd[w] &= dom[p][w];
+                        }
+                    }
+                }
+                newd[b / 64] |= 1u64 << (b % 64);
+                if newd != dom[b] {
+                    dom[b] = newd;
+                    changed = true;
+                }
+            }
+        }
+        Some(Cfg {
+            block_of,
+            succs,
+            dom,
+            words,
+        })
+    }
+
+    /// `true` when `def` dominates `blk` (unreachable blocks dominate nothing).
+    fn dominates(&self, def: usize, blk: usize) -> bool {
+        if def >= self.succs.len() || blk >= self.succs.len() || self.words == 0 {
+            return false;
+        }
+        self.dom[blk][def / 64] & (1u64 << (def % 64)) != 0
+    }
+
+    /// True when the instruction at `redef` — a pure overwrite of `reg` — runs
+    /// before every read of `reg` that the `mov` at `mov_idx` could have fed.
+    /// Reads listed in `rewritten` are renamed onto the alias source, so they
+    /// need no dominance; reads in blocks the mov cannot reach cannot observe
+    /// its value at all.
+    /// True when every read of `reg` that can execute after the `mov` at
+    /// `mov_idx` *without passing the redefinition at `redef`* is listed in
+    /// `rewritten` (and is therefore renamed onto the alias source).
+    ///
+    /// Reads that are only reachable by going through the redefinition see the
+    /// redefined value, not the mov's, so they are irrelevant.  That is what
+    /// makes this exact instead of conservative: a loop-carried redefinition
+    /// lets the fold fire even though the loop body also contains earlier
+    /// reads, while `glibc_memcmp`'s .LBB37 — reachable without running the
+    /// redefinition — still rejects it.
+    fn redef_covers_all_reads(
+        &self,
+        lines: &[String],
+        kinds: &[LineKind],
+        reg: u8,
+        mov_idx: usize,
+        redef: usize,
+        rewritten: &[usize],
+    ) -> bool {
+        let nb = self.succs.len();
+        let start_block = self.block_of[mov_idx];
+        let def_block = self.block_of[redef];
+        // Blocks executable after the mov without running the redefinition.
+        // Traversal stops at the redefinition's block: any path leaving it has
+        // executed `redef` first, so everything beyond is fed by the new value.
+        let mut seen = vec![false; nb];
+        seen[start_block] = true;
+        let mut stack = vec![start_block];
+        while let Some(b) = stack.pop() {
+            // The redefinition's own block IS entered by paths fed by the mov:
+            // execution can run the lines *before* the redefinition, which read
+            // the mov's value.  (`mov x19, x20` before a loop whose body ends
+            // in `mov x19, x5` — the first iteration reads x20 through x19.
+            // Skipping this block deleted that copy and broke
+            // zlib_ng_adler32.)  It is walked, but not propagated out of: every
+            // path leaving it has executed the redefinition.
+            if b == def_block {
+                continue;
+            }
+            for &s in &self.succs[b] {
+                if seen[s] {
+                    continue;
+                }
+                seen[s] = true;
+                stack.push(s);
+            }
+        }
+        // Is the mov's block part of a cycle?  Then it is re-entered at its
+        // top and its lines before the mov can be fed by it.
+        let mut in_loop = false;
+        {
+            let mut vis = vec![false; nb];
+            let mut work: Vec<usize> = Vec::new();
+            for &s in &self.succs[start_block] {
+                if s == start_block {
+                    in_loop = true;
+                }
+                if !vis[s] {
+                    vis[s] = true;
+                    work.push(s);
+                }
+            }
+            while !in_loop {
+                let Some(b) = work.pop() else { break };
+                for &s in &self.succs[b] {
+                    if s == start_block {
+                        in_loop = true;
+                        break;
+                    }
+                    if !vis[s] {
+                        vis[s] = true;
+                        work.push(s);
+                    }
+                }
+            }
+        }
+        for k in 0..lines.len() {
+            if !reads_gp_register(&lines[k], kinds[k], reg) {
+                continue;
+            }
+            let b = self.block_of[k];
+            // In a loop the back edge re-enters the block at its TOP, so the
+            // lines before the mov are fed by it on the next iteration —
+            // `mov x19, x5` inside a loop body reads as dead to a linear scan
+            // while the loop back edge feeds `add x5, x19, #1` at the top from
+            // it.  Without this, that copy was deleted and zlib_ng_adler32
+            // produced no output at all.
+            let feeds_mov = if b == def_block {
+                k < redef && (b != start_block || in_loop || k > mov_idx)
+            } else if b == start_block {
+                in_loop || k > mov_idx
+            } else {
+                seen[b]
+            };
+            if !feeds_mov {
+                continue;
+            }
+            if rewritten.binary_search(&k).is_ok() {
+                continue; // renamed onto the alias source
+            }
+            return false;
+        }
+        true
+    }
+}
+
+/// Does `line` read `reg`?  A single-mention overwrite of `reg` is a write,
+/// not a read; everything else that mentions the register reads it.
+fn reads_gp_register(line: &str, kind: LineKind, reg: u8) -> bool {
+    fn mentions(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    fn mention_count(line: &str, reg: u8) -> usize {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
+            .count()
+    }
+    if !mentions(line, reg) {
+        return false;
+    }
+    let trusted = matches!(
+        kind,
+        LineKind::Move { .. }
+            | LineKind::MoveImm { .. }
+            | LineKind::MoveWide { .. }
+            | LineKind::Sxtw { .. }
+            | LineKind::LoadSp { .. }
+            | LineKind::LoadswSp { .. }
+            | LineKind::Alu
+            | LineKind::Compare
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch
+            | LineKind::StoreSp { .. }
+    );
+    !(trusted && written_gp_register(line, kind) == Some(reg) && mention_count(line, reg) == 1)
+}
+
 fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     fn mentions(line: &str, reg: u8) -> bool {
         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -731,6 +1051,18 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
             .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
             .count()
     }
+    // Labels that some branch in this function actually targets.  A label no
+    // branch targets is not a control-flow entry point: the only way to reach
+    // the code after it is to fall in from the instruction above, so crossing
+    // such a label does NOT leave the mov's linear region and does not break
+    // the "every path out of the mov runs the redefinition" argument.  Treating
+    // every label as a boundary (the previous, conservative rule) threw away
+    // every alias fold that spans an unreferenced label, which cost ~0.3% of
+    // instructions across the benchmark corpus.
+    // Lazily built CFG: only candidates that the cheap textual rule rejects
+    // pay for it, so the common single-block fold stays as fast as before.
+    let mut cfg: Option<Cfg> = None;
+    let mut cfg_resolvable = true;
     let mut changed = false;
     for i in 0..n {
         let LineKind::Move {
@@ -747,7 +1079,11 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
         let mut uses = Vec::new();
         let mut valid = true;
         let mut provably_dead = false;
+        let mut dead_by_redef = false;
         let mut src_alive = true;
+        // Has the scan left the basic block that holds `mov dst, src`?  Only a
+        // redefinition in that SAME block dominates every path leaving the mov,
+        // so only there does an overwrite prove the mov's value dead.
         let mut j = i + 1;
         while j < n {
             if is_function_boundary(&lines[j]) {
@@ -763,7 +1099,22 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                 // that return path, and textually later blocks (other paths)
                 // may still use it, so it falls through to the plain-mention
                 // handling and blocks the transform.
-                LineKind::Nop | LineKind::Directive | LineKind::Label | LineKind::Ret => {}
+                LineKind::Nop | LineKind::Directive => {}
+                // A `ret` ends this path, and dst can be LIVE-OUT there: x0-x7 carry
+                // the return value.  A redefinition found after a ret therefore does
+                // not prove the mov's value dead — the path that returned it handed
+                // the value to the caller.  `glibc_memcmp` died exactly this way:
+                // `mov x0, x5` (return staging) was deleted because a later block
+                // redefined x0, and the function returned garbage (exit 2).
+                // x8+ cannot be live-out: x8-x17 are caller-saved and x19-x28 are
+                // restored by the epilogue before the ret, which is a redefinition.
+                LineKind::Ret => {
+                    if dst < 8 {
+                        valid = false;
+                        break;
+                    }
+                }
+                LineKind::Label => {}
                 // Calls clobber src (x0) and all caller-saved registers. Rather
                 // than reason about save/restore pairs, stop without committing.
                 LineKind::Call => {
@@ -794,11 +1145,50 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                     }
                     if mentions(&lines[j], dst) {
                         if trusted && written == Some(dst) && mention_count(&lines[j], dst) == 1 {
+                            // The redefinition is outside the mov's block,
+                            // or a conditional transfer can divert around
+                            // it, so the textual argument no longer holds.
+                            // Ask the CFG the exact question instead of
+                            // giving up: fire only when the redefinition
+                            // dominates every read of dst the mov could
+                            // have fed.  `glibc_memcmp` at -Os is rejected
+                            // here — .LBB37 reads x19 on a path that never
+                            // ran the redefinition — while a loop-carried
+                            // redefinition, which dominates all of its
+                            // readers, is accepted and the fold fires.
+                            let dominated = if !cfg_resolvable {
+                                false
+                            } else {
+                                if cfg.is_none() {
+                                    let built = Cfg::build(&lines[..], &kinds[..], n);
+                                    cfg_resolvable = built.is_some();
+                                    cfg = built;
+                                }
+                                match &cfg {
+                                    Some(c) => c.redef_covers_all_reads(
+                                        &lines[..],
+                                        &kinds[..],
+                                        dst,
+                                        i,
+                                        j,
+                                        &uses,
+                                    ),
+                                    None => false,
+                                }
+                            };
+                            if !dominated {
+                                valid = false;
+                                break;
+                            }
                             // dst overwritten without being read: the mov's
                             // value is dead past this instruction (register
                             // assignments are per-value with disjoint live
-                            // intervals, so no later text can use the old value).
+                            // intervals, so no later text can use the old
+                            // value).  Reached here the redefinition is in the
+                            // mov's own block, or the CFG proved it dominates
+                            // every read of dst.
                             provably_dead = true;
+                            dead_by_redef = true;
                             break;
                         }
                         // A pre/post-indexed writeback WRITES the base:
@@ -832,7 +1222,12 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
         if j == n {
             provably_dead = true; // scanned to the end of the file
         }
-        if valid && provably_dead && !uses.is_empty() {
+        // A copy killed by a redefinition is deleted whether or not it had
+        // address uses to rewrite: it feeds nothing.  Gating this on
+        // `!uses.is_empty()` left every dead copy without rewritable uses in
+        // the output.  Copies that merely survive to the end of the function
+        // still need their uses rewritten, since dst may be live-out there.
+        if valid && provably_dead && (!uses.is_empty() || dead_by_redef) {
             for use_idx in uses {
                 lines[use_idx] =
                     replace_whole_word(&lines[use_idx], xreg_name(dst), xreg_name(src));

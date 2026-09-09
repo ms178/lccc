@@ -1,7 +1,9 @@
 // Switch/dispatch benchmark (branch prediction, jump tables)
 #include <stdio.h>
 
+#ifndef N
 #define N 50000000
+#endif
 
 static int dispatch(int op, int a, int b) {
     switch (op) {

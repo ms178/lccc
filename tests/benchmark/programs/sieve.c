@@ -2,7 +2,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef N
 #define N 10000000
+#endif
 
 static char sieve[N+1];
 

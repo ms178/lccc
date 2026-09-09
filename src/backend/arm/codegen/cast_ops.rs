@@ -279,8 +279,7 @@ impl ArmCodegen {
             && matches!(src, Operand::Value(v) if self.bitop_nonneg_values.contains(&v.0))
         {
             self.emit_load_operand(src);
-            self.store_x0_to(dest);
-            self.state.reg_cache.invalidate_acc();
+            self.store_x0_to_and_release(dest);
             return;
         }
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);

@@ -49,8 +49,12 @@ double copysign (double x, double y)
  * fused result bit-for-bit. */
 double fma (double x, double y, double z) { return x * y + z; }
 
+#ifndef N
 #define N 4096
+#endif
+#ifndef PASSES
 #define PASSES 20000U
+#endif
 
 static double buf[N];
 static double out[N];
