@@ -110,6 +110,39 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
 
     let mut count = 0;
 
+    // ARX-vectorized loops (passes::vec_arx) keep their ROLLED vector body
+    // deliberately: one lane-parallel 128-bit body per iteration is the
+    // ICX-beating shape for block-cipher rounds (instruction count AND
+    // I-cache). Scalar unroll economics do not apply — the body already
+    // saturates the machine's lane parallelism — and unrolling a trip-10
+    // ARX loop would multiply .text tenfold for zero ILP gain. The marker
+    // intrinsics (VecRolI32x4/VecShufdI32x4) are only ever produced by
+    // that pass, so this filter cannot fire on any other loop.
+    let arx_marker_labels: FxHashSet<u32> = {
+        let mut hit: FxHashSet<u32> = FxHashSet::default();
+        for block in &func.blocks {
+            let has_marker = block.instructions.iter().any(|inst| {
+                matches!(inst, crate::ir::reexports::Instruction::Intrinsic { op, .. }
+                    if matches!(op,
+                        crate::ir::reexports::IntrinsicOp::VecRolI32x4
+                        | crate::ir::reexports::IntrinsicOp::VecShufdI32x4))
+            });
+            if has_marker {
+                hit.insert(block.label.0);
+            }
+        }
+        hit
+    };
+    // (Free function so the candidate filters below can call it while
+    // `func` is otherwise mutably borrowed by the unroll attempts.)
+    let loop_is_arx = |lp: &loop_analysis::NaturalLoop, f: &IrFunction| {
+        !arx_marker_labels.is_empty()
+            && lp
+                .body
+                .iter()
+                .any(|&b| arx_marker_labels.contains(&f.blocks[b].label.0))
+    };
+
     // Pass A: complete-unroll constant-trip loops. Two shapes:
     //   1. the 2–3 block linear form (flattened into one straight-line
     //      block per iteration), and
@@ -129,7 +162,7 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
         let mut did = false;
         let mut tiny: Vec<_> = loops_now
             .iter()
-            .filter(|lp| matches!(lp.body.len(), 2 | 3))
+            .filter(|lp| matches!(lp.body.len(), 2 | 3) && !loop_is_arx(lp, func))
             .cloned()
             .collect();
         tiny.sort_by_key(|lp| lp.header);
@@ -156,7 +189,7 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
             // budget, shape) just fall through to the next candidate.
             let mut general: Vec<_> = loops_now
                 .iter()
-                .filter(|lp| lp.body.len() > 3 && lp.body.len() <= 33)
+                .filter(|lp| lp.body.len() > 3 && lp.body.len() <= 33 && !loop_is_arx(lp, func))
                 .cloned()
                 .collect();
             general.sort_by_key(|lp: &loop_analysis::NaturalLoop| {
@@ -184,6 +217,7 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
     // Collect and sort candidates by body size (smallest first = innermost first).
     let mut candidates: Vec<UnrollCandidate> = loops
         .iter()
+        .filter(|lp| !loop_is_arx(lp, func))
         .filter_map(|lp| analyze_loop(func, lp, &cfg, &all_headers))
         .collect();
     candidates.sort_by_key(|c| c.body_work.len());

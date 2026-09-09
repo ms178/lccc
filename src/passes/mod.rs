@@ -14,6 +14,7 @@
 pub(crate) mod aggregate_copy_forward;
 pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
+pub(crate) mod arx_vectorize;
 pub(crate) mod backedge_pre;
 pub(crate) mod bit_idioms;
 pub(crate) mod block_layout;
@@ -63,6 +64,7 @@ pub(crate) mod store_load_forward;
 pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
 pub(crate) mod use_def;
+pub(crate) mod vec_arx;
 pub(crate) mod vec_interleave;
 pub(crate) mod vec_load_sink;
 pub(crate) mod vector_temp_promotion;
@@ -1379,6 +1381,60 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
+        // Phase 2b-arx: lane-parallel ARX vectorization (ChaCha20/Salsa
+        // quarter-round packing) — x86-64, -O2+, iter 0, BEFORE any
+        // unrolling so the round loop is still rolled when the transform
+        // fires (the rolled vector body is the ICX-beating shape: one
+        // ~46-instruction body executed `trip` times). The unrollers
+        // refuse loops containing the ARX marker intrinsics, keeping the
+        // shape intact through every later unroll phase.
+        // Pass name for CCC_DISABLE_PASSES: "vec_arx".
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && matches!(target, crate::backend::Target::X86_64)
+            && !pass_disabled(&disabled, "vec_arx")
+        {
+            let n = timed_pass!(
+                "vec_arx",
+                run_on_visited(module, &dirty, &mut changed, vec_arx::vec_arx_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2b-pre: pre-unroll CONST-TRIP map vectorization. The complete
+        // unroller below runs BEFORE the Phase 2b-vec vectorizer and steals
+        // every constant-trip elementwise loop (limit <= 16), leaving 16
+        // scalar copies where ONE packed op per iteration is strictly better
+        // (4x lanes, 1/4 the memory ops). This focused entry takes exactly
+        // the map-shaped const-trip 5..=16 loops FIRST (the map transform
+        // itself declines trips <= the vector width); the unroller then
+        // either unrolls the remaining vector iterations (trip <= 4 — the
+        // ideal no-branch shape) or leaves them rolled.
+        // Pass name for CCC_DISABLE_PASSES: "vectorize".
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && !dis.unroll
+            && matches!(target, crate::backend::Target::X86_64)
+            && !pass_disabled(&disabled, "vectorize")
+        {
+            let n = timed_pass!(
+                "vectorize_const_trip_maps",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    |f: &mut crate::ir::reexports::IrFunction| {
+                        vectorize::vectorize_const_trip_map_loops(f, fp_contract)
+                    }
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phase 2b: Loop unrolling — iter 0 only, before GVN/LICM so that
         // subsequent passes can optimize the unrolled copies.
         // Pass name for CCC_DISABLE_PASSES: "unroll"
@@ -1483,6 +1539,31 @@ pub(crate) fn run_passes(
                     run_on_visited(module, &dirty, &mut changed, |f| {
                         vec_interleave::run(f, fp_reassoc)
                     })
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
+            // ARX lane vectorization, phi-spelling form (PR #455 port with
+            // the integration audit's three CFG fixes): ChaCha20-style
+            // 16-word Add-Rotate-Xor permutation loops whose state lives
+            // in 16 SCALAR u32 phi-carried locals — the spelling the
+            // memory-form `vec_arx` pass (Phase 2b-arx, before promotion)
+            // deliberately declines.  The matcher PROVES the loop is
+            // exactly the generic double round (symbolic term comparison)
+            // before replacing it with the 4-lane SIMD form.  Runs after
+            // the map vectorizer: ARX loops have no memory traffic in the
+            // body, so the two passes are disjoint.
+            // Pass name for CCC_DISABLE_PASSES: "arx_vectorize"
+            if iter == 0
+                && opt_level >= 2
+                && !optimize_for_size
+                && matches!(target, crate::backend::Target::X86_64)
+                && !pass_disabled(&disabled, "arx_vectorize")
+            {
+                let n = timed_pass!(
+                    "arx_vectorize",
+                    run_on_visited(module, &dirty, &mut changed, arx_vectorize::run)
                 );
                 total_changes += n;
                 total_changes_excl_dce += n;
