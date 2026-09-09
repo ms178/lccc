@@ -32,8 +32,22 @@ pub(crate) fn reg_num(name: &str) -> Option<u8> {
         "r13b" | "r13w" | "r13d" | "r13" | "xmm13" | "ymm13" | "zmm13" => Some(5),
         "r14b" | "r14w" | "r14d" | "r14" | "xmm14" | "ymm14" | "zmm14" => Some(6),
         "r15b" | "r15w" | "r15d" | "r15" | "xmm15" | "ymm15" | "zmm15" => Some(7),
-        _ => None,
+        _ => vec_reg_id(name).map(|n| n & 7),
     }
+}
+
+/// Full 5-bit vector register number (xmm/ymm/zmm 0–31).
+pub(crate) fn vec_reg_id(name: &str) -> Option<u8> {
+    for prefix in ["zmm", "ymm", "xmm"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if let Ok(n) = rest.parse::<u8>() {
+                if n < 32 {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Is this an MMX register?
@@ -153,14 +167,24 @@ pub(crate) fn is_kreg(name: &str) -> bool {
         && name.as_bytes().get(1).is_some_and(|c| c.is_ascii_digit())
 }
 
-/// Does a ZMM register need the EVEX R' extension bit (zmm16-31)?
+/// Does a vector register need EVEX R'/V'/X extra bits (xmm/ymm/zmm 16–31)?
 pub(crate) fn needs_evex_rprime(name: &str) -> bool {
-    if let Some(num) = name.strip_prefix("zmm") {
-        if let Ok(n) = num.parse::<u8>() {
-            return n >= 16;
+    vec_reg_id(name).is_some_and(|n| n >= 16)
+}
+
+/// Operand requires EVEX (cannot be encoded with VEX/legacy).
+pub(crate) fn operand_needs_evex(op: &Operand) -> bool {
+    match op {
+        Operand::Register(r) => {
+            is_zmm(&r.name)
+                || is_kreg(&r.name)
+                || needs_evex_rprime(&r.name)
+                || r.mask.is_some()
+                || r.zeroing
         }
+        Operand::Memory(m) => m.mask.is_some() || m.zeroing,
+        _ => false,
     }
-    false
 }
 
 /// Does this register need the VEX.B extension bit? Same as REX ext but for VEX-encoded instructions.

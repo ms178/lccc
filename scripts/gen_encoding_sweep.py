@@ -36,6 +36,15 @@ The families, and why each admits a choice:
   inc_dec         inc/dec via 0xFE/0xFF vs the (invalid in 64-bit) 0x40+r.
   xchg_acc        xchg with the accumulator has the one-byte 0x90+r form.
   lea_strength    LEA forms that a smarter assembler can shorten.
+  vex_commutative Integer/bitwise AVX ops on the 0F map may swap sources to
+                  collapse VEX3 to VEX2 when the r/m source is xmm8–15 and
+                  vvvv is xmm0–7. 0F38/0F3A maps cannot VEX2 (mm≠1).
+  avx_ssse3       VEX encodings that used to be EVEX-only (xmm/ymm rejected)
+                  or missing entirely: vpmulhuw, vpmulhrsw, vphsub*, vpmuldq.
+  sse_rex         Unsuffixed cvtsi2s[sd] and extractps with xmm8+/r8+: a
+                  single combined REX, never two, and never REX.W for r8d.
+  evex_quality    EVEX dest≠0, xmm/ymm16–31, compressed disp8×N. Must match
+                  GAS; never prefer EVEX over a legal VEX encoding.
 
 Output is one instruction per line, ready for `encdiff.py --file`.
 """
@@ -270,6 +279,94 @@ def nop_forms(out):
         out.append(f"nopw {m}" if m in ("%ax",) else f"nopl {m}")
 
 
+def vex_commutative(out):
+    """0F-map integer/bitwise AVX: swap high r/m + low vvvv to reach VEX2."""
+    ops = [
+        "vpaddd", "vpaddq", "vpand", "vpor", "vpxor",
+        "vpmullw", "vpmulhw", "vpmulhuw", "vpmuludq",
+        "vpsadbw", "vpmaddwd", "vpavgb", "vpavgw",
+        "vpcmpeqb", "vpcmpeqd", "vpcmpeqw",
+        "vpaddusb", "vpaddusw", "vpaddsb", "vpaddsw",
+        "vpminub", "vpmaxub", "vpminsw", "vpmaxsw",
+        "vandps", "vorps", "vxorps", "vxorpd",
+    ]
+    for op in ops:
+        # High r/m, low vvvv, low dest: the VEX2-swap win.
+        out.append(f"{op} %xmm9, %xmm2, %xmm3")
+        out.append(f"{op} %ymm9, %ymm2, %ymm3")
+        # Controls: both high (still VEX3), both low (already VEX2), swapped
+        # already (no win), dest high (REX.R / VEX.R, still VEX2-eligible).
+        out.append(f"{op} %xmm2, %xmm9, %xmm3")
+        out.append(f"{op} %xmm9, %xmm10, %xmm3")
+        out.append(f"{op} %xmm2, %xmm3, %xmm9")
+        out.append(f"{op} %xmm1, %xmm2, %xmm3")
+
+
+def avx_ssse3(out):
+    """Newly enabled VEX arms (previously EVEX-only or missing)."""
+    for op, opc_note in (
+        ("vpmulhuw", "0F E4 commutative"),
+        ("vpmulhrsw", "0F38 0B"),
+        ("vphsubw", "0F38 05"),
+        ("vphsubd", "0F38 06"),
+        ("vphaddsw", "0F38 03"),
+        ("vphsubsw", "0F38 07"),
+        ("vpmuldq", "0F38 28"),
+    ):
+        del opc_note  # documentation in the tuple only
+        out.append(f"{op} %xmm1, %xmm2, %xmm3")
+        out.append(f"{op} %ymm1, %ymm2, %ymm3")
+        out.append(f"{op} %xmm9, %xmm2, %xmm3")
+        out.append(f"{op} (%rdi), %xmm1, %xmm2")
+        out.append(f"{op} (%rdi), %ymm1, %ymm2")
+    out.append("vmpsadbw $0, %xmm1, %xmm2, %xmm3")
+    out.append("vmpsadbw $1, %ymm1, %ymm2, %ymm3")
+    out.append("vphminposuw %xmm1, %xmm2")
+    out.append("vphminposuw (%rdi), %xmm2")
+
+
+def evex_quality(out):
+    """EVEX dest!=0, xmm/ymm16–31, compressed disp8*N. Must match GAS."""
+    out.append("vpshufd $1, %zmm2, %zmm3")
+    out.append("vpermq $0xe4, %zmm2, %zmm3")
+    out.append("vpternlogd $0xaa, %zmm2, %zmm1, %zmm3")
+    out.append("vpbroadcastd %eax, %zmm3")
+    out.append("vpxord 64(%rdi), %xmm0, %xmm1")
+    out.append("vpxord 64(%rdi), %zmm0, %zmm1")
+    out.append("vaddps %xmm16, %xmm0, %xmm1")
+    out.append("vaddps %xmm0, %xmm16, %xmm1")
+    out.append("vaddps %xmm0, %xmm1, %xmm31")
+    out.append("vpaddd %zmm16, %zmm1, %zmm2")
+    out.append("vmovdqu64 %zmm16, %zmm17")
+    out.append("vandps %xmm16, %xmm0, %xmm1")
+    out.append("vaddss %xmm16, %xmm0, %xmm1")
+    out.append("vmovaps %xmm16, %xmm1")
+    out.append("vpbroadcastd 4(%rdi), %zmm1")
+    out.append("vbroadcasti32x4 16(%rdi), %zmm1")
+    out.append("vphminposuw %xmm1, %xmm2")
+
+
+def sse_rex(out):
+    """REX.R/B (and not-W) for unsuffixed cvtsi2s[sd] and extractps."""
+    for op in ("cvtsi2ss", "cvtsi2sd"):
+        out.append(f"{op} %eax, %xmm0")
+        out.append(f"{op} %rax, %xmm0")
+        out.append(f"{op} %r8d, %xmm0")
+        out.append(f"{op} %r8, %xmm0")
+        out.append(f"{op} %eax, %xmm8")
+        out.append(f"{op} %r8d, %xmm8")
+        out.append(f"{op} %rax, %xmm8")
+        out.append(f"{op} (%rdi), %xmm0")
+        out.append(f"{op} (%rdi), %xmm8")
+    for imm in (0, 1, 3):
+        out.append(f"extractps ${imm}, %xmm1, %eax")
+        out.append(f"extractps ${imm}, %xmm8, %eax")
+        out.append(f"extractps ${imm}, %xmm1, %r8d")
+        out.append(f"extractps ${imm}, %xmm8, %r8d")
+        out.append(f"extractps ${imm}, %xmm1, (%rdi)")
+        out.append(f"extractps ${imm}, %xmm8, (%r8)")
+
+
 GROUPS = {
     "accumulator": accumulator,
     "imm8_sext": imm8_sext,
@@ -287,6 +384,10 @@ GROUPS = {
     "movzx_sx": movzx_sx,
     "setcc_cmov": setcc_cmov,
     "nop_forms": nop_forms,
+    "vex_commutative": vex_commutative,
+    "avx_ssse3": avx_ssse3,
+    "sse_rex": sse_rex,
+    "evex_quality": evex_quality,
 }
 
 

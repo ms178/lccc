@@ -789,3 +789,34 @@ immediates uses `C7` instead of `movabs`.
 The encoder supports legacy (REX), VEX (2-byte and 3-byte for AVX/BMI2), and
 EVEX (4-byte for initial AVX-512) prefix formats.  The 2-byte VEX form is
 preferred when possible (map=1, W=0, no X/B extension bits).
+
+### 11. Shortest legal encoding (not merely a legal encoding)
+
+Where the ISA offers more than one correct encoding, LCCC prefers the
+shortest form that still decodes as the same instruction (`scripts/encdiff.py`
+and `scripts/insndiff.py` both re-disassemble before accepting a size win):
+
+- **VEX2 source-swap** on 0F-map integer/bitwise AVX (`encode_avx_3op_commutative`):
+  if r/m is xmm8–15 and vvvv is xmm0–7, the sources are swapped so VEX.B
+  clears and the prefix collapses from 3 bytes to 2. Applies to `vpadd*`,
+  `vpand`/`vpor`/`vpxor`, `vpmullw`/`vpmulhw`/`vpmulhuw`/`vpmuludq`,
+  `vpsadbw`, `vpmaddwd`, packed integer min/max/avg/pcmpeq, and bitwise
+  `vandps`/`vorps`/`vxorp*`. Does **not** apply to FP add/mul (NaN payload
+  is operand-order sensitive: `DECLINED-FP`) or to 0F38/0F3A maps (mm≠1,
+  VEX2 is impossible).
+- **Scale-1 index fold** (`fold_scale1_index` in x86 `encoder/core.rs`,
+  duplicated in i686 `encoder/core.rs`): `(,%reg,1)` with no base becomes
+  `(%reg)`, which is the ICC 4-byte encoding versus GAS/Clang/GCC/ICX's
+  8-byte SIB+disp32. `%rsp`/`%esp` never fold.
+- **Unsuffixed `cvtsi2ss`/`cvtsi2sd`** reuse `encode_sse_cvt_gp_to_xmm` with
+  `infer_reg_size` (memory defaults to 32-bit) so `%r8d` does not get REX.W
+  and `%xmm8`/`%r8` share a single REX byte.
+- **`extractps`** emits REX.R for `%xmm8–15` and REX.B for `%r8d–%r15d`
+  through `emit_rex_rr`/`emit_rex_rm`, and adjusts a RIP-relative addend for
+  the trailing imm8.
+
+xmm/ymm forms of `vpmulhuw`, `vpmulhrsw`, `vphsubw`/`vphsubd`, `vphaddsw`/
+`vphsubsw`, `vpmuldq`, `vmpsadbw` and `vphminposuw` have VEX arms; EVEX
+remains the zmm path. Do **not** regenerate `tests/asm-diff/{avx,lea,modrm,misc}.casefile`
+from `gen_asmdiff_corpus.py`: that generator does not preserve hand-tagged
+`betterok` groups.

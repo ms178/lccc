@@ -427,6 +427,9 @@ def gen_sse(e: Emitter):
         "cvtsi2sd %eax, %xmm0", "cvtsi2sd %rax, %xmm0",
         "cvtsi2sdl (%rdi), %xmm0", "cvtsi2sdq (%rdi), %xmm0",
         "cvtsi2ss %eax, %xmm0", "cvtsi2ss %rax, %xmm0",
+        "cvtsi2ss %r8d, %xmm0", "cvtsi2ss %eax, %xmm8",
+        "cvtsi2ss %r8d, %xmm8", "cvtsi2sd %r8d, %xmm0",
+        "cvtsi2sd %eax, %xmm8", "cvtsi2ss %r8, %xmm8",
         "cvtsd2si %xmm0, %eax", "cvtsd2si %xmm0, %rax",
         "cvttsd2si %xmm0, %eax", "cvttsd2si %xmm0, %rax",
         "cvtss2si %xmm0, %eax", "cvttss2si %xmm0, %rax",
@@ -499,7 +502,8 @@ def gen_avx(e: Emitter):
                "vpand", "vpandn", "vpor", "vpxor", "vpmulld", "vpmullw",
                "vpcmpeqb", "vpcmpeqd", "vpcmpgtb", "vpcmpgtd", "vpmaxsd",
                "vpminud", "vpackusdw", "vpshufb", "vpunpcklbw",
-               "vpunpckhqdq", "vpavgb", "vpsadbw", "vpmaddwd"):
+               "vpunpckhqdq", "vpavgb", "vpsadbw", "vpmaddwd",
+               "vpmuludq", "vpmulhuw"):
         for w in ("xmm", "ymm"):
             lines += [f"{op} %{w}1, %{w}2, %{w}3", f"{op} %{w}9, %{w}10, %{w}11",
                       f"{op} (%rdi), %{w}1, %{w}2",
@@ -600,6 +604,33 @@ def gen_avx(e: Emitter):
         "vpclmulqdq $0x11, %xmm1, %xmm2, %xmm3", "vldmxcsr (%rsp)",
         "vstmxcsr (%rsp)", "vmovntps %ymm3, (%rdi)", "vmovntpd %ymm3, (%r12)",
         "vmovntdq %xmm13, (%r13,%rax,8)"])
+
+    # VEX coverage that used to be EVEX-only (xmm/ymm rejected) or missing.
+    # Do NOT regenerate tests/asm-diff/avx.casefile from this generator:
+    # Emitter.block never writes `betterok`, and avx_arith / vex2_commutative
+    # are hand-tagged. The matching groups below are maintained by hand in
+    # avx.casefile as `avx_ssse3` and `vex2_commutative betterok`.
+    lines = []
+    for op in ("vpmulhuw", "vpmulhrsw", "vphsubw", "vphsubd",
+               "vphaddsw", "vphsubsw", "vpmuldq"):
+        for w in ("xmm", "ymm"):
+            lines += [f"{op} %{w}1, %{w}2, %{w}3",
+                      f"{op} (%rdi), %{w}1, %{w}2"]
+    lines += ["vmpsadbw $0, %xmm1, %xmm2, %xmm3",
+              "vmpsadbw $1, %ymm1, %ymm2, %ymm3",
+              "vphminposuw %xmm1, %xmm2",
+              "vphminposuw (%rdi), %xmm2"]
+    e.block("avx_ssse3", lines)
+
+    lines = []
+    for op in ("vpaddd", "vpaddb", "vpaddw", "vpaddq", "vpand", "vpor", "vpxor",
+               "vpmullw", "vpmulhw", "vpmulhuw", "vpmuludq", "vpsadbw",
+               "vpmaddwd", "vxorps", "vandps", "vorps", "vxorpd"):
+        lines.append(f"{op} %xmm9, %xmm2, %xmm3")
+    lines += ["vpaddd %ymm9, %ymm2, %ymm3", "vpxor %ymm9, %ymm2, %ymm3",
+              "vpaddd %xmm2, %xmm9, %xmm3", "vpaddd %xmm9, %xmm10, %xmm3",
+              "vpaddd %xmm2, %xmm3, %xmm9"]
+    e.block("vex2_commutative", lines, flags="betterok")
 
 
 def gen_bmi(e: Emitter):

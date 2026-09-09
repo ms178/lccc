@@ -309,6 +309,30 @@ impl InstructionEncoder {
             "vminps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x5D)),
             "vmaxpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x5F)),
             "vmaxps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x5F)),
+            "vandps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x54)),
+            "vandpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x54)),
+            "vandnps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x55)),
+            "vandnpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x55)),
+            "vorps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x56)),
+            "vorpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x56)),
+            "vxorps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x57)),
+            "vxorpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x57)),
+            "vaddss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x58)),
+            "vaddsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x58)),
+            "vsubss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5C)),
+            "vsubsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5C)),
+            "vmulss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x59)),
+            "vmulsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x59)),
+            "vdivss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5E)),
+            "vdivsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5E)),
+            "vminss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5D)),
+            "vminsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5D)),
+            "vmaxss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5F)),
+            "vmaxsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5F)),
+            "vmovaps" => r(self.encode_evex_vmov(ops, 0, 0, 0x28, 0x29)),
+            "vmovapd" => r(self.encode_evex_vmov(ops, 1, 1, 0x28, 0x29)),
+            "vmovups" => r(self.encode_evex_vmov(ops, 0, 0, 0x10, 0x11)),
+            "vmovupd" => r(self.encode_evex_vmov(ops, 1, 1, 0x10, 0x11)),
             // unary
             "vpabsb" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x1C)),
             "vpabsw" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x1D)),
@@ -540,16 +564,11 @@ impl InstructionEncoder {
         // a miscompile with no diagnostic.
         validate_operands(mnemonic, ops)?;
 
-        // AVX-512: instructions touching zmm or k (opmask) registers, plus the
-        // AVX-512 byte/word vector moves, route through the EVEX dispatcher.
-        // Without this guard, zmm operands would silently encode as 128-bit VEX.
-        let has_zmm_or_k = ops.iter().any(|op| match op {
-            Operand::Register(r) => {
-                is_zmm(&r.name) || is_kreg(&r.name) || r.mask.is_some() || r.zeroing
-            }
-            Operand::Memory(m) => m.mask.is_some() || m.zeroing,
-            _ => false,
-        });
+        // AVX-512: zmm, k, masking, and xmm/ymm16–31 all require EVEX.
+        // xmm/ymm0–15 stay on the VEX path (shorter). Without the high-reg
+        // check, xmm16 would be rejected as "bad register" or, after a
+        // 3-bit wrap, silently encoded as xmm0.
+        let has_zmm_or_k = ops.iter().any(operand_needs_evex);
         // Mnemonics with NO VEX encoding (EVEX is the only form): must be
         // routed to the EVEX table even for 128/256-bit (xmm/ymm) operands.
         let evex_only = matches!(
@@ -2072,7 +2091,9 @@ impl InstructionEncoder {
             "vpunpckhqdq" => self.encode_avx_3op(ops, 0x6D, true),
             "vpmullw" => self.encode_avx_3op_commutative(ops, 0xD5, true, true),
             "vpmulld" => self.encode_avx_3op_38(ops, 0x40, true),
-            "vpmuludq" => self.encode_avx_3op(ops, 0xF4, true),
+            "vpmuludq" => self.encode_avx_3op_commutative(ops, 0xF4, true, true),
+            "vpmulhuw" => self.encode_avx_3op_commutative(ops, 0xE4, true, true),
+            "vpmuldq" => self.encode_avx_3op_38(ops, 0x28, true),
             "vpsllw" => self.encode_avx_shift(ops, 0xF1, 6, 0x71, true),
             "vpslld" => self.encode_avx_shift(ops, 0xF2, 6, 0x72, true),
             "vpsllq" => self.encode_avx_shift(ops, 0xF3, 6, 0x73, true),
@@ -2171,7 +2192,7 @@ impl InstructionEncoder {
             "vpmaxud" => self.encode_avx_3op_38(ops, 0x3F, true),
             "vpavgb" => self.encode_avx_3op_commutative(ops, 0xE0, true, true),
             "vpavgw" => self.encode_avx_3op_commutative(ops, 0xE3, true, true),
-            "vpsadbw" => self.encode_avx_3op(ops, 0xF6, true),
+            "vpsadbw" => self.encode_avx_3op_commutative(ops, 0xF6, true, true),
             "vpmaddubsw" => self.encode_avx_3op_38(ops, 0x04, true),
             // AVX-VNNI (66 pp) — Raptor Lake+
             "vpdpbusd" => self.encode_avx_3op_38_pp(ops, 0x50, 1),
@@ -2206,7 +2227,23 @@ impl InstructionEncoder {
             "vpclmulqdq" => self.encode_avx_3op_3a_pp_imm8(ops, 0x44, 1),
             "vphaddw" => self.encode_avx_3op_38(ops, 0x01, true),
             "vphaddd" => self.encode_avx_3op_38(ops, 0x02, true),
-            "vpmaddwd" => self.encode_avx_3op(ops, 0xF5, true),
+            "vphaddsw" => self.encode_avx_3op_38(ops, 0x03, true),
+            "vphsubw" => self.encode_avx_3op_38(ops, 0x05, true),
+            "vphsubd" => self.encode_avx_3op_38(ops, 0x06, true),
+            "vphsubsw" => self.encode_avx_3op_38(ops, 0x07, true),
+            "vpmulhrsw" => self.encode_avx_3op_38(ops, 0x0B, true),
+            "vphminposuw" => {
+                // SSE4.1 / AVX: 128-bit only. VEX.L=1 is #UD (GAS: operand size mismatch).
+                if ops.iter().any(
+                    |op| matches!(op, Operand::Register(r) if is_ymm(&r.name) || is_zmm(&r.name)),
+                ) {
+                    Err("vphminposuw is 128-bit only".to_string())
+                } else {
+                    self.encode_avx_2op_38(ops, 0x41, true)
+                }
+            }
+            "vmpsadbw" => self.encode_avx_3op_3a_imm8(ops, 0x42, true),
+            "vpmaddwd" => self.encode_avx_3op_commutative(ops, 0xF5, true, true),
             "vpmulhw" => self.encode_avx_3op_commutative(ops, 0xE5, true, true),
             "vpsubusb" => self.encode_avx_3op(ops, 0xD8, true),
             "vpsubusw" => self.encode_avx_3op(ops, 0xD9, true),

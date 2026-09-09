@@ -94,3 +94,23 @@ bts $63, %rax
 cmp $0, %eax
 test %eax, %eax
 or $0, %eax
+# 21. 0F-map AVX commutative VEX2 swap (high r/m, low vvvv)
+vpmuludq %xmm9, %xmm2, %xmm3
+vpsadbw %xmm9, %xmm2, %xmm3
+vpmaddwd %xmm9, %xmm2, %xmm3
+vpmulhuw %xmm9, %xmm2, %xmm3
+# 22. Newly enabled VEX (were EVEX-only or missing)
+vpmulhrsw %xmm1, %xmm2, %xmm3
+vphsubw %ymm1, %ymm2, %ymm3
+vpmuldq %xmm1, %xmm2, %xmm3
+vphaddsw %xmm1, %xmm2, %xmm3
+vmpsadbw $0, %xmm1, %xmm2, %xmm3
+vphminposuw %xmm1, %xmm2
+# 23. Unsuffixed cvtsi2s[sd] / extractps REX.R+B (and not-W for r8d)
+cvtsi2ss %r8d, %xmm8
+cvtsi2ss %eax, %xmm8
+cvtsi2sd %r8d, %xmm0
+extractps $0, %xmm8, %r8d
+# 24. i686-equivalent scale-1 index fold (also valid on x86-64)
+mov 0(,%eax,1), %ecx
+lea 0(,%rdi,1), %rdx

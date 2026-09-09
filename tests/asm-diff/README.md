@@ -32,6 +32,14 @@ The corpora are produced by `scripts/gen_asmdiff_corpus.py` and consumed by
 the corpus can never contain an input that would make the differential report
 a false failure.
 
+**Do not blindly regenerate** `avx.casefile`, `lea.casefile`, `modrm.casefile`
+or `misc.casefile`. Those files carry hand-tagged `betterok` groups
+(`avx_arith`, `vex2_commutative`, `lea`, `nobase_*`, `mov_imm32_zeroext`).
+A full regeneration would turn today's BETTER encodings into FAIL. Extend
+those files by hand. New coverage that must match GAS byte-for-byte
+(`avx_ssse3`, extra `sse_cvt`/`extractps` REX cases) is safe to add without
+the tag.
+
 ## Case flags
 
 ```
@@ -43,8 +51,10 @@ a false failure.
 
 ## Status
 
-All 728 cases pass against GNU as 2.47. Across the 9,918 distinct
-instructions in the corpus, the per-instruction differential reports:
+All 780 cases pass against GNU as 2.47. Across the 9,918 distinct
+instructions in the corpus (pre-expansion count; `avx_ssse3` and extra
+`sse_cvt`/`extractps` REX cases added since), the per-instruction
+differential reports:
 
 ```
 ok      = 9,695   byte-identical to GNU as

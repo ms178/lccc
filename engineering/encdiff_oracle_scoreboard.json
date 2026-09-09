@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "date": "2026-09-09",
+  "base": "91ecc08",
+  "lccc": "target/fastbuild/lccc",
+  "godbolt_audit": {
+    "gcc": "cg162 / 16.2",
+    "clang": "cclang2310 / 23.1.0",
+    "icc": "cicc2021100 / 2021.10.0",
+    "icx": "cicxlatest / moving"
+  },
+  "asmdiff_gas247": {"passed": 780, "failed": 0},
+  "codegen_gate": "PASS (7/7 golden workloads)",
+  "sweeps": [
+    {
+      "name": "focus",
+      "groups": ["sib_fold", "vex_len", "vex_commutative", "lea_strength",
+                 "sse_rex", "avx_ssse3", "imm8_sext", "shift_one",
+                 "xchg_acc", "disp_shrink"],
+      "n": 1717,
+      "verdicts": {"ok-best": 306, "ok": 1402, "DECLINED-FP": 8, "DECLINED-WRONG": 1},
+      "vs": [
+        {"oracle": "clang", "beat": 221, "tie": 1488, "lose": 8, "n": 1717, "lccc_bytes": 7932, "oracle_bytes": 8668, "delta": -736},
+        {"oracle": "icx",   "beat": 221, "tie": 1488, "lose": 8, "n": 1717, "lccc_bytes": 7932, "oracle_bytes": 8668, "delta": -736},
+        {"oracle": "icc",   "beat": 79,  "tie": 1637, "lose": 1, "n": 1717, "lccc_bytes": 7932, "oracle_bytes": 8010, "delta": -78},
+        {"oracle": "gcc",   "beat": 287, "tie": 1430, "lose": 0, "n": 1717, "lccc_bytes": 7932, "oracle_bytes": 8742, "delta": -810},
+        {"oracle": "gas",   "beat": 287, "tie": 1430, "lose": 0, "n": 1717, "lccc_bytes": 7932, "oracle_bytes": 8742, "delta": -810}
+      ]
+    },
+    {
+      "name": "rest",
+      "groups": ["accumulator", "test_and", "mov_imm", "redundant_rex",
+                 "push_imm", "inc_dec", "movzx_sx", "setcc_cmov", "nop_forms"],
+      "n": 1017,
+      "verdicts": {"BEATS": 30, "ok-best": 20, "ok": 967},
+      "vs": [
+        {"oracle": "clang", "beat": 30, "tie": 987, "lose": 0, "n": 1017, "lccc_bytes": 4594, "oracle_bytes": 4728, "delta": -134},
+        {"oracle": "icx",   "beat": 30, "tie": 987, "lose": 0, "n": 1017, "lccc_bytes": 4594, "oracle_bytes": 4728, "delta": -134},
+        {"oracle": "icc",   "beat": 33, "tie": 984, "lose": 0, "n": 1017, "lccc_bytes": 4594, "oracle_bytes": 4641, "delta": -47},
+        {"oracle": "gcc",   "beat": 30, "tie": 987, "lose": 0, "n": 1017, "lccc_bytes": 4594, "oracle_bytes": 4728, "delta": -134},
+        {"oracle": "gas",   "beat": 30, "tie": 987, "lose": 0, "n": 1017, "lccc_bytes": 4594, "oracle_bytes": 4728, "delta": -134}
+      ]
+    }
+  ],
+  "combined": {
+    "n": 2734,
+    "lccc_bytes": 12526,
+    "vs_clang_bytes": 13396,
+    "vs_icc_bytes": 12651,
+    "vs_gas_bytes": 13470,
+    "longer": 0,
+    "wrong_bytes": 0,
+    "rejects_valid": 0
+  },
+  "uops_ADD_M64_R64_indexed_extra_retire_uop": {
+    "SKL": {"retire_base": 2, "retire_indexed": 3},
+    "ICL": {"retire_base": 2, "retire_indexed": 3, "loop_tp_base": 0.53, "loop_tp_indexed": 0.67},
+    "ARL-P": {"retire_base": 2, "retire_indexed": 3, "mite_base": 2, "mite_indexed": 3}
+  }
+}

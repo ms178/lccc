@@ -1209,6 +1209,11 @@ impl super::InstructionEncoder {
     /// SSE extract-to-GPR/mem with imm8: extractps (66 0F3A 17 /r ib).
     /// AT&T ($imm, src, dst); ModRM.reg = src (xmm), r/m = dst (r32/m32),
     /// matching GNU as (src in reg field, dst in r/m).
+    ///
+    /// REX.R is required for %xmm8–15 in the reg field and REX.B for %r8d–%r15d
+    /// in r/m; a single `emit_rex_rr`/`emit_rex_rm` covers both (and the
+    /// combination). A trailing imm8 after a RIP-relative disp32 needs the
+    /// relocation addend adjusted by one, same as `encode_sse_extract`.
     pub(crate) fn encode_sse_extract_gpr_imm8(
         &mut self,
         ops: &[Operand],
@@ -1218,33 +1223,41 @@ impl super::InstructionEncoder {
             return Err("SSE extract-gpr requires 3 operands (imm, src, dst)".to_string());
         }
         match (&ops[0], &ops[1], &ops[2]) {
-            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Register(src), dst) => {
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Register(dst),
+            ) => {
                 let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                // Legacy prefix (66) must precede REX.
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 if bytes.first() == Some(&0x66) {
                     self.bytes.push(0x66);
                 }
-                let dst_need_rex = match dst {
-                    Operand::Register(d) => needs_rex_ext(&d.name),
-                    _ => false,
-                };
-                if dst_need_rex {
-                    self.bytes.push(0x41);
-                }
+                self.emit_rex_rr(0, &src.name, &dst.name);
                 for &b in &bytes[1..] {
                     self.bytes.push(b);
                 }
-                match dst {
-                    Operand::Register(d) => {
-                        let dst_num = reg_num(&d.name).ok_or("bad dst register")?;
-                        self.bytes.push(self.modrm(3, src_num, dst_num));
-                    }
-                    Operand::Memory(mem) => {
-                        self.encode_modrm_mem(src_num, mem)?;
-                    }
-                    _ => return Err("unsupported extract-gpr destination".to_string()),
-                }
+                self.bytes.push(self.modrm(3, src_num, dst_num));
                 self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Memory(mem),
+            ) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                if bytes.first() == Some(&0x66) {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_rm(0, &src.name, mem);
+                for &b in &bytes[1..] {
+                    self.bytes.push(b);
+                }
+                let rc = self.relocations.len();
+                self.encode_modrm_mem(src_num, mem)?;
+                self.bytes.push(*imm as u8);
+                self.adjust_rip_reloc_addend(rc, 1);
                 Ok(())
             }
             _ => Err("unsupported SSE extract-gpr operands".to_string()),
@@ -1262,44 +1275,32 @@ impl super::InstructionEncoder {
         if ops.len() != 2 {
             return Err("cvtsi2ss/cvtsi2sd requires 2 operands".to_string());
         }
-        match (&ops[0], &ops[1]) {
-            (Operand::Register(src), Operand::Register(dst)) if is_xmm(&dst.name) => {
-                let src_num = reg_num(&src.name).ok_or("bad gpr register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad xmm register")?;
-                match pp {
-                    2 => self.bytes.push(0xF3),
-                    3 => self.bytes.push(0xF2),
-                    _ => {}
+        // Unsuffixed forms infer GPR width from the source register (`r8d` is
+        // 32-bit, not 64-bit) and default memory sources to 32-bit, then reuse
+        // `encode_sse_cvt_gp_to_xmm` so REX.R (xmm8–15) and REX.B (r8–r15) share
+        // a single REX byte. The previous body could emit two REX prefixes and
+        // treated every `r*` name of length ≤ 3 as 64-bit.
+        let gp_size = match &ops[0] {
+            Operand::Register(src) => {
+                let sz = infer_reg_size(&src.name);
+                if sz == 4 || sz == 8 {
+                    sz
+                } else {
+                    return Err("cvtsi2ss/cvtsi2sd source must be a 32- or 64-bit GPR".to_string());
                 }
-                let is64 = src.name.starts_with('r') && src.name.len() <= 3
-                    || matches!(
-                        src.name.as_str(),
-                        "rax" | "rcx" | "rdx" | "rbx" | "rsp" | "rbp" | "rsi" | "rdi"
-                    );
-                if is64 {
-                    self.bytes.push(0x48);
-                } // REX.W
-                let rex_b = needs_rex_ext(&src.name);
-                if rex_b {
-                    self.bytes.push(0x41);
-                }
-                self.bytes.push(0x0F);
-                self.bytes.push(opcode);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
-                Ok(())
             }
-            (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
-                let dst_num = reg_num(&dst.name).ok_or("bad xmm register")?;
-                match pp {
-                    2 => self.bytes.push(0xF3),
-                    3 => self.bytes.push(0xF2),
-                    _ => {}
-                }
-                self.bytes.push(0x0F);
-                self.bytes.push(opcode);
-                self.encode_modrm_mem(dst_num, mem)
+            Operand::Memory(_) => 4,
+            _ => {
+                return Err(
+                    "cvtsi2ss/cvtsi2sd requires gpr/mem source and xmm destination".to_string(),
+                );
             }
-            _ => Err("cvtsi2ss/cvtsi2sd requires gpr/mem source and xmm destination".to_string()),
-        }
+        };
+        let prefix = match pp {
+            2 => 0xF3u8,
+            3 => 0xF2,
+            _ => return Err("cvtsi2ss/cvtsi2sd: bad SIMD prefix".to_string()),
+        };
+        self.encode_sse_cvt_gp_to_xmm(ops, &[prefix, 0x0F, opcode], gp_size)
     }
 }

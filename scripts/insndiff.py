@@ -181,7 +181,8 @@ _COMMUTATIVE_VEX = {
     "vpand", "vpor", "vpxor", "vpaddb", "vpaddw", "vpaddd", "vpaddq",
     "vpmullw", "vpaddsb", "vpaddsw", "vpaddusb", "vpaddusw",
     "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
-    "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
+    "vpmulhw", "vpmulhuw", "vpmuludq", "vpsadbw", "vpmaddwd",
+    "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
     "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
 }
 _VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")

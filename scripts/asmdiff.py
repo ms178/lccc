@@ -28,6 +28,7 @@ Flags:
 Usage:
     scripts/asmdiff.py                       # all corpora under tests/asm-diff
     scripts/asmdiff.py path/to/x.casefile -v
+    scripts/asmdiff.py --32 --lccc target/fastbuild/lccc-i686  # i686 vs as --32
 """
 from __future__ import annotations
 
@@ -60,10 +61,94 @@ class ElfImage:
     defined: dict[str, tuple[str, int]] = field(default_factory=dict)
 
 
+def _read_elf32(path: Path, b: bytes) -> ElfImage:
+    """Minimal ELF32 reader (i686 objects from `as --32` / lccc-i686)."""
+    e_shoff, e_shentsize = _u(b, 0x20, 4), _u(b, 0x2E, 2)
+    e_shnum, e_shstrndx = _u(b, 0x30, 2), _u(b, 0x32, 2)
+
+    sh = []
+    for i in range(e_shnum):
+        o = e_shoff + i * e_shentsize
+        sh.append(dict(
+            name=_u(b, o, 4), type=_u(b, o + 4, 4), flags=_u(b, o + 8, 4),
+            off=_u(b, o + 0x10, 4), size=_u(b, o + 0x14, 4),
+            link=_u(b, o + 0x18, 4), info=_u(b, o + 0x1C, 4)))
+
+    def raw(i):
+        s = sh[i]
+        return b"" if s["type"] == 8 else b[s["off"]: s["off"] + s["size"]]
+
+    shstr = raw(e_shstrndx)
+
+    def nm(tab: bytes, off: int) -> str:
+        end = tab.find(b"\0", off)
+        return tab[off:end].decode("utf-8", "replace")
+
+    names = [nm(shstr, s["name"]) for s in sh]
+    img = ElfImage()
+
+    SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL = 2, 3, 4, 9
+    syms: list[tuple] = []
+    for i, s in enumerate(sh):
+        if s["type"] != SHT_SYMTAB:
+            continue
+        strt, d = raw(s["link"]), raw(i)
+        for k in range(len(d) // 16):
+            o = k * 16
+            # Elf32_Sym: st_name, st_value, st_size, st_info, st_other, st_shndx
+            st_info = d[o + 12]
+            syms.append((nm(strt, _u(d, o, 4)), st_info >> 4, st_info & 0xF,
+                         _u(d, o + 14, 2), _u(d, o + 4, 4), _u(d, o + 8, 4)))
+        break
+
+    def sname(ix: int) -> str:
+        return {0: "UNDEF", 0xFFF1: "ABS", 0xFFF2: "COMMON"}.get(
+            ix, names[ix] if ix < len(names) else f"SHN{ix}")
+
+    img.symbols = [(n, bi, ty, sname(sx), v, sz)
+                   for (n, bi, ty, sx, v, sz) in syms]
+    for (n, _bi, ty, sx, v, _sz) in syms:
+        if n and ty not in (3, 4) and sx not in (0, 0xFFF1, 0xFFF2):
+            img.defined.setdefault(n, (sname(sx), v))
+
+    for i, s in enumerate(sh):
+        if s["type"] in (SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL):
+            continue
+        if names[i] in ("", ".shstrtab", ".strtab", ".symtab"):
+            continue
+        img.content[names[i]] = raw(i)
+
+    for i, s in enumerate(sh):
+        if s["type"] not in (SHT_RELA, SHT_REL):
+            continue
+        tgt = names[s["info"]] if s["info"] < len(names) else f"SEC{s['info']}"
+        step, d = (12 if s["type"] == SHT_RELA else 8), raw(i)
+        out = []
+        for k in range(len(d) // step):
+            o = k * step
+            info = _u(d, o + 4, 4)
+            add = 0
+            if s["type"] == SHT_RELA:
+                add = _u(d, o + 8, 4)
+                if add >= 1 << 31:
+                    add -= 1 << 32
+            si = info >> 8
+            sn = syms[si][0] if si < len(syms) else f"SYM{si}"
+            if not sn and si < len(syms):
+                sn = "@" + sname(syms[si][3])
+            out.append((_u(d, o, 4), info & 0xFF, sn, add))
+        img.relocs.setdefault(tgt, []).extend(sorted(out))
+    return img
+
+
 def read_elf(path: Path) -> ElfImage:
     b = path.read_bytes()
-    if b[:4] != b"\x7fELF" or b[4] != 2:
-        raise ValueError(f"{path}: not an ELF64 object")
+    if b[:4] != b"ELF":
+        raise ValueError(f"{path}: not an ELF object")
+    if b[4] == 1:
+        return _read_elf32(path, b)
+    if b[4] != 2:
+        raise ValueError(f"{path}: not an ELF32/ELF64 object")
     e_shoff, e_shentsize = _u(b, 0x28, 8), _u(b, 0x3A, 2)
     e_shnum, e_shstrndx = _u(b, 0x3C, 2), _u(b, 0x3E, 2)
 
@@ -199,7 +284,8 @@ _COMMUTATIVE_VEX = {
     "vpand", "vpor", "vpxor", "vpaddb", "vpaddw", "vpaddd", "vpaddq",
     "vpmullw", "vpaddsb", "vpaddsw", "vpaddusb", "vpaddusw",
     "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
-    "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
+    "vpmulhw", "vpmulhuw", "vpmuludq", "vpsadbw", "vpmaddwd",
+    "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
     "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
 }
 _VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
@@ -359,7 +445,8 @@ def load_cases(path: Path) -> list[Case]:
     return cases
 
 
-def run_case(c: Case, lccc: str, gas: str, wd: str, verbose: bool):
+def run_case(c: Case, lccc: str, gas: str, wd: str, verbose: bool,
+             bits32: bool = False):
     tag = re.sub(r"[^A-Za-z0-9_.-]", "_", c.name)
     src = Path(wd) / f"{tag}.s"
     src.write_text(c.text)
@@ -367,7 +454,8 @@ def run_case(c: Case, lccc: str, gas: str, wd: str, verbose: bool):
 
     r1 = subprocess.run([lccc, "-c", str(src), "-o", str(lo)],
                         capture_output=True, text=True, timeout=180)
-    r2 = subprocess.run([gas, "--64", "-o", str(go), str(src)],
+    gas_bits = "--32" if bits32 else "--64"
+    r2 = subprocess.run([gas, gas_bits, "-o", str(go), str(src)],
                         capture_output=True, text=True, timeout=180)
 
     if c.mode == "reject":
@@ -413,6 +501,9 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--max-report", type=int, default=30)
+    ap.add_argument("--32", dest="bits32", action="store_true",
+                    help="i686: GNU as --32, ELF32 objects, default corpus "
+                         "tests/asm-diff/i686/")
     args = ap.parse_args()
 
     if not (shutil.which(args.gas) or Path(args.gas).exists()):
@@ -422,7 +513,12 @@ def main() -> int:
         print(f"error: lccc not built at {args.lccc!r}", file=sys.stderr)
         return 2
 
-    files = args.cases or sorted(DEFAULT_CORPUS.glob("*.casefile"))
+    if args.cases:
+        files = args.cases
+    elif args.bits32:
+        files = sorted((DEFAULT_CORPUS / "i686").glob("*.casefile"))
+    else:
+        files = sorted(DEFAULT_CORPUS.glob("*.casefile"))
     cases = [c for f in files for c in load_cases(f)]
     if not cases:
         print("error: no cases found", file=sys.stderr)
@@ -432,7 +528,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="asmdiff-") as wd:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
             for fut in concurrent.futures.as_completed(
-                    [ex.submit(run_case, c, args.lccc, args.gas, wd, args.verbose)
+                    [ex.submit(run_case, c, args.lccc, args.gas, wd, args.verbose,
+                               args.bits32)
                      for c in cases]):
                 name, ok, msg = fut.result()
                 if ok:

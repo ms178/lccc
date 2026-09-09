@@ -110,6 +110,13 @@ impl super::InstructionEncoder {
         reg_field: u8,
         mem: &MemoryOperand,
     ) -> Result<(), String> {
+        // Fold before reading base/index so the rest of this function, including
+        // the .code16 early return, sees the rewritten operand. 16-bit ModR/M
+        // has no SIB; a scale-1 index-only form is 32-bit addressing and the
+        // fold turns `(,%eax,1)` into `(%eax)` which then takes the 0x67 path.
+        let folded = fold_scale1_index(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
+
         let base = mem.base.as_ref();
         let index = mem.index.as_ref();
 
@@ -363,4 +370,30 @@ impl super::InstructionEncoder {
             diff_symbol: Some(diff_sym.to_string()),
         });
     }
+}
+
+/// Fold a scale-1 index-only memory operand into a plain base.
+///
+/// Duplicated from the x86-64 encoder: `fold_scale1_index` is `pub(crate)` in
+/// the private `x86::assembler::encoder::core` module and is not re-exported.
+/// `%esp`/`%sp` can never be an index, so those are left for the validator.
+/// Every other register folds, including `%ebp` (the general encoder already
+/// emits mod=01 + disp8=0 for a bare `%ebp` base).
+///
+/// This is the ICC win: `mov 0(,%eax,1),%ecx` becomes `8b 08` (2 bytes of
+/// addressing) instead of SIB + disp32 (`8b 0c 05 00000000`).
+fn fold_scale1_index(mem: &MemoryOperand) -> Option<MemoryOperand> {
+    if mem.base.is_some() || mem.scale.unwrap_or(1) != 1 {
+        return None;
+    }
+    let idx = mem.index.as_ref()?;
+    if idx.name == "esp" || idx.name == "sp" {
+        return None;
+    }
+    Some(MemoryOperand {
+        base: mem.index.clone(),
+        index: None,
+        scale: None,
+        ..mem.clone()
+    })
 }
