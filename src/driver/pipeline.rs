@@ -2304,27 +2304,6 @@ fn first_sse_reference(asm: &str) -> Option<(String, String)> {
     None
 }
 
-#[cfg(test)]
-mod sse_reference_tests {
-    use super::first_sse_reference;
-
-    #[test]
-    fn finds_first_sse_line_with_function_name() {
-        let asm = ".type f, @function\nf:\n    movq %rdi, %rax\n    ret\n\
-                   .type g, @function\ng:\n    # LCCC_RET_XMM 1\n    movsd (%rdi), %xmm0\n    ret\n";
-        let (f, l) = first_sse_reference(asm).unwrap();
-        assert_eq!(f, "g");
-        assert_eq!(l.trim(), "movsd (%rdi), %xmm0");
-    }
-
-    #[test]
-    fn inline_asm_and_comments_are_exempt() {
-        let asm = ".type f, @function\nf:\n#APP\n    movaps %xmm0, %xmm1\n#NO_APP\n\
-                   # note: %xmm0\n    ret\n";
-        assert!(first_sse_reference(asm).is_none());
-    }
-}
-
 impl Driver {
     /// x86-64 code-generation ISA permission for this translation unit.
     ///
@@ -2362,5 +2341,26 @@ impl Driver {
             fma: ceiling.fma && !self.fma_explicitly_disabled,
         }
         .normalized()
+    }
+}
+
+#[cfg(test)]
+mod sse_reference_tests {
+    use super::first_sse_reference;
+
+    #[test]
+    fn finds_first_sse_line_with_function_name() {
+        let asm = ".type f, @function\nf:\n    movq %rdi, %rax\n    ret\n\
+                   .type g, @function\ng:\n    # LCCC_RET_XMM 1\n    movsd (%rdi), %xmm0\n    ret\n";
+        let (f, l) = first_sse_reference(asm).unwrap();
+        assert_eq!(f, "g");
+        assert_eq!(l.trim(), "movsd (%rdi), %xmm0");
+    }
+
+    #[test]
+    fn inline_asm_and_comments_are_exempt() {
+        let asm = ".type f, @function\nf:\n#APP\n    movaps %xmm0, %xmm1\n#NO_APP\n\
+                   # note: %xmm0\n    ret\n";
+        assert!(first_sse_reference(asm).is_none());
     }
 }

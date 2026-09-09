@@ -66,6 +66,7 @@ pub(crate) mod use_def;
 pub(crate) mod vec_interleave;
 pub(crate) mod vec_load_sink;
 pub(crate) mod vector_temp_promotion;
+pub(crate) mod arx_vectorize;
 pub(crate) mod vectorize;
 pub(crate) mod verify;
 
@@ -1483,6 +1484,27 @@ pub(crate) fn run_passes(
                     run_on_visited(module, &dirty, &mut changed, |f| {
                         vec_interleave::run(f, fp_reassoc)
                     })
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
+            // ARX lane vectorization (x86-64 only): ChaCha20-style
+            // 16-word Add-Rotate-Xor permutation loops — the matcher
+            // PROVES the loop is exactly the RFC 7539 double round
+            // (symbolic term comparison) before replacing it with the
+            // 4-lane SIMD form (38 instructions per double round with
+            // SSSE3 pshufb rotates, 46 at the SSE2 baseline, vs 96
+            // scalar).  Runs after the map vectorizer: ARX loops have no
+            // memory traffic in the body, so the two passes are disjoint.
+            // Pass name for CCC_DISABLE_PASSES: "arx_vectorize"
+            if target == crate::backend::Target::X86_64
+                && !optimize_for_size
+                && !pass_disabled(&disabled, "arx_vectorize")
+            {
+                let n = timed_pass!(
+                    "arx_vectorize",
+                    run_on_visited(module, &dirty, &mut changed, arx_vectorize::run)
                 );
                 total_changes += n;
                 total_changes_excl_dce += n;

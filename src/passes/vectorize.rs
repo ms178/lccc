@@ -158,8 +158,20 @@ fn x86_sse41_available() -> bool {
     X86_SSE41_AVAILABLE.with(|available| available.get())
 }
 
+/// Public twin of [`x86_sse41_available`]: SSE4.1 implies SSSE3, so this
+/// is the gate for `pshufb`-based rotate masks in the ARX vectorizer.
+pub(crate) fn x86_sse41_available_pub() -> bool {
+    x86_sse41_available()
+}
+
 fn x86_simd_available() -> bool {
     X86_SIMD_AVAILABLE.with(|available| available.get())
+}
+
+/// Public twin of [`x86_simd_available`] for the ARX lane vectorizer
+/// (same TU, same per-thread ISA profile).
+pub(crate) fn x86_simd_available_pub() -> bool {
+    x86_simd_available()
 }
 
 fn x86_avx2_available() -> bool {
@@ -496,6 +508,17 @@ fn vectorize_with_analysis_mode(
                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
             }
         } else if std::env::var("CCC_NO_MAP_VEC").is_err() {
+            // Conditional-store statement forms (`if (c1 && c2) s[i] = f(s[i]);`)
+            // are not map-shaped until the guarded store becomes a select
+            // against the dominating same-address load.  Rewrite first
+            // (fail-closed), then the standard analysis applies.
+            if loop_info.body.iter().copied().any(|b| {
+                b != loop_info.header
+                    && matches!(func.blocks[b].terminator, Terminator::CondBranch { .. })
+            }) && rewrite_conditional_store(func, loop_info)
+            {
+                total_changes += 1;
+            }
             if let Some(map_pattern) = analyze_map_pattern(func, loop_info, neon) {
                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
                 // the focused SSE diagnostic override requests 128-bit code.
@@ -3719,6 +3742,15 @@ struct MapEmitCtx<'a> {
     cmp_op: &'a dyn Fn(&IrCmpOp) -> Option<(IntrinsicOp, i32)>,
     minmax_op: &'a dyn Fn(bool) -> Option<IntrinsicOp>,
     blendv_op: Option<IntrinsicOp>,
+    /// Byte lanes at the SSE2 baseline broadcast through the DWORD splat
+    /// (`VecBroadcastI32x4`), so a constant operand must be replicated
+    /// into all four bytes at broadcast time.  The AVX2 byte path keeps
+    /// its dedicated `vpbroadcastb` op, which takes the low byte of the
+    /// operand directly and needs no replication.  Replication is a
+    /// property of THIS lowering, not of the expression: the scalar
+    /// remainder mirror evaluates the same `MapExpr` at the element type,
+    /// where a replicated constant would break every non-ring node.
+    replicate_byte_consts: bool,
     /// Every emitted node, keyed by its tree shape: identical subexpressions
     /// (reused loads, shared compares) emit exactly once — free CSE keeps
     /// e.g. a clamp tree at one load instead of three.
@@ -3766,11 +3798,17 @@ impl<'a> MapEmitCtx<'a> {
                 // Broadcasts live in the PREHEADER so they are hoisted out
                 // of the packed loop (register-allocated once).
                 let dest = self.fresh();
+                let operand = match (self.replicate_byte_consts, operand) {
+                    (true, Operand::Const(c)) => {
+                        Operand::Const(IrConst::I32(replicate_byte(c.to_i64()?)))
+                    }
+                    _ => operand.clone(),
+                };
                 self.preheader_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
                     op: self.broadcast_op,
                     dest_ptr: None,
-                    args: vec![operand.clone()],
+                    args: vec![operand],
                 });
                 Some(dest)
             }
@@ -3897,6 +3935,430 @@ impl<'a> MapEmitCtx<'a> {
 /// contain exactly one load and one store, only simple non-trapping arithmetic,
 /// and the two GEP base pointers must be provably distinct (separate globals
 /// or allocas) so the vector store cannot clobber a not-yet-read source lane.
+/// Rewrite the conditional-store statement form into the straight-line
+/// nested-Select map shape the standard pipeline already handles:
+///
+///   L = load s[i]; if (c1 && c2) s[i] = f(L);
+///   ── becomes ──
+///   L = load s[i]; s[i] = select(c1, select(c2, f(L), L), L);
+///
+/// The skip value is the SAME-address load that dominates the branch, so
+/// the store is never speculative: unselected lanes write back the bytes
+/// the scalar loop would have left untouched (the load+blend+store
+/// equivalence GCC's vpmaskmovd form and LLVM's if-conversion both rely
+/// on).  The condition chain is a linear dominator sequence of
+/// single-condition blocks whose non-storeward edges all bypass directly
+/// to the loop latch (the empty-else shape); the polarity of each
+/// condition (which edge continues toward the store) flips its compare
+/// when necessary, and the nested-Select form is exactly what the map
+/// parser recovers into `MaskConj` (and the range fold into `RangeMask`).
+///
+/// Fail-closed: any shape deviation (extra side effects, a second load, a
+/// different skip target, volatile access, non-integer compares the flip
+/// table does not cover) leaves the loop untouched.
+fn rewrite_conditional_store(
+    func: &mut IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+) -> bool {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let Some(latch_idx) = find_latch(func, loop_info) else {
+        return false;
+    };
+    let latch_label = func.blocks[latch_idx].label;
+    let header_idx = loop_info.header;
+    // Canonical while-form: the header's false edge exits; the body side
+    // is the true edge.
+    let entry_label = match &func.blocks[header_idx].terminator {
+        Terminator::CondBranch { true_label, .. } => *true_label,
+        _ => return false,
+    };
+    let idx_of =
+        |label: BlockId| -> Option<usize> { func.blocks.iter().position(|b| b.label == label) };
+    let Some(mut cur) = idx_of(entry_label) else {
+        return false;
+    };
+    if cur == latch_idx || cur == header_idx {
+        return false;
+    }
+
+    // ── Walk the condition chain ─────────────────────────────────────────
+    // (block, compare value, polarity: true = storeward edge is TRUE)
+    let mut chain: Vec<(usize, Value, bool)> = Vec::new();
+    let mut store_block: Option<usize> = None;
+    let mut first_block: Option<usize> = None;
+    for _ in 0..8 {
+        let block = &func.blocks[cur];
+        match &block.terminator {
+            Terminator::CondBranch {
+                cond,
+                true_label,
+                false_label,
+            } => {
+                if cur == latch_idx {
+                    return false; // condition in the latch: not our shape
+                }
+                let Some(t_idx) = idx_of(*true_label) else {
+                    return false;
+                };
+                let Some(f_idx) = idx_of(*false_label) else {
+                    return false;
+                };
+                // Exactly one edge must bypass straight to the latch.
+                let (storeward, polarity) = if f_idx == latch_idx && t_idx != latch_idx {
+                    (t_idx, true)
+                } else if t_idx == latch_idx && f_idx != latch_idx {
+                    (f_idx, false)
+                } else {
+                    return false; // both-to-latch (no store path) or neither
+                };
+                if storeward == header_idx {
+                    return false;
+                }
+                // Chain-block body: at most one compare (the branch
+                // condition's definition), plus addressing/cast plumbing.
+                // Loads only in the FIRST chain block (the dominating
+                // same-address load); stores never.
+                let is_first = first_block.is_none();
+                let mut cmp_seen: Option<(Value, &Instruction)> = None;
+                // Address plumbing: BinOps whose dest feeds a GEP offset in
+                // the same block (the i*4 byte-scale of dword streams).
+                let gep_offsets: FxHashSet<Value> = block
+                    .instructions
+                    .iter()
+                    .filter_map(|i| match i {
+                        Instruction::GetElementPtr { offset, .. } => match offset {
+                            Operand::Value(v) => Some(*v),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                for inst in &block.instructions {
+                    match inst {
+                        Instruction::Cmp { dest, .. } => {
+                            if cmp_seen.is_some() {
+                                return false;
+                            }
+                            cmp_seen = Some((*dest, inst));
+                        }
+                        Instruction::Load {
+                            volatile: false, ..
+                        } if is_first => {}
+                        Instruction::BinOp { dest, .. } if gep_offsets.contains(dest) => {}
+                        Instruction::GetElementPtr { .. }
+                        | Instruction::Cast { .. }
+                        | Instruction::Copy { .. } => {}
+                        _ => return false,
+                    }
+                }
+                let Some((cmp_dest, _)) = cmp_seen else {
+                    return false;
+                };
+                if *cond != Operand::Value(cmp_dest) {
+                    return false; // branch condition is not the block's compare
+                }
+                if first_block.is_none() {
+                    first_block = Some(cur);
+                }
+                chain.push((cur, cmp_dest, polarity));
+                cur = storeward;
+            }
+            Terminator::Branch(_) => {
+                store_block = Some(cur);
+                break;
+            }
+            _ => return false,
+        }
+    }
+    let Some(store_block) = store_block else {
+        return false; // chain never reached a plain block (too long / cyclic)
+    };
+    if chain.is_empty() || first_block.is_none() {
+        return false;
+    }
+    let first_block = first_block.unwrap();
+    if store_block == latch_idx || store_block == header_idx || store_block == first_block {
+        return false;
+    }
+    // The store block falls through to the latch.
+    if !matches!(&func.blocks[store_block].terminator,
+        Terminator::Branch(l) if *l == latch_label)
+    {
+        return false;
+    }
+
+    // ── Validate the store block and find the load ───────────────────────
+    // The first chain block's single load must be the same-address
+    // dominating load; the store block holds the value computation and the
+    // loop's only store (the map analysis re-checks the whole-loop scan).
+    let mut store_inst: Option<(Value, Value, IrType)> = None; // (ptr, val, ty)
+    let mut store_gep: Option<Value> = None;
+    for inst in &func.blocks[store_block].instructions {
+        match inst {
+            Instruction::Store {
+                val,
+                ptr,
+                ty,
+                volatile: false,
+                ..
+            } => {
+                if store_inst.is_some() {
+                    return false;
+                }
+                let Operand::Value(v) = val else { return false };
+                store_inst = Some((*ptr, *v, *ty));
+            }
+            Instruction::GetElementPtr { dest, .. } => {
+                if store_gep.is_some() {
+                    return false;
+                }
+                store_gep = Some(*dest);
+            }
+            Instruction::BinOp { op, ty, .. } if !op.can_trap() || ty.is_float() => {}
+            Instruction::Cast { .. } | Instruction::Copy { .. } | Instruction::UnaryOp { .. } => {}
+            _ => return false, // loads, calls, branches-in-body: fail closed
+        }
+    }
+    let Some((store_ptr, store_val, elem_ty)) = store_inst else {
+        return false;
+    };
+    if !matches!(
+        elem_ty,
+        IrType::I8 | IrType::U8 | IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64
+    ) {
+        return false;
+    }
+    // The dominating load: exactly one, in the first chain block, same
+    // element type.
+    let mut load_inst: Option<(Value, Value, Value)> = None; // (dest, gep, gep base+offset)
+    for inst in &func.blocks[first_block].instructions {
+        if let Instruction::Load {
+            dest,
+            ptr,
+            ty,
+            volatile: false,
+            ..
+        } = inst
+        {
+            if load_inst.is_some() || *ty != elem_ty {
+                return false;
+            }
+            load_inst = Some((*dest, *ptr, *ptr));
+        }
+    }
+    let Some((load_dest, load_ptr, _)) = load_inst else {
+        return false;
+    };
+    // Same-address proof: identical GEP value, or same (base, offset) pair.
+    let gep_pair = |v: Value| -> Option<(Value, Operand)> {
+        func.blocks.iter().find_map(|b| {
+            b.instructions.iter().find_map(|i| match i {
+                Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } if *dest == v => Some((*base, offset.clone())),
+                _ => None,
+            })
+        })
+    };
+    // Structural equivalence of pure addressing computations: the load and
+    // the store recompute the SAME i*4 byte-scale as distinct SSA values
+    // (canonical lowering emits one per GEP).  Bounded depth, values only
+    // through pure BinOp/Cast/Copy definitions.
+    fn operand_equiv(func: &IrFunction, a: &Operand, b: &Operand, depth: usize) -> bool {
+        if a == b {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        let (Operand::Value(va), Operand::Value(vb)) = (a, b) else {
+            return false;
+        };
+        let find_def = |v: &Value| -> Option<Instruction> {
+            func.blocks.iter().find_map(|blk| {
+                blk.instructions
+                    .iter()
+                    .find(|i| i.dest() == Some(*v))
+                    .cloned()
+            })
+        };
+        match (find_def(va), find_def(vb)) {
+            (
+                Some(Instruction::BinOp {
+                    op: oa,
+                    lhs: la,
+                    rhs: ra,
+                    ..
+                }),
+                Some(Instruction::BinOp {
+                    op: ob,
+                    lhs: lb,
+                    rhs: rb,
+                    ..
+                }),
+            ) => {
+                oa == ob
+                    && (operand_equiv(func, &la, &lb, depth - 1)
+                        && operand_equiv(func, &ra, &rb, depth - 1)
+                        || operand_equiv(func, &la, &rb, depth - 1)
+                            && operand_equiv(func, &ra, &lb, depth - 1))
+            }
+            (
+                Some(Instruction::Cast { src: sa, .. }) | Some(Instruction::Copy { src: sa, .. }),
+                Some(Instruction::Cast { src: sb, .. }) | Some(Instruction::Copy { src: sb, .. }),
+            ) => operand_equiv(func, &sa, &sb, depth - 1),
+            _ => false,
+        }
+    }
+    let same_address = if store_ptr == load_ptr {
+        true
+    } else {
+        match (gep_pair(store_ptr), gep_pair(load_ptr)) {
+            (Some((sb, so)), Some((lb, lo))) => sb == lb && operand_equiv(func, &so, &lo, 3),
+            _ => false,
+        }
+    };
+    if !same_address {
+        return false;
+    }
+
+    // ── Rewrite ──────────────────────────────────────────────────────────
+    // Move the store block's value computation into the first chain
+    // block, re-point the store at the load's address, and select the
+    // stored value against the dominating load per chain condition.
+    // Total flip table: every IrCmpOp variant maps to its negation, so a
+    // future enum extension is a compile error here rather than a silent
+    // rewrite decline at run time.
+    let flip = |op: &IrCmpOp| -> Option<IrCmpOp> {
+        Some(match op {
+            IrCmpOp::Slt => IrCmpOp::Sge,
+            IrCmpOp::Sge => IrCmpOp::Slt,
+            IrCmpOp::Sle => IrCmpOp::Sgt,
+            IrCmpOp::Sgt => IrCmpOp::Sle,
+            IrCmpOp::Ult => IrCmpOp::Uge,
+            IrCmpOp::Uge => IrCmpOp::Ult,
+            IrCmpOp::Ule => IrCmpOp::Ugt,
+            IrCmpOp::Ugt => IrCmpOp::Ule,
+            IrCmpOp::Eq => IrCmpOp::Ne,
+            IrCmpOp::Ne => IrCmpOp::Eq,
+        })
+    };
+    // Condition values in chain order, flipped when the storeward edge was
+    // the FALSE edge. The first block's compare (when kept) reuses its
+    // existing SSA value; flipped compares and other blocks' compares are
+    // re-emitted in the first block.
+    let mut cond_vals: Vec<Operand> = Vec::new();
+    let mut new_insts: Vec<Instruction> = Vec::new();
+    for (block_idx, cmp_val, polarity) in &chain {
+        let cmp = func.blocks[*block_idx]
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::Cmp { dest, .. } if *dest == *cmp_val))
+            .expect("chain compare validated above");
+        let (op, lhs, rhs, ty) = match cmp {
+            Instruction::Cmp {
+                op, lhs, rhs, ty, ..
+            } => (*op, lhs.clone(), rhs.clone(), *ty),
+            _ => unreachable!(),
+        };
+        let effective_op = if *polarity {
+            op
+        } else {
+            match flip(&op) {
+                Some(f) => f,
+                None => return false, // compare op outside the flip table
+            }
+        };
+        if *block_idx == first_block && *polarity {
+            cond_vals.push(Operand::Value(*cmp_val));
+        } else if *block_idx == first_block && !polarity {
+            let dest = Value(func.next_value_id);
+            func.next_value_id += 1;
+            new_insts.push(Instruction::Cmp {
+                dest,
+                op: effective_op,
+                lhs,
+                rhs,
+                ty,
+            });
+            cond_vals.push(Operand::Value(dest));
+        } else {
+            let dest = Value(func.next_value_id);
+            func.next_value_id += 1;
+            new_insts.push(Instruction::Cmp {
+                dest,
+                op: effective_op,
+                lhs,
+                rhs,
+                ty,
+            });
+            cond_vals.push(Operand::Value(dest));
+        }
+    }
+    // The store block's computation, minus its GEP and the store itself.
+    let moved: Vec<Instruction> = func.blocks[store_block]
+        .instructions
+        .iter()
+        .filter(|i| {
+            !matches!(i, Instruction::Store { .. })
+                && !matches!(i, Instruction::GetElementPtr { dest, .. } if Some(*dest) == store_gep)
+        })
+        .cloned()
+        .collect();
+
+    // The value computation must precede the selects that consume it.
+    new_insts.extend(moved);
+
+    // Nested selects, outermost = first condition:
+    //   select(c1, select(c2, f(L), L), L)
+    let mut inner: Value = store_val;
+    for cond in cond_vals.iter().rev() {
+        let dest = Value(func.next_value_id);
+        func.next_value_id += 1;
+        new_insts.push(Instruction::Select {
+            dest,
+            cond: cond.clone(),
+            true_val: Operand::Value(inner),
+            false_val: Operand::Value(load_dest),
+            ty: elem_ty,
+        });
+        inner = dest;
+    }
+    new_insts.push(Instruction::Store {
+        val: Operand::Value(inner),
+        ptr: load_ptr,
+        ty: elem_ty,
+        seg_override: AddressSpace::Default,
+        volatile: false,
+    });
+
+    // Commit: first chain block becomes the straight-line body.
+    let first = &mut func.blocks[first_block];
+    first.instructions.extend(new_insts);
+    first.terminator = Terminator::Branch(latch_label);
+    // The remaining chain blocks and the store block become empty bypass
+    // blocks (unreachable; later CFG cleanup removes them).
+    for (block_idx, _, _) in &chain {
+        if *block_idx != first_block {
+            let b = &mut func.blocks[*block_idx];
+            b.instructions.clear();
+            b.terminator = Terminator::Branch(latch_label);
+        }
+    }
+    {
+        let b = &mut func.blocks[store_block];
+        b.instructions.clear();
+        b.terminator = Terminator::Branch(latch_label);
+    }
+    if debug {
+        eprintln!(
+            "[VEC-MAP] conditional-store rewrite: {} condition(s), store folded into select",
+            chain.len()
+        );
+    }
+    true
+}
+
 fn analyze_map_pattern(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
@@ -4116,9 +4578,19 @@ fn analyze_map_pattern(
         for inst in &func.blocks[block_idx].instructions {
             match inst {
                 Instruction::Load { dest, ptr, ty, .. } => {
-                    // Packed I32/U32/F32/F64 all have native forms.
-                    if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
-                        || load_infos.len() >= MAP_MAX_STREAMS
+                    // Packed I32/U32/F32/F64 all have native forms; I8/U8
+                    // the AVX2 32xI8 byte-lane family (the transform's op
+                    // tables fail closed on non-AVX2 targets before any
+                    // mutation).
+                    if !matches!(
+                        *ty,
+                        IrType::I32
+                            | IrType::U32
+                            | IrType::F32
+                            | IrType::F64
+                            | IrType::I8
+                            | IrType::U8
+                    ) || load_infos.len() >= MAP_MAX_STREAMS
                     {
                         if debug {
                             eprintln!("[VEC-MAP] BAIL: bad load ty/streams");
@@ -4128,8 +4600,15 @@ fn analyze_map_pattern(
                     load_infos.push((block_idx, *dest, *ptr, *ty));
                 }
                 Instruction::Store { val, ptr, ty, .. } => {
-                    if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
-                        || store_info.is_some()
+                    if !matches!(
+                        *ty,
+                        IrType::I32
+                            | IrType::U32
+                            | IrType::F32
+                            | IrType::F64
+                            | IrType::I8
+                            | IrType::U8
+                    ) || store_info.is_some()
                     {
                         if debug {
                             eprintln!("[VEC-MAP] BAIL: bad store ty/dup");
@@ -4195,13 +4674,9 @@ fn analyze_map_pattern(
         return None;
     }
 
-    let elem_size = match elem_ty {
-        IrType::F64 | IrType::I64 | IrType::U64 => 8,
-        IrType::F32 | IrType::I32 | IrType::U32 => 4,
-        _ => {
-            set_reject("map element type not vectorizable");
-            return None;
-        }
+    let Some(elem_size) = map_elem_size(&elem_ty) else {
+        set_reject("map element type not vectorizable");
+        return None;
     };
     // The destination GEP must be indexed by the IV (canonical unit stride).
     if !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived, elem_size) {
@@ -4263,8 +4738,45 @@ fn analyze_map_pattern(
             allow_ext_fp_ops,
         )
     };
+    let byte_lane = matches!(elem_ty, IrType::I8 | IrType::U8);
     let expr = if load_dests.len() == 1 && store_val == load_dests[0] {
+        // Plain copy: the stored value IS the loaded byte/word, with no
+        // promotion in between.  Lane width is irrelevant to a copy.
         MapExpr::Load(0)
+    } else if byte_lane {
+        // ---- OP-05d: byte lanes ---------------------------------------
+        // C's integer promotions have already fragmented the source: the
+        // arithmetic runs at `int`, the selects run at `unsigned char`, and
+        // `zext`/`trunc` casts stitch the two together.  A dedicated
+        // parser walks that mixed graph, treats the width casts as what
+        // they are in 8-bit lanes (no-ops for the ring operations), and
+        // discharges the range side conditions the promoted compares and
+        // min/max folds need with an interval analysis.  Native byte-typed
+        // operations are admitted directly (byte-exact by construction,
+        // runtime operands included).
+        let leaf_tys: Vec<(Value, IrType)> = load_infos
+            .iter()
+            .map(|&(_, dest, _, ty)| (dest, ty))
+            .collect();
+        let parsed = parse_byte_map_expr(
+            func,
+            &loop_info.body,
+            &leaf_tys,
+            &is_invariant,
+            store_val,
+            0,
+        );
+        if debug {
+            eprintln!(
+                "[VEC-MAP]   byte parse store_val={} -> {:?}",
+                store_val.0, parsed
+            );
+        }
+        let Some((byte_expr, _)) = parsed else {
+            set_reject("byte map: tree is not byte-exact");
+            return None;
+        };
+        byte_expr
     } else {
         let parsed = parse_tree(store_val, 0);
         if debug {
@@ -4411,7 +4923,13 @@ fn parse_map_expr(
             }
             let fp = ty.is_float();
             match op {
-                IrBinOp::Add | IrBinOp::Mul => {}
+                IrBinOp::Add => {}
+                // Byte lanes have no packed multiply on any modeled target
+                // (x86 has no byte-mul ISA form). Reject at parse: the
+                // transform's op-availability check runs after the
+                // preheader/byte-IV mutations, so a parse-admitted
+                // table-less op must never reach it.
+                IrBinOp::Mul if !matches!(elem_ty, IrType::I8 | IrType::U8) => {}
                 // Sub/Div (and Sqrt below) lower to VecSub/VecDiv/VecSqrt,
                 // which only the x86 backend implements today.
                 IrBinOp::Sub | IrBinOp::SDiv if fp && allow_ext_fp_ops => {}
@@ -4530,10 +5048,12 @@ fn parse_map_expr(
             op, lhs, rhs, ty, ..
         } if !ty.is_float() && *ty == *elem_ty && allow_ext_fp_ops => {
             // Integer conditional maps (clamp / classify / saturate shapes).
-            // Dword lanes only: the packed integer compare emitters cover
-            // I32/U32 (VecCmpI32x8 AVX2, VecCmpI32x4 SSE2); narrower or
-            // wider element types fail closed and keep the loop scalar.
-            if !matches!(ty, IrType::I32 | IrType::U32) {
+            // Dword lanes: the packed integer compare emitters cover I32/U32
+            // (VecCmpI32x8 AVX2, VecCmpI32x4 SSE2). Byte lanes: the AVX2-only
+            // 32xI8 family (VecCmpI8x32) — the transform's op table fails
+            // closed before any mutation on non-AVX2 targets. Word and
+            // 64-bit lanes fail closed and keep the loop scalar.
+            if !matches!(ty, IrType::I32 | IrType::U32 | IrType::I8 | IrType::U8) {
                 return None;
             }
             // Normalize gt/ge by operand swap — exact for either
@@ -4636,11 +5156,16 @@ fn parse_map_expr(
             else {
                 return None;
             };
-            if !(*ty == *elem_ty && (ty.is_float() || matches!(ty, IrType::I32 | IrType::U32))) {
+            if !(*ty == *elem_ty
+                && (ty.is_float()
+                    || matches!(ty, IrType::I32 | IrType::U32 | IrType::I8 | IrType::U8)))
+            {
                 // FP conditions: packed compare emitters. I32/U32
                 // conditions: the integer conditional-map path
-                // (VecCmpI32x8/x4 + VecBlendvI32x8/x4). Anything else
-                // (byte/word lanes, 64-bit lanes) fails closed.
+                // (VecCmpI32x8/x4 + VecBlendvI32x8/x4). I8/U8 conditions:
+                // the byte-lane AVX2 family (VecCmpI8x32 + VecBlendvI8x32;
+                // fail closed pre-mutation on non-AVX2 targets). Anything
+                // else (word lanes, 64-bit lanes) fails closed.
                 return None;
             }
             let t = parse_map_operand(
@@ -4905,9 +5430,433 @@ fn parse_map_operand(
     )
 }
 
-/// Every BinOp/Sqrt/Cmp/Select/MinMax node in the tree must have a lowering
-/// before the transform starts mutating the function (fail-closed
-/// pre-validation).
+/// Byte-lane I32-wrap parser: the interior of the frontend's
+/// `Cast(byte->I32) ... Cast(I32->byte)` round-trip. Every admitted node is
+/// exactly congruent modulo 256 — the stored byte depends only on the low
+/// bytes of the operands — so the byte-lane vector body (and the byte scalar
+/// remainder mirror) compute the same result as the original I32 arithmetic:
+///
+///   * `Add`/`Sub`: two's-complement wrapping is width-independent;
+///   * `And`/`Or`/`Xor`: bitwise, lane-exact at any width;
+///   * `Select`: the condition is a byte-domain compare (native `Cmp ty I8`);
+///     the arms are wrapped trees;
+///   * `Cast(I8|U8 -> I32|U32)`: back into the byte domain (stream loads,
+///     native byte operations, byte selects);
+///   * constants / loop invariants: only the low byte is observed (the
+///     broadcast emitters read the scalar's low 8 bits).
+///
+/// Multiplies have no byte-lane lowering (and the parse rejects them for
+/// byte maps before the transform can admit a table-less op), shifts and
+/// divisions have no mod-256 congruence, and I32-typed compares inside the
+/// wrap are not produced by the frontend (compares stay native byte) — all
+/// fail closed and keep the loop scalar.
+#[expect(clippy::too_many_arguments)]
+// ===========================================================================
+// Byte-lane demotion for elementwise maps (OP-05d)
+// ===========================================================================
+//
+// C's integer promotions destroy byte parallelism.  `dst[i] = tolower(src[i])`
+// is written over `unsigned char`, but the abstract machine widens every
+// operand to `int`, so the IR is a 32-bit expression stitched to the byte
+// loads/stores by `zext`/`trunc` casts and byte-typed selects:
+//
+// ```text
+//     %c   = load u8, src[i]
+//     %w   = zext %c to u32
+//     %m   = <32-bit predicate over %w>
+//     %r   = select %m, add(%w, 32), %w
+//     %t   = trunc %r to u8
+//            store %t, dst[i]
+// ```
+//
+// Evaluating the SAME tree in 8-bit lanes gives 32 elements per YMM and
+// needs no conversion at all.  The transformation is legal because
+// truncation to 8 bits is a RING HOMOMORPHISM from Z/2^32 onto Z/2^8:
+// for `+`, `-`, `&`, `|`, `^` the low byte of the result depends only on
+// the low bytes of the operands, and the store keeps just that low byte —
+// the narrow evaluation is EQUAL, not approximate.
+//
+// Two node kinds are NOT homomorphic and need a side condition:
+//
+//   * `Cmp` (promoted) reads the whole value, not its low byte.  A byte
+//     compare agrees with the wide compare exactly when both operands are
+//     representable in the byte domain the predicate uses: [0, 255] for
+//     unsigned predicates, [-128, 127] for signed ones.  A compare the
+//     frontend kept AT byte type needs no condition — it is byte-exact by
+//     construction and admits runtime operands.
+//   * `MinMax` is a select over a compare and inherits the condition;
+//     `pminub`/`pmaxub` additionally fix the byte order as UNSIGNED, so
+//     both operands must lie in [0, 255] — where the signed and unsigned
+//     wide comparisons coincide anyway.
+//
+// The conditions are discharged by a small interval analysis over the
+// WIDE values: a zero-extended `u8` load is [0, 255], a sign-extended
+// `i8` load is [-128, 127], constants are singletons, truncation to a
+// byte type is the byte domain, and the arithmetic nodes propagate
+// intervals.  Anything the analysis cannot bound fails closed and the
+// loop keeps its scalar form.
+//
+// Deliberate exclusions, each with a concrete machine reason:
+//   * Multiply -- x86 has no packed byte multiply at any width.
+//   * Shifts   -- x86 has no packed byte shift; a word-shift-plus-mask
+//                 lowering is no longer a one-instruction op.
+//   * Non-constant loop invariants in PROMOTED positions -- broadcasting
+//                 one would need `vpbroadcastb` from a GPR (AVX2-only);
+//                 constants replicate into the dword broadcast for free.
+//                 (A native byte-typed compare with a runtime operand
+//                 stays admissible — no broadcast of the operand is
+//                 needed to compare at byte width.)
+
+/// Inclusive interval of the WIDE (promoted) value a demoted node can
+/// take.  `None` means "unbounded / unknown", which fails every side
+/// condition and refuses nothing that was exact.
+type WideRange = Option<(i64, i64)>;
+
+/// [0, 255] — the range of a zero-extended byte.
+const U8_RANGE: (i64, i64) = (0, 255);
+/// [-128, 127] — the range of a sign-extended byte.
+const I8_RANGE: (i64, i64) = (-128, 127);
+/// The value of a lane mask: all-ones (-1) or all-zeros (0).
+const MASK_RANGE: (i64, i64) = (-1, 0);
+
+fn range_within(r: WideRange, bound: (i64, i64)) -> bool {
+    matches!(r, Some((lo, hi)) if lo >= bound.0 && hi <= bound.1)
+}
+
+fn byte_type_range(ty: &IrType) -> Option<(i64, i64)> {
+    match ty {
+        IrType::U8 => Some(U8_RANGE),
+        IrType::I8 => Some(I8_RANGE),
+        _ => None,
+    }
+}
+
+/// Interval arithmetic on the wide domain.  Every operation saturates
+/// into `None` rather than wrapping, so a lost bound can only make the
+/// analysis more conservative.
+fn range_binop(op: IrBinOp, l: WideRange, r: WideRange) -> WideRange {
+    let (ll, lh) = l?;
+    let (rl, rh) = r?;
+    match op {
+        IrBinOp::Add => Some((ll.checked_add(rl)?, lh.checked_add(rh)?)),
+        IrBinOp::Sub => Some((ll.checked_sub(rh)?, lh.checked_sub(rl)?)),
+        // Bitwise results are only bounded when both operands are known
+        // non-negative; then the result cannot exceed the largest operand
+        // rounded up to a full mask of ones.
+        IrBinOp::And if ll >= 0 && rl >= 0 => Some((0, lh.min(rh))),
+        IrBinOp::Or | IrBinOp::Xor if ll >= 0 && rl >= 0 => {
+            let m = lh.max(rh);
+            let bits = 64 - (m as u64).leading_zeros();
+            Some((
+                0,
+                if bits >= 63 {
+                    return None;
+                } else {
+                    (1i64 << bits) - 1
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Byte predicate corresponding to a wide predicate, given that both
+/// operands are known non-negative and below 256.
+///
+/// All values are in [0, 255], so the wide SIGNED order, the wide
+/// UNSIGNED order and the byte UNSIGNED order are the same total order.
+/// Mapping every predicate onto its unsigned form is therefore exact —
+/// and it is also the form `fold_unsigned_range_masks` can fuse.
+fn byte_predicate_unsigned(op: IrCmpOp) -> IrCmpOp {
+    match op {
+        IrCmpOp::Slt | IrCmpOp::Ult => IrCmpOp::Ult,
+        IrCmpOp::Sle | IrCmpOp::Ule => IrCmpOp::Ule,
+        IrCmpOp::Sgt | IrCmpOp::Ugt => IrCmpOp::Ugt,
+        IrCmpOp::Sge | IrCmpOp::Uge => IrCmpOp::Uge,
+        IrCmpOp::Eq => IrCmpOp::Eq,
+        IrCmpOp::Ne => IrCmpOp::Ne,
+    }
+}
+
+/// Normalise a predicate into the EQ/NE/LT/LE subset the packed compare
+/// emitters accept as an immediate, swapping the operands for the GT/GE
+/// forms.  Returns `(op, swap_operands)`.
+fn normalize_cmp_for_lanes(op: IrCmpOp) -> (IrCmpOp, bool) {
+    match op {
+        IrCmpOp::Eq | IrCmpOp::Ne | IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Ult | IrCmpOp::Ule => {
+            (op, false)
+        }
+        IrCmpOp::Sgt => (IrCmpOp::Slt, true),
+        IrCmpOp::Sge => (IrCmpOp::Sle, true),
+        IrCmpOp::Ugt => (IrCmpOp::Ult, true),
+        IrCmpOp::Uge => (IrCmpOp::Ule, true),
+    }
+}
+
+/// Parse the expression feeding a BYTE store into a byte-lane `MapExpr`,
+/// together with the interval its value can take in the WIDE domain.
+///
+/// The width casts make byte trees taller than their dword equivalents
+/// (one cast per promotion, one per truncation), so the depth guard is
+/// looser than `parse_map_expr`'s 6; the node-count cap in the caller is
+/// still the primary size limit.
+fn parse_byte_map_expr(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    leaf_tys: &[(Value, IrType)],
+    is_invariant: &dyn Fn(&Operand) -> bool,
+    value: Value,
+    depth: usize,
+) -> Option<(MapExpr, WideRange)> {
+    if depth > 10 {
+        return None;
+    }
+    if let Some(idx) = leaf_tys.iter().position(|(d, _)| *d == value) {
+        let range = byte_type_range(&leaf_tys[idx].1)?;
+        return Some((MapExpr::Load(idx), Some(range)));
+    }
+    let (_, inst) = find_inst_in_loop(func, loop_blocks, value)?;
+    match inst {
+        Instruction::Copy { src, .. } => {
+            parse_byte_map_operand(func, loop_blocks, leaf_tys, is_invariant, src, depth + 1)
+        }
+        Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        } => {
+            if !from_ty.is_integer() || !to_ty.is_integer() {
+                return None;
+            }
+            let (e, r) =
+                parse_byte_map_operand(func, loop_blocks, leaf_tys, is_invariant, src, depth + 1)?;
+            if to_ty.size() >= from_ty.size() {
+                // Widening (zext/sext): value-preserving, hence the
+                // identity on the byte lane.  The interval is unchanged.
+                Some((e, r))
+            } else if to_ty.size() == 1 {
+                // Truncation to 8 bits: the identity on the byte lane,
+                // and the result's interval is the byte domain of the
+                // target type (C defines `(unsigned char)x` as `x mod
+                // 256`).
+                Some((e, byte_type_range(to_ty)))
+            } else {
+                // A truncation to 16 or 32 bits is NOT the identity on a
+                // byte lane's neighbours; there is nothing to demote to.
+                None
+            }
+        }
+        Instruction::BinOp { op, lhs, rhs, ty, .. } => {
+            if !matches!(
+                op,
+                IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+            ) {
+                // Multiply and shifts have no packed byte encoding at any
+                // vector width; refuse rather than widen.
+                return None;
+            }
+            let native_byte = matches!(ty, IrType::I8 | IrType::U8);
+            if !native_byte && !matches!(ty, IrType::I32 | IrType::U32) {
+                return None;
+            }
+            let (l, lr) =
+                parse_byte_map_operand(func, loop_blocks, leaf_tys, is_invariant, lhs, depth + 1)?;
+            let (r, rr) =
+                parse_byte_map_operand(func, loop_blocks, leaf_tys, is_invariant, rhs, depth + 1)?;
+            let range = if native_byte {
+                // A byte-typed operation wraps in its own domain; every
+                // byte value is reachable, so the interval is the type's.
+                byte_type_range(ty)
+            } else {
+                range_binop(*op, lr, rr)
+            };
+            Some((MapExpr::BinOp(*op, Box::new(l), Box::new(r)), range))
+        }
+        Instruction::Cmp { op, lhs, rhs, ty, .. } => {
+            let native_byte = matches!(ty, IrType::I8 | IrType::U8);
+            let (l, lr) =
+                parse_byte_map_operand(func, loop_blocks, leaf_tys, is_invariant, lhs, depth + 1)?;
+            let (r, rr) =
+                parse_byte_map_operand(func, loop_blocks, leaf_tys, is_invariant, rhs, depth + 1)?;
+            let byte_op = if native_byte {
+                // A compare the frontend kept AT byte type is byte-exact
+                // by construction — no side condition, runtime operands
+                // included.  Keep the predicate exactly as written.
+                *op
+            } else if range_within(lr, U8_RANGE) && range_within(rr, U8_RANGE) {
+                byte_predicate_unsigned(*op)
+            } else if range_within(lr, I8_RANGE) && range_within(rr, I8_RANGE) {
+                // Operands representable in i8: `x |-> x mod 256` is an
+                // order isomorphism from that window onto the byte domain
+                // for BOTH byte orders, so the predicate as written is
+                // exact at byte width.
+                *op
+            } else {
+                return None;
+            };
+            let (norm_op, swap) = normalize_cmp_for_lanes(byte_op);
+            let (a, b) = if swap { (r, l) } else { (l, r) };
+            Some((
+                MapExpr::Cmp(norm_op, Box::new(a), Box::new(b)),
+                Some(MASK_RANGE),
+            ))
+        }
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
+            let (cond_expr, cond_range) =
+                parse_byte_map_operand(func, loop_blocks, leaf_tys, is_invariant, cond, depth + 1)?;
+            // The condition must be a lane mask (all-ones / all-zeros).  A
+            // boolean carried as 0/1 would select on bit 0 only, which no
+            // blend instruction does.
+            if cond_range != Some(MASK_RANGE) {
+                return None;
+            }
+            let (t, tr) = parse_byte_map_operand(
+                func,
+                loop_blocks,
+                leaf_tys,
+                is_invariant,
+                true_val,
+                depth + 1,
+            )?;
+            let (f, fr) = parse_byte_map_operand(
+                func,
+                loop_blocks,
+                leaf_tys,
+                is_invariant,
+                false_val,
+                depth + 1,
+            )?;
+            let union = match (tr, fr) {
+                (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+                _ => None,
+            };
+            // Short-circuit recovery, mirroring the dword parser:
+            // if-conversion lowers `(c1 && c2) ? t : f` into nested
+            // selects over a shared arm.  Recovering the single mask is
+            // what lets the range fusion see `lo <= c && c <= hi` as ONE
+            // window instead of two independent compares.
+            let is_mask = |e: &MapExpr| matches!(e, MapExpr::Cmp(..) | MapExpr::MaskConj { .. });
+            if let MapExpr::Select(inner_cond, inner_t, inner_f) = &t {
+                if is_mask(inner_cond) && is_mask(&cond_expr) && **inner_f == f {
+                    return Some((
+                        MapExpr::Select(
+                            Box::new(MapExpr::MaskConj {
+                                is_and: true,
+                                l: Box::new(cond_expr),
+                                r: inner_cond.clone(),
+                            }),
+                            inner_t.clone(),
+                            Box::new(f),
+                        ),
+                        union,
+                    ));
+                }
+            }
+            if let MapExpr::Select(inner_cond, inner_t, inner_f) = &f {
+                if is_mask(inner_cond) && is_mask(&cond_expr) && **inner_t == t {
+                    return Some((
+                        MapExpr::Select(
+                            Box::new(MapExpr::MaskConj {
+                                is_and: false,
+                                l: Box::new(cond_expr),
+                                r: inner_cond.clone(),
+                            }),
+                            Box::new(t),
+                            inner_f.clone(),
+                        ),
+                        union,
+                    ));
+                }
+            }
+            // Exact unsigned min/max fold.  `pminub`/`pmaxub` need both
+            // operands inside [0, 255]; there the wide and byte unsigned
+            // orders coincide, which is exactly the condition the
+            // compare arm above already checked when it produced the
+            // mask.
+            if let MapExpr::Cmp(cmp_op, cl, cr) = &cond_expr {
+                let unsigned_domain = range_within(tr, U8_RANGE) && range_within(fr, U8_RANGE);
+                if unsigned_domain && matches!(cmp_op, IrCmpOp::Ult | IrCmpOp::Ule) {
+                    // `(a < b) ? a : b` == min(a, b); `(a < b) ? b : a` == max.
+                    if **cl == t && **cr == f {
+                        return Some((
+                            MapExpr::MinMax {
+                                is_max: false,
+                                l: Box::new(t),
+                                r: Box::new(f),
+                            },
+                            union,
+                        ));
+                    }
+                    if **cl == f && **cr == t {
+                        return Some((
+                            MapExpr::MinMax {
+                                is_max: true,
+                                l: Box::new(t),
+                                r: Box::new(f),
+                            },
+                            union,
+                        ));
+                    }
+                }
+            }
+            Some((
+                MapExpr::Select(Box::new(cond_expr), Box::new(t), Box::new(f)),
+                union,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Operand-level entry point for `parse_byte_map_expr`.
+///
+/// Constants keep their VALUE (they are NOT replicated into a byte
+/// pattern here: the scalar remainder mirror evaluates this same tree at
+/// the element type, and `MapEmitCtx` replicates only when it
+/// materialises the packed dword-splat broadcast of the SSE2 path).  The
+/// CARRIER type is canonicalised to `I32`, though: C's integer promotions
+/// leave the same literal spelled at different widths in different
+/// positions — `16` arrives as `I32` inside the promoted compare and as
+/// `I64` in the select arm — and the min/max and short-circuit folds
+/// match subtrees STRUCTURALLY, so without canonicalisation
+/// `(c < 16) ? 16 : c` fails to fold into `max(16, c)` purely because the
+/// two 16s have different carriers.
+///
+/// A NON-constant loop invariant in a promoted position would need a
+/// `vpbroadcastb` from a GPR (AVX2-only) — fail closed; the loop keeps
+/// its correct scalar form.  (Native byte-typed operations never reach
+/// this refusal: their operands are byte values, not wide invariants.)
+fn parse_byte_map_operand(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    leaf_tys: &[(Value, IrType)],
+    is_invariant: &dyn Fn(&Operand) -> bool,
+    operand: &Operand,
+    depth: usize,
+) -> Option<(MapExpr, WideRange)> {
+    if let Operand::Const(c) = operand {
+        let v = c.to_i64()?;
+        let canonical = match i32::try_from(v) {
+            Ok(narrow) => Operand::Const(IrConst::I32(narrow)),
+            Err(_) => operand.clone(),
+        };
+        return Some((MapExpr::Invariant(canonical), Some((v, v))));
+    }
+    let Operand::Value(v) = operand else {
+        return None;
+    };
+    if is_invariant(operand) {
+        return None;
+    }
+    parse_byte_map_expr(func, loop_blocks, leaf_tys, is_invariant, *v, depth)
+}
+
 fn map_tree_ops_available(
     expr: &MapExpr,
     bin_op: &dyn Fn(&IrBinOp) -> Option<IntrinsicOp>,
@@ -4920,34 +5869,118 @@ fn map_tree_ops_available(
         MapExpr::Load(_) | MapExpr::Invariant(_) => true,
         MapExpr::BinOp(op, l, r) => {
             bin_op(op).is_some()
-                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    l,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
+                && map_tree_ops_available(
+                    r,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
         }
         MapExpr::Sqrt(x) => {
             sqrt_op.is_some()
-                && map_tree_ops_available(x, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    x,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
         }
         MapExpr::Cmp(op, l, r) => {
             cmp_op(op).is_some()
-                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    l,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
+                && map_tree_ops_available(
+                    r,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
         }
         MapExpr::Select(c, t, f) => {
             blendv_op.is_some()
-                && map_tree_ops_available(c, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(t, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(f, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    c,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
+                && map_tree_ops_available(
+                    t,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
+                && map_tree_ops_available(
+                    f,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
         }
         MapExpr::MinMax { is_max, l, r } => {
             minmax_op(*is_max).is_some()
-                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    l,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
+                && map_tree_ops_available(
+                    r,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
         }
         MapExpr::MaskConj { is_and, l, r } => {
             // The mask AND/OR rides the packed integer And/Or op table.
             bin_op(if *is_and { &IrBinOp::And } else { &IrBinOp::Or }).is_some()
-                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    l,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
+                && map_tree_ops_available(
+                    r,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                )
         }
     }
 }
@@ -6852,8 +7885,8 @@ fn gep_uses_iv(
 ///
 /// GEP offsets in this IR are BYTE offsets (the remainder loop lowers
 /// `a[i]` to `GEP(base, i*elem_size)`), so offset == raw iv means a
-/// one-byte stride, which is only the canonical shape for elem_size == 1
-/// (never vectorizable) — it is rejected here.
+/// one-byte stride — the canonical shape exactly when elem_size == 1 (the
+/// byte-lane map family), and rejected for every wider element.
 ///
 /// Every accepted form is closed under the two rewrites the transforms
 /// perform: the vec_width scaling (`offset * w` covers w consecutive
@@ -6867,7 +7900,9 @@ fn offset_is_canonical_unit_stride(
     iv_derived: &FxHashSet<Value>,
     elem_size: u32,
 ) -> bool {
-    if elem_size < 2 || !elem_size.is_power_of_two() {
+    // 1 is 2^0 — a power of two; byte streams (elem_size 1) parse below
+    // with the raw IV as their canonical unit stride.
+    if elem_size == 0 || !elem_size.is_power_of_two() {
         return false;
     }
     // Small iterative worklist instead of recursion: the chains are short
@@ -6875,9 +7910,10 @@ fn offset_is_canonical_unit_stride(
     let mut cur = v;
     for _ in 0..8 {
         if cur == iv || iv_derived.contains(&cur) {
-            // A raw iv/cast-of-iv offset (no mul/shl) is a one-byte stride,
-            // which is not the canonical elem_size shape for elem_size >= 2.
-            return false;
+            // A raw iv/cast-of-iv offset (no mul/shl) is a one-byte stride:
+            // the canonical shape exactly when elem_size == 1 (byte
+            // streams); never canonical for a wider element.
+            return elem_size == 1;
         }
         let mut def: Option<&Instruction> = None;
         for block in &func.blocks {
@@ -8218,6 +9254,16 @@ fn find_reduction_byte_iv(
                             _ => {}
                         }
                     }
+                }
+                // Byte streams (elem_size 1): after Copy/Cast resolution
+                // the raw offset IS the canonical scale-1 index — the loop
+                // IV itself (or an IV-derived value; the caller's
+                // gep_uses_iv / offset_is_canonical_unit_stride gate
+                // re-verifies the raw-IV shape and rejects any residual
+                // mul/shl scaling as a non-unit stride). The shl-0 / mul-1
+                // degenerate forms above also match for elem_size 1.
+                if elem_size == 1 {
+                    return Some((*base, resolved_off));
                 }
                 // Offset exists but is not a clean shl/mul by elem_size.
                 return None;
@@ -13978,9 +15024,461 @@ fn fold_int_minmax(expr: &MapExpr) -> MapExpr {
     }
 }
 
-/// Transform a legal one-source store loop to packed 128/256-bit form.  The
-/// optional scale and offset operations stay optional: copies become exactly
-/// load/store, while scale/add/affine maps emit only their source operations.
+/// One side of a potential range conjunction: `lo <= x`, `lo < x` (bound on
+/// the LEFT, operand on the right) or `x <= hi`, `x < hi` (operand on the
+/// LEFT, bound on the right), with the bound a loop-invariant constant.
+struct RangeBoundSide<'a> {
+    /// False when this side carries the LOWER bound (`lo PRED x`).
+    is_upper: bool,
+    /// True for strict predicates (`<`); the fold adjusts the closed
+    /// interval by one before folding.
+    strict: bool,
+    /// True for the unsigned predicate family (Ule/Ult vs Sle/Slt).
+    unsigned: bool,
+    bound: i64,
+    x: &'a MapExpr,
+}
+
+impl<'a> RangeBoundSide<'a> {
+    fn classify(e: &'a MapExpr) -> Option<Self> {
+        let MapExpr::Cmp(op, l, r) = e else {
+            return None;
+        };
+        let (unsigned, strict) = match op {
+            IrCmpOp::Sle => (false, false),
+            IrCmpOp::Slt => (false, true),
+            IrCmpOp::Ule => (true, false),
+            IrCmpOp::Ult => (true, true),
+            _ => return None,
+        };
+        const_of(l)
+            .map(|bound| RangeBoundSide {
+                is_upper: false,
+                strict,
+                unsigned,
+                bound,
+                x: r,
+            })
+            .or_else(|| {
+                const_of(r).map(|bound| RangeBoundSide {
+                    is_upper: true,
+                    strict,
+                    unsigned,
+                    bound,
+                    x: l,
+                })
+            })
+    }
+}
+
+fn const_of(e: &MapExpr) -> Option<i64> {
+    match e {
+        MapExpr::Invariant(Operand::Const(c)) => c.to_i64(),
+        _ => None,
+    }
+}
+
+/// One side of a recovered unsigned range test on a shared subexpression.
+enum RangeBound {
+    /// `X >=u lo`
+    Lower(u64),
+    /// `X <=u hi`
+    Upper(u64),
+}
+
+/// Element size in BYTES for every type the elementwise map vectorizer can
+/// carry.  This is the single authority: `analyze_map_pattern` uses it to
+/// validate the GEP stride, `transform_map_vector` uses it to derive the
+/// vector width and rebuild the byte induction variable, and
+/// `build_map_remainder_loop` uses it to address the scalar remainder.  The
+/// three used to compute it independently, and the transform's copy said
+/// `4` for every non-`F64` type — silently wrong for `I64`/`U64` (8) and
+/// for byte lanes (1), making the remainder read past the array end.
+fn map_elem_size(elem_ty: &IrType) -> Option<u32> {
+    match elem_ty {
+        IrType::F64 | IrType::I64 | IrType::U64 => Some(8),
+        IrType::F32 | IrType::I32 | IrType::U32 => Some(4),
+        IrType::I8 | IrType::U8 => Some(1),
+        _ => None,
+    }
+}
+
+/// Lane width in bits for the integer element types the map vectorizer
+/// admits.  Non-integer (or unsupported) types return `None` and disable
+/// every rewrite in this section.
+fn map_lane_bits(elem_ty: &IrType) -> Option<u32> {
+    match elem_ty {
+        IrType::I8 | IrType::U8 => Some(8),
+        IrType::I32 | IrType::U32 => Some(32),
+        _ => None,
+    }
+}
+
+/// Constant lane value of an `Invariant` leaf, truncated to the lane width.
+///
+/// Truncation is the correct reading: the leaf is broadcast into W-bit
+/// lanes, so only its low W bits are observable.  A non-constant invariant
+/// (a runtime scalar) has no compile-time value and disables the rewrite.
+fn map_const_lane(expr: &MapExpr, bits: u32) -> Option<u64> {
+    let MapExpr::Invariant(Operand::Const(c)) = expr else {
+        return None;
+    };
+    let raw = c.to_i64()? as u64;
+    Some(if bits >= 64 {
+        raw
+    } else {
+        raw & ((1u64 << bits) - 1)
+    })
+}
+
+/// A byte constant replicated across all four bytes of an `I32` broadcast
+/// lane.  `VecBroadcastI32x4` splats a dword; splatting `b * 0x01010101`
+/// fills every BYTE lane with `b`, so the SSE2 byte path needs no
+/// `vpbroadcastb` (which is AVX2-only) for constant operands.
+fn replicate_byte(v: i64) -> i32 {
+    let b = (v as u64 & 0xFF) as u32;
+    (b * 0x0101_0101) as i32
+}
+
+/// Classify a compare node as an unsigned bound on a shared subexpression:
+/// returns `(X, bound)` when the node is `X REL const` or `const REL X`
+/// with an unsigned predicate.  The `+1` / `-1` edge adjustments are done
+/// in the lane's modular domain and fail closed when they would wrap:
+/// `X <u 0` and `X >u MAX` are unsatisfiable, and folding them to an empty
+/// range here would be a silent constant-false the caller cannot
+/// distinguish from "not fusible".
+fn classify_unsigned_bound<'a>(expr: &'a MapExpr, bits: u32) -> Option<(&'a MapExpr, RangeBound)> {
+    let MapExpr::Cmp(op, l, r) = expr else {
+        return None;
+    };
+    let max = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    match op {
+        // `k <= X`  =>  X >=u k
+        IrCmpOp::Ule if map_const_lane(l, bits).is_some() => {
+            Some((r.as_ref(), RangeBound::Lower(map_const_lane(l, bits)?)))
+        }
+        // `X <= k`  =>  X <=u k
+        IrCmpOp::Ule if map_const_lane(r, bits).is_some() => {
+            Some((l.as_ref(), RangeBound::Upper(map_const_lane(r, bits)?)))
+        }
+        // `k < X`   =>  X >=u k+1   (unsatisfiable when k == MAX)
+        IrCmpOp::Ult if map_const_lane(l, bits).is_some() => {
+            let k = map_const_lane(l, bits)?;
+            if k == max {
+                return None;
+            }
+            Some((r.as_ref(), RangeBound::Lower(k + 1)))
+        }
+        // `X < k`   =>  X <=u k-1   (unsatisfiable when k == 0)
+        IrCmpOp::Ult if map_const_lane(r, bits).is_some() => {
+            let k = map_const_lane(r, bits)?;
+            if k == 0 {
+                return None;
+            }
+            Some((l.as_ref(), RangeBound::Upper(k - 1)))
+        }
+        // `X > k`   =>  X >=u k+1   (unsatisfiable when k == MAX)
+        IrCmpOp::Ugt if map_const_lane(r, bits).is_some() => {
+            let k = map_const_lane(r, bits)?;
+            if k == max {
+                return None;
+            }
+            Some((l.as_ref(), RangeBound::Lower(k + 1)))
+        }
+        // `k > X`   =>  X <=u k-1   (unsatisfiable when k == 0)
+        IrCmpOp::Ugt if map_const_lane(l, bits).is_some() => {
+            let k = map_const_lane(l, bits)?;
+            if k == 0 {
+                return None;
+            }
+            Some((r.as_ref(), RangeBound::Upper(k - 1)))
+        }
+        // `X >= k`  =>  X >=u k
+        IrCmpOp::Uge if map_const_lane(r, bits).is_some() => {
+            Some((l.as_ref(), RangeBound::Lower(map_const_lane(r, bits)?)))
+        }
+        // `k >= X`  =>  X <=u k
+        IrCmpOp::Uge if map_const_lane(l, bits).is_some() => {
+            Some((r.as_ref(), RangeBound::Upper(map_const_lane(l, bits)?)))
+        }
+        _ => None,
+    }
+}
+
+/// Build `Cmp(Slt, Add(x, bias), T)` for the window `lo ..= hi`:
+///
+/// ```text
+///     lo <=u X <=u hi
+///   <=> (X - lo) mod 2^W  <=u  R,             R := hi - lo          (1)
+///   <=> signed((X - lo) + SB)  <=s  R - SB,   SB := 2^(W-1)         (2)
+///   <=> signed(X + bias)       <s   T,                              (3)
+///        bias := (SB - lo) mod 2^W,   T := R + 1 - SB
+/// ```
+///
+/// Step (2) is load-bearing: `u |-> signed(u + SB)` is exactly `u - SB`
+/// for EVERY `u` in `[0, 2^W)` — it is the order isomorphism from the
+/// unsigned order to the signed order, so the comparison is preserved
+/// rather than merely implied.  `T` is representable as a signed W-bit
+/// integer iff `R <= 2^W - 2`, which is why the whole-domain window (an
+/// always-true mask) is refused instead of fused.
+///
+/// The result is expressed entirely in ops every integer lane width
+/// already lowers — one `vpadd{b,d}` plus one `vpcmpgt{b,d}` — so the
+/// rewrite needs no new intrinsic and is exact by construction.  The
+/// constants are carried as LANE values sign-extended into the `I32`
+/// carrier; they are deliberately NOT byte-replicated (the scalar
+/// remainder mirror evaluates this tree at the element type, where the
+/// wrapping add and the signed compare are already the right width, and
+/// `MapEmitCtx` replicates when — and only when — it emits the packed
+/// dword-splat broadcast of the SSE2 byte path).
+fn build_fused_range(x: &MapExpr, lo: u64, hi: u64, bits: u32) -> Option<MapExpr> {
+    if lo > hi || bits == 0 || bits > 32 {
+        return None;
+    }
+    let modulus = 1u64 << bits;
+    let sign_bit = 1u64 << (bits - 1);
+    let span = hi - lo;
+    // R == 2^W - 1 is the always-true predicate; T = R + 1 - SB would be
+    // +SB, which is not a signed W-bit value.  Leave it to the two-compare
+    // form rather than emit a mask that is off by one lane value.
+    if span >= modulus - 1 {
+        return None;
+    }
+    let bias = sign_bit.wrapping_sub(lo) & (modulus - 1);
+    let threshold = (span + 1).wrapping_sub(sign_bit) & (modulus - 1);
+    let to_lane_const = |v: u64| -> Operand {
+        let sext = if v & sign_bit != 0 {
+            (v | !(modulus - 1)) as i64
+        } else {
+            v as i64
+        };
+        Operand::Const(IrConst::I32(sext as i32))
+    };
+    Some(MapExpr::Cmp(
+        IrCmpOp::Slt,
+        Box::new(MapExpr::BinOp(
+            IrBinOp::Add,
+            Box::new(x.clone()),
+            Box::new(MapExpr::Invariant(to_lane_const(bias))),
+        )),
+        Box::new(MapExpr::Invariant(to_lane_const(threshold))),
+    ))
+}
+
+/// Rewrite unsigned constant-bounded compare masks into the two-instruction
+/// biased signed form.  Applied bottom-up so a fused conjunction is itself
+/// visible to an enclosing rewrite.  Three shapes are recognised:
+///
+/// * `MaskConj{and, lower, upper}` on a *structurally identical* subject
+///   `X` — the `lo <= c && c <= hi` classifier — becomes one fused window.
+///   Structural identity is the right test: the emit cache keys nodes by
+///   their tree shape, so two equal subtrees are the same SSA value in the
+///   emitted code.
+/// * `MaskConj{or, lower, upper}` on a shared subject — the De Morgan
+///   complement `x < lo || x > hi` — is exactly the negated window, so it
+///   fuses the same way with the Select arms swapped by the caller's fold.
+/// * a leftover single-sided unsigned constant compare, which is the
+///   degenerate range `0 ..= hi` resp. `lo ..= MAX`.
+///
+/// The window fusion MUST be attempted on the UNFOLDED children: folding a
+/// child first rewrites `Cmp(Ule, k, X)` into the biased
+/// `Cmp(Slt, Add(X, b), T)`, which no longer classifies as an unsigned
+/// bound, so the conjunction would never be recognised.
+fn fold_unsigned_range_masks(expr: &MapExpr, bits: u32) -> MapExpr {
+    match expr {
+        MapExpr::Select(cond, t, f) => {
+            // De Morgan complement: `Select(x < lo || x > hi, t, f)` is
+            // `Select(lo <= x <= hi, f, t)` — the inside-window selects the
+            // original FALSE arm.  One fused window instead of two compares
+            // and a disjunction.
+            if let MapExpr::MaskConj { is_and: false, l, r } = &**cond {
+                if let (Some((xl, bl)), Some((xr, br))) = (
+                    classify_unsigned_bound(l, bits),
+                    classify_unsigned_bound(r, bits),
+                ) {
+                    if xl == xr {
+                        // The OR sides are the COMPLEMENT of a window:
+                        // `x <=u u  ||  x >=u v` is the negation of
+                        // `u+1 <=u x <=u v-1`, so the inner window's
+                        // bounds are the EXCLUSIVE edges — one past the
+                        // upper side, one below the lower side.  (Borrowing
+                        // the AND arm's inclusive pairing here would
+                        // produce an inverted, empty window.)
+                        let window = match (bl, br) {
+                            (RangeBound::Upper(u), RangeBound::Lower(v)) => Some((u + 1, v - 1)),
+                            (RangeBound::Lower(v), RangeBound::Upper(u)) => Some((u + 1, v - 1)),
+                            _ => None,
+                        };
+                        if let Some((lo, hi)) = window {
+                            let subject = fold_unsigned_range_masks(xl, bits);
+                            if let Some(fused) = build_fused_range(&subject, lo, hi, bits) {
+                                return MapExpr::Select(
+                                    Box::new(fused),
+                                    Box::new(fold_unsigned_range_masks(f, bits)),
+                                    Box::new(fold_unsigned_range_masks(t, bits)),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            MapExpr::Select(
+                Box::new(fold_unsigned_range_masks(cond, bits)),
+                Box::new(fold_unsigned_range_masks(t, bits)),
+                Box::new(fold_unsigned_range_masks(f, bits)),
+            )
+        }
+        MapExpr::MaskConj { is_and, l, r } => {
+            if *is_and {
+                if let (Some((xl, bl)), Some((xr, br))) = (
+                    classify_unsigned_bound(l, bits),
+                    classify_unsigned_bound(r, bits),
+                ) {
+                    if xl == xr {
+                        let window = match (bl, br) {
+                            (RangeBound::Lower(lo), RangeBound::Upper(hi)) => Some((lo, hi)),
+                            (RangeBound::Upper(hi), RangeBound::Lower(lo)) => Some((lo, hi)),
+                            // Two bounds of the same kind are an
+                            // intersection of half-lines, not a window.
+                            _ => None,
+                        };
+                        if let Some((lo, hi)) = window {
+                            let subject = fold_unsigned_range_masks(xl, bits);
+                            if let Some(fused) = build_fused_range(&subject, lo, hi, bits) {
+                                return fused;
+                            }
+                        }
+                    }
+                }
+            }
+            MapExpr::MaskConj {
+                is_and: *is_and,
+                l: Box::new(fold_unsigned_range_masks(l, bits)),
+                r: Box::new(fold_unsigned_range_masks(r, bits)),
+            }
+        }
+        MapExpr::Cmp(op, l, r) => {
+            let folded = MapExpr::Cmp(
+                *op,
+                Box::new(fold_unsigned_range_masks(l, bits)),
+                Box::new(fold_unsigned_range_masks(r, bits)),
+            );
+            let max = if bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            if let Some((x, bound)) = classify_unsigned_bound(&folded, bits) {
+                let (lo, hi) = match bound {
+                    RangeBound::Lower(lo) => (lo, max),
+                    RangeBound::Upper(hi) => (0, hi),
+                };
+                if let Some(fused) = build_fused_range(x, lo, hi, bits) {
+                    return fused;
+                }
+            }
+            folded
+        }
+        MapExpr::BinOp(op, l, r) => MapExpr::BinOp(
+            *op,
+            Box::new(fold_unsigned_range_masks(l, bits)),
+            Box::new(fold_unsigned_range_masks(r, bits)),
+        ),
+        MapExpr::Sqrt(x) => MapExpr::Sqrt(Box::new(fold_unsigned_range_masks(x, bits))),
+        MapExpr::MinMax { is_max, l, r } => MapExpr::MinMax {
+            is_max: *is_max,
+            l: Box::new(fold_unsigned_range_masks(l, bits)),
+            r: Box::new(fold_unsigned_range_masks(r, bits)),
+        },
+        MapExpr::Load(_) | MapExpr::Invariant(_) => expr.clone(),
+    }
+}
+
+/// Strength-reduce a lane select whose arms differ by a CONSTANT into mask
+/// arithmetic: `m ? x + k : x`  ==>  `x + (m & k)`, `m ? x - k : x`
+/// ==>  `x - (m & k)`, and the classifier shape `m ? k : 0` ==> `m & k`.
+///
+/// `m` is all-ones or all-zeros per lane, so `m & k` is `k` or `0` and the
+/// arithmetic reproduces the select exactly.  The payoff is
+/// microarchitectural: `vpand` + `vpaddb` are two single-uop instructions,
+/// whereas `vpblendvb` is TWO uops on every Intel core through Raptor Lake
+/// (and a 2-cycle op on Zen); the rewrite also shortens the dependency
+/// chain, because the `vpand` depends only on the mask.
+///
+/// PACKED-ONLY lowering: a scalar `setcc` yields 0/1, so `mask & k` would
+/// collapse to 0 in the scalar remainder — the caller keeps the original
+/// tree for the mirror and re-runs the op-availability gate on the result.
+fn strength_reduce_mask_select(expr: &MapExpr) -> MapExpr {
+    let rebuilt = match expr {
+        MapExpr::BinOp(op, l, r) => MapExpr::BinOp(
+            *op,
+            Box::new(strength_reduce_mask_select(l)),
+            Box::new(strength_reduce_mask_select(r)),
+        ),
+        MapExpr::Cmp(op, l, r) => MapExpr::Cmp(
+            *op,
+            Box::new(strength_reduce_mask_select(l)),
+            Box::new(strength_reduce_mask_select(r)),
+        ),
+        MapExpr::Select(c, t, f) => MapExpr::Select(
+            Box::new(strength_reduce_mask_select(c)),
+            Box::new(strength_reduce_mask_select(t)),
+            Box::new(strength_reduce_mask_select(f)),
+        ),
+        MapExpr::MinMax { is_max, l, r } => MapExpr::MinMax {
+            is_max: *is_max,
+            l: Box::new(strength_reduce_mask_select(l)),
+            r: Box::new(strength_reduce_mask_select(r)),
+        },
+        MapExpr::MaskConj { is_and, l, r } => MapExpr::MaskConj {
+            is_and: *is_and,
+            l: Box::new(strength_reduce_mask_select(l)),
+            r: Box::new(strength_reduce_mask_select(r)),
+        },
+        MapExpr::Sqrt(x) => MapExpr::Sqrt(Box::new(strength_reduce_mask_select(x))),
+        MapExpr::Load(_) | MapExpr::Invariant(_) => expr.clone(),
+    };
+    let MapExpr::Select(cond, t, f) = &rebuilt else {
+        return rebuilt;
+    };
+    // `m ? x + k : x`  ->  `x + (m & k)`   (k constant, x shared).  Add is
+    // commutative so either operand spelling matches; for Sub only the
+    // SUBTRAHEND may be the constant (`k - x` has no shared-operand form).
+    if let MapExpr::BinOp(arith, a_l, a_r) = t.as_ref() {
+        if matches!(arith, IrBinOp::Add | IrBinOp::Sub) {
+            let commutative = matches!(arith, IrBinOp::Add);
+            let mut pairs = vec![(a_l, a_r)];
+            if commutative {
+                pairs.push((a_r, a_l));
+            }
+            for (var, konst) in pairs {
+                if var.as_ref() == f.as_ref()
+                    && matches!(konst.as_ref(), MapExpr::Invariant(Operand::Const(_)))
+                {
+                    return MapExpr::BinOp(
+                        *arith,
+                        f.clone(),
+                        Box::new(MapExpr::BinOp(IrBinOp::And, cond.clone(), konst.clone())),
+                    );
+                }
+            }
+        }
+    }
+    // `m ? k : 0` — the classifier shape — is just `m & k`.
+    if let (MapExpr::Invariant(Operand::Const(_)), MapExpr::Invariant(Operand::Const(zero))) =
+        (t.as_ref(), f.as_ref())
+    {
+        if zero.to_i64() == Some(0) {
+            return MapExpr::BinOp(IrBinOp::And, cond.clone(), t.clone());
+        }
+    }
+    rebuilt
+}
+
 fn transform_map_vector(
     func: &mut IrFunction,
     pattern: &MapPattern,
@@ -13989,10 +15487,19 @@ fn transform_map_vector(
 ) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
+    // Byte-lane maps run at BOTH vector widths: 32xI8 per YMM under AVX2,
+    // 16xI8 per XMM at the SSE2 baseline (paddb/psubb/pcmpeqb/pcmpgtb and
+    // the unsigned pminub/pmaxub are all baseline SSE2 encodings; the byte
+    // select lowers to the lane-agnostic bitwise select).  Everything
+    // still fails closed through map_tree_ops_available BEFORE any
+    // mutation if a needed op has no table row.
     let vec_width: u64 = match (pattern.elem_ty, avx2) {
         (IrType::F64, true) => 4,
         (IrType::F64, false) => 2,
         (IrType::I64 | IrType::U64, _) => 2,
+        // Byte lanes: 32xI8 in one YMM (AVX2) / 16xI8 per XMM (SSE2).
+        (IrType::I8 | IrType::U8, true) => 32,
+        (IrType::I8 | IrType::U8, false) => 16,
         (_, true) => 8,
         (_, false) => 4,
     };
@@ -14030,7 +15537,18 @@ fn transform_map_vector(
         return 0;
     };
 
-    let elem_size = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
+    // Stream byte stride: 8 for F64, 1 for byte lanes, 4 otherwise.
+    // (I64/U64 maps take the 4 here — historical: their GEP offset is
+    // `iv << 3`, which find_reduction_byte_iv does not match at stride 4,
+    // so those patterns decline before any mutation; keeping the value
+    // preserves that fail-closed behavior.)
+    // MUST agree with `analyze_map_pattern`'s stride check and with the
+    // packed loop's byte induction variable — `map_elem_size` is the
+    // single authority (a local re-derivation silently mis-addresses
+    // every type it forgets: I64/U64 are 8 bytes, not 4).
+    let Some(elem_size) = map_elem_size(&pattern.elem_ty) else {
+        return 0;
+    };
     let mut src_bases = Vec::with_capacity(pattern.src_geps.len());
     for &src_gep in &pattern.src_geps {
         let Some((base, _)) =
@@ -14091,6 +15609,13 @@ fn transform_map_vector(
         (IrType::F32, false) => IntrinsicOp::VecBroadcastF32x4,
         (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecBroadcastI32x8,
         (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecBroadcastI32x4,
+        // Byte-lane maps, AVX2: the scalar operand's low 8 bits are
+        // broadcast (movd + vpbroadcastb), exact for the mod-256 congruent
+        // wrap.  SSE2: the dword splat carries a REPLICATED constant
+        // (b * 0x01010101 — see MapEmitCtx::replicate_byte_consts); no
+        // vpbroadcastb exists before AVX2.
+        (IrType::I8 | IrType::U8, true) => IntrinsicOp::VecBroadcastI8x32,
+        (IrType::I8 | IrType::U8, false) => IntrinsicOp::VecBroadcastI32x4,
         (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecBroadcastI64x2,
         _ => return 0,
     };
@@ -14102,6 +15627,11 @@ fn transform_map_vector(
         (IrType::F32, false) => IntrinsicOp::VecLoadF32x4,
         (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecLoadI32x8,
         (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecLoadI32x4,
+        (IrType::I8 | IrType::U8, true) => IntrinsicOp::VecLoadI8x32,
+        // Byte loads reuse the dword move at SSE2: `movdqu` transfers raw
+        // bits with no lane semantics, so a separate byte-named load op
+        // would be the identical instruction under a different name.
+        (IrType::I8 | IrType::U8, false) => IntrinsicOp::VecLoadI32x4,
         (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecLoadI64x2,
         _ => return 0,
     };
@@ -14112,6 +15642,8 @@ fn transform_map_vector(
         (IrType::F32, false) => IntrinsicOp::VecStoreF32x4,
         (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecStoreI32x8,
         (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecStoreI32x4,
+        (IrType::I8 | IrType::U8, true) => IntrinsicOp::VecStoreI8x32,
+        (IrType::I8 | IrType::U8, false) => IntrinsicOp::VecStoreI32x4,
         (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecStoreI64x2,
         _ => return 0,
     };
@@ -14148,6 +15680,23 @@ fn transform_map_vector(
             (IrType::I32 | IrType::U32, false, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x4),
             (IrType::I32 | IrType::U32, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x8),
             (IrType::I32 | IrType::U32, false, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x4),
+            // Byte-lane map arithmetic: the ISA's byte vocabulary only —
+            // Add/Sub/And/Or/Xor. There is no byte multiply or byte shift;
+            // the parser rejects those for byte maps so this table never
+            // sees them.  Add/Sub have byte encodings at both widths; the
+            // bitwise ops are bit-exact at EVERY lane width, so the SSE2
+            // path reuses the dword x4 forms rather than duplicating three
+            // identical instructions under byte names.
+            (IrType::I8 | IrType::U8, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddI8x32),
+            (IrType::I8 | IrType::U8, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI8x16),
+            (IrType::I8 | IrType::U8, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI8x32),
+            (IrType::I8 | IrType::U8, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI8x16),
+            (IrType::I8 | IrType::U8, true, IrBinOp::And) => Some(IntrinsicOp::VecAndI8x32),
+            (IrType::I8 | IrType::U8, false, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x4),
+            (IrType::I8 | IrType::U8, true, IrBinOp::Or) => Some(IntrinsicOp::VecOrI8x32),
+            (IrType::I8 | IrType::U8, false, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x4),
+            (IrType::I8 | IrType::U8, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI8x32),
+            (IrType::I8 | IrType::U8, false, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x4),
             (IrType::I64 | IrType::U64, _, IrBinOp::Add) => Some(IntrinsicOp::VecAddI64x2),
             (IrType::I64 | IrType::U64, _, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI64x2),
             (IrType::I64 | IrType::U64, _, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI64x2),
@@ -14182,6 +15731,12 @@ fn transform_map_vector(
             (IrType::F32, true) => IntrinsicOp::VecCmpF32x8,
             (IrType::F32, false) => IntrinsicOp::VecCmpF32x4,
             (IrType::I32, true) | (IrType::U32, true) => IntrinsicOp::VecCmpI32x8,
+            // Byte-lane compares (vpcmpeqb/vpcmpgtb + per-byte 0x80 bias
+            // for the unsigned forms): same predicate-immediate vocabulary
+            // as the dword emitter.  Both encodings are SSE2 BASELINE, so
+            // the 16xI8 path works on the plain x86-64 target.
+            (IrType::I8, true) | (IrType::U8, true) => IntrinsicOp::VecCmpI8x32,
+            (IrType::I8, false) | (IrType::U8, false) => IntrinsicOp::VecCmpI8x16,
             (IrType::I32, false) | (IrType::U32, false) => IntrinsicOp::VecCmpI32x4,
             _ => return None,
         };
@@ -14205,6 +15760,12 @@ fn transform_map_vector(
         (IrType::F32, true) => Some(IntrinsicOp::VecBlendvF32x8),
         (IrType::F32, false) => Some(IntrinsicOp::VecBlendvF32x4),
         (IrType::I32, true) | (IrType::U32, true) => Some(IntrinsicOp::VecBlendvI32x8),
+        // `vpblendvb` consults ONE SIGN BIT PER BYTE; the dword blend
+        // would smear a byte mask across four lanes, so the byte width
+        // needs its own op.  The 128-bit form falls back to the
+        // lane-agnostic bitwise select, exact for any mask granularity.
+        (IrType::I8, true) | (IrType::U8, true) => Some(IntrinsicOp::VecBlendvI8x32),
+        (IrType::I8, false) | (IrType::U8, false) => Some(IntrinsicOp::VecBlendvI8x16),
         (IrType::I32, false) | (IrType::U32, false) => Some(IntrinsicOp::VecBlendvI32x4),
         _ => None,
     };
@@ -14225,6 +15786,24 @@ fn transform_map_vector(
             // closed through map_tree_ops_available.
             (IrType::I32, true, false) => Some(IntrinsicOp::VecMinI32x8),
             (IrType::I32, true, true) => Some(IntrinsicOp::VecMaxI32x8),
+            // Unsigned byte min/max are SSE2 BASELINE instructions, so the
+            // byte clamp idiom lowers to two instructions on every x86-64
+            // target — no SSE4.1 gate, unlike the dword forms.  The byte
+            // parse only forms a MinMax after proving both operands lie in
+            // [0, 255], where the unsigned byte order and the wide order
+            // agree.
+            (IrType::I8, false, false) | (IrType::U8, false, false) => {
+                Some(IntrinsicOp::VecMinU8x16)
+            }
+            (IrType::I8, true, false) | (IrType::U8, true, false) => {
+                Some(IntrinsicOp::VecMinU8x32)
+            }
+            (IrType::I8, false, true) | (IrType::U8, false, true) => {
+                Some(IntrinsicOp::VecMaxU8x16)
+            }
+            (IrType::I8, true, true) | (IrType::U8, true, true) => {
+                Some(IntrinsicOp::VecMaxU8x32)
+            }
             _ => None,
         }
     };
@@ -14238,14 +15817,7 @@ fn transform_map_vector(
     // `add_scaled` under `-march=x86-64` processed 16 of 64 elements).
     // A mid-transform bail also leaves `func.next_value_id` stale and
     // corrupts every later pass (bit_idioms indexed out of bounds).
-    if !map_tree_ops_available(
-        &pattern.expr,
-        &bin_op,
-        sqrt_op,
-        &cmp_op,
-        &minmax_op,
-        blendv_op,
-    ) {
+    if !map_tree_ops_available(&pattern.expr, &bin_op, sqrt_op, &cmp_op, &minmax_op, blendv_op) {
         if debug {
             eprintln!("[VEC-MAP]   Tree requires an op with no vector lowering");
         }
@@ -14268,10 +15840,23 @@ fn transform_map_vector(
     // The SAME folded tree drives the packed body, the ops-availability
     // check, and the scalar remainder mirror, so all three stay
     // lane-exact with respect to each other.
-    let expr = if avx2 && pattern.elem_ty == IrType::I32 {
-        fold_int_minmax(&pattern.expr)
-    } else {
-        pattern.expr.clone()
+    // OP-05c: canonicalise unsigned constant-bounded masks into the
+    // biased signed form at EVERY integer lane width (8/32) — two packed
+    // instructions (`vpadd` + `vpcmpgt`) instead of the three-to-eleven
+    // instruction expansion the raw unsigned compares would pay, and four
+    // tree nodes instead of seven for the classifier window.  The integer
+    // min/max fold (AVX2 dword) runs afterwards, on the fused tree; byte
+    // min/max is folded during the byte parse itself.
+    let expr = match map_lane_bits(&pattern.elem_ty) {
+        Some(bits) => {
+            let fused = fold_unsigned_range_masks(&pattern.expr, bits);
+            if avx2 && pattern.elem_ty == IrType::I32 {
+                fold_int_minmax(&fused)
+            } else {
+                fused
+            }
+        }
+        None => pattern.expr.clone(),
     };
 
     let Some(remainder) = build_map_remainder_loop(
@@ -14388,28 +15973,13 @@ fn transform_map_vector(
         _ => return 0,
     };
 
-    // Rewrite the canonical IV < limit test to IV < floor(limit / width).
-    for &block_idx in &pattern.loop_blocks {
-        for inst in &mut func.blocks[block_idx].instructions {
-            if let Instruction::Cmp { lhs, rhs, .. } = inst {
-                let modifies_lhs = matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
-                let modifies_rhs = matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
-                if modifies_lhs {
-                    *rhs = divided_limit.clone();
-                    changes += 1;
-                } else if modifies_rhs {
-                    *lhs = divided_limit.clone();
-                    changes += 1;
-                }
-            }
-        }
-    }
-
     // Carry an independent I64 byte offset through the packed loop.  The
-    // source-language IV remains an element counter for its exact signed or
-    // unsigned exit semantics and for scalar-remainder recovery; the byte IV
-    // gives both memory streams one SIB/NEON indexed address with no per-
-    // iteration cast, multiply, or GEP materialization.
+    // byte IV gives both memory streams one SIB/NEON indexed address with
+    // no per-iteration cast, multiply, or GEP materialization — and (see
+    // the guard rewrite below) doubles as the loop's ONLY induction
+    // variable: the source-language element IV dies with the vector loop
+    // when nothing else consumes it, leaving `addq $32; cmpq; jl` loop
+    // control instead of a counter IV plus a derived offset IV.
     let byte_iv = Value(next_val_id);
     next_val_id += 1;
     let byte_iv_next = Value(next_val_id);
@@ -14443,7 +16013,114 @@ fn transform_map_vector(
         });
     changes += 2;
 
+    // ── Byte-granular exit guard: `byte_iv <u/s byte_limit` ──────────────
+    // byte_limit = divided_limit * vec_bytes is EXACTLY equivalent to the
+    // element guard `vec_iv < divided_limit` (byte_iv = 32*vec_iv, both
+    // non-negative while the loop runs, and negative trip counts make both
+    // guards false on iteration zero — the sign-biased quotient rounds
+    // toward zero).  When the guard rewrite succeeds, the element phi's
+    // remaining uses are the self-feeding latch add and the remainder
+    // resume computation (rewritten below to read byte_iv), so DCE retires
+    // the second induction variable entirely.
+    let vec_bytes = (elem_size as u64 * vec_width) as i64;
+    let byte_limit: Option<Operand> = match &divided_limit {
+        Operand::Const(c) => c
+            .to_i64()
+            .map(|n| Operand::Const(IrConst::I64(n.wrapping_mul(vec_bytes)))),
+        Operand::Value(v) => {
+            let cast = Value(next_val_id);
+            next_val_id += 1;
+            let blimit = Value(next_val_id);
+            next_val_id += 1;
+            let mut blimit_insts = Vec::new();
+            let cast_op = if matches!(pattern.iv_ty, IrType::I32 | IrType::U32) {
+                blimit_insts.push(Instruction::Cast {
+                    dest: cast,
+                    src: Operand::Value(*v),
+                    from_ty: pattern.iv_ty,
+                    to_ty: IrType::I64,
+                });
+                Operand::Value(cast)
+            } else {
+                Operand::Value(*v)
+            };
+            blimit_insts.push(Instruction::BinOp {
+                dest: blimit,
+                op: IrBinOp::Shl,
+                lhs: cast_op,
+                rhs: Operand::Const(IrConst::I64(vec_bytes.trailing_zeros() as i64)),
+                ty: IrType::I64,
+            });
+            changes += blimit_insts.len();
+            func.blocks[preheader_idx].instructions.extend(blimit_insts);
+            Some(Operand::Value(blimit))
+        }
+    };
+    let mut byte_guard = false;
+    if let Some(byte_limit) = byte_limit {
+        for &block_idx in &pattern.loop_blocks {
+            for inst in &mut func.blocks[block_idx].instructions {
+                if let Instruction::Cmp { lhs, rhs, ty, .. } = inst {
+                    let lhs_iv = matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
+                    let rhs_iv = matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
+                    if lhs_iv != rhs_iv && (lhs_iv || rhs_iv) {
+                        if lhs_iv {
+                            *lhs = Operand::Value(byte_iv);
+                            *rhs = byte_limit.clone();
+                        } else {
+                            *lhs = byte_limit.clone();
+                            *rhs = Operand::Value(byte_iv);
+                        }
+                        *ty = IrType::I64;
+                        changes += 1;
+                        byte_guard = true;
+                    }
+                }
+            }
+        }
+    }
+    if !byte_guard {
+        // Fallback: the original element-granular bound rewrite (the dual-IV
+        // form) — correct for every shape, one extra induction variable.
+        for &block_idx in &pattern.loop_blocks {
+            for inst in &mut func.blocks[block_idx].instructions {
+                if let Instruction::Cmp { lhs, rhs, .. } = inst {
+                    let modifies_lhs = matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
+                    let modifies_rhs = matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
+                    if modifies_lhs {
+                        *rhs = divided_limit.clone();
+                        changes += 1;
+                    } else if modifies_rhs {
+                        *lhs = divided_limit.clone();
+                        changes += 1;
+                    }
+                }
+            }
+        }
+    }
+
     let dst_address = (dst_base, Operand::Value(byte_iv));
+
+    // Mask-arithmetic strength reduction (`m ? x + k : x` ==> `x + (m&k)`)
+    // is a PACKED-ONLY lowering: it treats a compare result as an all-ones
+    // lane mask, which is what `vpcmpgt*` produces but NOT what a scalar
+    // compare produces (a scalar `setcc` yields 0/1, so `mask & k` would
+    // collapse to 0).  The scalar remainder mirror below therefore keeps
+    // `expr`; only the packed body sees the rewritten tree.  The rewrite
+    // trades a `Select` for an `And`, so the op-availability gate is re-run
+    // on the result: if the target lacks the bitwise lane op the packed
+    // body simply keeps the blend form.
+    let packed_expr = match map_lane_bits(&pattern.elem_ty) {
+        Some(_) => {
+            let reduced = strength_reduce_mask_select(&expr);
+            if map_tree_ops_available(&reduced, &bin_op, sqrt_op, &cmp_op, &minmax_op, blendv_op) {
+                reduced
+            } else {
+                expr.clone()
+            }
+        }
+        None => expr.clone(),
+    };
 
     // Replace the scalar store with only the packed operations present in the
     // source expression.  DCE removes the now-unreachable scalar dataflow.
@@ -14459,13 +16136,14 @@ fn transform_map_vector(
             cmp_op: &cmp_op,
             minmax_op: &minmax_op,
             blendv_op,
+            replicate_byte_consts: !avx2 && matches!(pattern.elem_ty, IrType::I8 | IrType::U8),
             node_cache: Vec::new(),
             preheader_insts: Vec::new(),
             vec_insts: Vec::new(),
             next_val_id,
             changes: &mut changes,
         };
-        let Some(current) = ctx.emit(&expr) else {
+        let Some(current) = ctx.emit(&packed_expr) else {
             if debug {
                 eprintln!("[VEC-MAP]   Tree emission failed");
             }
@@ -14509,7 +16187,86 @@ fn transform_map_vector(
 
     let rem_header_label = remainder.header_label;
     let rem_iv_phi = remainder.iv_phi;
+    let rem_vec_exit_label = remainder.vec_exit_label;
     changes += remainder.commit(func, pattern.header_idx);
+
+    // Single-IV loop control: the remainder resumes from the BYTE IV
+    // (element index = byte_iv >> log2(elem_size)), not the element phi —
+    // otherwise the phi's last non-self use keeps the second induction
+    // variable alive through the packed loop.  The vec-exit block's
+    // `iv * vec_width` resume computation is rewritten in place; when the
+    // byte-guard rewrite above did not fire, this rewrite is still exact
+    // (byte_iv at the vector exit = 32 * vector iterations = the element
+    // phi's value there * elem_size, element-wise identical resume point).
+    {
+        let elem_shift = elem_size.trailing_zeros() as i64;
+        let vec_exit_idx = func
+            .blocks
+            .iter()
+            .position(|b| b.label == rem_vec_exit_label)
+            .expect("vec-exit block present after remainder commit");
+        let mul_pos = func.blocks[vec_exit_idx]
+            .instructions
+            .iter()
+            .position(|inst| {
+                matches!(
+                    inst,
+                    Instruction::BinOp {
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(v),
+                        ..
+                    } if *v == pattern.iv
+                )
+            });
+        if let Some(pos) = mul_pos {
+            let i_rem_start = match &func.blocks[vec_exit_idx].instructions[pos] {
+                Instruction::BinOp { dest, .. } => *dest,
+                _ => unreachable!("position() matched a BinOp"),
+            };
+            let shr_val = if elem_shift > 0 {
+                let v = Value(next_val_id);
+                next_val_id += 1;
+                Some((
+                    v,
+                    Instruction::BinOp {
+                        dest: v,
+                        op: IrBinOp::LShr,
+                        lhs: Operand::Value(byte_iv),
+                        rhs: Operand::Const(IrConst::I64(elem_shift)),
+                        ty: IrType::I64,
+                    },
+                ))
+            } else {
+                None
+            };
+            let resume_src = shr_val
+                .as_ref()
+                .map(|(v, _)| Operand::Value(*v))
+                .unwrap_or(Operand::Value(byte_iv));
+            let resume = match pattern.iv_ty {
+                IrType::I32 | IrType::U32 => Instruction::Cast {
+                    dest: i_rem_start,
+                    src: resume_src,
+                    from_ty: IrType::I64,
+                    to_ty: pattern.iv_ty,
+                },
+                _ => Instruction::Copy {
+                    dest: i_rem_start,
+                    src: resume_src,
+                },
+            };
+            let mut replacement: Vec<Instruction> = Vec::new();
+            if let Some((_, inst)) = shr_val {
+                replacement.push(inst);
+            }
+            replacement.push(resume);
+            let n_new = replacement.len();
+            func.blocks[vec_exit_idx]
+                .instructions
+                .splice(pos..pos + 1, replacement);
+            changes += n_new;
+        }
+    }
 
     // Loop versioning for streams that may alias the destination.
     if !pattern.guarded_streams.is_empty() {
@@ -14973,7 +16730,12 @@ fn build_map_remainder_loop(
     } else {
         i_rem_iv
     };
-    let elem_bytes = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
+    // Same single authority: this used to be a local `if F64 { 8 } else
+    // { 4 }`, which silently produced scale-4 addressing for I64/U64
+    // elements and read past the end of the array in the remainder.
+    let Some(elem_bytes) = map_elem_size(&pattern.elem_ty).map(i64::from) else {
+        return None;
+    };
     remainder_insts.push(Instruction::BinOp {
         dest: offset_v,
         op: IrBinOp::Mul,
@@ -15176,8 +16938,10 @@ fn emit_map_scalar_tree(
             // Non-short-circuit mirror of `c1 && c2` / `c1 || c2`: both
             // sides are compares (side-effect-free by construction), so the
             // bitwise AND/OR of the two 0/1 boolean values is exact.
-            // Compare results are zero-extended setcc values; the 32-bit
-            // AND/OR of two such values stays a clean 0/1.
+            // Compare results are zero-extended setcc values (setcc +
+            // movzbl %al,%eax — width-independent of the compared operand
+            // type, so byte compares produce the same clean 0/1); the
+            // 32-bit AND/OR of two such values stays a clean 0/1.
             let lv = emit_map_scalar_tree(
                 l,
                 src_bases,
@@ -15277,7 +17041,23 @@ fn emit_map_scalar_tree(
                 *next_val_id += 1;
                 v
             };
-            let cmp_op = if *is_max { IrCmpOp::Sgt } else { IrCmpOp::Slt };
+            // The comparison's SIGNEDNESS must match the packed op the
+            // vector body emits, or the mirror and the packed loop
+            // disagree on exactly the values whose sign bit is set.
+            // Dword lanes fold to vpminsd/vpmaxsd (SIGNED); byte lanes
+            // fold to vpminub/vpmaxub (UNSIGNED — the only byte min/max
+            // in the SSE2 baseline), and the byte parse only forms a
+            // MinMax after proving both operands lie in [0, 255], where
+            // the unsigned order is the right one.  Emitting `Slt` for a
+            // byte clamp made `min(240, 16)` return 240 in the scalar
+            // remainder (as i8, 240 is -16).
+            let byte_lane = matches!(pattern.elem_ty, IrType::I8 | IrType::U8);
+            let cmp_op = match (*is_max, byte_lane) {
+                (true, false) => IrCmpOp::Sgt,
+                (false, false) => IrCmpOp::Slt,
+                (true, true) => IrCmpOp::Ugt,
+                (false, true) => IrCmpOp::Ult,
+            };
             remainder_insts.push(Instruction::Cmp {
                 dest: cmp_dest,
                 op: cmp_op,
@@ -15849,6 +17629,286 @@ mod fixed_distance_slp_tests {
 /// FP min/max/select map-parsing tests: the exact-ternary folds into
 /// VecMin/VecMax and the general compare+blendv shape must be recognized by
 /// analyze_map_pattern from a canonical post-if-convert loop.
+#[cfg(test)]
+mod range_fusion_tests {
+    use super::*;
+
+    fn load() -> MapExpr {
+        MapExpr::Load(0)
+    }
+    fn konst(v: i32) -> MapExpr {
+        MapExpr::Invariant(Operand::Const(IrConst::I32(v)))
+    }
+    fn cmp(op: IrCmpOp, l: MapExpr, r: MapExpr) -> MapExpr {
+        MapExpr::Cmp(op, Box::new(l), Box::new(r))
+    }
+    fn conj(is_and: bool, l: MapExpr, r: MapExpr) -> MapExpr {
+        MapExpr::MaskConj {
+            is_and,
+            l: Box::new(l),
+            r: Box::new(r),
+        }
+    }
+    fn select(c: MapExpr, t: MapExpr, f: MapExpr) -> MapExpr {
+        MapExpr::Select(Box::new(c), Box::new(t), Box::new(f))
+    }
+
+    /// Interpret the fused mask `Cmp(Slt, Add(x, bias), T)` on a concrete
+    /// lane value, in exactly the modular arithmetic the packed
+    /// instructions implement: wrapping add on W bits, then a SIGNED
+    /// compare of the W-bit results.
+    fn eval_fused(fused: &MapExpr, x: u64, bits: u32) -> bool {
+        let modulus = 1u64 << bits;
+        let sign_bit = 1u64 << (bits - 1);
+        let to_signed = |v: u64| -> i64 {
+            let v = v & (modulus - 1);
+            if v & sign_bit != 0 {
+                v as i64 - modulus as i64
+            } else {
+                v as i64
+            }
+        };
+        let MapExpr::Cmp(IrCmpOp::Slt, lhs, rhs) = fused else {
+            panic!("expected a signed-lt mask, got {fused:?}");
+        };
+        let MapExpr::BinOp(IrBinOp::Add, subject, bias) = lhs.as_ref() else {
+            panic!("expected a biased subject, got {lhs:?}");
+        };
+        assert_eq!(**subject, load(), "subject must be preserved verbatim");
+        let bias = map_const_lane(bias, bits).expect("bias must be a constant");
+        let threshold = map_const_lane(rhs, bits).expect("threshold must be a constant");
+        to_signed(x.wrapping_add(bias)) < to_signed(threshold)
+    }
+
+    /// EXHAUSTIVE proof at W = 8: for every window `lo..=hi` and every
+    /// lane value, the fused mask agrees with the unsigned range predicate
+    /// it replaces.  256*257/2 windows x 256 values ~ 8.4M checks — cheap,
+    /// and it covers every wrap, every sign-bit crossing and every edge
+    /// the 32-bit derivation relies on (the identity is width-parametric,
+    /// so an exhaustive 8-bit proof is a proof of the algebra at every
+    /// width).
+    #[test]
+    fn fused_mask_matches_unsigned_range_exhaustively_at_8_bits() {
+        let bits = 8u32;
+        for lo in 0u64..256 {
+            for hi in lo..256 {
+                if lo == 0 && hi == 255 {
+                    // The whole-domain window is refused by design (the
+                    // bias trick has no signed 8-bit threshold for it);
+                    // everything else must fuse.
+                    assert!(build_fused_range(&load(), 0, 255, bits).is_none());
+                    continue;
+                }
+                let fused = build_fused_range(&load(), lo, hi, bits)
+                    .unwrap_or_else(|| panic!("window {lo}..={hi} must fuse"));
+                for x in 0u64..256 {
+                    let expected = lo <= x && x <= hi;
+                    assert_eq!(
+                        eval_fused(&fused, x, bits),
+                        expected,
+                        "fused mask disagrees at lo={lo} hi={hi} x={x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The whole-domain window is REFUSED, not fused: `T` would be +SB,
+    /// which is not a signed W-bit value, and a silent off-by-one mask is
+    /// a miscompile.  Empty windows (lo > hi) are refused likewise.
+    #[test]
+    fn whole_domain_and_empty_windows_are_refused() {
+        assert!(build_fused_range(&load(), 0, 255, 8).is_none());
+        assert!(build_fused_range(&load(), 0, u32::MAX as u64, 32).is_none());
+        assert!(build_fused_range(&load(), 200, 100, 8).is_none());
+        // Every proper window at both widths fuses.
+        for (lo, hi) in [(0u64, 254u64), (1, 255), (65, 90), (127, 128), (200, 201)] {
+            assert!(build_fused_range(&load(), lo, hi, 8).is_some(), "{lo}..={hi}");
+        }
+        for (lo, hi) in [(0u64, (1 << 32) - 2), (1, u32::MAX as u64), (0x7fffffff, 0x80000000)] {
+            assert!(build_fused_range(&load(), lo, hi, 32).is_some(), "{lo}..={hi}");
+        }
+    }
+
+    /// `lo <= x && x <= hi` (the classifier idiom, either comparand order)
+    /// folds to ONE fused compare; `x < lo || x > hi` (the De Morgan
+    /// complement) folds the same window with the select arms swapped.
+    #[test]
+    fn conjunction_and_demorgan_complement_fold() {
+        let bits = 8u32;
+        let window = conj(
+            true,
+            cmp(IrCmpOp::Ule, konst(97), load()),
+            cmp(IrCmpOp::Ule, load(), konst(122)),
+        );
+        let folded = fold_unsigned_range_masks(&window, bits);
+        assert!(
+            matches!(&folded, MapExpr::Cmp(IrCmpOp::Slt, _, _)),
+            "AND window must fuse, got {folded:?}"
+        );
+        for x in 0u64..256 {
+            assert_eq!(eval_fused(&folded, x, bits), (97..=122).contains(&x));
+        }
+
+        // Complement: `x < 97 || x > 122` selects t; the fused window
+        // selects the ORIGINAL FALSE arm.
+        let complement = conj(
+            false,
+            cmp(IrCmpOp::Ult, load(), konst(97)),
+            cmp(IrCmpOp::Ugt, load(), konst(122)),
+        );
+        let sel = select(
+            complement,
+            konst(1),
+            konst(0),
+        );
+        let folded = fold_unsigned_range_masks(&sel, bits);
+        let MapExpr::Select(cond, t, f) = &folded else {
+            panic!("complement keeps the select, got {folded:?}");
+        };
+        assert!(matches!(cond.as_ref(), MapExpr::Cmp(IrCmpOp::Slt, _, _)));
+        assert_eq!(**t, konst(0), "false arm becomes the window's TRUE arm");
+        assert_eq!(**f, konst(1));
+        for x in 0u64..256 {
+            let MapExpr::Cmp(_, _, _) = cond.as_ref() else { unreachable!() };
+            let inside = eval_fused(cond, x, bits);
+            // The select yields t when the complement condition held, i.e.
+            // when x is OUTSIDE the window.
+            let out_of_window = !(97..=122).contains(&x);
+            assert_eq!(inside, !out_of_window);
+        }
+    }
+
+    /// Single-sided unsigned compares are the degenerate windows
+    /// `0..=hi` / `lo..=MAX` and fuse to the same two instructions.
+    #[test]
+    fn single_sided_bounds_fuse() {
+        let bits = 8u32;
+        let cases = [
+            (IrCmpOp::Ule, false, 100i32, 0u64, 100u64),   // x <= 100
+            (IrCmpOp::Ult, false, 100, 0, 99),             // x < 100
+            (IrCmpOp::Ule, true, 100, 100, 255),           // 100 <= x
+            (IrCmpOp::Ult, true, 100, 101, 255),           // 100 < x
+        ];
+        for (op, const_lhs, k, lo, hi) in cases {
+            let expr = if const_lhs {
+                cmp(op, konst(k), load())
+            } else {
+                cmp(op, load(), konst(k))
+            };
+            let folded = fold_unsigned_range_masks(&expr, bits);
+            assert!(
+                matches!(&folded, MapExpr::Cmp(IrCmpOp::Slt, _, _)),
+                "{op:?} must fuse, got {folded:?}"
+            );
+            for x in 0u64..256 {
+                assert_eq!(
+                    eval_fused(&folded, x, bits),
+                    (lo..=hi).contains(&x),
+                    "{op:?} const_lhs={const_lhs} k={k} x={x}"
+                );
+            }
+        }
+    }
+
+    /// Strength reduction: `m ? x + k : x` ==> `x + (m & k)` and
+    /// `m ? k : 0` ==> `m & k`; anything without the shared-operand /
+    /// constant shape is returned verbatim.
+    #[test]
+    fn strength_reduction_shapes() {
+        let m = cmp(IrCmpOp::Slt, load(), konst(10));
+        let cases: Vec<(MapExpr, MapExpr)> = vec![
+            (
+                // m ? x + 32 : x
+                select(
+                    m.clone(),
+                    MapExpr::BinOp(
+                        IrBinOp::Add,
+                        Box::new(load()),
+                        Box::new(konst(32)),
+                    ),
+                    load(),
+                ),
+                // x + (m & 32)
+                MapExpr::BinOp(
+                    IrBinOp::Add,
+                    Box::new(load()),
+                    Box::new(MapExpr::BinOp(
+                        IrBinOp::And,
+                        Box::new(m.clone()),
+                        Box::new(konst(32)),
+                    )),
+                ),
+            ),
+            (
+                // m ? x - 32 : x
+                select(
+                    m.clone(),
+                    MapExpr::BinOp(
+                        IrBinOp::Sub,
+                        Box::new(load()),
+                        Box::new(konst(32)),
+                    ),
+                    load(),
+                ),
+                MapExpr::BinOp(
+                    IrBinOp::Sub,
+                    Box::new(load()),
+                    Box::new(MapExpr::BinOp(
+                        IrBinOp::And,
+                        Box::new(m.clone()),
+                        Box::new(konst(32)),
+                    )),
+                ),
+            ),
+            (
+                // m ? 1 : 0  (the classifier shape)
+                select(m.clone(), konst(1), konst(0)),
+                MapExpr::BinOp(IrBinOp::And, Box::new(m), Box::new(konst(1))),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strength_reduce_mask_select(&input), expected);
+        }
+        // No shared operand / not a constant delta: verbatim.
+        let unrelated = select(
+            cmp(IrCmpOp::Slt, load(), konst(10)),
+            konst(5),
+            konst(7),
+        );
+        assert_eq!(strength_reduce_mask_select(&unrelated), unrelated);
+        // m ? x + y : x with y NON-constant: verbatim (m & y is still
+        // exact per lane, but the rewrite targets constant deltas only).
+        let nonconst = select(
+            cmp(IrCmpOp::Slt, load(), konst(10)),
+            MapExpr::BinOp(
+                IrBinOp::Add,
+                Box::new(load()),
+                Box::new(MapExpr::Load(1)),
+            ),
+            load(),
+        );
+        assert_eq!(strength_reduce_mask_select(&nonconst), nonconst);
+    }
+
+    /// `map_elem_size` is the single authority for the packed loop's
+    /// stride; every supported type must answer, and the answer must
+    /// match the ABI size.
+    #[test]
+    fn map_elem_size_matches_abi_sizes() {
+        assert_eq!(map_elem_size(&IrType::F64), Some(8));
+        assert_eq!(map_elem_size(&IrType::I64), Some(8));
+        assert_eq!(map_elem_size(&IrType::U64), Some(8));
+        assert_eq!(map_elem_size(&IrType::F32), Some(4));
+        assert_eq!(map_elem_size(&IrType::I32), Some(4));
+        assert_eq!(map_elem_size(&IrType::U32), Some(4));
+        assert_eq!(map_elem_size(&IrType::I8), Some(1));
+        assert_eq!(map_elem_size(&IrType::U8), Some(1));
+        assert_eq!(map_elem_size(&IrType::I16), None);
+        assert_eq!(map_elem_size(&IrType::U16), None);
+    }
+}
+
 #[cfg(test)]
 mod map_fp_select_tests {
     use super::*;

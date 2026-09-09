@@ -1561,6 +1561,7 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadF64x4
             | O::VecLoadI32x4
             | O::VecLoadI32x8
+            | O::VecLoadI8x32
             | O::VecLoadF32x4
             | O::VecLoadF32x8
             | O::VecHorizontalAddF64x2
@@ -1687,6 +1688,11 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecMaxF32x4
             | O::VecMaxF64x4
             | O::VecMaxF64x2
+            // Byte-lane two-operand forms (AVX2 32xI8): vpaddb via
+            // emit_avx_binary_256 and the vpbroadcastb producer share the
+            // dword family's deferred-%ymm0 consumer contract.
+            | O::VecAddI8x32
+            | O::VecBroadcastI8x32
     )
 }
 
@@ -1765,6 +1771,28 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // only the reduction path consumed VecMaxI32x8).
             | O::VecMinI32x8
             | O::VecMaxI32x8
+            // Byte-lane map ops (AVX2 32xI8): same SSA-scratch-pair
+            // contract — results live in the SIMD scratch pair until the
+            // adjacent VecStore.
+            | O::VecLoadI8x32
+            | O::VecAddI8x32
+            | O::VecSubI8x32
+            | O::VecAndI8x32
+            | O::VecOrI8x32
+            | O::VecXorI8x32
+            | O::VecCmpI8x32
+            | O::VecBlendvI8x32
+            | O::VecCmpI8x16
+            | O::VecBlendvI8x16
+            | O::VecMinU8x32
+            | O::VecMinU8x16
+            | O::VecMaxU8x32
+            | O::VecMaxU8x16
+            | O::VecRotlI32x4
+            | O::VecShufdI32x4
+            | O::VecShufbI32x4
+            | O::VecPackI32x4
+            | O::VecBroadcastI8x32
     )
 }
 
@@ -1876,13 +1904,17 @@ pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool 
             | O::VecLoadF32x4
             | O::VecLoadI32x4
             | O::VecLoadI64x2
+            | O::VecLoadI8x32
     )
 }
 
 /// 256-bit loads eligible for source-operand folding (VLFOLD).
 pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
-    matches!(op, O::VecLoadF64x4 | O::VecLoadF32x8 | O::VecLoadI32x8)
+    matches!(
+        op,
+        O::VecLoadF64x4 | O::VecLoadF32x8 | O::VecLoadI32x8 | O::VecLoadI8x32
+    )
 }
 
 /// Map FMA intrinsics `VecMadd*(input, scale, bias)` (`emit_avx_map_fma`):
@@ -1917,6 +1949,8 @@ pub(crate) fn is_cache_aware_3op(op: &crate::ir::intrinsics::IntrinsicOp) -> boo
             | O::VecCmpI32x4
             | O::VecBlendvI32x8
             | O::VecBlendvI32x4
+            | O::VecCmpI8x32
+            | O::VecBlendvI8x32
     )
 }
 
@@ -1945,6 +1979,11 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         // packed min/max contract above.
         O::VecAndI32x8 | O::VecOrI32x8 | O::VecXorI32x8 => Some(true),
         O::VecSubI32x8 => Some(false),
+        // Byte-lane map arithmetic (AVX2 32xI8): same emit_avx_binary_256
+        // memory-src2 contract; And/Or/Xor/Add commutative, Sub strictly
+        // ordered (fold only in the args[1] src2 position).
+        O::VecAddI8x32 | O::VecAndI8x32 | O::VecOrI8x32 | O::VecXorI8x32 => Some(true),
+        O::VecSubI8x32 => Some(false),
         _ => None,
     }
 }

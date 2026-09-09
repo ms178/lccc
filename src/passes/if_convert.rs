@@ -717,6 +717,16 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     // detection below (loads make arms fail the side-effect-free check).
     let rewrites = rewrite_covered_arm_loads(func, &label_to_idx, &preds);
 
+    // Shared-arm tail duplication (see `plan_shared_arm_dup`): restructure
+    // one nested conditional at a time so the diamond detectors below can
+    // convert it inside-out on this and the following fixpoint iterations.
+    // Planned on the post-rewrite CFG (label_to_idx/preds are still current
+    // — the covered-load rewrites are instruction-level); the detector
+    // context is built AFTER the duplication so it sees the fresh CFG.
+    let dup = match plan_shared_arm_dup(func, &label_to_idx, &preds) {
+        Some(plan) => usize::from(apply_shared_arm_dup(func, &plan)),
+        None => 0,
+    };
     // Detector context: natural loops (for the speculative arm-load gate) and
     // the def/copy maps.  Built AFTER the covered-load rewrites so the SSA
     // defs are the ones the detectors will actually see.
@@ -764,7 +774,397 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     // (they'll have no instructions and just an unconditional branch)
     // This is handled by the CFG simplification pass that runs after us.
 
-    converted + rewrites
+    converted + rewrites + dup
+}
+
+/// A planned shared-arm duplication: the outer head H's edge to the shared
+/// arm S is redirected to a fresh clone of S, leaving S the sole arm of the
+/// inner head H2.
+struct SharedArmDup {
+    /// Outer CondBranch head (its S-edge is redirected).
+    h_idx: usize,
+    /// True when H's TRUE edge targets S.
+    h_edge_is_true: bool,
+    /// The shared arm (preds {H, H2} before the transform).
+    s_idx: usize,
+}
+
+/// Plan the tail duplication of a SHARED ARM of a nested conditional.
+///
+/// The `c1 && c2 ? T : S` / `c1 || c2 ? S : T` statement forms lower to a
+/// CFG where the inner diamond's arm S has TWO predecessors (the outer head
+/// H and the inner head H2):
+///
+/// ```text
+///     H : CondBranch c1 -> H2 / S      (one edge to S, one to H2)
+///     H2: CondBranch c2 -> T / S       (S shared)
+///     S : ...pure...; Branch M         (preds {H, H2})
+///     T : ...pure...; Branch M         (preds {H2})
+///     M : phi [(vT, T), (vS, S), ...]
+/// ```
+///
+/// `detect_diamond` requires single-predecessor arms, so neither level
+/// converts and the whole shape stays branchy — this is exactly the shape
+/// of the `if (c >= 'a' && c <= 'z') s[i] = c - 32;` byte-casefold family
+/// (and its dword/word siblings), where GCC if-converts and then
+/// auto-vectorizes.
+///
+/// The transform redirects H's S-edge to a fresh clone S' of S (identical
+/// pure instructions, fresh SSA dests, operands unchanged) and extends M's
+/// phis with an S'-incoming carrying the same (clone-mapped) value:
+///
+/// * SSA dominance guarantees every operand of S's instructions is defined
+///   on the H->S path outside {H2, S} (H2 has not executed there), so the
+///   clone's operands are valid on its H->S' edge without any rewriting.
+/// * Values internal to S are remapped to the clone's dests; the phi
+///   S-incoming is replicated for S' with that mapping.
+/// * Per executed path the transform is neutral: S' runs exactly where S
+///   would have run.  It costs |S| duplicated instructions (bounded by the
+///   same arm budget the conversions use) and ENABLES the existing
+///   machinery: the inner diamond converts partially (3-pred merge), then
+///   the outer diamond converts fully, yielding the nested Select
+///   `Select(c1, Select(c2, vT, vS), vS)` — which the map vectorizer's
+///   MaskConj recovery fuses into one compare-conjunction blend.
+///
+/// One plan per pass invocation: the fixpoint in `if_convert_function`
+/// re-enters for deeper nests (a && b && c) and for the conversions
+/// themselves.  Fail-closed everywhere — any shape the diamond detectors
+/// would refuse (impure arms, budget overruns, unconvertible phis,
+/// boolean-diamond profitability guards, constant conditions) is not
+/// duplicated.
+fn plan_shared_arm_dup(
+    func: &IrFunction,
+    label_to_idx: &crate::common::fx_hash::FxHashMap<BlockId, usize>,
+    preds: &analysis::FlatAdj,
+) -> Option<SharedArmDup> {
+    for h_idx in 0..func.blocks.len() {
+        let (c1, t1, f1) = match &func.blocks[h_idx].terminator {
+            Terminator::CondBranch {
+                cond,
+                true_label,
+                false_label,
+            } => (cond, *true_label, *false_label),
+            _ => continue,
+        };
+        if is_constant_condition(&func.blocks[h_idx], c1) {
+            continue;
+        }
+        // H's two targets are the shared arm S and the inner head H2 (both
+        // orientations: `&&` puts H2 on the true edge, `||` on the false).
+        for (s_label, h2_label) in [(t1, f1), (f1, t1)] {
+            let Some(&s_idx) = label_to_idx.get(&s_label) else {
+                continue;
+            };
+            let Some(&h2_idx) = label_to_idx.get(&h2_label) else {
+                continue;
+            };
+            if s_idx == h2_idx || s_idx == h_idx || h2_idx == h_idx {
+                continue;
+            }
+            // H2 is the inner conditional head.  Its targets are T and the
+            // shared arm S (either orientation).
+            let (c2, t2, f2) = match &func.blocks[h2_idx].terminator {
+                Terminator::CondBranch {
+                    cond,
+                    true_label,
+                    false_label,
+                } => (cond, *true_label, *false_label),
+                _ => continue,
+            };
+            if is_constant_condition(&func.blocks[h2_idx], c2) || t2 == f2 {
+                continue;
+            }
+            let t_label = if t2 == s_label {
+                f2
+            } else if f2 == s_label {
+                t2
+            } else {
+                continue;
+            };
+            let Some(&t_idx) = label_to_idx.get(&t_label) else {
+                continue;
+            };
+            if t_idx == s_idx || t_idx == h_idx || t_idx == h2_idx {
+                continue;
+            }
+            // Structural shape: S has exactly the two heads as preds; T and
+            // H2 have exactly one; both arms merge at M.
+            if preds.len(s_idx) != 2 || preds.len(t_idx) != 1 || preds.len(h2_idx) != 1 {
+                continue;
+            }
+            let s_pred_set = {
+                let mut v = preds.row(s_idx).to_vec();
+                v.sort_unstable();
+                let mut expected = vec![h_idx as u32, h2_idx as u32];
+                expected.sort_unstable();
+                v == expected
+            };
+            if !s_pred_set
+                || preds.row(t_idx)[0] as usize != h2_idx
+                || preds.row(h2_idx)[0] as usize != h_idx
+            {
+                continue;
+            }
+            let s_block = &func.blocks[s_idx];
+            let t_block = &func.blocks[t_idx];
+            let m_idx = match (&s_block.terminator, &t_block.terminator) {
+                (Terminator::Branch(a), Terminator::Branch(b)) if a == b => *label_to_idx.get(a)?,
+                _ => continue,
+            };
+            if m_idx == h_idx || m_idx == h2_idx || m_idx == s_idx || m_idx == t_idx {
+                continue;
+            }
+            // Purity/budget, mirroring the diamond detector's gates for
+            // the INNER diamond (S and T are its arms).  The strict
+            // load-free purity gate is deliberate: a load in a DUPLICATED
+            // arm doubles the speculative-load analysis surface for a
+            // value-computation shape that almost never has one — fail
+            // closed and keep such nests branchy (the detector's own
+            // load-speculation gate still applies to non-shared diamonds).
+            if !is_side_effect_free(s_block) || !is_side_effect_free(t_block) {
+                continue;
+            }
+            let max_arm_insts: usize =
+                crate::backend::x86::cpu_model::active().if_convert_arm_budget();
+            if effective_arm_len(s_block) > max_arm_insts
+                || effective_arm_len(t_block) > max_arm_insts
+            {
+                continue;
+            }
+            // The inner conversion must have a convertible phi (both arms'
+            // incomings, no F128/I128 stragglers), and must not be one of
+            // the short-circuit boolean shapes the profitability guard
+            // keeps branchy.  Without these the duplication would be dead
+            // weight.
+            let merge_block = &func.blocks[m_idx];
+            let mut phi_selects: Vec<(Value, IrType, Operand, Operand)> = Vec::new();
+            for inst in &merge_block.instructions {
+                if let Instruction::Phi {
+                    dest, ty, incoming, ..
+                } = inst
+                {
+                    let mut tv = None;
+                    let mut fv = None;
+                    for (op, label) in incoming {
+                        if *label == t_block.label {
+                            tv = Some(*op);
+                        } else if *label == s_block.label {
+                            fv = Some(*op);
+                        }
+                    }
+                    match (tv, fv) {
+                        (Some(tv), Some(fv)) => {
+                            if ty.is_long_double() || ty.is_128bit() {
+                                // Mirror detect_diamond: a straggler phi
+                                // blocks the whole conversion.
+                                phi_selects.clear();
+                                break;
+                            }
+                            phi_selects.push((*dest, *ty, tv, fv));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if phi_selects.is_empty() || skip_boolean_diamond(func, &phi_selects) {
+                continue;
+            }
+            // Phi completeness: every phi in M must carry an S-incoming (S
+            // is a predecessor); the clone's edge needs one per phi.
+            let all_phis_have_s = merge_block.instructions.iter().all(|inst| match inst {
+                Instruction::Phi { incoming, .. } => {
+                    incoming.iter().any(|(_, label)| *label == s_block.label)
+                }
+                _ => true,
+            });
+            if !all_phis_have_s {
+                continue;
+            }
+            return Some(SharedArmDup {
+                h_idx,
+                h_edge_is_true: t1 == s_label,
+                s_idx,
+            });
+        }
+    }
+    None
+}
+
+/// Apply a planned shared-arm duplication (see `plan_shared_arm_dup`).
+fn apply_shared_arm_dup(func: &mut IrFunction, plan: &SharedArmDup) -> bool {
+    let s_label = func.blocks[plan.s_idx].label;
+    // Defensive re-validation: H still ends in the expected CondBranch.
+    let (t1, f1) = match &func.blocks[plan.h_idx].terminator {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => (*true_label, *false_label),
+        _ => return false,
+    };
+    let edge_is_true = if plan.h_edge_is_true {
+        t1 == s_label
+    } else {
+        f1 == s_label
+    };
+    if !edge_is_true {
+        return false;
+    }
+
+    // Clone S with fresh SSA dests; values internal to S are remapped,
+    // external operands are kept (dominance makes them valid on the
+    // H -> S' edge).  All reads are taken into owned locals first so no
+    // borrow of `func.blocks` spans the mutations below.
+    let (s_insts, s_term, s_spans) = {
+        let s_block = &func.blocks[plan.s_idx];
+        (
+            s_block.instructions.clone(),
+            s_block.terminator.clone(),
+            s_block.source_spans.clone(),
+        )
+    };
+    if !matches!(s_term, Terminator::Branch(_)) {
+        return false;
+    }
+    let mut clone_map: crate::common::fx_hash::FxHashMap<u32, u32> =
+        crate::common::fx_hash::FxHashMap::default();
+    let mut cloned_insts: Vec<Instruction> = Vec::with_capacity(s_insts.len());
+    for inst in &s_insts {
+        let mut cloned = inst.clone();
+        if let Some(dest) = inst.dest() {
+            let fresh = Value(func.next_value_id);
+            func.next_value_id += 1;
+            clone_map.insert(dest.0, fresh.0);
+            set_instruction_dest(&mut cloned, fresh);
+        }
+        remap_shared_arm_operands(&mut cloned, &clone_map);
+        cloned_insts.push(cloned);
+    }
+
+    let s_prime_label = BlockId(func.next_label);
+    func.next_label += 1;
+    func.blocks.push(BasicBlock {
+        label: s_prime_label,
+        instructions: cloned_insts,
+        terminator: s_term.clone(),
+        source_spans: s_spans,
+    });
+
+    // Extend M's phis: the S'-edge carries the S-edge's value, with values
+    // internal to S mapped to the clone's dests.
+    if let Terminator::Branch(m_label) = s_term {
+        let m_idx = func
+            .blocks
+            .iter()
+            .position(|b| b.label == m_label)
+            .expect("merge block exists");
+        let m_block = &mut func.blocks[m_idx];
+        for inst in &mut m_block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                if let Some(pos) = incoming.iter().position(|(_, l)| *l == s_label) {
+                    let v = incoming[pos].0;
+                    let mapped = match v {
+                        Operand::Value(val) => match clone_map.get(&val.0) {
+                            Some(&nv) => Operand::Value(Value(nv)),
+                            None => v,
+                        },
+                        other => other,
+                    };
+                    incoming.push((mapped, s_prime_label));
+                } else {
+                    // Phi completeness was planned; a missing S-incoming
+                    // means the function mutated underneath us.
+                    return false;
+                }
+            } else {
+                break; // phis are a contiguous prefix
+            }
+        }
+    }
+
+    // Redirect H's S-edge to the clone.
+    let term = &mut func.blocks[plan.h_idx].terminator;
+    if let Terminator::CondBranch {
+        true_label,
+        false_label,
+        ..
+    } = term
+    {
+        if *true_label == s_label {
+            *true_label = s_prime_label;
+        } else if *false_label == s_label {
+            *false_label = s_prime_label;
+        }
+    }
+    true
+}
+
+/// Rewrite the mutable value references of one (cloned) instruction through
+/// a dest map: `Operand::Value` positions, GEP bases and load pointers.
+/// Covers exactly the instruction kinds `arm_is_speculatable` admits.
+fn remap_shared_arm_operands(
+    inst: &mut Instruction,
+    map: &crate::common::fx_hash::FxHashMap<u32, u32>,
+) {
+    let mut map_val = |v: &mut Value| {
+        if let Some(&nv) = map.get(&v.0) {
+            *v = Value(nv);
+        }
+    };
+    let mut map_op = |o: &mut Operand| {
+        if let Operand::Value(v) = o {
+            map_val(v);
+        }
+    };
+    match inst {
+        Instruction::BinOp { lhs, rhs, .. } => {
+            map_op(lhs);
+            map_op(rhs);
+        }
+        Instruction::UnaryOp { src, .. } => map_op(src),
+        Instruction::Cmp { lhs, rhs, .. } => {
+            map_op(lhs);
+            map_op(rhs);
+        }
+        Instruction::Cast { src, .. } => map_op(src),
+        Instruction::Copy { src, .. } => map_op(src),
+        Instruction::GetElementPtr { base, offset, .. } => {
+            map_val(base);
+            map_op(offset);
+        }
+        Instruction::GlobalAddr { .. } => {}
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
+            map_op(cond);
+            map_op(true_val);
+            map_op(false_val);
+        }
+        Instruction::Load { ptr, .. } => map_val(ptr),
+        // The speculatable gate admits nothing else; leaving an exotic
+        // instruction untouched would be a silent miscompile, so refuse.
+        _ => {}
+    }
+}
+
+/// Set the destination of a cloned instruction (dest positions only; the
+/// map covers every kind `arm_is_speculatable` admits).
+fn set_instruction_dest(inst: &mut Instruction, fresh: Value) {
+    match inst {
+        Instruction::BinOp { dest, .. }
+        | Instruction::UnaryOp { dest, .. }
+        | Instruction::Cmp { dest, .. }
+        | Instruction::Cast { dest, .. }
+        | Instruction::Copy { dest, .. }
+        | Instruction::GetElementPtr { dest, .. }
+        | Instruction::GlobalAddr { dest, .. }
+        | Instruction::Select { dest, .. }
+        | Instruction::Load { dest, .. } => *dest = fresh,
+        _ => {}
+    }
 }
 
 /// Information about a detected diamond pattern.
@@ -1246,6 +1646,32 @@ fn skip_boolean_diamond(
         .all(|(dest, _, _, _)| value_only_controls_branch(func, *dest, &mut visited))
 }
 
+/// EFFECTIVE instruction count of a diamond arm: address-materialization
+/// chains (IV Cast, Shl scaling, base Copy, the GEP itself) are pure address
+/// math the backend folds into one SIB operand — they add nothing
+/// speculative.  Count only what actually executes speculatively.  The
+/// conditional reduction diamond (`if (arr[i] > 0) s += arr[i]`) is exactly
+/// this shape: each arm = {Cast,Shl,Copy,Shl,GEP,Load,Cast,Add} — 8 raw,
+/// 3 effective (Load, Cast, Add).
+fn effective_arm_len(block: &BasicBlock) -> usize {
+    block
+        .instructions
+        .iter()
+        .filter(|inst| {
+            !matches!(
+                *inst,
+                Instruction::GetElementPtr { .. }
+                    | Instruction::Copy { .. }
+                    | Instruction::GlobalAddr { .. }
+                    | Instruction::BinOp {
+                        op: IrBinOp::Shl,
+                        ..
+                    }
+            )
+        })
+        .count()
+}
+
 /// Detect a diamond pattern starting from a block with a CondBranch terminator.
 fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
     let func = &ctx.func;
@@ -1335,24 +1761,6 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
     // reduction diamond (`if (arr[i] > 0) s += arr[i]`) is exactly this
     // shape: each arm = {Cast,Shl,Copy,Shl,GEP,Load,Cast,Add} — 8 raw,
     // 3 effective (Load, Cast, Add).
-    let effective_arm_len = |block: &BasicBlock| -> usize {
-        block
-            .instructions
-            .iter()
-            .filter(|inst| {
-                !matches!(
-                    *inst,
-                    Instruction::GetElementPtr { .. }
-                        | Instruction::Copy { .. }
-                        | Instruction::GlobalAddr { .. }
-                        | Instruction::BinOp {
-                            op: IrBinOp::Shl,
-                            ..
-                        }
-                )
-            })
-            .count()
-    };
     if effective_arm_len(true_block) > max_arm_insts
         || effective_arm_len(false_block) > max_arm_insts
     {
