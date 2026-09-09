@@ -673,6 +673,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
+            changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
             changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
@@ -1039,6 +1040,154 @@ fn reads_gp_register(line: &str, kind: LineKind, reg: u8) -> bool {
             | LineKind::StoreSp { .. }
     );
     !(trusted && written_gp_register(line, kind) == Some(reg) && mention_count(line, reg) == 1)
+}
+
+/// Whole-function register-copy coalescing for the entry shuffle.
+///
+/// The x86 backend has this pass (`peephole/passes/copy_coalesce.rs`); ARM did
+/// not, which is why every ARM function paid for a shuffle the x86 backend
+/// deletes.  The register allocator hands parameters homes that do not match
+/// the ABI registers they arrive in, so functions open with `mov xD, xS`
+/// copies whose destination IS live for the rest of the function — no local
+/// pass can delete those, because dst really is read later.  Coalescing renames
+/// the destination family onto the source family everywhere after the copy and
+/// deletes the copy.
+///
+/// Legality, all four required:
+///  1. The copy sits in the straight-line entry run: no label, branch, call or
+///     return before it, so every earlier line runs exactly once and cannot be
+///     re-entered through a back edge.
+///  2. `src` is mentioned nowhere else in the function.  Then no later write
+///     clobbers the coalesced value, and no other live range of `src` is
+///     disturbed.  (A parameter's arrival in `src` is implicit, not a mention.)
+///  3. After the copy, `dst` has no unrenamable reader or writer: no implicit
+///     operand, no `ret` (x0-x7 carry the return value) and no call at all
+///     while the value lives in a caller-saved register (x0-x17 are clobbered).
+///  4. No unmodelled instruction after the copy (`Other` / `MemOther`); the
+///     implicit-operand oracle cannot vouch for what it touches.
+fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == xreg_name(reg) || tok == wreg_name(reg))
+    }
+    if n == 0 {
+        return false;
+    }
+    let mut starts: Vec<usize> = (0..n)
+        .filter(|&i| is_function_boundary(&lines[i]))
+        .collect();
+    if starts.is_empty() {
+        return false;
+    }
+    starts.push(n);
+    let mut changed = false;
+    for w in 0..starts.len() - 1 {
+        let (fstart, fend) = (starts[w], starts[w + 1]);
+        let mut eend = fend;
+        for k in fstart + 1..fend {
+            if matches!(
+                kinds[k],
+                LineKind::Label
+                    | LineKind::Branch
+                    | LineKind::CondBranch
+                    | LineKind::CmpBranch
+                    | LineKind::Call
+                    | LineKind::Ret
+            ) {
+                eend = k;
+                break;
+            }
+        }
+        let mut i = fstart + 1;
+        while i < eend {
+            i += 1;
+            let LineKind::Move {
+                dst,
+                src,
+                is_32bit: false,
+            } = kinds[i - 1]
+            else {
+                continue;
+            };
+            if dst == src || dst >= 29 || src >= 29 {
+                continue;
+            }
+            let i = i - 1;
+            let mut ok = true;
+            for k in fstart..fend {
+                if k == i || kinds[k] == LineKind::Nop {
+                    continue;
+                }
+                if mentions(&lines[k], src) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                for k in i + 1..fend {
+                    match kinds[k] {
+                        LineKind::Nop | LineKind::Directive | LineKind::Label => {}
+                        // `MemOther` names every register it touches (a
+                        // pre/post-indexed base is written explicitly), so the
+                        // rename covers it. `Other` is an unrecognised
+                        // mnemonic the oracle cannot vouch for.
+                        LineKind::Other => {
+                            ok = false;
+                            break;
+                        }
+                        // x0-x7 carry the return value: an implicit read the
+                        // rename cannot reach.
+                        LineKind::Ret => {
+                            if dst < 8 {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        // A call clobbers x0-x17, so the coalesced value must
+                        // not be living in one of them *and still be used*
+                        // after the call.  No mention of dst after the call
+                        // means the value is already dead there.
+                        LineKind::Call => {
+                            if src < 19
+                                && (k + 1..fend)
+                                    .any(|m| kinds[m] != LineKind::Nop && mentions(&lines[m], dst))
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    let (ireads, iwrites) = classify_implicit_operands_a64(&lines[k]);
+                    if (ireads | iwrites) & (1u64 << dst) != 0 {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let dx = xreg_name(dst).to_string();
+            let sx = xreg_name(src).to_string();
+            let dw = wreg_name(dst).to_string();
+            let sw = wreg_name(src).to_string();
+            for k in i + 1..fend {
+                if kinds[k] == LineKind::Nop {
+                    continue;
+                }
+                let new = replace_whole_word(&replace_whole_word(&lines[k], &dx, &sx), &dw, &sw);
+                if new != lines[k] {
+                    lines[k] = new;
+                    kinds[k] = classify_line(&lines[k]);
+                }
+            }
+            kinds[i] = LineKind::Nop;
+            changed = true;
+            break; // renaming changes the picture: re-scan this function
+        }
+    }
+    changed
 }
 
 fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {

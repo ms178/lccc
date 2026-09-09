@@ -7,7 +7,7 @@ actually matters, CODE GENERATION QUALITY, on the six golden workloads
 from the performance charter:
 
     gzip_crc32, zlib_ng_adler32, expat_xml_scan, sqlite_varint,
-    glibc_memcmp, hash_table  (+ stencil5 as the OP-05a sentinel)
+    glibc_memcmp, hash_table, zstd_count  (+ stencil5 as the OP-05a sentinel)
 
 Per workload it compiles with `lccc -O2 -S` and extracts stable, 
 noise-free assembly metrics:
@@ -51,6 +51,10 @@ WORKLOADS = [
     ("sqlite_varint.c", "sqlite_varint"),
     ("glibc_memcmp.c", "glibc_memcmp"),
     ("hash_table.c", "hash_table"),
+    # zstd: the FSE/Huffman inner loops from the decompressor.  It is the
+    # workload that caught the loop-carried copy bug (§9.8 hole 4) and it is
+    # what the x86 boot path decompresses with, so it belongs in the golden set.
+    ("zstd_count.c", "zstd_count"),
     ("fp_memfold_stencil5.c", "stencil5"),
 ]
 
