@@ -151,9 +151,11 @@ pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool, sse41: bool) {
     X86_SSE41_AVAILABLE.with(|available| available.set(sse41 && simd));
 }
 
-/// SSE4.1 availability on the 128-bit path: `pmulld` (VecMulI32x4) has no
-/// SSE2 encoding, so an I32 multiply map/dot under `-mno-sse4.1` /
-/// `-march=x86-64` must not be vectorised.
+/// SSE4.1 availability on the 128-bit path, for every consumer: `pmulld`
+/// (VecMulI32x4) has no SSE2 encoding, so an I32 multiply map/dot under
+/// `-mno-sse4.1` / `-march=x86-64` must not be vectorised; and since
+/// SSE4.1 implies SSSE3, this is also the gate for `pshufb`-based rotate
+/// masks in the ARX vectorizers.
 pub(crate) fn x86_sse41_available_pub() -> bool {
     x86_sse41_available()
 }
@@ -530,6 +532,19 @@ fn vectorize_with_analysis_mode(
                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
             }
         } else if std::env::var("CCC_NO_MAP_VEC").is_err() {
+            // Conditional-store statement forms (`if (c1 && c2) s[i] = f(s[i]);`)
+            // are not map-shaped until the guarded store becomes a select
+            // against the dominating same-address load.  Rewrite first
+            // (fail-closed), then the standard analysis applies.
+            if loop_info
+                .body
+                .iter()
+                .copied()
+                .any(|b| matches!(func.blocks[b].terminator, Terminator::CondBranch { .. }))
+                && rewrite_conditional_store(func, loop_info)
+            {
+                total_changes += 1;
+            }
             if let Some(map_pattern) = analyze_map_pattern(func, loop_info, neon) {
                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
                 // the focused SSE diagnostic override requests 128-bit code.
@@ -3965,6 +3980,949 @@ impl<'a> MapEmitCtx<'a> {
 /// contain exactly one load and one store, only simple non-trapping arithmetic,
 /// and the two GEP base pointers must be provably distinct (separate globals
 /// or allocas) so the vector store cannot clobber a not-yet-read source lane.
+/// Rewrite the conditional-store statement form into the straight-line
+/// nested-Select map shape the standard pipeline already handles:
+///
+///   L = load s[i]; if (c1 && c2) s[i] = f(L);
+///   ── becomes ──
+///   L = load s[i]; s[i] = select(c1, select(c2, f(L), L), L);
+///
+/// The skip value is the SAME-address load that dominates the branch, so
+/// the store is never speculative: unselected lanes write back the bytes
+/// the scalar loop would have left untouched (the load+blend+store
+/// equivalence GCC's vpmaskmovd form and LLVM's if-conversion both rely
+/// on).  The condition chain is a linear dominator sequence of
+/// single-condition blocks whose non-storeward edges all bypass directly
+/// to the loop latch (the empty-else shape); the polarity of each
+/// condition (which edge continues toward the store) flips its compare
+/// when necessary, and the nested-Select form is exactly what the map
+/// parser recovers into `MaskConj` (and the range fold into `RangeMask`).
+///
+/// Fail-closed: any shape deviation (extra side effects, a second load, a
+/// different skip target, volatile access, non-integer compares the flip
+/// table does not cover) leaves the loop untouched.
+fn rewrite_conditional_store(
+    func: &mut IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+) -> bool {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let Some(latch_idx) = find_latch(func, loop_info) else {
+        return false;
+    };
+    let latch_label = func.blocks[latch_idx].label;
+    let header_idx = loop_info.header;
+    // Canonical while-form: one edge runs the body, the other either
+    // exits the loop (the IV test) or bypasses to the latch (the folded
+    // store guard).  Enter on the edge that is neither the latch nor the
+    // header itself; branch canonicalisation may put the body on either
+    // side, and the walk's per-block polarity handling copes with both.
+    let idx_of =
+        |label: BlockId| -> Option<usize> { func.blocks.iter().position(|b| b.label == label) };
+    let entry_label = match &func.blocks[header_idx].terminator {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => match (idx_of(*true_label), idx_of(*false_label)) {
+            (Some(t), _) if t != latch_idx && t != header_idx => *true_label,
+            (_, Some(f)) if f != latch_idx && f != header_idx => *false_label,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let Some(mut cur) = idx_of(entry_label) else {
+        return false;
+    };
+    if cur == latch_idx || cur == header_idx {
+        return false;
+    }
+
+    // ── Walk the condition chain ─────────────────────────────────────────
+    // (block, its condition as a mask tree).  A block contributes either a
+    // single compare leaf (the classic short-circuit chain) or the whole
+    // and/or tree the if-combine pass folded into it; the rewrite
+    // conjunction-folds the contributions in chain order.
+    let mut chain: Vec<(usize, CondMaskNode)> = Vec::new();
+    let mut store_block: Option<usize> = None;
+    let mut first_block: Option<usize> = None;
+    for _ in 0..8 {
+        let block = &func.blocks[cur];
+        match &block.terminator {
+            Terminator::CondBranch {
+                cond,
+                true_label,
+                false_label,
+            } => {
+                if cur == latch_idx {
+                    return false; // condition in the latch: not our shape
+                }
+                let Some(t_idx) = idx_of(*true_label) else {
+                    return false;
+                };
+                let Some(f_idx) = idx_of(*false_label) else {
+                    return false;
+                };
+                // Exactly one edge must bypass straight to the latch.
+                let (storeward, polarity) = if f_idx == latch_idx && t_idx != latch_idx {
+                    (t_idx, true)
+                } else if t_idx == latch_idx && f_idx != latch_idx {
+                    (f_idx, false)
+                } else {
+                    return false; // both-to-latch (no store path) or neither
+                };
+                if storeward == header_idx {
+                    return false;
+                }
+                // The if-combine pass may fold part of the short-circuit
+                // chain into THIS single block: several compares combined
+                // by and/or into the branch condition.  Such a block
+                // contributes its whole mask tree; a classic block
+                // contributes exactly one compare leaf.
+                let folded_tree = {
+                    let n_cmps = block
+                        .instructions
+                        .iter()
+                        .filter(|i| matches!(i, Instruction::Cmp { .. }))
+                        .count();
+                    if n_cmps > 1 {
+                        match cond {
+                            Operand::Value(mv) => parse_cond_mask(&block.instructions, mv, 6),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if folded_tree.is_none()
+                    && block
+                        .instructions
+                        .iter()
+                        .filter(|i| matches!(i, Instruction::Cmp { .. }))
+                        .count()
+                        > 1
+                {
+                    return false; // several compares, not a folded guard: fail closed
+                }
+                // Chain-block body: at most one compare unless folded, plus
+                // addressing/cast plumbing.  Loads only in the FIRST chain
+                // block (the dominating same-address load); stores never.
+                let is_first = first_block.is_none();
+                let mut cmp_seen: Option<(Value, &Instruction)> = None;
+                // Address plumbing: BinOps whose dest feeds a GEP offset in
+                // the same block (the i*4 byte-scale of dword streams).
+                let gep_offsets: FxHashSet<Value> = block
+                    .instructions
+                    .iter()
+                    .filter_map(|i| match i {
+                        Instruction::GetElementPtr { offset, .. } => match offset {
+                            Operand::Value(v) => Some(*v),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .collect();
+                for inst in &block.instructions {
+                    match inst {
+                        Instruction::Cmp { dest, .. } => {
+                            if folded_tree.is_none() && cmp_seen.is_some() {
+                                return false;
+                            }
+                            cmp_seen = Some((*dest, inst));
+                        }
+                        Instruction::Load {
+                            volatile: false, ..
+                        } if is_first => {}
+                        Instruction::BinOp { op, dest, .. }
+                            if gep_offsets.contains(dest)
+                                || (folded_tree.is_some()
+                                    && matches!(op, IrBinOp::And | IrBinOp::Or)) => {}
+                        Instruction::GetElementPtr { .. }
+                        | Instruction::Cast { .. }
+                        | Instruction::Copy { .. } => {}
+                        _ => return false,
+                    }
+                }
+                // The block's condition contribution.
+                let node = if let Some(tree) = folded_tree {
+                    if polarity {
+                        tree
+                    } else {
+                        // Storeward was the FALSE edge: negate the tree
+                        // (DeMorgan + the total compare flip table).
+                        let Some(negated) = negate_cond_mask(tree) else {
+                            return false;
+                        };
+                        negated
+                    }
+                } else {
+                    let Some((cmp_dest, _)) = cmp_seen else {
+                        return false;
+                    };
+                    if *cond != Operand::Value(cmp_dest) {
+                        return false; // branch condition is not the block's compare
+                    }
+                    let Instruction::Cmp {
+                        op, lhs, rhs, ty, ..
+                    } = cmp_seen.expect("validated above").1
+                    else {
+                        unreachable!()
+                    };
+                    // A storeward FALSE edge flips the compare; the first
+                    // block's unflipped compare reuses its SSA value.
+                    let (effective_op, reuse) = if polarity {
+                        (*op, is_first)
+                    } else {
+                        match cond_store_cmp_flip(op) {
+                            Some(f) => (f, false),
+                            None => return false, // compare op outside the flip table
+                        }
+                    };
+                    CondMaskNode::Cmp {
+                        src: reuse.then_some(cmp_dest),
+                        op: effective_op,
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        ty: *ty,
+                    }
+                };
+                if first_block.is_none() {
+                    first_block = Some(cur);
+                }
+                chain.push((cur, node));
+                cur = storeward;
+            }
+            Terminator::Branch(_) => {
+                store_block = Some(cur);
+                break;
+            }
+            _ => return false,
+        }
+    }
+    let Some(store_block) = store_block else {
+        return false; // chain never reached a plain block (too long / cyclic)
+    };
+    if chain.is_empty() || first_block.is_none() {
+        // The if-combined spelling: the header's mask branch goes straight
+        // to the store block (no short-circuit chain left to walk).  The
+        // header is then the guard block itself.
+        let (mask_val, t_label, f_label) = match &func.blocks[header_idx].terminator {
+            Terminator::CondBranch {
+                cond: Operand::Value(v),
+                true_label,
+                false_label,
+            } => (*v, *true_label, *false_label),
+            _ => return false,
+        };
+        let idx_of2 =
+            |label: BlockId| -> Option<usize> { func.blocks.iter().position(|b| b.label == label) };
+        if let (Some(t_idx), Some(f_idx)) = (idx_of2(t_label), idx_of2(f_label)) {
+            let routed = if f_idx == latch_idx && t_idx != latch_idx {
+                Some((t_idx, true))
+            } else if t_idx == latch_idx && f_idx != latch_idx {
+                Some((f_idx, false))
+            } else {
+                None
+            };
+            if let Some((store_blk, on_true)) = routed {
+                if parse_cond_mask(&func.blocks[header_idx].instructions, &mask_val, 6).is_some() {
+                    return rewrite_folded_cond_store(
+                        func, loop_info, latch_idx, header_idx, store_blk, on_true,
+                    );
+                }
+            }
+        }
+        return false;
+    }
+    let first_block = first_block.unwrap();
+    if store_block == latch_idx || store_block == header_idx || store_block == first_block {
+        return false;
+    }
+    // The store block falls through to the latch.
+    if !matches!(&func.blocks[store_block].terminator,
+        Terminator::Branch(l) if *l == latch_label)
+    {
+        return false;
+    }
+
+    // ── Validate the store block and find the load ───────────────────────
+    // The first chain block's single load must be the same-address
+    // dominating load; the store block holds the value computation and the
+    // loop's only store (the map analysis re-checks the whole-loop scan).
+    let mut store_inst: Option<(Value, Operand, IrType)> = None; // (ptr, val, ty)
+    let mut store_gep: Option<Value> = None;
+    for inst in &func.blocks[store_block].instructions {
+        match inst {
+            Instruction::Store {
+                val,
+                ptr,
+                ty,
+                volatile: false,
+                ..
+            } => {
+                if store_inst.is_some() {
+                    return false;
+                }
+                // The stored value may be an SSA value (a computation over
+                // the load) or a CONSTANT (`if (...) p[i] = 0xFF;`).
+                store_inst = Some((*ptr, val.clone(), *ty));
+            }
+            Instruction::GetElementPtr { dest, .. } => {
+                if store_gep.is_some() {
+                    return false;
+                }
+                store_gep = Some(*dest);
+            }
+            Instruction::BinOp { op, ty, .. } if !op.can_trap() || ty.is_float() => {}
+            Instruction::Cast { .. } | Instruction::Copy { .. } | Instruction::UnaryOp { .. } => {}
+            _ => return false, // loads, calls, branches-in-body: fail closed
+        }
+    }
+    let Some((store_ptr, store_val, elem_ty)) = store_inst else {
+        return false;
+    };
+    if !matches!(
+        elem_ty,
+        IrType::I8 | IrType::U8 | IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64
+    ) {
+        return false;
+    }
+    // The dominating load: exactly one, in the first chain block, same
+    // element type.
+    let mut load_inst: Option<(Value, Value, Value)> = None; // (dest, gep, gep base+offset)
+    for inst in &func.blocks[first_block].instructions {
+        if let Instruction::Load {
+            dest,
+            ptr,
+            ty,
+            volatile: false,
+            ..
+        } = inst
+        {
+            if load_inst.is_some() || *ty != elem_ty {
+                return false;
+            }
+            load_inst = Some((*dest, *ptr, *ptr));
+        }
+    }
+    let Some((load_dest, load_ptr, _)) = load_inst else {
+        return false;
+    };
+    // Same-address proof: identical GEP value, or same (base, offset) pair.
+    let same_address = if store_ptr == load_ptr {
+        true
+    } else {
+        match (
+            cond_store_gep_pair(func, store_ptr),
+            cond_store_gep_pair(func, load_ptr),
+        ) {
+            (Some((sb, so)), Some((lb, lo))) => sb == lb && operand_equiv(func, &so, &lo, 3),
+            _ => false,
+        }
+    };
+    if !same_address {
+        return false;
+    }
+
+    // ── Rewrite ──────────────────────────────────────────────────────────
+    // Move the store block's value computation into the first chain
+    // block, re-point the store at the load's address, and select the
+    // stored value against the dominating load over the conjunction of
+    // every chain condition (each block's leaf compare or folded mask
+    // tree), nested outermost = first condition:
+    //   select(c1, select(c2, f(L), L), L)
+    let n_conds = chain.len();
+    let chain_blocks: Vec<usize> = chain.iter().map(|(b, _)| *b).collect();
+    let mut combined: Option<CondMaskNode> = None;
+    for (_, node) in chain.into_iter().rev() {
+        combined = Some(match combined {
+            Some(acc) => CondMaskNode::And(Box::new(node), Box::new(acc)),
+            None => node,
+        });
+    }
+    let Some(combined) = combined else {
+        return false;
+    };
+    // The store block's computation, minus its GEP and the store itself.
+    let moved: Vec<Instruction> = func.blocks[store_block]
+        .instructions
+        .iter()
+        .filter(|i| {
+            !matches!(i, Instruction::Store { .. })
+                && !matches!(i, Instruction::GetElementPtr { dest, .. } if Some(*dest) == store_gep)
+        })
+        .cloned()
+        .collect();
+
+    // The value computation must precede the selects that consume it.
+    let mut new_insts: Vec<Instruction> = moved;
+    let select_dest = emit_cond_mask_selects(
+        &combined,
+        store_val,
+        Operand::Value(load_dest),
+        elem_ty,
+        &mut func.next_value_id,
+        &mut new_insts,
+    );
+    new_insts.push(Instruction::Store {
+        val: Operand::Value(select_dest),
+        ptr: load_ptr,
+        ty: elem_ty,
+        seg_override: AddressSpace::Default,
+        volatile: false,
+    });
+
+    // Commit: first chain block becomes the straight-line body.
+    let first = &mut func.blocks[first_block];
+    first.instructions.extend(new_insts);
+    first.terminator = Terminator::Branch(latch_label);
+    // The remaining chain blocks and the store block become empty bypass
+    // blocks (unreachable; later CFG cleanup removes them).
+    for block_idx in &chain_blocks {
+        if *block_idx != first_block {
+            let b = &mut func.blocks[*block_idx];
+            b.instructions.clear();
+            b.terminator = Terminator::Branch(latch_label);
+        }
+    }
+    {
+        let b = &mut func.blocks[store_block];
+        b.instructions.clear();
+        b.terminator = Terminator::Branch(latch_label);
+    }
+    if debug {
+        eprintln!(
+            "[VEC-MAP] conditional-store rewrite: {} condition(s), store folded into select",
+            n_conds
+        );
+    }
+    true
+}
+
+/// Total flip table for the conditional-store condition negation: every
+/// `IrCmpOp` variant maps to its negation, so a future enum extension is a
+/// compile error here rather than a silent rewrite decline at run time.
+fn cond_store_cmp_flip(op: &IrCmpOp) -> Option<IrCmpOp> {
+    Some(match op {
+        IrCmpOp::Slt => IrCmpOp::Sge,
+        IrCmpOp::Sge => IrCmpOp::Slt,
+        IrCmpOp::Sle => IrCmpOp::Sgt,
+        IrCmpOp::Sgt => IrCmpOp::Sle,
+        IrCmpOp::Ult => IrCmpOp::Uge,
+        IrCmpOp::Uge => IrCmpOp::Ult,
+        IrCmpOp::Ule => IrCmpOp::Ugt,
+        IrCmpOp::Ugt => IrCmpOp::Ule,
+        IrCmpOp::Eq => IrCmpOp::Ne,
+        IrCmpOp::Ne => IrCmpOp::Eq,
+    })
+}
+
+/// GEP definition lookup for the conditional-store same-address proof:
+/// the (base, offset) pair of the GEP defining `v`, if any.
+fn cond_store_gep_pair(func: &IrFunction, v: Value) -> Option<(Value, Operand)> {
+    func.blocks.iter().find_map(|b| {
+        b.instructions.iter().find_map(|i| match i {
+            Instruction::GetElementPtr {
+                dest, base, offset, ..
+            } if *dest == v => Some((*base, offset.clone())),
+            _ => None,
+        })
+    })
+}
+
+/// Structural equivalence of pure addressing computations: the load and
+/// the store recompute the SAME `i * elem_size` byte-scale as distinct SSA
+/// values (canonical lowering emits one per GEP).  Bounded depth, values
+/// only through pure BinOp/Cast/Copy definitions.
+///
+/// Operand SWAP is treated as equivalence only for COMMUTATIVE ops.
+/// `Sub` is not commutative: `p[4-i]` and `p[i-4]` are different
+/// addresses, and proving them equal rewrote the store to the load's
+/// (wrong) address — the exact miscompile the conditional-store audit
+/// exists to prevent (k_swap_sub in tests/regression/vec_cond_store.c).
+fn operand_equiv(func: &IrFunction, a: &Operand, b: &Operand, depth: usize) -> bool {
+    if a == b {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let (Operand::Value(va), Operand::Value(vb)) = (a, b) else {
+        return false;
+    };
+    let find_def = |v: &Value| -> Option<Instruction> {
+        func.blocks.iter().find_map(|blk| {
+            blk.instructions
+                .iter()
+                .find(|i| i.dest() == Some(*v))
+                .cloned()
+        })
+    };
+    match (find_def(va), find_def(vb)) {
+        (
+            Some(Instruction::BinOp {
+                op: oa,
+                lhs: la,
+                rhs: ra,
+                ..
+            }),
+            Some(Instruction::BinOp {
+                op: ob,
+                lhs: lb,
+                rhs: rb,
+                ..
+            }),
+        ) => {
+            let commutative = matches!(
+                oa,
+                IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+            );
+            let direct = operand_equiv(func, &la, &lb, depth - 1)
+                && operand_equiv(func, &ra, &rb, depth - 1);
+            let swapped = commutative
+                && operand_equiv(func, &la, &rb, depth - 1)
+                && operand_equiv(func, &ra, &lb, depth - 1);
+            oa == ob && (direct || swapped)
+        }
+        (
+            Some(Instruction::Cast { src: sa, .. }) | Some(Instruction::Copy { src: sa, .. }),
+            Some(Instruction::Cast { src: sb, .. }) | Some(Instruction::Copy { src: sb, .. }),
+        ) => operand_equiv(func, &sa, &sb, depth - 1),
+        _ => false,
+    }
+}
+
+/// A conditional-store guard mask decomposed into its compare leaves:
+/// the and/or tree the if-combine pass folds a short-circuit chain into.
+enum CondMaskNode {
+    /// A compare leaf.  `src` is the existing SSA value when the compare
+    /// is consumed un-negated; a DeMorgan-negated leaf re-emits a fresh
+    /// flipped compare instead.
+    Cmp {
+        src: Option<Value>,
+        op: IrCmpOp,
+        lhs: Operand,
+        rhs: Operand,
+        ty: IrType,
+    },
+    And(Box<CondMaskNode>, Box<CondMaskNode>),
+    Or(Box<CondMaskNode>, Box<CondMaskNode>),
+}
+
+/// Parse the branch condition into header-local compares combined with
+/// and/or, bounded depth.  Anything else — a phi, a loaded bool, a call
+/// result, arithmetic — is not a folded guard and declines.
+fn parse_cond_mask(header: &[Instruction], v: &Value, depth: usize) -> Option<CondMaskNode> {
+    if depth == 0 {
+        return None;
+    }
+    for i in header {
+        match i {
+            Instruction::Cmp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } if *dest == *v => {
+                return Some(CondMaskNode::Cmp {
+                    src: Some(*dest),
+                    op: *op,
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    ty: *ty,
+                });
+            }
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::And,
+                lhs: Operand::Value(l),
+                rhs: Operand::Value(r),
+                ..
+            } if *dest == *v => {
+                return Some(CondMaskNode::And(
+                    Box::new(parse_cond_mask(header, l, depth - 1)?),
+                    Box::new(parse_cond_mask(header, r, depth - 1)?),
+                ));
+            }
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Or,
+                lhs: Operand::Value(l),
+                rhs: Operand::Value(r),
+                ..
+            } if *dest == *v => {
+                return Some(CondMaskNode::Or(
+                    Box::new(parse_cond_mask(header, l, depth - 1)?),
+                    Box::new(parse_cond_mask(header, r, depth - 1)?),
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// DeMorgan negation of a guard tree (the store sits on the branch's
+/// FALSE edge): `!and(a,b) == or(!a,!b)`, compares via the total flip
+/// table.  Returns `None` only if a compare lacks a flip (impossible
+/// today; the match is total).
+fn negate_cond_mask(node: CondMaskNode) -> Option<CondMaskNode> {
+    match node {
+        CondMaskNode::Cmp {
+            src: _,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => Some(CondMaskNode::Cmp {
+            src: None,
+            op: cond_store_cmp_flip(&op)?,
+            lhs,
+            rhs,
+            ty,
+        }),
+        CondMaskNode::And(a, b) => Some(CondMaskNode::Or(
+            Box::new(negate_cond_mask(*a)?),
+            Box::new(negate_cond_mask(*b)?),
+        )),
+        CondMaskNode::Or(a, b) => Some(CondMaskNode::And(
+            Box::new(negate_cond_mask(*a)?),
+            Box::new(negate_cond_mask(*b)?),
+        )),
+    }
+}
+
+/// Emit the nested selects for `node ? true_val : false_val` — the exact
+/// spelling the chain form produces, which both the dword and the
+/// byte-lane map parsers accept:
+///
+/// * `and(a, b) ? T : F` == `a ? (b ? T : F) : F`
+/// * `or (a, b) ? T : F` == `a ? T : (b ? T : F)`
+fn emit_cond_mask_selects(
+    node: &CondMaskNode,
+    true_val: Operand,
+    false_val: Operand,
+    elem_ty: IrType,
+    next_value_id: &mut u32,
+    out: &mut Vec<Instruction>,
+) -> Value {
+    match node {
+        CondMaskNode::Cmp {
+            src,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => {
+            let cond = match src {
+                Some(v) => Operand::Value(*v),
+                None => {
+                    let d = Value(*next_value_id);
+                    *next_value_id += 1;
+                    out.push(Instruction::Cmp {
+                        dest: d,
+                        op: *op,
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        ty: *ty,
+                    });
+                    Operand::Value(d)
+                }
+            };
+            let d = Value(*next_value_id);
+            *next_value_id += 1;
+            out.push(Instruction::Select {
+                dest: d,
+                cond,
+                true_val: true_val.clone(),
+                false_val: false_val.clone(),
+                ty: elem_ty,
+            });
+            d
+        }
+        CondMaskNode::And(a, b) => {
+            // a ? (b ? T : F) : F
+            let inner = emit_cond_mask_selects(b, true_val, false_val, elem_ty, next_value_id, out);
+            emit_cond_mask_selects(
+                a,
+                Operand::Value(inner),
+                false_val,
+                elem_ty,
+                next_value_id,
+                out,
+            )
+        }
+        CondMaskNode::Or(a, b) => {
+            // a ? T : (b ? T : F)
+            let inner = emit_cond_mask_selects(b, true_val, false_val, elem_ty, next_value_id, out);
+            emit_cond_mask_selects(
+                a,
+                true_val,
+                Operand::Value(inner),
+                elem_ty,
+                next_value_id,
+                out,
+            )
+        }
+    }
+}
+
+/// The IFCOMBINED conditional-store spelling.  The short-circuit chain the
+/// chain-form rewrite walks (`c1 ? c2 ? store : latch : latch`) is folded
+/// by the if-combine pass into a single and/or MASK branch in the loop
+/// header:
+///
+/// ```text
+///     header:  L = load p[i]; cmps; mask = and/or(cmp, cmp)
+///              CondBranch mask -> store_block / latch
+///     store:   f(L); store p'[i]; Branch latch
+///     latch:   i++; CondBranch iv-test -> header / exit
+/// ```
+///
+/// The chain walk finds an EMPTY chain (the header's true edge IS the
+/// store block) and used to decline, which left the whole
+/// conditional-store machinery unreachable once if-combine entered the
+/// pipeline — the canonical in-place casefold stayed scalar.  This form
+/// rewrites it directly: the store block keeps the value computation and
+/// gains the nested selects (`select(c1, select(c2, f(L), L), L)`, the
+/// exact spelling the chain form produces), the header's mask branch
+/// becomes an unconditional Branch to the store block (every block then
+/// executes every iteration), and the standard map analysis applies.
+///
+/// Fail-closed everywhere: exactly one edge of the header's branch may
+/// bypass to the latch (the other edge leaving the loop is the IV-exit
+/// form — a plain map, not a conditional store), the store block holds
+/// the loop's only store plus pure plumbing, the header holds exactly one
+/// non-volatile load of the element type, the mask must decompose into
+/// header-local compares via and/or (bounded depth; anything else — a
+/// loaded bool, a call result, a phi — declines), the store must sit on
+/// the branch's TRUE edge (the negated spelling is rare and stays
+/// scalar), and the store address must be PROVEN identical to the load
+/// address (same GEP value or structurally equivalent base+offset under
+/// the commutativity-restricted `operand_equiv`).
+fn rewrite_folded_cond_store(
+    func: &mut IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+    latch_idx: usize,
+    guard_block: usize,
+    store_block: usize,
+    store_on_true: bool,
+) -> bool {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let latch_label = func.blocks[latch_idx].label;
+    let header_idx = loop_info.header;
+    if store_block == header_idx
+        || store_block == latch_idx
+        || store_block == guard_block
+        || !loop_info.body.contains(&store_block)
+    {
+        return false;
+    }
+    // The guard block's mask branch: exactly one edge bypasses to the
+    // latch, the other runs the store block, consistently with the
+    // caller's derivation.
+    let (mask_val, t_label, f_label) = match &func.blocks[guard_block].terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(v),
+            true_label,
+            false_label,
+        } => (*v, *true_label, *false_label),
+        _ => return false,
+    };
+    let idx_of =
+        |label: BlockId| -> Option<usize> { func.blocks.iter().position(|b| b.label == label) };
+    let (Some(t_idx), Some(f_idx)) = (idx_of(t_label), idx_of(f_label)) else {
+        return false;
+    };
+    let (derived_store, derived_on_true) = if f_idx == latch_idx && t_idx != latch_idx {
+        (t_idx, true)
+    } else if t_idx == latch_idx && f_idx != latch_idx {
+        (f_idx, false)
+    } else {
+        return false;
+    };
+    if derived_store != store_block || derived_on_true != store_on_true {
+        return false;
+    }
+    // The store block falls through to the latch.
+    if !matches!(
+        &func.blocks[store_block].terminator,
+        Terminator::Branch(l) if *l == latch_label
+    ) {
+        return false;
+    }
+
+    // ── Validate the store block (the chain form's contract) ────────────
+    let mut store_inst: Option<(Value, Operand, IrType)> = None; // (ptr, val, ty)
+    let mut store_gep: Option<Value> = None;
+    for inst in &func.blocks[store_block].instructions {
+        match inst {
+            Instruction::Store {
+                val,
+                ptr,
+                ty,
+                volatile: false,
+                ..
+            } => {
+                if store_inst.is_some() {
+                    return false;
+                }
+                // The stored value may be an SSA value (a computation over
+                // the load) or a CONSTANT (`if (...) p[i] = 0xFF;`).
+                store_inst = Some((*ptr, val.clone(), *ty));
+            }
+            Instruction::GetElementPtr { dest, .. } => {
+                if store_gep.is_some() {
+                    return false;
+                }
+                store_gep = Some(*dest);
+            }
+            Instruction::BinOp { op, ty, .. } if !op.can_trap() || ty.is_float() => {}
+            Instruction::Cast { .. } | Instruction::Copy { .. } | Instruction::UnaryOp { .. } => {}
+            _ => return false, // loads, calls, branches-in-body: fail closed
+        }
+    }
+    let Some((store_ptr, store_val, elem_ty)) = store_inst else {
+        return false;
+    };
+    if !matches!(
+        elem_ty,
+        IrType::I8 | IrType::U8 | IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64
+    ) {
+        return false;
+    }
+
+    // ── Validate the guard block and find the dominating load ───────────
+    // Phis (the header's IV when the guard IS the header), exactly ONE
+    // non-volatile load of the element type (the dominating same-address
+    // load), the compares and the and/or mask tree over them, and
+    // GEP/cast/copy plumbing.  A second load, a store, a call, or any
+    // non-addressing arithmetic fails closed.
+    let mut load_inst: Option<(Value, Value)> = None; // (dest, ptr)
+    let guard_gep_offsets: FxHashSet<Value> = func.blocks[guard_block]
+        .instructions
+        .iter()
+        .filter_map(|i| match i {
+            Instruction::GetElementPtr { offset, .. } => match offset {
+                Operand::Value(v) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    for inst in &func.blocks[guard_block].instructions {
+        match inst {
+            Instruction::Phi { .. } => {}
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                volatile: false,
+                ..
+            } => {
+                if load_inst.is_some() || *ty != elem_ty {
+                    return false;
+                }
+                load_inst = Some((*dest, *ptr));
+            }
+            Instruction::Cmp { .. }
+            | Instruction::Cast { .. }
+            | Instruction::Copy { .. }
+            | Instruction::GetElementPtr { .. }
+            | Instruction::UnaryOp { .. } => {}
+            Instruction::BinOp { dest, op, .. }
+                if guard_gep_offsets.contains(dest) || matches!(op, IrBinOp::And | IrBinOp::Or) => {
+            }
+            _ => return false,
+        }
+    }
+    let Some((load_dest, load_ptr)) = load_inst else {
+        return false;
+    };
+    // Same-address proof: identical GEP value, or same (base, offset)
+    // pair under the commutativity-restricted equivalence.
+    let same_address = if store_ptr == load_ptr {
+        true
+    } else {
+        match (
+            cond_store_gep_pair(func, store_ptr),
+            cond_store_gep_pair(func, load_ptr),
+        ) {
+            (Some((sb, so)), Some((lb, lo))) => sb == lb && operand_equiv(func, &so, &lo, 3),
+            _ => false,
+        }
+    };
+    if !same_address {
+        return false;
+    }
+
+    // ── Decompile the mask tree into guard-local compares ───────────────
+    let Some(mask_tree) = parse_cond_mask(&func.blocks[guard_block].instructions, &mask_val, 6)
+    else {
+        return false; // not a folded compare guard: fail closed
+    };
+    let mask_tree = if store_on_true {
+        mask_tree
+    } else {
+        // The store runs when the guard is FALSE: negate the tree
+        // (DeMorgan + the total compare flip table).
+        let Some(negated) = negate_cond_mask(mask_tree) else {
+            return false;
+        };
+        negated
+    };
+
+    // ── Rewrite ──────────────────────────────────────────────────────────
+    // The store block's computation, minus its GEP and the store itself,
+    // keeps its place; the guarded store becomes nested selects against
+    // the dominating load (the chain form's exact spelling), and the
+    // guard's mask branch becomes an unconditional edge so every block
+    // executes every iteration — the map analysis then sees a plain
+    // elementwise loop.
+    let moved: Vec<Instruction> = func.blocks[store_block]
+        .instructions
+        .iter()
+        .filter(|i| {
+            !matches!(i, Instruction::Store { .. })
+                && !matches!(i, Instruction::GetElementPtr { dest, .. } if Some(*dest) == store_gep)
+        })
+        .cloned()
+        .collect();
+    let mut new_insts: Vec<Instruction> = moved;
+    let select_dest = emit_cond_mask_selects(
+        &mask_tree,
+        store_val,
+        Operand::Value(load_dest),
+        elem_ty,
+        &mut func.next_value_id,
+        &mut new_insts,
+    );
+    new_insts.push(Instruction::Store {
+        val: Operand::Value(select_dest),
+        ptr: load_ptr,
+        ty: elem_ty,
+        seg_override: AddressSpace::Default,
+        volatile: false,
+    });
+
+    // Commit: the store block becomes the straight-line body; the guard
+    // block unconditionally enters it.
+    {
+        let store_label = func.blocks[store_block].label;
+        let b = &mut func.blocks[store_block];
+        b.instructions = new_insts;
+        b.terminator = Terminator::Branch(latch_label);
+        let g = &mut func.blocks[guard_block];
+        g.terminator = Terminator::Branch(store_label);
+    }
+    if debug {
+        eprintln!(
+            "[VEC-MAP] conditional-store rewrite (folded mask form): store folded into select"
+        );
+    }
+    true
+}
 fn analyze_map_pattern(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
@@ -4408,12 +5366,15 @@ fn analyze_map_pattern(
         Some(bits) => fold_unsigned_range_masks(&expr, bits),
         None => expr,
     };
-    // 16 admits the recovered `&&`/`||` mask shapes (a two-compare
+    // 20 admits the recovered `&&`/`||` mask shapes (a two-compare
     // range-fold ternary parses to exactly 12 nodes; a three-condition
-    // chain to 16) while still bounding pathological trees. The budget
-    // guards compile time only: the emit cache is a linear scan, so cost
-    // is O(nodes^2) with a trivially small constant.
-    const MAP_MAX_NODES: usize = 16;
+    // conditional-store chain — the casefold-with-exception idiom
+    // `if (islower(c) && c != 'q') p[i] = c - 32;` — to exactly 20, the
+    // third compare contributing its own operand set plus the second
+    // select's false-arm load) while still bounding pathological trees.
+    // The budget guards compile time only: the emit cache is a linear
+    // scan, so cost is O(nodes^2) with a trivially small constant.
+    const MAP_MAX_NODES: usize = 20;
     if expr.node_count() > MAP_MAX_NODES {
         set_reject("map expression tree too large");
         return None;
@@ -4544,7 +5505,13 @@ fn parse_map_expr(
             }
             let fp = ty.is_float();
             match op {
-                IrBinOp::Add | IrBinOp::Mul => {}
+                IrBinOp::Add => {}
+                // Byte lanes have no packed multiply on any modeled target
+                // (x86 has no byte-mul ISA form). Reject at parse: the
+                // transform's op-availability check runs after the
+                // preheader/byte-IV mutations, so a parse-admitted
+                // table-less op must never reach it.
+                IrBinOp::Mul if !matches!(elem_ty, IrType::I8 | IrType::U8) => {}
                 // Sub/Div (and Sqrt below) lower to VecSub/VecDiv/VecSqrt,
                 // which only the x86 backend implements today.
                 IrBinOp::Sub | IrBinOp::SDiv if fp && allow_ext_fp_ops => {}
@@ -4663,10 +5630,12 @@ fn parse_map_expr(
             op, lhs, rhs, ty, ..
         } if !ty.is_float() && *ty == *elem_ty && allow_ext_fp_ops => {
             // Integer conditional maps (clamp / classify / saturate shapes).
-            // Dword lanes only: the packed integer compare emitters cover
-            // I32/U32 (VecCmpI32x8 AVX2, VecCmpI32x4 SSE2); narrower or
-            // wider element types fail closed and keep the loop scalar.
-            if !matches!(ty, IrType::I32 | IrType::U32) {
+            // Dword lanes: the packed integer compare emitters cover I32/U32
+            // (VecCmpI32x8 AVX2, VecCmpI32x4 SSE2). Byte lanes: the AVX2-only
+            // 32xI8 family (VecCmpI8x32) — the transform's op table fails
+            // closed before any mutation on non-AVX2 targets. Word and
+            // 64-bit lanes fail closed and keep the loop scalar.
+            if !matches!(ty, IrType::I32 | IrType::U32 | IrType::I8 | IrType::U8) {
                 return None;
             }
             // Normalize gt/ge by operand swap — exact for either
@@ -4769,11 +5738,16 @@ fn parse_map_expr(
             else {
                 return None;
             };
-            if !(*ty == *elem_ty && (ty.is_float() || matches!(ty, IrType::I32 | IrType::U32))) {
+            if !(*ty == *elem_ty
+                && (ty.is_float()
+                    || matches!(ty, IrType::I32 | IrType::U32 | IrType::I8 | IrType::U8)))
+            {
                 // FP conditions: packed compare emitters. I32/U32
                 // conditions: the integer conditional-map path
-                // (VecCmpI32x8/x4 + VecBlendvI32x8/x4). Anything else
-                // (byte/word lanes, 64-bit lanes) fails closed.
+                // (VecCmpI32x8/x4 + VecBlendvI32x8/x4). I8/U8 conditions:
+                // the byte-lane AVX2 family (VecCmpI8x32 + VecBlendvI8x32;
+                // fail closed pre-mutation on non-AVX2 targets). Anything
+                // else (word lanes, 64-bit lanes) fails closed.
                 return None;
             }
             let t = parse_map_operand(
@@ -5461,37 +6435,38 @@ fn analyze_byte_count_loop(
             else {
                 continue;
             };
-            // `acc' = add acc, V`: the accumulator is whichever side of the
-            // commutative `Add` is the header phi carried by this add
-            // (`acc + v` or `v + acc`, matching the sum reduction's
-            // lhs_is_acc/rhs_is_acc discipline); the other side is the
-            // counted value.  The dead `else if` this replaces matched the
-            // identical (Value, Value) shape, so the RHS spelling could
-            // never win even though `added_val` below already extracts it
-            // from either side.
+            // The add is commutative, so the accumulator phi may sit on
+            // EITHER side: probe both operands (a single-sided probe
+            // misses the right-side spelling outright).
             let (l, r) = match (lhs, rhs) {
                 (Operand::Value(l), Operand::Value(r)) => (l, r),
                 _ => continue,
             };
-            for acc in [l, r] {
-                // `acc` must be the header phi whose backedge is this add.
-                if let Some(phi) = func.blocks[header_idx].instructions.iter().find_map(|i| {
+            let mut matched_acc: Option<Value> = None;
+            for cand in [l, r] {
+                // `cand` must be the header phi whose backedge is this add.
+                let Some(phi) = func.blocks[header_idx].instructions.iter().find_map(|i| {
                     if let Instruction::Phi { dest, incoming, .. } = i {
-                        if *dest == *acc && incoming.len() == 2 {
+                        if *dest == *cand && incoming.len() == 2 {
                             return Some(incoming.clone());
                         }
                     }
                     None
-                }) {
-                    let backedge_ok = phi.iter().any(|(v, lbl)| {
-                        *lbl == latch_label && matches!(v, Operand::Value(vv) if vv.0 == dest.0)
-                    });
-                    if backedge_ok {
-                        add_site = Some((b, ii));
-                        acc_phi = Some(*acc);
-                        break 'outer;
-                    }
+                }) else {
+                    continue;
+                };
+                let backedge_ok = phi.iter().any(|(v, lbl)| {
+                    *lbl == latch_label && matches!(v, Operand::Value(vv) if vv.0 == dest.0)
+                });
+                if backedge_ok {
+                    matched_acc = Some(*cand);
+                    break;
                 }
+            }
+            if let Some(acc) = matched_acc {
+                add_site = Some((b, ii));
+                acc_phi = Some(acc);
+                break 'outer;
             }
         }
     }
@@ -6642,6 +7617,34 @@ fn classify_unsigned_bound<'a>(expr: &'a MapExpr, bits: u32) -> Option<(&'a MapE
             }
             Some((l.as_ref(), RangeBound::Upper(k - 1)))
         }
+        // The same four bounds under the `>=`/`>` spellings: frontends that
+        // do not canonicalise relational compares emit these directly, and
+        // refusing them silently kept `x > 122` (the complement window's
+        // upper side) out of the fusion.
+        // `k <= X` spelled `X >= k`  =>  X >=u k
+        IrCmpOp::Uge if map_const_lane(r, bits).is_some() => {
+            Some((l.as_ref(), RangeBound::Lower(map_const_lane(r, bits)?)))
+        }
+        // `k < X` spelled `X > k`  =>  X >=u k+1   (unsatisfiable when k == MAX)
+        IrCmpOp::Ugt if map_const_lane(r, bits).is_some() => {
+            let k = map_const_lane(r, bits)?;
+            if k == max {
+                return None;
+            }
+            Some((l.as_ref(), RangeBound::Lower(k + 1)))
+        }
+        // `X <= k` spelled `k >= X`  =>  X <=u k
+        IrCmpOp::Uge if map_const_lane(l, bits).is_some() => {
+            Some((r.as_ref(), RangeBound::Upper(map_const_lane(l, bits)?)))
+        }
+        // `X < k` spelled `k > X`  =>  X <=u k-1   (unsatisfiable when k == 0)
+        IrCmpOp::Ugt if map_const_lane(l, bits).is_some() => {
+            let k = map_const_lane(l, bits)?;
+            if k == 0 {
+                return None;
+            }
+            Some((r.as_ref(), RangeBound::Upper(k - 1)))
+        }
         _ => None,
     }
 }
@@ -6963,6 +7966,29 @@ fn classify_signed_bound<'a>(expr: &'a MapExpr, bits: u32) -> Option<(&'a MapExp
                 return None;
             }
             Some((l.as_ref(), RangeBound::Upper(k - 1)))
+        }
+        // The `>=`/`>` spellings of the same four signed bounds (same
+        // non-negativity discipline: a negative constant admits the
+        // negative half and is refused).
+        // `k <=s X` spelled `X >=s k`  =>  X in [k, smax]
+        IrCmpOp::Sge if nonneg(r).is_some() => Some((l.as_ref(), RangeBound::Lower(nonneg(r)?))),
+        // `k <s X` spelled `X >s k`  =>  X in [k+1, smax]  (empty when k == smax)
+        IrCmpOp::Sgt if nonneg(r).is_some() => {
+            let k = nonneg(r)?;
+            if k == smax {
+                return None;
+            }
+            Some((l.as_ref(), RangeBound::Lower(k + 1)))
+        }
+        // `X <=s k` spelled `k >=s X`  =>  X in negHalf ∪ [0, k]
+        IrCmpOp::Sge if nonneg(l).is_some() => Some((r.as_ref(), RangeBound::Upper(nonneg(l)?))),
+        // `X <s k` spelled `k >s X`  =>  X in negHalf ∪ [0, k-1]  (empty when k == 0)
+        IrCmpOp::Sgt if nonneg(l).is_some() => {
+            let k = nonneg(l)?;
+            if k == 0 {
+                return None;
+            }
+            Some((r.as_ref(), RangeBound::Upper(k - 1)))
         }
         _ => None,
     }
@@ -7473,6 +8499,7 @@ fn normalize_cmp_for_lanes(op: IrCmpOp) -> (IrCmpOp, bool) {
 /// truncate" bracket.  For `if (c >= 'A' && c <= 'Z') c += 32;` over
 /// `unsigned char`, the frontend + if-conversion emit a MIXED tree:
 ///
+/// ```text
 ///     %16 = load u8                       ; the byte itself
 ///     %18 = zext %16 to i32               ; promotion, used only by the
 ///     %20 = cmp sge i32 %18, 65           ;   compares and the add
@@ -7482,6 +8509,7 @@ fn normalize_cmp_for_lanes(op: IrCmpOp) -> (IrCmpOp, bool) {
 ///     %40 = select u8 %24, %29, %16       ; selects run at BYTE type,
 ///     %41 = select u8 %20, %40, %16       ;   over the RAW load
 ///            store u8 %41
+/// ```
 ///
 /// The narrow load is a direct operand of both selects, the promotion feeds
 /// only the arithmetic, and the truncation sits in the middle of the tree
@@ -9888,8 +10916,8 @@ fn gep_uses_iv(
 ///
 /// GEP offsets in this IR are BYTE offsets (the remainder loop lowers
 /// `a[i]` to `GEP(base, i*elem_size)`), so offset == raw iv means a
-/// one-byte stride, which is only the canonical shape for elem_size == 1
-/// (never vectorizable) — it is rejected here.
+/// one-byte stride — the canonical shape exactly when elem_size == 1 (the
+/// byte-lane map family), and rejected for every wider element.
 ///
 /// Every accepted form is closed under the two rewrites the transforms
 /// perform: the vec_width scaling (`offset * w` covers w consecutive
@@ -17048,9 +18076,60 @@ fn fold_int_minmax(expr: &MapExpr) -> MapExpr {
     }
 }
 
-/// Transform a legal one-source store loop to packed 128/256-bit form.  The
-/// optional scale and offset operations stay optional: copies become exactly
-/// load/store, while scale/add/affine maps emit only their source operations.
+/// One side of a potential range conjunction: `lo <= x`, `lo < x` (bound on
+/// the LEFT, operand on the right) or `x <= hi`, `x < hi` (operand on the
+/// LEFT, bound on the right), with the bound a loop-invariant constant.
+struct RangeBoundSide<'a> {
+    /// False when this side carries the LOWER bound (`lo PRED x`).
+    is_upper: bool,
+    /// True for strict predicates (`<`); the fold adjusts the closed
+    /// interval by one before folding.
+    strict: bool,
+    /// True for the unsigned predicate family (Ule/Ult vs Sle/Slt).
+    unsigned: bool,
+    bound: i64,
+    x: &'a MapExpr,
+}
+
+impl<'a> RangeBoundSide<'a> {
+    fn classify(e: &'a MapExpr) -> Option<Self> {
+        let MapExpr::Cmp(op, l, r) = e else {
+            return None;
+        };
+        let (unsigned, strict) = match op {
+            IrCmpOp::Sle => (false, false),
+            IrCmpOp::Slt => (false, true),
+            IrCmpOp::Ule => (true, false),
+            IrCmpOp::Ult => (true, true),
+            _ => return None,
+        };
+        const_of(l)
+            .map(|bound| RangeBoundSide {
+                is_upper: false,
+                strict,
+                unsigned,
+                bound,
+                x: r,
+            })
+            .or_else(|| {
+                const_of(r).map(|bound| RangeBoundSide {
+                    is_upper: true,
+                    strict,
+                    unsigned,
+                    bound,
+                    x: l,
+                })
+            })
+    }
+}
+
+fn const_of(e: &MapExpr) -> Option<i64> {
+    match e {
+        MapExpr::Invariant(Operand::Const(c)) => c.to_i64(),
+        _ => None,
+    }
+}
+
 fn transform_map_vector(
     func: &mut IrFunction,
     pattern: &MapPattern,
@@ -17160,6 +18239,13 @@ fn transform_map_vector(
         (IrType::F32, false) => IntrinsicOp::VecBroadcastF32x4,
         (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecBroadcastI32x8,
         (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecBroadcastI32x4,
+        // Byte-lane maps, AVX2: the scalar operand's low 8 bits are
+        // broadcast (movd + vpbroadcastb), exact for the mod-256 congruent
+        // wrap.  SSE2: the dword splat carries a REPLICATED constant
+        // (b * 0x01010101 — see MapEmitCtx::replicate_byte_consts); no
+        // vpbroadcastb exists before AVX2.
+        (IrType::I8 | IrType::U8, true) => IntrinsicOp::VecBroadcastI8x32,
+        (IrType::I8 | IrType::U8, false) => IntrinsicOp::VecBroadcastI32x4,
         (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecBroadcastI64x2,
         // Byte lanes broadcast through the DWORD splat: the demotion pass
         // rewrote every byte constant into `b * 0x01010101`
@@ -17168,16 +18254,12 @@ fn transform_map_vector(
         // pool entry is shared with the dword path's cache.  Runtime (non
         // constant) invariants were already rejected by the demotion
         // analysis, precisely because they would need a real byte splat.
-        // Byte lanes: a CONSTANT splats through the dword broadcast (the
-        // demotion replicates it to `b * 0x01010101` at emit time), while a
-        // RUNTIME invariant needs a real `vpbroadcastb`.  `MapEmitCtx`
+        // Word lanes: a CONSTANT splats through the dword broadcast (the
+        // demotion replicates it to `b * 0x00010001` at emit time), while a
+        // RUNTIME invariant needs the real narrow splat.  `MapEmitCtx`
         // selects between the two per operand -- see `byte_broadcast_op`.
-        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, true) => {
-            IntrinsicOp::VecBroadcastI32x8
-        }
-        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, false) => {
-            IntrinsicOp::VecBroadcastI32x4
-        }
+        (IrType::I16 | IrType::U16, true) => IntrinsicOp::VecBroadcastI32x8,
+        (IrType::I16 | IrType::U16, false) => IntrinsicOp::VecBroadcastI32x4,
         _ => return 0,
     };
 
@@ -17188,12 +18270,15 @@ fn transform_map_vector(
         (IrType::F32, false) => IntrinsicOp::VecLoadF32x4,
         (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecLoadI32x8,
         (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecLoadI32x4,
-        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecLoadI64x2,
-        // Byte lanes reuse the dword move: `vmovdqu`/`movdqu` transfer raw
+        (IrType::I8 | IrType::U8, true) => IntrinsicOp::VecLoadI8x32,
+        // Byte loads reuse the dword move at SSE2: `movdqu` transfers raw
         // bits with no lane semantics, so a separate byte-named load op
         // would be the identical instruction under a different name.
-        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, true) => IntrinsicOp::VecLoadI32x8,
-        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, false) => IntrinsicOp::VecLoadI32x4,
+        (IrType::I8 | IrType::U8, false) => IntrinsicOp::VecLoadI32x4,
+        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecLoadI64x2,
+        // Word lanes reuse the dword move for the same reason (raw bits).
+        (IrType::I16 | IrType::U16, true) => IntrinsicOp::VecLoadI32x8,
+        (IrType::I16 | IrType::U16, false) => IntrinsicOp::VecLoadI32x4,
         _ => return 0,
     };
     let store_op = match (pattern.elem_ty, avx2) {
@@ -17203,9 +18288,12 @@ fn transform_map_vector(
         (IrType::F32, false) => IntrinsicOp::VecStoreF32x4,
         (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecStoreI32x8,
         (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecStoreI32x4,
+        (IrType::I8 | IrType::U8, true) => IntrinsicOp::VecStoreI8x32,
+        (IrType::I8 | IrType::U8, false) => IntrinsicOp::VecStoreI32x4,
         (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecStoreI64x2,
-        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, true) => IntrinsicOp::VecStoreI32x8,
-        (IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16, false) => IntrinsicOp::VecStoreI32x4,
+        // Word lanes reuse the dword store (raw bits, no lane semantics).
+        (IrType::I16 | IrType::U16, true) => IntrinsicOp::VecStoreI32x8,
+        (IrType::I16 | IrType::U16, false) => IntrinsicOp::VecStoreI32x4,
         _ => return 0,
     };
     let bin_op = |op: &IrBinOp| -> Option<IntrinsicOp> {
@@ -17241,26 +18329,26 @@ fn transform_map_vector(
             (IrType::I32 | IrType::U32, false, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x4),
             (IrType::I32 | IrType::U32, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x8),
             (IrType::I32 | IrType::U32, false, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x4),
-            (IrType::I64 | IrType::U64, _, IrBinOp::Add) => Some(IntrinsicOp::VecAddI64x2),
-            (IrType::I64 | IrType::U64, _, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI64x2),
-            (IrType::I64 | IrType::U64, _, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI64x2),
-            // ---- Byte lanes (OP-05d) --------------------------------------
-            // Add/Sub have dedicated byte encodings; And/Or/Xor are bit-exact
-            // at every lane width, so they reuse the dword ops rather than
-            // duplicating three identical instructions under byte names.
-            // Multiply is ABSENT on purpose: x86 has no packed byte multiply,
-            // and `map_tree_ops_available` turns this `None` into a clean
-            // bail that leaves the loop scalar instead of miscompiling it.
+            // Byte-lane map arithmetic: the ISA's byte vocabulary only —
+            // Add/Sub/And/Or/Xor. There is no byte multiply or byte shift;
+            // the parser rejects those for byte maps so this table never
+            // sees them.  Add/Sub have byte encodings at both widths; the
+            // bitwise ops are bit-exact at EVERY lane width, so the SSE2
+            // path reuses the dword x4 forms rather than duplicating three
+            // identical instructions under byte names.
             (IrType::I8 | IrType::U8, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddI8x32),
             (IrType::I8 | IrType::U8, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI8x16),
             (IrType::I8 | IrType::U8, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI8x32),
             (IrType::I8 | IrType::U8, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI8x16),
-            (IrType::I8 | IrType::U8, true, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x8),
+            (IrType::I8 | IrType::U8, true, IrBinOp::And) => Some(IntrinsicOp::VecAndI8x32),
             (IrType::I8 | IrType::U8, false, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x4),
-            (IrType::I8 | IrType::U8, true, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x8),
+            (IrType::I8 | IrType::U8, true, IrBinOp::Or) => Some(IntrinsicOp::VecOrI8x32),
             (IrType::I8 | IrType::U8, false, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x4),
-            (IrType::I8 | IrType::U8, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x8),
+            (IrType::I8 | IrType::U8, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI8x32),
             (IrType::I8 | IrType::U8, false, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x4),
+            (IrType::I64 | IrType::U64, _, IrBinOp::Add) => Some(IntrinsicOp::VecAddI64x2),
+            (IrType::I64 | IrType::U64, _, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI64x2),
+            (IrType::I64 | IrType::U64, _, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI64x2),
             // ---- Word lanes (OP-05g) --------------------------------------
             // Words, unlike bytes, DO have a packed multiply (`pmullw`,
             // low half, exact for both signednesses), so `Mul` is admitted.
@@ -17309,9 +18397,13 @@ fn transform_map_vector(
             (IrType::F32, true) => IntrinsicOp::VecCmpF32x8,
             (IrType::F32, false) => IntrinsicOp::VecCmpF32x4,
             (IrType::I32, true) | (IrType::U32, true) => IntrinsicOp::VecCmpI32x8,
-            (IrType::I32, false) | (IrType::U32, false) => IntrinsicOp::VecCmpI32x4,
+            // Byte-lane compares (vpcmpeqb/vpcmpgtb + per-byte 0x80 bias
+            // for the unsigned forms): same predicate-immediate vocabulary
+            // as the dword emitter.  Both encodings are SSE2 BASELINE, so
+            // the 16xI8 path works on the plain x86-64 target.
             (IrType::I8, true) | (IrType::U8, true) => IntrinsicOp::VecCmpI8x32,
             (IrType::I8, false) | (IrType::U8, false) => IntrinsicOp::VecCmpI8x16,
+            (IrType::I32, false) | (IrType::U32, false) => IntrinsicOp::VecCmpI32x4,
             (IrType::I16, true) | (IrType::U16, true) => IntrinsicOp::VecCmpI16x16,
             (IrType::I16, false) | (IrType::U16, false) => IntrinsicOp::VecCmpI16x8,
             _ => return None,
@@ -17336,13 +18428,13 @@ fn transform_map_vector(
         (IrType::F32, true) => Some(IntrinsicOp::VecBlendvF32x8),
         (IrType::F32, false) => Some(IntrinsicOp::VecBlendvF32x4),
         (IrType::I32, true) | (IrType::U32, true) => Some(IntrinsicOp::VecBlendvI32x8),
-        (IrType::I32, false) | (IrType::U32, false) => Some(IntrinsicOp::VecBlendvI32x4),
-        // `vpblendvb` consults ONE SIGN BIT PER BYTE; the dword blend would
-        // smear a byte mask across four lanes, so the byte width needs its
-        // own op (the 128-bit form falls back to the lane-agnostic bitwise
-        // select, which is exact for any mask granularity).
+        // `vpblendvb` consults ONE SIGN BIT PER BYTE; the dword blend
+        // would smear a byte mask across four lanes, so the byte width
+        // needs its own op.  The 128-bit form falls back to the
+        // lane-agnostic bitwise select, exact for any mask granularity.
         (IrType::I8, true) | (IrType::U8, true) => Some(IntrinsicOp::VecBlendvI8x32),
         (IrType::I8, false) | (IrType::U8, false) => Some(IntrinsicOp::VecBlendvI8x16),
+        (IrType::I32, false) | (IrType::U32, false) => Some(IntrinsicOp::VecBlendvI32x4),
         // A word compare sets all 16 bits of its lane, so both bytes of every
         // lane carry the same sign bit and `vpblendvb` is exact at word
         // granularity; the 128-bit form is the per-bit bitwise select.
@@ -17577,6 +18669,15 @@ fn transform_map_vector(
     };
 
     // Rewrite the canonical IV < limit test to IV < floor(limit / width).
+    // LOAD-BEARING: without this the packed loop keeps comparing the
+    // element counter against the UNDIVIDED limit, so a trip count that is
+    // not a multiple of the vector width over-runs both streams by up to
+    // one full vector (reads AND writes past the arrays; every
+    // `vectorize_map_*_n{1,3,5,...}` shape segfaulted when this rewrite
+    // was lost in a merge).  The OP-06 fusion below also keys on the
+    // rewritten compare (it searches for the exit cmp against
+    // `divided_limit`), so dropping this silently disabled that fusion
+    // too (two IVs, two adds, one compare per iteration instead of one).
     for &block_idx in &pattern.loop_blocks {
         for inst in &mut func.blocks[block_idx].instructions {
             if let Instruction::Cmp { lhs, rhs, .. } = inst {
@@ -17879,7 +18980,86 @@ fn transform_map_vector(
 
     let rem_header_label = remainder.header_label;
     let rem_iv_phi = remainder.iv_phi;
+    let rem_vec_exit_label = remainder.vec_exit_label;
     changes += remainder.commit(func, pattern.header_idx);
+
+    // Single-IV loop control: the remainder resumes from the BYTE IV
+    // (element index = byte_iv >> log2(elem_size)), not the element phi —
+    // otherwise the phi's last non-self use keeps the second induction
+    // variable alive through the packed loop.  The vec-exit block's
+    // `iv * vec_width` resume computation is rewritten in place; when the
+    // byte-guard rewrite above did not fire, this rewrite is still exact
+    // (byte_iv at the vector exit = 32 * vector iterations = the element
+    // phi's value there * elem_size, element-wise identical resume point).
+    {
+        let elem_shift = elem_size.trailing_zeros() as i64;
+        let vec_exit_idx = func
+            .blocks
+            .iter()
+            .position(|b| b.label == rem_vec_exit_label)
+            .expect("vec-exit block present after remainder commit");
+        let mul_pos = func.blocks[vec_exit_idx]
+            .instructions
+            .iter()
+            .position(|inst| {
+                matches!(
+                    inst,
+                    Instruction::BinOp {
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(v),
+                        ..
+                    } if *v == pattern.iv
+                )
+            });
+        if let Some(pos) = mul_pos {
+            let i_rem_start = match &func.blocks[vec_exit_idx].instructions[pos] {
+                Instruction::BinOp { dest, .. } => *dest,
+                _ => unreachable!("position() matched a BinOp"),
+            };
+            let shr_val = if elem_shift > 0 {
+                let v = Value(next_val_id);
+                next_val_id += 1;
+                Some((
+                    v,
+                    Instruction::BinOp {
+                        dest: v,
+                        op: IrBinOp::LShr,
+                        lhs: Operand::Value(byte_iv),
+                        rhs: Operand::Const(IrConst::I64(elem_shift)),
+                        ty: IrType::I64,
+                    },
+                ))
+            } else {
+                None
+            };
+            let resume_src = shr_val
+                .as_ref()
+                .map(|(v, _)| Operand::Value(*v))
+                .unwrap_or(Operand::Value(byte_iv));
+            let resume = match pattern.iv_ty {
+                IrType::I32 | IrType::U32 => Instruction::Cast {
+                    dest: i_rem_start,
+                    src: resume_src,
+                    from_ty: IrType::I64,
+                    to_ty: pattern.iv_ty,
+                },
+                _ => Instruction::Copy {
+                    dest: i_rem_start,
+                    src: resume_src,
+                },
+            };
+            let mut replacement: Vec<Instruction> = Vec::new();
+            if let Some((_, inst)) = shr_val {
+                replacement.push(inst);
+            }
+            replacement.push(resume);
+            let n_new = replacement.len();
+            func.blocks[vec_exit_idx]
+                .instructions
+                .splice(pos..pos + 1, replacement);
+            changes += n_new;
+        }
+    }
 
     // Loop versioning for streams that may alias the destination.
     if !pattern.guarded_streams.is_empty() {
@@ -18586,8 +19766,10 @@ fn emit_map_scalar_tree(
             // Non-short-circuit mirror of `c1 && c2` / `c1 || c2`: both
             // sides are compares (side-effect-free by construction), so the
             // bitwise AND/OR of the two 0/1 boolean values is exact.
-            // Compare results are zero-extended setcc values; the 32-bit
-            // AND/OR of two such values stays a clean 0/1.
+            // Compare results are zero-extended setcc values (setcc +
+            // movzbl %al,%eax — width-independent of the compared operand
+            // type, so byte compares produce the same clean 0/1); the
+            // 32-bit AND/OR of two such values stays a clean 0/1.
             let lv = emit_map_scalar_tree(
                 l,
                 src_bases,
@@ -19402,6 +20584,399 @@ mod fixed_distance_slp_tests {
 /// VecMin/VecMax and the general compare+blendv shape must be recognized by
 /// analyze_map_pattern from a canonical post-if-convert loop.
 #[cfg(test)]
+mod cond_store_equiv_tests {
+    use super::operand_equiv;
+    use crate::common::types::IrType;
+    use crate::ir::instruction::{BasicBlock, BlockId, Instruction, Terminator};
+    use crate::ir::ops::IrBinOp;
+    use crate::ir::reexports::{IrConst, IrFunction, Operand, Value};
+
+    /// Two-instruction function skeleton: `v0 = op(a, b)`, `v1 = op(b, a)`.
+    fn build_func(a: Operand, b: Operand, op0: IrBinOp, op1: IrBinOp) -> IrFunction {
+        let mut f = IrFunction::new("test".into(), IrType::I64, vec![], false);
+        f.next_value_id = 4;
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: op0,
+                    lhs: a.clone(),
+                    rhs: b.clone(),
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: op1,
+                    lhs: b,
+                    rhs: a,
+                    ty: IrType::I64,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
+            source_spans: vec![],
+        });
+        f
+    }
+
+    /// `p[4-i]` vs `p[i-4]`: Sub with SWAPPED operands is NOT equivalence —
+    /// the addresses differ, and proving them equal is the conditional-store
+    /// miscompile the commutativity gate exists to prevent.
+    #[test]
+    fn swapped_sub_is_not_equivalence() {
+        let f = build_func(
+            Operand::Const(IrConst::I64(4)),
+            Operand::Value(Value(2)),
+            IrBinOp::Sub,
+            IrBinOp::Sub,
+        );
+        // Sub(4, i) vs Sub(i, 4)
+        assert!(!operand_equiv(
+            &f,
+            &Operand::Value(Value(0)),
+            &Operand::Value(Value(1)),
+            3
+        ));
+    }
+
+    /// Add IS commutative: `p[i+4]` and `p[4+i]` are the same address.
+    #[test]
+    fn swapped_add_is_equivalence() {
+        let f = build_func(
+            Operand::Value(Value(2)),
+            Operand::Const(IrConst::I64(4)),
+            IrBinOp::Add,
+            IrBinOp::Add,
+        );
+        assert!(operand_equiv(
+            &f,
+            &Operand::Value(Value(0)),
+            &Operand::Value(Value(1)),
+            3
+        ));
+    }
+
+    /// Different operators are never equivalent, swapped or not.
+    #[test]
+    fn different_ops_are_not_equivalence() {
+        let f = build_func(
+            Operand::Value(Value(2)),
+            Operand::Const(IrConst::I64(4)),
+            IrBinOp::Add,
+            IrBinOp::Sub,
+        );
+        assert!(!operand_equiv(
+            &f,
+            &Operand::Value(Value(0)),
+            &Operand::Value(Value(1)),
+            3
+        ));
+    }
+}
+
+#[cfg(test)]
+mod range_fusion_tests {
+    use super::*;
+
+    fn load() -> MapExpr {
+        MapExpr::Load(0)
+    }
+    fn konst(v: i32) -> MapExpr {
+        MapExpr::Invariant(Operand::Const(IrConst::I32(v)))
+    }
+    fn cmp(op: IrCmpOp, l: MapExpr, r: MapExpr) -> MapExpr {
+        MapExpr::Cmp(op, Box::new(l), Box::new(r))
+    }
+    fn conj(is_and: bool, l: MapExpr, r: MapExpr) -> MapExpr {
+        MapExpr::MaskConj {
+            is_and,
+            l: Box::new(l),
+            r: Box::new(r),
+        }
+    }
+    fn select(c: MapExpr, t: MapExpr, f: MapExpr) -> MapExpr {
+        MapExpr::Select(Box::new(c), Box::new(t), Box::new(f))
+    }
+
+    /// Interpret the fused mask `Cmp(Slt, Add(x, bias), T)` on a concrete
+    /// lane value, in exactly the modular arithmetic the packed
+    /// instructions implement: wrapping add on W bits, then a SIGNED
+    /// compare of the W-bit results.
+    fn eval_fused(fused: &MapExpr, x: u64, bits: u32) -> bool {
+        let modulus = 1u64 << bits;
+        let sign_bit = 1u64 << (bits - 1);
+        let to_signed = |v: u64| -> i64 {
+            let v = v & (modulus - 1);
+            if v & sign_bit != 0 {
+                v as i64 - modulus as i64
+            } else {
+                v as i64
+            }
+        };
+        let MapExpr::Cmp(IrCmpOp::Slt, lhs, rhs) = fused else {
+            panic!("expected a signed-lt mask, got {fused:?}");
+        };
+        let MapExpr::BinOp(IrBinOp::Add, subject, bias) = lhs.as_ref() else {
+            panic!("expected a biased subject, got {lhs:?}");
+        };
+        assert_eq!(**subject, load(), "subject must be preserved verbatim");
+        let bias = map_const_lane(bias, bits).expect("bias must be a constant");
+        let threshold = map_const_lane(rhs, bits).expect("threshold must be a constant");
+        to_signed(x.wrapping_add(bias)) < to_signed(threshold)
+    }
+
+    /// EXHAUSTIVE proof at W = 8: for every window `lo..=hi` and every
+    /// lane value, the fused mask agrees with the unsigned range predicate
+    /// it replaces.  256*257/2 windows x 256 values ~ 8.4M checks — cheap,
+    /// and it covers every wrap, every sign-bit crossing and every edge
+    /// the 32-bit derivation relies on (the identity is width-parametric,
+    /// so an exhaustive 8-bit proof is a proof of the algebra at every
+    /// width).
+    #[test]
+    fn fused_mask_matches_unsigned_range_exhaustively_at_8_bits() {
+        let bits = 8u32;
+        for lo in 0u64..256 {
+            for hi in lo..256 {
+                if lo == 0 && hi == 255 {
+                    // The whole-domain window is refused by design (the
+                    // bias trick has no signed 8-bit threshold for it);
+                    // everything else must fuse.
+                    assert!(build_range_mask(&load(), 0, 255, bits).is_none());
+                    continue;
+                }
+                let fused = build_range_mask(&load(), lo, hi, bits)
+                    .unwrap_or_else(|| panic!("window {lo}..={hi} must fuse"));
+                for x in 0u64..256 {
+                    let expected = lo <= x && x <= hi;
+                    assert_eq!(
+                        eval_fused(&fused, x, bits),
+                        expected,
+                        "fused mask disagrees at lo={lo} hi={hi} x={x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The whole-domain window is REFUSED, not fused: `T` would be +SB,
+    /// which is not a signed W-bit value, and a silent off-by-one mask is
+    /// a miscompile.  Empty windows (lo > hi) are refused likewise.
+    #[test]
+    fn whole_domain_and_empty_windows_are_refused() {
+        assert!(build_range_mask(&load(), 0, 255, 8).is_none());
+        assert!(build_range_mask(&load(), 0, u32::MAX as u64, 32).is_none());
+        assert!(build_range_mask(&load(), 200, 100, 8).is_none());
+        // Every proper window at both widths fuses.
+        for (lo, hi) in [(0u64, 254u64), (1, 255), (65, 90), (127, 128), (200, 201)] {
+            assert!(
+                build_range_mask(&load(), lo, hi, 8).is_some(),
+                "{lo}..={hi}"
+            );
+        }
+        for (lo, hi) in [
+            (0u64, (1 << 32) - 2),
+            (1, u32::MAX as u64),
+            (0x7fffffff, 0x80000000),
+        ] {
+            assert!(
+                build_range_mask(&load(), lo, hi, 32).is_some(),
+                "{lo}..={hi}"
+            );
+        }
+    }
+
+    /// `lo <= x && x <= hi` (the classifier idiom, either comparand order)
+    /// folds to ONE fused compare; `x < lo || x > hi` (the De Morgan
+    /// complement) folds the same window with the select arms swapped.
+    #[test]
+    fn conjunction_and_demorgan_complement_fold() {
+        let bits = 8u32;
+        let window = conj(
+            true,
+            cmp(IrCmpOp::Ule, konst(97), load()),
+            cmp(IrCmpOp::Ule, load(), konst(122)),
+        );
+        let folded = fold_unsigned_range_masks(&window, bits);
+        assert!(
+            matches!(&folded, MapExpr::Cmp(IrCmpOp::Slt, _, _)),
+            "AND window must fuse, got {folded:?}"
+        );
+        for x in 0u64..256 {
+            assert_eq!(eval_fused(&folded, x, bits), (97..=122).contains(&x));
+        }
+
+        // Complement: `x < 97 || x > 122` selects t.  The fused complement
+        // window keeps the select's arms VERBATIM — one `vpadd` plus one
+        // `vpcmpgt` decides outside/inside directly (`T-1 <s X+bias` is
+        // true exactly outside `[97, 122]`), so no arm swap and no
+        // inversion constant are needed.
+        let complement = conj(
+            false,
+            cmp(IrCmpOp::Ult, load(), konst(97)),
+            cmp(IrCmpOp::Ugt, load(), konst(122)),
+        );
+        let sel = select(complement, konst(1), konst(0));
+        let folded = fold_unsigned_range_masks(&sel, bits);
+        let MapExpr::Select(cond, t, f) = &folded else {
+            panic!("complement keeps the select, got {folded:?}");
+        };
+        assert!(
+            matches!(cond.as_ref(), MapExpr::Cmp(IrCmpOp::Slt, _, _)),
+            "complement must fuse to one compare, got {:?}",
+            cond
+        );
+        assert_eq!(**t, konst(1), "the select's arms are preserved verbatim");
+        assert_eq!(**f, konst(0));
+        for x in 0u64..256 {
+            let MapExpr::Cmp(_, cl, cr) = cond.as_ref() else {
+                unreachable!()
+            };
+            // The complement form is `T-1 <s X + bias`.
+            let t_minus_1 = map_const_lane(cl, bits).expect("threshold const");
+            let MapExpr::BinOp(IrBinOp::Add, subject, bias) = cr.as_ref() else {
+                panic!("expected the biased subject, got {cr:?}")
+            };
+            assert_eq!(**subject, load(), "subject must be preserved verbatim");
+            let bias = map_const_lane(bias, bits).expect("bias must be a constant");
+            let modulus = 1u64 << bits;
+            let sign_bit = 1u64 << (bits - 1);
+            let to_signed = |v: u64| -> i64 {
+                let v = v & (modulus - 1);
+                if v & sign_bit != 0 {
+                    v as i64 - modulus as i64
+                } else {
+                    v as i64
+                }
+            };
+            let ev = to_signed(t_minus_1) < to_signed(x.wrapping_add(bias));
+            // The select yields t exactly when the complement condition
+            // held, i.e. when x is OUTSIDE the window.
+            let out_of_window = !(97..=122).contains(&x);
+            assert_eq!(ev, out_of_window);
+        }
+    }
+
+    /// Single-sided unsigned compares are the degenerate windows
+    /// `0..=hi` / `lo..=MAX` and fuse to the same two instructions.
+    #[test]
+    fn single_sided_bounds_fuse() {
+        let bits = 8u32;
+        let cases = [
+            (IrCmpOp::Ule, false, 100i32, 0u64, 100u64), // x <= 100
+            (IrCmpOp::Ult, false, 100, 0, 99),           // x < 100
+            (IrCmpOp::Ule, true, 100, 100, 255),         // 100 <= x
+            (IrCmpOp::Ult, true, 100, 101, 255),         // 100 < x
+        ];
+        for (op, const_lhs, k, lo, hi) in cases {
+            let expr = if const_lhs {
+                cmp(op, konst(k), load())
+            } else {
+                cmp(op, load(), konst(k))
+            };
+            let folded = fold_unsigned_range_masks(&expr, bits);
+            assert!(
+                matches!(&folded, MapExpr::Cmp(IrCmpOp::Slt, _, _)),
+                "{op:?} must fuse, got {folded:?}"
+            );
+            for x in 0u64..256 {
+                assert_eq!(
+                    eval_fused(&folded, x, bits),
+                    (lo..=hi).contains(&x),
+                    "{op:?} const_lhs={const_lhs} k={k} x={x}"
+                );
+            }
+        }
+    }
+
+    /// Strength reduction: `m ? x + k : x` ==> `x + (m & k)` and
+    /// `m ? k : 0` ==> `m & k`; anything without the shared-operand /
+    /// constant shape is returned verbatim.
+    #[test]
+    fn strength_reduction_shapes() {
+        let m = cmp(IrCmpOp::Slt, load(), konst(10));
+        let cases: Vec<(MapExpr, MapExpr)> = vec![
+            (
+                // m ? x + 32 : x
+                select(
+                    m.clone(),
+                    MapExpr::BinOp(IrBinOp::Add, Box::new(load()), Box::new(konst(32))),
+                    load(),
+                ),
+                // x + (m & 32)
+                MapExpr::BinOp(
+                    IrBinOp::Add,
+                    Box::new(load()),
+                    Box::new(MapExpr::BinOp(
+                        IrBinOp::And,
+                        Box::new(m.clone()),
+                        Box::new(konst(32)),
+                    )),
+                ),
+            ),
+            (
+                // m ? x - 32 : x
+                select(
+                    m.clone(),
+                    MapExpr::BinOp(IrBinOp::Sub, Box::new(load()), Box::new(konst(32))),
+                    load(),
+                ),
+                MapExpr::BinOp(
+                    IrBinOp::Sub,
+                    Box::new(load()),
+                    Box::new(MapExpr::BinOp(
+                        IrBinOp::And,
+                        Box::new(m.clone()),
+                        Box::new(konst(32)),
+                    )),
+                ),
+            ),
+            (
+                // m ? 1 : 0  (the classifier shape)
+                select(m.clone(), konst(1), konst(0)),
+                MapExpr::BinOp(IrBinOp::And, Box::new(m), Box::new(konst(1))),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(strength_reduce_mask_select(&input), expected);
+        }
+        // No shared operand / not a constant delta: verbatim.
+        let unrelated = select(cmp(IrCmpOp::Slt, load(), konst(10)), konst(5), konst(7));
+        assert_eq!(strength_reduce_mask_select(&unrelated), unrelated);
+        // m ? x + y : x with y NON-constant: verbatim (m & y is still
+        // exact per lane, but the rewrite targets constant deltas only).
+        let nonconst = select(
+            cmp(IrCmpOp::Slt, load(), konst(10)),
+            MapExpr::BinOp(IrBinOp::Add, Box::new(load()), Box::new(MapExpr::Load(1))),
+            load(),
+        );
+        assert_eq!(strength_reduce_mask_select(&nonconst), nonconst);
+    }
+
+    /// `map_elem_size` is the single authority for the packed loop's
+    /// stride; every supported type must answer, and the answer must
+    /// match the ABI size.
+    #[test]
+    fn map_elem_size_matches_abi_sizes() {
+        assert_eq!(map_elem_size(&IrType::F64), Some(8));
+        assert_eq!(map_elem_size(&IrType::I64), Some(8));
+        assert_eq!(map_elem_size(&IrType::U64), Some(8));
+        assert_eq!(map_elem_size(&IrType::F32), Some(4));
+        assert_eq!(map_elem_size(&IrType::I32), Some(4));
+        assert_eq!(map_elem_size(&IrType::U32), Some(4));
+        assert_eq!(map_elem_size(&IrType::I8), Some(1));
+        assert_eq!(map_elem_size(&IrType::U8), Some(1));
+        // Word lanes are first-class map elements since OP-05g: loads,
+        // stores, broadcasts, the integer binops and the compares all carry
+        // them, so the element size is the real 2-byte ABI size.
+        assert_eq!(map_elem_size(&IrType::I16), Some(2));
+        assert_eq!(map_elem_size(&IrType::U16), Some(2));
+        assert_eq!(map_elem_size(&IrType::I128), None);
+        assert_eq!(map_elem_size(&IrType::Ptr), None);
+        assert_eq!(map_elem_size(&IrType::Void), None);
+    }
+}
+
+#[cfg(test)]
 mod map_fp_select_tests {
     use super::*;
     use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
@@ -19902,13 +21477,108 @@ mod range_mask_fusion_tests {
         assert_eq!(fold_unsigned_range_masks(&gt_max, bits), gt_max);
     }
 
-    /// Signed-twin windows fuse to the same one-compare form as the
-    /// unsigned spelling: `lo <=s X && X <=s hi` with non-negative
-    /// constants admits exactly the unsigned window `[lo, hi]` (a negative
-    /// X fails the signed lower bound, and the two orders agree on
-    /// non-negatives).  GCC folds this shape (`(unsigned)(c - lo) <=
-    /// hi - lo`); leaving it as two compares + a pand would penalise every
-    /// `int`/`short` classifier loop relative to GCC.
+    /// Signed bounds fuse only through the SOUND window: a signed lower
+    /// bound with a non-negative constant already excludes the negative
+    /// half, so `lo <=s X && X <=s hi` admits exactly the unsigned window
+    /// `[lo, min(hi, smax)]`.  A NEGATIVE lower bound, and the
+    /// unsigned-lower/signed-upper pair, admit the negative half and must
+    /// stay untouched (fusing them would silently select every negative
+    /// value).
+    #[test]
+    fn signed_bounds_fuse_only_through_the_sound_window() {
+        let bits = 32u32;
+        // Sound fusion: 65 <=s X && X <=s 90 is exactly the unsigned
+        // window [65, 90] (any negative X fails the signed lower bound).
+        let signed_conj = conj(
+            cmp(IrCmpOp::Sle, konst(65), load()),
+            cmp(IrCmpOp::Sle, load(), konst(90)),
+        );
+        let folded = fold_unsigned_range_masks(&signed_conj, bits);
+        assert!(
+            matches!(folded, MapExpr::Cmp(IrCmpOp::Slt, _, _)),
+            "non-negative signed window must fuse, got {folded:?}"
+        );
+        // Negative lower bound: the true window includes the negative
+        // half — no fusion.
+        let neg_lower = conj(
+            cmp(IrCmpOp::Sle, konst(-10), load()),
+            cmp(IrCmpOp::Sle, load(), konst(90)),
+        );
+        assert_eq!(fold_unsigned_range_masks(&neg_lower, bits), neg_lower);
+        // Unsigned lower + signed upper admits negHalf ∪ [65, 90] — the
+        // one fusible-looking pair that is NOT a window.  The conjunction
+        // must NOT fuse into a single window compare; the unsigned side
+        // may still fold as its own half-line (semantics preserved), the
+        // signed upper side stays verbatim.  Verified exhaustively at 8
+        // bits against the true set.
+        let bits8 = 8u32;
+        let mixed8 = conj(
+            cmp(IrCmpOp::Ule, konst(65), load()),
+            cmp(IrCmpOp::Sle, load(), konst(90)),
+        );
+        let folded8 = fold_unsigned_range_masks(&mixed8, bits8);
+        assert!(
+            matches!(folded8, MapExpr::MaskConj { is_and: true, .. }),
+            "the mixed pair must keep the conjunction, got {folded8:?}"
+        );
+        let to_signed = |v: u64| -> i64 {
+            let m = 1u64 << bits8;
+            let v = v & (m - 1);
+            if v & (1u64 << (bits8 - 1)) != 0 {
+                v as i64 - m as i64
+            } else {
+                v as i64
+            }
+        };
+        // Tiny denotational evaluator: Load = x, everything else is
+        // structure the fold is allowed to produce.
+        fn eval_bool(e: &MapExpr, x: u64, _bits: u32, to_signed: &dyn Fn(u64) -> i64) -> bool {
+            match e {
+                MapExpr::Cmp(op, l, r) => {
+                    let lv = eval_lane(l, x);
+                    let rv = eval_lane(r, x);
+                    let (ls, rs) = (to_signed(lv), to_signed(rv));
+                    match op {
+                        IrCmpOp::Slt => ls < rs,
+                        IrCmpOp::Sle => ls <= rs,
+                        IrCmpOp::Ult => lv < rv,
+                        IrCmpOp::Ule => lv <= rv,
+                        IrCmpOp::Sgt => ls > rs,
+                        IrCmpOp::Sge => ls >= rs,
+                        IrCmpOp::Ugt => lv > rv,
+                        IrCmpOp::Uge => lv >= rv,
+                        _ => panic!("unexpected compare {op:?}"),
+                    }
+                }
+                MapExpr::MaskConj { is_and, l, r } => {
+                    let (lv, rv) = (
+                        eval_bool(l, x, _bits, to_signed),
+                        eval_bool(r, x, _bits, to_signed),
+                    );
+                    if *is_and { lv && rv } else { lv || rv }
+                }
+                _ => panic!("unexpected mask node {e:?}"),
+            }
+        }
+        fn eval_lane(e: &MapExpr, x: u64) -> u64 {
+            match e {
+                MapExpr::Load(_) => x,
+                MapExpr::Invariant(Operand::Const(c)) => c.to_i64().unwrap_or(0) as u64,
+                MapExpr::BinOp(IrBinOp::Add, l, r) => eval_lane(l, x).wrapping_add(eval_lane(r, x)),
+                _ => panic!("unexpected lane node {e:?}"),
+            }
+        }
+        for x in 0u64..256 {
+            let got = eval_bool(&folded8, x, bits8, &to_signed);
+            let neg_half = (128u64..256).contains(&x);
+            let want = neg_half || (65..=90).contains(&x);
+            assert_eq!(got, want, "mixed window miscompiles at x = {x}");
+        }
+    }
+    /// Upstream PR #457's signed-window spellings, adopted: strict-twin
+    /// (`<s`/`<s`), mirrored operand order, and the composable
+    /// signed-lower + unsigned-upper pair all fuse to the same canonical
+    /// window as the `<=s` twins.
     #[test]
     fn signed_twin_windows_fuse_like_unsigned() {
         let bits = 32u32;
@@ -19939,29 +21609,8 @@ mod range_mask_fusion_tests {
         assert_eq!(fold_unsigned_range_masks(&mirrored, bits), canonical);
     }
 
-    /// The one mixed pair that looks fusible but is NOT: an unsigned LOWER
-    /// bound with a signed UPPER bound both admit the negative half, so the
-    /// conjunction is `negHalf ∪ [lo, hi]` — not a window.  Fusing it would
-    /// silently admit every negative value; the conjunction must survive
-    /// (children may still fold as their own half-lines — that is sound).
-    #[test]
-    fn mixed_unsigned_lower_signed_upper_is_refused() {
-        let bits = 32u32;
-        let refused = conj(
-            cmp(IrCmpOp::Ule, konst(65), load()), // 65 <=u X (Lower, unsigned)
-            cmp(IrCmpOp::Sle, load(), konst(90)), // X <=s 90 (Upper, signed)
-        );
-        let folded = fold_unsigned_range_masks(&refused, bits);
-        assert!(
-            matches!(folded, MapExpr::MaskConj { is_and: true, .. }),
-            "unsigned-lower + signed-upper must not fuse into a window, got {folded:?}"
-        );
-    }
-
-    /// Signed bounds with NEGATIVE constants never enter the window path:
-    /// classification fails closed (the negative-constant case analysis is
-    /// deliberately not written), and a lone signed predicate is left
-    /// structurally untouched.
+    /// A NEGATIVE constant on a signed bound admits the negative half —
+    /// never a window; fail closed in both the conj and lone forms.
     #[test]
     fn negative_constant_signed_bounds_fail_closed() {
         let bits = 32u32;
@@ -19976,6 +21625,22 @@ mod range_mask_fusion_tests {
         );
         let lone = cmp(IrCmpOp::Slt, load(), konst(-3)); // X <s -3
         assert_eq!(fold_unsigned_range_masks(&lone, bits), lone);
+    }
+
+    /// Unsigned lower + signed upper admits `negHalf ∪ [65, 90]` — the one
+    /// fusible-looking pair that is NOT a window; refused.
+    #[test]
+    fn mixed_unsigned_lower_signed_upper_is_refused() {
+        let bits = 32u32;
+        let refused = conj(
+            cmp(IrCmpOp::Ule, konst(65), load()), // 65 <=u X (Lower, unsigned)
+            cmp(IrCmpOp::Sle, load(), konst(90)), // X <=s 90 (Upper, signed)
+        );
+        let folded = fold_unsigned_range_masks(&refused, bits);
+        assert!(
+            matches!(folded, MapExpr::MaskConj { is_and: true, .. }),
+            "unsigned-lower + signed-upper must not fuse into a window, got {folded:?}"
+        );
     }
 
     /// Two bounds on DIFFERENT subjects are not a window.

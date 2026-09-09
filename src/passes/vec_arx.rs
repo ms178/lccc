@@ -72,7 +72,7 @@
 //! body executed `trip` times, which is the shape ICX emits and beats every
 //! unrolled scalar form on both instruction count and I-cache. The
 //! unrollers refuse loops containing this pass's marker intrinsics
-//! (`VecRolI32x4`/`VecShufdI32x4`), so the rolled shape survives every
+//! (`VecRotlI32x4`/`VecShufdI32x4`), so the rolled shape survives every
 //! later unroll phase. The rotate idioms are folded *inside* this pass
 //! (not by re-running bit_idioms early) so the pipeline order — and every
 //! other function's codegen — is untouched.
@@ -965,7 +965,7 @@ fn try_transform_loop(
                 if shufb_mask.is_some() {
                     IntrinsicOp::VecShufbI32x4
                 } else {
-                    IntrinsicOp::VecRolI32x4
+                    IntrinsicOp::VecRotlI32x4
                 }
             }
             _ => return 0,

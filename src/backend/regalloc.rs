@@ -5667,7 +5667,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::Pinsrd128
             | O::Pinsrb128
             | O::Pinsrq128
-            | O::VecRolI32x4
+            | O::VecRotlI32x4
             | O::VecShufdI32x4
             // Horizontal counting exit: one vector operand, scalar result.
             | O::VecHorizontalAddI64x4 => Some(1),
@@ -5703,22 +5703,24 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecCmpF64x2
             | O::VecCmpI32x8
             | O::VecCmpI32x4
-            // Byte-lane compares: same [a, b, imm] shape as the dword
-            // form — two vector reads plus a constant predicate.
-            | O::VecCmpI8x32
+         | O::VecCmpI8x32
             | O::VecCmpI8x16
-            // Word-lane compares (OP-05g): same shape again.
+            | O::VecMinU8x32
+            | O::VecMinU8x16
+            | O::VecMaxU8x32
+            | O::VecMaxU8x16
+            // Word-lane compares (OP-05g): same [a, b, imm] shape as the
+            // dword/byte forms — two vector reads plus a constant
+            // predicate.
             | O::VecCmpI16x16
             | O::VecCmpI16x8 => Some(2),
-
-            // ARX lane family additions (PR455 RA port; Rol/Shufd are
-            // already counted in the Some(1) arm above): the byte shuffle
-            // reads two vectors (data + mask), the pack's four inputs are
-            // scalars, and the lane extract reads one vector arg.
+            // ARX lane family: rotate/lane-shuffle read one vector arg
+            // (the amount/imm trail as immediates), the byte shuffle reads
+            // two (data + mask), the pack's four inputs are scalars, and
+            // the lane extract reads one vector arg.
             O::VecShufbI32x4 => Some(2),
             O::VecPackI32x4 => Some(0),
             O::VecExtractLaneI32x4 => Some(1),
-
 
             // Lane-mask selects: [false, true, mask] — all three are vector
             // reads resolved through the register cache by the AVX/SSE
@@ -5864,6 +5866,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecLoadF64x4
                 | O::VecLoadI32x4
                 | O::VecLoadI32x8
+                | O::VecLoadI8x32
                 | O::VecLoadF32x4
                 | O::VecLoadF32x8
                 | O::VecAddF64x2
@@ -6185,7 +6188,7 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecDivF64x2
                 | O::VecMinF64x2
                 | O::VecMaxF64x2
-                | O::VecRolI32x4
+                | O::VecRotlI32x4
                 | O::VecShufdI32x4
                 | O::VecShufbI32x4
         )
@@ -6701,7 +6704,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             O::VecBroadcastI32x8 | O::VecMaxI32x8 | O::VecMinI32x8 => Some(5),
             O::VecZeroI32x4 | O::VecLoadI32x4 | O::VecAddI32x4 | O::VecMulI32x4 => Some(6),
             // ARX lane ops (rotate/shuffle): class 6 (I32x4 family).
-            O::VecRolI32x4 | O::VecShufdI32x4 | O::VecXorI32x4 => Some(6),
+            O::VecRotlI32x4 | O::VecShufdI32x4 | O::VecXorI32x4 => Some(6),
             O::VecZeroI64x2 | O::VecLoadI64x2 | O::VecAddI64x2 | O::VecMulI64x2 => Some(7),
             // v12 Fix C: the widening reductions PRODUCE an I64x2 dest (the
             // new accumulator). Classifying them as class 7 lets the Copy-web
@@ -6764,7 +6767,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // through %xmm0/%xmm1 scratch without writing the home
                     // (movdqa in, shifts/por on scratch), so a register-homed
                     // I32x4 value stays live across them.
-                    | O::VecRolI32x4
+                    | O::VecRotlI32x4
                     | O::VecShufdI32x4
                     | O::VecXorI32x4
                     // The ARX pass's exit materialization consumes the
@@ -6848,6 +6851,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecBroadcastF64x4
                                 | O::VecBroadcastF64x2
                                 | O::VecBroadcastI64x2
+                                | O::VecBroadcastI8x32
                                 | O::VecStoreI32x8
                                 | O::VecStoreI32x4
                                 | O::VecStoreF32x8
@@ -6855,6 +6859,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecStoreF64x4
                                 | O::VecStoreF64x2
                                 | O::VecStoreI64x2
+                                | O::VecStoreI8x32
                                 // v12 Fix C: max reductions (find_max) and
                                 // their horizontal reduce — lowerings
                                 // confine scratch to xmm0/xmm1, exempt them.
@@ -6884,7 +6889,6 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecMaxU8x32
                                 | O::VecMinI8x32
                                 | O::VecMaxI8x32
-                                | O::VecBroadcastI8x32
                         ) =>
                 {
                     return FxHashSet::default();
@@ -7098,13 +7102,17 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     // endpoints, only the lane width of the ALU differs.
                     | O::VecAddI8x32
                     | O::VecSubI8x32
+                 | O::VecAndI8x32
+                    | O::VecOrI8x32
+                    | O::VecXorI8x32
                     | O::VecCmpI8x32
+                    | O::VecBlendvI8x32
                     | O::VecMinU8x32
                     | O::VecMaxU8x32
-                    | O::VecBlendvI8x32
-| O::VecMinI8x32
+                    | O::VecMinI8x32
                     | O::VecMaxI8x32
-                    // Word lanes (OP-05g) share the 256-bit integer class: same YMM file, same VecLoad/StoreI32x8 endpoints.
+                    // Word lanes (OP-05g) share the 256-bit integer class:
+                    // same YMM file, same VecLoad/StoreI32x8 endpoints.
                     | O::VecAddI16x16
                     | O::VecSubI16x16
                     | O::VecMulI16x16
@@ -7292,15 +7300,24 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecBlendvI32x8
             | O::VecMinI32x8
             | O::VecMaxI32x8
-            | O::VecAddI8x32
+         // Byte-lane map intermediates (AVX2 32xI8): identical home-
+            // aware emitter paths (emit_avx_binary_256, emit_int_cmp_i8,
+            // emit_avx_blendv_256, shared VecStore arm via
+            // vec_store_source_256).
+            | O::VecLoadI8x32
             | O::VecSubI8x32
+            | O::VecAddI8x32
+            | O::VecAndI8x32
+            | O::VecOrI8x32
+            | O::VecXorI8x32
             | O::VecCmpI8x32
+            | O::VecBlendvI8x32
             | O::VecMinU8x32
             | O::VecMaxU8x32
-            | O::VecBlendvI8x32
             | O::VecMinI8x32
             | O::VecMaxI8x32
-            // Word lanes (OP-05g) share the 256-bit integer class: same YMM file, same VecLoad/StoreI32x8 endpoints.
+            // Word lanes (OP-05g) share the 256-bit integer class: same
+            // YMM file, same VecLoad/StoreI32x8 endpoints.
             | O::VecAddI16x16
             | O::VecSubI16x16
             | O::VecMulI16x16
@@ -7319,6 +7336,10 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecXorI32x4
             | O::VecCmpI32x4
             | O::VecBlendvI32x4
+         | O::VecRotlI32x4
+            | O::VecShufdI32x4
+            | O::VecShufbI32x4
+            | O::VecPackI32x4
             | O::VecAddI8x16
             | O::VecSubI8x16
             | O::VecCmpI8x16
@@ -7331,13 +7352,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecCmpI16x8
             | O::VecMinI16x8
             | O::VecMaxI16x8
-            | O::VecBlendvI16x8
-            // ARX lane ops (vec_arx loops): rotate/shuffle results are
-            // in-body intermediates whose consumers are the other ARX
-            // lane ops (and the latch Copy — that consumer is covered by
-            // the reduction collector's copy web instead).
-            | O::VecRolI32x4
-            | O::VecShufdI32x4 => Some(6),
+         | O::VecBlendvI16x8 => Some(6),
             _ => None,
         }
     };
@@ -7422,6 +7437,18 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMaxU16x16
                     | O::VecBlendvI16x16
                     | O::VecStoreI32x8
+                    // Byte ops NOT in the list above: the bitwise byte ops
+                    // (register-file identical to the dword forms) and the
+                    // 128-bit compares/mins/maxes.
+                    | O::VecAndI8x32
+                    | O::VecOrI8x32
+                    | O::VecXorI8x32
+                    | O::VecCmpI8x16
+                    | O::VecBlendvI8x16
+                    | O::VecMinU8x16
+                    | O::VecMaxU8x16
+                    | O::VecStoreI8x32
+                    | O::VecStoreI32x4
             ),
             6 => matches!(
                 op,
@@ -7449,9 +7476,11 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     // ARX lane ops: scratch-only emitters (xmm0/xmm1 pair,
                     // the source home is never written) — a register-homed
                     // value stays live across them.
-                    | O::VecRolI32x4
-                    | O::VecShufdI32x4
                     | O::VecStoreI32x4
+                    | O::VecRotlI32x4
+                    | O::VecShufdI32x4
+                    | O::VecShufbI32x4
+                    | O::VecExtractLaneI32x4
             ),
             _ => false,
         }

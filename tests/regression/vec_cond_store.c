@@ -12,6 +12,12 @@
  *   (c) a cast in the second condition block (the dangling-SSA shape) —
  *       decline is fine, wrong code is not;
  *   (d) a volatile stream — never rewritten.
+ *   (e) the IN-PLACE statement form (`c = p[i]; if (c1 && c2) p[i] = f(c)`)
+ *       — the same-address load dominates the guarded store, so the
+ *       rewrite applies and the loop must vectorize or run scalar,
+ *       byte-exact either way, for every trip count.
+ *   (f) the in-place single-compare dword form (the map parser's dword
+ *       conditional path).
  *
  * References use volatile scalars so they cannot share the transform.
  */
@@ -20,6 +26,7 @@
 #define N 1031
 
 static unsigned char p[N], q[N], ref[N];
+static int iq[N], iref[N];
 
 static void k_casefold(unsigned char *restrict d, const unsigned char *restrict s, unsigned long n) {
     for (unsigned long i = 0; i < n; ++i) {
@@ -51,6 +58,34 @@ static void k_volatile_store(const unsigned char *restrict s, unsigned long n) {
         if (c == 0x2A) vsink[i & 15] = c;
     }
 }
+/* (e) in-place byte form: load p[i] dominates the guarded store to p[i]. */
+static void k_inplace_casefold(unsigned char *restrict p, unsigned long n) {
+    for (unsigned long i = 0; i < n; ++i) {
+        unsigned char c = p[i];
+        if (c >= 'A' && c <= 'Z') p[i] = (unsigned char)(c + 32);
+    }
+}
+/* (f) in-place dword form, single compare. */
+static void k_inplace_min(int *restrict p, int lo, unsigned long n) {
+    for (unsigned long i = 0; i < n; ++i) {
+        int v = p[i];
+        if (v < lo) p[i] = lo;
+    }
+}
+/* (g) in-place or-mask with a CONSTANT stored value. */
+static void k_inplace_ormask(unsigned char *restrict p, unsigned long n) {
+    for (unsigned long i = 0; i < n; ++i) {
+        unsigned char c = p[i];
+        if (c == 0 || c > 250) p[i] = 0xFF;
+    }
+}
+/* (h) in-place three-condition chain: folded mask + residual compare. */
+static void k_inplace_three(unsigned char *restrict p, unsigned long n) {
+    for (unsigned long i = 0; i < n; ++i) {
+        unsigned char c = p[i];
+        if (c >= 'a' && c <= 'z' && c != 'q') p[i] = (unsigned char)(c - 32);
+    }
+}
 
 /* volatile references */
 static void v_casefold(unsigned char *restrict d, const unsigned char *restrict s, unsigned long n) {
@@ -69,6 +104,30 @@ static void v_cast_chain(unsigned char *restrict d, const unsigned char *restric
     for (unsigned long i = 0; i < n; ++i) {
         volatile unsigned char c = s[i];
         if (c >= 'A' && (char)flag == 5) d[i] = (unsigned char)(c + 32);
+    }
+}
+static void v_inplace_casefold(unsigned char *restrict p, unsigned long n) {
+    for (unsigned long i = 0; i < n; ++i) {
+        volatile unsigned char c = p[i];
+        if (c >= 'A' && c <= 'Z') p[i] = (unsigned char)(c + 32);
+    }
+}
+static void v_inplace_min(int *restrict p, int lo, unsigned long n) {
+    for (unsigned long i = 0; i < n; ++i) {
+        volatile int v = p[i];
+        if (v < lo) p[i] = lo;
+    }
+}
+static void v_inplace_ormask(unsigned char *restrict p, unsigned long n) {
+    for (unsigned long i = 0; i < n; ++i) {
+        volatile unsigned char c = p[i];
+        if (c == 0 || c > 250) p[i] = 0xFF;
+    }
+}
+static void v_inplace_three(unsigned char *restrict p, unsigned long n) {
+    for (unsigned long i = 0; i < n; ++i) {
+        volatile unsigned char c = p[i];
+        if (c >= 'a' && c <= 'z' && c != 'q') p[i] = (unsigned char)(c - 32);
     }
 }
 
@@ -92,6 +151,18 @@ int main(void) {
         for (int i = 0; i < N; i++) { q[i] = p[i]; ref[i] = p[i]; }
         k_cast_chain(q, p, 5, n); v_cast_chain(ref, p, 5, n);
         for (int i = 0; i < N; i++) CHECK(q[i], ref[i], "cast_chain");
+        for (int i = 0; i < N; i++) { q[i] = p[i]; ref[i] = p[i]; }
+        k_inplace_casefold(q, n); v_inplace_casefold(ref, n);
+        for (int i = 0; i < N; i++) CHECK(q[i], ref[i], "inplace_casefold");
+        for (int i = 0; i < N; i++) { iref[i] = iq[i] = (int)i * 7 - 300; }
+        k_inplace_min(iq, -100, n); v_inplace_min(iref, -100, n);
+        for (int i = 0; i < N; i++) CHECK(iq[i], iref[i], "inplace_min");
+        for (int i = 0; i < N; i++) { q[i] = p[i]; ref[i] = p[i]; }
+        k_inplace_ormask(q, n); v_inplace_ormask(ref, n);
+        for (int i = 0; i < N; i++) CHECK(q[i], ref[i], "inplace_ormask");
+        for (int i = 0; i < N; i++) { q[i] = p[i]; ref[i] = p[i]; }
+        k_inplace_three(q, n); v_inplace_three(ref, n);
+        for (int i = 0; i < N; i++) CHECK(q[i], ref[i], "inplace_three");
     }
     k_volatile_store(p, N);
     if (fails == 0) printf("ALL OK\n");
