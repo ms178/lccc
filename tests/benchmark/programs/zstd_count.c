@@ -12,9 +12,15 @@
  */
 #include <stdio.h>
 
+#ifndef BUFFER_SIZE
 #define BUFFER_SIZE (1UL << 20)
+#endif
+#ifndef QUERY_COUNT
 #define QUERY_COUNT (1U << 17)
+#endif
+#ifndef PASSES
 #define PASSES 16U
+#endif
 
 typedef unsigned char u8;
 typedef unsigned int u32;

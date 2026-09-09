@@ -1,8 +1,12 @@
 // Mandelbrot set computation (FP-heavy inner loop, branching)
 #include <stdio.h>
 
+#ifndef WIDTH
 #define WIDTH 4000
+#endif
+#ifndef HEIGHT
 #define HEIGHT 4000
+#endif
 #define MAX_ITER 50
 
 int main(void) {

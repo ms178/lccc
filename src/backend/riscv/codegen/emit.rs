@@ -337,8 +337,22 @@ impl RiscvCodegen {
         }
     }
 
+    /// Bias a frame-slot offset by any outstanding stack-pointer adjustment.
+    ///
+    /// `emit_acc_save` lowers sp by 16 for the duration of an emission that
+    /// would otherwise clobber the accumulator, and RISC-V addresses every slot
+    /// sp-relative, so offsets computed inside that window must be biased by
+    /// the same delta. `emit_addi_sp` (which moves sp itself) is deliberately
+    /// NOT biased. The field is zero outside the protected window, so existing
+    /// codegen is unchanged.
+    #[inline]
+    fn slot_offset(&self, offset: i64) -> i64 {
+        offset + self.state.out.rsp_frame_size
+    }
+
     /// Emit: store `reg` to `offset(sp)`, handling large offsets via t6.
     pub(super) fn emit_store_to_sp(&mut self, reg: &str, offset: i64, store_instr: &str) {
+        let offset = self.slot_offset(offset);
         if Self::fits_imm12(offset) {
             self.state
                 .emit_fmt(format_args!("    {} {}, {}(sp)", store_instr, reg, offset));
@@ -352,6 +366,7 @@ impl RiscvCodegen {
 
     /// Emit: load from `offset(sp)` into `reg`, handling large offsets via t6.
     pub(super) fn emit_load_from_sp(&mut self, reg: &str, offset: i64, load_instr: &str) {
+        let offset = self.slot_offset(offset);
         if Self::fits_imm12(offset) {
             self.state
                 .emit_fmt(format_args!("    {} {}, {}(sp)", load_instr, reg, offset));
@@ -730,6 +745,21 @@ impl RiscvCodegen {
 impl ArchCodegen for RiscvCodegen {
     fn is_value_reg_assigned(&self, vid: u32) -> bool {
         self.reg_assignments.contains_key(&vid)
+    }
+
+    fn emit_acc_save(&mut self) -> i64 {
+        // RISC-V has no push and (unlike AArch64) no pre-indexed store, so the
+        // save is `addi` + `sd`. Neither instruction touches a pending
+        // compare's state. 16 bytes keeps sp 16-byte aligned and leaves the
+        // slot emitters' imm12 range reachable.
+        self.state.emit("    addi sp, sp, -16");
+        self.state.emit("    sd t0, 0(sp)");
+        16
+    }
+
+    fn emit_acc_restore(&mut self) {
+        self.state.emit("    ld t0, 0(sp)");
+        self.state.emit("    addi sp, sp, 16");
     }
 
     fn state(&mut self) -> &mut CodegenState {

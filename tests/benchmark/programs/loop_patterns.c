@@ -1,7 +1,9 @@
 // Loop optimization patterns (unrolling, strength reduction, LICM targets)
 #include <stdio.h>
 
+#ifndef SIZE
 #define SIZE 10000000
+#endif
 
 static int array[SIZE];
 

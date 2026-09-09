@@ -3,8 +3,12 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifndef NSTRINGS
 #define NSTRINGS 100000
+#endif
+#ifndef MAX_LEN
 #define MAX_LEN 200
+#endif
 
 static char strings[NSTRINGS][MAX_LEN];
 

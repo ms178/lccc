@@ -17,8 +17,12 @@
 
 #define BASE 65521U
 #define NMAX 5552U
+#ifndef DATA_SIZE
 #define DATA_SIZE (2UL << 20)
+#endif
+#ifndef PASSES
 #define PASSES 48U
+#endif
 
 #define ADLER_DO1(sum1, sum2, buf, i) \
   { (sum1) += (buf)[(i)]; (sum2) += (sum1); }
