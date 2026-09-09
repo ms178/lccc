@@ -1561,6 +1561,7 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadF64x4
             | O::VecLoadI32x4
             | O::VecLoadI32x8
+            | O::VecLoadI8x32
             | O::VecLoadF32x4
             | O::VecLoadF32x8
             | O::VecHorizontalAddF64x2
@@ -1605,7 +1606,7 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecMaxI16x8
             // ARX lane ops consume a 128-bit vector source directly
             // (scratch-only emission; see the x86 emitters).
-            | O::VecRolI32x4
+            | O::VecRotlI32x4
             | O::VecShufbI32x4
             | O::VecShufdI32x4
             | O::Psubusb128
@@ -1733,6 +1734,10 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecMaxF32x4
             | O::VecMaxF64x4
             | O::VecMaxF64x2
+            // Byte-lane two-operand forms (AVX2 32xI8): vpaddb via
+            // emit_avx_binary_256 and the vpbroadcastb producer share the
+            // dword family's deferred-%ymm0 consumer contract.
+            | O::VecBroadcastI8x32
     )
 }
 
@@ -1778,9 +1783,10 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // ARX lane producers (vec_arx): rotate/shuffle results home
             // like other Vec* SSA values (scratch-pair contract, no
             // deferred-store dependency).
-            | O::VecRolI32x4
+            | O::VecRotlI32x4
             | O::VecShufbI32x4
             | O::VecShufdI32x4
+            | O::VecPackI32x4
             // Counting-reduction producers (vpsadbw/vpaddq groups, the
             // horizontal exit's scalar is not a vector value).
             | O::VecSadbwU8x32
@@ -1856,6 +1862,13 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // only the reduction path consumed VecMaxI32x8).
             | O::VecMinI32x8
             | O::VecMaxI32x8
+            // Byte-lane map ops (AVX2 32xI8): same SSA-scratch-pair
+            // contract — results live in the SIMD scratch pair until the
+            // adjacent VecStore.
+            | O::VecLoadI8x32
+            | O::VecAndI8x32
+            | O::VecOrI8x32
+            | O::VecXorI8x32
     )
 }
 
@@ -1967,13 +1980,17 @@ pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool 
             | O::VecLoadF32x4
             | O::VecLoadI32x4
             | O::VecLoadI64x2
+            | O::VecLoadI8x32
     )
 }
 
 /// 256-bit loads eligible for source-operand folding (VLFOLD).
 pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
-    matches!(op, O::VecLoadF64x4 | O::VecLoadF32x8 | O::VecLoadI32x8)
+    matches!(
+        op,
+        O::VecLoadF64x4 | O::VecLoadF32x8 | O::VecLoadI32x8 | O::VecLoadI8x32
+    )
 }
 
 /// Map FMA intrinsics `VecMadd*(input, scale, bias)` (`emit_avx_map_fma`):
@@ -2053,12 +2070,18 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         // packed min/max contract above.
         O::VecAndI32x8 | O::VecOrI32x8 | O::VecXorI32x8 => Some(true),
         O::VecSubI32x8 => Some(false),
-        // Byte lanes: `vpaddb` and the unsigned byte min/max are
-        // commutative (integer min/max has none of the FP
-        // unordered/signed-zero asymmetry, so either operand may carry
-        // the folded memory source); `vpsubb` is `src1 - src2`.
-        O::VecAddI8x32 | O::VecMinU8x32 | O::VecMaxU8x32 => Some(true),
-        O::VecMinI8x32 | O::VecMaxI8x32 => Some(true),
+        // Byte lanes: `vpaddb`, the bitwise byte ops, and the byte/word
+        // integer min/max are commutative (integer min/max has none of the
+        // FP unordered/signed-zero asymmetry, so either operand may carry
+        // the folded memory source); `vpsubb`/`vpsubw` are `src1 - src2`.
+        O::VecAddI8x32
+        | O::VecAndI8x32
+        | O::VecOrI8x32
+        | O::VecXorI8x32
+        | O::VecMinU8x32
+        | O::VecMaxU8x32
+        | O::VecMinI8x32
+        | O::VecMaxI8x32 => Some(true),
         // Counting binaries: `vpsadbw(a, b)` is symmetric (sum of absolute
         // differences), `vpaddq` commutative.
         O::VecSadbwU8x32 | O::VecAddI64x4 => Some(true),

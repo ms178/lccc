@@ -1398,7 +1398,7 @@ fn transform_arx_loop(
         *next_val_id += 1;
         k.push(Instruction::Intrinsic {
             dest: Some(dest),
-            op: IntrinsicOp::VecRolI32x4,
+            op: IntrinsicOp::VecRotlI32x4,
             dest_ptr: None,
             args: vec![Operand::Value(v), Operand::Const(IrConst::I32(n as i32))],
         });

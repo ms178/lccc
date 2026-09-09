@@ -298,7 +298,7 @@ pub enum IntrinsicOp {
     /// triple `pslld $n / psrld $(32-n) / por` (x86 has no packed rotate
     /// before AVX-512 `vprold`). Produced by the lane-parallel ARX pass
     /// (`passes::vec_arx`) from ChaCha20/Salsa-style quarter-rounds.
-    VecRolI32x4,
+    VecRotlI32x4,
     /// Vector lane shuffle: %dest_vec = pshufd(%src_vec, imm) — the
     /// destination lane `l` reads source lane `(l + imm_selector(l)) % 4`
     /// per the SSE2 pshufd immediate encoding (bits [2l+1:2l]). Used by
@@ -444,6 +444,19 @@ pub enum IntrinsicOp {
     /// to the integer-domain `pand/pandn/por` triple (no SSE4.1, no
     /// float-domain bypass delay).
     VecBlendvI32x4,
+    /// Byte-lane conditional maps (AVX2 only, 32×I8/U8 lanes — the
+    /// `s[i] = cond ? f(s[i]) : s[i]` family over `char`/`signed char`/
+    /// `unsigned char` arrays). The whole family mirrors the dword-lane
+    /// pipeline at one-byte granularity:
+    VecLoadI8x32,
+    /// Store 32×I8/U8 (see `VecLoadI8x32`).
+    VecStoreI8x32,
+    /// 32×I8/U8 lane bitwise — vpand.
+    VecAndI8x32,
+    /// 32×I8/U8 lane bitwise — vpor.
+    VecOrI8x32,
+    /// 32×I8/U8 lane bitwise — vpxor.
+    VecXorI8x32,
     /// Widening reduction step: dest(I64x2 accumulator) += sign-extend of
     /// 4×I32 loaded from (base, byte_offset). One intrinsic = load 4 I32s,
     /// widen lanes 0..1 and 2..3 to two I64x2 halves, add both into the
@@ -714,7 +727,6 @@ pub enum IntrinsicOp {
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×F32 → F32
     VecHorizontalAddF32x4,
     VecHorizontalAddI64x2,
-
     /// Vector zero: %dest_vec = {0.0, 0.0, 0.0, 0.0} - AVX2 4×F64
     /// No args; dest = zero vector
     VecZeroF64x4,
@@ -1435,9 +1447,10 @@ impl IntrinsicOp {
             | VecMinF32x8 | VecMaxF32x8 | VecCmpF32x8 | VecBlendvF32x8
             | VecMinF64x4 | VecMaxF64x4 | VecCmpF64x4 | VecBlendvF64x4
             | VecCmpI32x8 | VecBlendvI32x8 | VecMinI32x8
-            | VecAddI8x32 | VecSubI8x32 | VecCmpI8x32
-            | VecMinU8x32 | VecMaxU8x32 | VecBlendvI8x32
-            | VecMinI8x32 | VecMaxI8x32 | VecBroadcastI8x32
+            | VecLoadI8x32 | VecBroadcastI8x32
+            | VecCmpI8x32 | VecBlendvI8x32 | VecMinU8x32 | VecMaxU8x32
+            | VecMinI8x32 | VecMaxI8x32
+            | VecAddI8x32 | VecSubI8x32 | VecAndI8x32 | VecOrI8x32 | VecXorI8x32
             | VecAddI16x16
             | VecSubI16x16
             | VecMulI16x16
@@ -1526,13 +1539,15 @@ impl IntrinsicOp {
             | VecWidenMaskedAddI32x4ToI64x2
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
             | VecSubI32x4 | VecSubI64x2 | VecAndI32x4 | VecOrI32x4 | VecXorI32x4
-            | VecRolI32x4 | VecShufdI32x4 | VecShufbI32x4 | VecPackI32x4
             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
             | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
             | Punpckldq128 | Punpckhdq128 | Punpcklqdq128 | Punpckhqdq128
             | Setzero128 | Extracti128
+            // ARX lane family: 128-bit XMM results (pslld/pshufd/pshufb/
+            // pack are x4-lane).
+            | VecRotlI32x4 | VecShufdI32x4 | VecShufbI32x4 | VecPackI32x4
             => Some(16),
             // Everything else produces a scalar GPR/x87 result, no result, or
             // is an F128 helper handled by the dedicated f128 slot path.
@@ -1704,7 +1719,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecOrI32x4
                 | IntrinsicOp::VecXorI32x8
                 | IntrinsicOp::VecXorI32x4
-                | IntrinsicOp::VecRolI32x4
+                | IntrinsicOp::VecRotlI32x4
                 | IntrinsicOp::VecShufdI32x4
                 | IntrinsicOp::VecShufbI32x4
                 | IntrinsicOp::VecPackI32x4
@@ -1777,10 +1792,14 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecCmpI32x4
                 | IntrinsicOp::VecBlendvI32x8
                 | IntrinsicOp::VecBlendvI32x4
+                | IntrinsicOp::VecLoadI8x32
                 | IntrinsicOp::VecCmpI8x32
                 | IntrinsicOp::VecCmpI8x16
                 | IntrinsicOp::VecBlendvI8x32
                 | IntrinsicOp::VecBlendvI8x16
+                | IntrinsicOp::VecAndI8x32
+                | IntrinsicOp::VecOrI8x32
+                | IntrinsicOp::VecXorI8x32
         )
     }
 }
@@ -1844,11 +1863,6 @@ mod vector_result_width_tests {
     ///   agrees with its name.
     /// - `VecSadalpI32x4` / `VecSmlal{Hi,Lo}I32x4` are unlowered NEON-shaped
     ///   variants with no registered result; exempt until a lowering lands.
-    /// - `VecExtractLane*` name their INPUT vector; the result is one lane
-    ///   in a scalar GPR (`pextrd`; `pshufd`+`movd` on the SSE2 baseline) —
-    ///   the `Pextr*` class that `vector_result_width`'s contract keeps
-    ///   scalar on purpose: listing it as a vector corrupts scalar slot
-    ///   handling (the documented volatile_access regression class).
     #[test]
     fn declared_width_agrees_with_the_lane_count_in_the_name() {
         const SRC: &str = include_str!("intrinsics.rs");
@@ -1905,6 +1919,8 @@ mod vector_result_width_tests {
                 || (name.starts_with("VecStore") && name != "VecStoreI64x2")
                 || name.starts_with("VecSadalp")
                 || name.starts_with("VecSmlal")
+             // Reads a 128-bit vector, extracts ONE lane into a GPR:
+                // the name describes the input, the result is a scalar.
                 || name.starts_with("VecExtractLane");
             let last = SHAPES
                 .iter()
@@ -1940,7 +1956,7 @@ mod vector_result_width_tests {
             "VecAddF64x2" => IntrinsicOp::VecAddF64x2,
             "VecAddF64x4" => IntrinsicOp::VecAddF64x4,
             "VecAddI32x4" => IntrinsicOp::VecAddI32x4,
-            "VecRolI32x4" => IntrinsicOp::VecRolI32x4,
+            "VecRotlI32x4" => IntrinsicOp::VecRotlI32x4,
             "VecShufdI32x4" => IntrinsicOp::VecShufdI32x4,
             "VecShufbI32x4" => IntrinsicOp::VecShufbI32x4,
             "VecPackI32x4" => IntrinsicOp::VecPackI32x4,
@@ -1967,6 +1983,24 @@ mod vector_result_width_tests {
             "VecCmpF32x4" => IntrinsicOp::VecCmpF32x4,
             "VecCmpF32x8" => IntrinsicOp::VecCmpF32x8,
             "VecCmpI32x4" => IntrinsicOp::VecCmpI32x4,
+            "VecLoadI8x32" => IntrinsicOp::VecLoadI8x32,
+            "VecStoreI8x32" => IntrinsicOp::VecStoreI8x32,
+            "VecBroadcastI8x32" => IntrinsicOp::VecBroadcastI8x32,
+            "VecCmpI8x32" => IntrinsicOp::VecCmpI8x32,
+            "VecAddI8x16" => IntrinsicOp::VecAddI8x16,
+            "VecSubI8x16" => IntrinsicOp::VecSubI8x16,
+            "VecCmpI8x16" => IntrinsicOp::VecCmpI8x16,
+            "VecBlendvI8x16" => IntrinsicOp::VecBlendvI8x16,
+            "VecMinU8x32" => IntrinsicOp::VecMinU8x32,
+            "VecMinU8x16" => IntrinsicOp::VecMinU8x16,
+            "VecMaxU8x32" => IntrinsicOp::VecMaxU8x32,
+            "VecMaxU8x16" => IntrinsicOp::VecMaxU8x16,
+            "VecBlendvI8x32" => IntrinsicOp::VecBlendvI8x32,
+            "VecAddI8x32" => IntrinsicOp::VecAddI8x32,
+            "VecSubI8x32" => IntrinsicOp::VecSubI8x32,
+            "VecAndI8x32" => IntrinsicOp::VecAndI8x32,
+            "VecOrI8x32" => IntrinsicOp::VecOrI8x32,
+            "VecXorI8x32" => IntrinsicOp::VecXorI8x32,
             "VecCmpI32x8" => IntrinsicOp::VecCmpI32x8,
             "VecCmpF64x2" => IntrinsicOp::VecCmpF64x2,
             "VecCmpF64x4" => IntrinsicOp::VecCmpF64x4,
@@ -2036,9 +2070,6 @@ mod vector_result_width_tests {
             "VecSubF32x8" => IntrinsicOp::VecSubF32x8,
             "VecSubF64x2" => IntrinsicOp::VecSubF64x2,
             "VecSubF64x4" => IntrinsicOp::VecSubF64x4,
-            "VecAddI8x16" => IntrinsicOp::VecAddI8x16,
-            "VecAddI8x32" => IntrinsicOp::VecAddI8x32,
-            "VecBlendvI8x16" => IntrinsicOp::VecBlendvI8x16,
             "VecBroadcastI8x16" => IntrinsicOp::VecBroadcastI8x16,
             "VecAddI16x16" => IntrinsicOp::VecAddI16x16,
             "VecAddI16x8" => IntrinsicOp::VecAddI16x8,
@@ -2058,18 +2089,8 @@ mod vector_result_width_tests {
             "VecMulI16x8" => IntrinsicOp::VecMulI16x8,
             "VecSubI16x16" => IntrinsicOp::VecSubI16x16,
             "VecSubI16x8" => IntrinsicOp::VecSubI16x8,
-            "VecBroadcastI8x32" => IntrinsicOp::VecBroadcastI8x32,
-            "VecBlendvI8x32" => IntrinsicOp::VecBlendvI8x32,
-            "VecCmpI8x16" => IntrinsicOp::VecCmpI8x16,
-            "VecCmpI8x32" => IntrinsicOp::VecCmpI8x32,
-            "VecMaxU8x16" => IntrinsicOp::VecMaxU8x16,
-            "VecMaxU8x32" => IntrinsicOp::VecMaxU8x32,
             "VecMaxI8x32" => IntrinsicOp::VecMaxI8x32,
             "VecMinI8x32" => IntrinsicOp::VecMinI8x32,
-            "VecMinU8x16" => IntrinsicOp::VecMinU8x16,
-            "VecMinU8x32" => IntrinsicOp::VecMinU8x32,
-            "VecSubI8x16" => IntrinsicOp::VecSubI8x16,
-            "VecSubI8x32" => IntrinsicOp::VecSubI8x32,
             "VecSubI32x4" => IntrinsicOp::VecSubI32x4,
             "VecSubI32x8" => IntrinsicOp::VecSubI32x8,
             "VecSubI64x2" => IntrinsicOp::VecSubI64x2,

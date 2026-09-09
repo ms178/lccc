@@ -116,7 +116,7 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
     // I-cache). Scalar unroll economics do not apply — the body already
     // saturates the machine's lane parallelism — and unrolling a trip-10
     // ARX loop would multiply .text tenfold for zero ILP gain. The marker
-    // intrinsics (VecRolI32x4/VecShufdI32x4) are only ever produced by
+    // intrinsics (VecRotlI32x4/VecShufdI32x4) are only ever produced by
     // that pass, so this filter cannot fire on any other loop.
     let arx_marker_labels: FxHashSet<u32> = {
         let mut hit: FxHashSet<u32> = FxHashSet::default();
@@ -124,7 +124,7 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
             let has_marker = block.instructions.iter().any(|inst| {
                 matches!(inst, crate::ir::reexports::Instruction::Intrinsic { op, .. }
                     if matches!(op,
-                        crate::ir::reexports::IntrinsicOp::VecRolI32x4
+                        crate::ir::reexports::IntrinsicOp::VecRotlI32x4
                         | crate::ir::reexports::IntrinsicOp::VecShufdI32x4))
             });
             if has_marker {
