@@ -1107,6 +1107,252 @@ fn is_rax_dead_after(store: &LineStore, infos: &[LineInfo], start: usize, len: u
     is_reg_dead_after(store, infos, start, len, 0)
 }
 
+/// Byte width of a supported binary ALU mnemonic's frame-slot source operand.
+/// Returns None unless `mn` is an integer ALU with a trailing b/w/l/q suffix.
+fn alu_memop_size(mn: &str) -> Option<MoveSize> {
+    if mn.len() < 2 {
+        return None;
+    }
+    let op = &mn[..mn.len() - 1];
+    if !matches!(op, "add" | "sub" | "and" | "or" | "xor" | "cmp" | "test" | "adc" | "sbb" | "imul")
+    {
+        return None;
+    }
+    match mn.as_bytes()[mn.len() - 1] {
+        b'q' => Some(MoveSize::Q),
+        b'l' => Some(MoveSize::L),
+        b'w' => Some(MoveSize::W),
+        b'b' => Some(MoveSize::B),
+        _ => None,
+    }
+}
+
+/// Fold a dead `mov %reg, slot` into the following ALU instruction that reads
+/// the same slot as a memory source operand, substituting `%reg` for the
+/// memory operand and deleting the store.
+///
+/// Pattern (the register allocator's "value spilled to a slot then read back
+/// through a memory operand" shape — also the residual form left behind when
+/// `fold_memory_operands`/`fold_store_relay` have already run):
+///
+/// ```text
+///   movl %eax, -404(%rbp)        ; store %reg -> slot
+///   xorl -404(%rbp), %r8d        ; ALU reads slot; writes %r8d
+/// ```
+///
+/// The store's source register still holds exactly the value the ALU reads,
+/// so the memory operand may be replaced by that register and the store
+/// deleted.  The store is only deleted when it is provably dead afterwards
+/// — the slot is never reloaded before its next overwrite — so no reader is
+/// deprived of the value.  `fp_liveness` fails closed (reports the slot live)
+/// when the function is opaque, so a `%rbp` pointer-dereference under a
+/// data-register `%rbp`, or an escaping-slot address, is never folded.
+///
+/// Width rule: the ALU must not read bytes the store did not write.  The slot
+/// is substituted at the ALU's width, so an 8-byte store feeding a 4-byte op
+/// folds to the low 32-bit register (sound: `%eax` observes exactly the low
+/// four bytes `%rax` wrote); a 4-byte store feeding an 8-byte op is refused
+/// (the slot's high half is undefined).
+/// True when the line at index `k` may be safely stepped over while scanning
+/// from the store to a later ALU without clobbering the store's source
+/// register `reg` or invalidating the frame slot the store wrote.  Anything
+/// that touches a frame slot, reads/writes opaque memory, transfers or merges
+/// control, or writes the tracked register terminates the scan.
+fn is_transparent_for_store_fold(
+    store: &LineStore,
+    infos: &[LineInfo],
+    k: usize,
+    reg: RegId,
+    base_fam: u8,
+) -> bool {
+    if infos[k].is_nop()
+        || infos[k].kind == LineKind::Empty
+        || infos[k].kind == LineKind::Directive
+    {
+        return true;
+    }
+    if infos[k].pinned {
+        return false;
+    }
+    match infos[k].kind {
+        LineKind::Label
+        | LineKind::Jmp
+        | LineKind::JmpIndirect
+        | LineKind::Ret
+        | LineKind::CondJmp
+        | LineKind::Call
+        | LineKind::InlineAsm
+        | LineKind::Push { .. }
+        | LineKind::Pop { .. } => return false,
+        _ => {}
+    }
+    // Any frame-slot access (load, store, ALU memory operand, lea) could be
+    // our slot revisited or an aliasing neighbour; treat as a boundary.
+    if infos[k].has_indirect_mem || infos[k].rbp_offset != RBP_OFFSET_NONE {
+        return false;
+    }
+    if matches!(
+        infos[k].kind,
+        LineKind::StoreRbp { .. }
+            | LineKind::LoadRbp { .. }
+            | LineKind::StoreXmmRbp { .. }
+            | LineKind::LoadXmmRbp { .. }
+    ) {
+        return false;
+    }
+    // A write to the store's source register or to the frame base register
+    // (which the slot's address depends on) makes the register-carry / address
+    // assumption stale.
+    if writes_family(&infos[k], infos[k].trimmed(store.get(k)), reg)
+        || writes_family(&infos[k], infos[k].trimmed(store.get(k)), base_fam as RegId)
+    {
+        return false;
+    }
+    true
+}
+
+/// Fold a dead `mov %reg, slot` into a later ALU instruction that reads the
+/// same slot as a memory source operand, substituting `%reg` for the memory
+/// operand and deleting the store.
+///
+/// Pattern (the register allocator's "value spilled to a slot then read back
+/// through a memory operand" shape — also the residual form left behind when
+/// `fold_memory_operands`/`fold_store_relay` have already run):
+///
+/// ```text
+///   movl %eax, -404(%rbp)        ; store %reg -> slot
+///   xorl -404(%rbp), %r8d        ; ALU reads slot; writes %r8d
+/// ```
+///
+/// The store's source register still holds exactly the value the ALU reads,
+/// so the memory operand may be replaced by that register.  The store is only
+/// deleted when it is provably dead afterwards — the slot is never reloaded
+/// before its next overwrite — so no reader is deprived of the value; the
+/// forward scan also refuses to step over any line that reads or writes the
+/// slot (so a load between the store and the ALU, which would consume the
+/// store's value, blocks the fold).  `fp_liveness` fails closed (reports the
+/// slot live) when the function is opaque, so a `%rbp` pointer-dereference
+/// under a data-register `%rbp`, or an escaping-slot address, is never folded.
+///
+/// Width rule: the ALU must not read bytes the store did not write.  The slot
+/// is substituted at the ALU's width, so an 8-byte store feeding a 4-byte op
+/// folds to the low 32-bit register (sound: `%eax` observes exactly the low
+/// four bytes `%rax` wrote); a 4-byte store feeding an 8-byte op is refused
+/// (the slot's high half is undefined).
+pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let lv = FpLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let LineKind::StoreRbp { reg, offset, size } = infos[i].kind else {
+            i += 1;
+            continue;
+        };
+        if reg > 15 {
+            i += 1;
+            continue;
+        }
+        let tstore = infos[i].trimmed(store.get(i));
+        let base = if tstore.contains("(%rbp)") {
+            5u8
+        } else if tstore.contains("(%rsp)") {
+            4u8
+        } else {
+            i += 1;
+            continue;
+        };
+        let slot_text = format!("{}(%r{})", offset, if base == 4 { "sp" } else { "bp" });
+
+        // Scan forward over lines that provably do not touch `reg`, the frame
+        // base, or the slot, looking for the ALU that reads the slot.  A Label
+        // (CFG rejoin), call, opaque memory line, or a slot/register write
+        // terminates the search.
+        let mut j = i + 1;
+        let mut advanced = false;
+        loop {
+            while j < len
+                && (infos[j].is_nop()
+                    || infos[j].kind == LineKind::Empty
+                    || infos[j].kind == LineKind::Directive)
+            {
+                j += 1;
+            }
+            if j >= len {
+                break;
+            }
+            let tj = infos[j].trimmed(store.get(j));
+            let (mn, operands) = match tj.split_once(char::is_whitespace) {
+                Some((m, o)) => (m, o.trim()),
+                None => {
+                    j += 1;
+                    continue;
+                }
+            };
+
+            let mut folded_here = false;
+            if !infos[j].pinned {
+                if let Some(alu_size) = alu_memop_size(mn) {
+                    if let Some((a, b)) = operands.split_once(',') {
+                        let src = a.trim();
+                        let dstr = b.trim();
+                        if src == slot_text
+                            && !dstr.contains(',')
+                            && dstr.starts_with('%')
+                            && !dstr.contains('(')
+                            && register_family_fast(dstr) != REG_NONE
+                            && alu_size.byte_size() <= size.byte_size()
+                        {
+                            // The store's source register still holds exactly the
+                            // value the ALU reads, so the memory operand may be
+                            // substituted for any register op — the substitution is
+                            // sound whether or not the store stays (a later slot
+                            // reader still observes the kept store).  The store is
+                            // deleted only when fp_liveness proves it dead: the slot
+                            // is never reloaded before its next overwrite.  It fails
+                            // closed (reports live) for opaque / address-taken
+                            // functions, so the store is kept there — never folded
+                            // across a possibly-aliasing access.
+                            let dead = lv.slot_dead_after(j, base, offset, size.byte_size());
+                            let regname = reg_id_to_name(reg, alu_size);
+                            let new_inst = format!("    {} {}, {}", mn, regname, dstr);
+                            replace_line(store, &mut infos[j], j, new_inst);
+                            if dead {
+                                mark_nop(&mut infos[i]);
+                            }
+                            changed = true;
+                            folded_here = true;
+                        }
+                    }
+                }
+            }
+
+            if folded_here {
+                i = j + 1;
+                advanced = true;
+                break;
+            }
+
+            // Not (or not foldably) a slot-reading ALU.  If the line is not
+            // transparent, the store's value can no longer be assumed to reach
+            // a later line; stop scanning and move on.
+            if !is_transparent_for_store_fold(store, infos, j, reg, base) {
+                break;
+            }
+            j += 1;
+        }
+
+        if !advanced {
+            i += 1;
+        }
+    }
+    changed
+}
+
 /// Fold stack loads into subsequent ALU instructions as memory operands.
 ///
 /// Safety: We only fold when the loaded register (the one being eliminated) is
@@ -3120,5 +3366,94 @@ mod fp_const_hoist_tests {
             out[1], "movss .LCFP_0(%rip), %xmm0",
             "single-precision pool read: {out:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod store_alu_memop_tests {
+    use super::*;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_store_alu_memop(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    fn header(body: &str) -> String {
+        format!(
+            "foo:\n.cfi_startproc\n    pushq %rbp\n    movq %rsp, %rbp\n    subq $64, %rsp\n{body}    addq $64, %rsp\n    popq %rbp\n    ret\n.cfi_endproc\n"
+        )
+    }
+
+    /// The core PF-STORE-FOLDOP-1 shape: a dead `mov %reg, slot` immediately
+    /// followed by an ALU reading the slot as a memory operand folds to a
+    /// pure-register ALU and the store is deleted.
+    #[test]
+    fn folds_adjacent_dead_store_into_alu_memop() {
+        let (changed, out) = run(&header(
+            "    movl %eax, -4(%rbp)\n    xorl -4(%rbp), %r8d\n    addl %r8d, %r12d\n",
+        ));
+        assert!(changed, "{out:?}");
+        assert!(out.contains(&"xorl %eax, %r8d".to_string()), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.contains("-4(%rbp)")),
+            "store must be gone: {out:?}"
+        );
+    }
+
+    /// The register-carrying instruction between the store and the ALU may be
+    /// stepped over only when it provably leaves `%reg` and the slot intact.
+    /// Here `movl %r14d, %edx` writes a different register, so the fold still
+    /// applies.
+    #[test]
+    fn steps_over_an_unrelated_register_move() {
+        let (changed, out) = run(&header(
+            "    movl %eax, -4(%rbp)\n    movl %r14d, %edx\n    addl -4(%rbp), %edx\n",
+        ));
+        assert!(changed, "{out:?}");
+        assert!(out.contains(&"addl %eax, %edx".to_string()), "{out:?}");
+    }
+
+    /// SOUNDNESS: if the store's source register is rewritten between the store
+    /// and the ALU, the ALU no longer observes the stored value and the fold
+    /// must be refused (otherwise it would read the clobbering value).
+    #[test]
+    fn refuses_when_the_source_register_is_clobbered() {
+        let (changed, out) = run(&header(
+            "    movl %eax, -4(%rbp)\n    movl %edi, %eax\n    xorl -4(%rbp), %eax\n",
+        ));
+        assert!(!changed, "{out:?}");
+        assert!(out.iter().any(|l| l.contains("-4(%rbp)")), "{out:?}");
+    }
+
+    /// SOUNDNESS: a load of the slot between the store and the ALU consumes the
+    /// store's value, so deleting the store would leak a stale slot read.  The
+    /// scan must stop at the load.
+    #[test]
+    fn refuses_when_a_slot_load_intervenes() {
+        let (changed, out) = run(&header(
+            "    movl %eax, -4(%rbp)\n    movl -4(%rbp), %ecx\n    xorl -4(%rbp), %r8d\n",
+        ));
+        assert!(!changed, "{out:?}");
+        assert!(out.iter().any(|l| l.contains("-4(%rbp)")), "{out:?}");
+    }
+
+    /// SOUNDNESS: the ALU must not read bytes the store did not write.  A
+    /// 4-byte store feeding an 8-byte read is refused (the slot's high half is
+    /// undefined); the register form would pull in the register's stale upper
+    /// bits.
+    #[test]
+    fn refuses_a_wider_alu_than_the_store() {
+        let (changed, out) = run(&header(
+            "    movl %eax, -4(%rbp)\n    addq -4(%rbp), %rdx\n",
+        ));
+        assert!(!changed, "{out:?}");
     }
 }
