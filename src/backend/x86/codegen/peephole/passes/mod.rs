@@ -1159,6 +1159,11 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         if !sk("store_relay") {
             global_changed |= memory_fold::fold_store_relay(&mut store, &mut infos);
         }
+        // ms178: a dead `mov %reg, slot` followed by an ALU reading the slot as
+        // a memory operand folds into a pure-register ALU and drops the store.
+        if !sk("store_alu_fold") {
+            global_changed |= memory_fold::fold_store_alu_memop(&mut store, &mut infos);
+        }
         global_changed
     };
     if let Some(s) = phase2_start {
@@ -1229,6 +1234,9 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             }
             if !sk("store_relay") {
                 changed2 |= memory_fold::fold_store_relay(&mut store, &mut infos);
+            }
+            if !sk("store_alu_fold") {
+                changed2 |= memory_fold::fold_store_alu_memop(&mut store, &mut infos);
             }
             if !sk("base_index") {
                 changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
