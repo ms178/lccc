@@ -14,6 +14,7 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x18]);
                 self.encode_modrm_mem(hint, mem)
             }
@@ -28,6 +29,7 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x0D]);
                 self.encode_modrm_mem(hint, mem)
             }
@@ -143,6 +145,7 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.encode_modrm_mem(7, mem)
             }
@@ -157,6 +160,7 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x00]);
                 self.encode_modrm_mem(5, mem)
             }
@@ -192,6 +196,7 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
+                self.emit_segment_prefix(mem);
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 self.bytes.extend_from_slice(&[0x0F, 0x03]);
                 self.encode_modrm_mem(dst_num, mem)
@@ -250,6 +255,7 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.encode_modrm_mem(reg_ext, mem)
             }
@@ -278,6 +284,7 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.encode_modrm_mem(6, mem)
             }
@@ -309,6 +316,7 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.encode_modrm_mem(4, mem)
             }
@@ -377,12 +385,14 @@ impl super::InstructionEncoder {
             }
             // mov %sreg, mem
             (Operand::Register(src), Operand::Memory(mem)) if is_segment_reg(&src.name) => {
+                self.emit_segment_prefix(mem);
                 let sr = seg_num(&src.name).ok_or("bad segment register")?;
                 self.bytes.push(0x8C);
                 self.encode_modrm_mem(sr, mem)
             }
             // mov mem, %sreg
             (Operand::Memory(mem), Operand::Register(dst)) if is_segment_reg(&dst.name) => {
+                self.emit_segment_prefix(mem);
                 let sr = seg_num(&dst.name).ok_or("bad segment register")?;
                 self.bytes.push(0x8E);
                 self.encode_modrm_mem(sr, mem)
@@ -432,6 +442,7 @@ impl super::InstructionEncoder {
                 }
             }
             Operand::Memory(mem) => {
+                self.emit_segment_prefix(mem);
                 // popw m16 = 66 8F /0 (memory destination).
                 self.sized_op = true;
                 self.bytes.push(0x66);
@@ -467,6 +478,7 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
+                self.emit_segment_prefix(mem);
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 self.bytes.extend_from_slice(&opcode);
                 self.encode_modrm_mem(dst_num, mem)

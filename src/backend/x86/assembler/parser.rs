@@ -321,8 +321,13 @@ pub enum Displacement {
     Integer(i64),
     Symbol(String),
     /// Symbol with an addend offset: symbol+offset or symbol-offset (e.g., GD_struct+128(%rip))
-    #[cfg_attr(not(feature = "gcc_assembler"), expect(dead_code))]
-    // Constructed by elf.rs numeric label resolver; consumed by encoder
+    // Constructed by elf.rs numeric label resolver; consumed by encoder.
+    //
+    // The expectation is scoped to the shipped build: the i686 addressing
+    // encoder's unit tests construct this variant, so leaving it asserted
+    // under `cfg(test)` would make the expectation unfulfilled and fail
+    // `-D warnings` on the `lib test` target.
+    #[cfg_attr(all(not(feature = "gcc_assembler"), not(test)), expect(dead_code))]
     SymbolAddend(String, i64),
     /// Symbol with relocation modifier: symbol@GOT, symbol@GOTPCREL, symbol@TPOFF, etc.
     SymbolMod(String, String),
