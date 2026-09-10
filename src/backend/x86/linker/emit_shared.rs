@@ -349,6 +349,7 @@ pub(super) fn emit_shared_library(
                     R_X86_64_GOTPCREL
                     | R_X86_64_GOTPCRELX
                     | R_X86_64_REX_GOTPCRELX
+                    | R_X86_64_CODE_4_GOTPCRELX
                     | R_X86_64_GOTTPOFF => {
                         if got_needed_seen.insert(sym.name.to_string()) {
                             got_needed_names.push(sym.name.to_string());
@@ -1909,11 +1910,15 @@ pub(super) fn emit_shared_library(
                     R_X86_64_32S => {
                         w32(&mut out, fp, (s as i64 + a) as u32);
                     }
-                    R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
+                    R_X86_64_GOTPCREL
+                    | R_X86_64_GOTPCRELX
+                    | R_X86_64_REX_GOTPCRELX
+                    | R_X86_64_CODE_4_GOTPCRELX => {
                         if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
                             w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
                         } else if (rela.rela_type == R_X86_64_GOTPCRELX
-                            || rela.rela_type == R_X86_64_REX_GOTPCRELX)
+                            || rela.rela_type == R_X86_64_REX_GOTPCRELX
+                            || rela.rela_type == R_X86_64_CODE_4_GOTPCRELX)
                             && !sym.name.is_empty()
                         {
                             // GOT relaxation: convert to LEA

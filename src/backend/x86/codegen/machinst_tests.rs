@@ -4782,3 +4782,40 @@ fn isel_refuses_register_homed_store_value() {
     ));
     assert!(out.is_empty());
 }
+
+#[test]
+fn apx_ndd_fuses_mov_plus_add_only_when_enabled() {
+    let mov = MachInst::Mov {
+        src: MachOperand::Reg(MachReg::Phys(PhysReg(14))), // rdi
+        dst: MachOperand::Reg(MachReg::Phys(PhysReg(0))),  // rax
+        size: OpSize::S64,
+    };
+    let add = MachInst::Alu {
+        op: AluOp::Add,
+        src: MachOperand::Reg(MachReg::Phys(PhysReg(15))), // rsi
+        dst: MachReg::Phys(PhysReg(0)),
+        size: OpSize::S64,
+    };
+    super::isel::set_apx_enabled(false);
+    let mut off = AsmOutput::new();
+    emit_machinsts(&[mov.clone(), add.clone()], &mut off);
+    let off_text = off.buf;
+    assert!(
+        off_text.contains("movq") && off_text.contains("addq"),
+        "without -mapx the pair must stay two-address, got {off_text}"
+    );
+
+    super::isel::set_apx_enabled(true);
+    let mut on = AsmOutput::new();
+    emit_machinsts(&[mov, add], &mut on);
+    super::isel::set_apx_enabled(false);
+    let on_text = on.buf;
+    assert!(
+        on_text.contains("addq %rsi, %rdi, %rax"),
+        "APX NDD should emit 3-operand add, got {on_text}"
+    );
+    assert!(
+        !on_text.contains("movq"),
+        "the leading copy should vanish under NDD: {on_text}"
+    );
+}

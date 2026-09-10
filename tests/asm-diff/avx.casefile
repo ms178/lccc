@@ -968,16 +968,48 @@ vpand %xmm9, %xmm2, %xmm3
 vpor %xmm9, %xmm2, %xmm3
 vpxor %xmm9, %xmm2, %xmm3
 vpmullw %xmm9, %xmm2, %xmm3
+vpmulhw %xmm9, %xmm2, %xmm3
+vpmulhuw %xmm9, %xmm2, %xmm3
+vpmuludq %xmm9, %xmm2, %xmm3
+vpsadbw %xmm9, %xmm2, %xmm3
+vpmaddwd %xmm9, %xmm2, %xmm3
 vxorps %xmm9, %xmm2, %xmm3
 vandps %xmm9, %xmm2, %xmm3
 vorps %xmm9, %xmm2, %xmm3
 vxorpd %xmm9, %xmm2, %xmm3
 vpaddd %ymm9, %ymm2, %ymm3
 vpxor %ymm9, %ymm2, %ymm3
+vpmuludq %ymm9, %ymm2, %ymm3
+vpsadbw %ymm9, %ymm2, %ymm3
+vpmaddwd %ymm9, %ymm2, %ymm3
 vpaddd %xmm2, %xmm9, %xmm3
 vpaddd %xmm9, %xmm10, %xmm3
 vpaddd %xmm2, %xmm3, %xmm9
 
+
+;;; avx_ssse3
+.text
+vpmulhuw %xmm1, %xmm2, %xmm3
+vpmulhuw %ymm1, %ymm2, %ymm3
+vpmulhuw (%rdi), %xmm1, %xmm2
+vpmulhrsw %xmm1, %xmm2, %xmm3
+vpmulhrsw %ymm1, %ymm2, %ymm3
+vpmulhrsw (%rdi), %xmm1, %xmm2
+vphsubw %xmm1, %xmm2, %xmm3
+vphsubw %ymm1, %ymm2, %ymm3
+vphsubd %xmm1, %xmm2, %xmm3
+vphsubd %ymm1, %ymm2, %ymm3
+vphaddsw %xmm1, %xmm2, %xmm3
+vphaddsw %ymm1, %ymm2, %ymm3
+vphsubsw %xmm1, %xmm2, %xmm3
+vphsubsw %ymm1, %ymm2, %ymm3
+vpmuldq %xmm1, %xmm2, %xmm3
+vpmuldq %ymm1, %ymm2, %ymm3
+vpmuldq (%rdi), %xmm1, %xmm2
+vmpsadbw $0, %xmm1, %xmm2, %xmm3
+vmpsadbw $1, %ymm1, %ymm2, %ymm3
+vphminposuw %xmm1, %xmm2
+vphminposuw (%rdi), %xmm2
 ;;; vex_noncommutative_guard
 .text
 vsubps %xmm9, %xmm2, %xmm3
@@ -998,3 +1030,11 @@ vsqrtss %xmm0, %xmm0, %xmm0
 vsqrtsd (%rax), %xmm2, %xmm3
 vsqrtss 8(%rdi,%rcx,4), %xmm12, %xmm13
 vsqrtsd %xmm9, %xmm10, %xmm11
+
+;;; evex_egpr_mem
+.text
+vaddps (%r16), %zmm1, %zmm2
+vaddps (%r20), %zmm1, %zmm2
+vaddps (%r21), %zmm1, %zmm2
+vaddps (%r16,%r17,4), %zmm1, %zmm2
+vaddps 64(%r16), %zmm1, %zmm2

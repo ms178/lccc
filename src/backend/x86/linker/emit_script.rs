@@ -2467,7 +2467,10 @@ fn link_with_script_machine(
                     // exactly what GNU ld does for -no-pie/static links, and it
                     // is what the kernel's vDSO and early-boot objects rely on:
                     // they are compiled -fPIC but linked to fixed addresses.
-                    R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
+                    R_X86_64_GOTPCREL
+                    | R_X86_64_GOTPCRELX
+                    | R_X86_64_REX_GOTPCRELX
+                    | R_X86_64_CODE_4_GOTPCRELX => {
                         // A -T link produces a fully-resolved image with no
                         // dynamic loader and no GOT, so every GOT reference
                         // must be relaxed into direct addressing. The x86-64

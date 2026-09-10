@@ -45,6 +45,7 @@ pub const R_X86_64_TPOFF32: u32 = 23;
 pub const R_X86_64_PC64: u32 = 24;
 pub const R_X86_64_GOTPCRELX: u32 = 41;
 pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
+pub const R_X86_64_CODE_4_GOTPCRELX: u32 = 43;
 pub const R_X86_64_IRELATIVE: u32 = 37;
 pub const R_X86_64_16: u32 = 12;
 pub const R_X86_64_PC16: u32 = 13;

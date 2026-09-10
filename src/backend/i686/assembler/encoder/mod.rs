@@ -1605,12 +1605,13 @@ impl InstructionEncoder {
             "vpmullw" => self.encode_avx_3op_commutative(ops, 0xD5, true, true),
             "vpmulhw" => self.encode_avx_3op_commutative(ops, 0xE5, true, true),
             "vpmulhuw" => self.encode_avx_3op_commutative(ops, 0xE4, true, true),
-            "vpmuludq" => self.encode_avx_3op(ops, 0xF4, true),
+            "vpmuludq" => self.encode_avx_3op_commutative(ops, 0xF4, true, true),
+            "vpmuldq" => self.encode_avx_3op_38(ops, 0x28, true),
             "vpmulld" => self.encode_avx_3op_38(ops, 0x40, true),
             "vpavgb" => self.encode_avx_3op_commutative(ops, 0xE0, true, true),
             "vpavgw" => self.encode_avx_3op_commutative(ops, 0xE3, true, true),
-            "vpsadbw" => self.encode_avx_3op(ops, 0xF6, true),
-            "vpmaddwd" => self.encode_avx_3op(ops, 0xF5, true),
+            "vpsadbw" => self.encode_avx_3op_commutative(ops, 0xF6, true, true),
+            "vpmaddwd" => self.encode_avx_3op_commutative(ops, 0xF5, true, true),
             "vpmaddubsw" => self.encode_avx_3op_38(ops, 0x04, true),
             "vpackssdw" => self.encode_avx_3op(ops, 0x6B, true),
             "vpacksswb" => self.encode_avx_3op(ops, 0x63, true),
@@ -1628,9 +1629,22 @@ impl InstructionEncoder {
             "vpmaxud" => self.encode_avx_3op_38(ops, 0x3F, true),
             "vphaddw" => self.encode_avx_3op_38(ops, 0x01, true),
             "vphaddd" => self.encode_avx_3op_38(ops, 0x02, true),
+            "vphaddsw" => self.encode_avx_3op_38(ops, 0x03, true),
             "vphsubw" => self.encode_avx_3op_38(ops, 0x05, true),
             "vphsubd" => self.encode_avx_3op_38(ops, 0x06, true),
+            "vphsubsw" => self.encode_avx_3op_38(ops, 0x07, true),
             "vpmulhrsw" => self.encode_avx_3op_38(ops, 0x0B, true),
+            "vphminposuw" => {
+                if ops
+                    .iter()
+                    .any(|op| matches!(op, Operand::Register(r) if r.name.starts_with("ymm")))
+                {
+                    Err("vphminposuw is 128-bit only".to_string())
+                } else {
+                    self.encode_avx_2op_38(ops, 0x41, true)
+                }
+            }
+            "vmpsadbw" => self.encode_avx_3op_3a_imm8(ops, 0x42, true),
             "vpalignr" => self.encode_avx_3op_3a_imm8(ops, 0x0F, true),
             "vpblendw" => self.encode_avx_3op_3a_imm8(ops, 0x0E, true),
             "vpblendd" => self.encode_avx_3op_3a_imm8(ops, 0x02, true),

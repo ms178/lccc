@@ -2186,6 +2186,7 @@ impl Driver {
             no_jump_tables: self.no_jump_tables,
             bmi1: self.enable_bmi,
             bmi2: self.enable_bmi2,
+            apx: self.enable_apxf,
             tune,
             lzcnt: self.enable_lzcnt,
             popcnt: self.enable_popcnt,

@@ -26,8 +26,10 @@ Usage
     # exit non-zero on any divergence (CI gate)
     scripts/insndiff.py --file cases.txt --quiet
 
-Exit status is 0 when every instruction agrees, 1 when any diverges, and 2 on
-a setup error (missing tool, unreadable input).
+Exit status is 0 when every instruction agrees with the oracle or is a
+verified-shorter encoding (BETTER), 1 when any diverges (wrong bytes, longer,
+rejects-valid, false-accept, or unverified shorter), and 2 on a setup error
+(missing tool, unreadable input).
 """
 from __future__ import annotations
 
@@ -83,7 +85,12 @@ PLACEHOLDER = re.compile(r"\{([A-Z0-9]+)\}")
 
 
 def expand(template: str) -> list[str]:
-    """Expand `{NAME}` placeholders over the Cartesian product of VOCAB."""
+    """Expand `{NAME}` placeholders over the Cartesian product of VOCAB.
+
+    Repeated names are independent axes: `{XMM}` three times is dest × src1 ×
+    src2, not a single register forced equal in every slot.  (`str.replace`
+    on a unique-ified name list used to collapse them.)
+    """
     # Resolve the `R{S}` shorthand first: the register class follows the size
     # suffix chosen for this expansion.
     out: list[str] = []
@@ -95,15 +102,26 @@ def expand(template: str) -> list[str]:
             t = t.replace("{S}", size)
             if suffix_dependent:
                 t = t.replace("{R{S}}", "{" + SUFFIX_REGS[size] + "}")
-        names = PLACEHOLDER.findall(t)
-        names = [n for n in dict.fromkeys(names) if n in VOCAB]
+        # Split on recognised placeholders, keeping order. Unknown `{FOO}`
+        # is left literal so a typo does not silently expand to nothing.
+        parts: list[str] = []
+        names: list[str] = []
+        last = 0
+        for m in PLACEHOLDER.finditer(t):
+            name = m.group(1)
+            if name not in VOCAB:
+                continue
+            parts.append(t[last:m.start()])
+            names.append(name)
+            last = m.end()
+        parts.append(t[last:])
         if not names:
             out.append(t)
             continue
         for combo in itertools.product(*(VOCAB[n] for n in names)):
-            s = t
-            for n, v in zip(names, combo):
-                s = s.replace("{" + n + "}", v)
+            s = parts[0]
+            for v, p in zip(combo, parts[1:]):
+                s += v + p
             out.append(s)
     return out
 
@@ -183,12 +201,14 @@ _COMMUTATIVE_VEX = {
     "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
     "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
     "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
+    # Integer 0F-map ops LCCC may source-swap to reach VEX2 (not FP add/mul).
+    "vpmuludq", "vpsadbw", "vpmaddwd",
 }
 _VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
 _GP32_TO_64 = {
     "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
     "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
-    **{f"r{n}d": f"r{n}" for n in range(8, 16)},
+    **{f"r{n}d": f"r{n}" for n in range(8, 32)},
 }
 _MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
 
@@ -303,7 +323,7 @@ def main() -> int:
                     help="assembly emitted before each instruction")
     ap.add_argument("--only-diff", action="store_true")
     ap.add_argument("--quiet", action="store_true",
-                    help="print only the summary (still exits non-zero on diff)")
+                    help="print only the summary (non-zero on unaccounted diffs)")
     ap.add_argument("--max-report", type=int, default=200)
     ap.add_argument("--list-vocab", action="store_true")
     args = ap.parse_args()
@@ -377,7 +397,8 @@ def main() -> int:
     counts: dict[str, int] = {}
     for _, kind, _, _ in results:
         counts[kind] = counts.get(kind, 0) + 1
-    bad = sum(v for k, v in counts.items() if k not in ("ok", "both-reject"))
+    bad = sum(v for k, v in counts.items()
+              if k not in ("ok", "both-reject", "BETTER"))
     summary = "  ".join(f"{k}={v}" for k, v in
                         sorted(counts.items(), key=lambda kv: SEVERITY.get(kv[0], 9)))
     print(f"\n=== insndiff: {len(results)} instruction(s): {summary} ===")

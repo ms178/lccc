@@ -32,8 +32,96 @@ pub(crate) fn reg_num(name: &str) -> Option<u8> {
         "r13b" | "r13w" | "r13d" | "r13" | "xmm13" | "ymm13" | "zmm13" => Some(5),
         "r14b" | "r14w" | "r14d" | "r14" | "xmm14" | "ymm14" | "zmm14" => Some(6),
         "r15b" | "r15w" | "r15d" | "r15" | "xmm15" | "ymm15" | "zmm15" => Some(7),
-        _ => None,
+        _ => vec_reg_id(name)
+            .map(|n| n & 7)
+            .or_else(|| gp_id(name).map(|id| id & 7)),
     }
+}
+
+/// Full 5-bit vector register number (xmm/ymm/zmm 0–31).
+pub(crate) fn vec_reg_id(name: &str) -> Option<u8> {
+    for prefix in ["zmm", "ymm", "xmm"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if let Ok(n) = rest.parse::<u8>() {
+                if n < 32 {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Full 5-bit GP register id (0..31). APX EGPRs occupy 16..31.
+pub(crate) fn gp_id(name: &str) -> Option<u8> {
+    match name {
+        "al" | "ax" | "eax" | "rax" => Some(0),
+        "cl" | "cx" | "ecx" | "rcx" => Some(1),
+        "dl" | "dx" | "edx" | "rdx" => Some(2),
+        "bl" | "bx" | "ebx" | "rbx" => Some(3),
+        "ah" | "spl" | "sp" | "esp" | "rsp" => Some(4),
+        "ch" | "bpl" | "bp" | "ebp" | "rbp" => Some(5),
+        "dh" | "sil" | "si" | "esi" | "rsi" => Some(6),
+        "bh" | "dil" | "di" | "edi" | "rdi" => Some(7),
+        "r8b" | "r8w" | "r8d" | "r8" => Some(8),
+        "r9b" | "r9w" | "r9d" | "r9" => Some(9),
+        "r10b" | "r10w" | "r10d" | "r10" => Some(10),
+        "r11b" | "r11w" | "r11d" | "r11" => Some(11),
+        "r12b" | "r12w" | "r12d" | "r12" => Some(12),
+        "r13b" | "r13w" | "r13d" | "r13" => Some(13),
+        "r14b" | "r14w" | "r14d" | "r14" => Some(14),
+        "r15b" | "r15w" | "r15d" | "r15" => Some(15),
+        _ => parse_egpr(name),
+    }
+}
+
+fn parse_egpr(name: &str) -> Option<u8> {
+    let stem = name
+        .strip_suffix('b')
+        .or_else(|| name.strip_suffix('w'))
+        .or_else(|| name.strip_suffix('d'))
+        .unwrap_or(name);
+    let digits = stem.strip_prefix('r')?;
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let id: u8 = digits.parse().ok()?;
+    (16..=31).contains(&id).then_some(id)
+}
+
+/// True for APX extended GPRs (%r16..%r31 and their width suffixes).
+pub(crate) fn is_egpr(name: &str) -> bool {
+    gp_id(name).is_some_and(|id| id >= 16)
+}
+
+/// Accumulator: %al/%ax/%eax/%rax only. %r8 and %r16 share ModR/M 000
+/// with %rax; using `reg_num == 0 && !needs_rex_ext` would treat %r16 as
+/// the accumulator and emit the 04/05/A8/A9/90 short forms against the
+/// wrong register.
+pub(crate) fn is_accum(name: &str) -> bool {
+    gp_id(name) == Some(0)
+}
+
+/// (bit3, bit4) of a GP id; vector registers only contribute bit3 via
+/// `needs_rex_ext`.
+pub(crate) fn gp_ext_bits(name: &str) -> (bool, bool) {
+    match gp_id(name) {
+        Some(id) => ((id & 8) != 0, id >= 16),
+        None => (needs_rex_ext(name), false),
+    }
+}
+
+/// True if any operand names an EGPR (including memory base/index).
+pub(crate) fn operands_have_egpr(ops: &[Operand]) -> bool {
+    ops.iter().any(|op| match op {
+        Operand::Register(r) => is_egpr(&r.name),
+        Operand::Memory(m) => {
+            m.base.as_ref().is_some_and(|b| is_egpr(&b.name))
+                || m.index.as_ref().is_some_and(|i| is_egpr(&i.name))
+        }
+        Operand::Indirect(inner) => operands_have_egpr(std::slice::from_ref(inner)),
+        _ => false,
+    })
 }
 
 /// Is this an MMX register?
@@ -105,17 +193,15 @@ pub(crate) fn is_ymm(name: &str) -> bool {
     name.starts_with("ymm")
 }
 
-/// Does this register need the REX.B/R/X extension bit?
+/// Does this register need the REX.B/R/X extension bit (id bit 3)?
+///
+/// APX %r16–%r23 have bit3 clear (they need REX2.R4/B4/X4, not REX.R/B/X),
+/// so they must NOT return true here. %r24–%r31 have both bit3 and bit4.
 pub(crate) fn needs_rex_ext(name: &str) -> bool {
-    name.starts_with("r8")
-        || name.starts_with("r9")
-        || name.starts_with("r10")
-        || name.starts_with("r11")
-        || name.starts_with("r12")
-        || name.starts_with("r13")
-        || name.starts_with("r14")
-        || name.starts_with("r15")
-        || name.starts_with("xmm8")
+    if let Some(id) = gp_id(name) {
+        return (id & 8) != 0;
+    }
+    name.starts_with("xmm8")
         || name.starts_with("xmm9")
         || name.starts_with("xmm10")
         || name.starts_with("xmm11")
@@ -153,14 +239,55 @@ pub(crate) fn is_kreg(name: &str) -> bool {
         && name.as_bytes().get(1).is_some_and(|c| c.is_ascii_digit())
 }
 
-/// Does a ZMM register need the EVEX R' extension bit (zmm16-31)?
+/// Does a vector register need EVEX R'/V'/X extra bits (xmm/ymm/zmm 16–31)?
 pub(crate) fn needs_evex_rprime(name: &str) -> bool {
-    if let Some(num) = name.strip_prefix("zmm") {
-        if let Ok(n) = num.parse::<u8>() {
-            return n >= 16;
+    vec_reg_id(name).is_some_and(|n| n >= 16)
+}
+
+/// Operand requires EVEX (cannot be encoded with VEX/legacy).
+pub(crate) fn operand_needs_evex(op: &Operand) -> bool {
+    match op {
+        Operand::Register(r) => {
+            is_zmm(&r.name)
+                || is_kreg(&r.name)
+                || needs_evex_rprime(&r.name)
+                || r.mask.is_some()
+                || r.zeroing
+                || r.sae
+                || r.rounding.is_some()
         }
+        Operand::Memory(m) => m.mask.is_some() || m.zeroing || m.broadcast.is_some(),
+        Operand::Label(s) => is_evex_sae_token(s),
+        _ => false,
     }
-    false
+}
+
+/// `{sae}` / `{r*-sae}` written as a standalone AT&T operand.
+pub(crate) fn is_evex_sae_token(s: &str) -> bool {
+    let t = s.trim().trim_matches(|c| c == '{' || c == '}').trim();
+    matches!(t, "sae" | "rn-sae" | "rd-sae" | "ru-sae" | "rz-sae")
+}
+
+/// Rounding control encoded in EVEX.L'L when EVEX.b is set.
+///
+/// `Some(None)` is bare `{sae}` (SAE-only insns: vmax/vmin/vcmp/vcomi).
+/// `Some(Some(rc))` is `{rn,rd,ru,rz-sae}` (ER insns: vadd/vmul/vsqrt/vcvt).
+/// GAS 2.47 rejects `{sae}` on ER mnemonics and `{r*-sae}` on SAE-only ones;
+/// they must not be rewritten into each other even though both use LL=00
+/// when rc=0.
+pub(crate) fn evex_sae_rounding(s: &str) -> Option<Option<u8>> {
+    if !is_evex_sae_token(s) {
+        return None;
+    }
+    let t = s.trim().trim_matches(|c| c == '{' || c == '}').trim();
+    match t {
+        "sae" => Some(None),
+        "rn-sae" => Some(Some(0)),
+        "rd-sae" => Some(Some(1)),
+        "ru-sae" => Some(Some(2)),
+        "rz-sae" => Some(Some(3)),
+        _ => None,
+    }
 }
 
 /// Does this register need the VEX.B extension bit? Same as REX ext but for VEX-encoded instructions.
@@ -188,6 +315,22 @@ pub(crate) fn is_reg64(name: &str) -> bool {
             | "r13"
             | "r14"
             | "r15"
+            | "r16"
+            | "r17"
+            | "r18"
+            | "r19"
+            | "r20"
+            | "r21"
+            | "r22"
+            | "r23"
+            | "r24"
+            | "r25"
+            | "r26"
+            | "r27"
+            | "r28"
+            | "r29"
+            | "r30"
+            | "r31"
     )
 }
 
@@ -211,6 +354,22 @@ pub(crate) fn is_reg32(name: &str) -> bool {
             | "r13d"
             | "r14d"
             | "r15d"
+            | "r16d"
+            | "r17d"
+            | "r18d"
+            | "r19d"
+            | "r20d"
+            | "r21d"
+            | "r22d"
+            | "r23d"
+            | "r24d"
+            | "r25d"
+            | "r26d"
+            | "r27d"
+            | "r28d"
+            | "r29d"
+            | "r30d"
+            | "r31d"
     )
 }
 
@@ -233,6 +392,22 @@ pub(crate) fn is_reg16(name: &str) -> bool {
             | "r13w"
             | "r14w"
             | "r15w"
+            | "r16w"
+            | "r17w"
+            | "r18w"
+            | "r19w"
+            | "r20w"
+            | "r21w"
+            | "r22w"
+            | "r23w"
+            | "r24w"
+            | "r25w"
+            | "r26w"
+            | "r27w"
+            | "r28w"
+            | "r29w"
+            | "r30w"
+            | "r31w"
     )
 }
 
@@ -259,6 +434,22 @@ pub(crate) fn is_reg8(name: &str) -> bool {
             | "r13b"
             | "r14b"
             | "r15b"
+            | "r16b"
+            | "r17b"
+            | "r18b"
+            | "r19b"
+            | "r20b"
+            | "r21b"
+            | "r22b"
+            | "r23b"
+            | "r24b"
+            | "r25b"
+            | "r26b"
+            | "r27b"
+            | "r28b"
+            | "r29b"
+            | "r30b"
+            | "r31b"
     )
 }
 
@@ -720,6 +911,7 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
     //    (`setl` is set-if-less, not "set long"), so they must be excluded.
     let is_cc_mnemonic = mnemonic.starts_with("set")
         || mnemonic.starts_with("cmov")
+        || mnemonic.starts_with("cfcmov")
         || (mnemonic.starts_with('j') && mnemonic != "jmp" && mnemonic != "jmpq");
     if let Some(sz) = mnemonic_size_suffix(mnemonic) {
         if !is_cc_mnemonic && !is_mixed_width_mnemonic(mnemonic) && matches!(sz, 1 | 2 | 4 | 8) {
@@ -833,6 +1025,9 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
             | "rdpkru"
             | "wrpkru"
             | "wbnoinvd"
+            | "clzero"
+            | "rdpru"
+            | "mcommit"
     ) && !ops.is_empty()
     {
         return Err(format!("`{}` takes no operands", mnemonic));

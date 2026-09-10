@@ -1131,6 +1131,7 @@ impl super::InstructionEncoder {
                     scale: None,
                     mask: None,
                     zeroing: false,
+                    broadcast: None,
                 };
                 self.encode_test(
                     &[Operand::Immediate(imm.clone()), Operand::Memory(mem)],

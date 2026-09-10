@@ -22,7 +22,7 @@ fn value_to_reg(v: &Value, reg_assignments: &FxHashMap<u32, PhysReg>) -> MachReg
     if let Some(&phys) = reg_assignments.get(&v.0) {
         // XMM registers (20-25) are for floats — shouldn't appear in integer MachInst.
         // Treat them as vregs so they get spilled to stack (safe fallback).
-        if phys.0 >= 20 {
+        if is_xmm_phys(phys) {
             return MachReg::Vreg(v.0);
         }
         MachReg::Phys(phys)
@@ -1242,6 +1242,19 @@ pub fn shlx_mode() -> ShlxMode {
         2 => ShlxMode::Always,
         _ => ShlxMode::Never,
     }
+}
+
+static APX_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Publish the TU's `-mapx` contract for emitters without `&self`
+/// (MachInst NDD fusion). Default off: APX encodings are #UD on every
+/// shipping core.
+pub fn set_apx_enabled(on: bool) {
+    APX_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn apx_enabled() -> bool {
+    APX_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Try to lower a variable-count shift to `ShiftX`.  Returns false (with

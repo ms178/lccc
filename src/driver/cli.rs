@@ -1135,7 +1135,11 @@ impl Driver {
                 "-msm4" => self.enable_sm4 = true,
                 "-mmovrs" => self.enable_movrs = true,
                 "-muser_msr" => self.enable_user_msr = true,
-                "-mapxf" => return Err("APX code generation is not implemented".to_string()),
+                // APX Foundation: extra GPRs r16–r31, NDD 3-operand ALU.
+                // Off by default — emitting it on a non-APX host (Raptor Lake,
+                // i7-14700KF, …) is #UD. `-march=raptorlake` must never imply this.
+                "-mapx" | "-mapxf" => self.enable_apxf = true,
+                "-mno-apx" | "-mno-apxf" => self.enable_apxf = false,
                 "-mamx-tile" => self.enable_amx_tile = true,
                 "-mamx-int8" => self.enable_amx_int8 = true,
                 "-mamx-bf16" => self.enable_amx_bf16 = true,

@@ -27,6 +27,12 @@ impl super::InstructionEncoder {
     // ---- Instruction-specific encoders ----
 
     pub(crate) fn encode_mov(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
+        if self.apx_nf {
+            return Err("{nf} unsupported for `mov`".to_string());
+        }
+        if self.apx_evex {
+            return Err("no EVEX encoding for `mov`".to_string());
+        }
         if ops.len() != 2 {
             return Err(format!("mov requires 2 operands, got {}", ops.len()));
         }
@@ -60,6 +66,7 @@ impl super::InstructionEncoder {
                     scale: None,
                     mask: None,
                     zeroing: false,
+                    broadcast: None,
                 };
                 self.encode_mov_mem_reg(&mem, dst, size)
             }
@@ -73,6 +80,7 @@ impl super::InstructionEncoder {
                     scale: None,
                     mask: None,
                     zeroing: false,
+                    broadcast: None,
                 };
                 self.encode_mov_reg_mem(src, &mem, size)
             }
@@ -103,45 +111,33 @@ impl super::InstructionEncoder {
                         // immediate at all: writing a 32-bit register zeroes
                         // the upper half of its 64-bit parent, so
                         // `movl $imm32, %eax` leaves exactly imm32 in %rax.
-                        // That is 5 bytes (6 with REX.B) against 10 for the
-                        // movabs form -- the single largest per-instruction
-                        // saving in the whole encoder.
+                        // That is 5 bytes (6 with REX.B, 7 with REX2) against
+                        // 10/11 for the movabs form -- the single largest
+                        // per-instruction saving in the whole encoder.
                         //
-                        // The sign-extended C7 /0 form CANNOT be used here:
-                        // it would load 0xFFFFFFFF_FFFFFFFF for 0xFFFFFFFF.
-                        // ICC emits exactly that and is wrong; verified against
-                        // GAS 2.47, which decodes `48 c7 c0 ff ff ff ff` as
-                        // `mov $0xffffffffffffffff,%rax`.  Only the
-                        // zero-extending 32-bit form is both short and correct.
-                        let b = needs_rex_ext(&dst.name);
-                        if b {
-                            self.bytes.push(self.rex(false, false, false, true));
-                        }
+                        // GAS 2.47 still emits 11-byte REX2-movabs for
+                        // `movq $0xffffffff, %r16`; the zero-extending 32-bit
+                        // form is both shorter and correct (ICC's C7 /0
+                        // sign-extends 0xffffffff to -1).
+                        self.emit_rex_unary(4, &dst.name);
                         self.bytes.push(0xB8 + (dst_num & 7));
                         self.bytes.extend_from_slice(&(val as u32).to_le_bytes());
                     } else {
                         // Need movabsq for a true 64-bit immediate.
-                        let b = needs_rex_ext(&dst.name);
-                        self.bytes.push(self.rex(true, false, false, b));
+                        self.emit_rex_unary(8, &dst.name);
                         self.bytes.push(0xB8 + (dst_num & 7));
                         self.bytes.extend_from_slice(&val.to_le_bytes());
                     }
                 } else if size == 4 {
                     // Prefer the B8+rd id form (no modrm byte) — matches GAS
                     // and is 1 byte shorter than C7 /0 for r8-r15.
-                    let b = needs_rex_ext(&dst.name);
-                    if b {
-                        self.bytes.push(self.rex(false, false, false, true));
-                    }
+                    self.emit_rex_unary(4, &dst.name);
                     self.bytes.push(0xB8 + (dst_num & 7));
                     self.bytes.extend_from_slice(&(val as i32).to_le_bytes());
                 } else if size == 2 {
                     // 66 B8+rd iw (matches GAS; avoids the modrm byte).
                     self.bytes.push(0x66); // operand size prefix
-                    let b = needs_rex_ext(&dst.name);
-                    if b {
-                        self.bytes.push(self.rex(false, false, false, true));
-                    }
+                    self.emit_rex_unary(2, &dst.name);
                     self.bytes.push(0xB8 + (dst_num & 7));
                     self.bytes.extend_from_slice(&(val as i16).to_le_bytes());
                 } else {
@@ -156,14 +152,10 @@ impl super::InstructionEncoder {
                     // (`lea 0x54(%rsp),%rbx; mov $0x50,%bh; mov %dil,(%rbx)`)
                     // and made struct_copy SIGSEGV intermittently at -O0.
                     // needs_rex_ext alone only covers r8b-r15b, so the
-                    // mandatory-REX set must be tested as well.
-                    if needs_rex_ext(&dst.name) || is_rex_required_8bit(&dst.name) {
-                        self.bytes
-                            .push(self.rex(false, false, false, needs_rex_ext(&dst.name)));
-                        self.bytes.push(0xB0 + (dst_num & 7));
-                    } else {
-                        self.bytes.push(0xB0 + (dst_num & 7));
-                    }
+                    // mandatory-REX set must be tested as well. emit_rex_unary
+                    // also emits REX2 for %r16b–%r31b.
+                    self.emit_rex_unary(1, &dst.name);
+                    self.bytes.push(0xB0 + (dst_num & 7));
                     self.bytes.push(val as u8);
                 }
             }
@@ -203,10 +195,7 @@ impl super::InstructionEncoder {
                 // form never appears for these (kernel-image offsets are
                 // far below 4 GiB).
                 if size == 4 {
-                    let b = needs_rex_ext(&dst.name);
-                    if b {
-                        self.bytes.push(self.rex(false, false, false, true));
-                    }
+                    self.emit_rex_unary(4, &dst.name);
                     self.bytes.push(0xB8 + (dst_num & 7));
                     self.add_diff_relocation(sym_a, sym_b, R_X86_64_32, 0);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
@@ -219,10 +208,7 @@ impl super::InstructionEncoder {
                     // link time to a constant; a R_X86_64_64 diff-relocation
                     // folds to the absolute 64-bit value. movabs (REX.W +
                     // B8+rd) is the only 64-bit-immediate mov form.
-                    let b = needs_rex_ext(&dst.name);
-                    // REX.W (0x48) selects 64-bit operand size; REX.B (the
-                    // low REX bit) extends the register field for r8-r15.
-                    self.bytes.push(self.rex(true, false, false, b));
+                    self.emit_rex_unary(8, &dst.name);
                     self.bytes.push(0xB8 + (dst_num & 7));
                     self.add_diff_relocation(sym_a, sym_b, R_X86_64_64, 0);
                     self.bytes.extend_from_slice(&[0; 8]);
@@ -373,8 +359,7 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let b = needs_rex_ext(&dst.name);
-                self.bytes.push(self.rex(true, false, false, b));
+                self.emit_rex_unary(8, &dst.name);
                 self.bytes.push(0xB8 + (dst_num & 7));
                 self.bytes.extend_from_slice(&val.to_le_bytes());
                 Ok(())
@@ -389,8 +374,7 @@ impl super::InstructionEncoder {
                     _ => 0,
                 };
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let b = needs_rex_ext(&dst.name);
-                self.bytes.push(self.rex(true, false, false, b));
+                self.emit_rex_unary(8, &dst.name);
                 self.bytes.push(0xB8 + (dst_num & 7));
                 self.add_relocation(sym, R_X86_64_64, addend);
                 self.bytes.extend_from_slice(&[0u8; 8]);
@@ -401,7 +385,7 @@ impl super::InstructionEncoder {
             // instructions that take a full 64-bit absolute address, and they
             // are hard-wired to the accumulator, so no ModRM byte is emitted.
             (Operand::Memory(mem), Operand::Register(dst))
-                if mem.base.is_none() && mem.index.is_none() && reg_num(&dst.name) == Some(0) =>
+                if mem.base.is_none() && mem.index.is_none() && is_accum(&dst.name) =>
             {
                 let addr = match &mem.displacement {
                     Displacement::Integer(v) => *v,
@@ -412,14 +396,14 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 if size == 8 {
-                    self.bytes.push(self.rex(true, false, false, false));
+                    self.emit_rex_unary(8, &dst.name);
                 }
                 self.bytes.push(if size == 1 { 0xA0 } else { 0xA1 });
                 self.bytes.extend_from_slice(&addr.to_le_bytes());
                 Ok(())
             }
             (Operand::Register(src), Operand::Memory(mem))
-                if mem.base.is_none() && mem.index.is_none() && reg_num(&src.name) == Some(0) =>
+                if mem.base.is_none() && mem.index.is_none() && is_accum(&src.name) =>
             {
                 let addr = match &mem.displacement {
                     Displacement::Integer(v) => *v,
@@ -430,7 +414,7 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 if size == 8 {
-                    self.bytes.push(self.rex(true, false, false, false));
+                    self.emit_rex_unary(8, &src.name);
                 }
                 self.bytes.push(if size == 1 { 0xA2 } else { 0xA3 });
                 self.bytes.extend_from_slice(&addr.to_le_bytes());
@@ -545,6 +529,7 @@ impl super::InstructionEncoder {
                     scale: None,
                     mask: None,
                     zeroing: false,
+                    broadcast: None,
                 };
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 if dst_size == 2 {
@@ -628,8 +613,11 @@ impl super::InstructionEncoder {
     }
 
     pub(crate) fn encode_lea(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
+        if self.apx_nf || self.apx_evex {
+            return Err("lea has no APX NDD/{nf}/{evex} form".to_string());
+        }
         if ops.len() != 2 {
-            return Err("lea requires 2 operands".to_string());
+            return Err("lea requires 2 operands (APX NDD lea is not encodable)".to_string());
         }
         match (&ops[0], &ops[1]) {
             (Operand::Memory(mem), Operand::Register(dst)) => {
@@ -647,15 +635,16 @@ impl super::InstructionEncoder {
     }
 
     pub(crate) fn encode_push(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if self.apx_nf || self.apx_evex {
+            return Err("{nf}/{evex} unsupported for `push'".to_string());
+        }
         if ops.len() != 1 {
             return Err("push requires 1 operand".to_string());
         }
         match &ops[0] {
             Operand::Register(reg) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
-                if needs_rex_ext(&reg.name) {
-                    self.bytes.push(self.rex(false, false, false, true));
-                }
+                self.emit_rex_unary(4, &reg.name);
                 self.bytes.push(0x50 + (num & 7));
                 Ok(())
             }
@@ -697,15 +686,16 @@ impl super::InstructionEncoder {
     }
 
     pub(crate) fn encode_pop(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if self.apx_nf || self.apx_evex {
+            return Err("{nf}/{evex} unsupported for `pop'".to_string());
+        }
         if ops.len() != 1 {
             return Err("pop requires 1 operand".to_string());
         }
         match &ops[0] {
             Operand::Register(reg) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
-                if needs_rex_ext(&reg.name) {
-                    self.bytes.push(self.rex(false, false, false, true));
-                }
+                self.emit_rex_unary(4, &reg.name);
                 self.bytes.push(0x58 + (num & 7));
                 Ok(())
             }
@@ -728,6 +718,18 @@ impl super::InstructionEncoder {
         mnemonic: &str,
         alu_op: u8,
     ) -> Result<(), String> {
+        if self.apx_nf && alu_op == 7 {
+            return Err("{nf} unsupported for `cmp'".to_string());
+        }
+        if ops.len() == 3 {
+            if alu_op == 7 {
+                return Err("cmp does not support APX NDD".to_string());
+            }
+            return self.encode_alu_apx(ops, mnemonic, alu_op, true);
+        }
+        if self.apx_wants_evex() {
+            return self.encode_alu_apx(ops, mnemonic, alu_op, false);
+        }
         if ops.len() != 2 {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
@@ -750,7 +752,7 @@ impl super::InstructionEncoder {
                     // (04+op*8 ib, 2 bytes) when the destination is AL —
                     // matches GAS (e.g. `and $0x80,%al` → `24 80`, not
                     // `80 e0 80`).
-                    if dst_num == 0 && !needs_rex_ext(&dst.name) {
+                    if is_accum(&dst.name) {
                         self.bytes.push(0x04 + alu_op * 8);
                         self.bytes.push(val as u8);
                     } else {
@@ -770,7 +772,7 @@ impl super::InstructionEncoder {
                     self.bytes.push(canonical_imm(val, size) as u8);
                 } else {
                     // imm32
-                    if dst_num == 0 && !needs_rex_ext(&dst.name) {
+                    if is_accum(&dst.name) {
                         // Special short form: op eax/rax, imm32
                         self.bytes
                             .push(if size == 1 { 0x04 } else { 0x05 } + alu_op * 8);
@@ -820,6 +822,7 @@ impl super::InstructionEncoder {
                     scale: None,
                     mask: None,
                     zeroing: false,
+                    broadcast: None,
                 };
                 if size == 2 {
                     self.bytes.push(0x66);
@@ -850,6 +853,7 @@ impl super::InstructionEncoder {
                     scale: None,
                     mask: None,
                     zeroing: false,
+                    broadcast: None,
                 };
                 if size == 2 {
                     self.bytes.push(0x66);
@@ -970,12 +974,209 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// APX EVEX (map-4) encoding of ADD/OR/ADC/SBB/AND/SUB/XOR.
+    /// `ndd` is true for the 3-operand NDD form (dest in vvvv).
+    fn encode_alu_apx(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        alu_op: u8,
+        ndd: bool,
+    ) -> Result<(), String> {
+        let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+        let nf = self.apx_nf;
+        let opc_rmr = if size == 1 { 0x00 } else { 0x01 } + alu_op * 8;
+        let opc_rrm = if size == 1 { 0x02 } else { 0x03 } + alu_op * 8;
+
+        if ndd {
+            if ops.len() != 3 {
+                return Err(format!("{} NDD requires 3 operands", mnemonic));
+            }
+            let ndd_name = match &ops[2] {
+                Operand::Register(r) => r.name.as_str(),
+                _ => return Err("APX NDD destination must be a register".to_string()),
+            };
+            return match (&ops[0], &ops[1]) {
+                (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(src1)) => {
+                    self.encode_alu_apx_imm(*val, size, alu_op, &src1.name, Some(ndd_name), nf)
+                }
+                (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {
+                    self.encode_alu_apx_imm_mem(*val, size, alu_op, mem, Some(ndd_name), nf)
+                }
+                (Operand::Register(src), Operand::Register(src1)) => {
+                    let src_n = reg_num(&src.name).ok_or("bad src register")?;
+                    let src1_n = reg_num(&src1.name).ok_or("bad register")?;
+                    self.emit_apx_evex_rr(size, &src.name, &src1.name, Some(ndd_name), nf)?;
+                    self.bytes.push(opc_rmr);
+                    self.bytes.push(self.modrm(3, src_n, src1_n));
+                    Ok(())
+                }
+                (Operand::Register(src), Operand::Memory(mem)) => {
+                    let src_n = reg_num(&src.name).ok_or("bad src register")?;
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_apx_evex_rm(size, &src.name, mem, Some(ndd_name), nf)?;
+                    self.bytes.push(opc_rmr);
+                    self.encode_modrm_mem(src_n, mem)
+                }
+                (Operand::Memory(mem), Operand::Register(src1)) => {
+                    let src1_n = reg_num(&src1.name).ok_or("bad register")?;
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_apx_evex_rm(size, &src1.name, mem, Some(ndd_name), nf)?;
+                    self.bytes.push(opc_rrm);
+                    self.encode_modrm_mem(src1_n, mem)
+                }
+                _ => Err(format!("unsupported {} NDD operands", mnemonic)),
+            };
+        }
+
+        if ops.len() != 2 {
+            return Err(format!("{} requires 2 operands", mnemonic));
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(dst)) => {
+                self.encode_alu_apx_imm(*val, size, alu_op, &dst.name, None, nf)
+            }
+            (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {
+                self.encode_alu_apx_imm_mem(*val, size, alu_op, mem, None, nf)
+            }
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_n = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_n = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_apx_evex_rr(size, &src.name, &dst.name, None, nf)?;
+                self.bytes.push(opc_rmr);
+                self.bytes.push(self.modrm(3, src_n, dst_n));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_n = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_segment_prefix(mem)?;
+                self.emit_apx_evex_rm(size, &dst.name, mem, None, nf)?;
+                self.bytes.push(opc_rrm);
+                self.encode_modrm_mem(dst_n, mem)
+            }
+            (Operand::Register(src), Operand::Memory(mem)) => {
+                let src_n = reg_num(&src.name).ok_or("bad src register")?;
+                self.emit_segment_prefix(mem)?;
+                self.emit_apx_evex_rm(size, &src.name, mem, None, nf)?;
+                self.bytes.push(opc_rmr);
+                self.encode_modrm_mem(src_n, mem)
+            }
+            _ => Err(format!("unsupported {} operands for APX EVEX", mnemonic)),
+        }
+    }
+
+    fn encode_alu_apx_imm(
+        &mut self,
+        val: i64,
+        size: u8,
+        alu_op: u8,
+        rm: &str,
+        ndd: Option<&str>,
+        nf: bool,
+    ) -> Result<(), String> {
+        Self::check_imm32s_q("alu", size, val)?;
+        let rm_n = reg_num(rm).ok_or("bad register")?;
+        self.emit_apx_evex_rr(size, "", rm, ndd, nf)?;
+        // Empty `reg` name: emit_apx_evex_rr uses gp_ext_bits("") → (false,false)
+        // which is correct for /digit opcodes (ModRM.reg = alu_op).
+        if size == 1 {
+            self.bytes.push(0x80);
+            self.bytes.push(self.modrm(3, alu_op, rm_n));
+            self.bytes.push(val as u8);
+        } else if fits_imm8(val, size) {
+            self.bytes.push(0x83);
+            self.bytes.push(self.modrm(3, alu_op, rm_n));
+            self.bytes.push(canonical_imm(val, size) as u8);
+        } else {
+            self.bytes.push(0x81);
+            self.bytes.push(self.modrm(3, alu_op, rm_n));
+            if size == 2 {
+                self.bytes.extend_from_slice(&(val as i16).to_le_bytes());
+            } else {
+                self.bytes.extend_from_slice(&(val as i32).to_le_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_alu_apx_imm_mem(
+        &mut self,
+        val: i64,
+        size: u8,
+        alu_op: u8,
+        mem: &MemoryOperand,
+        ndd: Option<&str>,
+        nf: bool,
+    ) -> Result<(), String> {
+        Self::check_imm32s_q("alu", size, val)?;
+        self.emit_segment_prefix(mem)?;
+        self.emit_apx_evex_rm(size, "", mem, ndd, nf)?;
+        if size == 1 {
+            self.bytes.push(0x80);
+            self.encode_modrm_mem(alu_op, mem)?;
+            self.bytes.push(val as u8);
+        } else if fits_imm8(val, size) {
+            self.bytes.push(0x83);
+            self.encode_modrm_mem(alu_op, mem)?;
+            self.bytes.push(canonical_imm(val, size) as u8);
+        } else {
+            self.bytes.push(0x81);
+            self.encode_modrm_mem(alu_op, mem)?;
+            if size == 2 {
+                self.bytes.extend_from_slice(&(val as i16).to_le_bytes());
+            } else {
+                self.bytes.extend_from_slice(&(val as i32).to_le_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    /// `{evex} test` is encoded as CTEST with SCC=0xA (GAS 2.47:
+    /// `{evex} testq %rcx, %rax` → `62 f4 84 0a 85 c8`). `{nf} test` is illegal.
+    fn encode_test_evex(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
+        let w = size == 8;
+        let pp = Self::apx_pp(size);
+        let opc = if size == 1 { 0x84u8 } else { 0x85 };
+        const SCC_TEST: u8 = 0x0A;
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_n = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_n = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_evex_ccmp_rr(w, &src.name, &dst.name, 0, SCC_TEST, pp)?;
+                self.bytes.push(opc);
+                self.bytes.push(self.modrm(3, src_n, dst_n));
+                Ok(())
+            }
+            (Operand::Register(src), Operand::Memory(mem)) => {
+                let src_n = reg_num(&src.name).ok_or("bad src register")?;
+                self.emit_segment_prefix(mem)?;
+                self.emit_evex_ccmp_rm(w, &src.name, mem, 0, SCC_TEST, pp)?;
+                self.bytes.push(opc);
+                self.encode_modrm_mem(src_n, mem)
+            }
+            (Operand::Memory(mem), Operand::Register(reg)) => {
+                let n = reg_num(&reg.name).ok_or("bad register")?;
+                self.emit_segment_prefix(mem)?;
+                self.emit_evex_ccmp_rm(w, &reg.name, mem, 0, SCC_TEST, pp)?;
+                self.bytes.push(opc);
+                self.encode_modrm_mem(n, mem)
+            }
+            _ => Err("unsupported {evex} test operands".to_string()),
+        }
+    }
+
     pub(crate) fn encode_test(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+        if self.apx_nf {
+            return Err("{nf} unsupported for `test`".to_string());
+        }
         if ops.len() != 2 {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
 
         let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+        if self.apx_evex {
+            return self.encode_test_evex(ops, size);
+        }
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
@@ -999,7 +1200,7 @@ impl super::InstructionEncoder {
                 self.emit_rex_unary(size, &dst.name);
 
                 if size == 1 {
-                    if dst_num == 0 && !needs_rex_ext(&dst.name) {
+                    if is_accum(&dst.name) {
                         self.bytes.push(0xA8);
                     } else {
                         self.bytes.push(0xF6);
@@ -1007,7 +1208,7 @@ impl super::InstructionEncoder {
                     }
                     self.bytes.push(val as u8);
                 } else {
-                    if dst_num == 0 && !needs_rex_ext(&dst.name) {
+                    if is_accum(&dst.name) {
                         self.bytes.push(0xA9);
                     } else {
                         self.bytes.push(0xF7);
@@ -1142,6 +1343,12 @@ impl super::InstructionEncoder {
                 (Operand::Register(src), Operand::Register(dst)) => {
                     let src_num = reg_num(&src.name).ok_or("bad register")?;
                     let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                    if self.apx_wants_evex() {
+                        self.emit_apx_evex_rr(size, &dst.name, &src.name, None, self.apx_nf)?;
+                        self.bytes.push(0xAF);
+                        self.bytes.push(self.modrm(3, dst_num, src_num));
+                        return Ok(());
+                    }
                     if size == 2 {
                         self.bytes.push(0x66);
                     }
@@ -1153,6 +1360,11 @@ impl super::InstructionEncoder {
                 (Operand::Memory(mem), Operand::Register(dst)) => {
                     let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                     self.emit_segment_prefix(mem)?;
+                    if self.apx_wants_evex() {
+                        self.emit_apx_evex_rm(size, &dst.name, mem, None, self.apx_nf)?;
+                        self.bytes.push(0xAF);
+                        return self.encode_modrm_mem(dst_num, mem);
+                    }
                     if size == 2 {
                         self.bytes.push(0x66);
                     }
@@ -1164,10 +1376,14 @@ impl super::InstructionEncoder {
                     let val = *val;
                     Self::check_imm32s_q("imul", size, val)?;
                     let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                    if size == 2 {
-                        self.bytes.push(0x66);
+                    if self.apx_wants_evex() {
+                        self.emit_apx_evex_rr(size, &dst.name, &dst.name, None, self.apx_nf)?;
+                    } else {
+                        if size == 2 {
+                            self.bytes.push(0x66);
+                        }
+                        self.emit_rex_rr(size, &dst.name, &dst.name);
                     }
-                    self.emit_rex_rr(size, &dst.name, &dst.name);
                     if fits_imm8(val, size) {
                         self.bytes.push(0x6B);
                         self.bytes.push(self.modrm(3, dst_num, dst_num));
@@ -1182,6 +1398,23 @@ impl super::InstructionEncoder {
                 _ => Err("unsupported imul operands".to_string()),
             },
             3 => {
+                // APX NDD: `imulq %src, %src1, %ndd` (no immediate).
+                if let (Operand::Register(src), Operand::Register(src1), Operand::Register(ndd)) =
+                    (&ops[0], &ops[1], &ops[2])
+                {
+                    let src_n = reg_num(&src.name).ok_or("bad register")?;
+                    let src1_n = reg_num(&src1.name).ok_or("bad register")?;
+                    self.emit_apx_evex_rr(
+                        size,
+                        &src1.name,
+                        &src.name,
+                        Some(&ndd.name),
+                        self.apx_nf,
+                    )?;
+                    self.bytes.push(0xAF);
+                    self.bytes.push(self.modrm(3, src1_n, src_n));
+                    return Ok(());
+                }
                 let (val, dst) = match (&ops[0], &ops[2]) {
                     (Operand::Immediate(ImmediateValue::Integer(v)), Operand::Register(d)) => {
                         (*v, d)
@@ -1238,6 +1471,9 @@ impl super::InstructionEncoder {
         op_ext: u8,
         size: u8,
     ) -> Result<(), String> {
+        if ops.len() == 2 || self.apx_wants_evex() {
+            return self.encode_unary_apx(ops, op_ext, size);
+        }
         if ops.len() != 1 {
             return Err("unary op requires 1 operand".to_string());
         }
@@ -1273,6 +1509,9 @@ impl super::InstructionEncoder {
         op_ext: u8,
         size: u8,
     ) -> Result<(), String> {
+        if ops.len() == 2 || self.apx_wants_evex() {
+            return self.encode_unary_apx(ops, op_ext, size);
+        }
         if ops.len() != 1 {
             return Err("inc/dec requires 1 operand".to_string());
         }
@@ -1319,7 +1558,7 @@ impl super::InstructionEncoder {
     /// message that says what actually went wrong and what to use instead.
     /// (ICC 2021 SILENTLY mis-encodes exactly this case — the defect class
     /// this check exists to prevent.)
-    fn check_imm32s_q(mnemonic: &str, size: u8, val: i64) -> Result<(), String> {
+    pub(crate) fn check_imm32s_q(mnemonic: &str, size: u8, val: i64) -> Result<(), String> {
         if size == 8 && (val > i32::MAX as i64 || val < i32::MIN as i64) {
             return Err(format!(
                 "{}: immediate 0x{:x} does not fit the sign-extended 32-bit \
@@ -1382,6 +1621,10 @@ impl super::InstructionEncoder {
         shift_op: u8,
     ) -> Result<(), String> {
         let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+
+        if self.apx_wants_evex() || ops.len() == 3 {
+            return self.encode_shift_apx(ops, mnemonic, shift_op, size);
+        }
 
         // Handle 1-operand form: shift by 1 implicitly
         if ops.len() == 1 {
@@ -1474,14 +1717,166 @@ impl super::InstructionEncoder {
         }
     }
 
+    fn encode_unary_apx(&mut self, ops: &[Operand], op_ext: u8, size: u8) -> Result<(), String> {
+        // APX NF applies to NEG/INC/DEC/MUL/DIV/IDIV, not NOT.
+        if self.apx_nf && op_ext == 2 {
+            return Err("{nf} unsupported for `not'".to_string());
+        }
+        let nf = self.apx_nf;
+        let base_opcode = if op_ext <= 1 {
+            if size == 1 { 0xFE } else { 0xFF }
+        } else if size == 1 {
+            0xF6
+        } else {
+            0xF7
+        };
+        match ops {
+            [Operand::Register(src), Operand::Register(ndd)] => {
+                let num = reg_num(&src.name).ok_or("bad register")?;
+                self.emit_apx_evex_rr(size, "", &src.name, Some(&ndd.name), nf)?;
+                self.bytes.push(base_opcode);
+                self.bytes.push(self.modrm(3, op_ext, num));
+                Ok(())
+            }
+            [Operand::Memory(mem), Operand::Register(ndd)] => {
+                self.emit_segment_prefix(mem)?;
+                self.emit_apx_evex_rm(size, "", mem, Some(&ndd.name), nf)?;
+                self.bytes.push(base_opcode);
+                self.encode_modrm_mem(op_ext, mem)
+            }
+            [Operand::Register(rm)] => {
+                let num = reg_num(&rm.name).ok_or("bad register")?;
+                self.emit_apx_evex_rr(size, "", &rm.name, None, nf)?;
+                self.bytes.push(base_opcode);
+                self.bytes.push(self.modrm(3, op_ext, num));
+                Ok(())
+            }
+            [Operand::Memory(mem)] => {
+                self.emit_segment_prefix(mem)?;
+                self.emit_apx_evex_rm(size, "", mem, None, nf)?;
+                self.bytes.push(base_opcode);
+                self.encode_modrm_mem(op_ext, mem)
+            }
+            _ => Err("unsupported APX unary operands".to_string()),
+        }
+    }
+
+    fn encode_shift_apx(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        shift_op: u8,
+        size: u8,
+    ) -> Result<(), String> {
+        if self.apx_nf && (mnemonic.starts_with("rcl") || mnemonic.starts_with("rcr")) {
+            return Err(format!("{{nf}} unsupported for `{mnemonic}`"));
+        }
+        let nf = self.apx_nf;
+        let emit_body = |enc: &mut Self,
+                         rm: &str,
+                         ndd: Option<&str>,
+                         opcode: u8,
+                         imm: Option<u8>|
+         -> Result<(), String> {
+            let num = reg_num(rm).ok_or("bad register")?;
+            enc.emit_apx_evex_rr(size, "", rm, ndd, nf)?;
+            enc.bytes.push(opcode);
+            enc.bytes.push(enc.modrm(3, shift_op, num));
+            if let Some(c) = imm {
+                enc.bytes.push(c);
+            }
+            Ok(())
+        };
+        match ops {
+            [
+                Operand::Immediate(ImmediateValue::Integer(count)),
+                Operand::Register(src),
+                Operand::Register(ndd),
+            ] => {
+                Self::check_shift_imm(mnemonic, size, *count)?;
+                let count = *count as u8;
+                if count == 1 {
+                    emit_body(
+                        self,
+                        &src.name,
+                        Some(&ndd.name),
+                        if size == 1 { 0xD0 } else { 0xD1 },
+                        None,
+                    )
+                } else {
+                    emit_body(
+                        self,
+                        &src.name,
+                        Some(&ndd.name),
+                        if size == 1 { 0xC0 } else { 0xC1 },
+                        Some(count),
+                    )
+                }
+            }
+            [
+                Operand::Register(cl),
+                Operand::Register(src),
+                Operand::Register(ndd),
+            ] if cl.name == "cl" => emit_body(
+                self,
+                &src.name,
+                Some(&ndd.name),
+                if size == 1 { 0xD2 } else { 0xD3 },
+                None,
+            ),
+            [
+                Operand::Immediate(ImmediateValue::Integer(count)),
+                Operand::Register(dst),
+            ] => {
+                Self::check_shift_imm(mnemonic, size, *count)?;
+                let count = *count as u8;
+                if count == 1 {
+                    emit_body(
+                        self,
+                        &dst.name,
+                        None,
+                        if size == 1 { 0xD0 } else { 0xD1 },
+                        None,
+                    )
+                } else {
+                    emit_body(
+                        self,
+                        &dst.name,
+                        None,
+                        if size == 1 { 0xC0 } else { 0xC1 },
+                        Some(count),
+                    )
+                }
+            }
+            [Operand::Register(cl), Operand::Register(dst)] if cl.name == "cl" => emit_body(
+                self,
+                &dst.name,
+                None,
+                if size == 1 { 0xD2 } else { 0xD3 },
+                None,
+            ),
+            [Operand::Register(dst)] => emit_body(
+                self,
+                &dst.name,
+                None,
+                if size == 1 { 0xD0 } else { 0xD1 },
+                None,
+            ),
+            _ => Err(format!("unsupported APX {} operands", mnemonic)),
+        }
+    }
+
     pub(crate) fn encode_double_shift(
         &mut self,
         ops: &[Operand],
         opcode: u8,
         size: u8,
     ) -> Result<(), String> {
+        if ops.len() == 4 {
+            return self.encode_double_shift_ndd(ops, opcode, size);
+        }
         if ops.len() != 3 {
-            return Err("double shift requires 3 operands".to_string());
+            return Err("double shift requires 3 or 4 operands".to_string());
         }
 
         match (&ops[0], &ops[1], &ops[2]) {
@@ -1492,6 +1887,18 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                if self.apx_wants_evex() {
+                    // Map-4 remaps: shld-imm 24, shrd-imm 2C. CL forms keep A5/AD.
+                    let map4 = if opcode == 0xA4 { 0x24 } else { 0x2C };
+                    self.emit_apx_evex_rr(size, &src.name, &dst.name, None, self.apx_nf)?;
+                    self.bytes.push(map4);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                    self.bytes.push(*count as u8);
+                    return Ok(());
+                }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.emit_rex_rr(size, &src.name, &dst.name);
                 self.bytes.extend_from_slice(&[0x0F, opcode]);
                 self.bytes.push(self.modrm(3, src_num, dst_num));
@@ -1503,6 +1910,15 @@ impl super::InstructionEncoder {
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                if self.apx_wants_evex() {
+                    self.emit_apx_evex_rr(size, &src.name, &dst.name, None, self.apx_nf)?;
+                    self.bytes.push(opcode + 1);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                    return Ok(());
+                }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.emit_rex_rr(size, &src.name, &dst.name);
                 self.bytes.extend_from_slice(&[0x0F, opcode + 1]);
                 self.bytes.push(self.modrm(3, src_num, dst_num));
@@ -1512,7 +1928,78 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// APX NDD SHLD/SHRD: `shldq $imm/%cl, %src, %src1, %ndd`.
+    fn encode_double_shift_ndd(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        size: u8,
+    ) -> Result<(), String> {
+        let ndd = match &ops[3] {
+            Operand::Register(r) => r.name.as_str(),
+            _ => return Err("NDD destination must be a register".to_string()),
+        };
+        let nf = self.apx_nf;
+        let map4_imm = if opcode == 0xA4 { 0x24u8 } else { 0x2C };
+        match (&ops[0], &ops[1], &ops[2]) {
+            (
+                Operand::Immediate(ImmediateValue::Integer(count)),
+                Operand::Register(src),
+                Operand::Register(src1),
+            ) => {
+                let src_n = reg_num(&src.name).ok_or("bad register")?;
+                let src1_n = reg_num(&src1.name).ok_or("bad register")?;
+                self.emit_apx_evex_rr(size, &src.name, &src1.name, Some(ndd), nf)?;
+                self.bytes.push(map4_imm);
+                self.bytes.push(self.modrm(3, src_n, src1_n));
+                self.bytes.push(*count as u8);
+                Ok(())
+            }
+            (Operand::Register(cl), Operand::Register(src), Operand::Register(src1))
+                if cl.name == "cl" =>
+            {
+                let src_n = reg_num(&src.name).ok_or("bad register")?;
+                let src1_n = reg_num(&src1.name).ok_or("bad register")?;
+                self.emit_apx_evex_rr(size, &src.name, &src1.name, Some(ndd), nf)?;
+                self.bytes.push(opcode + 1);
+                self.bytes.push(self.modrm(3, src_n, src1_n));
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(count)),
+                Operand::Register(src),
+                Operand::Memory(mem),
+            ) => {
+                let src_n = reg_num(&src.name).ok_or("bad register")?;
+                self.emit_segment_prefix(mem)?;
+                self.emit_apx_evex_rm(size, &src.name, mem, Some(ndd), nf)?;
+                let rc = self.relocations.len();
+                self.bytes.push(map4_imm);
+                self.encode_modrm_mem(src_n, mem)?;
+                self.bytes.push(*count as u8);
+                self.adjust_rip_reloc_addend(rc, 1);
+                Ok(())
+            }
+            (Operand::Register(cl), Operand::Register(src), Operand::Memory(mem))
+                if cl.name == "cl" =>
+            {
+                let src_n = reg_num(&src.name).ok_or("bad register")?;
+                self.emit_segment_prefix(mem)?;
+                self.emit_apx_evex_rm(size, &src.name, mem, Some(ndd), nf)?;
+                self.bytes.push(opcode + 1);
+                self.encode_modrm_mem(src_n, mem)
+            }
+            _ => Err("unsupported NDD double shift operands".to_string()),
+        }
+    }
+
     pub(crate) fn encode_bswap(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
+        if self.apx_nf {
+            return Err("{nf} unsupported for `bswap`".to_string());
+        }
+        if self.apx_evex {
+            return Err("no EVEX encoding for `bswap`".to_string());
+        }
         if ops.len() != 1 {
             return Err("bswap requires 1 operand".to_string());
         }
@@ -1544,6 +2031,33 @@ impl super::InstructionEncoder {
         };
 
         let size = mnemonic_size_suffix(mnemonic).unwrap_or(4);
+
+        if self.apx_wants_evex() {
+            // Map-4 remaps: lzcnt F5, tzcnt F4, popcnt 88.
+            let map4 = match mnemonic {
+                "lzcntl" | "lzcntq" | "lzcntw" => 0xF5u8,
+                "tzcntl" | "tzcntq" | "tzcntw" => 0xF4,
+                _ => 0x88,
+            };
+            match (&ops[0], &ops[1]) {
+                (Operand::Register(src), Operand::Register(dst)) => {
+                    let src_num = reg_num(&src.name).ok_or("bad register")?;
+                    let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                    self.emit_apx_evex_rr(size, &dst.name, &src.name, None, self.apx_nf)?;
+                    self.bytes.push(map4);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    return Ok(());
+                }
+                (Operand::Memory(mem), Operand::Register(dst)) => {
+                    let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_apx_evex_rm(size, &dst.name, mem, None, self.apx_nf)?;
+                    self.bytes.push(map4);
+                    return self.encode_modrm_mem(dst_num, mem);
+                }
+                _ => return Err(format!("unsupported {} operands", mnemonic)),
+            }
+        }
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
@@ -1577,6 +2091,31 @@ impl super::InstructionEncoder {
             return Err("setcc requires 1 operand".to_string());
         }
 
+        if self.apx_nf {
+            return Err("{nf} unsupported for `setcc'".to_string());
+        }
+
+        // `setzuCC[b]`: APX zero-upper SETcc (ND=1, vvvv=0, pp=3).
+        if let Some(rest) = mnemonic.strip_prefix("setzu") {
+            let cc = cc_from_mnemonic(rest).or_else(|_| {
+                rest.strip_suffix('b')
+                    .ok_or_else(|| format!("unknown condition code: {rest}"))
+                    .and_then(cc_from_mnemonic)
+            })?;
+            return match &ops[0] {
+                Operand::Register(reg) => {
+                    let num = reg_num(&reg.name).ok_or("bad register")?;
+                    self.emit_apx_evex_rr_nd1_pp(false, "", &reg.name, false, 3)?;
+                    self.bytes.push(0x40 + cc);
+                    self.bytes.push(self.modrm(3, 0, num));
+                    Ok(())
+                }
+                // ZU zeros the unused upper bits of a GPR. Memory has no
+                // upper bits to clear, and GAS 2.47 rejects `setzu* (%reg)`.
+                _ => Err("setzu requires a register operand".to_string()),
+            };
+        }
+
         let cc_str = &mnemonic[3..];
         // Try the condition code as-is first, then strip trailing 'b' suffix
         let cc = cc_from_mnemonic(cc_str).or_else(|_| {
@@ -1587,13 +2126,31 @@ impl super::InstructionEncoder {
             }
         })?;
 
+        // `{evex} setCC` is EVEX without ZU (ND=0). `setzuCC` above is the ZU form.
+        // EGPR without `{evex}` stays on the shorter REX2 0F 90+cc encoding.
+        if self.apx_evex {
+            return match &ops[0] {
+                Operand::Register(reg) => {
+                    let num = reg_num(&reg.name).ok_or("bad register")?;
+                    self.emit_apx_evex_rr_pp(false, "", &reg.name, None, false, 3)?;
+                    self.bytes.push(0x40 + cc);
+                    self.bytes.push(self.modrm(3, 0, num));
+                    Ok(())
+                }
+                Operand::Memory(mem) => {
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_apx_evex_rm_pp(false, "", mem, None, false, 3)?;
+                    self.bytes.push(0x40 + cc);
+                    self.encode_modrm_mem(0, mem)
+                }
+                _ => Err("setcc requires register or memory operand".to_string()),
+            };
+        }
+
         match &ops[0] {
             Operand::Register(reg) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
-                if needs_rex_ext(&reg.name) || is_rex_required_8bit(&reg.name) {
-                    self.bytes
-                        .push(self.rex(false, false, false, needs_rex_ext(&reg.name)));
-                }
+                self.emit_rex_unary(1, &reg.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x90 + cc]);
                 self.bytes.push(self.modrm(3, 0, num));
                 Ok(())
@@ -1608,8 +2165,14 @@ impl super::InstructionEncoder {
     }
 
     pub(crate) fn encode_cmovcc(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
-        if ops.len() != 2 {
-            return Err("cmovcc requires 2 operands".to_string());
+        if ops.len() != 2 && ops.len() != 3 {
+            return Err("cmovcc requires 2 or 3 operands".to_string());
+        }
+        if self.apx_nf {
+            return Err("{nf} unsupported for `cmov'".to_string());
+        }
+        if ops.len() == 2 && self.apx_evex {
+            return Err("no EVEX encoding for 2-operand `cmov'".to_string());
         }
 
         // Extract condition code: strip "cmov" prefix and size suffix
@@ -1624,6 +2187,56 @@ impl super::InstructionEncoder {
             (without_prefix, 8u8) // default to 64-bit
         };
         let cc = cc_from_mnemonic(cc_str)?;
+
+        if ops.len() == 3 {
+            // APX NDD: `cmovzq %src, %src1, %ndd`. GAS encodes ModRM.reg=src1,
+            // r/m=src, vvvv=ndd — same operand polarity as IMUL 0xAF.
+            return match (&ops[0], &ops[1], &ops[2]) {
+                (Operand::Register(src), Operand::Register(src1), Operand::Register(ndd)) => {
+                    let src_n = reg_num(&src.name).ok_or("bad register")?;
+                    let src1_n = reg_num(&src1.name).ok_or("bad register")?;
+                    self.emit_apx_evex_rr(
+                        size,
+                        &src1.name,
+                        &src.name,
+                        Some(&ndd.name),
+                        self.apx_nf,
+                    )?;
+                    self.bytes.push(0x40 + cc);
+                    self.bytes.push(self.modrm(3, src1_n, src_n));
+                    Ok(())
+                }
+                (Operand::Memory(mem), Operand::Register(src1), Operand::Register(ndd)) => {
+                    let src1_n = reg_num(&src1.name).ok_or("bad register")?;
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_apx_evex_rm(size, &src1.name, mem, Some(&ndd.name), self.apx_nf)?;
+                    self.bytes.push(0x40 + cc);
+                    self.encode_modrm_mem(src1_n, mem)
+                }
+                _ => Err("unsupported cmov NDD operands".to_string()),
+            };
+        }
+
+        if self.apx_wants_evex() {
+            return match (&ops[0], &ops[1]) {
+                (Operand::Register(src), Operand::Register(dst)) => {
+                    let src_n = reg_num(&src.name).ok_or("bad register")?;
+                    let dst_n = reg_num(&dst.name).ok_or("bad register")?;
+                    self.emit_apx_evex_rr(size, &dst.name, &src.name, None, self.apx_nf)?;
+                    self.bytes.push(0x40 + cc);
+                    self.bytes.push(self.modrm(3, dst_n, src_n));
+                    Ok(())
+                }
+                (Operand::Memory(mem), Operand::Register(dst)) => {
+                    let dst_n = reg_num(&dst.name).ok_or("bad register")?;
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_apx_evex_rm(size, &dst.name, mem, None, self.apx_nf)?;
+                    self.bytes.push(0x40 + cc);
+                    self.encode_modrm_mem(dst_n, mem)
+                }
+                _ => Err("unsupported cmov operands for APX EVEX".to_string()),
+            };
+        }
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
@@ -1670,9 +2283,7 @@ impl super::InstructionEncoder {
             Operand::Indirect(inner) => match inner.as_ref() {
                 Operand::Register(reg) => {
                     let num = reg_num(&reg.name).ok_or("bad register")?;
-                    if needs_rex_ext(&reg.name) {
-                        self.bytes.push(self.rex(false, false, false, true));
-                    }
+                    self.emit_rex_unary(4, &reg.name);
                     self.bytes.push(0xFF);
                     self.bytes.push(self.modrm(3, 4, num));
                     Ok(())
@@ -1729,9 +2340,7 @@ impl super::InstructionEncoder {
                 match inner.as_ref() {
                     Operand::Register(reg) => {
                         let num = reg_num(&reg.name).ok_or("bad register")?;
-                        if needs_rex_ext(&reg.name) {
-                            self.bytes.push(self.rex(false, false, false, true));
-                        }
+                        self.emit_rex_unary(4, &reg.name);
                         self.bytes.push(0xFF);
                         self.bytes.push(self.modrm(3, 2, num));
                         Ok(())
@@ -1750,6 +2359,12 @@ impl super::InstructionEncoder {
     }
 
     pub(crate) fn encode_xchg(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+        if self.apx_nf {
+            return Err("{nf} unsupported for `xchg`".to_string());
+        }
+        if self.apx_evex {
+            return Err("no EVEX encoding for `xchg`".to_string());
+        }
         if ops.len() != 2 {
             return Err("xchg requires 2 operands".to_string());
         }
@@ -1782,16 +2397,15 @@ impl super::InstructionEncoder {
                 //     87 c0.  `xchg %rax,%rax` and `xchg %ax,%ax` are safe
                 //     (48 90 -> canonical 90, and 66 90).
                 if size != 1 {
-                    let other = if src_num == 0 && !needs_rex_ext(&src.name) {
+                    let other = if is_accum(&src.name) {
                         Some(&dst.name)
-                    } else if dst_num == 0 && !needs_rex_ext(&dst.name) {
+                    } else if is_accum(&dst.name) {
                         Some(&src.name)
                     } else {
                         None
                     };
                     if let Some(other) = other {
-                        let other_is_eax =
-                            size == 4 && reg_num(other) == Some(0) && !needs_rex_ext(other);
+                        let other_is_eax = size == 4 && is_accum(other);
                         if !other_is_eax {
                             let onum = reg_num(other).ok_or("bad register")?;
                             if size == 2 {
@@ -1800,7 +2414,7 @@ impl super::InstructionEncoder {
                             // `xchg %rax,%rax` needs no REX.W: exchanging the
                             // accumulator with itself is a no-op either way, so
                             // GAS folds it to the canonical one-byte NOP.
-                            if !(size == 8 && onum == 0 && !needs_rex_ext(other)) {
+                            if !(size == 8 && is_accum(other)) {
                                 self.emit_rex_unary(size, other);
                             }
                             self.bytes.push(0x90 + (onum & 7));
@@ -1838,6 +2452,18 @@ impl super::InstructionEncoder {
                     .extend_from_slice(&[0x0F, if size == 1 { 0xB0 } else { 0xB1 }]);
                 self.encode_modrm_mem(src_num, mem)
             }
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_rr(size, &src.name, &dst.name);
+                self.bytes
+                    .extend_from_slice(&[0x0F, if size == 1 { 0xB0 } else { 0xB1 }]);
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                Ok(())
+            }
             _ => Err("unsupported cmpxchg operands".to_string()),
         }
     }
@@ -1858,6 +2484,18 @@ impl super::InstructionEncoder {
                 self.bytes
                     .extend_from_slice(&[0x0F, if size == 1 { 0xC0 } else { 0xC1 }]);
                 self.encode_modrm_mem(src_num, mem)
+            }
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_rr(size, &src.name, &dst.name);
+                self.bytes
+                    .extend_from_slice(&[0x0F, if size == 1 { 0xC0 } else { 0xC1 }]);
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                Ok(())
             }
             _ => Err("unsupported xadd operands".to_string()),
         }

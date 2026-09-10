@@ -2034,7 +2034,10 @@ pub(super) fn emit_executable(
                             }
                         }
                     }
-                    R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
+                    R_X86_64_GOTPCREL
+                    | R_X86_64_GOTPCRELX
+                    | R_X86_64_REX_GOTPCRELX
+                    | R_X86_64_CODE_4_GOTPCRELX => {
                         if !sym.name.is_empty() && !sym.is_local() {
                             if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if let Some(gi) = g.got_idx {
@@ -2056,7 +2059,8 @@ pub(super) fn emit_executable(
                                     continue;
                                 }
                                 if (rela.rela_type == R_X86_64_GOTPCRELX
-                                    || rela.rela_type == R_X86_64_REX_GOTPCRELX)
+                                    || rela.rela_type == R_X86_64_REX_GOTPCRELX
+                                    || rela.rela_type == R_X86_64_CODE_4_GOTPCRELX)
                                     && g.defined_in.is_some()
                                 {
                                     if fp >= 2 && fp < out.len() && out[fp - 2] == 0x8b {

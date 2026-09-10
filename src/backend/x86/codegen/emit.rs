@@ -58,6 +58,46 @@ pub(super) const X86_CALLER_SAVED: [PhysReg; 6] = [
     PhysReg(15),
 ];
 
+/// APX extra GPRs `%r16`–`%r31`. SysV treats them as caller-saved (volatile).
+/// PhysReg encoding 40..=55 so they never collide with the XMM bank (18..=33)
+/// or the legacy GPR file (0..=16). Only added to the allocator pool when
+/// `-mapx`/`-mapxf` is set — otherwise the encodings are #UD.
+pub(super) const X86_APX_EGPRS: [PhysReg; 16] = [
+    PhysReg(40),
+    PhysReg(41),
+    PhysReg(42),
+    PhysReg(43),
+    PhysReg(44),
+    PhysReg(45),
+    PhysReg(46),
+    PhysReg(47),
+    PhysReg(48),
+    PhysReg(49),
+    PhysReg(50),
+    PhysReg(51),
+    PhysReg(52),
+    PhysReg(53),
+    PhysReg(54),
+    PhysReg(55),
+];
+
+pub(super) const EGPR64: [&str; 16] = [
+    "r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23", "r24", "r25", "r26", "r27", "r28",
+    "r29", "r30", "r31",
+];
+pub(super) const EGPR32: [&str; 16] = [
+    "r16d", "r17d", "r18d", "r19d", "r20d", "r21d", "r22d", "r23d", "r24d", "r25d", "r26d", "r27d",
+    "r28d", "r29d", "r30d", "r31d",
+];
+pub(super) const EGPR16: [&str; 16] = [
+    "r16w", "r17w", "r18w", "r19w", "r20w", "r21w", "r22w", "r23w", "r24w", "r25w", "r26w", "r27w",
+    "r28w", "r29w", "r30w", "r31w",
+];
+pub(super) const EGPR8: [&str; 16] = [
+    "r16b", "r17b", "r18b", "r19b", "r20b", "r21b", "r22b", "r23b", "r24b", "r25b", "r26b", "r27b",
+    "r28b", "r29b", "r30b", "r31b",
+];
+
 /// x86-64 XMM registers available for F64 allocation.
 /// Caller-saved (SysV ABI), only for values that don't span calls.
 /// xmm0/xmm1 are reserved for the accumulator pattern and FP return values.
@@ -98,6 +138,22 @@ pub(super) fn reg_name_to_32(name: &str) -> &'static str {
         "r13" => "r13d",
         "r14" => "r14d",
         "r15" => "r15d",
+        "r16" => "r16d",
+        "r17" => "r17d",
+        "r18" => "r18d",
+        "r19" => "r19d",
+        "r20" => "r20d",
+        "r21" => "r21d",
+        "r22" => "r22d",
+        "r23" => "r23d",
+        "r24" => "r24d",
+        "r25" => "r25d",
+        "r26" => "r26d",
+        "r27" => "r27d",
+        "r28" => "r28d",
+        "r29" => "r29d",
+        "r30" => "r30d",
+        "r31" => "r31d",
         _ => unreachable!("invalid 64-bit register name: {}", name),
     }
 }
@@ -120,6 +176,7 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
         14 => "rdi",
         15 => "rsi",
         16 => "rdx",
+        n if (40..=55).contains(&n) => EGPR64[(n - 40) as usize],
         // XMM registers for F64 allocation
         20 => "xmm2",
         21 => "xmm3",
@@ -146,7 +203,14 @@ pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
 /// Check if a PhysReg is an XMM register (used for F64 values).
 #[inline]
 pub(super) fn is_xmm_reg(reg: PhysReg) -> bool {
-    reg.0 >= 20 && reg.0 <= 33
+    (20..=33).contains(&reg.0)
+}
+
+/// Integer GPR the allocator / emitters may name: legacy file plus APX EGPRs.
+/// XMM scratch (18/19) and the XMM bank (20..=33) are excluded.
+#[inline]
+pub(super) fn is_gpr_reg(reg: PhysReg) -> bool {
+    reg.0 <= 16 || (40..=55).contains(&reg.0)
 }
 
 /// Map an XMM allocator register to the corresponding 256-bit AVX name.
@@ -192,6 +256,7 @@ pub(super) fn phys_reg_name_32(reg: PhysReg) -> &'static str {
         14 => "edi",
         15 => "esi",
         16 => "edx",
+        n if (40..=55).contains(&n) => EGPR32[(n - 40) as usize],
         _ => unreachable!("invalid x86 register index {}", reg.0),
     }
 }
@@ -232,6 +297,7 @@ pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
             14 => "dil",
             15 => "sil",
             16 => "dl",
+            n if (40..=55).contains(&n) => EGPR8[(n - 40) as usize],
             _ => phys_reg_name(reg),
         },
         _ => phys_reg_name(reg),
@@ -511,6 +577,9 @@ pub struct X86Codegen {
     pub(super) popcnt_enabled: bool,
     /// True when the target has BMI2 (`-mbmi2` or an enabling -march).
     pub(super) bmi2_enabled: bool,
+    /// True when the target has APX Foundation (`-mapx` / `-mapxf`).
+    /// Gates `%r16`–`%r31` allocation and NDD 3-operand integer ALU.
+    pub(super) apx_enabled: bool,
     /// Measured tuning row for the selected `-mtune`/`-march` core.
     pub(super) tune: crate::backend::x86::cpu_model::X86Tune,
     /// True when the target has AVX2; gates YMM constant-size copies.
@@ -941,6 +1010,7 @@ impl X86Codegen {
             lzcnt_enabled: false,
             popcnt_enabled: false,
             bmi2_enabled: false,
+            apx_enabled: false,
             tune: crate::backend::x86::cpu_model::X86Tune::GENERIC,
             avx2_enabled: false,
             isa: super::super::isa::X86Isa::default(),
@@ -1055,6 +1125,8 @@ impl X86Codegen {
         self.lzcnt_enabled = opts.lzcnt;
         self.popcnt_enabled = opts.popcnt;
         self.bmi2_enabled = opts.bmi2;
+        self.apx_enabled = opts.apx;
+        super::isel::set_apx_enabled(opts.apx);
         self.tune = opts.tune;
         super::isel::set_shlx_mode(if opts.tune.prefer_shlx(opts.bmi2) {
             super::isel::ShlxMode::Always
@@ -3560,6 +3632,92 @@ impl X86Codegen {
     }
 
     /// Register-direct path for simple ALU ops (add/sub/and/or/xor/mul).
+    /// APX NDD 3-operand ALU: `op src, src1, dst` writes dst without
+    /// clobbering src1. Taken only when `-mapx` is on AND dest is a different
+    /// GPR from the lhs home — otherwise the 2-address form is shorter and
+    /// legal on every x86-64. Never fires on a non-APX TU (the encodings
+    /// are #UD on Raptor Lake / Zen 5).
+    fn try_emit_ndd_alu(
+        &mut self,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+        is_unsigned: bool,
+        dest_value_id: u32,
+    ) -> bool {
+        if !self.apx_enabled {
+            return false;
+        }
+        if !matches!(
+            op,
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+        ) {
+            return false;
+        }
+        if is_xmm_reg(dest_phys) {
+            return false;
+        }
+        let Some(lhs_phys) = self.operand_reg(lhs).filter(|&r| is_gpr_reg(r)) else {
+            return false;
+        };
+        // Two-address is shorter when dest already holds lhs.
+        if lhs_phys == dest_phys {
+            return false;
+        }
+        let mnemonic = alu_mnemonic(op);
+        let (dest_n, lhs_n, sfx) = if use_32bit {
+            (phys_reg_name_32(dest_phys), phys_reg_name_32(lhs_phys), "l")
+        } else {
+            (phys_reg_name(dest_phys), phys_reg_name(lhs_phys), "q")
+        };
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            self.state.emit_fmt(format_args!(
+                "    {}{} ${}, %{}, %{}",
+                mnemonic, sfx, imm, lhs_n, dest_n
+            ));
+        } else if let Some(rhs_phys) = self.operand_reg(rhs).filter(|&r| is_gpr_reg(r)) {
+            if rhs_phys == dest_phys {
+                // dest holds rhs: commutative ops can NDD-swap; Sub cannot.
+                if op == IrBinOp::Sub {
+                    return false;
+                }
+                let rhs_n = if use_32bit {
+                    phys_reg_name_32(rhs_phys)
+                } else {
+                    phys_reg_name(rhs_phys)
+                };
+                self.state.emit_fmt(format_args!(
+                    "    {}{} %{}, %{}, %{}",
+                    mnemonic, sfx, lhs_n, rhs_n, dest_n
+                ));
+            } else {
+                let rhs_n = if use_32bit {
+                    phys_reg_name_32(rhs_phys)
+                } else {
+                    phys_reg_name(rhs_phys)
+                };
+                self.state.emit_fmt(format_args!(
+                    "    {}{} %{}, %{}, %{}",
+                    mnemonic, sfx, rhs_n, lhs_n, dest_n
+                ));
+            }
+        } else {
+            return false;
+        }
+        if use_32bit {
+            self.emit_sext32_for_value(
+                phys_reg_name_32(dest_phys),
+                phys_reg_name(dest_phys),
+                is_unsigned,
+                dest_value_id,
+            );
+        }
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
     pub(super) fn emit_alu_reg_direct(
         &mut self,
         op: IrBinOp,
@@ -3570,6 +3728,17 @@ impl X86Codegen {
         is_unsigned: bool,
         dest_value_id: u32,
     ) {
+        if self.try_emit_ndd_alu(
+            op,
+            lhs,
+            rhs,
+            dest_phys,
+            use_32bit,
+            is_unsigned,
+            dest_value_id,
+        ) {
+            return;
+        }
         let dest_name = phys_reg_name(dest_phys);
         // Safety: verify the 32-bit name is valid. The "rbpd" bug appears to be
         // caused by some codegen path concatenating the 64-bit name with "d" suffix
@@ -4551,7 +4720,7 @@ fn is_mi_unsafe_value(
         return true;
     }
     if let Some(r) = reg_assignments.get(&v) {
-        if r.0 >= 20 {
+        if is_xmm_reg(*r) {
             return true; // XMM-assigned
         }
     }
@@ -4622,7 +4791,10 @@ impl X86Codegen {
                 self.state.resolve_slot_addr(ptr.0),
                 Some(crate::backend::state::SlotAddr::OverAligned(_, _))
             ))
-            || self.reg_assignments.get(&ptr.0).is_some_and(|r| r.0 < 20);
+            || self
+                .reg_assignments
+                .get(&ptr.0)
+                .is_some_and(|r| is_gpr_reg(*r));
         if !ptr_ok
             || folded_global_addrs.contains(&ptr.0)
             || self.state.folded_gep_values.contains(&ptr.0)
@@ -4725,7 +4897,7 @@ impl X86Codegen {
             {
                 return false;
             }
-            self.state.is_alloca(v) || ra.get(&v).is_some_and(|r| r.0 < 20)
+            self.state.is_alloca(v) || ra.get(&v).is_some_and(|r| is_gpr_reg(*r))
         };
         match inst {
             Instruction::Store {
@@ -4913,7 +5085,7 @@ impl X86Codegen {
                         return None;
                     }
                     if let Some(&r) = ra.get(&v.0) {
-                        if r.0 >= 20 || r.0 == 0 || r.0 == 6 || r.0 == 7 {
+                        if is_xmm_reg(r) || r.0 == 0 || r.0 == 6 || r.0 == 7 {
                             return None; // xmm / rax / rbp / rcx homes
                         }
                         return Some(TypedCallSrc::Reg(r));
@@ -4935,7 +5107,7 @@ impl X86Codegen {
                     return false;
                 }
                 let src = if let Some(&r) = ra.get(&d.0) {
-                    if r.0 >= 20 || r.0 == 0 || r.0 == 6 {
+                    if is_xmm_reg(r) || r.0 == 0 || r.0 == 6 {
                         return false;
                     }
                     TypedCallSrc::Reg(r)
@@ -5225,7 +5397,7 @@ impl X86Codegen {
         }
         // Resolve the destination home.
         let dst = if let Some(&r) = self.reg_assignments.get(&dest.0) {
-            if r.0 >= 20 || r.0 == 0 || r.0 == 6 || r.0 == 7 {
+            if is_xmm_reg(r) || r.0 == 0 || r.0 == 6 || r.0 == 7 {
                 return Err("ParamRef(unsafe-home)"); // xmm / rax / rbp / rcx
             }
             ParamDst::Reg(r)
@@ -5908,7 +6080,7 @@ impl ArchCodegen for X86Codegen {
                     return;
                 }
                 if let Some(r) = ra.get(&v.0) {
-                    if r.0 >= 20 {
+                    if is_xmm_reg(*r) {
                         reject = true;
                         return;
                     }
@@ -5945,7 +6117,7 @@ impl ArchCodegen for X86Codegen {
                     reject = true;
                 }
                 if let Some(r) = ra.get(&ptr.0) {
-                    if r.0 >= 20 {
+                    if is_xmm_reg(*r) {
                         reject = true;
                     }
                 }
@@ -5985,7 +6157,7 @@ impl ArchCodegen for X86Codegen {
                     reject = true;
                 }
                 if let Some(r) = ra.get(&base.0) {
-                    if r.0 >= 20 {
+                    if is_xmm_reg(*r) {
                         reject = true;
                     }
                 }
@@ -6028,7 +6200,7 @@ impl ArchCodegen for X86Codegen {
                 reject = true;
             }
             if let Some(r) = ra.get(&dest.0) {
-                if r.0 >= 20 {
+                if is_xmm_reg(*r) {
                     reject = true;
                 }
                 // Workaround: skip rbp-dest BinOps to avoid triggering a register
@@ -7153,5 +7325,18 @@ mod machinst_resolution_tests {
         assert_eq!(cmp_secondary_reg(IrType::U32), "ecx");
         assert_eq!(cmp_secondary_reg(IrType::I64), "rcx");
         assert_eq!(cmp_secondary_reg(IrType::U64), "rcx");
+    }
+
+    #[test]
+    fn apx_egpr_names_are_gprs_not_xmm() {
+        assert_eq!(phys_reg_name(PhysReg(40)), "r16");
+        assert_eq!(phys_reg_name(PhysReg(55)), "r31");
+        assert_eq!(phys_reg_name_32(PhysReg(40)), "r16d");
+        assert_eq!(phys_reg_name_32(PhysReg(55)), "r31d");
+        assert!(is_gpr_reg(PhysReg(40)));
+        assert!(is_gpr_reg(PhysReg(16)));
+        assert!(!is_gpr_reg(PhysReg(20)));
+        assert!(!is_xmm_reg(PhysReg(40)));
+        assert!(is_xmm_reg(PhysReg(20)));
     }
 }
