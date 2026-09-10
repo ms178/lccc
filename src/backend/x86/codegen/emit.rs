@@ -1,4 +1,4 @@
-use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
+use super::machinst::{AluOp, MachInst, MachOperand, MachReg, OpSize};
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, ParamClass};
 use crate::backend::cast::FloatOp;
 use crate::backend::common::PtrDirective;
@@ -5076,23 +5076,15 @@ impl X86Codegen {
             match op {
                 crate::ir::reexports::Operand::Const(c) => c.to_i64().map(TypedCallSrc::Imm),
                 crate::ir::reexports::Operand::Value(v) => {
-                    // Address-of-local arguments (`&x`): a separate pre-move
-                    // (Mov { AllocaAddr } → leaq by the resolver) places the
-                    // address into the ABI register before the call. The
-                    // slot must exist for the resolver to render the leaq.
+                    // Address-of-local arguments (`&x`): a pre-move places
+                    // the address into the ABI register before the call —
+                    // a single LeaSlot for a normal alloca, or the
+                    // leaq+addq+andq align-up sequence staged INTO the ABI
+                    // register itself for an over-aligned (>16) alloca
+                    // (the pre-move loop below picks the form; every
+                    // consumer of a padded slot must target the EFFECTIVE
+                    // align_up'd address). The slot must exist.
                     if state.is_alloca(v.0) {
-                        // Over-aligned (>16) allocas: the resolver renders a
-                        // raw-slot LeaSlot, but every consumer of the alloca
-                        // (prologue capture, ParamRef loads, memcpys) targets
-                        // the EFFECTIVE align_up'd address inside the padded
-                        // slot — a raw leaq passes the pad base to the callee
-                        // (the `sinkp32(&x)` regression). Fall back to the
-                        // mature path, which computes the effective address
-                        // (mirrors the OverAligned rejections in the typed
-                        // load/store admission).
-                        if state.alloca_over_align(v.0).is_some() {
-                            return None;
-                        }
                         return state.get_slot(v.0).map(|_| TypedCallSrc::AllocaAddr(v.0));
                     }
                     if is_mi_unsafe_value(v.0, ra, state, value_types) {
@@ -5241,11 +5233,38 @@ impl X86Codegen {
                     if caller_saves.iter().any(|(r, _)| *r == m.dst_reg) {
                         return false;
                     }
-                    pre_moves.push(MachInst::Mov {
-                        src: MachOperand::AllocaAddr(*id),
-                        dst: MachOperand::Reg(MachReg::Phys(m.dst_reg)),
-                        size: OpSize::S64,
-                    });
+                    let Some(slot) = state.get_slot(*id) else {
+                        return false; // no slot: the leaq cannot render
+                    };
+                    let dst = MachReg::Phys(m.dst_reg);
+                    if let Some(align) = state.alloca_over_align(*id) {
+                        // Over-aligned (>16) alloca: the callee must receive
+                        // the EFFECTIVE align_up'd address, never the pad
+                        // base. Stage the computation in the ABI register
+                        // itself — leaq slot(%rbp), %r; addq $align-1, %r;
+                        // andq $-align, %r — no scratch, the run stays
+                        // unsplit (byte-identical to the mature path's
+                        // emit_alloca_aligned_addr sequence).
+                        pre_moves.push(MachInst::LeaSlot { slot: slot.0, dst });
+                        pre_moves.push(MachInst::Alu {
+                            op: AluOp::Add,
+                            src: MachOperand::Imm((align - 1) as i64),
+                            dst,
+                            size: OpSize::S64,
+                        });
+                        pre_moves.push(MachInst::Alu {
+                            op: AluOp::And,
+                            src: MachOperand::Imm(-(align as i64)),
+                            dst,
+                            size: OpSize::S64,
+                        });
+                    } else {
+                        pre_moves.push(MachInst::Mov {
+                            src: MachOperand::AllocaAddr(*id),
+                            dst: MachOperand::Reg(dst),
+                            size: OpSize::S64,
+                        });
+                    }
                 }
                 _ => typed_args.push(m),
             }
@@ -5436,18 +5455,50 @@ impl X86Codegen {
         // alloca slot holds the staged value — one load.
         if param_idx < self.state.param_alloca_slots.len() {
             if let Some((slot, alloca_ty, alloca_id)) = self.state.param_alloca_slots[param_idx] {
+                let over_align = self.state.alloca_over_align(alloca_id);
                 // Over-aligned (>16) param allocas: the capture wrote the
                 // EFFECTIVE align_up'd address inside the padded slot, and
-                // the text path loads from that same effective address
-                // (emit_alloca_aligned_addr_impl). A raw StackSlot operand
-                // here would read the alignment pad. Reject to the text
-                // path — the effective-address dance needs a scratch
-                // register and a multi-instruction sequence, which the
-                // typed census deliberately does not own (same doctrine as
-                // the OverAligned rejections in the typed load/store and
-                // call-argument admission).
-                if self.state.alloca_over_align(alloca_id).is_some() {
-                    return Err("ParamRef(over-aligned-alloca)");
+                // every read must resolve that same effective address — a
+                // raw StackSlot operand would read the alignment pad. For a
+                // register-homed destination the address computation is
+                // staged IN the destination register itself
+                // (leaq+addq+andq, then a load through it): no scratch,
+                // the run stays unsplit, byte-identical to the mature
+                // path's emit_alloca_aligned_addr sequence. A slot-homed
+                // destination needs a two-memory relay through a scratch
+                // register, which the typed census deliberately does not
+                // own — that shape stays on the text path.
+                if let Some(align) = over_align {
+                    return match dst {
+                        ParamDst::Reg(r) => {
+                            let form = Self::paramref_reg_load_form(alloca_ty)
+                                .ok_or("ParamRef(float-domain)")?;
+                            let d = MachReg::Phys(r);
+                            self.machinst_buf.push(MachInst::LeaSlot {
+                                slot: slot.0,
+                                dst: d,
+                            });
+                            self.machinst_buf.push(MachInst::Alu {
+                                op: AluOp::Add,
+                                src: MachOperand::Imm((align - 1) as i64),
+                                dst: d,
+                                size: OpSize::S64,
+                            });
+                            self.machinst_buf.push(MachInst::Alu {
+                                op: AluOp::And,
+                                src: MachOperand::Imm(-(align as i64)),
+                                dst: d,
+                                size: OpSize::S64,
+                            });
+                            self.push_paramref_reg_load(
+                                form,
+                                MachOperand::Mem { base: d, offset: 0 },
+                                d,
+                            );
+                            Ok(())
+                        }
+                        ParamDst::Slot(_) => Err("ParamRef(over-aligned-slot-home)"),
+                    };
                 }
                 return match dst {
                     ParamDst::Reg(r) => {

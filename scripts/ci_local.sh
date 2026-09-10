@@ -144,6 +144,9 @@ gate "strict-computed-recip-codegen" fast \
 gate "machinst-window-alloc" fast \
     bash tests/regression/check_machinst_window_alloc_wide_copy.sh
 
+gate "overalign-typed-census" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_overalign_typed_census.sh
+
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 
