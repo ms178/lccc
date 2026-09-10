@@ -47,15 +47,30 @@ TARBALL="$WORK/linux-$KVER.tar.xz"
 # LCCC build and therefore easy to have absent on a fresh machine; failing
 # there wastes the whole download+patch phase that precedes it.  Check first.
 preflight_host_tools() {
-  local missing=() tool
+  local missing=() tool comp cfgname
   # kconfig lexers/parsers, plus the unconditional build-time host tools.
   for tool in make gcc ld ar nm objcopy perl awk sed bc flex bison cpio \
               xz patch tar; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
   # Compression tool implied by the package config (KERNEL_ZSTD=y upstream).
-  for tool in zstd xz lz4 lzop bzip2 gzip; do
-    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool (only if CONFIG_KERNEL_*=$tool)")
+  # Preflight the config that step 4 installs ($PKGDIR/config) instead of
+  # demanding every compressor some *other* config might select: lz4/lzop
+  # absent must not block a zstd kernel (the old unconditional list did).
+  local cfg="$PKGDIR/config"
+  for comp in zstd lz4 lzop gzip bzip2 xz; do
+    case $comp in
+      zstd)  cfgname=ZSTD ;;
+      lz4)   cfgname=LZ4 ;;
+      lzop)  cfgname=LZO ;;
+      gzip)  cfgname=GZIP ;;
+      bzip2) cfgname=BZIP2 ;;
+      xz)    cfgname=XZ ;;
+    esac
+    if [[ -r $cfg ]] && grep -q "^CONFIG_KERNEL_${cfgname}=y" "$cfg"; then
+      command -v "$comp" >/dev/null 2>&1 \
+        || missing+=("$comp (CONFIG_KERNEL_${cfgname}=y)")
+    fi
   done
   if ((${#missing[@]})); then
     echo "prepare_kernel_tree: missing host tools: ${missing[*]}" >&2
