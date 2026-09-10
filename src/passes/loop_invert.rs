@@ -90,15 +90,64 @@ fn is_duplicable(inst: &Instruction) -> bool {
     )
 }
 
+/// Whether loop inversion runs at all.
+///
+/// The kill switch is resolved **once**, by the driver, and then passed down
+/// explicitly. It used to be read out of the process environment deep inside
+/// the pass; because `std::env::set_var` is process-global, a test that
+/// toggled it raced with every test running in parallel on the other threads
+/// of the test binary, and those tests observed the wrong value (the symptom
+/// was a ~1-in-10 flake in this module). Configuration a caller can supply
+/// belongs in a parameter, not in ambient global state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct LoopInvertConfig {
+    pub enabled: bool,
+    pub debug: bool,
+}
+
+impl LoopInvertConfig {
+    /// The driver's configuration: the documented `CCC_NO_LOOP_INVERT` /
+    /// `CCC_DEBUG_LOOP_INVERT` escape hatches, read at most once per run.
+    pub fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("CCC_NO_LOOP_INVERT").is_err(),
+            debug: std::env::var("CCC_DEBUG_LOOP_INVERT").is_ok(),
+        }
+    }
+
+    /// Configuration used by the unit tests: no environment access at all.
+    #[cfg(test)]
+    const fn testing() -> Self {
+        Self {
+            enabled: true,
+            debug: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            debug: false,
+        }
+    }
+}
+
 /// Invert every eligible top-test loop in `func`. Returns the number rotated.
 pub(crate) fn invert_loops(func: &mut IrFunction) -> usize {
+    let cfg = LoopInvertConfig::from_env();
+    invert_loops_with(func, cfg)
+}
+
+/// The pass itself, parameterised by [`LoopInvertConfig`].
+pub(crate) fn invert_loops_with(func: &mut IrFunction, cfg: LoopInvertConfig) -> usize {
+    let debug = cfg.debug;
     if func.blocks.len() < 3 {
         return 0;
     }
-    if std::env::var("CCC_NO_LOOP_INVERT").is_ok() {
+    if !cfg.enabled {
         return 0;
     }
-    let debug = std::env::var("CCC_DEBUG_LOOP_INVERT").is_ok();
 
     // Phis must already be gone; this pass's whole safety argument rests on it.
     debug_assert!(
@@ -442,7 +491,7 @@ mod tests {
     #[test]
     fn a_top_test_counted_loop_is_bottom_tested() {
         let mut f = counted_loop();
-        assert_eq!(invert_loops(&mut f), 1);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
 
         // The header keeps its test and becomes the guard, executed once.
         assert!(matches!(
@@ -479,7 +528,7 @@ mod tests {
         // duplicated compare that follows it must read the NEW value -- that
         // is the whole point of a bottom test.
         let mut f = counted_loop();
-        invert_loops(&mut f);
+        invert_loops_with(&mut f, LoopInvertConfig::testing());
         let latch = &f.blocks[3];
         let Instruction::Cmp { lhs, .. } = &latch.instructions[1] else {
             panic!("expected the duplicated Cmp second");
@@ -493,7 +542,7 @@ mod tests {
     #[test]
     fn value_ids_stay_unique_after_inversion() {
         let mut f = counted_loop();
-        invert_loops(&mut f);
+        invert_loops_with(&mut f, LoopInvertConfig::testing());
         let mut seen = FxHashSet::default();
         for b in &f.blocks {
             for i in &b.instructions {
@@ -531,7 +580,7 @@ mod tests {
         // the collision is purely an ID-allocation hazard across the function.
         let mut f = counted_loop();
         f.blocks[4].instructions.insert(0, asm);
-        assert_eq!(invert_loops(&mut f), 1);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
 
         let mut seen = FxHashSet::default();
         for b in &f.blocks {
@@ -576,7 +625,7 @@ mod tests {
                 volatile: false,
             },
         );
-        assert_eq!(invert_loops(&mut f), 0);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
     }
 
     #[test]
@@ -585,7 +634,7 @@ mod tests {
         // execution instead of this iteration's.
         let mut f = counted_loop();
         f.blocks[2].instructions.push(add1(31, 10));
-        assert_eq!(invert_loops(&mut f), 0);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
     }
 
     #[test]
@@ -596,7 +645,7 @@ mod tests {
             blk(1, vec![cmp(10, 20), add1(20, 20)], cond(10, 1, 2)),
             blk(2, vec![], ret()),
         ]);
-        assert_eq!(invert_loops(&mut f), 0);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
     }
 
     #[test]
@@ -610,7 +659,7 @@ mod tests {
             blk(4, vec![add1(21, 20)], br(1)),
             blk(5, vec![], ret()),
         ]);
-        assert_eq!(invert_loops(&mut f), 0);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
     }
 
     #[test]
@@ -625,7 +674,7 @@ mod tests {
             blk(4, vec![cmp(11, 20), add1(20, 20)], cond(11, 1, 5)),
             blk(5, vec![], ret()),
         ]);
-        assert_eq!(invert_loops(&mut f), 0);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
     }
 
     #[test]
@@ -635,23 +684,16 @@ mod tests {
             f.blocks[1].instructions.insert(0, add1(40 + k, 20));
         }
         // Those values are used nowhere, so only the size guard can stop it.
-        assert_eq!(invert_loops(&mut f), 0);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 0);
     }
 
     #[test]
     fn the_pass_can_be_disabled() {
-        // Escape hatch for bisecting a codegen regression.
-        temp_env_set("CCC_NO_LOOP_INVERT", "1");
+        // Escape hatch for bisecting a codegen regression. Exercised through
+        // the config parameter: setting the environment variable here would be
+        // process-global and would race with the tests running in parallel.
         let mut f = counted_loop();
-        let n = invert_loops(&mut f);
-        temp_env_unset("CCC_NO_LOOP_INVERT");
+        let n = invert_loops_with(&mut f, LoopInvertConfig::disabled());
         assert_eq!(n, 0);
-    }
-
-    fn temp_env_set(k: &str, v: &str) {
-        unsafe { std::env::set_var(k, v) };
-    }
-    fn temp_env_unset(k: &str) {
-        unsafe { std::env::remove_var(k) };
     }
 }

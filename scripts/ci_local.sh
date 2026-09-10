@@ -20,6 +20,10 @@
 #   ./scripts/ci_local.sh --fast       # skip the two slowest oracles
 #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
 #
+# Environment:
+#   LCCC_TEST_REPEATS=N   run the unit-test suite N times (default 1). N > 1
+#                         surfaces tests that depend on process-global state.
+#
 # Exit status is non-zero if ANY gate fails, and every failure is repeated in
 # the summary at the end so a long log cannot hide one.
 set -u -o pipefail
@@ -86,8 +90,30 @@ fi
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
 
-gate "cargo-test" slow \
-    cargo test --profile fastbuild --all-targets --locked -j 2
+# The unit-test gate is what GitHub's required check runs on every PR, so it
+# belongs in the fast set: a red PR has to be reproducible with --fast.
+#
+# The suite runs its tests on parallel threads, so a test that touches
+# process-global state -- the environment, a static -- passes or fails
+# depending on what its neighbours are doing. A single run hides that class of
+# bug: PR #471 was red with a ~1-in-10 failure while every local single-shot
+# run was green. Repeating the suite is the only way to see it, and it is
+# cheap once the test binaries are built. Set LCCC_TEST_REPEATS to raise the
+# count (CI itself runs it once).
+cargo_test_repeated() {
+    local flags="" n i
+    # Reuse the flags the build gate resolved, or cargo rebuilds everything.
+    [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
+    n="${LCCC_TEST_REPEATS:-1}"
+    for ((i = 1; i <= n; i++)); do
+        if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j 2; then
+            printf 'cargo-test: FAILED on repeat %d/%d\n' "$i" "$n" >&2
+            return 1
+        fi
+    done
+}
+
+gate "cargo-test" fast cargo_test_repeated
 
 # CCC_VALIDATE_SSA is what CI sets; without it the corpus does not verify SSA
 # form after every pass and a malformed-IR bug can hide behind a correct

@@ -95,10 +95,20 @@ Root causes (distinct; all three FAILs MATCH gcc with rotation OFF):
    nested inside another (tighter "cond uses outer-header phi" is not
    enough — copy-prop hides the phi dest). Test: `simd_crc_adler`.
 
-Still open before default-ON: full corpus, 9-worst, nbody bit-identical,
-kernel 15/15, fuzz. Guard E is a correctness fence; nested inner loops
-no longer rotate (perf left on the table — a sound nested-rotate rewrite
-is future work).
+Still open before default-ON: full corpus, 9-worst, kernel 15/15, fuzz.
+Guard E is a correctness fence; nested inner loops no longer rotate (perf
+left on the table — a sound nested-rotate rewrite is future work).
+
+Update 2026-09-10 — `nbody` is bit-identical at every opt level, so it is no
+longer a blocker. The AArch64 `-O2`/`-O3` SIGSEGV it stood for was a register
+copy deleted while still live on the loop path; it is fixed by the exact-CFG
+alias fold described in
+`FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md` §2-§3.
+
+Scope note: this task is about the **IR** pass `loop_rotate.rs`. Independently,
+the ARM backend peephole rotates simple loops **by default**
+(`rotate_simple_loops`, off only under `CCC_NO_LOOP_ROTATE`) — that is not what
+this task gates.
 
 ## Session 2026-09-01 — post-merge audit (`453cbea`, PRs #325–#328)
 

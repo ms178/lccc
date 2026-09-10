@@ -84,6 +84,11 @@ printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
 if [ "${LCCC_ALLOW_WARNINGS:-0}" != "1" ]; then
     rustflags="${rustflags:+$rustflags }-D warnings"
 fi
+# Publish the resolved flags. RUSTFLAGS is part of cargo's fingerprint, so a
+# later `cargo test` that passed a different value would rebuild the entire
+# tree; `scripts/ci_local.sh` reads this file to reuse the build's cache.
+mkdir -p target && printf '%s\n' "$rustflags" > target/lccc-rustflags
+
 # Export unconditionally: RUSTFLAGS outranks every config file, so it is the
 # single authoritative source of rustc flags in all three link modes. (Only the
 # host target is built here; the i686 `-m32` link arg in .cargo/config.toml
