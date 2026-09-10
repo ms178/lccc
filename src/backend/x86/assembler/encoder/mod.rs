@@ -59,6 +59,22 @@ pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 /// Relaxable GOT load whose instruction starts 4 bytes before the
 /// displacement (REX2 `0xD5`). ELF `R_X86_64_CODE_4_GOTPCRELX`.
 pub const R_X86_64_CODE_4_GOTPCRELX: u32 = 43;
+/// REX2 TLS Initial-Exec. Linker looks 4 bytes before the disp32 for `0xD5`.
+pub const R_X86_64_CODE_4_GOTTPOFF: u32 = 44;
+/// REX2 TLSDESC. Linker looks 4 bytes before the disp32 for `0xD5`.
+pub const R_X86_64_CODE_4_GOTPC32_TLSDESC: u32 = 45;
+/// Relaxable GOT load whose instruction starts 6 bytes before the
+/// displacement (APX EVEX `0x62` + opcode + ModRM). ELF `R_X86_64_CODE_6_GOTPCRELX`.
+/// Not used for AVX-512 EVEX (those stay `R_X86_64_GOTPCREL`).
+pub const R_X86_64_CODE_6_GOTPCRELX: u32 = 49;
+/// APX EVEX TLS Initial-Exec. Linker looks 6 bytes before the disp32 for `0x62`.
+pub const R_X86_64_CODE_6_GOTTPOFF: u32 = 50;
+/// APX EVEX TLSDESC. Linker looks 6 bytes before the disp32 for `0x62`.
+/// GAS 2.47 rejects `{evex} lea …@TLSDESC`; the constant is kept so the
+/// encoder can classify a forced-EVEX form if one is ever accepted.
+pub const R_X86_64_CODE_6_GOTPC32_TLSDESC: u32 = 51;
+/// GOT-relative TLS descriptor load (`lea sym@TLSDESC(%rip), %reg`).
+pub const R_X86_64_GOTPC32_TLSDESC: u32 = 34;
 pub const R_X86_64_TPOFF32: u32 = 23;
 pub const R_X86_64_GOTTPOFF: u32 = 22;
 #[expect(dead_code)] // ELF standard constant, defined for reference/future use
@@ -3517,6 +3533,10 @@ mod apx_tests {
         assert!(fails("pop2 %rax, %rax"));
         assert!(fails("{nf} push2 %rax, %rcx"));
         assert!(fails("{evex} pushq %rax"));
+        // GAS 2.47: PUSH2/POP2 are register-only.
+        assert!(fails("push2 (%rax), %rcx"));
+        assert!(fails("pop2 %rax, (%rcx)"));
+        assert!(fails("push2p (%rax), %rcx"));
     }
 
     #[test]
@@ -3666,6 +3686,50 @@ mod apx_tests {
         let (h, rels) = hex_relocs("addq foo@GOTPCREL(%rip), %r16");
         assert_eq!(h, "d5 48 03 05 00 00 00 00");
         assert_eq!(rels, vec![R_X86_64_CODE_4_GOTPCRELX]);
+
+        // GAS 2.47: APX EVEX of a *relaxable* legacy ALU is CODE_6 (49).
+        let (h, rels) = hex_relocs("{evex} addq foo@GOTPCREL(%rip), %rax");
+        assert_eq!(h, "62 f4 fc 08 03 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_CODE_6_GOTPCRELX]);
+        let (h, rels) = hex_relocs("{nf} addq foo@GOTPCREL(%rip), %rax");
+        assert_eq!(h, "62 f4 fc 0c 03 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_CODE_6_GOTPCRELX]);
+        let (h, rels) = hex_relocs("addq foo@GOTPCREL(%rip), %rax, %r16");
+        assert_eq!(h, "62 f4 fc 10 03 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_CODE_6_GOTPCRELX]);
+        let (h, rels) = hex_relocs("{rex2} addq foo@GOTPCREL(%rip), %rax");
+        assert_eq!(h, "d5 08 03 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_CODE_4_GOTPCRELX]);
+
+        // AVX-512 EVEX and APX map-4 BMI/crc32 are not relaxable: type 9.
+        let (h, rels) = hex_relocs("vmovdqa64 foo@GOTPCREL(%rip), %zmm0");
+        assert_eq!(h, "62 f1 fd 48 6f 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_GOTPCREL]);
+        let (h, rels) = hex_relocs("{evex} crc32q foo@GOTPCREL(%rip), %rax");
+        assert_eq!(h, "62 f4 fc 08 f1 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_GOTPCREL]);
+        let (h, rels) = hex_relocs("{evex} andnq foo@GOTPCREL(%rip), %rax, %rcx");
+        assert_eq!(h, "62 f2 fc 08 f2 0d 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_GOTPCREL]);
+
+        // GOTTPOFF / TLSDESC: REX2 → CODE_4, APX EVEX ALU → CODE_6, else classic.
+        let (h, rels) = hex_relocs("movq foo@GOTTPOFF(%rip), %r16");
+        assert_eq!(h, "d5 48 8b 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_CODE_4_GOTTPOFF]);
+        let (h, rels) = hex_relocs("{evex} addq foo@GOTTPOFF(%rip), %rax");
+        assert_eq!(h, "62 f4 fc 08 03 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_CODE_6_GOTTPOFF]);
+        let (h, rels) = hex_relocs("leaq foo@TLSDESC(%rip), %rax");
+        assert_eq!(h, "48 8d 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_GOTPC32_TLSDESC]);
+        let (h, rels) = hex_relocs("{rex2} leaq foo@TLSDESC(%rip), %rax");
+        assert_eq!(h, "d5 08 8d 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_CODE_4_GOTPC32_TLSDESC]);
+
+        // GAS 2.47: GOTPCREL without %rip stays un-relaxable type 9, even REX2.
+        let (h, rels) = hex_relocs("addq foo@GOTPCREL(%rax), %r16");
+        assert_eq!(h, "d5 48 03 80 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_GOTPCREL]);
     }
 
     #[test]

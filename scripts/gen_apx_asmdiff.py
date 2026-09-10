@@ -257,6 +257,33 @@ def main() -> None:
         ],
     )
 
+    # GAS 2.47: APX EVEX of a relaxable legacy ALU is R_X86_64_CODE_6_GOTPCRELX
+    # (49); REX2 is CODE_4 (43). asmdiff compares reloc types too.
+    case(
+        "apx_gotpcrel_code6",
+        [
+            "{evex} addq foo@GOTPCREL(%rip), %rax",
+            "{nf} addq foo@GOTPCREL(%rip), %rax",
+            "addq foo@GOTPCREL(%rip), %rax, %r16",
+            "{rex2} addq foo@GOTPCREL(%rip), %rax",
+            "addq foo@GOTPCREL(%rip), %r16",
+            "movq foo@GOTTPOFF(%rip), %r16",
+            "{evex} addq foo@GOTTPOFF(%rip), %rax",
+            "leaq foo@TLSDESC(%rip), %rax",
+            "{rex2} leaq foo@TLSDESC(%rip), %rax",
+        ],
+    )
+
+    # GAS 2.47: AVX-512 EVEX and APX map-4 BMI/crc32 stay R_X86_64_GOTPCREL (9).
+    case(
+        "apx_gotpcrel_not_code6",
+        [
+            "vmovdqa64 foo@GOTPCREL(%rip), %zmm0",
+            "{evex} crc32q foo@GOTPCREL(%rip), %rax",
+            "{evex} andnq foo@GOTPCREL(%rip), %rax, %rcx",
+        ],
+    )
+
     print("\n".join(lines).rstrip() + "\n")
 
 

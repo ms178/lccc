@@ -135,6 +135,7 @@ fn reg_name_8(reg: PhysReg) -> &'static str {
         14 => "dil",
         15 => "sil",
         16 => "dl",
+        n if (40..=55).contains(&n) => EGPR8[(n - 40) as usize],
         _ => unreachable!("invalid machinst register index {}", reg.0),
     }
 }
@@ -1222,7 +1223,19 @@ pub fn emit_machinsts(insts: &[MachInst], out: &mut AsmOutput) {
     let apx = super::isel::apx_enabled();
     let mut i = 0;
     while i < insts.len() {
-        if apx && i + 1 < insts.len() && try_emit_ndd_pair(&insts[i], &insts[i + 1], out) {
+        // 64/32-bit `mov %src1, %dst; add %src, %dst` → LEA. One µop, no
+        // flags, 4 bytes vs NDD EVEX 6 or mov+add 6. Legal on every x86-64
+        // (the 14700KF default path included) — dest ≠ src1 is the only
+        // shape LEA wins, and isel already prefers two-address ADD when
+        // dest coalesced with the base.
+        if i + 1 < insts.len() && try_emit_lea_add_pair(&insts[i], &insts[i + 1], out) {
+            i += 2;
+            continue;
+        }
+        if apx
+            && i + 1 < insts.len()
+            && try_emit_ndd_pair(&insts[i], &insts[i + 1], &insts[i + 2..], out)
+        {
             i += 2;
             continue;
         }
@@ -1231,10 +1244,80 @@ pub fn emit_machinsts(insts: &[MachInst], out: &mut AsmOutput) {
     }
 }
 
+/// True when a later MachInst still consumes EFLAGS produced here.
+/// Flag-neutral moves/LEAs are skipped; the next flag writer kills them.
+fn flags_live_after(rest: &[MachInst]) -> bool {
+    for inst in rest {
+        match inst {
+            MachInst::Cmov { .. } | MachInst::SetCC { .. } | MachInst::Jcc { .. } => return true,
+            MachInst::Alu { .. }
+            | MachInst::Imul3 { .. }
+            | MachInst::Neg { .. }
+            | MachInst::Not { .. }
+            | MachInst::Shift { .. }
+            | MachInst::Cmp { .. }
+            | MachInst::Test { .. }
+            | MachInst::Div { .. }
+            | MachInst::Cqto { .. }
+            | MachInst::XorRdx => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Fuse `mov %src1, %dst; add %src, %dst` into `lea (src1, src), dst`.
+fn try_emit_lea_add_pair(a: &MachInst, b: &MachInst, out: &mut AsmOutput) -> bool {
+    let MachInst::Mov {
+        src: MachOperand::Reg(src1),
+        dst: MachOperand::Reg(dst_m),
+        size: sz_mov,
+    } = a
+    else {
+        return false;
+    };
+    let MachInst::Alu {
+        op: AluOp::Add,
+        src,
+        dst,
+        size: sz_alu,
+    } = b
+    else {
+        return false;
+    };
+    if !matches!(*sz_alu, OpSize::S32 | OpSize::S64)
+        || sz_mov != sz_alu
+        || dst_m != dst
+        || src1 == dst
+    {
+        return false;
+    }
+    if matches!(src, MachOperand::Reg(r) if r == dst) {
+        return false;
+    }
+    let suffix = sz_alu.suffix();
+    let dst_str = fmt_reg(dst, *sz_alu);
+    let base = fmt_reg(src1, OpSize::S64);
+    match src {
+        MachOperand::Reg(idx) => {
+            let index = fmt_reg(idx, OpSize::S64);
+            out.emit_fmt(format_args!("    lea{suffix} ({base}, {index}), {dst_str}"));
+            true
+        }
+        MachOperand::Imm(v) if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 => {
+            out.emit_fmt(format_args!("    lea{suffix} {v}({base}), {dst_str}"));
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Fuse `mov %src1, %dst; op %src, %dst` into APX NDD `op %src, %src1, %dst`
 /// when dest ≠ src1. Off unless `-mapx` (the encodings are #UD otherwise).
+/// `{nf}` is set when no later insn in this window reads the flags — NDD is
+/// already EVEX, so the NF bit is free and skips the APX flag-merge uop.
 /// Returns true if both instructions were consumed.
-fn try_emit_ndd_pair(a: &MachInst, b: &MachInst, out: &mut AsmOutput) -> bool {
+fn try_emit_ndd_pair(a: &MachInst, b: &MachInst, rest: &[MachInst], out: &mut AsmOutput) -> bool {
     let MachInst::Mov {
         src: MachOperand::Reg(src1),
         dst: MachOperand::Reg(dst_m),
@@ -1273,8 +1356,9 @@ fn try_emit_ndd_pair(a: &MachInst, b: &MachInst, out: &mut AsmOutput) -> bool {
     let src_str = fmt_operand(src, *sz_alu, out);
     let src1_str = fmt_reg(src1, *sz_alu);
     let dst_str = fmt_reg(dst, *sz_alu);
+    let nf = if flags_live_after(rest) { "" } else { "{nf} " };
     out.emit_fmt(format_args!(
-        "    {mnem}{suffix} {src_str}, {src1_str}, {dst_str}"
+        "    {nf}{mnem}{suffix} {src_str}, {src1_str}, {dst_str}"
     ));
     true
 }

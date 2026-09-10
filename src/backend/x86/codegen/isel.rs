@@ -1244,17 +1244,20 @@ pub fn shlx_mode() -> ShlxMode {
     }
 }
 
-static APX_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static APX_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Publish the TU's `-mapx` contract for emitters without `&self`
-/// (MachInst NDD fusion). Default off: APX encodings are #UD on every
-/// shipping core.
+/// (MachInst NDD fusion / window EGPR pool). Default off: APX encodings
+/// are #UD on every shipping core. Thread-local so two TUs compiled on
+/// different threads cannot leak `-mapx` into a Raptor Lake object.
 pub fn set_apx_enabled(on: bool) {
-    APX_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+    APX_ENABLED.with(|c| c.set(on));
 }
 
 pub fn apx_enabled() -> bool {
-    APX_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    APX_ENABLED.with(|c| c.get())
 }
 
 /// Try to lower a variable-count shift to `ShiftX`.  Returns false (with

@@ -1982,7 +1982,7 @@ pub(super) fn emit_executable(
                         }
                         w32(&mut out, fp, v as u32);
                     }
-                    R_X86_64_GOTTPOFF => {
+                    R_X86_64_GOTTPOFF | R_X86_64_CODE_4_GOTTPOFF | R_X86_64_CODE_6_GOTTPOFF => {
                         // Initial Exec TLS via GOT: GOT entry contains TPOFF value
                         let mut resolved = false;
                         if !sym.name.is_empty() && !sym.is_local() {
@@ -2001,6 +2001,16 @@ pub(super) fn emit_executable(
                             }
                         }
                         if !resolved {
+                            // IE-to-LE rewrites a REX-prefixed movq/addq. REX2
+                            // (CODE_4) and APX EVEX (CODE_6) keep a GOT slot
+                            // when one exists; without a slot we refuse rather
+                            // than corrupt the prefix.
+                            if rela.rela_type != R_X86_64_GOTTPOFF {
+                                return Err(format!(
+                                    "GOTTPOFF IE-to-LE relaxation failed: APX/REX2 form of '{}' has no GOT slot",
+                                    sym.name
+                                ));
+                            }
                             // IE-to-LE relaxation: convert GOT-indirect to immediate TPOFF.
                             //   movq  sym@GOTTPOFF(%rip), %reg  ->  movq $tpoff, %reg
                             //   addq  sym@GOTTPOFF(%rip), %reg  ->  addq $tpoff, %reg
@@ -2037,7 +2047,8 @@ pub(super) fn emit_executable(
                     R_X86_64_GOTPCREL
                     | R_X86_64_GOTPCRELX
                     | R_X86_64_REX_GOTPCRELX
-                    | R_X86_64_CODE_4_GOTPCRELX => {
+                    | R_X86_64_CODE_4_GOTPCRELX
+                    | R_X86_64_CODE_6_GOTPCRELX => {
                         if !sym.name.is_empty() && !sym.is_local() {
                             if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if let Some(gi) = g.got_idx {
@@ -2058,10 +2069,7 @@ pub(super) fn emit_executable(
                                     w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
                                     continue;
                                 }
-                                if (rela.rela_type == R_X86_64_GOTPCRELX
-                                    || rela.rela_type == R_X86_64_REX_GOTPCRELX
-                                    || rela.rela_type == R_X86_64_CODE_4_GOTPCRELX)
-                                    && g.defined_in.is_some()
+                                if is_gotpcrelx_relaxable(rela.rela_type) && g.defined_in.is_some()
                                 {
                                     if fp >= 2 && fp < out.len() && out[fp - 2] == 0x8b {
                                         out[fp - 2] = 0x8d;
@@ -2204,16 +2212,14 @@ pub(super) fn emit_executable(
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
                         w64(&mut out, fp, (tpoff + a) as u64);
                     }
-                    R_X86_64_GOTPC32_TLSDESC => {
+                    R_X86_64_GOTPC32_TLSDESC
+                    | R_X86_64_CODE_4_GOTPC32_TLSDESC
+                    | R_X86_64_CODE_6_GOTPC32_TLSDESC => {
                         // TLSDESC -> LE relaxation:
-                        //   48 8d 05 <disp32>  lea sym@tlsdesc(%rip),%rax
+                        //   [REX|REX2|EVEX] 8d 05 <disp32>  lea sym@tlsdesc(%rip),%rax
                         // becomes
-                        //   48 c7 c0 <tpoff32> mov $tpoff,%rax
-                        if fp >= 3
-                            && out[fp - 3] == 0x48
-                            && out[fp - 2] == 0x8d
-                            && out[fp - 1] == 0x05
-                        {
+                        //   [same prefix]   c7 c0 <tpoff32> mov $tpoff,%rax
+                        if fp >= 2 && out[fp - 2] == 0x8d && out[fp - 1] == 0x05 {
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
                             out[fp - 2] = 0xc7;
                             out[fp - 1] = 0xc0;

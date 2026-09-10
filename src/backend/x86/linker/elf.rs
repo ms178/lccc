@@ -46,7 +46,46 @@ pub const R_X86_64_PC64: u32 = 24;
 pub const R_X86_64_GOTPCRELX: u32 = 41;
 pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
 pub const R_X86_64_CODE_4_GOTPCRELX: u32 = 43;
+pub const R_X86_64_CODE_4_GOTTPOFF: u32 = 44;
+pub const R_X86_64_CODE_4_GOTPC32_TLSDESC: u32 = 45;
+pub const R_X86_64_CODE_6_GOTPCRELX: u32 = 49;
+pub const R_X86_64_CODE_6_GOTTPOFF: u32 = 50;
+pub const R_X86_64_CODE_6_GOTPC32_TLSDESC: u32 = 51;
 pub const R_X86_64_IRELATIVE: u32 = 37;
+
+/// GOT-load family: fill from a GOT slot (and, for the `*X` types, may LEA-relax).
+#[inline]
+pub fn is_gotpcrel_family(t: u32) -> bool {
+    matches!(
+        t,
+        R_X86_64_GOTPCREL
+            | R_X86_64_GOTPCRELX
+            | R_X86_64_REX_GOTPCRELX
+            | R_X86_64_CODE_4_GOTPCRELX
+            | R_X86_64_CODE_6_GOTPCRELX
+    )
+}
+
+/// Relaxable GOTPCRELX variants (linker may rewrite `mov` → `lea`).
+#[inline]
+pub fn is_gotpcrelx_relaxable(t: u32) -> bool {
+    matches!(
+        t,
+        R_X86_64_GOTPCRELX
+            | R_X86_64_REX_GOTPCRELX
+            | R_X86_64_CODE_4_GOTPCRELX
+            | R_X86_64_CODE_6_GOTPCRELX
+    )
+}
+
+/// TLS Initial-Exec through a GOT slot (classic / REX2 / APX EVEX).
+#[inline]
+pub fn is_gottpoff_family(t: u32) -> bool {
+    matches!(
+        t,
+        R_X86_64_GOTTPOFF | R_X86_64_CODE_4_GOTTPOFF | R_X86_64_CODE_6_GOTTPOFF
+    )
+}
 pub const R_X86_64_16: u32 = 12;
 pub const R_X86_64_PC16: u32 = 13;
 pub const R_X86_64_8: u32 = 14;

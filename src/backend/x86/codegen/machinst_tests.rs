@@ -4784,7 +4784,7 @@ fn isel_refuses_register_homed_store_value() {
 }
 
 #[test]
-fn apx_ndd_fuses_mov_plus_add_only_when_enabled() {
+fn mov_plus_add_folds_to_lea_even_without_apx() {
     let mov = MachInst::Mov {
         src: MachOperand::Reg(MachReg::Phys(PhysReg(14))), // rdi
         dst: MachOperand::Reg(MachReg::Phys(PhysReg(0))),  // rax
@@ -4797,25 +4797,72 @@ fn apx_ndd_fuses_mov_plus_add_only_when_enabled() {
         size: OpSize::S64,
     };
     super::isel::set_apx_enabled(false);
+    let mut out = AsmOutput::new();
+    emit_machinsts(&[mov, add], &mut out);
+    let text = out.buf;
+    assert!(
+        text.contains("leaq (%rdi, %rsi), %rax") || text.contains("leaq (%rdi,%rsi), %rax"),
+        "mov+add dest≠src1 must become LEA (1 µop, 4 bytes, no flags), got {text}"
+    );
+    assert!(
+        !text.contains("movq"),
+        "the leading copy should vanish: {text}"
+    );
+    assert!(!text.contains("addq"), "ADD must not remain: {text}");
+}
+
+#[test]
+fn apx_ndd_fuses_mov_plus_sub_only_when_enabled() {
+    let mov = MachInst::Mov {
+        src: MachOperand::Reg(MachReg::Phys(PhysReg(14))), // rdi
+        dst: MachOperand::Reg(MachReg::Phys(PhysReg(0))),  // rax
+        size: OpSize::S64,
+    };
+    let sub = MachInst::Alu {
+        op: AluOp::Sub,
+        src: MachOperand::Reg(MachReg::Phys(PhysReg(15))), // rsi
+        dst: MachReg::Phys(PhysReg(0)),
+        size: OpSize::S64,
+    };
+    super::isel::set_apx_enabled(false);
     let mut off = AsmOutput::new();
-    emit_machinsts(&[mov.clone(), add.clone()], &mut off);
+    emit_machinsts(&[mov.clone(), sub.clone()], &mut off);
     let off_text = off.buf;
     assert!(
-        off_text.contains("movq") && off_text.contains("addq"),
+        off_text.contains("movq") && off_text.contains("subq"),
         "without -mapx the pair must stay two-address, got {off_text}"
     );
 
     super::isel::set_apx_enabled(true);
     let mut on = AsmOutput::new();
-    emit_machinsts(&[mov, add], &mut on);
-    super::isel::set_apx_enabled(false);
+    emit_machinsts(&[mov.clone(), sub.clone()], &mut on);
     let on_text = on.buf;
     assert!(
-        on_text.contains("addq %rsi, %rdi, %rax"),
-        "APX NDD should emit 3-operand add, got {on_text}"
+        on_text.contains("subq %rsi, %rdi, %rax"),
+        "APX NDD should emit 3-operand sub, got {on_text}"
+    );
+    assert!(
+        on_text.contains("{nf}"),
+        "NDD with dead flags should set {{nf}} (free in EVEX): {on_text}"
     );
     assert!(
         !on_text.contains("movq"),
         "the leading copy should vanish under NDD: {on_text}"
+    );
+
+    // Flags live: a following cmov must keep the SUB's EFLAGS.
+    let cmov = MachInst::Cmov {
+        cc: CondCode::E,
+        src: MachOperand::Reg(MachReg::Phys(PhysReg(15))),
+        dst: MachReg::Phys(PhysReg(1)),
+        size: OpSize::S64,
+    };
+    let mut live = AsmOutput::new();
+    emit_machinsts(&[mov, sub, cmov], &mut live);
+    super::isel::set_apx_enabled(false);
+    let live_text = live.buf;
+    assert!(
+        live_text.contains("subq %rsi, %rdi, %rax") && !live_text.contains("{nf}"),
+        "NDD feeding cmov must write flags, got {live_text}"
     );
 }
