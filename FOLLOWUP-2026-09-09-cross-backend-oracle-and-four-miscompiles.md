@@ -1,562 +1,354 @@
-# FOLLOWUP — Session 33 (2026-09-09): cross-backend execution oracle + the defects it found
+# Cross-backend oracle, miscompile fixes and cross-pollination
 
-**Branch state**: `ms178-1.patch` rebased on `ms178/lccc` main (`91ecc083`).
-**Compiler**: `scripts/build_lccc_fast.sh` (fastbuild, -O1, -j2, 4 GiB swapfile).
-**Verified**: a new cross-backend execution oracle (§1) found **5 distinct
-defects** — 4 silent miscompiles plus one hard compile failure — plus a scaled
-variant of the last one. **All are fixed and verified** against GCC on all four
-backends at `-O0/-O1/-O2/-O3/-Os`.
-**CI**: `scripts/ci_local.sh` 16/16 green (see §10).
+State of the work as of the ARM/RISC-V copy-coalescing ports. This document
+describes **what is true now**; superseded analyses are not kept as history.
 
 ---
 
-## 1. The instrument this session built: `scripts/cross_backend_check.py`
+## 0. Environment: the sandbox resets at every turn boundary
 
-**WHY.** LCCC has four production backends (x86-64, i686, AArch64, RISC-V)
-sharing a front end, IR and optimiser but each with its own code generator.
-Every defect found this session was invisible to single-target testing and to
-assembly diffing.
-
-**The oracle.** A deterministic C program's observable behaviour (exit status +
-stdout) is a property of the *program plus its C data model*, not of the target.
-So the host GCC build is the reference and every backend must reproduce it.
-That removes the need for cross toolchains: references are native, and
-correctness is checked by *execution*, not by eyeballing assembly.
-
-```
-scripts/cross_backend_check.py                        # whole corpus, -O0..-Os
-scripts/cross_backend_check.py --programs sha256_transform --json /tmp/x.json
-scripts/cross_backend_check.py --gate --opts="-O0,-O2"  # CI-usable exit status
-```
-
-* Runs each binary natively (x86-64, i686) or under `qemu-user` (AArch64,
-  RISC-V); static linking, no runtime dependencies.
-* **Per-data-model reference**: `unsigned long` is 64-bit on LP64 targets and
-  32-bit on i686, so a `%lu` checksum legitimately differs. i686 is compared
-  against `gcc -m32`, the LP64 targets against plain `gcc`. Without this the
-  oracle reports false positives (it did, on `expat_xml_scan.c`).
-* Workload scaling: the corpus' `#ifndef` size macros are overridden with `-D`
-  so runs finish under TCG (`--no-scale` restores full size).
-* `--json` writes a full report; `--gate` exits non-zero on any mismatch or
-  compile failure. Exit 2 = usage/environment problem.
-* **Scale-macro fallback ladder**: the size macros are passed to every program
-  because unused `-D` defines are harmless, but a program that uses one of those
-  names as an identifier (an enum member `N`, a variable `SIZE`) is a *program*
-  compile error, not a compiler bug. The oracle retries the unscaled program and
-  then builds the backends the same way, so reference and target always see the
-  identical program (`binary_search.c`, `double_reduction.c`).
-
-**Corpus scaling guards** (session 32) are what make this possible: 28/45
-programs now accept `-DBLOCK_COUNT=`/`-DPASSES=`/`-DXML_SIZE=`-style overrides.
-
-**First-run findings** (23 min, 45 programs × 5 opt levels × 4 backends):
-`expat_xml_scan.c` i686 wrong at **every** level; `glibc_memcmp.c` AArch64
-`-Os` segfault; `fannkuch.c` AArch64 `-Os` internal error. §5 and §6 add two
-more found while narrowing those down. Everything else agreed with GCC.
-
----
-
-## 2. Fixed: AArch64 silent miscompile (`sha256_transform`) — **verified**
-
-Root cause: `emit_shifted_logical_impl` (and the madd/msub twins) staged the
-non-shifted operand *first*; `materialize` clobbered `x0`, destroying the
-shifted operand that lived only there. `operand_to_x0` then emitted
-`mov x0, #0` and the checksum silently lost its `state[3]` term — the kernel
-still passed its own known-answer self-check, so nothing but a cross-target
-comparison could see it.
-
-Change: `stage_operands_acc_first()` in `src/backend/arm/codegen/alu.rs`; the
-`mov x0, #0` fallback in `operand_to_x0` is now a hard `panic!`.
-
-**Result**: `sha256_transform.c` matches GCC on **all four backends** at
-`-O0/-O1/-O2/-O3/-Os` (BLOCK_COUNT 3 and 64).
-
-## 3. Fixed: `-O0` emitted x86 text into AArch64/RISC-V assembly — **verified**
-
-`remat_indexed_acc_safe` (`src/backend/generation.rs`) is arch-agnostic but
-hard-coded `pushq %rax` / `popq %rax`, which the AArch64/RISC-V assemblers
-reject ("unsupported instruction: pushq %rax") — `lccc-arm -O0` could not
-compile `sha256_transform.c` at all.
-
-Change: new **required** (no default) `ArchCodegen::emit_acc_save` /
-`emit_acc_restore` hooks (`src/backend/traits.rs`), implemented per target:
-
-| target | save | restore | notes |
-|---|---|---|---|
-| x86-64 | `pushq %rax` | `popq %rax` | flags-neutral |
-| i686 | `pushl %eax` | `popl %eax` | flags-neutral |
-| AArch64 | `str x0, [sp, #-16]!` | `ldr x0, [sp], #16` | pre/post-index; keeps 16-byte SP alignment |
-| RISC-V | `addi sp,sp,-16` + `sd t0,0(sp)` | `ld t0,0(sp)` + `addi sp,sp,16` | no pre-indexed store exists |
-
-SP-relative slot emitters on ARM (`emit_store_to_sp`, `emit_load_from_sp`,
-`emit_stp_to_sp`, `emit_ldp_from_sp`, `emit_add_sp_offset`) and RISC-V
-(`emit_store_to_sp`, `emit_load_from_sp`) now bias offsets by
-`out.rsp_frame_size` through a new `slot_offset()` helper; x29/x19-based frames
-are unaffected, exactly like x86's RBP frames. `emit_addi_sp` is deliberately
-*not* biased (it moves SP itself). Outside the protected window the field is
-zero, so all existing codegen is bit-identical.
-
-Because the hooks are required rather than defaulted, a future target cannot
-silently inherit x86 text again.
-
-## 4. Fixed: i686 expat name-scanner miscompile — **verified**
-
-`expat_xml_scan.c` returned 2 (self-check failure) on i686 at every level ≥
--O1: the UTF-8 name-length kernel returned 0 instead of 7/8. Expat is one of
-the user's named golden workloads.
-
-Chain: `range_fold` folded the classification (32-bit `unsigned long` changes
-its range lattice), producing `movl %ebp,%eax; cmpl $128,%eax`. Pattern 6 of
-`fold_reg_copy_idioms` correctly rewrote that to `cmpl $128,%ebp`; Pattern 15
-then narrowed it to `cmpw $128,%r16` — and `low_subreg_name("%ebp", 2)`
-returned `None`, so `.unwrap_or("%ax")` **silently substituted a different
-register**. Every character took the UTF-8 path.
-
-```asm
-; before                          ; after
-movzbl (%edi), %ebp               movzbl (%edi), %ebp
-cmpw   $128, %ax   ; WRONG REG    cmpw   $128, %bp   ; correct
-```
-
-Changes (both in `src/backend/i686/codegen/peephole.rs`):
-1. `low_subreg_name` now knows the 16-bit forms of `%ebp/%esi/%edi`
-   (`%bp/%si/%di`) — legal in 32-bit mode. `%esp` stays `None`: narrowing a
-   compare onto the stack pointer must never happen. (The 8-bit forms are
-   still limited to eax/ecx/edx/ebx, which keeps Pattern 13 safe.)
-2. The `%ax` fallback is gone: when there is no 16-bit name the rewrite is
-   **refused** (`i += 1; continue`). A missed 2-byte size win costs nothing;
-   a wrong register costs correctness.
-
-**Result**: `expat_min.c` and the full `expat_xml_scan.c` match `gcc -m32` at
-`-O0/-O1/-O2/-O3/-Os`.
-
-## 5. Fixed: AArch64 `-Os` value orphaned by `invalidate_acc` — **verified**
-
-`fannkuch.c` at `-Os` reached `emit_load_indexed_impl`'s unassigned-dest path:
-`ldrsw x0, […]` produced a value with no register assignment and no stack slot,
-`store_x0_to(dest)` registered x0 as its home, and the very next line called
-`invalidate_acc()` — orphaning the value. The next `operand_to_x0` had nothing
-left, which is what the new panic gate reports (before the gate: `mov x0, #0`,
-i.e. a silent miscompile).
-
-Change: new `store_x0_to_and_release()` — drops the accumulator entry **only
-when the value actually reached a durable home** — used at the five sites that
-paired `store_x0_to` with `invalidate_acc` (`memory.rs`, `cast_ops.rs`,
-3× `comparison.rs`).
-
-**Result**: `fannkuch.c` matches GCC on all four backends at `-O0..-Os`.
-
----
-
-## 6. Fixed: AArch64 `-Os` peephole deleted a live alias — **verified**
-
-`glibc_memcmp.c` segfaulted under qemu-aarch64 at `-Os` only (x86-64, i686 and
-RISC-V were correct).
-
-* `LCCC_NO_PEEPHOLE=1` fixed it; **no** existing per-pass kill switch did
-  (`CCC_NO_FP_PAIR`, `_SLOT_LOAD_DEDUP`, `_FP_SLOT_FWD`, `_STORE_DSE`,
-  `_STORE_SINK`, `_GDSE`, `_REUSE_STACK_LOADS`, `_ZEXT_MASK_FOLD`,
-  `_AND_TST_FUSION`, `_DEAD_PRE_RET`, `_SPILL_THREAD`, `_ADRP_CSE`,
-  `_LOOP_ROTATE`, nor any of the 44 `CCC_DISABLE_PASSES` names except `all` /
-  `ifconv`, which merely remove the triggering shape).
-* Bisecting the Phase-1/2 passes with a temporary `CCC_SKIP_PEEP` gate pointed
-  at **`propagate_address_aliases`** — one rebuild, then one test per name.
-* Proven pre-existing: reverting the §5 hunk still segfaulted, and the acc-save
-  window (`str x0, [sp, #-16]!`) appears in neither the good nor the bad asm.
-
-**Mechanism.** The pass rewrites `mov xD, xS` into its address uses
-(`ldr x0, [xD]` → `ldr x0, [xS]`) and deletes the mov when the scan finds a
-later instruction that overwrites `xD` — treating that as proof the value is
-dead. The scan is *textual*, so the overwrite it found (`mov x19, x0`) sat in a
-**different basic block** than the mov (the prologue's `mov x19, x24`), which
-does not dominate every path out of the mov's block. `.LBB37` reached
-`ldr x0, [x19]` without passing the overwrite, so it read the caller's
-callee-saved value restored by the prologue's `ldp x19, x20, [sp, #112]` — a
-garbage pointer.
-
-Fix: track whether the scan has crossed a label. A redefinition of `dst` proves
-death **only inside the mov's own block**; once the scan has left that block the
-transform bails out instead of deleting the mov.
-
-**Measured cost of the conservative bail** (instruction counts over 43 corpus
-programs, `lccc-arm`): `-Os` 10 677 → 10 703 (+26, **+0.24 %**), `-O2`
-11 248 → 11 279 (+31, **+0.28 %**). Correctness is worth 0.25 % of code size.
-
-The same fix also cleared §6b from the previous revision: scaled-down
-`fannkuch.c -Os` no longer trips the `operand_to_x0` panic gate (it was the same
-lost-alias → orphaned-value path). Both previously-open items are now closed.
-
-## 6b. Sibling-pass audit (read-only, no behaviour change)
-
-The §6 bug is a design pattern worth grepping for: a peephole pass that scans
-**across** labels while using a **straight-line** death proof. Auditing every
-pass in `src/backend/arm/codegen/peephole.rs` that deletes a line:
-
-| pass | verdict |
-|---|---|
-| `propagate_address_aliases` | **was the bug** — scanned past labels, now fixed |
-| `eliminate_overwritten_moves` | sound: breaks on `Label`/`Branch`/`Call`/`Ret` |
-| `eliminate_overwritten_stores` | sound: default arm breaks the scan |
-| `reuse_stack_loads_within_blocks` | sound: block-scoped, cache cleared at every label |
-| `eliminate_dead_pre_ret_moves` | sound: only pre-`ret` moves |
-
-So `propagate_address_aliases` was the only pass with the flaw. The i686
-peephole uses a different mechanism (`staging_reads_safe`, a whole-function read
-census) and is listed as an audit item in §9 rather than assumed safe.
-
-## 7. Techniques that worked (reuse these)
-
-| need | how |
-|---|---|
-| find cross-target miscompiles | `scripts/cross_backend_check.py` — execution, not assembly |
-| locate a peephole culprit | `LCCC_NO_PEEPHOLE=1` for i686/ARM/RISC-V (**not** `CCC_NO_PEEPHOLE`, which only gates ARM and x86-64), then diff good/bad `-S` output |
-| bisect a pass | `CCC_DISABLE_PASSES=<name>` (harvest names: `grep -rhoE 'pass_disabled\(&(disabled\|dis), "[a-z0-9_]+"\)' src/passes/*.rs`) |
-| find which peephole *pattern* | temporarily wrap each pass call in a `CCC_SKIP_PEEP`-gated macro, rebuild once, then bisect by name (this is how Pattern 15 was caught) |
-| prove a bug is/isn't yours | revert the one suspect hunk, rebuild (~25 s incremental), re-test |
-| find the emitter of a bad instruction | `RUST_BACKTRACE=full` gives `operand_to_x0` ← `emit_store_default` ← `emit_store_impl` in one shot |
-
-## 8. Environment notes
-
-* `gcc -m32` works after removing the conflicting `gcc-<N>-<triplet>` cross
-  packages; use it as the i686 reference.
-* qemu-user needs sysroots: `-L /usr/aarch64-linux-gnu`,
-  `-L /usr/riscv64-linux-gnu`.
-* Distro `rustc` is 1.85 (< MSRV 1.98.1) — use the rustup toolchain.
-* **`/tmp` is a 993 MB tmpfs on this box.** A full oracle run builds ~1 350
-  static binaries; `tempfile.TemporaryDirectory()` defaults to `/tmp` and the
-  run died at `binary_trees.c` with `final link failed: No space left on
-  device` (188 spurious "reference compile failed" entries). The oracle now
-  writes to a disk-backed scratch directory (`--scratch`, default
-  `target/crossbe-scratch`) and unlinks every binary the moment it has been
-  consumed. Any new harness script must do the same — never let scratch output
-  accumulate in `/tmp`.
-* Full-corpus oracle run ≈ 45–60 min wall clock; run it with `start_process`
-  and `PYTHONUNBUFFERED=1` (otherwise `tee` sees nothing until exit).
-* Never rebuild `lccc` while an oracle run is in flight: it replaces the
-  binaries under test and silently mixes results.
-
-## 9. TODO for the next session (ordered)
-
-1. Re-run `scripts/cross_backend_check.py` over the full corpus × 5 opt levels
-   (≈23 min) and drive it to zero failures; then wire `--gate` into
-   `scripts/ci_local.sh` on a reduced matrix so cross-backend regressions cannot
-   land silently.
-2. Add the six fixed defects as **execution** tests (not just unit tests) so the
-   oracle's coverage is permanent and cheap.
-3. Apply the §6 lesson to the sibling passes that use the same textual
-   "first overwrite proves death" reasoning: `eliminate_overwritten_moves`,
-   `eliminate_overwritten_stores`, `thread_spill_slots` and the i686
-   `staging_reads_safe` family all scan linearly and may hold the same latent
-   bug. Audit them with the oracle rather than by inspection.
-4. AArch64 peephole: re-enable global store forwarding (correctness bug,
-   test 0036_0041) — the oracle now makes a fix verifiable.
-5. Resume the session-32 backlog: the `ms178-1.patch` insn-count win, the
-   `ms178-1-ext-*.patch` segments, and `lccc`'s icount (2.66 M vs 1.96 M).
-
-## 10. CI status
-
-`scripts/ci_local.sh`: **16/16 PASS**. The only failure seen this session was
-`rustfmt`, caused by a temporary debug macro that was removed before the final
-run; `cargo fmt --all -- --check` is clean on the final tree.
-
-| gate | result |
-|---|---|
-| build, rust-toolchain-selector, cargo-test | PASS |
-| regression-corpus-ssa | PASS — 726 passed, 0 failed, 9 skipped-compare (735 total) |
-| benchmark-output-oracle, differential-correctness-oracle | PASS |
-| loop-alignment-contract, fuzz-engine-wiring, differential-fuzz-smoke | PASS |
-| strict-computed-recip-codegen, machinst-window-alloc | PASS |
-| linker-fuzz, linker-elf-grammar-fuzz, codegen-quality-gate | PASS |
-| rustfmt, clippy | PASS (after removing the temporary debug macro) |
-
-
-1. **§6a** — make the ARM peephole's copy-deletion analysis agree with
-   `propagate_register_copies` (dominance requirement), then re-run the oracle
-   at `-Os` on the whole corpus.
-2. **§6b** — find the second orphaned-value path (asm-tail panic trick).
-3. Re-run `scripts/cross_backend_check.py` over the full corpus × 5 opt levels
-   and drive it to zero failures; then wire `--gate` into `ci_local.sh` on a
-   reduced matrix so regressions cannot land silently.
-4. Add the four fixed defects as execution tests (not just unit tests) so the
-   oracle's coverage is permanent.
-5. Resume the session-32 backlog: ARM peephole store-forwarding
-   (correctness-blocked), the `ms178-1.patch` insn-count win, the
-   `ms178-1-ext-*.patch` segments, and `lccc`'s icount (2.66 M vs 1.96 M).
-
-## 9. v2 follow-up (second pass)
-
-### 9.1 Why PR #464 was red, and the fix
-The `Clippy` job runs **two** commands (`.github/workflows/ci.yml:234-254`), and
-`scripts/ci_local.sh:144-146` reproduces both verbatim:
-
-```
-cargo fmt --all -- --check
-cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
-```
-
-The failure was `cargo fmt`, not clippy: the temporary `peep!` debug macro used
-to bisect the ungated ARM peephole passes was still in the tree when the patch
-was snapshotted. It has been removed. Both commands now exit 0 locally
-(`FMT_EXIT=0`, `CLIPPY_EXIT=0`). **Lesson: never snapshot while a debug macro is
-in the tree — run `cargo fmt --all -- --check` as part of the snapshot gate.**
-
-### 9.2 The conservative `propagate_address_aliases` fix was wrong — precise version
-The first fix bailed out of the alias fold whenever the forward scan crossed
-*any* label. That is sound but costs instructions (-Os 10677 → 10703, -O2
-11248 → 11279 over the 43-program ARM corpus) because it throws away every fold
-that spans a label nothing branches to.
-
-The replacement rule is precise and recovers the folds:
-
-* **A label only ends the region if some branch in the function targets it.**
-  A label no branch targets is not a control-flow entry point: the only way to
-  reach the code after it is to fall in from the line above, so every path out
-  of the `mov` still runs the redefinition. The target set is computed once per
-  pass invocation in a `FxHashSet` over `Branch`/`CondBranch`/`CmpBranch` lines.
-* **A conditional transfer inside the region invalidates the fold.** `b.cond`
-  / `cbz` / `tbz` divert to a target *outside* the scanned region, so the taken
-  path reaches the code after the redefinition without running it, keeping the
-  `mov`'s value live. This also closes a latent hole the label-only rule left
-  open.
-* Unconditional `b`, `br` and `ret` remain safe to scan past: entry into any
-  later block must go through a real branch target, which the first rule
-  catches, so they cannot smuggle in a path that skipped the redefinition.
-
-The glibc_memcmp `-Os` SIGSEGV stays fixed: `.LBB37` is a real branch target, so
-the fold that deleted the prologue's `mov x19, x24` is still rejected.
-
-### 9.3 Environment: the sandbox resets at every turn boundary
 Everything outside the persisted `/home/user` workspace disappears between
-turns, **and `target/` is excluded from snapshots by design**, so the compiled
-lccc binaries are gone too. The `rustup` shim survives but loses its `+x` bit
-and `~/.rustup/toolchains` is deleted. Restore sequence, in this order:
+turns, and `target/` is excluded from snapshots by design, so the compiled
+compiler is gone too. Restore in this order (one command):
 
 ```
-curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-./scripts/build_lccc_fast.sh                 # ~2m40s from clean
-sudo apt-get install -y -qq gcc-multilib gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
-git ls-tree -r HEAD --format='%(objectmode) %(path)' | awk '$1=="100755"{print $2}' | xargs chmod +x
-git diff --summary | grep -c "mode change"   # must be 0 before snapshotting
+scripts/arena_session_restore.sh      # swap, toolchain, apt deps, exec bits
+cargo build --profile fastbuild -j 2  # ~2m30s from clean
 ```
 
-`gcc-multilib` (i686 reference) and the two cross toolchains (ARM/RISC-V
-builtin headers under `/usr/lib/gcc/<triplet>/14/include`, sysroots under
-`/usr/<triplet>`) now install together without conflict. Without the cross
-toolchains, `lccc-arm`/`lccc-riscv` fail with `stddef.h: No such file or
-directory` even for a one-line program.
+`arena_session_restore.sh` is idempotent and covers everything: 8 GB swapfile
+(`/sbin/swapon`, not on PATH), the rustup toolchain under `/home/user/.cargo`
++ `/home/user/.rustup`, `gcc-multilib` + `gcc-aarch64-linux-gnu` +
+`gcc-riscv64-linux-gnu` + `qemu-user`, the `origin` remote, and the `+x` bits
+(86 scripts lose them on every restore).
 
-### 9.4 Open defect carried forward: `lccc-arm -O2/-O3` SIGSEGV on `nbody.c`
-* Repro: `lccc-arm -O2 -static -lm -DSTEPS=5000 tests/benchmark/programs/nbody.c`
-  → `qemu-aarch64`: `uncaught target signal 11`. -O0/-O1/-Os are correct and
-  match gcc (`-0.169075164 -0.169089263`).
-* Threshold: STEPS 200/2000 fine, 5000 and above crash — so it is drift over
-  the outer `advance()` step loop, not a single bad pointer.
-* Masked by `CCC_DISABLE_PASSES` ∈ {all, gaddrcse, gvn, inline, ivsr, licm,
-  postinline, unroll}; **not** masked by any peephole gate. Eight different
-  passes hiding one bug means the defect is downstream, in ARM codegen/RA, and
-  only reachable once the loop is optimised.
-* Asm pair to continue from: `/tmp/nb_bad.s` (-O2) vs `/tmp/nb_good.s`
-  (-O2 + `CCC_DISABLE_PASSES=ivsr`). The step loop is the region enclosing
-  `.LBB9`/`.LBB10` (i loop) and `.LBB11`/`.LBB12` (j loop); the crash happens in
-  the code reached from `.LBB7`/`.LBB8`. Compare the callee-save area offsets
-  (`[sp,#312]…[sp,#440]` bad vs `[sp,#304]…` good) and the `str x0, [sp, #304]`
-  spill in the bad build.
+Two traps that cost real time:
 
-### 9.5 Measured cost of the alias-fold fixes (ARM corpus, 43 programs)
-| build | -Os | -O2 |
+- **Without the cross toolchains, `lccc-arm`/`lccc-riscv` fail with
+  `stddef.h: No such file or directory`** — they read GCC's builtin include
+  directory for the target (`/usr/lib/gcc/<triplet>/14/include`). A one-line
+  `hello.c` fails; it looks like a compiler bug and is not.
+- **`git diff` shows ~86 spurious mode changes** after a restore. Run
+  `git ls-tree -r HEAD --format='%(objectmode) %(path)' | awk '$1=="100755"{print $2}' | xargs chmod +x`
+  and verify `git diff --summary | grep -c 'mode change'` is **0** before
+  snapshotting, or the patch carries all of them.
+
+---
+
+## 1. The instrument: `scripts/cross_backend_check.py`
+
+Compiles each corpus program with `lccc`, `lccc-i686`, `lccc-arm`,
+`lccc-riscv` and one or more reference compilers, runs every binary under
+qemu, and diffs exit status + stdout.
+
+```
+python3 scripts/cross_backend_check.py [--programs a,b] [--opts=-O0,-O2,-Os]
+        [--reference gcc [--reference clang]] [--repeat N] [--jobs N]
+        [--json P --compare OLD] [--quick] [--gate] [--strict-timeout]
+```
+
+Design points that matter (each one was a false bug report before it was
+fixed):
+
+- **All references must agree**, or the program is skipped as unusable.
+- **`preflight()`** checks every compiler, qemu and the 32-bit libs *before*
+  the run and exits 2 — never 45 minutes into it.
+- **Per-cell verdicts** distinguish `ok` / `MISMATCH` / `COMPILEFAIL` /
+  `TIMEOUT` / `EXECFAIL` / `NONDET`. A qemu timeout under `--jobs` load is a
+  speed artefact, not a miscompile; `--repeat N` separates nondeterminism from
+  a real mismatch.
+- **A program's output is a function of its data model *and* its FP model.**
+  The i686 reference must be `-m32 -msse2 -mfpmath=sse`: plain `-m32` uses x87
+  excess precision and fakes a `libm_round_family` mismatch at every opt level.
+- **`LINK_LIBS = ["-lm"]`** is appended to every link (nbody needs `sqrt`).
+- **Never put a data-defining macro in `DEFAULT_SCALE`.** `-DNBODIES=32` on
+  `nbody.c` zero-fills 27 of the 32 static bodies, so every backend prints NaN
+  and "mismatches" identically. Only pure size/step macros belong there.
+- Scratch is disk-backed (default `target/crossbe-scratch`): `/tmp` is a
+  993 MB tmpfs and ~1350 static binaries exhaust it, which surfaces as
+  `final link failed: No space left on device` reported as a reference failure.
+
+Run it with `PYTHONUNBUFFERED=1` under `tee`, and never rebuild lccc while a
+run is in flight.
+
+---
+
+## 2. Miscompiles found and fixed (all verified against reference compilers)
+
+| # | Bug | Status |
 |---|---|---|
-| buggy (pre-fix, glibc_memcmp SIGSEGV) | 10677 | 11248 |
-| conservative: bail on ANY crossed label | 10703 | 11279 |
-| **precise: bail only on real branch targets / cond. transfers** | **10703** | **11279** |
+| 1 | AArch64 silent miscompile in `sha256_transform` | fixed |
+| 2 | `-O0` emitted x86 text into AArch64/RISC-V assembly | fixed |
+| 3 | i686 expat name-scanner miscompile | fixed |
+| 4 | AArch64 `-Os`: value orphaned by `invalidate_acc` | fixed |
+| 5 | AArch64 `-Os`: peephole deleted a live alias (`glibc_memcmp` SIGSEGV) | fixed |
 
-The precise rule measures **identical** to the conservative one: in lccc's
-output every basic-block label really is a branch target, so the "is it a
-target?" refinement recovers nothing on this corpus. The remaining +26 (-Os) /
-+31 (-O2) instructions versus the *buggy* build are the price of not emitting
-the `glibc_memcmp` SIGSEGV — they are not recoverable by restricting where the
-fold fires, because in every blocked case the mov is genuinely live on some
-other path.
+Bug 5's **root cause is not what the first fix assumed**. The scan treated
+`ret` as having no runtime effect, so a redefinition of `x0` in a *later block*
+was accepted as proof that a copy was dead — but x0-x7 are return-value
+registers, and the path through that `ret` had already handed the value to the
+caller. The first fix ("never cross a label") suppressed that one layout and
+left the hole open. The real fix is a `ret` barrier for `dst < 8`
+(`LineKind::Ret` invalidates the fold); x8-x17 are caller-saved and x19-x28 are
+restored by the epilogue, which is itself a redefinition, so the barrier is
+precise rather than another guess.
 
-**The correct fix is structural, not another restriction** (designed, not yet
-implemented): build a CFG once per function, compute dominators, and replace the
-linear scan's `crossed_label`/`crossed_cond` heuristics with the exact condition
-"the block containing the redefinition dominates every block that reads dst".
-That is sound by construction and strictly more aggressive than the buggy
-version in every case where the fold is legal, so it should also *beat* 10677 /
-11248. Secondary: the dead `mov xD, xS` exists because RA missed a coalesce —
-fixing coalescing removes the copy at the source instead of cleaning it up.
+The `nbody` `-O2`/`-O3` AArch64 SIGSEGV that used to be listed here as an open
+defect is **fixed** — it was the same class of bug (a copy deleted while still
+live on the loop path) and now matches gcc at every opt level.
 
-### 9.6 Final: the alias fold now uses the EXACT condition, not a heuristic
-Superseding §9.2 and §9.5.  `propagate_address_aliases` now builds a real CFG
-(`struct Cfg`: blocks, successors, iterative dominator bitsets) over the
-function and gates the fold on a single exact query, `redef_covers_all_reads`:
+---
+
+## 3. ARM alias folding: from heuristic to exact CFG query
+
+`propagate_address_aliases` deletes `mov xD, xS` when dst is only ever used as
+an address base, rewriting those uses onto `xS`. Proving the copy dead needs to
+know whether the redefinition of dst *dominates* every read of it, which text
+cannot answer.
+
+The pass now builds a real CFG (`struct Cfg`: blocks, successors, iterative
+dominator bitsets) and gates the fold on one exact query,
+`redef_covers_all_reads`:
 
 > every read of `dst` that can execute after the `mov` **without passing the
-> redefinition** must be an address use that gets renamed onto the alias source.
+> redefinition** must be an address use that gets renamed onto the source.
 
-Traversal stops at the redefinition's block, because any path leaving it has
-executed the redefinition — so reads beyond it see the *new* value and are
-irrelevant.  That is what makes the rule exact rather than conservative: it
-accepts loop-carried redefinitions (the common case the buggy pass got right
-for the wrong reasons) and rejects `glibc_memcmp`'s `.LBB37`, which is reachable
-without running the redefinition.
+Details that make it exact rather than conservative:
 
-| build | -Os | -O2 | correctness |
-|---|---|---|---|
-| buggy (pre-fix) | 10677 | 11248 | **SIGSEGV** on glibc_memcmp -Os |
-| conservative: bail on any crossed label (NAK'd) | 10703 | 11279 | clean |
-| **exact CFG/dominator rule (shipped)** | **10701** | **11281** | **240/240 oracle cells agree** |
+- Blocks split after **every** control transfer, not only at labels. Earlier
+  passes can leave a branch mid-block; an edge missing from `succs` is an edge
+  the query cannot see.
+- The redefinition's own block **is** walked (execution can run the lines
+  before the redefinition) but is not propagated out of (every path leaving it
+  has executed the redefinition).
+- When the mov's block is in a cycle, the back edge re-enters at the block's
+  **top**, so lines *before* the mov are fed by it and are checked too.
+- `LineKind::Ret` invalidates the fold for `dst < 8` (§2).
 
-The ~25 instructions the buggy build "saved" are exactly the illegal deletions:
-the pass was removing copies that are live on some other path.  Since the new
-rule accepts **every** case that is legal, no further recovery is possible
-without miscompiling — the remaining delta is the true cost of correctness,
-measured to the last instruction.
+With that in place the dead-copy deletion — removing a copy with no rewritable
+address uses — is sound. It is worth 11 (-Os) / 16 (-O2) instructions; the
+other ~40 of the raw 53/51 that the unsound version removed were illegal
+deletions of live copies, i.e. latent miscompiles of the glibc_memcmp kind.
 
-Verified: `glibc_memcmp` -Os/-O2/-O3 all print `2158787064` and exit 0;
-`cross_backend_check.py` over 12 programs × 5 opt levels × 4 backends against
-gcc reported *ALL BACKENDS AGREE WITH THE REFERENCE COMPILERS*;
-`cargo fmt --all -- --check` and the exact CI clippy command both exit 0.
+---
 
-**Rejected during this work (do not resurrect without understanding why):**
-deleting a provably-dead copy that has no rewritable address uses
-(`!uses.is_empty()` → allow empty).  It is worth ~65 instructions at -Os but
-breaks `sieve` (-O1..-O3) and `glibc_memcmp` -O3 even under the strict dominance
-query, so the "provably dead" proof is incomplete for that case — most likely
-`reads_gp_register`/`written_gp_register` misclassifying an instruction that
-reads `dst` (a `str xD, [sp,#k]` spill reads it) as a pure overwrite.  Audit
-`written_gp_register` for store forms before retrying; that is a real further
-win, not a speculation.
+## 4. Cross-pollination: register-copy coalescing, x86 -> ARM -> RISC-V
 
-### 9.7 Root cause of the "65-instruction win" breakage — and the real bug
-Superseding the speculation at the end of §9.6.  The deletions that broke
-`sieve` and `glibc_memcmp` were **return-value staging copies**:
-
-```
-    mov x5, x0      ; save
-    ...             ; later
-    mov x0, x5      ; restore / return staging
-```
-
-`propagate_address_aliases` treated `LineKind::Ret` as having "no runtime
-effect" and kept scanning past it, so a redefinition of `x0` in a *later block*
-was accepted as proof that the copy was dead.  It is not: the path through that
-`ret` handed the mov's value to the **caller** — x0-x7 are return-value
-registers.  `glibc_memcmp` returned garbage and exited 2.
-
-**This is the true root cause of the original glibc_memcmp -Os SIGSEGV.** The
-earlier "never cross a label" rule fixed it only by accident: it refused the
-fold in that particular layout while leaving the live-out hole wide open.
-
-Fix: `LineKind::Ret` now invalidates the fold when `dst < 8`.  x8-x17 are
-caller-saved and x19-x28 are restored by the epilogue before the `ret` (which is
-itself a redefinition), so only x0-x7 can be live-out at a return — the barrier
-is precise, not another guess.
-
-With that barrier the dead-copy deletion (removing `!uses.is_empty()`, the win
-§9.6 deferred) is sound, and lccc-arm now beats the *buggy* baseline:
-
-| build | -Os | -O2 |
-|---|---|---|
-| buggy baseline (SIGSEGV on glibc_memcmp) | 10677 | 11248 |
-| conservative label bail (NAK'd) | 10703 | 11279 |
-| exact CFG rule, no dead-copy deletion | 10701 | 11281 |
-| **exact CFG rule + dead-copy deletion + ret barrier** | **10648** | **11230** |
-
-glibc_memcmp -Os/-O2/-O3 all print `2158787064` (gcc: identical); sieve -O1..-O3
-print `primes up to 10000000: 664579` (gcc: identical).
-
-### 9.8 The 65-instruction win, investigated properly (final)
-Deleting a provably-dead copy with no rewritable address uses is worth ~53 (-Os)
-/ ~51 (-O2) instructions — and it was unsound three times over.  Each failure
-was a distinct hole in the "is this copy dead" proof, found by diffing the asm
-produced with and without the deletion (`CCC_NO_DEADCOPY=1`) and reading the
-deleted instruction:
-
-1. **Live-out at a `ret`** (`glibc_memcmp`, `sieve`): the scan treated `ret` as
-   having no runtime effect and accepted a redefinition in a later block as
-   proof of death, but x0-x7 are return-value registers — the path through that
-   `ret` had already handed the value to the caller.  Fixed by invalidating the
-   fold at a `ret` when `dst < 8` (precise: x8-x17 are caller-saved and x19-x28
-   are restored by the epilogue, which is itself a redefinition).
-   **This is also the true root cause of the original glibc_memcmp SIGSEGV.**
-2. **Mid-block control transfer** (`fannkuch`, `zstd_count`): the CFG treated
-   only the last line of a label-delimited run as the terminator, so a branch
-   left by an earlier peephole pass contributed no edge and the query answered
-   "no read" for blocks that were reachable.  Fixed by also splitting blocks
-   after every `b`/`b.cond`/`cbz`/`tbz`/`ret`.
-3. **Entering the redefinition's block from the top** (`zlib_ng_adler32`): the
-   traversal skipped the def block entirely, but execution can run the lines
-   *before* the redefinition — `mov x19, x20` before a loop whose body ends in
-   `mov x19, x5` feeds the first iteration.  Fixed by walking the def block
-   (checking its pre-redefinition lines) while not propagating out of it.
-4. **Loop re-entry above the mov** (`zlib_ng_adler32`, the `mov x19, x5` loop
-   increment itself): when the mov's block is part of a cycle, the back edge
-   re-enters at the block's TOP, so lines *before* the mov are fed by it.  The
-   linear scan never sees the back edge.  Fixed by checking the whole block when
-   the block is reachable from itself.
-
-With all four fixed the deletion is sound, and lccc-arm is smaller than the
-conservative build it replaces:
-
-| build | -Os | -O2 | glibc_memcmp | fannkuch | zlib_ng_adler32 | zstd_count |
-|---|---|---|---|---|---|---|
-| buggy baseline | 10677 | 11248 | **SIGSEGV** | ok | ok | ok |
-| conservative label bail (NAK'd) | 10703 | 11279 | ok | ok | ok | ok |
-| exact CFG rule, no deletion | 10701 | 11281 | ok | ok | ok | ok |
-| **exact CFG + deletion + holes 1-4 fixed** | **10690** | **11265** | ok | ok | ok | ok |
-
-The deletion is worth 11 (-Os) / 16 (-O2) instructions *once it is correct* —
-the other ~40 of the raw 53/51 were illegal deletions of live copies, i.e. latent
-miscompiles of exactly the glibc_memcmp kind.  lccc-arm is now **27 instructions
-smaller than the NAK'd conservative build** and, unlike the 10677/11248
-baseline, does not miscompile.  `nbody` -O2 (the open AArch64 SIGSEGV from §9.4)
-now matches gcc as well.
-
-`struct_copy` -O1/-Os mismatches the reference but also fails with
-`LCCC_NO_PEEPHOLE=1`, so it is a pre-existing codegen defect outside the
-peephole — not a regression from this work, and still open.
-
-### 9.9 Cross-pollination: x86's copy coalescer ported to ARM (the real win)
 x86 had whole-function register-copy coalescing
-(`x86/codegen/peephole/passes/copy_coalesce.rs`); **ARM and RISC-V had
-nothing** — ARM functions paid for an entry shuffle the x86 backend deletes.
-Measurement first (`/tmp/count_shuffle.py`): **567** entry-run `mov xD, xS`
-copies across the corpus, 75 of them with a source that appears nowhere else.
+(`x86/codegen/peephole/passes/copy_coalesce.rs`). **ARM and RISC-V had
+nothing**, so their functions paid an entry shuffle x86 deletes: the register
+allocator hands parameters homes that do not match the ABI registers they
+arrive in, and the resulting `mov`/`mv` has a destination that is live for the
+whole function — no local pass can remove it. Coalescing renames the
+destination family onto the source everywhere after the copy and drops the
+copy.
 
-Ported as `coalesce_entry_copies` in the ARM peephole, with AArch64 legality
-rules (x86's are x86-specific):
+Ported as `coalesce_entry_copies` in both backends, with per-architecture
+legality rules:
 
-1. The copy sits in the straight-line entry run (no label/branch/call/ret before
-   it), so earlier lines run once and cannot be re-entered by a back edge.
-2. `src` is mentioned nowhere else in the function — no later clobber, no other
-   live range disturbed. A parameter's arrival in `src` is implicit, not a
-   mention.
-3. After the copy, `dst` has no unrenamable reader/writer: no implicit operand
-   (`classify_implicit_operands_a64`), no `ret` when `dst < 8` (x0-x7 carry the
-   return value), and no call while the value lives in a caller-saved register
-   **and is still used afterwards** (refined from a blanket "no call": a call
-   with no mention of `dst` after it is harmless).
-4. No `Other` (unmodelled mnemonic). `MemOther` is allowed: it names every
-   register it touches, pre/post-indexed writeback included.
+1. The copy sits in the **straight-line entry run** (no label/branch/call/ret
+   before it), so every earlier line runs once and cannot be re-entered by a
+   back edge.
+2. **`src` is mentioned nowhere else in the function** — no later write
+   clobbers the coalesced value, no other live range is disturbed. A
+   parameter's arrival in `src` is implicit, not a mention.
+3. After the copy, `dst` has **no unrenamable reader or writer**: no implicit
+   operand (`classify_implicit_operands_a64` / `_rv`), no `ret` while `dst` is
+   a return-value register (ARM x0-x7, RISC-V a0-a7), and no call while the
+   value lives in a caller-saved register **and is still used afterwards**.
+4. Frame pointer, return address and stack pointer are never renamed
+   (ARM x29/x30/sp; RISC-V s0/ra/sp). A far RISC-V `jump` uses t6 as scratch,
+   so t6 is not renamed across one.
+
+**Measured (43-program corpus, instruction count):**
+
+| backend | -Os | -O2 | win vs. no coalescer |
+|---|---|---|---|
+| ARM | 10675 | 11253 | -15 / -12 |
+| RISC-V | 20942 | 21998 | -9 / -2 |
+
+The ARM win is real because 75 of its 567 entry-run copies have a source that
+appears nowhere else. **RISC-V has 775 entry-run copies but only 1 with a
+unique source** — its allocator reuses argument registers after moving them to
+their homes, so rule 2 rejects nearly everything. That is the single biggest
+remaining optimisation in this area: x86's pass uses **liveness**
+(`live_after(i, src) == false`) instead of the syntactic rule 2, and porting
+that liveness to ARM and RISC-V is what would unlock the other ~490 (ARM) and
+~774 (RISC-V) copies. It is the first item in §10.
+
+---
+
+## 5. Measured results
+
+ARM, 43 programs, instruction count:
 
 | build | -Os | -O2 |
 |---|---|---|
-| buggy baseline (miscompiles) | 10677 | 11248 |
-| conservative label bail (NAK'd) | 10703 | 11279 |
-| + exact CFG rule + dead-copy deletion | 10690 | 11265 |
-| **+ ARM copy coalescing (shipped)** | **10675** | **11253** |
+| baseline before this work (miscompiles: glibc_memcmp SIGSEGV) | 10677 | 11248 |
+| conservative label bail | 10703 | 11279 |
+| + exact CFG query | 10701 | 11281 |
+| + sound dead-copy deletion | 10690 | 11265 |
+| + copy coalescing | 10675 | 11253 |
+| **+ identical-block merging (current)** | **10630** | **11223** |
 
-lccc-arm is now **28 (-Os) / 26 (-O2) instructions smaller than the NAK'd
-conservative build** — 54 total — and within +2/+5 of the miscompiling
-baseline, i.e. the entire "regression" is now paid for by a *new* optimisation
-rather than by giving one up. Spot-checked against aarch64 gcc at -O2/-Os:
-glibc_memcmp, zlib_ng_adler32, zstd_count, fannkuch, sieve, gzip_crc32,
-expat_xml_scan all match.
+RISC-V, same 43 programs:
 
-### 9.10 zstd added to the golden workloads
-`zstd_count.c` is now a golden workload in
-`.github/scripts/ci-codegen-gate.py` with a baseline entry
-(`insns 131, moves 34, pushes 7, stackmem 0`). It earned its place: it is the
-workload that caught the loop-carried copy bug (§9.8 hole 4), and the x86 boot
-path decompresses with zstd, so it ties the golden set to the kernel work.
+| build | -Os | -O2 |
+|---|---|---|
+| baseline | 20951 | 22000 |
+| + copy coalescing | 20942 | 21998 |
+| **+ identical-block merging (current)** | **20891** | **21953** |
+
+The correctness fixes are paid for by two new optimisations rather than by
+surrendering one: the current ARM build is **47 (-Os) / 25 (-O2) instructions
+smaller than the miscompiling baseline it replaces**, and the RISC-V build is
+**60 / 47** smaller than the pre-work baseline.
+
+
+---
+
+## 5b. Cross-pollination from x86: identical basic-block merging
+
+The x86 backend is the most polished of the four: 22 peephole pass modules
+behind ~70 `sk("...")` gates, where ARM and RISC-V carry their passes inline.
+A census of what x86 has that the others do not singled out three passes:
+`identical_blocks`, `epilogue_merge` and `frame_compact` — none of which
+existed in ARM, RISC-V or i686.
+
+`identical_blocks` was ported first. Its soundness contract, carried over
+verbatim in spirit, is:
+
+1. the two blocks must have the same instruction text;
+2. the deleted block must be entered only by **explicit branches** — a
+   fall-through edge cannot be retargeted by renaming a label, and after
+   deletion the preceding block would fall into whatever now follows it;
+3. a **function's entry block is never deleted** (its label is the symbol);
+4. blocks reached from an unresolvable edge (an indirect `br xN` jump table,
+   a `jalr`) are excluded — and, unlike `Cfg::build`, they do **not** poison
+   the whole file. The merge pass therefore builds its own tolerant block
+   model: a function containing a switch's jump table still gets merged
+   everywhere else.
+
+On entry state, x86 requires *equal predecessor sets* plus *not flag-dependent
+at entry*. AArch64 and RISC-V have no EFLAGS, so the second condition
+disappears — and the first turned out to be far too weak on its own:
+
+> **Measured.** A census of the ARM corpus found 19 duplicate-text groups (33
+> candidate pairs). **All 33 were rejected by the predecessor-set rule** —
+> the x86 pattern it was written for (phi trampolines sharing their
+> predecessors) simply does not occur in this corpus. Porting the rule as
+> written would have shipped a pass that never fires.
+
+The fix was to add a second, *stronger* admission test that does not need the
+predecessor sets at all: a block is **live-in independent** when every register
+it reads is defined inside the block before the read (implicit operands
+included; blocks containing a call or `ret` are excluded, since a call reads
+the argument registers implicitly and `ret` reads the return-value registers).
+Two identical live-in-independent blocks are interchangeable whatever their
+predecessors are, because the live-in state is irrelevant to both. With that
+test added the pass fires for real: **-45 / -30 instructions on ARM, -51 / -45
+on RISC-V.**
+
+Both backends were verified at 48/48 against `aarch64-linux-gnu-gcc` and
+`riscv64-linux-gnu-gcc` under qemu at `-O1/-O2/-Os/-O3` (12 programs x 4
+levels), on top of the corpus-wide instruction-count measurements.
+
+Still unported: `epilogue_merge` and `frame_compact` (x86-only), and the
+register-copy coalescers still use the *syntactic* "source appears nowhere
+else" rule on ARM/RISC-V rather than x86's *liveness* rule
+(`live_after(i, src) == false`). The census for that is in section 4: ~490
+further copies on ARM and ~774 on RISC-V are in reach once the liveness rule
+is ported — the largest remaining single item.
+
+---
+
+## 6. Golden workloads: zstd added
+
+`.github/scripts/ci-codegen-gate.py` now gates `zstd_count.c` alongside
+gzip_crc32, zlib_ng_adler32, expat_xml_scan, sqlite_varint, glibc_memcmp and
+hash_table, with a baseline entry (`insns 131, moves 34, pushes 7,
+stackmem 0`). It earned the place twice: it caught the loop-carried copy bug
+(§3), and zstd is what the x86 boot path decompresses with, so the golden set
+now covers the decoder the boot path actually runs.
+
+---
+
+## 7. Known open defects
+
+- **`struct_copy` -O1/-Os (AArch64) mismatches the reference.** It also fails
+  with `LCCC_NO_PEEPHOLE=1`, so it is **not** a peephole bug — it is a
+  pre-existing codegen defect elsewhere (struct copy / aggregate ABI) and is
+  still open.
+- **ARM global store forwarding remains disabled** (test `0036_0041`): the
+  same-register NOP elimination has an unidentified correctness bug in complex
+  float-array code. RISC-V *has* a working `global_store_forwarding`, so that
+  implementation is the reference for fixing ARM's.
+- **The i686 `staging_reads_safe` census** (whole-function read census in the
+  i686 peephole) is still unaudited.
+- **IR loop rotation is still opt-in** (`CCC_LOOP_ROTATE=1`,
+  `engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md`); the ARM peephole's
+  `rotate_simple_loops` is default-on independently.
+
+---
+
+## 8. Kernel boot: blocked, and how to unblock
+
+`scripts/build_kernel_boot.sh` cannot run: the workspace wipe removed
+`/home/user/kernel-work/linux-6.18.47` **and**
+`/home/user/archpkgbuilds/packages/linux-cachymod-6.18`, which
+`prepare_kernel_tree.sh` requires for the 26 CachyMod patches and the package
+config (`PKGDIR` check line 44, patches line 158, config line 172).
+
+The AUR `linux-cachyos` clone is **not** a substitute: it is version **7.2**
+and carries **0 patch files**.
+
+```
+# restore the PKGBUILD tree (26 patches + config, CachyOS source order), then:
+KERNEL_DIR=/home/user/kernel-work/linux-6.18.47 bash scripts/prepare_kernel_tree.sh
+KERNEL_DIR=... LCCC=.../lccc bash scripts/build_kernel_boot.sh
+```
+
+Fallback if the patch set is unrecoverable: a **vanilla 6.18.47** tree. The
+tarball download is already in the script (kernel.org), and `arch/x86/boot` is
+largely patch-independent, so a defconfig build is a valid boot-code test.
+`scripts/qemu_qmp_probe.py` probes `decompress_kernel -> zstd_decompress_dctx`.
+
+---
+
+## 9. CI status
+
+- `cargo fmt --all -- --check` and
+  `cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings`
+  — the two commands of the `Clippy` job (`.github/workflows/ci.yml:234-254`,
+  reproduced verbatim by `scripts/ci_local.sh:144-146`) — both **exit 0**.
+- The previous red was `cargo fmt`: a temporary `peep!` debug macro was still in
+  the tree when the patch was snapshotted. Never snapshot with debug code in
+  the tree; `cargo fmt --all -- --check` is part of the snapshot gate.
+- **The full `ci_local.sh` has not been run end to end.** Run
+  `scripts/ci_local.sh --fast` per the standing instruction; the full run
+  (regression corpus + benchmark oracle, ~26 min) is still owed.
+
+---
+
+## 10. TODO for the next session (ordered)
+
+1. **Liveness-based copy coalescing for ARM and RISC-V.** Replace rule 2
+   ("`src` mentioned nowhere else") with x86's dataflow rule
+   (`live_after(i, src) == false`, plus "no write to `src` while `dst` is still
+   live"). Measured upside: ~490 more copies on ARM, ~774 on RISC-V. This is
+   by far the largest single win available in the backend.
+2. **Close the RISC-V pass gap.** Its peephole has 27 passes against ARM's 78
+   and i686's 117; candidates for porting, cheapest first:
+   `eliminate_move_chains`, `eliminate_overwritten_moves`,
+   `eliminate_overwritten_stores`, `reuse_stack_loads_within_blocks`,
+   `thread_spill_slots`, `hoist_loop_invariant_remats`,
+   `sink_loop_carried_stores`, `fold_zero_stores`.
+3. **Fix ARM global store forwarding** using RISC-V's working
+   `global_store_forwarding` as the reference (test `0036_0041`).
+4. **`struct_copy` AArch64 defect** — bisect outside the peephole (it fails
+   with the peephole disabled).
+5. **Audit i686 `staging_reads_safe`.**
+6. **Kernel boot** once the tree is restored (§8): build the 23 setup objects
+   with lccc + lccc-ld, pass the `_end <= 0x8000` ASSERT, then fix whatever
+   miscompiles the boot exposes.
+7. **Full `ci_local.sh`** end to end.
