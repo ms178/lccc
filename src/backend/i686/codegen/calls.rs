@@ -400,10 +400,17 @@ impl I686Codegen {
     }
 
     pub(super) fn emit_call_store_f128_result_impl(&mut self, dest: &Value) {
+        // The callee returns the F128 value on st(0); the caller must pop
+        // it in every case, or the entry leaks into subsequent code (the
+        // x87 stack wraps after eight stray pushes). With a slot the
+        // store-and-pop `fstpt` does both; without one the result is dead
+        // and a bare pop balances the stack.
         if let Some(slot) = self.state.get_slot(dest.0) {
             let sr = self.slot_ref(slot);
             emit!(self.state, "    fstpt {}", sr);
             self.state.f128_direct_slots.insert(dest.0);
+        } else {
+            self.state.emit("    fstp %st(0)");
         }
     }
 

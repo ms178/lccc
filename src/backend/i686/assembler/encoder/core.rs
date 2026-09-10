@@ -1889,8 +1889,8 @@ mod i686_encoding_helper_tests {
             ("GOTOFF", R_386_GOTOFF),
             ("PLT", R_386_PLT32),
             ("GOTPC", R_386_GOTPC),
-            ("GOTNTPOFF", R_386_TLS_IE),
-            ("INDNTPOFF", R_386_TLS_IE),
+            ("GOTNTPOFF", R_386_TLS_GOTIE),
+            ("INDNTPOFF", R_386_TLS_GOTIE),
         ] {
             assert!(i686_known_tls_modifier(modifier));
 

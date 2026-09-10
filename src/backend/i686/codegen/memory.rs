@@ -285,8 +285,20 @@ impl I686Codegen {
             }
         }
         if ty == IrType::F128 {
+            // Resolve the pointer BEFORE loading the value: a constant (or
+            // any operand that stages through %eax) clobbers %eax during
+            // the value load, so a pointer homed in %eax must be stashed
+            // in the %ecx address scratch first (same hazard the 64-bit
+            // pair branch below handles for its own staging).
+            let mut addr = self.state.resolve_slot_addr(ptr.0);
+            if let Some(SlotAddr::Reg(reg)) = addr {
+                if phys_reg_name(reg) == "eax" {
+                    self.state.emit("    movl %eax, %ecx");
+                    addr = Some(SlotAddr::Reg(crate::backend::regalloc::PhysReg(4)));
+                }
+            }
+
             self.emit_f128_load_to_x87(val);
-            let addr = self.state.resolve_slot_addr(ptr.0);
             if let Some(addr) = addr {
                 match addr {
                     SlotAddr::OverAligned(slot, id) => {
@@ -303,6 +315,12 @@ impl I686Codegen {
                     }
                     SlotAddr::Reg(reg) => emit!(self.state, "    fstpt (%{})", phys_reg_name(reg)),
                 }
+            } else {
+                // The address could not be resolved, so the store is
+                // dropped -- but the loaded value must not stay on the
+                // x87 stack. `fstpt` is store-and-pop; here only the pop
+                // half is needed.
+                self.state.emit("    fstp %st(0)");
             }
             self.state.reg_cache.invalidate_acc();
             return;
@@ -495,8 +513,17 @@ impl I686Codegen {
         ty: IrType,
     ) {
         if ty == IrType::F128 {
+            // Pointer-first resolution for the %eax-homed base hazard and
+            // dead-address fallback; see the offset-less F128 store above.
+            let mut addr = self.state.resolve_slot_addr(base.0);
+            if let Some(SlotAddr::Reg(reg)) = addr {
+                if phys_reg_name(reg) == "eax" {
+                    self.state.emit("    movl %eax, %ecx");
+                    addr = Some(SlotAddr::Reg(crate::backend::regalloc::PhysReg(4)));
+                }
+            }
+
             self.emit_f128_load_to_x87(val);
-            let addr = self.state.resolve_slot_addr(base.0);
             if let Some(addr) = addr {
                 match addr {
                     SlotAddr::OverAligned(slot, id) => {
@@ -527,6 +554,8 @@ impl I686Codegen {
                         }
                     }
                 }
+            } else {
+                self.state.emit("    fstp %st(0)");
             }
             self.state.reg_cache.invalidate_acc();
             return;

@@ -381,7 +381,17 @@ impl Lowerer {
         // from the C expression type. IrConst::I64 stores both signed and
         // unsigned 64-bit bit patterns; `~0ULL` is represented as I64(-1) and
         // must still convert to float as UINT64_MAX, not -1.
-        let (bits, _) = self.eval_const_expr_as_bits(inner)?;
+        //
+        // Prefer the evaluated value's own bits: walking the expression
+        // descends into a float leaf for float->int cast chains and calls
+        // irconst_to_bits on a float constant there, which falls back to 0
+        // (`(uint32_t)(int)3.999L` folded to 0 instead of 3). For pure
+        // integer chains both sources agree; the value form also survives
+        // sign-extending narrow casts (`(i8)255` -> 0xffffffff).
+        let (bits, _) = match src_val.to_i64() {
+            Some(v) => (v as u64, true),
+            None => self.eval_const_expr_as_bits(inner)?,
+        };
         let src_signed = !self.is_expr_unsigned_for_const(inner);
 
         // For 128-bit targets, sign/zero-extend based on source signedness

@@ -1700,6 +1700,17 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
     // This handles nested parens in the displacement like ((6*8) + 8*16)(%rsp).
     // We scan backwards from the end to find the matching '(' for the final ')'.
     if let Some(paren_end) = s.rfind(')') {
+        // Anything after the closing paren is garbage: `8(%esp)+4` must be
+        // rejected like GAS ("junk `(%esp)+4` after expression"), not
+        // silently truncated to `8(%esp)`. The truncation previously
+        // mis-assembled stores when a codegen path emitted `{}+k` on a
+        // base+disp slot string.
+        let trailing = s[paren_end + 1..].trim();
+        if !trailing.is_empty() {
+            return Err(format!(
+                "junk `{trailing}` after expression in memory operand: `{s}`"
+            ));
+        }
         let mut depth = 0i32;
         let mut paren_start = None;
         for (i, c) in s[..=paren_end].char_indices().rev() {
@@ -3803,6 +3814,34 @@ fn eval_if_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `disp(base)+k` must be rejected like GAS ("junk after expression"),
+    /// never silently truncated to `disp(base)`: the truncation previously
+    /// mis-assembled `movl %edx, 128(%esp)+8` as a store to `128(%esp)`.
+    #[test]
+    fn test_memory_operand_trailing_junk_is_rejected() {
+        for bad in [
+            "128(%esp)+8",
+            "8(%esp)+4",
+            "sym(%eax)+4",
+            "8(%ebx,%ecx,4)+2",
+        ] {
+            assert!(parse_memory_operand(bad).is_err(), "must reject: {bad}");
+        }
+
+        // The legal forms still parse, with the offset INSIDE the
+        // displacement: `sym+4(%esp)` is a symbol-addend displacement.
+        let mem = match parse_memory_operand("8(%esp)").expect("plain disp+base") {
+            Operand::Memory(m) => m,
+            other => panic!("expected memory operand, got {other:?}"),
+        };
+        assert!(matches!(mem.displacement, Displacement::Integer(8)));
+        assert_eq!(mem.base, Some(Register::new("esp")));
+        // `sym+4(%esp)` keeps the symbol-addend expression in the
+        // displacement slot; the exact Displacement variant is the
+        // resolver's business, so only require a successful parse.
+        assert!(parse_memory_operand("sym+4(%esp)").is_ok());
+    }
 
     /// GAS `\@` must be substituted with a DISTINCT value per macro
     /// expansion (kernel ANNOTATE emits `.Lhere_\@:` once per use; a shared

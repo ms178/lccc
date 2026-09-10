@@ -1,14 +1,61 @@
-//! i686 type cast emission.
+//! i686 numeric cast emission.
 //!
-//! Handles `emit_cast` and `emit_cast_instrs` for the i686 backend.
-//! On i686, casts involving F64/F128 or 64-bit integers require special
-//! handling because:
-//! - F64 values are 8 bytes but the accumulator (eax) is only 32 bits
-//! - F128 (long double) is native x87 80-bit extended precision (12 bytes)
-//! - 64-bit integers use the eax:edx register pair
+//! # Representation conventions (this backend)
 //!
-//! All F64/F128 conversions go through the x87 FPU, bypassing the default
-//! emit_load_operand path that assumes values fit in a single register.
+//! - Scalar integers and F32 bit patterns use `%eax`; signed subword values
+//!   are sign-extended in the register, unsigned subword values are
+//!   zero-extended (`movsbl`/`movswl`/`movzbl`/`movzwl`).
+//! - I64/U64 and raw F64 copies use the `%edx:%eax` pair.
+//! - F128 denotes native x87 extended precision (80-bit) inside a 12-byte
+//!   ABI object; `fstpt` writes its 10 significant bytes. Values marked in
+//!   `f128_direct_slots` hold that native representation in a 16-byte
+//!   stack slot.
+//!
+//! # ISA floor
+//!
+//! The sequences below use the scalar SSE conversions (`cvtsi2ssl`,
+//! `cvttss2si`, `movd`) and SSE3's `fisttp`. That is not a new
+//! requirement: the i686 backend already emits SSE/SSE2/SSE3
+//! unconditionally across `intrinsics.rs`, `alu.rs`, `comparison.rs` and
+//! the original cast paths, and no target-feature gating interface exists
+//! (recorded as a follow-up; the Linux-kernel `no_sse` flag only governs
+//! variadic prologues). `fisttp` truncates toward zero by definition, so
+//! float-to-integer conversion is independent of the ambient x87
+//! rounding control without any control-word save/restore.
+//!
+//! # Unsigned conversions (no ambient-precision arithmetic)
+//!
+//! - U64 → x87: values with bit 63 set are loaded with `fldt` from their
+//!   exact native extended encoding (significand = the 64 integer bits,
+//!   exponent word `0x403e` = bias + 63), not via `fildq` + `fadds 2^64`.
+//!   The correction addition is exact only while the x87 precision
+//!   control is 64-bit; the encoding is exact at every PC setting.
+//! - x87 → U64: compare against `2^63` (`fucomip`), convert the low half
+//!   with `fisttpq` directly, and for `x >= 2^63` convert the exact
+//!   difference `x - 2^63` (Sterbenz-exact in extended precision, result
+//!   in `[0, 2^63)`) and OR bit 63 back. No signed-overflow indefinite,
+//!   no FE_INVALID on valid inputs, no control-word traffic.
+//! - F32 → U32: `flds` + `fisttpq` (64-bit form), never the signed
+//!   `cvttss2si`, which returns the indefinite `0x80000000` and raises
+//!   FE_INVALID for `[2^31, 2^32)`.
+//!
+//! # x87 stack discipline
+//!
+//! Every x87-backed conversion below pushes exactly the entries it pops.
+//! `fstpt` is store-and-pop, so an F128 destination without a stack slot
+//! (a dead result under this backend's convention; see `float_ops.rs`)
+//! must skip the whole conversion before any load — otherwise the load
+//! leaks one stack entry per dead cast. F32/F64 destinations cannot
+//! leak: their store paths always pop (`fstps`, or `emit_f64_store_from_x87`,
+//! which pops even without a slot).
+//!
+//! # Cache discipline
+//!
+//! `operand_to_eax` records the loaded value in the accumulator cache, so
+//! every instruction that writes `%eax` (or `%edx`) to something other
+//! than the cached value must invalidate the corresponding entry.
+//! Pure-x87 and push/pop sequences leave `%eax` untouched and therefore
+//! keep the cache entry alive.
 
 use super::emit::I686Codegen;
 use crate::backend::traits::ArchCodegen;
@@ -16,10 +63,45 @@ use crate::common::types::IrType;
 use crate::emit;
 use crate::ir::reexports::{Operand, Value};
 
+/// Positive native extended-precision numbers in `[2^63, 2^64)` have this
+/// complete sign/exponent word (bias 16383 + exponent 63).
+const U64_HIGH_X87_EXPONENT: u16 = 0x403e;
+
+fn cast_is_float(ty: IrType) -> bool {
+    matches!(ty, IrType::F32 | IrType::F64 | IrType::F128)
+}
+
+fn cast_is_integer(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+    )
+}
+
+fn cast_is_integer_pair(ty: IrType) -> bool {
+    matches!(ty, IrType::I64 | IrType::U64)
+}
+
+/// Establish the canonical 32-bit register form of a subword integer
+/// already in eax.
+fn cast_normalization_instruction(ty: IrType) -> Option<&'static str> {
+    match ty {
+        IrType::I8 => Some("    movsbl %al, %eax"),
+        IrType::U8 => Some("    movzbl %al, %eax"),
+        IrType::I16 => Some("    movswl %ax, %eax"),
+        IrType::U16 => Some("    movzwl %ax, %eax"),
+        _ => None,
+    }
+}
+
 impl I686Codegen {
-    /// Override emit_cast to handle F64 source/destination specially on i686.
-    /// F64 values are 8 bytes but the accumulator is only 32 bits, so we use
-    /// x87 FPU for all F64 conversions, bypassing the default emit_load_operand path.
     pub(super) fn emit_cast_impl(
         &mut self,
         dest: &Value,
@@ -29,38 +111,8 @@ impl I686Codegen {
     ) {
         use crate::backend::cast::{CastKind, classify_cast_with_f128};
 
-        // Register-preserving no-op: when dest and src share a register and the
-        // cast does not change the 32-bit register contents, emit nothing.
-        // Sub-word values are ALWAYS extended in their register (movsbl/movzbl
-        // loads, store_eax_to of the extended %eax), so same-width U32<->I32
-        // and sub-word-widening casts are no-ops on a coalesced pair. The
-        // coalescer merges exactly these edges (including overlapping ones),
-        // so this fires for `(I32)(I8)*p` after a sign-extending load and for
-        // `(I32)(I8)c` after the narrowing already masked into the register.
-        if let Operand::Value(sv) = src {
-            if let (Some(&dp), Some(&sp)) = (
-                self.reg_assignments.get(&dest.0),
-                self.reg_assignments.get(&sv.0),
-            ) {
-                if dp == sp {
-                    let noop = matches!(
-                        (from_ty, to_ty),
-                        (
-                            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16,
-                            IrType::I32 | IrType::U32
-                        ) | (IrType::I32, IrType::U32)
-                            | (IrType::U32, IrType::I32)
-                            | (IrType::I32, IrType::I32)
-                            | (IrType::U32, IrType::U32)
-                    );
-                    if noop {
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Let the default handle i128 conversions
+        // Preserve the existing i128 delegation: its implementation and
+        // calling convention live outside this file.
         if crate::backend::generation::is_i128_type(from_ty)
             || crate::backend::generation::is_i128_type(to_ty)
         {
@@ -68,179 +120,173 @@ impl I686Codegen {
             return;
         }
 
-        // On i686, F128 (long double) is native x87 80-bit extended precision,
-        // stored as 12 bytes. We must use f128_is_native=true so that F128 casts
-        // go through the dedicated SignedToF128/UnsignedToF128/F128ToSigned/etc.
-        // paths that use fstpt (12-byte store), not through the F64 paths that
-        // use fstpl (8-byte store) which would corrupt F128 values.
-        match classify_cast_with_f128(from_ty, to_ty, true) {
-            // --- Casts where F64 is the destination (result needs 8-byte slot) ---
-            CastKind::SignedToFloat {
-                to_f64: true,
-                from_ty: src_ty,
-            } => {
-                self.emit_signed_to_f64(src, src_ty, dest);
+        // A genuine identity operation on the same SSA value needs no
+        // code. Same-register coalescing is restricted to 32-bit
+        // same-width pairs: it requires no assumptions about canonical
+        // subword register contents (every subword producer normalizes,
+        // but the invariant is not audited across all consumers).
+        if let Operand::Value(source) = src {
+            if source.0 == dest.0 && from_ty == to_ty {
+                return;
             }
-            CastKind::UnsignedToFloat {
-                to_f64: true,
-                from_ty,
-            } => {
-                self.emit_unsigned_to_f64(src, from_ty, dest);
-            }
-            CastKind::FloatToFloat { widen: true } => {
-                // F32 -> F64: load F32 from eax, x87 will auto-extend
-                self.operand_to_eax(src);
-                self.state.emit("    pushl %eax");
-                self.state.emit("    flds (%esp)");
-                self.state.emit("    addl $4, %esp");
-                // st(0) is now the F64 value, store to 8-byte slot
-                self.emit_f64_store_from_x87(dest);
-                self.state.reg_cache.invalidate_acc();
-            }
-
-            // --- Casts where F64 is the source (need to load 8-byte value) ---
-            CastKind::FloatToSigned { from_f64: true } => {
-                self.emit_f64_to_signed(src, to_ty, dest);
-            }
-            CastKind::FloatToUnsigned {
-                from_f64: true,
-                to_u64,
-            } => {
-                self.emit_f64_to_unsigned(src, to_u64, to_ty, dest);
-            }
-            CastKind::FloatToFloat { widen: false } => {
-                // F64 -> F32: load full 8-byte F64, convert to F32 on x87
-                self.emit_f64_load_to_x87(src);
-                self.state.emit("    subl $4, %esp");
-                self.state.emit("    fstps (%esp)");
-                self.state.emit("    movl (%esp), %eax");
-                self.state.emit("    addl $4, %esp");
-                self.state.reg_cache.invalidate_acc();
-                self.store_eax_to(dest);
-            }
-
-            // --- F128 <-> F64/F32 conversions ---
-            CastKind::FloatToF128 { from_f32 } => {
-                self.emit_float_to_f128(src, from_f32, dest);
-            }
-            CastKind::F128ToFloat { to_f32 } => {
-                self.emit_f128_to_float(src, to_f32, dest);
-            }
-
-            // --- F128 <-> int conversions ---
-            CastKind::SignedToF128 { from_ty: src_ty } => {
-                self.emit_signed_to_f128(src, src_ty, dest);
-            }
-            CastKind::UnsignedToF128 { from_ty: src_ty } => {
-                self.emit_unsigned_to_f128(src, src_ty, dest);
-            }
-            CastKind::F128ToSigned { to_ty: dest_ty } => {
-                self.emit_f128_to_signed(src, dest_ty, dest);
-            }
-            CastKind::F128ToUnsigned { to_ty: dest_ty } => {
-                self.emit_f128_to_unsigned(src, dest_ty, dest);
-            }
-
-            // --- I64 -> F32: use x87 fildq for full 64-bit precision ---
-            CastKind::SignedToFloat {
-                to_f64: false,
-                from_ty: IrType::I64,
-            } => {
-                self.emit_load_acc_pair(src);
-                self.state.emit("    pushl %edx");
-                self.state.emit("    pushl %eax");
-                self.state.emit("    fildq (%esp)");
-                self.state.emit("    fstps (%esp)");
-                self.state.emit("    movl (%esp), %eax");
-                self.state.emit("    addl $8, %esp");
-                self.state.reg_cache.invalidate_acc();
-                self.store_eax_to(dest);
-            }
-            // --- U64 -> F32: use x87 with unsigned handling ---
-            CastKind::UnsignedToFloat {
-                to_f64: false,
-                from_ty: IrType::U64,
-            } => {
-                self.emit_u64_to_f32(src, dest);
-            }
-            // --- F32 -> I64: use x87 fisttpq ---
-            CastKind::FloatToSigned { from_f64: false } if to_ty == IrType::I64 => {
-                self.emit_f32_to_i64(src, dest);
-            }
-            // --- F32 -> U64: use x87 fisttpq ---
-            CastKind::FloatToUnsigned {
-                from_f64: false,
-                to_u64: true,
-            } => {
-                self.emit_f32_to_i64(src, dest); // same implementation as F32->I64
-            }
-
-            // --- Same-size cast between I64 and U64: copy all 8 bytes ---
-            CastKind::SignedToUnsignedSameSize { to_ty: IrType::U64 }
-            | CastKind::UnsignedToSignedSameSize { to_ty: IrType::I64 }
-            | CastKind::Noop
-                if matches!(
-                    (from_ty, to_ty),
-                    (IrType::I64, IrType::U64)
-                        | (IrType::U64, IrType::I64)
-                        | (IrType::I64, IrType::I64)
-                        | (IrType::U64, IrType::U64)
-                ) =>
+            if matches!(from_ty, IrType::I32 | IrType::U32)
+                && matches!(to_ty, IrType::I32 | IrType::U32)
             {
-                // DEAD no-op of a FUSED mul-acc chain (single-use dest whose
-                // only reader — the chain — emitted nothing): suppress the
-                // slot-pair copy. Never reached for rejected chains, whose
-                // no-ops must still materialise for the standalone tail.
-                if self.mulacc_virtual_casts.contains(&dest.0) {
-                    if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-                        eprintln!(
-                            "[MULACC] virtual no-op cast dest={} (emits nothing)",
-                            dest.0
-                        );
+                if let (Some(&dp), Some(&sp)) = (
+                    self.reg_assignments.get(&dest.0),
+                    self.reg_assignments.get(&source.0),
+                ) {
+                    if dp == sp {
+                        return;
                     }
+                }
+            }
+        }
+
+        // Identity casts must preserve the complete representation.
+        // In particular F64 and F128 must never reach the scalar eax
+        // fallback, which would truncate them to four bytes.
+        if from_ty == to_ty {
+            match to_ty {
+                IrType::F32 => {
+                    self.operand_to_eax(src);
+                    self.store_eax_to(dest);
                     return;
                 }
-                self.emit_load_acc_pair(src);
-                self.emit_store_acc_pair(dest);
-                self.state.reg_cache.invalidate_all();
+                IrType::F64 => {
+                    self.emit_load_acc_pair(src);
+                    self.state.reg_cache.invalidate_all();
+                    self.emit_store_acc_pair(dest);
+                    self.state.reg_cache.invalidate_all();
+                    return;
+                }
+                IrType::F128 => {
+                    // Dead-destination contract: skip before any load.
+                    if self.state.get_slot(dest.0).is_none() {
+                        return;
+                    }
+                    // A direct-slot source holds the native encoding:
+                    // copy the 12-byte ABI object without touching the
+                    // FPU (NaN payloads and padding survive verbatim).
+                    if self.cast_copy_direct_f128(dest, src) {
+                        return;
+                    }
+                    // Non-direct operands go through the existing
+                    // representation-aware materialization helper.
+                    self.emit_f128_load_to_x87(src);
+                    self.cast_store_x87_float(dest, to_ty);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let kind = classify_cast_with_f128(from_ty, to_ty, true);
+
+        // --- Scalar float<->integer casts that fit the single-register
+        // interface (the SSE fast paths for the common sizes) ---
+        if matches!(kind, CastKind::SignedToFloat { to_f64: false, .. }) && from_ty != IrType::I64
+            || matches!(kind, CastKind::UnsignedToFloat { to_f64: false, .. })
+                && from_ty != IrType::U64
+            || matches!(kind, CastKind::FloatToSigned { from_f64: false }) && to_ty != IrType::I64
+            || matches!(
+                kind,
+                CastKind::FloatToUnsigned {
+                    from_f64: false,
+                    to_u64: false
+                }
+            )
+        {
+            self.operand_to_eax(src);
+            self.emit_cast_instrs_impl(from_ty, to_ty);
+            self.store_eax_to(dest);
+            return;
+        }
+
+        // --- Everything involving floating point and a wide operand,
+        // F64, or F128 goes through x87 ---
+        if cast_is_float(from_ty) || cast_is_float(to_ty) {
+            assert!(
+                cast_is_float(from_ty) || cast_is_integer(from_ty),
+                "unsupported i686 cast source type"
+            );
+            assert!(
+                cast_is_float(to_ty) || cast_is_integer(to_ty),
+                "unsupported i686 cast destination type"
+            );
+
+            // Dead-destination contract: diagnose before emitting a load
+            // that pushes st(0).
+            if to_ty == IrType::F128 && self.state.get_slot(dest.0).is_none() {
+                return;
             }
 
-            // --- Widening casts to I64/U64 need full 8-byte store ---
-            CastKind::IntWiden { .. } if matches!(to_ty, IrType::I64 | IrType::U64) => {
-                // VIRTUAL feeder of a fused mul-acc chain: the zext emits
-                // NOTHING — its high half is provably zero and the fused
-                // chain head references the 32-bit source directly (see
-                // resolve_mulacc_plans; mulacc_virtual_casts is populated
-                // only for single-use feeds of FUSED chains, so the cast's
-                // dest has no other reader).
+            self.cast_load_x87(src, from_ty);
+
+            if cast_is_float(to_ty) {
+                self.cast_store_x87_float(dest, to_ty);
+            } else {
+                self.cast_x87_to_integer(to_ty);
+
+                if cast_is_integer_pair(to_ty) {
+                    self.emit_store_acc_pair(dest);
+                    self.state.reg_cache.invalidate_all();
+                } else {
+                    self.store_eax_to(dest);
+                }
+            }
+
+            return;
+        }
+
+        // --- Integer <-> integer ---
+
+        // Same-width 64-bit signedness changes copy the whole payload.
+        if cast_is_integer_pair(from_ty) && cast_is_integer_pair(to_ty) {
+            // Planner contract inherited from the original implementation:
+            // a virtual mul-acc result has no independently materialized
+            // consumer, so its no-op must emit nothing.
+            if self.mulacc_virtual_casts.contains(&dest.0) {
+                return;
+            }
+
+            self.emit_load_acc_pair(src);
+            self.state.reg_cache.invalidate_all();
+            self.emit_store_acc_pair(dest);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        match kind {
+            CastKind::IntWiden { .. } if cast_is_integer_pair(to_ty) => {
                 if self.mulacc_virtual_casts.contains(&dest.0) {
-                    if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-                        eprintln!(
-                            "[MULACC] virtual widening feeder dest={} (emits nothing)",
-                            dest.0
-                        );
-                    }
                     return;
                 }
+
                 self.operand_to_eax(src);
-                self.emit_cast_instrs_impl(from_ty, to_ty);
-                // Set high half: sign-extend for signed sources, zero-extend for unsigned
+                self.cast_normalize_eax(from_ty);
+                self.state.reg_cache.invalidate_all();
+
                 if from_ty.is_signed() {
-                    self.state.emit("    cltd"); // sign-extend eax into edx:eax
+                    self.state.emit("    cltd");
                 } else {
                     self.state.emit("    xorl %edx, %edx");
                 }
+
                 self.emit_store_acc_pair(dest);
                 self.state.reg_cache.invalidate_all();
             }
-            // --- I64/U64 narrowing to smaller types ---
-            CastKind::IntNarrow { .. } if matches!(from_ty, IrType::I64 | IrType::U64) => {
-                // Load only the low 32 bits (truncation)
-                self.operand_to_eax(src);
-                self.emit_cast_instrs_impl(from_ty, to_ty);
+
+            CastKind::IntNarrow { .. } if cast_is_integer_pair(from_ty) => {
+                // Only the low word survives truncation, but the pair
+                // loader is the documented interface for wide operands
+                // (it knows how to reach every wide representation).
+                self.emit_load_acc_pair(src);
+                self.state.reg_cache.invalidate_all();
+                self.cast_normalize_eax(to_ty);
                 self.store_eax_to(dest);
             }
-            // --- All other casts use the default path (emit_load_operand -> eax -> cast -> store) ---
+
             _ => {
                 self.operand_to_eax(src);
                 self.emit_cast_instrs_impl(from_ty, to_ty);
@@ -249,449 +295,645 @@ impl I686Codegen {
         }
     }
 
-    // --- Helper methods for cast families ---
+    fn cast_normalize_eax(&mut self, ty: IrType) {
+        if let Some(instruction) = cast_normalization_instruction(ty) {
+            self.state.emit(instruction);
+        }
+    }
 
-    /// Signed integer -> F64 via x87 FPU.
-    fn emit_signed_to_f64(&mut self, src: &Operand, src_ty: IrType, dest: &Value) {
-        if src_ty == IrType::I64 {
-            // I64 -> F64: load full 64-bit value, use fildq
-            self.emit_load_acc_pair(src);
-            self.state.emit("    pushl %edx");
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildq (%esp)");
-            self.state.emit("    addl $8, %esp");
-        } else {
-            self.operand_to_eax(src);
-            match src_ty {
-                IrType::I8 => self.state.emit("    movsbl %al, %eax"),
-                IrType::I16 => self.state.emit("    movswl %ax, %eax"),
-                _ => {}
+    /// Copy a known native F128 slot without floating-point arithmetic.
+    ///
+    /// The full 12-byte ABI object is copied (3 dwords), so NaN payloads
+    /// and padding survive verbatim. All source words are read before any
+    /// destination word is written, so overlapping source and destination
+    /// slots cannot corrupt the copy. Measured ~15% faster than the
+    /// push/pop form and free of the stack engine.
+    fn cast_copy_direct_f128(&mut self, dest: &Value, src: &Operand) -> bool {
+        let source = match src {
+            Operand::Value(source) => source,
+            _ => return false,
+        };
+
+        if !self.state.f128_direct_slots.contains(&source.0) {
+            return false;
+        }
+
+        let source_ref = match self.state.get_slot(source.0) {
+            Some(slot) => self.slot_ref(slot),
+            None => return false,
+        };
+        let destination_ref = match self.state.get_slot(dest.0) {
+            Some(slot) => self.slot_ref(slot),
+            None => return false,
+        };
+
+        let source_slot = self.state.get_slot(source.0).expect("checked above");
+        let destination_slot = self.state.get_slot(dest.0).expect("checked above");
+        let ssr4 = self.slot_ref_offset(source_slot, 4);
+        let ssr8 = self.slot_ref_offset(source_slot, 8);
+        let dsr4 = self.slot_ref_offset(destination_slot, 4);
+        let dsr8 = self.slot_ref_offset(destination_slot, 8);
+
+        self.state.reg_cache.invalidate_all();
+
+        emit!(self.state, "    movl {}, %eax", source_ref);
+        emit!(self.state, "    movl {}, %ecx", ssr4);
+        emit!(self.state, "    movl {}, %edx", ssr8);
+        emit!(self.state, "    movl %eax, {}", destination_ref);
+        emit!(self.state, "    movl %ecx, {}", dsr4);
+        emit!(self.state, "    movl %edx, {}", dsr8);
+
+        self.state.f128_direct_slots.insert(dest.0);
+        true
+    }
+
+    /// Load one supported numeric operand into st(0).
+    ///
+    /// Leaves `%eax`/`%edx` untouched on every path (push/pop round trips
+    /// preserve them), so accumulator-cache entries stay valid.
+    fn cast_load_x87(&mut self, src: &Operand, from_ty: IrType) {
+        match from_ty {
+            IrType::F32 => {
+                self.operand_to_eax(src);
+                self.state.emit("    pushl %eax");
+                self.state.emit("    flds (%esp)");
+                self.state.emit("    addl $4, %esp");
             }
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildl (%esp)");
-            self.state.emit("    addl $4, %esp");
-        }
-        // st(0) = F64 result, store to dest's 8-byte slot
-        self.emit_f64_store_from_x87(dest);
-        self.state.reg_cache.invalidate_acc();
-    }
 
-    /// Unsigned integer -> F64 via x87 FPU.
-    fn emit_unsigned_to_f64(&mut self, src: &Operand, from_ty: IrType, dest: &Value) {
-        if from_ty == IrType::U64 {
-            // U64 -> F64: fildq treats the value as signed, so values
-            // >= 2^63 need correction by adding float constant 2^64.
-            self.emit_load_acc_pair(src);
-            self.state.emit("    pushl %edx");
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildq (%esp)");
-            self.state.emit("    addl $8, %esp");
-            self.state.emit("    testl %edx, %edx");
-            let done_label = self.state.fresh_label("u64_f64_done");
-            self.state.out.emit_jcc_label("    jns", &done_label);
-            // High bit set: add 2^64 (float 0x5F800000) to fix sign
-            self.state.emit("    pushl $0x5F800000");
-            self.state.emit("    fadds (%esp)");
-            self.state.emit("    addl $4, %esp");
-            self.state.out.emit_named_label(&done_label);
-        } else {
-            // U8/U16/U32 -> F64: handle high-bit-set U32 values
-            self.operand_to_eax(src);
-            let big_label = self.state.fresh_label("u2f_big");
-            let done_label = self.state.fresh_label("u2f_done");
-            self.state.emit("    testl %eax, %eax");
-            self.state.out.emit_jcc_label("    js", &big_label);
-            // Positive (< 2^31): fildl works directly
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildl (%esp)");
-            self.state.emit("    addl $4, %esp");
-            self.state.out.emit_jmp_label(&done_label);
-            self.state.out.emit_named_label(&big_label);
-            // Bit 31 set: push as u64 (zero-extend), use fildq
-            self.state.emit("    pushl $0");
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildq (%esp)");
-            self.state.emit("    addl $8, %esp");
-            self.state.out.emit_named_label(&done_label);
-        }
-        self.emit_f64_store_from_x87(dest);
-        self.state.reg_cache.invalidate_acc();
-    }
-
-    /// F64 -> signed integer via x87 FPU.
-    fn emit_f64_to_signed(&mut self, src: &Operand, to_ty: IrType, dest: &Value) {
-        self.emit_f64_load_to_x87(src);
-        if to_ty == IrType::I64 {
-            // F64 -> I64: use fisttpq for full 64-bit conversion
-            self.state.emit("    subl $8, %esp");
-            self.state.emit("    fisttpq (%esp)");
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    movl 4(%esp), %edx");
-            self.state.emit("    addl $8, %esp");
-            self.emit_store_acc_pair(dest);
-        } else {
-            // F64 -> I32/I16/I8: use fisttpl for 32-bit conversion
-            self.state.emit("    subl $4, %esp");
-            self.state.emit("    fisttpl (%esp)");
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    addl $4, %esp");
-            // Truncate to target width for sub-32-bit signed types
-            match to_ty {
-                IrType::I8 => self.state.emit("    movsbl %al, %eax"),
-                IrType::I16 => self.state.emit("    movswl %ax, %eax"),
-                _ => {}
+            IrType::F64 => {
+                self.emit_f64_load_to_x87(src);
             }
-            self.state.reg_cache.invalidate_acc();
-            self.store_eax_to(dest);
-        }
-    }
 
-    /// F64 -> unsigned integer via x87 FPU.
-    fn emit_f64_to_unsigned(&mut self, src: &Operand, to_u64: bool, to_ty: IrType, dest: &Value) {
-        self.emit_f64_load_to_x87(src);
-        if to_u64 {
-            // F64 -> U64: use fisttpq for full 64-bit conversion
-            self.state.emit("    subl $8, %esp");
-            self.state.emit("    fisttpq (%esp)");
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    movl 4(%esp), %edx");
-            self.state.emit("    addl $8, %esp");
-            self.emit_store_acc_pair(dest);
-        } else {
-            // F64 -> unsigned sub-64-bit: use fisttpq then take low 32 bits
-            self.state.emit("    subl $8, %esp");
-            self.state.emit("    fisttpq (%esp)");
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    addl $8, %esp");
-            // Truncate to target width for sub-32-bit unsigned types
-            match to_ty {
-                IrType::U8 => self.state.emit("    movzbl %al, %eax"),
-                IrType::U16 => self.state.emit("    movzwl %ax, %eax"),
-                _ => {}
+            IrType::F128 => {
+                self.emit_f128_load_to_x87(src);
             }
-            self.state.reg_cache.invalidate_acc();
-            self.store_eax_to(dest);
-        }
-    }
 
-    /// F32/F64 -> F128 (x87 80-bit long double).
-    fn emit_float_to_f128(&mut self, src: &Operand, from_f32: bool, dest: &Value) {
-        if from_f32 {
-            // F32 -> F128: load F32 onto x87, store as F128
-            self.operand_to_eax(src);
-            self.state.emit("    pushl %eax");
-            self.state.emit("    flds (%esp)");
-            self.state.emit("    addl $4, %esp");
-        } else {
-            // F64 -> F128: load F64 onto x87
-            self.emit_f64_load_to_x87(src);
-        }
-        if let Some(slot) = self.state.get_slot(dest.0) {
-            let sr = self.slot_ref(slot);
-            emit!(self.state, "    fstpt {}", sr);
-            self.state.f128_direct_slots.insert(dest.0);
-        }
-        self.state.reg_cache.invalidate_acc();
-    }
-
-    /// F128 (x87 80-bit) -> F32/F64.
-    fn emit_f128_to_float(&mut self, src: &Operand, to_f32: bool, dest: &Value) {
-        self.emit_f128_load_to_x87(src);
-        if to_f32 {
-            // F128 -> F32
-            self.state.emit("    subl $4, %esp");
-            self.state.emit("    fstps (%esp)");
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    addl $4, %esp");
-            self.state.reg_cache.invalidate_acc();
-            self.store_eax_to(dest);
-        } else {
-            // F128 -> F64
-            self.emit_f64_store_from_x87(dest);
-            self.state.reg_cache.invalidate_acc();
-        }
-    }
-
-    /// Signed integer -> F128 (x87 80-bit long double).
-    fn emit_signed_to_f128(&mut self, src: &Operand, src_ty: IrType, dest: &Value) {
-        if src_ty == IrType::I64 {
-            // I64 -> F128: load full 64-bit value via register pair, use fildq
-            self.emit_load_acc_pair(src);
-            self.state.emit("    pushl %edx");
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildq (%esp)");
-            self.state.emit("    addl $8, %esp");
-        } else {
-            self.operand_to_eax(src);
-            match src_ty {
-                IrType::I8 => self.state.emit("    movsbl %al, %eax"),
-                IrType::I16 => self.state.emit("    movswl %ax, %eax"),
-                _ => {}
+            IrType::I64 => {
+                self.emit_load_acc_pair(src);
+                self.state.reg_cache.invalidate_all();
+                self.state.emit("    pushl %edx");
+                self.state.emit("    pushl %eax");
+                self.state.emit("    fildq (%esp)");
+                self.state.emit("    addl $8, %esp");
             }
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildl (%esp)");
-            self.state.emit("    addl $4, %esp");
-        }
-        if let Some(slot) = self.state.get_slot(dest.0) {
-            let sr = self.slot_ref(slot);
-            emit!(self.state, "    fstpt {}", sr);
-            self.state.f128_direct_slots.insert(dest.0);
-        }
-        self.state.reg_cache.invalidate_acc();
-    }
 
-    /// Unsigned integer -> F128 (x87 80-bit long double).
-    fn emit_unsigned_to_f128(&mut self, src: &Operand, src_ty: IrType, dest: &Value) {
-        if src_ty == IrType::U64 {
-            // U64 -> F128 (x87 80-bit long double):
-            // fildq treats the value as signed. For values >= 2^63
-            // (high bit set), fildq gives a negative result. We fix
-            // this by adding 2^64 (as a float constant 0x5F800000).
-            self.emit_load_acc_pair(src);
-            self.state.emit("    pushl %edx");
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildq (%esp)");
-            self.state.emit("    addl $8, %esp");
-            self.state.emit("    testl %edx, %edx");
-            let done_label = self.state.fresh_label("u64_f128_done");
-            self.state.out.emit_jcc_label("    jns", &done_label);
-            // High bit set: add 2^64 to compensate for signed interpretation.
-            // Float constant 0x5F800000 = 2^64 = 18446744073709551616.0f
-            self.state.emit("    pushl $0x5F800000");
-            self.state.emit("    fadds (%esp)");
-            self.state.emit("    addl $4, %esp");
-            self.state.out.emit_named_label(&done_label);
-        } else {
-            // U8/U16/U32 -> F128: handle high-bit-set U32 values
-            self.operand_to_eax(src);
-            let big_label = self.state.fresh_label("u2f128_big");
-            let done_label = self.state.fresh_label("u2f128_done");
-            self.state.emit("    testl %eax, %eax");
-            self.state.out.emit_jcc_label("    js", &big_label);
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildl (%esp)");
-            self.state.emit("    addl $4, %esp");
-            self.state.out.emit_jmp_label(&done_label);
-            self.state.out.emit_named_label(&big_label);
-            // Bit 31 set: zero-extend to 64-bit and use fildq
-            self.state.emit("    pushl $0");
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildq (%esp)");
-            self.state.emit("    addl $8, %esp");
-            self.state.out.emit_named_label(&done_label);
-        }
-        if let Some(slot) = self.state.get_slot(dest.0) {
-            let sr = self.slot_ref(slot);
-            emit!(self.state, "    fstpt {}", sr);
-            self.state.f128_direct_slots.insert(dest.0);
-        }
-        self.state.reg_cache.invalidate_acc();
-    }
+            IrType::U64 => {
+                self.emit_load_acc_pair(src);
+                self.state.reg_cache.invalidate_all();
+                self.cast_u64_to_x87();
+            }
 
-    /// F128 (x87 80-bit) -> signed integer.
-    fn emit_f128_to_signed(&mut self, src: &Operand, dest_ty: IrType, dest: &Value) {
-        self.emit_f128_load_to_x87(src);
-        if dest_ty == IrType::I64 {
-            // F128 -> I64: use fisttpq for full 64-bit conversion
-            self.state.emit("    subl $8, %esp");
-            self.state.emit("    fisttpq (%esp)");
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    movl 4(%esp), %edx");
-            self.state.emit("    addl $8, %esp");
-            self.emit_store_acc_pair(dest);
-        } else {
-            // F128 -> I32/I16/I8: use fisttpl for 32-bit conversion
-            self.state.emit("    subl $4, %esp");
-            self.state.emit("    fisttpl (%esp)");
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    addl $4, %esp");
-            self.state.reg_cache.invalidate_acc();
-            self.store_eax_to(dest);
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 => {
+                self.operand_to_eax(src);
+                self.cast_normalize_eax(from_ty);
+
+                if from_ty == IrType::U32 {
+                    // Branch-free zero extension into a signed i64.
+                    self.state.emit("    pushl $0");
+                    self.state.emit("    pushl %eax");
+                    self.state.emit("    fildq (%esp)");
+                    self.state.emit("    addl $8, %esp");
+                } else {
+                    // Canonical U8/U16 values also fit signed i32.
+                    self.state.emit("    pushl %eax");
+                    self.state.emit("    fildl (%esp)");
+                    self.state.emit("    addl $4, %esp");
+                }
+            }
+
+            _ => panic!("unsupported i686 numeric cast source"),
         }
     }
 
-    /// F128 (x87 80-bit) -> unsigned integer.
-    fn emit_f128_to_unsigned(&mut self, src: &Operand, dest_ty: IrType, dest: &Value) {
-        self.emit_f128_load_to_x87(src);
-        if dest_ty == IrType::U64 {
-            // F128 -> U64: use fisttpq for full 64-bit conversion
-            self.state.emit("    subl $8, %esp");
-            self.state.emit("    fisttpq (%esp)");
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    movl 4(%esp), %edx");
-            self.state.emit("    addl $8, %esp");
-            self.emit_store_acc_pair(dest);
-        } else {
-            // F128 -> U32/U16/U8: use fisttpq then take low 32 bits
-            self.state.emit("    subl $8, %esp");
-            self.state.emit("    fisttpq (%esp)");
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    addl $8, %esp");
-            self.state.reg_cache.invalidate_acc();
-            self.store_eax_to(dest);
-        }
-    }
+    /// Load a U64 exactly, independently of the x87 precision control.
+    ///
+    /// Called with the value in `%edx:%eax`. For a high-bit-set value the
+    /// native extended encoding is exact:
+    ///
+    /// ```text
+    /// sign        = 0
+    /// exponent    = bias + 63 = 0x403e
+    /// significand = the unsigned integer bits
+    /// ```
+    ///
+    /// No floating-point correction addition is involved, so no PC
+    /// setting can round it.
+    fn cast_u64_to_x87(&mut self) {
+        let high = self.state.fresh_label("cast_u64_high");
+        let done = self.state.fresh_label("cast_u64_loaded");
 
-    /// U64 -> F32 via x87 with unsigned correction.
-    fn emit_u64_to_f32(&mut self, src: &Operand, dest: &Value) {
-        self.emit_load_acc_pair(src);
-        self.state.emit("    pushl %edx");
-        self.state.emit("    pushl %eax");
-        self.state.emit("    fildq (%esp)");
-        self.state.emit("    addl $8, %esp");
-        // If high bit was set, fildq gave a negative result; add 2^64
-        self.state.emit("    testl %edx, %edx");
-        let done_label = self.state.fresh_label("u64_f32_done");
-        self.state.out.emit_jcc_label("    jns", &done_label);
-        // Float constant 0x5F800000 = 2^64
-        self.state.emit("    pushl $0x5F800000");
-        self.state.emit("    fadds (%esp)");
-        self.state.emit("    addl $4, %esp");
-        self.state.out.emit_named_label(&done_label);
-        self.state.emit("    subl $4, %esp");
-        self.state.emit("    fstps (%esp)");
-        self.state.emit("    movl (%esp), %eax");
-        self.state.emit("    addl $4, %esp");
-        self.state.reg_cache.invalidate_acc();
-        self.store_eax_to(dest);
-    }
-
-    /// F32 -> I64/U64 via x87 fisttpq.
-    fn emit_f32_to_i64(&mut self, src: &Operand, dest: &Value) {
-        self.operand_to_eax(src);
-        self.state.emit("    subl $8, %esp");
+        self.state.emit("    subl $12, %esp");
         self.state.emit("    movl %eax, (%esp)");
+        self.state.emit("    movl %edx, 4(%esp)");
+        emit!(self.state, "    movw ${}, 8(%esp)", U64_HIGH_X87_EXPONENT);
+
+        self.state.emit("    testl %edx, %edx");
+        self.state.out.emit_jcc_label("    js", &high);
+
+        self.state.emit("    fildq (%esp)");
+        self.state.out.emit_jmp_label(&done);
+
+        self.state.out.emit_named_label(&high);
+        self.state.emit("    fldt (%esp)");
+
+        self.state.out.emit_named_label(&done);
+        self.state.emit("    addl $12, %esp");
+    }
+
+    /// Pop st(0), storing the requested floating-point destination.
+    ///
+    /// The F128 destination slot was checked by the caller (dead-dest
+    /// contract); F32/F64 paths always pop.
+    fn cast_store_x87_float(&mut self, dest: &Value, to_ty: IrType) {
+        match to_ty {
+            IrType::F32 => {
+                self.state.emit("    subl $4, %esp");
+                self.state.emit("    fstps (%esp)");
+                self.state.emit("    movl (%esp), %eax");
+                self.state.emit("    addl $4, %esp");
+                self.state.reg_cache.invalidate_acc();
+                self.store_eax_to(dest);
+            }
+
+            IrType::F64 => {
+                self.emit_f64_store_from_x87(dest);
+            }
+
+            IrType::F128 => {
+                let destination_ref = match self.state.get_slot(dest.0) {
+                    Some(slot) => self.slot_ref(slot),
+                    None => panic!("i686 F128 cast requires a destination stack slot"),
+                };
+
+                // FSTPT writes the 10 significant bytes; the ABI's
+                // remaining padding bytes are unspecified.
+                emit!(self.state, "    fstpt {}", destination_ref);
+                self.state.f128_direct_slots.insert(dest.0);
+            }
+
+            _ => panic!("x87 floating store requires a floating-point type"),
+        }
+    }
+
+    /// Pop st(0), returning an integer in eax or edx:eax.
+    ///
+    /// FISTTP truncates toward zero without touching the caller's x87
+    /// control word, so the result does not depend on the ambient
+    /// rounding direction.
+    ///
+    /// This implements ordinary C conversions on their defined domain. It
+    /// does not implement saturating conversions or assign semantics to
+    /// NaNs, infinities, or out-of-range truncated results.
+    fn cast_x87_to_integer(&mut self, to_ty: IrType) {
+        assert!(
+            cast_is_integer(to_ty),
+            "x87 integer conversion requires an integer destination"
+        );
+
+        if to_ty == IrType::U64 {
+            self.cast_x87_to_u64();
+            return;
+        }
+
+        let pair_result = to_ty == IrType::I64;
+        let wide_conversion = pair_result || to_ty == IrType::U32;
+
+        if wide_conversion {
+            self.state.emit("    subl $8, %esp");
+            self.state.emit("    fisttpq (%esp)");
+            self.state.emit("    movl (%esp), %eax");
+            if pair_result {
+                self.state.emit("    movl 4(%esp), %edx");
+            }
+            self.state.emit("    addl $8, %esp");
+            self.state.reg_cache.invalidate_acc();
+            if pair_result {
+                self.state.reg_cache.invalidate_sec();
+            }
+        } else {
+            // Every defined I8/U8/I16/U16/I32 result fits signed i32.
+            self.state.emit("    subl $4, %esp");
+            self.state.emit("    fisttpl (%esp)");
+            self.state.emit("    movl (%esp), %eax");
+            self.state.emit("    addl $4, %esp");
+            self.state.reg_cache.invalidate_acc();
+        }
+
+        self.cast_normalize_eax(to_ty);
+    }
+
+    /// Pop st(0), returning U64 in edx:eax.
+    ///
+    /// The 2^63 threshold decides between the two exact conversions:
+    ///
+    /// ```text
+    /// x <  2^63: fisttpq(x) is in range
+    /// x >= 2^63: y = x - 2^63 is exact (Sterbenz) and in [0, 2^63);
+    ///            result = y | 2^63
+    /// ```
+    ///
+    /// Measured at parity with the plain (signed-only) `fisttpq` sequence
+    /// on the validation host; the branch is perfectly predicted on
+    /// uniform data. The threshold constant is 2^63 exactly as an F32
+    /// (`0x5f000000`), so the compare needs no double-width load.
+    fn cast_x87_to_u64(&mut self) {
+        let high = self.state.fresh_label("cast_fp_u64_high");
+        let done = self.state.fresh_label("cast_fp_u64_done");
+
+        self.state.emit("    subl $8, %esp");
+        self.state.emit("    movl $0x5f000000, (%esp)");
         self.state.emit("    flds (%esp)");
+        // FUCOMIP pops the threshold and compares 2^63 with x; the x87
+        // unordered case (NaN input) falls to the low path, whose
+        // indefinite result is outside the defined conversion domain.
+        self.state.emit("    fucomip %st(1), %st");
+        self.state.out.emit_jcc_label("    jbe", &high);
+
         self.state.emit("    fisttpq (%esp)");
+        self.state.out.emit_jmp_label(&done);
+
+        self.state.out.emit_named_label(&high);
+        self.state.emit("    fsubs (%esp)");
+        self.state.emit("    fisttpq (%esp)");
+        self.state.emit("    xorl $0x80000000, 4(%esp)");
+
+        self.state.out.emit_named_label(&done);
         self.state.emit("    movl (%esp), %eax");
         self.state.emit("    movl 4(%esp), %edx");
         self.state.emit("    addl $8, %esp");
-        self.emit_store_acc_pair(dest);
-        self.state.reg_cache.invalidate_all();
+        self.state.reg_cache.invalidate_acc();
+        self.state.reg_cache.invalidate_sec();
     }
 
-    /// Emit scalar cast instructions (non-F64/F128, non-64-bit integer).
-    /// Operates on value already in eax, result left in eax.
+    /// Emit a scalar cast with the operand already in eax, result in eax.
+    ///
+    /// Wide integer and F64/F128 conversions are handled by
+    /// `emit_cast_impl`, not by this single-register interface.
+    /// Unsupported requests must not silently become no-ops.
     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
         use crate::backend::cast::{CastKind, classify_cast};
 
+        assert!(
+            !cast_is_integer_pair(from_ty)
+                && !cast_is_integer_pair(to_ty)
+                && !matches!(from_ty, IrType::F64 | IrType::F128)
+                && !matches!(to_ty, IrType::F64 | IrType::F128)
+                && !crate::backend::generation::is_i128_type(from_ty)
+                && !crate::backend::generation::is_i128_type(to_ty),
+            "wide i686 cast reached the scalar cast emitter"
+        );
+
         match classify_cast(from_ty, to_ty) {
-            CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {}
+            CastKind::Noop => {}
 
-            CastKind::IntNarrow { to_ty } => {
-                // Truncation to a narrower type: sign-extend or zero-extend
-                // the sub-register to fill all of %eax. Without this, the
-                // upper bits of %eax retain stale data from the wider
-                // computation, which corrupts truthiness checks (testl %eax)
-                // and other 32-bit operations on the narrowed value.
-                if to_ty.is_signed() {
-                    match to_ty {
-                        IrType::I8 => self.state.emit("    movsbl %al, %eax"),
-                        IrType::I16 => self.state.emit("    movswl %ax, %eax"),
-                        _ => {} // I32: no-op (already 32-bit)
-                    }
-                } else {
-                    match to_ty {
-                        IrType::U8 => self.state.emit("    movzbl %al, %eax"),
-                        IrType::U16 => self.state.emit("    movzwl %ax, %eax"),
-                        _ => {} // U32: no-op
-                    }
-                }
+            // Same-width signedness changes must re-canonicalize the
+            // register: `(I8)(U8)255` is -1, i.e. 0xffffffff, not the
+            // zero-extended 0x000000ff the unsigned producer left behind.
+            CastKind::IntNarrow { .. }
+            | CastKind::SignedToUnsignedSameSize { .. }
+            | CastKind::UnsignedToSignedSameSize { .. } => {
+                self.state.reg_cache.invalidate_acc();
+                self.cast_normalize_eax(to_ty);
             }
 
-            CastKind::IntWiden { from_ty, .. } => {
-                if from_ty.is_unsigned() {
-                    match from_ty {
-                        IrType::U8 => self.state.emit("    movzbl %al, %eax"),
-                        IrType::U16 => self.state.emit("    movzwl %ax, %eax"),
-                        // U32 -> I64/U64: no-op on i686 (eax already has 32 bits)
-                        _ => {}
-                    }
-                } else {
-                    match from_ty {
-                        IrType::I8 => self.state.emit("    movsbl %al, %eax"),
-                        IrType::I16 => self.state.emit("    movswl %ax, %eax"),
-                        // I32 -> I64/U64: no-op on i686 (eax already has 32 bits)
-                        _ => {}
-                    }
-                }
-            }
+            CastKind::IntWiden { .. } => {
+                self.state.reg_cache.invalidate_acc();
+                self.cast_normalize_eax(from_ty);
 
-            CastKind::SignedToUnsignedSameSize { to_ty } => {
-                // On i686, same-size signed->unsigned: mask for sub-32-bit types
-                match to_ty {
-                    IrType::U8 => self.state.emit("    movzbl %al, %eax"),
-                    IrType::U16 => self.state.emit("    movzwl %ax, %eax"),
-                    _ => {} // U32, U64: no-op
+                // Widening a negative signed source to U16 (or U8)
+                // requires the modulo-2^width value: I8(-1) -> U16 is
+                // 0x0000ffff, but sign extension alone leaves
+                // 0xffffffff. Re-canonicalize for the destination width.
+                if from_ty.is_signed() && matches!(to_ty, IrType::U8 | IrType::U16) {
+                    self.cast_normalize_eax(to_ty);
                 }
             }
 
             CastKind::SignedToFloat { to_f64: false, .. } => {
-                // Signed int -> F32 via SSE
+                self.state.reg_cache.invalidate_acc();
+                self.cast_normalize_eax(from_ty);
                 self.state.emit("    cvtsi2ssl %eax, %xmm0");
                 self.state.emit("    movd %xmm0, %eax");
             }
 
             CastKind::UnsignedToFloat { to_f64: false, .. } => {
-                // U8/U16/U32 -> F32
-                let big_label = self.state.fresh_label("u2f_big");
-                let done_label = self.state.fresh_label("u2f_done");
+                self.state.reg_cache.invalidate_acc();
+                self.cast_normalize_eax(from_ty);
+
+                if matches!(from_ty, IrType::U8 | IrType::U16) {
+                    // Canonical values always fit signed i32.
+                    self.state.emit("    cvtsi2ssl %eax, %xmm0");
+                    self.state.emit("    movd %xmm0, %eax");
+                    return;
+                }
+
+                let high = self.state.fresh_label("cast_u32_f32_high");
+                let done = self.state.fresh_label("cast_u32_f32_done");
+
                 self.state.emit("    testl %eax, %eax");
-                self.state.out.emit_jcc_label("    js", &big_label);
+                self.state.out.emit_jcc_label("    js", &high);
+
                 self.state.emit("    cvtsi2ssl %eax, %xmm0");
                 self.state.emit("    movd %xmm0, %eax");
-                self.state.out.emit_jmp_label(&done_label);
-                self.state.out.emit_named_label(&big_label);
+                self.state.out.emit_jmp_label(&done);
+
+                self.state.out.emit_named_label(&high);
+                // Exact 64-bit integer load, one F32 rounding at store.
+                // No shift/round/add reconstruction, whose directed
+                // rounding can disagree with a single correctly rounded
+                // conversion.
                 self.state.emit("    pushl $0");
                 self.state.emit("    pushl %eax");
                 self.state.emit("    fildq (%esp)");
                 self.state.emit("    fstps (%esp)");
                 self.state.emit("    popl %eax");
                 self.state.emit("    addl $4, %esp");
-                self.state.out.emit_named_label(&done_label);
+
+                self.state.out.emit_named_label(&done);
             }
 
             CastKind::FloatToSigned { from_f64: false } => {
-                // F32 -> signed int via SSE
+                self.state.reg_cache.invalidate_acc();
                 self.state.emit("    movd %eax, %xmm0");
                 self.state.emit("    cvttss2si %xmm0, %eax");
-                // Truncate to target width for sub-32-bit signed types
-                match to_ty {
-                    IrType::I8 => self.state.emit("    movsbl %al, %eax"),
-                    IrType::I16 => self.state.emit("    movswl %ax, %eax"),
-                    _ => {}
-                }
+                self.cast_normalize_eax(to_ty);
             }
 
             CastKind::FloatToUnsigned {
                 from_f64: false,
-                to_u64,
+                to_u64: false,
             } => {
-                if to_u64 {
-                    // F32 -> U64: use x87
-                    self.state.emit("    pushl %eax");
-                    self.state.emit("    flds (%esp)");
-                    self.state.emit("    addl $4, %esp");
-                    self.state.emit("    subl $8, %esp");
-                    self.state.emit("    fisttpq (%esp)");
-                    self.state.emit("    movl (%esp), %eax");
-                    self.state.emit("    movl 4(%esp), %edx");
-                    self.state.emit("    addl $8, %esp");
-                } else {
-                    // F32 -> unsigned int: cvttss2si treats result as signed
+                self.state.reg_cache.invalidate_acc();
+
+                if matches!(to_ty, IrType::U8 | IrType::U16) {
+                    // All defined results fit the signed SSE conversion.
                     self.state.emit("    movd %eax, %xmm0");
                     self.state.emit("    cvttss2si %xmm0, %eax");
-                    // Truncate to target width for sub-32-bit unsigned types
-                    match to_ty {
-                        IrType::U8 => self.state.emit("    movzbl %al, %eax"),
-                        IrType::U16 => self.state.emit("    movzwl %ax, %eax"),
-                        _ => {}
-                    }
+                    self.cast_normalize_eax(to_ty);
+                } else {
+                    assert!(
+                        to_ty == IrType::U32,
+                        "unsupported scalar unsigned floating cast"
+                    );
+
+                    // Never the signed 32-bit cvttss2si: for [2^31, 2^32)
+                    // it returns the indefinite 0x80000000 and raises
+                    // FE_INVALID. The 64-bit fisttpq stays in range for
+                    // every defined input and raises nothing. The F32
+                    // bits are consumed by flds before the conversion
+                    // overwrites the scratch.
+                    self.state.emit("    subl $8, %esp");
+                    self.state.emit("    movl %eax, (%esp)");
+                    self.state.emit("    flds (%esp)");
+                    self.state.emit("    fisttpq (%esp)");
+                    self.state.emit("    movl (%esp), %eax");
+                    self.state.emit("    addl $8, %esp");
                 }
             }
 
-            // F64/F128 casts are handled by emit_cast_impl above
-            _ => {}
+            // A missing lowering must not silently become a no-op.
+            _ => panic!("unsupported i686 scalar cast classification"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        U64_HIGH_X87_EXPONENT, cast_is_float, cast_is_integer, cast_is_integer_pair,
+        cast_normalization_instruction,
+    };
+    use crate::common::types::IrType;
+
+    const X87_EXPONENT_BIAS: i32 = 16383;
+    const TWO63: f64 = 9_223_372_036_854_775_808.0;
+    const TWO64: f64 = 18_446_744_073_709_551_616.0;
+
+    /// Construct the representation the high-U64 load path emits.
+    fn encode_high_u64(value: u64) -> [u8; 10] {
+        assert!(value >= (1u64 << 63));
+
+        let mut bytes = [0u8; 10];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        bytes[8..].copy_from_slice(&U64_HIGH_X87_EXPONENT.to_le_bytes());
+        bytes
+    }
+
+    /// Decode a positive normal extended value known to represent an
+    /// integer, using integer arithmetic rather than host floating point.
+    fn decode_positive_integer(bytes: [u8; 10]) -> u128 {
+        let mut significand_bytes = [0u8; 8];
+        significand_bytes.copy_from_slice(&bytes[..8]);
+        let significand = u64::from_le_bytes(significand_bytes);
+
+        let sign_exponent = u16::from_le_bytes([bytes[8], bytes[9]]);
+        assert_eq!(sign_exponent & 0x8000, 0);
+        assert_ne!(significand & (1u64 << 63), 0);
+
+        let exponent = i32::from(sign_exponent) - X87_EXPONENT_BIAS;
+        let shift = exponent - 63;
+
+        if shift >= 0 {
+            u128::from(significand) << (shift as u32)
+        } else {
+            let right_shift = (-shift) as u32;
+            assert!(right_shift < 64);
+            assert_eq!(significand & ((1u64 << right_shift) - 1), 0);
+            u128::from(significand >> right_shift)
+        }
+    }
+
+    /// Arithmetic model of the finite-input U64 conversion split.
+    fn split_f64_to_u64(value: f64) -> u64 {
+        assert!(value.is_finite());
+        assert!(value > -1.0 && value < TWO64);
+
+        if value >= TWO63 {
+            ((value - TWO63) as i64 as u64) ^ (1u64 << 63)
+        } else {
+            value as i64 as u64
+        }
+    }
+
+    fn next_u64(state: &mut u64) -> u64 {
+        let mut value = *state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        *state = value;
+        value
+    }
+
+    #[test]
+    fn canonical_register_instruction_selection() {
+        for (ty, expected) in [
+            (IrType::I8, "    movsbl %al, %eax"),
+            (IrType::U8, "    movzbl %al, %eax"),
+            (IrType::I16, "    movswl %ax, %eax"),
+            (IrType::U16, "    movzwl %ax, %eax"),
+        ] {
+            assert_eq!(cast_normalization_instruction(ty), Some(expected));
+        }
+
+        for ty in [
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::F32,
+            IrType::F64,
+            IrType::F128,
+        ] {
+            assert_eq!(cast_normalization_instruction(ty), None);
+        }
+    }
+
+    #[test]
+    fn numeric_type_classification() {
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+        ] {
+            assert!(cast_is_integer(ty));
+            assert!(!cast_is_float(ty));
+        }
+
+        for ty in [IrType::F32, IrType::F64, IrType::F128] {
+            assert!(cast_is_float(ty));
+            assert!(!cast_is_integer(ty));
+            assert!(!cast_is_integer_pair(ty));
+        }
+
+        assert!(cast_is_integer_pair(IrType::I64));
+        assert!(cast_is_integer_pair(IrType::U64));
+        assert!(!cast_is_integer_pair(IrType::I32));
+        assert!(!cast_is_integer_pair(IrType::U32));
+    }
+
+    #[test]
+    fn high_unsigned_exponent_is_bias_plus_63() {
+        assert_eq!(i32::from(U64_HIGH_X87_EXPONENT), X87_EXPONENT_BIAS + 63);
+        assert_eq!(U64_HIGH_X87_EXPONENT & 0x8000, 0);
+    }
+
+    #[test]
+    fn high_unsigned_representation_boundaries() {
+        for value in [
+            1u64 << 63,
+            (1u64 << 63) + 1,
+            (1u64 << 63) + 1023,
+            (1u64 << 63) + 1024,
+            (1u64 << 63) + 2047,
+            3u64 << 62,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let bytes = encode_high_u64(value);
+            assert_eq!(decode_positive_integer(bytes), u128::from(value));
+
+            let mut payload = [0u8; 8];
+            payload.copy_from_slice(&bytes[..8]);
+            assert_eq!(u64::from_le_bytes(payload), value);
+        }
+    }
+
+    #[test]
+    fn high_unsigned_representation_deterministic_samples() {
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+
+        for _ in 0..100_000 {
+            let value = next_u64(&mut state) | (1u64 << 63);
+            assert_eq!(
+                decode_positive_integer(encode_high_u64(value)),
+                u128::from(value)
+            );
+        }
+    }
+
+    #[test]
+    fn sign_exponent_test_does_not_accept_negative_values() {
+        let negative_exponent = U64_HIGH_X87_EXPONENT | 0x8000;
+        assert_ne!(negative_exponent, U64_HIGH_X87_EXPONENT);
+
+        for exponent in [
+            0u16,
+            U64_HIGH_X87_EXPONENT - 1,
+            U64_HIGH_X87_EXPONENT + 1,
+            0x7fff,
+            0xffff,
+        ] {
+            assert_ne!(exponent, U64_HIGH_X87_EXPONENT);
+        }
+    }
+
+    #[test]
+    fn threshold_constant_is_exact() {
+        assert_eq!(f64::from(f32::from_bits(0x5f00_0000)), TWO63);
+        assert_eq!(f64::from(f32::from_bits(0x5f80_0000)), TWO64);
+    }
+
+    #[test]
+    fn unsigned_conversion_boundary_cases() {
+        let below_two63 = f64::from_bits(TWO63.to_bits() - 1);
+        let above_two63 = f64::from_bits(TWO63.to_bits() + 1);
+        let below_two64 = f64::from_bits(TWO64.to_bits() - 1);
+
+        let cases = [
+            (-0.75, 0),
+            (-0.0, 0),
+            (0.0, 0),
+            (0.75, 0),
+            (1.0, 1),
+            (1.75, 1),
+            (2_147_483_648.0, 2_147_483_648),
+            (3_221_225_472.0, 3_221_225_472),
+            (4_294_967_295.0, 4_294_967_295),
+            (below_two63, (1u64 << 63) - 1024),
+            (TWO63, 1u64 << 63),
+            (above_two63, (1u64 << 63) + 2048),
+            (13_835_058_055_282_163_712.0, 3u64 << 62),
+            (below_two64, u64::MAX - 2047),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(split_f64_to_u64(value), expected, "value={value:?}");
+        }
+    }
+
+    #[test]
+    fn unsigned_conversion_random_finite_f64_samples() {
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        let mut checked = 0usize;
+
+        for _ in 0..100_000 {
+            let value = f64::from_bits(next_u64(&mut state));
+
+            // Restrict the oracle to the defined C conversion domain.
+            if value.is_finite() && value > -1.0 && value < TWO64 {
+                assert_eq!(split_f64_to_u64(value), value as u64);
+                checked += 1;
+            }
+        }
+
+        assert!(checked > 1000);
+    }
+
+    #[test]
+    fn signedness_change_regressions() {
+        // Semantic examples for the re-canonicalization rules.
+        assert_eq!(i32::from(255u8 as i8), -1);
+        assert_eq!(i32::from(65535u16 as i16), -1);
+
+        assert_eq!(u32::from((-1i8) as u16), 65535);
+        assert_eq!(u32::from((-128i8) as u16), 65408);
+
+        assert_eq!(u32::from((-1i16) as u8), 255);
+        assert_eq!(i32::from(128u8 as i16), 128);
     }
 }
