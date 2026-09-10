@@ -34,8 +34,10 @@
 //!
 //! # External contracts intentionally preserved
 //!
-//! - `pending_addr32` requests the existing `.code16` 0x67 prefix-fixup
-//!   path in `InstructionEncoder::encode`.
+//! - `pending_addr32` requests the 0x67 address-size prefix fixup in
+//!   `InstructionEncoder::encode`, which routes it to
+//!   `fixup_code16_prefixes` in `.code16` and to
+//!   `fixup_code32_addr16_prefix` in `.code32` (see below).
 //! - Symbolic displacement fields initially contain zero bytes;
 //!   `Relocation::addend` carries the addend until the ELF writer patches
 //!   it into the field (REL format, `ElfWriterCore`), with a patch width
@@ -55,21 +57,25 @@
 //!
 //! # Known, documented divergences from GNU as
 //!
-//! - 16-bit register addressing (`%bx`/`%bp`/`%si`/`%di`) in `.code32` is
-//!   **rejected** with a diagnostic. GNU as accepts it by emitting an
-//!   0x67 address-size override. This helper cannot place that prefix:
-//!   callers push the opcode before `encode_modrm_mem` runs, and inserting
-//!   a prefix at the instruction front requires the cross-file
-//!   `pending_*` machinery that only exists for the `.code16` direction.
-//!   The old behavior was a silent miscompile (`(%bx)` encoded as
-//!   `(%ebx)`); rejecting is strictly better and is tracked as follow-up
-//!   work for a prefix-aware refactor.
 //! - Numeric literals with leading zeroes are decimal (`010` == 10), the
 //!   historical contract of this helper. GNU as reads octal; no shipped
 //!   source depends on either reading, and changing it now would be a
 //!   gratuitous compatibility break.
 //! - `symbol+offset` absolute labels pass through `split_label_offset`
 //!   unchanged (symbol plus addend), matching the pre-existing pipeline.
+//!
+//! # Divergences closed by this rewrite
+//!
+//! - 16-bit register addressing (`%bx`/`%bp`/`%si`/`%di`) in `.code32` used
+//!   to be **rejected** with a diagnostic, because this file cannot place
+//!   the 0x67 address-size override itself: callers push the opcode before
+//!   `encode_modrm_mem` runs. It is now supported, exactly as GNU as does
+//!   it. `encode_modrm_mem` reports a 16-bit addressing form through
+//!   `pending_addr32`, and `InstructionEncoder::fixup_code32_addr16_prefix`
+//!   (`encoder/mod.rs`) splices 0x67 into the instruction's prefix run
+//!   after FWAIT and any group-1/segment override, shifting the offsets of
+//!   the relocations it displaces. The behavior this replaced was a silent
+//!   miscompile (`(%bx)` encoded as `(%ebx)`).
 
 use super::*;
 
