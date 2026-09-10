@@ -262,6 +262,59 @@ is ported — the largest remaining single item.
 
 ---
 
+## 5c. Cross-pollination: x86's copy-coalescing rule -> ARM
+
+x86 admits a coalescing when the source is **dead immediately after the copy**
+(`live_after(i, src) == Some(false)`) -- an exact dataflow question. ARM and
+RISC-V asked a syntactic one instead ("is the source mentioned anywhere else in
+the function?"), which is blind to the common case where the source is used
+again later but its value is already dead at the copy.
+
+`scripts/coalesce_census.py` (new) measures the gap by parsing the emitted
+assembly, so it reports what shipped rather than what the pass believes:
+
+    ARM     -O2 -Os   syntactic(current)   0   liveness(x86 rule)  62   extra 62
+    RISC-V  -O2 -Os   syntactic(current)   0   liveness(x86 rule)   5   extra  5
+
+Zero for the current rule is expected: it runs on post-peephole output, so
+everything the syntactic rule can take has already been taken. The 62 are what
+only dataflow can reach.
+
+Porting the rule needed a liveness analysis ARM did not have, and **the port
+found two soundness gaps that the syntactic rule had been hiding**:
+
+1. **A write to `dst` becomes a write to `src`.** Coalescing renames `dst` to
+   `src` in every later line, including lines that merely *write* `dst` -- the
+   epilogue restore of a callee-saved register above all. In `qsort`'s
+   comparator this turned `ldr x21, [sp, #32]` into `ldr x0, [sp, #32]`,
+   overwriting the return value: the program printed `806235850` instead of
+   `1071022847`. Fixed by rule 3 -- a later write to `dst` is only safe when
+   `src` holds nothing live.
+2. **`ret` reads x0-x7.** `classify_implicit_operands_a64` models a bare `ret`
+   as reading only x30 (the link register), so liveness believed the return
+   value was dead and rule 3 slept through the case above. The file already
+   carried a hand-written `Ret` guard for `dst < 8` for exactly this gap; the
+   analysis now models the return-value read too.
+
+That second fix is a **two-mode** analysis, and the reason is measured, not
+stylistic: modelling `ret` as reading x0-x7 *globally* made rule 1 reject every
+copy whose source is an argument register -- the corpus went from 10630 to
+**10643 (+13)**. Rule 1 asks "is this source dead?", which must not see the
+return-value read; rule 3 asks "would this write destroy something?", which
+must. One flag, two analyses, built once per function invocation.
+
+Result: **-1 / -2 instructions** (ARM -Os / -O2), 0/48 differential failures,
+no compile-time change (31 ms per compilation, unchanged). Honest assessment:
+the 62 the census saw are mostly blocked by soundness guards that are doing
+real work -- `Other` mnemonics, `Ret` with `dst < 8`, and rule 3 itself. The
+value of this change is the exact analysis and the two latent bugs it
+surfaced, not the instruction count.
+
+RISC-V's 5 are the same port waiting to happen; its coalescer still runs the
+syntactic rule, which is why it fires on ~1 copy in 775.
+
+---
+
 ## 6. Golden workloads: zstd added
 
 `.github/scripts/ci-codegen-gate.py` now gates `zstd_count.c` alongside

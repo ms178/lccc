@@ -66,6 +66,16 @@ passes; the backend peepholes are documented per backend
   (`coalesce_entry_copies`); i686 has its own equivalents. It is the only way
   to remove an entry-shuffle copy, whose destination is live to the end of the
   function, so no local pass can touch it.
+
+  The copy must sit in the straight-line entry run, and then the admission
+  question is whether the rename is safe afterwards. **x86 and ARM** answer it
+  with exact backward dataflow: the source must be dead immediately after the
+  copy, a later write to the source must not clobber the value, and a later
+  write to the *destination* (the epilogue restore of a callee-saved register,
+  typically) must not destroy whatever is still live in the source. **RISC-V**
+  still uses the older syntactic rule — the source must not be mentioned
+  anywhere else in the function — which is why it fires far less often.
+  `scripts/coalesce_census.py` measures both against the emitted assembly.
 - **Alias folding** (ARM `propagate_address_aliases`) — deletes `mov xD, xS`
   when dst is only ever used as an address base. Gated on an exact CFG query
   (`Cfg::redef_covers_all_reads`): every read of dst reachable *without passing

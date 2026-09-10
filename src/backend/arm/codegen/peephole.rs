@@ -1084,6 +1084,198 @@ fn reads_gp_register(line: &str, kind: LineKind, reg: u8) -> bool {
 ///     while the value lives in a caller-saved register (x0-x17 are clobbered).
 ///  4. No unmodelled instruction after the copy (`Other` / `MemOther`); the
 ///     implicit-operand oracle cannot vouch for what it touches.
+/// The GP registers a line reads and writes, as bitmasks.
+///
+/// A register that appears exactly once and is the line's destination is a
+/// definition, not a read; a register that appears twice (`add x0, x0, x1`)
+/// is both. Implicit operands — the argument registers a `bl` reads, the
+/// caller-saved registers it clobbers, the return-value registers a `ret`
+/// reads — come from `classify_implicit_operands_a64` and are part of both
+/// sets, because a rename cannot reach them either.
+fn gp_operands(line: &str, kind: LineKind, ret_value: bool) -> (u64, u64) {
+    let (ireads, iwrites) = classify_implicit_operands_a64(line);
+    let (mut uses, mut defs) = (ireads, iwrites);
+    let out = written_gp_register(line, kind);
+    let sole_mention = match out {
+        Some(r) => {
+            let (xn, wn) = (xreg_name(r), wreg_name(r));
+            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|t| *t == xn || *t == wn)
+                .count()
+                == 1
+        }
+        None => false,
+    };
+    for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        let reg = if let Some(rest) = tok.strip_prefix('x') {
+            rest.parse::<u8>().ok()
+        } else if let Some(rest) = tok.strip_prefix('w') {
+            rest.parse::<u8>().ok()
+        } else {
+            None
+        };
+        let Some(r) = reg else { continue };
+        if r > 30 {
+            continue;
+        }
+        if sole_mention && out == Some(r) {
+            defs |= 1u64 << r;
+        } else {
+            uses |= 1u64 << r;
+        }
+    }
+    // `classify_implicit_operands_a64` models a `ret` as reading only x30 --
+    // the link register it returns through -- but a return also consumes
+    // x0-x7. Whether to model that is a caller's choice: a rename that
+    // CLOBBERS a return-value register must see the read (or it will destroy
+    // the result), while a rename that merely asks "is this source dead?"
+    // must not, or every copy whose source is an argument register looks live
+    // at the `ret` and is rejected for no reason.
+    if ret_value && line.trim().starts_with("ret") {
+        uses |= 0xff; // x0-x7
+    }
+    (uses, defs)
+}
+
+/// Backward liveness of the GP registers over one function.
+///
+/// `live_before[i]` is the set live immediately **before** line `i`, so the
+/// set live after line `i` is `live_before[i + 1]`. Ported from the x86
+/// backend, whose copy coalescer asks the dataflow question
+/// (`live_after(i, src) == Some(false)`) instead of the syntactic one ("is
+/// `src` mentioned anywhere else?"): only an exact answer says anything about
+/// paths that re-enter this code.
+///
+/// `None` when the function contains control flow the analysis cannot resolve
+/// — an indirect `br xN`, which is what a switch's jump table is. Callers must
+/// then keep the conservative answer rather than assume the best one.
+struct Liveness {
+    live_before: Vec<u64>,
+    end: usize,
+}
+
+impl Liveness {
+    fn build(
+        lines: &[String],
+        kinds: &[LineKind],
+        start: usize,
+        end: usize,
+        ret_value: bool,
+    ) -> Option<Self> {
+        if start >= end {
+            return None;
+        }
+        let mut starts: Vec<usize> = vec![start];
+        for k in start..end {
+            if k > start && kinds[k] == LineKind::Label {
+                starts.push(k);
+            }
+            if k + 1 < end
+                && matches!(
+                    kinds[k],
+                    LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret
+                )
+            {
+                starts.push(k + 1);
+            }
+        }
+        starts.sort_unstable();
+        starts.dedup();
+        let nb = starts.len();
+        let bend = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { end } };
+        let mut label_block: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::default();
+        for b in 0..nb {
+            if kinds[starts[b]] == LineKind::Label {
+                label_block.insert(lines[starts[b]].trim().trim_end_matches(':'), b);
+            }
+        }
+        let mut succs: Vec<Vec<usize>> = Vec::with_capacity(nb);
+        for b in 0..nb {
+            let e = bend(b);
+            let mut t = e;
+            while t > starts[b] && kinds[t - 1] == LineKind::Nop {
+                t -= 1;
+            }
+            if t == starts[b] {
+                succs.push(if b + 1 < nb { vec![b + 1] } else { Vec::new() });
+                continue;
+            }
+            let last = t - 1;
+            let mut s = Vec::new();
+            match kinds[last] {
+                LineKind::Ret => {}
+                LineKind::Branch => {
+                    let tgt = lines[last].trim().split_whitespace().next_back();
+                    match tgt.and_then(|t| label_block.get(t).copied()) {
+                        Some(tb) => s.push(tb),
+                        None => return None, // indirect: no exact answer
+                    }
+                }
+                LineKind::CondBranch | LineKind::CmpBranch => {
+                    let tgt = lines[last].trim().split_whitespace().next_back();
+                    match tgt.and_then(|t| label_block.get(t).copied()) {
+                        Some(tb) => s.push(tb),
+                        None => return None,
+                    }
+                    if b + 1 < nb {
+                        s.push(b + 1);
+                    }
+                }
+                _ => {
+                    if b + 1 < nb {
+                        s.push(b + 1);
+                    }
+                }
+            }
+            succs.push(s);
+        }
+        let mut live_out = vec![0u64; nb];
+        let mut live_in = vec![0u64; nb];
+        let mut live_before = vec![0u64; end];
+        for _ in 0..64 {
+            let mut changed = false;
+            for b in (0..nb).rev() {
+                let mut out = 0u64;
+                for &sc in &succs[b] {
+                    out |= live_in[sc];
+                }
+                if out != live_out[b] {
+                    live_out[b] = out;
+                    changed = true;
+                }
+                let mut live = live_out[b];
+                for k in (starts[b]..bend(b)).rev() {
+                    if matches!(
+                        kinds[k],
+                        LineKind::Nop | LineKind::Directive | LineKind::Label
+                    ) {
+                        live_before[k] = live;
+                        continue;
+                    }
+                    let (u, d) = gp_operands(&lines[k], kinds[k], ret_value);
+                    live = (live & !d) | u;
+                    live_before[k] = live;
+                }
+                live_in[b] = live;
+            }
+            if !changed {
+                break;
+            }
+        }
+        Some(Liveness { live_before, end })
+    }
+
+    /// Is `reg` live immediately after line `i`? `None` at the end of the
+    /// function, where the answer depends on the caller.
+    fn live_after(&self, i: usize, reg: u8) -> Option<bool> {
+        if reg > 30 || i + 1 >= self.end {
+            return None;
+        }
+        Some(self.live_before[i + 1] & (1u64 << reg) != 0)
+    }
+}
+
 fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     fn mentions(line: &str, reg: u8) -> bool {
         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -1117,6 +1309,11 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                 break;
             }
         }
+        // Built once per function invocation: every candidate in the entry run
+        // sees the same text (a successful rename ends the scan), so nothing
+        // here needs recomputing per copy.
+        let lv = Liveness::build(lines, kinds, fstart, fend, false);
+        let mut lv_ret: Option<Liveness> = None;
         let mut i = fstart + 1;
         while i < eend {
             i += 1;
@@ -1132,16 +1329,17 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                 continue;
             }
             let i = i - 1;
-            let mut ok = true;
-            for k in fstart..fend {
-                if k == i || kinds[k] == LineKind::Nop {
-                    continue;
-                }
-                if mentions(&lines[k], src) {
-                    ok = false;
-                    break;
-                }
-            }
+            // Rule 1 (ported from x86): the source must be DEAD immediately
+            // after the copy. The old test -- "`src` is mentioned nowhere else
+            // in the function" -- is syntactic and says nothing about paths
+            // that re-enter this code, so it rejects every copy whose source
+            // appears anywhere else even when the value is already dead here.
+            // Early mentions are harmless: the copy sits in the straight-line
+            // entry run, so every line before it executes exactly once.
+            let Some(lv) = lv.as_ref() else {
+                continue;
+            };
+            let mut ok = lv.live_after(i, src) == Some(false);
             if ok {
                 for k in i + 1..fend {
                     match kinds[k] {
@@ -1162,15 +1360,27 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                                 break;
                             }
                         }
-                        // A call clobbers x0-x17, so the coalesced value must
-                        // not be living in one of them *and still be used*
-                        // after the call.  No mention of dst after the call
-                        // means the value is already dead there.
+                        // A call is the one hazard the operand classifier
+                        // cannot describe: `classify_implicit_operands_a64`
+                        // reports a `bl` as writing only x30, but the callee
+                        // also clobbers x0-x17 and reads x0-x7 as its
+                        // arguments. Liveness answers both, where the old
+                        // test -- "is `dst` mentioned anywhere later?" --
+                        // rejected far more than it had to.
                         LineKind::Call => {
-                            if src < 19
-                                && (k + 1..fend)
-                                    .any(|m| kinds[m] != LineKind::Nop && mentions(&lines[m], dst))
-                            {
+                            // After the rename the coalesced value lives in
+                            // `src`, and a caller-saved `src` is destroyed by
+                            // the call: safe only when `dst` is dead after it.
+                            if src < 19 && lv.live_after(k, dst) != Some(false) {
+                                ok = false;
+                                break;
+                            }
+                            // The callee reads x0-x7 and that read cannot be
+                            // rewritten, so `dst` must not still be live at
+                            // the call. An argument the code sets up
+                            // explicitly is safe: the setup line renames with
+                            // everything else, and it kills `dst` right here.
+                            if dst < 8 && lv.live_before[k] & (1u64 << dst) != 0 {
                                 ok = false;
                                 break;
                             }
@@ -1178,9 +1388,57 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                         _ => {}
                     }
                     let (ireads, iwrites) = classify_implicit_operands_a64(&lines[k]);
-                    if (ireads | iwrites) & (1u64 << dst) != 0 {
+                    // An implicit WRITE to `dst` -- the caller-saved registers
+                    // a `bl` clobbers -- destroys the coalesced value, so it
+                    // is harmless exactly when `dst` is dead afterwards. The
+                    // old test rejected such a line unconditionally, which
+                    // cost every function that contains a call.
+                    if iwrites & (1u64 << dst) != 0 {
                         ok = false;
                         break;
+                    }
+                    // An implicit READ of `dst` -- the argument registers a
+                    // `bl` consumes -- cannot be rewritten, so it must not
+                    // happen while the value is still live: after the rename
+                    // the value lives in `src`, not in `dst`.
+                    if ireads & (1u64 << dst) != 0 {
+                        ok = false;
+                        break;
+                    }
+                    let defs_k = gp_operands(&lines[k], kinds[k], false).1;
+                    // Rule 2: an explicit WRITE to `src` clobbers the value
+                    // that now lives there -- harmless exactly when `dst` is
+                    // dead immediately afterwards. A later read of `src` is
+                    // already excluded by rule 1.
+                    if defs_k & (1u64 << src) != 0 && lv.live_after(k, dst) != Some(false) {
+                        ok = false;
+                        break;
+                    }
+                    // Rule 3: the rename rewrites every later mention of
+                    // `dst`, so a line that WRITES `dst` becomes a write to
+                    // `src` -- and it must not destroy a value that is still
+                    // live in `src` itself. The epilogue restore of a
+                    // callee-saved register is the case that bites: renaming
+                    // `ldr x21, [sp, #32]` to `ldr x0, [sp, #32]` overwrote
+                    // the return value sitting in x0.
+                    if defs_k & (1u64 << dst) != 0 {
+                        // Only reached for the handful of candidates that
+                        // survive rules 1 and 2, so the second analysis --
+                        // which models `ret` as reading x0-x7 -- is built
+                        // lazily.
+                        if lv_ret.is_none() {
+                            lv_ret = Liveness::build(lines, kinds, fstart, fend, true);
+                        }
+                        let live_here = lv_ret.as_ref().and_then(|l| l.live_before.get(k));
+                        match live_here {
+                            Some(m) if m & (1u64 << src) == 0 => {}
+                            // Unresolvable control flow, or `src` is still
+                            // live here: either way the write is unsafe.
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
                     }
                 }
             }
