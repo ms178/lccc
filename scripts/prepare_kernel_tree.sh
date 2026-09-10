@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================================
-# prepare_kernel_tree.sh — regenerate the patched linux-cachymod-6.18.47 tree
+# prepare_kernel_tree.sh — regenerate the patched linux-cachymod-6.18.50 tree
 # used by build_kernel_boot.sh / realmode_corpus.sh.
 #
 # The Arena workspace snapshot is capped (~128 MiB / 10k files), so the
 # ~55k-file kernel tree and the 155 MiB tarball do NOT survive a harness wipe
 # between turns even though /home/user is persisted.  This script makes the
 # tree cheap to regenerate deterministically (~3 min): download, extract,
-# apply the 26 CachyMod patches in PKGBUILD source order, configure with the
+# apply the 28 CachyMod patches in PKGBUILD source order, configure with the
 # package's real config, run `make prepare` (host tooling = gcc), and create
 # the boot-code stubs (capflags.c, utsversion.h, zoffset.h, voffset.h) that a
 # full Kbuild would otherwise generate.
@@ -27,17 +27,17 @@ LCCC_PREPARED_CANARIES=(
 )
 #
 # Usage:
-#   prepare_kernel_tree.sh [kernel-dir]          (default: /home/user/kernel-work/linux-6.18.47)
+#   prepare_kernel_tree.sh [kernel-dir]          (default: /home/user/kernel-work/linux-6.18.50)
 # Environment:
 #   PKGDIR   archpkgbuilds sparse checkout of packages/linux-cachymod-6.18
 #            (default: /home/user/archpkgbuilds/packages/linux-cachymod-6.18)
-#   KVER     kernel version (default 6.18.47)
+#   KVER     kernel version (default 6.18.50)
 # ============================================================================
 set -euo pipefail
 
-KDIR=${1:-${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}}
+KDIR=${1:-${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.50}}
 PKGDIR=${PKGDIR:-/home/user/archpkgbuilds/packages/linux-cachymod-6.18}
-KVER=${KVER:-6.18.47}
+KVER=${KVER:-6.18.50}
 WORK=$(dirname "$KDIR")
 TARBALL="$WORK/linux-$KVER.tar.xz"
 
@@ -122,9 +122,20 @@ for sentinel in Makefile init/main.c arch/x86/Makefile kernel/sched/core.c inclu
 done
 cd "$KDIR"
 
+# ---- 2b. localversion files, exactly like prepare() --------------------------
+# PKGBUILD: echo "-$pkgrel" > localversion.10-pkgrel;
+#           echo "${pkgbase#linux}" > localversion.20-pkgname
+# (pkgrel=2.1, pkgbase=linux-cachymod at 6.18.50 time of writing).
+printf -- '-%s\n' "${LCCC_PKGREL:-2.1}" > localversion.10-pkgrel
+printf -- '%s\n' "${LCCC_PKGBASE_SUFFIX:--cachymod}" > localversion.20-pkgname
+
 # ---- 3. apply the CachyMod patch series (PKGBUILD source order) -------------
 # Mirrors prepare() of the linux-cachymod-6.18 PKGBUILD with the default
-# options: _cpusched=eevdf, _prevent_avx2=no (0300 patch is not in source=).
+# options: _cpusched=eevdf, _prevent_avx2=no (0300-…-prevent-avx2 patch is
+# conditional and not in source=).
+# Updated for 6.18.50: 0300-oom-reaper-check-ms178.patch (v2, now in source=)
+# and 2000-kbuild-speedup-series-ms178.patch were added in PKGBUILD source
+# order; the localversion files are created exactly like prepare() does.
 PATCHES=(
   0000-rt.patch
   0004-bbr3.patch
@@ -141,6 +152,7 @@ PATCHES=(
   0210-cachymod-misc.patch
   0260-fair-update-cachy-mods.patch
   0280-prefer-prevcpu-for-wakeup.patch
+  0300-oom-reaper-check-ms178.patch
   0001-ms178.patch
   0002-ms178-stringopts.patch
   0001-raptorlake-ms178.patch
@@ -152,6 +164,7 @@ PATCHES=(
   0400-cache-aware-scheduling-v4-ms178.patch
   0410-cache-aware-scheduling-cluster-aware-raptorlake.patch
   1020-r8169-rtl8125-multi-queue-godlike.patch
+  2000-kbuild-speedup-series-ms178.patch
 )
 n=0
 for p in "${PATCHES[@]}"; do

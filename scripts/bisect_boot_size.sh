@@ -5,7 +5,7 @@ set -uo pipefail
 REV=$1
 WT=/home/user/bisect
 REPO=/home/user/lccc
-K=/home/user/kernel-work/linux-6.18.47
+K=/home/user/kernel-work/linux-6.18.50
 export PATH=/home/user/.cargo/bin:$PATH
 # Resolve from the live checkout, not from a historical worktree: a bisection
 # must use the current supported compiler toolchain for every candidate.
