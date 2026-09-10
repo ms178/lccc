@@ -121,6 +121,9 @@ gate "machinst-window-alloc" fast \
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 
+gate "i686-asm-diff" fast \
+    python3 scripts/asmdiff.py --32 --lccc target/fastbuild/lccc-i686
+
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
 

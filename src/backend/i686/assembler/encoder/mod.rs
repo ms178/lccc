@@ -201,9 +201,17 @@ impl InstructionEncoder {
         // an operand is not expressible in 16-bit form. GAS orders the pair as
         // 0x67 before 0x66 (verified against binutils 2.47:
         // `movl %eax,(%eax)` in .code16 assembles to `67 66 89 00`).
-        if result.is_ok() && self.code16 {
+        if result.is_ok() {
             let addr32 = std::mem::take(&mut self.pending_addr32);
-            self.fixup_code16_prefixes(start_len, addr32);
+            if self.code16 {
+                self.fixup_code16_prefixes(start_len, addr32);
+            } else if addr32 {
+                // `.code32` with a 16-bit addressing form: splice the 0x67
+                // address-size override in after the group-1/segment prefix
+                // run (GAS: `mov %es:8(%bx), %ax` assembles to
+                // `26 67 66 8b 47 08`).
+                self.fixup_code32_addr16_prefix(start_len);
+            }
         } else {
             self.pending_addr32 = false;
         }
@@ -216,12 +224,49 @@ impl InstructionEncoder {
         result
     }
 
+    /// Splice the 0x67 address-size override for a 16-bit addressing form in
+    /// 32-bit mode. The byte goes after the group-1 (lock/rep) and segment
+    /// overrides and before any operand-size prefix and the opcode. Every
+    /// relocation recorded at or after the splice point shifts by one.
+    fn fixup_code32_addr16_prefix(&mut self, start: usize) {
+        // The FWAIT byte of the x87 waiting forms stays ahead of the
+        // override (GAS: `9b 26 67 d9 7f 08` for `fstcw %es:8(%bx)` in
+        // .code32).
+        let mut i = start;
+        if self.bytes.get(i) == Some(&0x9B) {
+            i += 1;
+        }
+        while i < self.bytes.len()
+            && matches!(
+                self.bytes[i],
+                0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65
+            )
+        {
+            i += 1;
+        }
+        self.bytes.insert(i, 0x67);
+        for relocation in self.relocations.iter_mut() {
+            if relocation.offset >= i as u64 {
+                relocation.offset += 1;
+            }
+        }
+    }
+
     /// Rewrite the operand/address-size prefixes of the instruction that
     /// starts at `start` for 16-bit mode.
     fn fixup_code16_prefixes(&mut self, start: usize, addr32: bool) {
+        // The FWAIT byte (0x9B) of the x87 waiting forms heads the whole
+        // prefix run (GAS: `9b 26 67 d9 78 08` for `fstcw %es:8(%eax)` in
+        // .code16) and is re-emitted first.
+        let mut i = start;
+        let mut fwait = false;
+        if self.bytes.get(i) == Some(&0x9B) {
+            fwait = true;
+            i += 1;
+        }
+
         // Locate the legacy-prefix run: group-1 (lock/rep), segment overrides,
         // and the size overrides may appear in any order before the opcode.
-        let mut i = start;
         let mut had_66 = false;
         let mut had_67 = false;
         let mut keep: Vec<u8> = Vec::new();
@@ -260,15 +305,20 @@ impl InstructionEncoder {
         let want_66 = if self.sized_op { !had_66 } else { had_66 };
         let want_67 = had_67 || addr32;
 
-        let mut out = Vec::with_capacity(self.bytes.len() - start + 2);
-        // GAS byte order: address-size override precedes operand-size override.
+        let mut out = Vec::with_capacity(self.bytes.len() - start + 3);
+        // GAS byte order: FWAIT, segment overrides, then address-size,
+        // then operand-size (verified: `mov %ss:8(%eax), %ebx` in .code16
+        // assembles to `36 67 66 8b 58 08`).
+        if fwait {
+            out.push(0x9B);
+        }
+        out.extend_from_slice(&keep);
         if want_67 {
             out.push(0x67);
         }
         if want_66 {
             out.push(0x66);
         }
-        out.extend_from_slice(&keep);
         out.extend_from_slice(&body);
 
         // Adding or removing a prefix MOVES every byte after it, so any

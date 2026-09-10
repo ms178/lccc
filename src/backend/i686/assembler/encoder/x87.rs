@@ -14,6 +14,20 @@ impl super::InstructionEncoder {
         opcode: &[u8],
         ext: u8,
     ) -> Result<(), String> {
+        if let [Operand::Memory(mem)] = ops {
+            self.emit_segment_prefix(mem);
+        }
+        self.encode_x87_mem_raw(ops, opcode, ext)
+    }
+
+    /// Body of encode_x87_mem without segment-prefix handling.
+    /// encode_x87_wait_mem uses this so the override precedes 0x9B.
+    fn encode_x87_mem_raw(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("x87 mem op requires 1 operand".to_string());
         }
@@ -32,8 +46,13 @@ impl super::InstructionEncoder {
         opcode: &[u8],
         ext: u8,
     ) -> Result<(), String> {
+        // GAS emits the FWAIT (0x9B) byte BEFORE the segment override:
+        // `9b 26 d9 70 08` for `fstenv %es:8(%eax)` (binutils 2.44).
         self.bytes.push(0x9B);
-        self.encode_x87_mem(ops, opcode, ext)
+        if let [Operand::Memory(mem)] = ops {
+            self.emit_segment_prefix(mem);
+        }
+        self.encode_x87_mem_raw(ops, opcode, ext)
     }
 
     pub(super) fn encode_fcomip(&mut self, ops: &[Operand]) -> Result<(), String> {
@@ -124,6 +143,15 @@ impl super::InstructionEncoder {
 
     /// Encode fnstsw (store FPU status word).
     pub(super) fn encode_fnstsw(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if let [Operand::Memory(mem)] = ops {
+            self.emit_segment_prefix(mem);
+        }
+        self.encode_fnstsw_raw(ops)
+    }
+
+    /// Body of encode_fnstsw without segment-prefix handling (see
+    /// encode_fstsw, which must place the override before 0x9B).
+    fn encode_fnstsw_raw(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.is_empty() {
             // fnstsw with no operand defaults to %ax
             self.bytes.extend_from_slice(&[0xDF, 0xE0]);
@@ -146,8 +174,12 @@ impl super::InstructionEncoder {
     }
 
     pub(super) fn encode_fstsw(&mut self, ops: &[Operand]) -> Result<(), String> {
+        // GAS order: FWAIT first, then the segment override (`9b 26 dd 78 08`).
         self.bytes.push(0x9B);
-        self.encode_fnstsw(ops)
+        if let [Operand::Memory(mem)] = ops {
+            self.emit_segment_prefix(mem);
+        }
+        self.encode_fnstsw_raw(ops)
     }
 
     pub(super) fn encode_x87_st_i(
