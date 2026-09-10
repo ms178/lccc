@@ -354,8 +354,18 @@ impl X86Codegen {
             return;
         }
         if from_ty == IrType::F128 && !to_ty.is_float() {
-            self.emit_f128_to_int_cast(to_ty);
-            return;
+            // Fail closed: a 16-byte F128 cannot ride the %rax accumulator
+            // rail. Every F128->int cast is dispatched earlier by
+            // `emit_f128_to_int` (cast_ops.rs), which knows the operand's
+            // home (memory / f128 source / constant) and converts through
+            // the canonical x87 ST0 path. Reaching this arm would mean the
+            // dispatch missed a shape -- historically this rail emitted a
+            // `fldl` of the low 8 bytes of the F128 (a latent miscompile);
+            // a hard panic is the correct failure mode.
+            panic!(
+                "F128->int cast reached the accumulator rail (from {from_ty:?} to {to_ty:?}); \
+                 must be dispatched via emit_f128_to_int"
+            );
         }
         if from_ty == IrType::F128 && to_ty == IrType::F32 {
             self.emit_f128_to_f32_cast();
@@ -404,56 +414,6 @@ impl X86Codegen {
         }
     }
 
-    /// Emit x87 FISTTP-based F128 -> integer conversion.
-    fn emit_f128_to_int_cast(&mut self, to_ty: IrType) {
-        if to_ty.is_signed() || to_ty == IrType::Ptr {
-            self.emit_fisttp_from_f64_via_stack();
-            if to_ty.size() < 8 && to_ty != IrType::Ptr {
-                self.emit_sign_extend_to_rax(to_ty);
-            }
-        } else if to_ty == IrType::U64 {
-            self.emit_f128_to_u64_cast();
-        } else {
-            // Smaller unsigned types: FISTTP then truncate
-            self.emit_fisttp_from_f64_via_stack();
-            self.emit_zero_extend_to_rax(to_ty);
-        }
-    }
-
-    fn emit_f128_to_u64_cast(&mut self) {
-        let big_label = self.state.fresh_label("ld2u_big");
-        let not_range_label = self.state.fresh_label("ld2u_notrange");
-        let done_label = self.state.fresh_label("ld2u_done");
-        self.state.emit("    subq $16, %rsp");
-        self.state.emit("    movq %rax, (%rsp)");
-        self.state.emit("    fldl (%rsp)");
-        self.state.emit("    movabsq $4890909195324358656, %rcx"); // 2^63 as f64 bits
-        self.state.emit("    movq %rcx, (%rsp)");
-        self.state.emit("    fldl (%rsp)"); // ST0 = 2^63, ST1 = value
-        self.state.emit("    fcomip %st(1), %st");
-        self.state.out.emit_jcc_label("    jbe", &big_label);
-        // Small case: value < 2^63
-        self.state.emit("    fisttpq (%rsp)");
-        self.state.emit("    movq (%rsp), %rax");
-        self.state.out.emit_jmp_label(&done_label);
-        // Big case: value >= 2^63 — native extended payload, no
-        // arithmetic (precision-control independent; see
-        // emit_f128_st0_to_int above).
-        self.state.out.emit_named_label(&big_label);
-        self.state.emit("    fstpt (%rsp)");
-        self.state.emit("    cmpw $16446, 8(%rsp)"); // 0x403e
-        self.state.out.emit_jcc_label("    jne", &not_range_label);
-        self.state.emit("    movq (%rsp), %rax");
-        self.state.out.emit_jmp_label(&done_label);
-        // NaN / infinity / >= 2^64 / negative: integer-indefinite.
-        self.state.out.emit_named_label(&not_range_label);
-        self.state.emit("    fldt (%rsp)");
-        self.state.emit("    fisttpq (%rsp)");
-        self.state.emit("    movq (%rsp), %rax");
-        self.state.out.emit_named_label(&done_label);
-        self.state.emit("    addq $16, %rsp");
-    }
-
     fn emit_f128_to_f32_cast(&mut self) {
         self.state.emit("    subq $8, %rsp");
         self.state.emit("    movq %rax, (%rsp)");
@@ -469,16 +429,6 @@ impl X86Codegen {
         self.state.emit("    movq %rax, (%rsp)");
         self.state.emit("    fildq (%rsp)");
         self.state.emit("    fstpl (%rsp)");
-        self.state.emit("    movq (%rsp), %rax");
-        self.state.emit("    addq $8, %rsp");
-    }
-
-    /// Load f64 from rax via stack, FISTTP to i64 — used for F128->int.
-    fn emit_fisttp_from_f64_via_stack(&mut self) {
-        self.state.emit("    subq $8, %rsp");
-        self.state.emit("    movq %rax, (%rsp)");
-        self.state.emit("    fldl (%rsp)");
-        self.state.emit("    fisttpq (%rsp)");
         self.state.emit("    movq (%rsp), %rax");
         self.state.emit("    addq $8, %rsp");
     }

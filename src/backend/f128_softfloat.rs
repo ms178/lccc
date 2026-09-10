@@ -299,6 +299,7 @@ pub fn f128_operand_to_arg1<T: F128SoftFloat + ?Sized>(cg: &mut T, op: &Operand)
                         }
                         SlotAddr::OverAligned(slot, id) => {
                             cg.f128_alloca_aligned_addr(slot, id);
+                            cg.f128_move_aligned_to_addr_reg();
                             if offset != 0 {
                                 cg.f128_add_offset_to_addr_reg(offset);
                             }

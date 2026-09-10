@@ -67,6 +67,11 @@ enum LineKind {
     CondJmp,
     Call,
     Ret,
+    /// `ret $N` — callee-pops conventions (fastcall/stdcall/sret cleanup).
+    /// Semantically a return exactly like `Ret` (observes %eax/%edx/%esp,
+    /// terminates the block), but kept distinct so passes that only handle
+    /// the plain form (tail-call conversion) never see it.
+    RetN,
     Push {
         reg: RegId,
     },
@@ -139,7 +144,8 @@ impl LineInfo {
         matches!(
             self.kind,
             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
-            LineKind::CondJmp | LineKind::Ret | LineKind::Directive | LineKind::InlineAsm |
+            LineKind::CondJmp | LineKind::Ret | LineKind::RetN | LineKind::Directive
+                | LineKind::InlineAsm |
             // ESP changes renumber every (%esp) slot: push/pop and explicit
             // %esp arithmetic fence all slot windows now that ESP-relative
             // slots participate in the peepholes. Pushes/pops only appear
@@ -828,6 +834,13 @@ fn classify_line(raw: &str) -> LineInfo {
 
     if first == b'r' && s == "ret" {
         return line_info(LineKind::Ret, ts);
+    }
+    // `ret $N` (callee-pops return): a return in every respect, but
+    // classified distinctly so tail-call conversion (which requires the
+    // plain form) and the dead-move elimination (which MUST treat it as
+    // observing %eax/%edx) can both be correct.
+    if first == b'r' && s.starts_with("ret ") {
+        return line_info(LineKind::RetN, ts);
     }
 
     // test instructions
@@ -2127,7 +2140,7 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
                     }
                 }
             }
-            LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret => {
+            LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret | LineKind::RetN => {
                 // Control flow change - invalidate all
                 slots = [(REG_NONE, MoveSize::L); SLOT_COUNT];
             }
@@ -3284,7 +3297,7 @@ fn line_reg_use_def(store: &LineStore, infos: &[LineInfo], idx: usize) -> (u16, 
             uses |= caller;
             defs = caller;
         }
-        LineKind::Ret => {
+        LineKind::Ret | LineKind::RetN => {
             // EAX is every scalar return.  EDX liveness for wide integer
             // returns is added from the private function metadata by the CFG
             // driver below.
@@ -3542,7 +3555,7 @@ fn compute_gpr_live_out(
                 .and_then(|name| labels.get(name).copied());
             let mut out = 0u16;
             match infos[i].kind {
-                LineKind::Ret => {}
+                LineKind::Ret | LineKind::RetN => {}
                 LineKind::JmpIndirect => {
                     // See above: jump tables / tail calls — stay conservative.
                     out = GprLiveness::ALL;
@@ -3573,7 +3586,7 @@ fn compute_gpr_live_out(
                 }
             }
             let (mut uses, defs) = line_reg_use_def(store, infos, i);
-            if return_uses_edx && infos[i].kind == LineKind::Ret {
+            if return_uses_edx && matches!(infos[i].kind, LineKind::Ret | LineKind::RetN) {
                 uses |= 1u16 << REG_EDX;
             }
             let input = uses | (out & !defs);
@@ -3995,7 +4008,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
             // %eax/%edx carry the return value, so they must stay live to the
             // `ret`; the pops between here and it are handled by the Pop arm
             // below, which sees the register being redefined.
-            if matches!(infos[j].kind, LineKind::Ret) {
+            if matches!(infos[j].kind, LineKind::Ret | LineKind::RetN) {
                 if is_callee_saved_reg(dst_reg) {
                     infos[i].kind = LineKind::Nop;
                     changed = true;
@@ -4118,7 +4131,10 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                 // can see.  Refuse the fallback for the return registers
                 // unless the function has no `ret` at all (noreturn tail).
                 let ret_observes = matches!(dst_reg, REG_EAX | REG_EDX)
-                    && (fs..fe).any(|k| infos[k].kind == LineKind::Ret && !infos[k].is_nop());
+                    && (fs..fe).any(|k| {
+                        matches!(infos[k].kind, LineKind::Ret | LineKind::RetN)
+                            && !infos[k].is_nop()
+                    });
                 if !ret_observes && census_reg_reads(store, &infos, fs, fe, dst_reg, &[i]) == 0 {
                     infos[i].kind = LineKind::Nop;
                     changed = true;
@@ -6345,7 +6361,7 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
                 }
                 match infos[b].kind {
                     LineKind::Directive | LineKind::Empty => continue,
-                    LineKind::Ret | LineKind::Jmp | LineKind::JmpIndirect => {
+                    LineKind::Ret | LineKind::RetN | LineKind::Jmp | LineKind::JmpIndirect => {
                         guarded = true;
                     }
                     _ => {}
@@ -6924,6 +6940,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         LineKind::Jmp
                         | LineKind::CondJmp
                         | LineKind::Ret
+                        | LineKind::RetN
                         | LineKind::JmpIndirect => break,
                         _ => {}
                     }
@@ -9818,6 +9835,40 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ret_n_observes_return_register() {
+        // `ret $N` (fastcall/stdcall/sret callee-pop) must classify as a
+        // return: the return-value move right before it is LIVE and must
+        // never be deleted by eliminate_dead_reg_moves. Before the RetN
+        // classification, the scan crossed the `ret $8` (a non-barrier
+        // line), saw no read of %eax and dropped the move -- fastcall
+        // callees returned garbage in a non-%eax home.
+        let asm = concat!(
+            "    movl %ecx, %eax\n",
+            "    movl %ebp, %esp\n",
+            "    popl %ebp\n",
+            "    ret $8\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("movl %ecx, %eax"),
+            "return-value move deleted before ret $8:\n{result}"
+        );
+        // The callee-saved variant: a dead write to %esi before ret $8 is
+        // still dead and must still be removed.
+        let asm2 = concat!(
+            "    movl %eax, %esi\n",
+            "    movl %ebp, %esp\n",
+            "    popl %ebp\n",
+            "    ret $8\n",
+        );
+        let result2 = peephole_optimize(asm2.to_string());
+        assert!(
+            !result2.contains("movl %eax, %esi"),
+            "dead callee-saved write must still be removed before ret $8:\n{result2}"
+        );
+    }
 
     #[test]
     fn unary_rmw_breaks_copy_alias() {

@@ -466,7 +466,17 @@ impl Parser {
             // on a function pointer parameter (e.g. `__attribute__((__noreturn__)) fn_ptr_t`)
             // doesn't leak to the enclosing function declaration.
             let saved_noreturn = self.attrs.parsing_noreturn();
-            self.skip_gcc_extensions();
+            // Parse pre-name GCC attributes (e.g. `__attribute__((aligned(16))) int x`)
+            // instead of skipping them, so a pre-name aligned attribute is
+            // honored exactly like the _Alignas pre-name spelling.
+            let (_, pre_align, _, _, _) = self.parse_gcc_attributes();
+            if let Some(a) = pre_align {
+                self.attrs.parsed_alignas = Some(
+                    self.attrs
+                        .parsed_alignas
+                        .map_or(a, |prev: usize| prev.max(a)),
+                );
+            }
             // Save and reset parsing_const to detect if this parameter's base type is const.
             let saved_const = self.attrs.parsing_const();
             self.attrs.set_const(false);
@@ -487,6 +497,25 @@ impl Parser {
                     inner_ptr_depth,
                     param_is_restrict,
                 ) = self.parse_param_declarator_full();
+                // Post-name GCC attributes: `int x __attribute__((aligned(32)))`.
+                // The parameter declarator parser does not consume them; parse
+                // them here and merge `aligned` with any pre-name/_Alignas
+                // alignment already captured.
+                let (_, post_align, _, _, _) = self.parse_gcc_attributes();
+                if let Some(a) = post_align {
+                    self.attrs.parsed_alignas = Some(
+                        self.attrs
+                            .parsed_alignas
+                            .map_or(a, |prev: usize| prev.max(a)),
+                    );
+                }
+                // Direct `__attribute__((aligned(N)))` / `_Alignas(...)`
+                // spellings on the parameter: captured during declarator
+                // parsing. `take()` also prevents leakage into the NEXT
+                // parameter (the save/reset pattern above covers const and
+                // noreturn, but parsed_alignas was never reset here).
+                let param_alignment = self.attrs.parsed_alignas.take();
+                let param_alignas_type = self.attrs.parsed_alignas_type.take();
                 self.skip_gcc_extensions();
 
                 // Apply pointer levels
@@ -528,6 +557,8 @@ impl Parser {
                 params.push(ParamDecl {
                     type_spec,
                     name,
+                    alignment: param_alignment,
+                    alignas_type: param_alignas_type,
                     fptr_params: fptr_param_decls,
                     fptr_variadic,
                     is_const: param_is_const,
@@ -560,6 +591,8 @@ impl Parser {
             params.push(ParamDecl {
                 type_spec: TypeSpecifier::Int, // K&R default type
                 name: Some(n),
+                alignment: None,
+                alignas_type: None,
                 fptr_params: None,
                 fptr_variadic: false,
                 is_const: false,

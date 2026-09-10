@@ -188,6 +188,17 @@ impl I686Codegen {
     // ---- Store/Load overrides ----
 
     pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
+        // Over-aligned-param homing-store elision: `store %p, %a` where %a is
+        // an over-aligned param alloca. The prologue capture already wrote the
+        // incoming value to the alloca's EFFECTIVE aligned address, so this
+        // store is a redundant rewrite (and, pre-elision, the destructive
+        // garbage-copy source: it re-loaded %p from a slot the capture never
+        // wrote). Elide: zero instructions instead of load+store.
+        if let Operand::Value(v) = val {
+            if self.state.param_homing_stores.contains(&(v.0, ptr.0)) {
+                return;
+            }
+        }
         // 128-bit integer container stores (IrType::I128/U128: the _Float128
         // gp-view, _Decimal128, vector pack results).  The historical
         // "i128 == 64-bit eax:edx pair" model truncated these to 8 bytes,

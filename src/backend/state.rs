@@ -453,7 +453,21 @@ pub struct CodegenState {
     /// Populated by `emit_store_params` so that `emit_param_ref` can load the
     /// parameter value from its alloca slot (where emit_store_params saved it)
     /// instead of reading from ABI registers that may have been clobbered.
-    pub param_alloca_slots: Vec<Option<(StackSlot, IrType)>>,
+    /// Over-aligned-param homing-store elision: (store value id = ParamRef
+    /// dest, alloca value id) pairs for `store %p, %a` instructions whose
+    /// effect the prologue capture already performed (it wrote the incoming
+    /// value to the alloca's EFFECTIVE aligned address). Emitting the store
+    /// would re-load the dest slot and re-write the alloca — two memory ops
+    /// per over-aligned parameter. `emit_store_impl` elides them.
+    pub param_homing_stores: FxHashSet<(u32, u32)>,
+    /// ParamRef dests whose ONLY use was the elided homing store: dead after
+    /// the elision. `emit_param_ref_impl` skips them entirely.
+    pub dead_param_ref_dests: FxHashSet<u32>,
+    /// Per-parameter alloca home: (slot, alloca IR type, alloca value id).
+    /// The value id lets ParamRef resolve over-aligned (>16) parameter
+    /// allocas through `alloca_over_align` / `emit_alloca_addr_to`, whose
+    /// effective address differs from the raw slot by the alignment pad.
+    pub param_alloca_slots: Vec<Option<(StackSlot, IrType, u32)>>,
     /// Set of param indices whose values have been pre-stored directly to a
     /// callee-saved register during `emit_store_params`. `emit_param_ref` can
     /// skip the alloca load for these and just emit a no-op (the value is
@@ -578,6 +592,8 @@ impl CodegenState {
             num_params: 0,
             func_is_variadic: false,
             param_alloca_slots: Vec::new(),
+            param_homing_stores: FxHashSet::default(),
+            dead_param_ref_dests: FxHashSet::default(),
             param_pre_stored: FxHashSet::default(),
             uses_sret: false,
             function_sections: false,

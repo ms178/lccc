@@ -2302,6 +2302,39 @@ impl ArmCodegen {
     }
 
     /// Resolve param alloca to (slot, type) for parameter `i`.
+    /// Store `reg` into a parameter alloca home slot: over-aligned (>16)
+    /// allocas have a padded slot and every reader resolves the EFFECTIVE
+    /// align_up'd address — the capture must target it too or the incoming
+    /// value desyncs from its readers by the alignment pad. `over_aligned`
+    /// reports whether x11 currently holds that effective base (computed
+    /// once per parameter in the capture loops); `instr` is the store
+    /// mnemonic (str/strb/strh, or str qN for the 16-byte F128 form).
+    fn emit_param_home_store_impl(
+        &mut self,
+        over_aligned: bool,
+        instr: &str,
+        reg: &str,
+        slot: StackSlot,
+        off: i64,
+    ) {
+        if over_aligned {
+            if off == 0 {
+                self.state
+                    .emit_fmt(format_args!("    {} {}, [x11]", instr, reg));
+            } else if (0..=4095).contains(&off) {
+                self.state
+                    .emit_fmt(format_args!("    {} {}, [x11, #{}]", instr, reg, off));
+            } else {
+                self.load_large_imm("x17", off);
+                self.state.emit("    add x17, x11, x17");
+                self.state
+                    .emit_fmt(format_args!("    {} {}, [x17]", instr, reg));
+            }
+        } else {
+            self.emit_store_to_sp(reg, slot.0 + off, instr);
+        }
+    }
+
     fn resolve_param_slot(
         &self,
         func: &IrFunction,
@@ -2341,16 +2374,30 @@ impl ArmCodegen {
                 continue;
             }
 
-            let (slot, ty, _) = match self.resolve_param_slot(func, i) {
+            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
                 Some(v) => v,
                 None => continue,
             };
+            // Over-aligned (>16) param allocas: the slot is padded and
+            // every reader resolves the EFFECTIVE align_up'd address; the
+            // capture must target it too or the incoming value desyncs
+            // from its readers by the alignment pad. x11 holds the
+            // effective base for the whole arm (x9/x10 are the per-arm
+            // staging registers, x17 is emit_alloca_addr's scratch).
+            let over_aligned = self
+                .state
+                .alloca_over_align(dest_val.0)
+                .filter(|&a| a > 16)
+                .is_some();
+            if over_aligned {
+                self.emit_alloca_addr("x11", dest_val.0, slot.0);
+            }
 
             match class {
                 ParamClass::IntReg { reg_idx } => {
                     if sret_shift > 0 && reg_idx == 0 && i == 0 {
                         // sret pointer: comes in x8 on AArch64
-                        self.emit_store_to_sp("x8", slot.0, "str");
+                        self.emit_param_home_store_impl(over_aligned, "str", "x8", slot, 0);
                     } else {
                         let actual_idx = if reg_idx >= sret_shift {
                             reg_idx - sret_shift
@@ -2359,7 +2406,7 @@ impl ArmCodegen {
                         };
                         let store_instr = Self::str_for_type(ty);
                         let reg = Self::reg_for_type(ARM_ARG_REGS[actual_idx], ty);
-                        self.emit_store_to_sp(reg, slot.0, store_instr);
+                        self.emit_param_home_store_impl(over_aligned, store_instr, reg, slot, 0);
                     }
                 }
                 ParamClass::I128RegPair { base_reg_idx } => {
@@ -2368,8 +2415,20 @@ impl ArmCodegen {
                     } else {
                         base_reg_idx
                     };
-                    self.emit_store_to_sp(ARM_ARG_REGS[actual_idx], slot.0, "str");
-                    self.emit_store_to_sp(ARM_ARG_REGS[actual_idx + 1], slot.0 + 8, "str");
+                    self.emit_param_home_store_impl(
+                        over_aligned,
+                        "str",
+                        ARM_ARG_REGS[actual_idx],
+                        slot,
+                        0,
+                    );
+                    self.emit_param_home_store_impl(
+                        over_aligned,
+                        "str",
+                        ARM_ARG_REGS[actual_idx + 1],
+                        slot,
+                        8,
+                    );
                 }
                 ParamClass::StructByValReg { base_reg_idx, size } => {
                     let actual_idx = if base_reg_idx >= sret_shift {
@@ -2377,9 +2436,21 @@ impl ArmCodegen {
                     } else {
                         base_reg_idx
                     };
-                    self.emit_store_to_sp(ARM_ARG_REGS[actual_idx], slot.0, "str");
+                    self.emit_param_home_store_impl(
+                        over_aligned,
+                        "str",
+                        ARM_ARG_REGS[actual_idx],
+                        slot,
+                        0,
+                    );
                     if size > 8 {
-                        self.emit_store_to_sp(ARM_ARG_REGS[actual_idx + 1], slot.0 + 8, "str");
+                        self.emit_param_home_store_impl(
+                            over_aligned,
+                            "str",
+                            ARM_ARG_REGS[actual_idx + 1],
+                            slot,
+                            8,
+                        );
                     }
                 }
                 ParamClass::LargeStructByRefReg { reg_idx, size } => {
@@ -2393,7 +2464,7 @@ impl ArmCodegen {
                     for qi in 0..n_dwords {
                         let src_off = (qi * 8) as i64;
                         self.emit_load_from_reg("x9", src_reg, src_off, "ldr");
-                        self.emit_store_to_sp("x9", slot.0 + src_off, "str");
+                        self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, src_off);
                     }
                 }
                 _ => {}
@@ -2428,10 +2499,18 @@ impl ArmCodegen {
                 ParamClass::FloatReg { reg_idx } => reg_idx,
                 _ => continue,
             };
-            let (slot, ty, _) = match self.resolve_param_slot(func, i) {
+            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
                 Some(v) => v,
                 None => continue,
             };
+            let over_aligned = self
+                .state
+                .alloca_over_align(dest_val.0)
+                .filter(|&a| a > 16)
+                .is_some();
+            if over_aligned {
+                self.emit_alloca_addr("x11", dest_val.0, slot.0);
+            }
             let fp_reg_off = (reg_idx * 16) as i64;
             if ty == IrType::F32 {
                 self.state
@@ -2442,7 +2521,7 @@ impl ArmCodegen {
                     .emit_fmt(format_args!("    ldr d0, [sp, #{}]", fp_reg_off));
                 self.state.emit("    fmov x9, d0");
             }
-            self.emit_store_to_sp("x9", slot.0 + 128, "str");
+            self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 128);
         }
 
         // Process F128 FP reg params: store full 16-byte f128, then f64 approx.
@@ -2455,10 +2534,18 @@ impl ArmCodegen {
                 Some(v) => v,
                 None => continue,
             };
+            let over_aligned = self
+                .state
+                .alloca_over_align(dest_val.0)
+                .filter(|&a| a > 16)
+                .is_some();
+            if over_aligned {
+                self.emit_alloca_addr("x11", dest_val.0, slot.0);
+            }
             let fp_reg_off = (reg_idx * 16) as i64;
             self.state
                 .emit_fmt(format_args!("    ldr q0, [sp, #{}]", fp_reg_off));
-            self.emit_store_to_sp("q0", slot.0 + 128, "str");
+            self.emit_param_home_store_impl(over_aligned, "str", "q0", slot, 128);
             self.state.track_f128_self(dest_val.0);
             self.state.emit("    bl __trunctfdf2");
             self.state.emit("    fmov x0, d0");
@@ -2477,10 +2564,18 @@ impl ArmCodegen {
                 ParamClass::FloatReg { reg_idx } => reg_idx,
                 _ => continue,
             };
-            let (slot, ty, _) = match self.resolve_param_slot(func, i) {
+            let (slot, ty, dest_val) = match self.resolve_param_slot(func, i) {
                 Some(v) => v,
                 None => continue,
             };
+            let over_aligned = self
+                .state
+                .alloca_over_align(dest_val.0)
+                .filter(|&a| a > 16)
+                .is_some();
+            if over_aligned {
+                self.emit_alloca_addr("x11", dest_val.0, slot.0);
+            }
             if ty == IrType::F32 {
                 self.state
                     .emit_fmt(format_args!("    fmov w9, s{}", reg_idx));
@@ -2488,7 +2583,7 @@ impl ArmCodegen {
                 self.state
                     .emit_fmt(format_args!("    fmov x9, d{}", reg_idx));
             }
-            self.emit_store_to_sp("x9", slot.0, "str");
+            self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 0);
         }
     }
 
@@ -2512,6 +2607,14 @@ impl ArmCodegen {
                 Some(v) => v,
                 None => continue,
             };
+            let over_aligned = self
+                .state
+                .alloca_over_align(dest_val.0)
+                .filter(|&a| a > 16)
+                .is_some();
+            if over_aligned {
+                self.emit_alloca_addr("x11", dest_val.0, slot.0);
+            }
 
             match class {
                 ParamClass::StructStack { offset, size }
@@ -2520,23 +2623,23 @@ impl ArmCodegen {
                     for qi in 0..size.div_ceil(8) {
                         let off = qi as i64 * 8;
                         self.emit_load_from_sp("x9", caller_offset + off, "ldr");
-                        self.emit_store_to_sp("x9", slot.0 + off, "str");
+                        self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, off);
                     }
                 }
                 ParamClass::F128Stack { offset } => {
                     let caller_offset = frame_size + offset;
                     self.emit_load_from_sp("x9", caller_offset, "ldr");
-                    self.emit_store_to_sp("x9", slot.0, "str");
+                    self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 0);
                     self.emit_load_from_sp("x9", caller_offset + 8, "ldr");
-                    self.emit_store_to_sp("x9", slot.0 + 8, "str");
+                    self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 8);
                     self.state.track_f128_self(dest_val.0);
                 }
                 ParamClass::I128Stack { offset } => {
                     let caller_offset = frame_size + offset;
                     self.emit_load_from_sp("x9", caller_offset, "ldr");
-                    self.emit_store_to_sp("x9", slot.0, "str");
+                    self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 0);
                     self.emit_load_from_sp("x9", caller_offset + 8, "ldr");
-                    self.emit_store_to_sp("x9", slot.0 + 8, "str");
+                    self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 8);
                 }
                 ParamClass::StackScalar { offset } => {
                     let caller_offset = frame_size + offset;
@@ -2546,7 +2649,7 @@ impl ArmCodegen {
                     let load_instr = self.load_instr_for_type_impl(ty);
                     let (arm_load, dest_reg) = Self::arm_parse_load_to_reg(load_instr, "x9", "w9");
                     self.emit_load_from_sp(dest_reg, caller_offset, arm_load);
-                    self.emit_store_to_sp("x9", slot.0, "str");
+                    self.emit_param_home_store_impl(over_aligned, "str", "x9", slot, 0);
                 }
                 ParamClass::LargeStructByRefStack { offset, size } => {
                     let caller_offset = frame_size + offset;
@@ -2554,7 +2657,7 @@ impl ArmCodegen {
                     for qi in 0..size.div_ceil(8) {
                         let off = (qi * 8) as i64;
                         self.emit_load_from_reg("x10", "x9", off, "ldr");
-                        self.emit_store_to_sp("x10", slot.0 + off, "str");
+                        self.emit_param_home_store_impl(over_aligned, "str", "x10", slot, off);
                     }
                 }
                 _ => {}
