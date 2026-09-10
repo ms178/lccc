@@ -41,6 +41,10 @@
 //!
 //! 8. **Global dead store elimination**: Removes stores to stack slots that
 //!    are never loaded anywhere in the function.
+//!
+//! 9. **Range-safe branch-over-jump fusion**: Inverts a conditional branch
+//!    over an unconditional jump when the new B-type target is conservatively
+//!    proven to fit its ±4 KiB range.
 
 // ── Line classification types ────────────────────────────────────────────────
 
@@ -473,6 +477,30 @@ fn label_name(line: &str) -> Option<&str> {
     trimmed.strip_suffix(':')
 }
 
+/// Invert a RISC-V conditional branch mnemonic.
+fn invert_branch_mnemonic(op: &str) -> Option<&'static str> {
+    match op {
+        "beq" => Some("bne"),
+        "bne" => Some("beq"),
+        "blt" => Some("bge"),
+        "bge" => Some("blt"),
+        "bltu" => Some("bgeu"),
+        "bgeu" => Some("bltu"),
+        "beqz" => Some("bnez"),
+        "bnez" => Some("beqz"),
+        _ => None,
+    }
+}
+
+/// Parse a conditional branch into (mnemonic, operands before target, target).
+fn branch_parts(line: &str) -> Option<(&str, &str, &str)> {
+    let trimmed = line.trim();
+    let (op, args) = trimmed.split_once(' ')?;
+    invert_branch_mnemonic(op)?;
+    let comma = args.rfind(',')?;
+    Some((op, args[..comma].trim_end(), args[comma + 1..].trim()))
+}
+
 /// Parse the destination register from an ALU-style instruction.
 /// RISC-V ALU instructions have the form: `mnemonic rd, rs1, rs2/imm`
 /// The destination is the first operand.
@@ -502,6 +530,9 @@ pub fn peephole_optimize(asm: String) -> String {
         return asm;
     }
 
+    let merge_blocks = std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
+    let coalesce_entry = std::env::var("CCC_NO_ENTRY_COPY_COALESCE").is_err();
+
     // Phase 1: Iterative local passes (up to 8 rounds)
     let mut changed = true;
     let mut rounds = 0;
@@ -510,20 +541,22 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_jumps(&lines, &mut kinds, n);
         changed |= rewrite_far_jumps_to_near(&mut lines, &mut kinds, n);
+        changed |= fuse_branch_over_jump(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
-        changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
-        changed |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+        if merge_blocks {
+            changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
+        }
+        if coalesce_entry {
+            changed |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+        }
         changed |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
         rounds += 1;
     }
 
-    // NOTE: Branch-over-branch optimization is not safe on RISC-V because
-    // B-type branches have ±4KB range while the `jump label, t6` instruction
-    // (auipc+jalr) has unlimited range. Inverting a branch to directly target
-    // a far label would cause R_RISCV_JAL relocation truncation errors in
-    // large functions. The codegen already uses the near/far pattern correctly.
+    // Branch-over-jump fusion above is deliberately range-gated: B-type
+    // branches reach only ±4 KiB, unlike the far `jump` pseudo.
 
     // Phase 2: Global passes (run once)
     let mut global_changed = false;
@@ -541,11 +574,16 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_jumps(&lines, &mut kinds, n);
             changed2 |= rewrite_far_jumps_to_near(&mut lines, &mut kinds, n);
+            changed2 |= fuse_branch_over_jump(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
-            changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
-            changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+            if merge_blocks {
+                changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
+            }
+            if coalesce_entry {
+                changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+            }
             changed2 |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
             changed2 |= eliminate_dead_reg_moves(&lines, &mut kinds, n);
             rounds2 += 1;
@@ -682,6 +720,97 @@ fn rewrite_far_jumps_to_near(lines: &mut [String], kinds: &mut [LineKind], n: us
             }
         }
         start = end;
+    }
+    changed
+}
+
+// ── Branch-over-jump fusion ──────────────────────────────────────────────────
+//
+//     b<cond> rs..., .Lskip       b<!cond> rs..., .Ltarget
+//     j/jump .Ltarget       ->
+// .Lskip:                    .Lskip:
+//
+// This is the RV counterpart of ARM's branch-over-branch pass, but RV B-type
+// branches have only a ±4 KiB reach.  Count every intervening source
+// instruction as 32 bytes (the worst expansion of the pseudos emitted here)
+// and retain a generous 1 KiB linker/relaxation margin.  The deliberately
+// conservative bound trades a few missed folds for relocation-proof output.
+fn fuse_branch_over_jump(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_BRANCH_OVER_JUMP").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] != LineKind::Branch {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n || kinds[j] != LineKind::Jump {
+            continue;
+        }
+        let mut k = j + 1;
+        while k < n && kinds[k] == LineKind::Nop {
+            k += 1;
+        }
+        if k >= n || kinds[k] != LineKind::Label {
+            continue;
+        }
+        let Some((op, operands, skip)) = branch_parts(&lines[i]) else {
+            continue;
+        };
+        if label_name(&lines[k]) != Some(skip) {
+            continue;
+        }
+        let Some(target) = jump_target(&lines[j]) else {
+            continue;
+        };
+        // Only local labels in this function are candidates.  Find the unique
+        // target without crossing a global symbol (a function boundary).
+        let mut target_pos = None;
+        let (lo, hi) = if target.starts_with(".L") {
+            (0, n)
+        } else {
+            continue;
+        };
+        for m in lo..hi {
+            if m != i && kinds[m] == LineKind::Label && label_name(&lines[m]) == Some(target) {
+                target_pos = Some(m);
+                break;
+            }
+        }
+        let Some(tp) = target_pos else { continue };
+        let a = i.min(tp);
+        let b = i.max(tp);
+        if (a + 1..b).any(|m| {
+            (kinds[m] == LineKind::Label
+                && !label_name(&lines[m]).unwrap_or("").starts_with('.'))
+                // `.space`, `.rept`, inline `.insn`, and large alignments can
+                // contribute an unbounded number of bytes that a line census
+                // cannot estimate. Fail closed rather than risk B-range
+                // relocation overflow.
+                || kinds[m] == LineKind::Directive
+        }) {
+            continue;
+        }
+        let insns = (a..=b)
+            .filter(|&m| {
+                !matches!(
+                    kinds[m],
+                    LineKind::Nop | LineKind::Label | LineKind::Directive
+                )
+            })
+            .count();
+        if insns.saturating_mul(32) > 3_000 {
+            continue;
+        }
+        let inv = invert_branch_mnemonic(op).unwrap();
+        lines[i] = format!("    {} {}, {}", inv, operands, target);
+        kinds[i] = LineKind::Branch;
+        kinds[j] = LineKind::Nop;
+        changed = true;
     }
     changed
 }
@@ -1178,6 +1307,7 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
         }
     }
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    let mut falls_through = vec![false; nb];
     let mut unknown_out = vec![false; nb];
     for b in 0..nb {
         let e = end(b);
@@ -1188,6 +1318,7 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
         if t == starts[b] {
             if b + 1 < nb {
                 succs[b].push(b + 1);
+                falls_through[b] = true;
             }
             continue;
         }
@@ -1210,11 +1341,13 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
                 }
                 if b + 1 < nb {
                     succs[b].push(b + 1);
+                    falls_through[b] = true;
                 }
             }
             _ => {
                 if b + 1 < nb {
                     succs[b].push(b + 1);
+                    falls_through[b] = true;
                 }
             }
         }
@@ -1265,6 +1398,13 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
                 }
                 // A function's entry block is the symbol itself.
                 if lines[starts[dup]].ends_with(':') && !lines[starts[dup]].starts_with('.') {
+                    continue;
+                }
+                // A fall-through successor is semantically part of a block
+                // even though it is absent from the textual body.  Identical
+                // instruction sequences with different following blocks are
+                // therefore not interchangeable.
+                if (falls_through[keep] || falls_through[dup]) && succs[keep] != succs[dup] {
                     continue;
                 }
                 let same_preds = {
@@ -1927,6 +2067,36 @@ fn extract_s0_offset_from_line(line: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_blocks_with_different_fallthroughs_do_not_merge() {
+        let asm = "f:\n    beq a0, zero, .Ldup\n.Lkeep:\n    li t0, 1\n.Lkeep_next:\n    li t1, 11\n    ret\n.Ldup:\n    li t0, 1\n.Ldup_next:\n    li t1, 22\n    ret\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!merge_identical_blocks(&mut lines, &mut kinds, n));
+        assert_eq!(kinds[7], LineKind::Label, "duplicate block was deleted");
+    }
+
+    #[test]
+    fn branch_over_jump_fuses_only_to_in_range_target() {
+        let input = "f:\n    beq t0, t1, .Lskip\n    jump .Ltarget, t6\n.Lskip:\n    li t2, 3\n.Ltarget:\n    ret\n";
+        let out = peephole_optimize(input.to_string());
+        assert!(out.contains("bne t0, t1, .Ltarget"), "{out}");
+        assert!(!out.contains("jump .Ltarget"), "{out}");
+    }
+
+    #[test]
+    fn branch_over_jump_keeps_out_of_range_target() {
+        let mut input =
+            String::from("f:\n    beq t0, t1, .Lskip\n    jump .Ltarget, t6\n.Lskip:\n");
+        for _ in 0..100 {
+            input.push_str("    add t2, t2, t3\n");
+        }
+        input.push_str(".Ltarget:\n    ret\n");
+        let out = peephole_optimize(input);
+        assert!(out.contains("beq t0, t1, .Lskip"), "{out}");
+    }
 
     #[test]
     fn test_classify_store() {
