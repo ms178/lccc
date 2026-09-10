@@ -246,6 +246,46 @@ x86-64 typed-MachInst admission):**
    classes). Verified by qemu runtime + disassembly at all opt levels,
    outputs ≡ cross-GCC.
 
+## S11 — typed-MachInst census: native over-aligned-alloca admission (missed-optimization follow-up)
+
+The S10 correctness fixes migrated two over-aligned-alloca shapes OUT of
+the typed census (reject-to-mature-path). That fallback was fail-safe but
+split the MachInst run and flushed it around the instruction — the
+conservative-slowdown class this follow-up closes.
+
+**Design.** The address computation needs no scratch register when the
+destination register can carry the address itself:
+
+* Call arguments (`&x` of an over-aligned alloca): stage
+  `leaq slot(%rbp), %abi; addq $align-1, %abi; andq $-align, %abi` INTO
+  the ABI register before the call (pre-move sequence in the typed call
+  plan; the caller-save guard is unchanged). Byte-identical to the mature
+  path's `emit_alloca_aligned_addr` sequence.
+* ParamRef Case 1 with an over-aligned param alloca and a REGISTER-homed
+  destination: the same three instructions into the destination register,
+  then the extending/raw load through it. A slot-homed destination would
+  need a two-memory relay through a scratch register; that shape stays on
+  the text path (`ParamRef(over-aligned-slot-home)`).
+
+**Evidence (A/B against the pre-change compiler, worktree at origin/main).**
+
+* `overalign_typed_census.c` (-O1 census): pre-change **11/12 lowered
+  (91.7%)** with `rejected 1 Call(arg-unrepresentable)`; post-change
+  **12/12 (100%)**, zero rejections.
+* `ovalign4` (-O1/-O2): 4/5 (80%) → 5/5 and 2/3 (66.7%) → 3/3.
+* Corpus-wide census: identical (49.18% of 76082) — the over-aligned
+  call-arg class does not occur in the regression corpus, which is why the
+  structural gate below (not a corpus run) is the regression lock.
+* Runtime: all over-aligned probes green on lccc-x86-64/-i686 and
+  arm/riscv under qemu; CI-exact SSA corpus 730/730.
+
+**Regression lock.** `tests/regression/check_overalign_typed_census.sh`
++ `tests/regression/overalign_typed_census.c` (self-checking under the
+corpus, census trip-wire at -O1 via `CCC_ISEL_STATS`), wired into
+`.github/workflows/ci.yml` and `scripts/ci_local.sh` ("overalign-typed-census"
+fast gate). Mutation-verified: the pre-change compiler fails the gate with
+the exact rejection recorded above.
+
 ## Follow-ups
 
 * ICC classic: no 32-bit runtime (ia32_lin not shipped in the 2023.2.4

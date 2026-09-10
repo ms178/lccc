@@ -205,6 +205,11 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_machinst_window_alloc_wide_copy.sh
 
+      - name: Verify over-aligned alloca typed-census admission
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_overalign_typed_census.sh
+
       - name: Upload regression results
         if: always()
         uses: actions/upload-artifact@v7
