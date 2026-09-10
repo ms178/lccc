@@ -436,9 +436,22 @@ pub(super) fn classify_instructions(
                 // its address escaping to a call), the ParamRef must have its
                 // own separate slot. Otherwise the ParamRef would read back the
                 // modified value instead of the original parameter value.
+                //
+                // Second exception: OVER-ALIGNED (>16) param allocas. Their
+                // slot is padded and every access — including the prologue
+                // capture — targets the EFFECTIVE align_up'd address, not the
+                // raw base. A ParamRef dest sharing that slot would access the
+                // RAW base (its accesses resolve as a plain value), so the
+                // capture (aligned) and the dest (raw) desync by the alignment
+                // pad: the dest reads/writes padding garbage and, worse,
+                // writes it back over the captured value (the garbage-copy
+                // regression with runtime-nondeterministic results). The dest
+                // keeps its own plain slot and emit_param_ref materializes it
+                // FROM the alloca through the aligned address.
                 if *param_idx < func.param_alloca_values.len() {
                     let alloca_val = func.param_alloca_values[*param_idx];
                     if !modified_param_allocas.contains(&alloca_val.0)
+                        && !state.alloca_alignments.contains_key(&alloca_val.0)
                         && !reg_assigned.contains_key(&dest.0)
                     {
                         if let Some(&slot) = state.value_locations.get(&alloca_val.0) {
@@ -1403,6 +1416,21 @@ pub(super) fn resolve_copy_aliases(
     }
 
     for (&dest_id, &root_id) in copy_alias {
+        // An over-aligned (>16) alloca's slot is PADDED: the effective
+        // address (align_up) differs from the raw slot base, and every
+        // access routes through the aligned address. A plain SSA value
+        // sharing that slot would read/write the RAW base and desync
+        // from the aligned accesses (the parameter capture writes the
+        // aligned slot; ParamRef copies read it through the same aligned
+        // address). Refuse the share for BOTH endpoints so the aliased
+        // value keeps its own plain slot — its accesses are then correct
+        // by construction, and the copy between the two runs through the
+        // aligned address on the alloca side.
+        if state.alloca_alignments.contains_key(&dest_id)
+            || state.alloca_alignments.contains_key(&root_id)
+        {
+            continue;
+        }
         // For phi-web coalesced values, force-overwrite the existing slot with
         // the root's slot. These values were checked for interference during
         // phi-web analysis and are safe to share. Loop-backedge phi aliases are

@@ -53,6 +53,8 @@ impl Lowerer {
                         .map(|(cty, name)| ParamDecl {
                             type_spec: Self::ctype_to_type_spec(cty),
                             name: name.clone(),
+                            alignment: None,
+                            alignas_type: None,
                             fptr_params: None,
                             fptr_variadic: false,
                             is_const: false,
@@ -111,6 +113,8 @@ impl Lowerer {
                     .map(|(cty, name)| ParamDecl {
                         type_spec: Self::ctype_to_type_spec(cty),
                         name: name.clone(),
+                        alignment: None,
+                        alignas_type: None,
                         fptr_params: None,
                         fptr_variadic: false,
                         is_const: false,

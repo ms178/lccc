@@ -276,6 +276,16 @@ pub struct IrParam {
     /// Struct alignment in bytes. Used on RISC-V to even-align register pairs for
     /// 2×XLEN-aligned structs. None for non-struct params.
     pub struct_align: Option<usize>,
+    /// Declared alignment of a scalar parameter's type when an explicit
+    /// alignment override (`__attribute__((aligned(N)))` / `_Alignas(N)`,
+    /// most often through a typedef) exceeds the type's natural alignment.
+    /// The frontend drops nothing here; the backend must home the parameter
+    /// alloca at this alignment so `&x` (and aligned vector accesses on the
+    /// parameter) see the declared alignment, matching GCC, which realigns
+    /// its frame for over-aligned parameter types. None for struct/union
+    /// params (struct_align already covers those) and for scalars without an
+    /// override.
+    pub param_align: Option<usize>,
     /// Per-eightbyte SysV ABI classification for struct params (x86-64 only).
     /// Empty for non-struct params or when classification is not applicable.
     /// Each entry indicates whether that eightbyte should use SSE or GP registers.

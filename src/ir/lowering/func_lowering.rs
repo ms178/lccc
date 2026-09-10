@@ -182,6 +182,7 @@ impl Lowerer {
                     noalias: false,
                     struct_size: None,
                     struct_align: None,
+                    param_align: None,
                     struct_eightbyte_classes: Vec::new(),
                     riscv_float_class: None,
                     is_f128_sse: false,
@@ -221,6 +222,7 @@ impl Lowerer {
                         noalias: false,
                         struct_size: None,
                         struct_align: None,
+                        param_align: None,
                         struct_eightbyte_classes: Vec::new(),
                         riscv_float_class: None,
                         is_f128_sse: false,
@@ -237,6 +239,7 @@ impl Lowerer {
                         noalias: false,
                         struct_size: None,
                         struct_align: None,
+                        param_align: None,
                         struct_eightbyte_classes: Vec::new(),
                         riscv_float_class: None,
                         is_f128_sse: false,
@@ -247,6 +250,7 @@ impl Lowerer {
                         noalias: false,
                         struct_size: None,
                         struct_align: None,
+                        param_align: None,
                         struct_eightbyte_classes: Vec::new(),
                         riscv_float_class: None,
                         is_f128_sse: false,
@@ -292,11 +296,32 @@ impl Lowerer {
                     } else {
                         (None, Vec::new(), None)
                     };
+                // Struct params carry alignment through `struct_align`.
+                // The struct LAYOUT's natural alignment (layout.align) is not
+                // enough: a typedef override (`typedef S7 AS32
+                // __attribute__((aligned(32)))`) or a direct parameter-list
+                // spelling (`struct S {...} s __attribute__((aligned(32)))`)
+                // raises the alignment of the PARAMETER OBJECT itself above
+                // the layout's — and `&s` must observe it (GCC homes the
+                // param at the declared alignment). Fold the declared
+                // alignment in so the alloca is padded and the capture
+                // targets the effective aligned address.
+                let declared_align = self.alignof_type(&param.type_spec);
+                let direct_align = param
+                    .alignment
+                    .or_else(|| param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)));
+                let extra = declared_align.max(direct_align.unwrap_or(0));
+                let struct_align = match struct_align {
+                    Some(a) => Some(a.max(extra)),
+                    None if extra > 0 => Some(extra),
+                    None => None,
+                };
                 params.push(IrParam {
                     ty: IrType::Ptr,
                     noalias: false,
                     struct_size,
                     struct_align,
+                    param_align: None,
                     struct_eightbyte_classes,
                     riscv_float_class,
                     is_f128_sse: false,
@@ -310,11 +335,24 @@ impl Lowerer {
             // a 16-byte SSE struct so the backend routes it through XMM regs.
             if matches!(param_ctype, CType::Float128 | CType::Decimal128) {
                 let ir_idx = params.len();
+                // The carrier is 16 bytes / 16-aligned by ABI, but the
+                // DECLARED alignment may exceed that (typedef override or a
+                // direct parameter-list spelling): `&x` of an
+                // `aligned(32)` _Float128 parameter must be 32-aligned.
+                // Fold it in exactly like the scalar arm.
+                let natural_align = self.ctype_align(&param_ctype);
+                let declared_align = self.alignof_type(&param.type_spec);
+                let direct_align = param
+                    .alignment
+                    .or_else(|| param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)));
+                let declared = declared_align.max(direct_align.unwrap_or(0));
+                let param_align = (declared > natural_align).then_some(declared);
                 params.push(IrParam {
                     ty: IrType::U128,
                     noalias: false,
                     struct_size: Some(16),
-                    struct_align: Some(16),
+                    struct_align: Some(16.max(declared)),
+                    param_align,
                     struct_eightbyte_classes: vec![
                         crate::common::types::EightbyteClass::Sse,
                         crate::common::types::EightbyteClass::Sse,
@@ -337,11 +375,33 @@ impl Lowerer {
                     other => other,
                 };
             }
+            // Declared alignment of the parameter type, honoring typedef
+            // `__attribute__((aligned(N)))` / `_Alignas(N)` overrides. An
+            // override above the type's natural alignment must reach the
+            // backend so the parameter alloca is homed at that alignment
+            // (GCC realigns its frame for over-aligned parameter types, so
+            // `&x` of an `aligned(32)` parameter is 32-aligned there).
+            // Without this, a typedef-aligned scalar parameter is copied to
+            // a naturally-placed slot and `&x` is misaligned.
+            let natural_align = self.ctype_align(&param_ctype);
+            let declared_align = self.alignof_type(&param.type_spec);
+            // Direct spellings written IN the parameter list
+            // (`int x __attribute__((aligned(32)))`, `_Alignas(32) int x`)
+            // ride on ParamDecl, not the type spec. lccc accepts them
+            // (GCC/Clang reject), so they MUST be honored — otherwise the
+            // parameter is homed at natural alignment while the user asked
+            // for more (silent misalignment of `&x`).
+            let direct_align = param
+                .alignment
+                .or_else(|| param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)));
+            let declared_align = declared_align.max(direct_align.unwrap_or(0));
+            let param_align = (declared_align > natural_align).then_some(declared_align);
             params.push(IrParam {
                 ty,
                 noalias: param.is_restrict && ty == IrType::Ptr,
                 struct_size: None,
                 struct_align: None,
+                param_align,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
                 is_f128_sse: false,
@@ -384,11 +444,14 @@ impl Lowerer {
                 .ty
                 .size()
                 .max(param.struct_size.unwrap_or(param.ty.size()));
-            // Carry the struct's ABI alignment onto its parameter alloca. Without
+            // Carry the parameter's declared alignment onto its alloca. Without
             // this, a by-value `_Alignas(16)` struct parameter is copied into an
             // 8-aligned slot in emit_store_params and `&s` (or an aligned vector
-            // access on the param) sees a misaligned address.
-            let align = param.struct_align.unwrap_or(0);
+            // access on the param) sees a misaligned address. `param_align`
+            // extends the same guarantee to typedef-aligned scalar parameters
+            // (`typedef int A32 __attribute__((aligned(32)))`), whose alignment
+            // the frontend would otherwise drop entirely.
+            let align = param.struct_align.or(param.param_align).unwrap_or(0);
             self.emit(Instruction::Alloca {
                 dest: alloca,
                 ty: param.ty,

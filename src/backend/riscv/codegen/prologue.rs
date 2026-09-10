@@ -350,8 +350,9 @@ impl RiscvCodegen {
         // Pre-compute param alloca slots for emit_param_ref
         self.state.param_alloca_slots = (0..func.params.len())
             .map(|i| {
-                find_param_alloca(func, i)
-                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
+                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                    self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
+                })
             })
             .collect();
 
@@ -829,7 +830,7 @@ impl RiscvCodegen {
         // already saved the incoming register value). This avoids issues where
         // ABI registers get clobbered during emit_store_params' processing.
         if param_idx < self.state.param_alloca_slots.len() {
-            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
+            if let Some((slot, alloca_ty, _alloca_id)) = self.state.param_alloca_slots[param_idx] {
                 let load_instr = Self::load_for_type(alloca_ty);
                 self.emit_load_from_s0("t0", slot.0, load_instr);
                 self.store_t0_to(dest);

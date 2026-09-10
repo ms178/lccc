@@ -615,6 +615,17 @@ impl X86Codegen {
     // ---- Store/Load overrides ----
 
     pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
+        // Over-aligned-param homing-store elision: `store %p, %a` where %a is
+        // an over-aligned param alloca. The prologue capture already wrote the
+        // incoming value to the alloca's EFFECTIVE aligned address, so this
+        // store is a redundant rewrite (and, pre-elision, the destructive
+        // garbage-copy source: it re-loaded %p from a slot the capture never
+        // wrote). Elide: zero instructions instead of load+store.
+        if let Operand::Value(v) = val {
+            if self.state.param_homing_stores.contains(&(v.0, ptr.0)) {
+                return;
+            }
+        }
         if ty == IrType::F128 {
             if let Operand::Const(IrConst::LongDouble(_, f128_bytes)) = val {
                 let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);

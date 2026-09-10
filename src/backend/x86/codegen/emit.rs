@@ -5413,7 +5413,7 @@ impl X86Codegen {
         // Case 1 (text path's first materializing case): the parameter's
         // alloca slot holds the staged value — one load.
         if param_idx < self.state.param_alloca_slots.len() {
-            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
+            if let Some((slot, alloca_ty, _alloca_id)) = self.state.param_alloca_slots[param_idx] {
                 return match dst {
                     ParamDst::Reg(r) => {
                         let form = Self::paramref_reg_load_form(alloca_ty)

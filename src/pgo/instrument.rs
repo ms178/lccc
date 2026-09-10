@@ -1598,6 +1598,7 @@ fn push_helper_fn(
             noalias: false,
             struct_size: None,
             struct_align: None,
+            param_align: None,
             struct_eightbyte_classes: vec![],
             is_f128_sse: false,
             riscv_float_class: None,

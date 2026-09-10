@@ -79,6 +79,15 @@ fn va_root_is_stable(func: &IrFunction, root: u32) -> bool {
     false
 }
 
+/// Destination selector for parameter-capture stores: the raw
+/// rbp-relative slot offset, or the effective (over-aligned) base
+/// pre-computed in %r11.
+#[derive(Clone, Copy)]
+enum CaptureDst {
+    Raw(i64),
+    Aligned,
+}
+
 impl X86Codegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
         // ms178 debug: dump IR per function
@@ -2204,6 +2213,56 @@ impl X86Codegen {
         let _ = frame_size;
     }
 
+    /// Capture-store a 64-bit GPR into the parameter home slot.
+    fn emit_capture_store_qword(&mut self, dst: CaptureDst, src_reg: &str, off: i64) {
+        match dst {
+            CaptureDst::Raw(b) => {
+                self.state
+                    .out
+                    .emit_instr_reg_rbp("    movq", src_reg, b + off);
+            }
+            CaptureDst::Aligned => self
+                .state
+                .emit_fmt(format_args!("    movq %{}, {}(%r11)", src_reg, off)),
+        }
+    }
+
+    /// Capture-store a 64-bit XMM payload into the parameter home slot.
+    fn emit_capture_store_xmm(&mut self, dst: CaptureDst, src_reg: &str, off: i64) {
+        match dst {
+            CaptureDst::Raw(b) => {
+                self.state
+                    .out
+                    .emit_instr_reg_rbp("    movq", src_reg, b + off);
+            }
+            CaptureDst::Aligned => self
+                .state
+                .emit_fmt(format_args!("    movq %{}, {}(%r11)", src_reg, off)),
+        }
+    }
+
+    /// Capture-store a full 16-byte XMM register (F128SseReg: movdqu).
+    fn emit_capture_store_movdqu(&mut self, dst: CaptureDst, src_reg: &str) {
+        match dst {
+            CaptureDst::Raw(b) => {
+                self.state.out.emit_instr_rbp_reg("    movdqu", b, src_reg);
+            }
+            CaptureDst::Aligned => self
+                .state
+                .emit_fmt(format_args!("    movdqu %{}, (%r11)", src_reg)),
+        }
+    }
+
+    /// Capture-store the x87 ST0 80-bit image (F128AlwaysStack).
+    fn emit_capture_fstpt(&mut self, dst: CaptureDst, off: i64) {
+        match dst {
+            CaptureDst::Raw(b) => {
+                self.state.out.emit_instr_rbp("    fstpt", b + off);
+            }
+            CaptureDst::Aligned => self.state.emit_fmt(format_args!("    fstpt {}(%r11)", off)),
+        }
+    }
+
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
         let xmm_regs = [
             "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
@@ -2216,8 +2275,9 @@ impl X86Codegen {
 
         self.state.param_alloca_slots = (0..func.params.len())
             .map(|i| {
-                find_param_alloca(func, i)
-                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
+                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                    self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
+                })
             })
             .collect();
 
@@ -2494,14 +2554,44 @@ impl X86Codegen {
                 }
             }
 
-            let (slot, ty) = if let Some((dest, ty)) = find_param_alloca(func, i) {
+            let (slot, ty, dest_id) = if let Some((dest, ty)) = find_param_alloca(func, i) {
                 if let Some(slot) = self.state.get_slot(dest.0) {
-                    (slot, ty)
+                    (slot, ty, dest.0)
                 } else {
                     continue;
                 }
             } else {
                 continue;
+            };
+
+            // Over-aligned (>16) parameter allocas: the slot is padded by
+            // (align-1) and every access resolves the EFFECTIVE aligned
+            // address — the capture must target it too, or the aligned
+            // reads desync from the written data (the same class the
+            // StructStack arm fixed for _Alignas(32) structs; extended
+            // here to every capture class, including the capture-only
+            // ones — F128/I128/struct-by-reg — that no IR-level store
+            // re-homes afterwards).
+            //
+            // %r11 is the aligned-base scratch: it has no SysV incoming
+            // role (rdi,rsi,rdx,rcx,r8,r9 are the argument registers and
+            // %r10 carries the nested-function static chain), so it is
+            // dead by construction here and the parallel-copy pass
+            // reserves only %rax.
+            let over_align = self.state.alloca_over_align(dest_id).filter(|&a| a > 16);
+            if let Some(a) = over_align {
+                self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "r11");
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    addq", (a - 1) as i64, "r11");
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    andq", -(a as i64), "r11");
+            }
+            let dst = if over_align.is_some() {
+                CaptureDst::Aligned
+            } else {
+                CaptureDst::Raw(slot.0)
             };
 
             match class {
@@ -2516,46 +2606,26 @@ impl X86Codegen {
                     // uninitialized memory and trigger valgrind errors.
                     // The typed load in emit_param_ref_impl correctly extracts only the
                     // meaningful bytes (e.g., movslq for I32).
-                    self.state
-                        .out
-                        .emit_instr_reg_rbp("    movq", X86_ARG_REGS[reg_idx], slot.0);
+                    self.emit_capture_store_qword(dst, X86_ARG_REGS[reg_idx], 0);
                 }
                 ParamClass::FloatReg { reg_idx } => {
                     if ty == IrType::F32 || ty == IrType::D32 {
                         self.state
                             .out
                             .emit_instr_reg_reg("    movd", xmm_regs[reg_idx], "eax");
-                        self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+                        self.emit_capture_store_qword(dst, "rax", 0);
                     } else {
-                        self.state
-                            .out
-                            .emit_instr_reg_rbp("    movq", xmm_regs[reg_idx], slot.0);
+                        self.emit_capture_store_xmm(dst, xmm_regs[reg_idx], 0);
                     }
                 }
                 ParamClass::I128RegPair { base_reg_idx } => {
-                    self.state.out.emit_instr_reg_rbp(
-                        "    movq",
-                        X86_ARG_REGS[base_reg_idx],
-                        slot.0,
-                    );
-                    self.state.out.emit_instr_reg_rbp(
-                        "    movq",
-                        X86_ARG_REGS[base_reg_idx + 1],
-                        slot.0 + 8,
-                    );
+                    self.emit_capture_store_qword(dst, X86_ARG_REGS[base_reg_idx], 0);
+                    self.emit_capture_store_qword(dst, X86_ARG_REGS[base_reg_idx + 1], 8);
                 }
                 ParamClass::StructByValReg { base_reg_idx, size } => {
-                    self.state.out.emit_instr_reg_rbp(
-                        "    movq",
-                        X86_ARG_REGS[base_reg_idx],
-                        slot.0,
-                    );
+                    self.emit_capture_store_qword(dst, X86_ARG_REGS[base_reg_idx], 0);
                     if size > 8 {
-                        self.state.out.emit_instr_reg_rbp(
-                            "    movq",
-                            X86_ARG_REGS[base_reg_idx + 1],
-                            slot.0 + 8,
-                        );
+                        self.emit_capture_store_qword(dst, X86_ARG_REGS[base_reg_idx + 1], 8);
                     }
                 }
                 ParamClass::StructSseReg {
@@ -2563,71 +2633,51 @@ impl X86Codegen {
                     hi_fp_idx,
                     ..
                 } => {
-                    self.state
-                        .out
-                        .emit_instr_reg_rbp("    movq", xmm_regs[lo_fp_idx], slot.0);
+                    self.emit_capture_store_xmm(dst, xmm_regs[lo_fp_idx], 0);
                     if let Some(hi) = hi_fp_idx {
-                        self.state
-                            .out
-                            .emit_instr_reg_rbp("    movq", xmm_regs[hi], slot.0 + 8);
+                        self.emit_capture_store_xmm(dst, xmm_regs[hi], 8);
                     }
                 }
                 ParamClass::F128SseReg { reg_idx } => {
                     // _Float128: the full 16 bytes arrive in ONE XMM register.
-                    self.state
-                        .out
-                        .emit_instr_reg_rbp("    movdqu", xmm_regs[reg_idx], slot.0);
+                    self.emit_capture_store_movdqu(dst, xmm_regs[reg_idx]);
                 }
                 ParamClass::StructMixedIntSseReg {
                     int_reg_idx,
                     fp_reg_idx,
                     ..
                 } => {
-                    self.state.out.emit_instr_reg_rbp(
-                        "    movq",
-                        X86_ARG_REGS[int_reg_idx],
-                        slot.0,
-                    );
-                    self.state
-                        .out
-                        .emit_instr_reg_rbp("    movq", xmm_regs[fp_reg_idx], slot.0 + 8);
+                    self.emit_capture_store_qword(dst, X86_ARG_REGS[int_reg_idx], 0);
+                    self.emit_capture_store_xmm(dst, xmm_regs[fp_reg_idx], 8);
                 }
                 ParamClass::StructMixedSseIntReg {
                     fp_reg_idx,
                     int_reg_idx,
                     ..
                 } => {
-                    self.state
-                        .out
-                        .emit_instr_reg_rbp("    movq", xmm_regs[fp_reg_idx], slot.0);
-                    self.state.out.emit_instr_reg_rbp(
-                        "    movq",
-                        X86_ARG_REGS[int_reg_idx],
-                        slot.0 + 8,
-                    );
+                    self.emit_capture_store_xmm(dst, xmm_regs[fp_reg_idx], 0);
+                    self.emit_capture_store_qword(dst, X86_ARG_REGS[int_reg_idx], 8);
                 }
                 ParamClass::F128AlwaysStack { offset } => {
                     let src = stack_base + offset;
                     self.state.out.emit_instr_rbp("    fldt", src);
-                    self.state.out.emit_instr_rbp("    fstpt", slot.0);
+                    self.emit_capture_fstpt(dst, 0);
                 }
                 ParamClass::I128Stack { offset } => {
                     let src = stack_base + offset;
                     self.state.out.emit_instr_rbp_reg("    movq", src, "rax");
-                    self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+                    self.emit_capture_store_qword(dst, "rax", 0);
                     self.state
                         .out
                         .emit_instr_rbp_reg("    movq", src + 8, "rax");
-                    self.state
-                        .out
-                        .emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
+                    self.emit_capture_store_qword(dst, "rax", 8);
                 }
                 ParamClass::StackScalar { offset } => {
                     // Load from caller's stack frame and store full 8 bytes to ensure
                     // the entire slot is initialized (see IntReg comment above).
                     let src = stack_base + offset;
                     self.state.out.emit_instr_rbp_reg("    movq", src, "rax");
-                    self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+                    self.emit_capture_store_qword(dst, "rax", 0);
                 }
                 ParamClass::StructStack { offset, size }
                 | ParamClass::LargeStructStack { offset, size } => {
@@ -2636,51 +2686,19 @@ impl X86Codegen {
                     // Over-aligned (>16) parameter allocas have their slot
                     // oversized by (align-1); the EFFECTIVE address is
                     // align_up(slot, align). `&s` (via value_to_reg) resolves
-                    // that same aligned address, so the copy must target it too
-                    // — writing the raw slot desyncs the two by the alignment
-                    // pad (the _Alignas(32) struct param regression).
-                    let over_align = find_param_alloca(func, i)
-                        .and_then(|(dest, _)| self.state.alloca_over_align(dest.0))
-                        .filter(|&a| a > 16);
-                    if let Some(a) = over_align {
-                        // The aligned-address scratch MUST NOT be %rcx: with
-                        // three or more register-class integer parameters the
-                        // third SysV integer argument LIVES in %rcx at this
-                        // point (fn4 stress repro: `long a3` arrived in %rcx,
-                        // the lea/add/and overwrote it with the aligned-home
-                        // address, and every later read of a3 consumed a
-                        // stack pointer).  %r11 is the only GP register with
-                        // no incoming role on SysV — it is not one of the six
-                        // argument registers (rdi,rsi,rdx,rcx,r8,r9) and it
-                        // does not carry the nested-function static chain
-                        // (%r10) — so it is dead by construction here, and
-                        // the parallel-copy pass below reserves only %rax.
-                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "r11");
+                    // that same aligned address, so the copy must target it
+                    // too — writing the raw slot desyncs the two by the
+                    // alignment pad (the _Alignas(32) struct param
+                    // regression). The aligned base is pre-computed in %r11
+                    // above (a register with no SysV incoming role — see the
+                    // comment there; %rcx is NOT usable here: it may still
+                    // carry an uncaptured third integer argument).
+                    for qi in 0..n_qwords {
+                        let src_off = src + (qi as i64 * 8);
                         self.state
                             .out
-                            .emit_instr_imm_reg("    addq", (a - 1) as i64, "r11");
-                        self.state
-                            .out
-                            .emit_instr_imm_reg("    andq", -(a as i64), "r11");
-                        for qi in 0..n_qwords {
-                            let src_off = src + (qi as i64 * 8);
-                            self.state
-                                .out
-                                .emit_instr_rbp_reg("    movq", src_off, "rax");
-                            self.state
-                                .emit_fmt(format_args!("    movq %rax, {}(%r11)", qi * 8));
-                        }
-                    } else {
-                        for qi in 0..n_qwords {
-                            let src_off = src + (qi as i64 * 8);
-                            let dst_off = slot.0 + (qi as i64 * 8);
-                            self.state
-                                .out
-                                .emit_instr_rbp_reg("    movq", src_off, "rax");
-                            self.state
-                                .out
-                                .emit_instr_reg_rbp("    movq", "rax", dst_off);
-                        }
+                            .emit_instr_rbp_reg("    movq", src_off, "rax");
+                        self.emit_capture_store_qword(dst, "rax", qi as i64 * 8);
                     }
                 }
                 ParamClass::F128FpReg { .. }
@@ -2902,6 +2920,13 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_param_ref_impl(&mut self, dest: &Value, param_idx: usize, ty: IrType) {
+        // Over-aligned-param homing elision: this dest's only use was the
+        // elided homing store. The prologue capture is the single
+        // authoritative home of the alloca; the dest itself is dead. Emit
+        // nothing (its slot, if any, is never read).
+        if self.state.dead_param_ref_dests.contains(&dest.0) {
+            return;
+        }
         if param_idx >= self.state.param_classes.len() {
             return;
         }
@@ -2914,12 +2939,23 @@ impl X86Codegen {
         }
 
         if param_idx < self.state.param_alloca_slots.len() {
-            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
+            if let Some((slot, alloca_ty, alloca_id)) = self.state.param_alloca_slots[param_idx] {
                 let load_instr = Self::mov_load_for_type(alloca_ty);
                 let reg = Self::load_dest_reg(alloca_ty);
-                let sr = self.slot_ref(slot.0);
-                self.state
-                    .emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
+                if self.state.alloca_over_align(alloca_id).is_some() {
+                    // Over-aligned (>16) param alloca: the capture wrote the
+                    // EFFECTIVE align_up'd address, not the raw slot base.
+                    // Load from the same effective address (via %rcx) or the
+                    // dest receives padding garbage and, through the homing
+                    // store, writes it back over the captured value.
+                    self.emit_alloca_aligned_addr_impl(slot, alloca_id);
+                    self.state
+                        .emit_fmt(format_args!("    {} (%rcx), {}", load_instr, reg));
+                } else {
+                    let sr = self.slot_ref(slot.0);
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
+                }
                 self.store_rax_to(dest);
                 return;
             }

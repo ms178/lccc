@@ -513,8 +513,9 @@ impl ArmCodegen {
 
         self.state.param_alloca_slots = (0..func.params.len())
             .map(|i| {
-                find_param_alloca(func, i)
-                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
+                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                    self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
+                })
             })
             .collect();
 
@@ -643,7 +644,7 @@ impl ArmCodegen {
         }
 
         if param_idx < self.state.param_alloca_slots.len() {
-            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
+            if let Some((slot, alloca_ty, _alloca_id)) = self.state.param_alloca_slots[param_idx] {
                 let ldr_instr = self.load_instr_for_type_impl(alloca_ty);
                 let (actual_instr, reg) = Self::arm_parse_load(ldr_instr);
                 self.emit_load_from_sp(reg, slot.0, actual_instr);
