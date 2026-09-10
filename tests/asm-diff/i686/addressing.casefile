@@ -1,0 +1,187 @@
+;;; addressing_c32_bases
+.text
+mov (%eax), %ebx
+mov (%ebp), %eax
+mov (%esp), %eax
+mov (,%ecx,2), %eax
+mov -1(,%ebp,1), %eax
+mov 8(%ebp,%ecx,4), %eax
+mov (%eax,%ecx,2), %edx
+mov (%ebx), %eax
+mov (%esi), %eax
+mov (%edi), %eax
+mov 8(%esp), %eax
+
+;;; addressing_c32_displacements
+.text
+mov 0(%eax), %ebx
+mov 127(%eax), %ebx
+mov -128(%eax), %ebx
+mov 128(%eax), %ebx
+mov 0x12345678(%eax), %ebx
+mov 0xffffffff(%eax), %ebx
+mov 0xffff(%eax), %ebx
+mov 4294967296(%eax), %ebx
+mov -2147483648(%eax), %ebx
+mov -2147483649(%eax), %ebx
+mov 0x80000000(%eax), %ebx
+mov 8(%ebp), %eax
+mov 0(%ebp), %eax
+
+;;; addressing_c32_16bit_regs
+.text
+mov (%bx), %eax
+mov (%bp), %eax
+mov (%bx,%si), %ax
+mov (%bp,%di), %ax
+mov (%si), %ax
+mov (%di), %ax
+mov 0xffff(%bx), %ax
+mov 0x10000(%bx), %ax
+mov -32769(%bx), %ax
+mov 127(%bx), %ax
+
+;;; addressing_abs
+.text
+mov 0x10, %eax
+mov 0x10, %al
+mov 0x10, %ax
+mov 0x10, %ebx
+mov %eax, 0x10
+mov %al, 0x10
+mov 0x123456789, %eax
+mov %es:0x10, %eax
+mov %ss:0x10, %al
+mov %eax, %es:0x10
+mov %al, %fs:0x10
+
+;;; addressing_segments
+.text
+mov %es:8(%eax), %ebx
+mov %cs:8(%eax), %ebx
+mov %ss:8(%eax), %ebx
+mov %ds:8(%eax), %ebx
+mov %fs:8(%eax), %ebx
+mov %gs:8(%eax), %ebx
+mov %ss:8(%ebp), %eax
+mov %ds:8(%ebp), %eax
+addl %es:8(%eax), %ebx
+leal %es:8(%ebp), %ebx
+pushl %es:8(%eax)
+popl %es:8(%eax)
+shll $3, %es:8(%eax)
+imull $6, %es:8(%eax), %ebx
+movzbl %ss:8(%ebp), %ebx
+paddb %es:8(%eax), %xmm0
+vaddps %es:8(%eax), %ymm1, %ymm0
+fstcw %es:8(%eax)
+fstcw %es:8(%bx)
+fstenv %es:8(%eax)
+fstsw %es:8(%eax)
+btl $2, %es:8(%eax)
+setne %es:8(%eax)
+cmovne %es:8(%eax), %ebx
+xchgl %ecx, %es:8(%eax)
+cmpxchgl %ecx, %es:8(%eax)
+xaddl %ecx, %es:8(%eax)
+clflush %es:8(%eax)
+prefetcht0 %es:8(%eax)
+invlpg %es:8(%eax)
+lgdtl %fs:8(%eax)
+movw %es:8(%eax), %ds
+movw %ds, %es:8(%eax)
+pextrw $3, %xmm0, %es:8(%eax)
+pinsrw $3, %es:8(%eax), %xmm0
+cmpxchg8b %es:8(%eax)
+vmovups %es:8(%eax), %ymm0
+vmovups %ymm0, %es:8(%eax)
+vpmovzxbw %es:8(%eax), %ymm0
+
+;;; addressing_c16
+.code16
+mov (%bx), %ax
+mov (%bx), %eax
+mov (%bp), %ax
+mov (%bx,%si), %ax
+mov (%si), %ax
+mov 0x7f(%bx), %ax
+mov -0x80(%bx), %ax
+mov 0x1234(%bx), %ax
+mov 0x10000(%bx), %ax
+mov -32769(%bx), %ax
+mov (%eax), %ax
+mov (%esi,%edi,2), %ax
+mov (%ebp), %ax
+mov 0x1234, %dx
+movb 0x12, %al
+movl 0x12345678, %eax
+mov 0x10, %eax
+mov %al, 0x10
+mov %es:0x10, %eax
+mov %ss:8(%eax), %ebx
+mov %ds:8(%ebp), %eax
+mov %es:8(%bx), %ax
+fstcw %es:8(%eax)
+fstcw %es:8(%bx)
+movw %ss:8(%eax), %bx
+movl %fs:8(%bx), %ebx
+movb %gs:8(%eax), %bl
+addw %es:8(%bx), %ax
+addl %es:8(%eax), %ebx
+leaw %es:8(%bx), %ax
+pushw %es:8(%bx)
+popw %es:8(%bx)
+incw %es:8(%bx)
+shlw %es:8(%bx)
+movw %es:8(%bx), %ds
+movw %ds, %es:8(%bx)
+flds %es:8(%bx)
+fstcw %es:8(%bx)
+fstenv %es:8(%bx)
+
+;;; addressing_relocs
+.text
+mov sym(%ecx), %eax
+mov sym, %eax
+mov sym(%ebp,%ecx,4), %eax
+mov sym, %ebx
+mov %eax, sym
+.code16
+mov sym(%bx), %ax
+mov sym, %ax
+movw sym, %dx
+
+;;; addressing_fold_scale1 betterok
+.text
+mov -1(,%ecx,1), %eax
+mov 0(,%eax,1), %ecx
+mov 8(,%ebx,1), %eax
+
+;;; addressing_reject_esp_index reject
+.text
+mov (%esp,%esp,2), %eax
+mov -1(,%esp,1), %eax
+
+;;; addressing_reject_scales reject
+.text
+mov (%eax,%ecx,3), %edx
+mov (%eax,%ecx,5), %edx
+mov (%eax,%ecx,0), %edx
+mov (%eax,,2), %ebx
+
+;;; addressing_reject_bad_regs reject
+.text
+mov (%xmm0), %eax
+mov (%ah), %eax
+mov (%ax), %eax
+mov (%sp), %eax
+mov (%bx,%eax), %ax
+mov (%eax,%si), %ax
+
+;;; addressing_reject_16bit_forms reject
+.text
+mov (%si,%bx), %ax
+mov (%si,%di), %ax
+mov (%bx,%bp), %ax
+mov (%bx,%si,2), %ax
+mov (%bx,%eax), %ax
