@@ -46,9 +46,10 @@
 //!    over an unconditional jump when the new B-type target is conservatively
 //!    proven to fit its ±4 KiB range.
 //!
-//! 10. **Redundant byte zero-extension elimination**: Tracks values produced
-//!     by `lbu`, byte-sized constants, and register copies, removing a later
-//!     `andi r, r, 0xff` when the upper bits are already known zero.
+//! 10. **Narrow-value lattice / redundant zero extensions**: Cross-pollinates
+//!     AArch64 extension folding and x86 upper-bit knowledge across unsigned
+//!     loads, constants, copies, comparisons, masks, logic and shifts; removes
+//!     both redundant byte masks and RV64 `slli 32; srli 32` zext.w pairs.
 
 // ── Line classification types ────────────────────────────────────────────────
 
@@ -971,81 +972,169 @@ fn eliminate_redundant_sext_w(lines: &[String], kinds: &mut [LineKind], n: usize
     changed
 }
 
-// ── Redundant byte zero-extension elimination ────────────────────────────────
+// ── Narrow-value lattice and redundant zero-extension elimination ────────────
 //
-// RV64 `lbu` already produces an XLEN-wide zero-extended value.  The generic
-// lowering nevertheless often emits a later `andi r, r, 0xff`, usually with
-// register-copy staging in between.  This is the RISC-V adaptation of ARM's
-// redundant-zext pass: maintain a conservative per-basic-block proof that a
-// register is in [0,255], propagate it through `mv`, and delete only a self
-// mask whose input is proven.  Cross-register masks become moves because they
-// still define their destination.
+// This is the RV64 adaptation of AArch64's repeated-extension elimination and
+// x86's upper-bit knowledge: track the maximum number of potentially nonzero
+// low bits in each register.  The lattice recognises ten target constructs:
+// lbu/lhu/lwu, nonnegative li, mv, seqz/snez/slt*, positive andi masks,
+// logical and/or/xor, srli, slli, and the canonical slli+srli zext.w pair.
+// Unknown instructions and CFG joins fail closed.  Calls retain only the
+// callee-saved s-register facts.
 fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
-    if std::env::var("CCC_NO_ZEXT_BYTE_ELIM").is_ok() {
+    if std::env::var("CCC_NO_ZEXT_BYTE_ELIM").is_ok()
+        || std::env::var("CCC_NO_NARROW_VALUE_ELIM").is_ok()
+    {
         return false;
     }
-    let mut known: u64 = 0;
+    fn bits_for_nonnegative(v: i64) -> u8 {
+        if v <= 0 {
+            1
+        } else {
+            (64 - (v as u64).leading_zeros()) as u8
+        }
+    }
+    fn set_width(widths: &mut [u8; NUM_REGS], reg: u8, width: u8) {
+        if (reg as usize) < NUM_REGS {
+            widths[reg as usize] = if width == 0 || width >= 64 { 0 } else { width };
+        }
+    }
+
+    let mut widths = [0u8; NUM_REGS]; // 0 = unknown/full 64-bit
     let mut changed = false;
-    for i in 0..n {
+    let mut i = 0;
+    while i < n {
         match kinds[i] {
             LineKind::Label | LineKind::Branch | LineKind::Jump | LineKind::Ret => {
-                known = 0;
+                widths.fill(0);
+                i += 1;
                 continue;
             }
             LineKind::Call => {
-                // Preserve only callee-saved s0-s11 knowledge.
-                for r in 0..=6u8 {
-                    known &= !(1u64 << r);
+                for r in 0..=6usize {
+                    widths[r] = 0;
                 }
-                for r in 30..=37u8 {
-                    known &= !(1u64 << r);
+                for r in 30..=37usize {
+                    widths[r] = 0;
                 }
+                widths[REG_RA as usize] = 0;
+                i += 1;
                 continue;
             }
-            LineKind::Nop | LineKind::Directive => continue,
+            LineKind::Nop | LineKind::Directive => {
+                i += 1;
+                continue;
+            }
             _ => {}
         }
 
-        let t = lines[i].trim();
-        let (mnem, operands) = match t.split_once(' ') {
+        // Own the current text because successful folds rewrite `lines[i]`
+        // while mnemonic/operand slices remain live for lattice bookkeeping.
+        let text = lines[i].trim().to_owned();
+        let (mnem, operands) = match text.split_once(' ') {
             Some(parts) => parts,
             None => {
-                known = 0;
+                widths.fill(0);
+                i += 1;
                 continue;
             }
         };
+        let ops: Vec<&str> = operands.split(',').map(str::trim).collect();
 
-        // `lbu rd, address` establishes the proof regardless of addressing
-        // mode. Other unclassified instructions remain fail-closed below.
-        if mnem == "lbu" {
-            let dst = parse_reg(operands.split(',').next().unwrap_or("").trim());
-            if dst == REG_NONE {
-                known = 0;
-            } else {
-                known |= 1u64 << dst;
+        // Canonical RV64 zero-extension: slli d,s,32; srli d,d,32.  If s is
+        // already u32-or-narrower, preserve the destination definition with a
+        // move (or delete both for the self form).
+        if mnem == "slli" && ops.len() == 3 && parse_asm_i64(ops[2]) == Some(32) {
+            let dst = parse_reg(ops[0]);
+            let src = parse_reg(ops[1]);
+            let mut j = i + 1;
+            while j < n && kinds[j] == LineKind::Nop {
+                j += 1;
             }
+            if dst != REG_NONE
+                && src != REG_NONE
+                && widths[src as usize] != 0
+                && widths[src as usize] <= 32
+                && j < n
+            {
+                let jt = lines[j].trim();
+                let jops: Vec<&str> = jt
+                    .strip_prefix("srli ")
+                    .map(|s| s.split(',').map(str::trim).collect())
+                    .unwrap_or_default();
+                if jops.len() == 3
+                    && parse_reg(jops[0]) == dst
+                    && parse_reg(jops[1]) == dst
+                    && parse_asm_i64(jops[2]) == Some(32)
+                {
+                    if dst == src {
+                        kinds[i] = LineKind::Nop;
+                    } else {
+                        lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
+                        kinds[i] = LineKind::Move { dst, src };
+                    }
+                    kinds[j] = LineKind::Nop;
+                    let src_width = widths[src as usize];
+                    set_width(&mut widths, dst, src_width);
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        // Unsigned loads establish width regardless of their addressing mode.
+        if let Some(width) = match mnem {
+            "lbu" => Some(8),
+            "lhu" => Some(16),
+            "lwu" | "zext.w" => Some(32),
+            _ => None,
+        } {
+            let dst = parse_reg(ops.first().copied().unwrap_or(""));
+            if dst == REG_NONE {
+                widths.fill(0);
+            } else {
+                set_width(&mut widths, dst, width);
+            }
+            i += 1;
+            continue;
+        }
+        // Signed/full-width loads kill only their destination proof; ordinary
+        // stores define no GP register on RISC-V.  Keeping unrelated facts
+        // across these fully modelled instructions is safe and materially
+        // improves AND-with-a-narrow-operand cases.
+        if matches!(mnem, "lb" | "lh" | "lw" | "ld") {
+            let dst = parse_reg(ops.first().copied().unwrap_or(""));
+            if dst == REG_NONE {
+                widths.fill(0);
+            } else {
+                set_width(&mut widths, dst, 0);
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(mnem, "sb" | "sh" | "sw" | "sd") {
+            i += 1;
             continue;
         }
 
-        if mnem == "andi" {
-            let ops: Vec<&str> = operands.split(',').map(str::trim).collect();
-            if ops.len() == 3 {
-                let dst = parse_reg(ops[0]);
-                let src = parse_reg(ops[1]);
-                let imm = parse_asm_i64(ops[2]);
-                if dst != REG_NONE && src != REG_NONE && imm == Some(255) {
-                    if known & (1u64 << src) != 0 {
-                        if dst == src {
-                            kinds[i] = LineKind::Nop;
-                        } else {
-                            lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
-                            kinds[i] = LineKind::Move { dst, src };
-                        }
-                        changed = true;
+        if mnem == "andi" && ops.len() == 3 {
+            let dst = parse_reg(ops[0]);
+            let src = parse_reg(ops[1]);
+            let imm = parse_asm_i64(ops[2]);
+            if dst != REG_NONE && src != REG_NONE {
+                if imm == Some(255) && widths[src as usize] != 0 && widths[src as usize] <= 8 {
+                    if dst == src {
+                        kinds[i] = LineKind::Nop;
+                    } else {
+                        lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
+                        kinds[i] = LineKind::Move { dst, src };
                     }
-                    // Masking with 255 establishes the invariant even when it
-                    // could not itself be removed.
-                    known |= 1u64 << dst;
+                    changed = true;
+                }
+                if let Some(v) = imm.filter(|v| *v >= 0) {
+                    set_width(&mut widths, dst, bits_for_nonnegative(v));
+                    i += 1;
                     continue;
                 }
             }
@@ -1053,34 +1142,88 @@ fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n
 
         match kinds[i] {
             LineKind::Move { dst, src } => {
-                if known & (1u64 << src) != 0 {
-                    known |= 1u64 << dst;
-                } else {
-                    known &= !(1u64 << dst);
-                }
+                let src_width = widths[src as usize];
+                set_width(&mut widths, dst, src_width);
             }
             LineKind::LoadImm { dst } => {
-                let value = operands
-                    .split_once(',')
-                    .and_then(|(_, imm)| parse_asm_i64(imm));
-                if value.is_some_and(|v| (0..=255).contains(&v)) {
-                    known |= 1u64 << dst;
+                let width = ops
+                    .get(1)
+                    .and_then(|imm| parse_asm_i64(imm))
+                    .filter(|v| *v >= 0)
+                    .map(bits_for_nonnegative)
+                    .unwrap_or(0);
+                set_width(&mut widths, dst, width);
+            }
+            LineKind::Alu
+                if matches!(mnem, "seqz" | "snez" | "slt" | "sltu" | "slti" | "sltiu") =>
+            {
+                if let Some(dst) = parse_alu_dest(&lines[i]) {
+                    set_width(&mut widths, dst, 1);
                 } else {
-                    known &= !(1u64 << dst);
+                    widths.fill(0);
                 }
             }
-            LineKind::Alu if mnem == "seqz" || mnem == "snez" => {
-                if let Some(dst) = parse_alu_dest(&lines[i]) {
-                    known |= 1u64 << dst;
+            LineKind::Alu if matches!(mnem, "and" | "or" | "xor") && ops.len() == 3 => {
+                let dst = parse_reg(ops[0]);
+                let a = parse_reg(ops[1]);
+                let b = parse_reg(ops[2]);
+                if dst == REG_NONE || a == REG_NONE || b == REG_NONE {
+                    widths.fill(0);
                 } else {
-                    known = 0;
+                    let (wa, wb) = (widths[a as usize], widths[b as usize]);
+                    let w = if mnem == "and" {
+                        match (wa, wb) {
+                            (0, 0) => 0,
+                            (0, x) | (x, 0) => x,
+                            (x, y) => x.min(y),
+                        }
+                    } else if wa != 0 && wb != 0 {
+                        wa.max(wb)
+                    } else {
+                        0
+                    };
+                    set_width(&mut widths, dst, w);
+                }
+            }
+            LineKind::Alu if mnem == "srli" && ops.len() == 3 => {
+                let dst = parse_reg(ops[0]);
+                let src = parse_reg(ops[1]);
+                let sh = parse_asm_i64(ops[2]).filter(|v| (0..64).contains(v));
+                if dst == REG_NONE || src == REG_NONE || sh.is_none() {
+                    widths.fill(0);
+                } else {
+                    let sh = sh.unwrap() as u8;
+                    let sw = widths[src as usize];
+                    let w = if sw == 0 {
+                        64 - sh
+                    } else {
+                        sw.saturating_sub(sh).max(1)
+                    };
+                    set_width(&mut widths, dst, w);
+                }
+            }
+            LineKind::Alu if mnem == "slli" && ops.len() == 3 => {
+                let dst = parse_reg(ops[0]);
+                let src = parse_reg(ops[1]);
+                let sh = parse_asm_i64(ops[2]).filter(|v| (0..64).contains(v));
+                if dst == REG_NONE || src == REG_NONE || sh.is_none() {
+                    widths.fill(0);
+                } else {
+                    let sw = widths[src as usize];
+                    let w = if sw != 0 {
+                        sw.saturating_add(sh.unwrap() as u8)
+                    } else {
+                        0
+                    };
+                    set_width(&mut widths, dst, w);
                 }
             }
             _ => match sext_producing_def(&lines[i], kinds[i]) {
-                Some((dst, _)) => known &= !(1u64 << dst),
-                None => known = 0,
+                Some((dst, _)) => set_width(&mut widths, dst, 0),
+                None => widths.fill(0),
             },
         }
+        i += 1;
     }
     changed
 }
@@ -2542,6 +2685,115 @@ mod jump_near_tests {
         let input = "f:\n    jump some_function, t6\n    ret\n";
         let out = peephole_optimize(input.to_string());
         assert!(out.contains("jump some_function, t6"), "\n{}", out);
+    }
+
+    #[test]
+    fn word_zext_pair_removed_after_lwu_and_copy() {
+        let input = concat!(
+            "f:\n",
+            "    lwu t0, 0(t2)\n",
+            "    mv a0, t0\n",
+            "    slli a0, a0, 32\n",
+            "    srli a0, a0, 32\n",
+            "    ret\n",
+        );
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
+        assert_eq!(kinds[3], LineKind::Nop);
+        assert_eq!(kinds[4], LineKind::Nop);
+    }
+
+    #[test]
+    fn word_zext_cross_register_pair_becomes_move() {
+        let input = "f:\n    lhu t0, 0(t2)\n    slli a0, t0, 32\n    srli a0, a0, 32\n    add a1, a0, t3\n    ret\n";
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
+        assert_eq!(lines[2].trim(), "mv a0, t0");
+        assert_eq!(kinds[3], LineKind::Nop);
+    }
+
+    #[test]
+    fn narrow_logic_and_shift_producers_feed_word_zext() {
+        let input = concat!(
+            "f:\n",
+            "    lbu t0, 0(t2)\n",
+            "    li t1, 255\n",
+            "    xor t0, t0, t1\n",
+            "    srli t0, t0, 1\n",
+            "    slli t0, t0, 32\n",
+            "    srli t0, t0, 32\n",
+            "    ret\n",
+        );
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
+        assert_eq!(kinds[5], LineKind::Nop);
+        assert_eq!(kinds[6], LineKind::Nop);
+    }
+
+    #[test]
+    fn narrow_producer_lattice_covers_comparisons_masks_and_logic() {
+        let cases = [
+            "    seqz t0, t1\n",
+            "    sltu t0, t1, t2\n",
+            "    andi t0, t1, 1023\n",
+            "    lhu t0, 0(t2)\n    ld t1, 8(t2)\n    and t0, t0, t1\n",
+            "    lbu t0, 0(t2)\n    li t1, 3\n    or t0, t0, t1\n",
+            "    lbu t0, 0(t2)\n    slli t0, t0, 4\n",
+        ];
+        for producer in cases {
+            let input =
+                format!("f:\n{producer}    slli t0, t0, 32\n    srli t0, t0, 32\n    ret\n");
+            let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+            let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+            let n = lines.len();
+            assert!(
+                eliminate_redundant_zext_byte(&mut lines, &mut kinds, n),
+                "producer did not establish a narrow value:\n{input}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .zip(&kinds)
+                    .any(|(line, kind)| *kind != LineKind::Nop && line.trim() == "slli t0, t0, 32"),
+                "zext pair survived:\n{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_or_operand_prevents_false_narrow_proof() {
+        let input = concat!(
+            "f:\n",
+            "    lbu t0, 0(t2)\n",
+            "    ld t1, 8(t2)\n",
+            "    or t0, t0, t1\n",
+            "    slli t0, t0, 32\n",
+            "    srli t0, t0, 32\n",
+            "    ret\n",
+        );
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
+        assert_eq!(kinds[4], LineKind::Alu);
+        assert_eq!(kinds[5], LineKind::Alu);
+    }
+
+    #[test]
+    fn word_zext_pair_kept_without_upper_bit_proof() {
+        let input = "f:\n    ld t0, 0(t2)\n    slli t0, t0, 32\n    srli t0, t0, 32\n    ret\n";
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
+        assert_eq!(kinds[2], LineKind::Alu);
+        assert_eq!(kinds[3], LineKind::Alu);
     }
 
     #[test]
