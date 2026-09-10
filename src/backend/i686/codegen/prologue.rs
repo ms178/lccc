@@ -651,6 +651,106 @@ impl I686Codegen {
         }
     }
 
+    // ---- Over-aligned parameter alloca support ----
+
+    /// Store 4-byte words into a parameter alloca slot, honoring over-aligned
+    /// (>16) parameter allocas: the slot is oversized by (align-1) and the
+    /// EFFECTIVE address is align_up(slot, align) — every alloca-address user
+    /// (emit_alloca_addr_to, memcpy paths, ParamRef loads) resolves that same
+    /// aligned address, so a capture written to the raw slot would desync
+    /// from every later read by the alignment pad (mirrors the struct-capture
+    /// arm's handling and the x86-64 prologue's _Alignas fix).
+    ///
+    /// Returns true when the stores were emitted through the effective
+    /// address; false means the slot is not over-aligned and the caller must
+    /// emit the normal raw-slot stores (keeps the common path identical).
+    ///
+    /// %ecx holds the aligned base for the stores. While register parameters
+    /// could still be live (regparm/fastcall), %ecx is saved/restored around
+    /// the copy and a %ecx source is read from its pushed copy; capture sites
+    /// run in parameter order, so staging sources through %eax cannot
+    /// clobber an uncaptured incoming register (%eax is param 0's regparm
+    /// source — captured before any later parameter's copy — and is never a
+    /// fastcall source). `esp_adjust` stays in sync so esp-relative refs
+    /// below the push stay exact.
+    pub(super) fn emit_over_aligned_param_stores<'a>(
+        &mut self,
+        dest_id: u32,
+        slot: StackSlot,
+        words: impl IntoIterator<Item = (&'a str, i64)>,
+    ) -> bool {
+        if self.state.alloca_over_align(dest_id).is_none() {
+            return false;
+        }
+        let ecx_free = self.regparm == 0 && !self.is_fastcall;
+        if !ecx_free {
+            self.state.emit("    pushl %ecx");
+            self.esp_adjust += 4;
+        }
+        self.emit_alloca_addr_to("ecx", dest_id, slot);
+        for (src, off) in words {
+            match src {
+                "%eax" => {}
+                "%ecx" if !ecx_free => {
+                    // The incoming source was saved below the base
+                    // computation; reload it from the pushed copy.
+                    self.state.emit("    movl 0(%esp), %eax");
+                }
+                _ => emit!(self.state, "    movl {}, %eax", src),
+            }
+            emit!(self.state, "    movl %eax, {}(%ecx)", off);
+        }
+        if !ecx_free {
+            self.state.emit("    popl %ecx");
+            self.esp_adjust -= 4;
+        }
+        true
+    }
+
+    /// Load `ty` from a (possibly over-aligned) parameter alloca slot into
+    /// %eax. Over-aligned slots load through the effective address (%ecx,
+    /// which is free scratch at any ParamRef in the body: the prologue has
+    /// long captured the incoming registers); plain slots keep the exact
+    /// previous raw-slot-ref load.
+    pub(super) fn emit_param_slot_load(&mut self, dest_id: u32, slot: StackSlot, ty: IrType) {
+        let load_instr = self.mov_load_for_type(ty);
+        if self.state.alloca_over_align(dest_id).is_some() {
+            self.emit_alloca_addr_to("ecx", dest_id, slot);
+            emit!(self.state, "    {} 0(%ecx), %eax", load_instr);
+        } else {
+            let src_ref = self.slot_ref(slot);
+            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+        }
+    }
+
+    /// Copy 4-byte words from a (possibly over-aligned) parameter alloca
+    /// slot to a destination slot. Over-aligned sources read through the
+    /// effective address (%ecx); plain slots keep the exact previous
+    /// raw-slot-ref loads.
+    pub(super) fn emit_param_slot_word_copies(
+        &mut self,
+        dest_id: u32,
+        src_slot: StackSlot,
+        dst_slot: StackSlot,
+        offs: &[i64],
+    ) {
+        if self.state.alloca_over_align(dest_id).is_some() {
+            self.emit_alloca_addr_to("ecx", dest_id, src_slot);
+            for &j in offs {
+                emit!(self.state, "    movl {}(%ecx), %eax", j);
+                let dst_ref = self.slot_ref_offset(dst_slot, j);
+                emit!(self.state, "    movl %eax, {}", dst_ref);
+            }
+        } else {
+            for &j in offs {
+                let src_ref = self.slot_ref_offset(src_slot, j);
+                let dst_ref = self.slot_ref_offset(dst_slot, j);
+                emit!(self.state, "    movl {}, %eax", src_ref);
+                emit!(self.state, "    movl %eax, {}", dst_ref);
+            }
+        }
+    }
+
     // ---- emit_store_params ----
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
@@ -662,8 +762,9 @@ impl I686Codegen {
 
         self.state.param_alloca_slots = (0..func.params.len())
             .map(|i| {
-                find_param_alloca(func, i)
-                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
+                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                    self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
+                })
             })
             .collect();
 
@@ -675,20 +776,25 @@ impl I686Codegen {
         // Used to handle the case where param alloca was eliminated by mem2reg
         // but the register allocator assigned a callee-saved register.
         let mut paramref_dests: Vec<Option<Value>> = vec![None; func.params.len()];
-        if self.is_fastcall || self.regparm > 0 {
-            for block in &func.blocks {
-                for inst in &block.instructions {
-                    if let Instruction::ParamRef {
-                        dest, param_idx, ..
-                    } = inst
-                    {
-                        if *param_idx < paramref_dests.len() {
-                            paramref_dests[*param_idx] = Some(*dest);
-                        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::ParamRef {
+                    dest, param_idx, ..
+                } = inst
+                {
+                    if *param_idx < paramref_dests.len() {
+                        paramref_dests[*param_idx] = Some(*dest);
                     }
                 }
             }
         }
+
+        // NOTE: ParamRef dest values never share an over-aligned (>16)
+        // parameter alloca's slot — resolve_copy_aliases refuses the share
+        // (the padded slot's effective address differs from its raw base,
+        // so a plain value sharing it would desync from every aligned
+        // access). The dest keeps its own plain slot; ParamRef copies
+        // from the alloca through the aligned address.
 
         let stack_base: i64 = 8;
 
@@ -726,7 +832,7 @@ impl I686Codegen {
                 match *class {
                     ParamClass::IntReg { reg_idx } => {
                         let src_full = regparm_srcs[reg_idx];
-                        if let Some((_, slot)) = alloca_slot {
+                        if let Some((dest, slot)) = alloca_slot {
                             // Typed capture into the alloca slot. Sub-int
                             // types are extended in-register first (the
                             // extension clobbers only this param's own
@@ -734,7 +840,6 @@ impl I686Codegen {
                             let ty = func.params[i].ty;
                             let regparm_regs_byte = ["%al", "%dl", "%cl"];
                             let regparm_regs_word = ["%ax", "%dx", "%cx"];
-                            let slot_ref = self.slot_ref(slot);
                             match ty {
                                 IrType::I8 => {
                                     emit!(
@@ -743,7 +848,6 @@ impl I686Codegen {
                                         regparm_regs_byte[reg_idx],
                                         src_full
                                     );
-                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
                                 }
                                 IrType::U8 => {
                                     emit!(
@@ -752,7 +856,6 @@ impl I686Codegen {
                                         regparm_regs_byte[reg_idx],
                                         src_full
                                     );
-                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
                                 }
                                 IrType::I16 => {
                                     emit!(
@@ -761,7 +864,6 @@ impl I686Codegen {
                                         regparm_regs_word[reg_idx],
                                         src_full
                                     );
-                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
                                 }
                                 IrType::U16 => {
                                     emit!(
@@ -770,11 +872,13 @@ impl I686Codegen {
                                         regparm_regs_word[reg_idx],
                                         src_full
                                     );
-                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
                                 }
-                                _ => {
-                                    emit!(self.state, "    movl {}, {}", src_full, slot_ref);
-                                }
+                                _ => {}
+                            }
+                            let words = [(src_full, 0i64)];
+                            if !self.emit_over_aligned_param_stores(dest.0, slot, words) {
+                                let slot_ref = self.slot_ref(slot);
+                                emit!(self.state, "    movl {}, {}", src_full, slot_ref);
                             }
                         } else if let Some(dest) = paramref_dests[i] {
                             if let Some(&phys) = self.reg_assignments.get(&dest.0) {
@@ -813,10 +917,30 @@ impl I686Codegen {
                     }
                     ParamClass::I64RegPair { base_reg_idx } => {
                         // Wide values always live in 8-byte slots on i686.
-                        let slot = alloca_slot
-                            .map(|(_, s)| s)
-                            .or_else(|| paramref_dests[i].and_then(|d| self.state.get_slot(d.0)));
-                        if let Some(slot) = slot {
+                        if let Some((dest, slot)) = alloca_slot {
+                            let words = [
+                                (regparm_srcs[base_reg_idx], 0i64),
+                                (regparm_srcs[base_reg_idx + 1], 4i64),
+                            ];
+                            if !self.emit_over_aligned_param_stores(dest.0, slot, words) {
+                                let sr0 = self.slot_ref(slot);
+                                let sr4 = self.slot_ref_offset(slot, 4);
+                                emit!(
+                                    self.state,
+                                    "    movl {}, {}",
+                                    regparm_srcs[base_reg_idx],
+                                    sr0
+                                );
+                                emit!(
+                                    self.state,
+                                    "    movl {}, {}",
+                                    regparm_srcs[base_reg_idx + 1],
+                                    sr4
+                                );
+                            }
+                        } else if let Some(slot) =
+                            paramref_dests[i].and_then(|d| self.state.get_slot(d.0))
+                        {
                             let sr0 = self.slot_ref(slot);
                             let sr4 = self.slot_ref_offset(slot, 4);
                             emit!(
@@ -831,18 +955,30 @@ impl I686Codegen {
                                 regparm_srcs[base_reg_idx + 1],
                                 sr4
                             );
-                            if alloca_slot.is_none() {
-                                self.state.param_pre_stored.insert(i);
-                            }
+                            self.state.param_pre_stored.insert(i);
                         }
                     }
                     ParamClass::StructByValReg { base_reg_idx, size } => {
-                        let slot = alloca_slot
-                            .map(|(_, s)| s)
-                            .or_else(|| paramref_dests[i].and_then(|d| self.state.get_slot(d.0)));
-                        if let Some(slot) = slot {
-                            let words = size.div_ceil(4);
-                            for k in 0..words {
+                        let nwords = size.div_ceil(4);
+                        if let Some((dest, slot)) = alloca_slot {
+                            let words: Vec<(&str, i64)> = (0..nwords)
+                                .map(|k| (regparm_srcs[base_reg_idx + k], (k * 4) as i64))
+                                .collect();
+                            if !self.emit_over_aligned_param_stores(dest.0, slot, words) {
+                                for k in 0..nwords {
+                                    let sr = self.slot_ref_offset(slot, (k * 4) as i64);
+                                    emit!(
+                                        self.state,
+                                        "    movl {}, {}",
+                                        regparm_srcs[base_reg_idx + k],
+                                        sr
+                                    );
+                                }
+                            }
+                        } else if let Some(slot) =
+                            paramref_dests[i].and_then(|d| self.state.get_slot(d.0))
+                        {
+                            for k in 0..nwords {
                                 let sr = self.slot_ref_offset(slot, (k * 4) as i64);
                                 emit!(
                                     self.state,
@@ -851,9 +987,7 @@ impl I686Codegen {
                                     sr
                                 );
                             }
-                            if alloca_slot.is_none() {
-                                self.state.param_pre_stored.insert(i);
-                            }
+                            self.state.param_pre_stored.insert(i);
                         }
                     }
                     _ => {}
@@ -1028,29 +1162,27 @@ impl I686Codegen {
                     let src_reg_full: &'static str = ["%ecx", "%edx"][reg_idx as usize];
                     let src_byte: &'static str = ["%cl", "%dl"][reg_idx as usize];
                     let src_word: &'static str = ["%cx", "%dx"][reg_idx as usize];
-                    let slot_ref = self.slot_ref(slot);
                     // For sub-int types, sign/zero-extend to full 32-bit before
                     // storing to the 4-byte SSA slot (avoids partial-write issues).
                     match ty {
                         IrType::I8 => {
                             emit!(self.state, "    movsbl {}, {}", src_byte, src_reg_full);
-                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
                         }
                         IrType::U8 => {
                             emit!(self.state, "    movzbl {}, {}", src_byte, src_reg_full);
-                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
                         }
                         IrType::I16 => {
                             emit!(self.state, "    movswl {}, {}", src_word, src_reg_full);
-                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
                         }
                         IrType::U16 => {
                             emit!(self.state, "    movzwl {}, {}", src_word, src_reg_full);
-                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
                         }
-                        _ => {
-                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-                        }
+                        _ => {}
+                    }
+                    let words = [(src_reg_full, 0i64)];
+                    if !self.emit_over_aligned_param_stores(dest_id, slot, words) {
+                        let slot_ref = self.slot_ref(slot);
+                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
                     }
                     continue;
                 }
@@ -1105,24 +1237,36 @@ impl I686Codegen {
                         || ty == IrType::D64
                     {
                         let src_ref = self.param_ref(src_offset);
-                        let dst_ref = self.slot_ref(slot);
-                        emit!(self.state, "    movl {}, %eax", src_ref);
-                        emit!(self.state, "    movl %eax, {}", dst_ref);
                         let src_ref_hi = self.param_ref(src_offset + 4);
-                        let dst_ref_hi = self.slot_ref_offset(slot, 4);
-                        emit!(self.state, "    movl {}, %eax", src_ref_hi);
-                        emit!(self.state, "    movl %eax, {}", dst_ref_hi);
+                        let words = [(&*src_ref, 0i64), (&*src_ref_hi, 4i64)];
+                        if !self.emit_over_aligned_param_stores(dest_id, slot, words) {
+                            let dst_ref = self.slot_ref(slot);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                            let dst_ref_hi = self.slot_ref_offset(slot, 4);
+                            emit!(self.state, "    movl {}, %eax", src_ref_hi);
+                            emit!(self.state, "    movl %eax, {}", dst_ref_hi);
+                        }
                     } else {
                         let load_instr = self.mov_load_for_type(ty);
                         let src_ref = self.param_ref(src_offset);
-                        let dst_ref = self.slot_ref(slot);
-                        emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
-                        // Always store full 32-bit value to SSA slot. The load
-                        // instruction above already sign/zero-extended sub-int
-                        // types into the full eax register. Using movb/movw here
-                        // would leave garbage in the upper bytes of the 4-byte
-                        // slot, which gets read back later by movl.
-                        emit!(self.state, "    movl %eax, {}", dst_ref);
+                        if self.state.alloca_over_align(dest_id).is_some() {
+                            // Load + sign/zero-extend into %eax first (the
+                            // helper stages memory sources with a plain
+                            // movl), then store through the aligned base.
+                            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+                            let words = [("%eax", 0i64)];
+                            self.emit_over_aligned_param_stores(dest_id, slot, words);
+                        } else {
+                            let dst_ref = self.slot_ref(slot);
+                            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+                            // Always store full 32-bit value to SSA slot. The load
+                            // instruction above already sign/zero-extended sub-int
+                            // types into the full eax register. Using movb/movw here
+                            // would leave garbage in the upper bytes of the 4-byte
+                            // slot, which gets read back later by movl.
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                        }
                     }
                 }
                 ParamClass::StructStack { offset: _, size }
@@ -1197,29 +1341,50 @@ impl I686Codegen {
                     // would re-canonicalize exceptional encodings and
                     // rewrite the padding; the slot keeps the native 80-bit
                     // representation, so f128_direct_slots still applies.
-                    for j in (0..12).step_by(4) {
-                        let src_ref = self.param_ref(src_offset + j as i64);
-                        let dst_ref = self.slot_ref_offset(slot, j as i64);
-                        emit!(self.state, "    movl {}, %eax", src_ref);
-                        emit!(self.state, "    movl %eax, {}", dst_ref);
+                    let words: Vec<(String, i64)> = (0..12)
+                        .step_by(4)
+                        .map(|j| (self.param_ref(src_offset + j as i64), j as i64))
+                        .collect();
+                    let refs: Vec<(&str, i64)> =
+                        words.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+                    if !self.emit_over_aligned_param_stores(dest_id, slot, refs) {
+                        for (src_ref, j) in words {
+                            let dst_ref = self.slot_ref_offset(slot, j);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                        }
                     }
                     self.state.f128_direct_slots.insert(dest_id);
                 }
                 ParamClass::I128Stack { offset: _ } => {
-                    for j in (0..16).step_by(4) {
-                        let src_ref = self.param_ref(src_offset + j as i64);
-                        let dst_ref = self.slot_ref_offset(slot, j as i64);
-                        emit!(self.state, "    movl {}, %eax", src_ref);
-                        emit!(self.state, "    movl %eax, {}", dst_ref);
+                    let words: Vec<(String, i64)> = (0..16)
+                        .step_by(4)
+                        .map(|j| (self.param_ref(src_offset + j as i64), j as i64))
+                        .collect();
+                    let refs: Vec<(&str, i64)> =
+                        words.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+                    if !self.emit_over_aligned_param_stores(dest_id, slot, refs) {
+                        for (src_ref, j) in words {
+                            let dst_ref = self.slot_ref_offset(slot, j);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                        }
                     }
                 }
                 ParamClass::F128Stack { offset: _ } => {
                     // Bit-exact 12-byte copy (see F128AlwaysStack above).
-                    for j in (0..12).step_by(4) {
-                        let src_ref = self.param_ref(src_offset + j as i64);
-                        let dst_ref = self.slot_ref_offset(slot, j as i64);
-                        emit!(self.state, "    movl {}, %eax", src_ref);
-                        emit!(self.state, "    movl %eax, {}", dst_ref);
+                    let words: Vec<(String, i64)> = (0..12)
+                        .step_by(4)
+                        .map(|j| (self.param_ref(src_offset + j as i64), j as i64))
+                        .collect();
+                    let refs: Vec<(&str, i64)> =
+                        words.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+                    if !self.emit_over_aligned_param_stores(dest_id, slot, refs) {
+                        for (src_ref, j) in words {
+                            let dst_ref = self.slot_ref_offset(slot, j);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                        }
                     }
                     self.state.f128_direct_slots.insert(dest_id);
                 }
@@ -1250,6 +1415,14 @@ impl I686Codegen {
     pub(super) fn emit_param_ref_impl(&mut self, dest: &Value, param_idx: usize, ty: IrType) {
         use crate::backend::call_abi::ParamClass;
 
+        // Over-aligned-param homing elision: this dest's only use was the
+        // elided homing store. The prologue capture is the single
+        // authoritative home of the alloca; the dest itself is dead. Emit
+        // nothing (its slot, if any, is never read).
+        if self.state.dead_param_ref_dests.contains(&dest.0) {
+            return;
+        }
+
         // If this param was pre-stored in the prologue (fastcall register param
         // with eliminated alloca), the value is already in the correct physical
         // register or stack slot. No code generation needed.
@@ -1269,7 +1442,9 @@ impl I686Codegen {
         }
 
         if param_idx < self.state.param_alloca_slots.len() {
-            if let Some((alloca_slot, _alloca_ty)) = self.state.param_alloca_slots[param_idx] {
+            if let Some((alloca_slot, _alloca_ty, alloca_id)) =
+                self.state.param_alloca_slots[param_idx]
+            {
                 if let Some(dest_slot) = self.state.get_slot(dest.0) {
                     if dest_slot.0 == alloca_slot.0 {
                         // The param value is already in the alloca slot (stored by
@@ -1280,9 +1455,7 @@ impl I686Codegen {
                         // (uninitialized) instead of the slot.
                         if let Some(phys) = self.dest_reg(dest) {
                             let reg = phys_reg_name(phys);
-                            let load_instr = self.mov_load_for_type(ty);
-                            let src_ref = self.slot_ref(alloca_slot);
-                            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+                            self.emit_param_slot_load(alloca_id, alloca_slot, ty);
                             emit!(self.state, "    movl %eax, %{}", reg);
                             self.state.reg_cache.invalidate_acc();
                         }
@@ -1304,9 +1477,7 @@ impl I686Codegen {
                     // params (they have no stack home).
                     if let Some(phys) = self.dest_reg(dest) {
                         let reg = phys_reg_name(phys);
-                        let load_instr = self.mov_load_for_type(ty);
-                        let src_ref = self.slot_ref(alloca_slot);
-                        emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+                        self.emit_param_slot_load(alloca_id, alloca_slot, ty);
                         emit!(self.state, "    movl %eax, %{}", reg);
                         self.state.reg_cache.invalidate_acc();
                     }
@@ -1314,40 +1485,36 @@ impl I686Codegen {
                 }
                 if let Some(dest_slot) = self.state.get_slot(dest.0) {
                     if is_i128_type(ty) {
-                        for i in (0..16).step_by(4) {
-                            let src_ref = self.slot_ref_offset(alloca_slot, i as i64);
-                            let dst_ref = self.slot_ref_offset(dest_slot, i as i64);
-                            emit!(self.state, "    movl {}, %eax", src_ref);
-                            emit!(self.state, "    movl %eax, {}", dst_ref);
-                        }
+                        self.emit_param_slot_word_copies(
+                            alloca_id,
+                            alloca_slot,
+                            dest_slot,
+                            &[0, 4, 8, 12],
+                        );
                     } else if ty == IrType::F128 {
                         // Bit-exact 12-byte copy (see the F128 capture
                         // arms above); the destination keeps the native
                         // 80-bit representation.
-                        for j in (0..12).step_by(4) {
-                            let src_ref = self.slot_ref_offset(alloca_slot, j as i64);
-                            let dst_ref = self.slot_ref_offset(dest_slot, j as i64);
-                            emit!(self.state, "    movl {}, %eax", src_ref);
-                            emit!(self.state, "    movl %eax, {}", dst_ref);
-                        }
+                        self.emit_param_slot_word_copies(
+                            alloca_id,
+                            alloca_slot,
+                            dest_slot,
+                            &[0, 4, 8],
+                        );
                         self.state.f128_direct_slots.insert(dest.0);
                     } else if ty == IrType::F64
                         || ty == IrType::I64
                         || ty == IrType::U64
                         || ty == IrType::D64
                     {
-                        let src_ref = self.slot_ref(alloca_slot);
-                        let dst_ref = self.slot_ref(dest_slot);
-                        emit!(self.state, "    movl {}, %eax", src_ref);
-                        emit!(self.state, "    movl %eax, {}", dst_ref);
-                        let src_ref_hi = self.slot_ref_offset(alloca_slot, 4);
-                        let dst_ref_hi = self.slot_ref_offset(dest_slot, 4);
-                        emit!(self.state, "    movl {}, %eax", src_ref_hi);
-                        emit!(self.state, "    movl %eax, {}", dst_ref_hi);
+                        self.emit_param_slot_word_copies(
+                            alloca_id,
+                            alloca_slot,
+                            dest_slot,
+                            &[0, 4],
+                        );
                     } else {
-                        let load_instr = self.mov_load_for_type(ty);
-                        let src_ref = self.slot_ref(alloca_slot);
-                        emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+                        self.emit_param_slot_load(alloca_id, alloca_slot, ty);
                         self.store_eax_to(dest);
                     }
                     return;
@@ -1360,10 +1527,10 @@ impl I686Codegen {
         // location to read.
         if self.is_fastcall {
             if let I686FastcallSlot::Reg(_) = self.fastcall_slots[param_idx] {
-                if let Some(Some((slot, _slot_ty))) = self.state.param_alloca_slots.get(param_idx) {
-                    let load_instr = self.mov_load_for_type(ty);
-                    let slot_ref = self.slot_ref(*slot);
-                    emit!(self.state, "    {} {}, %eax", load_instr, slot_ref);
+                if let Some(Some((slot, _slot_ty, alloca_id))) =
+                    self.state.param_alloca_slots.get(param_idx)
+                {
+                    self.emit_param_slot_load(*alloca_id, *slot, ty);
                     self.store_eax_to(dest);
                 }
                 return;

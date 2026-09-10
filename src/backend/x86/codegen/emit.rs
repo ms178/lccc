@@ -5081,6 +5081,18 @@ impl X86Codegen {
                     // address into the ABI register before the call. The
                     // slot must exist for the resolver to render the leaq.
                     if state.is_alloca(v.0) {
+                        // Over-aligned (>16) allocas: the resolver renders a
+                        // raw-slot LeaSlot, but every consumer of the alloca
+                        // (prologue capture, ParamRef loads, memcpys) targets
+                        // the EFFECTIVE align_up'd address inside the padded
+                        // slot — a raw leaq passes the pad base to the callee
+                        // (the `sinkp32(&x)` regression). Fall back to the
+                        // mature path, which computes the effective address
+                        // (mirrors the OverAligned rejections in the typed
+                        // load/store admission).
+                        if state.alloca_over_align(v.0).is_some() {
+                            return None;
+                        }
                         return state.get_slot(v.0).map(|_| TypedCallSrc::AllocaAddr(v.0));
                     }
                     if is_mi_unsafe_value(v.0, ra, state, value_types) {
@@ -5380,6 +5392,16 @@ impl X86Codegen {
         {
             return Ok(());
         }
+        // Homing-elision mirror: a dest whose ONLY use was the elided
+        // homing store also gets no code on the text path
+        // (`emit_param_ref_impl` early-outs via `dead_param_ref_dests`).
+        // The store still counts in `value_use_counts` above, so this is a
+        // separate check — and it must come first: for an over-aligned
+        // alloca a materialized load would read the alignment PAD, which
+        // is uninitialized memory, not the captured value.
+        if self.state.dead_param_ref_dests.contains(&dest.0) {
+            return Ok(());
+        }
         // Pre-stored parameters are already in their destination register;
         // `emit_store_params` placed them during the prologue. This takes
         // priority over the alloca slot exactly as on the text path.
@@ -5413,7 +5435,20 @@ impl X86Codegen {
         // Case 1 (text path's first materializing case): the parameter's
         // alloca slot holds the staged value — one load.
         if param_idx < self.state.param_alloca_slots.len() {
-            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
+            if let Some((slot, alloca_ty, alloca_id)) = self.state.param_alloca_slots[param_idx] {
+                // Over-aligned (>16) param allocas: the capture wrote the
+                // EFFECTIVE align_up'd address inside the padded slot, and
+                // the text path loads from that same effective address
+                // (emit_alloca_aligned_addr_impl). A raw StackSlot operand
+                // here would read the alignment pad. Reject to the text
+                // path — the effective-address dance needs a scratch
+                // register and a multi-instruction sequence, which the
+                // typed census deliberately does not own (same doctrine as
+                // the OverAligned rejections in the typed load/store and
+                // call-argument admission).
+                if self.state.alloca_over_align(alloca_id).is_some() {
+                    return Err("ParamRef(over-aligned-alloca)");
+                }
                 return match dst {
                     ParamDst::Reg(r) => {
                         let form = Self::paramref_reg_load_form(alloca_ty)

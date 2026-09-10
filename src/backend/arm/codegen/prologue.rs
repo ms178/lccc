@@ -513,8 +513,9 @@ impl ArmCodegen {
 
         self.state.param_alloca_slots = (0..func.params.len())
             .map(|i| {
-                find_param_alloca(func, i)
-                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
+                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                    self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
+                })
             })
             .collect();
 
@@ -643,10 +644,20 @@ impl ArmCodegen {
         }
 
         if param_idx < self.state.param_alloca_slots.len() {
-            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
+            if let Some((slot, alloca_ty, alloca_id)) = self.state.param_alloca_slots[param_idx] {
                 let ldr_instr = self.load_instr_for_type_impl(alloca_ty);
                 let (actual_instr, reg) = Self::arm_parse_load(ldr_instr);
-                self.emit_load_from_sp(reg, slot.0, actual_instr);
+                if self.state.alloca_over_align(alloca_id).is_some() {
+                    // Over-aligned (>16) param alloca: the capture wrote the
+                    // EFFECTIVE align_up'd address (x9 convention of
+                    // emit_alloca_aligned_addr_impl); a raw slot load would
+                    // read the alignment pad.
+                    self.emit_alloca_aligned_addr_impl(slot, alloca_id);
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, [x9]", actual_instr, reg));
+                } else {
+                    self.emit_load_from_sp(reg, slot.0, actual_instr);
+                }
                 self.store_x0_to(dest);
                 return;
             }

@@ -889,6 +889,7 @@ mod tests {
                 noalias: false,
                 struct_size: None,
                 struct_align: None,
+                param_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
                 is_f128_sse: false,

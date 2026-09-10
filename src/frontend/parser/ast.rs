@@ -283,6 +283,14 @@ pub struct FunctionDef {
 pub struct ParamDecl {
     pub type_spec: TypeSpecifier,
     pub name: Option<String>,
+    /// Direct alignment override written IN the parameter list:
+    /// `int x __attribute__((aligned(32)))` or `_Alignas(32) int x`.
+    /// The typedef spelling rides on `type_spec` (TypedefName); the direct
+    /// spelling lands here — without it the alignment is silently dropped
+    /// while the spelling is accepted (silent misalignment of `&x`).
+    pub alignment: Option<usize>,
+    /// `_Alignas(type-name)` form: resolved by the lowerer via alignof_type.
+    pub alignas_type: Option<TypeSpecifier>,
     /// For function pointer parameters, the parameter types of the pointed-to function.
     /// E.g., for `float (*func)(float, float)`, this holds the two float param decls.
     pub fptr_params: Option<Vec<ParamDecl>>,

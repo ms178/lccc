@@ -54,7 +54,7 @@ pub use regalloc_helpers::{
 use super::regalloc::PhysReg;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrFunction};
+use crate::ir::reexports::{Instruction, IrFunction, Operand};
 
 use alloca_coalescing::CoalescableAllocas;
 
@@ -469,6 +469,80 @@ pub fn calculate_stack_space_common(
     // Phase 7: Propagate wide-value status through Copy chains (32-bit targets only).
     slot_assignment::propagate_wide_values(state, func, &ctx.copy_alias);
 
+    // Phase 7.5: Over-aligned-param homing-store elision.
+    //
+    // For a parameter whose alloca survived with an over-aligned (>16) slot,
+    // the PROLOGUE CAPTURE already wrote the incoming value to the alloca's
+    // effective aligned address. The IR-level homing store
+    // (`store %p, %a` with %p the ParamRef dest) therefore re-writes the same
+    // value to the same location: emitting it costs a dest-slot load plus an
+    // aligned store per over-aligned parameter, with zero semantic effect.
+    // Record the (dest, alloca) pair for `emit_store_impl` to elide; when the
+    // dest has no other use, record it as dead so `emit_param_ref_impl`
+    // elides the ParamRef too (the capture is the single authoritative home
+    // — this beats GCC's realign+copy by both memory operations).
+    state.param_homing_stores.clear();
+    state.dead_param_ref_dests.clear();
+    {
+        let mut paramref_dests: Vec<Option<u32>> = vec![None; func.param_alloca_values.len()];
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::ParamRef {
+                    dest, param_idx, ..
+                } = inst
+                {
+                    if *param_idx < paramref_dests.len() {
+                        paramref_dests[*param_idx] = Some(dest.0);
+                    }
+                }
+            }
+        }
+        let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut homing_uses: FxHashMap<u32, u32> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Store { val, ptr, .. } = inst {
+                    if let Operand::Value(v) = val {
+                        // Is this store the homing store of v's parameter?
+                        // (ptr is the param alloca of the param v is the
+                        // ParamRef dest of.)
+                        for (i, alloca) in func.param_alloca_values.iter().enumerate() {
+                            if ptr.0 == alloca.0
+                                && paramref_dests.get(i).copied().flatten() == Some(v.0)
+                            {
+                                homing_uses.entry(v.0).and_modify(|c| *c += 1).or_insert(1);
+                                break;
+                            }
+                        }
+                    }
+                }
+                inst.for_each_used_value(|vid| {
+                    use_counts.entry(vid).and_modify(|c| *c += 1).or_insert(1);
+                });
+            }
+        }
+        for (i, alloca) in func.param_alloca_values.iter().enumerate() {
+            let Some(dest_id) = paramref_dests.get(i).copied().flatten() else {
+                continue;
+            };
+            // Only when the alloca is over-aligned AND has a slot: the
+            // capture then wrote the effective address and the homing store
+            // is redundant. (A non-slotted alloca has no capture, so the
+            // store stays.)
+            if !state.alloca_alignments.contains_key(&alloca.0)
+                || !state.value_locations.contains_key(&alloca.0)
+            {
+                continue;
+            }
+            if homing_uses.get(&dest_id).copied().unwrap_or(0) >= 1 {
+                state.param_homing_stores.insert((dest_id, alloca.0));
+                if use_counts.get(&dest_id).copied().unwrap_or(0) == 1 {
+                    state.dead_param_ref_dests.insert(dest_id);
+                }
+            }
+        }
+    }
+
     // Diagnostic: dump the full value→slot map (and the vector/defer sets) so
     // slot aliasing miscompiles can be root-caused from the layout alone.
     // Usage: CCC_DEBUG_SLOTS=1 lccc -O2 -c file.c
@@ -556,15 +630,17 @@ fn build_layout_context(
         ra_config,
     );
 
-    // Authoritative ABI alignment of struct/union parameter allocas (the
-    // Alloca.align may have been dropped by a pass; IrParam.struct_align is not).
+    // Authoritative ABI alignment of parameter allocas (the Alloca.align may
+    // have been dropped by a pass; IrParam.struct_align / IrParam.param_align
+    // are not). struct_align covers struct/union params; param_align covers
+    // typedef-aligned scalar params (`aligned(32) int` parameter types).
     // `param_alloca_values` and `params` are index-aligned (both include the
     // sret pointer at index 0 when present).
     let param_aligns: FxHashMap<u32, usize> = func
         .params
         .iter()
         .zip(func.param_alloca_values.iter())
-        .filter_map(|(p, v)| p.struct_align.map(|a| (v.0, a)))
+        .filter_map(|(p, v)| p.param_align.or(p.struct_align).map(|a| (v.0, a)))
         .collect();
 
     // Alloca coalescability analysis.
