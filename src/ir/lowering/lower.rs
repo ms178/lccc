@@ -63,6 +63,9 @@ pub struct Lowerer {
     /// Set of function names declared with __attribute__((fastcall)).
     /// On i386, these use ecx/edx for the first two integer/pointer args.
     pub(super) fastcall_functions: FxHashSet<String>,
+    /// __attribute__((regparm(N))) per function name (definitions and
+    /// declarations). Consulted at call sites like fastcall_functions.
+    pub(super) regparm_functions: FxHashMap<String, u8>,
     /// Set of function names declared with __attribute__((pure)).
     pub pure_functions: FxHashSet<String>,
     /// Set of function names declared with __attribute__((const)).
@@ -220,6 +223,7 @@ impl Lowerer {
             error_functions: FxHashSet::default(),
             noreturn_functions: FxHashSet::default(),
             fastcall_functions: FxHashSet::default(),
+            regparm_functions: FxHashMap::default(),
             pure_functions: FxHashSet::default(),
             const_functions: FxHashSet::default(),
             discard_expr_result: false,
@@ -427,6 +431,7 @@ impl Lowerer {
                     struct_arg_is_f128_sse: Vec::new(),
                     is_sret: false,
                     is_fastcall: false,
+                    regparm: None,
                     is_pure: false,
                     is_const: false,
                     ret_eightbyte_classes: Vec::new(),
@@ -782,6 +787,9 @@ impl Lowerer {
                     if func.attrs.is_fastcall() {
                         self.fastcall_functions.insert(func.name.clone());
                     }
+                    if let Some(n) = func.attrs.regparm {
+                        self.regparm_functions.insert(func.name.clone(), n);
+                    }
                 }
                 ExternalDecl::Declaration(decl) => {
                     for declarator in &decl.declarators {
@@ -835,6 +843,12 @@ impl Lowerer {
                         // Collect __attribute__((fastcall))
                         if declarator.attrs.is_fastcall() && !declarator.name.is_empty() {
                             self.fastcall_functions.insert(declarator.name.clone());
+                        }
+                        // Collect __attribute__((regparm(N)))
+                        if let Some(n) = declarator.attrs.regparm {
+                            if !declarator.name.is_empty() {
+                                self.regparm_functions.insert(declarator.name.clone(), n);
+                            }
                         }
                         // Collect __attribute__((pure))
                         if declarator.attrs.is_pure() && !declarator.name.is_empty() {
@@ -1969,6 +1983,7 @@ impl Lowerer {
                     struct_arg_is_f128_sse: full_f128,
                     is_sret: true,
                     is_fastcall: false,
+                    regparm: None,
                     ret_eightbyte_classes: Vec::new(),
                     ret_is_f128_sse: false,
                     is_const: false,
@@ -2020,6 +2035,7 @@ impl Lowerer {
                 struct_arg_is_f128_sse: arg_is_f128,
                 is_sret: false,
                 is_fastcall: false,
+                regparm: None,
                 is_pure: false,
                 is_const: false,
                 ret_eightbyte_classes: ret_classes,
@@ -2361,6 +2377,7 @@ impl Lowerer {
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
                 is_fastcall: false,
+                regparm: None,
                 is_pure: false,
                 is_const: false,
                 ret_eightbyte_classes: Vec::new(),
@@ -2399,6 +2416,7 @@ impl Lowerer {
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
                 is_fastcall: false,
+                regparm: None,
                 is_pure: false,
                 is_const: false,
                 ret_eightbyte_classes: Vec::new(),

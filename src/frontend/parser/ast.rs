@@ -34,6 +34,11 @@ pub struct FunctionAttributes {
     pub visibility: Option<String>,
     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
     pub symver: Option<String>,
+    /// __attribute__((regparm(N))) - pass N integer args in EAX/EDX/ECX.
+    /// None = attribute absent; Some(N) with N in 0..=3 (GCC semantics:
+    /// bare `regparm` means N = 3; the global -mregparm flag applies only
+    /// when the attribute is absent).
+    pub regparm: Option<u8>,
 }
 
 /// Bit masks for boolean flags in `FunctionAttributes::flags`.
@@ -249,6 +254,7 @@ impl std::fmt::Debug for FunctionAttributes {
             .field("is_weak", &self.is_weak())
             .field("is_used", &self.is_used())
             .field("is_fastcall", &self.is_fastcall())
+            .field("regparm", &self.regparm)
             .field("is_naked", &self.is_naked())
             .field("is_noreturn", &self.is_noreturn())
             .field("is_cold", &self.is_cold())
@@ -581,6 +587,8 @@ pub struct DeclAttributes {
     pub cleanup_fn: Option<String>,
     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
     pub symver: Option<String>,
+    /// __attribute__((regparm(N))) on a function declaration.
+    pub regparm: Option<u8>,
 }
 
 /// Bit masks for boolean flags in `DeclAttributes::flags`.
@@ -735,6 +743,7 @@ impl std::fmt::Debug for DeclAttributes {
             .field("is_noreturn", &self.is_noreturn())
             .field("is_used", &self.is_used())
             .field("alias_target", &self.alias_target)
+            .field("regparm", &self.regparm)
             .field("visibility", &self.visibility)
             .field("section", &self.section)
             .field("asm_register", &self.asm_register)

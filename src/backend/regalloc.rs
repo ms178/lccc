@@ -8065,6 +8065,35 @@ fn collect_i686_scratch_hazard_points_refined(
                 {
                     (true, true)
                 }
+                // F128 identity casts expand to either the direct copy
+                // (six movl staging through %eax/%ecx/%edx —
+                // casts.rs cast_copy_direct_f128, which fires when the
+                // source slot holds the native encoding) or the x87
+                // fallback (fldt/fstpt, no GPR scratch). The RA cannot
+                // see slot membership, so mark BOTH registers dirty:
+                // this point may clobber them. (F128<->scalar casts
+                // also fall here via the catch-all; the emitter reads
+                // results from the stack scratch and stages through
+                // %eax, but %edx receives the pair result of
+                // F128->U64, and conservatism at a rare instruction
+                // costs nothing.)
+                Instruction::Cast {
+                    from_ty,
+                    to_ty,
+                    src,
+                    dest,
+                    ..
+                } if matches!(from_ty, IrType::F128) || matches!(to_ty, IrType::F128) => {
+                    // A same-value F128->F128 cast emits nothing
+                    // (cast_same_value early-return in casts.rs).
+                    let same_value =
+                        matches!(src, Operand::Value(v) if v.0 == dest.0) && from_ty == to_ty;
+                    if same_value {
+                        (true, true)
+                    } else {
+                        (false, false)
+                    }
+                }
                 Instruction::Copy { dest, src } => match src {
                     Operand::Value(v) => {
                         let c = !wide.contains(&v.0) && !wide.contains(&dest.0);

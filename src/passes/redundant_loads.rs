@@ -287,6 +287,7 @@ mod tests {
             param_alloca_values: vec![],
             uses_sret: false,
             is_fastcall: false,
+            regparm: None,
             is_naked: false,
             no_instrument: false,
             global_init_label_blocks: vec![],

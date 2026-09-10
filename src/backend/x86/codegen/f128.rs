@@ -287,33 +287,48 @@ impl X86Codegen {
                 }
             }
         } else if to_ty == IrType::U64 {
-            // Unsigned 64-bit: handle values >= 2^63
+            // Unsigned 64-bit: the threshold compare selects between two
+            // EXACT conversions and NEITHER performs x87 arithmetic, so the
+            // result is independent of the ambient precision control. The
+            // previous high path computed `fisttpq(x - 2^63)` and added
+            // 2^63 back: the subtraction rounds at the current x87
+            // precision, so under 24/53-bit precision control an exactly
+            // representable input like 2^64 - 1 rounds to 2^63 — outside
+            // the signed range — and converts to the integer-indefinite
+            // value (verified: GCC 14.2 miscompiles identically).
             let big_label = self.state.fresh_label("ld2u_big");
+            let not_range_label = self.state.fresh_label("ld2u_notrange");
             let done_label = self.state.fresh_label("ld2u_done");
             // Load 2^63 as x87 extended precision for comparison
-            self.state.emit("    subq $8, %rsp");
+            self.state.emit("    subq $16, %rsp");
             self.state.emit("    movabsq $4890909195324358656, %rcx"); // 2^63 as f64 bits
             self.state.emit("    movq %rcx, (%rsp)");
             self.state.emit("    fldl (%rsp)"); // ST0 = 2^63 (f64), ST1 = value (80-bit)
             self.state.emit("    fcomip %st(1), %st"); // compare and pop 2^63
             self.state.out.emit_jcc_label("    jbe", &big_label);
-            // Small case: value < 2^63
+            // Small case: value < 2^63 — FISTTP truncates exactly; no
+            // arithmetic subject to precision control. Fractional inputs
+            // may still raise FE_INEXACT.
             self.state.emit("    fisttpq (%rsp)");
             self.state.emit("    movq (%rsp), %rax");
-            self.state.emit("    addq $8, %rsp");
             self.state.out.emit_jmp_label(&done_label);
-            // Big case: value >= 2^63
+            // Big case: value >= 2^63. Store the native extended
+            // representation (stores are exact) and inspect the
+            // sign/exponent word without reloading.
             self.state.out.emit_named_label(&big_label);
-            self.state.emit("    movabsq $4890909195324358656, %rcx");
-            self.state.emit("    movq %rcx, (%rsp)");
-            self.state.emit("    fldl (%rsp)"); // ST0 = 2^63, ST1 = value
-            self.state.emit("    fsubrp %st, %st(1)"); // ST0 = value - 2^63
+            self.state.emit("    fstpt (%rsp)");
+            self.state.emit("    cmpw $16446, 8(%rsp)"); // 0x403e: bias + 63
+            self.state.out.emit_jcc_label("    jne", &not_range_label);
+            // Finite [2^63, 2^64): the 64-bit significand is the result.
+            self.state.emit("    movq (%rsp), %rax");
+            self.state.out.emit_jmp_label(&done_label);
+            // NaN / infinity / >= 2^64 / negative: integer-indefinite.
+            self.state.out.emit_named_label(&not_range_label);
+            self.state.emit("    fldt (%rsp)");
             self.state.emit("    fisttpq (%rsp)");
             self.state.emit("    movq (%rsp), %rax");
-            self.state.emit("    addq $8, %rsp");
-            self.state.emit("    movabsq $9223372036854775808, %rcx");
-            self.state.emit("    addq %rcx, %rax");
             self.state.out.emit_named_label(&done_label);
+            self.state.emit("    addq $16, %rsp");
         } else {
             // Smaller unsigned types: fisttpq then truncate
             self.state.emit("    subq $8, %rsp");
@@ -407,8 +422,9 @@ impl X86Codegen {
 
     fn emit_f128_to_u64_cast(&mut self) {
         let big_label = self.state.fresh_label("ld2u_big");
+        let not_range_label = self.state.fresh_label("ld2u_notrange");
         let done_label = self.state.fresh_label("ld2u_done");
-        self.state.emit("    subq $8, %rsp");
+        self.state.emit("    subq $16, %rsp");
         self.state.emit("    movq %rax, (%rsp)");
         self.state.emit("    fldl (%rsp)");
         self.state.emit("    movabsq $4890909195324358656, %rcx"); // 2^63 as f64 bits
@@ -419,20 +435,23 @@ impl X86Codegen {
         // Small case: value < 2^63
         self.state.emit("    fisttpq (%rsp)");
         self.state.emit("    movq (%rsp), %rax");
-        self.state.emit("    addq $8, %rsp");
         self.state.out.emit_jmp_label(&done_label);
-        // Big case: value >= 2^63
+        // Big case: value >= 2^63 — native extended payload, no
+        // arithmetic (precision-control independent; see
+        // emit_f128_st0_to_int above).
         self.state.out.emit_named_label(&big_label);
-        self.state.emit("    movabsq $4890909195324358656, %rcx");
-        self.state.emit("    movq %rcx, (%rsp)");
-        self.state.emit("    fldl (%rsp)");
-        self.state.emit("    fsubrp %st, %st(1)"); // ST0 = value - 2^63
+        self.state.emit("    fstpt (%rsp)");
+        self.state.emit("    cmpw $16446, 8(%rsp)"); // 0x403e
+        self.state.out.emit_jcc_label("    jne", &not_range_label);
+        self.state.emit("    movq (%rsp), %rax");
+        self.state.out.emit_jmp_label(&done_label);
+        // NaN / infinity / >= 2^64 / negative: integer-indefinite.
+        self.state.out.emit_named_label(&not_range_label);
+        self.state.emit("    fldt (%rsp)");
         self.state.emit("    fisttpq (%rsp)");
         self.state.emit("    movq (%rsp), %rax");
-        self.state.emit("    addq $8, %rsp");
-        self.state.emit("    movabsq $9223372036854775808, %rcx");
-        self.state.emit("    addq %rcx, %rax");
         self.state.out.emit_named_label(&done_label);
+        self.state.emit("    addq $16, %rsp");
     }
 
     fn emit_f128_to_f32_cast(&mut self) {

@@ -1178,6 +1178,7 @@ impl Lowerer {
             is_used: true,
             has_inlined_calls: false,
             is_fastcall: false,
+            regparm: None,
             is_naked: false,
             no_instrument: false,
             param_alloca_values: param_alloca_vals,

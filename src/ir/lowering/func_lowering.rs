@@ -987,6 +987,7 @@ impl Lowerer {
             param_alloca_values: param_alloca_vals,
             uses_sret,
             is_fastcall: func.attrs.is_fastcall(),
+            regparm: func.attrs.regparm,
             is_naked: func.attrs.is_naked(),
             no_instrument: func.attrs.is_no_instrument(),
             global_init_label_blocks: global_init_labels,

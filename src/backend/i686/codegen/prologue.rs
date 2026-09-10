@@ -2,7 +2,7 @@
 
 use super::emit::{
     I686_CALLEE_SAVED, I686_CALLEE_SAVED_WITH_EBP, I686_CALLER_SAVED, I686Codegen,
-    i686_clobber_to_phys, i686_constraint_to_phys, phys_reg_name,
+    I686FastcallSlot, i686_clobber_to_phys, i686_constraint_to_phys, phys_reg_name,
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{
@@ -10,6 +10,7 @@ use crate::backend::generation::{
     run_regalloc_and_merge_clobbers,
 };
 use crate::backend::regalloc::PhysReg;
+use crate::backend::state::StackSlot;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::emit;
@@ -91,6 +92,36 @@ impl I686Codegen {
         self.is_variadic = func.is_variadic;
         self.is_fastcall = func.is_fastcall;
         self.current_return_type = func.return_type;
+
+        // Effective regparm for this function: a function-level
+        // `__attribute__((regparm(N)))` overrides the global -mregparm
+        // flag; fastcall wins over both (GCC passes ECX/EDX and the two
+        // attributes together are rejected at parse time). The
+        // classification itself ignores regparm for variadic functions
+        // (GCC function_arg_32: all-stack).
+        self.regparm = if func.is_fastcall {
+            0
+        } else {
+            func.regparm.unwrap_or(self.base_regparm).min(3)
+        };
+
+        // Fastcall layout: the single source of truth shared by parameter
+        // capture, ParamRef and the return instruction. Computed here (not
+        // in emit_store_params) because the conflict analysis below needs
+        // it after register allocation.
+        self.fastcall_slots.clear();
+        self.conflict_param_slots.clear();
+        if self.is_fastcall {
+            let param_tys: Vec<IrType> = func.params.iter().map(|p| p.ty).collect();
+            let struct_sizes: Vec<Option<usize>> =
+                func.params.iter().map(|p| p.struct_size).collect();
+            let (slots, stack_bytes) =
+                self.fastcall_layout(&param_tys, &struct_sizes, func.is_variadic);
+            self.fastcall_slots = slots;
+            self.fastcall_stack_cleanup = stack_bytes;
+        } else {
+            self.fastcall_stack_cleanup = 0;
+        }
 
         // Same-block div/rem pair fusion table (one divl serves a
         // URem+UDiv couple with identical operands). Constant-RHS pairs
@@ -365,6 +396,11 @@ impl I686Codegen {
             self.used_callee_saved.insert(0, PhysReg(0));
         }
 
+        // Incoming register parameters whose destinations share one
+        // physical register get 4-byte conflict slots (allocated below)
+        // instead of an entry-time register capture.
+        let conflict_params = self.compute_conflict_params(func);
+
         let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
 
         // The bias ensures that slots requiring >= 16-byte alignment land on
@@ -413,10 +449,77 @@ impl I686Codegen {
         // fusibility depends on the final register homes and stack slots
         // (see compute_i686_mulacc_chains / resolve_mulacc_plans).
         self.resolve_mulacc_plans(func);
-        space
+
+        // Conflict slots: appended past the packed slot region, so they
+        // cannot collide with any allocator-assigned slot. The extra space
+        // becomes part of the frame.
+        for (k, &param_idx) in conflict_params.iter().enumerate() {
+            let offset = -(space + 4 + (k as i64) * 4);
+            self.conflict_param_slots
+                .insert(param_idx, StackSlot(offset));
+        }
+        space + conflict_params.len() as i64 * 4
     }
 
     // ---- aligned_frame_size ----
+
+    /// Incoming register parameters (fastcall %ecx/%edx slots, or regparm
+    /// %eax/%edx/%ecx classes) whose ParamRef destinations share one
+    /// physical register. Their IR live ranges are disjoint, so RA may
+    /// legally reuse the register — but every capture happens at function
+    /// entry, so capturing both into the shared register would clobber the
+    /// first. These parameters are captured into 4-byte conflict slots
+    /// instead (see `conflict_param_slots`).
+    fn compute_conflict_params(&self, func: &IrFunction) -> Vec<usize> {
+        let mut paramref_dests: Vec<Option<Value>> = vec![None; func.params.len()];
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::ParamRef {
+                    dest, param_idx, ..
+                } = inst
+                {
+                    if *param_idx < paramref_dests.len() {
+                        paramref_dests[*param_idx] = Some(*dest);
+                    }
+                }
+            }
+        }
+
+        let mut candidates: Vec<usize> = Vec::new();
+        if self.is_fastcall {
+            for (i, slot) in self.fastcall_slots.iter().enumerate() {
+                if matches!(slot, I686FastcallSlot::Reg(_)) {
+                    candidates.push(i);
+                }
+            }
+        } else if self.regparm > 0 {
+            let config = self.call_abi_config();
+            let classes = classify_params(func, &config);
+            for (i, class) in classes.iter().enumerate() {
+                if matches!(class, ParamClass::IntReg { .. }) {
+                    candidates.push(i);
+                }
+            }
+        }
+
+        let mut by_reg: crate::common::fx_hash::FxHashMap<u8, Vec<usize>> =
+            crate::common::fx_hash::FxHashMap::default();
+        for i in candidates {
+            if let Some(dest) = paramref_dests[i] {
+                if let Some(&phys) = self.reg_assignments.get(&dest.0) {
+                    by_reg.entry(phys.0).or_default().push(i);
+                }
+            }
+        }
+        let mut conflicts: Vec<usize> = Vec::new();
+        for (_, params) in by_reg {
+            if params.len() > 1 {
+                conflicts.extend(params);
+            }
+        }
+        conflicts.sort_unstable();
+        conflicts
+    }
 
     pub(super) fn aligned_frame_size_impl(&self, raw_space: i64) -> i64 {
         let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
@@ -444,21 +547,28 @@ impl I686Codegen {
         if matches!(func.return_type, IrType::I64 | IrType::U64) || is_i128_type(func.return_type) {
             self.state.emit("# lccc-i686-return-uses-edx");
         }
+        // CFA tracking for unwind tables: with a frame pointer the CFA is
+        // %ebp+8 once `pushl %ebp` ran and switches register with
+        // cfi_def_cfa_register; the callee-save pushes and the frame
+        // subtraction then move the CFA by known, emitted amounts. Without a
+        // frame pointer the CFA stays %esp-relative and every push/sub
+        // advances it (the previous code emitted none of these, so
+        // unwinders saw the entry CFA and restored garbage into
+        // %ebx/%esi/%edi at every interior PC).
+        let mut cfa_offset: i64 = 4; // entry CFA: %esp+4
+        let frame_ptr_mode = !self.omit_frame_pointer;
         if self.omit_frame_pointer {
             // No frame pointer setup; use ESP-relative addressing.
-            // frame_base_offset and esp_adjust will be set after callee-saved pushes.
-            // TODO: Emit ESP-relative CFI directives (.cfi_def_cfa_offset after each
-            // push/sub) for proper unwinding when frame pointer is omitted. Currently
-            // the default .cfi_startproc CFA (ESP+4) is used, which is only valid at
-            // function entry. This is acceptable for now since -fomit-frame-pointer on
-            // i686 is primarily used by the Linux kernel boot code, which disables
-            // unwind tables via -fno-asynchronous-unwind-tables.
+            // frame_base_offset and esp_adjust are set after the
+            // callee-saved pushes; the CFA stays %esp-based and is
+            // tracked through every push/sub below.
         } else {
             self.state.emit("    pushl %ebp");
             if self.state.emit_cfi {
                 self.state.emit("    .cfi_def_cfa_offset 8");
                 self.state.emit("    .cfi_offset %ebp, -8");
             }
+            cfa_offset = 8;
             self.state.emit("    movl %esp, %ebp");
             if self.state.emit_cfi {
                 self.state.emit("    .cfi_def_cfa_register %ebp");
@@ -468,6 +578,19 @@ impl I686Codegen {
         for &reg in self.used_callee_saved.iter() {
             let name = phys_reg_name(reg);
             emit!(self.state, "    pushl %{}", name);
+            if self.state.emit_cfi {
+                cfa_offset += 4;
+                // Frame-pointer mode: the CFA is %ebp+8 and does NOT move
+                // when %esp changes; only the saved-register offset grows.
+                // No-FP mode: the CFA tracks %esp, so both directives
+                // advance (the pushed register sits at CFA-cfa_offset).
+                if frame_ptr_mode {
+                    emit!(self.state, "    .cfi_offset %{}, -{}", name, cfa_offset);
+                } else {
+                    emit!(self.state, "    .cfi_def_cfa_offset {}", cfa_offset);
+                    emit!(self.state, "    .cfi_offset %{}, -{}", name, cfa_offset);
+                }
+            }
         }
 
         if self.pic_got_live {
@@ -482,6 +605,10 @@ impl I686Codegen {
 
         if frame_size > 0 {
             emit!(self.state, "    subl ${}, %esp", frame_size);
+            if self.state.emit_cfi && !frame_ptr_mode {
+                cfa_offset += frame_size;
+                emit!(self.state, "    .cfi_def_cfa_offset {}", cfa_offset);
+            }
         }
 
         // Post-prologue %esp baseline (ebp-relative), valid in both frame
@@ -540,32 +667,9 @@ impl I686Codegen {
             })
             .collect();
 
-        let fastcall_reg_count = if self.is_fastcall {
-            self.count_fastcall_reg_params(func)
-        } else {
-            0
-        };
-        self.fastcall_reg_param_count = fastcall_reg_count;
-
-        if self.is_fastcall {
-            let mut total_stack_bytes: usize = 0;
-            for (i, _p) in func.params.iter().enumerate() {
-                if i < fastcall_reg_count {
-                    continue;
-                }
-                let ty = func.params[i].ty;
-                let size = match ty {
-                    IrType::I64 | IrType::U64 | IrType::F64 => 8,
-                    IrType::F128 => 12,
-                    _ if is_i128_type(ty) => 16,
-                    _ => 4,
-                };
-                total_stack_bytes += size;
-            }
-            self.fastcall_stack_cleanup = total_stack_bytes;
-        } else {
-            self.fastcall_stack_cleanup = 0;
-        }
+        // The fastcall layout (self.fastcall_slots /
+        // self.fastcall_stack_cleanup) was computed in
+        // calculate_stack_space_impl, before register allocation.
 
         // Build a map of param_idx -> ParamRef dest Value for fast lookup.
         // Used to handle the case where param alloca was eliminated by mem2reg
@@ -587,7 +691,6 @@ impl I686Codegen {
         }
 
         let stack_base: i64 = 8;
-        let mut fastcall_reg_idx = 0usize;
 
         // ── regparm callee-side capture ─────────────────────────────────────
         // Register parameters (%eax/%edx/%ecx) are caller-saved: the ONLY safe
@@ -611,8 +714,12 @@ impl I686Codegen {
             // MUST cover register params with live allocas too: the main
             // loop's stack-param copies stage through %eax (and wide copies
             // through %edx), which would destroy unsaved register args.
-            let mut reg_moves: Vec<(usize, &'static str, crate::backend::regalloc::PhysReg)> =
-                Vec::new(); // (param_idx, src, dst)
+            let mut reg_moves: Vec<(
+                usize,
+                &'static str,
+                crate::backend::regalloc::PhysReg,
+                IrType,
+            )> = Vec::new(); // (param_idx, src, dst, ty)
             for (i, class) in param_classes.iter().enumerate() {
                 let alloca_slot = find_param_alloca(func, i)
                     .and_then(|(dest, _)| self.state.get_slot(dest.0).map(|s| (dest, s)));
@@ -671,10 +778,34 @@ impl I686Codegen {
                             }
                         } else if let Some(dest) = paramref_dests[i] {
                             if let Some(&phys) = self.reg_assignments.get(&dest.0) {
-                                reg_moves.push((i, src_full, phys));
+                                if let Some(&conflict_slot) = self.conflict_param_slots.get(&i) {
+                                    // Shared register home with another
+                                    // parameter: capture into the conflict
+                                    // slot (the ParamRef reloads from there);
+                                    // capturing into the register would
+                                    // clobber the other param's value.
+                                    let cr = self.slot_ref(conflict_slot);
+                                    emit!(self.state, "    movl {}, {}", src_full, cr);
+                                } else {
+                                    reg_moves.push((i, src_full, phys, func.params[i].ty));
+                                }
                             } else if let Some(slot) = self.state.get_slot(dest.0) {
-                                let sr = self.slot_ref(slot);
-                                emit!(self.state, "    movl {}, {}", src_full, sr);
+                                // Normalize sub-int types into the spill
+                                // slot: one extension here is never more
+                                // expensive than extending at every later
+                                // use, and the slot then carries a full
+                                // 32-bit value.
+                                let slot_ref = self.slot_ref(slot);
+                                let ty = func.params[i].ty;
+                                match ty {
+                                    IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => {
+                                        self.emit_incoming_reg_move(src_full, "eax", ty);
+                                        emit!(self.state, "    movl %eax, {}", slot_ref);
+                                    }
+                                    _ => {
+                                        emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                    }
+                                }
                                 self.state.param_pre_stored.insert(i);
                             }
                             // Neither register nor slot: value is dead.
@@ -728,47 +859,83 @@ impl I686Codegen {
                     _ => {}
                 }
             }
-            // Phase 2: register-target captures form a parallel move: a target
-            // (%ecx/%edx — and since Phase 2e also %eax — are allocatable on
-            // i686) can be another move's still-unread source. Standard
-            // resolution: repeatedly emit a move whose target is not a pending
-            // source; a stuck state is a swap cycle, broken with xchg. (In
-            // practice a param never lands an %eax home — any real use spans
-            // an eax hazard — so cycles stay within {%ecx, %edx}.)
-            while !reg_moves.is_empty() {
-                let pending_srcs: Vec<&str> = reg_moves.iter().map(|m| m.1).collect();
-                if let Some(pos) = reg_moves.iter().position(|&(_, src, dst)| {
-                    let dst_name = format!("%{}", phys_reg_name(dst));
-                    dst_name == src || !pending_srcs.contains(&dst_name.as_str())
-                }) {
-                    let (i, src, dst) = reg_moves.remove(pos);
-                    let dst_name = phys_reg_name(dst);
-                    if format!("%{}", dst_name) != src {
-                        emit!(self.state, "    movl {}, %{}", src, dst_name);
-                    }
-                    self.state.param_pre_stored.insert(i);
-                } else {
-                    // Pure swap cycle: only possible between %ecx and %edx.
-                    self.state.emit("    xchgl %ecx, %edx");
-                    for m in reg_moves.drain(..) {
-                        // After the swap both values sit in their targets.
-                        self.state.param_pre_stored.insert(m.0);
-                    }
-                }
-            }
-            self.state.reg_cache.invalidate_acc();
+            // Phase 2: register-target captures form a parallel move: a
+            // target (%eax/%ecx/%edx are all allocatable on i686) can be
+            // another move's still-unread source. The shared resolver
+            // (emit.rs) emits moves only while a move exists whose target
+            // is not a pending source, breaks 2-cycles with xchg and
+            // rotates longer cycles (which require %eax participation)
+            // through a scratch stack slot. The previous hardcoded
+            // `xchgl %ecx, %edx` fallback miscompiled every %eax cycle.
+            self.resolve_incoming_reg_moves(&mut reg_moves);
         }
 
-        // Build a map from physical register -> list of param indices that use it,
-        // so we can detect when two params share the same callee-saved register.
-        let mut reg_to_params: crate::common::fx_hash::FxHashMap<u8, Vec<usize>> =
-            crate::common::fx_hash::FxHashMap::default();
+        // ── fastcall register capture ──────────────────────────────────────
+        // Fastcall register arguments (%ecx/%edx) are captured in parameter
+        // order before the main copy loop runs. All stack copies stage
+        // through %eax only (the over-aligned aggregate path saves/restores
+        // %ecx), so the sources stay intact — but register-target captures
+        // are collected and resolved as one parallel move AFTER the loop, so
+        // a swap between two register params cannot corrupt a source.
+        let mut fc_reg_moves: Vec<(
+            usize,
+            &'static str,
+            crate::backend::regalloc::PhysReg,
+            IrType,
+        )> = Vec::new();
         if self.is_fastcall {
-            for (i, _) in func.params.iter().enumerate() {
-                if let Some(paramref_dest) = paramref_dests[i] {
-                    if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
-                        reg_to_params.entry(phys_reg.0).or_default().push(i);
+            for i in 0..func.params.len() {
+                let I686FastcallSlot::Reg(reg_idx) = self.fastcall_slots[i] else {
+                    continue;
+                };
+                let src_full: &'static str = ["%ecx", "%edx"][reg_idx as usize];
+                let src_byte: &'static str = ["%cl", "%dl"][reg_idx as usize];
+                let src_word: &'static str = ["%cx", "%dx"][reg_idx as usize];
+                let ty = func.params[i].ty;
+                let has_alloca_slot = find_param_alloca(func, i)
+                    .and_then(|(dest, _)| self.state.get_slot(dest.0))
+                    .is_some();
+                if has_alloca_slot {
+                    // Handled by the alloca capture in the main loop below
+                    // (which normalizes sub-int types into the slot).
+                    continue;
+                }
+                let Some(paramref_dest) = paramref_dests[i] else {
+                    continue;
+                };
+                if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
+                    if let Some(&conflict_slot) = self.conflict_param_slots.get(&i) {
+                        // Shared register home: capture into the conflict
+                        // slot; the ParamRef reloads from there.
+                        let cr = self.slot_ref(conflict_slot);
+                        emit!(self.state, "    movl {}, {}", src_full, cr);
+                    } else {
+                        fc_reg_moves.push((i, src_full, phys_reg, ty));
                     }
+                } else if let Some(slot) = self.state.get_slot(paramref_dest.0) {
+                    let slot_ref = self.slot_ref(slot);
+                    match ty {
+                        IrType::I8 => {
+                            emit!(self.state, "    movsbl {}, %eax", src_byte);
+                            emit!(self.state, "    movl %eax, {}", slot_ref);
+                        }
+                        IrType::U8 => {
+                            emit!(self.state, "    movzbl {}, %eax", src_byte);
+                            emit!(self.state, "    movl %eax, {}", slot_ref);
+                        }
+                        IrType::I16 => {
+                            emit!(self.state, "    movswl {}, %eax", src_word);
+                            emit!(self.state, "    movl %eax, {}", slot_ref);
+                        }
+                        IrType::U16 => {
+                            emit!(self.state, "    movzwl {}, %eax", src_word);
+                            emit!(self.state, "    movl %eax, {}", slot_ref);
+                        }
+                        _ => {
+                            emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                        }
+                    }
+                    self.state.param_pre_stored.insert(i);
                 }
             }
         }
@@ -791,6 +958,11 @@ impl I686Codegen {
                 // STACK value over the already-captured register argument
                 // (observed: d_i(double, int) read b as garbage at -O1+).
                 if self.state.param_pre_stored.contains(&i) {
+                    continue;
+                }
+                // Conflict-slot capture: the value sits in a frame slot,
+                // not the destination — nothing to re-capture here.
+                if self.conflict_param_slots.contains_key(&i) {
                     continue;
                 }
                 let has_alloca_slot = find_param_alloca(func, i)
@@ -837,129 +1009,95 @@ impl I686Codegen {
                 }
             }
 
-            // Pre-store optimization for fastcall register params: when the param's
-            // alloca was eliminated (by mem2reg) but the ParamRef dest is register-
-            // allocated to a callee-saved register, store the fastcall ABI register
-            // (%ecx/%edx) directly to the assigned physical register. This is critical
-            // because:
-            // 1. Dead alloca means no stack slot exists for this param
-            // 2. %ecx/%edx are caller-saved and will be clobbered
-            // 3. We must save the value NOW, before any other code runs
-            // 4. emit_param_ref will see param_pre_stored and skip code generation
-            if self.is_fastcall && fastcall_reg_idx < fastcall_reg_count {
-                let param_ty = func.params[i].ty;
-                if self.is_fastcall_reg_eligible(param_ty) {
-                    let has_alloca_slot = find_param_alloca(func, i)
-                        .and_then(|(dest, _)| self.state.get_slot(dest.0))
-                        .is_some();
-                    if !has_alloca_slot {
-                        let src_reg = if fastcall_reg_idx == 0 {
-                            "%ecx"
-                        } else {
-                            "%edx"
-                        };
-                        if let Some(paramref_dest) = paramref_dests[i] {
-                            if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
-                                // Safety check: if another param's dest is also assigned
-                                // to this register, skip pre-store to avoid conflicts.
-                                let shared = reg_to_params
-                                    .get(&phys_reg.0)
-                                    .is_some_and(|users| users.len() > 1);
-                                if !shared {
-                                    // Store directly to the callee-saved register
-                                    let dest_reg = phys_reg_name(phys_reg);
-                                    emit!(self.state, "    movl {}, %{}", src_reg, dest_reg);
-                                    self.state.param_pre_stored.insert(i);
-                                }
-                            } else if let Some(slot) = self.state.get_slot(paramref_dest.0) {
-                                // Value was spilled to a stack slot - no register conflict
-                                let slot_ref = self.slot_ref(slot);
-                                emit!(self.state, "    movl {}, {}", src_reg, slot_ref);
-                                self.state.param_pre_stored.insert(i);
-                            }
-                        }
-                        fastcall_reg_idx += 1;
-                        continue;
-                    }
-                }
-            }
-
             let (slot, ty, dest_id) = if let Some((dest, ty)) = find_param_alloca(func, i) {
                 if let Some(slot) = self.state.get_slot(dest.0) {
                     (slot, ty, dest.0)
                 } else {
-                    if self.is_fastcall
-                        && fastcall_reg_idx < fastcall_reg_count
-                        && i < func.params.len()
-                        && self.is_fastcall_reg_eligible(ty)
-                    {
-                        fastcall_reg_idx += 1;
-                    }
                     continue;
                 }
             } else {
-                if self.is_fastcall
-                    && fastcall_reg_idx < fastcall_reg_count
-                    && i < func.params.len()
-                {
-                    let param_ty = func.params[i].ty;
-                    if self.is_fastcall_reg_eligible(param_ty) {
-                        fastcall_reg_idx += 1;
-                    }
-                }
                 continue;
             };
 
-            if self.is_fastcall
-                && fastcall_reg_idx < fastcall_reg_count
-                && self.is_fastcall_reg_eligible(ty)
-            {
-                let src_reg_full = if fastcall_reg_idx == 0 {
-                    "%ecx"
-                } else {
-                    "%edx"
-                };
-                let slot_ref = self.slot_ref(slot);
-                // For sub-int types, sign/zero-extend to full 32-bit before
-                // storing to the 4-byte SSA slot (avoids partial-write issues).
-                match ty {
-                    IrType::I8 => {
-                        let src_byte = if fastcall_reg_idx == 0 { "%cl" } else { "%dl" };
-                        emit!(self.state, "    movsbl {}, {}", src_byte, src_reg_full);
-                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+            // Fastcall register parameters whose alloca survived: capture
+            // %ecx/%edx into the alloca slot (normalizing sub-int types).
+            // The fc_reg_moves pass above skipped them precisely so this
+            // arm (which knows the slot) handles the capture.
+            if self.is_fastcall {
+                if let I686FastcallSlot::Reg(reg_idx) = self.fastcall_slots[i] {
+                    let src_reg_full: &'static str = ["%ecx", "%edx"][reg_idx as usize];
+                    let src_byte: &'static str = ["%cl", "%dl"][reg_idx as usize];
+                    let src_word: &'static str = ["%cx", "%dx"][reg_idx as usize];
+                    let slot_ref = self.slot_ref(slot);
+                    // For sub-int types, sign/zero-extend to full 32-bit before
+                    // storing to the 4-byte SSA slot (avoids partial-write issues).
+                    match ty {
+                        IrType::I8 => {
+                            emit!(self.state, "    movsbl {}, {}", src_byte, src_reg_full);
+                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                        }
+                        IrType::U8 => {
+                            emit!(self.state, "    movzbl {}, {}", src_byte, src_reg_full);
+                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                        }
+                        IrType::I16 => {
+                            emit!(self.state, "    movswl {}, {}", src_word, src_reg_full);
+                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                        }
+                        IrType::U16 => {
+                            emit!(self.state, "    movzwl {}, {}", src_word, src_reg_full);
+                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                        }
+                        _ => {
+                            emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                        }
                     }
-                    IrType::U8 => {
-                        let src_byte = if fastcall_reg_idx == 0 { "%cl" } else { "%dl" };
-                        emit!(self.state, "    movzbl {}, {}", src_byte, src_reg_full);
-                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-                    }
-                    IrType::I16 => {
-                        let src_word = if fastcall_reg_idx == 0 { "%cx" } else { "%dx" };
-                        emit!(self.state, "    movswl {}, {}", src_word, src_reg_full);
-                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-                    }
-                    IrType::U16 => {
-                        let src_word = if fastcall_reg_idx == 0 { "%cx" } else { "%dx" };
-                        emit!(self.state, "    movzwl {}, {}", src_word, src_reg_full);
-                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-                    }
-                    _ => {
-                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
-                    }
+                    continue;
                 }
-                fastcall_reg_idx += 1;
+            }
+
+            // Register-class parameters (IntReg with a surviving alloca,
+            // I64RegPair, StructByValReg) were captured into their alloca
+            // slots by the regparm phases above, before any stack copy
+            // could clobber the incoming registers. The main loop copies
+            // stack-class parameters only.
+            if matches!(
+                class,
+                ParamClass::IntReg { .. }
+                    | ParamClass::I64RegPair { .. }
+                    | ParamClass::StructByValReg { .. }
+            ) {
                 continue;
             }
 
-            let stack_offset_adjust = if self.is_fastcall {
-                fastcall_reg_count as i64 * 4
+            // Stack-parameter source offset. For fastcall functions the
+            // layout gives each stack parameter its exact offset in the
+            // compacted argument area (GCC rule: register args removed
+            // wherever they occur, floats skipped without removal, so a
+            // blanket `reg_count * 4` subtraction is NOT generally valid).
+            let src_offset = if self.is_fastcall {
+                match self.fastcall_slots[i] {
+                    I686FastcallSlot::Stack { offset, .. } => stack_base + offset,
+                    I686FastcallSlot::Reg(_) => unreachable!("handled above"),
+                }
             } else {
-                0
+                match class {
+                    ParamClass::StackScalar { offset }
+                    | ParamClass::StructStack { offset, .. }
+                    | ParamClass::LargeStructStack { offset, .. }
+                    | ParamClass::F128AlwaysStack { offset }
+                    | ParamClass::I128Stack { offset }
+                    | ParamClass::F128Stack { offset }
+                    | ParamClass::LargeStructByRefStack { offset, .. } => stack_base + offset,
+                    _ => {
+                        // Register classes: captured by the regparm phases.
+                        unreachable!("register parameter without capture: {:?}", class)
+                    }
+                }
             };
 
             match class {
-                ParamClass::StackScalar { offset } => {
-                    let src_offset = stack_base + offset - stack_offset_adjust;
+                ParamClass::StackScalar { offset: _ } => {
                     // D64: BID bit container — integer pair copy, no x87.
                     if ty == IrType::F64
                         || ty == IrType::I64
@@ -987,9 +1125,8 @@ impl I686Codegen {
                         emit!(self.state, "    movl %eax, {}", dst_ref);
                     }
                 }
-                ParamClass::StructStack { offset, size }
-                | ParamClass::LargeStructStack { offset, size } => {
-                    let src = stack_base + offset - stack_offset_adjust;
+                ParamClass::StructStack { offset: _, size }
+                | ParamClass::LargeStructStack { offset: _, size } => {
                     // Over-aligned (>16) parameter allocas: the slot is
                     // oversized by (align-1) and the EFFECTIVE address is
                     // align_up(slot, align) — every alloca-address user
@@ -1021,13 +1158,13 @@ impl I686Codegen {
                         }
                         let mut copied = 0usize;
                         while copied + 4 <= size {
-                            let src_ref = self.param_ref(src + copied as i64);
+                            let src_ref = self.param_ref(src_offset + copied as i64);
                             emit!(self.state, "    movl {}, %eax", src_ref);
                             emit!(self.state, "    movl %eax, {}(%ecx)", copied);
                             copied += 4;
                         }
                         while copied < size {
-                            let src_ref = self.param_ref(src + copied as i64);
+                            let src_ref = self.param_ref(src_offset + copied as i64);
                             emit!(self.state, "    movb {}, %al", src_ref);
                             emit!(self.state, "    movb %al, {}(%ecx)", copied);
                             copied += 1;
@@ -1039,14 +1176,14 @@ impl I686Codegen {
                     } else {
                         let mut copied = 0usize;
                         while copied + 4 <= size {
-                            let src_ref = self.param_ref(src + copied as i64);
+                            let src_ref = self.param_ref(src_offset + copied as i64);
                             let dst_ref = self.slot_ref_offset(slot, copied as i64);
                             emit!(self.state, "    movl {}, %eax", src_ref);
                             emit!(self.state, "    movl %eax, {}", dst_ref);
                             copied += 4;
                         }
                         while copied < size {
-                            let src_ref = self.param_ref(src + copied as i64);
+                            let src_ref = self.param_ref(src_offset + copied as i64);
                             let dst_ref = self.slot_ref_offset(slot, copied as i64);
                             emit!(self.state, "    movb {}, %al", src_ref);
                             emit!(self.state, "    movb %al, {}", dst_ref);
@@ -1054,29 +1191,36 @@ impl I686Codegen {
                         }
                     }
                 }
-                ParamClass::F128AlwaysStack { offset } => {
-                    let src = stack_base + offset - stack_offset_adjust;
-                    let src_ref = self.param_ref(src);
-                    let dst_ref = self.slot_ref(slot);
-                    emit!(self.state, "    fldt {}", src_ref);
-                    emit!(self.state, "    fstpt {}", dst_ref);
+                ParamClass::F128AlwaysStack { offset: _ } => {
+                    // Bit-exact 12-byte copy of the incoming argument (the
+                    // caller's 10 payload bytes + 2 pad). An x87 round trip
+                    // would re-canonicalize exceptional encodings and
+                    // rewrite the padding; the slot keeps the native 80-bit
+                    // representation, so f128_direct_slots still applies.
+                    for j in (0..12).step_by(4) {
+                        let src_ref = self.param_ref(src_offset + j as i64);
+                        let dst_ref = self.slot_ref_offset(slot, j as i64);
+                        emit!(self.state, "    movl {}, %eax", src_ref);
+                        emit!(self.state, "    movl %eax, {}", dst_ref);
+                    }
                     self.state.f128_direct_slots.insert(dest_id);
                 }
-                ParamClass::I128Stack { offset } => {
-                    let src = stack_base + offset - stack_offset_adjust;
+                ParamClass::I128Stack { offset: _ } => {
                     for j in (0..16).step_by(4) {
-                        let src_ref = self.param_ref(src + j as i64);
+                        let src_ref = self.param_ref(src_offset + j as i64);
                         let dst_ref = self.slot_ref_offset(slot, j as i64);
                         emit!(self.state, "    movl {}, %eax", src_ref);
                         emit!(self.state, "    movl %eax, {}", dst_ref);
                     }
                 }
-                ParamClass::F128Stack { offset } => {
-                    let src = stack_base + offset - stack_offset_adjust;
-                    let src_ref = self.param_ref(src);
-                    let dst_ref = self.slot_ref(slot);
-                    emit!(self.state, "    fldt {}", src_ref);
-                    emit!(self.state, "    fstpt {}", dst_ref);
+                ParamClass::F128Stack { offset: _ } => {
+                    // Bit-exact 12-byte copy (see F128AlwaysStack above).
+                    for j in (0..12).step_by(4) {
+                        let src_ref = self.param_ref(src_offset + j as i64);
+                        let dst_ref = self.slot_ref_offset(slot, j as i64);
+                        emit!(self.state, "    movl {}, %eax", src_ref);
+                        emit!(self.state, "    movl %eax, {}", dst_ref);
+                    }
                     self.state.f128_direct_slots.insert(dest_id);
                 }
                 ParamClass::IntReg { .. }
@@ -1091,6 +1235,14 @@ impl I686Codegen {
                 }
             }
         }
+
+        // Fastcall register-target captures: resolved LAST, after every
+        // stack copy and every alloca-slot capture has read its source
+        // register (stack copies stage through %eax only; the over-aligned
+        // path preserves %ecx). Resolving earlier would let a cycle's
+        // scratch moves overwrite %ecx/%edx before an alloca-slot capture
+        // further down the parameter list read them.
+        self.resolve_incoming_reg_moves(&mut fc_reg_moves);
     }
 
     // ---- emit_param_ref ----
@@ -1102,6 +1254,17 @@ impl I686Codegen {
         // with eliminated alloca), the value is already in the correct physical
         // register or stack slot. No code generation needed.
         if self.state.param_pre_stored.contains(&param_idx) {
+            return;
+        }
+
+        // Shared register home: the prologue captured this param into a
+        // conflict slot instead of the destination register (a second
+        // capture would have clobbered another param's value). Reload.
+        if let Some(&conflict_slot) = self.conflict_param_slots.get(&param_idx) {
+            let load_instr = self.mov_load_for_type(ty);
+            let src_ref = self.slot_ref(conflict_slot);
+            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+            self.store_eax_to(dest);
             return;
         }
 
@@ -1122,6 +1285,12 @@ impl I686Codegen {
                             emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
                             emit!(self.state, "    movl %eax, %{}", reg);
                             self.state.reg_cache.invalidate_acc();
+                        }
+                        // The shared slot holds the native F128 encoding
+                        // (emit_store_params captured it bit-exactly), so a
+                        // later identity cast may use the direct copy path.
+                        if ty == IrType::F128 {
+                            self.state.f128_direct_slots.insert(dest.0);
                         }
                         return;
                     }
@@ -1152,12 +1321,21 @@ impl I686Codegen {
                             emit!(self.state, "    movl %eax, {}", dst_ref);
                         }
                     } else if ty == IrType::F128 {
-                        let src_ref = self.slot_ref(alloca_slot);
-                        let dst_ref = self.slot_ref(dest_slot);
-                        emit!(self.state, "    fldt {}", src_ref);
-                        emit!(self.state, "    fstpt {}", dst_ref);
+                        // Bit-exact 12-byte copy (see the F128 capture
+                        // arms above); the destination keeps the native
+                        // 80-bit representation.
+                        for j in (0..12).step_by(4) {
+                            let src_ref = self.slot_ref_offset(alloca_slot, j as i64);
+                            let dst_ref = self.slot_ref_offset(dest_slot, j as i64);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                        }
                         self.state.f128_direct_slots.insert(dest.0);
-                    } else if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 {
+                    } else if ty == IrType::F64
+                        || ty == IrType::I64
+                        || ty == IrType::U64
+                        || ty == IrType::D64
+                    {
                         let src_ref = self.slot_ref(alloca_slot);
                         let dst_ref = self.slot_ref(dest_slot);
                         emit!(self.state, "    movl {}, %eax", src_ref);
@@ -1177,23 +1355,29 @@ impl I686Codegen {
             }
         }
 
-        if self.is_fastcall && param_idx < self.fastcall_reg_param_count {
-            if let Some(Some((slot, _slot_ty))) = self.state.param_alloca_slots.get(param_idx) {
-                let load_instr = self.mov_load_for_type(ty);
-                let slot_ref = self.slot_ref(*slot);
-                emit!(self.state, "    {} {}, %eax", load_instr, slot_ref);
-                self.store_eax_to(dest);
+        // Fastcall register parameter: captured in the prologue into its
+        // home (param_pre_stored, or its alloca slot). It has no stack
+        // location to read.
+        if self.is_fastcall {
+            if let I686FastcallSlot::Reg(_) = self.fastcall_slots[param_idx] {
+                if let Some(Some((slot, _slot_ty))) = self.state.param_alloca_slots.get(param_idx) {
+                    let load_instr = self.mov_load_for_type(ty);
+                    let slot_ref = self.slot_ref(*slot);
+                    emit!(self.state, "    {} {}, %eax", load_instr, slot_ref);
+                    self.store_eax_to(dest);
+                }
+                return;
             }
-            return;
         }
 
         let stack_base: i64 = 8;
-        let stack_offset_adjust = if self.is_fastcall {
-            self.fastcall_reg_param_count as i64 * 4
-        } else {
-            0
-        };
-        let param_offset = if param_idx < self.state.param_classes.len() {
+        let param_offset = if self.is_fastcall {
+            // Exact compacted offset from the authoritative layout.
+            match self.fastcall_slots[param_idx] {
+                I686FastcallSlot::Stack { offset, .. } => stack_base + offset,
+                I686FastcallSlot::Reg(_) => unreachable!("handled above"),
+            }
+        } else if param_idx < self.state.param_classes.len() {
             match self.state.param_classes[param_idx] {
                 ParamClass::StackScalar { offset }
                 | ParamClass::StructStack { offset, .. }
@@ -1201,9 +1385,7 @@ impl I686Codegen {
                 | ParamClass::F128AlwaysStack { offset }
                 | ParamClass::I128Stack { offset }
                 | ParamClass::F128Stack { offset }
-                | ParamClass::LargeStructByRefStack { offset, .. } => {
-                    stack_base + offset - stack_offset_adjust
-                }
+                | ParamClass::LargeStructByRefStack { offset, .. } => stack_base + offset,
                 ParamClass::IntReg { .. }
                 | ParamClass::I64RegPair { .. }
                 | ParamClass::StructByValReg { .. } => {
@@ -1235,13 +1417,17 @@ impl I686Codegen {
             }
         } else if ty == IrType::F128 {
             if let Some(dest_slot) = self.state.get_slot(dest.0) {
-                let src_ref = self.param_ref(param_offset);
-                let dst_ref = self.slot_ref(dest_slot);
-                emit!(self.state, "    fldt {}", src_ref);
-                emit!(self.state, "    fstpt {}", dst_ref);
+                // Bit-exact 12-byte copy; destination keeps the native
+                // 80-bit representation.
+                for j in (0..12).step_by(4) {
+                    let src_ref = self.param_ref(param_offset + j as i64);
+                    let dst_ref = self.slot_ref_offset(dest_slot, j as i64);
+                    emit!(self.state, "    movl {}, %eax", src_ref);
+                    emit!(self.state, "    movl %eax, {}", dst_ref);
+                }
                 self.state.f128_direct_slots.insert(dest.0);
             }
-        } else if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 {
+        } else if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 || ty == IrType::D64 {
             if let Some(slot) = self.state.get_slot(dest.0) {
                 let src_ref = self.param_ref(param_offset);
                 let dst_ref = self.slot_ref(slot);
@@ -1269,7 +1455,9 @@ impl I686Codegen {
             // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
             // function_value semantics) — nothing is on the stack to pop.
             self.state.emit("    ret $4");
-        } else if self.is_fastcall && self.fastcall_stack_cleanup > 0 {
+        } else if self.is_fastcall && !self.is_variadic && self.fastcall_stack_cleanup > 0 {
+            // Variadic fastcall callees receive everything on the stack and
+            // pop nothing (plain `ret`); the caller owns the cleanup.
             emit!(self.state, "    ret ${}", self.fastcall_stack_cleanup);
         } else {
             self.state.emit("    ret");

@@ -185,18 +185,20 @@ impl I686Codegen {
 
         // --- Scalar float<->integer casts that fit the single-register
         // interface (the SSE fast paths for the common sizes) ---
-        if matches!(kind, CastKind::SignedToFloat { to_f64: false, .. }) && from_ty != IrType::I64
-            || matches!(kind, CastKind::UnsignedToFloat { to_f64: false, .. })
-                && from_ty != IrType::U64
-            || matches!(kind, CastKind::FloatToSigned { from_f64: false }) && to_ty != IrType::I64
-            || matches!(
-                kind,
-                CastKind::FloatToUnsigned {
-                    from_f64: false,
-                    to_u64: false
-                }
-            )
-        {
+        //
+        // The width restriction is stated directly in the types: only
+        // F32<->subword/integer32 conversions use the eax interface. F64
+        // and F128 (and every wide pair) take the x87 path below; the
+        // previous classifier-boolean form derived the same set through
+        // `to_f64`/`from_f64` encodings, which did not locally prove the
+        // width.
+        let integer_to_f32 =
+            to_ty == IrType::F32 && cast_is_integer(from_ty) && !cast_is_integer_pair(from_ty);
+
+        let f32_to_integer =
+            from_ty == IrType::F32 && cast_is_integer(to_ty) && !cast_is_integer_pair(to_ty);
+
+        if integer_to_f32 || f32_to_integer {
             self.operand_to_eax(src);
             self.emit_cast_instrs_impl(from_ty, to_ty);
             self.store_eax_to(dest);
@@ -295,8 +297,12 @@ impl I686Codegen {
         }
     }
 
+    /// Normalize a subword integer in EAX.
+    ///
+    /// EAX may no longer contain the previously cached representation.
     fn cast_normalize_eax(&mut self, ty: IrType) {
         if let Some(instruction) = cast_normalization_instruction(ty) {
+            self.state.reg_cache.invalidate_acc();
             self.state.emit(instruction);
         }
     }
@@ -306,8 +312,14 @@ impl I686Codegen {
     /// The full 12-byte ABI object is copied (3 dwords), so NaN payloads
     /// and padding survive verbatim. All source words are read before any
     /// destination word is written, so overlapping source and destination
-    /// slots cannot corrupt the copy. Measured ~15% faster than the
-    /// push/pop form and free of the stack engine.
+    /// slots cannot corrupt the copy. No x87 round trip, no stack-engine
+    /// traffic, no precision-control interaction.
+    ///
+    /// %eax/%ecx/%edx scratch contract: the i686 register allocator's
+    /// scratch-hazard model (regalloc.rs collect_i686_scratch_hazard_points)
+    /// marks every Cast instruction as an ECX/EDX hazard point, so no value
+    /// homed in a caller-saved register can be live across this sequence —
+    /// the scratch use here is allocator-modelled, not cache-hidden.
     fn cast_copy_direct_f128(&mut self, dest: &Value, src: &Operand) -> bool {
         let source = match src {
             Operand::Value(source) => source,
@@ -349,8 +361,9 @@ impl I686Codegen {
 
     /// Load one supported numeric operand into st(0).
     ///
-    /// Leaves `%eax`/`%edx` untouched on every path (push/pop round trips
-    /// preserve them), so accumulator-cache entries stay valid.
+    /// Operand materialization may modify EAX/EDX. Integer-pair loads
+    /// invalidate cached register contents here; subword normalization
+    /// invalidates the accumulator cache when it emits an instruction.
     fn cast_load_x87(&mut self, src: &Operand, from_ty: IrType) {
         match from_ty {
             IrType::F32 => {
@@ -425,7 +438,6 @@ impl I686Codegen {
         self.state.emit("    subl $12, %esp");
         self.state.emit("    movl %eax, (%esp)");
         self.state.emit("    movl %edx, 4(%esp)");
-        emit!(self.state, "    movw ${}, 8(%esp)", U64_HIGH_X87_EXPONENT);
 
         self.state.emit("    testl %edx, %edx");
         self.state.out.emit_jcc_label("    js", &high);
@@ -434,6 +446,9 @@ impl I686Codegen {
         self.state.out.emit_jmp_label(&done);
 
         self.state.out.emit_named_label(&high);
+        // The exponent word is needed only on this path: the common
+        // low-range conversion executes one fewer store.
+        emit!(self.state, "    movw ${}, 8(%esp)", U64_HIGH_X87_EXPONENT);
         self.state.emit("    fldt (%esp)");
 
         self.state.out.emit_named_label(&done);
@@ -524,43 +539,76 @@ impl I686Codegen {
 
     /// Pop st(0), returning U64 in edx:eax.
     ///
-    /// The 2^63 threshold decides between the two exact conversions:
+    /// The threshold compare selects between two EXACT conversions, and
+    /// neither path performs any x87 arithmetic, so the result does not
+    /// depend on the ambient precision-control setting:
     ///
     /// ```text
-    /// x <  2^63: fisttpq(x) is in range
-    /// x >= 2^63: y = x - 2^63 is exact (Sterbenz) and in [0, 2^63);
-    ///            result = y | 2^63
+    /// x <  2^63: fisttpq(x) directly — truncation, in signed range.
+    /// x >= 2^63: the native extended encoding is stored with fstpt.
+    ///            Every finite extended value in [2^63, 2^64) is an
+    ///            integer whose sign/exponent word is 0x403e and whose
+    ///            64-bit significand IS the unsigned result — read the
+    ///            payload directly, no subtraction.
     /// ```
     ///
-    /// Measured at parity with the plain (signed-only) `fisttpq` sequence
-    /// on the validation host; the branch is perfectly predicted on
-    /// uniform data. The threshold constant is 2^63 exactly as an F32
-    /// (`0x5f000000`), so the compare needs no double-width load.
+    /// The previous high path computed `fisttpq(x - 2^63)` and XORed the
+    /// high bit back in. That subtraction rounds at the ambient x87
+    /// precision: under a 24- or 53-bit precision control, 2^64 - 1
+    /// (exactly representable in extended precision, e.g. loaded with
+    /// fldt from memory or produced by fild-based integer arithmetic)
+    /// rounds to 2^63, which lies outside the signed 64-bit range and
+    /// converts to the integer-indefinite value — 0 after the XOR
+    /// instead of UINT64_MAX (verified against GCC 14.2 -m32, which
+    /// miscompiles identically; we exceed it).
+    ///
+    /// NaNs, infinities and values >= 2^64 fall through to fisttpq,
+    /// yielding the same integer-indefinite value GCC produces.
+    /// The threshold constant is 2^63 exactly as an F32 (`0x5f000000`),
+    /// so the compare needs no double-width load; FUCOMIP pops the
+    /// threshold and keeps x, and the unordered (NaN) case sets CF=ZF=1
+    /// so `jbe` routes it to the high-path fallback.
     fn cast_x87_to_u64(&mut self) {
         let high = self.state.fresh_label("cast_fp_u64_high");
+        let not_range = self.state.fresh_label("cast_fp_u64_notrange");
         let done = self.state.fresh_label("cast_fp_u64_done");
 
-        self.state.emit("    subl $8, %esp");
+        self.state.emit("    subl $12, %esp");
         self.state.emit("    movl $0x5f000000, (%esp)");
         self.state.emit("    flds (%esp)");
-        // FUCOMIP pops the threshold and compares 2^63 with x; the x87
-        // unordered case (NaN input) falls to the low path, whose
-        // indefinite result is outside the defined conversion domain.
         self.state.emit("    fucomip %st(1), %st");
         self.state.out.emit_jcc_label("    jbe", &high);
 
+        // Low path: defined inputs truncate into signed i64. FISTTP
+        // truncates toward zero independently of the ambient rounding
+        // direction and performs no arithmetic subject to precision
+        // control. Fractional inputs may still raise FE_INEXACT.
         self.state.emit("    fisttpq (%esp)");
+        self.state.emit("    movl (%esp), %eax");
+        self.state.emit("    movl 4(%esp), %edx");
         self.state.out.emit_jmp_label(&done);
 
         self.state.out.emit_named_label(&high);
-        self.state.emit("    fsubs (%esp)");
-        self.state.emit("    fisttpq (%esp)");
-        self.state.emit("    xorl $0x80000000, 4(%esp)");
+        // High path: store the native extended representation (stores are
+        // exact) and inspect the sign/exponent word without reloading.
+        self.state.emit("    fstpt (%esp)");
+        emit!(self.state, "    cmpw ${}, 8(%esp)", U64_HIGH_X87_EXPONENT);
+        self.state.out.emit_jcc_label("    jne", &not_range);
 
-        self.state.out.emit_named_label(&done);
+        // Finite [2^63, 2^64): the significand is the result.
         self.state.emit("    movl (%esp), %eax");
         self.state.emit("    movl 4(%esp), %edx");
-        self.state.emit("    addl $8, %esp");
+        self.state.out.emit_jmp_label(&done);
+
+        // NaN / infinity / >= 2^64 (or negative): integer-indefinite.
+        self.state.out.emit_named_label(&not_range);
+        self.state.emit("    fldt (%esp)");
+        self.state.emit("    fisttpq (%esp)");
+        self.state.emit("    movl (%esp), %eax");
+        self.state.emit("    movl 4(%esp), %edx");
+
+        self.state.out.emit_named_label(&done);
+        self.state.emit("    addl $12, %esp");
         self.state.reg_cache.invalidate_acc();
         self.state.reg_cache.invalidate_sec();
     }
@@ -678,8 +726,9 @@ impl I686Codegen {
 
                     // Never the signed 32-bit cvttss2si: for [2^31, 2^32)
                     // it returns the indefinite 0x80000000 and raises
-                    // FE_INVALID. The 64-bit fisttpq stays in range for
-                    // every defined input and raises nothing. The F32
+                    // FE_INVALID. The signed 64-bit conversion accommodates
+                    // every defined U32 result, including [2^31, 2^32).
+                    // Fractional inputs may still raise FE_INEXACT. The F32
                     // bits are consumed by flds before the conversion
                     // overwrites the scratch.
                     self.state.emit("    subl $8, %esp");
@@ -843,17 +892,77 @@ mod tests {
         }
     }
 
-    #[test]
-    fn high_unsigned_representation_deterministic_samples() {
-        let mut state = 0x6a09_e667_f3bc_c909u64;
+    /// Integer-arithmetic model of rounding a positive integer to a
+    /// binary precision using round-to-nearest, ties-to-even.
+    ///
+    /// This models the x87 precision-control rounding applied to the
+    /// superseded subtraction-based U64 conversion's FSUB result. It does
+    /// not execute x87.
+    fn round_integer_to_binary_precision(value: u128, precision: u32) -> u128 {
+        assert!((1..=64).contains(&precision));
 
-        for _ in 0..100_000 {
-            let value = next_u64(&mut state) | (1u64 << 63);
-            assert_eq!(
-                decode_positive_integer(encode_high_u64(value)),
-                u128::from(value)
-            );
+        if value == 0 {
+            return 0;
         }
+
+        let width = u128::BITS - value.leading_zeros();
+        if width <= precision {
+            return value;
+        }
+
+        let shift = width - precision;
+        let retained = value >> shift;
+        let discarded = value & ((1_u128 << shift) - 1);
+        let halfway = 1_u128 << (shift - 1);
+
+        let increment = discarded > halfway || (discarded == halfway && retained & 1 != 0);
+
+        (retained + u128::from(increment)) << shift
+    }
+
+    /// The superseded high path computed fisttpq(x - 2^63). Under a 24- or
+    /// 53-bit precision control the subtraction of an exactly representable
+    /// extended input rounds to 2^63 — outside the signed range — and the
+    /// conversion yields the integer-indefinite value. The native-payload
+    /// path performs no arithmetic and is immune.
+    #[test]
+    fn subtraction_based_u64_conversion_has_precision_counterexample() {
+        let exact_difference = (1_u128 << 63) - 1;
+
+        for precision in [24, 53] {
+            let rounded = round_integer_to_binary_precision(exact_difference, precision);
+
+            assert_eq!(rounded, 1_u128 << 63);
+            assert!(rounded > i64::MAX as u128);
+        }
+
+        assert_eq!(
+            round_integer_to_binary_precision(exact_difference, 64),
+            exact_difference
+        );
+    }
+
+    #[test]
+    fn precision_model_implements_ties_to_even() {
+        assert_eq!(round_integer_to_binary_precision(17, 4), 16);
+        assert_eq!(round_integer_to_binary_precision(19, 4), 20);
+        assert_eq!(round_integer_to_binary_precision(21, 4), 20);
+        assert_eq!(round_integer_to_binary_precision(23, 4), 24);
+    }
+
+    #[test]
+    fn native_high_u64_payload_avoids_the_subtraction_counterexample() {
+        let encoded = encode_high_u64(u64::MAX);
+
+        assert_eq!(
+            u16::from_le_bytes([encoded[8], encoded[9]]),
+            U64_HIGH_X87_EXPONENT
+        );
+
+        let mut payload = [0_u8; 8];
+        payload.copy_from_slice(&encoded[..8]);
+
+        assert_eq!(u64::from_le_bytes(payload), u64::MAX);
     }
 
     #[test]

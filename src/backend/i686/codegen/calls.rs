@@ -185,7 +185,7 @@ impl I686Codegen {
         _stack_arg_space: usize,
         _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
     ) {
-        if self.regparm == 0 {
+        if self.current_call_regparm == 0 {
             return; // cdecl: no register args
         }
         // regparm register order: EAX (reg_idx 0), EDX (reg_idx 1), ECX (reg_idx 2).
@@ -315,7 +315,7 @@ impl I686Codegen {
             }
         } else if indirect {
             if let Some(fptr) = func_ptr {
-                if self.regparm > 0 {
+                if self.current_call_regparm > 0 {
                     // Under regparm, %eax/%edx/%ecx carry arguments — staging
                     // the target in %eax would destroy arg 0. Call through
                     // the value's home directly (register or stack slot);

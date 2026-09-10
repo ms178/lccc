@@ -4431,6 +4431,7 @@ mod typed_indirect_calls {
                 ret_is_f128_sse: false,
                 is_sret: false,
                 is_fastcall: false,
+                regparm: None,
                 is_pure: false,
                 is_const: false,
                 ret_eightbyte_classes: vec![],
