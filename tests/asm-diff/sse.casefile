@@ -906,6 +906,12 @@ cvtsi2sdl (%rdi), %xmm0
 cvtsi2sdq (%rdi), %xmm0
 cvtsi2ss %eax, %xmm0
 cvtsi2ss %rax, %xmm0
+cvtsi2ss %r8d, %xmm0
+cvtsi2ss %eax, %xmm8
+cvtsi2ss %r8d, %xmm8
+cvtsi2sd %r8d, %xmm0
+cvtsi2sd %eax, %xmm8
+cvtsi2ss %r8, %xmm8
 cvtsd2si %xmm0, %eax
 cvtsd2si %xmm0, %rax
 cvttsd2si %xmm0, %eax
@@ -1097,6 +1103,9 @@ roundps $15, %xmm1, %xmm2
 roundsd $15, %xmm1, %xmm2
 insertps $0, %xmm1, %xmm2
 extractps $0, %xmm1, %eax
+extractps $0, %xmm8, %eax
+extractps $0, %xmm1, %r8d
+extractps $0, %xmm8, %r8d
 pinsrd $0, %eax, %xmm1
 pextrd $0, %xmm1, %eax
 pinsrq $0, %rax, %xmm1

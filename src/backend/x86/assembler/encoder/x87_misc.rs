@@ -72,6 +72,7 @@ impl super::InstructionEncoder {
                     scale: None,
                     mask: None,
                     zeroing: false,
+                    broadcast: None,
                 };
                 self.emit_rex_rm(size, "", &mem);
                 let rc = self.relocations.len();
@@ -418,11 +419,8 @@ impl super::InstructionEncoder {
                 let src_num = reg_num(&src.name).ok_or("bad seg register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 // 8C /r - MOV r/m16, Sreg
-                if is_reg64(&dst.name) {
-                    self.emit_rex_unary(8, &dst.name);
-                } else if needs_rex_ext(&dst.name) {
-                    self.bytes.push(self.rex(false, false, false, true));
-                }
+                // MOV Sreg→GP never needs REX.W; a 64-bit dest zero-extends.
+                self.emit_rex_unary(4, &dst.name);
                 self.bytes.push(0x8C);
                 self.bytes.push(self.modrm(3, src_num, dst_num));
                 Ok(())
@@ -432,9 +430,7 @@ impl super::InstructionEncoder {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad seg register")?;
                 // 8E /r - MOV Sreg, r/m16
-                if needs_rex_ext(&src.name) {
-                    self.bytes.push(self.rex(false, false, false, true));
-                }
+                self.emit_rex_unary(4, &src.name);
                 self.bytes.push(0x8E);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
@@ -496,8 +492,7 @@ impl super::InstructionEncoder {
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let b = needs_rex_ext(&src.name);
-                self.bytes.push(self.rex(true, false, false, b));
+                self.emit_rex_rr(8, &dst.name, &src.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x6E]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
@@ -508,8 +503,7 @@ impl super::InstructionEncoder {
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let b = needs_rex_ext(&dst.name);
-                self.bytes.push(self.rex(true, false, false, b));
+                self.emit_rex_rr(8, &src.name, &dst.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x7E]);
                 self.bytes.push(self.modrm(3, src_num, dst_num));
                 Ok(())
@@ -554,10 +548,17 @@ impl super::InstructionEncoder {
         ops: &[Operand],
         alu_op: u8,
     ) -> Result<(), String> {
-        if ops.len() != 2 {
-            return Err("ALU op requires 2 operands".to_string());
+        if ops.len() != 2 && ops.len() != 3 {
+            return Err("ALU op requires 2 or 3 operands".to_string());
         }
-        let size = infer_operand_size_from_pair(&ops[0], &ops[1]);
+        let size = if ops.len() == 3 {
+            match ops.last() {
+                Some(Operand::Register(r)) => infer_reg_size(&r.name),
+                _ => infer_operand_size_from_pair(&ops[0], &ops[1]),
+            }
+        } else {
+            infer_operand_size_from_pair(&ops[0], &ops[1])
+        };
         let suffix = match size {
             1 => "b",
             2 => "w",
@@ -599,14 +600,18 @@ impl super::InstructionEncoder {
         ops: &[Operand],
         shift_op: u8,
     ) -> Result<(), String> {
-        if ops.len() != 2 {
-            return Err("shift requires 2 operands".to_string());
+        if ops.len() < 1 || ops.len() > 3 {
+            return Err("shift requires 1-3 operands".to_string());
         }
-        // Size comes from dst (second) operand
-        let size = match &ops[1] {
-            Operand::Register(r) => infer_reg_size(&r.name),
-            _ => 8,
-        };
+        // Size comes from the destination (last register).
+        let size = ops
+            .iter()
+            .rev()
+            .find_map(|op| match op {
+                Operand::Register(r) if r.name != "cl" => Some(infer_reg_size(&r.name)),
+                _ => None,
+            })
+            .unwrap_or(8);
         let op_name = match shift_op {
             4 => "shl",
             5 => "shr",
@@ -632,14 +637,14 @@ impl super::InstructionEncoder {
         ops: &[Operand],
         op_ext: u8,
     ) -> Result<(), String> {
-        if ops.len() != 1 {
-            return Err("unary op requires 1 operand".to_string());
+        if ops.len() != 1 && ops.len() != 2 {
+            return Err("unary op requires 1 or 2 operands".to_string());
         }
-        let size = match &ops[0] {
-            Operand::Register(r) => infer_reg_size(&r.name),
+        let size = match ops.last() {
+            Some(Operand::Register(r)) => infer_reg_size(&r.name),
             _ => 8,
         };
-        if size == 2 {
+        if size == 2 && !self.apx_wants_evex() && ops.len() == 1 {
             self.bytes.push(0x66);
         }
         self.encode_unary_rm(ops, op_ext, size)

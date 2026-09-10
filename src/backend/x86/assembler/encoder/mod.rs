@@ -3,6 +3,7 @@
 //! Encodes parsed x86-64 instructions into machine code bytes.
 //! Handles REX prefixes, ModR/M, SIB, and displacement encoding.
 
+mod apx;
 mod avx;
 mod core;
 mod gp_integer;
@@ -55,6 +56,9 @@ pub const R_X86_64_GOTPCREL: u32 = 9;
 // the instruction has a REX prefix, so the rewrite must preserve its length.
 pub const R_X86_64_GOTPCRELX: u32 = 41;
 pub const R_X86_64_REX_GOTPCRELX: u32 = 42;
+/// Relaxable GOT load whose instruction starts 4 bytes before the
+/// displacement (REX2 `0xD5`). ELF `R_X86_64_CODE_4_GOTPCRELX`.
+pub const R_X86_64_CODE_4_GOTPCRELX: u32 = 43;
 pub const R_X86_64_TPOFF32: u32 = 23;
 pub const R_X86_64_GOTTPOFF: u32 = 22;
 #[expect(dead_code)] // ELF standard constant, defined for reference/future use
@@ -70,6 +74,14 @@ pub struct InstructionEncoder {
     pub relocations: Vec<Relocation>,
     /// Current offset within the section.
     pub offset: u64,
+    /// APX `{nf}`: emit EVEX.NF (no EFLAGS update).
+    apx_nf: bool,
+    /// APX `{evex}`: force the map-4 EVEX encoding of a legacy insn.
+    apx_evex: bool,
+    /// APX `{rex2}`: force a REX2 prefix even without an EGPR.
+    apx_rex2: bool,
+    /// APX `{dfv=}` bitmap for CCMP/CTEST (P1.vvvv, not inverted).
+    apx_dfv: u8,
 }
 
 impl InstructionEncoder {
@@ -78,12 +90,23 @@ impl InstructionEncoder {
             bytes: Vec::new(),
             relocations: Vec::new(),
             offset: 0,
+            apx_nf: false,
+            apx_evex: false,
+            apx_rex2: false,
+            apx_dfv: 0,
         }
     }
 
     /// Encode a single instruction and append bytes.
     pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
         let start_len = self.bytes.len();
+        self.apx_nf = instr.nf;
+        self.apx_evex = instr.force_evex;
+        self.apx_rex2 = instr.force_rex2;
+        self.apx_dfv = instr.dfv;
+        if (self.apx_nf || self.apx_evex) && self.apx_rex2 {
+            return Err("{rex2} cannot be combined with {evex} or {nf}".to_string());
+        }
 
         // PREFIX ORDER. x86 legacy prefixes come from four groups and, while
         // the hardware accepts any order, the canonical encoding used by GAS,
@@ -117,7 +140,20 @@ impl InstructionEncoder {
         };
 
         let reloc_base = self.relocations.len();
-        let result = self.encode_mnemonic(instr);
+        let mut result = self.encode_mnemonic(instr);
+        if result.is_ok() {
+            result = self.fixup_rex2_map1(start_len);
+        }
+        if result.is_ok() && operands_have_egpr(&instr.operands) {
+            let body = &self.bytes[start_len..];
+            let has_apx = body.iter().any(|&b| b == 0xD5 || b == 0x62);
+            if !has_apx {
+                result = Err(format!(
+                    "internal: EGPR operand without REX2/EVEX prefix ({})",
+                    instr.mnemonic
+                ));
+            }
+        }
 
         if let (Ok(()), Some(pfx)) = (&result, group1) {
             let mut at = start_len;
@@ -309,6 +345,30 @@ impl InstructionEncoder {
             "vminps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x5D)),
             "vmaxpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x5F)),
             "vmaxps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x5F)),
+            "vandps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x54)),
+            "vandpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x54)),
+            "vandnps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x55)),
+            "vandnpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x55)),
+            "vorps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x56)),
+            "vorpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x56)),
+            "vxorps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x57)),
+            "vxorpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x57)),
+            "vaddss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x58)),
+            "vaddsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x58)),
+            "vsubss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5C)),
+            "vsubsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5C)),
+            "vmulss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x59)),
+            "vmulsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x59)),
+            "vdivss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5E)),
+            "vdivsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5E)),
+            "vminss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5D)),
+            "vminsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5D)),
+            "vmaxss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5F)),
+            "vmaxsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5F)),
+            "vmovaps" => r(self.encode_evex_vmov(ops, 0, 0, 0x28, 0x29)),
+            "vmovapd" => r(self.encode_evex_vmov(ops, 1, 1, 0x28, 0x29)),
+            "vmovups" => r(self.encode_evex_vmov(ops, 0, 0, 0x10, 0x11)),
+            "vmovupd" => r(self.encode_evex_vmov(ops, 1, 1, 0x10, 0x11)),
             // unary
             "vpabsb" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x1C)),
             "vpabsw" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x1D)),
@@ -374,6 +434,11 @@ impl InstructionEncoder {
             "vpcmpq" => r(self.encode_evex_cmp_mask(ops, 3, 1, 1, 0x1F)),
             "vpcmpuq" => r(self.encode_evex_cmp_mask(ops, 3, 1, 1, 0x1E)),
             "vpshufbitqmb" => r(self.encode_evex_cmp_mask_nimm(ops, 2, 1, 0, 0x8F)),
+            // EVEX packed compare-to-mask (same layout as vpcmp*, opcode C2).
+            "vcmpps" => r(self.encode_evex_cmp_mask(ops, 1, 0, 0, 0xC2)),
+            "vcmppd" => r(self.encode_evex_cmp_mask(ops, 1, 1, 1, 0xC2)),
+            "vcvtps2dq" => r(self.encode_evex_unary(ops, 1, 1, 0, 0x5B)),
+            "vcvtdq2ps" => r(self.encode_evex_unary(ops, 1, 0, 0, 0x5B)),
             // vpcmpeq*/vpcmpgt* aliases: mask-dest forms use the original opcodes;
             // vector-dest forms are VEX-only (512-bit vector-dest compares do not
             // exist — reject like GAS).
@@ -540,16 +605,23 @@ impl InstructionEncoder {
         // a miscompile with no diagnostic.
         validate_operands(mnemonic, ops)?;
 
-        // AVX-512: instructions touching zmm or k (opmask) registers, plus the
-        // AVX-512 byte/word vector moves, route through the EVEX dispatcher.
-        // Without this guard, zmm operands would silently encode as 128-bit VEX.
-        let has_zmm_or_k = ops.iter().any(|op| match op {
-            Operand::Register(r) => {
-                is_zmm(&r.name) || is_kreg(&r.name) || r.mask.is_some() || r.zeroing
-            }
-            Operand::Memory(m) => m.mask.is_some() || m.zeroing,
-            _ => false,
-        });
+        if mnemonic.starts_with("ccmp") {
+            return self.encode_ccmp(ops, mnemonic);
+        }
+        if mnemonic.starts_with("ctest") {
+            return self.encode_ctest(ops, mnemonic);
+        }
+        if mnemonic.starts_with("cfcmov") {
+            return self.encode_cfcmovcc(ops, mnemonic);
+        }
+        if mnemonic.starts_with("imulzu") {
+            return self.encode_imulzu(ops, mnemonic);
+        }
+
+        // AVX-512: zmm, k, masking, and xmm/ymm16–31 all require EVEX.
+        // xmm/ymm0–15 stay on the VEX path (shorter). Without the high-reg
+        // check, xmm16 would wrap into the 3-bit VEX/ModRM fields as xmm0.
+        let has_zmm_or_k = ops.iter().any(operand_needs_evex);
         // Mnemonics with NO VEX encoding (EVEX is the only form): must be
         // routed to the EVEX table even for 128/256-bit (xmm/ymm) operands.
         let evex_only = matches!(
@@ -728,6 +800,13 @@ impl InstructionEncoder {
             // Stack ops
             "pushq" | "pushl" => self.encode_push(ops),
             "popq" | "popl" => self.encode_pop(ops),
+            "pushp" => self.encode_pushp(ops, false),
+            "popp" => self.encode_pushp(ops, true),
+            "push2" => self.encode_push2(ops, false),
+            "push2p" => self.encode_push2(ops, true),
+            "pop2" => self.encode_pop2(ops, false),
+            "pop2p" => self.encode_pop2(ops, true),
+            "jmpabs" => self.encode_jmpabs(ops),
 
             // Arithmetic
             "addq" | "addl" | "addw" | "addb" => self.encode_alu(ops, mnemonic, 0),
@@ -776,6 +855,8 @@ impl InstructionEncoder {
             // Double-precision shifts
             "shldq" => self.encode_double_shift(ops, 0xA4, 8),
             "shrdq" => self.encode_double_shift(ops, 0xAC, 8),
+            "shldw" => self.encode_double_shift(ops, 0xA4, 2),
+            "shrdw" => self.encode_double_shift(ops, 0xAC, 2),
 
             // Sign extension.  Both the AT&T spellings and the Intel aliases GAS
             // accepts map onto the same three opcodes, distinguished only by the
@@ -1127,6 +1208,21 @@ impl InstructionEncoder {
             }
             "sfence" => {
                 self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xF8]);
+                Ok(())
+            }
+            // AMD Zen / cache-line / processor-register helpers omitted by
+            // PR #462. Encodings match GAS 2.47: clzero 0F 01 FC, rdpru
+            // 0F 01 FD, mcommit F3 0F 01 FA.
+            "clzero" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFC]);
+                Ok(())
+            }
+            "rdpru" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xFD]);
+                Ok(())
+            }
+            "mcommit" => {
+                self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01, 0xFA]);
                 Ok(())
             }
             "clflush" => self.encode_clflush(ops),
@@ -2072,7 +2168,9 @@ impl InstructionEncoder {
             "vpunpckhqdq" => self.encode_avx_3op(ops, 0x6D, true),
             "vpmullw" => self.encode_avx_3op_commutative(ops, 0xD5, true, true),
             "vpmulld" => self.encode_avx_3op_38(ops, 0x40, true),
-            "vpmuludq" => self.encode_avx_3op(ops, 0xF4, true),
+            "vpmuludq" => self.encode_avx_3op_commutative(ops, 0xF4, true, true),
+            "vpmulhuw" => self.encode_avx_3op_commutative(ops, 0xE4, true, true),
+            "vpmuldq" => self.encode_avx_3op_38(ops, 0x28, true),
             "vpsllw" => self.encode_avx_shift(ops, 0xF1, 6, 0x71, true),
             "vpslld" => self.encode_avx_shift(ops, 0xF2, 6, 0x72, true),
             "vpsllq" => self.encode_avx_shift(ops, 0xF3, 6, 0x73, true),
@@ -2171,7 +2269,7 @@ impl InstructionEncoder {
             "vpmaxud" => self.encode_avx_3op_38(ops, 0x3F, true),
             "vpavgb" => self.encode_avx_3op_commutative(ops, 0xE0, true, true),
             "vpavgw" => self.encode_avx_3op_commutative(ops, 0xE3, true, true),
-            "vpsadbw" => self.encode_avx_3op(ops, 0xF6, true),
+            "vpsadbw" => self.encode_avx_3op_commutative(ops, 0xF6, true, true),
             "vpmaddubsw" => self.encode_avx_3op_38(ops, 0x04, true),
             // AVX-VNNI (66 pp) — Raptor Lake+
             "vpdpbusd" => self.encode_avx_3op_38_pp(ops, 0x50, 1),
@@ -2206,7 +2304,23 @@ impl InstructionEncoder {
             "vpclmulqdq" => self.encode_avx_3op_3a_pp_imm8(ops, 0x44, 1),
             "vphaddw" => self.encode_avx_3op_38(ops, 0x01, true),
             "vphaddd" => self.encode_avx_3op_38(ops, 0x02, true),
-            "vpmaddwd" => self.encode_avx_3op(ops, 0xF5, true),
+            "vphaddsw" => self.encode_avx_3op_38(ops, 0x03, true),
+            "vphsubw" => self.encode_avx_3op_38(ops, 0x05, true),
+            "vphsubd" => self.encode_avx_3op_38(ops, 0x06, true),
+            "vphsubsw" => self.encode_avx_3op_38(ops, 0x07, true),
+            "vpmulhrsw" => self.encode_avx_3op_38(ops, 0x0B, true),
+            "vphminposuw" => {
+                // SSE4.1 / AVX: 128-bit only. VEX.L=1 is #UD.
+                if ops.iter().any(
+                    |op| matches!(op, Operand::Register(r) if is_ymm(&r.name) || is_zmm(&r.name)),
+                ) {
+                    Err("vphminposuw is 128-bit only".to_string())
+                } else {
+                    self.encode_avx_2op_38(ops, 0x41, true)
+                }
+            }
+            "vmpsadbw" => self.encode_avx_3op_3a_imm8(ops, 0x42, true),
+            "vpmaddwd" => self.encode_avx_3op_commutative(ops, 0xF5, true, true),
             "vpmulhw" => self.encode_avx_3op_commutative(ops, 0xE5, true, true),
             "vpsubusb" => self.encode_avx_3op(ops, 0xD8, true),
             "vpsubusw" => self.encode_avx_3op(ops, 0xD9, true),
@@ -2429,6 +2543,18 @@ impl InstructionEncoder {
                 let w = self.bmi2_infer_w(ops);
                 self.encode_bmi2_shift(ops, 0xF7, 0, w)
             }
+            "blsi" => {
+                let w = self.bmi2_infer_w(ops);
+                self.encode_bmi_blsx(ops, 3, w)
+            }
+            "blsr" => {
+                let w = self.bmi2_infer_w(ops);
+                self.encode_bmi_blsx(ops, 1, w)
+            }
+            "blsmsk" => {
+                let w = self.bmi2_infer_w(ops);
+                self.encode_bmi_blsx(ops, 2, w)
+            }
 
             // ---- Suffix-less forms (infer size from operands) ----
             // These are commonly emitted by inline asm
@@ -2541,8 +2667,8 @@ impl InstructionEncoder {
             | "cmovl" | "cmovle" | "cmovg" | "cmovge" | "cmovb" | "cmovbe" | "cmova" | "cmovae"
             | "cmovc" | "cmovnc" | "cmovno" | "cmovo" | "cmovna" | "cmovnb" | "cmovnbe"
             | "cmovnge" | "cmovng" | "cmovnle" | "cmovnl" | "cmovpe" | "cmovpo" | "cmovnae" => {
-                if ops.len() == 2 {
-                    let size = infer_operand_size_from_pair(&ops[0], &ops[1]);
+                if ops.len() == 2 || ops.len() == 3 {
+                    let size = infer_operand_size_from_pair(&ops[0], ops.last().unwrap());
                     let suffix = match size {
                         8 => "q",
                         4 => "l",
@@ -2552,7 +2678,7 @@ impl InstructionEncoder {
                     let new_mnemonic = format!("{}{}", mnemonic, suffix);
                     self.encode_cmovcc(ops, &new_mnemonic)
                 } else {
-                    Err("cmov requires 2 operands".to_string())
+                    Err("cmov requires 2 or 3 operands".to_string())
                 }
             }
 
@@ -2741,27 +2867,25 @@ impl InstructionEncoder {
 
             // ---- Suffix-less shrd/shld ----
             "shrd" => {
-                if ops.len() == 3 {
-                    let size = match &ops[2] {
-                        Operand::Register(r) => infer_reg_size(&r.name),
+                if ops.len() == 3 || ops.len() == 4 {
+                    let size = match ops.last() {
+                        Some(Operand::Register(r)) => infer_reg_size(&r.name),
                         _ => 8,
                     };
-                    let opcode = 0xACu8;
-                    self.encode_double_shift(ops, opcode, size)
+                    self.encode_double_shift(ops, 0xAC, size)
                 } else {
-                    Err("shrd requires 3 operands".to_string())
+                    Err("shrd requires 3 or 4 operands".to_string())
                 }
             }
             "shld" => {
-                if ops.len() == 3 {
-                    let size = match &ops[2] {
-                        Operand::Register(r) => infer_reg_size(&r.name),
+                if ops.len() == 3 || ops.len() == 4 {
+                    let size = match ops.last() {
+                        Some(Operand::Register(r)) => infer_reg_size(&r.name),
                         _ => 8,
                     };
-                    let opcode = 0xA4u8;
-                    self.encode_double_shift(ops, opcode, size)
+                    self.encode_double_shift(ops, 0xA4, size)
                 } else {
-                    Err("shld requires 3 operands".to_string())
+                    Err("shld requires 3 or 4 operands".to_string())
                 }
             }
 
@@ -3042,9 +3166,8 @@ impl InstructionEncoder {
                 [Operand::Register(r)] => {
                     let num = reg_num(&r.name).ok_or("rdpid: bad register")?;
                     self.bytes.push(0xF3);
-                    if needs_rex_ext(&r.name) {
-                        self.bytes.push(self.rex(false, false, false, true));
-                    }
+                    // W=0 even for r64 (vDSO uses `rdpid %rcx`). EGPR → REX2.
+                    self.emit_rex_unary(4, &r.name);
                     self.bytes.extend_from_slice(&[0x0F, 0xC7]);
                     self.bytes.push(self.modrm(3, 7, num));
                     Ok(())
@@ -3173,5 +3296,529 @@ impl InstructionEncoder {
                 Err(format!("unhandled instruction: {} {:?}", mnemonic, ops))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod apx_tests {
+    use super::*;
+
+    pub(super) fn hex(line: &str) -> String {
+        let items = parse_asm(line).unwrap_or_else(|e| panic!("parse `{line}`: {e}"));
+        let mut enc = InstructionEncoder::new();
+        for it in items {
+            if let AsmItem::Instruction(i) = it {
+                enc.encode(&i)
+                    .unwrap_or_else(|e| panic!("encode `{line}`: {e}"));
+            }
+        }
+        enc.bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub(super) fn fails(line: &str) -> bool {
+        let items = match parse_asm(line) {
+            Ok(i) => i,
+            Err(_) => return true,
+        };
+        let mut enc = InstructionEncoder::new();
+        items.into_iter().any(|it| {
+            if let AsmItem::Instruction(i) = it {
+                enc.encode(&i).is_err()
+            } else {
+                false
+            }
+        })
+    }
+
+    fn hex_relocs(line: &str) -> (String, Vec<u32>) {
+        let items = parse_asm(line).unwrap_or_else(|e| panic!("parse `{line}`: {e}"));
+        let mut enc = InstructionEncoder::new();
+        for it in items {
+            if let AsmItem::Instruction(i) = it {
+                enc.encode(&i)
+                    .unwrap_or_else(|e| panic!("encode `{line}`: {e}"));
+            }
+        }
+        let h = enc
+            .bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rels = enc.relocations.iter().map(|r| r.reloc_type).collect();
+        (h, rels)
+    }
+
+    #[test]
+    fn rex2_two_op_egpr() {
+        assert_eq!(hex("addq %rax, %r16"), "d5 18 01 c0");
+        assert_eq!(hex("addq %r16, %rax"), "d5 48 01 c0");
+        assert_eq!(hex("addq %r16, %r17"), "d5 58 01 c1");
+        assert_eq!(hex("addq %r24, %rax"), "d5 4c 01 c0");
+        assert_eq!(hex("addq (%r16), %rax"), "d5 18 03 00");
+        assert_eq!(hex("addq %rax, (%r16)"), "d5 18 01 00");
+        assert_eq!(hex("leaq (%rax), %r16"), "d5 48 8d 00");
+        assert_eq!(hex("leaq (%r16,%r17,4), %r18"), "d5 78 8d 14 88");
+        assert_eq!(hex("pushq %r16"), "d5 10 50");
+        assert_eq!(hex("popq %r16"), "d5 10 58");
+        assert_eq!(hex("jmp *%r16"), "d5 10 ff e0");
+        assert_eq!(hex("call *%r16"), "d5 10 ff d0");
+        assert_eq!(hex("incq %r16"), "d5 18 ff c0");
+        assert_eq!(hex("addq $1, %r16"), "d5 18 83 c0 01");
+    }
+
+    #[test]
+    fn rex2_map1_skips_0f() {
+        assert_eq!(hex("imulq %r16, %rax"), "d5 98 af c0");
+        assert_eq!(hex("cmovzq %rax, %r16"), "d5 c8 44 c0");
+        assert_eq!(hex("setzb %r16b"), "d5 90 94 c0");
+        assert_eq!(hex("bswapq %r16"), "d5 98 c8");
+    }
+
+    #[test]
+    fn movq_imm_zero_extends_not_movabs() {
+        // Size win vs GAS 2.47, which emits 11-byte REX2-movabs.
+        assert_eq!(hex("movq $0xffffffff, %r16"), "d5 10 b8 ff ff ff ff");
+        assert_eq!(hex("movl $0xffffffff, %r16d"), "d5 10 b8 ff ff ff ff");
+        assert_eq!(hex("movq $0, %r16"), "d5 18 c7 c0 00 00 00 00");
+        assert_eq!(hex("movq $-1, %r16"), "d5 18 c7 c0 ff ff ff ff");
+    }
+
+    #[test]
+    fn r16_is_not_the_accumulator() {
+        // Must not emit the 05/A9/90 rax short forms for %r16.
+        assert_ne!(hex("addq $0x1000, %r16"), hex("addq $0x1000, %rax"));
+        assert_eq!(hex("xchgq %r16, %rax"), "d5 18 90");
+    }
+
+    #[test]
+    fn force_rex2_and_hints() {
+        assert_eq!(hex("{rex2} addq %rax, %rbx"), "d5 08 01 c3");
+        assert_eq!(hex("{evex} addq %rax, %rbx"), "62 f4 fc 08 01 c3");
+        assert_eq!(hex("{nf} addq %rax, %rbx"), "62 f4 fc 0c 01 c3");
+        assert_eq!(hex("{nf}{evex} addq %rax, %rbx"), "62 f4 fc 0c 01 c3");
+        assert!(fails("{nf}{rex2} addq %rax, %rbx"));
+        assert!(fails("{nf} cmpq %rax, %rbx"));
+        assert!(fails("leaq (%rax), %rbx, %r16"));
+        assert!(fails("{nf} leaq (%rax), %rbx"));
+    }
+
+    #[test]
+    fn apx_ndd_alu() {
+        assert_eq!(hex("addq %rcx, %rdx, %r16"), "62 f4 fc 10 01 ca");
+        assert_eq!(hex("addq %rcx, %rdx, %r17"), "62 f4 f4 10 01 ca");
+        assert_eq!(hex("addq %rcx, %rdx, %r8"), "62 f4 bc 18 01 ca");
+        assert_eq!(hex("addq %rcx, %rdx, %r24"), "62 f4 bc 10 01 ca");
+        assert_eq!(hex("subq %rcx, %rdx, %r16"), "62 f4 fc 10 29 ca");
+        assert_eq!(hex("addl %ecx, %edx, %r16d"), "62 f4 7c 10 01 ca");
+        assert_eq!(hex("addq %rcx, (%rax), %r16"), "62 f4 fc 10 01 08");
+        assert_eq!(hex("addq (%rax), %rcx, %r16"), "62 f4 fc 10 03 08");
+        assert_eq!(hex("addq $1, %rax, %r16"), "62 f4 fc 10 83 c0 01");
+        assert_eq!(hex("{nf} addq %rcx, %rdx, %r16"), "62 f4 fc 14 01 ca");
+        assert_eq!(hex("{evex} addq %r16, %rax"), "62 e4 fc 08 01 c0");
+        assert_eq!(hex("{evex} addq %rax, %r16"), "62 fc fc 08 01 c0");
+        assert_eq!(hex("{evex} addq %r24, %rax"), "62 64 fc 08 01 c0");
+        assert_eq!(hex("{evex} addq %rax, %r24"), "62 dc fc 08 01 c0");
+        assert_eq!(hex("{evex} addl %eax, %ebx"), "62 f4 7c 08 01 c3");
+        assert_eq!(hex("{evex} addw %ax, %bx"), "62 f4 7d 08 01 c3");
+        assert_eq!(hex("{nf} addq $1, %rax"), "62 f4 fc 0c 83 c0 01");
+        assert_eq!(hex("{nf} xorq %rax, %rax"), "62 f4 fc 0c 31 c0");
+    }
+
+    #[test]
+    fn apx_ndd_unary_shift_cmov_imul() {
+        assert_eq!(hex("incq %rax, %r16"), "62 f4 fc 10 ff c0");
+        assert_eq!(hex("{nf} incq %rax"), "62 f4 fc 0c ff c0");
+        assert_eq!(hex("notq %rax, %r16"), "62 f4 fc 10 f7 d0");
+        assert_eq!(hex("shlq $1, %rax, %r16"), "62 f4 fc 10 d1 e0");
+        assert_eq!(hex("shlq %cl, %rax, %r16"), "62 f4 fc 10 d3 e0");
+        assert_eq!(hex("cmovzq %rax, %rbx, %r16"), "62 f4 fc 10 44 d8");
+        assert_eq!(hex("imulq %rcx, %rdx, %r16"), "62 f4 fc 10 af d1");
+    }
+
+    #[test]
+    fn lock_splices_before_rex2() {
+        assert_eq!(hex("lock addq %rax, (%r16)"), "f0 d5 18 01 00");
+    }
+
+    #[test]
+    fn apx_map4_crc32_adx_movbe() {
+        assert_eq!(hex("crc32q %rax, %r16"), "62 e4 fc 08 f1 c0");
+        assert_eq!(hex("crc32q %r16, %rax"), "62 fc fc 08 f1 c0");
+        assert_eq!(hex("crc32l %eax, %r16d"), "62 e4 7c 08 f1 c0");
+        assert_eq!(hex("crc32b %al, %r16d"), "62 e4 7c 08 f0 c0");
+        assert_eq!(hex("crc32b %al, %r16"), "62 e4 fc 08 f0 c0");
+        assert_eq!(hex("crc32w %ax, %r16d"), "62 e4 7d 08 f1 c0");
+        assert_eq!(hex("crc32q (%r16), %rax"), "62 fc fc 08 f1 00");
+        assert_eq!(hex("{evex} crc32q %rax, %rbx"), "62 f4 fc 08 f1 d8");
+        assert_eq!(hex("adcxq %r16, %rax"), "62 fc fd 08 66 c0");
+        assert_eq!(hex("adcxq %rax, %r16"), "62 e4 fd 08 66 c0");
+        assert_eq!(hex("adoxq %r16, %rax"), "62 fc fe 08 66 c0");
+        assert_eq!(hex("adoxq %rax, %r16"), "62 e4 fe 08 66 c0");
+        assert_eq!(hex("adcxl %eax, %r16d"), "62 e4 7d 08 66 c0");
+        assert_eq!(hex("movbeq (%r16), %rax"), "62 fc fc 08 60 00");
+        assert_eq!(hex("movbeq %rax, (%r16)"), "62 fc fc 08 61 00");
+        assert_eq!(hex("movbel (%r16), %eax"), "62 fc 7c 08 60 00");
+        assert_eq!(hex("movbew (%r16), %ax"), "62 fc 7d 08 60 00");
+        assert_eq!(hex("{evex} adcxq %rax, %rbx"), "62 f4 fd 08 66 d8");
+        assert_eq!(hex("{evex} movbeq (%rax), %rbx"), "62 f4 fc 08 60 18");
+        assert!(fails("{nf} crc32q %rax, %rbx"));
+        assert!(fails("{nf} adcxq %rax, %rbx"));
+        assert!(fails("{nf} movbeq (%rax), %rbx"));
+        // W follows dest: crc32b into %rax is REX.W, matching GAS 2.47.
+        assert_eq!(hex("crc32b %al, %rax"), "f2 48 0f 38 f0 c0");
+    }
+
+    #[test]
+    fn apx_bmi2_evex() {
+        // No EGPR: keep the shorter VEX form.
+        assert_eq!(hex("andnq %rcx, %rdx, %rax"), "c4 e2 e8 f2 c1");
+        assert_eq!(hex("shlxq %rcx, %rdx, %rax"), "c4 e2 f1 f7 c2");
+        assert_eq!(hex("rorxq $1, %rax, %r16"), "62 e3 ff 08 f0 c0 01");
+        assert_eq!(hex("{evex} rorxq $1, %rax, %rcx"), "62 f3 ff 08 f0 c8 01");
+        // EGPR / {nf} / {evex} → EVEX mmm=2.
+        assert_eq!(hex("shlxq %rcx, %rdx, %r16"), "62 e2 f5 08 f7 c2");
+        assert_eq!(hex("{evex} shlxq %rcx, %rdx, %rax"), "62 f2 f5 08 f7 c2");
+        assert_eq!(hex("{nf} andnq %rcx, %rdx, %rax"), "62 f2 ec 0c f2 c1");
+        assert_eq!(hex("{nf} andnq %rcx, %rdx, %r16"), "62 e2 ec 0c f2 c1");
+        assert_eq!(hex("{nf} bextrq %rcx, %rdx, %rax"), "62 f2 f4 0c f7 c2");
+        assert_eq!(hex("{nf} bzhiq %rcx, %rdx, %rax"), "62 f2 f4 0c f5 c2");
+        assert_eq!(hex("{nf} blsmskq %rax, %rcx"), "62 f2 f4 0c f3 d0");
+        assert_eq!(hex("{nf} blsiq %rax, %r16"), "62 f2 fc 04 f3 d8");
+        assert!(fails("{nf} shlxq %rcx, %rdx, %rax"));
+        assert!(fails("{nf} mulxq %rcx, %rdx, %rax"));
+        assert!(fails("{nf} rorxq $1, %rax, %rcx"));
+        assert!(fails("{nf} pdepq %rcx, %rdx, %rax"));
+    }
+
+    #[test]
+    fn apx_push2_pushp_jmpabs() {
+        assert_eq!(hex("pushw %r16w"), "66 d5 10 50");
+        assert_eq!(hex("pushp %rax"), "d5 08 50");
+        assert_eq!(hex("pushp %r16"), "d5 18 50");
+        assert_eq!(hex("pushp %rsp"), "d5 08 54");
+        assert_eq!(hex("popp %rax"), "d5 08 58");
+        assert_eq!(hex("push2p %rax, %rcx"), "62 f4 f4 18 ff f0");
+        assert_eq!(hex("pop2p %rax, %rcx"), "62 f4 f4 18 8f c0");
+        assert_eq!(hex("push2 %rax, %rcx"), "62 f4 74 18 ff f0");
+        assert_eq!(hex("push2 %r16, %rax"), "62 fc 7c 18 ff f0");
+        assert_eq!(hex("push2 %rax, %r16"), "62 f4 7c 10 ff f0");
+        assert_eq!(hex("push2 %r16, %r16"), "62 fc 7c 10 ff f0");
+        assert_eq!(hex("pop2 %rax, %rcx"), "62 f4 74 18 8f c0");
+        assert_eq!(
+            hex("jmpabs $0x123456789abcdef0"),
+            "d5 00 a1 f0 de bc 9a 78 56 34 12"
+        );
+        assert!(fails("push2 %rsp, %rax"));
+        assert!(fails("pop2 %rax, %rax"));
+        assert!(fails("{nf} push2 %rax, %rcx"));
+        assert!(fails("{evex} pushq %rax"));
+    }
+
+    #[test]
+    fn apx_ccmp_ctest() {
+        assert_eq!(hex("ccmpneq %rax, %rbx"), "62 f4 84 05 39 c3");
+        assert_eq!(hex("ccmpne %rax, %rbx"), "62 f4 84 05 39 c3");
+        assert_eq!(hex("ccmpneq {dfv=cf} %rax, %rbx"), "62 f4 8c 05 39 c3");
+        assert_eq!(
+            hex("ccmpneq {dfv=of,sf,zf,cf} %rax, %rbx"),
+            "62 f4 fc 05 39 c3"
+        );
+        assert_eq!(hex("ctestneq %rax, %rbx"), "62 f4 84 05 85 c3");
+        assert_eq!(hex("ctesteb $0x80, %al"), "62 f4 04 04 f6 c0 80");
+        assert_eq!(hex("ctesteq $0, %rax"), "62 f4 84 04 f7 c0 00 00 00 00");
+        assert_eq!(hex("ccmpneq (%r16), %rax"), "62 fc 84 05 3b 00");
+        assert_eq!(hex("ccmpneq %rax, (%r16)"), "62 fc 84 05 39 00");
+        assert_eq!(hex("ccmpneq $1, (%r16)"), "62 fc 84 05 83 38 01");
+        assert_eq!(hex("ctestneb %al, %bl"), "62 f4 04 05 84 c3");
+        assert!(fails("ccmpneq {dfv=pf} %rax, %rbx"));
+        assert!(fails("ccmpp %rax, %rbx"));
+    }
+
+    #[test]
+    fn apx_evex_setcc_nf_bitcount_shld() {
+        assert_eq!(hex("{evex} setzb %al"), "62 f4 7f 08 44 c0");
+        assert_eq!(hex("{evex} setzb %r16b"), "62 fc 7f 08 44 c0");
+        assert_eq!(hex("setzb %r16b"), "d5 90 94 c0");
+        assert_eq!(hex("{nf} lzcntq %rax, %rcx"), "62 f4 fc 0c f5 c8");
+        assert_eq!(hex("{nf} tzcntq %rax, %rcx"), "62 f4 fc 0c f4 c8");
+        assert_eq!(hex("{nf} popcntq %rax, %rcx"), "62 f4 fc 0c 88 c8");
+        assert_eq!(hex("{nf} shldq $1, %rax, %rcx"), "62 f4 fc 0c 24 c1 01");
+        assert_eq!(hex("{nf} shrdq $1, %rax, %rcx"), "62 f4 fc 0c 2c c1 01");
+        assert_eq!(hex("{nf} shldq %cl, %rax, %rcx"), "62 f4 fc 0c a5 c1");
+        assert_eq!(hex("{nf} imulq %rcx, %rax"), "62 f4 fc 0c af c1");
+        assert_eq!(hex("{nf} mulq %rax"), "62 f4 fc 0c f7 e0");
+        assert_eq!(hex("{nf} divq %rax"), "62 f4 fc 0c f7 f0");
+        assert_eq!(hex("{nf} idivq %rax"), "62 f4 fc 0c f7 f8");
+        assert_eq!(hex("negq %rax, %r16"), "62 f4 fc 10 f7 d8");
+        assert_eq!(hex("{nf} negq %rax, %r16"), "62 f4 fc 14 f7 d8");
+        assert_eq!(hex("addq $1, %rax, %rcx"), "62 f4 f4 18 83 c0 01");
+        assert_eq!(hex("imulq $2, %rax, %r16"), "d5 48 6b c0 02");
+        assert_eq!(hex("{evex} imulq %rcx, %rax"), "62 f4 fc 08 af c1");
+        assert_eq!(hex("{evex} cmovzq %rax, %rbx, %r16"), "62 f4 fc 10 44 d8");
+        assert!(fails("{nf} notq %rax"));
+        assert!(fails("{nf} notq %rax, %r16"));
+        assert!(fails("{nf} cmovzq %rax, %rbx"));
+        assert!(fails("{nf} cmovzq %rax, %rbx, %r16"));
+        assert!(fails("{evex} cmovzq %rax, %rbx"));
+        assert!(fails("{evex} pushq %rax"));
+    }
+
+    #[test]
+    fn apx_imulzu_cfcmov_ndd_shld_rex2_leftovers() {
+        // IMULZU: 16-bit ZU (ND=1, vvvv=0). 32/64-bit forms are not encodable.
+        assert_eq!(hex("imulzuw $2, %ax, %cx"), "62 f4 7d 18 6b c8 02");
+        assert_eq!(hex("imulzu $2, %ax, %cx"), "62 f4 7d 18 6b c8 02");
+        assert_eq!(hex("imulzuw $0x100, %ax, %cx"), "62 f4 7d 18 69 c8 00 01");
+        assert_eq!(hex("imulzuw $2, %ax"), "62 f4 7d 18 6b c0 02");
+        assert_eq!(hex("imulzuw $2, (%rax), %cx"), "62 f4 7d 18 6b 08 02");
+        assert_eq!(hex("imulzuw $2, %ax, %r16w"), "62 e4 7d 18 6b c0 02");
+        assert_eq!(hex("{nf} imulzuw $2, %ax, %cx"), "62 f4 7d 1c 6b c8 02");
+        assert!(fails("imulzuq $2, %rax, %rcx"));
+        assert!(fails("imulzul $2, %eax, %ecx"));
+
+        // SETZU: ND=1 zeros the upper bits of the GP dest. `{evex} setcc` stays ND=0.
+        assert_eq!(hex("setzuz %al"), "62 f4 7f 18 44 c0");
+        assert_eq!(hex("setzue %al"), "62 f4 7f 18 44 c0");
+        assert_eq!(hex("setzub %al"), "62 f4 7f 18 42 c0");
+        assert_eq!(hex("setzune %al"), "62 f4 7f 18 45 c0");
+        assert_eq!(hex("setzua %al"), "62 f4 7f 18 47 c0");
+        assert_eq!(hex("setzuz %r16b"), "62 fc 7f 18 44 c0");
+        assert!(fails("setzub (%rax)"));
+
+        // CFCMOV: 2-op ND=0 NF=0 (load / reg); store NF=1; 3-op NDD NF=1.
+        assert_eq!(hex("cfcmovzq %rax, %rbx"), "62 f4 fc 08 44 d8");
+        assert_eq!(hex("cfcmovz %rax, %rbx"), "62 f4 fc 08 44 d8");
+        assert_eq!(hex("cfcmovzw %ax, %bx"), "62 f4 7d 08 44 d8");
+        assert_eq!(hex("cfcmovzl %eax, %ebx"), "62 f4 7c 08 44 d8");
+        assert_eq!(hex("cfcmovzq (%rax), %rbx"), "62 f4 fc 08 44 18");
+        assert_eq!(hex("cfcmovzq %rax, (%rbx)"), "62 f4 fc 0c 44 03");
+        assert_eq!(hex("cfcmovzq %rax, %rbx, %r16"), "62 f4 fc 14 44 d8");
+        assert_eq!(hex("cfcmovneq %rcx, %rdx, %r8"), "62 f4 bc 1c 45 d1");
+        assert_eq!(hex("cfcmovaeq %rax, %rbx"), "62 f4 fc 08 43 d8");
+        assert_eq!(hex("cfcmovzq %r16, %rax"), "62 fc fc 08 44 c0");
+        assert_eq!(hex("cfcmovzq %rax, %r16"), "62 e4 fc 08 44 c0");
+
+        // Four-operand NDD SHLD/SHRD. Imm remaps to 24/2C; CL keeps A5/AD.
+        assert_eq!(hex("shldq $1, %rax, %rcx, %r16"), "62 f4 fc 10 24 c1 01");
+        assert_eq!(hex("shldq %cl, %rax, %rcx, %r16"), "62 f4 fc 10 a5 c1");
+        assert_eq!(
+            hex("{nf} shldq $1, %rax, %rcx, %r16"),
+            "62 f4 fc 14 24 c1 01"
+        );
+        assert_eq!(hex("shrdq $1, %rax, %rcx, %r16"), "62 f4 fc 10 2c c1 01");
+        assert_eq!(hex("{nf} shrdq %cl, %rax, %rcx, %r16"), "62 f4 fc 14 ad c1");
+        assert_eq!(hex("shldq $1, %rax, (%rcx), %r16"), "62 f4 fc 10 24 01 01");
+        assert_eq!(hex("shldq $1, %rax, %rcx, %rdx"), "62 f4 ec 18 24 c1 01");
+        assert_eq!(hex("shldw $1, %ax, %cx, %r16w"), "62 f4 7d 10 24 c1 01");
+        assert_eq!(hex("shldl $1, %eax, %ecx, %r16d"), "62 f4 7c 10 24 c1 01");
+        assert_eq!(hex("shldw $1, %ax, %cx"), "66 0f a4 c1 01");
+
+        // Leftover `self.rex` paths now emit REX2 for EGPR.
+        assert_eq!(hex("rdpid %r16"), "f3 d5 90 c7 f8");
+        assert_eq!(hex("wrfsbase %r16"), "f3 d5 98 ae d0");
+        assert_eq!(hex("rdfsbase %r16"), "f3 d5 98 ae c0");
+        assert_eq!(hex("rdgsbase %r31"), "f3 d5 99 ae cf");
+        assert_eq!(hex("wrfsbase %r16d"), "f3 d5 90 ae d0");
+        assert_eq!(hex("sldt %r16"), "d5 90 00 c0");
+        assert_eq!(hex("smsw %r16"), "d5 98 01 e0");
+        assert_eq!(hex("smsw %rax"), "48 0f 01 e0");
+        assert_eq!(hex("lmsw %r16w"), "d5 90 01 f0");
+        assert_eq!(hex("fxsaveq (%r16)"), "d5 98 ae 00");
+        assert_eq!(hex("fxrstorq (%r16)"), "d5 98 ae 08");
+        assert_eq!(hex("movq %r16, %xmm0"), "66 d5 98 6e c0");
+        assert_eq!(hex("movq %xmm0, %r16"), "66 d5 98 7e c0");
+        assert_eq!(hex("cvtsi2sdq %r16, %xmm0"), "f2 d5 98 2a c0");
+        assert_eq!(hex("movq %fs, %r16"), "d5 10 8c e0");
+        assert_eq!(hex("movq %r16, %fs"), "d5 10 8e e0");
+        assert_eq!(hex("movq %mm0, %r16"), "d5 98 7e c0");
+        assert_eq!(hex("mov %cr0, %r16"), "d5 90 20 c0");
+        assert!(fails("xsave64 (%r16)"));
+
+        // xadd/cmpxchg register-register, including EGPR.
+        assert_eq!(hex("xaddq %rax, %rbx"), "48 0f c1 c3");
+        assert_eq!(hex("xaddq %rax, %r16"), "d5 98 c1 c0");
+        assert_eq!(hex("cmpxchgq %rax, %r16"), "d5 98 b1 c0");
+        assert_eq!(hex("lock xaddq %rax, (%r16)"), "f0 d5 98 c1 00");
+
+        // CCMP 16-bit / byte / X4 index coverage.
+        assert_eq!(hex("ccmpnew %ax, %bx"), "62 f4 05 05 39 c3");
+        assert_eq!(hex("ccmpnew %ax, %r16w"), "62 fc 05 05 39 c0");
+        assert_eq!(hex("ccmpnel %eax, %r16d"), "62 fc 04 05 39 c0");
+        assert_eq!(hex("ccmpneb %al, %r16b"), "62 fc 04 05 38 c0");
+        assert_eq!(hex("ccmpneq %rax, (%rax,%r16,4)"), "62 f4 80 05 39 04 80");
+        assert_eq!(hex("addq %rcx, (%rax,%r16), %r17"), "62 f4 f0 10 01 0c 00");
+
+        // REX2 GOTPCRELX (CODE_4 = 43) vs REX GOTPCRELX (42).
+        let (h, rels) = hex_relocs("movq foo@GOTPCREL(%rip), %r16");
+        assert_eq!(h, "d5 48 8b 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_CODE_4_GOTPCRELX]);
+        let (h, rels) = hex_relocs("movq foo@GOTPCREL(%rip), %rax");
+        assert_eq!(h, "48 8b 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_REX_GOTPCRELX]);
+        let (h, rels) = hex_relocs("{rex2} movq foo@GOTPCREL(%rip), %rax");
+        assert_eq!(h, "d5 08 8b 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_CODE_4_GOTPCRELX]);
+        let (h, rels) = hex_relocs("addq foo@GOTPCREL(%rip), %r16");
+        assert_eq!(h, "d5 48 03 05 00 00 00 00");
+        assert_eq!(rels, vec![R_X86_64_CODE_4_GOTPCRELX]);
+    }
+
+    #[test]
+    fn gp_id_table() {
+        assert_eq!(gp_id("rax"), Some(0));
+        assert_eq!(gp_id("r8"), Some(8));
+        assert_eq!(gp_id("r16"), Some(16));
+        assert_eq!(gp_id("r16d"), Some(16));
+        assert_eq!(gp_id("r31b"), Some(31));
+        assert!(!is_accum("r16"));
+        assert!(is_accum("eax"));
+        assert!(is_egpr("r16"));
+        assert!(!is_egpr("r15"));
+        assert!(!needs_rex_ext("r16"));
+        assert!(needs_rex_ext("r24"));
+        assert!(is_reg64("r16"));
+        assert!(is_reg32("r16d"));
+    }
+}
+
+#[cfg(test)]
+mod encoding_opt_tests {
+    use super::apx_tests::{fails, hex};
+    use super::*;
+
+    #[test]
+    fn vex2_commutative_integer_source_swap() {
+        // High r/m + low vvvv collapses C4 to C5. GAS keeps C4; we take the byte.
+        assert_eq!(hex("vpmuludq %xmm8, %xmm1, %xmm0"), "c5 b9 f4 c1");
+        assert_eq!(hex("vpmulhuw %xmm8, %xmm1, %xmm0"), "c5 b9 e4 c1");
+        assert_eq!(hex("vpsadbw %xmm8, %xmm1, %xmm0"), "c5 b9 f6 c1");
+        assert_eq!(hex("vpmaddwd %xmm8, %xmm1, %xmm0"), "c5 b9 f5 c1");
+        // Unswapped (low r/m) stays C5 already.
+        assert_eq!(hex("vpmuludq %xmm1, %xmm8, %xmm0"), "c5 b9 f4 c1");
+    }
+
+    #[test]
+    fn ssse3_vex_arms() {
+        assert_eq!(hex("vphaddsw %xmm1, %xmm2, %xmm3"), "c4 e2 69 03 d9");
+        assert_eq!(hex("vphsubw %xmm1, %xmm2, %xmm3"), "c4 e2 69 05 d9");
+        assert_eq!(hex("vphsubd %xmm1, %xmm2, %xmm3"), "c4 e2 69 06 d9");
+        assert_eq!(hex("vphsubsw %xmm1, %xmm2, %xmm3"), "c4 e2 69 07 d9");
+        assert_eq!(hex("vpmulhrsw %xmm1, %xmm2, %xmm3"), "c4 e2 69 0b d9");
+        assert_eq!(hex("vpmuldq %xmm1, %xmm2, %xmm3"), "c4 e2 69 28 d9");
+        assert_eq!(hex("vphminposuw %xmm1, %xmm0"), "c4 e2 79 41 c1");
+        assert!(fails("vphminposuw %ymm1, %ymm0"));
+        assert_eq!(hex("vmpsadbw $1, %xmm1, %xmm2, %xmm3"), "c4 e3 69 42 d9 01");
+    }
+
+    #[test]
+    fn evex_high_vector_regs() {
+        assert_eq!(hex("vpaddd %xmm16, %xmm0, %xmm1"), "62 b1 7d 08 fe c8");
+        assert_eq!(hex("vandps %xmm16, %xmm0, %xmm1"), "62 b1 7c 08 54 c8");
+        assert_eq!(hex("vmovaps %xmm16, %xmm1"), "62 b1 7c 08 28 c8");
+        assert_eq!(hex("vaddss %xmm16, %xmm0, %xmm1"), "62 b1 7e 08 58 c8");
+        assert_eq!(hex("vpermq $0x44, %zmm1, %zmm2"), "62 f3 fd 48 00 d1 44");
+    }
+
+    #[test]
+    fn sse_rex_cvtsi_extractps() {
+        assert_eq!(hex("extractps $0, %xmm8, %eax"), "66 44 0f 3a 17 c0 00");
+        assert_eq!(hex("extractps $0, %xmm0, %r8d"), "66 41 0f 3a 17 c0 00");
+        assert_eq!(hex("cvtsi2ss %r8d, %xmm0"), "f3 41 0f 2a c0");
+        assert_eq!(hex("cvtsi2ss %r8, %xmm8"), "f3 4d 0f 2a c0");
+    }
+
+    #[test]
+    fn suffixless_bmi_and_amd_system() {
+        assert_eq!(hex("blsi %rax, %rcx"), "c4 e2 f0 f3 d8");
+        assert_eq!(hex("blsr %eax, %ecx"), "c4 e2 70 f3 c8");
+        assert_eq!(hex("blsmsk %rdx, %rax"), "c4 e2 f8 f3 d2");
+        assert_eq!(hex("clzero"), "0f 01 fc");
+        assert_eq!(hex("rdpru"), "0f 01 fd");
+        assert_eq!(hex("mcommit"), "f3 0f 01 fa");
+        assert!(fails("clzero %rax"));
+    }
+
+    #[test]
+    fn evex_dest_modrm_reg_and_tuple_disp8() {
+        // GAS 2.44: dest lives in ModRM.reg, not hard-wired 0.
+        assert_eq!(hex("vpshufd $1, %zmm2, %zmm3"), "62 f1 7d 48 70 da 01");
+        assert_eq!(
+            hex("vpternlogd $0xaa, %zmm2, %zmm1, %zmm3"),
+            "62 f3 75 48 25 da aa"
+        );
+        assert_eq!(hex("vpbroadcastd %eax, %zmm3"), "62 f2 7d 48 7c d8");
+        assert_eq!(
+            hex("vinserti32x4 $1, %xmm2, %zmm1, %zmm3"),
+            "62 f3 75 48 38 da 01"
+        );
+        assert_eq!(hex("vpslld $4, %zmm2, %zmm3"), "62 f1 65 48 72 f2 04");
+        // Compressed disp8*N: pmovzx Half/Quarter/Eighth.
+        assert_eq!(hex("vpmovzxbw 32(%rdi), %zmm1"), "62 f2 7d 48 30 4f 01");
+        assert_eq!(hex("vpmovzxbd 16(%rdi), %zmm1"), "62 f2 7d 48 31 4f 01");
+        assert_eq!(hex("vpmovzxbq 8(%rdi), %zmm1"), "62 f2 7d 48 32 4f 01");
+        assert_eq!(
+            hex("vextracti32x4 $1, %zmm1, 16(%rdi)"),
+            "62 f3 7d 48 39 4f 01 01"
+        );
+        assert_eq!(hex("vprold $1, (%rdi), %zmm1"), "62 f1 75 48 72 0f 01");
+        // xmm vpxord (EVEX-only mnemonic, dest != 0).
+        assert_eq!(hex("vpxord %xmm2, %xmm1, %xmm3"), "62 f1 75 08 ef da");
+    }
+
+    #[test]
+    fn evex_sae_broadcast_and_cmp_cvt() {
+        assert_eq!(
+            hex("vaddps {rn-sae}, %zmm1, %zmm2, %zmm3"),
+            "62 f1 6c 18 58 d9"
+        );
+        assert_eq!(
+            hex("vmaxps {sae}, %zmm1, %zmm2, %zmm3"),
+            "62 f1 6c 18 5f d9"
+        );
+        assert_eq!(
+            hex("vaddps (%rdi){1to16}, %zmm1, %zmm2"),
+            "62 f1 74 58 58 17"
+        );
+        assert_eq!(
+            hex("vaddps 4(%rdi){1to16}, %zmm1, %zmm2"),
+            "62 f1 74 58 58 57 01"
+        );
+        assert_eq!(
+            hex("vpternlogd $0xaa, 4(%rdi){1to16}, %zmm1, %zmm3"),
+            "62 f3 75 58 25 5f 01 aa"
+        );
+        assert_eq!(
+            hex("vcmpps $0, {sae}, %zmm1, %zmm2, %k1"),
+            "62 f1 6c 18 c2 c9 00"
+        );
+        assert_eq!(hex("vcvtps2dq {rz-sae}, %zmm1, %zmm2"), "62 f1 7d 78 5b d1");
+        // GAS 2.47: EGPR as AVX-512 memory base (P0.B4, P1.!X4).
+        assert_eq!(hex("vaddps (%r16), %zmm1, %zmm2"), "62 f9 74 48 58 10");
+        assert_eq!(hex("vaddps (%r20), %zmm1, %zmm2"), "62 f9 74 48 58 14 24");
+        assert_eq!(
+            hex("vaddps (%r16,%r17,4), %zmm1, %zmm2"),
+            "62 f9 70 48 58 14 88"
+        );
+        assert_eq!(hex("vaddps 64(%r16), %zmm1, %zmm2"), "62 f9 74 48 58 50 01");
+        // SAE vs ER are not interchangeable (Intel SDM {sae} vs {er}).
+        assert!(fails("vaddps {sae}, %zmm1, %zmm2, %zmm3"));
+        assert!(fails("vmaxps {rn-sae}, %zmm1, %zmm2, %zmm3"));
+        assert!(fails("vpaddd {sae}, %zmm1, %zmm2, %zmm3"));
+        assert!(fails("vcmpps $0, {rn-sae}, %zmm1, %zmm2, %k1"));
+        // APX NDD ALU-imm memory; {evex} test; FALSE-ACCEPT guards.
+        assert_eq!(hex("addq $1, (%rax), %rcx"), "62 f4 f4 18 83 00 01");
+        assert_eq!(hex("{evex} addq $1, (%rax)"), "62 f4 fc 08 83 00 01");
+        assert_eq!(hex("{evex} testq %rcx, %rax"), "62 f4 84 0a 85 c8");
+        assert!(fails("{nf} testq %rax, %rax"));
+        assert!(fails("{nf} rclq $1, %rax"));
+        assert!(fails("{nf} rcrq $1, %rax"));
+        assert!(fails("{nf} bswapq %rax"));
+        assert!(fails("{evex} movq %rcx, %rax"));
+        assert!(fails("{nf}{rex2} addq %rcx, %rax"));
     }
 }

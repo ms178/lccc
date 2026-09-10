@@ -41,12 +41,507 @@ impl super::InstructionEncoder {
     /// Emit REX prefix if needed for reg-reg operation.
     pub(crate) fn emit_rex_rr(&mut self, size: u8, reg: &str, rm: &str) {
         let w = size == 8;
-        let r = needs_rex_ext(reg);
-        let b = needs_rex_ext(rm);
-        let need_rex = w || r || b || is_rex_required_8bit(reg) || is_rex_required_8bit(rm);
-        if need_rex {
-            self.bytes.push(self.rex(w, r, false, b));
+        let (r, r4) = gp_ext_bits(reg);
+        let (b, b4) = gp_ext_bits(rm);
+        let extra = is_rex_required_8bit(reg) || is_rex_required_8bit(rm);
+        self.emit_rex_or_rex2(w, r, false, b, r4, false, b4, extra);
+    }
+
+    /// REX2 payload: `0xD5 | M0 R4 X4 B4 W R3 X3 B3`. M0 is left 0 here;
+    /// `fixup_rex2_map1` promotes a following `0x0F` escape into M0=1.
+    pub(crate) fn emit_rex2(
+        &mut self,
+        w: bool,
+        r: bool,
+        x: bool,
+        b: bool,
+        r4: bool,
+        x4: bool,
+        b4: bool,
+    ) {
+        let mut p = 0u8;
+        if r4 {
+            p |= 1 << 6;
         }
+        if x4 {
+            p |= 1 << 5;
+        }
+        if b4 {
+            p |= 1 << 4;
+        }
+        if w {
+            p |= 1 << 3;
+        }
+        if r {
+            p |= 1 << 2;
+        }
+        if x {
+            p |= 1 << 1;
+        }
+        if b {
+            p |= 1 << 0;
+        }
+        self.bytes.push(0xD5);
+        self.bytes.push(p);
+    }
+
+    /// REX or REX2. REX2 wins whenever an EGPR is involved or `{rex2}` was
+    /// requested: REX cannot address %r16–%r31.
+    pub(crate) fn emit_rex_or_rex2(
+        &mut self,
+        w: bool,
+        r: bool,
+        x: bool,
+        b: bool,
+        r4: bool,
+        x4: bool,
+        b4: bool,
+        extra_rex: bool,
+    ) {
+        if r4 || x4 || b4 || self.apx_rex2 {
+            self.emit_rex2(w, r, x, b, r4, x4, b4);
+            return;
+        }
+        if w || r || x || b || extra_rex {
+            self.bytes.push(self.rex(w, r, x, b));
+        }
+    }
+
+    /// APX EVEX prefix for promoted GP integer instructions.
+    ///
+    /// Verified against GNU as 2.47 (`build_apx_evex_prefix`):
+    /// P0 = `~R3 ~X3 ~B3 ~R4 B4 mmm` (B4 is **not** inverted),
+    /// P1 = `W ~vvvv ~X4 pp`,
+    /// P2 = `0 00 ND ~v4 NF 00`.
+    ///
+    /// `mmm`: 4 = legacy map-0/1 promotions, 2 = 0F38 BMI, 3 = 0F3A (rorx).
+    pub(crate) fn emit_evex_apx(
+        &mut self,
+        r: bool,
+        x: bool,
+        b: bool,
+        r4: bool,
+        x4: bool,
+        b4: bool,
+        w: bool,
+        vvvv: u8,
+        nd: bool,
+        nf: bool,
+        pp: u8,
+    ) {
+        self.emit_evex_apx_map(r, x, b, r4, x4, b4, w, vvvv, nd, nf, pp, 4);
+    }
+
+    pub(crate) fn emit_evex_apx_map(
+        &mut self,
+        r: bool,
+        x: bool,
+        b: bool,
+        r4: bool,
+        x4: bool,
+        b4: bool,
+        w: bool,
+        vvvv: u8,
+        nd: bool,
+        nf: bool,
+        pp: u8,
+        mmm: u8,
+    ) {
+        let mut p0 = mmm & 7;
+        if !r {
+            p0 |= 0x80;
+        }
+        if !x {
+            p0 |= 0x40;
+        }
+        if !b {
+            p0 |= 0x20;
+        }
+        if !r4 {
+            p0 |= 0x10; // R4 inverted
+        }
+        if b4 {
+            p0 |= 0x08; // B4 NOT inverted
+        }
+        let v_lo = vvvv & 0x0F;
+        let mut p1 = (u8::from(w) << 7) | ((!v_lo & 0x0F) << 3) | (pp & 3);
+        if !x4 {
+            p1 |= 0x04; // X4 inverted (U bit)
+        }
+        let v4 = (vvvv & 0x10) != 0;
+        let mut p2 = 0u8;
+        if nd {
+            p2 |= 0x10;
+        }
+        if !v4 {
+            p2 |= 0x08; // v4 inverted
+        }
+        if nf {
+            p2 |= 0x04;
+        }
+        self.bytes.extend_from_slice(&[0x62, p0, p1, p2]);
+    }
+
+    /// CCMP/CTEST EVEX: P1.vvvv is the DFV bitmap **not inverted**; P2[3:0] is SCC.
+    /// ND/NF/v4 are unused (must be 0).
+    pub(crate) fn emit_evex_ccmp(
+        &mut self,
+        r: bool,
+        x: bool,
+        b: bool,
+        r4: bool,
+        x4: bool,
+        b4: bool,
+        w: bool,
+        dfv: u8,
+        scc: u8,
+        pp: u8,
+    ) {
+        let mut p0 = 0x04u8;
+        if !r {
+            p0 |= 0x80;
+        }
+        if !x {
+            p0 |= 0x40;
+        }
+        if !b {
+            p0 |= 0x20;
+        }
+        if !r4 {
+            p0 |= 0x10;
+        }
+        if b4 {
+            p0 |= 0x08;
+        }
+        let mut p1 = (u8::from(w) << 7) | ((dfv & 0x0F) << 3) | (pp & 3);
+        if !x4 {
+            p1 |= 0x04;
+        }
+        let p2 = scc & 0x0F;
+        self.bytes.extend_from_slice(&[0x62, p0, p1, p2]);
+    }
+
+    /// After a REX2 map-0 encoding, collapse `D5 pp 0F opc` into `D5 (pp|0x80) opc`
+    /// (M0=1, omit the 0F escape). Map 2/3 (`0F 38` / `0F 3A`) cannot use REX2.
+    pub(crate) fn fixup_rex2_map1(&mut self, start: usize) -> Result<(), String> {
+        let mut i = start;
+        while i < self.bytes.len() {
+            match self.bytes[i] {
+                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {
+                    i += 1;
+                }
+                0xD5 => {
+                    if i + 2 >= self.bytes.len() {
+                        return Ok(());
+                    }
+                    if self.bytes[i + 2] == 0x0F {
+                        if i + 3 < self.bytes.len() && matches!(self.bytes[i + 3], 0x38 | 0x3A) {
+                            return Err(
+                                "EGPR with 0F38/0F3A opcode requires APX EVEX (map 4)".into()
+                            );
+                        }
+                        self.bytes[i + 1] |= 0x80; // M0
+                        self.bytes.remove(i + 2);
+                        for r in &mut self.relocations {
+                            if r.offset as usize > i + 2 {
+                                r.offset -= 1;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Operand-size pp field for APX EVEX (replaces a leading 0x66).
+    pub(crate) fn apx_pp(size: u8) -> u8 {
+        if size == 2 { 1 } else { 0 }
+    }
+
+    fn gp_id_or_err(name: &str) -> Result<u8, String> {
+        gp_id(name).ok_or_else(|| format!("not a GP register: {}", name))
+    }
+
+    /// Emit APX EVEX for a GP dest-in-r/m form (reg = ModRM.reg, rm = r/m,
+    /// optional NDD in vvvv).
+    pub(crate) fn emit_apx_evex_rr(
+        &mut self,
+        size: u8,
+        reg: &str,
+        rm: &str,
+        ndd: Option<&str>,
+        nf: bool,
+    ) -> Result<(), String> {
+        self.emit_apx_evex_rr_pp(size == 8, reg, rm, ndd, nf, Self::apx_pp(size))
+    }
+
+    /// Like `emit_apx_evex_rr` with an explicit EVEX.W / pp (map-2 promotions
+    /// such as `adcx`/`adox`/`crc32`/`movbe` do not follow the ALU size→pp rule).
+    pub(crate) fn emit_apx_evex_rr_pp(
+        &mut self,
+        w: bool,
+        reg: &str,
+        rm: &str,
+        ndd: Option<&str>,
+        nf: bool,
+        pp: u8,
+    ) -> Result<(), String> {
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = gp_ext_bits(rm);
+        let (nd, vvvv) = match ndd {
+            Some(n) => (true, Self::gp_id_or_err(n)?),
+            None => (false, 0),
+        };
+        self.emit_evex_apx(r, false, b, r4, false, b4, w, vvvv, nd, nf, pp);
+        Ok(())
+    }
+
+    pub(crate) fn emit_apx_evex_rm(
+        &mut self,
+        size: u8,
+        reg: &str,
+        mem: &MemoryOperand,
+        ndd: Option<&str>,
+        nf: bool,
+    ) -> Result<(), String> {
+        self.emit_apx_evex_rm_pp(size == 8, reg, mem, ndd, nf, Self::apx_pp(size))
+    }
+
+    pub(crate) fn emit_apx_evex_rm_pp(
+        &mut self,
+        w: bool,
+        reg: &str,
+        mem: &MemoryOperand,
+        ndd: Option<&str>,
+        nf: bool,
+        pp: u8,
+    ) -> Result<(), String> {
+        let folded = fold_scale1_index(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
+        let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
+            || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
+        if addr32 {
+            self.bytes.push(0x67);
+        }
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = mem
+            .base
+            .as_ref()
+            .map(|b| gp_ext_bits(&b.name))
+            .unwrap_or((false, false));
+        let (x, x4) = mem
+            .index
+            .as_ref()
+            .map(|i| gp_ext_bits(&i.name))
+            .unwrap_or((false, false));
+        let (nd, vvvv) = match ndd {
+            Some(n) => (true, Self::gp_id_or_err(n)?),
+            None => (false, 0),
+        };
+        self.emit_evex_apx(r, x, b, r4, x4, b4, w, vvvv, nd, nf, pp);
+        Ok(())
+    }
+
+    /// APX EVEX with ND=1 and vvvv=0. Used by ZU forms (`imulzu`, `setzu`)
+    /// that set the NDD bit without an extra destination register.
+    pub(crate) fn emit_apx_evex_rr_nd1(
+        &mut self,
+        size: u8,
+        reg: &str,
+        rm: &str,
+        nf: bool,
+    ) -> Result<(), String> {
+        self.emit_apx_evex_rr_nd1_pp(size == 8, reg, rm, nf, Self::apx_pp(size))
+    }
+
+    pub(crate) fn emit_apx_evex_rr_nd1_pp(
+        &mut self,
+        w: bool,
+        reg: &str,
+        rm: &str,
+        nf: bool,
+        pp: u8,
+    ) -> Result<(), String> {
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = gp_ext_bits(rm);
+        self.emit_evex_apx(r, false, b, r4, false, b4, w, 0, true, nf, pp);
+        Ok(())
+    }
+
+    pub(crate) fn emit_apx_evex_rm_nd1(
+        &mut self,
+        size: u8,
+        reg: &str,
+        mem: &MemoryOperand,
+        nf: bool,
+    ) -> Result<(), String> {
+        self.emit_apx_evex_rm_nd1_pp(size == 8, reg, mem, nf, Self::apx_pp(size))
+    }
+
+    pub(crate) fn emit_apx_evex_rm_nd1_pp(
+        &mut self,
+        w: bool,
+        reg: &str,
+        mem: &MemoryOperand,
+        nf: bool,
+        pp: u8,
+    ) -> Result<(), String> {
+        let folded = fold_scale1_index(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
+        let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
+            || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
+        if addr32 {
+            self.bytes.push(0x67);
+        }
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = mem
+            .base
+            .as_ref()
+            .map(|b| gp_ext_bits(&b.name))
+            .unwrap_or((false, false));
+        let (x, x4) = mem
+            .index
+            .as_ref()
+            .map(|i| gp_ext_bits(&i.name))
+            .unwrap_or((false, false));
+        self.emit_evex_apx(r, x, b, r4, x4, b4, w, 0, true, nf, pp);
+        Ok(())
+    }
+
+    /// BMI/BMI2 EVEX: dest in ModRM.reg, vvvv is a source (ND=0), map 2 or 3.
+    pub(crate) fn emit_apx_evex_vvvv_rr(
+        &mut self,
+        w: bool,
+        reg: &str,
+        rm: &str,
+        vvvv: &str,
+        nf: bool,
+        pp: u8,
+        mmm: u8,
+    ) -> Result<(), String> {
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = gp_ext_bits(rm);
+        let v = Self::gp_id_or_err(vvvv)?;
+        self.emit_evex_apx_map(r, false, b, r4, false, b4, w, v, false, nf, pp, mmm);
+        Ok(())
+    }
+
+    pub(crate) fn emit_apx_evex_vvvv_rm(
+        &mut self,
+        w: bool,
+        reg: &str,
+        mem: &MemoryOperand,
+        vvvv: &str,
+        nf: bool,
+        pp: u8,
+        mmm: u8,
+    ) -> Result<(), String> {
+        let folded = fold_scale1_index(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
+        let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
+            || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
+        if addr32 {
+            self.bytes.push(0x67);
+        }
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = mem
+            .base
+            .as_ref()
+            .map(|b| gp_ext_bits(&b.name))
+            .unwrap_or((false, false));
+        let (x, x4) = mem
+            .index
+            .as_ref()
+            .map(|i| gp_ext_bits(&i.name))
+            .unwrap_or((false, false));
+        let v = Self::gp_id_or_err(vvvv)?;
+        self.emit_evex_apx_map(r, x, b, r4, x4, b4, w, v, false, nf, pp, mmm);
+        Ok(())
+    }
+
+    pub(crate) fn emit_evex_ccmp_rr(
+        &mut self,
+        w: bool,
+        reg: &str,
+        rm: &str,
+        dfv: u8,
+        scc: u8,
+        pp: u8,
+    ) -> Result<(), String> {
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = gp_ext_bits(rm);
+        self.emit_evex_ccmp(r, false, b, r4, false, b4, w, dfv, scc, pp);
+        Ok(())
+    }
+
+    pub(crate) fn emit_evex_ccmp_rm(
+        &mut self,
+        w: bool,
+        reg: &str,
+        mem: &MemoryOperand,
+        dfv: u8,
+        scc: u8,
+        pp: u8,
+    ) -> Result<(), String> {
+        let folded = fold_scale1_index(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
+        let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
+            || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
+        if addr32 {
+            self.bytes.push(0x67);
+        }
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = mem
+            .base
+            .as_ref()
+            .map(|b| gp_ext_bits(&b.name))
+            .unwrap_or((false, false));
+        let (x, x4) = mem
+            .index
+            .as_ref()
+            .map(|i| gp_ext_bits(&i.name))
+            .unwrap_or((false, false));
+        self.emit_evex_ccmp(r, x, b, r4, x4, b4, w, dfv, scc, pp);
+        Ok(())
+    }
+
+    pub(crate) fn apx_wants_evex(&self) -> bool {
+        self.apx_nf || self.apx_evex
     }
 
     /// Emit segment override prefix (0x64 for %fs, 0x65 for %gs) if present.
@@ -110,23 +605,38 @@ impl super::InstructionEncoder {
             self.bytes.push(0x67);
         }
         let w = size == 8;
-        let r = needs_rex_ext(reg);
-        let b = mem.base.as_ref().is_some_and(|b| needs_rex_ext(&b.name));
-        let x = mem.index.as_ref().is_some_and(|i| needs_rex_ext(&i.name));
-        let need_rex = w || r || b || x || is_rex_required_8bit(reg);
-        if need_rex {
-            self.bytes.push(self.rex(w, r, x, b));
-        }
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = mem
+            .base
+            .as_ref()
+            .map(|b| gp_ext_bits(&b.name))
+            .unwrap_or((false, false));
+        let (x, x4) = mem
+            .index
+            .as_ref()
+            .map(|i| gp_ext_bits(&i.name))
+            .unwrap_or((false, false));
+        self.emit_rex_or_rex2(w, r, x, b, r4, x4, b4, is_rex_required_8bit(reg));
     }
 
     /// Emit REX prefix for unary operation on register.
     pub(crate) fn emit_rex_unary(&mut self, size: u8, rm: &str) {
         let w = size == 8;
-        let b = needs_rex_ext(rm);
-        let need_rex = w || b || is_rex_required_8bit(rm);
-        if need_rex {
-            self.bytes.push(self.rex(w, false, false, b));
-        }
+        let (b, b4) = gp_ext_bits(rm);
+        self.emit_rex_or_rex2(
+            w,
+            false,
+            false,
+            b,
+            false,
+            false,
+            b4,
+            is_rex_required_8bit(rm),
+        );
     }
 
     /// Encode ModR/M + SIB + displacement for a memory operand.
@@ -147,6 +657,24 @@ impl super::InstructionEncoder {
             }
         }
         false
+    }
+
+    /// Relaxable GOTPCREL reloc for the instruction currently in `self.bytes`.
+    ///
+    /// REX (0x40-0x4F) → `R_X86_64_REX_GOTPCRELX` (42).
+    /// REX2 (0xD5)     → `R_X86_64_CODE_4_GOTPCRELX` (43) — the displacement
+    /// sits 4 bytes after the prefix start (`D5 pp opc modrm disp32`).
+    /// Anything else   → `R_X86_64_GOTPCRELX` (41).
+    pub(crate) fn gotpcrel_x_type(&self) -> u32 {
+        for &b in &self.bytes {
+            match b {
+                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {}
+                0x40..=0x4F => return R_X86_64_REX_GOTPCRELX,
+                0xD5 => return R_X86_64_CODE_4_GOTPCRELX,
+                _ => return R_X86_64_GOTPCRELX,
+            }
+        }
+        R_X86_64_GOTPCRELX
     }
 
     pub(crate) fn encode_modrm_mem(
@@ -191,15 +719,10 @@ impl super::InstructionEncoder {
                             // local -- removing a GOT entry and a load.  Which
                             // of the two applies is decided purely by whether
                             // the instruction carries a REX prefix.
-                            "gotpcrel" => {
-                                if self.has_rex_prefix() {
-                                    R_X86_64_REX_GOTPCRELX
-                                } else {
-                                    R_X86_64_GOTPCRELX
-                                }
-                            }
+                            "gotpcrel" => self.gotpcrel_x_type(),
                             "gotpcrelx" => R_X86_64_GOTPCRELX,
                             "rex_gotpcrelx" => R_X86_64_REX_GOTPCRELX,
+                            "code_4_gotpcrelx" => R_X86_64_CODE_4_GOTPCRELX,
                             "gottpoff" => R_X86_64_GOTTPOFF,
                             "tpoff" => R_X86_64_TPOFF32,
                             "plt" => R_X86_64_PLT32,

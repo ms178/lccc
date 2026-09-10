@@ -1,8 +1,8 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
 use super::emit::{
-    X86_ARG_REGS, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED, X86Codegen,
-    collect_inline_asm_callee_saved_x86, is_xmm_reg, phys_reg_name,
+    X86_APX_EGPRS, X86_ARG_REGS, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED,
+    X86Codegen, collect_inline_asm_callee_saved_x86, is_xmm_reg, phys_reg_name,
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
@@ -347,6 +347,12 @@ impl X86Codegen {
         }
 
         let mut caller_saved_regs = X86_CALLER_SAVED.to_vec();
+        // Extra GPRs r16–r31 are caller-saved in the APX SysV extension.
+        // Only add them when the TU asked for APX — otherwise the encodings
+        // are #UD on the host (Raptor Lake, i7-14700KF, Zen 5, …).
+        if self.apx_enabled {
+            caller_saved_regs.extend_from_slice(&X86_APX_EGPRS);
+        }
         let mut has_indirect_call = false;
         let mut has_calls = false;
         let mut has_i128_ops = false;
@@ -2311,7 +2317,8 @@ impl X86Codegen {
                         // read that copy-propagation could corrupt
                         // (sqlite_vdbe_peephole: `op` read from %dil).
                         let is_callee_saved = phys_reg.0 >= 1 && phys_reg.0 <= 6;
-                        let is_caller_saved_gpr = (10..=16).contains(&phys_reg.0);
+                        let is_caller_saved_gpr =
+                            (10..=16).contains(&phys_reg.0) || (40..=55).contains(&phys_reg.0);
                         let is_xmm = super::emit::is_xmm_reg(phys_reg);
                         if self.state.ra_config.debug_param_store {
                             let shared =

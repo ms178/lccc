@@ -139,6 +139,11 @@ pub(crate) struct CodegenOptions {
     /// Whether the target has BMI2 (`-mbmi2` or an enabling `-march`).
     /// Gates SHLX/SHRX/SARX selection for variable shifts.
     pub(crate) bmi2: bool,
+    /// Whether the target has APX Foundation (`-mapx` / `-mapxf`).
+    /// Gates extra GPRs `%r16`–`%r31` and NDD 3-operand integer ALU.
+    /// Must stay off unless the TU asked for it: those encodings are #UD
+    /// on every shipping Intel/AMD core as of 2026 (Raptor Lake, Zen 5, …).
+    pub(crate) apx: bool,
     /// Measured microarchitectural tuning row selected by `-mtune`/`-march`
     /// (see `backend::x86::cpu_model`).  Drives every decision that depends
     /// on instruction latency/µop facts rather than ISA availability.

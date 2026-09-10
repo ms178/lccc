@@ -3,6 +3,7 @@
 //! After register allocation rewrites all MachReg::Vreg to MachReg::Phys,
 //! this module pattern-matches each MachInst to produce text assembly.
 
+use super::emit::{EGPR8, EGPR16, EGPR32, EGPR64};
 use super::machinst::*;
 use crate::backend::common::AsmOutput;
 use crate::backend::regalloc::PhysReg;
@@ -38,6 +39,7 @@ fn reg_name(reg: PhysReg) -> &'static str {
         14 => "rdi",
         15 => "rsi",
         16 => "rdx",
+        n if (40..=55).contains(&n) => EGPR64[(n - 40) as usize],
         // XMM registers for F64 allocation
         18 => "xmm0",
         19 => "xmm1",
@@ -87,6 +89,7 @@ fn reg_name_32(reg: PhysReg) -> &'static str {
         14 => "edi",
         15 => "esi",
         16 => "edx",
+        n if (40..=55).contains(&n) => EGPR32[(n - 40) as usize],
         _ => unreachable!("invalid machinst register index {}", reg.0),
     }
 }
@@ -109,6 +112,7 @@ fn reg_name_16(reg: PhysReg) -> &'static str {
         14 => "di",
         15 => "si",
         16 => "dx",
+        n if (40..=55).contains(&n) => EGPR16[(n - 40) as usize],
         _ => unreachable!("invalid machinst register index {}", reg.0),
     }
 }
@@ -1120,7 +1124,7 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             // destination register itself. A 64-bit constant cannot be
             // named by an inline mov operand (GAS: "operand type mismatch")
             // and truncating it would be a silent miscompile — staging it
-            // through the destination register is both the shortest and the
+            // through the destination register is both he shortest and the
             // only sound form. The move reads nothing, so it is a pure
             // writer in the lowering's topological order: every move that
             // reads this argument register executes before it.
@@ -1215,7 +1219,62 @@ pub fn emit_machinsts(insts: &[MachInst], out: &mut AsmOutput) {
     // Loop alignment is owned by `passes::loop_align`, which decides on the
     // final block layout (hotness-gated, flag-controlled, GAS max-skip
     // aware) and is consumed by the block-label emitter in generation.rs.
-    for inst in insts {
-        emit_machinst(inst, out);
+    let apx = super::isel::apx_enabled();
+    let mut i = 0;
+    while i < insts.len() {
+        if apx && i + 1 < insts.len() && try_emit_ndd_pair(&insts[i], &insts[i + 1], out) {
+            i += 2;
+            continue;
+        }
+        emit_machinst(&insts[i], out);
+        i += 1;
     }
+}
+
+/// Fuse `mov %src1, %dst; op %src, %dst` into APX NDD `op %src, %src1, %dst`
+/// when dest ≠ src1. Off unless `-mapx` (the encodings are #UD otherwise).
+/// Returns true if both instructions were consumed.
+fn try_emit_ndd_pair(a: &MachInst, b: &MachInst, out: &mut AsmOutput) -> bool {
+    let MachInst::Mov {
+        src: MachOperand::Reg(src1),
+        dst: MachOperand::Reg(dst_m),
+        size: sz_mov,
+    } = a
+    else {
+        return false;
+    };
+    let MachInst::Alu {
+        op,
+        src,
+        dst,
+        size: sz_alu,
+    } = b
+    else {
+        return false;
+    };
+    if sz_mov != sz_alu || dst_m != dst || src1 == dst {
+        return false;
+    }
+    // Dest holding the ALU source is the two-address hazard; the isel
+    // already swapped commutative ops, so refuse rather than emit
+    // `op %dst, %src1, %dst`.
+    if matches!(src, MachOperand::Reg(r) if r == dst) {
+        return false;
+    }
+    // Wide immediates cannot be an ALU operand; leave the pair to the
+    // existing scratch-staging path.
+    if let MachOperand::Imm(v) = src {
+        if *v < i32::MIN as i64 || *v > i32::MAX as i64 {
+            return false;
+        }
+    }
+    let mnem = alu_mnemonic(*op);
+    let suffix = sz_alu.suffix();
+    let src_str = fmt_operand(src, *sz_alu, out);
+    let src1_str = fmt_reg(src1, *sz_alu);
+    let dst_str = fmt_reg(dst, *sz_alu);
+    out.emit_fmt(format_args!(
+        "    {mnem}{suffix} {src_str}, {src1_str}, {dst_str}"
+    ));
+    true
 }
