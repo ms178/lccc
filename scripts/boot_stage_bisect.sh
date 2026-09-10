@@ -25,7 +25,7 @@
 #   BOOT_BISECT_LD=ld.bfd scripts/boot_stage_bisect.sh
 #   BOOT_BISECT_ORACLE_FILES="main tty" scripts/boot_stage_bisect.sh
 # Environment:
-#   KERNEL_DIR                 kernel tree (default /home/user/kernel-work/linux-6.18.47)
+#   KERNEL_DIR                 kernel tree (default /home/user/kernel-work/linux-6.18.50)
 #   LCCC / LCCC_LD             toolchain under test
 #   BOOT_BISECT_LD             lccc-ld (default) | ld.bfd | ld.lld
 #   BOOT_BISECT_ORACLE_FILES   space-separated basenames compiled by $CC_ORACLE
@@ -35,7 +35,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.50}
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 LCCC=${LCCC:-$here/../target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-$here/../target/fastbuild/lccc-ld}

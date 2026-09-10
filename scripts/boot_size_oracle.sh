@@ -27,7 +27,7 @@
 #   CC_ORACLE=clang scripts/boot_size_oracle.sh           # clang oracle
 #   CC_ORACLE="clang gcc" scripts/boot_size_oracle.sh     # both
 # Environment:
-#   KERNEL_DIR   kernel tree        (default /home/user/kernel-work/linux-6.18.47)
+#   KERNEL_DIR   kernel tree        (default /home/user/kernel-work/linux-6.18.50)
 #   LCCC         lccc compiler      (default <repo>/target/fastbuild/lccc)
 #   LCCC_LD      lccc linker        (default <repo>/target/fastbuild/lccc-ld)
 #   OUT          work directory     (default /var/tmp/bootbuild)
@@ -36,7 +36,7 @@
 set -euo pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.50}
 LCCC=${LCCC:-$here/../target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-$here/../target/fastbuild/lccc-ld}
 OUT=${OUT:-/var/tmp/bootbuild}

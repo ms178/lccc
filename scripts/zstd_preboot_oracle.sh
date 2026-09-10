@@ -15,7 +15,7 @@
 # scripts/zstd_oracle_cc.sh.
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.50}
 LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
 OUT=${OUT:-/tmp/zstd-oracle}
 mkdir -p "$OUT"
