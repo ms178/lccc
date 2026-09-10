@@ -1027,17 +1027,12 @@ impl super::InstructionEncoder {
     ) -> Result<(), String> {
         self.emit_segment_prefix(mem)?;
 
-        // RIP-relative
+        // RIP-relative: same ModRM (mod=00 rm=101 + disp32) as the legacy
+        // encoder, including `sym@GOTPCREL` / `@GOTTPOFF` / `@TLSDESC`.
+        // `gotpcrel_x_type` then classifies AVX-512 EVEX as plain
+        // `R_X86_64_GOTPCREL` (9); only APX-promoted ALU is CODE_6.
         if mem.base.as_ref().is_some_and(|b| b.name == "rip") {
-            self.bytes.push(self.modrm(0, reg_field, 5));
-            match &mem.displacement {
-                Displacement::Integer(v) => {
-                    self.bytes.extend_from_slice(&(*v as i32).to_le_bytes());
-                }
-                Displacement::None => self.bytes.extend_from_slice(&[0, 0, 0, 0]),
-                _ => return Err("unsupported EVEX RIP-relative displacement".to_string()),
-            }
-            return Ok(());
+            return self.encode_modrm_mem(reg_field, mem);
         }
 
         let base_num = match &mem.base {

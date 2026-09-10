@@ -265,12 +265,19 @@ fn is_tls_reloc(rtype: u32) -> bool {
             matches!(rtype, 14..=19 | 24..=37 | 39..=41)
         }
         crate::backend::elf::EM_X86_64 => {
-            // x86-64 TLS relocations: DTPMOD64=16, DTPOFF64=17, TPOFF64=18,
-            // TLSGD=19, TLSLD=20, DTPOFF32=21, GOTTPOFF=22, TPOFF32=23,
-            // GOTPC32_TLSDESC=29, TLSDESC_CALL=30, TLSDESC=31.
-            // 41 (GOTPCRELX) and 42 (REX_GOTPCRELX) are relaxable GOT relocations,
-            // NOT TLS — deliberately excluded.
-            matches!(rtype, 16..=23 | 29..=31)
+            // x86-64 TLS (System V AMD64 ABI + binutils CODE_* APX):
+            //   DTPMOD64=16, DTPOFF64=17, TPOFF64=18, TLSGD=19, TLSLD=20,
+            //   DTPOFF32=21, GOTTPOFF=22, TPOFF32=23,
+            //   GOTPC32_TLSDESC=34, TLSDESC_CALL=35, TLSDESC=36,
+            //   CODE_4_GOTTPOFF=44, CODE_4_GOTPC32_TLSDESC=45,
+            //   CODE_5_GOTTPOFF=47, CODE_5_GOTPC32_TLSDESC=48,
+            //   CODE_6_GOTTPOFF=50, CODE_6_GOTPC32_TLSDESC=51.
+            // 29..=31 are GOTPC64/GOTPLT64/PLTOFF64 — NOT TLS.
+            // 41/42/43/49 are GOTPCRELX variants — NOT TLS.
+            matches!(
+                rtype,
+                16..=23 | 34..=36 | 44 | 45 | 47 | 48 | 50 | 51
+            )
         }
         crate::backend::elf::EM_AARCH64 => {
             // AArch64 TLS: TLSLE_ADD_TPREL_HI12=549, ADD_TPREL_LO12=550,
@@ -329,13 +336,25 @@ mod tests {
         }
 
         // x86-64: TLSGD=19 is TLS while GOTPCRELX=41 / REX_GOTPCRELX=42 /
-        // CODE_4_GOTPCRELX=43 are not.
+        // CODE_4_GOTPCRELX=43 / CODE_6_GOTPCRELX=49 are not. 29..=31 is
+        // GOTPC64/GOTPLT64/PLTOFF64, not TLSDESC (those are 34..=36).
         set_target_elf_machine(EM_X86_64);
         assert!(is_tls_reloc(19));
         assert!(is_tls_reloc(16));
+        assert!(is_tls_reloc(22));
+        assert!(is_tls_reloc(34));
+        assert!(is_tls_reloc(35));
+        assert!(is_tls_reloc(36));
+        assert!(is_tls_reloc(44));
+        assert!(is_tls_reloc(45));
+        assert!(is_tls_reloc(50));
+        assert!(is_tls_reloc(51));
+        assert!(!is_tls_reloc(29));
+        assert!(!is_tls_reloc(31));
         assert!(!is_tls_reloc(41));
         assert!(!is_tls_reloc(42));
         assert!(!is_tls_reloc(43));
+        assert!(!is_tls_reloc(49));
 
         // i386 keeps its proven table.
         set_target_elf_machine(EM_386);

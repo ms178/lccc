@@ -2470,7 +2470,8 @@ fn link_with_script_machine(
                     R_X86_64_GOTPCREL
                     | R_X86_64_GOTPCRELX
                     | R_X86_64_REX_GOTPCRELX
-                    | R_X86_64_CODE_4_GOTPCRELX => {
+                    | R_X86_64_CODE_4_GOTPCRELX
+                    | R_X86_64_CODE_6_GOTPCRELX => {
                         // A -T link produces a fully-resolved image with no
                         // dynamic loader and no GOT, so every GOT reference
                         // must be relaxed into direct addressing. The x86-64
@@ -2593,12 +2594,10 @@ fn link_with_script_machine(
                     }
                     // TLSDESC: `lea sym@tlsdesc(%rip),%rax` -> `mov $tpoff,%rax`,
                     // and the indirect call through the descriptor becomes a nop.
-                    R_X86_64_GOTPC32_TLSDESC => {
-                        if fp >= 3
-                            && out[fp - 3] == 0x48
-                            && out[fp - 2] == 0x8d
-                            && out[fp - 1] == 0x05
-                        {
+                    R_X86_64_GOTPC32_TLSDESC
+                    | R_X86_64_CODE_4_GOTPC32_TLSDESC
+                    | R_X86_64_CODE_6_GOTPC32_TLSDESC => {
+                        if fp >= 2 && out[fp - 2] == 0x8d && out[fp - 1] == 0x05 {
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
                             out[fp - 2] = 0xc7;
                             out[fp - 1] = 0xc0;
@@ -2618,7 +2617,7 @@ fn link_with_script_machine(
                             out[fp + 1] = 0x90;
                         }
                     }
-                    R_X86_64_GOTTPOFF => {
+                    R_X86_64_GOTTPOFF | R_X86_64_CODE_4_GOTTPOFF | R_X86_64_CODE_6_GOTTPOFF => {
                         // Initial-Exec through a GOT slot. With no GOT, relax
                         //   mov sym@gottpoff(%rip),%reg   48 8b ..
                         // into

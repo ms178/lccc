@@ -2,7 +2,8 @@
 
 Encodings reverse-engineered against GNU as 2.47 and unit-tested in
 `encoder::apx_tests`. Size wins vs GAS are kept (REX2 over EVEX, VEX over
-EVEX, `movl` zero-extend over `movabs`).
+EVEX, `movl` zero-extend over `movabs`). Default ISel does **not** emit
+APX: i7-14700KF (Raptor Lake) #UDs EGPR / REX2 / NDD EVEX.
 
 ## What landed
 
@@ -25,87 +26,76 @@ EVEX, `movl` zero-extend over `movabs`).
   lzcnt/tzcnt/popcnt/shld-imm/shrd-imm/imul/mul/div.
 
 ### S04 — leftovers, IMULZU, CFCMOV, NDD SHLD, REX2 GOTPCRELX
-* **Leftover `self.rex`** converted to `emit_rex_or_rex2` /
-  `emit_rex_unary` / `emit_rex_rr` / `emit_rex_rm`: `rdpid`, fsgsbase,
-  sldt/str/smsw/lmsw, fxsaveq/fxrstorq, movq xmm↔gp, movq mmx↔gp,
-  mov seg, mov cr/dr. EGPR on those paths now encodes as REX2 (map-1
-  collapsed by `fixup_rex2_map1`).
-* **XSAVE family** still rejects EGPR base/index (ISA: #UD; GAS agrees).
-  FXSAVEQ/FXRSTORQ **do** accept EGPR via REX2.
-* **`smsw %rax`** now emits REX.W (`48 0f 01 e0`), matching GAS; SLDT
-  still omits W (upper bits zero without it).
+* Leftover `self.rex` paths emit REX2 for EGPR.
 * **`R_X86_64_CODE_4_GOTPCRELX` (43)** for RIP-relative GOT loads whose
-  instruction starts with REX2 `0xD5`. `gotpcrel_x_type()` scans past
-  legacy prefixes: `0x40-0x4F` → 42, `0xD5` → 43, else 41. Linker
-  relaxation treats 43 like the other X variants (`8b`→`8d`).
-* **IMULZU**: 16-bit only (`imulzu` / `imulzuw`), EVEX map-4 ND=1 vvvv=0,
-  opcode 6B/69. `{nf}` sets P2.NF. 32/64-bit forms rejected (ZU is a no-op
-  there; GAS also refuses them).
-* **SETZU**: `setzuCC[b]` is the true ZU form (ND=1, pp=3, opcode 40+cc).
-  `{evex} setcc` stays ND=0. Shorter EGPR `setzb %r16b` remains REX2.
-  Memory dest rejected (`setzub (%rax)`): ZU zeros unused GPR bits.
-* **CFCMOV**: 2-op load/reg ND=0 NF=0; 2-op store ND=0 NF=1; 3-op NDD
-  ND=1 NF=1. Distinct from 3-op `cmov` (NF=0) and from `{evex}` 2-op
-  `cmov` (still rejected).
-* **4-op NDD SHLD/SHRD**: `shldq $imm/%cl, %src, %src1, %ndd`. Imm
-  remaps to map-4 24/2C; CL keeps A5/AD. `{nf}` ORs P2.NF. 16/32-bit
-  via pp. 3-op `shldw` now emits the missing `0x66`.
-* **xadd/cmpxchg** register-register (including EGPR) — previously only
-  the memory dest form existed.
-* **CCMP** 16-bit / byte / X4-index coverage (`ccmpnew`, `ccmpneb`,
-  `(%rax,%r16,4)`).
+  instruction starts with REX2 `0xD5`.
 
 ### S05 — PR #462 encoder wins, without its CI regressions
-Adopted the *valid* encoder optimizations from
-[PR #462](https://github.com/ms178/lccc/pull/462) (closed) and skipped the
-parts that broke CI:
-
-* **VEX2 commutative source-swap** on `vpmuludq` / `vpsadbw` / `vpmaddwd` /
-  `vpmulhuw` (integer only; FP add/mul still declined — NaN payload).
-* **SSSE3 VEX arms**: `vpmulhrsw`, `vphsubw/d/sw`, `vphaddsw`, `vpmuldq`,
-  `vmpsadbw`, `vphminposuw` (128-bit only).
-* **EVEX xmm/ymm16–31**: `vec_reg_id` + `operand_needs_evex` force the EVEX
-  path; `emit_evex_mod3` / `emit_evex_memop` thread R′/V′/X so high ids no
-  longer wrap to xmm0. `vpermq`/`vpermpd` dest is ModRM.reg (vvvv unused).
-* **`extractps` / unsuffixed `cvtsi2ss/sd`**: one REX via `emit_rex_*`;
-  `%r8d` is 32-bit.
-* **i686 scale-1 SIB fold**: `mov 0(,%eax,1),%ecx` → `8b 08` (ICC win).
-* **Suffix-less** `blsi`/`blsr`/`blsmsk`; **AMD** `clzero`/`rdpru`/`mcommit`.
-* **Fuzz OOM**: `m_absurd_alignment` is 2^20, not 2^40 (1 TiB freeze).
-* Did **not** strip script `100755` bits (the PR #462 CI killer).
+VEX2 integer commutative swap, SSSE3 VEX arms, EVEX xmm16+, cvtsi/extractps
+REX, i686 SIB fold. Did **not** VEX-swap FP add/mul. Did **not** strip
+script `100755` bits.
 
 ### S06 — oracle harness matches S05 encodings
-S05 `ci_local.sh --fast` was 14/14; snapshot `16e9ffc`. Whole-object
-`asmdiff.py` vs GNU as 2.47 was 788/789: the only miss was
-`apx_mov_imm betterok` (`movq $0xffffffff, %r16` as 7-byte `movl`).
-The bytes were right; the harness did not treat an EGPR 32-bit write as
-zero-extending, so `semantically_equal` rejected a verified size win.
+`_GP32_TO_64` includes `%r16d`–`%r31d`. asmdiff 789/789 at the time.
 
-* `_GP32_TO_64` now includes `%r16d`–`%r31d` in `asmdiff.py`,
-  `insndiff.py`, and `encdiff.py`.
-* `_COMMUTATIVE_VEX` includes `vpmuludq` / `vpsadbw` / `vpmaddwd` so a
-  VEX2 source-swap is scored BETTER, not unverified SHORTER. FP add/mul
-  still not swapped.
-* `insndiff --sweep` expands repeated `{XMM}` / `{R64}` independently
-  (dest × src1 × src2), matching the documented
-  `imul{S} ${IMM}, %{R{S}}, %{R{S}}` example.
-* `insndiff` exit 0 on BETTER (same as asmdiff `betterok`).
+### S07 / S08 — EVEX dest / tuple / SAE / EGPR mem
+Dest-in-ModRM.reg, compressed disp8*N, SAE vs ER, AVX-512 EGPR B4/X4.
 
-Checked vs GAS 2.47: asmdiff **789/789**. AVX sweep 864 (vpmuludq /
-vpsadbw / vpmaddwd / vpmulhuw × XMM³): 648 ok + 216 BETTER. ALU/mov/lea
-sweeps 2692: 2592 ok + 100 both-reject (illegal `ah`/`spl` mix etc.).
+### S09 — CODE_6 GOTPCRELX / CODE_4 GOTTPOFF / `-mapx` reject
+GAS 2.47 (verified):
+
+| insn | prefix | reloc |
+|---|---|---|
+| `{evex}`/`{nf}`/NDD `addq foo@GOTPCREL(%rip)` | `62 f4 fc {08,0c,10} 03 05` | **49** `CODE_6_GOTPCRELX` |
+| `{rex2}` / `%r16` `addq foo@GOTPCREL(%rip)` | `d5 {08,48} 03 05` | **43** `CODE_4_GOTPCRELX` |
+| `vmovdqa64` / `{evex} crc32q` / `{evex} andnq` GOTPCREL | EVEX, not ALU-map-4-relaxable | **9** `GOTPCREL` |
+| `movq foo@GOTTPOFF(%rip), %r16` | `d5 48 8b 05` | **44** `CODE_4_GOTTPOFF` |
+| `{evex} addq foo@GOTTPOFF(%rip)` | APX EVEX ALU | **50** `CODE_6_GOTTPOFF` |
+| `leaq foo@TLSDESC(%rip), %rax` | REX.W | **34** `GOTPC32_TLSDESC` |
+| `{rex2} leaq foo@TLSDESC(%rip)` | `d5 08 8d 05` | **45** `CODE_4_GOTPC32_TLSDESC` |
+
+Encoder: `gotpcrel_x_type` / `gottpoff_type` / `tlsdesc_type` look at the
+first non-legacy-prefix byte. CODE_6 only when EVEX P0.mmm==4 **and** the
+opcode is a relaxable legacy ALU (`add`/`or`/`adc`/`sbb`/`and`/`sub`/`xor`/`cmp`/`test`/`mov`/`imul`).
+AVX-512 (mmm=1/2/3) and APX map-4 BMI/crc32/adcx stay type 9.
+
+Linker (`emit_exec` / `emit_script` / `emit_shared` / `plt_got`): CODE_4/6
+GOTPCREL + GOTTPOFF. TLSDESC 45/51 in exec+script (prefix-agnostic
+`8d 05` → `c7 c0`). `is_tls_reloc` (x86-64): `16..=23 | 34..=36 | 44 | 45 | 47 | 48 | 50 | 51`
+(29..=31 is GOTPC64/GOTPLT64/PLTOFF64, **not** TLS).
+
+CLI overlay from this session: CODE_6 / GOTTPOFF / TLSDESC only. **`-mapx`
+codegen is PR #470** (gated, off by default) — see
+`docs/FOLLOWUP_CODEGEN_APX.md`. Default ISel still never emits EGPR/NDD.
+
+PUSH2 memory operands are GAS-illegal; encoder rejects them.
+
+RIP-less `foo@GOTPCREL(%reg)` stays type **9** even with REX2 (GAS 2.47).
+
+AVX-512 `encode_evex_mem` RIP-relative now shares `encode_modrm_mem`
+(so `vmovdqa64 foo@GOTPCREL(%rip), %zmm0` encodes and is type 9, not CODE_6).
+
+### S10 — rebase onto PR #470 + NDD quality
+Rebased CODE_6 overlay onto `919572ce` (PR #470 gated `-mapx`). Kept 470's
+enable of `-mapx`/`-mapxf`. NDD dest==rhs stays 2-address; 64-bit Add
+stays LEA (ungated MachInst fold); `{nf}` on NDD when flags are dead;
+I16/I8 EGPR names; thread-local APX flag; window EGPR pool when `-mapx`.
+**Do not** PUSH2 in prologues (6B EVEX vs 3B two pushes).
 
 ## Not yet (next session)
 
 1. Full `ci_local.sh` (cargo-test --all-targets, clippy, regression).
    Do not add asmdiff to CI without `LCCC_GAS`.
-2. **Codegen**: do **not** emit APX from ISel for `-march=raptorlake`
-   (i7-14700KF has no APX). Assembler support is for hand-written /
-   future `-mapx` assembly.
-3. Optional: EVEX GOTPCREL (`R_X86_64_CODE_6_*`) if anyone writes
-   `{evex} movq foo@GOTPCREL(%rip), %reg`. REX2 covers the EGPR case.
-4. Optional: remaining exotic APX (PUSH2 mem). `{zu}` as a prefix is
-   junk (GAS); ZU is `setzu*` / `imulzu`.
+2. Default ISel / `-march=raptorlake` still must not emit APX (`#UD` on
+   14700KF). `-mapx` is gated codegen, not a march alias.
+3. `emit_shared` has no GOTPC32_TLSDESC apply/relax arm (pre-existing for
+   type 34 too). Shared objects keep TLSDESC dynamic; not needed for the
+   static/exec path this session covers.
+4. CODE_5_* (VEX3, types 46–48): no GAS 2.47 oracle case yet; VEX3 GOTPCREL
+   stays type 9.
+5. `{evex} lea` / `{evex} movq GOTPCREL` are not GAS forms — do not chase.
+6. Optional remaining exotic APX. `{zu}` as a prefix is junk (GAS); ZU is
+   `setzu*` / `imulzu`.
 
 ## Oracle notes
 
@@ -114,8 +104,8 @@ sweeps 2692: 2592 ok + 100 both-reject (illegal `ah`/`spl` mix etc.).
 * `{evex}` / `{nf}` / NDD of *legacy map 0/1* → EVEX map-4.
 * BMI 0F38 with EGPR/`{nf}`/`{evex}` → EVEX **mmm=2**, not map-4. No-EGPR
   VEX is shorter and kept.
+* CODE_6 is **relaxable APX EVEX ALU**, not every `0x62`.
 * ZU is **not** `{evex} setcc`. ZU is `setzuCC` / `imulzu` (ND=1, no extra dest).
-* CFCMOV store uses NF as the “reverse operand” bit, not a no-flags hint.
 * Group-1 prefixes (`lock`/`rep`) splice *before* `0xD5`/`0x62`.
 
 ## Files
@@ -123,10 +113,10 @@ sweeps 2692: 2592 ok + 100 both-reject (illegal `ah`/`spl` mix etc.).
 * `src/backend/x86/assembler/encoder/{apx,avx,core,gp_integer,mod,registers,sse,system,x87_misc}.rs`
 * `src/backend/x86/linker/{elf,emit_exec,emit_script,emit_shared,plt_got}.rs`
 * `src/backend/elf/symbol_table.rs`
+* `src/backend/x86/codegen/emit.rs` (ISel EGPR guard)
+* `src/driver/cli.rs`
 * `tests/asm-diff/apx.casefile`, `scripts/gen_apx_asmdiff.py`
 
-
 See also `docs/FOLLOWUP_ASSEMBLER_EVEX.md` (S07 dest-in-ModRM.reg / tuple /
-SAE; **S08** GAS 2.47 on `0d842bc`: AVX-512 EGPR B4/X4, SAE vs ER legality,
-NDD ALU-imm memory, FALSE-ACCEPT guards).
-
+SAE; **S08** GAS 2.47, rebased onto `6461190`: AVX-512 EGPR B4/X4, SAE vs ER
+legality, NDD ALU-imm memory, FALSE-ACCEPT guards).

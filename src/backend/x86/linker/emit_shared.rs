@@ -350,7 +350,10 @@ pub(super) fn emit_shared_library(
                     | R_X86_64_GOTPCRELX
                     | R_X86_64_REX_GOTPCRELX
                     | R_X86_64_CODE_4_GOTPCRELX
-                    | R_X86_64_GOTTPOFF => {
+                    | R_X86_64_CODE_6_GOTPCRELX
+                    | R_X86_64_GOTTPOFF
+                    | R_X86_64_CODE_4_GOTTPOFF
+                    | R_X86_64_CODE_6_GOTTPOFF => {
                         if got_needed_seen.insert(sym.name.to_string()) {
                             got_needed_names.push(sym.name.to_string());
                         }
@@ -1913,14 +1916,11 @@ pub(super) fn emit_shared_library(
                     R_X86_64_GOTPCREL
                     | R_X86_64_GOTPCRELX
                     | R_X86_64_REX_GOTPCRELX
-                    | R_X86_64_CODE_4_GOTPCRELX => {
+                    | R_X86_64_CODE_4_GOTPCRELX
+                    | R_X86_64_CODE_6_GOTPCRELX => {
                         if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
                             w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
-                        } else if (rela.rela_type == R_X86_64_GOTPCRELX
-                            || rela.rela_type == R_X86_64_REX_GOTPCRELX
-                            || rela.rela_type == R_X86_64_CODE_4_GOTPCRELX)
-                            && !sym.name.is_empty()
-                        {
+                        } else if is_gotpcrelx_relaxable(rela.rela_type) && !sym.name.is_empty() {
                             // GOT relaxation: convert to LEA
                             if let Some(g) = globals_snap.get(sym.name.as_str()) {
                                 if g.defined_in.is_some() {
@@ -1939,7 +1939,7 @@ pub(super) fn emit_shared_library(
                     R_X86_64_PC64 => {
                         w64(&mut out, fp, (s as i64 + a - p as i64) as u64);
                     }
-                    R_X86_64_GOTTPOFF => {
+                    R_X86_64_GOTTPOFF | R_X86_64_CODE_4_GOTTPOFF | R_X86_64_CODE_6_GOTTPOFF => {
                         // TLS Initial-Exec: point the instruction at the GOT entry.
                         // For locally-defined TLS symbols, the GOT entry was already
                         // filled with the static TPOFF value above. For external TLS

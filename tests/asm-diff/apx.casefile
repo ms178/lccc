@@ -232,3 +232,27 @@ ctesteq %rcx, %rax
 {nf} bswapq %rax
 {evex} movq %rcx, %rax
 {nf} notq %rax
+
+;;; apx_gotpcrel_code6
+.text
+{evex} addq foo@GOTPCREL(%rip), %rax
+{nf} addq foo@GOTPCREL(%rip), %rax
+addq foo@GOTPCREL(%rip), %rax, %r16
+{rex2} addq foo@GOTPCREL(%rip), %rax
+addq foo@GOTPCREL(%rip), %r16
+movq foo@GOTTPOFF(%rip), %r16
+{evex} addq foo@GOTTPOFF(%rip), %rax
+leaq foo@TLSDESC(%rip), %rax
+{rex2} leaq foo@TLSDESC(%rip), %rax
+
+;;; apx_gotpcrel_not_code6
+.text
+vmovdqa64 foo@GOTPCREL(%rip), %zmm0
+{evex} crc32q foo@GOTPCREL(%rip), %rax
+{evex} andnq foo@GOTPCREL(%rip), %rax, %rcx
+
+;;; apx_push2_mem reject
+.text
+push2 (%rax), %rcx
+pop2 %rax, (%rcx)
+push2p (%rax), %rcx

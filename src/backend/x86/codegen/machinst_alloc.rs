@@ -247,6 +247,9 @@ impl<'a> Scan<'a> {
                 for r in MACHINST_ALLOCATABLE_GPRS {
                     touched.push(r.0);
                 }
+                if super::isel::apx_enabled() {
+                    touched.extend(40u8..=55);
+                }
             }
             _ => {}
         }
@@ -662,8 +665,13 @@ pub(crate) fn allocate_window(
         .map(|r| r.0)
         .filter(|&r| r != RBP.0)
         .collect();
+    // Extra GPRs r16–r31: caller-saved in the APX SysV extension. Only
+    // when `-mapx` — otherwise the encodings are #UD on Raptor Lake.
+    if super::isel::apx_enabled() {
+        pool.extend(40u8..=55);
+    }
     pool.sort_by_key(|&r| {
-        let caller_saved = matches!(r, 10 | 11 | 12 | 13 | 14 | 15 | 16); // r11,r10,r8,r9,rdi,rsi,rdx
+        let caller_saved = matches!(r, 10 | 11 | 12 | 13 | 14 | 15 | 16) || (40..=55).contains(&r);
         if caller_saved { 0 } else { 1 }
     });
 

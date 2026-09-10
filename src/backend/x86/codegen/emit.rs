@@ -281,6 +281,7 @@ pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
             14 => "di",
             15 => "si",
             16 => "dx",
+            n if (40..=55).contains(&n) => EGPR16[(n - 40) as usize],
             _ => phys_reg_name(reg),
         },
         IrType::I8 | IrType::U8 => match reg.0 {
@@ -3652,7 +3653,7 @@ impl X86Codegen {
         }
         if !matches!(
             op,
-            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul
         ) {
             return false;
         }
@@ -3666,7 +3667,18 @@ impl X86Codegen {
         if lhs_phys == dest_phys {
             return false;
         }
-        let mnemonic = alu_mnemonic(op);
+        // Immediate IMUL is the legacy 3-operand form *and* the strength-
+        // reduction plan (`mul_const_plan`) lives in the caller. Stealing
+        // `imul $k, %src, %dst` here would hide LEA/SHL chains that beat
+        // IMUL on every shipping core.
+        if op == IrBinOp::Mul && Self::const_as_imm32(rhs).is_some() {
+            return false;
+        }
+        let mnemonic = if op == IrBinOp::Mul {
+            "imul"
+        } else {
+            alu_mnemonic(op)
+        };
         let (dest_n, lhs_n, sfx) = if use_32bit {
             (phys_reg_name_32(dest_phys), phys_reg_name_32(lhs_phys), "l")
         } else {
@@ -3679,30 +3691,20 @@ impl X86Codegen {
             ));
         } else if let Some(rhs_phys) = self.operand_reg(rhs).filter(|&r| is_gpr_reg(r)) {
             if rhs_phys == dest_phys {
-                // dest holds rhs: commutative ops can NDD-swap; Sub cannot.
-                if op == IrBinOp::Sub {
-                    return false;
-                }
-                let rhs_n = if use_32bit {
-                    phys_reg_name_32(rhs_phys)
-                } else {
-                    phys_reg_name(rhs_phys)
-                };
-                self.state.emit_fmt(format_args!(
-                    "    {}{} %{}, %{}, %{}",
-                    mnemonic, sfx, lhs_n, rhs_n, dest_n
-                ));
-            } else {
-                let rhs_n = if use_32bit {
-                    phys_reg_name_32(rhs_phys)
-                } else {
-                    phys_reg_name(rhs_phys)
-                };
-                self.state.emit_fmt(format_args!(
-                    "    {}{} %{}, %{}, %{}",
-                    mnemonic, sfx, rhs_n, lhs_n, dest_n
-                ));
+                // dest already holds rhs: two-address `op %lhs, %dest` is
+                // 3 bytes vs EVEX NDD 6. Commutative or not, the short
+                // form wins; Sub cannot commute into NDD anyway.
+                return false;
             }
+            let rhs_n = if use_32bit {
+                phys_reg_name_32(rhs_phys)
+            } else {
+                phys_reg_name(rhs_phys)
+            };
+            self.state.emit_fmt(format_args!(
+                "    {}{} %{}, %{}, %{}",
+                mnemonic, sfx, rhs_n, lhs_n, dest_n
+            ));
         } else {
             return false;
         }
@@ -7333,10 +7335,46 @@ mod machinst_resolution_tests {
         assert_eq!(phys_reg_name(PhysReg(55)), "r31");
         assert_eq!(phys_reg_name_32(PhysReg(40)), "r16d");
         assert_eq!(phys_reg_name_32(PhysReg(55)), "r31d");
+        assert_eq!(typed_phys_reg_name(PhysReg(40), IrType::I16), "r16w");
+        assert_eq!(typed_phys_reg_name(PhysReg(55), IrType::U16), "r31w");
+        assert_eq!(typed_phys_reg_name(PhysReg(40), IrType::I8), "r16b");
         assert!(is_gpr_reg(PhysReg(40)));
         assert!(is_gpr_reg(PhysReg(16)));
         assert!(!is_gpr_reg(PhysReg(20)));
         assert!(!is_xmm_reg(PhysReg(40)));
         assert!(is_xmm_reg(PhysReg(20)));
+    }
+
+    #[test]
+    fn isel_homes_never_include_egpr_by_default() {
+        // i7-14700KF (Raptor Lake) has no APX: %r16–%r31 / REX2 / NDD EVEX
+        // are #UD. Default ISel (no `-mapx`) must stay in the legacy GP pool.
+        fn assert_not_egpr(n: &str) {
+            let digits: String = n
+                .chars()
+                .skip(1)
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            let id = digits.parse::<u32>().unwrap_or(0);
+            assert!(
+                id < 16,
+                "default ISel GP home {n} is an EGPR (APX is #UD on Raptor Lake)"
+            );
+        }
+        for r in X86_CALLEE_SAVED.iter().chain(X86_CALLER_SAVED.iter()) {
+            assert_not_egpr(phys_reg_name(*r));
+        }
+        assert_eq!(phys_reg_name(PhysReg(16)), "rdx");
+        for r in super::super::machinst::MACHINST_ALLOCATABLE_GPRS {
+            let n = match r.0 {
+                0 => "rax",
+                7 => "rcx",
+                _ => phys_reg_name(*r),
+            };
+            assert_not_egpr(n);
+        }
+        // The extra file exists for the gated path only.
+        assert_eq!(X86_APX_EGPRS[0], PhysReg(40));
+        assert_eq!(phys_reg_name(X86_APX_EGPRS[0]), "r16");
     }
 }

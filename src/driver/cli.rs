@@ -2007,6 +2007,11 @@ mod cli_tests {
     #[test]
     fn unimplemented_enable_flags_still_rejected() {
         assert!(try_flag("-msse4a").is_err(), "-msse4a must be rejected");
+        // `-mapx`/`-mapxf` are gated codegen (EGPR + NDD), off unless asked.
+        // `-mno-apx` is the default and must stay a no-op.
+        for f in ["-mapx", "-mapxf", "-mno-apx", "-mno-apxf"] {
+            assert!(try_flag(f).is_ok(), "{f} must be accepted");
+        }
     }
 
     /// Stack alignment: a request for <= 16 bytes is permission to align less

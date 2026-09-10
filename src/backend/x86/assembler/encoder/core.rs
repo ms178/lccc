@@ -659,22 +659,95 @@ impl super::InstructionEncoder {
         false
     }
 
+    /// Skip group-2/3/4 legacy prefixes; return the index of the first
+    /// opcode/REX/VEX/EVEX byte of the instruction currently in `self.bytes`.
+    fn prefix_start(&self) -> usize {
+        let mut i = 0;
+        while i < self.bytes.len() {
+            match self.bytes[i] {
+                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {
+                    i += 1
+                }
+                _ => break,
+            }
+        }
+        i
+    }
+
+    /// APX EVEX of a *relaxable* legacy-map ALU (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP,
+    /// TEST, IMUL, MOV). GAS 2.47 emits `R_X86_64_CODE_6_GOTPCRELX` for these
+    /// and plain `R_X86_64_GOTPCREL` for AVX-512 EVEX and APX map-4 BMI/ADX
+    /// (`andn`, `crc32`, `adcx`, …) which the linker cannot rewrite.
+    fn apx_evex_legacy_relaxable(&self) -> bool {
+        let i = self.prefix_start();
+        if self.bytes.len() < i + 5 || self.bytes[i] != 0x62 {
+            return false;
+        }
+        // EVEX P0.mmm: 4 = APX-promoted legacy/map-4. AVX-512 uses 1/2/3.
+        if self.bytes[i + 1] & 7 != 4 {
+            return false;
+        }
+        matches!(
+            self.bytes[i + 4],
+            0x01 | 0x03
+                | 0x09
+                | 0x0B
+                | 0x11
+                | 0x13
+                | 0x19
+                | 0x1B
+                | 0x21
+                | 0x23
+                | 0x29
+                | 0x2B
+                | 0x31
+                | 0x33
+                | 0x39
+                | 0x3B
+                | 0x85
+                | 0x8B
+                | 0xAF
+        )
+    }
+
     /// Relaxable GOTPCREL reloc for the instruction currently in `self.bytes`.
     ///
     /// REX (0x40-0x4F) → `R_X86_64_REX_GOTPCRELX` (42).
     /// REX2 (0xD5)     → `R_X86_64_CODE_4_GOTPCRELX` (43) — the displacement
     /// sits 4 bytes after the prefix start (`D5 pp opc modrm disp32`).
+    /// APX EVEX ALU    → `R_X86_64_CODE_6_GOTPCRELX` (49) — disp sits 6 bytes
+    /// after `0x62` (`62 p1 p2 p3 opc modrm disp32`).
+    /// AVX-512 EVEX / APX map-4 BMI → `R_X86_64_GOTPCREL` (9), matching GAS.
     /// Anything else   → `R_X86_64_GOTPCRELX` (41).
     pub(crate) fn gotpcrel_x_type(&self) -> u32 {
-        for &b in &self.bytes {
-            match b {
-                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {}
-                0x40..=0x4F => return R_X86_64_REX_GOTPCRELX,
-                0xD5 => return R_X86_64_CODE_4_GOTPCRELX,
-                _ => return R_X86_64_GOTPCRELX,
-            }
+        let i = self.prefix_start();
+        match self.bytes.get(i).copied() {
+            Some(0x40..=0x4F) => R_X86_64_REX_GOTPCRELX,
+            Some(0xD5) => R_X86_64_CODE_4_GOTPCRELX,
+            Some(0x62) if self.apx_evex_legacy_relaxable() => R_X86_64_CODE_6_GOTPCRELX,
+            Some(0x62) => R_X86_64_GOTPCREL,
+            _ => R_X86_64_GOTPCRELX,
         }
-        R_X86_64_GOTPCRELX
+    }
+
+    /// GOTTPOFF reloc class for the instruction currently in `self.bytes`.
+    pub(crate) fn gottpoff_type(&self) -> u32 {
+        let i = self.prefix_start();
+        match self.bytes.get(i).copied() {
+            Some(0xD5) => R_X86_64_CODE_4_GOTTPOFF,
+            Some(0x62) if self.apx_evex_legacy_relaxable() => R_X86_64_CODE_6_GOTTPOFF,
+            _ => R_X86_64_GOTTPOFF,
+        }
+    }
+
+    /// TLSDESC reloc class for the instruction currently in `self.bytes`.
+    pub(crate) fn tlsdesc_type(&self) -> u32 {
+        let i = self.prefix_start();
+        match self.bytes.get(i).copied() {
+            Some(0xD5) => R_X86_64_CODE_4_GOTPC32_TLSDESC,
+            Some(0x62) if self.apx_evex_legacy_relaxable() => R_X86_64_CODE_6_GOTPC32_TLSDESC,
+            _ => R_X86_64_GOTPC32_TLSDESC,
+        }
     }
 
     pub(crate) fn encode_modrm_mem(
@@ -723,7 +796,9 @@ impl super::InstructionEncoder {
                             "gotpcrelx" => R_X86_64_GOTPCRELX,
                             "rex_gotpcrelx" => R_X86_64_REX_GOTPCRELX,
                             "code_4_gotpcrelx" => R_X86_64_CODE_4_GOTPCRELX,
-                            "gottpoff" => R_X86_64_GOTTPOFF,
+                            "code_6_gotpcrelx" => R_X86_64_CODE_6_GOTPCRELX,
+                            "gottpoff" => self.gottpoff_type(),
+                            "tlsdesc" => self.tlsdesc_type(),
                             "tpoff" => R_X86_64_TPOFF32,
                             "plt" => R_X86_64_PLT32,
                             _ => R_X86_64_PC32,
@@ -774,10 +849,16 @@ impl super::InstructionEncoder {
                 (0i64, true, Some((sym.clone(), R_X86_64_32, *addend)))
             }
             Displacement::SymbolMod(sym, modifier) => {
+                // Non-RIP `sym@GOTPCREL(%reg)` is not relaxable: GAS 2.47
+                // emits plain `R_X86_64_GOTPCREL` (9) even when the insn is
+                // REX2 (`addq foo@GOTPCREL(%rax), %r16` → type 9, not 43).
+                // GOTTPOFF/TLSDESC without %rip are rejected by GAS; keep
+                // the classic types if they ever reach the encoder.
                 let reloc_type = match modifier.to_ascii_lowercase().as_str() {
                     "tpoff" => R_X86_64_TPOFF32,
                     "gotpcrel" => R_X86_64_GOTPCREL,
                     "gottpoff" => R_X86_64_GOTTPOFF,
+                    "tlsdesc" => R_X86_64_GOTPC32_TLSDESC,
                     _ => R_X86_64_32S,
                 };
                 (0i64, true, Some((sym.clone(), reloc_type, 0i64)))
@@ -946,7 +1027,19 @@ impl super::InstructionEncoder {
         if self.relocations.len() > reloc_count_before {
             let reloc = &mut self.relocations[reloc_count_before];
             match reloc.reloc_type {
-                R_X86_64_PC32 | R_X86_64_PLT32 | R_X86_64_GOTPCREL | R_X86_64_GOTTPOFF => {
+                R_X86_64_PC32
+                | R_X86_64_PLT32
+                | R_X86_64_GOTPCREL
+                | R_X86_64_GOTPCRELX
+                | R_X86_64_REX_GOTPCRELX
+                | R_X86_64_CODE_4_GOTPCRELX
+                | R_X86_64_CODE_6_GOTPCRELX
+                | R_X86_64_GOTTPOFF
+                | R_X86_64_CODE_4_GOTTPOFF
+                | R_X86_64_CODE_6_GOTTPOFF
+                | R_X86_64_GOTPC32_TLSDESC
+                | R_X86_64_CODE_4_GOTPC32_TLSDESC
+                | R_X86_64_CODE_6_GOTPC32_TLSDESC => {
                     reloc.addend -= trailing_bytes;
                 }
                 _ => {}
