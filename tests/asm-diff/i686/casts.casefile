@@ -1,0 +1,30 @@
+;;; cast_x87_core
+.text
+flds (%esp)
+fldl (%esp)
+fldt (%esp)
+fisttpl (%esp)
+fisttpq (%esp)
+fstps (%esp)
+fstpl (%esp)
+fstpt (%esp)
+fucomip %st(1), %st
+fsubs (%esp)
+fildl (%esp)
+fildq (%esp)
+fchs
+
+;;; cast_sse_core
+.text
+cvtsi2ssl %eax, %xmm0
+cvttss2si %xmm0, %eax
+movd %xmm0, %eax
+movd %eax, %xmm0
+
+;;; cast_scratch_forms
+.text
+movl %eax, 8(%esp)
+movl %edx, 12(%esp)
+movl 8(%esp), %eax
+movl 12(%esp), %edx
+movw $16384, 8(%esp)

@@ -2634,15 +2634,25 @@ impl ArchCodegen for I686Codegen {
             return;
         }
         if ty == IrType::F128 {
+            // Dead-destination contract (see float_ops.rs): the x87 stack
+            // entry the operand loads push is only ever popped by the
+            // destination store, and `f{}p` pops exactly one of the two
+            // loaded operands. A destination without a slot is a dead
+            // result under this backend's convention, so emit nothing at
+            // all -- emitting the loads without the store would leak one
+            // x87 stack entry per dead-result binop.
+            if self.state.get_slot(dest.0).is_none() {
+                return;
+            }
+
             let mnemonic = self.emit_float_binop_mnemonic(op);
             self.emit_f128_load_to_x87(lhs);
             self.emit_f128_load_to_x87(rhs);
             emit!(self.state, "    f{}p %st, %st(1)", mnemonic);
-            if let Some(slot) = self.state.get_slot(dest.0) {
-                let sr = self.slot_ref(slot);
-                emit!(self.state, "    fstpt {}", sr);
-                self.state.f128_direct_slots.insert(dest.0);
-            }
+            let slot = self.state.get_slot(dest.0).expect("checked above");
+            let sr = self.slot_ref(slot);
+            emit!(self.state, "    fstpt {}", sr);
+            self.state.f128_direct_slots.insert(dest.0);
             self.state.reg_cache.invalidate_acc();
             return;
         }

@@ -330,7 +330,11 @@ impl super::InstructionEncoder {
             "GOTOFF" => R_386_GOTOFF,
             "PLT" => R_386_PLT32,
             "GOTPC" => R_386_GOTPC,
-            "GOTNTPOFF" | "INDNTPOFF" => R_386_TLS_IE,
+            // GAS emits R_386_TLS_GOTIE for the GOT-slot initial-exec
+            // forms; R_386_TLS_IE in a shared object forces DT_TEXTREL
+            // because the linker cannot relax it without the GOT-slot
+            // marking.
+            "GOTNTPOFF" | "INDNTPOFF" => R_386_TLS_GOTIE,
             _ => R_386_32,
         }
     }
