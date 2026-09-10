@@ -158,17 +158,8 @@ impl super::InstructionEncoder {
                 // movq %crN, %rax  =>  0F 20 ModR/M
                 let cr_num = control_reg_num(&cr.name).ok_or("bad control register")?;
                 let gp_num = reg_num(&gp.name).ok_or("bad register")?;
-                // Need REX prefix for r8-r15 or for cr8
-                let mut rex = 0u8;
-                if cr_num >= 8 {
-                    rex |= 0x44;
-                } // REX.R
-                if needs_rex_ext(&gp.name) {
-                    rex |= 0x41;
-                } // REX.B
-                if rex != 0 {
-                    self.bytes.push(rex);
-                }
+                let (b, b4) = gp_ext_bits(&gp.name);
+                self.emit_rex_or_rex2(false, cr_num >= 8, false, b, false, false, b4, false);
                 self.bytes.extend_from_slice(&[0x0F, 0x20]);
                 self.bytes.push(self.modrm(3, cr_num & 7, gp_num));
                 Ok(())
@@ -177,16 +168,8 @@ impl super::InstructionEncoder {
                 // movq %rax, %crN  =>  0F 22 ModR/M
                 let cr_num = control_reg_num(&cr.name).ok_or("bad control register")?;
                 let gp_num = reg_num(&gp.name).ok_or("bad register")?;
-                let mut rex = 0u8;
-                if cr_num >= 8 {
-                    rex |= 0x44;
-                } // REX.R
-                if needs_rex_ext(&gp.name) {
-                    rex |= 0x41;
-                } // REX.B
-                if rex != 0 {
-                    self.bytes.push(rex);
-                }
+                let (b, b4) = gp_ext_bits(&gp.name);
+                self.emit_rex_or_rex2(false, cr_num >= 8, false, b, false, false, b4, false);
                 self.bytes.extend_from_slice(&[0x0F, 0x22]);
                 self.bytes.push(self.modrm(3, cr_num & 7, gp_num));
                 Ok(())
@@ -270,6 +253,7 @@ impl super::InstructionEncoder {
                     scale: None,
                     mask: None,
                     zeroing: false,
+                    broadcast: None,
                 };
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.encode_modrm_mem(reg_ext, &mem)
@@ -287,9 +271,7 @@ impl super::InstructionEncoder {
         match &ops[0] {
             Operand::Register(reg) => {
                 let rm = reg_num(&reg.name).ok_or("bad register")?;
-                if needs_rex_ext(&reg.name) {
-                    self.bytes.push(self.rex(false, false, false, true));
-                }
+                self.emit_rex_unary(2, &reg.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.bytes.push(self.modrm(3, 6, rm));
                 Ok(())
@@ -313,13 +295,12 @@ impl super::InstructionEncoder {
         match &ops[0] {
             Operand::Register(reg) => {
                 let rm = reg_num(&reg.name).ok_or("bad register")?;
-                let is_16 = is_reg16(&reg.name);
-                if is_16 {
+                let size = infer_reg_size(&reg.name);
+                if size == 2 {
                     self.bytes.push(0x66);
                 }
-                if needs_rex_ext(&reg.name) {
-                    self.bytes.push(self.rex(false, false, false, true));
-                }
+                // SMSW to a 64-bit dest uses REX.W (zero-extends); 32-bit does not.
+                self.emit_rex_unary(if size == 8 { 8 } else { 4 }, &reg.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.bytes.push(self.modrm(3, 4, rm));
                 Ok(())
@@ -348,9 +329,7 @@ impl super::InstructionEncoder {
             Operand::Register(reg) => {
                 let reg_num = reg_num(&reg.name).ok_or("bad register")?;
                 // No REX.W for 16-bit system register instructions
-                if needs_rex_ext(&reg.name) {
-                    self.bytes.push(self.rex(false, false, false, true));
-                }
+                self.emit_rex_unary(2, &reg.name);
                 self.bytes.extend_from_slice(opcode);
                 self.bytes.push(self.modrm(3, ext, reg_num));
                 Ok(())
@@ -405,10 +384,13 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
+                if operands_have_egpr(ops) {
+                    return Err(
+                        "extended GPR cannot be used as base/index for `xsave' family".to_string(),
+                    );
+                }
                 if force_rex_w {
-                    let rex_b = mem.base.as_ref().is_some_and(|r| needs_rex_ext(&r.name));
-                    let rex_x = mem.index.as_ref().is_some_and(|r| needs_rex_ext(&r.name));
-                    self.bytes.push(self.rex(true, false, rex_x, rex_b));
+                    self.emit_rex_rm(8, "", mem);
                 } else {
                     self.emit_rex_rm(0, "", mem);
                 }
@@ -426,10 +408,7 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                // Force REX.W prefix
-                let rex_b = mem.base.as_ref().is_some_and(|r| needs_rex_ext(&r.name));
-                let rex_x = mem.index.as_ref().is_some_and(|r| needs_rex_ext(&r.name));
-                self.bytes.push(self.rex(true, false, rex_x, rex_b));
+                self.emit_rex_rm(8, "", mem);
                 self.bytes.extend_from_slice(&[0x0F, 0xAE]);
                 self.encode_modrm_mem(0, mem)
             }
@@ -444,10 +423,7 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                // Force REX.W prefix
-                let rex_b = mem.base.as_ref().is_some_and(|r| needs_rex_ext(&r.name));
-                let rex_x = mem.index.as_ref().is_some_and(|r| needs_rex_ext(&r.name));
-                self.bytes.push(self.rex(true, false, rex_x, rex_b));
+                self.emit_rex_rm(8, "", mem);
                 self.bytes.extend_from_slice(&[0x0F, 0xAE]);
                 self.encode_modrm_mem(1, mem)
             }
@@ -492,12 +468,8 @@ impl super::InstructionEncoder {
             Operand::Register(reg) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
                 self.bytes.push(0xF3);
-                // Need REX.W for 64-bit register, REX.B for extended register
-                let is_64 = is_reg64(&reg.name);
-                let ext_reg = needs_rex_ext(&reg.name);
-                if is_64 || ext_reg {
-                    self.bytes.push(self.rex(is_64, false, false, ext_reg));
-                }
+                let size = infer_reg_size(&reg.name);
+                self.emit_rex_unary(if size == 8 { 8 } else { 4 }, &reg.name);
                 self.bytes.extend_from_slice(&[0x0F, 0xAE]);
                 self.bytes.push(self.modrm(3, ext, num));
                 Ok(())

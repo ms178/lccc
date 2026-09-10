@@ -113,3 +113,13 @@ btl $31, %r8
 btl %ecx, %r8
 btq $31, %r8d
 btl $5, %rax
+
+;;; vphminposuw_ymm reject
+.text
+vphminposuw %ymm0, %ymm1
+
+;;; evex_sae_er_mismatch reject
+.text
+vaddps {sae}, %zmm1, %zmm2, %zmm3
+vmaxps {rn-sae}, %zmm1, %zmm2, %zmm3
+vpaddd {sae}, %zmm1, %zmm2, %zmm3

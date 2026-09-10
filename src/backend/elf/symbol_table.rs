@@ -328,12 +328,14 @@ mod tests {
             assert!(is_tls_reloc(r), "AArch64 r{r} must be TLS");
         }
 
-        // x86-64: TLSGD=19 is TLS while GOTPCRELX=41 / REX_GOTPCRELX=42 are not.
+        // x86-64: TLSGD=19 is TLS while GOTPCRELX=41 / REX_GOTPCRELX=42 /
+        // CODE_4_GOTPCRELX=43 are not.
         set_target_elf_machine(EM_X86_64);
         assert!(is_tls_reloc(19));
         assert!(is_tls_reloc(16));
         assert!(!is_tls_reloc(41));
         assert!(!is_tls_reloc(42));
+        assert!(!is_tls_reloc(43));
 
         // i386 keeps its proven table.
         set_target_elf_machine(EM_386);

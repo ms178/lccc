@@ -270,6 +270,71 @@ def nop_forms(out):
         out.append(f"nopw {m}" if m in ("%ax",) else f"nopl {m}")
 
 
+def avx_ssse3(out):
+    """Newly enabled VEX arms (previously EVEX-only or missing)."""
+    for op in (
+        "vpmulhuw", "vpmulhrsw", "vphsubw", "vphsubd",
+        "vphaddsw", "vphsubsw", "vpmuldq",
+    ):
+        out.append(f"{op} %xmm1, %xmm2, %xmm3")
+        out.append(f"{op} %ymm1, %ymm2, %ymm3")
+        out.append(f"{op} %xmm9, %xmm2, %xmm3")
+        out.append(f"{op} (%rdi), %xmm1, %xmm2")
+        out.append(f"{op} (%rdi), %ymm1, %ymm2")
+    out.append("vmpsadbw $0, %xmm1, %xmm2, %xmm3")
+    out.append("vmpsadbw $1, %ymm1, %ymm2, %ymm3")
+    out.append("vphminposuw %xmm1, %xmm2")
+    out.append("vphminposuw (%rdi), %xmm2")
+
+
+def evex_quality(out):
+    """EVEX dest!=0, xmm/ymm16-31, compressed disp8*N, SAE, {1toN}."""
+    out.append("vpshufd $1, %zmm2, %zmm3")
+    out.append("vpermq $0xe4, %zmm2, %zmm3")
+    out.append("vpternlogd $0xaa, %zmm2, %zmm1, %zmm3")
+    out.append("vpbroadcastd %eax, %zmm3")
+    out.append("vpxord 64(%rdi), %xmm0, %xmm1")
+    out.append("vpxord 64(%rdi), %zmm0, %zmm1")
+    out.append("vaddps %xmm16, %xmm0, %xmm1")
+    out.append("vaddps %xmm0, %xmm16, %xmm1")
+    out.append("vaddps %xmm0, %xmm1, %xmm31")
+    out.append("vpaddd %zmm16, %zmm1, %zmm2")
+    out.append("vmovdqu64 %zmm16, %zmm17")
+    out.append("vandps %xmm16, %xmm0, %xmm1")
+    out.append("vaddss %xmm16, %xmm0, %xmm1")
+    out.append("vmovaps %xmm16, %xmm1")
+    out.append("vpbroadcastd 4(%rdi), %zmm1")
+    out.append("vbroadcasti32x4 16(%rdi), %zmm1")
+    out.append("vphminposuw %xmm1, %xmm2")
+    out.append("vpmovzxbw 32(%rdi), %zmm1")
+    out.append("vaddps {rn-sae}, %zmm1, %zmm2, %zmm3")
+    out.append("vaddps (%rdi){1to16}, %zmm1, %zmm2")
+    out.append("vcmpps $0, {sae}, %zmm1, %zmm2, %k1")
+    out.append("vcvtps2dq {rz-sae}, %zmm1, %zmm2")
+    out.append("vextracti32x4 $1, %zmm1, 16(%rdi)")
+
+
+def sse_rex(out):
+    """REX.R/B (and not-W) for unsuffixed cvtsi2s[sd] and extractps."""
+    for op in ("cvtsi2ss", "cvtsi2sd"):
+        out.append(f"{op} %eax, %xmm0")
+        out.append(f"{op} %rax, %xmm0")
+        out.append(f"{op} %r8d, %xmm0")
+        out.append(f"{op} %r8, %xmm0")
+        out.append(f"{op} %eax, %xmm8")
+        out.append(f"{op} %r8d, %xmm8")
+        out.append(f"{op} %rax, %xmm8")
+        out.append(f"{op} (%rdi), %xmm0")
+        out.append(f"{op} (%rdi), %xmm8")
+    for imm in (0, 1, 3):
+        out.append(f"extractps ${imm}, %xmm1, %eax")
+        out.append(f"extractps ${imm}, %xmm8, %eax")
+        out.append(f"extractps ${imm}, %xmm1, %r8d")
+        out.append(f"extractps ${imm}, %xmm8, %r8d")
+        out.append(f"extractps ${imm}, %xmm1, (%rdi)")
+        out.append(f"extractps ${imm}, %xmm8, (%r8)")
+
+
 GROUPS = {
     "accumulator": accumulator,
     "imm8_sext": imm8_sext,
@@ -287,6 +352,9 @@ GROUPS = {
     "movzx_sx": movzx_sx,
     "setcc_cmov": setcc_cmov,
     "nop_forms": nop_forms,
+    "avx_ssse3": avx_ssse3,
+    "sse_rex": sse_rex,
+    "evex_quality": evex_quality,
 }
 
 

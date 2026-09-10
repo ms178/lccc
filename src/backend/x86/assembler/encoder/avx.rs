@@ -1,5 +1,14 @@
 use super::*;
 
+/// Intel SDM Vol.2: `{er}` (embedded rounding, implies SAE) vs `{sae}`
+/// (SAE without rounding). GAS 2.47 rejects the wrong decorator per mnemonic.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EvexSae {
+    None,
+    Er,
+    Sae,
+}
+
 impl super::InstructionEncoder {
     // ---- VEX encoding helpers for AVX ----
 
@@ -59,6 +68,7 @@ impl super::InstructionEncoder {
         ll: u8,
         z: bool,
         aaa: u8,
+        bcst: bool,
     ) {
         let r_bit = if r { 0u8 } else { 1 };
         let x_bit = if x { 0u8 } else { 1 };
@@ -78,7 +88,8 @@ impl super::InstructionEncoder {
         self.bytes.push(byte2);
 
         // Byte 3: z L'L b V' aaa
-        let byte3 = ((z as u8) << 7) | (ll << 5) | (v_prime_bit << 3) | (aaa & 0x7);
+        let byte3 =
+            ((z as u8) << 7) | (ll << 5) | ((bcst as u8) << 4) | (v_prime_bit << 3) | (aaa & 0x7);
         self.bytes.push(byte3);
     }
 
@@ -107,6 +118,166 @@ impl super::InstructionEncoder {
         self.encode_evex_mem(reg_field, mem, scale_n)
     }
 
+    /// 5-bit EVEX register id: vector 0–31, GPR 0–31 (`gp_id`), k 0–7.
+    fn evex_id(name: &str) -> Result<u8, String> {
+        if let Some(v) = vec_reg_id(name) {
+            return Ok(v);
+        }
+        if let Some(g) = gp_id(name) {
+            return Ok(g);
+        }
+        let n = reg_num(name).ok_or_else(|| format!("bad EVEX register: {}", name))?;
+        Ok(n | if needs_rex_ext(name) { 8 } else { 0 })
+    }
+
+    fn evex_vvvv_bits(name: Option<&str>) -> Result<(u8, bool), String> {
+        match name {
+            Some(v) => {
+                let id = Self::evex_id(v)?;
+                Ok((id & 0xF, (id & 16) != 0))
+            }
+            None => Ok((0, false)),
+        }
+    }
+
+    /// EVEX prefix for a register r/m operand (ModRM.mod = 11).
+    /// `vvvv` is the NDS/NDD register, or `None` for unused (encoded 1111).
+    pub(crate) fn emit_evex_mod3(
+        &mut self,
+        dst: &str,
+        src: &str,
+        vvvv: Option<&str>,
+        map: u8,
+        w: u8,
+        pp: u8,
+        ll: u8,
+        z: bool,
+        aaa: u8,
+        bcst: bool,
+    ) -> Result<(u8, u8), String> {
+        let d = Self::evex_id(dst)?;
+        let s = Self::evex_id(src)?;
+        let (vvvv_enc, v_prime) = Self::evex_vvvv_bits(vvvv)?;
+        // APX map-4 lives in apx.rs (NDD/NF/EGPR). AVX-512 uses X = r/m bit4.
+        self.emit_evex(
+            (d & 8) != 0,
+            (s & 16) != 0,
+            (s & 8) != 0,
+            (d & 16) != 0,
+            map,
+            w,
+            vvvv_enc,
+            v_prime,
+            pp,
+            ll,
+            z,
+            aaa,
+            bcst,
+        );
+        Ok((d & 7, s & 7))
+    }
+
+    /// EVEX prefix for a memory r/m operand. Returns the 3-bit ModRM.reg field.
+    pub(crate) fn emit_evex_memop(
+        &mut self,
+        reg: &str,
+        mem: &MemoryOperand,
+        vvvv: Option<&str>,
+        map: u8,
+        w: u8,
+        pp: u8,
+        ll: u8,
+        z: bool,
+        aaa: u8,
+        bcst: bool,
+    ) -> Result<u8, String> {
+        let d = Self::evex_id(reg)?;
+        let (x3, b3, b4, x4) = Self::evex_addr_bits(mem);
+        let (vvvv_enc, v_prime) = Self::evex_vvvv_bits(vvvv)?;
+        self.emit_evex(
+            (d & 8) != 0,
+            x3,
+            b3,
+            (d & 16) != 0,
+            map,
+            w,
+            vvvv_enc,
+            v_prime,
+            pp,
+            ll,
+            z,
+            aaa,
+            bcst,
+        );
+        self.apply_evex_apx_addr(b4, x4);
+        Ok(d & 7)
+    }
+
+    /// APX EGPR addressing on AVX-512 EVEX (GAS 2.47):
+    /// P0 bit3 = B4 of the GP base (not inverted); P1 bit2 = !X4 of the index.
+    /// Classic EVEX required those bits 0 and 1 respectively (X4=B4=0).
+    fn evex_addr_bits(mem: &MemoryOperand) -> (bool, bool, bool, bool) {
+        let b_id = mem.base.as_ref().and_then(|b| gp_id(&b.name));
+        let x_id = mem.index.as_ref().and_then(|i| gp_id(&i.name));
+        let b3 = match b_id {
+            Some(id) => (id & 8) != 0,
+            None => mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name)),
+        };
+        let x3 = match x_id {
+            Some(id) => (id & 8) != 0,
+            None => mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name)),
+        };
+        (
+            x3,
+            b3,
+            b_id.is_some_and(|id| id >= 16),
+            x_id.is_some_and(|id| id >= 16),
+        )
+    }
+
+    fn apply_evex_apx_addr(&mut self, b4: bool, x4: bool) {
+        let n = self.bytes.len();
+        if n < 4 || self.bytes[n - 4] != 0x62 {
+            return;
+        }
+        if b4 {
+            self.bytes[n - 3] |= 1 << 3;
+        }
+        if x4 {
+            self.bytes[n - 2] &= !0x04;
+        }
+    }
+
+    fn evex_sae_class(map: u8, opcode: u8) -> EvexSae {
+        match (map, opcode) {
+            (1, 0x58 | 0x59 | 0x5C | 0x5E | 0x51 | 0x5B) => EvexSae::Er, // add/mul/sub/div/sqrt/cvt
+            (1, 0x5D | 0x5F | 0xC2) => EvexSae::Sae,                     // min/max/vcmp
+            (2, 0x96..=0x9F) | (2, 0xA6..=0xAF) | (2, 0xB6..=0xBF) => EvexSae::Er, // FMA + fmaddsub
+            _ => EvexSae::None,
+        }
+    }
+
+    fn apply_evex_sae(
+        sae: Option<Option<u8>>,
+        class: EvexSae,
+        vl_ll: u8,
+    ) -> Result<(bool, u8), String> {
+        match sae {
+            None => Ok((false, vl_ll)),
+            Some(tok) => match class {
+                EvexSae::None => Err("unsupported static rounding/sae".to_string()),
+                EvexSae::Er => match tok {
+                    Some(rc) => Ok((true, rc)),
+                    None => Err("unsupported static rounding/sae".to_string()),
+                },
+                EvexSae::Sae => match tok {
+                    None => Ok((true, 0)),
+                    Some(_) => Err("unsupported static rounding/sae".to_string()),
+                },
+            },
+        }
+    }
+
     /// EVEX vector length from operands: 00=128(xmm), 01=256(ymm), 10=512(zmm).
     fn evex_ll(ops: &[Operand]) -> u8 {
         for op in ops {
@@ -123,6 +294,48 @@ impl super::InstructionEncoder {
         0b00
     }
 
+    /// Strip a leading `{sae}` / `{r*-sae}` AT&T decorator operand.
+    /// `None` = no decorator; `Some(None)` = bare `{sae}`; `Some(Some(rc))` = `{r*-sae}`.
+    fn peel_evex_sae(ops: &[Operand]) -> (&[Operand], Option<Option<u8>>) {
+        match ops.first() {
+            Some(Operand::Label(s)) => {
+                if let Some(tok) = evex_sae_rounding(s) {
+                    return (&ops[1..], Some(tok));
+                }
+            }
+            Some(Operand::Register(r))
+                if (r.sae || r.rounding.is_some())
+                    && !is_xmm(&r.name)
+                    && !is_ymm(&r.name)
+                    && !is_zmm(&r.name)
+                    && !is_kreg(&r.name) =>
+            {
+                return (&ops[1..], Some(r.rounding));
+            }
+            _ => {}
+        }
+        (ops, None)
+    }
+
+    fn evex_vl_bytes(ll: u8) -> u32 {
+        [16u32, 32, 64][ll.min(2) as usize]
+    }
+
+    fn evex_mem_scale(mem: &MemoryOperand, vl_ll: u8, tuple_div: u8) -> (bool, u32) {
+        if let Some(count) = mem.broadcast {
+            let vl = Self::evex_vl_bytes(vl_ll);
+            let n = if count == 0 {
+                vl
+            } else {
+                vl / u32::from(count)
+            };
+            (true, n.max(1))
+        } else {
+            let n = Self::evex_vl_bytes(vl_ll) / u32::from(tuple_div.max(1));
+            (false, n.max(1))
+        }
+    }
+
     /// EVEX 2-source binary op, AT&T (src, vvvv, dst) with optional mask on dst.
     /// Encodings verified byte-for-byte against GNU as 2.42 (see LCCC_ENGINEERING
     /// PLAN_PART3 WP-A; reference bytes captured from `as` on 2026-08-12).
@@ -136,34 +349,49 @@ impl super::InstructionEncoder {
         w: u8,
         opcode: u8,
     ) -> Result<(), String> {
+        let (ops, sae) = Self::peel_evex_sae(ops);
         if ops.len() != 3 {
             return Err("EVEX binary op requires 3 operands".to_string());
         }
-        let ll = Self::evex_ll(ops);
+        let vl_ll = Self::evex_ll(ops);
+        let (sae_bcst, ll) = Self::apply_evex_sae(sae, Self::evex_sae_class(map, opcode), vl_ll)?;
+        let mut bcst = sae_bcst;
         let (aaa, z) = Self::evex_mask_info(&ops[2]);
         match (&ops[0], &ops[1], &ops[2]) {
             (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
-                let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                let vvvv_num = reg_num(&vvvv.name).ok_or("bad vvvv register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_evex(r, false, b, false, map, w, vvvv_enc, false, pp, ll, z, aaa);
+                let (dst_num, src_num) = self.emit_evex_mod3(
+                    &dst.name,
+                    &src.name,
+                    Some(&vvvv.name),
+                    map,
+                    w,
+                    pp,
+                    ll,
+                    z,
+                    aaa,
+                    bcst,
+                )?;
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(vvvv), Operand::Register(dst)) => {
-                let vvvv_num = reg_num(&vvvv.name).ok_or("bad vvvv register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_evex(r, x, b_ext, false, map, w, vvvv_enc, false, pp, ll, z, aaa);
+                let (mem_bcst, scale_n) = Self::evex_mem_scale(mem, vl_ll, 1);
+                bcst |= mem_bcst;
+                let dst_num = self.emit_evex_memop(
+                    &dst.name,
+                    mem,
+                    Some(&vvvv.name),
+                    map,
+                    w,
+                    pp,
+                    ll,
+                    z,
+                    aaa,
+                    bcst,
+                )?;
                 self.bytes.push(opcode);
-                self.encode_evex_rm(dst_num, mem, ll)
+                self.encode_evex_mem(dst_num, mem, scale_n)
             }
             _ => Err("unsupported EVEX binary operands".to_string()),
         }
@@ -179,36 +407,43 @@ impl super::InstructionEncoder {
         w: u8,
         opcode: u8,
     ) -> Result<(), String> {
+        let (ops, sae) = Self::peel_evex_sae(ops);
         if ops.len() != 2 {
             return Err("EVEX unary op requires 2 operands".to_string());
         }
         // Vector length comes from the DESTINATION: pmovzx*/pmovsx* widen
         // (ymm src -> zmm dst) and the EVEX.LL field must be 10.
-        let ll = match ops.last() {
+        let vl_ll = match ops.last() {
             Some(Operand::Register(r)) if r.name.to_lowercase().starts_with("zmm") => 0b10,
             Some(Operand::Register(r)) if r.name.to_lowercase().starts_with("ymm") => 0b01,
             _ => 0b00,
         };
+        let (sae_bcst, ll) = Self::apply_evex_sae(sae, Self::evex_sae_class(map, opcode), vl_ll)?;
+        let mut bcst = sae_bcst;
+        // Compressed disp8 N is a fraction of VL for the pmovzx/sx wideners:
+        // Half (bw/wd/dq), Quarter (bd/wq), Eighth (bq). Everything else is Full.
+        let tuple_div = match opcode {
+            0x30 | 0x33 | 0x35 | 0x20 | 0x23 | 0x25 => 2,
+            0x31 | 0x34 | 0x21 | 0x24 => 4,
+            0x32 | 0x22 => 8,
+            _ => 1,
+        };
         let (aaa, z) = Self::evex_mask_info(&ops[1]);
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
-                let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                self.emit_evex(r, false, b, false, map, w, 0, false, pp, ll, z, aaa);
+                let (dst_num, src_num) =
+                    self.emit_evex_mod3(&dst.name, &src.name, None, map, w, pp, ll, z, aaa, bcst)?;
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_evex(r, x, b_ext, false, map, w, 0, false, pp, ll, z, aaa);
+                let (mem_bcst, scale_n) = Self::evex_mem_scale(mem, vl_ll, tuple_div);
+                bcst |= mem_bcst;
+                let dst_num =
+                    self.emit_evex_memop(&dst.name, mem, None, map, w, pp, ll, z, aaa, bcst)?;
                 self.bytes.push(opcode);
-                self.encode_evex_rm(dst_num, mem, ll)
+                self.encode_evex_mem(dst_num, mem, scale_n)
             }
             _ => Err("unsupported EVEX unary operands".to_string()),
         }
@@ -235,13 +470,10 @@ impl super::InstructionEncoder {
                 Operand::Register(src),
                 Operand::Register(dst),
             ) => {
-                let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                self.emit_evex(r, false, b, false, map, w, 0, false, pp, ll, z, aaa);
+                let (dst_num, src_num) =
+                    self.emit_evex_mod3(&dst.name, &src.name, None, map, w, pp, ll, z, aaa, false)?;
                 self.bytes.push(opcode);
-                self.bytes.push(self.modrm(3, 0, src_num));
+                self.bytes.push(self.modrm(3, dst_num, src_num));
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
@@ -250,13 +482,11 @@ impl super::InstructionEncoder {
                 Operand::Memory(mem),
                 Operand::Register(dst),
             ) => {
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_evex(r, x, b_ext, false, map, w, 0, false, pp, ll, z, aaa);
+                let (mem_bcst, scale_n) = Self::evex_mem_scale(mem, ll, 1);
+                let dst_num =
+                    self.emit_evex_memop(&dst.name, mem, None, map, w, pp, ll, z, aaa, mem_bcst)?;
                 self.bytes.push(opcode);
-                self.encode_evex_rm(0, mem, ll)?;
+                self.encode_evex_mem(dst_num, mem, scale_n)?;
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
@@ -264,8 +494,9 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// EVEX 2-operand + imm8 with vvvv = dest (NDD), AT&T ($imm, src, dst).
-    /// vpermq/vpermpd: 66.0F3A.W1 00 /r ib.
+    /// EVEX 2-operand + imm8 (vpermq/vpermpd). Dest is ModRM.reg, vvvv unused.
+    /// The previous "NDD / vvvv=dest, ModRM.reg=0" spelling encoded every
+    /// non-zmm0 destination as the wrong register (verified vs GAS 2.47).
     pub(crate) fn encode_evex_imm2_ndd(
         &mut self,
         ops: &[Operand],
@@ -274,30 +505,7 @@ impl super::InstructionEncoder {
         w: u8,
         opcode: u8,
     ) -> Result<(), String> {
-        if ops.len() != 3 {
-            return Err("EVEX imm2-ndd op requires 3 operands (imm, src, dst)".to_string());
-        }
-        let ll = Self::evex_ll(ops);
-        let (aaa, z) = Self::evex_mask_info(&ops[2]);
-        match (&ops[0], &ops[1], &ops[2]) {
-            (
-                Operand::Immediate(ImmediateValue::Integer(imm)),
-                Operand::Register(src),
-                Operand::Register(dst),
-            ) => {
-                let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                let vvvv_enc = dst_num | (if needs_vex_ext(&dst.name) { 8 } else { 0 });
-                self.emit_evex(r, false, b, false, map, w, vvvv_enc, false, pp, ll, z, aaa);
-                self.bytes.push(opcode);
-                self.bytes.push(self.modrm(3, 0, src_num));
-                self.bytes.push(*imm as u8);
-                Ok(())
-            }
-            _ => Err("unsupported EVEX imm2-ndd operands".to_string()),
-        }
+        self.encode_evex_imm2(ops, map, pp, w, opcode)
     }
 
     /// EVEX shift-by-immediate, AT&T ($imm, src, dst); vvvv = dest (NDD).
@@ -320,13 +528,25 @@ impl super::InstructionEncoder {
                 Operand::Register(src),
                 Operand::Register(dst),
             ) => {
-                let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let b = needs_vex_ext(&src.name);
-                let vvvv_enc = dst_num | (if needs_vex_ext(&dst.name) { 8 } else { 0 });
-                self.emit_evex(false, false, b, false, 1, w, vvvv_enc, false, 1, ll, z, aaa);
+                let src_id = Self::evex_id(&src.name)?;
+                let dst_id = Self::evex_id(&dst.name)?;
+                self.emit_evex(
+                    false,
+                    (src_id & 16) != 0,
+                    (src_id & 8) != 0,
+                    false,
+                    1,
+                    w,
+                    dst_id & 0xF,
+                    (dst_id & 16) != 0,
+                    1,
+                    ll,
+                    z,
+                    aaa,
+                    false,
+                );
                 self.bytes.push(opcode);
-                self.bytes.push(self.modrm(3, ext, src_num));
+                self.bytes.push(self.modrm(3, ext, src_id & 7));
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
@@ -335,13 +555,27 @@ impl super::InstructionEncoder {
                 Operand::Memory(mem),
                 Operand::Register(dst),
             ) => {
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let vvvv_enc = dst_num | (if needs_vex_ext(&dst.name) { 8 } else { 0 });
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_evex(false, x, b_ext, false, 1, w, vvvv_enc, false, 1, ll, z, aaa);
+                let dst_id = Self::evex_id(&dst.name)?;
+                let (x3, b3, b4, x4) = Self::evex_addr_bits(mem);
+                let (mem_bcst, scale_n) = Self::evex_mem_scale(mem, ll, 1);
+                self.emit_evex(
+                    false,
+                    x3,
+                    b3,
+                    false,
+                    1,
+                    w,
+                    dst_id & 0xF,
+                    (dst_id & 16) != 0,
+                    1,
+                    ll,
+                    z,
+                    aaa,
+                    mem_bcst,
+                );
+                self.apply_evex_apx_addr(b4, x4);
                 self.bytes.push(opcode);
-                self.encode_evex_rm(ext, mem, ll)?;
+                self.encode_evex_mem(ext, mem, scale_n)?;
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
@@ -352,7 +586,7 @@ impl super::InstructionEncoder {
     /// EVEX 3-source + imm8, AT&T ($imm, src2, src1, dst) with optional mask on dst.
     /// vpternlogd/q (0F3A 25), vpalignr (0F3A 0F), vpclmulqdq (0F3A 44),
     /// vinserti32x4/i64x2 (0F3A 38), vpshld*/vpshrd* (0F3A 70-73).
-    /// GAS convention: ModRM.reg = 0, imm8 trailing, vvvv = src1.
+    /// GAS convention: ModRM.reg = dest, r/m = src2, vvvv = src1.
     pub(crate) fn encode_evex_3src_imm(
         &mut self,
         ops: &[Operand],
@@ -373,15 +607,20 @@ impl super::InstructionEncoder {
                 Operand::Register(src1),
                 Operand::Register(dst),
             ) => {
-                let src2_num = reg_num(&src2.name).ok_or("bad src2 register")?;
-                let src1_num = reg_num(&src1.name).ok_or("bad src1 register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src2.name);
-                let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
-                self.emit_evex(r, false, b, false, map, w, vvvv_enc, false, pp, ll, z, aaa);
+                let (dst_num, src2_num) = self.emit_evex_mod3(
+                    &dst.name,
+                    &src2.name,
+                    Some(&src1.name),
+                    map,
+                    w,
+                    pp,
+                    ll,
+                    z,
+                    aaa,
+                    false,
+                )?;
                 self.bytes.push(opcode);
-                self.bytes.push(self.modrm(3, 0, src2_num));
+                self.bytes.push(self.modrm(3, dst_num, src2_num));
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
@@ -391,15 +630,32 @@ impl super::InstructionEncoder {
                 Operand::Register(src1),
                 Operand::Register(dst),
             ) => {
-                let src1_num = reg_num(&src1.name).ok_or("bad src1 register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
-                self.emit_evex(r, x, b_ext, false, map, w, vvvv_enc, false, pp, ll, z, aaa);
+                // vinserti32x4/i64x2 (38) N=16; vinserti32x8/i64x4 (3A) N=32;
+                // everything else is Full VL (or {1toN} broadcast).
+                let tuple_n = match opcode {
+                    0x38 => 16u32,
+                    0x3A => 32,
+                    _ => Self::evex_vl_bytes(ll),
+                };
+                let (mem_bcst, scale_n) = if mem.broadcast.is_some() {
+                    Self::evex_mem_scale(mem, ll, 1)
+                } else {
+                    (false, tuple_n)
+                };
+                let dst_num = self.emit_evex_memop(
+                    &dst.name,
+                    mem,
+                    Some(&src1.name),
+                    map,
+                    w,
+                    pp,
+                    ll,
+                    z,
+                    aaa,
+                    mem_bcst,
+                )?;
                 self.bytes.push(opcode);
-                self.encode_evex_rm(0, mem, ll)?;
+                self.encode_evex_mem(dst_num, mem, scale_n)?;
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
@@ -418,27 +674,62 @@ impl super::InstructionEncoder {
         w: u8,
         opcode: u8,
     ) -> Result<(), String> {
-        if ops.len() != 4 {
+        // `{sae}` sits between the immediate and src2: `$0, {sae}, %zmm1, %zmm2, %k1`.
+        let (head, rest) = ops.split_first().ok_or("EVEX cmp-mask: missing operands")?;
+        let (rest, sae) = Self::peel_evex_sae(rest);
+        if rest.len() != 3 {
             return Err("EVEX cmp-mask op requires 4 operands (imm, src2, src1, kdst)".to_string());
         }
-        let ll = Self::evex_ll(ops);
-        match (&ops[0], &ops[1], &ops[2], &ops[3]) {
+        let vl_ll = Self::evex_ll(rest);
+        let (sae_bcst, ll) = Self::apply_evex_sae(sae, Self::evex_sae_class(map, opcode), vl_ll)?;
+        let mut bcst = sae_bcst;
+        match (head, &rest[0], &rest[1], &rest[2]) {
             (
                 Operand::Immediate(ImmediateValue::Integer(imm)),
                 Operand::Register(src2),
                 Operand::Register(src1),
                 Operand::Register(kdst),
             ) => {
-                let src2_num = reg_num(&src2.name).ok_or("bad src2 register")?;
-                let src1_num = reg_num(&src1.name).ok_or("bad src1 register")?;
                 let k_num = reg_num(&kdst.name).ok_or("bad k-dest register")?;
-                let b = needs_vex_ext(&src2.name);
-                let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
-                self.emit_evex(
-                    false, false, b, false, map, w, vvvv_enc, false, pp, ll, false, 0,
-                );
+                let (_, src2_num) = self.emit_evex_mod3(
+                    &kdst.name,
+                    &src2.name,
+                    Some(&src1.name),
+                    map,
+                    w,
+                    pp,
+                    ll,
+                    false,
+                    0,
+                    bcst,
+                )?;
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, k_num, src2_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Memory(mem),
+                Operand::Register(src1),
+                Operand::Register(kdst),
+            ) => {
+                let (mem_bcst, scale_n) = Self::evex_mem_scale(mem, vl_ll, 1);
+                bcst |= mem_bcst;
+                let k_num = self.emit_evex_memop(
+                    &kdst.name,
+                    mem,
+                    Some(&src1.name),
+                    map,
+                    w,
+                    pp,
+                    ll,
+                    false,
+                    0,
+                    bcst,
+                )?;
+                self.bytes.push(opcode);
+                self.encode_evex_mem(k_num, mem, scale_n)?;
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
@@ -462,17 +753,40 @@ impl super::InstructionEncoder {
         let ll = Self::evex_ll(ops);
         match (&ops[0], &ops[1], &ops[2]) {
             (Operand::Register(src2), Operand::Register(src1), Operand::Register(kdst)) => {
-                let src2_num = reg_num(&src2.name).ok_or("bad src2 register")?;
-                let src1_num = reg_num(&src1.name).ok_or("bad src1 register")?;
                 let k_num = reg_num(&kdst.name).ok_or("bad k-dest register")?;
-                let b = needs_vex_ext(&src2.name);
-                let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
-                self.emit_evex(
-                    false, false, b, false, map, w, vvvv_enc, false, pp, ll, false, 0,
-                );
+                let (_, src2_num) = self.emit_evex_mod3(
+                    &kdst.name,
+                    &src2.name,
+                    Some(&src1.name),
+                    map,
+                    w,
+                    pp,
+                    ll,
+                    false,
+                    0,
+                    false,
+                )?;
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, k_num, src2_num));
                 Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(src1), Operand::Register(kdst)) => {
+                let k_num = reg_num(&kdst.name).ok_or("bad k-dest register")?;
+                let (bcst, scale_n) = Self::evex_mem_scale(mem, ll, 1);
+                let _ = self.emit_evex_memop(
+                    &kdst.name,
+                    mem,
+                    Some(&src1.name),
+                    map,
+                    w,
+                    pp,
+                    ll,
+                    false,
+                    0,
+                    bcst,
+                )?;
+                self.bytes.push(opcode);
+                self.encode_evex_mem(k_num, mem, scale_n)
             }
             _ => Err("unsupported EVEX cmp-mask-nimm operands".to_string()),
         }
@@ -500,13 +814,25 @@ impl super::InstructionEncoder {
                 Operand::Register(src),
                 Operand::Register(dst),
             ) => {
-                let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                self.emit_evex(r, false, b, false, map, w, 0, false, pp, ll, z, aaa);
+                // GAS: ModRM.reg = src, r/m = dst.
+                let (src_num, dst_num) =
+                    self.emit_evex_mod3(&src.name, &dst.name, None, map, w, pp, ll, z, aaa, false)?;
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, src_num, dst_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Memory(mem),
+            ) => {
+                // Tuple: i32x4/i64x2 (39) N=16, i32x8/i64x4 (3B) N=32.
+                let tuple_n = if opcode == 0x3B { 32u32 } else { 16 };
+                let src_num =
+                    self.emit_evex_memop(&src.name, mem, None, map, w, pp, ll, z, aaa, false)?;
+                self.bytes.push(opcode);
+                self.encode_evex_mem(src_num, mem, tuple_n)?;
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
@@ -531,32 +857,23 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let (aaa, z) = Self::evex_mask_info(&ops[1]);
-                let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                self.emit_evex(r, false, b, false, 1, w, 0, false, pp, ll, z, aaa);
+                let (dst_num, src_num) =
+                    self.emit_evex_mod3(&dst.name, &src.name, None, 1, w, pp, ll, z, aaa, false)?;
                 self.bytes.push(load_op);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let (aaa, z) = Self::evex_mask_info(&ops[1]);
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_evex(r, x, b_ext, false, 1, w, 0, false, pp, ll, z, aaa);
+                let dst_num =
+                    self.emit_evex_memop(&dst.name, mem, None, 1, w, pp, ll, z, aaa, false)?;
                 self.bytes.push(load_op);
                 self.encode_evex_rm(dst_num, mem, ll)
             }
             (Operand::Register(src), Operand::Memory(mem)) => {
                 let (aaa, z) = Self::evex_mask_info(&ops[1]);
-                let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                let r = needs_vex_ext(&src.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_evex(r, x, b_ext, false, 1, w, 0, false, pp, ll, z, aaa);
+                let src_num =
+                    self.emit_evex_memop(&src.name, mem, None, 1, w, pp, ll, z, aaa, false)?;
                 self.bytes.push(store_op);
                 self.encode_evex_rm(src_num, mem, ll)
             }
@@ -579,14 +896,27 @@ impl super::InstructionEncoder {
         let (aaa, z) = Self::evex_mask_info(&ops[1]);
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
-                let src_num = reg_num(&src.name).ok_or("bad gpr register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                self.emit_evex(r, false, b, false, 2, w, 0, false, 1, ll, z, aaa);
+                let (dst_num, src_num) =
+                    self.emit_evex_mod3(&dst.name, &src.name, None, 2, w, 1, ll, z, aaa, false)?;
                 self.bytes.push(opcode);
-                self.bytes.push(self.modrm(3, 0, src_num));
+                self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num =
+                    self.emit_evex_memop(&dst.name, mem, None, 2, w, 1, ll, z, aaa, false)?;
+                self.bytes.push(opcode);
+                // Tuple1 scalar: N is the broadcast element size, not VL.
+                let n = match opcode {
+                    0x7A | 0x78 => 1u32, // byte
+                    0x7B | 0x79 => 2,    // word
+                    0x7C if w == 0 => 4, // dword (GPR form)
+                    0x7C if w == 1 => 8, // qword
+                    0x58 => 4,           // vpbroadcastd from xmm/mem
+                    0x59 => 8,           // vpbroadcastq from xmm/mem
+                    _ => [16u32, 32, 64][ll as usize],
+                };
+                self.encode_evex_mem(dst_num, mem, n)
             }
             _ => Err("unsupported EVEX gpr-broadcast operands".to_string()),
         }
@@ -607,13 +937,17 @@ impl super::InstructionEncoder {
         let (aaa, z) = Self::evex_mask_info(&ops[1]);
         match (&ops[0], &ops[1]) {
             (Operand::Memory(mem), Operand::Register(dst)) => {
-                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_evex(r, x, b_ext, false, 2, w, 0, false, 1, ll, z, aaa);
+                let dst_num =
+                    self.emit_evex_memop(&dst.name, mem, None, 2, w, 1, ll, z, aaa, false)?;
                 self.bytes.push(opcode);
-                self.encode_evex_rm(0, mem, ll)
+                // Tuple type is a 128/256-bit chunk, not the destination VL:
+                // i32x4/i64x2 → N=16, i32x8/i64x4 → N=32.
+                let n = match opcode {
+                    0x5A => 16u32,
+                    0x5B => 32,
+                    _ => [16u32, 32, 64][ll as usize],
+                };
+                self.encode_evex_mem(dst_num, mem, n)
             }
             _ => Err("unsupported EVEX mem-broadcast operands".to_string()),
         }
@@ -644,38 +978,9 @@ impl super::InstructionEncoder {
         pp: u8,
         w: u8,
     ) -> Result<(), String> {
-        if ops.len() != 3 {
-            return Err("EVEX 3-op requires 3 operands".to_string());
-        }
-        let ll = self.evex_ll_from_ops(ops);
-
-        match (&ops[0], &ops[1], &ops[2]) {
-            (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
-                let src_num = reg_num(&src.name).ok_or("bad register")?;
-                let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
-                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                // mm=1 (0F map)
-                self.emit_evex(r, false, b, false, 1, w, vvvv_enc, false, pp, ll, false, 0);
-                self.bytes.push(opcode);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
-                Ok(())
-            }
-            (Operand::Memory(mem), Operand::Register(vvvv), Operand::Register(dst)) => {
-                let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_evex(r, x, b_ext, false, 1, w, vvvv_enc, false, pp, ll, false, 0);
-                self.bytes.push(opcode);
-                self.encode_modrm_mem(dst_num, mem)
-            }
-            _ => Err("unsupported EVEX 3-op operands".to_string()),
-        }
+        // Same layout as encode_evex_binary (map=1). Keep this wrapper so
+        // vpxord/vpandd and friends stay on the high-reg / dest!=0 path.
+        self.encode_evex_binary(ops, 1, pp, w, opcode)
     }
 
     /// Encode EVEX rotate-by-immediate instructions (vprold, vprolq, vprord, vprorq).
@@ -702,17 +1007,55 @@ impl super::InstructionEncoder {
                 Operand::Register(src),
                 Operand::Register(dst),
             ) => {
-                let src_num = reg_num(&src.name).ok_or("bad register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let b = needs_vex_ext(&src.name);
-                let dst_ext = needs_vex_ext(&dst.name);
-                let vvvv_enc = dst_num | (if dst_ext { 8 } else { 0 });
-                // pp=1 (66), mm=1 (0F map), no R extension needed for reg field (it's a fixed /ext)
+                let src_id = Self::evex_id(&src.name)?;
+                let dst_id = Self::evex_id(&dst.name)?;
+                // pp=1 (66), mm=1 (0F map); ModRM.reg is the /ext, dest is vvvv.
                 self.emit_evex(
-                    false, false, b, false, 1, w, vvvv_enc, false, 1, ll, false, 0,
+                    false,
+                    (src_id & 16) != 0,
+                    (src_id & 8) != 0,
+                    false,
+                    1,
+                    w,
+                    dst_id & 0xF,
+                    (dst_id & 16) != 0,
+                    1,
+                    ll,
+                    false,
+                    0,
+                    false,
                 );
                 self.bytes.push(opcode);
-                self.bytes.push(self.modrm(3, ext, src_num));
+                self.bytes.push(self.modrm(3, ext, src_id & 7));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Memory(mem),
+                Operand::Register(dst),
+            ) => {
+                let dst_id = Self::evex_id(&dst.name)?;
+                let (x3, b3, b4, x4) = Self::evex_addr_bits(mem);
+                let (bcst, scale_n) = Self::evex_mem_scale(mem, ll, 1);
+                self.emit_evex(
+                    false,
+                    x3,
+                    b3,
+                    false,
+                    1,
+                    w,
+                    dst_id & 0xF,
+                    (dst_id & 16) != 0,
+                    1,
+                    ll,
+                    false,
+                    0,
+                    bcst,
+                );
+                self.apply_evex_apx_addr(b4, x4);
+                self.bytes.push(opcode);
+                self.encode_evex_mem(ext, mem, scale_n)?;
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
@@ -1932,10 +2275,6 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst))
                 if !is_xmm_or_ymm(&src.name) && is_xmm_or_ymm(&dst.name) =>
             {
-                let src_num = reg_num(&src.name).ok_or("bad register")?;
-                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
                 let ll = if dst.name.to_lowercase().starts_with("zmm") {
                     0b10
                 } else if dst.name.to_lowercase().starts_with("ymm") {
@@ -1943,9 +2282,8 @@ impl super::InstructionEncoder {
                 } else {
                     0
                 };
-                // EVEX: R X B R'=1 00 mm=2 | W vvvv=1111 1 pp=01 | z L'L b V'=1 aaa
-                // (no extended registers, no vvvv operand: reserved fields are 1s)
-                self.emit_evex(r, false, b, false, 2, w, 0, false, 1, ll, false, 0);
+                let (dst_num, src_num) =
+                    self.emit_evex_mod3(&dst.name, &src.name, None, 2, w, 1, ll, false, 0, false)?;
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
@@ -2717,6 +3055,50 @@ impl super::InstructionEncoder {
             Operand::Register(r) => r,
             _ => return Err("BMI2: vvvv operand must be register".to_string()),
         };
+        // NF is legal for bextr (F7/pp=0) and bzhi (F5/pp=0) only.
+        let nf_ok = matches!((opcode, pp), (0xF7, 0) | (0xF5, 0));
+        if self.apx_nf && !nf_ok {
+            return Err("{nf} unsupported for this BMI instruction".to_string());
+        }
+        let use_evex = self.apx_nf || self.apx_evex || operands_have_egpr(ops);
+
+        if use_evex {
+            return match (rm_op, &ops[2]) {
+                (Operand::Register(src), Operand::Register(dst)) => {
+                    let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                    let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                    self.emit_apx_evex_vvvv_rr(
+                        w != 0,
+                        &dst.name,
+                        &src.name,
+                        &vvvv_reg.name,
+                        self.apx_nf,
+                        pp,
+                        2,
+                    )?;
+                    self.bytes.push(opcode);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    Ok(())
+                }
+                (Operand::Memory(mem), Operand::Register(dst)) => {
+                    let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_apx_evex_vvvv_rm(
+                        w != 0,
+                        &dst.name,
+                        mem,
+                        &vvvv_reg.name,
+                        self.apx_nf,
+                        pp,
+                        2,
+                    )?;
+                    self.bytes.push(opcode);
+                    self.encode_modrm_mem(dst_num, mem)
+                }
+                _ => Err("BMI2: unsupported operand combination".to_string()),
+            };
+        }
+
         let vvvv_num = reg_num(&vvvv_reg.name).ok_or("bad vvvv register")?;
         let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv_reg.name) { 8 } else { 0 });
 
@@ -2948,6 +3330,33 @@ impl super::InstructionEncoder {
             Operand::Register(r) => r,
             _ => return Err("BMI1 bls*: destination must be a register".to_string()),
         };
+        let use_evex = self.apx_nf || self.apx_evex || operands_have_egpr(ops);
+        if use_evex {
+            return match &ops[0] {
+                Operand::Register(src) => {
+                    let src_num = reg_num(&src.name).ok_or("bad source register")?;
+                    self.emit_apx_evex_vvvv_rr(
+                        w != 0,
+                        "",
+                        &src.name,
+                        &dst.name,
+                        self.apx_nf,
+                        0,
+                        2,
+                    )?;
+                    self.bytes.push(0xF3);
+                    self.bytes.push(self.modrm(3, ext, src_num));
+                    Ok(())
+                }
+                Operand::Memory(mem) => {
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_apx_evex_vvvv_rm(w != 0, "", mem, &dst.name, self.apx_nf, 0, 2)?;
+                    self.bytes.push(0xF3);
+                    self.encode_modrm_mem(ext, mem)
+                }
+                _ => Err("BMI1 bls*: unsupported source operand".to_string()),
+            };
+        }
         let vvvv = reg_num(&dst.name).ok_or("bad destination register")?
             | (if needs_vex_ext(&dst.name) { 8 } else { 0 });
 
@@ -2984,6 +3393,43 @@ impl super::InstructionEncoder {
             Operand::Register(r) => r,
             _ => return Err("andn: second operand must be register".to_string()),
         };
+        let use_evex = self.apx_nf || self.apx_evex || operands_have_egpr(ops);
+        if use_evex {
+            return match (&ops[0], &ops[2]) {
+                (Operand::Register(src), Operand::Register(dst)) => {
+                    let src_num = reg_num(&src.name).ok_or("bad register")?;
+                    let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                    self.emit_apx_evex_vvvv_rr(
+                        w != 0,
+                        &dst.name,
+                        &src.name,
+                        &vvvv_reg.name,
+                        self.apx_nf,
+                        0,
+                        2,
+                    )?;
+                    self.bytes.push(0xF2);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    Ok(())
+                }
+                (Operand::Memory(mem), Operand::Register(dst)) => {
+                    let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_apx_evex_vvvv_rm(
+                        w != 0,
+                        &dst.name,
+                        mem,
+                        &vvvv_reg.name,
+                        self.apx_nf,
+                        0,
+                        2,
+                    )?;
+                    self.bytes.push(0xF2);
+                    self.encode_modrm_mem(dst_num, mem)
+                }
+                _ => Err("unsupported andn operands".to_string()),
+            };
+        }
         let vvvv_num = reg_num(&vvvv_reg.name).ok_or("bad vvvv register")?;
         let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv_reg.name) { 8 } else { 0 });
 
@@ -3025,6 +3471,35 @@ impl super::InstructionEncoder {
             Operand::Immediate(ImmediateValue::Integer(val)) => *val as u8,
             _ => return Err("rorx: first operand must be immediate".to_string()),
         };
+        if self.apx_nf {
+            return Err("{nf} unsupported for `rorx'".to_string());
+        }
+        let use_evex = self.apx_evex || operands_have_egpr(ops);
+        if use_evex {
+            return match (&ops[1], &ops[2]) {
+                (Operand::Register(src), Operand::Register(dst)) => {
+                    let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                    let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                    self.emit_apx_evex_vvvv_rr(w != 0, &dst.name, &src.name, "rax", false, 3, 3)?;
+                    self.bytes.push(0xF0);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    self.bytes.push(imm);
+                    Ok(())
+                }
+                (Operand::Memory(mem), Operand::Register(dst)) => {
+                    let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                    self.emit_segment_prefix(mem)?;
+                    self.emit_apx_evex_vvvv_rm(w != 0, &dst.name, mem, "rax", false, 3, 3)?;
+                    self.bytes.push(0xF0);
+                    let rc = self.relocations.len();
+                    self.encode_modrm_mem(dst_num, mem)?;
+                    self.bytes.push(imm);
+                    self.adjust_rip_reloc_addend(rc, 1);
+                    Ok(())
+                }
+                _ => Err("rorx: unsupported operand combination".to_string()),
+            };
+        }
 
         match (&ops[1], &ops[2]) {
             (Operand::Register(src), Operand::Register(dst)) => {

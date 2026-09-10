@@ -68,7 +68,7 @@ TIMEOUT = int(os.environ.get("GODBOLT_TIMEOUT", "120"))
 # differential needs. Pinned ids keep results reproducible; `--compiler` can
 # override for a one-off check against a newer build.
 REMOTE_ORACLES = {
-    "clang": "cclang2210",
+    "clang": "cclang2310",
     "gcc": "cg162",
     "icx": "cicxlatest",
     "icc": "cicc2021100",
@@ -436,6 +436,8 @@ _COMMUTATIVE_VEX = {
     "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
     "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
     "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
+    # Integer 0F-map ops LCCC may source-swap to reach VEX2 (not FP add/mul).
+    "vpmuludq", "vpsadbw", "vpmaddwd",
 }
 _VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
 _GP32_TO_64 = {
@@ -638,6 +640,8 @@ def main() -> int:
                     help="instructions per remote request (0 disables batching)")
     ap.add_argument("--max-report", type=int, default=200)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--json", type=Path,
+                    help="write a per-instruction scoreboard (bytes vs every oracle)")
     args = ap.parse_args()
 
     insns: list[str] = list(args.insn)
@@ -723,6 +727,70 @@ def main() -> int:
     print(f"\n=== encdiff: {len(rows)} instruction(s): {summary} ===")
     reachable = sorted({n for r in rows for n, e in r.oracles.items() if e.ok})
     print(f"oracles reached: {', '.join(reachable) if reachable else 'none'}")
+
+    # Head-to-head: how often is LCCC strictly shorter / tied / longer than
+    # each named oracle, counting only instructions that oracle assembled.
+    print("\n=== LCCC vs each oracle (payload bytes; lower is better) ===")
+    print(f"{'oracle':<8} {'beat':>6} {'tie':>6} {'lose':>6} {'n':>6}  "
+          f"{'lccc B':>8} {'them B':>8}  delta")
+    vs_rows = []
+    for name in reachable:
+        beat = tie = lose = 0
+        lccc_b = them_b = 0
+        n = 0
+        for r in rows:
+            e = r.oracles.get(name)
+            if not (e and e.ok and e.data is not None
+                    and r.lccc.ok and r.lccc.data is not None):
+                continue
+            n += 1
+            a, b = len(r.lccc.data), len(e.data)
+            lccc_b += a
+            them_b += b
+            if a < b:
+                beat += 1
+            elif a == b:
+                tie += 1
+            else:
+                lose += 1
+        delta = lccc_b - them_b
+        vs_rows.append((name, beat, tie, lose, n, lccc_b, them_b, delta))
+        print(f"{name:<8} {beat:>6} {tie:>6} {lose:>6} {n:>6}  "
+              f"{lccc_b:>8} {them_b:>8}  {delta:+d}")
+
+    if args.json:
+        payload = {
+            "schema": 2,
+            "n": len(rows),
+            "verdicts": counts,
+            "oracles_reached": reachable,
+            "vs": [
+                {"oracle": n, "beat": b, "tie": t, "lose": l, "n": nn,
+                 "lccc_bytes": lb, "oracle_bytes": ob, "delta": d}
+                for (n, b, t, l, nn, lb, ob, d) in vs_rows
+            ],
+            "rows": [
+                {
+                    "insn": r.insn,
+                    "verdict": r.verdict,
+                    "note": r.note,
+                    "lccc": None if not r.lccc.ok else r.lccc.data.hex(),
+                    "lccc_n": None if not r.lccc.ok else len(r.lccc.data),
+                    "oracles": {
+                        k: None if not e.ok else e.data.hex()
+                        for k, e in r.oracles.items()
+                    },
+                    "oracle_n": {
+                        k: None if not (e.ok and e.data is not None) else len(e.data)
+                        for k, e in r.oracles.items()
+                    },
+                }
+                for r in rows
+            ],
+        }
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"wrote {args.json}")
 
     bad = sum(counts.get(k, 0) for k in ("WRONG-BYTES", "REJECTS-VALID", "LONGER"))
     return 1 if bad else 0

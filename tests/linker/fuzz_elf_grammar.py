@@ -290,9 +290,13 @@ def m_merge_unterminated(o, ix, rng):
 
 
 def m_absurd_alignment(o, ix, rng):
+    # Keep this "absurd" relative to a .text section, but never 2^40:
+    # a 1 TiB sh_addralign makes the linker pad toward a terabyte mapping
+    # and freezes the fuzz harness (OOM / multi-minute stall). 1 MiB is
+    # still illegal for .text and still exercises the reject path.
     nm, st, fl, data, link, info, al, es = o.sections[ix["text"]]
-    o.sections[ix["text"]] = (nm, st, fl, data, link, info, 1 << 40, es)
-    return "section alignment 2^40"
+    o.sections[ix["text"]] = (nm, st, fl, data, link, info, 1 << 20, es)
+    return "section alignment 2^20"
 
 
 def m_non_power_of_two_align(o, ix, rng):

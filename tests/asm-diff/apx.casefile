@@ -1,0 +1,234 @@
+;;; apx_rex2
+.text
+addq %rax, %r16
+addq %r16, %rax
+addq %r16, %r17
+addq %r24, %rax
+addq (%r16), %rax
+addq %rax, (%r16)
+leaq (%rax), %r16
+leaq (%r16,%r17,4), %r18
+pushq %r16
+popq %r16
+incq %r16
+addq $1, %r16
+imulq %r16, %rax
+cmovzq %rax, %r16
+setzb %r16b
+bswapq %r16
+xchgq %r16, %rax
+lock addq %rax, (%r16)
+{rex2} addq %rax, %rbx
+jmp *%r16
+call *%r16
+
+;;; apx_evex_ndd
+.text
+addq %rcx, %rdx, %r16
+addq %rcx, %rdx, %r17
+addq %rcx, %rdx, %r8
+addq %rcx, %rdx, %r24
+addq %rcx, %rdx, %r16
+orq %rcx, %rdx, %r16
+adcq %rcx, %rdx, %r16
+sbbq %rcx, %rdx, %r16
+andq %rcx, %rdx, %r16
+subq %rcx, %rdx, %r16
+xorq %rcx, %rdx, %r16
+addl %ecx, %edx, %r16d
+addq %rcx, (%rax), %r16
+addq (%rax), %rcx, %r16
+addq $1, %rax, %r16
+{nf} addq %rcx, %rdx, %r16
+{evex} addq %rax, %rbx
+{nf} addq %rax, %rbx
+{nf}{evex} addq %rax, %rbx
+{evex} addq %r16, %rax
+{evex} addq %rax, %r16
+{evex} addq %r24, %rax
+{evex} addq %rax, %r24
+{evex} addl %eax, %ebx
+{evex} addw %ax, %bx
+{nf} addq $1, %rax
+{nf} xorq %rax, %rax
+incq %rax, %r16
+{nf} incq %rax
+notq %rax, %r16
+shlq $1, %rax, %r16
+shlq %cl, %rax, %r16
+cmovzq %rax, %rbx, %r16
+imulq %rcx, %rdx, %r16
+
+;;; apx_mov_imm betterok
+.text
+movq $0xffffffff, %r16
+movl $0xffffffff, %r16d
+movq $0x80000000, %r16
+
+;;; apx_map4_0f38
+.text
+crc32q %rax, %r16
+crc32q %r16, %rax
+crc32l %eax, %r16d
+crc32b %al, %r16d
+crc32w %ax, %r16d
+crc32q (%r16), %rax
+{evex} crc32q %rax, %rbx
+adcxq %r16, %rax
+adcxq %rax, %r16
+adoxq %r16, %rax
+adoxq %rax, %r16
+adcxl %eax, %r16d
+movbeq (%r16), %rax
+movbeq %rax, (%r16)
+movbel (%r16), %eax
+movbew (%r16), %ax
+{evex} adcxq %rax, %rbx
+{evex} movbeq (%rax), %rbx
+
+;;; apx_bmi2
+.text
+andnq %rcx, %rdx, %rax
+shlxq %rcx, %rdx, %rax
+shlxq %rcx, %rdx, %r16
+{evex} shlxq %rcx, %rdx, %rax
+{nf} andnq %rcx, %rdx, %rax
+{nf} andnq %rcx, %rdx, %r16
+{nf} bextrq %rcx, %rdx, %rax
+{nf} bzhiq %rcx, %rdx, %rax
+{nf} blsmskq %rax, %rcx
+{nf} blsiq %rax, %r16
+rorxq $1, %rax, %r16
+{evex} rorxq $1, %rax, %rcx
+
+;;; apx_push2_jmpabs
+.text
+pushw %r16w
+pushp %rax
+pushp %r16
+pushp %rsp
+popp %rax
+push2 %rax, %rcx
+push2 %r16, %rax
+push2 %rax, %r16
+push2 %r16, %r16
+pop2 %rax, %rcx
+push2p %rax, %rcx
+pop2p %rax, %rcx
+jmpabs $0x123456789abcdef0
+
+;;; apx_ccmp_ctest
+.text
+ccmpneq %rax, %rbx
+ccmpne %rax, %rbx
+ccmpneq {dfv=cf} %rax, %rbx
+ccmpneq {dfv=of,sf,zf,cf} %rax, %rbx
+ctestneq %rax, %rbx
+ctesteb $0x80, %al
+ctesteq $0, %rax
+ccmpneq (%r16), %rax
+ccmpneq %rax, (%r16)
+ccmpneq $1, (%r16)
+ctestneb %al, %bl
+ccmpnew %ax, %bx
+ccmpnew %ax, %r16w
+ccmpnel %eax, %r16d
+ccmpneb %al, %r16b
+ccmpneq %rax, (%rax,%r16,4)
+
+;;; apx_nf_map4_extra
+.text
+{evex} setzb %al
+{evex} setzb %r16b
+{nf} lzcntq %rax, %rcx
+{nf} tzcntq %rax, %rcx
+{nf} popcntq %rax, %rcx
+{nf} shldq $1, %rax, %rcx
+{nf} shrdq $1, %rax, %rcx
+{nf} shldq %cl, %rax, %rcx
+{nf} imulq %rcx, %rax
+{evex} imulq %rcx, %rax
+{nf} mulq %rax
+{nf} divq %rax
+{nf} idivq %rax
+negq %rax, %r16
+{nf} negq %rax, %r16
+addq $1, %rax, %rcx
+imulq $2, %rax, %r16
+
+;;; apx_imulzu_cfcmov_ndd_shld
+.text
+imulzuw $2, %ax, %cx
+imulzu $2, %ax, %cx
+imulzuw $2, %ax
+imulzuw $2, (%rax), %cx
+imulzuw $2, %ax, %r16w
+{nf} imulzuw $2, %ax, %cx
+setzuz %al
+setzub %al
+setzune %al
+setzuz %r16b
+cfcmovzq %rax, %rbx
+cfcmovzw %ax, %bx
+cfcmovzl %eax, %ebx
+cfcmovzq (%rax), %rbx
+cfcmovzq %rax, (%rbx)
+cfcmovzq %rax, %rbx, %r16
+cfcmovneq %rcx, %rdx, %r8
+shldq $1, %rax, %rcx, %r16
+shldq %cl, %rax, %rcx, %r16
+{nf} shldq $1, %rax, %rcx, %r16
+shrdq $1, %rax, %rcx, %r16
+shldw $1, %ax, %cx, %r16w
+shldl $1, %eax, %ecx, %r16d
+
+;;; apx_rex2_leftovers
+.text
+rdpid %r16
+wrfsbase %r16
+rdfsbase %r16
+rdgsbase %r31
+sldt %r16
+smsw %r16
+lmsw %r16w
+fxsaveq (%r16)
+fxrstorq (%r16)
+movq %r16, %xmm0
+movq %xmm0, %r16
+cvtsi2sdq %r16, %xmm0
+movq %fs, %r16
+movq %r16, %fs
+movq %mm0, %r16
+mov %cr0, %r16
+xaddq %rax, %r16
+cmpxchgq %rax, %r16
+lock xaddq %rax, (%r16)
+
+
+;;; apx_imm_mem_ndd
+.text
+addq $1, (%rax), %rcx
+{evex} addq $1, (%rax)
+addq $127, %rax, %rcx
+{nf} rolq $1, %rax
+{nf} sarq $3, %rax
+{evex} incq %rax
+{evex} notq %rax
+{evex} testq %rcx, %rax
+push2 %r16, %r17
+ccmpeq %rcx, %rax
+ccmpb %cl, %al
+ctesteq %rcx, %rax
+
+;;; apx_nf_rex2 reject
+.text
+{nf}{rex2} addq %rcx, %rax
+
+;;; apx_nf_test_rcl_bswap_mov reject
+.text
+{nf} testq %rax, %rax
+{nf} rclq $1, %rax
+{nf} rcrq $1, %rax
+{nf} bswapq %rax
+{evex} movq %rcx, %rax
+{nf} notq %rax

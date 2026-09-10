@@ -1586,4 +1586,11 @@ mod tests {
         ];
         assert_eq!(assemble_text(asm), golden);
     }
+
+    #[test]
+    fn scale1_index_folds_to_base() {
+        // ICC win: `0(,%eax,1)` -> `(%eax)` (2-byte addressing, not SIB+disp32).
+        let bytes = assemble_text(".text\nmov 0(,%eax,1), %ecx\n");
+        assert_eq!(bytes, vec![0x8b, 0x08]);
+    }
 }

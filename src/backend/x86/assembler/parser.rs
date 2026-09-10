@@ -212,6 +212,15 @@ pub struct Instruction {
     pub mnemonic: String,
     /// Operands in AT&T order (source first, destination last)
     pub operands: Vec<Operand>,
+    /// GNU as `{nf}`: APX no-flags (EVEX.NF). Suppresses EFLAGS writes.
+    pub nf: bool,
+    /// GNU as `{evex}`: force the APX EVEX (map-4) encoding of a legacy insn.
+    pub force_evex: bool,
+    /// GNU as `{rex2}`: force a REX2 prefix even without an EGPR.
+    pub force_rex2: bool,
+    /// GNU as `{dfv=cf,zf,sf,of}`: APX default-flags value for CCMP/CTEST.
+    /// Encoded raw in EVEX P1.vvvv (not inverted). Bits: CF=1 ZF=2 SF=4 OF=8.
+    pub dfv: u8,
 }
 
 /// An instruction operand.
@@ -237,6 +246,10 @@ pub struct Register {
     pub mask: Option<String>,
     /// EVEX zeroing semantics on the destination: `%zmm0{%k1}{z}`.
     pub zeroing: bool,
+    /// EVEX suppress-all-exceptions: `{sae}` attached to this operand.
+    pub sae: bool,
+    /// EVEX embedded rounding: 0=rn, 1=rd, 2=ru, 3=rz (`{r*-sae}`).
+    pub rounding: Option<u8>,
 }
 
 impl Register {
@@ -258,6 +271,8 @@ impl Register {
             name: n.to_string(),
             mask: None,
             zeroing: false,
+            sae: false,
+            rounding: None,
         }
     }
 }
@@ -295,6 +310,8 @@ pub struct MemoryOperand {
     pub mask: Option<String>,
     /// EVEX zeroing semantics on the destination.
     pub zeroing: bool,
+    /// EVEX embedded broadcast: `(%rdi){1to16}`. The integer is N in `{1toN}`.
+    pub broadcast: Option<u8>,
 }
 
 /// Memory displacement.
@@ -1172,7 +1189,9 @@ fn parse_instruction(line: &str, prefix: Option<String>) -> Result<AsmItem, Stri
     }
 
     // Split mnemonic from operands
-    let (mnemonic, operand_str) = split_mnemonic_operands(trimmed);
+    let (nf, force_evex, force_rex2, rest) = parse_encoding_hints(trimmed);
+    let (mnemonic, operand_str) = split_mnemonic_operands(rest);
+    let (dfv, operand_str) = parse_dfv_hint(operand_str)?;
 
     if mnemonic.is_empty() {
         return Err(format!("empty mnemonic in: {}", line));
@@ -1188,26 +1207,78 @@ fn parse_instruction(line: &str, prefix: Option<String>) -> Result<AsmItem, Stri
         prefix,
         mnemonic: mnemonic.to_string(),
         operands,
+        nf,
+        force_evex,
+        force_rex2,
+        dfv,
     }))
+}
+
+/// Strip stacked GNU as encoding-prefix hints (`{nf}`, `{evex}`, `{rex2}`,
+/// `{vex}`/`{vex2}`/`{vex3}`). `{vex*}` is accepted and ignored (the encoder
+/// already picks the shortest legal VEX form). `{nf}`/`{evex}`/`{rex2}` are
+/// APX hints forwarded to the encoder.
+fn parse_encoding_hints(line: &str) -> (bool, bool, bool, &str) {
+    let mut nf = false;
+    let mut force_evex = false;
+    let mut force_rex2 = false;
+    let mut s = line.trim_start();
+    loop {
+        if !s.starts_with('{') {
+            break;
+        }
+        let Some(close) = s.find('}') else {
+            break;
+        };
+        match &s[1..close] {
+            "nf" => nf = true,
+            "evex" => force_evex = true,
+            "rex2" => force_rex2 = true,
+            "vex" | "vex2" | "vex3" => {}
+            _ => break,
+        }
+        s = s[close + 1..].trim_start();
+    }
+    (nf, force_evex, force_rex2, s)
+}
+
+/// GNU as `{dfv=cf,zf,sf,of}` sits *after* the mnemonic (never as a leading
+/// hint). Empty `{dfv=}` is legal and means all four flags default to 0.
+fn parse_dfv_hint(s: &str) -> Result<(u8, &str), String> {
+    let s = s.trim_start();
+    if !s.starts_with("{dfv") {
+        return Ok((0, s));
+    }
+    let Some(close) = s.find('}') else {
+        return Err("unterminated {dfv=} hint".to_string());
+    };
+    let inner = &s[1..close];
+    let mut dfv = 0u8;
+    if inner == "dfv" || inner == "dfv=" {
+        // empty bitmap
+    } else if let Some(rest) = inner.strip_prefix("dfv=") {
+        for part in rest.split(',') {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            match p {
+                "cf" => dfv |= 0x1,
+                "zf" => dfv |= 0x2,
+                "sf" => dfv |= 0x4,
+                "of" => dfv |= 0x8,
+                other => return Err(format!("unknown dfv flag: {other}")),
+            }
+        }
+    } else {
+        return Err(format!("bad dfv hint: {{{inner}}}"));
+    }
+    Ok((dfv, s[close + 1..].trim_start()))
 }
 
 /// Split a line into mnemonic and operand string.
 fn split_mnemonic_operands(line: &str) -> (&str, &str) {
-    // Strip GNU as encoding-prefix hints ({vex}, {vex3}, {vex2}, {evex}).
-    // LCCC's encoders emit the shortest valid VEX encoding for 128/256-bit
-    // instructions, which is semantically identical to the hinted form; the
-    // prefixes are accepted so GCC/LLVM-generated assembly assembles cleanly.
     let trimmed = line.trim_start();
-    let trimmed = if let Some(rest) = trimmed
-        .strip_prefix("{vex} ")
-        .or_else(|| trimmed.strip_prefix("{vex3} "))
-        .or_else(|| trimmed.strip_prefix("{vex2} "))
-        .or_else(|| trimmed.strip_prefix("{evex} "))
-    {
-        rest
-    } else {
-        trimmed
-    };
     let trimmed = if (trimmed.starts_with("%v") || trimmed.starts_with("%x"))
         && trimmed.len() > 2
         && trimmed.as_bytes()[2].is_ascii_alphabetic()
@@ -1341,8 +1412,15 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
                 scale: None,
                 mask: None,
                 zeroing: false,
+                broadcast: None,
             }));
         }
+    }
+
+    // Standalone EVEX decorator: `{rn-sae}`, `{sae}`, `{1to16}`.
+    // GAS writes these as their own AT&T operand (`vaddps {rn-sae}, %zmm1, %zmm2, %zmm3`).
+    if s.starts_with('{') && s.ends_with('}') {
+        return Ok(Operand::Label(s.to_string()));
     }
 
     // Plain label reference (for jmp/call targets)
@@ -1350,12 +1428,25 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
     Ok(Operand::Label(s.to_string()))
 }
 
-/// Split an EVEX mask/zeroing suffix: `%zmm0{%k1}{z}` -> ("%zmm0", Some("k1"), true).
-/// Accepts both `{%k1}` and `{k1}` (GNU as tolerates the bare form), and `{z}`.
-fn parse_evex_mask_suffix(s: &str) -> (String, Option<String>, bool) {
+/// Parsed `{k1}` / `{z}` / `{sae}` / `{rn-sae}` / `{1toN}` suffixes.
+struct EvexSuffix {
+    rest: String,
+    mask: Option<String>,
+    zeroing: bool,
+    sae: bool,
+    rounding: Option<u8>,
+    broadcast: Option<u8>,
+}
+
+/// Split EVEX suffixes: `%zmm0{%k1}{z}` / `(%rdi){1to16}` / `{rn-sae}`.
+/// Accepts both `{%k1}` and `{k1}` (GNU as tolerates the bare form).
+fn parse_evex_mask_suffix(s: &str) -> EvexSuffix {
     let mut name = s.to_string();
     let mut mask = None;
     let mut zeroing = false;
+    let mut sae = false;
+    let mut rounding = None;
+    let mut broadcast = None;
     loop {
         if let Some(pos) = name.find('{') {
             let close = name[pos..].find('}');
@@ -1366,6 +1457,26 @@ fn parse_evex_mask_suffix(s: &str) -> (String, Option<String>, bool) {
             name = before + &after;
             if inner == "z" {
                 zeroing = true;
+            } else if inner == "sae" {
+                sae = true;
+            } else if inner == "rn-sae" {
+                sae = true;
+                rounding = Some(0);
+            } else if inner == "rd-sae" {
+                sae = true;
+                rounding = Some(1);
+            } else if inner == "ru-sae" {
+                sae = true;
+                rounding = Some(2);
+            } else if inner == "rz-sae" {
+                sae = true;
+                rounding = Some(3);
+            } else if let Some(rest) = inner.strip_prefix("1to") {
+                if let Ok(n) = rest.parse::<u8>() {
+                    if matches!(n, 2 | 4 | 8 | 16 | 32) {
+                        broadcast = Some(n);
+                    }
+                }
             } else if let Some(rest) = inner.strip_prefix('%') {
                 mask = Some(rest.trim().to_string());
             } else if !inner.is_empty() {
@@ -1375,15 +1486,22 @@ fn parse_evex_mask_suffix(s: &str) -> (String, Option<String>, bool) {
             break;
         }
     }
-    (name, mask, zeroing)
+    EvexSuffix {
+        rest: name,
+        mask,
+        zeroing,
+        sae,
+        rounding,
+        broadcast,
+    }
 }
 
 /// Parse a register operand like %rax, %st(0).
 fn parse_register_operand(s: &str) -> Result<Operand, String> {
     // GNU as tolerates whitespace between '%' and the register name
     // (glibc emits `mov % r13, ...` from `% " R13_LP "` macro splicing).
-    let (clean, mask, zeroing) = parse_evex_mask_suffix(s);
-    let s = clean.as_str();
+    let suf = parse_evex_mask_suffix(s);
+    let s = suf.rest.as_str();
     let name = s[1..].trim_start(); // strip % and any following spaces
 
     // Handle %st(N)
@@ -1398,15 +1516,18 @@ fn parse_register_operand(s: &str) -> Result<Operand, String> {
         if is_segment_name(seg) {
             let mut mem = parse_memory_inner(rest)?;
             mem.segment = Some(seg.to_string());
-            mem.mask = mask;
-            mem.zeroing = zeroing;
+            mem.mask = suf.mask;
+            mem.zeroing = suf.zeroing;
+            mem.broadcast = suf.broadcast;
             return Ok(Operand::Memory(mem));
         }
     }
 
     let mut reg = Register::new(name);
-    reg.mask = mask;
-    reg.zeroing = zeroing;
+    reg.mask = suf.mask;
+    reg.zeroing = suf.zeroing;
+    reg.sae = suf.sae;
+    reg.rounding = suf.rounding;
     Ok(Operand::Register(reg))
 }
 
@@ -1562,10 +1683,11 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
 
     // EVEX mask/zeroing suffix on a memory operand: `(%rax){%k1}`.
     if s.contains('{') {
-        let (clean, mask, zeroing) = parse_evex_mask_suffix(s);
-        let mut mem = parse_memory_inner(&clean)?;
-        mem.mask = mask;
-        mem.zeroing = zeroing;
+        let suf = parse_evex_mask_suffix(s);
+        let mut mem = parse_memory_inner(&suf.rest)?;
+        mem.mask = suf.mask;
+        mem.zeroing = suf.zeroing;
+        mem.broadcast = suf.broadcast;
         return Ok(mem);
     }
 
@@ -1610,6 +1732,7 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
                     scale: None,
                     mask: None,
                     zeroing: false,
+                    broadcast: None,
                 });
             }
         }
@@ -1677,6 +1800,7 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
             scale,
             mask: None,
             zeroing: false,
+            broadcast: None,
         })
     } else {
         // No parens - could be just a displacement/symbol
@@ -1689,6 +1813,7 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
             scale: None,
             mask: None,
             zeroing: false,
+            broadcast: None,
         })
     }
 }

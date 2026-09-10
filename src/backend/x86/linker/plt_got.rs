@@ -93,7 +93,10 @@ pub(super) fn create_plt_got(
                             }
                         }
                     }
-                    R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
+                    R_X86_64_GOTPCREL
+                    | R_X86_64_GOTPCRELX
+                    | R_X86_64_REX_GOTPCRELX
+                    | R_X86_64_CODE_4_GOTPCRELX => {
                         // GOTPCREL always needs a dedicated GOT entry, even if the
                         // symbol also has a PLT entry. The PLT's GOT.PLT slot uses
                         // JUMP_SLOT (lazy binding, initially PLT+6) which is wrong

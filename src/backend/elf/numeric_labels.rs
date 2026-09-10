@@ -91,6 +91,10 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
                     prefix: instr.prefix.clone(),
                     mnemonic: instr.mnemonic.clone(),
                     operands: new_ops,
+                    nf: instr.nf,
+                    force_evex: instr.force_evex,
+                    force_rex2: instr.force_rex2,
+                    dfv: instr.dfv,
                 }));
             }
             AsmItem::Short(vals) => {
@@ -159,6 +163,7 @@ fn resolve_numeric_operand(
                     scale: mem.scale,
                     mask: mem.mask.clone(),
                     zeroing: mem.zeroing,
+                    broadcast: mem.broadcast,
                 })
             } else {
                 op.clone()

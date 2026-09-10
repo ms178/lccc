@@ -1,0 +1,83 @@
+;;; evex_dest
+.text
+vpshufd $1, %zmm2, %zmm3
+vpshufd $1, %zmm2, %zmm0
+vpermq $0xe4, %zmm2, %zmm3
+vpternlogd $0xaa, %zmm2, %zmm1, %zmm3
+vpalignr $1, %zmm2, %zmm1, %zmm3
+vpabsd %zmm2, %zmm3
+vpslld $4, %zmm2, %zmm3
+vpbroadcastd %eax, %zmm3
+vpbroadcastd %xmm2, %zmm3
+vinserti32x4 $1, %xmm2, %zmm1, %zmm3
+vextracti32x4 $1, %zmm3, %xmm2
+;;; evex_disp
+.text
+vpxord 64(%rdi), %zmm0, %zmm1
+vpxord 64(%rdi), %xmm0, %xmm1
+vpxord %xmm2, %xmm1, %xmm3
+vpaddd 64(%rdi), %zmm0, %zmm1
+vpbroadcastd 4(%rdi), %zmm1
+vbroadcasti32x4 16(%rdi), %zmm1
+vbroadcasti32x4 (%rdi), %zmm1
+;;; evex_high
+.text
+vaddps %xmm16, %xmm0, %xmm1
+vaddps %xmm0, %xmm16, %xmm1
+vaddps %xmm0, %xmm1, %xmm31
+vpaddd %ymm16, %ymm1, %ymm2
+vpaddd %zmm16, %zmm1, %zmm2
+vmovdqu64 %zmm16, %zmm17
+vandps %xmm16, %xmm0, %xmm1
+vaddss %xmm16, %xmm0, %xmm1
+vmovaps %xmm16, %xmm1
+vpaddd %xmm16, %xmm0, %xmm1
+;;; vphminposuw_xmm
+.text
+vphminposuw %xmm0, %xmm1
+vphminposuw (%rdi), %xmm2
+;;; vphminposuw_ymm reject
+.text
+vphminposuw %ymm0, %ymm1
+;;; vpxor_xmm16 reject
+.text
+vpxor %xmm16, %xmm0, %xmm1
+;;; vmovdqa_xmm16 reject
+.text
+vmovdqa %xmm16, %xmm1
+;;; evex_tuple_sae
+.text
+vpmovzxbw 32(%rdi), %zmm1
+vpmovzxbd 16(%rdi), %zmm1
+vpmovzxbq 8(%rdi), %zmm1
+vpmovzxwd 32(%rdi), %zmm1
+vpmovzxwq 16(%rdi), %zmm1
+vpmovzxdq 32(%rdi), %zmm1
+vpmovsxbw 32(%rdi), %zmm1
+vpabsb 64(%rdi), %zmm1
+vpcmpd $1, (%rdi), %zmm2, %k1
+vpcmpd $1, %zmm1, %zmm2, %k1
+vpcmpb $1, 64(%rdi), %zmm2, %k3
+vpshufbitqmb (%rdi), %zmm2, %k1
+vprold $1, (%rdi), %zmm1
+vprorq $7, 64(%rsi), %zmm3
+vaddps (%rdi){1to16}, %zmm1, %zmm2
+vaddps {rn-sae}, %zmm1, %zmm2, %zmm3
+vaddps {rd-sae}, %zmm1, %zmm2, %zmm3
+vaddps {ru-sae}, %zmm1, %zmm2, %zmm3
+vaddps {rz-sae}, %zmm1, %zmm2, %zmm3
+vmaxps {sae}, %zmm1, %zmm2, %zmm3
+vcmpps $0, {sae}, %zmm1, %zmm2, %k1
+vpaddd (%rdi){1to16}, %zmm1, %zmm2
+vpxord (%rdi){1to16}, %zmm1, %zmm2
+vfmadd132ps {rn-sae}, %zmm1, %zmm2, %zmm3
+vsqrtps {rn-sae}, %zmm1, %zmm2
+vcvtps2dq {rz-sae}, %zmm1, %zmm2
+vaddps 4(%rdi){1to16}, %zmm1, %zmm2
+vaddps (%rdi){1to8}, %ymm1, %ymm2
+vextracti32x4 $1, %zmm1, (%rdi)
+vextracti32x4 $1, %zmm1, 16(%rdi)
+vcmpps $0, %zmm1, %zmm2, %k1
+vcmpps $0, (%rdi), %zmm2, %k1
+vpmovzxbw 32(%rdi), %zmm1{%k1}{z}
+vpaddd (%rdi){1to16}, %zmm1, %zmm2{%k1}{z}
