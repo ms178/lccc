@@ -601,6 +601,8 @@ pub fn peephole_optimize(asm: String) -> String {
 
     // Phase 1: Iterative local passes (up to 8 rounds)
     let rotate = std::env::var("CCC_NO_LOOP_ROTATE").is_err();
+    let merge_blocks = std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
+    let coalesce_entry = std::env::var("CCC_NO_ENTRY_COPY_COALESCE").is_err();
     let mut changed = true;
     let mut rounds = 0;
     while changed && rounds < 8 {
@@ -617,7 +619,9 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
-        changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
+        if merge_blocks {
+            changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
+        }
         changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
         changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
         changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
@@ -674,8 +678,12 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
-            changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
-            changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+            if merge_blocks {
+                changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
+            }
+            if coalesce_entry {
+                changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
+            }
             changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
@@ -1330,6 +1338,7 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
         }
     }
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    let mut falls_through = vec![false; nb];
     let mut unknown_out = vec![false; nb];
     for b in 0..nb {
         let e = end(b);
@@ -1340,6 +1349,7 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
         if t == starts[b] {
             if b + 1 < nb {
                 succs[b].push(b + 1);
+                falls_through[b] = true;
             }
             continue;
         }
@@ -1362,11 +1372,13 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
                 }
                 if b + 1 < nb {
                     succs[b].push(b + 1);
+                    falls_through[b] = true;
                 }
             }
             _ => {
                 if b + 1 < nb {
                     succs[b].push(b + 1);
+                    falls_through[b] = true;
                 }
             }
         }
@@ -1440,6 +1452,16 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
                     continue;
                 }
                 if is_function_boundary(&lines[starts[dup]]) {
+                    continue;
+                }
+                // Equal instruction text is not enough when execution falls
+                // through: the label following each body is part of that
+                // block's behaviour.  Redirecting `.Ldup` to `.Lkeep` would
+                // otherwise execute keep's successor (the expat O0 failure
+                // merged two identical `ptr++` blocks whose continuations
+                // were different).  Explicitly terminated equal bodies name
+                // their successor in the body text and need no extra check.
+                if (falls_through[keep] || falls_through[dup]) && succs[keep] != succs[dup] {
                     continue;
                 }
                 let same_preds = {
@@ -5059,11 +5081,26 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
     let mut edits: Vec<(usize, String, usize, usize)> = Vec::new();
 
     for &(h, j) in &regions {
-        // Region-level hazards: calls, returns, or branches to unknown labels.
+        // Region-level hazards: calls, returns, branches to unknown labels, or
+        // an escaped/materialised stack address.  The latter can read a slot
+        // through a derived base (`add x10, sp, #280; ldp ..., [x10]`), which
+        // is invisible to an exact `[sp,#280]` textual census.  Sinking the
+        // stores that initialise such an object past the loop made struct_copy
+        // consume stale zeros.  A precise region alias graph is possible, but
+        // until then any sp-derived pointer makes store sinking ineligible.
         let mut region_bad = false;
         for p in h..=j {
             let t = &v[p].2;
-            if t.starts_with("bl ") || t.starts_with("blr ") || t == "ret" {
+            let materializes_sp = t
+                .strip_prefix("mov ")
+                .and_then(|ops| ops.split_once(", "))
+                .is_some_and(|(_, src)| src.trim() == "sp")
+                || t.strip_prefix("add ")
+                    .or_else(|| t.strip_prefix("sub "))
+                    .and_then(|ops| ops.split_once(", "))
+                    .and_then(|(_, rest)| rest.split_once(", "))
+                    .is_some_and(|(base, _)| base.trim() == "sp");
+            if materializes_sp || t.starts_with("bl ") || t.starts_with("blr ") || t == "ret" {
                 region_bad = true;
                 break;
             }
@@ -5946,12 +5983,40 @@ fn hoist_loop_invariant_remats(
             }
         };
         let target = target.as_str();
+        // Process the last backedge to this header.  Treating an earlier
+        // backedge as the loop end misses later entries that jump straight to
+        // the label and therefore bypass the copy inserted immediately before
+        // it (nbody -O2 hoisted an sp-slot base for the first of two
+        // backedges, leaving the second entry with a stale x1).
+        if ((i + 1)..n).any(|m| branch_targets(&lines[m], kinds[m], target)) {
+            i += 1;
+            continue;
+        }
         let Some(top) = (0..i).rev().find(|&k| {
             kinds[k] == LineKind::Label && lines[k].trim().trim_end_matches(':') == target
         }) else {
             i += 1;
             continue;
         };
+        // There must be a provable first entry that executes code immediately
+        // before the header (fall-through) or an earlier branch we can seed.
+        // A header preceded by an unconditional branch can be reached for the
+        // first time from a side entry later in the textual region; placing a
+        // copy before its label is then dead code (nbody's `.LBB14`).
+        let prev_real = (0..top).rev().find(|&m| {
+            !matches!(
+                kinds[m],
+                LineKind::Nop | LineKind::Directive | LineKind::Label
+            )
+        });
+        let has_fallthrough_entry =
+            prev_real.is_some_and(|m| !matches!(kinds[m], LineKind::Branch | LineKind::Ret));
+        let has_earlier_entry_branch =
+            (0..top).any(|m| branch_targets(&lines[m], kinds[m], target));
+        if !has_fallthrough_entry && !has_earlier_entry_branch {
+            i += 1;
+            continue;
+        }
 
         // ── loop validity ──
         // Entry edges into the loop top are the fallthrough and branches
@@ -6136,6 +6201,16 @@ fn hoist_loop_invariant_remats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_blocks_with_different_fallthroughs_do_not_merge() {
+        let asm = "f:\n    cbz x0, .Ldup\n.Lkeep:\n    mov x2, #1\n.Lkeep_next:\n    mov x3, #11\n    ret\n.Ldup:\n    mov x2, #1\n.Ldup_next:\n    mov x3, #22\n    ret\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!merge_identical_blocks(&mut lines, &mut kinds, n));
+        assert_eq!(kinds[7], LineKind::Label, "duplicate block was deleted");
+    }
 
     #[test]
     fn test_classify_store() {
@@ -6374,6 +6449,28 @@ mod tests {
             pre.contains("mov w2, w0") || pre.contains("ldr w2, [sp, #40]\n    b.lt"),
             "entry path not fed:\n{}",
             result
+        );
+    }
+
+    #[test]
+    fn test_invar_hoist_waits_for_last_backedge() {
+        let input = concat!(
+            "main:\n",
+            ".Ltop:\n",
+            "    ldr x1, [sp, #32]\n",
+            "    add x2, x1, x3\n",
+            "    cmp x20, #5\n",
+            "    b.lt .Ltop\n",
+            "    mov x1, x4\n",
+            "    cmp x21, #5\n",
+            "    b.lt .Ltop\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        let body = result.split(".Ltop:\n").nth(1).unwrap_or("");
+        assert!(
+            body.starts_with("    ldr x1, [sp, #32]"),
+            "earlier backedge caused a bypassable hoist:\n{result}"
         );
     }
 
@@ -7489,6 +7586,26 @@ f:
         let be = result.find("b.le .Lbody").unwrap();
         let st = result.find("str x0, [sp, #24]").unwrap();
         assert!(st > be, "store after backedge:\n{}", result);
+    }
+
+    #[test]
+    fn test_sink_blocked_by_sp_derived_alias() {
+        let input = "\
+f:
+.Lbody:
+    fmul d16, d16, d1
+    str d16, [sp, #280]
+    add x10, sp, #280
+    ldr d0, [x10]
+    cmp w20, w21
+    b.le .Lbody
+    ret
+";
+        let mut lines: Vec<String> = input.lines().map(String::from).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
+        assert!(matches!(kinds[3], LineKind::MemOther));
     }
 
     #[test]

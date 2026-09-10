@@ -49,8 +49,13 @@ int main(void) {
 
     // Benchmark: strcmp pairs
     long cmp_sum = 0;
-    for (int i = 0; i < NSTRINGS - 1; i++)
-        cmp_sum += strcmp(strings[i], strings[i + 1]);
+    for (int i = 0; i < NSTRINGS - 1; i++) {
+        // ISO C specifies only the sign of a nonzero strcmp result, not its
+        // magnitude.  Normalise it so this execution oracle compares compiler
+        // behaviour rather than x86 and AArch64 libc implementation details.
+        int cmp = strcmp(strings[i], strings[i + 1]);
+        cmp_sum += (cmp > 0) - (cmp < 0);
+    }
 
     // Benchmark: strstr search
     long found = 0;
