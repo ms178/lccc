@@ -93,5 +93,73 @@ int main(void) {
         CHECK(ident_f128(q) == q);
     }
 
+#if defined(__i386__) || defined(__x86_64__)
+    /* F128 -> U64 must not depend on the x87 precision control.
+     * The superseded subtraction-based high path rounded 2^64 - 1 to
+     * 2^63 under 24/53-bit precision control (verified against GCC 14.2
+     * -m32, which miscompiles identically) and returned 0 instead of
+     * UINT64_MAX. The native-payload path performs no arithmetic.
+     */
+    {
+        static __inline__ void set_pc(unsigned short pc) {
+            unsigned short cw;
+            __asm__ volatile("fnstcw %0" : "=m"(cw));
+            cw = (unsigned short)((cw & ~0x0300u) | pc);
+            __asm__ volatile("fldcw %0" : : "m"(cw));
+        }
+        static __inline__ unsigned short get_pc(void) {
+            unsigned short cw;
+            __asm__ volatile("fnstcw %0" : "=m"(cw));
+            return cw;
+        }
+        unsigned short save_pc = get_pc();
+        static const unsigned short pcs[3] = { 0x0000, 0x0200, 0x0300 };
+
+        /* 2^64 - 1 is exactly representable in extended precision, so
+         * loading it via a volatile long double must reach the converter
+         * unrounded at every precision-control setting. */
+        volatile f128 hi = 18446744073709551615.0L;
+        volatile f128 hi2 = 18446744073709549568.0L; /* 2^64 - 2048 */
+        for (int c = 0; c < 3; c++) {
+            set_pc(pcs[c]);
+            CHECK((u64)hi == 18446744073709551615ULL);
+            CHECK((u64)hi2 == 18446744073709549568ULL);
+            CHECK((u64)(f128)9223372036854775808.0L == 9223372036854775808ULL);
+            CHECK((u64)(f128)9223372036854775807.0L == 9223372036854775807ULL);
+            /* low-range values stay exact at every precision */
+            CHECK((u64)(f128)12345.75L == 12345);
+        }
+        /* the not-in-range fallback keeps the GCC-compatible indefinite */
+        set_pc(0x0300);
+        {
+            volatile f128 inf = 1.0L / 0.0L;
+            CHECK((u64)inf == 0x8000000000000000ULL);
+        }
+        set_pc(save_pc);
+    }
+
+    /* F128 identity copy must not clobber a caller-saved register home:
+     * under regparm register pressure the allocator may keep a parameter
+     * in ECX/EDX (the hazard model marks Cast points so it never spans
+     * one, but a value used AFTER the cast must still read its true
+     * home). This exercises the direct 3-register copy path. */
+#if defined(__i386__)
+    {
+        extern long long f128_copy_pressure(int a, int b, int c, long double x);
+        long long r = f128_copy_pressure(7, 11, 13, 100.0L);
+        CHECK(r == 131); /* 7 + 11 + 13 + (int)100.5 */
+    }
+#endif
+#endif
+
     return fails;
 }
+
+#if defined(__i386__)
+__attribute__((regparm(3), noinline))
+long long f128_copy_pressure(int a, int b, int c, long double x) {
+    long double y = x;                  /* identity cast: direct copy path */
+    volatile long double z = y + 0.5L;  /* keep a/b/c live across the cast */
+    return a + b + c + (int)z;
+}
+#endif

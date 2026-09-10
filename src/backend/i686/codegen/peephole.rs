@@ -6099,6 +6099,26 @@ fn census_reg_reads(
             k += 1;
             continue;
         }
+        // A direct call semantically READS the incoming argument registers:
+        // regparm callees consume %eax/%edx/%ecx and fastcall callees
+        // %ecx/%edx, without the call line ever naming them. Deleting the
+        // move that staged such an argument made the callee read caller
+        // garbage (fastcall struct return: `leal 20(%esp),%eax;
+        // movl %eax,%ecx; call mk` lost the %ecx move). This matches the
+        // GprLiveness oracle's Call model exactly.
+        if infos[k].kind == LineKind::Call {
+            if reg == REG_EAX || reg == REG_ECX || reg == REG_EDX {
+                n += 1;
+            }
+            k += 1;
+            continue;
+        }
+        // Computed branches may select any GPR (jump-table dispatch).
+        if infos[k].kind == LineKind::JmpIndirect && reg <= REG_GP_MAX {
+            n += 1;
+            k += 1;
+            continue;
+        }
         let line = trimmed(store, &infos[k], k);
         // A read is: an explicit textual mention that is not a pure write
         // of the family, or an architectural implicit READ (the oracle's

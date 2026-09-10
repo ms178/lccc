@@ -147,6 +147,7 @@ fn hook_call(vfn: Value, vsite: Value) -> CallInfo {
         ret_is_f128_sse: false,
         is_sret: false,
         is_fastcall: false,
+        regparm: None,
         // The hooks observe and mutate profiler state: never pure, never
         // const, never removable. (Explicit for clarity; these are the
         // defaults an extern call gets anyway.)

@@ -145,13 +145,27 @@ reverse order to avoid clobbering `%eax` (the accumulator) prematurely.
 
 Passes the first two DWORD-or-smaller integer/pointer arguments in `%ecx` and
 `%edx`.  The callee pops the *stack* arguments on return (callee-cleanup) via
-`ret $N`.  Implemented via `is_fastcall`, `fastcall_reg_param_count`, and
-`fastcall_stack_cleanup` fields on the codegen struct.
+`ret $N`.  Implemented via `is_fastcall`, `fastcall_slots` (per-parameter
+`I686FastcallSlot` layout from `fastcall_layout`) and `fastcall_stack_cleanup`
+fields on the codegen struct.
 
-The prologue handles fastcall parameter storage by storing from `%ecx`/`%edx`
-to the appropriate stack slots, with sub-integer types (I8, U8, I16, U16)
-properly sign/zero-extended before storing.  The epilogue emits `ret $N`
-where N accounts for the stack bytes the callee must clean up.
+The layout follows the GCC i386 fastcall rules exactly: float and `_Decimal`
+scalars are *skipped* (they neither consume a register nor end the chain),
+aggregates and 64/128-bit integers *break* the chain, and variadic fastcall
+passes everything on the stack with a plain `ret`.  One layout drives the
+prologue capture, `emit_param_ref` and the epilogue `ret $N`, replacing the
+previous three independently-derived assignments whose positional counting
+diverged from GCC for every float-interleaved signature.
+
+The prologue captures `%ecx`/`%edx` parameters before any stack-parameter
+copy can clobber them, with sub-integer types (I8, U8, I16, U16) sign/zero-
+extended before storing.  Register-target captures are resolved as a
+parallel move (`resolve_incoming_reg_moves`): moves emit while a target is
+not a pending source, 2-cycles become one `xchgl`, longer cycles rotate
+through a scratch slot, and params whose destinations share one physical
+register (disjoint IR live ranges, entry-time capture) go through 4-byte
+conflict slots in the frame.  The epilogue emits `ret $N` where N accounts
+for the stack bytes the callee must clean up.
 
 ### ABI Configuration
 

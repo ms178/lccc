@@ -905,6 +905,8 @@ pub trait ArchCodegen {
         struct_arg_is_f128_sse: &[bool],
         is_sret: bool,
         _is_fastcall: bool,
+        // i686: per-callee `__attribute__((regparm(N)))` override.
+        _is_regparm: Option<u8>,
         ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
         ret_is_f128_sse: bool,
     ) {

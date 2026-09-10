@@ -180,6 +180,8 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_cleanup_fn: Option<String>,
     /// `__attribute__((symver("name@@VERSION")))` symbol version string.
     pub parsing_symver: Option<String>,
+    /// `__attribute__((regparm(N)))` register-argument count.
+    pub parsing_regparm: Option<u8>,
     /// `__attribute__((vector_size(N)))` total vector size in bytes.
     pub parsing_vector_size: Option<usize>,
     /// `__attribute__((vector_size(EXPR)))` whose EXPR was not parse-time
@@ -447,6 +449,7 @@ impl std::fmt::Debug for ParsedDeclAttrs {
                 &self.parsing_transparent_union(),
             )
             .field("parsing_fastcall", &self.parsing_fastcall())
+            .field("parsing_regparm", &self.parsing_regparm)
             .field("parsing_cold", &self.parsing_cold())
             .field("parsing_alias_target", &self.parsing_alias_target)
             .field("parsing_visibility", &self.parsing_visibility)
@@ -1317,8 +1320,37 @@ impl Parser {
                 self.advance();
             }
             "fastcall" | "__fastcall__" => {
+                let span = self.peek_span();
                 self.attrs.set_fastcall(true);
                 self.advance();
+                // GCC: "fastcall and regparm attributes are not compatible"
+                if self.attrs.parsing_regparm.is_some() {
+                    self.emit_error("fastcall and regparm attributes are not compatible", span);
+                }
+            }
+            "regparm" | "__regparm__" => {
+                // GCC i386 `__attribute__((regparm(N)))`: pass the first N
+                // integer arguments in EAX, EDX, ECX. The argument is
+                // required (bare `regparm` is an error in GCC); values above
+                // 3 warn and clamp to 3.
+                let span = self.peek_span();
+                self.advance();
+                if !matches!(self.peek(), TokenKind::LParen) {
+                    self.emit_error(
+                        "wrong number of arguments specified for 'regparm' attribute",
+                        span,
+                    );
+                } else if let Some(v) = self.parse_alignment_expr() {
+                    let n = v.min(3) as u8;
+                    if v > 3 {
+                        self.diagnostics
+                            .warning("argument to 'regparm' attribute larger than 3", span);
+                    }
+                    self.attrs.parsing_regparm = Some(n);
+                    if self.attrs.parsing_fastcall() {
+                        self.emit_error("fastcall and regparm attributes are not compatible", span);
+                    }
+                }
             }
             "naked" | "__naked__" => {
                 self.attrs.set_naked(true);

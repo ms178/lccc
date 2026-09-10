@@ -101,6 +101,9 @@ pub struct CallInfo {
     pub is_sret: bool,
     /// True if the callee uses the fastcall calling convention.
     pub is_fastcall: bool,
+    /// i686: `__attribute__((regparm(N)))` on the callee — per-function
+    /// override of the global -mregparm flag. None = attribute absent.
+    pub regparm: Option<u8>,
     /// True if the callee is marked pure (no memory writes outside local allocas, no side effects).
     pub is_pure: bool,
     /// True if the callee is marked const (no memory reads or writes outside local allocas, no side effects).

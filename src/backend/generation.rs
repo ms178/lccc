@@ -5246,6 +5246,7 @@ pub(super) fn generate_instruction(
                 &info.struct_arg_is_f128_sse,
                 info.is_sret,
                 info.is_fastcall,
+                info.regparm,
                 &info.ret_eightbyte_classes,
                 info.ret_is_f128_sse,
             );
@@ -5268,6 +5269,7 @@ pub(super) fn generate_instruction(
                 &info.struct_arg_is_f128_sse,
                 info.is_sret,
                 info.is_fastcall,
+                info.regparm,
                 &info.ret_eightbyte_classes,
                 info.ret_is_f128_sse,
             );

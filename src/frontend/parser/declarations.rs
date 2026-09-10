@@ -182,6 +182,7 @@ impl Parser {
         let symver = self.attrs.parsing_symver.take();
         let is_used = self.attrs.parsing_used();
         let is_fastcall = self.attrs.parsing_fastcall();
+        let regparm = self.attrs.parsing_regparm;
         let is_naked = self.attrs.parsing_naked();
         let no_instrument = self.attrs.parsing_no_instrument();
         let is_pure = self.attrs.parsing_pure();
@@ -197,6 +198,7 @@ impl Parser {
         decl_attrs.set_noreturn(is_noreturn);
         decl_attrs.set_used(is_used);
         decl_attrs.set_fastcall(is_fastcall);
+        decl_attrs.regparm = regparm;
         decl_attrs.set_naked(is_naked);
         decl_attrs.set_no_instrument(no_instrument);
         decl_attrs.set_pure(is_pure);
@@ -326,6 +328,7 @@ impl Parser {
                 attrs.set_weak(decl_attrs.is_weak());
                 attrs.set_used(decl_attrs.is_used());
                 attrs.set_fastcall(decl_attrs.is_fastcall());
+                attrs.regparm = decl_attrs.regparm;
                 attrs.set_naked(decl_attrs.is_naked());
                 attrs.set_no_instrument(no_instrument_merged);
                 attrs.set_noreturn(decl_attrs.is_noreturn());
@@ -636,6 +639,9 @@ impl Parser {
         if self.attrs.parsing_fastcall() {
             last_decl.attrs.set_fastcall(true);
         }
+        if let Some(n) = self.attrs.parsing_regparm {
+            last_decl.attrs.regparm = Some(n);
+        }
         if self.attrs.parsing_naked() {
             last_decl.attrs.set_naked(true);
         }
@@ -666,6 +672,7 @@ impl Parser {
         self.attrs.parsing_cleanup_fn = None;
         self.attrs.set_used(false);
         self.attrs.set_fastcall(false);
+        self.attrs.parsing_regparm = None;
         self.attrs.set_naked(false);
         self.attrs.set_no_instrument(false);
         ctx.is_common = ctx.is_common || extra_common;
@@ -713,6 +720,7 @@ impl Parser {
                 None
             };
             let d_fastcall = self.attrs.parsing_fastcall();
+            let d_regparm = self.attrs.parsing_regparm;
             declarators.push(InitDeclarator {
                 name: dname.unwrap_or_default(),
                 derived: dderived,
@@ -728,6 +736,7 @@ impl Parser {
                     da.set_const_attr(d_const_attr);
                     da.set_used(d_used);
                     da.set_fastcall(d_fastcall);
+                    da.regparm = d_regparm;
                     da.alias_target = d_alias;
                     da.visibility = d_vis;
                     da.section = d_section;
@@ -875,6 +884,7 @@ impl Parser {
                     da.set_destructor(self.attrs.parsing_destructor());
                     da.set_weak(self.attrs.parsing_weak());
                     da.set_fastcall(self.attrs.parsing_fastcall());
+                    da.regparm = self.attrs.parsing_regparm;
                     da.set_naked(self.attrs.parsing_naked());
                     da.set_no_instrument(self.attrs.parsing_no_instrument());
                     da.set_error_attr(self.attrs.parsing_error_attr());

@@ -1234,6 +1234,7 @@ impl Lowerer {
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(),
                             is_fastcall: false,
+                            regparm: None,
                             is_pure: false,
                             is_const: false,
                             ret_eightbyte_classes: call_ret_classes,
@@ -1265,6 +1266,10 @@ impl Lowerer {
                         }
                     }
                     let callee_is_fastcall = self.fastcall_functions.contains(name.as_str());
+                    let mut callee_regparm = self.regparm_functions.get(name.as_str()).copied();
+                    if callee_is_fastcall {
+                        callee_regparm = None;
+                    }
                     let is_pure = self.pure_functions.contains(name.as_str());
                     let is_const = self.const_functions.contains(name.as_str());
                     let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
@@ -1284,6 +1289,7 @@ impl Lowerer {
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(),
                             is_fastcall: callee_is_fastcall,
+                            regparm: callee_regparm,
                             is_pure,
                             is_const,
                             ret_eightbyte_classes: call_ret_classes,
@@ -1344,6 +1350,7 @@ impl Lowerer {
                         struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                         is_sret: sret_size.is_some(),
                         is_fastcall: false,
+                        regparm: None,
                         is_pure: false,
                         is_const: false,
                         ret_eightbyte_classes: call_ret_classes,
@@ -1403,6 +1410,11 @@ impl Lowerer {
                         }
                     }
                     let callee_is_fastcall = self.fastcall_functions.contains(call_name.as_str());
+                    let mut callee_regparm =
+                        self.regparm_functions.get(call_name.as_str()).copied();
+                    if callee_is_fastcall {
+                        callee_regparm = None;
+                    }
                     let is_pure = self.pure_functions.contains(call_name.as_str());
                     let is_const = self.const_functions.contains(call_name.as_str());
                     let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
@@ -1422,6 +1434,7 @@ impl Lowerer {
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(),
                             is_fastcall: callee_is_fastcall,
+                            regparm: callee_regparm,
                             is_pure,
                             is_const,
                             ret_eightbyte_classes: call_ret_classes,
@@ -1446,6 +1459,7 @@ impl Lowerer {
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(),
                             is_fastcall: false,
+                            regparm: None,
                             is_pure: false,
                             is_const: false,
                             ret_eightbyte_classes: call_ret_classes,

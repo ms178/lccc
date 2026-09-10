@@ -3043,6 +3043,7 @@ mod tests {
                 struct_arg_is_f128_sse: Vec::new(),
                 is_sret: false,
                 is_fastcall: false,
+                regparm: None,
                 is_pure: false,
                 is_const: false,
                 ret_eightbyte_classes: Vec::new(),

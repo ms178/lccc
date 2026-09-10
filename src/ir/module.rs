@@ -216,6 +216,9 @@ pub struct IrFunction {
     /// __attribute__((fastcall)) - i386 fastcall calling convention.
     /// First two integer/pointer args passed in ecx/edx instead of stack.
     pub is_fastcall: bool,
+    /// i686: `__attribute__((regparm(N)))` on the function definition —
+    /// per-function override of the global -mregparm flag.
+    pub regparm: Option<u8>,
     /// __attribute__((naked)) - emit no prologue/epilogue; function body is pure asm.
     pub is_naked: bool,
     /// __attribute__((no_instrument_function)) - skip mcount/__fentry__ entry
@@ -353,6 +356,7 @@ impl IrFunction {
             param_alloca_values: Vec::new(),
             uses_sret: false,
             is_fastcall: false,
+            regparm: None,
             is_naked: false,
             no_instrument: false,
             global_init_label_blocks: Vec::new(),
