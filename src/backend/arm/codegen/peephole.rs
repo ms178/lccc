@@ -617,6 +617,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
         changed |= propagate_address_aliases(&mut lines, &mut kinds, n);
+        changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
         changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
         changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
         changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
@@ -673,6 +674,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
             changed2 |= propagate_address_aliases(&mut lines, &mut kinds, n);
+            changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
             changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
             changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
@@ -737,6 +739,10 @@ fn is_function_boundary(line: &str) -> bool {
 /// not (a reader on a path that never ran the redefinition).
 struct Cfg {
     block_of: Vec<usize>,
+    /// First line index of every block.
+    starts: Vec<usize>,
+    /// Label introducing a block; empty when the block starts without one.
+    labels: Vec<String>,
     succs: Vec<Vec<usize>>,
     /// Dominator bitsets: `dom[b]` has bit `d` set iff `d` dominates `b`.
     dom: Vec<Vec<u64>>,
@@ -771,10 +777,13 @@ impl Cfg {
             block_of[i] = starts.len() - 1;
         }
         let nb = starts.len();
+        let mut labels: Vec<String> = vec![String::new(); nb];
         let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
         for i in 0..n {
             if kinds[i] == LineKind::Label {
-                label_block.insert(lines[i].trim().trim_end_matches(':'), block_of[i]);
+                let name = lines[i].trim().trim_end_matches(':');
+                label_block.insert(name, block_of[i]);
+                labels[block_of[i]] = (*name).to_string();
             }
         }
         let end = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { n } };
@@ -884,6 +893,8 @@ impl Cfg {
         }
         Some(Cfg {
             block_of,
+            starts: starts.clone(),
+            labels,
             succs,
             dom,
             words,
@@ -1188,6 +1199,309 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         }
     }
     changed
+}
+
+/// Merge identical basic blocks.
+///
+/// Ported from the x86 backend's `identical_blocks` pass — the most polished of
+/// the four.  Two blocks with the same instruction text and the same set of
+/// predecessor blocks are interchangeable: the predecessors are single basic
+/// blocks, so their register state on every outgoing edge is identical, and
+/// equal predecessor sets therefore imply equal live-in state.  Keeping one
+/// copy and retargeting the rest is then semantics-preserving.
+///
+/// AArch64 needs less than x86 here: there are no EFLAGS, so the x86 pass's
+/// "not flag-dependent at entry" condition has no counterpart.  What remains
+/// is enforced:
+///   * the deleted block must be entered **only by explicit branches** — a
+///     fall-through edge cannot be retargeted by renaming a label, and after
+///     deletion the preceding block would fall into whatever now follows it;
+///   * a function's entry block is never deleted (its label is the symbol);
+///   * both blocks must be in the same function.
+///
+/// The x86 pass also records the trap that empty predecessor sets must not be
+/// treated as equal: a block can look orphaned only because its fall-through
+/// edge was missed, and merging two such "orphans" deleted a live block.  Here
+/// the predecessor sets come from the CFG that already models fall-through, and
+/// empty sets are rejected outright.
+///
+/// One merge per call: rewriting the text invalidates the CFG, so the pass
+/// returns and the driver's fixpoint loop re-runs it.
+/// True when a block defines every register it reads before the read, so its
+/// result cannot depend on the state it is entered with.  Two identical blocks
+/// that are both live-in independent are interchangeable **regardless of their
+/// predecessors** — the predecessor-set equality that `merge_identical_blocks`
+/// otherwise requires exists only to guarantee equal live-in state, which is
+/// vacuous here.  Blocks containing a call or a return are excluded: a call
+/// reads the argument registers implicitly and a return reads x0-x7, and
+/// neither can be proven defined at the block's entry.
+fn block_is_live_in_independent(
+    lines: &[String],
+    kinds: &[LineKind],
+    start: usize,
+    end: usize,
+) -> bool {
+    let mut defined: u64 = 0;
+    for k in start..end {
+        match kinds[k] {
+            LineKind::Nop | LineKind::Directive | LineKind::Label => {}
+            LineKind::Call | LineKind::Ret => return false,
+            _ => {}
+        }
+        let line = &lines[k];
+        let (ireads, iwrites) = classify_implicit_operands_a64(line);
+        if ireads & !defined != 0 {
+            return false;
+        }
+        let out = written_gp_register(line, kinds[k]);
+        let mentions_dst_once = match out {
+            Some(r) => {
+                let xn = xreg_name(r);
+                let wn = wreg_name(r);
+                line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .filter(|t| *t == xn || *t == wn)
+                    .count()
+                    == 1
+            }
+            None => false,
+        };
+        for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            let reg = if let Some(rest) = tok.strip_prefix('x') {
+                rest.parse::<u8>().ok()
+            } else if let Some(rest) = tok.strip_prefix('w') {
+                rest.parse::<u8>().ok()
+            } else {
+                None
+            };
+            let Some(r) = reg else { continue };
+            if r > 30 {
+                continue;
+            }
+            if mentions_dst_once && out == Some(r) {
+                continue; // sole mention is the definition
+            }
+            if defined & (1u64 << r) == 0 {
+                return false;
+            }
+        }
+        if let Some(r) = out {
+            defined |= 1u64 << r;
+        }
+        defined |= iwrites;
+    }
+    true
+}
+
+fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    // A block model that never fails.  `Cfg::build` bails out for the whole
+    // file on an indirect `br xN` — which is exactly what a switch's jump table
+    // is — and merging must still work in the rest of such a function.  Blocks
+    // with an unresolvable out-edge (and everything they reach) are simply
+    // marked unusable instead of poisoning the file.
+    let mut starts: Vec<usize> = vec![0];
+    for i in 0..n {
+        let after_transfer = i != 0
+            && matches!(
+                kinds[i - 1],
+                LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret
+            );
+        if i != 0 && (kinds[i] == LineKind::Label || after_transfer) {
+            starts.push(i);
+        }
+    }
+    let nb = starts.len();
+    if nb < 2 {
+        return false;
+    }
+    let end = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { n } };
+    let mut block_of = vec![0usize; n];
+    for b in 0..nb {
+        for k in starts[b]..end(b) {
+            block_of[k] = b;
+        }
+    }
+    let mut labels: Vec<String> = vec![String::new(); nb];
+    let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
+    for i in 0..n {
+        if kinds[i] == LineKind::Label {
+            let name = lines[i].trim().trim_end_matches(':');
+            label_block.insert(name, block_of[i]);
+            labels[block_of[i]] = (*name).to_string();
+        }
+    }
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    let mut unknown_out = vec![false; nb];
+    for b in 0..nb {
+        let e = end(b);
+        let mut t = e;
+        while t > starts[b] && kinds[t - 1] == LineKind::Nop {
+            t -= 1;
+        }
+        if t == starts[b] {
+            if b + 1 < nb {
+                succs[b].push(b + 1);
+            }
+            continue;
+        }
+        let last = t - 1;
+        match kinds[last] {
+            LineKind::Ret => {}
+            LineKind::Branch => {
+                let text = lines[last].trim();
+                let tgt = text.split_whitespace().next_back();
+                match tgt.and_then(|t| label_block.get(t).copied()) {
+                    Some(tb) => succs[b].push(tb),
+                    None => unknown_out[b] = true, // `br xN`: jump table
+                }
+            }
+            LineKind::CondBranch | LineKind::CmpBranch => {
+                let tgt = lines[last].trim().split_whitespace().next_back();
+                match tgt.and_then(|t| label_block.get(t).copied()) {
+                    Some(tb) => succs[b].push(tb),
+                    None => unknown_out[b] = true,
+                }
+                if b + 1 < nb {
+                    succs[b].push(b + 1);
+                }
+            }
+            _ => {
+                if b + 1 < nb {
+                    succs[b].push(b + 1);
+                }
+            }
+        }
+    }
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    for b in 0..nb {
+        for &s in &succs[b] {
+            preds[s].push(b);
+        }
+    }
+    // A block reached from an unresolvable edge has an incomplete predecessor
+    // set, so it must not take part in a merge.
+    let mut unusable = vec![false; nb];
+    for b in 0..nb {
+        if unknown_out[b] {
+            unusable[b] = true;
+        }
+    }
+    for b in 0..nb {
+        if preds[b].iter().any(|&p| unknown_out[p]) {
+            unusable[b] = true;
+        }
+    }
+    // Body text: instructions only, so labels, directives and alignment are
+    // transparent (an alignment directive must not make two blocks differ).
+    let mut body: Vec<String> = Vec::with_capacity(nb);
+    for b in 0..nb {
+        let mut t = String::new();
+        for k in starts[b]..end(b) {
+            if matches!(
+                kinds[k],
+                LineKind::Nop | LineKind::Directive | LineKind::Label
+            ) {
+                continue;
+            }
+            t.push_str(lines[k].trim());
+            t.push('\n');
+        }
+        body.push(t);
+    }
+    let mut func_of = vec![0usize; nb];
+    {
+        let mut f = 0usize;
+        for b in 0..nb {
+            let st = starts[b];
+            if kinds[st] == LineKind::Label && is_function_boundary(&lines[st]) {
+                f += 1;
+            }
+            func_of[b] = f;
+        }
+    }
+    let mut groups: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+    for b in 0..nb {
+        if unusable[b] || body[b].trim().is_empty() {
+            continue;
+        }
+        groups.entry(body[b].as_str()).or_default().push(b);
+    }
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        for (i, &keep) in members.iter().enumerate() {
+            for &dup in members.iter().skip(i + 1) {
+                let from = labels[dup].clone();
+                let to = labels[keep].clone();
+                if from.is_empty() || to.is_empty() || keep == dup {
+                    continue;
+                }
+                if func_of[keep] != func_of[dup] {
+                    continue;
+                }
+                if is_function_boundary(&lines[starts[dup]]) {
+                    continue;
+                }
+                let same_preds = {
+                    let mut a = preds[keep].clone();
+                    let mut b = preds[dup].clone();
+                    a.sort_unstable();
+                    a.dedup();
+                    b.sort_unstable();
+                    b.dedup();
+                    !a.is_empty() && a == b // never trust two empty sets
+                };
+                if !same_preds
+                    && !(block_is_live_in_independent(lines, kinds, starts[keep], end(keep))
+                        && block_is_live_in_independent(lines, kinds, starts[dup], end(dup)))
+                {
+                    continue;
+                }
+                // `dup` must not be entered by fall-through: that edge cannot
+                // be retargeted by renaming a label.
+                let mut fallthrough_in = false;
+                for &p in &preds[dup] {
+                    let e = end(p);
+                    let mut t = e;
+                    while t > starts[p] && kinds[t - 1] == LineKind::Nop {
+                        t -= 1;
+                    }
+                    let term = if t > starts[p] {
+                        kinds[t - 1]
+                    } else {
+                        LineKind::Nop
+                    };
+                    if !matches!(term, LineKind::Branch | LineKind::Ret) && p + 1 == dup {
+                        fallthrough_in = true;
+                        break;
+                    }
+                }
+                if fallthrough_in {
+                    continue;
+                }
+                for k in 0..n {
+                    if !matches!(
+                        kinds[k],
+                        LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+                    ) {
+                        continue;
+                    }
+                    let mut parts: Vec<&str> = lines[k].split_whitespace().collect();
+                    let last = parts.len() - 1;
+                    if parts[last] == from {
+                        parts[last] = to.as_str();
+                        lines[k] = parts.join(" ");
+                        kinds[k] = classify_line(&lines[k]);
+                    }
+                }
+                for k in starts[dup]..end(dup) {
+                    kinds[k] = LineKind::Nop;
+                }
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {

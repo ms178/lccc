@@ -24,14 +24,15 @@ Older text that claimed “all `-O` levels run the same pipeline” is **obsolet
 
 The `-O` flags still set `__OPTIMIZE__` / `__OPTIMIZE_SIZE__` for kernel-style `#ifdef`s.
 
-## Passes added since this page was written (August 2026)
+## Recently added passes
 
-This page predates several production passes; `src/passes/README.md` and
-`src/passes/mod.rs` are authoritative. Landed since:
+`src/passes/README.md` and `src/passes/mod.rs` are authoritative for the IR
+passes; the backend peepholes are documented per backend
+(`src/backend/<arch>/codegen/`). Landed since this page was written:
 
 - **DSE** (`dse.rs`) — same-block dead-store elimination with closed-alloca
   escape analysis and byte-range kills (`CCC_NO_DSE`).
-- **Backedge PRE** — integer recurrences default-on (1.14× measured);
+- **Backedge PRE** — integer recurrences default-on (1.14x measured);
   FP variants gated (`CCC_BEPRE_FP=1` research).
 - **GlobalAddr CSE** (`global_addr_cse.rs`) — oracle-derived placement:
   cold singletons branch-local, loop addresses to the innermost preheader,
@@ -39,14 +40,48 @@ This page predates several production passes; `src/passes/README.md` and
 - **Stencil vectorizer** — constant-tap affine loops, bit-exact vs scalar
   (`CCC_NO_STENCIL_VEC`).
 - **Map expression trees** — elementwise FP/int map loops (`CCC_NO_MAP_VEC`).
-- **Widening + masked conditional-sum reductions** — I32→I64 `paddq`
-  pipelines, VEX-only bodies (9× AVX-SSE transition penalty avoided).
-- **Loop rotation** (`loop_rotate.rs`) — opt-in (`CCC_LOOP_ROTATE=1`),
-  runs after vectorize; default-enable pending hardening.
+- **Widening + masked conditional-sum reductions** — I32->I64 `paddq`
+  pipelines, VEX-only bodies (9x AVX-SSE transition penalty avoided).
+- **Loop rotation** (`loop_rotate.rs`, IR) — **opt-in** at the IR level
+  (`CCC_LOOP_ROTATE=1`), runs after vectorize; default-enable pending
+  hardening (see `engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md`).
+  Independently, the **ARM backend peephole rotates simple loops by default**
+  (`rotate_simple_loops`, off only under `CCC_NO_LOOP_ROTATE`).
 - **General complete unrolling** — nested/multi-block constant-trip loops
   with FP-aware expansion budget.
 - **Tri-state FP contraction** — `FpContract { Off, OnExpr, Fast }`,
   default Off (GCC `gnu*` parity); FMA emission requires the FMA3 feature.
+- **Identical basic-block merging** (`merge_identical_blocks`, ARM + RISC-V
+  backend peepholes) — collapses duplicate blocks that a switch's phi
+  trampolines, repeated guard sequences and cloned epilogue stubs leave behind.
+  Ported from the x86 backend's `identical_blocks` pass.  Measured on the
+  43-program corpus: **-45 / -30 instructions (ARM `-Os` / `-O2`)** and
+  **-51 / -45 (RISC-V)**.
+
+### Backend peepholes worth knowing about
+
+- **Register-copy coalescing** — whole-function: renames a copy's destination
+  onto its source everywhere and deletes the copy. Installed in **x86**
+  (`passes/copy_coalesce.rs`), **ARM** and **RISC-V**
+  (`coalesce_entry_copies`); i686 has its own equivalents. It is the only way
+  to remove an entry-shuffle copy, whose destination is live to the end of the
+  function, so no local pass can touch it.
+- **Alias folding** (ARM `propagate_address_aliases`) — deletes `mov xD, xS`
+  when dst is only ever used as an address base. Gated on an exact CFG query
+  (`Cfg::redef_covers_all_reads`): every read of dst reachable *without passing
+  the redefinition* must be a rewritable address use. A `ret` invalidates it
+  for x0-x7, which carry the return value.
+
+- **Identical basic-block merging** (`merge_identical_blocks`) — a block is
+  deleted and its predecessors retargeted when its instruction text matches
+  another block's and either (a) both have the **same non-empty predecessor
+  set**, so the live-in state is identical, or (b) both are **live-in
+  independent** — every register they read is defined inside the block — so
+  the live-in state is irrelevant.  Additionally the deleted block must be
+  entered only by explicit branches (a fall-through edge cannot be retargeted
+  by renaming a label), must not be a function's entry block, and blocks whose
+  predecessors are unknown (an indirect `br xN` jump table, or a `jalr`) are
+  excluded rather than poisoning the whole function.
 
 ## Pass Order
 

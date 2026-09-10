@@ -513,6 +513,8 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
+        changed |= merge_identical_blocks(&mut lines, &mut kinds, n);
+        changed |= coalesce_entry_copies(&mut lines, &mut kinds, n);
         changed |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
         rounds += 1;
     }
@@ -542,6 +544,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
+            changed2 |= merge_identical_blocks(&mut lines, &mut kinds, n);
+            changed2 |= coalesce_entry_copies(&mut lines, &mut kinds, n);
             changed2 |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
             changed2 |= eliminate_dead_reg_moves(&lines, &mut kinds, n);
             rounds2 += 1;
@@ -890,6 +894,435 @@ fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
 // The key insight: if we see `mv A, B` followed by `mv C, A` and A is a temp
 // register, we can redirect to `mv C, B` and eliminate the first mv if A
 // is not used elsewhere.
+
+/// Instructions whose effects are not fully described by their textual
+/// operands: system, atomic and memory-ordering traffic.  A register rename
+/// cannot reach into any of them, so a candidate crossing one is rejected.
+fn has_unmodelled_effects(line: &str) -> bool {
+    let m = line.trim().split_whitespace().next().unwrap_or("");
+    matches!(
+        m,
+        "ecall"
+            | "ebreak"
+            | "fence"
+            | "fence.i"
+            | "sfence.vma"
+            | "wfi"
+            | "mret"
+            | "sret"
+            | "uret"
+            | "csrr"
+            | "csrw"
+            | "csrs"
+            | "csrc"
+            | "csrrw"
+            | "csrrs"
+            | "csrrc"
+            | "csrrwi"
+            | "csrrsi"
+            | "csrrci"
+    ) || m.starts_with("lr.")
+        || m.starts_with("sc.")
+        || m.starts_with("amo")
+}
+
+/// Whole-function register-copy coalescing for the entry shuffle.
+///
+/// Ported from the ARM backend, which ports the x86 pass
+/// (`x86/codegen/peephole/passes/copy_coalesce.rs`).  RISC-V had no coalescing
+/// at all, so its functions paid for an entry shuffle both other backends
+/// delete: the register allocator hands parameters homes that do not match the
+/// a0-a7 registers they arrive in, so functions open with `mv rD, rS` copies
+/// whose destination really is live for the rest of the function — no local
+/// pass can delete those.  Coalescing renames the destination onto the source
+/// everywhere after the copy and drops the copy.
+///
+/// Legality, all required:
+///  1. The copy sits in the straight-line entry run (no label, jump, branch,
+///     call or return before it), so every earlier line runs exactly once and
+///     cannot be re-entered through a back edge.
+///  2. `src` is mentioned nowhere else in the function — no later write
+///     clobbers the coalesced value and no other live range is disturbed.  A
+///     parameter's arrival in `src` is implicit, not a mention.
+///  3. After the copy, `dst` has no unrenamable reader or writer: no implicit
+///     operand, no `ret` with `dst` in a0-a7 (the return-value registers), no
+///     call while the value lives in a caller-saved register *and is still used
+///     afterwards*, and no unmodelled instruction.  A far `jump` uses t6 as its
+///     scratch, so t6 is never renamed across one.
+///  4. s0 (frame pointer), ra and sp are never renamed.
+fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions(line: &str, reg: u8) -> bool {
+        let name = reg_name(reg);
+        !name.is_empty()
+            && line
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|tok| tok == name)
+    }
+    /// Caller-saved: clobbered by `call`.  t0-t6, the unnamed temporaries,
+    /// and a0-a7.
+    fn caller_saved(reg: u8) -> bool {
+        reg <= 9 || (REG_A0..=REG_A7).contains(&reg)
+    }
+    fn renamable(reg: u8) -> bool {
+        (reg as usize) < NUM_REGS && reg != REG_S0 && reg != REG_RA && reg != REG_SP
+    }
+    if n == 0 {
+        return false;
+    }
+    let mut starts: Vec<usize> = (0..n)
+        .filter(|&i| {
+            lines[i].ends_with(':')
+                && !lines[i].starts_with('.')
+                && !lines[i].starts_with(char::is_whitespace)
+        })
+        .collect();
+    if starts.is_empty() {
+        return false;
+    }
+    starts.push(n);
+    let mut changed = false;
+    for w in 0..starts.len() - 1 {
+        let (fstart, fend) = (starts[w], starts[w + 1]);
+        let mut eend = fend;
+        for k in fstart + 1..fend {
+            if matches!(
+                kinds[k],
+                LineKind::Label
+                    | LineKind::Jump
+                    | LineKind::Branch
+                    | LineKind::Call
+                    | LineKind::Ret
+            ) {
+                eend = k;
+                break;
+            }
+        }
+        let mut i = fstart + 1;
+        while i < eend {
+            i += 1;
+            let LineKind::Move { dst, src } = kinds[i - 1] else {
+                continue;
+            };
+            let i = i - 1;
+            if dst == src || !renamable(dst) || !renamable(src) {
+                continue;
+            }
+            let mut ok = true;
+            for k in fstart..fend {
+                if k == i || kinds[k] == LineKind::Nop {
+                    continue;
+                }
+                if mentions(&lines[k], src) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                for k in i + 1..fend {
+                    match kinds[k] {
+                        LineKind::Nop | LineKind::Directive | LineKind::Label => {}
+                        LineKind::Ret => {
+                            if (REG_A0..=REG_A7).contains(&dst) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        LineKind::Jump => {
+                            if dst == REG_T6 {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        LineKind::Call => {
+                            if caller_saved(src)
+                                && (k + 1..fend)
+                                    .any(|m| kinds[m] != LineKind::Nop && mentions(&lines[m], dst))
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if !ok || has_unmodelled_effects(&lines[k]) {
+                        ok = false;
+                        break;
+                    }
+                    let (ireads, iwrites) = classify_implicit_operands_rv(&lines[k]);
+                    if (ireads | iwrites) & (1u64 << dst) != 0 {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let d = reg_name(dst).to_string();
+            let s = reg_name(src).to_string();
+            for k in i + 1..fend {
+                if kinds[k] == LineKind::Nop {
+                    continue;
+                }
+                let new = crate::backend::peephole_common::replace_whole_word(&lines[k], &d, &s);
+                if new != lines[k] {
+                    lines[k] = new;
+                    kinds[k] = classify_line(&lines[k]);
+                }
+            }
+            kinds[i] = LineKind::Nop;
+            changed = true;
+            break; // the rename changes the picture: re-scan this function
+        }
+    }
+    changed
+}
+
+/// True when a block defines every register it reads before the read, so its
+/// result cannot depend on the state it is entered with.  Two identical blocks
+/// that are both live-in independent are interchangeable regardless of their
+/// predecessors.  Calls and returns are excluded: a call reads the argument
+/// registers implicitly and a `ret` reads a0-a7.
+fn block_is_live_in_independent(
+    lines: &[String],
+    kinds: &[LineKind],
+    start: usize,
+    end: usize,
+) -> bool {
+    let mut defined: u64 = 0;
+    for k in start..end {
+        match kinds[k] {
+            LineKind::Nop | LineKind::Directive | LineKind::Label => continue,
+            LineKind::Call | LineKind::Ret => return false,
+            _ => {}
+        }
+        let line = &lines[k];
+        let (ireads, iwrites) = classify_implicit_operands_rv(line);
+        if ireads & !defined != 0 {
+            return false;
+        }
+        let out = sext_producing_def(line, kinds[k]).map(|(d, _)| d);
+        let mentions_dst_once = match out {
+            Some(r) => {
+                let name = reg_name(r);
+                !name.is_empty()
+                    && line
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .filter(|t| *t == name)
+                        .count()
+                        == 1
+            }
+            None => false,
+        };
+        for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            let r = parse_reg(tok);
+            if r == REG_NONE || (r as usize) >= NUM_REGS {
+                continue;
+            }
+            if mentions_dst_once && out == Some(r) {
+                continue; // sole mention is the definition
+            }
+            if defined & (1u64 << r) == 0 {
+                return false;
+            }
+        }
+        if let Some(r) = out {
+            defined |= 1u64 << r;
+        }
+        defined |= iwrites;
+    }
+    true
+}
+
+/// Merge identical basic blocks.
+///
+/// Ported from the ARM backend, which ports it from x86's `identical_blocks`.
+/// Two blocks with the same instruction text are interchangeable when either
+/// their predecessor sets are equal (so the live-in state is identical) or both
+/// are live-in independent (so the live-in state is irrelevant).  The deleted
+/// block must be entered only by explicit jumps — a fall-through edge cannot be
+/// retargeted by renaming a label — and a function's entry block is never
+/// deleted.  Empty predecessor sets are never treated as equal: a block can
+/// look orphaned only because an edge was missed.
+fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut starts: Vec<usize> = vec![0];
+    for i in 0..n {
+        let after_transfer = i != 0
+            && matches!(
+                kinds[i - 1],
+                LineKind::Jump | LineKind::Branch | LineKind::Ret
+            );
+        if i != 0 && (kinds[i] == LineKind::Label || after_transfer) {
+            starts.push(i);
+        }
+    }
+    let nb = starts.len();
+    if nb < 2 {
+        return false;
+    }
+    let end = |b: usize| -> usize { if b + 1 < nb { starts[b + 1] } else { n } };
+    let mut block_of = vec![0usize; n];
+    for b in 0..nb {
+        for k in starts[b]..end(b) {
+            block_of[k] = b;
+        }
+    }
+    let mut labels: Vec<String> = vec![String::new(); nb];
+    let mut label_block: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::default();
+    for i in 0..n {
+        if kinds[i] == LineKind::Label {
+            let name = lines[i].trim().trim_end_matches(':');
+            label_block.insert(name, block_of[i]);
+            labels[block_of[i]] = (*name).to_string();
+        }
+    }
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    let mut unknown_out = vec![false; nb];
+    for b in 0..nb {
+        let e = end(b);
+        let mut t = e;
+        while t > starts[b] && kinds[t - 1] == LineKind::Nop {
+            t -= 1;
+        }
+        if t == starts[b] {
+            if b + 1 < nb {
+                succs[b].push(b + 1);
+            }
+            continue;
+        }
+        let last = t - 1;
+        match kinds[last] {
+            LineKind::Ret => {}
+            // `jump L, t6` names its scratch register last, so the label is
+            // the first argument — `jump_target` knows both spellings.
+            LineKind::Jump => {
+                match jump_target(&lines[last]).and_then(|t| label_block.get(t).copied()) {
+                    Some(tb) => succs[b].push(tb),
+                    None => unknown_out[b] = true,
+                }
+            }
+            LineKind::Branch => {
+                let tgt = lines[last].trim().split_whitespace().next_back();
+                match tgt.and_then(|t| label_block.get(t).copied()) {
+                    Some(tb) => succs[b].push(tb),
+                    None => unknown_out[b] = true,
+                }
+                if b + 1 < nb {
+                    succs[b].push(b + 1);
+                }
+            }
+            _ => {
+                if b + 1 < nb {
+                    succs[b].push(b + 1);
+                }
+            }
+        }
+    }
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    for b in 0..nb {
+        for &s in &succs[b] {
+            preds[s].push(b);
+        }
+    }
+    let unusable: Vec<bool> = (0..nb)
+        .map(|b| unknown_out[b] || preds[b].iter().any(|&p| unknown_out[p]))
+        .collect();
+    let body: Vec<String> = (0..nb)
+        .map(|b| {
+            let mut t = String::new();
+            for k in starts[b]..end(b) {
+                if matches!(
+                    kinds[k],
+                    LineKind::Nop | LineKind::Directive | LineKind::Label
+                ) {
+                    continue;
+                }
+                t.push_str(lines[k].trim());
+                t.push('\n');
+            }
+            t
+        })
+        .collect();
+    let mut groups: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::default();
+    for b in 0..nb {
+        if unusable[b] || body[b].trim().is_empty() {
+            continue;
+        }
+        groups.entry(body[b].as_str()).or_default().push(b);
+    }
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        for (i, &keep) in members.iter().enumerate() {
+            for &dup in members.iter().skip(i + 1) {
+                let from = labels[dup].clone();
+                let to = labels[keep].clone();
+                if keep == dup || from.is_empty() || to.is_empty() {
+                    continue;
+                }
+                // A function's entry block is the symbol itself.
+                if lines[starts[dup]].ends_with(':') && !lines[starts[dup]].starts_with('.') {
+                    continue;
+                }
+                let same_preds = {
+                    let mut a = preds[keep].clone();
+                    let mut b = preds[dup].clone();
+                    a.sort_unstable();
+                    a.dedup();
+                    b.sort_unstable();
+                    b.dedup();
+                    !a.is_empty() && a == b
+                };
+                if !same_preds
+                    && !(block_is_live_in_independent(lines, kinds, starts[keep], end(keep))
+                        && block_is_live_in_independent(lines, kinds, starts[dup], end(dup)))
+                {
+                    continue;
+                }
+                // `dup` must not be entered by fall-through.
+                let mut fallthrough_in = false;
+                for &p in &preds[dup] {
+                    let e = end(p);
+                    let mut t = e;
+                    while t > starts[p] && kinds[t - 1] == LineKind::Nop {
+                        t -= 1;
+                    }
+                    let term = if t > starts[p] {
+                        kinds[t - 1]
+                    } else {
+                        LineKind::Nop
+                    };
+                    if !matches!(term, LineKind::Jump | LineKind::Ret) && p + 1 == dup {
+                        fallthrough_in = true;
+                        break;
+                    }
+                }
+                if fallthrough_in {
+                    continue;
+                }
+                for k in 0..n {
+                    if !matches!(kinds[k], LineKind::Jump | LineKind::Branch) {
+                        continue;
+                    }
+                    let new =
+                        crate::backend::peephole_common::replace_whole_word(&lines[k], &from, &to);
+                    if new != lines[k] {
+                        lines[k] = new;
+                        kinds[k] = classify_line(&lines[k]);
+                    }
+                }
+                for k in starts[dup]..end(dup) {
+                    kinds[k] = LineKind::Nop;
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
 
 fn eliminate_redundant_mv_chain(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
