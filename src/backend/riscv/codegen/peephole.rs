@@ -45,6 +45,10 @@
 //! 9. **Range-safe branch-over-jump fusion**: Inverts a conditional branch
 //!    over an unconditional jump when the new B-type target is conservatively
 //!    proven to fit its ±4 KiB range.
+//!
+//! 10. **Redundant byte zero-extension elimination**: Tracks values produced
+//!     by `lbu`, byte-sized constants, and register copies, removing a later
+//!     `andi r, r, 0xff` when the upper bits are already known zero.
 
 // ── Line classification types ────────────────────────────────────────────────
 
@@ -501,6 +505,17 @@ fn branch_parts(line: &str) -> Option<(&str, &str, &str)> {
     Some((op, args[..comma].trim_end(), args[comma + 1..].trim()))
 }
 
+fn parse_asm_i64(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if let Some(hex) = text.strip_prefix("0x") {
+        i64::from_str_radix(hex, 16).ok()
+    } else if let Some(hex) = text.strip_prefix("-0x") {
+        i64::from_str_radix(hex, 16).ok()?.checked_neg()
+    } else {
+        text.parse().ok()
+    }
+}
+
 /// Parse the destination register from an ALU-style instruction.
 /// RISC-V ALU instructions have the form: `mnemonic rd, rs1, rs2/imm`
 /// The destination is the first operand.
@@ -543,6 +558,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= rewrite_far_jumps_to_near(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_jump(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
+        changed |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
         if merge_blocks {
@@ -576,6 +592,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= rewrite_far_jumps_to_near(&mut lines, &mut kinds, n);
             changed2 |= fuse_branch_over_jump(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
+            changed2 |= eliminate_redundant_zext_byte(&mut lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
             if merge_blocks {
@@ -950,6 +967,120 @@ fn eliminate_redundant_sext_w(lines: &[String], kinds: &mut [LineKind], n: usize
             }
         }
         i += 1;
+    }
+    changed
+}
+
+// ── Redundant byte zero-extension elimination ────────────────────────────────
+//
+// RV64 `lbu` already produces an XLEN-wide zero-extended value.  The generic
+// lowering nevertheless often emits a later `andi r, r, 0xff`, usually with
+// register-copy staging in between.  This is the RISC-V adaptation of ARM's
+// redundant-zext pass: maintain a conservative per-basic-block proof that a
+// register is in [0,255], propagate it through `mv`, and delete only a self
+// mask whose input is proven.  Cross-register masks become moves because they
+// still define their destination.
+fn eliminate_redundant_zext_byte(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_ZEXT_BYTE_ELIM").is_ok() {
+        return false;
+    }
+    let mut known: u64 = 0;
+    let mut changed = false;
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::Jump | LineKind::Ret => {
+                known = 0;
+                continue;
+            }
+            LineKind::Call => {
+                // Preserve only callee-saved s0-s11 knowledge.
+                for r in 0..=6u8 {
+                    known &= !(1u64 << r);
+                }
+                for r in 30..=37u8 {
+                    known &= !(1u64 << r);
+                }
+                continue;
+            }
+            LineKind::Nop | LineKind::Directive => continue,
+            _ => {}
+        }
+
+        let t = lines[i].trim();
+        let (mnem, operands) = match t.split_once(' ') {
+            Some(parts) => parts,
+            None => {
+                known = 0;
+                continue;
+            }
+        };
+
+        // `lbu rd, address` establishes the proof regardless of addressing
+        // mode. Other unclassified instructions remain fail-closed below.
+        if mnem == "lbu" {
+            let dst = parse_reg(operands.split(',').next().unwrap_or("").trim());
+            if dst == REG_NONE {
+                known = 0;
+            } else {
+                known |= 1u64 << dst;
+            }
+            continue;
+        }
+
+        if mnem == "andi" {
+            let ops: Vec<&str> = operands.split(',').map(str::trim).collect();
+            if ops.len() == 3 {
+                let dst = parse_reg(ops[0]);
+                let src = parse_reg(ops[1]);
+                let imm = parse_asm_i64(ops[2]);
+                if dst != REG_NONE && src != REG_NONE && imm == Some(255) {
+                    if known & (1u64 << src) != 0 {
+                        if dst == src {
+                            kinds[i] = LineKind::Nop;
+                        } else {
+                            lines[i] = format!("    mv {}, {}", reg_name(dst), reg_name(src));
+                            kinds[i] = LineKind::Move { dst, src };
+                        }
+                        changed = true;
+                    }
+                    // Masking with 255 establishes the invariant even when it
+                    // could not itself be removed.
+                    known |= 1u64 << dst;
+                    continue;
+                }
+            }
+        }
+
+        match kinds[i] {
+            LineKind::Move { dst, src } => {
+                if known & (1u64 << src) != 0 {
+                    known |= 1u64 << dst;
+                } else {
+                    known &= !(1u64 << dst);
+                }
+            }
+            LineKind::LoadImm { dst } => {
+                let value = operands
+                    .split_once(',')
+                    .and_then(|(_, imm)| parse_asm_i64(imm));
+                if value.is_some_and(|v| (0..=255).contains(&v)) {
+                    known |= 1u64 << dst;
+                } else {
+                    known &= !(1u64 << dst);
+                }
+            }
+            LineKind::Alu if mnem == "seqz" || mnem == "snez" => {
+                if let Some(dst) = parse_alu_dest(&lines[i]) {
+                    known |= 1u64 << dst;
+                } else {
+                    known = 0;
+                }
+            }
+            _ => match sext_producing_def(&lines[i], kinds[i]) {
+                Some((dst, _)) => known &= !(1u64 << dst),
+                None => known = 0,
+            },
+        }
     }
     changed
 }
@@ -2411,6 +2542,66 @@ mod jump_near_tests {
         let input = "f:\n    jump some_function, t6\n    ret\n";
         let out = peephole_optimize(input.to_string());
         assert!(out.contains("jump some_function, t6"), "\n{}", out);
+    }
+
+    #[test]
+    fn byte_zext_tracks_lbu_through_moves() {
+        let input = "f:\n    lbu t0, 0(t2)\n    mv a0, t0\n    andi t0, t0, 0xff\n    ret\n";
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
+        assert_eq!(kinds[3], LineKind::Nop);
+    }
+
+    #[test]
+    fn byte_zext_cross_register_form_keeps_definition() {
+        let input = "f:\n    lbu t0, 0(t2)\n    andi a0, t0, 0xff\n    add a1, a0, t3\n    ret\n";
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
+        assert_eq!(lines[2].trim(), "mv a0, t0");
+    }
+
+    #[test]
+    fn byte_zext_respects_calls_and_abi_register_classes() {
+        let input = concat!(
+            "f:\n",
+            "    lbu s1, 0(t2)\n",
+            "    lbu a0, 1(t2)\n",
+            "    call helper\n",
+            "    andi s1, s1, 0xff\n",
+            "    andi a0, a0, 0xff\n",
+            "    ret\n",
+        );
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
+        assert_eq!(kinds[4], LineKind::Nop, "s1 is callee-saved");
+        assert_eq!(kinds[5], LineKind::Alu, "a0 is caller-clobbered");
+    }
+
+    #[test]
+    fn byte_zext_label_kills_path_specific_proof() {
+        let input = "f:\n    lbu t0, 0(t2)\n.Ljoin:\n    andi t0, t0, 0xff\n    ret\n";
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
+        assert_eq!(kinds[3], LineKind::Alu);
+    }
+
+    #[test]
+    fn byte_zext_unknown_instruction_kills_proof() {
+        let input =
+            "f:\n    lbu t0, 0(t2)\n    csrrw t3, mstatus, t4\n    andi t0, t0, 0xff\n    ret\n";
+        let mut lines: Vec<String> = input.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!eliminate_redundant_zext_byte(&mut lines, &mut kinds, n));
+        assert_eq!(kinds[3], LineKind::Alu);
     }
 
     #[test]
