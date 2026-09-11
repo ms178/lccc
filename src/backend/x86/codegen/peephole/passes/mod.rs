@@ -1019,6 +1019,21 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed |= c;
             }
         }
+        // Copy-into-RMW coalescing: `mov %S,%D` feeding a read-modify-write
+        // consumer that destinations `%D`. Placed AFTER every copy+ALU
+        // specialist on purpose (specific before general): `copy_add_lea` /
+        // `copy_shift_lea` (flag-free `lea`), `copy_mask_movz` / `narrow_signext`
+        // (`movzx`), `xor_move_fold` and `copy_coalesce` all produce
+        // structurally better code than a retargeted ALU op wherever they
+        // match, and `load_alu_fuse` (which runs first) already takes the
+        // commutative dying-operand shapes — this pass takes the remainder.
+        if !sk("copy_rmw_coalesce") {
+            {
+                let c = relay_and_lea::coalesce_copy_into_rmw(&mut store, &mut infos);
+                trace("coalesce_copy_into_rmw", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
         if !sk("rotate_idiom") {
             {
                 let c = local_patterns::fold_rotate_idiom(&mut store, &mut infos);

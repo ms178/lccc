@@ -344,6 +344,36 @@ impl FileLiveness {
         saw_ret
     }
 
+    /// The prologue's `# LCCC_RET_RDX 0|1` marker (see `prologue.rs`):
+    /// whether `%rdx` is read by this function's `ret`s. `Some` (either way)
+    /// is authoritative; `None` means absent or illegible — the caller falls
+    /// back to tail-block inference. The scan stops at the first `ret`: like
+    /// its `# LCCC_RET_XMM` sibling, the marker precedes the body.
+    pub(super) fn ret_rdx_marker(
+        store: &LineStore,
+        infos: &[LineInfo],
+        start: usize,
+        end: usize,
+    ) -> Option<bool> {
+        for n in start..end {
+            if infos[n].is_nop() {
+                continue;
+            }
+            let t = infos[n].trimmed(store.get(n));
+            if let Some(m) = t.strip_prefix("# LCCC_RET_RDX ") {
+                match m.trim() {
+                    "1" => return Some(true),
+                    "0" => return Some(false),
+                    _ => {} // illegible: keep looking, then fall back
+                }
+            }
+            if infos[n].kind == LineKind::Ret {
+                break;
+            }
+        }
+        None
+    }
+
     #[expect(clippy::needless_range_loop)]
     fn analyse_function(
         &mut self,
@@ -352,10 +382,23 @@ impl FileLiveness {
         start: usize,
         end: usize,
     ) {
-        let ret_live = if Self::returns_in_rax_only(store, infos, start, end) {
-            RET_LIVE_RAX_ONLY
-        } else {
-            RET_LIVE
+        let ret_live = match Self::ret_rdx_marker(store, infos, start, end) {
+            // The prologue marker is authoritative: it was computed from the
+            // signature's return classification, which no tail-block shape
+            // can defeat (a shared epilogue, `%rdx` traffic that is a mere
+            // read, ...). It governs ONLY the `%rdx` bit; everything else in
+            // RET_LIVE (callee-saved must-restore, `%rax`) stands.
+            Some(true) => RET_LIVE,
+            Some(false) => RET_LIVE_RAX_ONLY,
+            // No (legible) marker — hand-written fragments, unit tests: the
+            // tail-block detector below.
+            None => {
+                if Self::returns_in_rax_only(store, infos, start, end) {
+                    RET_LIVE_RAX_ONLY
+                } else {
+                    RET_LIVE
+                }
+            }
         };
         // ── labels ───────────────────────────────────────────────────────────
         let mut labels: Vec<(String, usize)> = Vec::new();
@@ -877,5 +920,59 @@ mod tests {
             Some(false),
             "cltd's implicit %rdx write must kill the loop-carried def"
         );
+    }
+
+    #[test]
+    fn ret_rdx_marker_is_authoritative() {
+        // The epilogue reads `%rdx` (`movzbl %dl`), which defeats the
+        // tail-block detector — yet the marker says the function returns an
+        // `int`, so `%rdx` is dead after the copy.
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    # LCCC_RET_RDX 0\n",
+            "    movzbl %dl, %r11d\n",
+            "    andl $127, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let n = line_of(&store, "movzbl %dl, %r11d");
+        assert_eq!(lv.live_after(n, 2), Some(false));
+        // And the `1` spelling keeps `%rdx` live (an i128 return).
+        let asm = asm.replace("# LCCC_RET_RDX 0", "# LCCC_RET_RDX 1");
+        let (store, _infos, lv) = build(&asm);
+        let n = line_of(&store, "movzbl %dl, %r11d");
+        assert_eq!(lv.live_after(n, 2), Some(true));
+    }
+
+    #[test]
+    fn ret_rdx_falls_back_to_tail_inference_without_marker() {
+        // No marker: the tail-block detector decides. A `%rdx` mention in
+        // the tail keeps the register conservatively live (whether or not
+        // the function "really" returns an `int` — unknowable from text).
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl %dl, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let n = line_of(&store, "movzbl %dl, %r11d");
+        assert_eq!(lv.live_after(n, 2), Some(true));
+        // A clean tail still infers rax-only without any marker.
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let n = line_of(&store, "movl %r11d, %eax");
+        assert_eq!(lv.live_after(n, 2), Some(false));
     }
 }
