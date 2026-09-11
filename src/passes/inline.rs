@@ -1875,10 +1875,13 @@ struct CalleeData {
     /// call-graph snapshot, and identifies wrappers that have acquired a loop
     /// body after their initial tiny/small eligibility decision.
     has_inlined_calls: bool,
-    /// Whether this callee is a `static` (non-`inline`) function with exactly
-    /// one call site in the whole module. Such callees are dead after inlining
-    /// (net code shrink), so they are exempt from the caller-size caps and the
-    /// per-caller inlining budget, matching GCC's -O2 behavior.
+    /// Whether this callee is a `static` function (including `static inline`)
+    /// with exactly one call site in the whole module. Such callees are dead
+    /// after inlining (net code shrink), so they are exempt from the
+    /// caller-size caps and the per-caller inlining budget, matching GCC's
+    /// -O2 behavior (`-finline-functions-called-once` applies regardless of
+    /// the `inline` keyword: a single-site body that is never address-taken
+    /// disappears whether or not it was declared `inline`).
     is_single_call_site_static: bool,
     /// Whether this callee contains any back-edges (loops).
     /// Functions without loops can use a higher block limit for inlining.
@@ -2480,12 +2483,18 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 direct_call_count: total_calls,
                 has_inlineable_loop_descendant: false,
                 has_inlined_calls: func.has_inlined_calls,
-                // Any static (non-inline) callee with a single call site is
-                // dead after inlining, so it is exempt from the soft caller-
-                // size cap and the per-caller budget in select_inline_site
-                // (regardless of which size bucket above admitted it).
+                // Any static callee with a single call site is dead after
+                // inlining (internal linkage + address never taken), so it is
+                // exempt from the soft caller-size cap and the per-caller
+                // budget in select_inline_site (regardless of which size
+                // bucket above admitted it). This deliberately INCLUDES
+                // `static inline`: inlining the only call is always a net
+                // code shrink (the outlined body, prologue/epilogue and call
+                // sequence all disappear). Excluding `inline` here left
+                // loop-containing `static inline` helpers over the 6-block
+                // normal limit permanently outlined (zstd_count: 10 blocks,
+                // 63 instructions, one hot call site — GCC inlines it).
                 is_single_call_site_static: func.is_static
-                    && !func.is_inline
                     && has_single_call_site
                     && !survives_via_reference,
                 single_call_site: has_single_call_site,
@@ -2814,8 +2823,16 @@ fn find_inline_call_sites(
                         if skip_list.iter().any(|s| s == callee_name) {
                             continue;
                         }
-                        // Skip callees that exceed normal limits unless caller has a section
-                        if callee_data.exceeds_normal_limits && !caller_has_section {
+                        // Skip callees that exceed normal limits unless the caller
+                        // has a section (cross-section calls are dangerous) or
+                        // the callee is dead after inlining (single call site,
+                        // address never taken): then inlining is a net shrink
+                        // and size limits do not apply (GCC
+                        // -finline-functions-called-once parity).
+                        if callee_data.exceeds_normal_limits
+                            && !caller_has_section
+                            && !callee_data.is_single_call_site_static
+                        {
                             continue;
                         }
                         sites.push(InlineCallSite {
