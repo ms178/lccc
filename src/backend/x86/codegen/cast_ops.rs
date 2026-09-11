@@ -686,6 +686,9 @@ impl X86Codegen {
         for slot in 0..2 {
             if let Some(p) = self.pending_widen[slot].take() {
                 self.emit_int_widen_move(&p.src, p.from_ty, p.dest_phys);
+                // Definition-writes-home accounting: the deferred widening
+                // move IS the cast dest's definition into its home.
+                self.note_inplace_compute(p.dest_phys, p.dest);
             }
         }
     }
@@ -945,9 +948,30 @@ impl X86Codegen {
         }
     }
 
+    /// Register-direct cast emission, wrapped so the
+    /// definition-writes-home invariant is enforced at ONE boundary: every
+    /// arm of the inner emitter writes `dest_phys` with the cast's result
+    /// (staged copy, widening move, narrowing move, or accumulator-targeted
+    /// extension). Forgetting the note on any arm is exactly the PR #487
+    /// bug class — the dest stays home_clobbered and its consumer hits the
+    /// stale-home refusal — so the boundary note covers them all.
     fn try_emit_cast_reg_direct(
         &mut self,
-        _dest: &Value,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+        dest_phys: crate::backend::regalloc::PhysReg,
+    ) -> bool {
+        if !self.try_emit_cast_reg_direct_inner(src, from_ty, to_ty, dest_phys) {
+            return false;
+        }
+        self.note_inplace_compute(dest_phys, dest.0);
+        true
+    }
+
+    fn try_emit_cast_reg_direct_inner(
+        &mut self,
         src: &Operand,
         from_ty: IrType,
         to_ty: IrType,

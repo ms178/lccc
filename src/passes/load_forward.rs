@@ -20,6 +20,13 @@
 //! Safety: we require B to have a single predecessor (so the earlier load is
 //! guaranteed to have executed), identical pointer value and load type, and no
 //! memory clobber (store/call/memcpy/atomic/fence) between the two loads.
+//!
+//! MULTI-DEF GUARD (gvn/copy_prop class): the predecessor load's dest must be
+//! single-definition.  A multi-def value id (post-phi coalescing web) has
+//! position-dependent content — a redefinition sitting between the
+//! predecessor's load and this block's reload (non-memory rewrites are NOT
+//! clobbers in the scans above) would make `Copy dest = pred_dest` read the
+//! redefined content instead of the loaded one. Refuse and keep the reload.
 
 use crate::common::types::AddressSpace;
 use crate::ir::analysis;
@@ -31,6 +38,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     // Map label -> block index for predecessor lookups.
     let label_to_idx = analysis::build_label_map(func);
     let (preds, _succs) = analysis::build_cfg(func, &label_to_idx);
+    let multi_def = super::gvn::find_multi_def_values(func);
 
     // dest value of a load -> (ptr value id, type) for loads that end a block
     // with no trailing memory clobber. Built per-block below.
@@ -100,6 +108,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         && ptr.0 == pred_ptr
                         && *ty == pred_ty
                         && dest.0 != pred_dest
+                        && !multi_def.contains(&pred_dest)
                     {
                         rewrites.push((bi, ii, *dest, Value(pred_dest)));
                     }

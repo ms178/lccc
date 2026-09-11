@@ -23,6 +23,15 @@
 //! canonical load is earlier in the same block, so every dominated use stays
 //! dominated (SSA use sites of the duplicate are, by SSA construction,
 //! dominated by the duplicate's block, hence by the canonical def's block).
+//!
+//! MULTI-DEF GUARD (same class as the gvn/copy_prop guard): a value with
+//! more than one definition (post-phi coalescing webs) has position-
+//! dependent content.  Rewriting a duplicate load's uses onto a MULTI-DEF
+//! canonical (its id redefined between the canonical load and the use
+//! feeds the consumer the redefined content), or rewriting the uses of a
+//! MULTI-DEF duplicate function-wide (uses after its other defs expect
+//! those contents), are both unsound position-independent rewrites — the
+//! free_area_init_node GVN bug class.  Refuse and keep the recomputation.
 
 use super::alias;
 use crate::common::fx_hash::FxHashMap;
@@ -37,6 +46,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     }
     let cfg = crate::ir::analysis::CfgAnalysis::build(func);
     let frames = alias::LoopFrames::build_with_cfg(func, &cfg);
+    let multi_def = super::gvn::find_multi_def_values(func);
 
     // Analysis phase: immutable borrow of func plus a defs map over it.
     let mut all_rewrites: FxHashMap<u32, u32> = FxHashMap::default();
@@ -84,9 +94,15 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         if let Some((_, _, canon)) =
                             available.iter().find(|(f, t, _)| *f == form && *t == *ty)
                         {
-                            all_rewrites.insert(dest.0, canon.0);
-                            removed.push(ii);
-                            continue;
+                            // MULTI-DEF GUARD: see the module doc. A multi-def
+                            // canonical's content is not position-stable, and a
+                            // multi-def duplicate's uses are not all reading
+                            // this load. Keep both loads in that case.
+                            if !multi_def.contains(&canon.0) && !multi_def.contains(&dest.0) {
+                                all_rewrites.insert(dest.0, canon.0);
+                                removed.push(ii);
+                                continue;
+                            }
                         }
                         available.push((form, *ty, *dest));
                     }

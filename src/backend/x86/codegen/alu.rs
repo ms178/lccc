@@ -509,6 +509,9 @@ impl X86Codegen {
                     .out
                     .emit_instr_reg_reg("    movq", "rdx", reg_name);
             }
+            // Definition-writes-home accounting: the divrem pair head's
+            // dual-store wrote the remainder's dest into its home.
+            self.note_inplace_compute(reg, dest.0);
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             if use_small {
                 self.state.out.emit_instr_reg_rbp("    movl", "edx", slot.0);
@@ -767,6 +770,9 @@ impl X86Codegen {
             }
             if op == IrBinOp::BitTest {
                 if self.emit_bit_test_reg_direct(lhs, rhs, dest_phys, use_32bit) {
+                    // Definition-writes-home accounting: BT staged the base
+                    // into dest_phys and SETC materialised the boolean there.
+                    self.note_inplace_compute(dest_phys, dest.0);
                     return;
                 }
             }
@@ -1427,8 +1433,16 @@ impl X86Codegen {
         // that fits in imm32. Order matters: try this BEFORE the memory-source
         // and operand_to_eax paths so the register-homed lhs is not staged.
         if let Operand::Value(lhs_val) = mul_lhs {
+            // Home-freshness gate (see emit.rs home_fresh): the 3-operand
+            // form reads the LHS in place from its home — only sound while
+            // the register provably still holds that value. A stale home
+            // (the accumulator emitter reuses destination registers in
+            // place for derived values) falls through to the general path,
+            // which stages the LHS through the reload machinery (kernel
+            // 6.18.50 free_area_init_node: the fused mul-add consumed the
+            // zone POINTER as the loop index).
             if let Some(lhs_reg) = self
-                .dest_reg(lhs_val)
+                .fresh_home_of(lhs_val.0)
                 .filter(|r| !super::emit::is_xmm_reg(*r))
             {
                 if let Some(imm) = Self::const_as_imm32_typed(mul_rhs, use_32bit) {
@@ -1551,6 +1565,10 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    movq %rax, %{}", dest_name_64));
                 }
                 self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting: the relay wrote the
+                // fused add's result into its dest home (PR #487 root cause:
+                // fused mul-add chains left the dest permanently stale).
+                self.note_inplace_compute(dest_phys, add_dest.0);
                 return;
             }
 
@@ -1568,6 +1586,12 @@ impl X86Codegen {
                 ));
             }
             self.state.reg_cache.invalidate_acc();
+            // Definition-writes-home accounting: the staging + in-place add
+            // derived the fused add's dest into its home; without this note
+            // the acc-staging eviction (mulacc tail's patched segment) stuck
+            // and the consumer hit the stale-home refusal (PR #487,
+            // crash_synth_20260908: `movq %r10, %rsi; addq %rax, %rsi`).
+            self.note_inplace_compute(dest_phys, add_dest.0);
             return;
         }
 

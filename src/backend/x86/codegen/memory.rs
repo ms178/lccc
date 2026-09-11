@@ -102,7 +102,9 @@ impl X86Codegen {
     /// must not be gambled on. Refusals fall back to the `leaq` path, which
     /// reloads the index through the sext-aware operand machinery.
     fn ensure_sib_index_form(&mut self, index: &Value) -> bool {
-        let Some(&reg) = self.reg_assignments.get(&index.0) else {
+        // Freshness-gated (see home_fresh): a stale home must not feed a
+        // SIB index; refusing the fold falls back to the reload path.
+        let Some(reg) = self.fresh_home_of(index.0) else {
             return false;
         };
         if is_xmm_reg(reg) {
@@ -181,13 +183,13 @@ impl X86Codegen {
         };
 
         // Check if both base and counter are in registers
-        let base_reg = match self.reg_assignments.get(&ivsr_info.base_ptr.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let base_reg = match self.fresh_home_of(ivsr_info.base_ptr.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
-        let index_reg = match self.reg_assignments.get(&counter_val.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let index_reg = match self.fresh_home_of(counter_val.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
@@ -203,7 +205,7 @@ impl X86Codegen {
 
         // Check if loading the store value would clobber base or index register
         if let Operand::Value(v) = val {
-            if let Some(&val_reg) = self.reg_assignments.get(&v.0) {
+            if let Some(val_reg) = self.fresh_home_of(v.0) {
                 let val_name = phys_reg_name(val_reg);
                 if val_name == base_reg || val_name == index_reg {
                     return false;
@@ -332,13 +334,13 @@ impl X86Codegen {
         };
 
         // Check if base and index both have register assignments
-        let base_reg = match self.reg_assignments.get(&gep_base.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let base_reg = match self.fresh_home_of(gep_base.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
-        let index_reg = match self.reg_assignments.get(&index_val.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let index_reg = match self.fresh_home_of(index_val.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
@@ -356,7 +358,7 @@ impl X86Codegen {
         // the base/index, or when operand_to_rax needs to use the register for
         // intermediate computations. If so, fall back to non-indexed store.
         if let Operand::Value(v) = val {
-            if let Some(&val_reg) = self.reg_assignments.get(&v.0) {
+            if let Some(val_reg) = self.fresh_home_of(v.0) {
                 let val_name = phys_reg_name(val_reg);
                 if val_name == base_reg || val_name == index_reg {
                     return false; // Register conflict, fall back
@@ -438,13 +440,13 @@ impl X86Codegen {
         };
 
         // Check if both base and counter are in registers
-        let base_reg = match self.reg_assignments.get(&ivsr_info.base_ptr.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let base_reg = match self.fresh_home_of(ivsr_info.base_ptr.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
-        let index_reg = match self.reg_assignments.get(&counter_val.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let index_reg = match self.fresh_home_of(counter_val.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
@@ -564,13 +566,13 @@ impl X86Codegen {
         };
 
         // Check if base and index both have register assignments
-        let base_reg = match self.reg_assignments.get(&gep_base.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let base_reg = match self.fresh_home_of(gep_base.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
-        let index_reg = match self.reg_assignments.get(&index_val.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let index_reg = match self.fresh_home_of(index_val.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
@@ -946,10 +948,12 @@ impl X86Codegen {
             } else {
                 "    movss"
             };
-            let dest_xmm = match self.reg_assignments.get(&dest.0) {
-                Some(&r) if is_xmm_reg(r) => Some(phys_reg_name(r)),
-                _ => None,
-            };
+            let dest_xmm_reg = self
+                .reg_assignments
+                .get(&dest.0)
+                .copied()
+                .filter(|&r| is_xmm_reg(r));
+            let dest_xmm = dest_xmm_reg.map(phys_reg_name);
             let target = dest_xmm.unwrap_or("xmm0");
             let addr = self.state.resolve_slot_addr(ptr.0);
             match addr {
@@ -995,6 +999,10 @@ impl X86Codegen {
             }
             if dest_xmm.is_none() {
                 self.store_xmm_to(dest, "xmm0", ty);
+            } else {
+                // Definition-writes-home accounting: the FP load wrote the
+                // dest's XMM home directly.
+                self.note_inplace_compute(dest_xmm_reg.expect("dest_xmm is Some here"), dest.0);
             }
             return;
         }
@@ -1030,6 +1038,19 @@ impl X86Codegen {
                             ));
                             if fold_reg.is_some() {
                                 self.fold_skip_cast = fold_target.map(|(_, c)| c);
+                            }
+                            // Definition-writes-home accounting: the direct
+                            // load wrote the destination home register with
+                            // the loaded value. For the W2 fold the written
+                            // value is the CONSUMER CAST's dest (its emission
+                            // is skipped); for the plain path it is the load's
+                            // own dest. Missing this note was the PR #487
+                            // class: loads are the most common def of a homed
+                            // value.
+                            if let Some((fr, fold_dest)) = fold_target {
+                                self.note_inplace_compute(fr, fold_dest);
+                            } else {
+                                self.note_inplace_compute(d_reg, dest.0);
                             }
                             return;
                         }
@@ -1642,10 +1663,12 @@ impl X86Codegen {
             } else {
                 "    movss"
             };
-            let dest_xmm = match self.reg_assignments.get(&dest.0) {
-                Some(&r) if is_xmm_reg(r) => Some(phys_reg_name(r)),
-                _ => None,
-            };
+            let dest_xmm_reg = self
+                .reg_assignments
+                .get(&dest.0)
+                .copied()
+                .filter(|&r| is_xmm_reg(r));
+            let dest_xmm = dest_xmm_reg.map(phys_reg_name);
             let target = dest_xmm.unwrap_or("xmm0");
             let addr = self.state.resolve_slot_addr(base.0);
             match addr {
@@ -1672,6 +1695,13 @@ impl X86Codegen {
                             }
                             if dest_xmm.is_none() {
                                 self.store_xmm_to(dest, "xmm0", ty);
+                            } else {
+                                // Definition-writes-home accounting: the FP
+                                // field load wrote the dest's XMM home.
+                                self.note_inplace_compute(
+                                    dest_xmm_reg.expect("dest_xmm is Some here"),
+                                    dest.0,
+                                );
                             }
                             self.state.reg_cache.invalidate_acc();
                             return;
@@ -1730,6 +1760,10 @@ impl X86Codegen {
             }
             if dest_xmm.is_none() {
                 self.store_xmm_to(dest, "xmm0", ty);
+            } else {
+                // Definition-writes-home accounting: the FP field load wrote
+                // the dest's XMM home directly.
+                self.note_inplace_compute(dest_xmm_reg.expect("dest_xmm is Some here"), dest.0);
             }
             // Conservative: a stale acc entry for a value that aliases the
             // loaded memory must not survive this load.
@@ -1954,15 +1988,21 @@ impl X86Codegen {
         // FP loads stay in the SSE domain.
         if matches!(ty, IrType::F32 | IrType::F64) {
             let instr = if ty == IrType::F64 { "movsd" } else { "movss" };
-            let dest_xmm = match self.reg_assignments.get(&dest.0) {
-                Some(&r) if is_xmm_reg(r) => Some(phys_reg_name(r)),
-                _ => None,
-            };
+            let dest_xmm_reg = self
+                .reg_assignments
+                .get(&dest.0)
+                .copied()
+                .filter(|&r| is_xmm_reg(r));
+            let dest_xmm = dest_xmm_reg.map(phys_reg_name);
             let target = dest_xmm.unwrap_or("xmm0");
             self.state
                 .emit_fmt(format_args!("    {} {}, %{}", instr, mem, target));
             if dest_xmm.is_none() {
                 self.store_xmm_to(dest, "xmm0", ty);
+            } else {
+                // Definition-writes-home accounting: the indexed FP load
+                // wrote the dest's XMM home directly.
+                self.note_inplace_compute(dest_xmm_reg.expect("dest_xmm is Some here"), dest.0);
             }
             self.state.reg_cache.invalidate_acc();
             return true;
@@ -2507,6 +2547,9 @@ impl X86Codegen {
                 base_name, index_name, dest_name
             ));
             self.state.reg_cache.invalidate_acc();
+            // Definition-writes-home accounting: the LEA wrote the GEP's
+            // result into the dest's home.
+            self.note_inplace_compute(dp, dest.0);
         } else {
             self.state.emit_fmt(format_args!(
                 "    leaq (%{}, %{}), %rax",
@@ -2564,6 +2607,9 @@ impl X86Codegen {
                 self.state
                     .emit_fmt(format_args!("    leaq {}, %{}", mem, d_name));
                 self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting: the symbol-index LEA
+                // wrote the GEP's dest into its home.
+                self.note_inplace_compute(d_reg, dest.0);
                 return true;
             }
         }

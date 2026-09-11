@@ -1452,6 +1452,9 @@ impl X86Codegen {
                 if !is_xmm_reg(d_reg) {
                     self.operand_to_callee_reg(chosen, d_reg);
                     self.state.reg_cache.invalidate_acc();
+                    // Definition-writes-home accounting (constant-cond
+                    // select: the chosen arm was staged into the dest home).
+                    self.note_inplace_compute(d_reg, dest.0);
                     return;
                 }
             }
@@ -1609,6 +1612,9 @@ impl X86Codegen {
                         self.emit_cmov_typed(cmov_cc, "rcx", d_name, ty);
                     }
                     self.state.reg_cache.invalidate_acc();
+                    // Definition-writes-home accounting: the false_val
+                    // staging + cmov defined the select's dest into its home.
+                    self.note_inplace_compute(d_reg, dest.0);
                     return;
                 }
                 // Legacy path: condition not testable in place.
@@ -1626,6 +1632,8 @@ impl X86Codegen {
                 self.state
                     .emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
                 self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting (legacy select arm).
+                self.note_inplace_compute(d_reg, dest.0);
                 return;
             }
         }

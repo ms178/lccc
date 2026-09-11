@@ -194,6 +194,7 @@ fn apply_inst(
     map: &mut FxHashMap<FieldPath, (Operand, i64)>,
     rewrite: bool,
     changed: &mut usize,
+    multi_def: &crate::common::fx_hash::FxHashSet<u32>,
 ) {
     match inst {
         Instruction::Store {
@@ -248,7 +249,12 @@ fn apply_inst(
                         Operand::Value(v) => v.0 == dest.0,
                         Operand::Const(_) => false,
                     };
-                    if rewrite && store_size == type_size(*ty) && !is_self_copy {
+                    let stored_multi_def = match stored_op {
+                        Operand::Value(v) => multi_def.contains(&v.0),
+                        Operand::Const(_) => false,
+                    };
+                    if rewrite && store_size == type_size(*ty) && !is_self_copy && !stored_multi_def
+                    {
                         *inst = Instruction::Copy {
                             dest: *dest,
                             src: stored_op,
@@ -331,6 +337,15 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     if paths.is_empty() {
         return 0;
     }
+    // MULTI-DEF GUARD (gvn/copy_prop class): the forwarded operand's content
+    // must be position-stable between the STORE that recorded it and the
+    // LOAD it satisfies. A multi-def value id (post-phi coalescing web)
+    // denotes different content at different program points, so forwarding
+    // `Copy load_dest = stored_op` can feed the consumer the redefined
+    // content instead of the stored one. Refuse those matches and keep the
+    // load. The rewrite itself stays local (the Copy redefines the load's
+    // dest with exactly the loaded content), so the DEST needs no guard.
+    let multi_def = super::gvn::find_multi_def_values(func);
 
     let label_to_idx = analysis::build_label_map(func);
     let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
@@ -367,7 +382,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         let mut m = in_b;
         let mut dummy = 0;
         for inst in &mut func.blocks[b].instructions {
-            apply_inst(inst, &paths, &mut m, false, &mut dummy);
+            apply_inst(inst, &paths, &mut m, false, &mut dummy, &multi_def);
         }
         if m != out_map[b] {
             out_map[b] = m;
@@ -382,7 +397,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     for b in 0..n {
         let mut m = in_map[b].clone();
         for inst in &mut func.blocks[b].instructions {
-            apply_inst(inst, &paths, &mut m, true, &mut changes);
+            apply_inst(inst, &paths, &mut m, true, &mut changes, &multi_def);
         }
     }
     changes

@@ -377,8 +377,39 @@ fn collect_derived_pointers(func: &IrFunction, root: Value) -> FxHashSet<u32> {
 pub(crate) fn propagate_copies(func: &mut IrFunction) -> usize {
     let max_id = func.max_value_id() as usize;
 
+    // Multi-def guard (SOUNDNESS): forwarding `use(x)` to `use(src)` is valid
+    // only while `src` still denotes the same content at the USE as it did at
+    // the Copy. A source with multiple definitions (post-phi coalescing webs,
+    // chained dest==src rewrites) changes content between the Copy and the
+    // use, and the SSA-brained rewrite silently feeds the consumer the
+    // redefined content (kernel 6.18.50 free_area_init_node: the second zone
+    // computation read the ZONE POINTER through the coalesced Cast→Mul→Add
+    // web). Drop every entry whose resolved source is multi-def.
+    let mut def_counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                *def_counts.entry(dest.0).or_insert(0) += 1;
+            }
+        }
+    }
+    let multi_def: std::collections::HashSet<u32> = def_counts
+        .into_iter()
+        .filter(|(_, c)| *c > 1)
+        .map(|(v, _)| v)
+        .collect();
+
     // Phase 1: Build the copy map as a flat lookup table (dest -> resolved source)
-    let (copy_map, has_copies) = build_copy_map(func, max_id);
+    let (mut copy_map, has_copies) = build_copy_map(func, max_id);
+    if has_copies {
+        for i in 0..copy_map.len() {
+            if let Some(Operand::Value(src)) = copy_map[i] {
+                if multi_def.contains(&src.0) {
+                    copy_map[i] = None;
+                }
+            }
+        }
+    }
 
     // Early exit if no copies found (avoids scanning the entire copy_map Vec)
     if !has_copies {
