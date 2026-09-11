@@ -45,6 +45,7 @@ pub(crate) mod load_forward;
 pub(crate) mod loop_align;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_carried_forward;
+pub(crate) mod loop_idiom;
 pub(crate) mod loop_invert;
 pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_rotate;
@@ -2308,6 +2309,21 @@ pub(crate) fn run_passes(
     // recurrences that the early run could not normalise.
     loop_carried_forward::run_module(module);
     verify::verify_after_pass(module, "loop_carried_forward_late");
+    // Loop-idiom recognition (LIR): byte-store loops → memset(3), byte-copy
+    // loops → memcpy(3). Runs LATE so loop-rotate/loop-invert have produced
+    // the rotated single-block shape the recognizer requires, and before
+    // redundant-load elimination so the new call acts as the memory barrier
+    // the removed loop's stores were. See loop_idiom.rs for the soundness
+    // contracts (rotate-guard signature, distinct-object copies, exit-value
+    // reconstruction). Kill switch `CCC_NO_LOOP_IDIOM`. -O2+.
+    if !pass_disabled(&disabled, "loop_idiom") && std::env::var_os("CCC_NO_LOOP_IDIOM").is_none() {
+        for function in &mut module.functions {
+            let changed = loop_idiom::run(function);
+            if changed > 0 {
+                verify::verify_after_func_pass(function, "loop_idiom");
+            }
+        }
+    }
     // Late redundant-load elimination: post-IVSR field accesses have constant
     // offsets, so same-address loads merge when intervening stores are
     // provably non-aliasing (volatile loads are exempt by construction).
