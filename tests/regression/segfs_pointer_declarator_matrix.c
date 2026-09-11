@@ -47,6 +47,51 @@ static unsigned long via_typedef_variable(void) {
     return *p;
 }
 
+/* Qualifier BEFORE the base type at declaration level (`__seg_fs T *p`),
+ * with the pending qualifier flowing spec-qual-list -> declaration
+ * snapshot -> apply_declaration_address_space onto the pointer. The
+ * initializer cast re-uses the before-base spelling, exercising the
+ * nested-type-name scoping from the other side: the cast's own
+ * qualifier must reach the cast's `*` even though a (possibly live)
+ * enclosing pending slot is saved/restored around it.
+ */
+static unsigned long qualifier_before_base_decl(void) {
+    __seg_fs unsigned long *p = (__seg_fs unsigned long *)40;
+    return *p;
+}
+
+/* DECLARE_PER_CPU(T, name) expands to `__seg_fs __typeof__(T) name`:
+ * the qualifier sits before the __typeof__ and must land on the
+ * DECLARED object (via the declaration snapshot), whatever T is.
+ * T = unsigned long here: the typeof argument has no `*`, so the
+ * pending qualifier survives even an unscoped parse; the runnable
+ * value proves the snapshot -> pointer-AS application still works.
+ */
+static unsigned long typeof_qual_before_base(void) {
+    __seg_fs __typeof__(unsigned long) *p = (__seg_fs unsigned long *)40;
+    return *p;
+}
+
+/* The typeof argument's OWN internal qualifier (after its base, before
+ * its `*`) must reach that inner `*` under nested-type-name scoping:
+ * the scoping clears the pending slot at entry, the argument's
+ * `__seg_fs` re-fills it, its `*` consumes it.
+ */
+static unsigned long typeof_internal_qualifier(void) {
+    __typeof__(unsigned long __seg_fs *) p = (unsigned long __seg_fs *)40;
+    return *p;
+}
+
+/* A cast whose type-name has an internal array-of-pointer declarator:
+ * the suffix parser must take the qualifier the cast's spec-qual-list
+ * set before its own base type, through the nested-type-name scoping.
+ */
+static unsigned long cast_array_of_fs_pointers(void) {
+    unsigned long __seg_fs *arr[1];
+    arr[0] = (__seg_fs unsigned long *)40;
+    return *arr[0];
+}
+
 /* Pointer selected between two constant TLS offsets: lowers to
  * `phi-home = Copy(Const)` feeding a SegFs load — the exact
  * __libc_start_main_impl shape that ICEd. %fs:0 holds the TCB self
@@ -64,6 +109,13 @@ static unsigned long no_leak(void) {
     return *q;
 }
 
+/* Forward declaration: segstore_conflation is defined below main (next to
+ * its long rationale comment); declaring it here keeps the GCC oracle in
+ * the comparison — GCC 14's default gnu23 mode treats the implicit
+ * declaration as an error, which silently downgraded this test to
+ * lccc-only (SKIP-COMPARE) instead of a differential run. */
+__attribute__((noinline)) static unsigned long segstore_conflation(void);
+
 int main(void) {
     unsigned long canary = direct_cast();
     int ok = canary != 0;
@@ -71,6 +123,10 @@ int main(void) {
     ok &= via_variable() == canary;
     ok &= via_typedef_cast() == canary;
     ok &= via_typedef_variable() == canary;
+    ok &= qualifier_before_base_decl() == canary;
+    ok &= typeof_qual_before_base() == canary;
+    ok &= typeof_internal_qualifier() == canary;
+    ok &= cast_array_of_fs_pointers() == canary;
     ok &= phi_const_ptr(sel) == canary;
     ok &= phi_const_ptr(0) != 0; /* %fs:0 = TCB self pointer */
     ok &= no_leak() == 7;

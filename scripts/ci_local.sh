@@ -162,6 +162,9 @@ gate "demorgan-branch-split" fast \
 gate "gvn-xsign-load-cse" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_gvn_xsign_load_cse.sh
 
+gate "segfs-declarator-codegen" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_segfs_typeof_nosteal.sh
+
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 

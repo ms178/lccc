@@ -1947,8 +1947,12 @@ impl Parser {
         let save_typedef = self.attrs.parsing_typedef();
         self.advance(); // consume (
         if self.is_type_specifier() {
-            if let Some(ts) = self.parse_type_specifier() {
-                let result_type = self.parse_abstract_declarator_suffix(ts);
+            // parse_nested_type_name scopes the pending address-space
+            // qualifier: the alignas type-name argument must not steal an
+            // enclosing declaration's `__seg_gs`/`__seg_fs`, and the
+            // enclosing qualifier is restored before any return (including
+            // the backtrack below).
+            if let Some(result_type) = self.parse_nested_type_name() {
                 if matches!(self.peek(), TokenKind::RParen) {
                     self.advance(); // consume )
                     // Save the type specifier so the lowerer can resolve typedefs

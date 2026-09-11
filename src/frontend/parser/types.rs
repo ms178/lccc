@@ -146,10 +146,19 @@ impl Parser {
                         // make the outer declaration const).
                         let saved_const = self.attrs.parsing_const();
                         self.attrs.set_const(false);
+                        // Scope the pending address-space qualifier: the
+                        // `_Atomic(type-name)` argument is a nested type-name,
+                        // so a `*` in its abstract declarator must not steal
+                        // an enclosing declaration's `__seg_gs`/`__seg_fs`,
+                        // and the enclosing qualifier must be restored on
+                        // every exit below.
+                        let enclosing_address_space =
+                            std::mem::take(&mut self.attrs.parsing_address_space);
                         let inner = self.parse_type_specifier();
                         self.attrs.set_const(saved_const);
                         if let Some(inner_type) = inner {
                             let result = self.parse_abstract_declarator_suffix(inner_type);
+                            self.attrs.parsing_address_space = enclosing_address_space;
                             self.expect_closing(&TokenKind::RParen, open);
                             return Some(result);
                         }
@@ -160,6 +169,7 @@ impl Parser {
                             self.advance();
                         }
                         self.consume_if(&TokenKind::RParen);
+                        self.attrs.parsing_address_space = enclosing_address_space;
                         return Some(TypeSpecifier::Int);
                     }
                     // _Atomic without parens is a type qualifier; since we don't
@@ -809,10 +819,16 @@ impl Parser {
         // don't leak into the outer declaration.
         let saved_flags = self.attrs.flags;
         let save = self.pos;
-        // Try parsing as a type first
+        // Try parsing as a type first. parse_nested_type_name scopes the
+        // pending address-space qualifier: an enclosing declaration's
+        // `__seg_gs`/`__seg_fs` must survive a `*` inside this argument
+        // (the kernel's `extern __seg_gs __typeof__(struct irq_stack *) x;`
+        // shape), while a qualifier the argument sets itself still reaches
+        // its own declarator. The restore happens inside the helper before
+        // it returns, so the backtrack path below also sees the enclosing
+        // state again.
         if self.is_type_specifier() {
-            if let Some(ts) = self.parse_type_specifier() {
-                let result_type = self.parse_abstract_declarator_suffix(ts);
+            if let Some(result_type) = self.parse_nested_type_name() {
                 if matches!(self.peek(), TokenKind::RParen) {
                     self.advance();
                     self.attrs.flags = saved_flags;
@@ -1313,12 +1329,61 @@ impl Parser {
         (result_type, qualifiers)
     }
 
+    /// Parse a type-name NESTED inside an expression or another type context:
+    /// the operand of a cast or compound literal, the argument of `typeof`,
+    /// `sizeof`, `_Alignof`/`__alignof__`, `alignas`, `_Generic` associations
+    /// and `_Atomic(...)`. A type-name is a specifier-qualifier-list followed
+    /// by an optional abstract declarator (C17 6.7.7).
+    ///
+    /// Address-space scoping — the boundary the __typeof__-steal fix needs:
+    /// `attrs.parsing_address_space` is the parser's pending-qualifier slot.
+    /// It is SET by a `__seg_gs`/`__seg_fs` token wherever one appears, and
+    /// TAKEN (mem::take) by the `*` arms of the declarator parsers. When a
+    /// nested type-name is parsed while an ENCLOSING declaration has a
+    /// pending qualifier (the kernel's `extern __seg_gs __typeof__(struct
+    /// irq_stack *) hardirq_stack_ptr;` — the `__seg_gs` belongs to the
+    /// declared object), a `*` inside the nested abstract declarator would
+    /// otherwise steal the enclosing qualifier: the typeof type silently
+    /// gains the segment, the declaration snapshot reads Default, and every
+    /// access to the object compiles as a plain RIP-relative reference to
+    /// the static per-CPU image instead of %gs:.
+    ///
+    /// The nested type-name therefore starts from a CLEAN slot — the
+    /// enclosing value is saved, the slot cleared, and the full type-name
+    /// (specifier-qualifier-list + abstract declarator, so a qualifier the
+    /// nested type-name sets BEFORE its own base type, as in
+    /// `(__seg_fs unsigned long *)40`, still reaches its own `*` arm) is
+    /// parsed — after which the enclosing value is restored, on every exit
+    /// path including failure and caller-side backtracking (the restore
+    /// happens before this function returns, so the caller rewinding
+    /// `self.pos` cannot resurrect a clobbered slot).
+    pub(super) fn parse_nested_type_name(&mut self) -> Option<TypeSpecifier> {
+        let enclosing_address_space = self.attrs.parsing_address_space;
+        self.attrs.parsing_address_space = AddressSpace::Default;
+        // The closure borrows `&mut self` after `parse_type_specifier` has
+        // returned (no live borrow of the Option), so the mutable capture
+        // is fine; the restore below still runs on both arms of the map.
+        let result = self
+            .parse_type_specifier()
+            .map(|base| self.parse_abstract_declarator_suffix(base));
+        self.attrs.parsing_address_space = enclosing_address_space;
+        result
+    }
+
     /// Parse an abstract declarator suffix: pointer(s), parenthesized pointer groups,
     /// and array dimensions after a type name. Used by cast expressions, sizeof,
     /// typeof, and _Alignof to avoid duplicating this logic.
     ///
     /// Input: base type already parsed.
     /// Output: type wrapped with pointer/array/function-pointer modifiers.
+    ///
+    /// Callers that enter this from a nested type-name context (casts,
+    /// typeof arguments, ...) must go through `parse_nested_type_name`
+    /// instead of calling `parse_type_specifier` + this function directly:
+    /// the pending address-space qualifier needs the scoping described
+    /// there. Entering with a qualifier set before this suffix's own base
+    /// type (e.g. the cast `(__seg_fs unsigned long *)`) is legitimate —
+    /// the leading `skip_cv_qualifiers`/`*` arms below capture it.
     pub(super) fn parse_abstract_declarator_suffix(
         &mut self,
         mut result_type: TypeSpecifier,

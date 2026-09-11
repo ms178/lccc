@@ -3,7 +3,17 @@
 //! After peephole optimization, some callee-saved registers may no longer be
 //! referenced in the function body (all uses were optimized away). This pass
 //! detects such registers and removes their prologue save / epilogue restore
-//! instructions. The stack frame is not shrunk (see rationale inside function).
+//! instructions.
+//!
+//! Frame contract (push style, frame pointer present): every push removed
+//! raises the post-prologue %rsp by 8 while all local-slot offsets stay at
+//! their rbp-relative addresses. The pass therefore GROWS the prologue
+//! `subq $N, %rsp` by 8 per eliminated push so the frame bottom stays below
+//! the deepest slot and the 16-byte %rsp alignment at call sites is kept;
+//! the bytes below the remaining pushes become dead space. Elimination is
+//! refused outright when the frame cannot be re-anchored: a stack-probe
+//! prologue (no plain subq to rewrite), or a pushes-only frame whose body
+//! still calls out or references negative %rbp offsets.
 //!
 //! Two prologue shapes are handled:
 //!
@@ -82,18 +92,24 @@ pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [
             break;
         }
 
-        // Skip subq $N, %rsp if present (also skip directives)
+        // Skip subq $N, %rsp if present (also skip directives), recording its
+        // index and value: the push-elimination rewrite below must re-anchor
+        // the frame depth through this very instruction. A stack-probe
+        // prologue instead starts `movq $N, %r11` + a page-touch loop — no
+        // plain subq exists to rewrite, so push elimination must refuse there
+        // (handled by the gate below via prologue_subq == None).
+        let mut prologue_subq: Option<(usize, i64)> = None;
         while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Directive) {
             j += 1;
         }
         if j < len {
             let subq_line = infos[j].trimmed(store.get(j));
             if let Some(rest) = subq_line.strip_prefix("subq $") {
-                if rest
+                if let Some(v) = rest
                     .strip_suffix(", %rsp")
                     .and_then(|v| v.parse::<i64>().ok())
-                    .is_some()
                 {
+                    prologue_subq = Some((j, v));
                     j += 1;
                 }
             }
@@ -144,10 +160,63 @@ pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [
             }
         }
 
+        // Push-elimination safety gate. With a plain prologue subq the frame
+        // can always be re-anchored (the rewrite below grows it), so pushes
+        // may be eliminated. Without one, pushes are only removable when the
+        // frame is pushes-only in the strong sense: no call (nothing is ever
+        // pushed below %rsp by this function), and no negative %rbp memory
+        // reference (no local slot area exists below the pushes — the layout
+        // emits the subq precisely when slots exist). A stack-probe prologue
+        // has no plain subq and huge slots, so it lands here and is refused.
+        let push_elim_allowed = prologue_subq.is_some() || {
+            let mut clean = true;
+            'body: for k in body_start..func_end {
+                if infos[k].is_nop() {
+                    continue;
+                }
+                if matches!(infos[k].kind, LineKind::Call) {
+                    clean = false;
+                    break 'body;
+                }
+                // Stack-teardown lines (push/pop pairs, the epilogue's
+                // `leaq -N(%rbp), %rsp` reset) are position-independent data
+                // wise — the pass rewrites the leaq anyway. Only DATA
+                // references below the pushes make a pushes-only frame
+                // unsafe.
+                let line = infos[k].trimmed(store.get(k));
+                let is_teardown =
+                    matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
+                        || (line.starts_with("leaq ") && line.ends_with(", %rsp"));
+                if is_teardown {
+                    continue;
+                }
+                if let LineKind::StoreRbp { offset, .. } | LineKind::LoadRbp { offset, .. } =
+                    infos[k].kind
+                {
+                    if offset < 0 {
+                        clean = false;
+                        break 'body;
+                    }
+                }
+                let rbp_off = infos[k].rbp_offset;
+                if rbp_off != RBP_OFFSET_NONE && rbp_off < 0 {
+                    clean = false;
+                    break 'body;
+                }
+            }
+            clean
+        };
+
         // For each callee-saved register, check if it's referenced in the body
         // (excluding the save/restore instructions themselves).
         for save in &saves {
             let reg = save.reg;
+            // A push save can only be dropped when the frame contract allows
+            // the re-anchor (see the gate above); movq-style saves address
+            // their slots rbp-relatively and are unaffected by push removal.
+            if save.is_push && !push_elim_allowed {
+                continue;
+            }
 
             let mut restore_indices: Vec<usize> = Vec::new();
             let mut body_has_reference = false;
@@ -201,6 +270,31 @@ pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [
             .filter(|s| s.is_push && infos[s.save_line_idx].is_nop())
             .count();
         if eliminated_pushes > 0 {
+            // Re-anchor the frame: each dropped push raises the post-prologue
+            // %rsp by 8 while every local-slot offset keeps its rbp-relative
+            // address, so the deepest slots would dangle BELOW %rsp, where the
+            // next call's pushed return address (and, in kernel mode, any
+            // interrupt pt_regs frame) overwrites live data. Growing the subq
+            // by 8 per eliminated push restores the original frame depth:
+            // slot coverage AND the 16-byte %rsp alignment at call sites are
+            // preserved exactly. (Observed fallout of the old no-rewrite
+            // behaviour: acpi_match_platform_list kept its 36-byte
+            // `struct acpi_table_header hdr` at -0x60(%rbp) while %rsp moved
+            // to -0x58; the call's pushed return address landed inside hdr,
+            // the header copy wrote "DSDT"+length over it, and the callee
+            // `ret`urned to 0x21fc54445344 — boot page fault on garbage CR2.)
+            // The epilogues already reset %rsp from %rbp, so the extra bytes
+            // cost nothing at teardown; they are dead space below the
+            // remaining pushes.
+            if let Some((subq_idx, subq_val)) = prologue_subq {
+                let grown = subq_val + 8 * eliminated_pushes as i64;
+                replace_line(
+                    store,
+                    &mut infos[subq_idx],
+                    subq_idx,
+                    format!("    subq ${}, %rsp", grown),
+                );
+            }
             let remaining_pushes = saves
                 .iter()
                 .filter(|s| s.is_push && !infos[s.save_line_idx].is_nop())
@@ -225,14 +319,9 @@ pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [
             }
         }
 
-        // Note: we intentionally do NOT shrink the stack frame (subq $N, %rsp)
-        // even though some callee-saved saves were eliminated. The remaining saves
-        // still reference their original rbp-relative offsets, which are below rsp
-        // if we shrink the frame. Data below rsp can be corrupted by interrupts
-        // or signal handlers. Keeping the original frame size ensures all saved
-        // registers remain safely above rsp. The unused slots become dead space.
-        // TODO: To also shrink the frame, we would need to rewrite the offsets of
-        // all remaining callee-saved saves/restores to pack them tightly.
+        // Note: the subq is intentionally grown (not shrunk) above; a true
+        // frame shrink would require re-laying-out every rbp-relative slot
+        // offset, which belongs in the pre-emit layout, not a text peephole.
 
         i = func_end;
     }
