@@ -101,6 +101,11 @@ pub(crate) struct RaConfig {
     pub(crate) no_segment_scan: bool,
     /// `CCC_EVICT_MODE`: eviction mode (default: 3; malformed values use 3).
     pub(crate) evict_mode: i32,
+    /// `CCC_EVICT_SHORT_K`: cost-ratio escape for the mode>=3 next-use
+    /// gate (default: 16; 0 disables the escape). A short victim whose
+    /// next use dies before the incoming ends is still evicted when the
+    /// incoming outweighs it by more than Kx. Malformed values use 16.
+    pub(crate) evict_short_k: u64,
     /// `CCC_RA_LOOP_SPAN_RESERVE`: CEILING on the registers the main scan
     /// reserves for block-local ranges by capping how many registers
     /// loop-spanning ranges may hold at once (default: 0 = OFF). The
@@ -295,6 +300,9 @@ impl RaConfig {
             evict_mode: text("CCC_EVICT_MODE")
                 .and_then(|value| value.parse::<i32>().ok())
                 .unwrap_or(3),
+            evict_short_k: text("CCC_EVICT_SHORT_K")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(16),
             loop_span_reserve: number("CCC_RA_LOOP_SPAN_RESERVE", 0),
             pgo_weight_max: text("CCC_PGO_WEIGHT_MAX")
                 .and_then(|value| value.parse::<u64>().ok())
@@ -9037,6 +9045,336 @@ fn const_address_link_bases(func: &IrFunction) -> FxHashMap<u32, u32> {
     bases
 }
 
+/// Potential simultaneous-sharing components: a deliberate SUPERSET of every
+/// mechanism that can place two values in one home with overlapping ranges.
+///
+/// Edges (unioned):
+/// * multi-def-dest + single-def-src `Copy D <- S` — every phi-coalesce
+///   candidate edge (multi-def srcs are never candidates);
+/// * phi-transport `Copy D <- S` (`D` feeds a Phi / `S` is a Phi result);
+/// * adjacent `(def(S), Copy D <- S)` — the latch same-value relaxation
+///   mirrored exactly (see below);
+/// * int-class `Cast D <- S` (float/decimal casts never share a GPR home).
+///
+/// General Copy merges and phi-congruence merges are overlap-checked
+/// (time-share only): two values covering one program point cannot
+/// time-share there, so they need no edge. Actual coalesced webs are
+/// subsets of these components, hence values in different components
+/// NEVER share a home — the soundness anchor for exempting hidden
+/// folded reads whose consumer provably lives in another web (lz4: the
+/// v403-rooted copy Loads extend v224/v212 through the v403<-v426<-v404
+/// snapshot chain and veto the {v404,v212,v224} web even though
+/// {v403,v426} provably occupies a different home).
+///
+/// Roots compare with [`web_find`].
+fn coalesce_web_parent(func: &IrFunction) -> FxHashMap<u32, u32> {
+    let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut copy_dests: FxHashSet<u32> = FxHashSet::default();
+    let mut phi_dests: FxHashSet<u32> = FxHashSet::default();
+    let mut phi_operands: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                *def_count.entry(dest.0).or_insert(0) += 1;
+            }
+            match inst {
+                Instruction::Copy { dest, .. } => {
+                    copy_dests.insert(dest.0);
+                }
+                Instruction::Phi { dest, incoming, .. } => {
+                    phi_dests.insert(dest.0);
+                    for (op, _) in incoming {
+                        if let Operand::Value(v) = op {
+                            phi_operands.insert(v.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|u| {
+                *use_count.entry(u).or_insert(0) += 1;
+            });
+        }
+        block
+            .terminator
+            .for_each_used_value(|u| *use_count.entry(u).or_insert(0) += 1);
+    }
+    fn union_sets(parent: &mut FxHashMap<u32, u32>, a: u32, b: u32) {
+        if a == b {
+            return;
+        }
+        parent.entry(a).or_insert(a);
+        parent.entry(b).or_insert(b);
+        let ra = web_find(parent, a);
+        let rb = web_find(parent, b);
+        if ra != rb {
+            parent.insert(rb, ra);
+        }
+    }
+    let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
+    let int_class = |t: &IrType| {
+        matches!(
+            t,
+            IrType::I8
+                | IrType::I16
+                | IrType::I32
+                | IrType::I64
+                | IrType::I128
+                | IrType::U8
+                | IrType::U16
+                | IrType::U32
+                | IrType::U64
+                | IrType::U128
+                | IrType::Ptr
+        )
+    };
+    for block in &func.blocks {
+        for w in block.instructions.windows(2) {
+            if let (
+                prev,
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(s),
+                },
+            ) = (&w[0], &w[1])
+            {
+                // Mirror latch_same_value in build_coalesce_groups exactly
+                // (keep in sync: loosening there without updating here misses
+                // simultaneous sharings and is unsound; use_count==1 is
+                // load-bearing — the zstd HUF DTable miscompile).
+                if copy_dests.contains(&dest.0)
+                    && def_count.get(&dest.0).copied().unwrap_or(0) > 1
+                    && prev.dest().is_some_and(|pd| pd.0 == s.0)
+                    && use_count.get(&s.0).copied().unwrap_or(0) == 1
+                {
+                    union_sets(&mut parent, dest.0, s.0);
+                }
+            }
+        }
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(s),
+                } => {
+                    let (d, s) = (dest.0, s.0);
+                    // Phi-pair arm mirrors the candidate enumeration filter
+                    // (multi-def Copy dest + single-def src; keep in sync —
+                    // admitting multi-def srcs there without updating here is
+                    // unsound). Transport arms stay unfiltered (superset).
+                    let phi_edge = copy_dests.contains(&d)
+                        && def_count.get(&d).copied().unwrap_or(0) > 1
+                        && def_count.get(&s).copied().unwrap_or(0) == 1;
+                    let transport_edge = phi_operands.contains(&d) || phi_dests.contains(&s);
+                    if phi_edge || transport_edge {
+                        union_sets(&mut parent, d, s);
+                    }
+                }
+                Instruction::Cast {
+                    dest,
+                    src: Operand::Value(s),
+                    from_ty,
+                    to_ty,
+                } => {
+                    if int_class(from_ty) && int_class(to_ty) {
+                        union_sets(&mut parent, dest.0, s.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    parent
+}
+
+/// Union-find root with path compression. Total: values without an entry
+/// are singleton roots (they never share a home simultaneously — every
+/// simultaneous-sharing mechanism above needs an edge).
+fn web_find(parent: &mut FxHashMap<u32, u32>, x: u32) -> u32 {
+    let mut root = x;
+    loop {
+        match parent.get(&root).copied() {
+            None => break,
+            Some(p) if p == root => break,
+            Some(p) => root = p,
+        }
+    }
+    let mut c = x;
+    while c != root {
+        let next = parent.get(&c).copied().unwrap_or(root);
+        parent.insert(c, root);
+        c = next;
+    }
+    root
+}
+
+/// Every value on a folded consumer's address path: the ptr itself plus
+/// everything reachable by peeling what the backend can fold into the
+/// addressing mode (GEP base+index, Cast, const-operand Add/Sub/Shl/Mul).
+/// A SUPERSET of the backend peel set (no addr-fed filter): peeling too
+/// far only costs exemptions, while stopping early would compare a folded
+/// (homeless) intermediate. Multi-def values, params and unrecognized defs
+/// stop the peel (they hold their own home, which the consumer reads).
+/// `None` on runaway (fail-closed: no exemption).
+fn consumer_address_path(
+    ptr: u32,
+    def_of: &FxHashMap<u32, &Instruction>,
+    def_count: &FxHashMap<u32, u32>,
+) -> Option<Vec<u32>> {
+    let mut path = Vec::new();
+    let mut stack = vec![ptr];
+    let mut seen: FxHashSet<u32> = FxHashSet::default();
+    while let Some(v) = stack.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        if seen.len() > 1024 {
+            return None;
+        }
+        path.push(v);
+        if def_count.get(&v).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let Some(def) = def_of.get(&v) else {
+            continue;
+        };
+        match *def {
+            Instruction::GetElementPtr { base, offset, .. } => {
+                stack.push(base.0);
+                if let Operand::Value(o) = offset {
+                    stack.push(o.0);
+                }
+            }
+            Instruction::Cast {
+                src: Operand::Value(s),
+                ..
+            } => {
+                stack.push(s.0);
+            }
+            Instruction::BinOp { op, lhs, rhs, .. }
+                if matches!(
+                    op,
+                    IrBinOp::Add | IrBinOp::Sub | IrBinOp::Shl | IrBinOp::Mul
+                ) =>
+            {
+                let mut has_const = false;
+                let mut vals = Vec::new();
+                for opnd in [lhs, rhs] {
+                    match opnd {
+                        Operand::Const(_) => has_const = true,
+                        Operand::Value(w) => vals.push(w.0),
+                    }
+                }
+                if has_const {
+                    stack.extend(vals);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(path)
+}
+
+/// True when a hidden (folded-chain) read of the candidate source at
+/// `consumer` provably observes a different home: every value on the
+/// consumer's address path lives in a different potential-sharing
+/// component than the source, so the consumer's home cannot be the
+/// candidate's shared home and a dest redef cannot corrupt it.
+/// Fail-closed (`false`) for non-Load/Store consumers and runaway peels.
+fn hidden_read_in_disjoint_web(
+    consumer: &Instruction,
+    src_web: u32,
+    web_parent: &mut FxHashMap<u32, u32>,
+    def_of: &FxHashMap<u32, &Instruction>,
+    def_count: &FxHashMap<u32, u32>,
+) -> bool {
+    let ptr = match consumer {
+        Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => ptr.0,
+        _ => return false,
+    };
+    let Some(path) = consumer_address_path(ptr, def_of, def_count) else {
+        return false;
+    };
+    // Read-home distance gate (profitability, not soundness — disjointness
+    // below is the soundness proof): exempt only multi-peel chains (the
+    // lz4 snapshot-chain pathology: copy-Load isolation through 2+ folds,
+    // read-home distance >= 2). Single-peel hidden reads (ptr -> base, the
+    // consumer adjacent to the candidate) stay vetoed (legacy): merging on
+    // weak evidence churns global coloring for one Copy (expat's len-2
+    // {v185,v20} cost 8% with identical spill counts).
+    if path.len() < 3 {
+        return false;
+    }
+    path.iter().all(|&v| web_find(web_parent, v) != src_web)
+}
+
+/// Profitability gate for homeless-merging (one home for the union):
+/// merging saves the segment overlap (two homes -> one over the shared
+/// points) but costs the incremental fat-fill (union points neither
+/// member covers that the merged fat range then occupies). Refuse when
+/// the incremental fill exceeds the overlap — pure-gap merges (a
+/// disjoint init folded into a global web) burn a global home to delete
+/// one cold Copy (expat's {v185,v20} spilled where the base allocator
+/// spilled nothing). Fail-open (merge) when coverage data is missing
+/// (matches legacy behavior; the gate is profitability, not safety).
+fn homeless_merge_profitable(segments: &[LiveInterval], dest: u32, src: u32) -> bool {
+    let mut l_segs: Vec<(u32, u32)> = Vec::new();
+    let mut s_segs: Vec<(u32, u32)> = Vec::new();
+    for iv in segments {
+        if iv.value_id == dest {
+            l_segs.push((iv.start, iv.end));
+        } else if iv.value_id == src {
+            s_segs.push((iv.start, iv.end));
+        }
+    }
+    if l_segs.is_empty() || s_segs.is_empty() {
+        return true;
+    }
+    let seg_len = |segs: &[(u32, u32)]| -> u64 {
+        let mut v = segs.to_vec();
+        v.sort_unstable();
+        let mut len: u64 = 0;
+        let mut cur_s = v[0].0;
+        let mut cur_e = v[0].1;
+        for &(s, e) in &v[1..] {
+            if s <= cur_e {
+                cur_e = cur_e.max(e);
+            } else {
+                len += u64::from(cur_e.saturating_sub(cur_s));
+                cur_s = s;
+                cur_e = e;
+            }
+        }
+        len + u64::from(cur_e.saturating_sub(cur_s))
+    };
+    let fat_span = |segs: &[(u32, u32)]| -> u64 {
+        let lo = segs.iter().map(|&(s, _)| s).min().unwrap_or(0);
+        let hi = segs.iter().map(|&(_, e)| e).max().unwrap_or(0);
+        u64::from(hi.saturating_sub(lo))
+    };
+    let mut overlap: u64 = 0;
+    for &(ls, le) in &l_segs {
+        for &(ss, se) in &s_segs {
+            let lo = ls.max(ss);
+            let hi = le.min(se);
+            if hi > lo {
+                overlap += u64::from(hi - lo);
+            }
+        }
+    }
+    let mut both = l_segs.clone();
+    both.extend_from_slice(&s_segs);
+    let leader_fill = fat_span(&l_segs).saturating_sub(seg_len(&l_segs));
+    let union_fill = fat_span(&both).saturating_sub(seg_len(&both));
+    let incr_fill = union_fill.saturating_sub(leader_fill);
+    overlap >= incr_fill
+}
+
 fn source_home_survives_dest_redefs(
     func: &IrFunction,
     liveness: &LivenessResult,
@@ -9093,6 +9431,20 @@ fn source_home_survives_dest_redefs(
         used
     };
 
+    // Potential-sharing components + def maps for the disjoint-web hidden-read
+    // exemption below (a few O(func) passes, negligible next to the CFG walk).
+    let mut web_parent = coalesce_web_parent(func);
+    let mut def_of: FxHashMap<u32, &Instruction> = FxHashMap::default();
+    let mut path_def_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                *path_def_count.entry(dest.0).or_insert(0) += 1;
+                def_of.entry(dest.0).or_insert(inst);
+            }
+        }
+    }
+    let src_web = web_find(&mut web_parent, src);
     let mut work = vec![(
         candidate.source_block_idx,
         candidate.source_def_idx.saturating_add(1),
@@ -9130,6 +9482,13 @@ fn source_home_survives_dest_redefs(
             if dirty
                 && hidden_use_at(point)
                 && !folded_consumer_reads_dest_home(inst, dest, &fold_base_of)
+                && !hidden_read_in_disjoint_web(
+                    inst,
+                    src_web,
+                    &mut web_parent,
+                    &def_of,
+                    &path_def_count,
+                )
             {
                 return false;
             }
@@ -10067,6 +10426,7 @@ mod ra_config_tests {
         assert_eq!(defaults.loop_pin, 2);
         assert_eq!(defaults.hot_web_steal, 3);
         assert_eq!(defaults.evict_mode, 3);
+        assert_eq!(defaults.evict_short_k, 16);
         assert_eq!(defaults.pgo_weight_max, 1);
         assert_eq!(defaults.loop_span_reserve, 0);
         assert_eq!(
@@ -12614,6 +12974,20 @@ mod allocation_kernel_tests {
         func.blocks = vec![block(
             0,
             vec![
+                Instruction::BinOp {
+                    dest: Value(9),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Value(Value(2)),
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(7),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(9)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::I64,
+                },
                 Instruction::GetElementPtr {
                     dest: Value(11),
                     base: Value(2),
@@ -12658,7 +13032,7 @@ mod allocation_kernel_tests {
         func.next_value_id = 12;
         let mut liveness = compute_live_intervals(&func);
         let base = liveness.block_starts[0];
-        liveness.folded_read_points.insert(5, vec![base + 3]);
+        liveness.folded_read_points.insert(5, vec![base + 5]);
         let label_to_idx = analysis::build_label_map(&func);
         let (_preds, succs) = analysis::build_cfg(&func, &label_to_idx);
         let cand = PhiCoalesceCandidate {
@@ -12666,23 +13040,210 @@ mod allocation_kernel_tests {
             backedge_src: 5,
             block_idx: 0,
             source_block_idx: 0,
-            source_def_idx: 1,
-            copy_idx: 5,
+            source_def_idx: 3,
+            copy_idx: 7,
         };
         assert!(
             source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
             "dest-rooted folded read must not veto (adler32 buf+=8 shape)"
         );
 
-        // Control: the same folded read through a root that is NOT dest
-        // still vetoes — the home may hold dest's value instead of src's.
-        let Instruction::GetElementPtr { base, .. } = &mut func.blocks[0].instructions[0] else {
+        // Control: the same folded read through a root that IS the source
+        // still vetoes — the consumer reads the shared home itself while it
+        // holds dest's newer value (true dirty-window hazard).
+        let Instruction::GetElementPtr { base, .. } = &mut func.blocks[0].instructions[2] else {
+            panic!("fixture shape changed");
+        };
+        *base = Value(5);
+        assert!(
+            !source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+            "src-rooted folded read in a dirty window must veto"
+        );
+
+        // Disjoint web: the same folded read through a two-peel chain
+        // (GEP(v7) of folded address math v7 = v9+1 over the opaque root v9;
+        // read-home distance 2) that provably occupies a different home (no
+        // potential-sharing
+        // edge to the candidate web) must NOT veto — the dest redef cannot
+        // corrupt a home the consumer never reads (lz4 snapshot-chain
+        // shape; single-peel reads stay vetoed, see the distance gate).
+        let Instruction::GetElementPtr { base, .. } = &mut func.blocks[0].instructions[2] else {
             panic!("fixture shape changed");
         };
         *base = Value(7);
         assert!(
+            source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+            "disjoint-web folded read in a dirty window must not veto"
+        );
+
+        // Distance gate: the same folded read one peel away (GEP over the
+        // opaque root v9 directly; read-home distance 1) stays vetoed even
+        // though v9 provably occupies a different home — single-peel
+        // evidence is too weak to risk global recolor churn (expat len-2
+        // regression guard).
+        let Instruction::GetElementPtr { base, .. } = &mut func.blocks[0].instructions[2] else {
+            panic!("fixture shape changed");
+        };
+        *base = Value(9);
+        assert!(
             !source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
-            "non-dest-rooted folded read in a dirty window must veto"
+            "single-peel disjoint folded read must veto (distance gate)"
+        );
+    }
+
+    #[test]
+    fn hidden_read_through_deep_address_chain_does_not_veto() {
+        // Miniature lz4 {v404,v224} shape: the consumer address (ptr v11)
+        // folds through a deep address chain (v7 = v6+1, v6 = v9+1, v9
+        // opaque) whose root provably occupies a different home (no
+        // potential-sharing edge to the candidate web {2,5}), so the
+        // dirty-window hidden read of the source must not veto. (Real lz4
+        // paths are len-4 GEP/BinOp/Cast chains; Copies stop the peel, so
+        // snapshot Copies are invisible here by construction.)
+        let mut func = IrFunction::new("snapshot_chain".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![block(
+            0,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(9),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Value(Value(2)),
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(9)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(7),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(6)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::I64,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(11),
+                    base: Value(7),
+                    offset: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I64,
+                },
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(5)),
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::I64,
+                },
+                Instruction::Load {
+                    dest: Value(8),
+                    ptr: Value(11),
+                    ty: IrType::U8,
+                    volatile: false,
+                    seg_override: Default::default(),
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        func.next_value_id = 12;
+        let mut liveness = compute_live_intervals(&func);
+        let base = liveness.block_starts[0];
+        liveness.folded_read_points.insert(5, vec![base + 7]);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (_preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 2,
+            backedge_src: 5,
+            block_idx: 0,
+            source_block_idx: 0,
+            source_def_idx: 4,
+            copy_idx: 5,
+        };
+        assert!(
+            source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+            "hidden read through a snapshot chain into a disjoint web must not veto"
+        );
+    }
+
+    #[test]
+    fn homeless_merge_profitability_gate() {
+        // Expat {v185,v20} shape: source covers 2 points disjoint from the
+        // leader's global segments; the merged fat range would occupy ~40
+        // new gap points to delete one cold Copy — refuse.
+        let gap = vec![
+            LiveInterval {
+                value_id: 185,
+                start: 0,
+                end: 10,
+            },
+            LiveInterval {
+                value_id: 185,
+                start: 33,
+                end: 87,
+            },
+            LiveInterval {
+                value_id: 20,
+                start: 127,
+                end: 128,
+            },
+        ];
+        assert!(
+            !homeless_merge_profitable(&gap, 185, 20),
+            "pure-gap merge (overlap 0, fill ~40) must be refused"
+        );
+        // lz4 {v404,v212} shape: full fat overlap — merge.
+        let fat = vec![
+            LiveInterval {
+                value_id: 404,
+                start: 0,
+                end: 265,
+            },
+            LiveInterval {
+                value_id: 212,
+                start: 0,
+                end: 265,
+            },
+        ];
+        assert!(
+            homeless_merge_profitable(&fat, 404, 212),
+            "full-overlap merge (overlap 265, fill 0) must be accepted"
+        );
+        // Inside-disjoint: source sits in a hole of the leader's span —
+        // no new span, shrinking fill — merge.
+        let inside = vec![
+            LiveInterval {
+                value_id: 7,
+                start: 0,
+                end: 30,
+            },
+            LiveInterval {
+                value_id: 7,
+                start: 50,
+                end: 100,
+            },
+            LiveInterval {
+                value_id: 8,
+                start: 40,
+                end: 41,
+            },
+        ];
+        assert!(
+            homeless_merge_profitable(&inside, 7, 8),
+            "inside-disjoint merge (no new span) must be accepted"
         );
     }
 }

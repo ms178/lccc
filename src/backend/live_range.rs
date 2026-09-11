@@ -1475,7 +1475,36 @@ impl LinearScanAllocator {
             let span_steal_arch =
                 crate::common::types::target_elf_machine() == crate::backend::elf::EM_386;
             if mode >= 3 && nxt <= incoming.end && (!incoming.spans_loop || !span_steal_arch) {
-                continue;
+                // Cost-ratio escape: the next-use gate protects short
+                // chain-links (struct_copy/sha256: evicting hot shorts
+                // for spans measured ~2x), but it is absolute — a span
+                // orders of magnitude hotter than the short still spills
+                // (lz4's src base, prio 700 vs a prio-20 temp: 2 hot
+                // reloads/iter). Escape when the incoming outweighs the
+                // short by more than Kx (default 16: struct_copy's ~7x
+                // stays gated, lz4's 35x escapes). K=0 disables.
+                // The escape requires the victim's next use strictly
+                // inside the incoming's life (nxt > pos): a use AT the
+                // incoming position is a use-before-def hazard (the
+                // incoming would overwrite a value read first).
+                // The victim must also DIE at its next use (no remaining
+                // cost past nxt): the escape then costs exactly one victim
+                // reload and the victim never re-competes. A victim with
+                // future cost reloads at nxt and keeps fighting for its
+                // register, cascading into recoloring churn the local
+                // ratio cannot see (measured: expat victims with vrem
+                // 1-210 cost +5 moves with zero spill win; every winning
+                // escape — rbtree spills 29->14, moving_stats 12->5 —
+                // had vrem=0). Evaluated last: O(log n) suffix lookup,
+                // only reached when the O(1) ratio already passes.
+                let k = self.ra_config.evict_short_k;
+                let escapes = k > 0
+                    && nxt > pos
+                    && (priority as u128) * (k as u128) < (bar as u128)
+                    && interval.range.remaining_cost(nxt) == 0;
+                if !escapes {
+                    continue;
+                }
             }
             if mode >= 3 && incoming.spans_loop && span_steal_arch {
                 if interval.range.span_recurrence {
@@ -3518,7 +3547,7 @@ mod tests {
 
             next_use: None,
         });
-        let incoming = lr(3, 10, 50, vec![10, 50], 100);
+        let incoming = lr(3, 10, 50, vec![10, 50], 10);
 
         let idx3 = a.select_evict_victim(&incoming, 3).expect("legal victim");
         assert_eq!(
@@ -3851,7 +3880,7 @@ mod tests {
         assert_eq!(a.select_evict_victim(&incoming, 6), None);
 
         // (b) A victim needed DURING the incoming's lifetime is refused.
-        let victim = lr_weighted(3, 0, 200, vec![(1, 100), (80, 1)]);
+        let victim = lr_weighted(3, 0, 200, vec![(1, 100), (80, 200)]);
         let incoming2 = lr_weighted(4, 50, 120, vec![(60, 1000), (119, 1000)]);
         assert!(victim.remaining_cost(50) < incoming2.remaining_cost(50));
         let mut b = LinearScanAllocator::new(vec![], regs);
@@ -3862,6 +3891,56 @@ mod tests {
             None,
             "next use 80 lies inside [50,120]: reload thrash, refuse"
         );
+    }
+
+    /// Cost-ratio escape (mode 3, K=CCC_EVICT_SHORT_K default 16): a victim
+    /// whose next use lies inside the incoming's life is normally refused,
+    /// but escapes when the incoming outweighs it by more than Kx (lz4's
+    /// prio-700 span vs a prio-20 short: 35x escapes; struct_copy's ~7x
+    /// stays gated). Demands nxt strictly inside (use-before-def hazard
+    /// at nxt == pos refuses regardless of ratio), the victim dead at nxt
+    /// (no remaining cost past it, else re-competition churn), and K=0
+    /// disables.
+    #[test]
+    fn short_victim_escapes_by_cost_ratio() {
+        let regs = vec![PhysReg(0)];
+        // (a) 35x escapes: hot span takes the short's register.
+        let victim = lr(1, 0, 200, vec![1, 80], 20);
+        let incoming = lr(2, 50, 120, vec![60, 119], 700);
+        let mut a = LinearScanAllocator::new(vec![], regs.clone());
+        a.init_registers();
+        a.allocate_range(victim);
+        assert_eq!(a.select_evict_victim(&incoming, 3), Some(0));
+        // (b) 7x stays gated: the short keeps its register.
+        let victim = lr(3, 0, 200, vec![1, 80], 100);
+        let incoming = lr(4, 50, 120, vec![60, 119], 700);
+        let mut b = LinearScanAllocator::new(vec![], regs.clone());
+        b.init_registers();
+        b.allocate_range(victim);
+        assert_eq!(b.select_evict_victim(&incoming, 3), None);
+        // (c) nxt == pos refuses even at 35x (use-before-def hazard).
+        let victim = lr(5, 0, 200, vec![1, 50], 20);
+        let incoming = lr(6, 50, 120, vec![60, 119], 700);
+        let mut c = LinearScanAllocator::new(vec![], regs.clone());
+        c.init_registers();
+        c.allocate_range(victim);
+        assert_eq!(c.select_evict_victim(&incoming, 3), None);
+        // (d) K=0 disables the escape entirely.
+        let victim = lr(7, 0, 200, vec![1, 80], 20);
+        let incoming = lr(8, 50, 120, vec![60, 119], 700);
+        let mut d = LinearScanAllocator::new(vec![], regs.clone());
+        d.init_registers();
+        d.allocate_range(victim);
+        Arc::get_mut(&mut d.ra_config).unwrap().evict_short_k = 0;
+        assert_eq!(d.select_evict_victim(&incoming, 3), None);
+        // (e) A victim that lives past its next use refuses even at 35x:
+        // it would reload at nxt and keep re-competing (expat churn).
+        let victim = lr(9, 0, 200, vec![1, 80, 150], 20);
+        let incoming = lr(10, 50, 120, vec![60, 119], 700);
+        let mut e = LinearScanAllocator::new(vec![], regs);
+        e.init_registers();
+        e.allocate_range(victim);
+        assert_eq!(e.select_evict_victim(&incoming, 3), None);
     }
 
     /// Modes 1-3 must be untouched by the cost model: same victim, same

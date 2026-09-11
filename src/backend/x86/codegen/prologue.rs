@@ -923,8 +923,7 @@ impl X86Codegen {
             let replay_scan = super::comparison::compute_cmp_replay_scan(func, &use_counts, &fused);
             self.cmp_replay_operand_links = replay_scan.operand_links;
             self.cmp_replay = replay_scan.replay;
-            self.cmp_bool_pair = replay_scan.bool_pair;
-            self.bool_pair_cmps = replay_scan.bool_pair_cmps;
+            self.cmp_replay_multi = replay_scan.replay_multi;
             // FP-SELECT (S05): float Cmps whose boolean feeds only Selects.
             // The Cmp emitter skips the ucomisd/setcc boolean entirely; every
             // select re-derives a vcmpsd/vcmpss mask from the recorded
@@ -933,6 +932,13 @@ impl X86Codegen {
             // whose operands became unreadable falls back to re-materializing
             // the boolean (emit_fp_cmp_boolean) and the ordinary cmov path.
             self.fp_select_cmps = replay_scan.fp_select;
+            // DE MORGAN SPLIT (branch-join): And/Or dests whose branch
+            // re-emits both comparisons. Stored UNPRUNED here; the
+            // post-slot-assignment prune below (after
+            // calculate_stack_space_common) drops entries whose operands
+            // are unreadable at the terminator and builds the skip set.
+            self.demorgan_branch = replay_scan.demorgan;
+            self.demorgan_skip.clear();
 
             self.fused_cmp_dests = fused;
             self.fused_forward_dests = fused_forward;
@@ -1522,56 +1528,7 @@ impl X86Codegen {
             }
             for d in prune {
                 self.cmp_replay.remove(&d);
-            }
-            // ── BOOL-PAIR post-RA prune ─────────────────────────────────────
-            // Same readability contract as the replay prune: the branch
-            // re-reads all four leg operands at the branch position. A pair
-            // with any unreadable operand is dropped ATOMICALLY — including
-            // its two bool_pair_cmps members — so both Cmps fall back to
-            // materializing their booleans at their own positions and the
-            // And emits the ordinary andl. That fallback must be all-or-
-            // nothing: a half-pruned pair would skip one leg's setcc and
-            // read a boolean that was never written.
-            {
-                let ext_active = !self.state.ra_config.no_folded_index_liveness;
-                let acc_no_home: crate::common::fx_hash::FxHashSet<u32> =
-                    accumulator_assignments.iter().map(|a| a.value_id).collect();
-                let readable = |op: &Operand| -> bool {
-                    match op {
-                        Operand::Const(_) => true,
-                        Operand::Value(v) => {
-                            if self.state.get_slot(v.0).is_some() {
-                                return true;
-                            }
-                            if self.reg_assignments.contains_key(&v.0) {
-                                return ext_active;
-                            }
-                            if acc_no_home.contains(&v.0) {
-                                return false;
-                            }
-                            false
-                        }
-                    }
-                };
-                let mut prune_pairs: Vec<u32> = Vec::new();
-                for (adest, pair) in self.cmp_bool_pair.iter() {
-                    if ![&pair.lhs1, &pair.rhs1, &pair.lhs2, &pair.rhs2]
-                        .iter()
-                        .all(|op| readable(op))
-                    {
-                        prune_pairs.push(*adest);
-                    }
-                }
-                for adest in prune_pairs {
-                    // Un-skip by LEG DEST, not by leg operand: the skip set
-                    // holds the two Cmps' dests. Removing operand ids here
-                    // would leave both legs skipped while the And falls
-                    // back to a real `andl` over never-written homes.
-                    if let Some(pair) = self.cmp_bool_pair.remove(&adest) {
-                        self.bool_pair_cmps.remove(&pair.dest1);
-                        self.bool_pair_cmps.remove(&pair.dest2);
-                    }
-                }
+                self.cmp_replay_multi.remove(&d);
             }
             // ── FP-SELECT post-RA prune (S05) ───────────────────────────────
             // Same readability contract as the replay prune above: a select
@@ -1939,6 +1896,100 @@ impl X86Codegen {
             },
             cached_liveness,
         );
+
+        // ── DE MORGAN post-slot-assignment prune ────────────────────────
+        // Same readability contract as the compare-replay prune above
+        // (Const, slot, register home with the folded-index extension
+        // active; accumulator-only and homeless operands are out), but
+        // positioned AFTER calculate_stack_space_common: the tiered slot
+        // allocator runs there, so a value that WILL be slot-homed reads
+        // as homeless at the earlier prune point (lz4's match-length
+        // And: both Cmp operands are tier-spilled AFTER the replay
+        // prune, and pruning here instead of there is the difference
+        // between cmp;jcc;cmp;jcc and setcc+andl). Survivors populate
+        // the skip set (the And/Or + both Cmp dests emit nothing at
+        // their own positions); pruned entries fall back to the
+        // ordinary materialize-the-booleans path. The operand links
+        // were already consumed by the RA above — the prune only
+        // affects emission, so a retained link for a pruned entry only
+        // over-constrains the allocator, never under-constrains.
+        if !self.demorgan_branch.is_empty() {
+            let ext_active = !self.state.ra_config.no_folded_index_liveness;
+            let acc_no_home: crate::common::fx_hash::FxHashSet<u32> =
+                accumulator_assignments.iter().map(|a| a.value_id).collect();
+            let debug = super::comparison::demorgan_debug_enabled();
+            let mut prune_dm: Vec<u32> = Vec::new();
+            for (andor_id, rec) in self.demorgan_branch.iter() {
+                let readable = |op: &Operand| -> bool {
+                    match op {
+                        Operand::Const(_) => true,
+                        Operand::Value(v) => {
+                            if self.state.get_slot(v.0).is_some() {
+                                return true;
+                            }
+                            if self.reg_assignments.contains_key(&v.0) {
+                                return ext_active;
+                            }
+                            if acc_no_home.contains(&v.0) {
+                                return false;
+                            }
+                            false
+                        }
+                    }
+                };
+                let ops = [&rec.a.1, &rec.a.2, &rec.b.1, &rec.b.2];
+                if debug {
+                    let homes: Vec<String> = ops
+                        .iter()
+                        .map(|op| match op {
+                            Operand::Const(_) => "const".to_string(),
+                            Operand::Value(v) => {
+                                if self.state.get_slot(v.0).is_some() {
+                                    format!("v{}:slot", v.0)
+                                } else if self.reg_assignments.contains_key(&v.0) {
+                                    format!("v{}:reg", v.0)
+                                } else {
+                                    format!("v{}:none", v.0)
+                                }
+                            }
+                        })
+                        .collect();
+                    eprintln!(
+                        "[demorgan] prune-check andor={} homes=[{}]",
+                        andor_id,
+                        homes.join(", ")
+                    );
+                }
+                // NOTE: skipped defs (the And/Or, its passthru, both Cmps)
+                // need NO accumulator-homing refusal. The accumulator
+                // assignment is not an emission path — it only tells slot
+                // assignment the value needs no home (it passes through
+                // %rax between adjacent def/use, set at def emission via
+                // the acc cache). A skipped def never emits, so it never
+                // sets an acc entry; its only reader is skipped (branch
+                // replays, passthru skipped) or is the branch itself.
+                // Only the OPERAND readability above matters (an acc-only
+                // operand has no readable home at the replay distance).
+                if ops.iter().any(|op| !readable(op)) {
+                    if debug {
+                        eprintln!("[demorgan] prune andor={}", andor_id);
+                    }
+                    prune_dm.push(*andor_id);
+                } else if debug {
+                    eprintln!("[demorgan] survive andor={}", andor_id);
+                }
+            }
+            for d in prune_dm {
+                self.demorgan_branch.remove(&d);
+            }
+            self.demorgan_skip.clear();
+            for (andor_id, rec) in self.demorgan_branch.iter() {
+                self.demorgan_skip.insert(*andor_id);
+                self.demorgan_skip.insert(rec.binop_id);
+                self.demorgan_skip.insert(rec.cmp_dests[0]);
+                self.demorgan_skip.insert(rec.cmp_dests[1]);
+            }
+        }
 
         // Allocate spill slots for Phase 2b caller-saved-spanning registers.
         self.caller_save_spill_slots.clear();

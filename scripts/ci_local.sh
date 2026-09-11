@@ -156,6 +156,12 @@ gate "bool-pair-tail-jmp-contract" fast \
 gate "bool-pair-prune-atomicity" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_prune.sh
 
+gate "demorgan-branch-split" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_demorgan_branch_split.sh
+
+gate "gvn-xsign-load-cse" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_gvn_xsign_load_cse.sh
+
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 

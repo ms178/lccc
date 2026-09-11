@@ -54,6 +54,16 @@ impl X86Codegen {
             return;
         }
         self.fold_skip_cast = None;
+        // DE MORGAN SPLIT: Cast passthru (`bool c = a&&b; if (c)` — the
+        // materialized boolean is cast to the branch-cond type) — the
+        // branch replays the original comparisons, so the cast result is
+        // never read; emitting it would convert a never-written home. No
+        // widen-flush is needed (unlike the Cmp gate): the skipped Cmp
+        // gates ahead of this instruction already flushed every deferred
+        // narrowing widen, and the replay reads only the Cmp operands.
+        if self.demorgan_skip.contains(&dest.0) {
+            return;
+        }
         // A cast OF an x87 bit-pattern value (LDFabs/LDCopysign result,
         // tracked in f128_direct_slots) is a no-op regardless of the source
         // type in the IR (the value is already the 16-byte x87 format).
