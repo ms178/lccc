@@ -38,6 +38,12 @@ cd "$K"
 . "$SCRIPT_DIR/boot_flags.sh"
 RMF="$LCCC_BOOT_CFLAGS"
 INC="$LCCC_BOOT_CPPFLAGS"
+# Extra flags for kconfigless staging (see boot_kconfigless_stage.sh): ways to
+# spell a Kconfig-generated environment (generated headers, forced -D macros)
+# that the sandbox cannot produce (no flex/bison).  Empty by default, so the
+# canonical gate invocation is unaffected; A/B stays valid as long as both
+# sides share the identical staged tree and EXTRA value.
+EXTRA="${LCCC_BOOT_EXTRA:-}"
 
 mkdir -p "$OUT"
 
@@ -53,14 +59,14 @@ fi
 ASM_FILES=("${LCCC_BOOT_ASM_FILES[@]}")
 for f in "${ASM_FILES[@]}"; do
   echo "AS   $f.S"
-  "$LCCC" $INC $RMF -D__ASSEMBLY__ -c "arch/x86/boot/$f.S" -o "$OUT/$f.o"
+  "$LCCC" $INC $RMF $EXTRA -D__ASSEMBLY__ -c "arch/x86/boot/$f.S" -o "$OUT/$f.o"
 done
 
 # ---- compile the .c files --------------------------------------------------
 C_FILES=("${LCCC_BOOT_C_FILES[@]}")
 for f in "${C_FILES[@]}"; do
   echo "CC   $f.c"
-  "$LCCC" $INC $RMF -c "arch/x86/boot/$f.c" -o "$OUT/$f.o"
+  "$LCCC" $INC $RMF $EXTRA -c "arch/x86/boot/$f.c" -o "$OUT/$f.o"
 done
 
 # ---- link setup.elf with lccc-ld -------------------------------------------

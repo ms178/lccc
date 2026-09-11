@@ -3471,12 +3471,35 @@ impl X86Codegen {
                 // An optional third argument is a constant displacement
                 // (vec_interleave interleave slices), folded into the SIB
                 // operand.
+                // A homed destination loads straight into its home: the FP
+                // twin (VecLoadF64x2) has always done this, while the integer
+                // form staged through %xmm0 and paid a `movdqa` per load.
                 let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
-                self.state
-                    .emit_fmt(format_args!("    movdqu {}, %xmm0", mem));
+                let mut loaded_home = false;
+                if let Some(d) = dest {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let name = phys_reg_name(reg);
+                            self.state
+                                .emit_fmt(format_args!("    movdqu {}, %{}", mem, name));
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(name);
+                            loaded_home = true;
+                        }
+                    }
+                }
+                if !loaded_home {
+                    self.state
+                        .emit_fmt(format_args!("    movdqu {}, %xmm0", mem));
+                }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    self.sse_store_dest(d, "xmm0");
+                    if !loaded_home {
+                        self.sse_store_dest(d, "xmm0");
+                    }
                 }
             }
             IntrinsicOp::VecLoadF64x2 => {
@@ -3557,12 +3580,35 @@ impl X86Codegen {
                 // An optional third argument is a constant displacement
                 // (vec_interleave interleave slices), folded into the SIB
                 // operand.
+                // A homed destination loads straight into its home (same
+                // pattern as VecLoadF64x2/VecLoadI64x2): staging through
+                // %xmm0 cost a `movdqa` per load in every integer SSE loop.
                 let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
-                self.state
-                    .emit_fmt(format_args!("    movdqu {}, %xmm0", mem));
+                let mut loaded_home = false;
+                if let Some(d) = dest {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let name = phys_reg_name(reg);
+                            self.state
+                                .emit_fmt(format_args!("    movdqu {}, %{}", mem, name));
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(name);
+                            loaded_home = true;
+                        }
+                    }
+                }
+                if !loaded_home {
+                    self.state
+                        .emit_fmt(format_args!("    movdqu {}, %xmm0", mem));
+                }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    self.sse_store_dest(d, "xmm0");
+                    if !loaded_home {
+                        self.sse_store_dest(d, "xmm0");
+                    }
                 }
             }
 

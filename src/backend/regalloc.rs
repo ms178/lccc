@@ -814,82 +814,54 @@ pub fn collect_x64_rdx_clobber_points(func: &IrFunction) -> Vec<u32> {
 /// not proven, for that class; every other emitter is exercised with
 /// `%rdx` homes by the clobber-free bodies that admit `%rdx` today.
 pub fn x86_body_has_wide_ops(func: &IrFunction) -> bool {
-    let wide = |t: &IrType| matches!(t, IrType::I128 | IrType::U128);
-    let mut wide_values: FxHashSet<u32> = FxHashSet::default();
-    loop {
-        let before = wide_values.len();
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                match inst {
-                    Instruction::BinOp { dest, ty, .. }
-                    | Instruction::UnaryOp { dest, ty, .. }
-                    | Instruction::Load { dest, ty, .. }
-                    | Instruction::ParamRef { dest, ty, .. }
-                    | Instruction::Select { dest, ty, .. }
-                    | Instruction::AtomicLoad { dest, ty, .. }
-                    | Instruction::AtomicRmw { dest, ty, .. }
-                    | Instruction::AtomicCmpxchg { dest, ty, .. } => {
-                        if wide(ty) {
-                            wide_values.insert(dest.0);
-                        }
-                    }
-                    Instruction::Phi { dest, ty, .. } => {
-                        if wide(ty) {
-                            wide_values.insert(dest.0);
-                        }
-                    }
-                    Instruction::Cast {
-                        dest,
-                        from_ty,
-                        to_ty,
-                        ..
-                    } => {
-                        if wide(from_ty) || wide(to_ty) {
-                            wide_values.insert(dest.0);
-                        }
-                    }
-                    Instruction::Copy { dest, src } => {
-                        let src_wide = match src {
-                            Operand::Const(IrConst::I128(_)) => true,
-                            Operand::Value(v) => wide_values.contains(&v.0),
-                            _ => false,
-                        };
-                        if src_wide {
-                            wide_values.insert(dest.0);
-                        }
-                    }
-                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                        if let Some(dest) = info.dest {
-                            if wide(&info.return_type) {
-                                wide_values.insert(dest.0);
-                            }
-                        }
-                        for (arg, ty) in info.args.iter().zip(info.arg_types.iter()) {
-                            if wide(ty) {
-                                if let Operand::Value(v) = arg {
-                                    wide_values.insert(v.0);
-                                }
-                            }
-                        }
-                    }
-                    Instruction::Store { val, ty, .. } => {
-                        // The stored operand's static width is the store's
-                        // type: the value itself is wide.
-                        if wide(ty) {
-                            if let Operand::Value(v) = val {
-                                wide_values.insert(v.0);
-                            }
-                        }
-                    }
-                    _ => {}
+    let wide = |ty: &IrType| matches!(ty, IrType::I128 | IrType::U128);
+    if wide(&func.return_type) {
+        return true;
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let typed_wide = match inst {
+                Instruction::BinOp { ty, .. }
+                | Instruction::UnaryOp { ty, .. }
+                | Instruction::Cmp { ty, .. }
+                | Instruction::Load { ty, .. }
+                | Instruction::Store { ty, .. }
+                | Instruction::ParamRef { ty, .. }
+                | Instruction::Select { ty, .. }
+                | Instruction::AtomicLoad { ty, .. }
+                | Instruction::AtomicRmw { ty, .. }
+                | Instruction::AtomicCmpxchg { ty, .. }
+                | Instruction::Phi { ty, .. } => wide(ty),
+                Instruction::Cast { from_ty, to_ty, .. } => wide(from_ty) || wide(to_ty),
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    wide(&info.return_type) || info.arg_types.iter().any(wide)
                 }
+                _ => false,
+            };
+            if typed_wide {
+                return true;
+            }
+            let mut wide_constant = false;
+            for_each_operand_in_instruction(inst, |operand| {
+                if matches!(operand, Operand::Const(IrConst::I128(_))) {
+                    wide_constant = true;
+                }
+            });
+            if wide_constant {
+                return true;
             }
         }
-        if wide_values.len() == before {
-            break;
+        let mut wide_constant = false;
+        for_each_operand_in_terminator(&block.terminator, |operand| {
+            if matches!(operand, Operand::Const(IrConst::I128(_))) {
+                wide_constant = true;
+            }
+        });
+        if wide_constant {
+            return true;
         }
     }
-    !wide_values.is_empty()
+    false
 }
 
 /// Companion of [`x86_param_caller_homes_safe`]: with parameters parked in
@@ -1115,17 +1087,171 @@ pub struct RegAllocConfig {
     pub leaf_caller_saved_homes: bool,
 }
 
+/// Conservative envelope for every value.
+///
+/// Production liveness emits one fat interval per defined value. If a caller
+/// still supplies several, keep the complete envelope rather than last-write
+/// coverage that silently drops an earlier range.
 fn interval_map(liveness: &LivenessResult) -> FxHashMap<u32, (u32, u32)> {
-    let mut m = FxHashMap::default();
+    let mut m: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
     m.reserve(liveness.intervals.len());
     for iv in &liveness.intervals {
-        m.insert(iv.value_id, (iv.start, iv.end));
+        debug_assert!(
+            iv.start <= iv.end,
+            "invalid live interval for v{}: [{}, {}]",
+            iv.value_id,
+            iv.start,
+            iv.end
+        );
+        if let Some(bounds) = m.get_mut(&iv.value_id) {
+            bounds.0 = bounds.0.min(iv.start);
+            bounds.1 = bounds.1.max(iv.end);
+        } else {
+            m.insert(iv.value_id, (iv.start, iv.end));
+        }
     }
     m
 }
 
 fn intervals_overlap(a: (u32, u32), b: (u32, u32)) -> bool {
     a.0 < b.1 && b.0 < a.1
+}
+
+fn summed_use_weight(values: &[u32], use_count: &FxHashMap<u32, u64>) -> u64 {
+    values.iter().fold(0u64, |total, value| {
+        total.saturating_add(use_count.get(value).copied().unwrap_or(0))
+    })
+}
+
+/// Resolve a root in an acyclic union-find forest.
+///
+/// Missing entries are singleton roots. The forest must be constructed
+/// through root-to-root unions; arbitrary parent cycles are invalid.
+fn allocation_class_root(parent: &FxHashMap<u32, u32>, value: u32) -> u32 {
+    let mut root = value;
+    while let Some(&next) = parent.get(&root) {
+        if next == root {
+            break;
+        }
+        root = next;
+    }
+    root
+}
+
+/// Normalize all entries before direct parent lookups are used as class ids.
+fn flatten_allocation_classes(parent: &mut FxHashMap<u32, u32>) {
+    let values: Vec<u32> = parent.keys().copied().collect();
+    for value in values {
+        let root = allocation_class_root(parent, value);
+        parent.insert(value, root);
+    }
+}
+
+/// Enumerate conflicts using the existing allocator boundary predicate.
+///
+/// Input: `(physical register, start, end, allocation class)`.
+/// Output: `(physical register, lower class id, higher class id,
+/// overlap start, overlap end)`.
+///
+/// Preserves `intervals_overlap`, including its treatment of zero-length
+/// ranges. Production callers normalize coverage within each
+/// `(register, class)` before calling this function.
+fn overlapping_class_spans(mut spans: Vec<(u8, u32, u32, u32)>) -> Vec<(u8, u32, u32, u32, u32)> {
+    spans.sort_unstable();
+    let mut out = Vec::new();
+    let mut active: Vec<(u32, u32, u32)> = Vec::new();
+    let mut current_reg: Option<u8> = None;
+    for (reg, start, end, class) in spans {
+        assert!(
+            start <= end,
+            "invalid register-allocation range: r{} class v{} [{}, {}]",
+            reg,
+            class,
+            start,
+            end
+        );
+        if current_reg != Some(reg) {
+            active.clear();
+            current_reg = Some(reg);
+        }
+        active.retain(|&(_, active_end, _)| active_end > start);
+        for &(other_start, other_end, other_class) in &active {
+            if other_class != class && intervals_overlap((other_start, other_end), (start, end)) {
+                out.push((
+                    reg,
+                    other_class.min(class),
+                    other_class.max(class),
+                    other_start.max(start),
+                    other_end.min(end),
+                ));
+            }
+        }
+        // A zero-length range can conflict with an earlier enclosing range
+        // under `intervals_overlap`, but cannot conflict with a subsequent
+        // range whose start is >= its end.
+        if start < end {
+            active.push((start, end, class));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Shared homes must satisfy the union of member restrictions.
+/// `member_of` maps directly to final owners.
+fn propagate_member_restrictions(restricted: &mut FxHashSet<u32>, member_of: &FxHashMap<u32, u32>) {
+    let owners: Vec<u32> = member_of
+        .iter()
+        .filter_map(|(&member, &owner)| restricted.contains(&member).then_some(owner))
+        .collect();
+    restricted.extend(owners);
+}
+
+fn allocation_owner_bounds(
+    value: u32,
+    merged_of: &FxHashMap<u32, LiveInterval>,
+    iv_map: &FxHashMap<u32, (u32, u32)>,
+) -> Option<(u32, u32)> {
+    merged_of
+        .get(&value)
+        .map(|interval| (interval.start, interval.end))
+        .or_else(|| iv_map.get(&value).copied())
+}
+
+/// Per-owner coverage, including a fat-interval fallback for every value
+/// that has no segment data.
+///
+/// A single segmented member must not hide an unsegmented member of the
+/// same allocation web.
+fn owned_live_segments(
+    liveness: &LivenessResult,
+    member_of: &FxHashMap<u32, u32>,
+) -> FxHashMap<u32, Vec<(u32, u32)>> {
+    let owner_of = |value: u32| member_of.get(&value).copied().unwrap_or(value);
+    let mut owned: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    let mut segmented: FxHashSet<u32> = FxHashSet::default();
+    for segment in &liveness.segments {
+        segmented.insert(segment.value_id);
+        owned
+            .entry(owner_of(segment.value_id))
+            .or_default()
+            .push((segment.start, segment.end));
+    }
+    for interval in &liveness.intervals {
+        if !segmented.contains(&interval.value_id) {
+            owned
+                .entry(owner_of(interval.value_id))
+                .or_default()
+                .push((interval.start, interval.end));
+        }
+    }
+    for pieces in owned.values_mut() {
+        pieces.sort_unstable();
+        let source = std::mem::take(pieces);
+        insert_segment_union(pieces, &source);
+    }
+    owned
 }
 
 /// Linear merge-style interference test for sorted hole-aware segment sets.
@@ -1172,6 +1298,41 @@ fn insert_segment_union(into: &mut Vec<(u32, u32)>, added: &[(u32, u32)]) {
     *into = all;
 }
 
+/// Sorted, coalesced coverage pieces of two values overlap.
+///
+/// Used by general coalescing so a phi-web exemption is hole-aware: exclusive
+/// CFG arms may share a home, simultaneously-live segments may not.
+fn sorted_coverage_overlaps(left: &[(u32, u32)], right: &[(u32, u32)]) -> bool {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < left.len() && j < right.len() {
+        if intervals_overlap(left[i], right[j]) {
+            return true;
+        }
+        if left[i].1 <= right[j].0 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    false
+}
+
+fn coverage_of_value(
+    value: u32,
+    segments_of: &FxHashMap<u32, Vec<(u32, u32)>>,
+    iv_map: &FxHashMap<u32, (u32, u32)>,
+) -> Vec<(u32, u32)> {
+    if let Some(pieces) = segments_of.get(&value) {
+        return pieces.clone();
+    }
+    iv_map
+        .get(&value)
+        .copied()
+        .map(|span| vec![span])
+        .unwrap_or_default()
+}
+
 /// RA-05: attach hole-aware live coverage to scan ranges so the linear scan's
 /// interference test can see through liveness holes (values on mutually
 /// exclusive diamond/switch arms — the xmltok/inflate 12×/15× stack-memory
@@ -1191,20 +1352,7 @@ fn attach_scan_segments(
     if ranges.is_empty() {
         return;
     }
-    let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
-    let mut owned: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
-    for seg in &liveness.segments {
-        let owner = owner_of(seg.value_id);
-        owned.entry(owner).or_default().push((seg.start, seg.end));
-    }
-    if owned.is_empty() {
-        return;
-    }
-    for pieces in owned.values_mut() {
-        pieces.sort_unstable();
-        let source = std::mem::take(pieces);
-        insert_segment_union(pieces, &source);
-    }
+    let owned = owned_live_segments(liveness, coalesce_member_of);
     for range in ranges.iter_mut() {
         let Some(segs) = owned.get(&range.value_id) else {
             continue;
@@ -1231,6 +1379,51 @@ fn spans_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
     idx < call_points.len() && call_points[idx] < iv.end
 }
 
+/// Half-open `[start, end)` occupancy against a sorted point list.
+///
+/// Unlike `spans_any_call`, a point exactly at `start` counts: synthetic
+/// slot contents can already be live at a block boundary.
+fn half_open_range_contains_any_point(start: u32, end: u32, points: &[u32]) -> bool {
+    if start >= end {
+        return false;
+    }
+    let index = points.partition_point(|&point| point < start);
+    index < points.len() && points[index] < end
+}
+
+/// Owners whose live coverage includes a call after their definition.
+///
+/// Segment data is authoritative when present. Values with no segments fall
+/// back to the fat envelope so a missing-segment owner is never treated as
+/// "not call-spanning".
+fn collect_call_spanning_owners(
+    liveness: &LivenessResult,
+    iv_map: &FxHashMap<u32, (u32, u32)>,
+    coalesce_member_of: &FxHashMap<u32, u32>,
+    call_points: &[u32],
+) -> FxHashSet<u32> {
+    let owner_of = |value: u32| coalesce_member_of.get(&value).copied().unwrap_or(value);
+    let mut set = FxHashSet::default();
+    let mut segmented: FxHashSet<u32> = FxHashSet::default();
+    for seg in &liveness.segments {
+        segmented.insert(seg.value_id);
+        let def = iv_map
+            .get(&seg.value_id)
+            .map(|&(s, _)| s)
+            .unwrap_or(seg.start);
+        let idx = call_points.partition_point(|&cp| cp < seg.start || cp <= def);
+        if idx < call_points.len() && call_points[idx] < seg.end {
+            set.insert(owner_of(seg.value_id));
+        }
+    }
+    for interval in &liveness.intervals {
+        if !segmented.contains(&interval.value_id) && spans_any_call(interval, call_points) {
+            set.insert(owner_of(interval.value_id));
+        }
+    }
+    set
+}
+
 /// Inclusive — i686 scratch may clobber while the insn still reads the value.
 #[inline]
 fn overlaps_inclusive(iv: &LiveInterval, points: &[u32]) -> bool {
@@ -1247,13 +1440,10 @@ fn overlaps_inclusive(iv: &LiveInterval, points: &[u32]) -> bool {
 /// claim `%ecx` across their own defining instruction.
 #[inline]
 fn overlaps_inclusive_skip_birth(iv: &LiveInterval, points: &[u32]) -> bool {
-    let idx = points.partition_point(|&p| p < iv.start);
-    // Skip a hazard exactly at the def point (birth), then require any
-    // remaining hazard to fall within (start, end].
-    let mut idx = idx;
-    if idx < points.len() && points[idx] == iv.start {
-        idx += 1;
-    }
+    // Skip every duplicate birth-point hazard, then require any remaining
+    // hazard to fall within (start, end]. The caller must establish that
+    // `start` is a valid birth exemption for this candidate.
+    let idx = points.partition_point(|&p| p <= iv.start);
     idx < points.len() && points[idx] <= iv.end
 }
 
@@ -1363,6 +1553,18 @@ pub(crate) fn compute_i686_divrem_pairs_with_config(
         pt += block.instructions.len() as u32 + 1;
     }
 
+    // Only distinguish zero, one, and multiple definitions. Fusion publishes
+    // one head-point mapping per destination, so multi-def dests cannot pair.
+    let mut def_count: FxHashMap<u32, u8> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                let count = def_count.entry(dest.0).or_insert(0);
+                *count = count.saturating_add(1).min(2);
+            }
+        }
+    }
+
     let pairs_64 = target != DivRemTarget::I686;
     let is_gpr32_ty = |ty: &IrType| {
         matches!(
@@ -1376,20 +1578,59 @@ pub(crate) fn compute_i686_divrem_pairs_with_config(
                 | IrType::Ptr
         ) || (pairs_64 && matches!(ty, IrType::I64 | IrType::U64))
     };
-    let div_flavor = |op: IrBinOp| -> Option<bool> {
-        // Some(true) = quotient (div), Some(false) = remainder, None = not div-like
+    let flavor = |op: IrBinOp| -> Option<(bool, bool)> {
+        // (signed, quotient)
         match op {
-            IrBinOp::UDiv | IrBinOp::SDiv => Some(true),
-            IrBinOp::URem | IrBinOp::SRem => Some(false),
+            IrBinOp::SDiv => Some((true, true)),
+            IrBinOp::SRem => Some((true, false)),
+            IrBinOp::UDiv => Some((false, true)),
+            IrBinOp::URem => Some((false, false)),
             _ => None,
         }
     };
-    let is_signed = |op: IrBinOp| matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+    let operand_stamp = |operand: &Operand, last_def: &FxHashMap<u32, usize>| -> Option<usize> {
+        match operand {
+            Operand::Value(value) => last_def.get(&value.0).copied(),
+            Operand::Const(_) => None,
+        }
+    };
+
+    struct DivRemCand<'a> {
+        instruction_index: usize,
+        ty: &'a IrType,
+        lhs: &'a Operand,
+        rhs: &'a Operand,
+        lhs_stamp: Option<usize>,
+        rhs_stamp: Option<usize>,
+        barrier_stamp: Option<usize>,
+        signed: bool,
+        quotient: bool,
+        dest: u32,
+    }
 
     for (bi, block) in func.blocks.iter().enumerate() {
-        // Collect this block's div-like instructions.
-        let mut cands: Vec<(usize, IrBinOp, &Operand, &Operand, bool, u32)> = Vec::new();
+        let mut cands: Vec<DivRemCand<'_>> = Vec::new();
+        let mut last_def: FxHashMap<u32, usize> = FxHashMap::default();
+        let mut barrier_stamp: Option<usize> = None;
         for (ii, inst) in block.instructions.iter().enumerate() {
+            // Do not propagate a pairing proof through an instruction that
+            // can change the execution context. Ordinary calls are not
+            // automatic barriers: early-born tail results are already
+            // modeled across calls by `patch_divrem_tail_intervals`.
+            let exceptional_barrier = matches!(
+                inst,
+                Instruction::InlineAsm { .. }
+                    | Instruction::NonlocalGotoSave { .. }
+                    | Instruction::Intrinsic {
+                        op: IntrinsicOp::BuiltinSetjmp
+                            | IntrinsicOp::BuiltinLongjmp
+                            | IntrinsicOp::DoBuiltinApply,
+                        ..
+                    }
+            ) || crate::backend::liveness::is_returns_twice_call(inst);
+            if exceptional_barrier {
+                barrier_stamp = Some(ii);
+            }
             if let Instruction::BinOp {
                 dest,
                 op,
@@ -1399,20 +1640,35 @@ pub(crate) fn compute_i686_divrem_pairs_with_config(
                 ..
             } = inst
             {
-                if div_flavor(*op).is_some() && is_gpr32_ty(ty) {
+                if let Some((signed, quotient)) = flavor(*op) {
                     // i686: constant divisors pair too: the head folds the
                     // pair into ONE magic-number sequence (q in %eax, r in
-                    // %edx, `emit_divrem_const_in_eax_edx`) or, at -Os, one
-                    // `divl $imm`-staged division. Both clobber exactly the
-                    // {%eax,%ecx,%edx} set the RA model already charges a
-                    // constant-divisor division with, and the tail still
-                    // emits nothing, so the model stays exact. Other
-                    // targets keep the non-constant rule (their IR-level
-                    // div_by_const pass owns constant divisors).
-                    if target == DivRemTarget::I686 || !matches!(rhs, Operand::Const(_)) {
-                        cands.push((ii, *op, lhs, rhs, is_signed(*op), dest.0));
+                    // %edx) or, at -Os, one `divl $imm`-staged division.
+                    // Other targets keep the non-constant rule.
+                    let constant_rhs_ok =
+                        target == DivRemTarget::I686 || !matches!(rhs, Operand::Const(_));
+                    if is_gpr32_ty(ty)
+                        && constant_rhs_ok
+                        && def_count.get(&dest.0).copied() == Some(1)
+                    {
+                        cands.push(DivRemCand {
+                            instruction_index: ii,
+                            ty,
+                            lhs,
+                            rhs,
+                            lhs_stamp: operand_stamp(lhs, &last_def),
+                            rhs_stamp: operand_stamp(rhs, &last_def),
+                            barrier_stamp,
+                            signed,
+                            quotient,
+                            dest: dest.0,
+                        });
                     }
                 }
+            }
+            // Input stamps refer to the state before this definition.
+            if let Some(dest) = inst.dest() {
+                last_def.insert(dest.0, ii);
             }
         }
         if cands.len() < 2 {
@@ -1423,38 +1679,25 @@ pub(crate) fn compute_i686_divrem_pairs_with_config(
             if used[i] {
                 continue;
             }
-            let (_, op_i, lhs_i, rhs_i, signed_i, dest_i) = &cands[i];
-            // Nearest unused compatible partner ahead in this block.
             let mut mate: Option<usize> = None;
             for j in (i + 1)..cands.len() {
                 if used[j] {
                     continue;
                 }
-                let (_, op_j, lhs_j, rhs_j, signed_j, _) = &cands[j];
-                // OPPOSITE flavours only: one quotient, one remainder.
-                //
-                // A single `idivl`/`divl` produces the quotient in %eax and
-                // the remainder in %edx, so a pair is only meaningful when the
-                // two consumers want DIFFERENT halves. Every emitter derives
-                // the register split from the HEAD's flavour alone
-                // (`div_dest = if self_is_div { dest } else { partner }`,
-                // i686 `emit_divrem_pair_head`; the AArch64 map does not even
-                // carry the tail's flavour), i.e. they all *assume* the
-                // flavours differ — but nothing enforced it.
-                //
-                // Two same-flavour div-likes with identical operands compute
-                // the SAME value; that is a CSE miss, not a fusion
-                // opportunity. Pairing them handed the tail the wrong half:
-                // `x[n % 1000] = 2` read the quotient, so the index grew to
-                // 999 against a `n % 1000 + 1`-element VLA and scribbled off
-                // the stack (gcc.c-torture i686 `20040811-1.c`,
-                // `vla-dealloc-1.c`, `pr43220.c`; `981001-1.c` and
-                // `20000511-1.c` are the same defect through repeated
-                // `n / 2` / `b % c`).
-                if signed_i == signed_j
-                    && lhs_i == lhs_j
-                    && rhs_i == rhs_j
-                    && div_flavor(*op_i) != div_flavor(*op_j)
+                let head = &cands[i];
+                let tail = &cands[j];
+                // OPPOSITE flavours only, same width, same operand
+                // incarnations. A same-flavour pair is a CSE miss, not
+                // fusion. Identical value-ids after phi-elim do not imply
+                // identical incarnations if a redef sits between them.
+                if head.ty == tail.ty
+                    && head.signed == tail.signed
+                    && head.quotient != tail.quotient
+                    && head.lhs == tail.lhs
+                    && head.rhs == tail.rhs
+                    && head.lhs_stamp == tail.lhs_stamp
+                    && head.rhs_stamp == tail.rhs_stamp
+                    && head.barrier_stamp == tail.barrier_stamp
                 {
                     mate = Some(j);
                     break;
@@ -1463,18 +1706,16 @@ pub(crate) fn compute_i686_divrem_pairs_with_config(
             let Some(j) = mate else { continue };
             used[i] = true;
             used[j] = true;
-            let (_, op_j, _, _, _, dest_j) = &cands[j];
-            // Head = i (earlier), tail = j. The partner's result register:
-            // quotient ops read %eax, remainder ops read %edx.
-            let partner_from_eax = div_flavor(*op_j) == Some(true);
+            let head = &cands[i];
+            let tail = &cands[j];
             pairs
                 .head_partners
-                .insert(*dest_i, (*dest_j, partner_from_eax));
-            pairs.tail_dests.insert(*dest_j);
-            pairs.tail_points.insert((bi, cands[j].0));
+                .insert(head.dest, (tail.dest, tail.quotient));
+            pairs.tail_dests.insert(tail.dest);
+            pairs.tail_points.insert((bi, tail.instruction_index));
             pairs
                 .head_point_of_tail
-                .insert(*dest_j, block_start[bi] + cands[i].0 as u32);
+                .insert(tail.dest, block_start[bi] + head.instruction_index as u32);
         }
     }
     pairs
@@ -2087,10 +2328,7 @@ fn bump_coalesce_group_priority(
     }
     for r in ranges {
         if let Some(members) = groups.get(&r.value_id) {
-            let total: u64 = members
-                .iter()
-                .map(|m| use_count.get(m).copied().unwrap_or(0))
-                .sum();
+            let total = summed_use_weight(members, use_count);
             if total > r.priority {
                 // The cost model needs the same information: a coalesce
                 // leader is really read by every member of its web, not
@@ -2302,11 +2540,24 @@ fn unique_load_def_types(func: &IrFunction) -> FxHashMap<u32, (IrType, u32)> {
 fn build_coalesce_groups(
     func: &IrFunction,
     iv_map: &FxHashMap<u32, (u32, u32)>,
+    segments: &[LiveInterval],
     eligible: &FxHashSet<u32>,
     param_ref_values: &FxHashSet<u32>,
     ra_config: &RaConfig,
 ) -> FxHashMap<u32, Vec<u32>> {
     let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut segments_of: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    for segment in segments {
+        segments_of
+            .entry(segment.value_id)
+            .or_default()
+            .push((segment.start, segment.end));
+    }
+    for pieces in segments_of.values_mut() {
+        pieces.sort_unstable();
+        let source = std::mem::take(pieces);
+        insert_segment_union(pieces, &source);
+    }
     let load_def_types = unique_load_def_types(func);
     // (cast dest, cast src) edges where the cast is a bit-preserving no-op on
     // the register: same-width U32<->I32, or a widening of a sub-word load
@@ -2592,7 +2843,10 @@ fn build_coalesce_groups(
 
     let mut result: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for (leader, mut members) in groups {
-        members.sort_by_key(|&m| iv_map.get(&m).map(|&(s, _)| s).unwrap_or(0));
+        members.sort_by_key(|&m| {
+            let (start, end) = iv_map.get(&m).copied().unwrap_or((0, 0));
+            (start, end, m)
+        });
         let mut accepted: Vec<u32> = Vec::new();
         for m in members {
             let ok = match iv_map.get(&m) {
@@ -2607,11 +2861,16 @@ fn build_coalesce_groups(
                             // emits nothing.
                             || same_value_edges.contains(&(m, *a))
                             || same_value_edges.contains(&(*a, m))
-                            // Phi-congruence: dest/incomings of a phi are one
-                            // variable on exclusive CFG paths (see the
-                            // web_parent construction above).
-                            || phi_web_class.get(&m).zip(phi_web_class.get(a))
-                                .is_some_and(|(cm, ca)| cm == ca)
+                            // Phi-web members on exclusive CFG paths may
+                            // share a home. Linearized fat intervals overlap
+                            // even then; hole-aware segments are the proof.
+                            // Simultaneously-live segments are a miscompile.
+                            || (phi_web_class.get(&m).zip(phi_web_class.get(a)).is_some_and(
+                                |(cm, ca)| cm == ca,
+                            ) && !sorted_coverage_overlaps(
+                                &coverage_of_value(m, &segments_of, iv_map),
+                                &coverage_of_value(*a, &segments_of, iv_map),
+                            ))
                     })
                 }),
             };
@@ -2653,28 +2912,29 @@ fn collect_gpr_scan_intervals(
     merged_of: &FxHashMap<u32, LiveInterval>,
     member_of: &FxHashMap<u32, u32>,
 ) -> Vec<LiveInterval> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(liveness.intervals.len());
     let mut seen: FxHashSet<u32> = FxHashSet::default();
-    for iv in &liveness.intervals {
-        if member_of.contains_key(&iv.value_id) {
+    for interval in &liveness.intervals {
+        let value = interval.value_id;
+        if !eligible.contains(&value) || member_of.contains_key(&value) {
             continue;
         }
-        if let Some(&merged) = merged_of.get(&iv.value_id) {
-            if seen.insert(merged.value_id) {
-                out.push(merged);
-            }
-            continue;
-        }
-        if eligible.contains(&iv.value_id) && iv.end > iv.start && seen.insert(iv.value_id) {
-            out.push(*iv);
+        let candidate = merged_of.get(&value).copied().unwrap_or(*interval);
+        if candidate.start < candidate.end && seen.insert(candidate.value_id) {
+            out.push(candidate);
         }
     }
     // Leader may have a degenerate raw interval; members still have range.
-    for (&leader, merged) in merged_of {
-        if eligible.contains(&leader) && merged.end > merged.start && seen.insert(leader) {
-            out.push(*merged);
+    for (&leader, &interval) in merged_of {
+        if eligible.contains(&leader)
+            && !member_of.contains_key(&leader)
+            && interval.start < interval.end
+            && seen.insert(leader)
+        {
+            out.push(interval);
         }
     }
+    out.sort_unstable_by_key(|interval| (interval.start, interval.end, interval.value_id));
     out
 }
 
@@ -2709,26 +2969,21 @@ fn find_overlapping_classes(
     assignments: &FxHashMap<u32, PhysReg>,
     parent: &FxHashMap<u32, u32>,
 ) -> Vec<(u8, u32, u32, u32, u32)> {
-    fn find_ro(parent: &FxHashMap<u32, u32>, x: u32) -> u32 {
-        let mut root = x;
-        while let Some(&p) = parent.get(&root) {
-            if p == root {
-                break;
-            }
-            root = p;
-        }
-        root
-    }
-    let mut group_segments: FxHashMap<(u8, u32), Vec<(u32, u32)>> = FxHashMap::default();
+    let mut roots = parent.clone();
+    flatten_allocation_classes(&mut roots);
+    let mut coverage: FxHashMap<(u8, u32), Vec<(u32, u32)>> = FxHashMap::default();
     let mut segmented: FxHashSet<u32> = FxHashSet::default();
     for segment in &liveness.segments {
         let Some(&reg) = assignments.get(&segment.value_id) else {
             continue;
         };
         segmented.insert(segment.value_id);
-        let rep = find_ro(parent, segment.value_id);
-        group_segments
-            .entry((reg.0, rep))
+        let class = roots
+            .get(&segment.value_id)
+            .copied()
+            .unwrap_or(segment.value_id);
+        coverage
+            .entry((reg.0, class))
             .or_default()
             .push((segment.start, segment.end));
     }
@@ -2739,40 +2994,27 @@ fn find_overlapping_classes(
         let Some(&reg) = assignments.get(&interval.value_id) else {
             continue;
         };
-        let rep = find_ro(parent, interval.value_id);
-        group_segments
-            .entry((reg.0, rep))
+        let class = roots
+            .get(&interval.value_id)
+            .copied()
+            .unwrap_or(interval.value_id);
+        coverage
+            .entry((reg.0, class))
             .or_default()
             .push((interval.start, interval.end));
     }
-    let mut by_reg: FxHashMap<u8, Vec<(u32, u32, u32)>> = FxHashMap::default();
-    for ((reg, rep), pieces) in &mut group_segments {
+    let mut spans = Vec::new();
+    for ((reg, class), mut pieces) in coverage {
         pieces.sort_unstable();
-        let source = std::mem::take(pieces);
-        insert_segment_union(pieces, &source);
-        by_reg
-            .entry(*reg)
-            .or_default()
-            .extend(pieces.iter().map(|&(s, e)| (s, e, *rep)));
+        let mut normalized = Vec::new();
+        insert_segment_union(&mut normalized, &pieces);
+        spans.extend(
+            normalized
+                .into_iter()
+                .map(|(start, end)| (reg, start, end, class)),
+        );
     }
-    let mut out = Vec::new();
-    for (&reg, events) in by_reg.iter_mut() {
-        events.sort_unstable();
-        let mut previous: Option<(u32, u32, u32)> = None;
-        for &(start, end, rep) in events.iter() {
-            if let Some((_, prev_end, prev_rep)) = previous {
-                if start < prev_end && rep != prev_rep {
-                    out.push((reg, prev_rep, rep, start, prev_end.min(end)));
-                }
-            }
-            if previous.is_none_or(|(_, pe, _)| end > pe) {
-                previous = Some((start, end, rep));
-            }
-        }
-    }
-    out.sort_unstable();
-    out.dedup();
-    out
+    overlapping_class_spans(spans)
 }
 
 pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllocResult {
@@ -2982,6 +3224,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // both fall back to the envelope for them).
             }
         }
+        liveness
+            .segments
+            .sort_unstable_by_key(|segment| (segment.start, segment.value_id, segment.end));
     }
     let iv_map = interval_map(&liveness);
     let call_points = &liveness.call_points;
@@ -3003,7 +3248,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // register instead (Phase 2/2d/2h filters; see
     // collect_i686_scratch_denials for the full denial policy: indexed-GEP
     // dests, their GlobalAddr bases and load dests, and div quotients).
-    let scratch_denied = if is_32bit {
+    let mut scratch_denied = if is_32bit {
         crate::backend::generation::collect_i686_scratch_denials(func)
     } else {
         FxHashSet::default()
@@ -3013,7 +3258,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // one of those registers (rdi/rsi/rdx/r8/r9 on x86-64) is clobbered by an
     // earlier argument before this value is read. Exclude arg registers from
     // the Phase-2 pool for exactly these values (see RegAllocConfig::call_arg_regs).
-    let (later_arg_values, indirect_arg_values) = collect_call_arg_values(func);
+    let (mut later_arg_values, mut indirect_arg_values) = collect_call_arg_values(func);
 
     let block_loop_weight: Vec<u64> = liveness
         .block_loop_depth
@@ -3101,20 +3346,23 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
             for_each_operand_in_instruction(inst, |op| {
                 if let Operand::Value(v) = op {
-                    *use_count.entry(v.0).or_insert(0) += weight;
+                    let count = use_count.entry(v.0).or_insert(0);
+                    *count = count.saturating_add(weight);
                     let entry = use_loop_depth.entry(v.0).or_insert(0);
                     *entry = (*entry).max(depth);
                 }
             });
             for_each_value_use_in_instruction(inst, |v| {
-                *use_count.entry(v.0).or_insert(0) += weight;
+                let count = use_count.entry(v.0).or_insert(0);
+                *count = count.saturating_add(weight);
                 let entry = use_loop_depth.entry(v.0).or_insert(0);
                 *entry = (*entry).max(depth);
             });
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
-                *use_count.entry(v.0).or_insert(0) += weight;
+                let count = use_count.entry(v.0).or_insert(0);
+                *count = count.saturating_add(weight);
                 let entry = use_loop_depth.entry(v.0).or_insert(0);
                 *entry = (*entry).max(depth);
             }
@@ -3215,6 +3463,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         build_coalesce_groups(
             func,
             &iv_map,
+            &liveness.segments,
             &eligible,
             &param_ref_values,
             &config.ra_config,
@@ -3272,7 +3521,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // GetStaticChain/Alloca defs, so the guard is computed from the actual
     // instruction order.  Params themselves are exempt (their homes are the
     // hinted incoming registers, written by nobody but the caller).
-    let riscv_entry_guard: FxHashSet<u32> = if config.available_regs.iter().any(|r| r.0 == 11)
+    let mut riscv_entry_guard: FxHashSet<u32> = if config.available_regs.iter().any(|r| r.0 == 11)
         && config.caller_saved_regs.iter().any(|r| r.0 == 12)
     {
         let mut guard = FxHashSet::default();
@@ -3293,6 +3542,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     } else {
         FxHashSet::default()
     };
+    propagate_member_restrictions(&mut riscv_entry_guard, &coalesce_member_of);
 
     // Hole-aware call spanning (the "80% of LLVM's split" win): a value needs
     // a callee-saved home only when a call point falls INSIDE one of its live
@@ -3308,39 +3558,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // callee-saved home — the merged leader interval is what the scan sees.
     // `segments` covers non-alloca SSA values only; the synthetic alloca
     // vector intervals keep the fat `spans_any_call` check.
-    let call_spanning: FxHashSet<u32> = {
-        let mut acc: FxHashMap<u32, Vec<(u32, u32, u32)>> = FxHashMap::default();
-        for seg in &liveness.segments {
-            let def = iv_map
-                .get(&seg.value_id)
-                .map(|&(s, _)| s)
-                .unwrap_or(seg.start);
-            let owner = coalesce_member_of
-                .get(&seg.value_id)
-                .copied()
-                .unwrap_or(seg.value_id);
-            acc.entry(owner)
-                .or_default()
-                .push((seg.start, seg.end, def));
-        }
-        let mut set = FxHashSet::default();
-        for (owner, entries) in &acc {
-            for &(s, e, def) in entries {
-                let mut idx = call_points.partition_point(|&cp| cp < s);
-                while idx < call_points.len() && call_points[idx] < e {
-                    if call_points[idx] > def {
-                        set.insert(*owner);
-                        break;
-                    }
-                    idx += 1;
-                }
-                if set.contains(owner) {
-                    break;
-                }
-            }
-        }
-        set
-    };
+    let call_spanning: FxHashSet<u32> =
+        collect_call_spanning_owners(&liveness, &iv_map, &coalesce_member_of, call_points);
 
     let has_nonlocal_control = func.blocks.iter().any(|b| {
         b.instructions.iter().any(|inst| {
@@ -3650,7 +3869,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
                         caller_used_regs_set.insert(reg.0);
-                        if let Some(&(start, end)) = iv_map.get(vid) {
+                        if let Some((start, end)) =
+                            allocation_owner_bounds(*vid, &merged_of, &iv_map)
+                        {
                             if end > start {
                                 // Seed spans are HALF-OPEN in the allocator
                                 // (`occupy_register` stores `end + 1`), while
@@ -3737,7 +3958,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
                         caller_used_regs_set.insert(reg.0);
-                        if let Some(&(start, end)) = iv_map.get(vid) {
+                        if let Some((start, end)) =
+                            allocation_owner_bounds(*vid, &merged_of, &iv_map)
+                        {
                             if end > start {
                                 // Half-open seed span (see the Wave 1 note).
                                 seeded
@@ -4183,6 +4406,19 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 _ => for_each_operand_in_terminator(&block.terminator, |op| mark(op, false)),
             }
         }
+        // A coalesced leader may claim %eax only when every web member is
+        // accumulator-first. Otherwise a non-first member inherits the home
+        // and is clobbered by the consumer's early write.
+        for (leader, members) in &coalesce_groups {
+            let all_acc_first = members
+                .iter()
+                .all(|member| acc_first_uses.contains(member) && !non_acc_first.contains(member));
+            if all_acc_first {
+                acc_first_uses.insert(*leader);
+            } else {
+                acc_first_uses.remove(leader);
+            }
+        }
 
         let reg = PhysReg(6);
         let holders: Vec<(u32, u32)> = assignments
@@ -4279,14 +4515,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .copied()
                     .filter(|&h| overlaps_vid(h, vid))
                     .collect();
-                let cost: u64 = evict
-                    .iter()
-                    .map(|h| use_count.get(h).copied().unwrap_or(0))
-                    .sum();
+                let cost = summed_use_weight(&evict, &use_count);
                 if cost >= hot_count {
                     continue;
                 }
-                if best.as_ref().is_none_or(|&(_, _, c)| cost < c) {
+                if best
+                    .as_ref()
+                    .is_none_or(|&(best_reg, _, c)| (cost, reg_id) < (c, best_reg))
+                {
                     best = Some((reg_id, evict, cost));
                 }
             }
@@ -4347,11 +4583,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         let web_use_count = |v: u32| -> u64 {
             let mut uc = use_count.get(&v).copied().unwrap_or(0);
             if let Some(members) = coalesce_groups.get(&v) {
-                let total: u64 = members
-                    .iter()
-                    .map(|m| use_count.get(m).copied().unwrap_or(0))
-                    .sum();
-                uc = uc.max(total);
+                uc = uc.max(summed_use_weight(members, &use_count));
             }
             uc
         };
@@ -4371,8 +4603,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         candidates.dedup_by_key(|&mut (v, _)| v);
 
         let overlaps_vid = |a: u32, b: u32| -> bool {
-            match (iv_map.get(&a), iv_map.get(&b)) {
-                (Some(&ia), Some(&ib)) => intervals_overlap(ia, ib),
+            match (
+                allocation_owner_bounds(a, &merged_of, &iv_map),
+                allocation_owner_bounds(b, &merged_of, &iv_map),
+            ) {
+                (Some(ia), Some(ib)) => intervals_overlap(ia, ib),
                 _ => false,
             }
         };
@@ -4405,14 +4640,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 if evict.is_empty() {
                     continue;
                 }
-                let cost: u64 = evict
-                    .iter()
-                    .map(|&h| use_count.get(&h).copied().unwrap_or(0))
-                    .sum();
+                let cost = summed_use_weight(&evict, &use_count);
                 if cost >= hot_count {
                     continue;
                 }
-                if best.as_ref().is_none_or(|&(_, _, c)| cost < c) {
+                if best
+                    .as_ref()
+                    .is_none_or(|&(best_reg, _, c)| (cost, reg_id) < (c, best_reg))
+                {
                     best = Some((reg_id, evict, cost));
                 }
             }
@@ -4629,21 +4864,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     if !config.ra_config.no_segment_fill && !used_regs_set.is_empty() {
         let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
 
-        let mut owned_segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
-        for seg in &liveness.segments {
-            let owner = owner_of(seg.value_id);
-            owned_segments
-                .entry(owner)
-                .or_default()
-                .push((seg.start, seg.end));
-        }
-        // Coalesced members can contribute overlapping/adjacent pieces. Merge
-        // them so the interference test remains linear and deterministic.
-        for pieces in owned_segments.values_mut() {
-            pieces.sort_unstable();
-            let source = std::mem::take(pieces);
-            insert_segment_union(pieces, &source);
-        }
+        let mut owned_segments = owned_live_segments(&liveness, &coalesce_member_of);
         for iv in &scan_ivs {
             owned_segments
                 .entry(iv.value_id)
@@ -4675,12 +4896,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
         let group_pressure = |value: u32| -> u64 {
             let own = use_count.get(&value).copied().unwrap_or(0);
-            let group = coalesce_groups.get(&value).map_or(0, |members| {
-                members
-                    .iter()
-                    .map(|m| use_count.get(m).copied().unwrap_or(0))
-                    .sum()
-            });
+            let group = coalesce_groups
+                .get(&value)
+                .map_or(0, |members| summed_use_weight(members, &use_count));
             own.max(group)
         };
 
@@ -4797,7 +5015,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    apply_phi_coalesce_assignments_with_config(
+    let mut applied_phi_coalesce = apply_phi_coalesce_assignments_with_config(
         func,
         &liveness,
         &iv_map,
@@ -4829,6 +5047,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         FxHashSet::default()
     };
 
+    let mut fp_web_member_of: FxHashMap<u32, u32> = FxHashMap::default();
     if !config.xmm_regs.is_empty() {
         // Destructive-form pre-allocation for SSE-128 vector chains: values
         // produced by a two-operand SSE intrinsic whose first operand dies
@@ -4858,7 +5077,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         &sse_chain_values,
                         &sse_chain_pool,
                         &|vid: u32| assignments.contains_key(&vid),
-                        call_points,
+                        &liveness,
                     );
                     sse_chain_alloc = coalesced.iter().map(|&(v, _)| v).collect();
                     for (vid, reg) in coalesced {
@@ -4953,7 +5172,6 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         } else {
             FxHashMap::default()
         };
-        let mut fp_web_member_of: FxHashMap<u32, u32> = FxHashMap::default();
         if !fp_web_groups.is_empty() {
             let member_intervals: FxHashMap<u32, (u32, u32)> = f64_intervals
                 .iter()
@@ -4991,6 +5209,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                             dropped.insert(m);
                         }
                     }
+                    // Drop the original leader envelope too: the merged
+                    // leader interval is the only scan seed for the web.
+                    dropped.insert(*leader);
                 }
             }
             f64_intervals.retain(|iv| !dropped.contains(&iv.value_id));
@@ -5006,8 +5227,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             );
             // RA-05: hole-aware coverage for the XMM scan as well — FP phi
             // webs spanning mutually exclusive arms get the same treatment
-            // as the GPR scan.
-            attach_scan_segments(&mut f64_ranges, &liveness, &coalesce_member_of);
+            // as the GPR scan. Use the FP web map so member segments attach
+            // to the merged leader, not to the GPR coalesce owner.
+            attach_scan_segments(&mut f64_ranges, &liveness, &fp_web_member_of);
             let scan_pool: Vec<PhysReg> = if x86_fp_pool {
                 config
                     .xmm_regs
@@ -5054,7 +5276,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     let vec_intervals: Vec<LiveInterval> = vec_intervals
                         .into_iter()
                         .filter(|iv| !assignments.contains_key(&iv.value_id))
-                        .filter(|iv| !spans_any_call(iv, call_points))
+                        .filter(|iv| {
+                            !half_open_range_contains_any_point(iv.start, iv.end, call_points)
+                        })
                         .collect();
                     if !vec_intervals.is_empty() {
                         // The vecreg-ALLOCA scheme keeps its original
@@ -5092,11 +5316,25 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     if arm_fp_pool {
         for (index, value) in func.loop_promoted_f64_values.iter().take(8).enumerate() {
+            // d24–d31 (IDs 48..55) are caller-saved: a promoted value whose
+            // live coverage spans a call must not take a reserved home. The
+            // promotion pass only builds call-free loops, but the value's
+            // range can still reach a call on exit/outer paths. Skipped
+            // values fall through to the normal FP scan below.
+            let owner = coalesce_member_of.get(&value.0).copied().unwrap_or(value.0);
+            if call_spanning.contains(&owner) || call_spanning.contains(&value.0) {
+                continue;
+            }
             assignments.insert(value.0, PhysReg(48 + index as u8));
         }
     }
 
     if arm_fp_pool || !vector_values.is_empty() || !f64_value_set.is_empty() {
+        // Segment coverage for the phi-move conflict test (built once;
+        // no web map — webs only merge coverage, and the test must see
+        // each third value's own pieces).
+        let no_webs: FxHashMap<u32, u32> = FxHashMap::default();
+        let fp_phi_seg_cov = owned_live_segments(&liveness, &no_webs);
         for candidate in &all_phi_pairs {
             let is_fp = |r: &PhysReg| {
                 if arm_fp_pool {
@@ -5124,17 +5362,30 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             let Some(&src_iv) = iv_map.get(&candidate.backedge_src) else {
                 continue;
             };
-            let conflict = liveness.intervals.iter().any(|iv| {
-                if iv.value_id == candidate.backedge_src || iv.value_id == candidate.phi_dest {
-                    return false;
-                }
-                assignments
-                    .get(&iv.value_id)
-                    .is_some_and(|&o| o.0 == d.0 && intervals_overlap((iv.start, iv.end), src_iv))
-            });
-            if !conflict {
-                assignments.insert(candidate.backedge_src, d);
+            if fp_phi_move_conflicts(
+                &fp_phi_seg_cov,
+                &iv_map,
+                &assignments,
+                candidate.phi_dest,
+                candidate.backedge_src,
+                d.0,
+            ) {
+                continue;
             }
+            // Sharing the dest home is a new live range for the source.
+            // Caller-saved XMM/volatile NEON cannot inherit a home that
+            // the source already needed to survive a call.
+            let src_live = LiveInterval {
+                start: src_iv.0,
+                end: src_iv.1,
+                value_id: candidate.backedge_src,
+            };
+            let dest_callee_fp = arm_fp_pool && (32..=38).contains(&d.0);
+            if spans_any_call(&src_live, call_points) && !dest_callee_fp {
+                continue;
+            }
+            assignments.insert(candidate.backedge_src, d);
+            applied_phi_coalesce.push(*candidate);
         }
     }
 
@@ -5199,8 +5450,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
-    used_regs.sort_by_key(|r| r.0);
+    // used_regs_set is the running "already-saved" pool for later phases
+    // (segment fill, spanning). The prologue save-set is rebuilt AFTER
+    // repair and CCC_RA_DROP from the homes that actually survive.
 
     // ── Post-RA overlap repair (soundness backstop) ────────────────────────
     // The allocator is a federation: linear-scan phases, wave seeds, phi
@@ -5214,59 +5466,85 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // seam after the fact and aborts; this pass REPAIRS the output: of any
     // two coalesce/phi classes whose register's class-union coverage
     // overlaps, the colder class loses its register homes (demoted to
-    // stack slots — always sound). One fixpoint-free pass: evictions only
-    // remove homes, never add, so no new overlap can appear.
+    // stack slots — always sound). Evictions only remove homes, never add, so
+    // no new overlap can appear; iterate to a fixpoint so the compiler stays
+    // total even on adversarial inputs (a single pass plus a hard assert
+    // would panic the whole compilation if enumeration ever disagreed with
+    // the victim selection). Every round with conflicts evicts at least one
+    // class, and classes are finite, so the loop terminates; the round cap is
+    // a fail-closed backstop that evicts every remaining conflicting class.
     {
         let mut parent: FxHashMap<u32, u32> = assignments.keys().map(|&v| (v, v)).collect();
         for (&member, &leader) in &coalesce_member_of {
             unite_map(&mut parent, member, leader);
         }
-        for pair in &all_phi_pairs {
+        // Only actually-applied destructive updates share a home at this
+        // point; rejected candidates must not bless overlaps.
+        for pair in &applied_phi_coalesce {
             unite_map(&mut parent, pair.phi_dest, pair.backedge_src);
         }
-        let rep = find_overlapping_classes(&liveness, &assignments, &parent);
-        if config.ra_config.debug_ra_repair {
-            eprintln!(
-                "[RA-REPAIR] fn={} scanned assignments={} classes={} overlaps={}",
-                func.name,
-                assignments.len(),
-                parent.len(),
-                rep.len()
-            );
-            for (reg, a, b, s, e) in &rep {
-                eprintln!(
-                    "[RA-REPAIR] fn={} r{}: class v{} overlaps class v{} at [{},{}] — evicting colder",
-                    func.name, reg, a, b, s, e
-                );
-            }
+        for (&member, &leader) in &fp_web_member_of {
+            unite_map(&mut parent, member, leader);
         }
-        if !rep.is_empty() {
+        flatten_allocation_classes(&mut parent);
+        let max_rounds = parent.len().saturating_add(2);
+        let mut round = 0u32;
+        loop {
+            let rep = find_overlapping_classes(&liveness, &assignments, &parent);
+            if rep.is_empty() {
+                break;
+            }
+            round += 1;
+            if config.ra_config.debug_ra_repair {
+                eprintln!(
+                    "[RA-REPAIR] fn={} round={} scanned assignments={} classes={} overlaps={}",
+                    func.name,
+                    round,
+                    assignments.len(),
+                    parent.len(),
+                    rep.len()
+                );
+                for (reg, a, b, s, e) in &rep {
+                    eprintln!(
+                        "[RA-REPAIR] fn={} r{}: class v{} overlaps class v{} at [{},{}] — evicting colder",
+                        func.name, reg, a, b, s, e
+                    );
+                }
+            }
             // Evict the colder class of each conflicting pair (fewer total
             // uses; ties break to the LATER value id so the eviction is
             // deterministic).
-            let class_weight = |rep_id: u32| -> u64 {
-                let mut w = 0u64;
-                for (&v, &r) in parent.iter() {
-                    if r == rep_id {
-                        w += use_count.get(&v).copied().unwrap_or(0);
-                    }
-                }
-                w
-            };
+            let mut class_weights: FxHashMap<u32, u64> = FxHashMap::default();
+            for &value in assignments.keys() {
+                let class = parent.get(&value).copied().unwrap_or(value);
+                let weight = use_count.get(&value).copied().unwrap_or(0);
+                let total = class_weights.entry(class).or_insert(0);
+                *total = total.saturating_add(weight);
+            }
             let mut evict_classes: FxHashSet<u32> = FxHashSet::default();
-            for &(_reg, a, b, _s, _e) in &rep {
-                if evict_classes.contains(&a) || evict_classes.contains(&b) {
-                    continue;
+            if round > max_rounds as u32 {
+                // Unreachable in practice (each round removes a class); if it
+                // ever triggers, evict every conflicting class fail-closed.
+                for &(_reg, a, b, _s, _e) in &rep {
+                    evict_classes.insert(a);
+                    evict_classes.insert(b);
                 }
-                let (wa, wb) = (class_weight(a), class_weight(b));
-                let loser = if wa != wb {
-                    if wa < wb { a } else { b }
-                } else if a < b {
-                    b
-                } else {
-                    a
-                };
-                evict_classes.insert(loser);
+            } else {
+                for &(_reg, a, b, _s, _e) in &rep {
+                    if evict_classes.contains(&a) || evict_classes.contains(&b) {
+                        continue;
+                    }
+                    let wa = class_weights.get(&a).copied().unwrap_or(0);
+                    let wb = class_weights.get(&b).copied().unwrap_or(0);
+                    let loser = if wa != wb {
+                        if wa < wb { a } else { b }
+                    } else if a < b {
+                        b
+                    } else {
+                        a
+                    };
+                    evict_classes.insert(loser);
+                }
             }
             let mut evicted: Vec<u32> = Vec::new();
             for (&v, &r) in parent.iter() {
@@ -5276,15 +5554,25 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
             if config.ra_config.debug_ra_repair {
                 eprintln!(
-                    "[RA-REPAIR] fn={} evicted {:?} (classes {:?})",
-                    func.name, evicted, evict_classes
+                    "[RA-REPAIR] fn={} round={} evicted {:?} (classes {:?})",
+                    func.name, round, evicted, evict_classes
                 );
             }
         }
+        debug_assert!(
+            find_overlapping_classes(&liveness, &assignments, &parent).is_empty(),
+            "RA repair left overlapping classes in {}",
+            func.name
+        );
     }
 
     if config.ra_config.verify_regalloc {
-        verify_no_overlap(&liveness, &assignments, &coalesce_member_of, &all_phi_pairs);
+        verify_no_overlap(
+            &liveness,
+            &assignments,
+            &coalesce_member_of,
+            &applied_phi_coalesce,
+        );
     }
 
     // Session-28 debug: per-value home census (register vs slot) for one
@@ -5450,6 +5738,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    let final_reg_ids: FxHashSet<u8> = assignments.values().map(|reg| reg.0).collect();
+    let mut used_regs: Vec<PhysReg> = config
+        .available_regs
+        .iter()
+        .copied()
+        .filter(|reg| final_reg_ids.contains(&reg.0))
+        .collect();
+    used_regs.sort_unstable_by_key(|reg| reg.0);
+    used_regs.dedup();
+    caller_save_spans.retain(|reg, spans| final_reg_ids.contains(reg) && !spans.is_empty());
+
     let mut accumulator_assignments = analyze_accumulator_assignments_with_config(
         func,
         config.accumulator_policy,
@@ -5512,70 +5811,12 @@ fn verify_no_overlap(
     for pair in phi_pairs {
         unite(&mut parent, pair.phi_dest, pair.backedge_src);
     }
-
-    let mut group_segments: FxHashMap<(u8, u32), Vec<(u32, u32)>> = FxHashMap::default();
-    let mut segmented: FxHashSet<u32> = FxHashSet::default();
-    for segment in &liveness.segments {
-        let Some(&reg) = assignments.get(&segment.value_id) else {
-            continue;
-        };
-        segmented.insert(segment.value_id);
-        let rep = find(&mut parent, segment.value_id);
-        group_segments
-            .entry((reg.0, rep))
-            .or_default()
-            .push((segment.start, segment.end));
-    }
-    // Synthetic values can be absent from `segments`; preserve the verifier's
-    // fail-closed behavior with their fat interval.
-    for interval in &liveness.intervals {
-        if segmented.contains(&interval.value_id) {
-            continue;
-        }
-        let Some(&reg) = assignments.get(&interval.value_id) else {
-            continue;
-        };
-        let rep = find(&mut parent, interval.value_id);
-        group_segments
-            .entry((reg.0, rep))
-            .or_default()
-            .push((interval.start, interval.end));
-    }
-
-    let mut by_reg: FxHashMap<u8, Vec<(u32, u32, u32)>> = FxHashMap::default();
-    for ((reg, rep), pieces) in &mut group_segments {
-        pieces.sort_unstable();
-        let source = std::mem::take(pieces);
-        insert_segment_union(pieces, &source);
-        by_reg
-            .entry(*reg)
-            .or_default()
-            .extend(pieces.iter().map(|&(start, end)| (start, end, *rep)));
-    }
-
-    for (reg, events) in &mut by_reg {
-        events.sort_unstable();
-        let mut previous: Option<(u32, u32, u32)> = None;
-        for &(start, end, rep) in events.iter() {
-            if let Some((prev_start, prev_end, prev_rep)) = previous {
-                assert!(
-                    start >= prev_end,
-                    "register-allocation overlap: r{} class v{}[{}, {}) vs class v{}[{}, {})",
-                    reg,
-                    prev_rep,
-                    prev_start,
-                    prev_end,
-                    rep,
-                    start,
-                    end
-                );
-                if end <= prev_end {
-                    continue;
-                }
-            }
-            previous = Some((start, end, rep));
-        }
-    }
+    flatten_allocation_classes(&mut parent);
+    let overlaps = find_overlapping_classes(liveness, assignments, &parent);
+    assert!(
+        overlaps.is_empty(),
+        "register-allocation overlap: {overlaps:?}"
+    );
 }
 
 /// 128-bit VECTOR VALUES safe to hold in an XMM for their whole live range.
@@ -5606,6 +5847,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
     let mut allocas: FxHashSet<u32> = FxHashSet::default();
     let mut volatile_allocas: FxHashSet<u32> = FxHashSet::default();
     let mut over_align_allocas: FxHashSet<u32> = FxHashSet::default();
+    let mut wrong_size_allocas: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Alloca {
@@ -5613,6 +5855,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 volatile,
                 semantic_volatile,
                 align,
+                size,
                 ..
             } = inst
             {
@@ -5622,6 +5865,10 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 }
                 if *align > 16 {
                     over_align_allocas.insert(dest.0);
+                }
+                // Legacy slot promotion is a 16-byte SSE register mirror.
+                if *size != 16 {
+                    wrong_size_allocas.insert(dest.0);
                 }
             }
         }
@@ -5947,6 +6194,11 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 } => {
                     if compute_vec_arg_count(op).is_some() || is_128_mem_load(op) {
                         produced.insert(d.0);
+                    } else {
+                        // Unknown dest_ptr writer: memory updates without the
+                        // promoted register mirror. Poison even if another
+                        // known producer also wrote this slot.
+                        bad_use.insert(d.0);
                     }
                     if is_store_target(op) {
                         store_target.insert(d.0);
@@ -6019,6 +6271,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             || store_target.contains(&v)
             || volatile_allocas.contains(&v)
             || over_align_allocas.contains(&v)
+            || wrong_size_allocas.contains(&v)
             || bad_use.contains(&v)
         {
             continue;
@@ -6048,184 +6301,214 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
 fn synthetic_vec_intervals(
     func: &IrFunction,
     candidates: &FxHashSet<u32>,
-    block_loop_depth: &[u32],
+    _block_loop_depth: &[u32],
 ) -> Vec<LiveInterval> {
-    let n = func.blocks.len();
-    let mut block_range: Vec<(u32, u32)> = Vec::with_capacity(n);
-    let mut first_at: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut last_at: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut mentioned_in: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
-    let mut point: u32 = 0;
+    use std::collections::VecDeque;
 
-    for (bi, block) in func.blocks.iter().enumerate() {
-        let bstart = point;
+    let block_count = func.blocks.len();
+    if block_count == 0 || candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut block_ranges: Vec<(u32, u32)> = Vec::with_capacity(block_count);
+    let mut block_uses: Vec<FxHashSet<u32>> =
+        (0..block_count).map(|_| FxHashSet::default()).collect();
+    let mut block_defs: Vec<FxHashSet<u32>> =
+        (0..block_count).map(|_| FxHashSet::default()).collect();
+    let mut bounds: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
+    let mut point = 0u32;
+
+    for (block_index, block) in func.blocks.iter().enumerate() {
+        let block_start = point;
         for inst in &block.instructions {
-            let mut hit = false;
-            if let Instruction::Intrinsic {
-                dest_ptr: Some(d), ..
-            } = inst
-            {
-                if candidates.contains(&d.0) {
-                    first_at.entry(d.0).or_insert(point);
-                    last_at.insert(d.0, point);
-                    hit = true;
-                    mentioned_in.entry(d.0).or_default().push(bi);
-                }
-            }
-            for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op {
-                    if candidates.contains(&v.0) {
-                        first_at.entry(v.0).or_insert(point);
-                        last_at.insert(v.0, point);
-                        if !hit {
-                            mentioned_in.entry(v.0).or_default().push(bi);
+            let end = point.checked_add(1).expect("IR program-point overflow");
+            let mut read_values: FxHashSet<u32> = FxHashSet::default();
+            let mut written_value: Option<u32> = None;
+            match inst {
+                Instruction::Intrinsic { dest_ptr, args, .. } => {
+                    for arg in args {
+                        if let Operand::Value(value) = arg {
+                            if candidates.contains(&value.0) {
+                                read_values.insert(value.0);
+                            }
+                        }
+                    }
+                    if let Some(dest) = dest_ptr {
+                        if candidates.contains(&dest.0) {
+                            written_value = Some(dest.0);
                         }
                     }
                 }
-            });
-            point += 1;
+                _ => {
+                    for_each_operand_in_instruction(inst, |operand| {
+                        if let Operand::Value(value) = operand {
+                            if candidates.contains(&value.0) {
+                                read_values.insert(value.0);
+                            }
+                        }
+                    });
+                    for_each_value_use_in_instruction(inst, |value| {
+                        if candidates.contains(&value.0) {
+                            read_values.insert(value.0);
+                        }
+                    });
+                }
+            }
+            for value in read_values {
+                if !block_defs[block_index].contains(&value) {
+                    block_uses[block_index].insert(value);
+                }
+                bounds
+                    .entry(value)
+                    .and_modify(|range| {
+                        range.0 = range.0.min(point);
+                        range.1 = range.1.max(end);
+                    })
+                    .or_insert((point, end));
+            }
+            if let Some(value) = written_value {
+                block_defs[block_index].insert(value);
+                bounds
+                    .entry(value)
+                    .and_modify(|range| {
+                        range.0 = range.0.min(point);
+                        range.1 = range.1.max(end);
+                    })
+                    .or_insert((point, end));
+            }
+            point = end;
         }
-        point += 1; // terminator
-        block_range.push((bstart, point));
+        let terminator_end = point.checked_add(1).expect("IR program-point overflow");
+        for_each_operand_in_terminator(&block.terminator, |operand| {
+            let Operand::Value(value) = operand else {
+                return;
+            };
+            if !candidates.contains(&value.0) {
+                return;
+            }
+            if !block_defs[block_index].contains(&value.0) {
+                block_uses[block_index].insert(value.0);
+            }
+            bounds
+                .entry(value.0)
+                .and_modify(|range| {
+                    range.0 = range.0.min(point);
+                    range.1 = range.1.max(terminator_end);
+                })
+                .or_insert((point, terminator_end));
+        });
+        point = terminator_end;
+        block_ranges.push((block_start, point));
     }
 
-    // Contiguous depth>0 runs in layout order.
-    let mut region_of: Vec<Option<usize>> = vec![None; n];
-    let mut regions: Vec<(u32, u32)> = Vec::new();
-    let mut i = 0;
-    while i < n {
-        if block_loop_depth.get(i).copied().unwrap_or(0) == 0 {
-            i += 1;
-            continue;
+    let labels = analysis::build_label_map(func);
+    let (preds, succs) = analysis::build_cfg(func, &labels);
+    let mut live_in: Vec<FxHashSet<u32>> = (0..block_count).map(|_| FxHashSet::default()).collect();
+    let mut live_out: Vec<FxHashSet<u32>> =
+        (0..block_count).map(|_| FxHashSet::default()).collect();
+    let mut work: VecDeque<usize> = (0..block_count).rev().collect();
+    let mut queued = vec![true; block_count];
+    while let Some(block_index) = work.pop_front() {
+        queued[block_index] = false;
+        let mut new_out: FxHashSet<u32> = FxHashSet::default();
+        for &successor in succs.row(block_index) {
+            let successor = successor as usize;
+            new_out.extend(live_in[successor].iter().copied());
         }
-        let rid = regions.len();
-        let rstart = block_range[i].0;
-        let mut j = i;
-        while j < n && block_loop_depth.get(j).copied().unwrap_or(0) > 0 {
-            region_of[j] = Some(rid);
-            j += 1;
-        }
-        regions.push((rstart, block_range[j - 1].1));
-        i = j;
-    }
-
-    let mut result = Vec::new();
-    for &v in candidates {
-        let Some(&s0) = first_at.get(&v) else {
-            continue;
-        };
-        let e0 = last_at.get(&v).copied().unwrap_or(s0).saturating_add(1);
-        let (mut s, mut e) = (s0.min(e0.saturating_sub(1)), e0.max(s0.saturating_add(1)));
-        if e <= s {
-            e = s.saturating_add(1);
-        }
-
-        if let Some(blocks) = mentioned_in.get(&v) {
-            let mut touched: Vec<usize> = blocks
+        let mut new_in = block_uses[block_index].clone();
+        new_in.extend(
+            new_out
                 .iter()
-                .filter_map(|&bi| region_of.get(bi).copied().flatten())
-                .collect();
-            if !touched.is_empty() {
-                touched.sort_unstable();
-                touched.dedup();
-                if touched.len() == 1 {
-                    let (rs, re) = regions[touched[0]];
-                    s = s.min(rs);
-                    e = e.max(re);
-                } else {
-                    // Split layout of one loop, or V used in two loops:
-                    // span the envelope. Over-approx, never a wrong assign.
-                    let rs = regions[touched[0]].0;
-                    let re = regions[*touched.last().unwrap()].1;
-                    s = s.min(rs);
-                    e = e.max(re);
+                .copied()
+                .filter(|value| !block_defs[block_index].contains(value)),
+        );
+        live_out[block_index] = new_out;
+        if new_in != live_in[block_index] {
+            live_in[block_index] = new_in;
+            for &predecessor in preds.row(block_index) {
+                let predecessor = predecessor as usize;
+                if predecessor < block_count && !queued[predecessor] {
+                    queued[predecessor] = true;
+                    work.push_back(predecessor);
                 }
             }
         }
+    }
 
-        if e > s {
-            result.push(LiveInterval {
-                value_id: v,
-                start: s,
-                end: e,
-            });
+    for block_index in 0..block_count {
+        let (block_start, block_end) = block_ranges[block_index];
+        for &value in &live_in[block_index] {
+            bounds
+                .entry(value)
+                .and_modify(|range| {
+                    range.0 = range.0.min(block_start);
+                })
+                .or_insert((block_start, block_start));
+        }
+        for &value in &live_out[block_index] {
+            bounds
+                .entry(value)
+                .and_modify(|range| {
+                    range.1 = range.1.max(block_end);
+                })
+                .or_insert((block_start, block_end));
         }
     }
+
+    let mut result: Vec<LiveInterval> = bounds
+        .into_iter()
+        .filter_map(|(value_id, (start, end))| {
+            (start < end).then_some(LiveInterval {
+                value_id,
+                start,
+                end,
+            })
+        })
+        .collect();
+    result.sort_unstable_by_key(|interval| (interval.start, interval.end, interval.value_id));
     result
 }
 
-/// Values belonging to SSE-128 two-operand chains: for every intrinsic in
-/// the SSE-128 arithmetic family (routed through `emit_sse_binary_128` or
-/// the ARX shuffle/rotate emitters) whose first operand's last mention is
-/// the defining instruction itself, both the destination and the dying
-/// operand are collected.  Homing exactly these in instruction order lets
-/// a register recycle at the dying operand; everything else keeps the
-/// existing scans.
-fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
+/// Chain-family predicate shared by the SSE-128 collector and the
+/// destructive allocator's handoff detector: two-operand 128-bit integer/FP
+/// SIMD intrinsics (plus rotate/shuffle) whose destination may share its
+/// first operand's home when that operand dies at the defining instruction.
+fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
-    let is_sse128_arith = |op: &O| {
-        matches!(
-            op,
-            O::VecAddI32x4
-                | O::VecSubI32x4
-                | O::VecMulI32x4
-                | O::VecAndI32x4
-                | O::VecOrI32x4
-                | O::VecXorI32x4
-                | O::VecAddI64x2
-                | O::VecSubI64x2
-                | O::VecAddI8x16
-                | O::VecSubI8x16
-                | O::VecMinU8x16
-                | O::VecMaxU8x16
-                | O::VecAddF32x4
-                | O::VecSubF32x4
-                | O::VecMulF32x4
-                | O::VecDivF32x4
-                | O::VecMinF32x4
-                | O::VecMaxF32x4
-                | O::VecAddF64x2
-                | O::VecSubF64x2
-                | O::VecMulF64x2
-                | O::VecDivF64x2
-                | O::VecMinF64x2
-                | O::VecMaxF64x2
-                | O::VecRotlI32x4
-                | O::VecShufdI32x4
-                | O::VecShufbI32x4
-        )
-    };
+    matches!(
+        op,
+        O::VecAddI32x4
+            | O::VecSubI32x4
+            | O::VecMulI32x4
+            | O::VecAndI32x4
+            | O::VecOrI32x4
+            | O::VecXorI32x4
+            | O::VecAddI64x2
+            | O::VecSubI64x2
+            | O::VecAddI8x16
+            | O::VecSubI8x16
+            | O::VecMinU8x16
+            | O::VecMaxU8x16
+            | O::VecAddF32x4
+            | O::VecSubF32x4
+            | O::VecMulF32x4
+            | O::VecDivF32x4
+            | O::VecMinF32x4
+            | O::VecMaxF32x4
+            | O::VecAddF64x2
+            | O::VecSubF64x2
+            | O::VecMulF64x2
+            | O::VecDivF64x2
+            | O::VecMinF64x2
+            | O::VecMaxF64x2
+            | O::VecRotlI32x4
+            | O::VecShufdI32x4
+            | O::VecShufbI32x4
+    )
+}
 
-    // Mention points (same scheme as the destructive allocator).
-    let mut last_at: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut point: u32 = 0;
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op {
-                    last_at.insert(v.0, point);
-                }
-            });
-            if let Instruction::Intrinsic {
-                dest: Some(d),
-                args,
-                ..
-            } = inst
-            {
-                last_at.insert(d.0, point);
-                for a in args {
-                    if let Operand::Value(v) = a {
-                        last_at.insert(v.0, point);
-                    }
-                }
-            }
-            point += 1;
-        }
-        point += 1; // terminator
-    }
-
+fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
     let mut out: FxHashSet<u32> = FxHashSet::default();
-    let mut point: u32 = 0;
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Intrinsic {
@@ -6235,20 +6518,21 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
                 ..
             } = inst
             {
-                if is_sse128_arith(op) && !args.is_empty() {
+                if is_sse128_chain_op(op) && !args.is_empty() {
                     if let Operand::Value(a0) = &args[0] {
                         let same_as_a1 = matches!(&args[1.min(args.len() - 1)], Operand::Value(v) if v.0 == a0.0);
                         if !same_as_a1 {
                             // Home the chain DEST and its first operand
                             // unconditionally: each gets its own register
-                            // whenever one is free for its (linear,
-                            // over-approximating) span -- overlapping
-                            // spans never share, so adding candidates is
-                            // always sound.  A first operand whose last
-                            // mention IS this instruction additionally
-                            // earns a death hint in the pass below, which
-                            // recycles its register into the destination
-                            // (the in-place form).  Restricting the
+                            // whenever one is free for its live coverage
+                            // (hole-aware segments) -- overlapping
+                            // coverage never shares, so adding candidates
+                            // is always sound.  A first operand whose last
+                            // read IS this instruction additionally earns
+                            // a proven handoff edge in the pass below,
+                            // which recycles its register into the
+                            // destination (the in-place form).  Restricting
+                            // the
                             // collection to dying operands (PR #455's
                             // original form) left loop-header role values
                             // -- alive to a loop-exit materialisation --
@@ -6266,185 +6550,376 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
                             // every use (measured: 4 mask reloads per
                             // double round).  Const operands (rotate
                             // amounts, compare predicates) stay out.
-                            if let Operand::Value(a1) = &args[1] {
+                            if let Some(Operand::Value(a1)) = args.get(1) {
                                 out.insert(a1.0);
                             }
                         }
                     }
                 }
             }
-            point += 1;
         }
-        point += 1; // terminator
     }
     out
 }
 
-/// Destructive-form vector register allocation (see the call site for the
-/// rationale).  Uses linear first/last mention spans — the same point
-/// scheme as `synthetic_vec_intervals` — with one crucial difference:
-/// values mentioned in a single block keep their raw span, so a register
-/// recycles at a dying operand's last use and in-place chains form.  Values
-/// mentioned in more than one loop-region block keep the conservative
-/// whole-region envelope (split layouts, cross-iteration liveness), exactly
-/// like the previous whole-region scan.
+/// Env-gated trace for the destructive SSE-128 scan: prints candidates,
+/// coverage, handoff edges, and assignments to stderr.  Zero cost when off;
+/// the REACT loop for chain-coloring quality work.
+fn sse_chain_debug_enabled() -> bool {
+    std::env::var_os("LCCC_DEBUG_SSE_CHAIN").is_some()
+}
+
+/// Segment-precise third-value conflict test for FP phi-pair propagation.
 ///
-/// Soundness: `sse_load_arg` only ever reads a home at a use point (or a
-/// block boundary, where the home content is re-established by the phi Copy
-/// lowering), and two candidates share a register only when their linear
-/// spans do not overlap; a dying first operand is allowed to meet its
-/// consumer exactly at the shared instruction (that IS the in-place form).
-/// Linear spans over-approximate every execution path's liveness, so an
-/// overlap is never missed — only (conservatively) invented.
+/// The move shares `d_reg` between `phi_dest` and `backedge_src` (unioned
+/// via `applied_phi_coalesce`, so the pair itself never conflicts).  It is
+/// blocked only by a THIRD value homed in `d_reg` whose live coverage
+/// overlaps the source's.  Coverage is hole-aware segments where present
+/// with fat-envelope fallback: the fat-only test vetoed loop webs whose
+/// dest reg also held a loop-spanning value (p20_sum_i64: v21's fat
+/// (13,61) blocked both the v27 and v50 moves although no segment
+/// overlaps, +8 movdqas).  Soundness: segments cover every live point
+/// (the same basis the repair verifier reasons about), so a true overlap
+/// is never missed — only false ones are removed.
+fn fp_phi_move_conflicts(
+    seg_cov: &FxHashMap<u32, Vec<(u32, u32)>>,
+    iv_map: &FxHashMap<u32, (u32, u32)>,
+    assignments: &FxHashMap<u32, PhysReg>,
+    phi_dest: u32,
+    backedge_src: u32,
+    d_reg: u8,
+) -> bool {
+    let src_cov: &[(u32, u32)] = match seg_cov.get(&backedge_src) {
+        Some(pieces) => pieces,
+        None => match iv_map.get(&backedge_src) {
+            Some(fat) => std::slice::from_ref(fat),
+            // No coverage at all: fail closed (the caller also gates on a
+            // fat interval, so this is unreachable in practice).
+            None => return true,
+        },
+    };
+    if src_cov.is_empty() {
+        return true;
+    }
+    assignments.iter().any(|(&vid, &home)| {
+        if home.0 != d_reg || vid == backedge_src || vid == phi_dest {
+            return false;
+        }
+        match seg_cov.get(&vid) {
+            Some(pieces) => pieces
+                .iter()
+                .any(|&p| src_cov.iter().any(|&s| intervals_overlap(p, s))),
+            None => iv_map
+                .get(&vid)
+                .is_some_and(|&f| src_cov.iter().any(|&s| intervals_overlap(f, s))),
+        }
+    })
+}
+
+/// True when none of `pieces` overlaps any already-held piece on a register,
+/// under the allocator's half-open convention (`intervals_overlap`): a piece
+/// ending at the exact point another begins shares cleanly (the in-place
+/// boundary handoff).
+fn sse_chain_pieces_fit(held: &[(u32, u32)], pieces: &[(u32, u32)]) -> bool {
+    held.iter()
+        .all(|&h| pieces.iter().all(|&p| !intervals_overlap(h, p)))
+}
+
+/// Destructive-form vector register allocation (see the call site for the
+/// rationale).
+///
+/// Coverage comes from the real liveness result (`owned_live_segments`:
+/// hole-aware segments, fat-envelope fallback) — never from first/last
+/// mention points.  The mention model had two under-approximation holes,
+/// both closed here:
+///
+/// * Copy/Phi/Call *definitions* were never recorded, so a value defined
+///   by a phi-edge Copy and first used later had a span starting at its
+///   first *use*; a short-lived chain value in between could claim the
+///   same register and its definition clobbered the accumulator (P0).
+/// * Terminator uses were never recorded, so a span could end early and
+///   the register recycled before the terminator read it.
+///
+/// Sharing rule: two candidates share a register only when their segment
+/// sets are disjoint under `intervals_overlap`.  The in-place *preference*
+/// (a destination takes its dying first operand's register) additionally
+/// requires a proven death: the operand's exact last read — operands of
+/// every instruction and terminator, the complete read model for vector
+/// values — is the defining instruction itself.  Vector values are never
+/// GEP bases, never `for_each_value_use` extras, and never inline-asm
+/// outputs; any candidate touching those paths (all fail-closed here) or
+/// recorded in `folded_read_points` is vetoed out of handoffs.  When the
+/// segments overhang past the proven death (block-granular
+/// over-approximation), the preference simply fails the overlap test and
+/// the destination takes another free register: sound in every build,
+/// optimal whenever the segments are tight.  Boundary handoffs are
+/// repair-clean — the post-RA verifier uses the same overlap test, so a
+/// handoff pair never trips an eviction.
+///
+/// Soundness: `sse_load_arg`/`vec_operand_reg`/`vex128_source` only ever
+/// read a home at a use point, and the phi Copy lowering (`emit_copy_value`)
+/// re-establishes homes across block boundaries with `movdqa`, so a home is
+/// valid wherever the value is live.  The pool holds caller-saved XMM only,
+/// hence the per-segment call-spanning veto; the scratch registers
+/// (xmm0/xmm1, xmm2 for pblendvb/VNNI) never enter this pool (call site
+/// filters `>= 21`).
 fn allocate_vector_registers_destructive(
     func: &IrFunction,
     candidates: &FxHashSet<u32>,
     pool: &[PhysReg],
     taken: &dyn Fn(u32) -> bool,
-    call_points: &[u32],
+    liveness: &LivenessResult,
 ) -> Vec<(u32, PhysReg)> {
-    // Pass 1: linear mention points (one point per instruction, one per
-    // terminator — the same scheme as `synthetic_vec_intervals`).
-    let mut first_at: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut last_at: FxHashMap<u32, u32> = FxHashMap::default();
+    if pool.is_empty() || candidates.is_empty() {
+        return Vec::new();
+    }
+    if sse_chain_debug_enabled() {
+        let pool_ids: Vec<u8> = pool.iter().map(|r| r.0).collect();
+        let mut taken_ids: Vec<u32> = candidates.iter().copied().filter(|v| taken(*v)).collect();
+        taken_ids.sort_unstable();
+        eprintln!(
+            "[SSE-CHAIN] func={} pool={pool_ids:?} taken={taken_ids:?}",
+            func.name
+        );
+    }
+    // Coverage: hole-aware segments where present, fat-envelope fallback.
+    // Chain values never join a GPR coalesce web, so the owner map is empty
+    // and every value owns exactly its own pieces.
+    let no_webs: FxHashMap<u32, u32> = FxHashMap::default();
+    let owned = owned_live_segments(liveness, &no_webs);
+
+    // Pass 1: exact last-read points + hidden-use vetoes.  Same point
+    // scheme as liveness (layout order, +1 per instruction, +1 per
+    // terminator) so these coordinates compare directly against segment
+    // endpoints.  Instruction + terminator operands are the complete read
+    // model for vector values: anything else (`for_each_value_use` extras,
+    // inline-asm outputs) vetoes the value out of handoffs, fail-closed.
+    let mut last_read: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut hidden: FxHashSet<u32> = FxHashSet::default();
     let mut point: u32 = 0;
     for block in &func.blocks {
         for inst in &block.instructions {
-            let mut note =
-                |v: u32, first_at: &mut FxHashMap<u32, u32>, last_at: &mut FxHashMap<u32, u32>| {
-                    if candidates.contains(&v) {
-                        first_at.entry(v).or_insert(point);
-                        last_at.insert(v, point);
-                    }
-                };
-            match inst {
-                Instruction::Intrinsic {
-                    dest: Some(d),
-                    args,
-                    ..
-                } => {
-                    note(d.0, &mut first_at, &mut last_at);
-                    for a in args {
-                        if let Operand::Value(v) = a {
-                            note(v.0, &mut first_at, &mut last_at);
-                        }
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if candidates.contains(&v.0) {
+                        last_read.insert(v.0, point);
                     }
                 }
-                _ => {
-                    for_each_operand_in_instruction(inst, |op| {
-                        if let Operand::Value(v) = op {
-                            note(v.0, &mut first_at, &mut last_at);
-                        }
-                    });
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                if candidates.contains(&v.0) {
+                    hidden.insert(v.0);
+                }
+            });
+            if let Instruction::InlineAsm { outputs, .. } = inst {
+                for (_, v, _) in outputs {
+                    if candidates.contains(&v.0) {
+                        hidden.insert(v.0);
+                    }
                 }
             }
-            point += 1;
+            point = point.saturating_add(1);
         }
-        point += 1; // terminator
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if candidates.contains(&v.0) {
+                    last_read.insert(v.0, point);
+                }
+            }
+        });
+        point = point.saturating_add(1);
     }
 
-    // Pass 2: death hints.  At the instruction defining `d`, the first
-    // operand `a0` whose LAST mention is this very instruction dies here —
-    // the textbook destructive-form coalescing candidate.
-    let mut death_hint: FxHashMap<u32, u32> = FxHashMap::default();
+    // Homeable set: live coverage, not already homed, not held across a
+    // call (the pool is caller-saved XMM).  Values with no coverage at all
+    // are skipped, fail-closed.
+    let mut coverage: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    for &v in candidates {
+        if taken(v) {
+            continue;
+        }
+        let Some(pieces) = owned.get(&v) else {
+            continue;
+        };
+        if pieces.is_empty() {
+            continue;
+        }
+        let spans_call = pieces.iter().any(|&(start, end)| {
+            spans_any_call(
+                &LiveInterval {
+                    value_id: v,
+                    start,
+                    end,
+                },
+                &liveness.call_points,
+            )
+        });
+        if spans_call {
+            continue;
+        }
+        // Proof witnesses, checked in test builds: a chain value is a
+        // 128-bit vector, never a folded GEP base (pointers) and never the
+        // target of a hidden folded re-read — the operand walk above is a
+        // complete read model for handoff purposes.
+        debug_assert!(
+            !liveness.gep_base_values.contains(&v),
+            "sse128 chain value {v} is a folded GEP base"
+        );
+        debug_assert!(
+            !liveness.folded_read_points.contains_key(&v),
+            "sse128 chain value {v} has hidden folded reads"
+        );
+        coverage.insert(v, pieces.clone());
+    }
+    if coverage.is_empty() {
+        return Vec::new();
+    }
+    let debug = sse_chain_debug_enabled();
+    if debug {
+        let mut vs: Vec<u32> = coverage.keys().copied().collect();
+        vs.sort_unstable();
+        eprintln!("[SSE-CHAIN] func={} coverage:", func.name);
+        for x in &vs {
+            eprintln!(
+                "[SSE-CHAIN]   v{x} pieces={:?} last_read={:?} hidden={}",
+                coverage[x],
+                last_read.get(x),
+                hidden.contains(x)
+            );
+        }
+    }
+
+    // Pass 2: destructive handoff edges.  At the chain instruction defining
+    // `d` from first operand `a0`, the edge `d <- a0` is proven when `a0`
+    // is never read again afterwards (its exact last read is this very
+    // instruction) and no other operand aliases it.  The emitter's in-place
+    // form (`op %src, %dst` with dst == a0's home) then overwrites only a
+    // dead value.
+    let mut death_from: FxHashMap<u32, u32> = FxHashMap::default();
     let mut point: u32 = 0;
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Intrinsic {
                 dest: Some(d),
                 args,
+                op,
                 ..
             } = inst
             {
-                if candidates.contains(&d.0) && !args.is_empty() {
-                    if let Operand::Value(a0) = &args[0] {
-                        if candidates.contains(&a0.0)
-                            && last_at.get(&a0.0) == Some(&point)
-                            && !matches!(&args[1.min(args.len() - 1)], Operand::Value(v) if v.0 == a0.0)
+                if is_sse128_chain_op(op) && coverage.contains_key(&d.0) {
+                    if let Some(Operand::Value(a0)) = args.first() {
+                        let a0_reused = args[1..]
+                            .iter()
+                            .any(|a| matches!(a, Operand::Value(v) if v.0 == a0.0));
+                        if !a0_reused
+                            && coverage.contains_key(&a0.0)
+                            && !hidden.contains(&a0.0)
+                            && !liveness.folded_read_points.contains_key(&a0.0)
+                            && last_read.get(&a0.0) == Some(&point)
                         {
-                            death_hint.entry(d.0).or_insert(a0.0);
+                            death_from.insert(d.0, a0.0);
                         }
                     }
                 }
             }
-            point += 1;
+            point = point.saturating_add(1);
         }
-        point += 1; // terminator
+        point = point.saturating_add(1);
     }
 
-    // Effective span per candidate: the raw linear first..last mention
-    // span.  Linear spans over-approximate every execution path's liveness
-    // (including backedge wrap-around: a backedge value's phi mention
-    // precedes its defining latch point, so its span covers the loop), so
-    // an overlap is never missed — two candidates share a register only
-    // when their spans are disjoint.  Cross-block values keep raw spans as
-    // well: the phi Copy lowering re-establishes a home at block
-    // boundaries, so a register may recycle at a dying operand even inside
-    // a loop.
-    let mut span: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
-    for &v in candidates {
-        if taken(v) {
-            continue;
-        }
-        let Some(&f) = first_at.get(&v) else {
-            continue;
-        };
-        let l = last_at.get(&v).copied().unwrap_or(f);
-        // Caller-saved pool registers cannot hold a value across a call.
-        if spans_any_call(
-            &LiveInterval {
-                value_id: v,
-                start: f,
-                end: l,
-            },
-            call_points,
-        ) {
-            continue;
-        }
-        span.insert(v, (f, l));
+    // Linear scan in (start, end, id) order over hole-aware coverage.
+    // `held` per register accumulates every holder's pieces, so values in
+    // each other's holes share the register; `lru_end` prefers the most
+    // recently freed register to preserve long-free ones for long spans.
+    // Deterministic: sorted order, pool-order iteration, and `max_by_key`
+    // (last-maximum) ties.
+    let mut order: Vec<u32> = coverage.keys().copied().collect();
+    order.sort_by_key(|v| {
+        let pieces = &coverage[v];
+        (
+            pieces.first().map(|&(s, _)| s).unwrap_or(u32::MAX),
+            pieces.last().map(|&(_, e)| e).unwrap_or(u32::MAX),
+            *v,
+        )
+    });
+
+    if debug {
+        let mut es: Vec<(u32, u32)> = death_from.iter().map(|(&d, &a)| (d, a)).collect();
+        es.sort_unstable();
+        eprintln!(
+            "[SSE-CHAIN] func={} handoffs={es:?} order={order:?}",
+            func.name
+        );
     }
 
-    // Linear allocation in first-mention order.  `free_from` per register
-    // holds the end of its current holder's span; a register is available
-    // for a value born at `f` when `free_from <= f` (boundary sharing is
-    // the in-place form: the previous holder's last mention IS this value's
-    // defining instruction).
-    let mut order: Vec<u32> = span
-        .keys()
-        .copied()
-        .filter(|v| first_at.contains_key(v))
-        .collect();
-    order.sort_by_key(|v| (first_at[v], last_at[v]));
-
-    let mut free_from: FxHashMap<u8, u32> = pool.iter().map(|r| (r.0, 0u32)).collect();
+    let mut held: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+    let mut lru_end: FxHashMap<u8, u32> = FxHashMap::default();
     let mut assigned: Vec<(u32, PhysReg)> = Vec::new();
     let mut assigned_map: FxHashMap<u32, PhysReg> = FxHashMap::default();
     for v in order {
-        let (_, e) = span[&v];
-        let birth = first_at[&v];
-        // Prefer the dying first operand's register when its holder span
-        // ends no later than this value's birth.
+        let pieces = &coverage[&v];
+        // Prefer the proven-dead first operand's register when it fits:
+        // the preference failing the overlap test (segment overhang past
+        // the proven death) is the automatic veto — the destination then
+        // takes another free register instead of tripping a repair
+        // eviction later.
         let mut preference: Option<u8> = None;
-        if let Some(&a0) = death_hint.get(&v) {
+        if let Some(&a0) = death_from.get(&v) {
             if let Some(&reg) = assigned_map.get(&a0) {
-                if free_from.get(&reg.0).copied().unwrap_or(u32::MAX) <= birth {
+                let fits = held
+                    .get(&reg.0)
+                    .map(|h| sse_chain_pieces_fit(h, pieces))
+                    .unwrap_or(true);
+                if fits {
                     preference = Some(reg.0);
                 }
             }
         }
+        // Pending-handoff reservation: a handoff source whose target is not
+        // yet assigned reserves its register.  A value without a usable
+        // preference takes another free register when one fits, so an
+        // unrelated value never steals a proven in-place home
+        // (p20_sum_i64: v21 stole v47's xmm15 on an LRU tie and blocked the
+        // v56 handoff, +11 movdqas).  Pure preference — soundness still
+        // rests on the overlap test alone.
+        let mut reserved: FxHashSet<u8> = FxHashSet::default();
+        if preference.is_none() {
+            for (&d, &a0) in death_from.iter() {
+                if !assigned_map.contains_key(&d) {
+                    if let Some(&reg) = assigned_map.get(&a0) {
+                        reserved.insert(reg.0);
+                    }
+                }
+            }
+        }
+        let fits = |rn: u8| {
+            held.get(&rn)
+                .map(|h| sse_chain_pieces_fit(h, pieces))
+                .unwrap_or(true)
+        };
         let chosen = if let Some(rn) = preference {
             pool.iter().find(|r| r.0 == rn).copied()
         } else {
-            // Free registers only; prefer the one that became free most
-            // recently (LRU) to preserve long-free registers for long
-            // spans.
-            pool.iter()
-                .filter(|r| free_from.get(&r.0).copied().unwrap_or(u32::MAX) <= birth)
-                .max_by_key(|r| free_from.get(&r.0).copied().unwrap_or(0))
+            let free: Vec<PhysReg> = pool.iter().filter(|r| fits(r.0)).copied().collect();
+            free.iter()
+                .filter(|r| !reserved.contains(&r.0))
+                .max_by_key(|r| lru_end.get(&r.0).copied().unwrap_or(0))
+                .or_else(|| {
+                    free.iter()
+                        .max_by_key(|r| lru_end.get(&r.0).copied().unwrap_or(0))
+                })
                 .copied()
         };
+        if debug {
+            eprintln!("[SSE-CHAIN]   v{v} pref={preference:?} chosen={chosen:?} pieces={pieces:?}");
+        }
         if let Some(reg) = chosen {
-            free_from.insert(reg.0, e);
+            held.entry(reg.0).or_default().extend_from_slice(pieces);
+            let end = pieces.last().map(|&(_, e)| e).unwrap_or(0);
+            lru_end
+                .entry(reg.0)
+                .and_modify(|e| *e = (*e).max(end))
+                .or_insert(end);
             assigned_map.insert(v, reg);
             assigned.push((v, reg));
         }
@@ -6523,7 +6998,8 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>
                 // Excluding their operands from the argument registers only
                 // spilled parameters and bought a frame.
                 Instruction::Call { func: name, info }
-                    if !crate::common::types::target_is_32bit()
+                    if crate::common::types::target_elf_machine()
+                        == crate::backend::elf::EM_X86_64
                         && (crate::backend::generation::inline_memcpy_len(
                             name,
                             &info.args,
@@ -8473,9 +8949,223 @@ fn src_use_path_clear_of_dest_redefs(
     true
 }
 
-/// The (def, copy) window of a phi-coalesce candidate contains a caller-saved
-/// clobber. Sharing the dest register then means the source is born in that
-/// register *before* the clobber and read after it — illegal for rdi/rsi/…
+/// Instruction-level check that `src`'s home is not overwritten on the way
+/// to the eliminated phi copy.
+///
+/// `src_use_path_clear_of_dest_redefs` skips the copy block entirely, so a
+/// redefinition sitting in that block never vetoes coalescing. Walk every
+/// instruction between the source definition and the copy, including the
+/// copy block itself, and fail closed on any dest/src redef in that window.
+/// Folded (hidden) reads from `liveness.folded_read_points` are real
+/// consumers of the shared home — except when the folding consumer's
+/// address root is the coalesced destination itself (see
+/// `folded_consumer_reads_dest_home`).
+/// True iff a folded (hidden) read of `src` at `consumer` actually reads the
+/// coalesced destination's value from the shared home.
+///
+/// Liveness attributes a folded access to every value in the address root's
+/// copy chain, but the emitter reads exactly one home for the address: the
+/// home of the address root. When that root is the coalesced `dest`
+/// (a `Load`/`Store` through `dest` directly, or through one
+/// constant-displacement `GEP`/`Add` link on `dest`), the shared home holds
+/// `dest`'s current runtime value — which is precisely what the access
+/// needs — no matter what the static copy attribution names. Vetoing those
+/// points would reject sound coalescing (zlib-ng adler32's inner `buf += 8`:
+/// every `GEP(buf, off)` load is folded-attributed to the increment `v703`
+/// via the latch copy `v727 = Copy v703`, while the outer-chunk `v727`
+/// redefinition dirties the window on the re-entry path).
+///
+/// Any other shape (a folded base/index that is not syntactically `dest`,
+/// a variable index, a deeper chain, a non-memory consumer) fails closed:
+/// the emitter may read the shared home expecting `src`'s value while the
+/// home holds `dest`'s newer value. Whether the link is actually folded by
+/// the backend is irrelevant to soundness: an unfolded link never reads the
+/// shared home at all, and a folded `dest`-rooted link reads the correct
+/// value, so skipping the veto is sound in both cases.
+fn folded_consumer_reads_dest_home(
+    consumer: &Instruction,
+    dest: u32,
+    fold_base_of: &FxHashMap<u32, u32>,
+) -> bool {
+    let ptr = match consumer {
+        Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => ptr.0,
+        _ => return false,
+    };
+    if ptr == dest {
+        return true;
+    }
+    fold_base_of.get(&ptr).copied() == Some(dest)
+}
+
+/// Constant-displacement address links (`GEP(base, const)` and integer
+/// `base + const`), dest value id -> base value id. Mirrors the syntactic
+/// shape liveness treats as foldable, without its foldability fixed point
+/// (unfolded links make the exemption harmless, never unsound).
+fn const_address_link_bases(func: &IrFunction) -> FxHashMap<u32, u32> {
+    let mut bases: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Const(_),
+                    ..
+                } => {
+                    bases.insert(dest.0, base.0);
+                }
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(base),
+                    rhs: Operand::Const(_),
+                    ty,
+                }
+                | Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(_),
+                    rhs: Operand::Value(base),
+                    ty,
+                } if !ty.is_float() && !ty.is_long_double() => {
+                    bases.insert(dest.0, base.0);
+                }
+                _ => {}
+            }
+        }
+    }
+    bases
+}
+
+fn source_home_survives_dest_redefs(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+    succs: &analysis::FlatAdj,
+    candidate: &PhiCoalesceCandidate,
+) -> bool {
+    let src = candidate.backedge_src;
+    let dest = candidate.phi_dest;
+    if src == dest {
+        return false;
+    }
+    let Some(source_block) = func.blocks.get(candidate.source_block_idx) else {
+        return false;
+    };
+    let Some(copy_block) = func.blocks.get(candidate.block_idx) else {
+        return false;
+    };
+    if candidate.source_def_idx >= source_block.instructions.len()
+        || candidate.copy_idx >= copy_block.instructions.len()
+        || source_block.instructions[candidate.source_def_idx]
+            .dest()
+            .is_none_or(|defined| defined.0 != src)
+        || !matches!(
+            &copy_block.instructions[candidate.copy_idx],
+            Instruction::Copy {
+                dest: copy_dest,
+                src: Operand::Value(copy_src),
+            } if copy_dest.0 == dest && copy_src.0 == src
+        )
+    {
+        return false;
+    }
+
+    // Instruction-level CFG walk: after dest is redefined, any read of `src`
+    // (IR-visible or folded-hidden) would read a clobbered home — unless the
+    // folded consumer's address root is `dest` itself, in which case the
+    // shared home holds exactly the value the access needs. Reads precede
+    // the definition of the same instruction, so a dirty read is checked
+    // before a later write in that instruction can rescue it.
+    let fold_base_of = const_address_link_bases(func);
+    let hidden_use_at = |point: u32| {
+        liveness
+            .folded_read_points
+            .get(&src)
+            .is_some_and(|points| points.contains(&point))
+    };
+    let terminator_uses_src = |terminator: &Terminator| {
+        let mut used = false;
+        for_each_operand_in_terminator(terminator, |operand| {
+            if matches!(operand, Operand::Value(value) if value.0 == src) {
+                used = true;
+            }
+        });
+        used
+    };
+
+    let mut work = vec![(
+        candidate.source_block_idx,
+        candidate.source_def_idx.saturating_add(1),
+        false,
+    )];
+    let mut seen: FxHashSet<(usize, usize, bool)> = FxHashSet::default();
+    while let Some((block_index, first_instruction, mut dirty)) = work.pop() {
+        if !seen.insert((block_index, first_instruction, dirty)) {
+            continue;
+        }
+        let Some(block) = func.blocks.get(block_index) else {
+            return false;
+        };
+        let Some(&block_start) = liveness.block_starts.get(block_index) else {
+            return false;
+        };
+        if first_instruction > block.instructions.len() {
+            return false;
+        }
+        for (instruction_index, inst) in block
+            .instructions
+            .iter()
+            .enumerate()
+            .skip(first_instruction)
+        {
+            let Ok(offset) = u32::try_from(instruction_index) else {
+                return false;
+            };
+            let Some(point) = block_start.checked_add(offset) else {
+                return false;
+            };
+            if dirty && uses_value(inst, src) {
+                return false;
+            }
+            if dirty
+                && hidden_use_at(point)
+                && !folded_consumer_reads_dest_home(inst, dest, &fold_base_of)
+            {
+                return false;
+            }
+            let Some(defined) = inst.dest() else {
+                continue;
+            };
+            if defined.0 == src {
+                // Any definition of `src` writes the shared home with the
+                // current source value. Phi-elim reuses the id across
+                // latches; treating extra defs as corruption rejected
+                // in-place `buf += 8` on zlib-ng adler32 (stackmem 11→12).
+                dirty = false;
+            } else if defined.0 == dest {
+                let selected =
+                    block_index == candidate.block_idx && instruction_index == candidate.copy_idx;
+                if !selected {
+                    dirty = true;
+                }
+            }
+        }
+        let Ok(terminator_offset) = u32::try_from(block.instructions.len()) else {
+            return false;
+        };
+        let Some(terminator_point) = block_start.checked_add(terminator_offset) else {
+            return false;
+        };
+        if dirty && (terminator_uses_src(&block.terminator) || hidden_use_at(terminator_point)) {
+            return false;
+        }
+        for &successor in succs.row(block_index) {
+            work.push((successor as usize, 0, dirty));
+        }
+    }
+    true
+}
+
 fn phi_window_clobbers_caller_saved(func: &IrFunction, cand: &PhiCoalesceCandidate) -> bool {
     let Some(copy_block) = func.blocks.get(cand.block_idx) else {
         return false;
@@ -8521,7 +9211,7 @@ fn apply_phi_coalesce_assignments(
     candidates: &[PhiCoalesceCandidate],
     assignments: &mut FxHashMap<u32, PhysReg>,
     callee_saved: &[PhysReg],
-) {
+) -> Vec<PhiCoalesceCandidate> {
     apply_phi_coalesce_assignments_with_config(
         func,
         liveness,
@@ -8541,10 +9231,16 @@ fn apply_phi_coalesce_assignments_with_config(
     assignments: &mut FxHashMap<u32, PhysReg>,
     callee_saved: &[PhysReg],
     ra_config: &RaConfig,
-) {
+) -> Vec<PhiCoalesceCandidate> {
+    // Applied destructive updates. The post-RA repair and the verifier must
+    // union exactly this set: candidates are proofs of eligibility, but only
+    // applied pairs share a register at repair time. Unioning rejected
+    // candidates would bless overlaps that no coalescing justifies.
+    let mut applied: Vec<PhiCoalesceCandidate> = Vec::new();
     // Lazily-computed %rdx clobber points for the Phase-2x64 propagation
     // guard below (None until a %rdx-homed phi dest is actually considered).
     let mut rdx_clobbers: Option<Vec<u32>> = None;
+    let mut succs: Option<analysis::FlatAdj> = None;
     for candidate in candidates {
         let phi_dest = candidate.phi_dest;
         let backedge_src = candidate.backedge_src;
@@ -8581,6 +9277,20 @@ fn apply_phi_coalesce_assignments_with_config(
                 .any(|inst| uses_value(inst, phi_dest))
         };
         if phi_used_in_window {
+            continue;
+        }
+
+        let succs = succs.get_or_insert_with(|| {
+            let label_to_idx = analysis::build_label_map(func);
+            analysis::build_cfg(func, &label_to_idx).1
+        });
+        if !source_home_survives_dest_redefs(func, liveness, succs, candidate) {
+            if ra_config.debug_phi_coalesce {
+                eprintln!(
+                    "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{}: source home does not survive dest redefs",
+                    phi_dest, backedge_src
+                );
+            }
             continue;
         }
 
@@ -8693,7 +9403,9 @@ fn apply_phi_coalesce_assignments_with_config(
             );
         }
         assignments.insert(backedge_src, reg);
+        applied.push(*candidate);
     }
+    applied
 }
 
 /// `CCC_PHI_COALESCE_SKIP` / `CCC_PHI_COALESCE_FUNC` bisect helper (see
@@ -9114,6 +9826,16 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                         )
                 })
             });
+            let source_home_probe = PhiCoalesceCandidate {
+                phi_dest: dest.0,
+                backedge_src: src.0,
+                block_idx,
+                source_block_idx: source_block,
+                source_def_idx,
+                copy_idx,
+            };
+            let source_home_killed =
+                !source_home_survives_dest_redefs(func, liveness, &succs, &source_home_probe);
             // Liveness-model veto: the source's definition overwrites the
             // phi's home, so the phi's OLD value may not be read at ANY
             // program point strictly inside the update window (after the
@@ -9170,6 +9892,7 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                 || phi_derived_used_in_window
                 || phi_live_in_window
                 || source_used_elsewhere
+                || source_home_killed
                 || source_used_before_copy
             {
                 if debug {
@@ -9195,14 +9918,7 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                     dest.0, src.0, source_block, source_def_idx, block_idx, copy_idx
                 );
             }
-            candidates.push(PhiCoalesceCandidate {
-                phi_dest: dest.0,
-                backedge_src: src.0,
-                block_idx,
-                source_block_idx: source_block,
-                source_def_idx,
-                copy_idx,
-            });
+            candidates.push(source_home_probe);
         }
     }
 
@@ -9622,11 +10338,11 @@ mod phi_coalesce_tests {
         func.next_value_id = 3;
 
         let liveness = compute_live_intervals(&func);
-        if liveness.block_loop_depth.first().copied().unwrap_or(0) == 0 {
-            // Loop-depth oracle did not mark the self-backedge; the
-            // detector correctly refuses depth-0 blocks.
-            return;
-        }
+        let loop_depth = liveness.block_loop_depth.first().copied().unwrap_or(0);
+        assert!(
+            loop_depth > 0,
+            "self-backedge must have positive loop depth, got {loop_depth}"
+        );
         let candidates = detect_phi_coalesce_groups(&func, &liveness);
         assert!(
             candidates
@@ -10193,17 +10909,21 @@ mod phi_coalesce_tests {
         func.next_value_id = 4;
 
         let liveness = compute_live_intervals(&func);
-        if liveness.block_loop_depth.get(1).copied().unwrap_or(0) == 0 {
-            return;
-        }
+        let loop_depth = liveness.block_loop_depth.get(1).copied().unwrap_or(0);
+        assert!(
+            loop_depth > 0,
+            "inner latch must have positive loop depth, got {loop_depth}"
+        );
         let candidates = detect_phi_coalesce_groups(&func, &liveness);
         let dest1: Vec<_> = candidates.iter().filter(|c| c.phi_dest == 1).collect();
-        if dest1.len() >= 2 {
-            assert_eq!(
-                dest1[0].backedge_src, 3,
-                "later latch must sort first: {candidates:?}"
-            );
-        }
+        assert!(
+            dest1.len() >= 2,
+            "two latches must both be candidates: {candidates:?}"
+        );
+        assert_eq!(
+            dest1[0].backedge_src, 3,
+            "later latch must sort first: {candidates:?}"
+        );
     }
 
     fn empty_call(dest: Option<Value>) -> Instruction {
@@ -11127,6 +11847,1167 @@ mod map_collector_tests {
         assert!(
             !set.contains(&1),
             "unlisted consumer must strand the broadcast"
+        );
+    }
+}
+
+#[cfg(test)]
+mod allocation_kernel_tests {
+    use super::*;
+    use crate::ir::analysis;
+    use crate::ir::intrinsics::IntrinsicOp;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst, Value};
+
+    fn iv(value_id: u32, start: u32, end: u32) -> LiveInterval {
+        LiveInterval {
+            value_id,
+            start,
+            end,
+        }
+    }
+
+    fn liveness_fixture(
+        intervals: Vec<LiveInterval>,
+        segments: Vec<LiveInterval>,
+    ) -> LivenessResult {
+        let mut func = IrFunction::new("kernel_fixture".to_string(), IrType::Void, vec![], false);
+        func.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        }];
+        let mut liveness = compute_live_intervals(&func);
+        liveness.intervals = intervals;
+        liveness.segments = segments;
+        liveness
+    }
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn quadratic_overlaps(spans: &[(u8, u32, u32, u32)]) -> Vec<(u8, u32, u32, u32, u32)> {
+        let mut out = Vec::new();
+        for (i, &(reg_a, start_a, end_a, class_a)) in spans.iter().enumerate() {
+            for &(reg_b, start_b, end_b, class_b) in spans.iter().skip(i + 1) {
+                if reg_a != reg_b || class_a == class_b {
+                    continue;
+                }
+                if intervals_overlap((start_a, end_a), (start_b, end_b)) {
+                    out.push((
+                        reg_a,
+                        class_a.min(class_b),
+                        class_a.max(class_b),
+                        start_a.max(start_b),
+                        end_a.min(end_b),
+                    ));
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn overlap_kernel_reports_all_pairwise_class_conflicts() {
+        // A[0,100], B[1,20], C[2,30] on one register: the previous-max-end
+        // scan missed B↔C because C starts before A's end.
+        let spans = vec![(1u8, 0u32, 100u32, 10u32), (1, 1, 20, 11), (1, 2, 30, 12)];
+        let got = overlapping_class_spans(spans.clone());
+        let expect = quadratic_overlaps(&spans);
+        assert_eq!(got, expect);
+        assert!(
+            got.iter().any(|&(_, a, b, _, _)| a == 11 && b == 12),
+            "B↔C conflict must be reported: {got:?}"
+        );
+        assert!(got.iter().any(|&(_, a, b, _, _)| a == 10 && b == 11));
+        assert!(got.iter().any(|&(_, a, b, _, _)| a == 10 && b == 12));
+    }
+
+    #[test]
+    fn overlap_kernel_keeps_zero_length_and_half_open_boundaries() {
+        assert!(intervals_overlap((0, 10), (5, 5)));
+        assert!(!intervals_overlap((0, 5), (5, 9)));
+        let zero_inside = overlapping_class_spans(vec![(3, 0, 10, 1), (3, 5, 5, 2)]);
+        assert_eq!(zero_inside, vec![(3, 1, 2, 5, 5)]);
+        let adjacent = overlapping_class_spans(vec![(3, 0, 5, 1), (3, 5, 9, 2)]);
+        assert!(adjacent.is_empty(), "{adjacent:?}");
+    }
+
+    #[test]
+    fn overlap_kernel_matches_quadratic_oracle() {
+        let mut seed: u64 = 0xC0FFEE;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed
+        };
+        for _ in 0..200 {
+            let n = (next() % 8) as usize;
+            let mut spans = Vec::with_capacity(n);
+            for _ in 0..n {
+                let reg = (next() % 3) as u8;
+                let class = (next() % 5) as u32;
+                let start = (next() % 16) as u32;
+                let span = (next() % 8) as u32;
+                spans.push((reg, start, start + span, class));
+            }
+            let got = overlapping_class_spans(spans.clone());
+            let expect = quadratic_overlaps(&spans);
+            assert_eq!(got, expect, "spans={spans:?}");
+        }
+    }
+
+    #[test]
+    fn flatten_resolves_indirect_class_parents() {
+        let mut parent = FxHashMap::default();
+        parent.insert(1, 2);
+        parent.insert(2, 3);
+        parent.insert(3, 3);
+        flatten_allocation_classes(&mut parent);
+        assert_eq!(parent.get(&1).copied(), Some(3));
+        assert_eq!(parent.get(&2).copied(), Some(3));
+        assert_eq!(allocation_class_root(&parent, 1), 3);
+        assert_eq!(allocation_class_root(&parent, 99), 99);
+    }
+
+    #[test]
+    fn interval_map_keeps_complete_envelope() {
+        let liveness = liveness_fixture(vec![iv(7, 2, 4), iv(7, 10, 18), iv(7, 0, 3)], Vec::new());
+        let map = interval_map(&liveness);
+        assert_eq!(map.get(&7).copied(), Some((0, 18)));
+    }
+
+    #[test]
+    fn collect_gpr_requires_eligibility_and_sorts() {
+        let liveness = liveness_fixture(
+            vec![iv(1, 8, 12), iv(2, 0, 4), iv(3, 1, 20), iv(4, 5, 6)],
+            Vec::new(),
+        );
+        let mut eligible = FxHashSet::default();
+        eligible.insert(1);
+        eligible.insert(2);
+        eligible.insert(4);
+        let mut merged_of = FxHashMap::default();
+        merged_of.insert(
+            3,
+            LiveInterval {
+                value_id: 3,
+                start: 1,
+                end: 20,
+            },
+        );
+        merged_of.insert(
+            1,
+            LiveInterval {
+                value_id: 1,
+                start: 8,
+                end: 40,
+            },
+        );
+        let mut member_of = FxHashMap::default();
+        member_of.insert(4, 1);
+        let scan = collect_gpr_scan_intervals(&liveness, &eligible, &merged_of, &member_of);
+        let ids: Vec<u32> = scan.iter().map(|i| i.value_id).collect();
+        assert_eq!(
+            ids,
+            vec![2, 1],
+            "ineligible merged 3 and member 4 must drop"
+        );
+        assert_eq!(scan[1].end, 40);
+    }
+
+    #[test]
+    fn skip_birth_consumes_every_duplicate_birth_hazard() {
+        let interval = iv(1, 5, 10);
+        assert!(!overlaps_inclusive_skip_birth(&interval, &[5, 5, 5]));
+        assert!(overlaps_inclusive_skip_birth(&interval, &[5, 5, 5, 8]));
+        assert!(overlaps_inclusive_skip_birth(&interval, &[5, 10]));
+        assert!(!overlaps_inclusive_skip_birth(&interval, &[4, 5]));
+    }
+
+    #[test]
+    fn owned_segments_keep_unsegmented_web_members() {
+        let liveness = liveness_fixture(
+            vec![iv(1, 0, 10), iv(2, 20, 30)],
+            vec![iv(1, 0, 4), iv(1, 8, 10)],
+        );
+        let mut member_of = FxHashMap::default();
+        member_of.insert(2, 1);
+        let owned = owned_live_segments(&liveness, &member_of);
+        let pieces = owned.get(&1).expect("owner coverage");
+        assert!(
+            pieces.iter().any(|&span| span == (20, 30)),
+            "unsegmented member 2 must contribute: {pieces:?}"
+        );
+        assert!(
+            pieces
+                .iter()
+                .any(|&span| span == (0, 4) || span == (0, 10) || span == (8, 10))
+        );
+    }
+
+    fn divrem_func(insts: Vec<Instruction>) -> IrFunction {
+        let mut func = IrFunction::new("divrem_kernel".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![block(0, insts, Terminator::Return(None))];
+        func.next_value_id = 20;
+        func
+    }
+
+    fn binop(dest: u32, op: IrBinOp, ty: IrType, lhs: Operand, rhs: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            ty,
+            lhs,
+            rhs,
+        }
+    }
+
+    #[test]
+    fn divrem_pairs_matching_operands_and_width() {
+        let func = divrem_func(vec![
+            binop(
+                2,
+                IrBinOp::UDiv,
+                IrType::I32,
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I32(3)),
+            ),
+            binop(
+                3,
+                IrBinOp::URem,
+                IrType::I32,
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I32(3)),
+            ),
+        ]);
+        let pairs = compute_i686_divrem_pairs(&func, DivRemTarget::I686);
+        assert!(
+            pairs.tail_dests.contains(&3),
+            "urem must be the tail: {:?}",
+            pairs.tail_dests
+        );
+        assert_eq!(pairs.head_partners.get(&2).copied(), Some((3, false)));
+    }
+
+    #[test]
+    fn divrem_rejects_width_mismatch() {
+        let func = divrem_func(vec![
+            binop(
+                2,
+                IrBinOp::UDiv,
+                IrType::I32,
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I32(3)),
+            ),
+            binop(
+                3,
+                IrBinOp::URem,
+                IrType::I16,
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I32(3)),
+            ),
+        ]);
+        let pairs = compute_i686_divrem_pairs(&func, DivRemTarget::I686);
+        assert!(pairs.tail_dests.is_empty(), "{:?}", pairs.tail_dests);
+    }
+
+    #[test]
+    fn divrem_rejects_redefined_operand_stamp() {
+        let func = divrem_func(vec![
+            Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(IrConst::I32(8)),
+            },
+            binop(
+                2,
+                IrBinOp::UDiv,
+                IrType::I32,
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I32(3)),
+            ),
+            Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(IrConst::I32(9)),
+            },
+            binop(
+                3,
+                IrBinOp::URem,
+                IrType::I32,
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I32(3)),
+            ),
+        ]);
+        let pairs = compute_i686_divrem_pairs(&func, DivRemTarget::I686);
+        assert!(
+            pairs.tail_dests.is_empty(),
+            "redef between div and rem must not pair: {:?}",
+            pairs.tail_dests
+        );
+    }
+
+    #[test]
+    fn divrem_rejects_exceptional_barrier() {
+        let func = divrem_func(vec![
+            binop(
+                2,
+                IrBinOp::UDiv,
+                IrType::I32,
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I32(3)),
+            ),
+            Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::BuiltinSetjmp,
+                dest_ptr: None,
+                args: vec![],
+            },
+            binop(
+                3,
+                IrBinOp::URem,
+                IrType::I32,
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I32(3)),
+            ),
+        ]);
+        let pairs = compute_i686_divrem_pairs(&func, DivRemTarget::I686);
+        assert!(
+            pairs.tail_dests.is_empty(),
+            "setjmp between div and rem must not pair: {:?}",
+            pairs.tail_dests
+        );
+    }
+
+    #[test]
+    fn wide_ops_see_i128_constants_without_typed_def() {
+        let mut func = IrFunction::new("wide_const".to_string(), IrType::Void, vec![], false);
+        func.blocks = vec![block(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(IrConst::I128(1)),
+            }],
+            Terminator::Return(None),
+        )];
+        func.next_value_id = 2;
+        assert!(x86_body_has_wide_ops(&func));
+    }
+
+    #[test]
+    fn propagate_restrictions_to_web_owners() {
+        let mut restricted = FxHashSet::default();
+        restricted.insert(4);
+        let mut member_of = FxHashMap::default();
+        member_of.insert(4, 1);
+        propagate_member_restrictions(&mut restricted, &member_of);
+        assert!(restricted.contains(&1));
+        assert!(restricted.contains(&4));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid register-allocation range")]
+    fn overlap_kernel_rejects_reversed_range() {
+        let _ = overlapping_class_spans(vec![(1, 10, 3, 7)]);
+    }
+
+    #[test]
+    fn call_spanning_falls_back_to_fat_interval() {
+        let mut liveness = liveness_fixture(vec![iv(1, 0, 20)], Vec::new());
+        liveness.call_points = vec![10];
+        let iv_map = interval_map(&liveness);
+        let spanning = collect_call_spanning_owners(
+            &liveness,
+            &iv_map,
+            &FxHashMap::default(),
+            &liveness.call_points,
+        );
+        assert!(spanning.contains(&1), "{spanning:?}");
+    }
+
+    #[test]
+    fn call_spanning_respects_segment_gaps() {
+        let mut liveness = liveness_fixture(vec![iv(1, 0, 20)], vec![iv(1, 0, 5), iv(1, 15, 20)]);
+        liveness.call_points = vec![10];
+        let iv_map = interval_map(&liveness);
+        let spanning = collect_call_spanning_owners(
+            &liveness,
+            &iv_map,
+            &FxHashMap::default(),
+            &liveness.call_points,
+        );
+        assert!(
+            spanning.is_empty(),
+            "call in a segment gap must not span: {spanning:?}"
+        );
+    }
+
+    #[test]
+    fn source_home_rejects_copy_block_redef() {
+        // After the latch copy, dest is overwritten and `src` is still
+        // read. Sharing a home would return the clobbered dest.
+        let mut func = IrFunction::new("redef".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Const(IrConst::I32(1)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Value(Value(2)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(IrConst::I32(9)),
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ),
+        ];
+        func.next_value_id = 3;
+        let liveness = compute_live_intervals(&func);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (_preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 1,
+            backedge_src: 2,
+            block_idx: 1,
+            source_block_idx: 0,
+            source_def_idx: 0,
+            copy_idx: 0,
+        };
+        assert!(!source_home_survives_dest_redefs(
+            &func, &liveness, &succs, &cand
+        ));
+    }
+
+    #[test]
+    fn source_home_accepts_clean_same_block_window() {
+        let mut func = IrFunction::new("clean".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![block(
+            0,
+            vec![
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        )];
+        func.next_value_id = 3;
+        let liveness = compute_live_intervals(&func);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (_preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 1,
+            backedge_src: 2,
+            block_idx: 0,
+            source_block_idx: 0,
+            source_def_idx: 1,
+            copy_idx: 2,
+        };
+        assert!(source_home_survives_dest_redefs(
+            &func, &liveness, &succs, &cand
+        ));
+    }
+
+    #[test]
+    fn coverage_overlap_is_linear_and_half_open() {
+        assert!(sorted_coverage_overlaps(&[(0, 10)], &[(5, 12)]));
+        assert!(!sorted_coverage_overlaps(&[(0, 5)], &[(5, 9)]));
+        assert!(!sorted_coverage_overlaps(&[(0, 4), (10, 12)], &[(4, 10)]));
+        assert!(sorted_coverage_overlaps(&[(0, 4), (8, 12)], &[(9, 11)]));
+    }
+
+    #[test]
+    fn phi_web_rejects_overlapping_segments() {
+        assert!(sorted_coverage_overlaps(&[(0, 20)], &[(5, 15)]));
+        let left = coverage_of_value(
+            1,
+            &{
+                let mut m = FxHashMap::default();
+                m.insert(1, vec![(0, 10), (20, 30)]);
+                m
+            },
+            &FxHashMap::default(),
+        );
+        let right = coverage_of_value(
+            2,
+            &{
+                let mut m = FxHashMap::default();
+                m.insert(2, vec![(10, 20)]);
+                m
+            },
+            &FxHashMap::default(),
+        );
+        assert!(
+            !sorted_coverage_overlaps(&left, &right),
+            "exclusive arms must not overlap: {left:?} {right:?}"
+        );
+    }
+
+    #[test]
+    fn vecreg_rejects_unknown_dest_ptr_writer() {
+        let mut func = IrFunction::new("unknown_writer".to_string(), IrType::Void, vec![], false);
+        func.blocks = vec![block(
+            0,
+            vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I8,
+                    size: 16,
+                    align: 16,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    dest_ptr: Some(Value(1)),
+                    op: IntrinsicOp::Loaddqu,
+                    args: vec![],
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    dest_ptr: Some(Value(1)),
+                    op: IntrinsicOp::Pxor128,
+                    args: vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    dest_ptr: Some(Value(1)),
+                    op: IntrinsicOp::Lfence,
+                    args: vec![],
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        func.next_value_id = 2;
+        let set = collect_vecreg_candidates(&func);
+        assert!(set.is_empty(), "unknown writer must poison: {set:?}");
+    }
+
+    #[test]
+    fn source_home_allows_pointer_increment_latch() {
+        // zlib-ng adler32 inner loop: `buf += 8` as
+        //   v_next = buf + 8; buf = v_next;
+        // plus a sibling latch. Sharing buf with v_next is the in-place add.
+        let mut func = IrFunction::new("ptr_latch".to_string(), IrType::Ptr, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(IrConst::I64(0)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Const(IrConst::I64(0)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(3),
+                        op: IrBinOp::Sub,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I64(8)),
+                        ty: IrType::I64,
+                    },
+                    Instruction::Load {
+                        dest: Value(4),
+                        ptr: Value(2),
+                        ty: IrType::U8,
+                        volatile: false,
+                        seg_override: Default::default(),
+                    },
+                    Instruction::BinOp {
+                        dest: Value(5),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Const(IrConst::I64(8)),
+                        ty: IrType::I64,
+                    },
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Value(Value(3)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(5)),
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(4)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                2,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ),
+        ];
+        func.next_value_id = 6;
+        let liveness = compute_live_intervals(&func);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (_preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 2,
+            backedge_src: 5,
+            block_idx: 1,
+            source_block_idx: 1,
+            source_def_idx: 2,
+            copy_idx: 4,
+        };
+        assert!(
+            source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+            "in-place buf+=8 latch must survive"
+        );
+    }
+
+    #[test]
+    fn vecreg_rejects_non_16_byte_alloca() {
+        let mut func = IrFunction::new("wide_slot".to_string(), IrType::Void, vec![], false);
+        func.blocks = vec![block(
+            0,
+            vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I8,
+                    size: 32,
+                    align: 16,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    dest_ptr: Some(Value(1)),
+                    op: IntrinsicOp::Loaddqu,
+                    args: vec![],
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    dest_ptr: Some(Value(1)),
+                    op: IntrinsicOp::Pxor128,
+                    args: vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        func.next_value_id = 2;
+        let set = collect_vecreg_candidates(&func);
+        assert!(set.is_empty(), "32-byte alloca must not promote: {set:?}");
+    }
+
+    #[test]
+    fn summed_use_weight_saturates_instead_of_wrapping() {
+        let use_count: FxHashMap<u32, u64> = [(1, u64::MAX), (2, 1)].into_iter().collect();
+        assert_eq!(summed_use_weight(&[1, 2], &use_count), u64::MAX);
+        assert_eq!(summed_use_weight(&[1], &use_count), u64::MAX);
+        assert_eq!(summed_use_weight(&[9], &use_count), 0);
+    }
+
+    #[test]
+    fn source_home_rejects_folded_read_in_dirty_window() {
+        // A folded (hidden) SIB-index read of `src` after a dest redefinition
+        // must veto exactly like an IR-visible use: the home no longer holds
+        // the source value at that program point.
+        let mut func = IrFunction::new("folded_dirty".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![block(
+            0,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I64(1)),
+                    rhs: Operand::Const(IrConst::I64(2)),
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I64(3)),
+                    rhs: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I64(5)),
+                    rhs: Operand::Const(IrConst::I64(6)),
+                    ty: IrType::I64,
+                },
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(5)),
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        func.next_value_id = 8;
+        let mut liveness = compute_live_intervals(&func);
+        // Folded read of v5 at instruction 2 (block_start + 2), after the
+        // v2 redefinition at instruction 1 dirtied the shared home.
+        let base = liveness.block_starts[0];
+        liveness.folded_read_points.insert(5, vec![base + 2]);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (_preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 2,
+            backedge_src: 5,
+            block_idx: 0,
+            source_block_idx: 0,
+            source_def_idx: 0,
+            copy_idx: 3,
+        };
+        assert!(
+            !source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+            "folded read of v5 in the dirty window must veto coalescing"
+        );
+
+        // The same shape without the folded read stays admissible: the v5
+        // redefinition at instruction 2 refreshes the shared home, so the
+        // copy reads the current source value.
+        liveness.folded_read_points.remove(&5);
+        assert!(
+            source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+            "clean window without folded reads must survive"
+        );
+    }
+
+    #[test]
+    fn folded_consumer_rooted_in_dest_does_not_veto() {
+        // Miniature zlib-ng adler32 `buf += 8`: the `GEP(buf, off)` loads are
+        // folded-attributed to the increment via the latch copy, but the
+        // address root is `dest` itself, so the shared home holds exactly
+        // the value the access needs even in a dirty window.
+        let mut func = IrFunction::new("folded_dest_root".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![block(
+            0,
+            vec![
+                Instruction::GetElementPtr {
+                    dest: Value(11),
+                    base: Value(2),
+                    offset: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::I64,
+                },
+                Instruction::Load {
+                    dest: Value(8),
+                    ptr: Value(11),
+                    ty: IrType::U8,
+                    volatile: false,
+                    seg_override: Default::default(),
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I64(2)),
+                    ty: IrType::I64,
+                },
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(5)),
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        func.next_value_id = 12;
+        let mut liveness = compute_live_intervals(&func);
+        let base = liveness.block_starts[0];
+        liveness.folded_read_points.insert(5, vec![base + 3]);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (_preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 2,
+            backedge_src: 5,
+            block_idx: 0,
+            source_block_idx: 0,
+            source_def_idx: 1,
+            copy_idx: 5,
+        };
+        assert!(
+            source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+            "dest-rooted folded read must not veto (adler32 buf+=8 shape)"
+        );
+
+        // Control: the same folded read through a root that is NOT dest
+        // still vetoes — the home may hold dest's value instead of src's.
+        let Instruction::GetElementPtr { base, .. } = &mut func.blocks[0].instructions[0] else {
+            panic!("fixture shape changed");
+        };
+        *base = Value(7);
+        assert!(
+            !source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+            "non-dest-rooted folded read in a dirty window must veto"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sse_destructive_tests {
+    use super::*;
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    use crate::ir::reexports::{BasicBlock, BlockId, Value};
+
+    fn v(id: u32) -> Operand {
+        Operand::Value(Value(id))
+    }
+
+    fn chain(dest: u32, op: O, a0: u32, a1: u32) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op,
+            dest_ptr: None,
+            args: vec![v(a0), v(a1)],
+        }
+    }
+
+    fn root(id: u32) -> Instruction {
+        Instruction::Copy {
+            dest: Value(id),
+            src: Operand::Const(IrConst::I32(0)),
+        }
+    }
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn mkfunc(blocks: Vec<BasicBlock>) -> IrFunction {
+        let mut f = IrFunction::new("sse_chain".to_string(), IrType::Void, vec![], false);
+        f.blocks = blocks;
+        f.next_value_id = 100;
+        f
+    }
+
+    fn run(func: &IrFunction, pool: &[PhysReg]) -> FxHashMap<u32, PhysReg> {
+        let liveness = compute_live_intervals(func);
+        let candidates = collect_sse128_chain_values(func);
+        allocate_vector_registers_destructive(func, &candidates, pool, &|_| false, &liveness)
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn handoff_recycles_dying_first_operand_down_a_chain() {
+        // v1 dies at the v3 def, v3 dies at the v4 def: both destinations
+        // must take their first operand's register (the in-place form),
+        // while the surviving second operand v2 keeps its own.
+        let func = mkfunc(vec![block(
+            0,
+            vec![
+                root(1),                        // @0
+                root(2),                        // @1
+                chain(3, O::VecXorI32x4, 1, 2), // @2
+                chain(4, O::VecAddI32x4, 3, 2), // @3
+            ],
+            Terminator::Return(Some(v(4))),
+        )]);
+        let pool = vec![PhysReg(21), PhysReg(22)];
+        let home = run(&func, &pool);
+        for id in [1, 2, 3, 4] {
+            assert!(home.contains_key(&id), "v{id} must be homed");
+        }
+        assert_eq!(home.get(&3), home.get(&1), "v3 must recycle v1's register");
+        assert_eq!(home.get(&4), home.get(&3), "v4 must recycle v3's register");
+        assert_ne!(
+            home.get(&2),
+            home.get(&3),
+            "live second operand needs its own register"
+        );
+    }
+
+    #[test]
+    fn copy_defined_accumulator_survives_inner_short_value() {
+        // P0: v2 is (re)defined by a phi-edge-style Copy at @1 but first
+        // used at @5.  A mention model starts its span at the first USE and
+        // lets the inner short-lived v3 [4,5] share the register — v3's
+        // definition then clobbers the accumulator.  Segment coverage
+        // starts at the definition, so the two must differ.
+        let func = mkfunc(vec![block(
+            0,
+            vec![
+                root(1), // @0
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: v(1),
+                }, // @1
+                root(8), // @2
+                root(9), // @3
+                chain(3, O::VecXorI32x4, 9, 8), // @4
+                chain(5, O::VecAddI32x4, 2, 3), // @5
+            ],
+            Terminator::Return(Some(v(5))),
+        )]);
+        let pool = vec![PhysReg(21), PhysReg(22)];
+        let home = run(&func, &pool);
+        assert!(home.contains_key(&2), "accumulator must be homed");
+        assert!(home.contains_key(&3), "inner value must be homed");
+        assert_ne!(
+            home.get(&2),
+            home.get(&3),
+            "accumulator and inner value overlap: different registers"
+        );
+        assert_eq!(
+            home.get(&5),
+            home.get(&2),
+            "v5 must recycle its dying first operand v2's register"
+        );
+        assert_ne!(
+            home.get(&5),
+            home.get(&3),
+            "in-place dest must not alias the live second operand"
+        );
+    }
+
+    #[test]
+    fn terminator_use_blocks_handoff() {
+        // v1's last read is the block-0 CondBranch condition, AFTER the v3
+        // def: no handoff edge may form (a mention model that skips
+        // terminators would recycle v1's register into v3 and miscompile
+        // the branch).
+        let func = mkfunc(vec![
+            block(
+                0,
+                vec![root(1), root(2), chain(3, O::VecXorI32x4, 1, 2)],
+                Terminator::CondBranch {
+                    cond: v(1),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                1,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            ),
+            block(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+            ),
+        ]);
+        let pool = vec![PhysReg(21), PhysReg(22)];
+        let home = run(&func, &pool);
+        assert!(home.contains_key(&1), "v1 must be homed");
+        assert!(home.contains_key(&3), "v3 must be homed");
+        assert_ne!(
+            home.get(&1),
+            home.get(&3),
+            "v1 is live in the terminator: v3 must not recycle its register"
+        );
+    }
+
+    #[test]
+    fn call_spanning_values_keep_no_xmm_home() {
+        // v1 and v3 are live across the Memcpy call point: the caller-saved
+        // pool must not home them.  v2 dies before, v5 is born after.
+        let func = mkfunc(vec![block(
+            0,
+            vec![
+                root(1),                        // @0
+                root(2),                        // @1
+                chain(3, O::VecXorI32x4, 1, 2), // @2
+                root(6),                        // @3
+                root(7),                        // @4
+                Instruction::Memcpy {
+                    dest: Value(6),
+                    src: Value(7),
+                    size: 16,
+                }, // @5: call point
+                chain(5, O::VecAddI32x4, 3, 1), // @6
+            ],
+            Terminator::Return(Some(v(5))),
+        )]);
+        let pool = vec![PhysReg(21), PhysReg(22)];
+        let home = run(&func, &pool);
+        assert!(!home.contains_key(&1), "v1 spans the call: no home");
+        assert!(!home.contains_key(&3), "v3 spans the call: no home");
+        assert!(home.contains_key(&2), "v2 dies before the call: homed");
+        assert!(home.contains_key(&5), "v5 born after the call: homed");
+    }
+
+    #[test]
+    fn allocation_is_deterministic() {
+        let func = mkfunc(vec![block(
+            0,
+            vec![
+                root(1),
+                root(2),
+                chain(3, O::VecXorI32x4, 1, 2),
+                chain(4, O::VecAddI32x4, 3, 2),
+            ],
+            Terminator::Return(Some(v(4))),
+        )]);
+        let pool = vec![PhysReg(21), PhysReg(22), PhysReg(23)];
+        let a = run(&func, &pool);
+        let b = run(&func, &pool);
+        assert_eq!(a, b, "two runs over the same IR must agree");
+    }
+}
+
+#[cfg(test)]
+mod fp_phi_move_tests {
+    use super::*;
+
+    fn phys(reg: u8) -> PhysReg {
+        PhysReg(reg)
+    }
+
+    /// p20_sum_i64 shape: the blocker shares the dest reg and its FAT
+    /// envelope overlaps the source, but no segment overlaps — the move
+    /// must be allowed (the old fat-only test vetoed it, +8 movdqas).
+    #[test]
+    fn segment_disjoint_despite_fat_overlap_moves() {
+        // Third value v21: fat (13,61), pieces avoid (51,54).
+        let seg_cov: FxHashMap<u32, Vec<(u32, u32)>> = [
+            (21u32, vec![(13, 22), (24, 24), (58, 61)]),
+            (50u32, vec![(51, 54)]),
+        ]
+        .into_iter()
+        .collect();
+        let iv_map: FxHashMap<u32, (u32, u32)> =
+            [(21u32, (13, 61)), (48u32, (10, 61)), (50u32, (51, 54))]
+                .into_iter()
+                .collect();
+        // Dest v48 and blocker v21 both homed in 32; source v50 in 30.
+        let assignments: FxHashMap<u32, PhysReg> =
+            [(21u32, phys(32)), (48u32, phys(32)), (50u32, phys(30))]
+                .into_iter()
+                .collect();
+        assert!(
+            !fp_phi_move_conflicts(&seg_cov, &iv_map, &assignments, 48, 50, 32),
+            "segment-disjoint blocker must not veto the phi move"
+        );
+    }
+
+    #[test]
+    fn true_segment_overlap_blocks() {
+        let seg_cov: FxHashMap<u32, Vec<(u32, u32)>> =
+            [(21u32, vec![(13, 22), (50, 52)]), (50u32, vec![(51, 54)])]
+                .into_iter()
+                .collect();
+        let iv_map: FxHashMap<u32, (u32, u32)> =
+            [(21u32, (13, 52)), (48u32, (10, 61)), (50u32, (51, 54))]
+                .into_iter()
+                .collect();
+        let assignments: FxHashMap<u32, PhysReg> =
+            [(21u32, phys(32)), (48u32, phys(32)), (50u32, phys(30))]
+                .into_iter()
+                .collect();
+        assert!(
+            fp_phi_move_conflicts(&seg_cov, &iv_map, &assignments, 48, 50, 32),
+            "a third value live in the dest home during the source must veto"
+        );
+    }
+
+    #[test]
+    fn fat_fallback_for_unsegmented_values() {
+        // Unsegmented blocker: fat envelope decides (conservative, sound).
+        let seg_cov: FxHashMap<u32, Vec<(u32, u32)>> =
+            [(50u32, vec![(51, 54)])].into_iter().collect();
+        let iv_map: FxHashMap<u32, (u32, u32)> =
+            [(21u32, (13, 61)), (48u32, (10, 61)), (50u32, (51, 54))]
+                .into_iter()
+                .collect();
+        let assignments: FxHashMap<u32, PhysReg> =
+            [(21u32, phys(32)), (48u32, phys(32)), (50u32, phys(30))]
+                .into_iter()
+                .collect();
+        assert!(
+            fp_phi_move_conflicts(&seg_cov, &iv_map, &assignments, 48, 50, 32),
+            "unsegmented blocker with overlapping fat envelope must veto"
+        );
+        // Unsegmented source: fat envelope decides against segments.
+        let seg_cov_src: FxHashMap<u32, Vec<(u32, u32)>> =
+            [(21u32, vec![(50, 52)])].into_iter().collect();
+        assert!(
+            fp_phi_move_conflicts(&seg_cov_src, &iv_map, &assignments, 48, 50, 32),
+            "unsegmented source with overlapping fat envelope must veto"
+        );
+    }
+
+    #[test]
+    fn ignores_other_regs_and_the_pair_itself() {
+        // Overlapping values in other regs, plus the pair itself, never veto.
+        let seg_cov: FxHashMap<u32, Vec<(u32, u32)>> = [
+            (21u32, vec![(51, 54)]),
+            (50u32, vec![(51, 54)]),
+            (48u32, vec![(10, 61)]),
+        ]
+        .into_iter()
+        .collect();
+        let iv_map: FxHashMap<u32, (u32, u32)> =
+            [(21u32, (51, 54)), (48u32, (10, 61)), (50u32, (51, 54))]
+                .into_iter()
+                .collect();
+        let assignments: FxHashMap<u32, PhysReg> =
+            [(21u32, phys(33)), (48u32, phys(32)), (50u32, phys(30))]
+                .into_iter()
+                .collect();
+        assert!(
+            !fp_phi_move_conflicts(&seg_cov, &iv_map, &assignments, 48, 50, 32),
+            "other-reg holders and the pair itself must not veto"
+        );
+    }
+
+    #[test]
+    fn no_coverage_fails_closed() {
+        let seg_cov: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+        let iv_map: FxHashMap<u32, (u32, u32)> = [(48u32, (10, 61))].into_iter().collect();
+        let assignments: FxHashMap<u32, PhysReg> = [(48u32, phys(32))].into_iter().collect();
+        assert!(
+            fp_phi_move_conflicts(&seg_cov, &iv_map, &assignments, 48, 50, 32),
+            "a source with no coverage info must fail closed"
         );
     }
 }
