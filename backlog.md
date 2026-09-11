@@ -342,3 +342,32 @@ not int` x4), param-rooted (`roots not unique`). In order of impact:
 5. Compare idiom (`while (p<e && *p==*q)`) as designed in module docs.
 Each extension reuses the validated M2 rewrite; flip `CCC_LOOP_IDIOM`
 default-on only after corpus A/B + fuzz on the final guard set.
+
+---
+
+## Session 2026-09-11 (line 2: audit fixes + loop-memset) — open items
+
+Base `6ec7b727`. Full account in
+`FOLLOWUP-2026-09-11-boolpair-jmp-and-loop-memset.md`.
+
+1. **DONE — bool-pair tail jmp** (audit finding, real miscompile, 2105 vs
+   2009 demonstrator). Fixed in the fused arm; pinned structurally +
+   differentially by `tests/regression/check_bool_pair_tail_jmp.sh`.
+   Remaining watch item: the structural check currently reports chains
+   found in ONE hand-built TU; if future pipelines produce more fused
+   sites, extend the corpus scan in `ci_local` if gaps appear.
+2. **DONE — loop-memset** (fill loops → `memset`): lz4 −1.75% Ir on this
+   tree, 39/39 corpus differential clean, disjoint from the merged
+   loop_idiom memcpy pass by census construction.
+3. **OPEN — call-aware RA span planning**: nested COPY loops still refuse
+   in any pass lacking call-aware planning (the merged early pass solves
+   them via preheader calls; a late-site copy rewrite remains blocked).
+   Prerequisite for re-enabling nested late-site copies.
+4. **OPEN — hash_table-class zero-init**: the golden hash_table workload's
+   init loop no longer matches after the upstream pipeline rework (3
+   loops in main, none matching). Re-derive the shape and check whether
+   loop-memset should fire there (insns down, gate-safe improvement).
+5. **OPEN — i686 span-steal validation**: the EM_386-gated steal (S03)
+   keeps its documented lz4/i686 rationale but has NO dynamic measurement
+   in this line yet (no i686 runner on this VM). Measure before touching
+   the knob defaults.

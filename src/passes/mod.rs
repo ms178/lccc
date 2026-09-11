@@ -48,6 +48,7 @@ pub(crate) mod loop_carried_forward;
 pub(crate) mod loop_idiom;
 pub(crate) mod loop_invert;
 pub(crate) mod loop_memory_promote;
+pub(crate) mod loop_memset;
 pub(crate) mod loop_rotate;
 pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
@@ -2329,6 +2330,24 @@ pub(crate) fn run_passes(
     // recurrences that the early run could not normalise.
     loop_carried_forward::run_module(module);
     verify::verify_after_pass(module, "loop_carried_forward_late");
+    // Loop-memset recognition (LMR): constant-byte fill loops → memset(3).
+    // Companion to the early loop_idiom pass (byte-COPY loops → memcpy):
+    // its census refuses stored load results, so the two passes are
+    // structurally disjoint. Runs LATE — the settled post-IVSR/CFG shape is
+    // what the while-form/do-while recognizers match — and before redundant
+    // load elimination, so the call acts as the memory barrier the removed
+    // stores were. Kill switches: `CCC_NO_MEMSET_LOOP`, per-gate refusal
+    // tracing via `CCC_MEMSET_LOOP_TRACE`. Pass name for CCC_DISABLE_PASSES:
+    // "loop_memset".
+    if !pass_disabled(&disabled, "loop_memset") && std::env::var_os("CCC_NO_MEMSET_LOOP").is_none()
+    {
+        for function in &mut module.functions {
+            let changed = loop_memset::run(function);
+            if changed > 0 {
+                verify::verify_after_func_pass(function, "loop_memset");
+            }
+        }
+    }
     // Late redundant-load elimination: post-IVSR field accesses have constant
     // offsets, so same-address loads merge when intervening stores are
     // provably non-aliasing (volatile loads are exempt by construction).

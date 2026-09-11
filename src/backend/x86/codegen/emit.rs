@@ -668,6 +668,24 @@ pub struct X86Codegen {
     /// recorded operands and uses cmovcc/jcc directly instead of testing the
     /// materialized boolean (setcc/movzbl/testq chain). Keyed by Cmp dest.
     pub(super) cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
+    /// BOOL-PAIR (AND-of-compares) branch fusion: And-binop dest (branch
+    /// condition) -> both legs' compares; the branch re-emits them as a
+    /// short-circuit jcc chain. `bool_pair_cmps` are the leg Cmp dests whose
+    /// setcc/movzbl materialization is skipped.
+    pub(super) cmp_bool_pair: FxHashMap<
+        u32,
+        (
+            IrCmpOp,
+            Operand,
+            Operand,
+            IrType,
+            IrCmpOp,
+            Operand,
+            Operand,
+            IrType,
+        ),
+    >,
+    pub(super) bool_pair_cmps: FxHashSet<u32>,
     /// CMP-REPLAY operand -> consumer links built with `cmp_replay` (IS-09):
     /// merged into the RA's folded_index_uses so register-homed replay
     /// operands keep their homes until the consumer re-emits the compare.
@@ -1065,6 +1083,8 @@ impl X86Codegen {
             bitop_nonneg_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
             fused_forward_dests: FxHashSet::default(),
+            cmp_bool_pair: FxHashMap::default(),
+            bool_pair_cmps: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             cmp_replay_operand_links: FxHashMap::default(),
             fp_select_cmps: FxHashMap::default(),
@@ -6370,6 +6390,21 @@ impl ArchCodegen for X86Codegen {
                 return false;
             }
         }
+        // BOOL-PAIR (AND-of-compares) branch fusion: a fused And emits
+        // NOTHING (the branch replays both leg compares). Keep it on the
+        // text path so emit_int_binop_impl's skip is the single point of
+        // enforcement — the MachInst window lowering would happily emit a
+        // real `andl` reading the legs' skipped boolean homes.
+        if let crate::ir::reexports::Instruction::BinOp {
+            dest,
+            op: crate::ir::reexports::IrBinOp::And,
+            ..
+        } = inst
+        {
+            if self.cmp_bool_pair.contains_key(&dest.0) {
+                return false;
+            }
+        }
         // W2 Load->Cast folding is a two-instruction runtime handshake: the
         // default Load emitter redirects into the Cast destination and arms
         // fold_skip_cast; the default Cast emitter consumes that handshake.
@@ -6467,7 +6502,8 @@ impl ArchCodegen for X86Codegen {
             }
             crate::ir::reexports::Instruction::Cmp { dest, .. }
                 if self.fused_cmp_dests.contains_key(&dest.0)
-                    || self.cmp_replay.contains_key(&dest.0) =>
+                    || self.cmp_replay.contains_key(&dest.0)
+                    || self.bool_pair_cmps.contains(&dest.0) =>
             {
                 // Fused candidates keep their flags for the adjacent consumer;
                 // REPLAY candidates are emitted by the mature path's Cmp
