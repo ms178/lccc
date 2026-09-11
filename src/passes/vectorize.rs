@@ -7550,10 +7550,32 @@ fn transform_byte_count_reduction_inner(
     // `And(tree, 1)` discipline: a 0/1 value in the scalar world equals
     // the original predicate).  Failing here is pre-mutation: clean
     // decline.
+    // The scalar mirror below references the map's source bases, which may
+    // be defined INSIDE the vectorized loop (in-loop GEPs) — visible neither
+    // in the remainder body nor in the vector exit. Rematerialize each base's
+    // pure chain into the vector-exit prefix (`vec_exit` dominates the whole
+    // remainder, so the fresh values are visible where the mirror needs them)
+    // and aim the mirror at those. Pre-mutation: declining here leaves the
+    // function untouched.
+    let mut vec_exit_prefix: Vec<Instruction> = Vec::new();
+    let mut mirror_bases: Vec<Value> = Vec::with_capacity(p.src_bases.len());
+    for &b in &p.src_bases {
+        let Some(plan) = plan_remainder_reference(func, b, &p.loop_blocks) else {
+            if debug {
+                eprintln!("[VEC-CNT] source base has no dominance plan; declining");
+            }
+            return 0;
+        };
+        mirror_bases.push(materialize_remainder_reference(
+            plan,
+            &mut vec_exit_prefix,
+            &mut *next_val_id,
+        ));
+    }
     let mut mirror_next = *next_val_id;
     let scalar_v = emit_scalar_count_tree(
         &count_tree,
-        &p.src_bases,
+        &mirror_bases,
         p.elem_ty,
         byte_off_op,
         &mut rem_body_insts,
@@ -7788,21 +7810,25 @@ fn transform_byte_count_reduction_inner(
 
     let vec_exit_block = BasicBlock {
         label: vec_exit_label,
-        instructions: vec![
-            Instruction::Intrinsic {
+        instructions: {
+            // The rematerialized source-base chains first: they dominate
+            // (and are consumed by) the remainder below.
+            let mut insts = vec_exit_prefix;
+            insts.push(Instruction::Intrinsic {
                 dest: Some(h),
                 op: IntrinsicOp::VecHorizontalAddI64x4,
                 dest_ptr: None,
                 args: vec![Operand::Value(p.acc_phi)],
-            },
-            Instruction::BinOp {
+            });
+            insts.push(Instruction::BinOp {
                 dest: rem_start,
                 op: IrBinOp::Mul,
                 lhs: Operand::Value(p.iv),
                 rhs: Operand::Const(iv_width_const),
                 ty: p.iv_ty,
-            },
-        ],
+            });
+            insts
+        },
         terminator: Terminator::Branch(rem_header_label),
         source_spans: vec![],
     };
@@ -14097,6 +14123,12 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
     // Hoist the loop-invariant A[i][k] scalar broadcast to the preheader.
     // AArch64 codegen keeps it in v15, outside the allocator's v16-v31 pool.
+    // `pattern.a_ptr` may be defined INSIDE the loop (an in-loop GEP over
+    // outer IVs); naming it from the preheader would be a use-before-def the
+    // verifier rejects. Rematerialize its pure chain above the broadcast.
+    // The `fma_remainder_references_sound` gate at function entry already
+    // proved a plan exists (steps 1-2 only ADD pure nodes to the chain), so
+    // `expect` documents an unreachable path rather than a real choice.
     if let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
         if pattern.loop_blocks.contains(&idx) {
             return None;
@@ -14105,13 +14137,18 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             if label == func.blocks[pattern.header_idx].label)
         .then_some(idx)
     }) {
+        let bc_plan = plan_remainder_reference(func, pattern.a_ptr, &pattern.loop_blocks)
+            .expect("fma broadcast hoist lost its dominance plan");
+        let mut hoist_prefix = Vec::new();
+        let bc_ptr = materialize_remainder_reference(bc_plan, &mut hoist_prefix, &mut next_val_id);
+        func.blocks[preheader_idx].instructions.extend(hoist_prefix);
         func.blocks[preheader_idx]
             .instructions
             .push(Instruction::Intrinsic {
                 dest: None,
                 op: IntrinsicOp::BroadcastLoadF64,
                 dest_ptr: None,
-                args: vec![Operand::Value(pattern.a_ptr)],
+                args: vec![Operand::Value(bc_ptr)],
             });
         changes += 1;
     }
@@ -14724,6 +14761,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
     // Hoist the loop-invariant A[i][k] scalar broadcast to the preheader.
     // Backend keeps it in ymm1, reused across all 4 FMA lanes (saves 3× vmovsd+vbroadcastsd per iter).
+    // `pattern.a_ptr` may be defined INSIDE the loop (see the f64x2 hoist
+    // above); rematerialize its pure chain above the broadcast. The entry
+    // gate already proved a plan exists, so `expect` is unreachable.
     if let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
         if pattern.loop_blocks.contains(&idx) {
             return None;
@@ -14732,19 +14772,24 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             if label == func.blocks[pattern.header_idx].label)
         .then_some(idx)
     }) {
+        let bc_plan = plan_remainder_reference(func, pattern.a_ptr, &pattern.loop_blocks)
+            .expect("fma broadcast hoist lost its dominance plan");
+        let mut hoist_prefix = Vec::new();
+        let bc_ptr = materialize_remainder_reference(bc_plan, &mut hoist_prefix, &mut next_val_id);
+        func.blocks[preheader_idx].instructions.extend(hoist_prefix);
         func.blocks[preheader_idx]
             .instructions
             .push(Instruction::Intrinsic {
                 dest: None,
                 op: IntrinsicOp::BroadcastLoadF64,
                 dest_ptr: None,
-                args: vec![Operand::Value(pattern.a_ptr)],
+                args: vec![Operand::Value(bc_ptr)],
             });
         changes += 1;
         if debug {
             eprintln!(
                 "[VEC]   Hoisted BroadcastLoadF64 for A ptr Value({}) into preheader block {}",
-                pattern.a_ptr.0, preheader_idx
+                bc_ptr.0, preheader_idx
             );
         }
     }

@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================================
-# check_bool_pair_prune.sh — pin the bool-pair post-RA prune's atomicity.
+# check_bool_pair_prune.sh — pin the And-split post-RA prune's atomicity.
+# (Kept name: the gate predates the De Morgan split that superseded the
+# bool-pair fusion; the contract it pins is unchanged.)
 #
-# The bool-pair fusion skips both legs' setcc/movzbl and re-emits the
-# compares at the branch. When a leg operand has no readable home at the
-# branch (post-RA prune in prologue.rs), the pair must be dropped
-# ATOMICALLY: the And entry AND both legs' skip memberships. A prune that
-# forgets the leg dests leaves both setccs skipped while the And falls
-# back to a real `andl` over never-written boolean homes (half-pruned
-# miscompile — every leg reads stale garbage).
+# The De Morgan split skips both legs' setcc/movzbl (plus the And/Or) and
+# re-emits the compares at the branch with a short-circuit jump between
+# them. When a leg operand has no readable home at the branch (post-RA
+# prune in prologue.rs), the split must be dropped ATOMICALLY: the And/Or
+# entry AND both legs' skip memberships. A prune that forgets the leg
+# dests leaves both setccs skipped while the And/Or falls back to a real
+# `andl`/`orl` over never-written boolean homes (half-pruned miscompile
+# — every leg reads stale garbage).
 #
 # Pruning is deterministic under CCC_NO_FOLDED_INDEX_LIVENESS=1 (register
 # homes lose their replay guarantee there), so each input below runs
@@ -103,8 +106,8 @@ done
 
 # Control: with the fusion disabled the nofold path must agree too (guards
 # against a broken test input rather than a broken fusion).
-if ! CCC_NO_FOLDED_INDEX_LIVENESS=1 CCC_NO_BOOL_PAIR=1 "$CCC" -O2 "$work/prune_binop_legs.c" -o "$work/ctl" 2>"$work/ctl.err"; then
-    echo "FAIL(control): lccc nofold+nobp compile"; head -5 "$work/ctl.err"; exit 1
+if ! CCC_NO_FOLDED_INDEX_LIVENESS=1 CCC_NO_DEMORGAN=1 "$CCC" -O2 "$work/prune_binop_legs.c" -o "$work/ctl" 2>"$work/ctl.err"; then
+    echo "FAIL(control): lccc nofold+nodm compile"; head -5 "$work/ctl.err"; exit 1
 fi
 rc_ctl=0; "$work/ctl" > "$work/ctl.out" || rc_ctl=$?
 if ! cmp -s "$work/prune_binop_legs.out.gcc" "$work/ctl.out"; then

@@ -2236,6 +2236,30 @@ impl X86Codegen {
         self.state
             .emit_fmt(format_args!("    # LCCC_RET_XMM {}", ret_xmm_mask));
 
+        // Publish whether `%rdx` is read by `ret` (a 128-bit or two-GP
+        // eightbyte return) so the late text peephole's GP liveness oracle
+        // (`liveness.rs`) need not infer it from the epilogue's tail block
+        // (which any `%rdx` traffic — even a mere read — defeats, hiding
+        // every `%rdx`-sourced coalescing opportunity). Same contract as the
+        // XMM marker: authoritative when present, tail-block inference
+        // otherwise. `%rax` stays unconditionally live (unchanged).
+        //
+        // Only 128-bit IR returns can keep `%rdx` live: plain `i128` (whose
+        // classification is empty — it is not a struct) and two-register
+        // structs/vectors (packed into `I128` by the lowering). A classified
+        // non-`[Integer, Integer]` pair is shuffled out of `%rdx` before
+        // every `ret` (see `returns.rs`), so it reads dead; anything
+        // unclassifiable fails closed to live, as do naked functions.
+        let ret_rdx_live = func.is_naked
+            || matches!(func.return_type, IrType::I128 | IrType::U128)
+                && (func.ret_eightbyte_classes.len() != 2
+                    || func.ret_eightbyte_classes
+                        == [EightbyteClass::Integer, EightbyteClass::Integer]);
+        self.state.emit_fmt(format_args!(
+            "    # LCCC_RET_RDX {}",
+            u8::from(ret_rdx_live)
+        ));
+
         if func.is_variadic {
             let base = self.reg_save_area_offset;
 

@@ -1598,7 +1598,13 @@ mod tests {
     }
 
     #[test]
-    fn copy_plus_add_is_kept_when_flags_are_read() {
+    fn copy_plus_add_keeps_flags_when_read() {
+        // The hazard pinned here is the flag-free `leal`: with `je` reading
+        // the flags, copy+add must never become `leal 1(%ebx), %r8d`. Two
+        // spellings satisfy that — the pair kept verbatim, or the copy
+        // coalesced into a retargeted `addl` (which computes IDENTICAL flags
+        // from the same value, so `je` still observes them). Pin the
+        // invariant, not the spelling.
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -1608,7 +1614,15 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(out.contains("addl $1, %r8d"), "{out}");
+        assert!(!out.contains("leal"), "{out}");
+        assert!(
+            out.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with("addl $1, ") && (l.ends_with("%r8d") || l.ends_with("%ebx"))
+            }),
+            "{out}"
+        );
+        assert!(out.contains("je .LBB9"), "{out}");
     }
 
     #[test]

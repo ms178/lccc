@@ -2,8 +2,10 @@
 # ============================================================================
 # check_bool_pair_tail_jmp.sh — pin the fused AND-of-compares chain's
 # fall-through contract.
+# (Kept name: the gate predates the De Morgan split that superseded the
+# bool-pair fusion; the contract it pins is unchanged.)
 #
-# The bool-pair fusion re-emits `cmp1; jcc(inv1) cold; cmp2; <jcc2>` at the
+# The De Morgan split re-emits `cmp1; jcc(inv1) cold; cmp2; <jcc2>` at the
 # branch. Control flow after jcc2 depends on layout:
 #   - hot successor physically next:  jcc2 -> cold; fall into hot;
 #   - cold successor physically next: jcc2 -> hot;  fall into cold;
@@ -42,7 +44,7 @@ static unsigned long run(unsigned seed) {
     for (unsigned i = 0; i < N; i++) {
         unsigned v = seed + i;
         /* The lz4_compress fill-loop shape: two pure compares ANDed into a
-         * branch — the exact pattern the bool-pair fusion fires on. */
+         * branch — the exact pattern the De Morgan split fires on. */
         if ((v & 15u) < 6u && i >= 128u) {
             s += (unsigned)D[i];
         } else {

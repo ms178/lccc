@@ -1,5 +1,6 @@
-//! Generic x86-64 codegen peepholes: register move-relay elimination and
-//! windowed `lea`→memory-operand folding.
+//! Generic x86-64 codegen peepholes: register move-relay elimination,
+//! windowed `lea`→memory-operand folding, and copy-into-RMW-consumer
+//! coalescing.
 //!
 //! Both passes are block-local, width-exact, and liveness-checked. They exist
 //! because the accumulator-based backend routinely emits
@@ -1045,7 +1046,11 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
                 abort = true;
                 break;
             };
-            rewrites.push((k, t, new_t));
+            // Raw stored line: restoring the trimmed matcher here stripped
+            // the line's indentation whenever the deadness proof refused the
+            // candidate (cosmetic only — the assembler ignores indentation —
+            // but it pollutes assembly diffs and indent-anchored counters).
+            rewrites.push((k, store.get(k).to_string(), new_t));
             k += 1;
         }
         if abort {
@@ -1083,6 +1088,346 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
     changed
 }
 
+// ── Pass: copy-into-RMW-consumer coalescing ──────────────────────────────
+
+/// Two-operand ALU mnemonics (AT&T, destination last) eligible as the
+/// consuming instruction of a coalesced copy. Every entry is strictly
+/// two-operand — no `imul` three-operand form, no `lea` SIB reads — and reads
+/// its source operands before writing its destination, so retargeting the
+/// destination from the copy's destination family to its source family
+/// preserves the computed value and the flags. Deliberately minimal: `adc`,
+/// `sbb`, `rol` and `ror` are sound by the same argument but unmeasured —
+/// extend only with census data.
+const RMW_CONSUMER_OPS: &[&str] = &[
+    "andl ", "orl ", "xorl ", "addl ", "subl ", "shll ", "shrl ", "sarl ", "andq ", "orq ",
+    "xorq ", "addq ", "subq ", "shlq ", "shrq ", "sarq ",
+];
+
+/// Coalesce `mov %S, %D` into the read-modify-write consumer that destinations
+/// `%D`, retargeting the consumer and renaming the following plain-register
+/// reads of `%D` to `%S`:
+///
+/// ```text
+///     movl %r8d, %r10d         andl $2080895, %r8d
+///     andl $2080895, %r10d  -> orl %r8d, %edi
+///     orl %r10d, %edi
+/// ```
+///
+/// Why the sibling passes decline it:
+/// * `eliminate_move_relays` rewrites uses of the copy destination to the
+///   copy source only when the consumer's destination is a DIFFERENT family
+///   (a pure source read) — here `%r10d` IS the consumer's destination;
+/// * `retarget_producer_into_copy` requires a pure (non-RMW) producer;
+/// * `coalesce_register_copies` handles only entry-block `movq` shuffles.
+///
+/// Soundness:
+/// 1. The consumer is adjacent (NOPs apart). For a plain copy `%S == %D`
+///    still holds there, and the destination width is at most the copy's
+///    width — a 64-bit consumer under a 32-bit copy would read the source's
+///    unknown upper half. For an extension copy the consumer must be
+///    `andl $mask` with the mask clearing every bit above the extension
+///    width: below it both spellings agree (the extension's identity bits),
+///    above it the mask forces zero in both. Either way the consumer reads
+///    identical values before and after the destination retarget, hence
+///    computes the identical result and flags (x86 reads all sources before
+///    writing the destination; the deleted `mov` writes no flags).
+/// 2. Every renamed line reads `%D` after the consumer wrote it, and `%S`
+///    holds exactly `%D`'s current value there (the retargeted consumer
+///    established it; every prior rename preserved it — including
+///    read-modify-writes of `%D`, which compute the identical result+flags
+///    from the same values into `%S`). A full redefinition of `%D` ends the
+///    window; ANY mention of `%S` aborts it (a pre-existing read would
+///    observe the new value instead of the old one, a write would clobber
+///    the renamed value); partial writes (`movb`, `setcc`), `cmov`/`xchg`
+///    and memory mentions of `%D` abort, as do pinned lines and lines with
+///    implicit register traffic; the window ends at barriers, leaving
+///    downstream paths to the deadness proof.
+/// 3. The source's OLD value must be dead at the copy (`provably_dead_lv` on
+///    the pre-rewrite text): the consumer's write unconditionally clobbers
+///    the source family.
+/// 4. After the rewrite, `%D` must be provably dead (`provably_dead_lv` on a
+///    fresh analysis, anchored at the consumer line): the deleted copy no
+///    longer defines it. On failure every rewrite is rolled back textually
+///    and the original pair stays.
+/// Parse an `and $imm, ...` source operand into its u32 mask. Accepts GAS
+/// decimal/hex immediates (`$127`, `$0x7f`, `$-1`); anything else (symbols,
+/// malformed) refuses so the caller falls back to `continue`.
+fn parse_and_mask(src: &str) -> Option<u32> {
+    let digits = src.strip_prefix('$')?;
+    if digits.is_empty() {
+        return None;
+    }
+    if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).ok()
+    } else if let Some(neg) = digits.strip_prefix('-') {
+        neg.parse::<i32>().ok().map(|v| (-v) as u32)
+    } else {
+        digits.parse::<u32>().ok()
+    }
+}
+
+/// `true` when `t` is a two-operand ALU read-modify-write fully redefining
+/// `fam`: the destination names `fam` at 32/64 bits and the mnemonic reads it
+/// (add/sub/logic/imul-2op/shift — every one of these reads its destination,
+/// so with `%S` holding `%D`'s current value the renamed op computes the
+/// identical result+flags into `%S`). The three-operand `imul` form is a pure
+/// write (no dest read); one-operand forms, `adc`/`sbb`, partial writes,
+/// `cmov`/`xchg` and port I/O are all conservatively excluded — unmeasured,
+/// kept aborting.
+fn is_rmw_of_family(t: &str, fam: RegId) -> bool {
+    if !dest_is_full_width(t, fam) {
+        return false;
+    }
+    let trimmed = t.trim_start();
+    let Some(sp) = trimmed.find(' ') else {
+        return false;
+    };
+    if !matches!(
+        &trimmed[..sp],
+        "andl"
+            | "orl"
+            | "xorl"
+            | "addl"
+            | "subl"
+            | "imull"
+            | "shll"
+            | "shrl"
+            | "sarl"
+            | "sall"
+            | "andq"
+            | "orq"
+            | "xorq"
+            | "addq"
+            | "subq"
+            | "imulq"
+            | "shlq"
+            | "shrq"
+            | "sarq"
+            | "salq"
+    ) {
+        return false;
+    }
+    let Some((s0, _)) = split_two_operands(trimmed[sp + 1..].trim_start()) else {
+        return false;
+    };
+    // A top-level comma inside the first operand means three operands (the
+    // pure-write `imul` form); commas inside memory parens are fine.
+    last_top_level_comma(s0.as_bytes()).is_none()
+}
+
+pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        let li = i;
+        i += 1;
+        if infos[li].is_nop() || infos[li].pinned || infos[li].is_barrier() {
+            continue;
+        }
+        let mov = infos[li].trimmed(store.get(li)).to_string();
+        // A plain copy (`movl`/`movq`), or a zero/sign-extending copy whose
+        // extension garbage the consumer's mask provably kills: `movzbl %dl,
+        // %r11d; andl $127, %r11d` ≡ `movl %edx, %r11d; andl $127, %r11d`,
+        // since the mask clears every bit the two spellings could disagree
+        // on. `ext_bits` records how many low bits they agree on.
+        let (copy_w, copy_rest, ext_bits) = if let Some(r) = mov.strip_prefix("movq ") {
+            (64u8, r, None)
+        } else if let Some(r) = mov.strip_prefix("movl ") {
+            (32u8, r, None)
+        } else if let Some(r) = mov
+            .strip_prefix("movzbl ")
+            .or_else(|| mov.strip_prefix("movsbl "))
+        {
+            (32u8, r, Some(8u32))
+        } else if let Some(r) = mov
+            .strip_prefix("movzwl ")
+            .or_else(|| mov.strip_prefix("movswl "))
+        {
+            (32u8, r, Some(16u32))
+        } else {
+            continue;
+        };
+        let Some((copy_src, copy_dst)) = split_two_operands(copy_rest) else {
+            continue;
+        };
+        let (Some(s_fam), Some(d_fam)) = (plain_gp_operand(copy_src), plain_gp_operand(copy_dst))
+        else {
+            continue;
+        };
+        if s_fam == d_fam || !is_relayable_family(s_fam) || !is_relayable_family(d_fam) {
+            continue;
+        }
+        // An extension copy must read the NARROW source at exactly the
+        // extension width and write the 32-bit destination: anything else is
+        // either invalid x86 or not an extension at all.
+        if let Some(bits) = ext_bits {
+            let narrow = if bits == 8 { 3usize } else { 2usize };
+            if copy_src != REG_NAMES[narrow][s_fam as usize]
+                || copy_dst != REG_NAMES[1][d_fam as usize]
+            {
+                continue;
+            }
+        }
+        // The consumer: adjacent (NOPs apart) so `%S == %D` still holds, a
+        // two-operand ALU op destinationing exactly `%D` at a width the copy
+        // established.
+        let mut j = li + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].pinned || infos[j].is_barrier() {
+            continue;
+        }
+        let cons = infos[j].trimmed(store.get(j)).to_string();
+        if has_implicit_reg_usage(&cons) {
+            continue;
+        }
+        let Some(op) = RMW_CONSUMER_OPS.iter().find(|op| cons.starts_with(**op)) else {
+            continue;
+        };
+        let Some((cons_src, cons_dst)) = split_two_operands(&cons[op.len()..]) else {
+            continue;
+        };
+        // Extension copies need an `andl $mask` consumer whose mask kills
+        // every bit above the extension width: below it both spellings agree
+        // (the extension's identity bits), above it the mask forces zero in
+        // both. Any other consumer — or an unparseable/wider mask — refuses.
+        if let Some(bits) = ext_bits {
+            if *op != "andl " {
+                continue;
+            }
+            let Some(mask) = parse_and_mask(cons_src) else {
+                continue;
+            };
+            if mask & !((1u32 << bits) - 1) != 0 {
+                continue;
+            }
+        }
+        let (Some(cons_dst_fam), Some(cons_w)) = (plain_gp_operand(cons_dst), dest_width(cons_dst))
+        else {
+            continue;
+        };
+        if cons_dst_fam != d_fam || cons_w > copy_w {
+            continue;
+        }
+        // The renamer doubles as the consumer validator: a plain-register
+        // `%D` source (`addl %D, %D`) retargets soundly (both operands hold
+        // the same value), while a memory mention of `%D` refuses the
+        // candidate. The rollback original is the RAW stored line: restoring
+        // the trimmed matcher would strip the line's indentation on the
+        // refuse path.
+        let Some(new_cons) = rename_plain_family_reads(&cons, d_fam, s_fam) else {
+            continue;
+        };
+        let orig_cons = store.get(j).to_string();
+        // The consumer's write unconditionally clobbers the source family,
+        // so the source's OLD value must be dead at the copy.
+        if !provably_dead_lv(&lv, store, infos, li, s_fam, &[li]) {
+            continue;
+        }
+        // --- rename window: plain-register reads of %D until the first full
+        // --- redefinition of %D or a barrier. Collect rewrites; abort on
+        // --- anything unrenamable.
+        let d_mask = 1u16 << d_fam;
+        let mut rewrites: Vec<(usize, String, String)> = vec![(j, orig_cons, new_cons)];
+        let mut abort = false;
+        let mut k = j + 1;
+        while k < len {
+            if infos[k].is_nop() {
+                k += 1;
+                continue;
+            }
+            if infos[k].pinned || has_implicit_reg_usage(infos[k].trimmed(store.get(k))) {
+                abort = true;
+                break;
+            }
+            if infos[k].is_barrier() {
+                break; // downstream paths are the deadness proof's job
+            }
+            let t = infos[k].trimmed(store.get(k)).to_string();
+            if line_refs_family(&t, s_fam) {
+                abort = true;
+                break;
+            }
+            if infos[k].reg_refs & d_mask == 0 {
+                k += 1;
+                continue;
+            }
+            // %D redefined without reading itself: later reads see the new
+            // def, not our value — the window ends.
+            if is_full_write(&infos[k], &t, d_fam) {
+                break;
+            }
+            // A read-modify-write of %D renames like a read: %S holds %D's
+            // current value (the retargeted consumer established it and every
+            // prior rename preserved it), so the renamed op computes the
+            // identical result and flags from the same values into %S, and
+            // later %D reads (renamed to %S) observe exactly the value they
+            // would have. Pure/partial writes (`movb`, `setcc`), `cmov` and
+            // `xchg` still abort (unmeasured, conservatively kept), as does
+            // anything the renamer cannot spell (memory mentions of %D, a
+            // `%cl` count of the coalesced family).
+            if writes_family(&infos[k], &t, d_fam) {
+                if !is_rmw_of_family(&t, d_fam) {
+                    abort = true;
+                    break;
+                }
+                let Some(new_t) = rename_plain_family_reads(&t, d_fam, s_fam) else {
+                    abort = true;
+                    break;
+                };
+                rewrites.push((k, store.get(k).to_string(), new_t));
+                k += 1;
+                continue;
+            }
+            let Some(new_t) = rename_plain_family_reads(&t, d_fam, s_fam) else {
+                abort = true;
+                break;
+            };
+            // Raw stored line (see the consumer note above): a trimmed
+            // rollback original would strip indentation on the refuse path.
+            rewrites.push((k, store.get(k).to_string(), new_t));
+            k += 1;
+        }
+        if abort {
+            continue;
+        }
+
+        // --- apply, prove, or roll back (same discipline as
+        // --- `fold_copy_into_lea_base`) -----------------------------------
+        let orig_copy = store.get(li).to_string();
+        mark_nop(&mut infos[li]);
+        for &(idx, _, ref new_t) in &rewrites {
+            replace_line(store, &mut infos[idx], idx, new_t.clone());
+        }
+        let lv2 = FileLiveness::new(store, infos);
+        // The deadness query is anchored at the consumer line, NOT at the
+        // copy: the copy is NOP-marked at this point and `FileLiveness` only
+        // marks real instructions as known, so a query at its index would
+        // answer `None` and silently degrade the proof to its syntactic
+        // fallbacks. Nothing between the copy and the consumer touches `%D`,
+        // so "dead after the consumer" is exactly "dead after the (deleted)
+        // copy" on the rewritten text.
+        if provably_dead_lv(&lv2, store, infos, j, d_fam, &[li, j]) {
+            lv = lv2;
+            changed = true;
+            i = j + 1;
+        } else {
+            replace_line(store, &mut infos[li], li, orig_copy);
+            for (idx, orig, _) in rewrites {
+                replace_line(store, &mut infos[idx], idx, orig);
+            }
+            // `lv` still describes the restored text.
+        }
+    }
+    changed
+}
+
 /// Rename every PLAIN-REGISTER mention of family `from` to the same-width
 /// register of family `to` inside one instruction's text. Returns `None`
 /// when `from` appears anywhere this routine cannot rewrite (a memory
@@ -1096,10 +1441,62 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> 
     let (mnemonic, rest) = trimmed.split_at(sp);
     let rest = rest.trim_start();
     let (s0, s1) = split_two_operands(rest)?;
+    // The shift/rotate count register is FIXED by the ISA: only `%cl` is
+    // encodable there, so a `%cl` source on these mnemonics can neither be
+    // renamed (invalid x86) nor kept (it would read the stale pre-rewrite
+    // value). Refuse; both callers abort/roll back on `None`. `%cl` as an
+    // ordinary byte operand (`movzbl %cl, %eax`) still renames — any byte
+    // register is a valid, value-identical spelling there.
+    let count_fixed = matches!(
+        mnemonic,
+        "shl"
+            | "shlb"
+            | "shlw"
+            | "shll"
+            | "shlq"
+            | "sal"
+            | "salb"
+            | "salw"
+            | "sall"
+            | "salq"
+            | "shr"
+            | "shrb"
+            | "shrw"
+            | "shrl"
+            | "shrq"
+            | "sar"
+            | "sarb"
+            | "sarw"
+            | "sarl"
+            | "sarq"
+            | "rol"
+            | "rolb"
+            | "rolw"
+            | "roll"
+            | "rolq"
+            | "ror"
+            | "rorb"
+            | "rorw"
+            | "rorl"
+            | "rorq"
+            | "rcl"
+            | "rclb"
+            | "rclw"
+            | "rcll"
+            | "rclq"
+            | "rcr"
+            | "rcrb"
+            | "rcrw"
+            | "rcrl"
+            | "rcrq"
+    );
     let ren = |op: &str| -> Option<String> {
         if let Some(f) = plain_gp_operand(op) {
             if f != from {
                 return Some(op.to_string());
+            }
+            if count_fixed && op == "%cl" {
+                return None; // unencodable anywhere else; unkeepable (stale)
             }
             for row in REG_NAMES.iter() {
                 if row[from as usize] == op {
@@ -1199,6 +1596,200 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(out.contains("movl %eax, %r10d"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_copy_and_renames_later_use() {
+        // The sqlite-varint exit shape: `movl` copy into an `andl` consumer
+        // with a second use of the copy dest further down.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    andl $2080895, %r10d\n",
+            "    orl %r10d, %edi\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("andl $2080895, %r8d"), "{out}");
+        assert!(out.contains("orl %r8d, %edi"), "{out}");
+        assert!(!out.contains("%r10"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_64bit_copy() {
+        // `subq` (non-commutative) defeats `load_alu_fuse`'s copy+commute,
+        // and the later full redefinition of %r12 defeats whole-function
+        // `copy_coalesce` (rule 2) without making the source live.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r12, %r11\n",
+            "    subq %r9, %r11\n",
+            "    movq %r11, (%rsi)\n",
+            "    call bar\n",
+            "    movq $5, %r12\n",
+            "    addq %r12, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("subq %r9, %r12"), "{out}");
+        assert!(out.contains("movq %r12, (%rsi)"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_32bit_consumer_under_64bit_copy() {
+        // A 32-bit consumer under a 64-bit copy reads only the established
+        // low half: sound, and the rewrite zero-extends identically. (The
+        // wide mask defeats `copy_mask_movz`; the later %r12 redefinition
+        // defeats whole-function `copy_coalesce`.)
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r12, %r11\n",
+            "    andl $2080895, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    call bar\n",
+            "    movq $5, %r12\n",
+            "    addq %r12, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("andl $2080895, %r12d"), "{out}");
+        assert!(out.contains("movl %r12d, %eax"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_64bit_consumer_under_32bit_copy() {
+        // The 64-bit shift reads the source's unknown upper half: unsound to
+        // retarget, so the copy must stay (whatever other passes do around
+        // it).
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %eax, %r9d\n",
+            "    shlq $32, %r9\n",
+            "    movq %r9, (%rsi)\n",
+            "    movl $0, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %eax, %r9d"), "{out}");
+        assert!(out.contains("shlq $32, %r9"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_live_source() {
+        // %r8d is read past a barrier: the rename window ends cleanly, but
+        // the source's old value is live, so the candidate must be refused.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    andl $2080895, %r10d\n",
+            "    orl %r10d, %edi\n",
+            "    jmp .Lx\n",
+            ".Lx:\n",
+            "    addl %r8d, %eax\n",
+            "    movl %edi, %edx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_source_read_inside_the_window() {
+        // The source is read between the consumer and the last dest use: the
+        // rename window must abort (a pre-existing read would observe the
+        // consumer's new value instead of the old one).
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    andl $2080895, %r10d\n",
+            "    orl %r10d, %edi\n",
+            "    addl %r8d, %eax\n",
+            "    movl %edi, %edx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_renames_rmw_of_dest_inside_the_window() {
+        // A read-modify-write of %D renames like a read: %S holds %D's
+        // current value (the retargeted consumer established it), so `addl
+        // %eax, %r8d` computes the identical result+flags from the same
+        // values, and the later %D read (renamed to %S) observes exactly
+        // the value it would have. (`xchg`/`cmov`/partial writes still
+        // abort — unmeasured, conservatively kept.)
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    andl $2080895, %r10d\n",
+            "    addl %eax, %r10d\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("andl $2080895, %r8d"), "{out}");
+        assert!(out.contains("addl %eax, %r8d"), "{out}");
+        assert!(out.contains("movl %r8d, %eax"), "{out}");
+        assert!(!out.contains("%r10"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_dest_live_at_return() {
+        // %rax is read implicitly by `ret`: the dest is not dead after the
+        // rewrite, so the transform must roll back.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r10d, %eax\n",
+            "    andl $2080895, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r10d, %eax"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_xchg_of_dest_inside_the_window() {
+        // `xchg` reads AND writes both operands: renaming it would write the
+        // source family mid-window and corrupt the later renamed reads.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    andl $2080895, %r10d\n",
+            "    xchgl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_cmov_of_dest_inside_the_window() {
+        // A conditional write of %r10d is still a write: renaming it would
+        // land its result in the wrong register on the taken path.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    andl $2080895, %r10d\n",
+            "    cmovzl %eax, %r10d\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
     }
 
     #[test]
@@ -1577,5 +2168,230 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(out.contains("leaq 1(%rbx), %r11"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_shift_count_of_dest() {
+        // `shll %cl, %ecx`: the count register is FIXED by the ISA, so the
+        // destination cannot be retargeted — renaming `%cl` emits invalid
+        // x86 (`shll %r8b, ...`), and keeping it reads the stale pre-copy
+        // count. No sound rewrite exists; the pair must stay verbatim.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %ecx\n",
+            "    shll %cl, %ecx\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %ecx"), "{out}");
+        assert!(out.contains("shll %cl, %ecx"), "{out}");
+        assert!(!out.contains("%r8b"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_shift_count_read_inside_the_window() {
+        // A `%cl` read of the destination inside the rename window is the
+        // same hazard one line later: the count cannot be renamed (invalid
+        // x86) and cannot be kept (stale value). The window must abort.
+        // (`andl`-immediate consumer: the wide mask defeats `copy_mask_movz`
+        // so the pair reaches this pass.)
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %ecx\n",
+            "    andl $2080895, %ecx\n",
+            "    shll %cl, %eax\n",
+            "    movl %eax, %edx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("andl $2080895, %ecx"), "{out}");
+        assert!(out.contains("shll %cl, %eax"), "{out}");
+        assert!(!out.contains("%r8b"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_shift_by_cl_of_other_family() {
+        // `%cl` is only special when it names the COALESCED family: here the
+        // count belongs to `%rcx` while the copy moves `%r8d`→`%r10d`, so
+        // the consumer retargets and the count survives untouched.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    shll %cl, %r10d\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("shll %cl, %r8d"), "{out}");
+        assert!(out.contains("movl %r8d, %eax"), "{out}");
+        assert!(!out.contains("%r10"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_source_read_by_consumer() {
+        // The consumer reads the source (`andl %r8d, %r10d`): the source's
+        // old value is live into the consumer, so the clobber cannot be
+        // proven dead and the candidate must be refused. (The rename
+        // window's `%S` scan is NOT for this case — it guards reads of a
+        // REDEFINED source further down the window.)
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    andl %r8d, %r10d\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+        assert!(out.contains("andl %r8d, %r10d"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_renames_byte_read_of_shift_count_family() {
+        // The `%cl` refusal is shift/rotate-specific: as an ordinary byte
+        // operand (`movzbl %cl, %eax`) `%cl` renames to `%r8b` soundly —
+        // any byte register is a valid, value-identical spelling there.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %ecx\n",
+            "    orl $3, %ecx\n",
+            "    movzbl %cl, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("orl $3, %r8d"), "{out}");
+        assert!(out.contains("movzbl %r8b, %eax"), "{out}");
+        assert!(!out.contains("%ecx"), "{out}");
+        assert!(!out.contains("%cl"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_zext_copy_under_masked_consumer() {
+        // The sqlite-varint exit shape: `movzbl %dl, %r11d` is not a plain
+        // copy (the upper bits differ from %edx's), but the `andl $127`
+        // consumer clears every bit the two spellings could disagree on —
+        // so the pair folds exactly like `movl %edx, %r11d`, and the
+        // following shift (an RMW of the destination) renames with it.
+        // (The `# LCCC_RET_RDX 0` line models prologue output: without the
+        // return-type fact the `%rdx` mention defeats the tail-block
+        // detector and the source proof conservatively refuses.)
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    # LCCC_RET_RDX 0\n",
+            "    movzbl %dl, %r11d\n",
+            "    andl $127, %r11d\n",
+            "    shll $7, %r11d\n",
+            "    movzbl %r9b, %r10d\n",
+            "    orl %r11d, %r10d\n",
+            "    movq %r10, (%rsi)\n",
+            "    movl $2, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("andl $127, %edx"), "{out}");
+        assert!(out.contains("shll $7, %edx"), "{out}");
+        assert!(out.contains("orl %edx, %r10d"), "{out}");
+        assert!(!out.contains("%r11d"), "{out}");
+        assert!(!out.contains("movzbl %dl"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_zext_copy_with_non_return_source() {
+        // Control for the masked-zext fold: the source family here is
+        // `%r9` (never read by `ret`), so the source-old-value proof needs
+        // no return-type facts and the pair folds.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl %r9b, %r11d\n",
+            "    andl $127, %r11d\n",
+            "    shll $7, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("andl $127, %r9d"), "{out}");
+        assert!(out.contains("shll $7, %r9d"), "{out}");
+        assert!(out.contains("movl %r9d, %eax"), "{out}");
+        assert!(!out.contains("%r11d"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_zext_when_rdx_return_marker_set() {
+        // The sound direction of the return-type fact: `# LCCC_RET_RDX 1`
+        // (an i128 return) keeps `%rdx` live at `ret`, so the source's old
+        // value cannot be proven dead and the pair must stay.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    # LCCC_RET_RDX 1\n",
+            "    movzbl %dl, %r11d\n",
+            "    andl $127, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movzbl %dl, %r11d"), "{out}");
+        assert!(out.contains("andl $127, %r11d"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_zext_copy_under_wide_mask() {
+        // `$511` keeps bit 8, where the zero-extension (0) and the raw
+        // source (garbage) disagree: folding would compute the wrong value.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl %dl, %r11d\n",
+            "    andl $511, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movzbl %dl, %r11d"), "{out}");
+        assert!(out.contains("andl $511, %r11d"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_zext_copy_under_non_mask_consumer() {
+        // `orl` does not kill the extension garbage (it ORs it in): only an
+        // `andl` with a subsuming mask admits an extension copy.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl %dl, %r11d\n",
+            "    orl $127, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movzbl %dl, %r11d"), "{out}");
+        assert!(out.contains("orl $127, %r11d"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_word_zext_copy_under_masked_consumer() {
+        // The 16-bit form: `movswl %dx, %r11d` agrees with %edx on the low
+        // 16 bits, and `$65535` clears the rest.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    # LCCC_RET_RDX 0\n",
+            "    movswl %dx, %r11d\n",
+            "    andl $65535, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("andl $65535, %edx"), "{out}");
+        assert!(out.contains("movl %edx, %eax"), "{out}");
+        assert!(!out.contains("%r11d"), "{out}");
     }
 }

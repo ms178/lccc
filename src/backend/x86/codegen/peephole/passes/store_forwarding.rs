@@ -336,6 +336,44 @@ fn gsf_handle_other(
     reg_offsets: &mut [SmallVec; 16],
     rbp_is_frame: bool,
 ) {
+    // SOUNDNESS: any write to %rsp reshuffles every %rsp-relative slot
+    // offset, so every offset-keyed mapping is stale afterwards. Mappings
+    // here are keyed by raw offset with no (base, offset) distinction and
+    // no rsp-bias tracker, so only a full invalidation is sound — exactly
+    // like the Push/Pop arm below (`subq $8, %rsp` before a push cascade
+    // is the same hazard as the pushes themselves).
+    //
+    // Without this, `movq %rax, 24(%rsp)` ... `subq $8, %rsp` ...
+    // `movl 24(%rsp), %eax` forwarded the pre-shift slot-24 value (still
+    // sitting in %rax) into the post-shift load that actually reads
+    // pre-shift slot 32 (machinst_window_alloc_wide_copy under
+    // CCC_NO_SMALL_SLOTS=1: the 15th printf argument). Push/Pop were
+    // already covered; only explicit %rsp arithmetic escaped.
+    //
+    // Cost: ~zero. Mappings are always empty at the prologue `subq`
+    // (the `movq %rsp, %rbp` above already cleared them via the rbp arm),
+    // and past a mid-function adjust the next push/call/label clears them
+    // anyway, so no live forwarding window is lost.
+    if dest_reg == 4 {
+        invalidate_all_mappings(slot_entries, reg_offsets);
+    }
+
+    // SOUNDNESS: `leave`/`enter` rewrite %rsp with no AT&T destination, so
+    // `dest_reg` is REG_NONE and the arm above cannot see them — and in a
+    // framed function the rbp arm below stays silent too. The emitter never
+    // produces them today (only inline asm does, and that is a barrier), but
+    // the framework classifies them as reachable text (`leave` in
+    // epilogue_merge/fp_liveness/liveness) and a future compact-epilogue
+    // optimization could emit `leave`; a stale mapping across a frame
+    // teardown would then miscompile silently. Insurance, zero cost
+    // (mappings are always empty where a teardown can stand).
+    {
+        let t = infos[i].trimmed(store.get(i));
+        if t == "leave" || t == "leaveq" || t.starts_with("enter") {
+            invalidate_all_mappings(slot_entries, reg_offsets);
+        }
+    }
+
     // SOUNDNESS: if rbp is NOT the frame pointer, any %rbp reference in an
     // Other instruction is a pointer dereference / address computation that may
     // read or write arbitrary memory. Invalidate ALL mappings so a stack slot is
@@ -686,6 +724,93 @@ mod tests {
         assert!(
             (0..store.len()).any(|i| store.get(i).contains("movq %rcx, %r11")),
             "plain straight-line forwarding must still fire"
+        );
+    }
+
+    #[test]
+    fn rsp_arithmetic_kills_slot_forwarding() {
+        // `subq $8, %rsp` between a store and a same-offset load reshuffles
+        // every %rsp-relative slot: the load reads a DIFFERENT physical
+        // slot than the store wrote. Forwarding the stored register (here
+        // %rax, still intact) into the load miscompiles — observed as the
+        // 15th printf argument going wrong in
+        // machinst_window_alloc_wide_copy under CCC_NO_SMALL_SLOTS=1.
+        // Push/Pop already invalidate; explicit %rsp arithmetic must too.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rax, 24(%rsp)\n",
+            "    subq $8, %rsp\n",
+            "    movl 24(%rsp), %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        assert!(
+            !global_store_forwarding(&mut store, &mut infos),
+            "no forwarding may fire across an %rsp adjustment"
+        );
+        let reload_idx = (0..store.len())
+            .find(|&i| store.get(i).contains("movl 24(%rsp), %eax"))
+            .expect("slot reload must survive verbatim");
+        assert!(
+            !infos[reload_idx].is_nop(),
+            "the post-shift reload must not be forwarded or deleted"
+        );
+    }
+
+    #[test]
+    fn rsp_add_kills_slot_forwarding() {
+        // Epilogue direction: `addq $N, %rsp` shifts slots the other way.
+        // Same hazard, same invalidation.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rbx, 16(%rsp)\n",
+            "    addq $16, %rsp\n",
+            "    movq 16(%rsp), %r12\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        assert!(
+            !global_store_forwarding(&mut store, &mut infos),
+            "no forwarding may fire across an %rsp add"
+        );
+        assert!(
+            (0..store.len()).any(|i| store.get(i).contains("movq 16(%rsp), %r12")),
+            "the post-shift reload must survive verbatim"
+        );
+    }
+
+    #[test]
+    fn leave_kills_slot_forwarding() {
+        // `leave` rewrites %rsp with no AT&T destination (`dest_reg` is
+        // REG_NONE), so the explicit-`%rsp`-write arm cannot see it — and
+        // with a frame pointer live the rbp arm stays silent too. Only
+        // inline asm produces `leave` today (a barrier), but the framework
+        // classifies it as reachable text and a future compact epilogue
+        // could emit one; a stale mapping across the teardown would
+        // miscompile. Pin the invalidation with a framed fragment.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movq %rax, 24(%rsp)\n",
+            "    leave\n",
+            "    movl 24(%rsp), %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        assert!(
+            !global_store_forwarding(&mut store, &mut infos),
+            "no forwarding may fire across a frame teardown"
+        );
+        assert!(
+            (0..store.len()).any(|i| store.get(i).contains("movl 24(%rsp), %eax")),
+            "the post-teardown reload must survive verbatim"
         );
     }
 }
