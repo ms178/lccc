@@ -147,6 +147,12 @@ gate "machinst-window-alloc" fast \
 gate "overalign-typed-census" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_overalign_typed_census.sh
 
+gate "loop-memset-decisions" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_memset.sh
+
+gate "bool-pair-tail-jmp-contract" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
+
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 

@@ -666,6 +666,18 @@ impl X86Codegen {
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
         let is_unsigned = ty.is_unsigned();
 
+        // BOOL-PAIR (AND-of-compares) branch fusion: this And's single use
+        // is the block's CondBranch and it is fused into a short-circuit
+        // two-jcc chain re-emitted by the branch (see
+        // emit_cond_branch_blocks_impl). Emit nothing here: the two leg
+        // compares already skipped their setcc materialization, and the
+        // branch replays both compares from the recorded operands. If
+        // post-RA pruning dropped the pair, the And dest was removed from
+        // cmp_bool_pair with it and the ordinary andl path below runs.
+        if op == IrBinOp::And && self.cmp_bool_pair.contains_key(&dest.0) {
+            return;
+        }
+
         // Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
         // X86_64 target). The TAIL of a pair emits nothing — its result was
         // stored by the HEAD's dual-store emission further up in this block
