@@ -923,6 +923,8 @@ impl X86Codegen {
             let replay_scan = super::comparison::compute_cmp_replay_scan(func, &use_counts, &fused);
             self.cmp_replay_operand_links = replay_scan.operand_links;
             self.cmp_replay = replay_scan.replay;
+            self.cmp_bool_pair = replay_scan.bool_pair;
+            self.bool_pair_cmps = replay_scan.bool_pair_cmps;
             // FP-SELECT (S05): float Cmps whose boolean feeds only Selects.
             // The Cmp emitter skips the ucomisd/setcc boolean entirely; every
             // select re-derives a vcmpsd/vcmpss mask from the recorded
@@ -1520,6 +1522,54 @@ impl X86Codegen {
             }
             for d in prune {
                 self.cmp_replay.remove(&d);
+            }
+            // ── BOOL-PAIR post-RA prune ─────────────────────────────────────
+            // Same readability contract as the replay prune: the branch
+            // re-reads all four leg operands at the branch position. A pair
+            // with any unreadable operand is dropped ATOMICALLY — including
+            // its two bool_pair_cmps members — so both Cmps fall back to
+            // materializing their booleans at their own positions and the
+            // And emits the ordinary andl. That fallback must be all-or-
+            // nothing: a half-pruned pair would skip one leg's setcc and
+            // read a boolean that was never written.
+            {
+                let ext_active = !self.state.ra_config.no_folded_index_liveness;
+                let acc_no_home: crate::common::fx_hash::FxHashSet<u32> =
+                    accumulator_assignments.iter().map(|a| a.value_id).collect();
+                let readable = |op: &Operand| -> bool {
+                    match op {
+                        Operand::Const(_) => true,
+                        Operand::Value(v) => {
+                            if self.state.get_slot(v.0).is_some() {
+                                return true;
+                            }
+                            if self.reg_assignments.contains_key(&v.0) {
+                                return ext_active;
+                            }
+                            if acc_no_home.contains(&v.0) {
+                                return false;
+                            }
+                            false
+                        }
+                    }
+                };
+                let mut prune_pairs: Vec<u32> = Vec::new();
+                for (adest, (_o1, l1, r1, _t1, _o2, l2, r2, _t2)) in self.cmp_bool_pair.iter() {
+                    if ![l1, r1, l2, r2].iter().all(|op| readable(op)) {
+                        prune_pairs.push(*adest);
+                    }
+                }
+                for adest in prune_pairs {
+                    if let Some((_o1, l1, r1, _t1, _o2, l2, r2, _t2)) =
+                        self.cmp_bool_pair.remove(&adest)
+                    {
+                        for op in [&l1, &r1, &l2, &r2] {
+                            if let Operand::Value(v) = op {
+                                self.bool_pair_cmps.remove(&v.0);
+                            }
+                        }
+                    }
+                }
             }
             // ── FP-SELECT post-RA prune (S05) ───────────────────────────────
             // Same readability contract as the replay prune above: a select

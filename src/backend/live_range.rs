@@ -1436,8 +1436,54 @@ impl LinearScanAllocator {
                 continue;
             }
             let nxt = next_use_after(&interval.range, incoming.start);
-            if mode >= 3 && nxt <= incoming.end {
+            // HOT-SPAN STEAL (RA-SPAN-STEAL): the mode-3 guard compares the
+            // victim's next use against the INCOMING's death point. That is
+            // the right churn guard for short incomings — a victim whose
+            // next use lies inside the incoming's life would be reloaded
+            // almost immediately. For a LOOP-SPANNING incoming the death
+            // point is (near) the end of the function, so the guard vetoes
+            // every active whose next use is anywhere inside the loop —
+            // i.e. it vetoes the steal exactly where the steal matters
+            // (lz4_compress: `ip` arrived at a full 6-register callee pool,
+            // remcost 1110, while spans of remcost 20-100 held registers;
+            // the guard demoted `ip` instead and every scan-loop read
+            // became a stack reload — 3.3x vs GCC). For span incomings the
+            // profitable-victim question is purely the cost comparison the
+            // `bar <= priority` check above already makes: a span holds
+            // its register from NOW to its death, so evicting a
+            // cost-dominated victim pays the victim's remaining cost once
+            // and buys the incoming's entire remaining cost. Keep two
+            // protections, both cheaper than the old blanket veto:
+            //
+            //  * recurrence-carried victims keep their register — their
+            //    reload sits ON the loop-carried chain (the sha256 a..h
+            //    lesson: +16% when those webs lose their homes), and the
+            //    cost model cannot see chain latency;
+            //  * the steal must be cost-dominated by a margin, so
+            //    near-equal costs never churn (register pressure is high
+            //    exactly where both costs are large; a marginal steal
+            //    would trade a cheap reload for an equally cheap reload).
+            if mode >= 3 && !incoming.spans_loop && nxt <= incoming.end {
                 continue;
+            }
+            if mode >= 3 && incoming.spans_loop {
+                if interval.range.span_recurrence {
+                    continue;
+                }
+                // Same cascade bound mode 5 uses: a span that already won
+                // its register by eviction may only lose it to an incoming
+                // of equal-or-higher generation, so hot-span steals cannot
+                // ping-pong through the pool.
+                if interval.range.cascade > incoming.cascade {
+                    continue;
+                }
+                // Cost domination with a 2x margin, on the position-aware
+                // weighted cost the mode-6 rank uses (the global priority
+                // comparison above stays as the mode-3 rank key).
+                let victim_cost = interval.range.spill_cost_at(pos);
+                if incoming_cost < victim_cost.saturating_mul(2) {
+                    continue;
+                }
             }
             let sw = interval.range.spill_weight;
             let better = best_idx.is_none()
@@ -1512,6 +1558,7 @@ impl LinearScanAllocator {
             && (self.ra_config.loop_span_reserve > 0
                 || range.remaining_cost(range.start) <= MAX_SPAN_REMCOST)
         {
+            if self.ra_config.trace_alloc { eprintln!("[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}", range.value_id, range.start, range.spans_loop, range.span_has_in_loop_use, range.remaining_cost(range.start), range.span_cost_bar, range.span_reserve, self.total_spans, 0); }
             self.allocate_spill_slot(range.value_id);
             return;
         }
@@ -1582,6 +1629,7 @@ impl LinearScanAllocator {
             // (function-entry pointers) and push the actually-read webs
             // out of the pool.
             if range.span_marked && !range.span_has_in_loop_use && self.total_spans > allowed {
+                if self.ra_config.trace_alloc { eprintln!("[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}", range.value_id, range.start, range.spans_loop, range.span_has_in_loop_use, range.remaining_cost(range.start), range.span_cost_bar, range.span_reserve, self.total_spans, 1); }
                 self.allocate_spill_slot(range.value_id);
                 return;
             }
@@ -1648,6 +1696,7 @@ impl LinearScanAllocator {
                     || range.remaining_cost(range.start) < range.span_cost_bar);
             if self.total_spans > allowed && worth_capping {
                 if self.loop_spanned_register_count() >= allowed {
+                    if self.ra_config.trace_alloc { eprintln!("[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}", range.value_id, range.start, range.spans_loop, range.span_has_in_loop_use, range.remaining_cost(range.start), range.span_cost_bar, range.span_reserve, self.total_spans, 2); }
                     self.allocate_spill_slot(range.value_id);
                     return;
                 }
@@ -1659,6 +1708,7 @@ impl LinearScanAllocator {
                     self.commit_assignment(range, reg);
                     return;
                 }
+                if self.ra_config.trace_alloc { eprintln!("[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}", range.value_id, range.start, range.spans_loop, range.span_has_in_loop_use, range.remaining_cost(range.start), range.span_cost_bar, range.span_reserve, self.total_spans, 3); }
                 self.allocate_spill_slot(range.value_id);
                 return;
             }
@@ -1716,6 +1766,7 @@ impl LinearScanAllocator {
         // ordinary cost-model eviction (it is the cheapest victim) frees
         // it later if pressure ever arrives.
         if range.spans_loop && range.span_marked && !range.span_has_in_loop_use {
+            if self.ra_config.trace_alloc { eprintln!("[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}", range.value_id, range.start, range.spans_loop, range.span_has_in_loop_use, range.remaining_cost(range.start), range.span_cost_bar, range.span_reserve, self.total_spans, 4); }
             self.allocate_spill_slot(range.value_id);
             return;
         }
@@ -1774,6 +1825,7 @@ impl LinearScanAllocator {
             }
         } else {
             // `range` moved only on the success path above.
+            if self.ra_config.trace_alloc { eprintln!("[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}", range.value_id, range.start, range.spans_loop, range.span_has_in_loop_use, range.remaining_cost(range.start), range.span_cost_bar, range.span_reserve, self.total_spans, 5); }
             self.allocate_spill_slot(range.value_id);
             return;
         }
