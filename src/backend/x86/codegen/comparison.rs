@@ -966,37 +966,43 @@ impl X86Codegen {
         // BOOL-PAIR (AND-of-compares) branch fusion: the condition is an
         // And of two single-use integer compares recorded by the replay
         // scan. Both compares are pure, so the And never materializes and
-        // the branch re-emits them as a short-circuit chain:
+        // the branch re-emits them as a short-circuit chain. Each leg jump
+        // targets the FALSE block: a leg being false decides the And, and
+        // the chain must leave for the false successor without evaluating
+        // the sibling (a single TRUE leg decides nothing, so no leg may
+        // jump towards the true block on its own).
         //
-        //   And, hot next (fallthrough = true target):
-        //       cmp1; j<inv1> cold; cmp2; j<inv2> cold;   (fall into hot)
-        //   And, cold next (fallthrough = false target):
-        //       cmp1; j<inv1> cold; cmp2; j<cmp2> hot;    (fall into cold)
+        //   true next:     cmp1; j<inv1> false; cmp2; j<inv2> false  (fall into true)
+        //   false next:    cmp1; j<inv1> false; cmp2; j<cmp2> true   (fall into false)
+        //   neither next:  cmp1; j<inv1> false; cmp2; j<inv2> false; jmp true
         //
         // 4 instructions instead of cmp+setcc+movzbl x2 + andl (+test/je)
         // and two fewer live booleans. Each leg's own emission already
         // happened at its IR position (materialization skipped); replaying
         // them here is the same contract the single-Cmp compare-replay
-        // uses. Soundness note: emit_jcc_block to `cold`/`hot` targets the
-        // BLOCK LABELS, so control flow is exact regardless of what the
-        // layout pass placed next; the only difference between the two
-        // shapes is which side avoids the extra jump.
+        // uses. Soundness note: the shape is keyed on the TRUE/FALSE
+        // successors themselves, never on the `hot`/`cold` layout aliases —
+        // the profile-driven fallthrough may make the FALSE successor the
+        // hot one (pref_true == false), and a chain written against
+        // `cold` would then branch on inverted conditions. The third shape
+        // is the mandatory tail jump for a branch whose block is followed
+        // by neither successor; every other arm in this function emits it,
+        // and without it the chain falls through into unrelated code.
         if let Operand::Value(cond_v) = cond {
             if let Some((o1, l1, r1, t1, o2, l2, r2, t2)) = self.cmp_bool_pair.remove(&cond_v.0) {
                 self.state.reg_cache.invalidate_acc();
-                let jcc1 = Self::cmp_jcc(o1);
-                let jcc2 = Self::cmp_jcc(o2);
+                let jcc1_false = Self::invert_jcc(Self::cmp_jcc(o1));
+                let jcc2_false = Self::invert_jcc(Self::cmp_jcc(o2));
                 self.emit_int_cmp_replay_insn(&l1, &r1, t1);
-                self.state
-                    .out
-                    .emit_jcc_block(Self::invert_jcc(jcc1), cold.0);
+                self.state.out.emit_jcc_block(jcc1_false, false_block.0);
                 self.emit_int_cmp_replay_insn(&l2, &r2, t2);
-                if hot_next {
-                    self.state
-                        .out
-                        .emit_jcc_block(Self::invert_jcc(jcc2), cold.0);
+                if next == Some(true_block) {
+                    self.state.out.emit_jcc_block(jcc2_false, false_block.0);
+                } else if next == Some(false_block) {
+                    self.state.out.emit_jcc_block(Self::cmp_jcc(o2), true_block.0);
                 } else {
-                    self.state.out.emit_jcc_block(jcc2, hot.0);
+                    self.state.out.emit_jcc_block(jcc2_false, false_block.0);
+                    self.state.out.emit_jmp_block(true_block.0);
                 }
                 self.state.reg_cache.invalidate_all();
                 return;
