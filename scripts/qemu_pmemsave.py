@@ -19,6 +19,7 @@ Addresses/sizes accept 0x-prefixed hex.  The VM is torn down afterwards.
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -48,17 +49,42 @@ def main():
     except FileNotFoundError:
         pass
     append = os.environ.get("QEMU_APPEND", "console=ttyS0,115200 nokaslr panic=-1")
+    # -display none + serial file: (not -nographic): the stdio chardev
+    # mux stalls QEMU's main loop when stdin is not a tty (harness/cron
+    # contexts), which also starves the QMP accept loop — the socket never
+    # accepts and this script dies with ConnectionRefused.
     cmd = [
         os.environ.get("QEMU", "qemu-system-x86_64"), "-m", os.environ.get("QEMU_MEM", "512"),
-        "-smp", "2", "-kernel", bz, "-nographic", "-no-reboot",
+        "-smp", "2", "-kernel", bz, "-display", "none",
+        "-serial", "file:/tmp/lccc-pmemsave-serial.log", "-no-reboot",
         "-append", append,
         "-qmp", "unix:%s,server,nowait" % qmp_path,
     ]
+    # Firmware location: without -L, QEMU falls back to its compiled-in
+    # /usr/share/qemu (absent on a rootless dpkg-extracted install) and
+    # aborts on "failed to find romfile" before the QMP socket serves.
+    # QEMU_DATA_DIR selects an explicit union dir; otherwise the qemu
+    # binary's own ../share/qemu is used when it holds the boot set.
+    fw = os.environ.get("QEMU_DATA_DIR", "")
+    if fw:
+        cmd[1:1] = ["-L", fw]
+    else:
+        qdir = os.path.join(os.path.dirname(os.path.abspath(shutil.which(cmd[0]) or "qemu-system-x86_64")), "..", "share", "qemu")
+        if all(os.path.isfile(os.path.join(qdir, f)) for f in
+               ("bios-256k.bin", "linuxboot_dma.bin", "kvmvapic.bin")):
+            cmd[1:1] = ["-L", qdir]
     p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(wait)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(qmp_path)
+        for _ in range(20):
+            try:
+                s.connect(qmp_path)
+                break
+            except (ConnectionRefusedError, FileNotFoundError):
+                time.sleep(0.5)
+        else:
+            raise ConnectionRefusedError("QMP socket %s never came up" % qmp_path)
         f = s.makefile("rw")
         read_msg(f)
         f.write(json.dumps({"execute": "qmp_capabilities"}) + "\n"); f.flush()

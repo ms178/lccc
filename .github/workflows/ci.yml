@@ -210,6 +210,20 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_overalign_typed_census.sh
 
+      # Segment-qualified declarator contract: a `__seg_fs`/`__seg_gs`
+      # qualifier before a nested type-name's base must reach that
+      # type-name's own `*` (cast `(__seg_fs unsigned long *)40` — the
+      # PR #497 CI regression: the matrix test SIGSEGV'd on an absolute
+      # load of address 40), while a `*` inside a `__typeof__` argument
+      # must not steal the ENCLOSING declaration's pending qualifier
+      # (the kernel's `extern __seg_gs __typeof__(struct irq_stack *) p;`
+      # per-CPU shape). Keep it in CI so a later parser change cannot
+      # silently re-drop either direction.
+      - name: Verify segment-qualified declarator codegen
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_segfs_typeof_nosteal.sh
+
       - name: Upload regression results
         if: always()
         uses: actions/upload-artifact@v7

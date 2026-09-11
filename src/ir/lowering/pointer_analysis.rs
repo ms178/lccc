@@ -521,6 +521,16 @@ impl Lowerer {
             }
             // Nested member access: s.inner.field — propagate from outermost base
             Expr::MemberAccess(base, _, _) => self.get_addr_space_of_struct_expr(base),
+            // Array element access: arr[i] (and a[i][j], i[a]) live in the
+            // base object's address space. Without this arm, the kernel's
+            // `__this_cpu_read(vector_irq[vector])` — which lowers through
+            // `&(vector_irq[vector])` — walked into the catch-all and lost
+            // `__seg_gs`, so common_interrupt looked the handler up in the
+            // STATIC percpu image instead of the per-CPU area and every
+            // timer interrupt hit "No irq handler for 0.48" (vector 0x30,
+            // the legacy timer IRQ whose desc binding lives precisely in
+            // that array) until "IO-APIC + timer doesn't work!" panicked.
+            Expr::ArraySubscript(base, _, _) => self.get_addr_space_of_struct_expr(base),
             // p->field where p is a segment-qualified pointer: the member
             // (including member ARRAYS, whose CType is Array not Pointer and
             // therefore invisible to get_addr_space_of_ptr_expr) lives in

@@ -14,6 +14,7 @@
 
 use super::ast::*;
 use super::parse::Parser;
+use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::TokenKind;
 
 /// C operator precedence levels (loosest to tightest binding).
@@ -195,8 +196,14 @@ impl Parser {
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
-                if let Some(type_spec) = self.parse_type_specifier() {
-                    let mut result_type = self.parse_abstract_declarator_suffix(type_spec);
+                // parse_nested_type_name scopes the pending address-space
+                // qualifier around the cast's type-name: a qualifier the
+                // cast sets before its own base (`(__seg_fs unsigned long
+                // *)40`) still reaches its own `*` arm, an enclosing
+                // declaration's qualifier is restored untouched for its
+                // own declarator, and the restore runs before any of the
+                // exits below — including the `self.pos = save` backtrack.
+                if let Some(mut result_type) = self.parse_nested_type_name() {
                     // If __attribute__((vector_size(N))) was parsed, wrap the type
                     result_type = self.apply_pending_vector_attr(result_type);
                     if matches!(self.peek(), TokenKind::RParen) {
@@ -312,8 +319,7 @@ impl Parser {
                 // _Alignof(type) - C11 standard, returns minimum ABI alignment
                 let open = self.peek_span();
                 self.expect_context(&TokenKind::LParen, "after '_Alignof'");
-                if let Some(ts) = self.parse_type_specifier() {
-                    let mut result_type = self.parse_abstract_declarator_suffix(ts);
+                if let Some(mut result_type) = self.parse_nested_type_name() {
                     result_type = self.apply_pending_vector_attr(result_type);
                     self.expect_closing(&TokenKind::RParen, open);
                     Expr::Alignof(result_type, span)
@@ -330,8 +336,7 @@ impl Parser {
                 // __alignof / __alignof__ - GCC extension, returns preferred alignment
                 let open = self.peek_span();
                 self.expect_context(&TokenKind::LParen, "after '__alignof__'");
-                if let Some(ts) = self.parse_type_specifier() {
-                    let mut result_type = self.parse_abstract_declarator_suffix(ts);
+                if let Some(mut result_type) = self.parse_nested_type_name() {
                     result_type = self.apply_pending_vector_attr(result_type);
                     self.expect_closing(&TokenKind::RParen, open);
                     Expr::GnuAlignof(result_type, span)
@@ -357,8 +362,10 @@ impl Parser {
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
-                if let Some(ts) = self.parse_type_specifier() {
-                    let mut result_type = self.parse_abstract_declarator_suffix(ts);
+                // parse_nested_type_name scopes the pending address-space
+                // qualifier (see its doc comment); the sizeof(type-name)
+                // argument is a nested type-name exactly like a cast's.
+                if let Some(mut result_type) = self.parse_nested_type_name() {
                     // If __attribute__((vector_size(N))) was parsed, wrap the type
                     result_type = self.apply_pending_vector_attr(result_type);
                     if matches!(self.peek(), TokenKind::RParen) {
@@ -741,6 +748,15 @@ impl Parser {
             // so we can detect whether `const` appeared in the type specifier.
             let saved_const = self.attrs.parsing_const();
             self.attrs.set_const(false);
+            // A _Generic association type is a nested type-name: scope the
+            // pending address-space qualifier around it so its abstract
+            // declarator cannot steal an enclosing declaration's
+            // `__seg_gs`/`__seg_fs`, and the enclosing qualifier is
+            // restored on every path. The const capture between the two
+            // parse steps is preserved, so the "pointee is const" logic
+            // below is unchanged.
+            let enclosing_address_space = self.attrs.parsing_address_space;
+            self.attrs.parsing_address_space = AddressSpace::Default;
             let (type_spec, is_const) = if matches!(self.peek(), TokenKind::Default) {
                 self.advance();
                 (None, false)
@@ -755,6 +771,7 @@ impl Parser {
             } else {
                 (None, false)
             };
+            self.attrs.parsing_address_space = enclosing_address_space;
             self.attrs.set_const(saved_const);
             self.expect_context(&TokenKind::Colon, "in '_Generic' association");
             let expr = self.parse_assignment_expr();
