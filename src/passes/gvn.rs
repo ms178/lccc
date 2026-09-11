@@ -15,7 +15,8 @@
 //! - Cast (type-to-type conversions)
 //! - GetElementPtr (base + offset address computation)
 //! - Load (redundant load elimination within dominator scope, invalidated
-//!   by stores, calls, and other memory-clobbering instructions)
+//!   by stores, calls, and other memory-clobbering instructions; integer
+//!   loads also CSE across signedness, see `XLoadUseKind`)
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
@@ -96,6 +97,40 @@ struct StoreFwdKey {
 struct MemoryVersion {
     global: u32,
     base: u64,
+}
+
+/// Load-CSE table entry: the canonical value, the EXACT load type it was
+/// recorded from (the key holds the signedness-normalized type), whether
+/// the canonical is a genuine `Load` instruction (vs a store-forwarded
+/// `Copy`), and the memory version at record time.
+///
+/// Cross-signedness CSE (an I8 canonical feeding a U8 candidate, etc.) is
+/// only sound for genuine-load canonicals: their register home then has a
+/// known extension (movsbl/movzbl), which the candidate-side use rule
+/// relies on. Forwarded entries stay exact-type-only.
+#[derive(Debug, Clone, Copy)]
+struct LoadCseEntry {
+    canon: Value,
+    canon_ty: IrType,
+    canon_is_plain_load: bool,
+    version: MemoryVersion,
+}
+
+/// Sole-use classification for cross-signedness load CSE (see
+/// `find_value_use_info`). Only the first three kinds read at most the
+/// low bits (or re-extend) from a sign-extended home, so only they admit
+/// a sext-home canonical for a zext-typed candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XLoadUseKind {
+    /// `Cmp` operand (8/16-bit cmps read the low sub-register only).
+    CmpVal,
+    /// `Cast` source with an integer-only target (int widens re-extract).
+    CastIntSrc,
+    /// `Store` value operand (`movb`/`movw` store the low bits only).
+    StoreVal,
+    /// Anything else (binops read full registers, calls/returns/terminators
+    /// have unverified narrow staging, ptr roles need full addresses).
+    Other,
 }
 
 /// A provably-distinct memory object a pointer may be rooted at.  Load-CSE and
@@ -193,8 +228,8 @@ struct GvnState {
     next_vn: u32,
     /// Pure expression -> canonical value (not memory-dependent).
     expr_to_value: FxHashMap<ExprKey, Value>,
-    /// Load expression -> canonical value and memory version.
-    load_expr_to_value: FxHashMap<ExprKey, (Value, MemoryVersion)>,
+    /// Load expression -> canonical entry (value, exact type, version).
+    load_expr_to_value: FxHashMap<ExprKey, LoadCseEntry>,
     /// Canonical value numbers for equivalent GEP addresses. The GEP
     /// instructions themselves are retained, avoiding backend Copy-chain
     /// hazards while letting memory forwarding recognize equal addresses.
@@ -241,11 +276,18 @@ struct GvnState {
     /// against the recorded `sext→v1020` and rewired the second zone
     /// computation to read the ZONE POINTER — boot page fault).
     multi_def_values: FxHashSet<u32>,
+    /// Per-value use info for cross-signedness load CSE: value id ->
+    /// (total use count, first-use kind). Computed once per function by
+    /// `find_value_use_info`; candidate counts are stable across the GVN
+    /// walk (rewrites only replace load defs with copies, never add or
+    /// remove uses of a candidate), so a recorded count of 1 plus a safe
+    /// first-use kind is sound at any later lookup.
+    xsign_use_info: FxHashMap<u32, (u32, XLoadUseKind)>,
     context: GvnContext,
     /// Rollback log for `expr_to_value`: (key, previous_value).
     rollback_log: Vec<(ExprKey, Option<Value>)>,
     /// Rollback log for `load_expr_to_value`: (key, previous_entry).
-    load_rollback_log: Vec<(ExprKey, Option<(Value, MemoryVersion)>)>,
+    load_rollback_log: Vec<(ExprKey, Option<LoadCseEntry>)>,
     /// Rollback log for `store_fwd_map`: (key, previous_entry).
     store_fwd_rollback_log: Vec<(StoreFwdKey, Option<(Operand, MemoryVersion)>)>,
     /// Rollback log for `value_numbers`: (index, previous_vn).
@@ -323,6 +365,7 @@ impl GvnState {
             nonescaping_allocas,
             noalias_params,
             multi_def_values,
+            xsign_use_info: FxHashMap::default(),
             context: context.clone(),
             rollback_log: Vec::new(),
             load_rollback_log: Vec::new(),
@@ -671,8 +714,9 @@ impl GvnState {
                 },
                 *dest,
             )),
-            // Load CSE: two loads from the same pointer with the same type can be
-            // CSE'd if no intervening memory modification occurred. The caller
+            // Load CSE: two loads from the same pointer with the same
+            // signedness-normalized integer type can be CSE'd if no intervening
+            // memory modification occurred. The caller
             // (process_block) handles invalidating Load entries on memory clobbers.
             //
             // Excluded from CSE:
@@ -719,10 +763,14 @@ impl GvnState {
                 }
                 let ptr_vn = self.operand_to_vn(&Operand::Value(*ptr));
                 let ptr_vn = self.canonical_addr_vn(ptr_vn);
+                // Signedness-normalized key: I8/U8 (etc.) loads of the same
+                // address hold the same bits. Exact-type hits keep the
+                // historical same-block rule; cross-signedness hits go
+                // through `cross_type_load_cse_ok`.
                 Some((
                     ExprKey::Load {
                         ptr: ptr_vn,
-                        ty: *ty,
+                        ty: ty.to_unsigned(),
                     },
                     *dest,
                 ))
@@ -767,8 +815,19 @@ impl GvnState {
     /// later loads/stores through an equivalent GEP (possibly over a
     /// site-local GlobalAddr duplicate) share one memory key.
     fn record_gep_addr_key(&mut self, base: &Value, offset: &Operand, ty: IrType, vn: u32) {
-        let Some(cb) = self.canonical_symbol_base_vn(base) else {
-            return;
+        // Symbol bases canonicalize through the symbol table (so site-local
+        // GlobalAddr duplicates share keys); every other base (params,
+        // allocas, ...) canonicalizes through its own value number. Two GEPs
+        // over the same base value with equal offsets compute the same
+        // address, so unifying their memory keys is sound (loads through
+        // them are still guarded by the memory-version check, and GVN's
+        // single dominator-DFS visit per block cannot span loop backedges).
+        let cb = match self.canonical_symbol_base_vn(base) {
+            Some(cb) => cb,
+            None => match self.operand_to_vn(&Operand::Value(*base)) {
+                VNOperand::ValueNum(v) => v,
+                VNOperand::Const(_) => return,
+            },
         };
         let off_vn = self.operand_to_vn(offset);
         let key = (cb, off_vn, ty);
@@ -1147,6 +1206,150 @@ pub(crate) fn find_multi_def_values(func: &IrFunction) -> FxHashSet<u32> {
         .collect()
 }
 
+/// Per-value use info for cross-signedness load CSE: value id -> (total
+/// use count, first-use kind). Instruction uses in `Cmp` operand,
+/// integer-`Cast` source, and `Store` value positions classify to their
+/// safe kinds when (and only when) the value is single-use; every other
+/// use (binops, calls, returns, terminators, pointer roles, copies,
+/// phis, selects, ...) classifies as `XLoadUseKind::Other`.
+fn find_value_use_info(func: &IrFunction) -> FxHashMap<u32, (u32, XLoadUseKind)> {
+    fn is_int_only_cast_target(ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+        )
+    }
+    let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| {
+                *counts.entry(v).or_insert(0) += 1;
+            });
+        }
+        block.terminator.for_each_used_value(|v| {
+            *counts.entry(v).or_insert(0) += 1;
+        });
+    }
+    let mut info: FxHashMap<u32, (u32, XLoadUseKind)> = FxHashMap::default();
+    for (v, c) in &counts {
+        info.insert(*v, (*c, XLoadUseKind::Other));
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Cmp { lhs, rhs, .. } => {
+                    for op in [lhs, rhs] {
+                        if let Operand::Value(v) = op {
+                            if let Some(e) = info.get_mut(&v.0) {
+                                if e.0 == 1 {
+                                    e.1 = XLoadUseKind::CmpVal;
+                                }
+                            }
+                        }
+                    }
+                }
+                Instruction::Cast { src, to_ty, .. } if is_int_only_cast_target(*to_ty) => {
+                    if let Operand::Value(v) = src {
+                        if let Some(e) = info.get_mut(&v.0) {
+                            if e.0 == 1 {
+                                e.1 = XLoadUseKind::CastIntSrc;
+                            }
+                        }
+                    }
+                }
+                Instruction::Store { val, .. } => {
+                    if let Operand::Value(v) = val {
+                        if let Some(e) = info.get_mut(&v.0) {
+                            if e.0 == 1 {
+                                e.1 = XLoadUseKind::StoreVal;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    info
+}
+
+/// Cross-signedness load-CSE legality: candidate `cand` (exact type
+/// `cand_ty`) against canonical `canon` (exact type `canon_ty`), known to
+/// share the signedness-normalized key with `canon_ty != cand_ty`.
+///
+/// Soundness cases:
+/// - 64-bit pairs are bit-identical `movq` loads: unconditional.
+/// - A zext-home canonical (U8/U16/U32) feeding an I8/I16/I32 candidate:
+///   every narrow signed lowering re-extracts from (or reads only) the
+///   low sub-register, so the zero-extended home is always safe.
+/// - A sext-home canonical (I8/I16/I32) feeding a U8/U16/U32 candidate:
+///   sound only when the candidate's single use reads at most the low
+///   bits (`Cmp`, integer `Cast`, `Store` value). Binops read full
+///   registers, float casts/utrunc assume pre-extended homes, and
+///   copies/phis/selects would propagate the sext home to unverified
+///   users — all excluded.
+fn cross_type_load_cse_ok(
+    state: &GvnState,
+    canon_ty: IrType,
+    canon_is_plain_load: bool,
+    cand: Value,
+    cand_ty: IrType,
+) -> bool {
+    // Canonical must be a genuine load (known home extension) ...
+    if !canon_is_plain_load {
+        return false;
+    }
+    // ... and the candidate single-definition (all its uses read this load).
+    // (The canonical's multi-def is already excluded by the caller lookup.)
+    if state.multi_def_values.contains(&cand.0) {
+        return false;
+    }
+    // Defensive: only same-width plain integers (the normalized key match
+    // already implies this; never trust it blindly).
+    fn is_plain_int(ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+        )
+    }
+    if !is_plain_int(canon_ty) || !is_plain_int(cand_ty) {
+        return false;
+    }
+    if canon_ty.size() != cand_ty.size() {
+        return false;
+    }
+    // 64-bit loads are bit-identical movq: unconditional.
+    if canon_ty.size() == 8 {
+        return true;
+    }
+    // Zext-home canonical (reverse direction): unconditional.
+    if canon_ty.is_unsigned() {
+        return true;
+    }
+    // Sext-home canonical (forward direction): single safe use only.
+    matches!(
+        state.xsign_use_info.get(&cand.0),
+        Some((
+            1,
+            XLoadUseKind::CmpVal | XLoadUseKind::CastIntSrc | XLoadUseKind::StoreVal
+        ))
+    )
+}
+
 pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &GvnContext) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 || function_uses_128(func) {
@@ -1170,6 +1373,7 @@ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &Gvn
             noalias,
             multi_def,
         );
+        state.xsign_use_info = find_value_use_info(func);
         return process_block(0, func, &mut state);
     }
     let cfg = analysis::CfgAnalysis::build(func);
@@ -1210,6 +1414,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
             noalias,
             multi_def,
         );
+        state.xsign_use_info = find_value_use_info(func);
         return process_block(0, func, &mut state);
     }
     let mut state = GvnState::new(
@@ -1224,6 +1429,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
         noalias,
         multi_def,
     );
+    state.xsign_use_info = find_value_use_info(func);
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
     state.total_eliminated
 }
@@ -1450,13 +1656,19 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                 // This catches the pattern: store V -> *P; load *P -> replace with V.
                 if is_load {
                     if let ExprKey::Load {
-                        ptr: ref ptr_vn,
-                        ty,
+                        ptr: ref ptr_vn, ..
                     } = expr_key
                     {
+                        // Store-forward keys use the EXACT load type (stores
+                        // record exact types): the normalized key type would
+                        // break I8-store -> U8-load forwarding.
+                        let exact_ty = match &inst {
+                            Instruction::Load { ty, .. } => *ty,
+                            _ => unreachable!("load expr key from non-load"),
+                        };
                         let fwd_key = StoreFwdKey {
                             ptr_vn: ptr_vn.clone(),
-                            ty,
+                            ty: exact_ty,
                         };
                         if let Some((stored_op, version)) = state.store_fwd_map.get(&fwd_key) {
                             let stored_is_multi_def = matches!(stored_op, Operand::Value(v)
@@ -1501,8 +1713,15 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                                 // same pointer can CSE with this load's dest.
                                 let version = state.memory_version(ptr_vn);
                                 let load_key_for_log = expr_key.clone();
-                                let old_load =
-                                    state.load_expr_to_value.insert(expr_key, (dest, version));
+                                let old_load = state.load_expr_to_value.insert(
+                                    expr_key,
+                                    LoadCseEntry {
+                                        canon: dest,
+                                        canon_ty: exact_ty,
+                                        canon_is_plain_load: false,
+                                        version,
+                                    },
+                                );
                                 state.load_rollback_log.push((load_key_for_log, old_load));
                                 new_instructions.push(Instruction::Copy {
                                     dest,
@@ -1517,23 +1736,8 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                 }
 
                 // Look up: check pure expr map, or load map with generation check
-                let existing = if is_load {
-                    let ptr_vn = match &expr_key {
-                        ExprKey::Load { ptr, .. } => ptr.clone(),
-                        _ => unreachable!(),
-                    };
-                    state
-                        .load_expr_to_value
-                        .get(&expr_key)
-                        .and_then(|&(val, version)| {
-                            if state.entry_valid_for(&ptr_vn, version)
-                                && !state.multi_def_values.contains(&val.0)
-                            {
-                                Some(val)
-                            } else {
-                                None
-                            }
-                        })
+                let existing_pure: Option<Value> = if is_load {
+                    None
                 } else {
                     state
                         .expr_to_value
@@ -1541,14 +1745,70 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         .copied()
                         .filter(|ev| !state.multi_def_values.contains(&ev.0))
                 };
+                let existing_load: Option<(Value, IrType, bool)> = if is_load {
+                    let ptr_vn = match &expr_key {
+                        ExprKey::Load { ptr, .. } => ptr.clone(),
+                        _ => unreachable!(),
+                    };
+                    state.load_expr_to_value.get(&expr_key).and_then(|entry| {
+                        if state.entry_valid_for(&ptr_vn, entry.version)
+                            && !state.multi_def_values.contains(&entry.canon.0)
+                        {
+                            Some((entry.canon, entry.canon_ty, entry.canon_is_plain_load))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
 
-                // Only CSE within the same block to avoid cross-block Copy issues.
-                // Cross-block CSE creates Copies whose source values may have
-                // their registers reused by the allocator before the Copy executes.
-                let same_block_existing = existing.filter(|ev| block_defs.contains(&ev.0));
-                if let Some(existing_value) = same_block_existing {
+                // Decide the CSE source value, if any. Returns the canonical
+                // plus, for cross-signedness hits, the (canon, candidate)
+                // exact types for the debug trace.
+                let cse_source: Option<(Value, Option<(IrType, IrType)>)> = if let Some(ev) =
+                    existing_pure
+                {
+                    // Only CSE within the same block to avoid cross-block Copy issues.
+                    // Cross-block CSE creates Copies whose source values may have
+                    // their registers reused by the allocator before the Copy executes.
+                    existing_pure
+                        .filter(|v| block_defs.contains(&v.0))
+                        .map(|v| (v, None))
+                } else if let Some((canon, canon_ty, canon_is_load)) = existing_load {
+                    let cand_ty = match &inst {
+                        Instruction::Load { ty, .. } => *ty,
+                        _ => unreachable!("load lookup from non-load"),
+                    };
+                    if canon_ty == cand_ty {
+                        // Exact-type load CSE: same-block only (unchanged).
+                        if block_defs.contains(&canon.0) {
+                            Some((canon, None))
+                        } else {
+                            None
+                        }
+                    } else if cross_type_load_cse_ok(state, canon_ty, canon_is_load, dest, cand_ty)
+                    {
+                        // Cross-signedness hit: the dominator-scoped entry
+                        // guarantees the canonical dominates and no clobber
+                        // sits between, so the cross-block Copy is sound.
+                        Some((canon, Some((canon_ty, cand_ty))))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some((existing_value, xload_tys)) = cse_source {
                     if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                        eprintln!("[GVNDBG] CSE load dest={} <- {}", dest.0, existing_value.0);
+                        if let Some((canon_ty, cand_ty)) = xload_tys {
+                            eprintln!(
+                                "[GVNDBG] CSE xload dest={} <- {} ({:?}->{:?})",
+                                dest.0, existing_value.0, canon_ty, cand_ty
+                            );
+                        } else {
+                            eprintln!("[GVNDBG] CSE load dest={} <- {}", dest.0, existing_value.0);
+                        }
                     }
                     let idx = existing_value.0 as usize;
                     let existing_vn = if idx < state.value_numbers.len()
@@ -1602,7 +1862,19 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         };
                         let version = state.memory_version(&ptr_vn);
                         let key_for_log = expr_key.clone();
-                        let old_val = state.load_expr_to_value.insert(expr_key, (dest, version));
+                        let record_ty = match &inst {
+                            Instruction::Load { ty, .. } => *ty,
+                            _ => unreachable!("load record from non-load"),
+                        };
+                        let old_val = state.load_expr_to_value.insert(
+                            expr_key,
+                            LoadCseEntry {
+                                canon: dest,
+                                canon_ty: record_ty,
+                                canon_is_plain_load: true,
+                                version,
+                            },
+                        );
                         state.load_rollback_log.push((key_for_log, old_val));
                     } else {
                         let key_for_log = expr_key.clone();

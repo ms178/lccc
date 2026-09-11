@@ -245,6 +245,7 @@ fn can_indexed_addr_fold(
     cg: &dyn ArchCodegen,
     info: &IndexedGepInfo,
     global_addr_map: &FxHashMap<u32, String>,
+    gep_dest: u32,
 ) -> bool {
     // Backend agreement on the ACCESS profile first: types (and store
     // staging) the backend's indexed emitter refuses must also refuse the
@@ -295,7 +296,26 @@ fn can_indexed_addr_fold(
         return false;
     }
     if let Some(sym) = global_addr_map.get(&info.base.0) {
-        return !rip_rel_blocked(cg, sym);
+        if rip_rel_blocked(cg, sym) {
+            return false;
+        }
+        // PIC cost rule: the symbol form rematerializes the base at EVERY
+        // folded use (leaq sym(%rip),%rcx — RIP+index is unencodable), so a
+        // GEP folded into N accesses pays N leas where one home + N SIB
+        // uses costs a single lea (lz4's hot probe paid 2-3 in-loop leas
+        // for globals the IR had hoisted to block 0). Fold only single-use
+        // GEPs under PIC (one lea, and the base's home is saved); multi-use
+        // GEPs keep their def (RA homes the base once, uses read it via
+        // SIB). Non-PIC absolute sym(,%idx,scale) is free — always fold
+        // there. An empty use table (backend didn't compute it) fails open.
+        let st = cg.state_ref();
+        if st.pic_mode {
+            let counts = &st.value_use_counts;
+            if !counts.is_empty() && counts.get(gep_dest as usize).copied().unwrap_or(0) > 1 {
+                return false;
+            }
+        }
+        return true;
     }
     false
 }
@@ -3999,7 +4019,7 @@ fn generate_function(
             if load_cmp_ptrs_func.contains(dest) {
                 continue; // pointer needed materialised by a cmp-mem fold
             }
-            if can_indexed_addr_fold(cg, info, &global_addr_map) {
+            if can_indexed_addr_fold(cg, info, &global_addr_map, *dest) {
                 foldable_folds.insert(*dest);
             }
         }
@@ -4440,7 +4460,7 @@ fn generate_function(
                 }
                 if let Some(info) = indexed_gep_map.get(&dest.0) {
                     if !load_cmp_ptrs.contains(&dest.0)
-                        && can_indexed_addr_fold(cg, info, &global_addr_map)
+                        && can_indexed_addr_fold(cg, info, &global_addr_map, dest.0)
                     {
                         cg.state().folded_gep_values.insert(dest.0);
                         cg.state().current_program_point += 1;
@@ -5611,7 +5631,7 @@ fn generate_load(
         rematerialize_const_addr(cg, ptr, gep_info);
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
-        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
+        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map, ptr.0) {
             if cg.emit_load_indexed(dest, &info.base, &info.index, info.shift, info.disp, ty) {
                 return;
             }
@@ -5680,7 +5700,7 @@ fn generate_store(
         remat_indexed_acc_safe(cg, val, |cg| rematerialize_const_addr(cg, ptr, gep_info));
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
-        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
+        if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map, ptr.0) {
             if cg.emit_store_indexed(val, &info.base, &info.index, info.shift, info.disp, ty) {
                 return;
             }

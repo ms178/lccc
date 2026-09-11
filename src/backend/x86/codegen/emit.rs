@@ -668,24 +668,13 @@ pub struct X86Codegen {
     /// recorded operands and uses cmovcc/jcc directly instead of testing the
     /// materialized boolean (setcc/movzbl/testq chain). Keyed by Cmp dest.
     pub(super) cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
-    /// BOOL-PAIR (AND-of-compares) branch fusion: And-binop dest (branch
-    /// condition) -> both legs' compares; the branch re-emits them as a
-    /// short-circuit jcc chain. `bool_pair_cmps` are the leg Cmp dests whose
-    /// setcc/movzbl materialization is skipped.
-    pub(super) cmp_bool_pair: FxHashMap<
-        u32,
-        (
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-        ),
-    >,
-    pub(super) bool_pair_cmps: FxHashSet<u32>,
+    /// De Morgan branch records (post-prune): And/Or dest → record. The
+    /// CondBranch consumes the record and re-emits both comparisons with a
+    /// short-circuit jump. Cleared per function; survivors only.
+    pub(super) demorgan_branch: FxHashMap<u32, super::comparison::DemorganRec>,
+    /// And/Or + Cmp dests skipped at their own positions by the De Morgan
+    /// split (machinst claim, alu And/Or gate, Cmp gate). Post-prune only.
+    pub(super) demorgan_skip: FxHashSet<u32>,
     /// CMP-REPLAY operand -> consumer links built with `cmp_replay` (IS-09):
     /// merged into the RA's folded_index_uses so register-homed replay
     /// operands keep their homes until the consumer re-emits the compare.
@@ -1083,9 +1072,9 @@ impl X86Codegen {
             bitop_nonneg_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
             fused_forward_dests: FxHashSet::default(),
-            cmp_bool_pair: FxHashMap::default(),
-            bool_pair_cmps: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
+            demorgan_branch: FxHashMap::default(),
+            demorgan_skip: FxHashSet::default(),
             cmp_replay_operand_links: FxHashMap::default(),
             fp_select_cmps: FxHashMap::default(),
             value_use_counts: FxHashMap::default(),
@@ -6246,6 +6235,34 @@ impl ArchCodegen for X86Codegen {
         {
             return false;
         }
+        // DE MORGAN SPLIT: And/Or + Cmp dests claimed by the branch split
+        // must NOT take the MachInst fast path — the branch re-emits both
+        // comparisons from the recorded operands, and the And/Or emits
+        // nothing at all. Claiming them here would materialize booleans the
+        // split was built to kill (and strand the skip-set: the text-path
+        // gates below would see an already-lowered instruction).
+        if let crate::ir::reexports::Instruction::BinOp { dest, .. } = inst {
+            if self.demorgan_skip.contains(&dest.0) {
+                return false;
+            }
+        }
+        if let crate::ir::reexports::Instruction::Cmp { dest, .. } = inst {
+            if self.demorgan_skip.contains(&dest.0) {
+                return false;
+            }
+        }
+        // Same for the Copy/Cast passthru (`bool c = a&&b; if (c)`): it is
+        // skipped by the text-path gates below, never MachInst-claimed.
+        if let crate::ir::reexports::Instruction::Copy { dest, .. } = inst {
+            if self.demorgan_skip.contains(&dest.0) {
+                return false;
+            }
+        }
+        if let crate::ir::reexports::Instruction::Cast { dest, .. } = inst {
+            if self.demorgan_skip.contains(&dest.0) {
+                return false;
+            }
+        }
         // TLS symbols must NOT take the MachInst LeaSym fast path: it lowers
         // GlobalAddr to a plain `leaq sym(%rip)`, which for a __thread symbol
         // computes the address of the .tdata TEMPLATE, not the calling
@@ -6390,21 +6407,6 @@ impl ArchCodegen for X86Codegen {
                 return false;
             }
         }
-        // BOOL-PAIR (AND-of-compares) branch fusion: a fused And emits
-        // NOTHING (the branch replays both leg compares). Keep it on the
-        // text path so emit_int_binop_impl's skip is the single point of
-        // enforcement — the MachInst window lowering would happily emit a
-        // real `andl` reading the legs' skipped boolean homes.
-        if let crate::ir::reexports::Instruction::BinOp {
-            dest,
-            op: crate::ir::reexports::IrBinOp::And,
-            ..
-        } = inst
-        {
-            if self.cmp_bool_pair.contains_key(&dest.0) {
-                return false;
-            }
-        }
         // W2 Load->Cast folding is a two-instruction runtime handshake: the
         // default Load emitter redirects into the Cast destination and arms
         // fold_skip_cast; the default Cast emitter consumes that handshake.
@@ -6502,8 +6504,7 @@ impl ArchCodegen for X86Codegen {
             }
             crate::ir::reexports::Instruction::Cmp { dest, .. }
                 if self.fused_cmp_dests.contains_key(&dest.0)
-                    || self.cmp_replay.contains_key(&dest.0)
-                    || self.bool_pair_cmps.contains(&dest.0) =>
+                    || self.cmp_replay.contains_key(&dest.0) =>
             {
                 // Fused candidates keep their flags for the adjacent consumer;
                 // REPLAY candidates are emitted by the mature path's Cmp
@@ -7492,6 +7493,12 @@ impl ArchCodegen for X86Codegen {
         // fused consumer uses the live Cmp flags), and its source is the
         // never-materialized boolean — emitting it would read a stale register.
         if self.fused_forward_dests.contains(&dest.0) {
+            return;
+        }
+        // DE MORGAN SPLIT: Copy passthru (`bool c = a&&b; if (c)`) — the
+        // branch replays the original comparisons, so the renamed boolean
+        // is never read; emitting the mov would copy a never-written home.
+        if self.demorgan_skip.contains(&dest.0) {
             return;
         }
         // Handle vector Copy instructions: %dest_vec = copy %src_vec

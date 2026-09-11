@@ -34,26 +34,49 @@ pub(crate) struct CmpReplayScan {
     /// single use is a Select; keyed by Cmp dest with the recorded operands
     /// re-derived as a vcmpsd/vcmpss mask by the select.
     pub fp_select: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
-    /// BOOL-PAIR (AND-of-compares) branch fusion: And-binop dest (the
-    /// CondBranch condition) -> both legs' recorded compares. The branch
-    /// re-emits them as a short-circuit jcc chain; the And itself and both
-    /// legs' boolean materializations are skipped.
-    pub bool_pair: crate::common::fx_hash::FxHashMap<
-        u32,
-        (
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-        ),
-    >,
-    /// The two Cmp dests of each recorded pair: they skip setcc/movzbl
-    /// materialization (the flags are re-derived by the branch replay).
-    pub bool_pair_cmps: crate::common::fx_hash::FxHashSet<u32>,
+    /// De Morgan branch records: `CondBranch(And/Or(CmpA, CmpB))` where the
+    /// And/Or and both Cmps are single-use and same-block. Keyed by the
+    /// And/Or dest; the branch re-emits both comparisons with a
+    /// short-circuit jump between them (cmpA; jcc; cmpB; jcc) instead of
+    /// materializing two booleans plus the conjunction (cmp; setcc; movzbl;
+    /// cmp; setcc; movzbl; and; test; jcc). The two Cmp dests are recorded
+    /// in [`DemorganRec::cmp_dests`] so emission can skip all three
+    /// instructions. Operand links for both Cmps' operands ride the shared
+    /// `operand_links` map (consumer = the And/Or dest, whose live end is
+    /// the terminator).
+    pub demorgan: crate::common::fx_hash::FxHashMap<u32, DemorganRec>,
+}
+
+/// One De Morgan branch-split candidate. See [`CmpReplayScan::demorgan`].
+#[derive(Clone)]
+pub(crate) struct DemorganRec {
+    /// True for `And` (short-circuit on false), false for `Or`
+    /// (short-circuit on true).
+    pub is_and: bool,
+    /// First comparison (op, lhs, rhs, ty), re-emitted first.
+    pub a: (IrCmpOp, Operand, Operand, IrType),
+    /// Second comparison, re-emitted after the short-circuit jump.
+    pub b: (IrCmpOp, Operand, Operand, IrType),
+    /// The two Cmp dest value ids (emission skips them and the And/Or).
+    pub cmp_dests: [u32; 2],
+    /// Copy/Cast indirection between the And/Or and the branch, if any:
+    /// `bool c = a&&b; if (c)` (or the `|`/`||` Or equivalents) leaves a
+    /// single-use same-block Copy/Cast whose dest is the branch cond and
+    /// whose src is the And/Or. Emission skips it alongside the And/Or
+    /// (the branch replays the original comparisons, so the renamed value
+    /// is never read); `None` when the And/Or feeds the branch directly.
+    /// Always equals the recorded consumer id when present.
+    pub passthru: Option<u32>,
+    /// The And/Or BinOp's own dest id: equals the map key (the branch
+    /// cond) in the direct case, the passthru's src in the indirect case.
+    /// Emission skips it alongside the Cmps and the passthru.
+    pub binop_id: u32,
+}
+
+/// Env-gated trace for the De Morgan branch split: prints scan matches,
+/// prune decisions, and emission fires to stderr. Zero cost when off.
+pub(crate) fn demorgan_debug_enabled() -> bool {
+    std::env::var_os("LCCC_DEBUG_DEMORGAN").is_some()
 }
 
 pub(crate) fn compute_cmp_replay_scan(
@@ -66,36 +89,9 @@ pub(crate) fn compute_cmp_replay_scan(
         crate::common::fx_hash::FxHashMap::default();
     let mut fp_select: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)> =
         crate::common::fx_hash::FxHashMap::default();
-    // Kill switch `CCC_NO_BOOL_PAIR` (CI/bisect): disables the fusion scan
-    // below; compares keep their setcc materialization and the And emits
-    // normally.
-    let bool_pair_enabled = !std::env::var_os("CCC_NO_BOOL_PAIR").is_some();
-    // BOOL-PAIR (AND-of-compares) branch fusion scan (RA-BOOL-PAIR):
-    //   Cmp c1; Cmp c2; And a = c1 & c2;  CondBranch { cond: a }
-    // with c1, c2, a all single-use, all in one block, records
-    // `bool_pair[a] = (c1, c2)` plus `bool_pair_cmps = {c1, c2}`: the two
-    // Cmps skip their setcc/movzbl materialization, the And emits nothing,
-    // and the branch re-emits both compares as a short-circuit
-    // `cmp1; jcc(inv1) cold; cmp2; jcc(inv2) cold` chain — 4 instructions
-    // instead of cmp+setcc+movzbl ×2 + andl + je (8). Compares are pure, so
-    // reordering them against each other and against the (never-emitted)
-    // And is semantically transparent; the redefinition guard below keeps
-    // each Cmp's operands intact up to the replay position.
-    let mut bool_pair: crate::common::fx_hash::FxHashMap<
-        u32,
-        (
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-        ),
-    > = crate::common::fx_hash::FxHashMap::default();
-    let mut bool_pair_cmps: crate::common::fx_hash::FxHashSet<u32> =
-        crate::common::fx_hash::FxHashSet::default();
+    let mut demorgan: crate::common::fx_hash::FxHashMap<u32, DemorganRec> =
+        crate::common::fx_hash::FxHashMap::default();
+    let demorgan_enabled = std::env::var("CCC_NO_DEMORGAN").is_err();
     for block in &func.blocks {
         let insts = &block.instructions;
         for (ii, inst) in insts.iter().enumerate() {
@@ -153,144 +149,6 @@ pub(crate) fn compute_cmp_replay_scan(
                         used_by_branch = true;
                     }
                 }
-            }
-            // BOOL-PAIR: the single use may instead be an `And` binop whose
-            // own single use is this block's CondBranch condition. Locate it
-            // and validate the full four-value chain (Cmp, Cmp, And, branch)
-            // before recording. The And consumer is only tracked when the
-            // other leg is also a single-use integer Cmp in this block —
-            // otherwise the And stays on the ordinary materialized path.
-            let mut and_consumer: Option<u32> = None;
-            if !used_by_select && !used_by_branch {
-                for other in insts.iter() {
-                    if let crate::ir::reexports::Instruction::BinOp {
-                        dest: adest,
-                        op: crate::ir::reexports::IrBinOp::And,
-                        lhs: Operand::Value(lv),
-                        rhs: Operand::Value(rv),
-                        ..
-                    } = other
-                    {
-                        if lv.0 == cdest || rv.0 == cdest {
-                            and_consumer = Some(adest.0);
-                            break;
-                        }
-                    }
-                }
-                let Some(adest) = and_consumer else {
-                    continue;
-                };
-                // Exactly-once contracts: each Cmp feeds the And once, the
-                // And feeds only the branch. (use_counts == 1 is the gate the
-                // replay scan already trusts for the Select/branch shapes.)
-                if use_counts.get(&adest).copied().unwrap_or(0) != 1 {
-                    continue;
-                }
-                let consumed_by_branch = matches!(
-                    &block.terminator,
-                    crate::ir::reexports::Terminator::CondBranch {
-                        cond: Operand::Value(v),
-                        ..
-                    } if v.0 == adest
-                );
-                if !consumed_by_branch {
-                    continue;
-                }
-                // Integer pairs only (see the wide/FP gate below — a pair
-                // must satisfy it for BOTH legs, so check early here too).
-                if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
-                    continue;
-                }
-                // Locate the sibling Cmp (the other leg of the And).
-                let sibling: Option<(usize, IrCmpOp, Operand, Operand, IrType)> =
-                    insts.iter().enumerate().find_map(|(jj, other)| {
-                        if let crate::ir::reexports::Instruction::Cmp {
-                            dest: d2,
-                            op: o2,
-                            lhs: l2,
-                            rhs: r2,
-                            ty: t2,
-                        } = other
-                        {
-                            if d2.0 != cdest
-                                && use_counts.get(&d2.0).copied() == Some(1)
-                                && !fused.contains_key(&d2.0)
-                                && t2.is_integer()
-                                && !crate::backend::generation::is_wide_int_type(*t2)
-                            {
-                                let feeds_and = insts.iter().any(|a| {
-                                    matches!(
-                                        a,
-                                        crate::ir::reexports::Instruction::BinOp {
-                                            op: crate::ir::reexports::IrBinOp::And,
-                                            lhs: Operand::Value(lv),
-                                            rhs: Operand::Value(rv),
-                                            ..
-                                        } if (lv.0 == d2.0 || rv.0 == d2.0)
-                                            && a.dest().is_some_and(|d| d.0 == adest)
-                                    )
-                                });
-                                if feeds_and {
-                                    return Some((jj, *o2, l2.clone(), r2.clone(), *t2));
-                                }
-                            }
-                        }
-                        None
-                    });
-                let Some((jj, op2, l2, r2, t2)) = sibling else {
-                    continue;
-                };
-                // No operand of EITHER leg may be redefined between its Cmp
-                // and the block end: both compares are re-emitted at the
-                // branch, after every instruction in the block.
-                let legs = [(ii, &clhs, &crhs), (jj, &l2, &r2)];
-                let redefined = legs.iter().any(|(pos, lhs, rhs)| {
-                    let ids: [Option<u32>; 2] = [lhs, rhs].map(|op| match op {
-                        Operand::Value(v) => Some(v.0),
-                        Operand::Const(_) => None,
-                    });
-                    ids.iter().flatten().any(|&vid| {
-                        insts[pos + 1..]
-                            .iter()
-                            .any(|other| other.dest().is_some_and(|d| d.0 == vid))
-                    })
-                });
-                if redefined {
-                    continue;
-                }
-                // Deterministic single record per And (both legs scan here).
-                if bool_pair.contains_key(&adest) {
-                    continue;
-                }
-                if bool_pair_enabled {
-                    bool_pair.insert(
-                        adest,
-                        (
-                            cop,
-                            clhs.clone(),
-                            crhs.clone(),
-                            cty,
-                            op2,
-                            l2.clone(),
-                            r2.clone(),
-                            t2,
-                        ),
-                    );
-                    bool_pair_cmps.insert(cdest);
-                    bool_pair_cmps.insert(insts[jj].dest().map(|d| d.0).unwrap_or(u32::MAX));
-                }
-                // Operand homes must survive to the branch: link every leg
-                // operand to the And value, whose own (single) use is the
-                // block terminator. Over-constraining links are harmless
-                // (see the replay comment above).
-                for (lhs, rhs) in [(&clhs, &crhs), (&l2, &r2)] {
-                    for op in [lhs, rhs] {
-                        if let Operand::Value(v) = op {
-                            operand_links.entry(v.0).or_default().push(adest);
-                        }
-                    }
-                }
-                continue;
             }
             if !used_by_select && !used_by_branch {
                 continue;
@@ -355,14 +213,183 @@ pub(crate) fn compute_cmp_replay_scan(
             }
             replay.insert(cdest, (cop, clhs, crhs, cty));
         }
+        // De Morgan branch split: `CondBranch(And/Or(CmpA, CmpB))` with all
+        // three single-use and same-block. The terminator re-emits cmpA,
+        // short-circuit-jumps, then re-emits cmpB — instead of
+        // materializing two booleans plus the conjunction. Operand links
+        // for both Cmps' operands ride the shared map (consumer = the
+        // And/Or dest, whose live end is the terminator).
+        if demorgan_enabled {
+            if let crate::ir::reexports::Terminator::CondBranch {
+                cond: Operand::Value(cond_v),
+                ..
+            } = &block.terminator
+            {
+                if use_counts.get(&cond_v.0).copied().unwrap_or(0) == 1
+                    && let Some(rec) = check_demorgan_pattern(insts, cond_v.0, use_counts, fused)
+                {
+                    if demorgan_debug_enabled() {
+                        eprintln!(
+                            "[demorgan] scan andor={} is_and={} fuzz=({},{})",
+                            cond_v.0, rec.is_and, rec.cmp_dests[0], rec.cmp_dests[1]
+                        );
+                    }
+                    for op in [&rec.a.1, &rec.a.2, &rec.b.1, &rec.b.2] {
+                        if let Operand::Value(v) = op {
+                            operand_links.entry(v.0).or_default().push(cond_v.0);
+                        }
+                    }
+                    demorgan.insert(cond_v.0, rec);
+                }
+            }
+        }
     }
     CmpReplayScan {
         replay,
         operand_links,
         fp_select,
-        bool_pair,
-        bool_pair_cmps,
+        demorgan,
     }
+}
+
+/// Match `And/Or(CmpA, CmpB)` for the De Morgan branch split: the And/Or
+/// producer must be a same-block `BinOp` with `And`/`Or` opcode, both arms
+/// single-use same-block *integer* (non-wide) Cmps, and neither Cmp's
+/// operands redefined between the Cmp and the block end (the replay
+/// re-reads them at the terminator — same contract as the Cmp-replay
+/// redefinition guard above).
+fn check_demorgan_pattern(
+    insts: &[crate::ir::reexports::Instruction],
+    andor_id: u32,
+    use_counts: &crate::common::fx_hash::FxHashMap<u32, u32>,
+    fused: &crate::common::fx_hash::FxHashMap<u32, u32>,
+) -> Option<DemorganRec> {
+    use crate::ir::reexports::{Instruction, IrBinOp};
+    // Resolve the branch cond to its And/Or producer: either directly
+    // (`if (a&&b)`, the cond IS the And/Or) or through one single-use
+    // same-block Copy/Cast (`bool c = a&&b; if (c)` — and the `|`/`||` Or
+    // equivalents, which ONLY arise in this materialized form: the frontend
+    // control-flow-lowers direct `||` and if-conversion never merges the
+    // Or-nest back). The cond must be defined EXACTLY once in this block:
+    // post-phi coalescing webs can carry position-dependent multi-defs
+    // (#490), and the terminator reads the LAST one — recording the first
+    // would replay the wrong arms. The And/Or itself must likewise be
+    // single-use (its only reader is the branch or the passthru — both are
+    // skipped, so nothing else may observe its never-written home).
+    let mut cond_defs: Vec<&Instruction> = Vec::new();
+    for inst in insts {
+        if inst.dest().is_some_and(|d| d.0 == andor_id) {
+            cond_defs.push(inst);
+        }
+    }
+    let [cond_def] = cond_defs.as_slice() else {
+        return None;
+    };
+    let (andor_src_id, passthru) = match cond_def {
+        Instruction::BinOp { .. } => (andor_id, None),
+        Instruction::Copy {
+            src: Operand::Value(s),
+            ..
+        }
+        | Instruction::Cast {
+            src: Operand::Value(s),
+            ..
+        } => {
+            if use_counts.get(&s.0).copied().unwrap_or(0) != 1 {
+                return None;
+            }
+            (s.0, Some(andor_id))
+        }
+        _ => return None,
+    };
+    let mut producer: Option<(bool, Operand, Operand)> = None;
+    for inst in insts {
+        if let Instruction::BinOp {
+            dest, op, lhs, rhs, ..
+        } = inst
+            && dest.0 == andor_src_id
+        {
+            if producer.is_some() {
+                return None;
+            }
+            match op {
+                IrBinOp::And => producer = Some((true, lhs.clone(), rhs.clone())),
+                IrBinOp::Or => producer = Some((false, lhs.clone(), rhs.clone())),
+                _ => return None,
+            }
+        }
+    }
+    let (is_and, a_op, b_op) = producer?;
+    if use_counts.get(&andor_src_id).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+    let mut found: [Option<(IrCmpOp, Operand, Operand, IrType, u32, usize)>; 2] = [None, None];
+    for (slot, arm) in [a_op, b_op].into_iter().enumerate() {
+        let arm_v = match arm {
+            Operand::Value(v) => v.0,
+            Operand::Const(_) => return None,
+        };
+        if use_counts.get(&arm_v).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        // Flag-fusion owns adjacent Cmp→Select/branch pairs: a fused Cmp's
+        // consumer reads live FLAGS, not a replayed compare. (Unreachable
+        // today — a fused Cmp's consumer is a Select/branch, never the
+        // And/Or — but free insurance against future fusion extensions.)
+        if fused.contains_key(&arm_v) {
+            return None;
+        }
+        // Exactly one same-block definition (same multi-def rationale as
+        // the And/Or guard above).
+        for (ci, inst) in insts.iter().enumerate() {
+            if let Instruction::Cmp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+                && dest.0 == arm_v
+            {
+                if found[slot].is_some() {
+                    return None;
+                }
+                if !ty.is_integer() || crate::backend::generation::is_wide_int_type(*ty) {
+                    return None;
+                }
+                found[slot] = Some((*op, lhs.clone(), rhs.clone(), *ty, arm_v, ci));
+            }
+        }
+        if found[slot].is_none() {
+            return None;
+        }
+    }
+    let [
+        (aop, alhs, arhs, aty, adest, aidx),
+        (bop, blhs, brhs, bty, bdest, bidx),
+    ] = found.map(|f| f.expect("checked above"));
+    // Redefinition guard: each Cmp's value operands must not be redefined
+    // between the Cmp and the terminator (the And/Or itself emits nothing,
+    // so only real defs in between can disturb the replayed reads).
+    for (op_a, op_b, cidx) in [(&alhs, &arhs, aidx), (&blhs, &brhs, bidx)] {
+        for op in [op_a, op_b] {
+            if let Operand::Value(v) = op
+                && insts[cidx + 1..]
+                    .iter()
+                    .any(|other| other.dest().is_some_and(|d| d.0 == v.0))
+            {
+                return None;
+            }
+        }
+    }
+    Some(DemorganRec {
+        is_and,
+        a: (aop, alhs, arhs, aty),
+        b: (bop, blhs, brhs, bty),
+        cmp_dests: [adest, bdest],
+        passthru,
+        binop_id: andor_src_id,
+    })
 }
 
 impl X86Codegen {
@@ -608,13 +635,10 @@ impl X86Codegen {
             self.flush_pending_widen_impl();
             return;
         }
-        // BOOL-PAIR leg: skip the ENTIRE instruction — including the cmp
-        // itself. The fused branch re-emits both legs from the recorded
-        // operands (this compare's flags could not survive anyway: the
-        // sibling leg's compare follows before the branch). If post-RA
-        // pruning dropped the pair, the dest was removed from
-        // bool_pair_cmps with it and the ordinary path below runs.
-        if self.bool_pair_cmps.contains(&dest.0) {
+        // DE MORGAN SPLIT: this Cmp's boolean feeds a skipped And/Or whose
+        // CondBranch re-emits the comparison from the recorded operands —
+        // skip the entire instruction (same contract as compare-replay).
+        if self.demorgan_skip.contains(&dest.0) {
             self.flush_pending_widen_impl();
             return;
         }
@@ -927,6 +951,18 @@ impl X86Codegen {
         None
     }
 
+    /// If `cond` is the destination of an And/Or eligible for the De Morgan
+    /// branch split, consume the record so the branch can re-emit both
+    /// comparisons with a short-circuit jump between them.
+    fn take_demorgan(&mut self, cond: &Operand) -> Option<(u32, DemorganRec)> {
+        if let Operand::Value(v) = cond {
+            if let Some(rec) = self.demorgan_branch.remove(&v.0) {
+                return Some((v.0, rec));
+            }
+        }
+        None
+    }
+
     #[inline]
     fn invert_jcc(cc: &str) -> &'static str {
         match cc {
@@ -971,59 +1007,48 @@ impl X86Codegen {
         let hot_next = next == Some(hot);
         let cold_next = next == Some(cold);
 
-        // BOOL-PAIR (AND-of-compares) branch fusion: the condition is an
-        // And of two single-use integer compares recorded by the replay
-        // scan. Both compares are pure, so the And never materializes and
-        // the branch re-emits them as a short-circuit chain:
-        //
-        //   And, hot next (fallthrough = true target):
-        //       cmp1; j<inv1> cold; cmp2; j<inv2> cold;   (fall into hot)
-        //   And, cold next (fallthrough = false target):
-        //       cmp1; j<inv1> cold; cmp2; j<cmp2> hot;    (fall into cold)
-        //   And, neither successor next: the cold-next shape plus an
-        //       explicit tail `jmp cold` (fall-through is unrelated).
-        //
-        // 4 instructions instead of cmp+setcc+movzbl x2 + andl (+test/je)
-        // and two fewer live booleans. Each leg's own emission already
-        // happened at its IR position (materialization skipped); replaying
-        // them here is the same contract the single-Cmp compare-replay
-        // uses. Soundness note: emit_jcc_block to `cold`/`hot` targets the
-        // BLOCK LABELS, so control flow is exact regardless of what the
-        // layout pass placed next; the only difference between the two
-        // shapes is which side avoids the extra jump.
-        if let Operand::Value(cond_v) = cond {
-            if let Some((o1, l1, r1, t1, o2, l2, r2, t2)) = self.cmp_bool_pair.remove(&cond_v.0) {
-                self.state.reg_cache.invalidate_acc();
-                let jcc1 = Self::cmp_jcc(o1);
-                let jcc2 = Self::cmp_jcc(o2);
-                self.emit_int_cmp_replay_insn(&l1, &r1, t1);
+        // DE MORGAN SPLIT: `CondBranch(And/Or(CmpA, CmpB))` with all three
+        // skipped at their own positions. Re-emit cmpA, short-circuit-jump
+        // on the decided outcome (And: !A → false; Or: A → true), re-emit
+        // cmpB, then branch on B with the usual hot/cold layout. Kills two
+        // boolean materializations (setcc+movzbl each) plus the And/Or plus
+        // the test per branch (lz4's match-length checks). The jumps always
+        // emit (even to the next block — a jcc to next skips the rest of
+        // this block, which is exactly the short-circuit semantic).
+        if let Some((andor_id, rec)) = self.take_demorgan(cond) {
+            if demorgan_debug_enabled() {
+                eprintln!("[demorgan] fire andor={} is_and={}", andor_id, rec.is_and);
+            }
+            self.state.reg_cache.invalidate_acc();
+            self.emit_int_cmp_replay_insn(&rec.a.1, &rec.a.2, rec.a.3);
+            if rec.is_and {
                 self.state
                     .out
-                    .emit_jcc_block(Self::invert_jcc(jcc1), cold.0);
-                self.emit_int_cmp_replay_insn(&l2, &r2, t2);
-                if hot_next {
-                    self.state
-                        .out
-                        .emit_jcc_block(Self::invert_jcc(jcc2), cold.0);
-                    // Fall-through reaches the hot successor.
-                } else {
-                    self.state.out.emit_jcc_block(jcc2, hot.0);
-                    // Fall-through reaches the cold successor ONLY when the
-                    // layout placed it next. The fused chain is a
-                    // two-target branch: when NEITHER successor is the
-                    // physically next block, an explicit tail jump is
-                    // mandatory or the both-compares-true path falls into
-                    // an unrelated block (the missing tail `jmp cold` was a
-                    // real control-flow corruption — this arm was the only
-                    // branch emitter without the guard). Mirrors the
-                    // FP/int flag-fusion and compare-replay arms exactly.
-                    if !cold_next {
-                        self.state.out.emit_jmp_block(cold.0);
-                    }
-                }
-                self.state.reg_cache.invalidate_all();
-                return;
+                    .emit_jcc_block(Self::invert_jcc(Self::cmp_jcc(rec.a.0)), false_block.0);
+            } else {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::cmp_jcc(rec.a.0), true_block.0);
             }
+            self.emit_int_cmp_replay_insn(&rec.b.1, &rec.b.2, rec.b.3);
+            let jcc_b = Self::cmp_jcc(rec.b.0);
+            let jcc_hot = if pref_true {
+                jcc_b
+            } else {
+                Self::invert_jcc(jcc_b)
+            };
+            if hot_next {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+            } else {
+                self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                if !cold_next {
+                    self.state.out.emit_jmp_block(cold.0);
+                }
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
         }
 
         // FLAG FUSION (FP): the condition is the direct result of an
