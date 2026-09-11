@@ -29,6 +29,62 @@ not yet reachable — those say so rather than being quietly dropped.
 the same window and against the same baseline. Never compare ratios across
 reports to claim a regression; use a paired same-window A/B with kill switches.
 
+## Session 2026-09-11 — rebase to `417951a4`, S05/S06/S07 landed, worst-10 re-triage
+
+Base `ms178/lccc` main `@ 417951a4` (PR #490); patch series ledger `S04`–`S07`
+in `/home/user/ms178-1.patch` (57,656 bytes, APPLIES-CLEAN, bundle test-cloned).
+Same-window full-corpus A/B (screening VM, `-O2`, 9 reps, 39/39 correct):
+geomean (LCCC/fastest-ref) 0.7777 → 0.7857 with S05 (neutral within noise).
+Worst-12 this window: lz4 1.941, mandelbrot 1.673, find_bit 1.404, expat 1.275,
+sqlite_varint 1.244, sha256 1.210, spectral_norm 1.193, zstd 1.137, sieve 1.123,
+switch_dispatch 1.102, binary_trees 1.094, nbody 1.089. Evidence and root
+causes: `FOLLOWUP-2026-09-11-rebase-perf-s04-s07.md`. Landed this session:
+
+- S05 inline-single-site-static: correctness fix (GCC called-once parity),
+  zstd gate 131 → 135 re-baselined with runtime improved. Done.
+- S06 cmp-branch-fusion-generalize: 4 latent-miscompile holes closed, 16 unit
+  tests, corpus byte-identical (zero fire — all 16 real setCC sites proven
+  correctly-unfused). Done; no follow-up except future-shape coverage.
+- S07 ifcombine-profitability-guard: pre-filter 4 (reject unless the loop can
+  go branch-free), lz4 +4.7%, 38/39 files byte-identical, classifiers still
+  vectorize. Done.
+
+New backlog items (ranked by measured impact):
+
+### PF-LZ4-1 · Loop-idiom recognition: byte-copy → `memcpy`, byte-compare → word-compare — ~10x
+
+lz4's *true* work gap is 8–11x (PASSES scaling 24 → 2400: ratio 2.75 → 7.6 →
+10.2; fixed-cost subtraction removes the startup artifact — see INF-HARNESS-1).
+Asm-constructed root cause: match-extend loop at 9 insns/byte
+(`movzbl/movzbl/cmpl/jne` + pointer bump), literal-copy loop at 7 insns/byte;
+GCC emits word-at-a-time compare + `call memcpy@PLT`. LCCC has no loop-idiom
+pass. "Done" means:trip-count-form coverage for `for (i = 0; i < n; i++)
+dst[i] = src[i]` (copy) and `while (p < end && *p == *q)` (extend) with proven
+aliasing/overlap/trip-count preconditions in this IR, plus A/B proof on lz4
+(and no movement on the other 38). S07's +4.7% (skip-path short-circuit) is
+banked and independent. Risk: high (loop legality); reward: highest in corpus.
+
+### PF-MB-1 · Mandelbrot loop vectorization — 1.67x
+
+Same static insn count as GCC (54 vs 55) but GCC emits 9 packed-double vs our
+1: the hot FP loop does not vectorize. Reproducer:
+`tests/benchmark/programs/mandelbrot.c`. "Done" = vectorized hot loop + A/B
+proof. Needs vectorizer triage (why the loop is refused) first.
+
+### PF-FB-1 · `linux_find_bit` hot-loop diff — 1.40x
+
+Our `bsfq` idiom IS present, yet 176 vs 142 insns and 1.40x slower — the gap
+is loop structure/branching, not idiom selection. "Done" = hot-loop
+LCCC-vs-GCC diff with a classified gap + fix or a proof of RA-bound status.
+
+### INF-HARNESS-1 · Subtract startup / scale short benchmarks
+
+lz4's A/B ratio (1.94x) understated the true 10x work gap: ~2 ms fixed cost
+(startup + `fill_source`) dominated the 7 ms measurement. "Done" = harness
+reports fixed-vs-work decomposition (or scales workloads / subtracts a
+calibrated startup) so no benchmark with fixed cost > 10% of measured time is
+reported bare. Without this, short-kernel tuning is blind.
+
 **Environment.** This is a screening VM (2-core Xeon @2.6 GHz, 1.9 GB RAM, no
 PMU). The authoritative runtime report is the in-repo CI report for the real
 i7-14700KF / Raptor Lake. On this VM the durable evidence is the instruction /
@@ -217,3 +273,72 @@ version preferences.
 - **A new kernel-level load forwarding exposed a real latent bug** — the pattern
   for finding these is to increase optimizer reach, then run the existing
   NEGATIVE probes, which are exactly the ones that fail loudly.
+
+## S09: cond-store rewrite use-without-def (PRE-EXISTING, FIXED 2026-09-11)
+PR #492 CI red on `vec_cond_store{,_sse2}` (`emit.rs:2443` unwrap:
+`Sle(Value(27), 122)` with no definition). Bisection blamed the S07
+if-combine guard as the *trigger*, but `CCC_NO_IFCOMBINE=1` panics on
+the pristine base binary too: the defect is a latent vectorizer bug the
+guard newly exposes by declining. Per-pass IR trace proved `vectorize`
+deletes the definition while keeping the use: `rewrite_conditional_store`
+empties every non-first chain block, but `emit_cond_mask_selects`
+re-emits non-first compares with their original operands verbatim — the
+`Cast` defining `Value(27)` died in the second condition block.
+Same-class hazards in the same functions: reused compares from cleared
+folded-tree blocks, store computations referencing cleared defs or the
+dropped address GEP, escaping uses of cleared values, and unconditional
+exclusion of a store-block GEP that is not the store address.
+Fix (`src/passes/vectorize.rs`, both chain and folded forms): operand
+availability gate — values defined outside the cleared blocks pass
+through, values defined inside get their pure def chain re-materialized
+ahead of the selects (casts/copies/unary/non-trapping arithmetic/address
+math/compares; trapping int div/rem never speculated; an identical
+already-dominating computation is reused, so the cast-in-condition shape
+emits zero new instructions), and anything else — or any surviving use
+of a dead definition — declines the rewrite (scalar stays byte-exact).
+The `k_inplace_three` uncombined shape now vectorizes fully (32-wide
+AVX2 byte lanes) instead of crashing; the combined (folded-mask) path
+is behavior-preserving. Validated: repro + `CCC_NO_IFCOMBINE=1` clean,
+both CI-failing tests pass, full CI suite (cargo test, 563-test
+regression corpus with `CCC_VALIDATE_SSA=1`, benchmark outputs,
+differential correctness, loop alignment) green.
+
+## S10: vectorizer IV-live-out miscompile (PRE-EXISTING, FIXED 2026-09-11)
+`wideret` (byte copy with IV live-out) miscompiled at default `-O2`: `wsum`
+got the vector iteration count (15) instead of the trip count (511).
+Root cause: the map and stencil transforms redefine the scalar counter once
+per vector iteration but never rewired escaping IV uses to the remainder IV
+— the reduction paths already called `rewire_escaping_iv_uses`, the map and
+stencil paths simply never did. A stencil probe miscompiled identically
+(`lstencil=64` for a `1..511` loop). Fix (`src/passes/vectorize.rs`):
+generalize `rewire_escaping_iv_uses` (`&ReductionPattern` → `iv: Value` +
+pass tag; also cover `Store.ptr`) and call it from `transform_map_vector`
+and `transform_stencil_vector` (outside-label snapshot before the remainder
+commit, rewire after); retarget exit-block phi loop-side incoming labels at
+the remainder header; and gate both analyzers with `loop_escape_closed`
+(single exit via the header, no loop-defined value consumed outside except
+the IV — fail closed). Zero-cost repair: no new arithmetic, loops stay
+vectorized (`wsum`: 256-bit U8 + 1 rewired use; stencil: 22 changes +
+1 rewired use). Validated: `wsum=511`, `lstencil=511`, reduction still
+exact, full CI suite green (cargo test, 748-test regression corpus with
+`CCC_VALIDATE_SSA=1`, benchmark outputs, differential correctness, loop
+alignment) + strict clippy clean.
+
+## S08-next: loop-idiom v1.1 roadmap (pass landed opt-in, M1+M2+M3 green)
+v1 matches ZERO lz4 loops (measured): hot loops are single-block (`body size
+1`: wildCopy8/32, memcpy_using_offset, decompress inners), pointer-IV (`IV
+not int` x4), param-rooted (`roots not unique`). In order of impact:
+1. **Single-block loops** (header==latch, load/store in header): biggest
+   real-world coverage win; rewrite is position-agnostic, matcher block
+   scan needs the header-load/store case + latch==header phi edges.
+2. **Pointer-IV loops** (`for (p=s; p<e; p++) *d++=*p++`): match `Ult` on
+   pointer phis; trip count = `end - start`; exit values analogous.
+3. **Preheader splitting**: `main loop@17: bail (preheader not Branch
+   header)` — clone the preheader edge when shared (standard; mind
+   critical-edge + phi updates).
+4. **Restrict-param roots** (needs frontend+IR work): `__restrict__` params
+   as unique roots unlocks libc-style `dst/src` copies; lz4 literal path
+   needs (1)+(2)+this. Match-copy smear must NEVER match (overlap).
+5. Compare idiom (`while (p<e && *p==*q)`) as designed in module docs.
+Each extension reuses the validated M2 rewrite; flip `CCC_LOOP_IDIOM`
+default-on only after corpus A/B + fuzz on the final guard set.

@@ -45,6 +45,7 @@ pub(crate) mod load_forward;
 pub(crate) mod loop_align;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_carried_forward;
+pub(crate) mod loop_idiom;
 pub(crate) mod loop_invert;
 pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_rotate;
@@ -1471,6 +1472,26 @@ pub(crate) fn run_passes(
                 crate::ir::mem2reg::promote_allocas_with_params(module);
                 copy_prop::run(module);
                 module.for_each_function(dce::eliminate_dead_code);
+            }
+        }
+
+        // Phase 2b-idiom: loop-idiom recognition — iter 0 only, immediately
+        // before vectorize. Byte-copy loops become one `memcpy` libcall
+        // instead of versioned-vectorize + runtime check + scalar
+        // remainder; everything unmatched still flows to the vectorizer.
+        // All targets (a plain call lowers everywhere), -O2+ including
+        // -Os/-Oz (a call is smaller than a loop). Bring-up is opt-in
+        // (`CCC_LOOP_IDIOM=1`); kill-switch `CCC_NO_LOOP_IDIOM`.
+        // Pass name for CCC_DISABLE_PASSES: "loop_idiom"
+        if iter == 0 && opt_level >= 2 && !pass_disabled(&disabled, "loop_idiom") {
+            let n = timed_pass!(
+                "loop_idiom",
+                run_on_visited(module, &dirty, &mut changed, loop_idiom::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+            if n > 0 {
+                crate::passes::verify::verify_after_pass(module, "loop_idiom");
             }
         }
 

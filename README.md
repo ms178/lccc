@@ -122,6 +122,18 @@ All 39 benchmark outputs are verified for **100% byte-for-byte correctness and a
 - **LCCC / Fastest Available Reference Geometric Mean Ratio:** **`0.8936`**
 - **Correctness Rate:** **39 / 39 (100.0%)** exact matching test verifications.
 
+> **Session 2026-09-11 (screening VM, same-window A/B, not comparable to the
+> table above across hosts).** Base `417951a4` + patch series S04–S07:
+> full-corpus geomean (LCCC/fastest-ref) 0.7777 → 0.7857 with the S05 inline
+> fix (neutral within noise; zstd_count runtime 1.1597 → 1.1371); S07
+> ifcombine-profitability-guard gives **lz4 +4.7%** with 38/39 corpus files
+> byte-identical. Worst-10 re-triage found lz4's *true* gap is ~10x (A/B
+> startup-overhead artifact; root cause: byte-at-a-time match/copy loops —
+> loop-idiom project), mandelbrot is a vectorizer gap, expat's ifcombine
+> loss was already guarded. Full analysis, evidence and follow-ups:
+> [`FOLLOWUP-2026-09-11-rebase-perf-s04-s07.md`](FOLLOWUP-2026-09-11-rebase-perf-s04-s07.md)
+> and `backlog.md` session entry 2026-09-11.
+
 ---
 
 ## Quickstart & Build Instructions
