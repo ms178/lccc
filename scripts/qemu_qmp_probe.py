@@ -33,6 +33,7 @@ import bisect
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -143,12 +144,35 @@ def main():
     except FileNotFoundError:
         pass
 
+    # A no-root harness runs QEMU from a dpkg-extracted prefix whose
+    # compiled-in data dir does not exist, so the PC BIOS and option ROMs
+    # must be supplied via -L. Honour the same QEMU_DATA_DIR contract as
+    # qemu_boot_test.sh; otherwise auto-detect a share/qemu next to the
+    # binary that holds the full firmware union (seabios BIOS +
+    # qemu-system-data option ROMs + ipxe-qemu NIC ROMs).
+    qemu_l = []
+    data_dir = os.environ.get("QEMU_DATA_DIR")
+    if data_dir:
+        if not os.path.isfile(os.path.join(data_dir, "bios-256k.bin")):
+            sys.exit("qemu_qmp_probe: QEMU_DATA_DIR has no bios-256k.bin: %s" % data_dir)
+        qemu_l = ["-L", data_dir]
+    else:
+        exe = shutil.which("qemu-system-x86_64") or "qemu-system-x86_64"
+        cand = os.path.join(os.path.dirname(os.path.abspath(exe)), "../share/qemu")
+        for need in ("bios-256k.bin", "linuxboot_dma.bin", "kvmvapic.bin", "efi-e1000.rom"):
+            if not os.path.isfile(os.path.join(cand, need)):
+                sys.exit(
+                    "qemu_qmp_probe: %s lacks %s; symlink the qemu-system-data + "
+                    "seabios + ipxe-qemu union into one dir and export QEMU_DATA_DIR"
+                    % (cand, need))
+        qemu_l = ["-L", os.path.normpath(cand)]
+
     cmd = [
         "qemu-system-x86_64", "-m", "512", "-smp", "2", "-kernel", bz,
         "-nographic", "-no-reboot",
         "-append", "console=ttyS0,115200 nokaslr panic=-1",
         "-qmp", "unix:%s,server,nowait" % qmp_path,
-    ]
+    ] + qemu_l
     p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(wait)

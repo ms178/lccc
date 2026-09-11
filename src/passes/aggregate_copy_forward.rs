@@ -323,6 +323,13 @@ fn pointer_paths(
             }
         }
     }
+    // MULTI-DEF GUARD (gvn/copy_prop class): a value id with several
+    // definitions has position-dependent content; attributing ONE (root,
+    // path) to the id describes only the first-seen definition while its
+    // other definitions may point elsewhere.  Every access through such an
+    // id then takes the untracked (conservative, no-forwarding) fallback —
+    // the same refusal discipline as gvn/copy_prop/global_addr_cse.
+    let multi_def = super::gvn::find_multi_def_values(func);
     let mut changed = true;
     while changed {
         changed = false;
@@ -335,7 +342,7 @@ fn pointer_paths(
                         offset,
                         ty,
                     } => {
-                        if paths.contains_key(&dest.0) {
+                        if paths.contains_key(&dest.0) || multi_def.contains(&dest.0) {
                             continue;
                         }
                         if let Some((root, parent)) = paths.get(&base.0).cloned() {
@@ -349,7 +356,7 @@ fn pointer_paths(
                         dest,
                         src: Operand::Value(src),
                     } => {
-                        if !paths.contains_key(&dest.0) {
+                        if !paths.contains_key(&dest.0) && !multi_def.contains(&dest.0) {
                             if let Some(path) = paths.get(&src.0).cloned() {
                                 paths.insert(dest.0, path);
                                 changed = true;
@@ -357,7 +364,7 @@ fn pointer_paths(
                         }
                     }
                     Instruction::Phi { dest, incoming, .. } => {
-                        if paths.contains_key(&dest.0) {
+                        if paths.contains_key(&dest.0) || multi_def.contains(&dest.0) {
                             continue;
                         }
                         let mut common = None;

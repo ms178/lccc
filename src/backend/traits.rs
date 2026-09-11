@@ -2574,6 +2574,22 @@ pub trait ArchCodegen {
     /// already correct (non-popping `fstl`), so this is always safe. No-op on
     /// backends without the x87 cache.
     fn flush_x87_pending(&mut self) {}
+
+    /// SOUNDNESS (home-register freshness): invoked by the shared dispatch
+    /// (`generate_instruction`) once an instruction's destination value has
+    /// been emitted. Accumulator-style emitters stage operands into
+    /// destination registers IN PLACE (`imulq $K, %r, %r` then
+    /// `leaq d(%r), %r`), which overwrites the register's previous content —
+    /// including OTHER values that the static `reg_assignments` map claims
+    /// are homed there. A backend that consults that static map to decide
+    /// "the operand is already in its home register" must record each
+    /// definition here so stale fast paths can be detected and turned into
+    /// a reload (kernel 6.18.50 free_area_init_node: the loop index was
+    /// sign-extended into %r11, the zone pointer chain reused %r11 in place,
+    /// and the second `pgdat->node_zones + i` computation consumed the ZONE
+    /// POINTER as the index, panicking the boot with CR2 garbage). No-op by
+    /// default; no other behavior may piggyback on this hook.
+    fn note_dest_defined(&mut self, _dest: &Value) {}
 }
 
 // ── Shared jump table helpers ─────────────────────────────────────────────────

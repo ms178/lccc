@@ -242,6 +242,10 @@ struct Ctx<'a> {
     globals: &'a FxHashMap<String, usize>,
     ptr_ty_size: usize,
     env: Env,
+    /// Values with more than one definition (see run_round's MULTI-DEF
+    /// GUARD comment): position-dependent content, refused by the
+    /// position-independent rewrites.
+    multi_def: &'a crate::common::fx_hash::FxHashSet<u32>,
 }
 
 struct LoopShape<'a> {
@@ -905,6 +909,22 @@ fn plan_loop(cx: &Ctx, sh: &LoopShape, out: &mut Vec<Rewrite>) {
             let Instruction::Store { val, .. } = cx.inst(s.block, s.idx) else {
                 continue;
             };
+            // MULTI-DEF GUARD: see run_round. store_val feeds the header
+            // phi's latch incoming; load_dest is renamed function-wide.
+            let store_val_multi_def = match val {
+                Operand::Value(v) => cx.multi_def.contains(&v.0),
+                Operand::Const(_) => false,
+            };
+            if store_val_multi_def || cx.multi_def.contains(&dest.0) {
+                if cx.env.debug {
+                    eprintln!(
+                        "[lcfwd] {}: loop@{} pair (load b{}i{}, store b{}i{}) rejected: \
+                         multi-def operand",
+                        cx.func.name, sh.header, l.block, l.idx, s.block, s.idx
+                    );
+                }
+                continue;
+            }
             claimed_loads.insert((l.block, l.idx));
             out.push(Rewrite {
                 load_block: l.block,
@@ -1102,6 +1122,18 @@ fn run_round(func: &mut IrFunction, globals: &FxHashMap<String, usize>, env: Env
     func.next_value_id = bound;
     let dom = DominanceChecker::new(func.blocks.len(), &cfg.idom);
     let defs = Defs::build(func, bound as usize);
+    // MULTI-DEF GUARD (gvn/copy_prop class): both rewrite directions here
+    // are position-independent and therefore unsound through a multi-def
+    // value id (post-phi coalescing web — content changes at each
+    // redefinition):
+    //  * `store_val` becomes the header phi's LATCH incoming — it reads the
+    //    value at the LATCH END; if the id is redefined between the store
+    //    and the latch end, the phi carries the redefined content while the
+    //    memory still holds the stored one.
+    //  * `load_dest`'s uses are renamed function-wide onto the fresh phi;
+    //    uses after the dest's OTHER definitions expect those contents.
+    // Refuse both shapes and keep the load.
+    let multi_def = super::gvn::find_multi_def_values(func);
     let ptr_ty_size = target_ptr_size();
     let int_ty = if ptr_ty_size == 8 {
         IrType::I64
@@ -1126,6 +1158,7 @@ fn run_round(func: &mut IrFunction, globals: &FxHashMap<String, usize>, env: Env
             globals,
             ptr_ty_size,
             env,
+            multi_def: &multi_def,
         };
         for lp in &loops {
             let Some(preheader) = lp.find_preheader(&cfg.preds) else {

@@ -1357,6 +1357,28 @@ impl X86Codegen {
                 &self.state.ra_config,
             );
 
+        // Home-freshness bookkeeping (SOUNDNESS): reg_assignments is now THIS
+        // function's final map. Build its inverse so note_dest_defined can
+        // evict every other value sharing a destination's home register, and
+        // start with nothing fresh — each value becomes fresh only at its
+        // own defining instruction (ArchCodegen::note_dest_defined).
+        self.home_fresh.clear();
+        self.home_clobbered.clear();
+        self.home_sharers.clear();
+        self.value_live_segments.clear();
+        for (&v, &reg) in &self.reg_assignments {
+            self.home_sharers.entry(reg.0).or_default().push(v);
+        }
+        if let Some(liv) = &cached_liveness {
+            for seg in &liv.segments {
+                self.value_live_segments
+                    .entry(seg.value_id)
+                    .or_default()
+                    .push((seg.start, seg.end));
+            }
+        }
+        self.call_fresh_snapshot.clear();
+
         // ── PF-07 post-RA demotion (dead-materialisation cleanup) ─────────
         // A promoted indexed-symbol base that the RA could not actually home
         // is pure dead weight as materialised: its indexed consumers refuse

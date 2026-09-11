@@ -117,6 +117,9 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    {} %xmm0, %{}", mov_instr, name));
                 }
                 self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting: the store wrote the
+                // dest's XMM home with its value.
+                self.note_inplace_compute(reg, dest.0);
                 return;
             }
         }
@@ -1450,6 +1453,11 @@ impl X86Codegen {
                                     fma, rhs_name, lhs_name, dest_name
                                 ));
                                 self.state.reg_cache.invalidate_acc();
+                                // Definition-writes-home accounting: the
+                                // destructive 231-form wrote the fused
+                                // dest's XMM home (and destroyed the acc's
+                                // bits there).
+                                self.note_inplace_compute(dest_reg, add_dest.0);
                                 return;
                             }
                             if let Some(slot) = self.state.get_slot(v.0) {
@@ -1459,6 +1467,7 @@ impl X86Codegen {
                                     fma, sr, lhs_name, dest_name
                                 ));
                                 self.state.reg_cache.invalidate_acc();
+                                self.note_inplace_compute(dest_reg, add_dest.0);
                                 return;
                             }
                         }
@@ -1498,6 +1507,10 @@ impl X86Codegen {
                             fma, rhs, lhs_name, dest_name
                         ));
                         self.state.reg_cache.invalidate_acc();
+                        // Definition-writes-home accounting: the preload
+                        // staged the acc and the 231-form derived the fused
+                        // dest into its XMM home.
+                        self.note_inplace_compute(dest_reg, add_dest.0);
                         return;
                     }
                 }
@@ -1546,6 +1559,9 @@ impl X86Codegen {
                                 fma213, rhs_name, dest_name
                             ));
                             self.state.reg_cache.invalidate_acc();
+                            // Definition-writes-home accounting: the 213-form
+                            // wrote the fused dest's XMM home.
+                            self.note_inplace_compute(dest_reg, add_dest.0);
                             return;
                         }
                     }

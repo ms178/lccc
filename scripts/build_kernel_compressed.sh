@@ -26,6 +26,11 @@ C=$K/arch/x86/boot/compressed
 B=$K/arch/x86/boot
 S=$K/arch/x86/boot/startup
 OUT=${OUT:-/tmp/lccc-compressed}
+# Resolve the script directory before `cd "$K"`: the fragment and the
+# boot-builder must be found relative to THIS script, not to an absolute
+# repo path baked in at write time (/home/user/lccc only exists on the
+# original Arena host).
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 [[ -d "$K" ]] || { echo "kernel tree missing: $K" >&2; exit 1; }
 [[ -x "$LCCC" ]] || { echo "lccc missing: $LCCC" >&2; exit 1; }
@@ -40,7 +45,7 @@ if [[ ! -f .lccc-vm-config ]]; then
   echo "config: allnoconfig + kernel-vm.fragment"
   make ARCH=x86_64 allnoconfig >/dev/null
   scripts/kconfig/merge_config.sh -m .config \
-    /home/user/lccc/scripts/kernel-vm.fragment >/dev/null
+    "$SCRIPT_DIR/kernel-vm.fragment" >/dev/null
   make ARCH=x86_64 olddefconfig >/dev/null
   make ARCH=x86_64 syncconfig >/dev/null
   # timeconst.h / asm-offsets must match HZ_800 from the fragment.
@@ -209,7 +214,7 @@ echo "zoffset.h:"
 cat "$B/zoffset.h"
 
 echo "setup (build_kernel_boot.sh)"
-OUT="$OUT/setup" /home/user/lccc/scripts/build_kernel_boot.sh
+OUT="$OUT/setup" "$SCRIPT_DIR/build_kernel_boot.sh"
 # header.o was compiled against a stub zoffset in that script if it ran
 # before zoffset existed; recompile header.o with the real one and relink.
 RMF="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -DSVGA_MODE=NORMAL_VGA"
