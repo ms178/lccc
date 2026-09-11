@@ -74,10 +74,27 @@ if [[ -n ${QEMU_DATA_DIR:-} ]]; then
     }
     qemu_l=(-L "$QEMU_DATA_DIR")
 else
+    # A bootable -kernel run needs BOTH the BIOS (seabios package) and the
+    # option ROMs (qemu-system-data: linuxboot_dma.bin, kvmvapic.bin;
+    # ipxe-qemu: efi-*.rom for the default NIC). A dir that has only one
+    # half boots SeaBIOS and then DIES on "failed to find romfile" — worse,
+    # the efi-e1000.rom miss is FATAL and aborts QEMU before the guest
+    # starts. On a no-root harness the three debs are dpkg-extracted side
+    # by side, so accept only a dir holding the complete union.
     qdir=$(dirname "$(command -v "$QEMU")")
     for d in "$qdir/../share/qemu" "$qdir/../share/seabios"; do
-        if [[ -f "$d/bios-256k.bin" ]]; then qemu_l=(-L "$d"); break; fi
+        if [[ -f "$d/bios-256k.bin" && -f "$d/linuxboot_dma.bin" \
+              && -f "$d/kvmvapic.bin" && -f "$d/efi-e1000.rom" ]]; then
+            qemu_l=(-L "$d"); break
+        fi
     done
+    if ((${#qemu_l[@]} == 0)); then
+        echo "qemu_boot_test: no firmware dir holds the full BIOS + option-ROM union" >&2
+        echo "  (bios-256k.bin + linuxboot_dma.bin + kvmvapic.bin + efi-e1000.rom)." >&2
+        echo "  On a no-root host: symlink the contents of qemu-system-data, seabios" >&2
+        echo "  and ipxe-qemu into one dir and export QEMU_DATA_DIR=<that dir>." >&2
+        exit 1
+    fi
 fi
 
 echo "boot: $QEMU ${qemu_l[*]} -kernel $BZIMAGE (log: $LOG)"

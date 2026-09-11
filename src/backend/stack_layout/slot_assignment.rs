@@ -719,10 +719,20 @@ fn classify_value(
     } else {
         8
     };
-    // A value that is a Memcpy dest/src must be at least as wide as the copy:
-    // struct-by-value temps otherwise get 8-byte slots that a 32-byte copy
-    // overflows (simd_avx2_256 mul_ps check corruption).
-    if memcpy_width > slot_size {
+    // A value that is a Memcpy dest/src can need a wider slot than its type
+    // suggests: struct-by-value temps are copied through their pointer, and
+    // the documented regression (simd_avx2_256 mul_ps) had a 32-byte vector
+    // copy overflowing an 8-byte fallback slot. That protection is bounded
+    // at 32 bytes on purpose: `Memcpy`'s dest/src operands are POINTERS
+    // (backend/generation.rs marks them ptr_uses), and any copy larger than
+    // a vector is by construction a buffer copy through those pointers —
+    // the pointer value's own home stays 8 bytes. Unbounded, the floor
+    // handed ZSTD_decodeLiteralsBlock's 64 KiB literal-buffer copies
+    // (rep movsb / memmove of 65536 bytes) 65536-byte spill slots: the
+    // frame ballooned to 131 KB, the boot stack ran out of .bss, spilled
+    // frames landed INSIDE .text, and the overwritten code triple-faulted
+    // the preboot decompressor (session-35 kernel boot failure).
+    if memcpy_width > slot_size && memcpy_width <= 32 {
         slot_size = memcpy_width;
     }
 

@@ -25,7 +25,11 @@ K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.50}
 LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
 LOG=${BUILD_LOG:-/tmp/kernel-build-lccc.log}
-FRAGMENT=${FRAGMENT:-/home/user/lccc/scripts/kernel-vm.fragment}
+# Resolve the script directory before `cd "$K"`: the fragment must be found
+# relative to THIS script, not to an absolute repo path baked in at write
+# time (/home/user/lccc only exists on the original Arena host).
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+FRAGMENT=${FRAGMENT:-$SCRIPT_DIR/kernel-vm.fragment}
 JOBS=${JOBS:-2}
 
 [[ -d "$K" ]] || { echo "build_kernel_vm: kernel tree missing: $K" >&2; exit 1; }
@@ -70,12 +74,25 @@ if [[ ! -f .lccc-vm-config ]]; then
   # whenever the config is touched, so VERIFY the config is fully answered
   # up front: a syncconfig dry-run here fails in seconds, not after the
   # compile phase.
-  make ARCH=x86_64 syncconfig >/dev/null || {
+  #
+  # 2026-09-10 (session 35): the dry-run MUST run under the build's own
+  # compiler. `CC=lccc` changes kconfig visibility (lccc answers the
+  # -fsanitize=kcfi-style probes differently from gcc, so symbols like kCFI
+  # turn NEW). A syncconfig issued under default gcc sees nothing to ask,
+  # passes, and the first CC=lccc syncconfig later PROMPTS interactively
+  # ("[N/y/?] (NEW)") and hangs a non-interactive build for good — observed
+  # as an unexplained multi-minute stall before the first CC line. Answer
+  # every NEW symbol with its default first: olddefconfig never reads
+  # stdin; the syncconfig that follows then has nothing left to ask.
+  kconfig_defsync() { # kconfig_defsync <extra make args...>
+    make ARCH=x86_64 "$@" olddefconfig >/dev/null || return 1
+    make ARCH=x86_64 "$@" syncconfig >/dev/null || return 1
+  }
+  kconfig_defsync CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc || {
     echo "build_kernel_vm: syncconfig cannot auto-answer the config (stale .config?); regenerating" >&2
     make ARCH=x86_64 allnoconfig >/dev/null
     scripts/kconfig/merge_config.sh -m .config "$FRAGMENT" >/dev/null
-    make ARCH=x86_64 olddefconfig >/dev/null
-    make ARCH=x86_64 syncconfig >/dev/null || {
+    kconfig_defsync CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc || {
       echo "build_kernel_vm: config still fails syncconfig after regeneration" >&2
       exit 1
     }
@@ -134,6 +151,12 @@ start=$(date +%s)
 # die with "Error in reading or end of file" — after the config phase
 # already passed.  A serial syncconfig here makes the build's own
 # syncconfig a no-op (auto.conf is fresh), eliminating the race entirely.
+# olddefconfig FIRST (same CC/LD): it answers any NEW symbol with its
+# default without reading stdin, so the syncconfig cannot prompt.
+make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc olddefconfig >/dev/null || {
+  echo "build_kernel_vm: serial olddefconfig refresh failed" >&2
+  exit 1
+}
 make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc syncconfig >/dev/null || {
   echo "build_kernel_vm: serial syncconfig refresh failed" >&2
   exit 1

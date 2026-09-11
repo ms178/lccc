@@ -231,6 +231,16 @@ struct GvnState {
     /// `restrict` pointer parameter indices: only these get
     /// `PtrBase::NoAliasParam` epochs.
     noalias_params: FxHashSet<usize>,
+    /// Values with MORE THAN ONE definition in this function (post-phi
+    /// coalescing webs, multi-def Copy chains). CSE must never replace a
+    /// later recomputation with a reference to such a value: the id's
+    /// content changes at each redefinition, so "the value at the record
+    /// point" differs from "the value at the use point" (kernel 6.18.50
+    /// free_area_init_node: `Cast v1020; Mul v1020=v1020*1216; Add
+    /// v1020=v84+v1020` chains, then GVN matched the second `sext(zid)`
+    /// against the recorded `sext→v1020` and rewired the second zone
+    /// computation to read the ZONE POINTER — boot page fault).
+    multi_def_values: FxHashSet<u32>,
     context: GvnContext,
     /// Rollback log for `expr_to_value`: (key, previous_value).
     rollback_log: Vec<(ExprKey, Option<Value>)>,
@@ -295,6 +305,7 @@ impl GvnState {
         site_local_gaddrs: FxHashSet<u32>,
         nonescaping_allocas: FxHashSet<u32>,
         noalias_params: FxHashSet<usize>,
+        multi_def_values: FxHashSet<u32>,
     ) -> Self {
         Self {
             value_numbers: vec![u32::MAX; max_value_id + 1],
@@ -311,6 +322,7 @@ impl GvnState {
             base_epoch_log: Vec::new(),
             nonescaping_allocas,
             noalias_params,
+            multi_def_values,
             context: context.clone(),
             rollback_log: Vec::new(),
             load_rollback_log: Vec::new(),
@@ -1117,6 +1129,24 @@ fn gvn_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
     super::global_addr_cse::classify_site_local_indexed(func)
 }
 
+/// Values defined by MORE THAN ONE instruction (post-phi coalescing webs,
+/// chained Copy/Mul/Add rewrites). See `GvnState::multi_def_values`.
+pub(crate) fn find_multi_def_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                *counts.entry(dest.0).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, c)| *c > 1)
+        .map(|(v, _)| v)
+        .collect()
+}
+
 pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &GvnContext) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 || function_uses_128(func) {
@@ -1126,6 +1156,7 @@ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &Gvn
     let volatile = find_volatile_allocas(func);
     let nonescaping = find_nonescaping_allocas(func);
     let noalias = find_noalias_params(func);
+    let multi_def = find_multi_def_values(func);
     if num_blocks == 1 {
         let mut state = GvnState::new(
             func.max_value_id() as usize,
@@ -1137,6 +1168,7 @@ pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &Gvn
             gvn_site_local_indexed(func),
             nonescaping,
             noalias,
+            multi_def,
         );
         return process_block(0, func, &mut state);
     }
@@ -1164,6 +1196,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
     let site_local = gvn_site_local_indexed(func);
     let nonescaping = find_nonescaping_allocas(func);
     let noalias = find_noalias_params(func);
+    let multi_def = find_multi_def_values(func);
     if num_blocks == 1 {
         let mut state = GvnState::new(
             func.max_value_id() as usize,
@@ -1175,6 +1208,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
             site_local,
             nonescaping,
             noalias,
+            multi_def,
         );
         return process_block(0, func, &mut state);
     }
@@ -1188,6 +1222,7 @@ pub(crate) fn run_gvn_with_analysis_and_context(
         site_local,
         nonescaping,
         noalias,
+        multi_def,
     );
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
     state.total_eliminated
@@ -1424,6 +1459,8 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                             ty,
                         };
                         if let Some((stored_op, version)) = state.store_fwd_map.get(&fwd_key) {
+                            let stored_is_multi_def = matches!(stored_op, Operand::Value(v)
+                                if state.multi_def_values.contains(&v.0));
                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
                                 eprintln!(
                                     "[GVNDBG] fwd cand ptr_vn={:?} valid={}",
@@ -1431,7 +1468,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                                     state.entry_valid_for(ptr_vn, *version)
                                 );
                             }
-                            if state.entry_valid_for(ptr_vn, *version) {
+                            if state.entry_valid_for(ptr_vn, *version) && !stored_is_multi_def {
                                 let stored_op = *stored_op;
                                 if std::env::var_os("CCC_DEBUG_GVN").is_some() {
                                     eprintln!(
@@ -1489,14 +1526,20 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         .load_expr_to_value
                         .get(&expr_key)
                         .and_then(|&(val, version)| {
-                            if state.entry_valid_for(&ptr_vn, version) {
+                            if state.entry_valid_for(&ptr_vn, version)
+                                && !state.multi_def_values.contains(&val.0)
+                            {
                                 Some(val)
                             } else {
                                 None
                             }
                         })
                 } else {
-                    state.expr_to_value.get(&expr_key).copied()
+                    state
+                        .expr_to_value
+                        .get(&expr_key)
+                        .copied()
+                        .filter(|ev| !state.multi_def_values.contains(&ev.0))
                 };
 
                 // Only CSE within the same block to avoid cross-block Copy issues.

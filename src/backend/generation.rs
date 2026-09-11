@@ -4937,6 +4937,11 @@ pub(super) fn generate_instruction(
     if !matches!(inst, Instruction::Cmp { .. } | Instruction::Cast { .. }) {
         cg.flush_pending_widen();
     }
+    // Captured up front: the destination this instruction defines, so the
+    // home-freshness note below cannot be skipped by any early return
+    // inside the dispatch arms (the inline-memcpy/memset Call arms return
+    // early with the result value already materialised).
+    let defined_dest = inst.dest();
     match inst {
         // GNU C nested-function support (static chain / trampoline /
         // non-local goto). x86-only; the trait defaults fail closed on
@@ -5218,6 +5223,9 @@ pub(super) fn generate_instruction(
                 let result = info.dest.filter(|d| call_result_is_used(cg, d));
                 cg.emit_inline_memcpy_call(&info.args[0], &info.args[1], size, result.as_ref());
                 clobber_after_call_like(cg);
+                if let Some(d) = defined_dest {
+                    cg.note_dest_defined(&d);
+                }
                 return;
             }
             // Fixed-size memset / __memset_chk: the backend decides per CPU
@@ -5228,6 +5236,9 @@ pub(super) fn generate_instruction(
                 let result = info.dest.filter(|d| call_result_is_used(cg, d));
                 cg.emit_inline_memset_call(&info.args[0], &info.args[1], size, result.as_ref());
                 clobber_after_call_like(cg);
+                if let Some(d) = defined_dest {
+                    cg.note_dest_defined(&d);
+                }
                 return;
             }
             cg.emit_call(
@@ -5461,6 +5472,14 @@ pub(super) fn generate_instruction(
             cg.emit_param_ref(dest, *param_idx, *ty);
             clobber_after_call_like(cg);
         }
+    }
+
+    // Home-register freshness bookkeeping (see ArchCodegen::note_dest_defined).
+    // Runs on EVERY dispatch path: the accumulator emitters reuse operand
+    // registers in place for derived values, so each definition evicts every
+    // OTHER value sharing that destination's home register.
+    if let Some(dest) = defined_dest {
+        cg.note_dest_defined(&dest);
     }
 }
 

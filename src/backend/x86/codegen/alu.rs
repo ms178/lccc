@@ -1427,8 +1427,16 @@ impl X86Codegen {
         // that fits in imm32. Order matters: try this BEFORE the memory-source
         // and operand_to_eax paths so the register-homed lhs is not staged.
         if let Operand::Value(lhs_val) = mul_lhs {
+            // Home-freshness gate (see emit.rs home_fresh): the 3-operand
+            // form reads the LHS in place from its home — only sound while
+            // the register provably still holds that value. A stale home
+            // (the accumulator emitter reuses destination registers in
+            // place for derived values) falls through to the general path,
+            // which stages the LHS through the reload machinery (kernel
+            // 6.18.50 free_area_init_node: the fused mul-add consumed the
+            // zone POINTER as the loop index).
             if let Some(lhs_reg) = self
-                .dest_reg(lhs_val)
+                .fresh_home_of(lhs_val.0)
                 .filter(|r| !super::emit::is_xmm_reg(*r))
             {
                 if let Some(imm) = Self::const_as_imm32_typed(mul_rhs, use_32bit) {

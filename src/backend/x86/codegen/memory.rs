@@ -102,7 +102,9 @@ impl X86Codegen {
     /// must not be gambled on. Refusals fall back to the `leaq` path, which
     /// reloads the index through the sext-aware operand machinery.
     fn ensure_sib_index_form(&mut self, index: &Value) -> bool {
-        let Some(&reg) = self.reg_assignments.get(&index.0) else {
+        // Freshness-gated (see home_fresh): a stale home must not feed a
+        // SIB index; refusing the fold falls back to the reload path.
+        let Some(reg) = self.fresh_home_of(index.0) else {
             return false;
         };
         if is_xmm_reg(reg) {
@@ -181,13 +183,13 @@ impl X86Codegen {
         };
 
         // Check if both base and counter are in registers
-        let base_reg = match self.reg_assignments.get(&ivsr_info.base_ptr.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let base_reg = match self.fresh_home_of(ivsr_info.base_ptr.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
-        let index_reg = match self.reg_assignments.get(&counter_val.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let index_reg = match self.fresh_home_of(counter_val.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
@@ -203,7 +205,7 @@ impl X86Codegen {
 
         // Check if loading the store value would clobber base or index register
         if let Operand::Value(v) = val {
-            if let Some(&val_reg) = self.reg_assignments.get(&v.0) {
+            if let Some(val_reg) = self.fresh_home_of(v.0) {
                 let val_name = phys_reg_name(val_reg);
                 if val_name == base_reg || val_name == index_reg {
                     return false;
@@ -332,13 +334,13 @@ impl X86Codegen {
         };
 
         // Check if base and index both have register assignments
-        let base_reg = match self.reg_assignments.get(&gep_base.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let base_reg = match self.fresh_home_of(gep_base.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
-        let index_reg = match self.reg_assignments.get(&index_val.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let index_reg = match self.fresh_home_of(index_val.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
@@ -356,7 +358,7 @@ impl X86Codegen {
         // the base/index, or when operand_to_rax needs to use the register for
         // intermediate computations. If so, fall back to non-indexed store.
         if let Operand::Value(v) = val {
-            if let Some(&val_reg) = self.reg_assignments.get(&v.0) {
+            if let Some(val_reg) = self.fresh_home_of(v.0) {
                 let val_name = phys_reg_name(val_reg);
                 if val_name == base_reg || val_name == index_reg {
                     return false; // Register conflict, fall back
@@ -438,13 +440,13 @@ impl X86Codegen {
         };
 
         // Check if both base and counter are in registers
-        let base_reg = match self.reg_assignments.get(&ivsr_info.base_ptr.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let base_reg = match self.fresh_home_of(ivsr_info.base_ptr.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
-        let index_reg = match self.reg_assignments.get(&counter_val.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let index_reg = match self.fresh_home_of(counter_val.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
@@ -564,13 +566,13 @@ impl X86Codegen {
         };
 
         // Check if base and index both have register assignments
-        let base_reg = match self.reg_assignments.get(&gep_base.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let base_reg = match self.fresh_home_of(gep_base.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 
-        let index_reg = match self.reg_assignments.get(&index_val.0) {
-            Some(&reg) => phys_reg_name(reg),
+        let index_reg = match self.fresh_home_of(index_val.0) {
+            Some(reg) => phys_reg_name(reg),
             None => return false,
         };
 

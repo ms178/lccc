@@ -534,6 +534,44 @@ pub struct X86Codegen {
     /// Register allocation results for the current function.
     /// Maps value ID -> callee-saved register assignment.
     pub(super) reg_assignments: FxHashMap<u32, PhysReg>,
+    /// Home-register freshness (SOUNDNESS): value IDs whose assigned home
+    /// register PROVABLY still holds their value right now. The static
+    /// `reg_assignments` map is written once per function, but the
+    /// accumulator emitter stages operands into destination registers in
+    /// place (`imulq $K, %r, %r`, `leaq d(%r), %r`), overwriting a home's
+    /// content with a DERIVED value. Consulting the static map alone then
+    /// skips a needed reload and feeds the derived value to a later use of
+    /// the original one — the kernel 6.18.50 free_area_init_node boot panic
+    /// (`pgdat->node_zones + i` computed the second time from the ZONE
+    /// POINTER left in %r11, CR2 garbage). `note_dest_defined` maintains
+    /// this set; read-side staging consults it.
+    pub(super) home_fresh: FxHashSet<u32>,
+    /// Values whose home register was CLOBBERED (staging / in-place derived
+    /// compute / window scratch / call) since their last recorded definition
+    /// — the register content is NOT theirs. Distinct from "not in
+    /// home_fresh": a value not yet defined in EMISSION order (back-edge
+    /// phi-cycle values whose def block comes later in the block array)
+    /// is neither fresh nor clobbered, and reading its home is sound — the
+    /// RA homed it for exactly that purpose and the def-writes-home
+    /// invariant holds at runtime (the def precedes every runtime consumer).
+    pub(super) home_clobbered: FxHashSet<u32>,
+    /// Hole-aware live segments per value (start, end) in program-point
+    /// numbering, from the RA's liveness. `note_reg_clobbered` consults them
+    /// to mark ONLY the sharers that are actually LIVE at the clobber point —
+    /// a dead sharer's consumers are unreachable from the clobber, so its
+    /// home stays readable (RA interference keeps the register's next
+    /// real holder's def on a path where this value is already dead).
+    pub(super) value_live_segments: FxHashMap<u32, Vec<(u32, u32)>>,
+    /// Inverse of `reg_assignments`: physical register id -> value IDs homed
+    /// there. Lets `note_dest_defined` evict every OTHER sharer of a
+    /// destination's home in O(sharers) instead of scanning the whole map.
+    pub(super) home_sharers: FxHashMap<u8, Vec<u32>>,
+    /// Freshness snapshot taken by emit_pre_call_save_caller_regs for the
+    /// registers it actually saves, replayed by emit_post_call_restore_
+    /// caller_regs: the call clobbers caller-saved homes, but the save and
+    /// restore preserve the content that was live at the call, so exactly
+    /// the snapshot set becomes fresh again after the restore.
+    pub(super) call_fresh_snapshot: Vec<u32>,
     /// Which callee-saved registers are used and need save/restore.
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// Whether SSE is disabled (-mno-sse). When true, variadic prologues skip
@@ -997,6 +1035,11 @@ impl X86Codegen {
             asm_scratch_idx: 0,
             asm_xmm_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),
+            home_fresh: FxHashSet::default(),
+            home_clobbered: FxHashSet::default(),
+            value_live_segments: FxHashMap::default(),
+            home_sharers: FxHashMap::default(),
+            call_fresh_snapshot: Vec::new(),
             used_callee_saved: Vec::new(),
             function_alignment: 0,
             skip_rax_setup: false,
@@ -1286,8 +1329,259 @@ impl X86Codegen {
     /// Get the callee-saved register assigned to an operand, if any.
     pub(super) fn operand_reg(&self, op: &Operand) -> Option<PhysReg> {
         match op {
-            Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
+            Operand::Value(v) => self.fresh_home_of(v.0),
             _ => None,
+        }
+    }
+
+    /// A value's assigned home register, but ONLY when that register's
+    /// current content is still the value (see `home_fresh`). Stale homes
+    /// return None so read-side consumers fall back to a reload instead of
+    /// consuming whatever derived value the accumulator emitter last left
+    /// in the register.
+    pub(super) fn fresh_home_of(&self, val_id: u32) -> Option<PhysReg> {
+        let reg = self.reg_assignments.get(&val_id).copied()?;
+        if self.home_clobbered.contains(&val_id) {
+            None
+        } else {
+            Some(reg)
+        }
+    }
+
+    /// Home-freshness-filtered view of `reg_assignments` for the MachInst
+    /// lowering (isel). isel pre-colors any value present in this map to its
+    /// `MachReg::Phys` home — including as a SOURCE operand, which is only
+    /// sound while the register provably still holds that value. The
+    /// accumulator emitter reuses destination registers in place for
+    /// derived values, so a stale home must NOT be pre-colored: passing it
+    /// as a Vreg lets the MachInst allocator reload it from its slot
+    /// (kernel 6.18.50 free_area_init_node zone-pointer-as-index panic).
+    /// Values not yet noted fresh fall back to the classic path or to a
+    /// MachInst-local reload — both sound.
+    fn fresh_ra_for_isel(&self) -> FxHashMap<u32, PhysReg> {
+        self.reg_assignments
+            .iter()
+            .filter(|(k, _)| !self.home_clobbered.contains(*k))
+            .map(|(k, v)| (*k, *v))
+            .collect()
+    }
+
+    /// Record that `dest_id` was just defined into its home register: the
+    /// emitters' standing invariant is "a homed value's definition writes its
+    /// home" (store_rax_to's register arm, register-direct loads, in-place
+    /// computes into the dest's own home). RA interference guarantees that a
+    /// sibling sharing this register has a DISJOINT live range — a sibling's
+    /// definition can only happen where THIS value is dead, and (SSA) a dead
+    /// point can never reach a later consumer — so a normal definition NEVER
+    /// evicts sharers. Only clobbering writes into a register that is NOT the
+    /// written value's own home (staging, in-place derived computes, window
+    /// scratch, calls) violate the invariant; those go through
+    /// `note_reg_clobbered`.
+    pub(super) fn note_home_written(&mut self, dest_id: u32) {
+        if self.reg_assignments.contains_key(&dest_id) {
+            if std::env::var_os("CCC_TRACE_NOTES").is_some() {
+                eprintln!("[INS] fn={} v={}", self.state.current_func_name, dest_id);
+            }
+            self.home_fresh.insert(dest_id);
+            self.home_clobbered.remove(&dest_id);
+        }
+    }
+
+    /// SOUNDNESS: register `phys` was just written with something that is NOT
+    /// the home-registered value of one of its sharers (staged operand,
+    /// in-place derived compute, window scratch assignment, call clobber).
+    /// Every value homed there is now stale: later consumers must reload from
+    /// slot / rematerialize / accumulator instead of reading the register
+    /// (kernel 6.18.50 free_area_init_node: `imulq $1216, %r11, %r11` left the
+    /// ZONE POINTER in the loop index's home and the fused mul-add consumed
+    /// it as the index).
+    pub(super) fn note_reg_clobbered(&mut self, phys: u8) {
+        if let Some(sharers) = self.home_sharers.get(&phys) {
+            let point = self.state.current_program_point;
+            // Liveness gate: only sharers LIVE at the clobber point lose
+            // their home. A dead sharer has no reachable consumer past this
+            // point (segments are hole-aware, so a value live on ANOTHER
+            // branch path is not live HERE) and its home content is
+            // irrelevant until its own redefinition re-marks it.
+            let stale: Vec<u32> = sharers
+                .iter()
+                .copied()
+                .filter(|v| {
+                    self.value_live_segments
+                        .get(v)
+                        .is_some_and(|segs| segs.iter().any(|&(s, e)| s <= point && point <= e))
+                })
+                .collect();
+            if std::env::var_os("CCC_TRACE_NOTES").is_some() && !stale.is_empty() {
+                eprintln!(
+                    "[CLOB] fn={} phys={} pp={} evicts={:?}",
+                    self.state.current_func_name, phys, point, stale
+                );
+            }
+            for v in stale {
+                self.home_fresh.remove(&v);
+                self.home_clobbered.insert(v);
+            }
+        }
+    }
+
+    /// Staging-write accounting for [`Self::operand_to_callee_reg`]/register
+    /// staging generally: the caller is about to write `target` with the
+    /// operand's content. If the operand is the value HOMED at `target`, this
+    /// re-establishes that home (mark fresh). Otherwise the write may
+    /// overwrite ANOTHER value's home register — invalidate every sharer so
+    /// later consumers reload instead of reading the staged content.
+    pub(super) fn note_staging_target(&mut self, op: &Operand, target: PhysReg) {
+        if let Operand::Value(v) = op {
+            if self
+                .reg_assignments
+                .get(&v.0)
+                .is_some_and(|r| r.0 == target.0)
+            {
+                self.home_fresh.insert(v.0);
+                self.home_clobbered.remove(&v.0);
+                return;
+            }
+        }
+        self.note_reg_clobbered(target.0);
+    }
+
+    /// Rematerialize a value whose home register is stale AND whose stack
+    /// slot was never written (homed-only accumulator values — the emitter
+    /// skips the slot store for register-allocated results). Chases the def
+    /// chain through Copy and integer Casts to a source with a real slot,
+    /// staging the source into @target and re-establishing the extension.
+    /// Returns false when the def shape is not rematerializable this way;
+    /// the caller then falls back to the slot load, which is exactly the
+    /// pre-fix behavior for that shape.
+    ///
+    /// Kernel 6.18.50 free_area_init_node: the sign-extended loop index
+    /// (`movslq -80(%rbp), %r11`) was homed in %r11 with no slot store; the
+    /// in-place GEP chain `imulq $1216, %r11, %r11; leaq base(, %r11), %r11`
+    /// overwrote it, and the second `pgdat->node_zones + i` computation
+    /// consumed the ZONE POINTER as the index. This remat re-emits the
+    /// extension from the loop counter's slot.
+    fn rematerialize_stale_into(&mut self, v: &Value, target: PhysReg, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let Some(inst) = self.get_defining_instruction(v.0).cloned() else {
+            return false;
+        };
+        match inst {
+            crate::ir::reexports::Instruction::Copy { src, .. } => {
+                let Operand::Value(sv) = src else {
+                    return false;
+                };
+                self.operand_to_callee_reg(&Operand::Value(sv), target);
+                true
+            }
+            crate::ir::reexports::Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_integer() && to_ty.is_integer() => {
+                let Operand::Value(sv) = src else {
+                    return false;
+                };
+                let from_sz = from_ty.size();
+                let to_sz = to_ty.size();
+                if from_sz >= to_sz {
+                    // Truncation or same-width reinterpret: staging the
+                    // source at its own width leaves exactly the needed
+                    // low bits in @target.
+                    self.operand_to_callee_reg(&Operand::Value(sv), target);
+                    return true;
+                }
+                if from_sz < 4 {
+                    // Sub-4-byte extensions depend on slot neighbour bits
+                    // that a full-width staging would drag in; not safe to
+                    // re-derive here.
+                    return false;
+                }
+                // Stage the source: for a 4-byte slot this is a zeroing
+                // `movl`, for 8 bytes a `movq` — either way the source's
+                // own materialisation path supplies the ground truth.
+                self.operand_to_callee_reg(&Operand::Value(sv), target);
+                if from_ty.is_signed() && to_sz == 8 {
+                    // Signed 32→64: re-establish the sign extension in
+                    // place (the staging's zero-extension is wrong for
+                    // negative values).
+                    let t32 = phys_reg_name_32(target);
+                    self.state
+                        .out
+                        .emit_instr_reg_reg("    movslq", t32, phys_reg_name(target));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Rax-targeted variant of [`Self::rematerialize_stale_into`] for the
+    /// accumulator paths: %rax has no PhysReg id in the emitter's register
+    /// numbering (it is never a home), so the extension move is emitted by
+    /// name. Rebuilds a stale-homed Cast/Copy-defined value into %rax from
+    /// its source; returns false when the def shape is not rematerializable.
+    fn rematerialize_stale_into_rax(
+        &mut self,
+        v: &Value,
+        is_alloca: bool,
+        depth: u8,
+    ) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let Some(inst) = self.get_defining_instruction(v.0).cloned() else {
+            return false;
+        };
+        match inst {
+            crate::ir::reexports::Instruction::Copy { src, .. } => {
+                let Operand::Value(sv) = src else {
+                    return false;
+                };
+                if !self.rematerialize_stale_into_rax(&sv, is_alloca, depth - 1) {
+                    self.operand_to_rax(&Operand::Value(sv));
+                }
+                self.state.reg_cache.set_acc(v.0, is_alloca);
+                true
+            }
+            crate::ir::reexports::Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_integer() && to_ty.is_integer() => {
+                let Operand::Value(sv) = src else {
+                    return false;
+                };
+                let from_sz = from_ty.size();
+                let to_sz = to_ty.size();
+                if from_sz < 4 || from_sz >= to_sz {
+                    // Same-width reinterpret or truncation: staging the
+                    // source at its own width suffices. Sub-4-byte sources
+                    // depend on slot neighbour bits; refuse (pre-fix
+                    // behavior then applies).
+                    if from_sz >= to_sz {
+                        self.operand_to_rax(&Operand::Value(sv));
+                        self.state.reg_cache.set_acc(v.0, is_alloca);
+                        return true;
+                    }
+                    return false;
+                }
+                // Stage the source (its slot write is the ground truth),
+                // then re-establish the extension in %rax.
+                self.operand_to_rax(&Operand::Value(sv));
+                if from_ty.is_signed() && to_sz == 8 {
+                    self.state
+                        .out
+                        .emit_instr_reg_reg("    movslq", "eax", "rax");
+                }
+                self.state.reg_cache.set_acc(v.0, is_alloca);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1313,11 +1607,17 @@ impl X86Codegen {
     /// and constants.
     pub(super) fn value_ptr_mem_operand(&self, val_id: u32) -> Option<String> {
         use crate::backend::state::SlotAddr;
-        if let Some(&reg) = self.reg_assignments.get(&val_id) {
+        // Freshness-gated: a home whose register currently holds a derived
+        // value must not be used as a memory-operand base.
+        if let Some(reg) = self.fresh_home_of(val_id) {
             if !is_xmm_reg(reg) && Self::VEC_BASE_SAFE_REGS.contains(&reg.0) {
                 let name = phys_reg_name(reg);
                 return Some(format!("(%{})", name));
             }
+            return None;
+        }
+        if self.reg_assignments.contains_key(&val_id) {
+            // Homed but stale: not usable as a register base.
             return None;
         }
         if let Some(addr) = self.state.resolve_slot_addr(val_id) {
@@ -1602,6 +1902,13 @@ impl X86Codegen {
 
     /// Handles constants, register-allocated values, and stack values.
     pub(super) fn operand_to_callee_reg(&mut self, op: &Operand, target: PhysReg) {
+        // Staging-write accounting (SOUNDNESS, see note_staging_target): this
+        // call writes `target` with the operand's content. Registering the
+        // write here keeps every consumer of a home register that a staging
+        // path overwrites honest (reload instead of reading the staged
+        // content). Arms that end up not writing `target` only make this
+        // conservative.
+        self.note_staging_target(op, target);
         let target_name = phys_reg_name(target);
         match op {
             Operand::Const(c) => {
@@ -1700,21 +2007,63 @@ impl X86Codegen {
                 }
             }
             Operand::Value(v) => {
+                // SOUNDNESS (home freshness): the static reg_assignments map
+                // says where a value is HOMED, not what the register holds
+                // RIGHT NOW. The accumulator emitter reuses destination
+                // registers in place for derived values (`imulq $K, %r, %r`
+                // then `leaq d(%r), %r`), so a home can hold a completely
+                // different value by the time the original is consumed
+                // again. Only a FRESH home may satisfy staging without a
+                // reload; a stale one falls through to the slot/accumulator
+                // materialisation paths (kernel 6.18.50 free_area_init_node:
+                // the second `pgdat->node_zones + i` consumed the zone
+                // POINTER as the index and panicked the boot).
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    if reg.0 != target.0 {
-                        if is_xmm_reg(reg) {
-                            // XMM → GPR
-                            let xmm_name = phys_reg_name(reg);
-                            self.state
-                                .emit_fmt(format_args!("    movq %{}, %{}", xmm_name, target_name));
-                        } else {
-                            let src_name = phys_reg_name(reg);
-                            self.state
-                                .out
-                                .emit_instr_reg_reg("    movq", src_name, target_name);
+                    if !self.home_clobbered.contains(&v.0) {
+                        if reg.0 != target.0 {
+                            if is_xmm_reg(reg) {
+                                // XMM → GPR
+                                let xmm_name = phys_reg_name(reg);
+                                self.state.emit_fmt(format_args!(
+                                    "    movq %{}, %{}",
+                                    xmm_name, target_name
+                                ));
+                            } else {
+                                let src_name = phys_reg_name(reg);
+                                self.state
+                                    .out
+                                    .emit_instr_reg_reg("    movq", src_name, target_name);
+                            }
                         }
+                        // If same register, nothing to do
+                    } else if self.rematerialize_stale_into(v, target, 3) {
+                        // Stale home, unwritten slot: the def chain was
+                        // re-emitted into @target (e.g. a sign-extended
+                        // index re-extended from its narrow source slot).
+                    } else if self.state.get_slot(v.0).is_some() {
+                        // Stale home: reload the value from its slot.
+                        self.value_to_reg(v, target_name);
+                    } else if self.state.reg_cache.acc_has(v.0, false)
+                        || self.state.reg_cache.acc_has(v.0, true)
+                    {
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", "rax", target_name);
+                    } else {
+                        // Stale home with no slot/remat/acc path. Reading the
+                        // home register would feed the consumer whatever
+                        // clobbering write (staging / in-place compute /
+                        // window / call) left there — the free_area_init_node
+                        // bug class. Fail loudly instead: a value whose home
+                        // was provably clobbered must have a recovery path.
+                        panic!(
+                            "x86 codegen: operand_to_callee_reg: value {} in function '{}' \
+                             has a stale home with no slot/remat/acc recovery — refusing to \
+                             read the clobbered register",
+                            v.0,
+                            self.state.current_func_name
+                        );
                     }
-                    // If same register, nothing to do
                 } else if let Some(slot) = self.state.get_slot(v.0) {
                     // Delegate to value_to_reg: it handles allocas (leaq with
                     // over-alignment), vector values, and — critically — loads
@@ -1779,21 +2128,52 @@ impl X86Codegen {
                 }
             },
             Operand::Value(v) => {
+                // Home-freshness gate (see operand_to_callee_reg): a homed
+                // value whose register now holds a derived value must reload
+                // instead of copying the stale content with movq.
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    if reg.0 != target.0 {
-                        if is_xmm_reg(reg) {
-                            let xmm_name = phys_reg_name(reg);
-                            self.state
-                                .emit_fmt(format_args!("    movq %{}, %{}", xmm_name, target_name));
+                    if !self.home_clobbered.contains(&v.0) {
+                        if reg.0 != target.0 {
+                            if is_xmm_reg(reg) {
+                                let xmm_name = phys_reg_name(reg);
+                                self.state.emit_fmt(format_args!(
+                                    "    movq %{}, %{}",
+                                    xmm_name, target_name
+                                ));
+                            } else {
+                                // Use movq for register-to-register to preserve sign bits.
+                                // movl zero-extends upper 32 bits, losing sign information
+                                // for I32 values that later flow into 64-bit operations.
+                                let src_name = phys_reg_name(reg);
+                                self.state
+                                    .out
+                                    .emit_instr_reg_reg("    movq", src_name, target_name);
+                            }
+                        }
+                        // Same fresh register: already staged.
+                    } else if let Some(slot) = self.state.get_slot(v.0) {
+                        if self.state.is_alloca(v.0) {
+                            // Allocas are addresses, use 64-bit
+                            self.operand_to_callee_reg(op, target);
+                            return;
                         } else {
-                            // Use movq for register-to-register to preserve sign bits.
-                            // movl zero-extends upper 32 bits, losing sign information
-                            // for I32 values that later flow into 64-bit operations.
-                            let src_name = phys_reg_name(reg);
+                            // Stale home: reload from the slot.
+                            // Use movq to preserve sign bits in upper 32 bits.
+                            // movl zero-extends, which corrupts negative I32 values
+                            // that later flow into 64-bit operations.
                             self.state
                                 .out
-                                .emit_instr_reg_reg("    movq", src_name, target_name);
+                                .emit_instr_rbp_reg("    movq", slot.0, target_name);
                         }
+                    } else if self.state.reg_cache.acc_has(v.0, false)
+                        || self.state.reg_cache.acc_has(v.0, true)
+                    {
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", "rax", target_name);
+                    } else {
+                        self.operand_to_callee_reg(op, target);
+                        return;
                     }
                 } else if let Some(slot) = self.state.get_slot(v.0) {
                     if self.state.is_alloca(v.0) {
@@ -1917,7 +2297,8 @@ impl X86Codegen {
                     return;
                 }
                 // Check register allocation: load from assigned register
-                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                // (freshness-gated: a stale home falls to the slot path).
+                if let Some(reg) = self.fresh_home_of(v.0) {
                     if is_xmm_reg(reg) {
                         let reg_name = phys_reg_name(reg);
                         self.state
@@ -2026,6 +2407,15 @@ impl X86Codegen {
                     // sqlite3KeyInfoFromExprList).  Reaching here means a
                     // producer/consumer handoff is broken; fail loudly.
                     //
+                    // Stale-home remat first: a Cast/Copy-defined value is
+                    // rebuilt exactly from its source (a sign-extended loop
+                    // index re-extended from its narrow source slot) — the
+                    // sound path for homes clobbered by MachInst windows or
+                    // in-place accumulator chains after the definition.
+                    if self.rematerialize_stale_into_rax(v, is_alloca, 3) {
+                        return;
+                    }
+                    //
                     // Include the tail of the asm emitted so far: the
                     // instruction context around the failure is exactly what a
                     // soundness hunt needs, and it is otherwise lost because
@@ -2036,10 +2426,17 @@ impl X86Codegen {
                         lines[n.saturating_sub(30)..].to_vec()
                     };
                     if std::env::var_os("CCC_DEBUG_NOHOME").is_some() {
+                        let home = self.reg_assignments.get(&v.0).map(|r| r.0);
+                        let fresh = self.home_fresh.contains(&v.0);
+                        let sharers = home
+                            .and_then(|h| self.home_sharers.get(&h).cloned());
                         eprintln!(
-                            "[NOHOME] fn={} value={} defined_by={:?} in_ir_shadow={}",
+                            "[NOHOME] fn={} value={} home={:?} fresh={} sharers={:?} defined_by={:?} in_ir_shadow={}",
                             self.state.current_func_name,
                             v.0,
+                            home,
+                            fresh,
+                            sharers,
                             self.get_defining_instruction(v.0).map(|i| format!("{i:?}")),
                             self.machinst_buf_ir
                                 .iter()
@@ -2654,9 +3051,7 @@ impl X86Codegen {
                 // Register home: one 32-bit move. XMM homes (bit-punned
                 // counts) fall through to the generic path.
                 if let Some(reg) = self
-                    .reg_assignments
-                    .get(&v.0)
-                    .copied()
+                    .fresh_home_of(v.0)
                     .filter(|&r| !is_xmm_reg(r))
                 {
                     self.state
@@ -2782,11 +3177,15 @@ impl X86Codegen {
                 }
             }
             Operand::Value(v) => {
+                // Home-freshness gate (see operand_to_callee_reg): only a
+                // register that provably still holds v may feed the
+                // zero-extending narrow load; a stale home reloads.
                 if let Some(reg) = self
                     .reg_assignments
                     .get(&v.0)
                     .copied()
                     .filter(|&r| !is_xmm_reg(r))
+                    .filter(|_| !self.home_clobbered.contains(&v.0))
                 {
                     let src_typed = typed_phys_reg_name(reg, ty);
                     self.state
@@ -2895,7 +3294,8 @@ impl X86Codegen {
                     return;
                 }
                 // Check register allocation: load from callee-saved register
-                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                // (freshness-gated: a stale home falls to the slot path).
+                if let Some(reg) = self.fresh_home_of(v.0) {
                     let reg_name = phys_reg_name(reg);
                     self.state
                         .out
@@ -3011,13 +3411,18 @@ impl X86Codegen {
                 let xmm_name = phys_reg_name(phys_reg);
                 self.state
                     .emit_fmt(format_args!("    movq %{}, %{}", xmm_name, reg));
-            } else {
+                return;
+            }
+            if !self.home_clobbered.contains(&val.0) {
                 let reg_name = phys_reg_name(phys_reg);
                 if reg_name != reg {
                     self.state.out.emit_instr_reg_reg("    movq", reg_name, reg);
                 }
+                return;
             }
-            return;
+            // Stale GPR home (content reused by a derived value): fall
+            // through to the slot materialisation below (the operand staging
+            // paths in operand_to_callee_reg carry the def-chain remat).
         }
         if let Some(slot) = self.state.get_slot(val.0) {
             if self.state.is_alloca(val.0) {
@@ -3717,7 +4122,27 @@ impl X86Codegen {
             );
         }
         self.state.reg_cache.invalidate_acc();
+        // In-place compute accounting (SOUNDNESS): the NDD form just wrote
+        // dest_phys with the derived result. Register the write so any
+        // OTHER live value homed there is reloaded by its next consumer
+        // instead of reading the derived content (note_staging_target/
+        // note_reg_clobbered).
+        self.note_inplace_compute(dest_phys, dest_value_id);
         true
+    }
+
+    /// In-place compute bookkeeping: `written` now holds the derived value of
+    /// `dest_id` (2-operand `op %r, %r`, LEA/shift chains, NDD 3-operand). If
+    /// `written` IS dest's home, the definition invariant marks it fresh;
+    /// every OTHER sharer of `written` is stale either way.
+    pub(super) fn note_inplace_compute(&mut self, written: PhysReg, dest_id: u32) {
+        self.note_reg_clobbered(written.0);
+        if let Some(&home) = self.reg_assignments.get(&dest_id) {
+            if home.0 == written.0 {
+                self.home_fresh.insert(dest_id);
+                self.home_clobbered.remove(&dest_id);
+            }
+        }
     }
 
     pub(super) fn emit_alu_reg_direct(
@@ -3909,6 +4334,7 @@ impl X86Codegen {
                             .emit_fmt(format_args!("    movq %rax, %{}", dest_name));
                     }
                     self.state.reg_cache.invalidate_acc();
+                    self.note_inplace_compute(dest_phys, dest_value_id);
                     return;
                 }
                 // Commutative: leave lhs in %rax, rhs in dest. The tail emits
@@ -3965,6 +4391,9 @@ impl X86Codegen {
             }
         }
         self.state.reg_cache.invalidate_acc();
+        // In-place compute accounting (SOUNDNESS, see note_inplace_compute):
+        // the 2-operand forms just wrote the derived result into dest_phys.
+        self.note_inplace_compute(dest_phys, dest_value_id);
     }
 
     /// Register-direct path for shift operations.
@@ -4089,6 +4518,9 @@ impl X86Codegen {
             );
         }
         self.state.reg_cache.invalidate_acc();
+        // In-place compute accounting (SOUNDNESS, see note_inplace_compute):
+        // every form above wrote the derived shift result into dest_phys.
+        self.note_inplace_compute(dest_phys, dest_value_id);
     }
 
     /// Register-direct rotate: `rol/ror $imm, %dest` for a constant count,
@@ -4794,9 +5226,8 @@ impl X86Codegen {
                 Some(crate::backend::state::SlotAddr::OverAligned(_, _))
             ))
             || self
-                .reg_assignments
-                .get(&ptr.0)
-                .is_some_and(|r| is_gpr_reg(*r));
+                .fresh_home_of(ptr.0)
+                .is_some_and(|r| is_gpr_reg(r));
         if !ptr_ok
             || folded_global_addrs.contains(&ptr.0)
             || self.state.folded_gep_values.contains(&ptr.0)
@@ -5687,7 +6118,12 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {
-        self.reg_assignments.get(&val_id).copied()
+        // Freshness-gated (see home_fresh): the static map only says where a
+        // value is HOMED; the GEP/LEA/SIB paths that consult this helper
+        // emit the register as an address BASE or INDEX — a stale home would
+        // feed a derived value into the address computation (the kernel
+        // 6.18.50 free_area_init_node zone-pointer-as-index panic).
+        self.fresh_home_of(val_id)
     }
 
     fn is_machinst_enabled(&self) -> bool {
@@ -6086,7 +6522,7 @@ impl ArchCodegen for X86Codegen {
             }
             let lowered = super::isel::lower_instruction_typed_ss(
                 inst,
-                &self.reg_assignments,
+                &self.fresh_ra_for_isel(),
                 &float_alloca_slots,
                 Some(&self.value_types),
                 Some(&self.state.small_slot_values),
@@ -6133,7 +6569,7 @@ impl ArchCodegen for X86Codegen {
             }
             let lowered = super::isel::lower_instruction_typed_ss(
                 inst,
-                &self.reg_assignments,
+                &self.fresh_ra_for_isel(),
                 &i128_slots,
                 Some(&self.value_types),
                 Some(&self.state.small_slot_values),
@@ -6335,9 +6771,10 @@ impl ArchCodegen for X86Codegen {
             _ => {}
         }
 
+        let ra_fresh = self.fresh_ra_for_isel();
         let lowered = super::isel::lower_instruction_typed_ss(
             inst,
-            &self.reg_assignments,
+            &ra_fresh,
             &alloca_slots,
             Some(&self.value_types),
             Some(&self.state.small_slot_values),
@@ -6505,6 +6942,50 @@ impl ArchCodegen for X86Codegen {
 
         super::machinst_emit::emit_machinsts(&final_insts, &mut self.state.out);
 
+        // Home-freshness bookkeeping (SOUNDNESS): MachInst-buffered
+        // instructions bypass generate_instruction, so their destinations
+        // never passed through note_dest_defined at their own position. The
+        // whole window has now been emitted at this program point. Only a
+        // dest that was PRE-COLORED to its (then-fresh) home is actually in
+        // that home now — mark it. Every other homed dest was written to a
+        // window scratch register and/or its slot: invalidate its home so
+        // later consumers reload instead of reading whatever the window or
+        // an earlier in-place chain left there (kernel 6.18.50
+        // free_area_init_node: the fused mul-add consumed the zone POINTER
+        // as the loop index after the MachInst chain reused %r11 in place).
+        {
+            let ir_shadow = std::mem::take(&mut self.machinst_buf_ir);
+            // Invalidate EVERY shadow dest's freshness: a pre-colored dest's
+            // home may have been overwritten afterwards by a window scratch
+            // assignment to the same register (the window allocator does not
+            // model pre-colored operands as interference), and a Vreg dest
+            // landed in a scratch register whose identity is not tracked
+            // here. Consumers after the window rebuild the value through
+            // the slot/reload/remat paths (kernel 6.18.50
+            // free_area_init_node: a MachInst [Cast→%r11][Mul %r11,%r11]
+            // window left the sign-extended loop index marked fresh in %r11
+            // after the multiply had already replaced it, so the following
+            // fused mul-add consumed the ZONE POINTER as the index).
+            for inst in &ir_shadow {
+                let Some(dest) = inst.dest() else { continue };
+                if self.reg_assignments.contains_key(&dest.0)
+                    && !self.home_clobbered.contains(&dest.0)
+                {
+                    // Pre-colored dest: the window wrote it into its home
+                    // (fresh_ra_for_isel passes exactly the not-clobbered
+                    // homed values) — a normal definition. Mark fresh so
+                    // later consumers may read the home.
+                    self.note_home_written(dest.0);
+                } else if self.reg_assignments.contains_key(&dest.0) {
+                    // Not pre-colored: the window's result went to scratch
+                    // and/or a slot; the home holds whatever preceded it.
+                    self.home_fresh.remove(&dest.0);
+                    self.home_clobbered.insert(dest.0);
+                }
+            }
+            self.machinst_buf_ir = ir_shadow;
+        }
+
         self.machinst_buf.clear();
         self.machinst_buf_ir.clear();
         self.state.reg_cache.invalidate_all();
@@ -6527,12 +7008,25 @@ impl ArchCodegen for X86Codegen {
 
     fn emit_pre_call_save_caller_regs(&mut self) {
         let point = self.state.current_program_point;
+        // Home-freshness snapshot for the registers this call actually saves:
+        // their content is preserved across the call by the save/restore
+        // pair, so exactly these values can be re-marked fresh afterwards.
+        // Every other caller-saved home is clobbered by the callee and is
+        // invalidated in emit_post_call_restore_caller_regs.
+        let mut snapshot: Vec<u32> = Vec::new();
         for (&reg_id, &slot) in &self.caller_save_spill_slots {
             if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
                 if intervals
                     .iter()
                     .any(|&(start, end)| start <= point && point <= end)
                 {
+                    if let Some(sharers) = self.home_sharers.get(&reg_id) {
+                        for &v in sharers {
+                            if self.home_fresh.contains(&v) {
+                                snapshot.push(v);
+                            }
+                        }
+                    }
                     let reg_name = phys_reg_name(PhysReg(reg_id));
                     self.state
                         .out
@@ -6540,22 +7034,38 @@ impl ArchCodegen for X86Codegen {
                 }
             }
         }
+        self.call_fresh_snapshot = snapshot;
     }
 
     fn emit_post_call_restore_caller_regs(&mut self) {
         let point = self.state.current_program_point;
+        let snapshot = std::mem::take(&mut self.call_fresh_snapshot);
         for (&reg_id, &slot) in &self.caller_save_spill_slots {
             if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
                 if intervals
                     .iter()
                     .any(|&(start, end)| start <= point && point <= end)
                 {
+                    // This caller-saved home is about to be rewritten with
+                    // the pre-call content; any OTHER fresh value homed here
+                    // (not covered by the snapshot) is gone.
+                    if let Some(sharers) = self.home_sharers.get(&reg_id) {
+                        for &v in sharers {
+                            self.home_fresh.remove(&v);
+                            self.home_clobbered.insert(v);
+                        }
+                    }
                     let reg_name = phys_reg_name(PhysReg(reg_id));
                     self.state
                         .out
                         .emit_instr_rbp_reg("    movq", slot.0, reg_name);
                 }
             }
+        }
+        // Values whose registers were saved and restored are fresh again.
+        for v in snapshot {
+            self.home_fresh.insert(v);
+            self.home_clobbered.remove(&v);
         }
     }
 
@@ -7161,6 +7671,10 @@ impl ArchCodegen for X86Codegen {
         // is materialised first so the mechanism is sound by construction.
         self.materialize_pending_memfold();
         self.flush_pending_vec_store_impl();
+    }
+
+    fn note_dest_defined(&mut self, dest: &Value) {
+        self.note_home_written(dest.0);
     }
 
     // ---- Intrinsics (kept inline - has extra logic) ----
