@@ -1554,20 +1554,22 @@ impl X86Codegen {
                     }
                 };
                 let mut prune_pairs: Vec<u32> = Vec::new();
-                for (adest, (_o1, l1, r1, _t1, _o2, l2, r2, _t2)) in self.cmp_bool_pair.iter() {
-                    if ![l1, r1, l2, r2].iter().all(|op| readable(op)) {
+                for (adest, pair) in self.cmp_bool_pair.iter() {
+                    if ![&pair.lhs1, &pair.rhs1, &pair.lhs2, &pair.rhs2]
+                        .iter()
+                        .all(|op| readable(op))
+                    {
                         prune_pairs.push(*adest);
                     }
                 }
                 for adest in prune_pairs {
-                    if let Some((_o1, l1, r1, _t1, _o2, l2, r2, _t2)) =
-                        self.cmp_bool_pair.remove(&adest)
-                    {
-                        for op in [&l1, &r1, &l2, &r2] {
-                            if let Operand::Value(v) = op {
-                                self.bool_pair_cmps.remove(&v.0);
-                            }
-                        }
+                    // Un-skip by LEG DEST, not by leg operand: the skip set
+                    // holds the two Cmps' dests. Removing operand ids here
+                    // would leave both legs skipped while the And falls
+                    // back to a real `andl` over never-written homes.
+                    if let Some(pair) = self.cmp_bool_pair.remove(&adest) {
+                        self.bool_pair_cmps.remove(&pair.dest1);
+                        self.bool_pair_cmps.remove(&pair.dest2);
                     }
                 }
             }

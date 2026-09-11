@@ -671,20 +671,9 @@ pub struct X86Codegen {
     /// BOOL-PAIR (AND-of-compares) branch fusion: And-binop dest (branch
     /// condition) -> both legs' compares; the branch re-emits them as a
     /// short-circuit jcc chain. `bool_pair_cmps` are the leg Cmp dests whose
-    /// setcc/movzbl materialization is skipped.
-    pub(super) cmp_bool_pair: FxHashMap<
-        u32,
-        (
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-        ),
-    >,
+    /// setcc/movzbl materialization is skipped. The entry carries each
+    /// leg's Cmp dest so post-RA pruning can un-skip both legs atomically.
+    pub(super) cmp_bool_pair: FxHashMap<u32, super::comparison::CmpBoolPair>,
     pub(super) bool_pair_cmps: FxHashSet<u32>,
     /// CMP-REPLAY operand -> consumer links built with `cmp_replay` (IS-09):
     /// merged into the RA's folded_index_uses so register-homed replay
