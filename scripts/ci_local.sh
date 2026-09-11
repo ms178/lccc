@@ -153,6 +153,9 @@ gate "loop-memset-decisions" fast \
 gate "bool-pair-tail-jmp-contract" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
 
+gate "bool-pair-prune-atomicity" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_prune.sh
+
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 

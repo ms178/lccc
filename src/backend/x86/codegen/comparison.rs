@@ -27,6 +27,28 @@ use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
 /// that end up with no home at all (never-materialized values) are
 /// pruned post-RA by the prologue; slot-homed operands never needed the
 /// extension (the slot is written at every definition).
+/// One recorded AND-of-compares (bool-pair) fusion: both legs' compares
+/// plus each leg's Cmp DEST. The dests are load-bearing: post-RA pruning
+/// drops the whole pair atomically — the And entry AND both legs' skip
+/// memberships — so a pruned pair falls back to two materialized booleans
+/// plus an ordinary `andl`. (A prune that forgets the leg dests leaves
+/// both setcc emissions skipped while the And reads their never-written
+/// boolean homes — a half-pruned miscompile. Named fields, not a tuple:
+/// positional (op, lhs, rhs, ty) × 2 is exactly how the dests got lost.)
+#[derive(Clone, Debug)]
+pub(crate) struct CmpBoolPair {
+    pub op1: IrCmpOp,
+    pub lhs1: Operand,
+    pub rhs1: Operand,
+    pub ty1: IrType,
+    pub dest1: u32,
+    pub op2: IrCmpOp,
+    pub lhs2: Operand,
+    pub rhs2: Operand,
+    pub ty2: IrType,
+    pub dest2: u32,
+}
+
 pub(crate) struct CmpReplayScan {
     pub replay: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
     pub operand_links: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
@@ -38,19 +60,7 @@ pub(crate) struct CmpReplayScan {
     /// CondBranch condition) -> both legs' recorded compares. The branch
     /// re-emits them as a short-circuit jcc chain; the And itself and both
     /// legs' boolean materializations are skipped.
-    pub bool_pair: crate::common::fx_hash::FxHashMap<
-        u32,
-        (
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-        ),
-    >,
+    pub bool_pair: crate::common::fx_hash::FxHashMap<u32, CmpBoolPair>,
     /// The two Cmp dests of each recorded pair: they skip setcc/movzbl
     /// materialization (the flags are re-derived by the branch replay).
     pub bool_pair_cmps: crate::common::fx_hash::FxHashSet<u32>,
@@ -81,19 +91,8 @@ pub(crate) fn compute_cmp_replay_scan(
     // reordering them against each other and against the (never-emitted)
     // And is semantically transparent; the redefinition guard below keeps
     // each Cmp's operands intact up to the replay position.
-    let mut bool_pair: crate::common::fx_hash::FxHashMap<
-        u32,
-        (
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-            IrCmpOp,
-            Operand,
-            Operand,
-            IrType,
-        ),
-    > = crate::common::fx_hash::FxHashMap::default();
+    let mut bool_pair: crate::common::fx_hash::FxHashMap<u32, CmpBoolPair> =
+        crate::common::fx_hash::FxHashMap::default();
     let mut bool_pair_cmps: crate::common::fx_hash::FxHashSet<u32> =
         crate::common::fx_hash::FxHashSet::default();
     for block in &func.blocks {
@@ -202,7 +201,7 @@ pub(crate) fn compute_cmp_replay_scan(
                     continue;
                 }
                 // Locate the sibling Cmp (the other leg of the And).
-                let sibling: Option<(usize, IrCmpOp, Operand, Operand, IrType)> =
+                let sibling: Option<(usize, u32, IrCmpOp, Operand, Operand, IrType)> =
                     insts.iter().enumerate().find_map(|(jj, other)| {
                         if let crate::ir::reexports::Instruction::Cmp {
                             dest: d2,
@@ -231,13 +230,13 @@ pub(crate) fn compute_cmp_replay_scan(
                                     )
                                 });
                                 if feeds_and {
-                                    return Some((jj, *o2, l2.clone(), r2.clone(), *t2));
+                                    return Some((jj, d2.0, *o2, l2.clone(), r2.clone(), *t2));
                                 }
                             }
                         }
                         None
                     });
-                let Some((jj, op2, l2, r2, t2)) = sibling else {
+                let Some((jj, d2dest, op2, l2, r2, t2)) = sibling else {
                     continue;
                 };
                 // No operand of EITHER leg may be redefined between its Cmp
@@ -265,19 +264,21 @@ pub(crate) fn compute_cmp_replay_scan(
                 if bool_pair_enabled {
                     bool_pair.insert(
                         adest,
-                        (
-                            cop,
-                            clhs.clone(),
-                            crhs.clone(),
-                            cty,
+                        CmpBoolPair {
+                            op1: cop,
+                            lhs1: clhs.clone(),
+                            rhs1: crhs.clone(),
+                            ty1: cty,
+                            dest1: cdest,
                             op2,
-                            l2.clone(),
-                            r2.clone(),
-                            t2,
-                        ),
+                            lhs2: l2.clone(),
+                            rhs2: r2.clone(),
+                            ty2: t2,
+                            dest2: d2dest,
+                        },
                     );
                     bool_pair_cmps.insert(cdest);
-                    bool_pair_cmps.insert(insts[jj].dest().map(|d| d.0).unwrap_or(u32::MAX));
+                    bool_pair_cmps.insert(d2dest);
                 }
                 // Operand homes must survive to the branch: link every leg
                 // operand to the And value, whose own (single) use is the
@@ -992,15 +993,15 @@ impl X86Codegen {
         // layout pass placed next; the only difference between the two
         // shapes is which side avoids the extra jump.
         if let Operand::Value(cond_v) = cond {
-            if let Some((o1, l1, r1, t1, o2, l2, r2, t2)) = self.cmp_bool_pair.remove(&cond_v.0) {
+            if let Some(pair) = self.cmp_bool_pair.remove(&cond_v.0) {
                 self.state.reg_cache.invalidate_acc();
-                let jcc1 = Self::cmp_jcc(o1);
-                let jcc2 = Self::cmp_jcc(o2);
-                self.emit_int_cmp_replay_insn(&l1, &r1, t1);
+                let jcc1 = Self::cmp_jcc(pair.op1);
+                let jcc2 = Self::cmp_jcc(pair.op2);
+                self.emit_int_cmp_replay_insn(&pair.lhs1, &pair.rhs1, pair.ty1);
                 self.state
                     .out
                     .emit_jcc_block(Self::invert_jcc(jcc1), cold.0);
-                self.emit_int_cmp_replay_insn(&l2, &r2, t2);
+                self.emit_int_cmp_replay_insn(&pair.lhs2, &pair.rhs2, pair.ty2);
                 if hot_next {
                     self.state
                         .out
