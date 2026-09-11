@@ -38,6 +38,14 @@ rm -rf "$WORK"; mkdir -p "$WORK/root/bin" "$WORK/root/proc" "$WORK/root/sys" "$W
 # ---- in-VM validation suite (POSIX sh, busybox-builtin-only) ----------------
 cat > "$WORK/root/init" <<'EOF'
 #!/bin/busybox sh
+# The initramfs ships only /bin/busybox (+ /bin/sh). Every applet the
+# suite calls below (mount, cat, zcat, grep, dmesg, poweroff, ...) is a
+# busybox multicall binary entry: without installing the applet symlinks
+# first, ash resolves them via PATH, finds nothing, and init dies with
+# "mount: not found" -> panic. `--install -s` creates them all in /bin.
+/bin/busybox --install -s /bin
+PATH=/bin
+export PATH
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs devtmpfs /dev
@@ -98,14 +106,27 @@ else
 fi
 
 echo "boot: $QEMU ${qemu_l[*]} -kernel $BZIMAGE (log: $LOG)"
+# -display none + -serial file: (not -nographic + stdio redirect): the stdio
+# chardev muxes serial and monitor onto the process's stdin/stdout, and its
+# shutdown path stalls when stdin is not a tty (harness runs, cron, nohup):
+# the guest reaches ACPI S5, "reboot: Power down" is the last serial line,
+# and the QEMU process never exits — the run can only end by timeout. A
+# dedicated file chardev has no stdio semantics to deadlock on: the same
+# image powers down and QEMU exits within ~1 s (measured). QEMU diagnostics
+# go to a separate file so the serial log stays grep-clean.
 timeout 600 "$QEMU" -m 512 -smp 2 \
     "${qemu_l[@]}" \
     -kernel "$BZIMAGE" -initrd "$WORK/initramfs.cpio.gz" \
-    -nographic -no-reboot \
+    -display none -serial file:"$LOG" \
+    -no-reboot \
     -accel tcg,thread=multi \
-    -append "console=ttyS0,115200 nokaslr panic=-1 vga=normal" > "$LOG" 2>&1 || true
+    -append "console=ttyS0,115200 nokaslr panic=-1 vga=normal" 2> "${LOG}.qemu-err" || true
 
 # ---- verdict ------------------------------------------------------------------
+# The 16550 serial file chardev writes the guest's CRLF line discipline
+# verbatim; strip the trailing \r so $-anchored verdict greps see clean
+# lines ("^2$" never matches "2\r").
+sed -i 's/\r$//' "$LOG"
 fail=0
 expect() { # expect <description> <grep-pattern>
   local desc=$1 pat=$2
@@ -126,7 +147,10 @@ expect "CACHY compiled in"                 "CONFIG_CACHY=y"
 expect "TCP_CONG_BBR (BBRv3) compiled in"  "CONFIG_TCP_CONG_BBR=y"
 expect "PREEMPT compiled in"               "CONFIG_PREEMPT=y"
 expect "SMP compiled in"                   "CONFIG_SMP=y"
-expect "bbr listed in congestion algos"    "^bbr( |$)"
+# tcp_available_congestion_control lists algos space-separated in
+# registration order — "reno bbr bic cubic westwood htcp" on this config —
+# so "bbr" is a mid-line word, not a line starter.
+expect "bbr listed in congestion algos"    "(^| )bbr( |$)"
 expect "BORE stats in sched_debug"         "bore|BORE"
 expect "2 CPUs online"                     "^2$"
 expect "validation ran to completion"      "LCCC KERNEL BOOT VALIDATION END"

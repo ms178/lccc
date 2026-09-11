@@ -1321,6 +1321,37 @@ impl Parser {
     /// Output: type wrapped with pointer/array/function-pointer modifiers.
     pub(super) fn parse_abstract_declarator_suffix(
         &mut self,
+        result_type: TypeSpecifier,
+    ) -> TypeSpecifier {
+        // Address-space scoping: a `__seg_gs`/`__seg_fs` qualifier parsed
+        // BEFORE the base type belongs to the ENCLOSING declaration (the
+        // declared object's address space), not to this suffix. The suffix's
+        // own form is `base __seg_gs *`, where the qualifier is consumed by
+        // skip_cv_qualifiers INSIDE the suffix, before the `*` — and the
+        // `*` arm below takes (mem::take) whatever the flag holds.
+        // Without this guard, a `*` inside the suffix — most importantly
+        // a pointer type nested in a `__typeof__(T *)` argument — steals
+        // the enclosing declaration's pending qualifier: the declaration
+        // then snapshots AddressSpace::Default (mem::take reset the flag)
+        // and every access to the object loses its segment prefix. That is
+        // exactly how the kernel's per-CPU pointer variables
+        // (`extern __seg_gs __typeof__(struct irq_stack *)
+        //   hardirq_stack_ptr;`)
+        // compiled to a plain RIP-relative load of the static percpu image
+        // instead of %gs: — common_interrupt then pushed the IRQ-stack
+        // switch through NULL on the first timer interrupt.
+        // Enter with the flag cleared so the take can only capture
+        // qualifiers consumed within the suffix; restore the enclosing
+        // state on exit so the declaration's own snapshot still sees it.
+        let enclosing_address_space = self.attrs.parsing_address_space;
+        self.attrs.parsing_address_space = AddressSpace::Default;
+        let result = self.parse_abstract_declarator_suffix_inner(result_type);
+        self.attrs.parsing_address_space = enclosing_address_space;
+        result
+    }
+
+    fn parse_abstract_declarator_suffix_inner(
+        &mut self,
         mut result_type: TypeSpecifier,
     ) -> TypeSpecifier {
         // Consume address space qualifiers that appear before the first '*'

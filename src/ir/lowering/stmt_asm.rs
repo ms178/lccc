@@ -15,6 +15,7 @@ use crate::backend::inline_asm::{
     constraint_has_immediate_alt, constraint_is_memory_only, constraint_needs_address,
 };
 use crate::common::types::{AddressSpace, IrType};
+use crate::frontend::parser::ast::TypeSpecifier;
 use crate::frontend::parser::ast::{AsmOperand, Expr};
 use crate::ir::reexports::{BlockId, Instruction, Operand, Value};
 
@@ -689,8 +690,25 @@ impl Lowerer {
     /// returns the address space from the pointer type in the deref.
     fn get_asm_operand_addr_space(&self, expr: &Expr) -> AddressSpace {
         match expr {
+            // `*ptr` as an asm memory operand: the segment the pointer points into.
             Expr::Deref(inner, _) => self.get_addr_space_of_ptr_expr(inner),
-            _ => AddressSpace::Default,
+            // A pointer-typed cast may itself carry the qualifier
+            // (`(T __seg_gs *)p`); get_addr_space_of_ptr_expr checks the cast
+            // type first and falls through to the operand.
+            Expr::Cast(TypeSpecifier::Pointer(..), _, _) => self.get_addr_space_of_ptr_expr(expr),
+            // Everything else — identifier, member access, array element,
+            // address-of — denotes an OBJECT: the segment is the object's
+            // declared address space. This is the "+m" shape of the kernel's
+            // per-CPU binary ops: `asm("addl %[val], %[var]" ::
+            // [var] "+m"(__my_cpu_var(__preempt_count)), ...)`, where the
+            // memory operand IS the __seg_gs-qualified variable. With only
+            // the Deref arm, preempt_count_add compiled to
+            // `addl $0x110000, __preempt_count(%rip)` — no %gs — so the NMI
+            // bookkeeping updated the static percpu image while every read
+            // (%gs:) saw the real per-CPU counter; exc_int3's
+            // irqentry_nmi_exit then BUGged on the missing in_nmi() residue
+            // during the alternatives int3 self-test.
+            _ => self.get_addr_space_of_struct_expr(expr),
         }
     }
 

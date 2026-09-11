@@ -1932,6 +1932,15 @@ impl InstructionEncoder {
                 }
                 match &ops[0] {
                     Operand::Memory(mem) => {
+                        // Segment override before REX (legacy prefixes
+                        // precede REX; `cmpxchg16b %gs:(%r8)` must encode
+                        // 65 49 0f c7 08). The kernel's per-CPU freelist
+                        // cmpxchg is exactly this form; dropping the 0x65
+                        // made the ALTERNATIVE-patched instruction address
+                        // raw low memory instead of the per-CPU area, the
+                        // cmpxchg never matched, and the SLUB fastpath
+                        // spun forever (boot stalled after pid_max).
+                        self.emit_segment_prefix(mem)?;
                         self.emit_rex_rm(8, "", mem); // REX.W
                         self.bytes.extend_from_slice(&[0x0F, 0xC7]);
                         self.encode_modrm_mem(1, mem)
@@ -2936,6 +2945,7 @@ impl InstructionEncoder {
                 }
                 match &ops[0] {
                     Operand::Memory(mem) => {
+                        self.emit_segment_prefix(mem)?;
                         self.emit_rex_rm(0, "", mem);
                         self.bytes.extend_from_slice(&[0x0F, 0xC7]);
                         self.encode_modrm_mem(1, mem)

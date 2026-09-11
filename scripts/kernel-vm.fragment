@@ -35,6 +35,21 @@ CONFIG_SCHED_DEBUG=y
 CONFIG_DEBUG_FS=y
 CONFIG_CACHY=y
 
+# --- power management / ACPI --------------------------------------------------
+# Allnoconfig has no ACPI, which costs the harness two things: busybox
+# `poweroff -f` degrades to "Power off not available: System halted
+# instead" (the guest halts, QEMU never exits, and the 600 s timeout is
+# the only thing that ends the run), and secondary-CPU bringup loses the
+# ACPI MADT. Real linux-cachymod always has ACPI; keep the fragment honest.
+# PCI must be on too: QEMU's i440fx DSDT declares PCI_Config
+# OperationRegions, and with CONFIG_PCI unset the table load dies with
+# "AE_BAD_PARAMETER during Region initialization", which aborts the ACPI
+# sleep setup before pm_power_off is registered — that is what actually
+# disabled poweroff, not the mere absence of ACPI.
+CONFIG_ACPI=y
+CONFIG_PM=y
+CONFIG_PCI=y
+
 # --- core kernel facilities ---------------------------------------------------
 CONFIG_PRINTK=y
 CONFIG_PRINTK_TIME=y
