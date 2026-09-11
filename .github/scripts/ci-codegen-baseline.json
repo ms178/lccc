@@ -1,25 +1,25 @@
 {
  "gzip_crc32": {
-  "insns": 77,
+  "insns": 75,
   "stackmem": 0,
-  "pushes": 5,
+  "pushes": 4,
   "moves": 18,
   "ymm": 0,
   "fma": 0
  },
  "zlib_ng_adler32": {
-  "insns": 233,
+  "insns": 230,
   "stackmem": 11,
   "pushes": 6,
-  "moves": 60,
+  "moves": 57,
   "ymm": 0,
   "fma": 0
  },
  "expat_xml_scan": {
-  "insns": 203,
+  "insns": 198,
   "stackmem": 20,
   "pushes": 6,
-  "moves": 42,
+  "moves": 39,
   "ymm": 0,
   "fma": 0
  },
@@ -40,9 +40,9 @@
   "fma": 0
  },
  "hash_table": {
-  "insns": 147,
+  "insns": 145,
   "stackmem": 0,
-  "pushes": 9,
+  "pushes": 8,
   "moves": 40,
   "ymm": 0,
   "fma": 0
@@ -56,10 +56,10 @@
   "fma": 0
  },
  "zstd_count": {
-  "insns": 131,
-  "stackmem": 0,
-  "pushes": 7,
-  "moves": 34,
+  "insns": 135,
+  "stackmem": 11,
+  "pushes": 6,
+  "moves": 30,
   "ymm": 0,
   "fma": 0
  }

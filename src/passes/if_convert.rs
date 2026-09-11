@@ -1013,6 +1013,52 @@ fn try_if_combine_loop(
         return 0;
     }
 
+    // Pre-filter 4: profitability — the guard the module docs promise.
+    // A combine converts a control dependence into a data dependence; it
+    // is a WIN only when the loop body ends up branch-free (straight-line
+    // goes to the vectorizer). It is a LOSS otherwise: the branches stay,
+    // and every iteration pays for predicates the short circuit used to
+    // skip (lz4's skip loop, expat's UTF-8 scanner).
+    //
+    // So every OTHER conditional branch in the body must provably go
+    // away: either it is part of this round's chain (folds now — the
+    // survivor is the diamond converter's problem, exactly as today), or
+    // the diamond/triangle converter below takes it (same detectors, same
+    // CPU-model budgets — no heuristic drift). In particular this rejects
+    // loops containing inner-loop back-edges or oversized if/else
+    // diamonds: those can never become branch-free, so no vectorizer will
+    // ever take the loop and the combine is pure added work.
+    //
+    // Fail-closed (reject = keep the short circuit) is always safe: the
+    // uncombined IR is the pipeline's common case.
+    let chain_blocks: crate::common::fx_hash::FxHashSet<usize> = cands
+        .iter()
+        .flat_map(|c| [c.pred_idx, c.inner_idx])
+        .collect();
+    {
+        let ctx = IfConvCtx::build(func);
+        for &b in &nl.body {
+            if b == exiting {
+                continue;
+            }
+            if !matches!(func.blocks[b].terminator, Terminator::CondBranch { .. }) {
+                continue;
+            }
+            if chain_blocks.contains(&b) {
+                continue;
+            }
+            if detect_diamond(&ctx, b).is_some() || detect_triangle(&ctx, b).is_some() {
+                continue;
+            }
+            if dbg {
+                eprintln!(
+                    "[IFCOMB] {} loop@{}: reject (branch in block {} survives)",
+                    func.name, nl.header, b
+                );
+            }
+            return 0;
+        }
+    }
     if dbg {
         eprintln!(
             "[IFCOMB] {} loop@{}: accept, {} candidate(s), exiting={}",

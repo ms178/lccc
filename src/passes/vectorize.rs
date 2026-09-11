@@ -3974,6 +3974,612 @@ impl<'a> MapEmitCtx<'a> {
     }
 }
 
+// ── Conditional-store operand availability ─────────────────────────────
+// Both cond-store rewrites (the short-circuit chain form and the folded
+// mask form) delete definitions: the chain form empties every non-first
+// chain block and the store block, the folded form drops the store
+// block's address GEP.  Every value the replacement straight-line body
+// references must therefore be DEFINED at its new site: values that
+// already dominate the append point pass through, values defined in a
+// cleared block have their pure def chain re-materialized (cloned)
+// ahead of the selects, and anything else declines the rewrite.
+// Re-emitting a compare with its original operands verbatim while an
+// operand's definition dies in a cleared block is a use-without-
+// definition the backend cannot survive (the vec_cond_store crash:
+// `Sle(Value(27), 122)` re-emitted while the `Cast` defining `Value(27)`
+// died with the second condition block).  Fail-closed throughout: a
+// declined rewrite leaves the scalar loop byte-exact.
+
+/// Index every SSA definition to its (block, instruction) site.
+fn cond_store_def_sites(func: &IrFunction) -> FxHashMap<Value, (usize, usize)> {
+    let mut defs = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(d) = inst.dest() {
+                defs.insert(d, (bi, ii));
+            }
+        }
+    }
+    defs
+}
+
+/// Whether `a` and `b` compute the same pure value: same opcode, same
+/// operand values, same types.  The destination is ignored, so this
+/// identifies an already-available computation a clone would duplicate.
+fn cond_store_same_pure(a: &Instruction, b: &Instruction) -> bool {
+    match (a, b) {
+        (
+            Instruction::Cast {
+                src: s1,
+                from_ty: f1,
+                to_ty: t1,
+                ..
+            },
+            Instruction::Cast {
+                src: s2,
+                from_ty: f2,
+                to_ty: t2,
+                ..
+            },
+        ) => s1 == s2 && f1 == f2 && t1 == t2,
+        (Instruction::Copy { src: s1, .. }, Instruction::Copy { src: s2, .. }) => s1 == s2,
+        (
+            Instruction::UnaryOp {
+                op: o1,
+                src: s1,
+                ty: t1,
+                ..
+            },
+            Instruction::UnaryOp {
+                op: o2,
+                src: s2,
+                ty: t2,
+                ..
+            },
+        ) => o1 == o2 && s1 == s2 && t1 == t2,
+        (
+            Instruction::BinOp {
+                op: o1,
+                lhs: l1,
+                rhs: r1,
+                ty: t1,
+                ..
+            },
+            Instruction::BinOp {
+                op: o2,
+                lhs: l2,
+                rhs: r2,
+                ty: t2,
+                ..
+            },
+        ) => o1 == o2 && l1 == l2 && r1 == r2 && t1 == t2,
+        (
+            Instruction::Cmp {
+                op: o1,
+                lhs: l1,
+                rhs: r1,
+                ty: t1,
+                ..
+            },
+            Instruction::Cmp {
+                op: o2,
+                lhs: l2,
+                rhs: r2,
+                ty: t2,
+                ..
+            },
+        ) => o1 == o2 && l1 == l2 && r1 == r2 && t1 == t2,
+        (
+            Instruction::GetElementPtr {
+                base: b1,
+                offset: o1,
+                ty: t1,
+                ..
+            },
+            Instruction::GetElementPtr {
+                base: b2,
+                offset: o2,
+                ty: t2,
+                ..
+            },
+        ) => b1 == b2 && o1 == o2 && t1 == t2,
+        _ => false,
+    }
+}
+
+/// Ensure `op` is defined at the straight-line append point once the
+/// `cleared` blocks die.  Values defined outside `cleared` pass through
+/// (valid input SSA dominates its uses, and every surviving definition
+/// site dominates the append point); values in `moved_defs` pass through
+/// (relocated into the survivor ahead of the selects); values defined in
+/// `cleared` blocks are re-materialized by cloning their pure def chain
+/// into `prefix` — `remap` dedups shared sub-chains and an identical
+/// computation already present in `keep_idx` (a surviving block that
+/// dominates the append point) or `prefix` is reused as-is, so the
+/// common cast-in-condition shape reuses the dominating cast instead of
+/// emitting a duplicate.  Anything stateful, trapping, volatile,
+/// missing, or deeper than `depth` fails the whole rewrite (`None` →
+/// the caller declines).  Note a trapping integer divide/remainder is
+/// never cloned: recomputing it unconditionally could introduce a trap
+/// on iterations the guarded loop would have bypassed.
+#[allow(clippy::too_many_arguments)]
+fn cond_store_materialize(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    keep_idx: usize,
+    op: &Operand,
+    cleared: &FxHashSet<usize>,
+    moved_defs: &FxHashSet<Value>,
+    remap: &mut FxHashMap<Value, Value>,
+    prefix: &mut Vec<Instruction>,
+    next_value_id: &mut u32,
+    depth: usize,
+) -> Option<Operand> {
+    let v = match op {
+        Operand::Const(_) => return Some(op.clone()),
+        Operand::Value(v) => *v,
+    };
+    if let Some(n) = remap.get(&v) {
+        return Some(Operand::Value(*n));
+    }
+    // No definition site: invalid input — fail closed rather than guess.
+    let (db, ii) = *defs.get(&v)?;
+    if !cleared.contains(&db) || moved_defs.contains(&v) {
+        return Some(Operand::Value(v));
+    }
+    if depth == 0 {
+        return None;
+    }
+    // The definition dies with its block: clone the pure chain.  The
+    // operands rewrite first (post-order, so every definition precedes
+    // its uses), then an identical available computation wins over a
+    // fresh clone.
+    let template = func.blocks[db].instructions[ii].clone();
+    let d = Value(*next_value_id);
+    *next_value_id += 1;
+    let cloned = match &template {
+        Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        } => {
+            let src = cond_store_materialize(
+                func,
+                defs,
+                keep_idx,
+                src,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+                depth - 1,
+            )?;
+            Instruction::Cast {
+                dest: d,
+                src,
+                from_ty: *from_ty,
+                to_ty: *to_ty,
+            }
+        }
+        Instruction::Copy { src, .. } => {
+            let src = cond_store_materialize(
+                func,
+                defs,
+                keep_idx,
+                src,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+                depth - 1,
+            )?;
+            Instruction::Copy { dest: d, src }
+        }
+        Instruction::UnaryOp { op, src, ty, .. } => {
+            let src = cond_store_materialize(
+                func,
+                defs,
+                keep_idx,
+                src,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+                depth - 1,
+            )?;
+            Instruction::UnaryOp {
+                dest: d,
+                op: *op,
+                src,
+                ty: *ty,
+            }
+        }
+        Instruction::BinOp {
+            op, lhs, rhs, ty, ..
+        } if !op.can_trap() || ty.is_float() => {
+            let lhs = cond_store_materialize(
+                func,
+                defs,
+                keep_idx,
+                lhs,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+                depth - 1,
+            )?;
+            let rhs = cond_store_materialize(
+                func,
+                defs,
+                keep_idx,
+                rhs,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+                depth - 1,
+            )?;
+            Instruction::BinOp {
+                dest: d,
+                op: *op,
+                lhs,
+                rhs,
+                ty: *ty,
+            }
+        }
+        Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } => {
+            let lhs = cond_store_materialize(
+                func,
+                defs,
+                keep_idx,
+                lhs,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+                depth - 1,
+            )?;
+            let rhs = cond_store_materialize(
+                func,
+                defs,
+                keep_idx,
+                rhs,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+                depth - 1,
+            )?;
+            Instruction::Cmp {
+                dest: d,
+                op: *op,
+                lhs,
+                rhs,
+                ty: *ty,
+            }
+        }
+        Instruction::GetElementPtr {
+            base, offset, ty, ..
+        } => {
+            let Operand::Value(base) = cond_store_materialize(
+                func,
+                defs,
+                keep_idx,
+                &Operand::Value(*base),
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+                depth - 1,
+            )?
+            else {
+                return None;
+            };
+            let offset = cond_store_materialize(
+                func,
+                defs,
+                keep_idx,
+                offset,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+                depth - 1,
+            )?;
+            Instruction::GetElementPtr {
+                dest: d,
+                base,
+                offset,
+                ty: *ty,
+            }
+        }
+        // Loads, stores, calls, phis, allocas, trapping arithmetic,
+        // volatile or atomic access: not re-executable — decline.
+        _ => return None,
+    };
+    for inst in func.blocks[keep_idx]
+        .instructions
+        .iter()
+        .chain(prefix.iter())
+    {
+        if cond_store_same_pure(&cloned, inst) {
+            if let Some(existing) = inst.dest() {
+                remap.insert(v, existing);
+                return Some(Operand::Value(existing));
+            }
+        }
+    }
+    remap.insert(v, d);
+    prefix.push(cloned);
+    Some(Operand::Value(d))
+}
+
+/// Rewrite one relocated store-computation instruction's operands
+/// through the materializer.  Only the shapes the store-block
+/// validation admits (address math, casts, copies, non-trapping
+/// arithmetic) reach here; anything else declines.
+#[allow(clippy::too_many_arguments)]
+fn cond_store_remap_moved(
+    inst: &Instruction,
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    keep_idx: usize,
+    cleared: &FxHashSet<usize>,
+    moved_defs: &FxHashSet<Value>,
+    remap: &mut FxHashMap<Value, Value>,
+    prefix: &mut Vec<Instruction>,
+    next_value_id: &mut u32,
+) -> Option<Instruction> {
+    let mut mat = |op: &Operand| {
+        cond_store_materialize(
+            func,
+            defs,
+            keep_idx,
+            op,
+            cleared,
+            moved_defs,
+            remap,
+            prefix,
+            next_value_id,
+            8,
+        )
+    };
+    match inst {
+        Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => Some(Instruction::BinOp {
+            dest: *dest,
+            op: *op,
+            lhs: mat(lhs)?,
+            rhs: mat(rhs)?,
+            ty: *ty,
+        }),
+        Instruction::Cast {
+            dest,
+            src,
+            from_ty,
+            to_ty,
+        } => Some(Instruction::Cast {
+            dest: *dest,
+            src: mat(src)?,
+            from_ty: *from_ty,
+            to_ty: *to_ty,
+        }),
+        Instruction::Copy { dest, src } => Some(Instruction::Copy {
+            dest: *dest,
+            src: mat(src)?,
+        }),
+        Instruction::UnaryOp { dest, op, src, ty } => Some(Instruction::UnaryOp {
+            dest: *dest,
+            op: *op,
+            src: mat(src)?,
+            ty: *ty,
+        }),
+        Instruction::GetElementPtr {
+            dest,
+            base,
+            offset,
+            ty,
+        } => {
+            let Operand::Value(base) = mat(&Operand::Value(*base))? else {
+                return None;
+            };
+            Some(Instruction::GetElementPtr {
+                dest: *dest,
+                base,
+                offset: mat(offset)?,
+                ty: *ty,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite a guard tree's operands through the materializer.  A reused
+/// compare (`src`) whose definition dies with a cleared block is
+/// re-emitted from materialized operands instead (the node already
+/// carries the polarity-adjusted predicate, so the fresh compare
+/// computes the same mask bit).
+#[allow(clippy::too_many_arguments)]
+fn cond_store_remap_tree(
+    node: &CondMaskNode,
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    keep_idx: usize,
+    cleared: &FxHashSet<usize>,
+    moved_defs: &FxHashSet<Value>,
+    remap: &mut FxHashMap<Value, Value>,
+    prefix: &mut Vec<Instruction>,
+    next_value_id: &mut u32,
+) -> Option<CondMaskNode> {
+    // NOTE: `CondMaskNode` is declared below; Rust resolves the forward
+    // reference within the module.
+    match node {
+        CondMaskNode::Cmp {
+            src,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => {
+            let src = match src {
+                Some(v) => {
+                    if let Some(n) = remap.get(v) {
+                        Some(*n)
+                    } else {
+                        let (db, _) = *defs.get(v)?;
+                        if cleared.contains(&db) && !moved_defs.contains(v) {
+                            None
+                        } else {
+                            Some(*v)
+                        }
+                    }
+                }
+                None => None,
+            };
+            let mut mat = |op: &Operand| {
+                cond_store_materialize(
+                    func,
+                    defs,
+                    keep_idx,
+                    op,
+                    cleared,
+                    moved_defs,
+                    remap,
+                    prefix,
+                    next_value_id,
+                    8,
+                )
+            };
+            Some(CondMaskNode::Cmp {
+                src,
+                op: *op,
+                lhs: mat(lhs)?,
+                rhs: mat(rhs)?,
+                ty: *ty,
+            })
+        }
+        CondMaskNode::And(a, b) => Some(CondMaskNode::And(
+            Box::new(cond_store_remap_tree(
+                a,
+                func,
+                defs,
+                keep_idx,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+            )?),
+            Box::new(cond_store_remap_tree(
+                b,
+                func,
+                defs,
+                keep_idx,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+            )?),
+        )),
+        CondMaskNode::Or(a, b) => Some(CondMaskNode::Or(
+            Box::new(cond_store_remap_tree(
+                a,
+                func,
+                defs,
+                keep_idx,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+            )?),
+            Box::new(cond_store_remap_tree(
+                b,
+                func,
+                defs,
+                keep_idx,
+                cleared,
+                moved_defs,
+                remap,
+                prefix,
+                next_value_id,
+            )?),
+        )),
+    }
+}
+
+/// Every value defined in `cleared` blocks dies with them except
+/// `moved_defs`, which relocate into the surviving straight-line body
+/// under their original ids.  Any surviving use — another block's
+/// instructions, terminator, or phi incomings — of a dead definition
+/// vetoes the rewrite (an escaping chain-block compare or address
+/// would otherwise dangle).
+fn cond_store_no_escaping_uses(
+    func: &IrFunction,
+    cleared: &FxHashSet<usize>,
+    moved_defs: &FxHashSet<Value>,
+) -> bool {
+    let mut dead: FxHashSet<Value> = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if !cleared.contains(&bi) {
+            continue;
+        }
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                if !moved_defs.contains(&d) {
+                    dead.insert(d);
+                }
+            }
+        }
+    }
+    if dead.is_empty() {
+        return true;
+    }
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if cleared.contains(&bi) {
+            continue;
+        }
+        let mut escaped = false;
+        for inst in &block.instructions {
+            inst.for_each_used_value(|u| {
+                if dead.contains(&Value(u)) {
+                    escaped = true;
+                }
+            });
+            if escaped {
+                return false;
+            }
+        }
+        block.terminator.for_each_used_value(|u| {
+            if dead.contains(&Value(u)) {
+                escaped = true;
+            }
+        });
+        if escaped {
+            return false;
+        }
+    }
+    true
+}
+
 /// Analyze a one-source copy/scale/add/affine store loop.
 ///
 /// Strict legality: the loop must be straight-line (no internal conditionals),
@@ -4249,7 +4855,7 @@ fn rewrite_conditional_store(
     // dominating load; the store block holds the value computation and the
     // loop's only store (the map analysis re-checks the whole-loop scan).
     let mut store_inst: Option<(Value, Operand, IrType)> = None; // (ptr, val, ty)
-    let mut store_gep: Option<Value> = None;
+    let mut _store_gep: Option<Value> = None;
     for inst in &func.blocks[store_block].instructions {
         match inst {
             Instruction::Store {
@@ -4267,10 +4873,10 @@ fn rewrite_conditional_store(
                 store_inst = Some((*ptr, val.clone(), *ty));
             }
             Instruction::GetElementPtr { dest, .. } => {
-                if store_gep.is_some() {
+                if _store_gep.is_some() {
                     return false;
                 }
-                store_gep = Some(*dest);
+                _store_gep = Some(*dest);
             }
             Instruction::BinOp { op, ty, .. } if !op.can_trap() || ty.is_float() => {}
             Instruction::Cast { .. } | Instruction::Copy { .. } | Instruction::UnaryOp { .. } => {}
@@ -4342,19 +4948,94 @@ fn rewrite_conditional_store(
     let Some(combined) = combined else {
         return false;
     };
-    // The store block's computation, minus its GEP and the store itself.
+    // The store block's computation, minus the store itself and the
+    // store's address GEP (the new store reuses the load's address).  A
+    // GEP that is NOT the store address is value computation and moves
+    // along — dropping it would strand its users.
     let moved: Vec<Instruction> = func.blocks[store_block]
         .instructions
         .iter()
         .filter(|i| {
             !matches!(i, Instruction::Store { .. })
-                && !matches!(i, Instruction::GetElementPtr { dest, .. } if Some(*dest) == store_gep)
+                && !matches!(i, Instruction::GetElementPtr { dest, .. } if *dest == store_ptr)
         })
         .cloned()
         .collect();
 
-    // The value computation must precede the selects that consume it.
-    let mut new_insts: Vec<Instruction> = moved;
+    // ── Operand availability ─────────────────────────────────────────
+    // The commit below empties every non-first chain block and the store
+    // block: every value the straight-line body references must survive
+    // that.  Values defined outside the cleared blocks pass through;
+    // values defined inside are re-materialized ahead of the selects;
+    // anything else (or any surviving use of a dead definition)
+    // declines the rewrite — the scalar loop stays byte-exact.
+    let mut cleared: FxHashSet<usize> = FxHashSet::default();
+    for b in &chain_blocks {
+        if *b != first_block {
+            cleared.insert(*b);
+        }
+    }
+    cleared.insert(store_block);
+    let moved_defs: FxHashSet<Value> = moved.iter().filter_map(|i| i.dest()).collect();
+    if !cond_store_no_escaping_uses(func, &cleared, &moved_defs) {
+        return false;
+    }
+    let defs = cond_store_def_sites(func);
+    let mut next_id = func.next_value_id;
+    let mut remap: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut prefix: Vec<Instruction> = Vec::new();
+    let mut moved_fixed: Vec<Instruction> = Vec::with_capacity(moved.len());
+    for inst in &moved {
+        let Some(fixed) = cond_store_remap_moved(
+            inst,
+            func,
+            &defs,
+            first_block,
+            &cleared,
+            &moved_defs,
+            &mut remap,
+            &mut prefix,
+            &mut next_id,
+        ) else {
+            return false;
+        };
+        moved_fixed.push(fixed);
+    }
+    let store_val = match cond_store_materialize(
+        func,
+        &defs,
+        first_block,
+        &store_val,
+        &cleared,
+        &moved_defs,
+        &mut remap,
+        &mut prefix,
+        &mut next_id,
+        8,
+    ) {
+        Some(s) => s,
+        None => return false,
+    };
+    let combined = match cond_store_remap_tree(
+        &combined,
+        func,
+        &defs,
+        first_block,
+        &cleared,
+        &moved_defs,
+        &mut remap,
+        &mut prefix,
+        &mut next_id,
+    ) {
+        Some(c) => c,
+        None => return false,
+    };
+    func.next_value_id = next_id;
+
+    // The re-materialized definitions come first, then the value
+    // computation; both precede the selects that consume them.
+    let mut new_insts: Vec<Instruction> = prefix;
+    new_insts.extend(moved_fixed);
     let select_dest = emit_cond_mask_selects(
         &combined,
         store_val,
@@ -4755,7 +5436,7 @@ fn rewrite_folded_cond_store(
 
     // ── Validate the store block (the chain form's contract) ────────────
     let mut store_inst: Option<(Value, Operand, IrType)> = None; // (ptr, val, ty)
-    let mut store_gep: Option<Value> = None;
+    let mut _store_gep: Option<Value> = None;
     for inst in &func.blocks[store_block].instructions {
         match inst {
             Instruction::Store {
@@ -4773,10 +5454,10 @@ fn rewrite_folded_cond_store(
                 store_inst = Some((*ptr, val.clone(), *ty));
             }
             Instruction::GetElementPtr { dest, .. } => {
-                if store_gep.is_some() {
+                if _store_gep.is_some() {
                     return false;
                 }
-                store_gep = Some(*dest);
+                _store_gep = Some(*dest);
             }
             Instruction::BinOp { op, ty, .. } if !op.can_trap() || ty.is_float() => {}
             Instruction::Cast { .. } | Instruction::Copy { .. } | Instruction::UnaryOp { .. } => {}
@@ -4874,22 +5555,87 @@ fn rewrite_folded_cond_store(
     };
 
     // ── Rewrite ──────────────────────────────────────────────────────────
-    // The store block's computation, minus its GEP and the store itself,
+    // The store block's computation, minus the store itself and the
+    // store's address GEP (the new store reuses the load's address),
     // keeps its place; the guarded store becomes nested selects against
     // the dominating load (the chain form's exact spelling), and the
     // guard's mask branch becomes an unconditional edge so every block
     // executes every iteration — the map analysis then sees a plain
-    // elementwise loop.
+    // elementwise loop.  A GEP that is NOT the store address is value
+    // computation and stays — dropping it would strand its users.
     let moved: Vec<Instruction> = func.blocks[store_block]
         .instructions
         .iter()
         .filter(|i| {
             !matches!(i, Instruction::Store { .. })
-                && !matches!(i, Instruction::GetElementPtr { dest, .. } if Some(*dest) == store_gep)
+                && !matches!(i, Instruction::GetElementPtr { dest, .. } if *dest == store_ptr)
         })
         .cloned()
         .collect();
-    let mut new_insts: Vec<Instruction> = moved;
+    // ── Operand availability ─────────────────────────────────────────
+    // The commit replaces the store block: only the relocated
+    // computation (under its original ids) survives.  The guard block
+    // is untouched, so it is the reuse/dominance anchor; anything the
+    // new body references must already dominate or re-materialize.
+    let mut cleared: FxHashSet<usize> = FxHashSet::default();
+    cleared.insert(store_block);
+    let moved_defs: FxHashSet<Value> = moved.iter().filter_map(|i| i.dest()).collect();
+    if !cond_store_no_escaping_uses(func, &cleared, &moved_defs) {
+        return false;
+    }
+    let defs = cond_store_def_sites(func);
+    let mut next_id = func.next_value_id;
+    let mut remap: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut prefix: Vec<Instruction> = Vec::new();
+    let mut moved_fixed: Vec<Instruction> = Vec::with_capacity(moved.len());
+    for inst in &moved {
+        let Some(fixed) = cond_store_remap_moved(
+            inst,
+            func,
+            &defs,
+            guard_block,
+            &cleared,
+            &moved_defs,
+            &mut remap,
+            &mut prefix,
+            &mut next_id,
+        ) else {
+            return false;
+        };
+        moved_fixed.push(fixed);
+    }
+    let store_val = match cond_store_materialize(
+        func,
+        &defs,
+        guard_block,
+        &store_val,
+        &cleared,
+        &moved_defs,
+        &mut remap,
+        &mut prefix,
+        &mut next_id,
+        8,
+    ) {
+        Some(s) => s,
+        None => return false,
+    };
+    let mask_tree = match cond_store_remap_tree(
+        &mask_tree,
+        func,
+        &defs,
+        guard_block,
+        &cleared,
+        &moved_defs,
+        &mut remap,
+        &mut prefix,
+        &mut next_id,
+    ) {
+        Some(t) => t,
+        None => return false,
+    };
+    func.next_value_id = next_id;
+    let mut new_insts: Vec<Instruction> = prefix;
+    new_insts.extend(moved_fixed);
     let select_dest = emit_cond_mask_selects(
         &mask_tree,
         store_val,
@@ -5036,6 +5782,17 @@ fn analyze_map_pattern(
         set_reject("map loop carries a value other than its induction variable");
         if debug {
             eprintln!("[VEC-MAP] BAIL: non-IV header phi");
+        }
+        return None;
+    }
+
+    // The transform rewires escaping IV uses to the remainder IV; anything
+    // else crossing the loop boundary (a second exit, a loop-defined value
+    // consumed outside) would observe vector-counter garbage.  Fail closed.
+    if !loop_escape_closed(func, &loop_info.body, header_idx, exit_idx, iv) {
+        set_reject("map loop boundary not closed (second exit or escaping non-IV value)");
+        if debug {
+            eprintln!("[VEC-MAP] BAIL: loop boundary not closed");
         }
         return None;
     }
@@ -9422,6 +10179,17 @@ fn analyze_stencil_pattern(
         return None;
     }
 
+    // The transform rewires escaping IV uses to the remainder IV; anything
+    // else crossing the loop boundary (a second exit, a loop-defined value
+    // consumed outside) would observe vector-counter garbage.  Fail closed.
+    if !loop_escape_closed(func, &loop_info.body, header_idx, exit_idx, iv) {
+        set_reject("stencil loop boundary not closed (second exit or escaping non-IV value)");
+        if debug {
+            eprintln!("[VEC-STENCIL] BAIL: loop boundary not closed");
+        }
+        return None;
+    }
+
     // IV start: the phi's non-latch incoming must be a constant.
     let latch_label = func.blocks[latch_idx].label;
     let mut iv_start = None;
@@ -10088,9 +10856,53 @@ fn transform_stencil_vector(
         changes += inserted;
     }
 
+    // Snapshot the labels of every block OUTSIDE the loop before the
+    // remainder lands: escaping uses of the scalar IV (a live-out
+    // induction value such as `wsum = i`) are rewired to the remainder
+    // IV below, while the remainder blocks themselves legitimately
+    // consume vector-loop values.
+    let outside_labels: Vec<BlockId> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(bi, _)| !pattern.loop_blocks.contains(bi))
+        .map(|(_, b)| b.label)
+        .collect();
+
     let rem_header_label = remainder.header_label;
     let rem_iv_phi = remainder.iv_phi;
     changes += remainder.commit(func, pattern.header_idx);
+
+    // Repair uses of the scalar IV that ESCAPE the loop: the packed loop
+    // redefines the counter once per vector iteration, so only the
+    // remainder IV holds the true post-loop value on the exit edge.
+    changes += rewire_escaping_iv_uses(
+        func,
+        pattern.iv,
+        Some(rem_iv_phi),
+        &outside_labels,
+        debug,
+        "[VEC-STENCIL]",
+    );
+    // Exit-block phis still name the loop-exit edge the remainder
+    // replaced: retarget loop-side incoming labels at the remainder
+    // header (values were rewired above; invariants keep their value).
+    {
+        let loop_labels: FxHashSet<BlockId> = pattern
+            .loop_blocks
+            .iter()
+            .map(|&bi| func.blocks[bi].label)
+            .collect();
+        for inst in func.blocks[pattern.exit_idx].instructions.iter_mut() {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (_, label) in incoming.iter_mut() {
+                    if loop_labels.contains(label) {
+                        *label = rem_header_label;
+                    }
+                }
+            }
+        }
+    }
 
     if pattern.needs_alias_guard {
         let disp_min = pattern.taps.iter().map(|t| t.disp_bytes).min().unwrap_or(0);
@@ -14443,24 +15255,25 @@ fn set_cloned_dest(inst: &mut Instruction, dest: Value) {
 /// that existed before the remainder was created (`outside_labels`), which
 /// excludes the remainder's own blocks -- their use of the vector counter is
 /// the legitimate byte-to-element conversion and must not be touched.
+///
+/// Shared by the reduction, map, and stencil paths.
 fn rewire_escaping_iv_uses(
     func: &mut IrFunction,
-    pattern: &ReductionPattern,
+    iv: Value,
     rem_iv: Option<Value>,
     outside_labels: &[BlockId],
     debug: bool,
+    tag: &str,
 ) -> usize {
-    let iv = pattern.iv;
     let Some(rem_iv) = rem_iv else {
         // No remainder loop was built, so there is no element-counting value
-        // to point at. This cannot happen for the element types the reduction
-        // path accepts (the only early return in
-        // `insert_reduction_remainder_loop` rejects types this transform never
-        // reaches), but a wrong answer is not an acceptable failure mode for a
-        // "cannot happen".
+        // to point at.  This cannot happen on any path that reaches here
+        // (every caller builds its remainder before the packed loop is
+        // touched and bails otherwise), but a wrong answer is not an
+        // acceptable failure mode for a "cannot happen".
         debug_assert!(
             false,
-            "vectorized a reduction without a remainder loop; an escaping \
+            "vectorized a loop without a remainder loop; an escaping \
              counter would read the vector counter"
         );
         return 0;
@@ -14491,12 +15304,99 @@ fn rewire_escaping_iv_uses(
 
     if debug && rewrites > 0 {
         eprintln!(
-            "[VEC-RED]   Rewired {} escaping use(s) of counter v{} to the \
+            "{}   Rewired {} escaping use(s) of counter v{} to the \
              remainder IV v{}",
-            rewrites, iv.0, rem_iv.0
+            tag, rewrites, iv.0, rem_iv.0
         );
     }
     rewrites
+}
+
+/// Soundness contract the map/stencil transforms rely on for values that
+/// cross the loop boundary.  The packed loop redefines the counter once
+/// per vector iteration while the scalar remainder owns the true
+/// post-loop IV, and the transform rewires escaping IV uses to the
+/// remainder IV — which is only correct if (1) the loop has no other
+/// edge to the outside than the header's false edge to `exit_idx` (a
+/// second exit would bypass the remainder and observe vector-counter
+/// values), and (2) no value defined inside the loop is consumed outside
+/// except the IV itself (anything else would read vector-iteration
+/// garbage or dangle once the scalar body is replaced).  Returns false
+/// → the analyzer bails and the loop stays scalar.
+fn loop_escape_closed(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    header_idx: usize,
+    exit_idx: usize,
+    iv: Value,
+) -> bool {
+    let exit_label = func.blocks[exit_idx].label;
+    let in_loop = |label: BlockId| {
+        func.blocks
+            .iter()
+            .position(|b| b.label == label)
+            .is_some_and(|idx| loop_blocks.contains(&idx))
+    };
+    for &bi in loop_blocks {
+        match &func.blocks[bi].terminator {
+            Terminator::Branch(t) => {
+                if bi == header_idx || !in_loop(*t) {
+                    return false;
+                }
+            }
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                if bi != header_idx || !in_loop(*true_label) || *false_label != exit_label {
+                    return false;
+                }
+            }
+            // Returns, switches, indirect branches inside the loop body:
+            // unhandled exit edges — fail closed.
+            _ => return false,
+        }
+    }
+    // Every definition inside the loop must stay inside, except the IV,
+    // whose escaping uses the transform rewires to the remainder IV.
+    let mut defined_in_loop: FxHashSet<u32> = FxHashSet::default();
+    for &bi in loop_blocks {
+        for inst in &func.blocks[bi].instructions {
+            if let Some(d) = inst.dest() {
+                defined_in_loop.insert(d.0);
+            }
+        }
+    }
+    if defined_in_loop.is_empty() {
+        return true;
+    }
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if loop_blocks.contains(&bi) {
+            continue;
+        }
+        for inst in &block.instructions {
+            let mut escaped = false;
+            inst.for_each_used_value(|u| {
+                if u != iv.0 && defined_in_loop.contains(&u) {
+                    escaped = true;
+                }
+            });
+            if escaped {
+                return false;
+            }
+        }
+        let mut escaped = false;
+        block.terminator.for_each_used_value(|u| {
+            if u != iv.0 && defined_in_loop.contains(&u) {
+                escaped = true;
+            }
+        });
+        if escaped {
+            return false;
+        }
+    }
+    true
 }
 
 /// Replace every use of `old` in `inst` with `new`.
@@ -16684,7 +17584,14 @@ fn transform_reduction_avx2(
     }
 
     // Step 5: repair uses of the loop counter that ESCAPE the loop.
-    changes += rewire_escaping_iv_uses(func, pattern, rem_iv, &outside_labels, debug);
+    changes += rewire_escaping_iv_uses(
+        func,
+        pattern.iv,
+        rem_iv,
+        &outside_labels,
+        debug,
+        "[VEC-RED]",
+    );
 
     // Update the function's next_value_id and next_label
     func.next_value_id = next_val_id;
@@ -17946,7 +18853,14 @@ fn transform_reduction_sse2(
     }
 
     // Step 5: repair uses of the loop counter that ESCAPE the loop.
-    changes += rewire_escaping_iv_uses(func, pattern, rem_iv, &outside_labels, debug);
+    changes += rewire_escaping_iv_uses(
+        func,
+        pattern.iv,
+        rem_iv,
+        &outside_labels,
+        debug,
+        "[VEC-RED]",
+    );
 
     // Update the function's next_value_id and next_label
     func.next_value_id = next_val_id;
@@ -18978,10 +19892,54 @@ fn transform_map_vector(
         changes += inserted;
     }
 
+    // Snapshot the labels of every block OUTSIDE the loop before the
+    // remainder lands: escaping uses of the scalar IV (a live-out
+    // induction value such as `wsum = i`) are rewired to the remainder
+    // IV below, while the remainder blocks themselves legitimately
+    // consume vector-loop values.
+    let outside_labels: Vec<BlockId> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(bi, _)| !pattern.loop_blocks.contains(bi))
+        .map(|(_, b)| b.label)
+        .collect();
+
     let rem_header_label = remainder.header_label;
     let rem_iv_phi = remainder.iv_phi;
     let rem_vec_exit_label = remainder.vec_exit_label;
     changes += remainder.commit(func, pattern.header_idx);
+
+    // Repair uses of the scalar IV that ESCAPE the loop: the packed loop
+    // redefines the counter once per vector iteration, so only the
+    // remainder IV holds the true post-loop value on the exit edge.
+    changes += rewire_escaping_iv_uses(
+        func,
+        pattern.iv,
+        Some(rem_iv_phi),
+        &outside_labels,
+        debug,
+        "[VEC-MAP]",
+    );
+    // Exit-block phis still name the loop-exit edge the remainder
+    // replaced: retarget loop-side incoming labels at the remainder
+    // header (values were rewired above; invariants keep their value).
+    {
+        let loop_labels: FxHashSet<BlockId> = pattern
+            .loop_blocks
+            .iter()
+            .map(|&bi| func.blocks[bi].label)
+            .collect();
+        for inst in func.blocks[pattern.exit_idx].instructions.iter_mut() {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (_, label) in incoming.iter_mut() {
+                    if loop_labels.contains(label) {
+                        *label = rem_header_label;
+                    }
+                }
+            }
+        }
+    }
 
     // Single-IV loop control: the remainder resumes from the BYTE IV
     // (element index = byte_iv >> log2(elem_size)), not the element phi —

@@ -159,7 +159,15 @@ def _is_simd_instruction(mnemonic: str) -> bool:
 
 def _function_body(lines: list[str], wanted: str | None) -> list[str] | None:
     if not wanted:
-        return [line for line in lines if not _DIRECTIVE.match(line)]
+        # Whole-translation-unit mode: drop directives but keep label
+        # definitions.  Local labels (`.LBB1:`, `.L2:`) start with a dot like
+        # directives, so a bare `_DIRECTIVE` filter strips them and leaves
+        # behind jumps to nowhere — the saved artifact then misleads every
+        # manual CFG/diff read (and cannot be re-assembled).  Statistics are
+        # unaffected either way: `_stats` skips colon-terminated lines and
+        # `_split_function_bodies` only splits on non-dot labels.
+        return [line for line in lines
+                if not _DIRECTIVE.match(line) or _LABEL.match(line)]
     label = re.compile(r'^\s*"?([^"\s:]+)"?:\s*(?:[#;].*)?$')
     out: list[str] = []
     active = False
