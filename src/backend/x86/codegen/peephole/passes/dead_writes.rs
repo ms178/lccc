@@ -102,23 +102,33 @@ pub(super) fn eliminate_dead_pure_writes(store: &LineStore, infos: &mut [LineInf
 /// starts a block dominated by its predecessor, so a value cached before it is
 /// still valid after it.
 #[expect(clippy::needless_range_loop)]
-fn label_is_fallthrough_only(store: &LineStore, infos: &[LineInfo], label_idx: usize) -> bool {
+pub(super) fn label_is_fallthrough_only(
+    store: &LineStore,
+    infos: &[LineInfo],
+    label_idx: usize,
+) -> bool {
     let t = infos[label_idx].trimmed(store.get(label_idx));
-    let Some(name) = t.strip_suffix(':') else {
+    let Some(name) = t.strip_suffix(':').map(str::trim) else {
         return false;
     };
+    // A label has a non-fallthrough predecessor when ANY other line names
+    // it. Direct `jmp`/`jcc` are the common case, but switch lowering reaches
+    // case blocks through an indirect `jmpq *%rdx` whose targets are spelled
+    // only in jump-table data (`.long .LBB4 - .Ljt_0`, `.quad .LBBn`):
+    // scanning jump mnemonics alone mislabels every jump-table target as
+    // fallthrough-only and would let folds/cascades cross into a block that
+    // is entered with different register state. Tokenise on the assembler
+    // symbol alphabet so `.L1` cannot match `.L10`; over-matching only ever
+    // fails closed (label treated as targeted, fold refused).
     for n in 0..store.len() {
         if infos[n].is_nop() || n == label_idx {
             continue;
         }
-        if !matches!(
-            infos[n].kind,
-            LineKind::Jmp | LineKind::CondJmp | LineKind::JmpIndirect
-        ) {
-            continue;
-        }
         let tn = infos[n].trimmed(store.get(n));
-        if tn.split_whitespace().nth(1) == Some(name) {
+        if tn
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '_' && c != '$')
+            .any(|tok| tok == name)
+        {
             return false;
         }
     }
@@ -320,6 +330,20 @@ fn reuse_redundant_loads_with(
             if redundant_same_dst_reload {
                 if let Some((op2, mem2, dst2, _)) = load_operand(t) {
                     if op2 == op && mem2 == mem_owned && dst2 == dst_owned {
+                        // Keep a reload that the stack-load→ALU memory-operand
+                        // fold is about to consume (`movq slot,%rcx; addq
+                        // %rcx,%rax` → `addq slot,%rax`). Deleting it here
+                        // makes a later consumer read the surviving earlier
+                        // load instead, and the fold's register-deadness
+                        // proof fails for the EARLIER load, so every member
+                        // of a reload chain stays materialized (one extra
+                        // instruction per chain). Preserving the redundant
+                        // copy costs nothing: the fold deletes it in the
+                        // very next phase. See load_would_memfold.
+                        if super::memory_fold::load_would_memfold(store, infos, j) {
+                            j += 1;
+                            continue;
+                        }
                         mark_nop(&mut infos[j]);
                         changed = true;
                         j += 1;
@@ -530,6 +554,128 @@ fn store_destination(t: &str) -> Option<&str> {
 /// The base register itself cannot move inside the scan: `%rsp`/`%rbp` are
 /// members of the cached load's `addr_fams`, and a write to any address family
 /// already ends the scan above. So the displacements compared here are stable.
+/// Exact upper bound on the bytes a STORE writes, or `None` when the write
+/// footprint cannot be bounded from the mnemonic alone.
+///
+/// The disjointness proof in [`store_cannot_alias_slot`] must NEVER use an
+/// under-estimate: a store charged 16 bytes that really writes 512 makes a
+/// live cached load look disjoint and deletes it (miscompile). The
+/// over-broad fallback in [`mnemonic_mem_width`] (16 for anything unknown)
+/// is fine on the READ/cached side — it only loses optimization — but on
+/// the store side it meets a whitelist:
+///
+/// * ordinary GP/extending/RMW mnemonics with a `b/w/l/q` suffix write
+///   exactly 1/2/4/8 bytes, apart from the handful whose suffix lies about
+///   their footprint (`fbstpb` stores 18 bytes of packed decimal,
+///   `cmpxchg8b` writes 8);
+/// * vector stores take the widest vector register named on the line
+///   (over-broad is sound because it only enlarges the store's range);
+/// * special bounded multi-byte stores are listed explicitly
+///   (`cmpxchg8b` 8, `cmpxchg16b`/`movdir64b`/`enqcmd(s)` 16/64/64);
+/// * state-save and environment instructions write large or
+///   implementation-variable areas and always return `None`
+///   (`fxsave[64]` 512, `xsave[c|opt|s][64]` up to 4 KiB+, `fnsave` 108,
+///   `fstenv` 28/32, `stmxcsr`/`sgdt`/`sidt`/`sldt`/`smsw` unrecognized
+///   suffix anyway, `enter`'s stacked frame).
+fn bounded_store_mem_width(t: &str) -> Option<i64> {
+    let mut s = t.trim();
+    if let Some(rest) = s.strip_prefix("lock ") {
+        s = rest;
+    }
+    if let Some(rest) = s.strip_prefix('v') {
+        // VEX: vector width dominates; strip the v so the suffix checks
+        // below see the base op (vmovntdq etc. are always vector stores).
+        let vw = if rest.contains("%zmm") {
+            64
+        } else if rest.contains("%ymm") {
+            32
+        } else if rest.contains("%xmm") {
+            16
+        } else {
+            // VEX op with no vector reg (e.g. vpinsrw always names xmm) —
+            // cannot decide cheaply; fail closed.
+            return None;
+        };
+        // State/string-ish VEX forms with oversized footprints are not
+        // known to exist as frame stores; keep the vector bound.
+        return Some(vw);
+    }
+    // Special bounded multi-byte stores (whole-token mnemonic match).
+    let mnem = s.split_whitespace().next().unwrap_or("");
+    let specials: &[(&str, i64)] = &[
+        ("cmpxchg8b", 8),
+        ("cmpxchg16b", 16),
+        ("movdir64b", 64),
+        ("enqcmd", 64),
+        ("enqcmds", 64),
+        // x87 memory stores — their last letter does NOT follow the GP
+        // suffix convention: fstpl is an 8-byte double (not 4), fistpll an
+        // 8-byte long-long and fstpt a 10-byte tbyte (charged 16, an
+        // over-estimate is safe on the store side).
+        ("fstps", 4),
+        ("fsts", 4),
+        ("fstpl", 8),
+        ("fstl", 8),
+        ("fstpt", 16),
+        ("fistps", 2),
+        ("fists", 2),
+        ("fistpl", 4),
+        ("fistl", 4),
+        ("fistpll", 8),
+        ("fisttps", 2),
+        ("fisttpl", 4),
+        ("fisttpll", 8),
+        ("fstcw", 2),
+        ("fnstcw", 2),
+        ("fstsw", 2),
+        ("fnstsw", 2),
+    ];
+    if let Some((_, w)) = specials.iter().find(|(m, _)| *m == mnem) {
+        return Some(*w);
+    }
+    // Unbounded / implementation-variable state saves: never prove
+    // disjointness through them. Prefix-matched so 32/64-bit spellings and
+    // the `fn` non-waiting variants are all covered (`fxsave`/`fxsave64`,
+    // `xsave[c|opt|s][64]`, `fnsave`, `fnstenv`, `fbstpb`=18 bytes …).
+    const BULK_PREFIXES: &[&str] = &[
+        "fxsave", "xsave", "fsave", "fnsave", "stenv", "fbstp", "sgdt", "sidt", "sldt", "smsw",
+    ];
+    if BULK_PREFIXES.iter().any(|p| mnem.starts_with(p)) {
+        return None;
+    }
+    // A %xmm/%ymm/%zmm store without VEX prefix (movntdq, movdqa, maskmov…):
+    // take the widest register, over-broad on purpose.
+    if s.contains("%zmm") {
+        return Some(64);
+    }
+    if s.contains("%ymm") {
+        return Some(32);
+    }
+    if s.contains("%xmm") {
+        return Some(16);
+    }
+    // MMX stores write 8 bytes; maskmovq writes through an indirect
+    // destination and never parses as a plain frame slot anyway.
+    if s.contains("%mm") && mnem.starts_with("mov") {
+        return Some(8);
+    }
+    // Suffix-exact GP store / RMW.
+    match mnem.bytes().last() {
+        Some(b'b') | Some(b'w') | Some(b'l') | Some(b'q') => {
+            Some(match mnem.bytes().last().unwrap() {
+                b'b' => 1,
+                b'w' => 2,
+                b'l' => 4,
+                _ => 8,
+            })
+        }
+        // Anything else (fstps/fstpt, stmxcsr, sgdt, movnti, rep forms,
+        // x87 pops, …): the written width is not the suffix width — fail
+        // closed.
+        _ => None,
+    }
+}
+
 fn store_cannot_alias_slot(cached: Option<FrameSlot>, t: &str) -> bool {
     let Some(slot) = cached else {
         return false;
@@ -537,7 +683,12 @@ fn store_cannot_alias_slot(cached: Option<FrameSlot>, t: &str) -> bool {
     let Some(dst) = store_destination(t) else {
         return false;
     };
-    let Some(other) = parse_frame_slot(dst, mnemonic_mem_width(t)) else {
+    // The store side needs an EXACT upper bound; an unrecognizable store
+    // footprint invalidates the cache instead of being guessed at.
+    let Some(width) = bounded_store_mem_width(t) else {
+        return false;
+    };
+    let Some(other) = parse_frame_slot(dst, width) else {
         return false;
     };
     if other.base != slot.base {
@@ -964,6 +1115,114 @@ mod tests {
         );
     }
 
+    /// State-save instructions write hundreds of implementation-sized bytes
+    /// at their frame operand (`fxsave64` = 512, `xsave64` up to 4 KiB).
+    /// Charging them the 16-byte "unknown mnemonic" width would falsely
+    /// prove them disjoint from nearby cached slots — a miscompile.
+    #[test]
+    fn bulk_state_saves_always_break_reuse() {
+        for (op, dst) in [
+            ("fxsave64", "32(%rsp)"),
+            ("fxsave", "32(%rsp)"),
+            ("xsave64", "(%rsp)"),
+            ("xsaveopt64", "(%rsp)"),
+            ("xrstor64", "(%rsp)"), // covered structurally like the saves
+            ("fnsave", "32(%rsp)"),
+            ("fnstenv", "32(%rsp)"),
+            ("fbstpb", "32(%rsp)"),
+        ] {
+            let body =
+                format!("    movq 48(%rsp), %rax\n    {op} {dst}\n    movq 48(%rsp), %rax\n");
+            let out = run_reuse(&frame(&body), ReusePolicy::full());
+            assert_eq!(
+                slot_refs(&out, "48(%rsp)"),
+                2,
+                "{op} must invalidate a cached load it may overwrite:\n{out}"
+            );
+        }
+    }
+
+    /// `movdir64b` writes 64 direct-store bytes and `cmpxchg16b` 16; their
+    /// suffix letter must not be read as a width (…b means byte elsewhere).
+    #[test]
+    fn oversized_special_stores_break_reuse_within_their_footprint() {
+        for (op, dst, cached) in [
+            ("movdir64b", "16(%rsp)", "48(%rsp)"),  // reaches [16,80)
+            ("cmpxchg16b", "32(%rsp)", "40(%rsp)"), // reaches [32,48)
+        ] {
+            let body =
+                format!("    movq {cached}, %rax\n    {op} {dst}\n    movq {cached}, %rax\n");
+            let out = run_reuse(&frame(&body), ReusePolicy::full());
+            assert_eq!(
+                slot_refs(&out, cached),
+                2,
+                "{op} must invalidate a cached load inside its footprint:\n{out}"
+            );
+        }
+        // A cache strictly beyond movdir64b's 64 bytes stays reusable.
+        let body = "    movq 88(%rsp), %rax\n    movdir64b 16(%rsp)\n    movq 88(%rsp), %rax\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "88(%rsp)"),
+            1,
+            "a store proven out of reach must not invalidate:\n{out}"
+        );
+    }
+
+    /// A same-destination reload that the stack-load→ALU memory-operand fold
+    /// is about to consume (`movq slot,%rcx; addq %rcx,%rax` ⇒ `addq
+    /// slot,%rax`) must survive the reuse pass. Deleting it makes the later
+    /// consumer read the surviving earlier load, and the fold's register
+    /// deadness proof then fails for that earlier load — so the whole reload
+    /// chain stays materialized (one extra instruction per chain, the
+    /// -O0 loop-carried reload regression).
+    #[test]
+    fn reload_feeding_memfold_consumer_is_preserved() {
+        let body = "    movq -16(%rbp), %rcx\n    addq %rcx, %rax\n    movq -16(%rbp), %rcx\n    addq %rcx, %rax\n    movq -8(%rbp), %rcx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "-16(%rbp)"),
+            2,
+            "both fold-feeding reloads must survive reuse:\n{out}"
+        );
+    }
+
+    /// Near-miss control: a reload whose following instruction is NOT a
+    /// foldable ALU consumer is still deleted as before.
+    #[test]
+    fn reload_without_memfold_consumer_still_deleted() {
+        let body = "    movq -16(%rbp), %rcx\n    movl %edx, %esi\n    movq -16(%rbp), %rcx\n    movq %rcx, %rdi\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "-16(%rbp)"),
+            1,
+            "only the first load must remain:\n{out}"
+        );
+    }
+
+    /// x87 store suffixes lie relative to the GP convention: `fstpl` writes
+    /// an 8-byte double despite the final `l`, `fistpll` an 8-byte
+    /// long-long. Verify the adjacent-slot cache is invalidated.
+    #[test]
+    fn x87_store_widths_are_charged_correctly() {
+        for (op, dst, cached, kept) in [
+            ("fstpl", "32(%rsp)", "40(%rsp)", 1), // [32,40) vs [40,48): disjoint
+            ("fstpl", "32(%rsp)", "36(%rsp)", 2),
+            ("fstpt", "32(%rsp)", "40(%rsp)", 2), // 10 bytes [32,42)
+            ("fistpll", "32(%rsp)", "36(%rsp)", 2),
+            ("fstpl", "40(%rsp)", "32(%rsp)", 1), // disjoint, cache survives
+        ] {
+            let body =
+                format!("    movq {cached}, %rax\n    {op} {dst}\n    movq {cached}, %rax\n");
+            let out = run_reuse(&frame(&body), ReusePolicy::full());
+            assert_eq!(
+                slot_refs(&out, cached),
+                kept,
+                "{op} {dst} vs cached {cached}:\n{out}"
+            );
+        }
+    }
+
     /// A store through a register makes no claim at all: without points-to
     /// analysis it may write anywhere, including the cached slot.
     #[test]
@@ -1271,6 +1530,74 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(!out.contains("movl (%rsi), %eax"), "{out}");
+    }
+
+    fn fallthrough_predicate(asm: &str, label: &str) -> bool {
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let idx = (0..store.len())
+            .position(|i| infos[i].trimmed(store.get(i)) == label)
+            .expect("label present");
+        label_is_fallthrough_only(&store, &infos, idx)
+    }
+
+    /// A plain guard label nobody branches to is fallthrough-only.
+    #[test]
+    fn fallthrough_label_without_predecessors_is_untargeted() {
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq 200(%rsp), %rax\n",
+            "    cmpq %rax, %rdi\n",
+            ".Lg:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        assert!(fallthrough_predicate(asm, ".Lg:"));
+    }
+
+    /// Jump-table case labels are reached through an indirect jump whose
+    /// targets exist only as `.long/.quad` data references: the predicate
+    /// must see those edges (regression: only jump mnemonics were scanned).
+    #[test]
+    fn jump_table_data_references_make_label_targeted() {
+        // PC-relative .long entries (LCCC's switch lowering).
+        let asm = concat!(
+            "    jmpq *%rdx\n",
+            ".section .rodata\n",
+            ".Ljt_0:\n",
+            "    .long .Lc4 - .Ljt_0\n",
+            "    .long .Lc5 - .Ljt_0\n",
+            ".section .text,\"ax\",@progbits\n",
+            ".Lc4:\n",
+            "    ret\n",
+            ".Lc5:\n",
+            "    ret\n",
+        );
+        assert!(!fallthrough_predicate(asm, ".Lc4:"));
+        assert!(!fallthrough_predicate(asm, ".Lc5:"));
+
+        // Absolute .quad entries.
+        let asm2 = concat!(
+            "    jmpq *%rdx\n",
+            "    .quad .Ld7\n",
+            ".Ld7:\n",
+            "    ret\n",
+        );
+        assert!(!fallthrough_predicate(asm2, ".Ld7:"));
+
+        // Token boundaries: a reference to .Lc40 must not flag .Lc4.
+        let asm3 = concat!(
+            "    jmp .Lc40\n",
+            ".Lc4:\n",
+            "    ret\n",
+            ".Lc40:\n",
+            "    ret\n",
+        );
+        assert!(fallthrough_predicate(asm3, ".Lc4:"));
+        assert!(!fallthrough_predicate(asm3, ".Lc40:"));
     }
 
     #[test]

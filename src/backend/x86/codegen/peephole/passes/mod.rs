@@ -248,9 +248,16 @@ fn pin_volatile_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
     }
 }
 
-fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
+/// Whole-buffer variant of the address-taken slot scan. Used only when the
+/// assembly contains no `.cfi_startproc` / `.cfi_endproc` boundaries (unit
+/// snippets, or unwind-info-disabled output), where function scoping is
+/// impossible.
+fn pin_address_taken_global(store: &LineStore, infos: &mut [LineInfo]) {
     let mut address_taken = Vec::new();
     for i in 0..store.len() {
+        if infos[i].is_nop() {
+            continue;
+        }
         let trimmed = infos[i].trimmed(store.get(i));
         let operand = if let Some(rest) = trimmed.strip_prefix("leaq ") {
             rest.split_once(',').map(|(op, _)| op)
@@ -267,10 +274,6 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
         return;
     }
     for i in 0..store.len() {
-        // Pin BOTH stores and loads of address-taken slots: through the
-        // escaped pointer, other code (e.g. a callee) may write the slot, so
-        // a load must not be folded/forwarded from an earlier store, and the
-        // store must not be dropped as dead.
         if !matches!(
             infos[i].kind,
             LineKind::StoreRbp { .. } | LineKind::LoadRbp { .. }
@@ -283,10 +286,101 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
             LineKind::LoadRbp { .. } => trimmed.split_once(',').map(|(op, _)| op),
             _ => None,
         };
-        let slot = operand.and_then(|op| direct_stack_slot(op.trim()));
-        if slot.is_some_and(|slot| address_taken.contains(&slot)) {
+        let is_taken = operand
+            .map(str::trim)
+            .and_then(direct_stack_slot)
+            .is_some_and(|slot| address_taken.contains(&slot));
+        if is_taken {
             infos[i].pinned = true;
         }
+    }
+}
+
+fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
+    // Frame-slot addresses are function-local; the taken-slot set is
+    // collected per function and never bleeds across `.cfi_startproc` /
+    // `.cfi_endproc` boundaries. A previous global list let a
+    // `leaq -112(%rbp), %rax` in one function pin every -112(%rbp) access
+    // in every other function in the TU (intrinsic TUs with dozens of tiny
+    // functions each lost exactly one store→load forwarding that way).
+    // No CFI function boundaries (unit-test snippets, or output with frame
+    // unwind info disabled): fall back to the translation-unit-wide scan.
+    // The cross-function bleed this avoids is impossible to scope without
+    // boundaries, and such TUs contain at most one emitted function.
+    let has_any_startproc = (0..store.len()).any(|k| {
+        !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_startproc")
+    });
+    if !has_any_startproc {
+        pin_address_taken_global(store, infos);
+        return;
+    }
+    let mut start = 0;
+    while start < store.len() {
+        // Find the next .cfi_startproc.
+        while start < store.len()
+            && !infos[start]
+                .trimmed(store.get(start))
+                .starts_with(".cfi_startproc")
+        {
+            start += 1;
+        }
+        if start >= store.len() {
+            break;
+        }
+        let mut end = start + 1;
+        while end < store.len()
+            && !infos[end]
+                .trimmed(store.get(end))
+                .starts_with(".cfi_endproc")
+        {
+            end += 1;
+        }
+        let slot_of = |k: usize| -> Option<(u8, i32)> {
+            let trimmed = infos[k].trimmed(store.get(k));
+            let operand = trimmed
+                .strip_prefix("leaq ")
+                .and_then(|r| r.split_once(',').map(|(op, _)| op))
+                .or_else(|| {
+                    trimmed
+                        .strip_prefix("lea ")
+                        .and_then(|r| r.split_once(',').map(|(op, _)| op))
+                });
+            operand.and_then(direct_stack_slot)
+        };
+        // A leaq may sit textually after the cold-block access it
+        // dominates, so collect first, apply second.
+        let taken: Vec<(u8, i32)> = (start..end)
+            .filter(|&k| !infos[k].is_nop())
+            .filter_map(slot_of)
+            .collect();
+        if !taken.is_empty() {
+            for i in start..end {
+                // Pin BOTH stores and loads of address-taken slots:
+                // through the escaped pointer another call can write the
+                // slot, so a load must not be folded/forwarded from an
+                // earlier store, and the store must not be dropped as dead.
+                if !matches!(
+                    infos[i].kind,
+                    LineKind::StoreRbp { .. } | LineKind::LoadRbp { .. }
+                ) {
+                    continue;
+                }
+                let trimmed = infos[i].trimmed(store.get(i));
+                let operand = match infos[i].kind {
+                    LineKind::StoreRbp { .. } => trimmed.rsplit_once(',').map(|(_, op)| op),
+                    LineKind::LoadRbp { .. } => trimmed.split_once(',').map(|(op, _)| op),
+                    _ => None,
+                };
+                let is_taken = operand
+                    .map(str::trim)
+                    .and_then(direct_stack_slot)
+                    .is_some_and(|slot| taken.contains(&slot));
+                if is_taken {
+                    infos[i].pinned = true;
+                }
+            }
+        }
+        start = end;
     }
 }
 
@@ -1468,6 +1562,325 @@ mod tests {
         assert!(
             !result.contains("movq %rax, 8(%rsp)"),
             "never-read slot store must be eliminated:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_parse_frame_mem_plain_sib_and_none() {
+        let f = |s: &str| parse_frame_mem(s);
+        let m = f("    movl -24(%rsp, %r10, 4), %edx").unwrap();
+        assert_eq!((m.base, m.disp, m.sib), (b's', -24, true));
+        let m = f("    movq %rax, 16(%rsp)").unwrap();
+        assert_eq!((m.base, m.disp, m.sib), (b's', 16, false));
+        let m = f("    addl (%rbp, %r8, 4), %eax").unwrap();
+        assert_eq!((m.base, m.disp, m.sib), (b'b', 0, true));
+        assert!(f("    movl (%rsi, %r11, 4), %eax").is_none());
+        assert!(f("    movq %rax, %rbx").is_none());
+    }
+
+    /// sha256_transform-shaped frame: a leaq floor for the w[] buffer at
+    /// 40(%rsp), bounded sliding-window SIB reads with shifted (negative)
+    /// displacements indexed by a proven induction register, and a main
+    /// loop with an upward SIB floor. The dead counter home-slot store at
+    /// 16(%rsp) must be deleted while a store inside the escaped w[] region
+    /// is retained.
+    #[test]
+    fn test_never_read_store_below_sib_array_is_eliminated() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %r12\n",
+            "    pushq %r13\n",
+            "    pushq %r14\n",
+            "    pushq %r15\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 368\n",
+            "    movq %rdi, 296(%rsp)\n",
+            "    leaq 40(%rsp), %rax\n",
+            "    movq %rdi, 48(%rsp)\n",
+            "    movq $16, %r10\n",
+            ".Lwhdr:\n",
+            "    cmpq $64, %r10\n",
+            "    jge .Lwout\n",
+            ".Lwbody:\n",
+            "    movl -24(%rsp, %r10, 4), %edx\n",
+            "    movl -20(%rsp, %r10, 4), %esi\n",
+            "    movl 12(%rsp, %r10, 4), %edx\n",
+            "    movl 32(%rsp, %r10, 4), %edx\n",
+            "    addq $1, %r10\n",
+            "    cmpq $64, %r10\n",
+            "    jl .Lwbody\n",
+            ".Lwout:\n",
+            "    xorl %r8d, %r8d\n",
+            ".Lmhdr:\n",
+            "    cmpq $64, %r8\n",
+            "    jge .Lmout\n",
+            ".Lmbody:\n",
+            "    movl 40(%rsp, %r8, 4), %esi\n",
+            "    movq %r8, %rax\n",
+            "    leaq 1(%r8), %rax\n",
+            "    movq %rax, 16(%rsp)\n",
+            "    movq %rax, %r8\n",
+            "    cmpq $64, %r8\n",
+            "    jl .Lmbody\n",
+            ".Lmout:\n",
+            "    movq 296(%rsp), %rcx\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %r15\n",
+            "    popq %r14\n",
+            "    popq %r13\n",
+            "    popq %r12\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movq %rax, 16(%rsp)"),
+            "dead home-slot store below the w[] region must be eliminated:\n{result}"
+        );
+        assert!(
+            result.contains("movq %rdi, 48(%rsp)"),
+            "a store at/above the escaped w[] floor must be retained:\n{result}"
+        );
+        assert!(
+            result.contains("movq %rdi, 296(%rsp)") || result.contains("movq"),
+            "sanity: output retains code:\n{result}"
+        );
+    }
+
+    /// Adversarial: a shifted-displacement SIB read with an UNBOUNDED index
+    /// (loaded from memory, no induction shape) can reach the low home slots,
+    /// so the never-read pass must fail closed for the whole function.
+    #[test]
+    fn test_unbounded_negative_sib_pins_dead_store() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 336\n",
+            "    movq (%rsi), %r10\n",
+            ".Lwbody:\n",
+            "    movl -24(%rsp, %r10, 4), %edx\n",
+            "    addl %edx, %eax\n",
+            "    movq %rax, 16(%rsp)\n",
+            "    jmp .Lwbody\n",
+            ".Lmout:\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rax, 16(%rsp)"),
+            "unbounded negative SIB reach must pin the home-slot store:\n{result}"
+        );
+    }
+
+    /// Variable-stride index (`leaq (%rX,%rY), %rX`) cannot prove the
+    /// induction bounds; a negative-displacement SIB read then fails closed
+    /// and pins the low home-slot store.
+    #[test]
+    fn test_variable_stride_sib_pins_home_slot() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 336\n",
+            "    movq $16, %r10\n",
+            ".Lwbody:\n",
+            "    movl -24(%rsp, %r10, 4), %edx\n",
+            "    leaq (%r10,%r9), %r10\n",
+            "    cmpq $64, %r10\n",
+            "    jl .Lwbody\n",
+            "    movq %rax, 16(%rsp)\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rax, 16(%rsp)"),
+            "variable-stride index must fail closed for negative-disp SIB:\n{result}"
+        );
+    }
+
+    /// A bit-string op through a frame SIB operand can reach the next
+    /// operand word; the suffix width must not bound it.
+    #[test]
+    fn test_bt_bitstring_sib_pins_home_slot() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 336\n",
+            "    movq $16, %r10\n",
+            ".Lwbody:\n",
+            "    btsq %r11, -24(%rsp, %r10, 4)\n",
+            "    addq $1, %r10\n",
+            "    cmpq $64, %r10\n",
+            "    jl .Lwbody\n",
+            "    movq %rax, 16(%rsp)\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rax, 16(%rsp)"),
+            "bit-string SIB reach must fail closed:\n{result}"
+        );
+    }
+
+    /// A positive scale-stride self-lea IS a provable (monotone) induction
+    /// step; the bounded interval still proves and a below-range home store
+    /// dies. (The interval is a safe over-approximation of the sparse
+    /// visited indices.)
+    #[test]
+    fn test_scale_stride_self_lea_is_bounded() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 336\n",
+            "    movq $4, %r10\n",
+            ".Lwbody:\n",
+            "    movl 16(%rsp, %r10, 4), %edx\n",
+            "    leaq (%r10,%r10,4), %r10\n",
+            "    cmpq $16, %r10\n",
+            "    jl .Lwbody\n",
+            "    movq %rcx, 8(%rsp)\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        // Bounded interval starts at 16 + 4*4 = 32; a home store at 8 never
+        // meets it and is dead.
+        assert!(
+            !result.contains("movq %rcx, 8(%rsp)"),
+            "bounded scale-stride induction must free the below-range slot:\n{result}"
+        );
+    }
+
+    /// Adversarial near-miss: a store whose bytes overlap a bounded SIB read
+    /// range must be retained even though no plain LoadRbp reads it.
+    #[test]
+    fn test_store_inside_bounded_sib_range_is_retained() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 336\n",
+            "    movq %rdi, 48(%rsp)\n",
+            "    movq $16, %r10\n",
+            ".Lwbody:\n",
+            "    movl -24(%rsp, %r10, 4), %edx\n",
+            "    addl %edx, %eax\n",
+            "    addq $1, %r10\n",
+            "    cmpq $64, %r10\n",
+            "    jl .Lwbody\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, 48(%rsp)"),
+            "store bytes inside the bounded SIB read range must survive:\n{result}"
+        );
+    }
+
+    /// Inline asm naming a FIXED frame slot (`vstmxcsr 48(%rsp)`) pins only
+    /// that slot's region, not unrelated low home slots.
+    #[test]
+    fn test_inline_asm_plain_frame_slot_is_local_pessimization() {
+        let asm = concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    subq $64, %rsp\n",
+            "#APP\n",
+            "    vstmxcsr 48(%rsp)\n",
+            "#NO_APP\n",
+            "    movl 48(%rsp), %r11d\n",
+            "    movl $21, %edx\n",
+            "#APP\n",
+            "    leaq (%rdx,%rdx), %rcx\n",
+            "#NO_APP\n",
+            "    movq %rcx, 8(%rsp)\n",
+            "    movq %rcx, %rax\n",
+            "    movq %rcx, %rdx\n",
+            "    addq $64, %rsp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size main, .-main\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movq %rcx, 8(%rsp)"),
+            "a fixed-slot asm operand must not pin an unrelated home slot:\n{result}"
+        );
+        assert!(
+            result.contains("vstmxcsr 48(%rsp)"),
+            "inline asm itself must never be touched:\n{result}"
+        );
+    }
+
+    /// Adversarial: inline asm with an SIB frame operand uses raw, C-UB-free
+    /// index values that can reach every lower slot — fail closed.
+    #[test]
+    fn test_inline_asm_sib_frame_pins_home_slot() {
+        let asm = concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    subq $64, %rsp\n",
+            "    movq (%rsi), %rcx\n",
+            "#APP\n",
+            "    movl 40(%rsp,%rcx,4), %eax\n",
+            "#NO_APP\n",
+            "    movq %rax, 8(%rsp)\n",
+            "    addq $64, %rsp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size main, .-main\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rax, 8(%rsp)"),
+            "SIB frame indexing inside raw asm must pin lower home slots:\n{result}"
         );
     }
 

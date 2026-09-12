@@ -16,6 +16,7 @@
 //! rcx=1, rdx=2) to avoid breaking live register values.
 
 use super::super::types::*;
+use super::dead_writes::label_is_fallthrough_only;
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
     implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, writes_family,
@@ -1094,6 +1095,223 @@ fn is_reg_dead_after(
     true // ran out of window = assume dead
 }
 
+/// Liveness for the redundant-reload protection predicate
+/// (`load_would_memfold`). Same windowed scan as `is_reg_dead_after`, but
+/// transparent to control-neutral `push`/`pop` of OTHER registers: those run
+/// before the push/pop elimination phase, do not touch the tracked scratch
+/// register, and do not change control flow. A `pop %reg` (reg == tracked)
+/// counts as the fresh overwrite that makes the current value dead, matching
+/// the LoadRbp treatment. Any real CFG barrier (label, branch, ret) still
+/// fails closed.
+fn scratch_dead_after_relaxed(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    len: usize,
+    reg: u8,
+) -> bool {
+    let scan_limit = (start + 64).min(len);
+    let mask = 1u16 << reg;
+    let mut scan = start;
+    while scan < scan_limit {
+        if infos[scan].is_nop() {
+            scan += 1;
+            continue;
+        }
+        match infos[scan].kind {
+            LineKind::Push { reg: r } => {
+                if r == reg {
+                    return false;
+                }
+                scan += 1;
+                continue;
+            }
+            LineKind::Pop { reg: r } => {
+                if r == reg {
+                    return true;
+                }
+                scan += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if infos[scan].is_barrier() {
+            return infos[scan].kind == LineKind::Call;
+        }
+        if infos[scan].reg_refs & mask != 0 {
+            match infos[scan].kind {
+                LineKind::LoadRbp { reg: r, .. } if r == reg => return true,
+                LineKind::Other { dest_reg } if dest_reg == reg => {
+                    let t = infos[scan].trimmed(store.get(scan));
+                    let (reg64, reg32, _reg8) = reg_names(reg);
+                    if t == format!("xorl {}, {}", reg32, reg32) {
+                        return true;
+                    }
+                    if t.ends_with(&format!(", %{}", reg64)) || t.ends_with(&format!(", {}", reg32))
+                    {
+                        let src = t
+                            .split_once(',')
+                            .map(|(s, _)| {
+                                let mut toks = s.splitn(2, char::is_whitespace);
+                                let _mnem = toks.next();
+                                toks.next().unwrap_or("")
+                            })
+                            .unwrap_or("");
+                        let reads = src.contains(reg32)
+                            || src.contains(&format!("%{}", reg64))
+                            || src.contains(_reg8);
+                        if !reads && !is_read_modify_write(t) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+        scan += 1;
+    }
+    true
+}
+
+/// True when line `k` is a pure register-to-register GP move that may be
+/// skipped while searching for the ALU consumer of a just-loaded scratch
+/// register. The move must establish ONLY one destination GP register
+/// (`want_dst`, checked by the caller against the ALU destination), must not
+/// read or write the loaded register, must not touch the frame bases, and must
+/// have no memory operand (no load, no store, no flags dependency — plain
+/// MOV copies set no flags).
+fn is_dst_establishing_move(
+    store: &LineStore,
+    infos: &[LineInfo],
+    k: usize,
+    load_reg: RegId,
+) -> Option<RegId> {
+    if infos[k].is_nop() || infos[k].pinned || infos[k].is_barrier() {
+        return None;
+    }
+    let LineKind::Other { dest_reg: dst_fam } = infos[k].kind else {
+        return None;
+    };
+    if dst_fam > 15 || dst_fam == load_reg || dst_fam == 4 || dst_fam == 5 {
+        return None;
+    }
+    let t = infos[k].trimmed(store.get(k));
+    let (mn, operands) = t.split_once(char::is_whitespace)?;
+    // Plain GP copies only (no `movq mem, %reg`, no lea, no stack moves).
+    // Every GAS reg-reg move/extension spelling is accepted: the copy is not
+    // rewritten or deleted, only stepped over, so its extension width is
+    // irrelevant — the fold substitutes the OTHER (scratch) source of the
+    // ALU op. NB: GAS spells the word-zero-extend "movzwl", never "movlzw"
+    // (a typo here silently disabled every such fold).
+    if !matches!(
+        mn,
+        "movq"
+            | "movl"
+            | "movw"
+            | "movb"
+            | "movzbl"
+            | "movzbw"
+            | "movzbq"
+            | "movzwl"
+            | "movzwq"
+            | "movsbl"
+            | "movsbq"
+            | "movswl"
+            | "movswq"
+            | "movslq"
+    ) {
+        return None;
+    }
+    let (src, dst) = operands.split_once(',')?;
+    let src = src.trim();
+    let dst = dst.trim();
+    if src.contains('(') || dst.contains('(') {
+        return None;
+    }
+    let src_fam = register_family_fast(src);
+    let dst_fam2 = register_family_fast(dst);
+    if src_fam == REG_NONE || dst_fam2 != dst_fam {
+        return None;
+    }
+    // The copy must neither read the loaded register nor depend on the flags.
+    if src_fam == load_reg || infos[k].reg_refs & (1u16 << load_reg) != 0 {
+        return None;
+    }
+    Some(dst_fam)
+}
+
+/// Resolve the ALU target for a scratch-register stack load at index `i`.
+///
+/// The common case is an adjacent `addq %rcx, %rax` after `movq slot, %rcx`.
+/// Up to three pure destination-establishing register copies are allowed in
+/// between (the raw `-O0` / pre-relay shape):
+///
+/// ```text
+///   movq -32(%rbp), %rcx
+///   movq %rdx, %rax          # establishes the ALU destination only
+///   addq %rcx, %rax      =>  addq -32(%rbp), %rax
+/// ```
+///
+/// Returns `Some((alu_idx, moved_dst))` where `moved_dst` is `None` for the
+/// adjacent case, or `Some(fam)` when one or more copies establish `fam` (the
+/// caller must verify the ALU destination equals it). All generic soundness
+/// guards (RSP shift, intervening stores, register liveness, width) remain the
+/// caller's responsibility and naturally cover the extended window.
+fn resolve_alu_memfold_target(
+    store: &LineStore,
+    infos: &[LineInfo],
+    i: usize,
+    j: usize,
+    load_reg: RegId,
+) -> Option<(usize, Option<RegId>)> {
+    let len = store.len();
+    if j >= len {
+        return None;
+    }
+    // An adjacent Other/Cmp line is the target even if it is not an ALU we
+    // understand (the caller re-validates); but a pure destination-establishing
+    // copy is stepped over (up to three), matching the raw `-O0` shape
+    // `load; movq %rdx,%rax; addq %rcx,%rax`.
+    let first_is_move = is_dst_establishing_move(store, infos, j, load_reg).is_some();
+    if !first_is_move {
+        return if matches!(infos[j].kind, LineKind::Other { .. } | LineKind::Cmp) {
+            Some((j, None))
+        } else {
+            None
+        };
+    }
+    let mut k = j;
+    let mut moved_dst: Option<RegId> = None;
+    for _ in 0..3 {
+        if k >= len {
+            return None;
+        }
+        if infos[k].is_nop() || infos[k].kind == LineKind::Empty {
+            k += 1;
+            continue;
+        }
+        let d = is_dst_establishing_move(store, infos, k, load_reg)?;
+        if let Some(prev) = moved_dst {
+            if prev != d {
+                return None;
+            }
+        }
+        moved_dst = Some(d);
+        k += 1;
+        while k < len && (infos[k].is_nop() || infos[k].kind == LineKind::Empty) {
+            k += 1;
+        }
+        if k < len
+            && matches!(infos[k].kind, LineKind::Other { .. } | LineKind::Cmp)
+            && is_dst_establishing_move(store, infos, k, load_reg).is_none()
+        {
+            return Some((k, moved_dst));
+        }
+    }
+    None
+}
+
 /// Register names for family id 0=rax, 1=rcx, 2=rdx: (64-bit, 32-bit, 8-bit).
 fn reg_names(reg: u8) -> (&'static str, &'static str, &'static str) {
     match reg {
@@ -1289,6 +1507,32 @@ pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]
             let (mn, operands) = match tj.split_once(char::is_whitespace) {
                 Some((m, o)) => (m, o.trim()),
                 None => {
+                    // A no-operand line is normally an empty/directive line,
+                    // but a block label (` .LBB34:`) has no whitespace too.
+                    // Skipping it unconditionally forwarded a predecessor
+                    // arm's store ACROSS A CFG JOIN into the merged block's
+                    // ALU (rotl ternary diamond: one arm stored the rotated
+                    // value, the other the identity; the join read the
+                    // identity register unconditionally).
+                    //
+                    // A label is crossable exactly when it begins a block that
+                    // has no incoming branch at all (`label_is_fallthrough_only`):
+                    // such a block is dominated by the code immediately before
+                    // it, so the store's source register still carries the
+                    // slot value past the label (an if-guard block emitted
+                    // before a self-loop body has this shape). A label targeted
+                    // by any branch is a CFG join/loop header with multiple
+                    // predecessor paths the textual scan cannot inspect, and
+                    // terminates the scan like every other opaque line.
+                    if infos[j].kind == LineKind::Label
+                        && label_is_fallthrough_only(store, infos, j)
+                    {
+                        j += 1;
+                        continue;
+                    }
+                    if !is_transparent_for_store_fold(store, infos, j, reg, base) {
+                        break;
+                    }
                     j += 1;
                     continue;
                 }
@@ -1353,6 +1597,72 @@ pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]
     changed
 }
 
+/// Predicate: would `fold_memory_operands` fold the scratch-register stack
+/// load at line `i` into an adjacent (or copy-separated) ALU as a memory
+/// source operand? Mirrors that pass's guards exactly, so a redundant-reload
+/// eliminator can preserve the load instead of deleting it and starving the
+/// memory-fold cascade (the -O0 loop-carried reload chain regression).
+pub(super) fn load_would_memfold(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
+    let len = store.len();
+    if infos[i].is_nop() || infos[i].pinned {
+        return false;
+    }
+    let LineKind::LoadRbp {
+        reg: load_reg,
+        offset,
+        size: load_size,
+    } = infos[i].kind
+    else {
+        return false;
+    };
+    if load_reg > 2 {
+        return false;
+    }
+    if load_size != MoveSize::Q && load_size != MoveSize::L {
+        return false;
+    }
+    let mut j = i + 1;
+    while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Empty) {
+        j += 1;
+    }
+    let Some((alu_j, moved_dst)) = resolve_alu_memfold_target(store, infos, i, j, load_reg) else {
+        return false;
+    };
+    for k in (i + 1)..alu_j {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let tk = infos[k].trimmed(store.get(k));
+        if is_rsp_shift_line(tk) {
+            return false;
+        }
+        if writes_family(&infos[k], tk, load_reg) {
+            return false;
+        }
+        if let LineKind::StoreRbp { offset: so, .. } = infos[k].kind {
+            if so == offset {
+                return false;
+            }
+        }
+    }
+    let tj = infos[alu_j].trimmed(store.get(alu_j));
+    let Some((op_suffix, _operands, src_fam, dst_fam)) = parse_alu_reg_reg(tj) else {
+        return false;
+    };
+    if load_size == MoveSize::L && op_suffix.ends_with('q') {
+        return false;
+    }
+    if src_fam != load_reg || dst_fam == load_reg {
+        return false;
+    }
+    if let Some(moved) = moved_dst {
+        if moved != dst_fam {
+            return false;
+        }
+    }
+    scratch_dead_after_relaxed(store, infos, alu_j + 1, len, load_reg)
+}
+
 /// Fold stack loads into subsequent ALU instructions as memory operands.
 ///
 /// Safety: We only fold when the loaded register (the one being eliminated) is
@@ -1415,6 +1725,16 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                 continue;
             }
 
+            // Resolve the ALU across up to three pure destination-establishing
+            // copies (`movq %rdx,%rax; addq %rcx,%rax`): such a copy only
+            // writes the ALU destination, so the memory fold is as sound as
+            // the adjacent case.
+            let Some((eff_j, moved_dst)) = resolve_alu_memfold_target(store, infos, i, j, load_reg)
+            else {
+                i += 1;
+                continue;
+            };
+            j = eff_j;
             let is_foldable_target =
                 matches!(infos[j].kind, LineKind::Other { .. } | LineKind::Cmp);
             if is_foldable_target {
@@ -1518,6 +1838,15 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                         continue;
                     }
                     if src_fam == load_reg && dst_fam != load_reg {
+                        // When destination-establishing copies were crossed,
+                        // the ALU destination must be exactly the register
+                        // those copies wrote (the value it reads pre-ALU).
+                        if let Some(moved) = moved_dst {
+                            if moved != dst_fam {
+                                i += 1;
+                                continue;
+                            }
+                        }
                         // Check for intervening store to the same offset
                         let mut intervening_store = false;
                         for k in (i + 1)..j {
@@ -3455,5 +3784,223 @@ mod store_alu_memop_tests {
             "    movl %eax, -4(%rbp)\n    addq -4(%rbp), %rdx\n",
         ));
         assert!(!changed, "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod store_alu_cross_join_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_store_alu_memop;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_store_alu_memop(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// Rotation ternary diamond: the join block's ALU merges two arms that
+    /// stored DIFFERENT registers to the same slot. The store immediately
+    /// before the join (identity arm) must not be forwarded across the join
+    /// label; the ALU keeps its slot memory operand.
+    /// Regression: differential fuzz seeds 20260912/20260939/20260960/20260990
+    /// at -O1 — `xorq slot,%r11` became `xorq %rbp,%r11`, discarding the
+    /// rotated arm's value.
+    #[test]
+    fn refuses_forward_across_cfg_join_label() {
+        let asm = "    testl %ecx, %ecx\n\
+     \x20   je .Ljoin_alt\n\
+    .Lrot_arm:\n\
+    \x20   movq %r12, 8(%rsp)\n\
+    \x20   jmp .Ljoin\n\
+    .Ljoin_alt:\n\
+    \x20   movq %rbp, 8(%rsp)\n\
+    .Ljoin:\n\
+    \x20   xorq 8(%rsp), %r11\n";
+        let (_, out) = run(asm);
+        let alu = out.iter().find(|l| l.starts_with("xorq")).unwrap();
+        assert!(
+            alu.contains("8(%rsp)"),
+            "join ALU must keep the slot operand (merge of two arms): {alu:?}"
+        );
+        assert!(
+            !alu.starts_with("xorq %rbp"),
+            "identity-arm register must not be forwarded across the join: {alu:?}"
+        );
+    }
+
+    /// Positive control: the same fold inside one straight-line block stays
+    /// legal and must continue to fire (the label barrier fix must not
+    /// disable the pass wholesale).
+    #[test]
+    fn folds_straightline_store_to_alu() {
+        let asm = "    movq %rax, 8(%rsp)\n\
+    \x20   xorq 8(%rsp), %r11\n";
+        let (changed, out) = run(asm);
+        assert!(changed, "straight-line store->ALU window must fold");
+        assert!(
+            out.iter().any(|l| l == "xorq %rax, %r11"),
+            "expected register substitution: {out:?}"
+        );
+    }
+
+    /// An `if`-guard label that NO branch targets is reached only by falling
+    /// through, so its block is dominated by the code before it and the
+    /// store's source register still carries the slot value past the label.
+    /// Regression: machinst_window_alloc_spill_base -O1..-Os.
+    #[test]
+    fn folds_across_untargeted_guard_label() {
+        let asm = "    movq %rax, 16(%rsp)\n\
+    \x20   xorl %r11d, %r11d\n\
+    \x20   xorl %r10d, %r10d\n\
+    .LBB1:\n\
+    \x20   cmpq 16(%rsp), %r10\n\
+    \x20   jge .LBB3\n\
+    .LBB2:\n\
+    \x20   addq $1, %r10\n\
+    \x20   cmpq 16(%rsp), %r10\n\
+    \x20   jl .LBB2\n\
+    .LBB3:\n\
+    \x20   ret\n";
+        let (changed, out) = run(asm);
+        assert!(changed, "dominated guard-label window must fold");
+        assert!(
+            out.iter().any(|l| l == "cmpq %rax, %r10"),
+            "expected register compare past untargeted label: {out:?}"
+        );
+    }
+
+    /// Negative twin: a label targeted by a branch is a CFG join/loop
+    /// header and must terminate the scan.
+    #[test]
+    fn refuses_across_targeted_loop_header_label() {
+        let asm = "    movq %rax, 16(%rsp)\n\
+    \x20   jmp .Lh\n\
+    .Lh:\n\
+    \x20   cmpq 16(%rsp), %r10\n\
+    \x20   ret\n";
+        let (changed, out) = run(asm);
+        assert!(
+            !out.iter().any(|l| l == "cmpq %rax, %r10"),
+            "join label must block the fold: {out:?}, changed={changed}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod memfold_dst_move_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_memory_operands;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_memory_operands(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// Raw -O0 shape: a pure destination-establishing copy between the
+    /// scratch load and the ALU must not prevent the memory-operand fold.
+    /// Regression: ra_folded_index_wave_follow -O0.
+    #[test]
+    fn folds_through_dst_establishing_move() {
+        let asm = "    movq -32(%rbp), %rcx\n\
+    \x20   movq %rdx, %rax\n\
+    \x20   addq %rcx, %rax\n";
+        let (changed, out) = run(asm);
+        assert!(changed, "{out:?}");
+        assert!(out.iter().any(|l| l == "addq -32(%rbp), %rax"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l == "movq -32(%rbp), %rcx"),
+            "the scratch load must be deleted: {out:?}"
+        );
+    }
+
+    /// The intervening copy READS the loaded register: refuse.
+    #[test]
+    fn refuses_when_move_reads_loaded_register() {
+        let asm = "    movq -32(%rbp), %rcx\n\
+    \x20   movq %rcx, %rax\n\
+    \x20   addq %rcx, %rax\n";
+        let (_, out) = run(asm);
+        assert!(
+            out.iter().any(|l| l == "movq -32(%rbp), %rcx"),
+            "load must stay when the copy reads its register: {out:?}"
+        );
+    }
+
+    /// The intervening copy loads from MEMORY: refuse.
+    #[test]
+    fn refuses_when_move_is_a_memory_load() {
+        let asm = "    movq -32(%rbp), %rcx\n\
+    \x20   movq (%rdx), %rax\n\
+    \x20   addq %rcx, %rax\n";
+        let (_, out) = run(asm);
+        assert!(
+            out.iter().any(|l| l == "movq -32(%rbp), %rcx"),
+            "memory copy must block the fold: {out:?}"
+        );
+    }
+
+    /// The copy writes a different register than the ALU destination.
+    #[test]
+    fn refuses_when_move_dst_differs_from_alu_dst() {
+        let asm = "    movq -32(%rbp), %rcx\n\
+    \x20   movq %rdx, %rdi\n\
+    \x20   addq %rcx, %rax\n";
+        let (_, out) = run(asm);
+        assert!(
+            out.iter().any(|l| l == "movq -32(%rbp), %rcx"),
+            "copy destination must match ALU destination: {out:?}"
+        );
+    }
+
+    /// GAS spells word-zero-extend `movzwl` (not `movlzw`): the typo once
+    /// blocked folds through this raw -O0 establisher.
+    #[test]
+    fn folds_through_movzwl_establisher() {
+        let asm = "    movl -32(%rbp), %ecx\n\
+    \x20   movzwl %dx, %eax\n\
+    \x20   addl %ecx, %eax\n";
+        let (changed, out) = run(asm);
+        assert!(changed, "{out:?}");
+        assert!(
+            out.iter().any(|l| l == "addl -32(%rbp), %eax"),
+            "expected fold through movzwl establisher: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "movzwl %dx, %eax"),
+            "the establishing copy itself must remain: {out:?}"
+        );
+    }
+
+    /// A partial-width destination copy (`movb`) is still only the ALU's
+    /// destination establisher; the scratch-source fold is unaffected.
+    #[test]
+    fn folds_through_movb_establisher() {
+        let asm = "    movq -32(%rbp), %rcx\n\
+    \x20   movb %dl, %al\n\
+    \x20   addq %rcx, %rax\n";
+        let (changed, out) = run(asm);
+        assert!(changed, "{out:?}");
+        assert!(
+            out.iter().any(|l| l == "addq -32(%rbp), %rax"),
+            "expected fold through movb establisher: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "movb %dl, %al"),
+            "the establishing movb must remain: {out:?}"
+        );
     }
 }

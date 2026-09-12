@@ -24,12 +24,15 @@
 //! register allocator went over budget and staged the rotation through the
 //! stack.
 //!
-//! # Blocker status: the allocator bug is fixed, the resolver stays opt-in
+//! # Resolution policy: cycle-accurate is the default (2026-09-12)
 //!
-//! The cycle-accurate resolver is **opt-in** (`CCC_PHI_ACYCLIC_ORDER=1`). It
-//! lowers `sha256_transform`'s static instruction count (210 -> 178) and stack
-//! references (62 -> 28) and wins wherever the region is not register-saturated,
-//! but on this kernel it still costs runtime, so it is not the default.
+//! The cycle-accurate resolver is **on by default**; `CCC_PHI_ACYCLIC_ORDER=0`
+//! (alias `CCC_NO_PHI_ACYCLIC_ORDER=1`) restores the legacy two-phase policy.
+//! It lowered `sha256_transform`'s stack references 53 -> 21 and instruction
+//! count 195 -> 170 at -O2, and the runtime delta flipped from a 1-7 % loss to
+//! a 3-169 % win at every optimizing tier (biggest at -O1/-Os where the legacy
+//! temps exploded the live-range population). See `copy_order_policy` for the
+//! measurements and the 6-of-807-TU blast-radius screen.
 //!
 //! The original ~5-7% penalty was misdiagnosed as "eliminating redundant copies
 //! is not monotone in code quality". It is not that. The real cause was an
@@ -128,7 +131,18 @@ use crate::ir::reexports::{
 };
 
 /// Eliminate all phi nodes in the module by lowering them to copies.
-pub fn eliminate_phis(module: &mut IrModule) {
+///
+/// `narrow_gprs` selects the target default parallel-copy policy. Targets
+/// with the i686 register economy (6 free GPRs) default to the legacy
+/// resolver, because the cycle-accurate resolver merges each loop-carried
+/// value's two short ranges into one range spanning the back edge, which on
+/// a 6-GPR target leaves exactly the recurrence words stack-homed: measured
+/// -7.4 % on `sha256_transform` (tight paired CI, i686 -O2) even though the
+/// static counts shrink. Wide-GPR targets (x86-64's 15 GPRs, AArch64's 31,
+/// RISC-V 64) default to the cycle-accurate resolver, where the same change
+/// is +3-169 %. The environment always wins (see [`copy_order_policy`]).
+pub fn eliminate_phis(module: &mut IrModule, narrow_gprs: bool) {
+    let policy = copy_order_policy(narrow_gprs);
     // Compute the global max block ID across ALL functions to avoid label collisions
     // when creating trampoline blocks. Labels are module-wide (.LBB0, .LBB1, ...).
     let mut next_block_id = 0u32;
@@ -141,8 +155,8 @@ pub fn eliminate_phis(module: &mut IrModule) {
     }
     if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
         eprintln!(
-            "[PHI] Starting phi_eliminate with next_block_id = {}",
-            next_block_id
+            "[PHI] Starting phi_eliminate with next_block_id = {} policy={:?}",
+            next_block_id, policy
         );
     }
 
@@ -157,7 +171,7 @@ pub fn eliminate_phis(module: &mut IrModule) {
                 func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>()
             );
         }
-        eliminate_phis_in_function(func, &mut next_block_id);
+        eliminate_phis_with_policy(func, &mut next_block_id, policy);
         if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
             eprintln!(
                 "[PHI] After processing {}, labels: {:?}, next_block_id now {}",
@@ -335,36 +349,60 @@ enum CopyOrderPolicy {
     Acyclic,
 }
 
-/// Read the opt-in gate. **Opt-in** because the cycle-accurate decomposition is
-/// semantically superior and a static win everywhere, yet still a small runtime
-/// loss on `sha256_transform` even after the allocator bug it exposed was fixed.
-fn copy_order_policy() -> CopyOrderPolicy {
-    // Opt-in: `CCC_PHI_ACYCLIC_ORDER=1` selects the cycle-accurate resolver.
-    //
-    // History. This used to cost ~5% runtime on `sha256_transform`, and the
-    // cause was never the resolver itself: `live_range::mark_loop_spanning`
-    // derived the web-wide in-loop-use flag from `ranges` alone, so coalesced
-    // members (which own no range) were invisible and the two recurrence words
-    // were demoted to the stack. That allocator bug is fixed. The penalty
-    // shrank accordingly — but it did not vanish, so this stays opt-in.
-    //
-    // Re-measured after the rebase onto `25ed36de`, 51- and 41-round paired
-    // interleaved A/B on `sha256_transform` (PASSES=8, BLOCK_COUNT=131072,
-    // ~430 ms/arm, both arms byte-distinct and digest-identical to gcc):
-    //
-    //   base -> RA fix only        +3.63% / +4.33%   p=0.0000 / p=0.0000
-    //   RA fix -> + acyclic phi    -1.99% / -0.71%   p=0.0008 / p=0.0288
-    //   base -> both               +1.88% / +1.98%   p=0.0000 / p=0.0002
-    //
-    // The ratios compose (0.9637 x 1.0199 = 0.9828 vs 0.9812 measured), so the
-    // decomposition is internally consistent. Shipping the resolver on top of
-    // the allocator fix therefore halves the win: the allocator fix alone is
-    // the better default. See
-    // `engineering/FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md`.
-    if std::env::var("CCC_PHI_ACYCLIC_ORDER").as_deref() == Ok("1") {
-        CopyOrderPolicy::Acyclic
-    } else {
+/// Select the parallel-copy resolution policy.
+///
+/// **Default: [`CopyOrderPolicy::Acyclic`]** (cycle-accurate Kahn
+/// decomposition). The legacy over-approximation (route every copy whose
+/// source is another copy's destination through a shared temporary) is kept
+/// behind the kill switch `CCC_PHI_ACYCLIC_ORDER=0` (alias
+/// `CCC_NO_PHI_ACYCLIC_ORDER=1`) for bisection and rollback.
+///
+/// History / why the default flipped on 2026-09-12. The cycle-accurate
+/// resolver originally shipped opt-in because it *measured* 1-7 % slower on
+/// `sha256_transform` while being a large static win. That runtime loss was
+/// never in the resolver: `live_range::mark_loop_spanning` derived the
+/// web-wide in-loop-use flag from `ranges` alone, so coalesced members
+/// (which own no range) were invisible and the hottest recurrence words were
+/// demoted to the stack. Once that supply bug was fixed (Session 16/17), the
+/// static gains still did not translate to speed, so it stayed gated.
+/// Re-measured on the full stack (post PR #501/#502), paired interleaved
+/// A/B with `scripts/run_benchmarks.py` (41 rounds,
+/// PASSES=8/BLOCK_COUNT=131072 ≈ 420-470 ms/arm, digest-identical outputs):
+///
+/// | flags | default/resolver paired median | CI 95 |
+/// |---|---|---|
+/// | -O1 | 2.69 × faster | [2.657, 2.701] |
+/// | -O2 | 1.028 × faster | [1.027, 1.030] |
+/// | -O3 | 1.029 × faster | [1.027, 1.031] |
+/// | -Os | 1.136 × faster | [1.135, 1.138] |
+///
+/// Corpus blast radius was screened assembly-by-assembly: of 807 translation
+/// units under tests/ only 6 change codegen at -O2 (sha256_transform, fib and
+/// four regression tests), all with equal or lower instruction/stack-ref
+/// counts; at -O0 output is byte-identical. The exhaustive 18,240-copy-graph
+/// oracle in the unit tests proves BOTH policies implement simultaneous
+/// assignment.
+fn copy_order_policy(narrow_gprs: bool) -> CopyOrderPolicy {
+    // Explicit kill: "0" on the positive switch, or the dedicated NO_ switch.
+    // Explicit enable: "1"/"true"/"yes" (used by tests, gates, and i686
+    // experiments). Unset/empty/other -> target default: acyclic on wide-GPR
+    // targets, legacy where the register economy cannot hold the merged
+    // back-edge ranges (i686, measured -7% sha256_transform).
+    match std::env::var("CCC_PHI_ACYCLIC_ORDER")
+        .as_deref()
+        .unwrap_or("")
+    {
+        "0" => return CopyOrderPolicy::Legacy,
+        "1" | "true" | "yes" => return CopyOrderPolicy::Acyclic,
+        _ => {}
+    }
+    if std::env::var("CCC_NO_PHI_ACYCLIC_ORDER").as_deref() == Ok("1") {
+        return CopyOrderPolicy::Legacy;
+    }
+    if narrow_gprs {
         CopyOrderPolicy::Legacy
+    } else {
+        CopyOrderPolicy::Acyclic
     }
 }
 
@@ -546,16 +584,12 @@ struct PhiElimCtx<'a> {
     trampoline_map: FxHashMap<(usize, BlockId), usize>,
     next_block_id: &'a mut u32,
     next_value: u32,
-    /// Which copy resolver this function was planned with; read once, from the
-    /// environment, by [`eliminate_phis_in_function`].
+    /// Which copy resolver this function was planned with; selected once per
+    /// module by [`eliminate_phis`] (target default + environment override).
     copy_order: CopyOrderPolicy,
 }
 
-fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
-    eliminate_phis_with_policy(func, next_block_id, copy_order_policy())
-}
-
-/// [`eliminate_phis_in_function`] with an explicit [`CopyOrderPolicy`].
+/// Module entry [`eliminate_phis`] with an explicit [`CopyOrderPolicy`].
 ///
 /// The production wrapper reads the opt-in gate; the unit tests pass a policy
 /// directly so the end-to-end rotation pin can exercise the cycle-accurate

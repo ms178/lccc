@@ -200,3 +200,36 @@ bash /home/user/lccc/scripts/arena_session_restore.sh  # fresh sandbox: swap + t
   mass deletion). Recovery that worked: `git clone /home/user/artifacts/lccc.bundle`, move the
   `.git` in, `git reset` (mixed, leaves the worktree alone), `git checkout -- .`. Snapshot via
   `/home/user/lccc-snapshot.sh` after *every* validated change; it is what made this recoverable.
+
+---
+
+# S16 (2026-09-12, part 2): census follow-ups, #503 carry/implicit-operand audit, latent jump-table gap
+
+Full record: `engineering/AUDIT-2026-09-12-S16-census-peephole-followups.md`.
+
+Shipped in this part:
+- `label_is_fallthrough_only` now treats jump-table data edges (`.long .LBB - .Ljt`, `.quad .LBB`)
+  as predecessors — the old predicate only scanned direct jumps, so switch case labels were
+  misclassified as fallthrough-only (latent store-fold miscompile path; no live corpus hit).
+  Symbol-token matching with boundary guards; positive + near-miss + adversarial tests.
+- `is_dst_establishing_move` allow-list fixed: `movlzw` was never a GAS mnemonic (it is `movzwl`);
+  now includes every reg-reg move/extend spelling. Missed -O0 folds only.
+- #503 carry audit completed: combined CF+ZF predicates (seta/setbe/cmova/jbe…) added to the
+  CF-reader set; silicon-verified PDEP/PEXT **preserve** CF (moved back to the skip table), BLSI
+  writes CF=1, ANDN/BEXTR/BZHI/BLSMSK/BLSR clear, PTEST/PCMPSTR/COMISS/FCOMI/RDRAND family
+  clobber; implicit-operand classifier extended and unified via `implicit_write_refs()`
+  (string/BCD/pusha*/syscall-family/VMM/TDX/RSM/PCONFIG/…).
+- Store/load cascade fixes (S15 leftovers): fold across untargeted guard labels; ALU fold target
+  resolution across destination-establishing copies; reload-preservation predicate so the phase-1
+  reload pass cannot starve the phase-2 memory fold.
+- Upstream miscompile documented: `ra09_selfop_xor.c -O1` forwards a register across a
+  rotl diamond that upstream gets wrong (candidate's +1 stack ref is the correct output).
+- Scripts added: `ab_pair_sweep.sh`, `ab_focused_remeasure.sh` (median-of-seeds),
+  `align_policy_ab.py`; A/B noise characterised (byte-identical controls; byte-exact NOP-padding
+  isolation) — blanket 32-byte alignment rejected after a 31-rep confirmation failed to reproduce
+  the 15-rep signal; default stays GCC's 16, hotness-driven alignment recorded as P1 follow-up.
+
+Final gates (hardened tree): ci_local --fast 27/27; clippy -D warnings clean; rustfmt clean;
+lib 2541/0/6; regression 746/0 (+SSA-validated 746/0); benchmark output oracle 204/0;
+x64 differential 0 rc-diff / 0 one-sided / censused 66 asm diffs; i686 fully byte-neutral;
+fuzz 2160/0; census -1885 insns / -1745 stack refs with only the two accepted residuals.
