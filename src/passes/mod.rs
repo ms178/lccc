@@ -1407,12 +1407,12 @@ pub(crate) fn run_passes(
 
         // Phase 2b-pre: pre-unroll CONST-TRIP map vectorization. The complete
         // unroller below runs BEFORE the Phase 2b-vec vectorizer and steals
-        // every constant-trip elementwise loop (limit <= 16), leaving 16
+        // every constant-trip elementwise loop (limit <= 64), leaving 64
         // scalar copies where ONE packed op per iteration is strictly better
         // (4x lanes, 1/4 the memory ops). This focused entry takes exactly
-        // the map-shaped const-trip 5..=16 loops FIRST (the map transform
+        // the map-shaped const-trip 5..=64 loops FIRST (the map transform
         // itself declines trips <= the vector width); the unroller then
-        // either unrolls the remaining vector iterations (trip <= 4 — the
+        // either unrolls the remaining vector iterations (trip <= 16 — the
         // ideal no-branch shape) or leaves them rolled.
         // Pass name for CCC_DISABLE_PASSES: "vectorize".
         if iter == 0

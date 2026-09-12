@@ -4589,15 +4589,34 @@ impl X86Codegen {
             // no-op.
             let amount = (imm as i64).rem_euclid(width);
             if amount != 0 {
-                self.state
-                    .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, dest_typed));
-                if width == 32 {
-                    // A rotate can move any bit into bit 31, so a signed I32
-                    // result needs the same upper-half normalization a signed
-                    // `shl` does. No-op for the unsigned types rotate idioms
-                    // actually use. Sub-word results keep their zero-extended
-                    // homes: `rolw`/`rolb` only write the low bits.
-                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                if self.bmi2_enabled && (width == 32 || width == 64) {
+                    // Prefer BMI2 rorx: non-destructive, flag-preserving.
+                    let ror_amount = match op {
+                        IrBinOp::RotateLeft => (width - amount) % width,
+                        IrBinOp::RotateRight => amount,
+                        _ => amount,
+                    };
+                    if ror_amount != 0 {
+                        let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
+                        self.state.emit_fmt(format_args!(
+                            "    {} ${}, %{}, %{}",
+                            ror_mnem, ror_amount, dest_typed, dest_typed
+                        ));
+                    }
+                    if width == 32 {
+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                    }
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, dest_typed));
+                    if width == 32 {
+                        // A rotate can move any bit into bit 31, so a signed I32
+                        // result needs the same upper-half normalization a signed
+                        // `shl` does. No-op for the unsigned types rotate idioms
+                        // actually use. Sub-word results keep their zero-extended
+                        // homes: `rolw`/`rolb` only write the low bits.
+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                    }
                 }
             }
             self.state.reg_cache.invalidate_acc();

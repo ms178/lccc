@@ -316,6 +316,9 @@ fn narrow_width_bits(ty: IrType) -> Option<u64> {
 fn high_bits_zero(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> bool {
     let v = peel_copies(opnd, defs);
     if let Some(c) = const_u64(v) {
+        if width >= 64 {
+            return true;
+        }
         return c < (1u64 << width);
     }
     let Operand::Value(id) = v else {
