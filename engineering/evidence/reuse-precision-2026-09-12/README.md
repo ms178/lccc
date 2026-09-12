@@ -124,26 +124,60 @@ Verified **output-neutral: 0 differing TUs of 805, 0 instruction delta**, isolat
 the peephole change. So F3 is a consistency/robustness fix, not a performance one, and it is
 honestly reported as such: the asymmetry was real in the code and unreachable in this corpus.
 
-## 4. Deliberate refusal: the precision is x86-64-only
+## 4. RETRACTED: "the precision is x86-64-only" (two claims below were false)
 
-`parse_frame_slot` accepts only `%rsp`/`%rbp`. `%esp`/`%ebp` map to the *same* register
-families (4/5) in `scan_register_refs`, so extending it would be sound by an identical
-argument and would be a two-line change.
+> **Correction, 2026-09-12 (S17).** This section shipped two claims that are
+> both wrong. They are preserved here struck through rather than quietly
+> rewritten, because the second one was acted on as a follow-up instruction.
+> The replacement analysis is
+> [`FOLLOWUP-2026-09-12-i686-x87-gp-pair-staging.md`](../../../FOLLOWUP-2026-09-12-i686-x87-gp-pair-staging.md)
+> and the audit trail is
+> [`engineering/AUDIT-2026-09-12-S17-redteam.md`](../../AUDIT-2026-09-12-S17-redteam.md).
 
-It is deliberately not done here. This sandbox has no 32-bit glibc dev headers, so **i686
-binaries cannot be executed**. Every x86-64 claim above is backed by running the 34
-differing translation units; the same claim on i686 could only be backed by an asm diff.
-Shipping a soundness-critical aliasing refinement on a target whose behaviour cannot be
-executed is not a trade worth making for a benefit measured at 0.06 % of instructions on
-the target where it *was* measurable.
+**False claim 1 — "this sandbox has no 32-bit glibc dev headers, so i686
+binaries cannot be executed."** Passwordless `sudo` was available and had never
+been probed. `sudo dpkg --add-architecture i386 && sudo apt-get install -y
+libc6-dev-i386 gcc-multilib` takes about 8 seconds, and an x86-64 kernel
+executes i386 ELF natively — no QEMU. Verified end to end: `lccc-i686 -O2 -o h
+h.c && ./h` runs and matches the `gcc -m32` oracle. i686 corpus coverage went
+from 292/805 to **792/807** TUs, all executable. The refusal this section
+justifies was based on an untested assumption, and it cost the project the
+entire i686 evidence base for a session.
 
-Current state is safe: the change is i686-neutral, and CI's `i686-atomics` and
-`i686-asm-diff` gates ran against an `lccc-i686` binary built *after* both source edits.
+**False claim 2 — extending `parse_frame_slot` to `%esp`/`%ebp` "would be a
+two-line change" that brings this precision to i686.** It would be two lines,
+and it would do **nothing**. `lccc-i686` does not use
+`src/backend/x86/codegen/peephole/` at all; it uses a separate 13,491-line
+`src/backend/i686/codegen/peephole.rs`. The change was applied, built and
+measured: the 792-TU i686 corpus came out **byte-identical** (271,585
+instructions, 102,701 frame-slot references, unchanged). Both edits were
+reverted rather than shipped as decoration.
 
-**Follow-up**, if someone with a 32-bit toolchain wants it: add `"%esp" => 4, "%ebp" => 5`
-to `parse_frame_slot`, then validate by executing — not just diffing — every differing TU,
-with particular attention to `subl $N, %esp` staging windows and to i686's red zone
-absence.
+What is actually true about i686, measured after the toolchain was installed:
+
+* The i686 peephole **already** participates `%esp`-relative slots and
+  **already** fences every `%esp` mover — `is_barrier` includes
+  `LineKind::Push | LineKind::Pop` and `Other { dest_reg: REG_ESP }`, and its
+  comment states the renumbering rule explicitly. `forward_slot_loads` already
+  performs store-to-load slot forwarding with `ranges_overlap` byte-range
+  precision, a 16-byte conservative width for unrecognised frame writes, and
+  breaks on `has_indirect_mem`.
+* Consequently the reload-reuse precision documented above has **no i686
+  analogue left to build**: the measured residual opportunity is 19 redundant
+  same-operand loads (3 same-destination) in 271,585 instructions — 0.007 %,
+  across 15 of 792 files.
+* The `subl $N, %esp` staging windows and the absence of an i386 red zone that
+  this section flagged as needing attention are both already handled, for the
+  reason above.
+* The real i686 gap is elsewhere and is large: `lccc-i686` is **1.264×** slower
+  than `gcc -m32 -O2` (geomean, 29 measurable benchmarks), reaching **16.05×**
+  on `nbody` and **13.80×** on `matmul`, because FP values are staged through
+  GP register pairs into stack slots instead of using x87 memory operands.
+  1,317 foldable sites, ≈5,268 instructions, ≈30 % of `nbody`'s instruction
+  stream. Specified with soundness conditions in the FOLLOWUP document above.
+
+The x86-64 claims in §1–§3 are unaffected and were re-verified on base
+`a0e03144`.
 
 ## 5. Oracle standing (whole-function, `-O2`)
 
