@@ -171,6 +171,12 @@ gate "phi-acyclic-copy-order" fast \
 gate "ra-web-inloop-use" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ra_web_inloop_use.sh
 
+gate "store-alu-cross-join" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_store_alu_cross_join.sh
+
+gate "gla-remat-policy" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_gla_remat_policy.sh
+
 gate "replay-gap-home-rewrite" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_replay_gap_home_rewrite.sh
 

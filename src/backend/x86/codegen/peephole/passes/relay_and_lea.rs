@@ -1272,10 +1272,23 @@ fn parse_imm32(src: &str) -> Option<u32> {
 const CF_READERS: &[&str] = &[
     "adc", "adcb", "adcw", "adcl", "adcq", "adcx", "sbb", "sbbb", "sbbw", "sbbl", "sbbq", "rcl",
     "rclb", "rclw", "rcll", "rclq", "rcr", "rcrb", "rcrw", "rcrl", "rcrq", "salc", "cmc", "aaa",
-    "aas", "aam", "aad", "daa", "das", "setb", "setc", "setnae", "setnb", "setnc", "setae",
-    "cmovb", "cmovc", "cmovnae", "cmovnb", "cmovnc", "cmovae", "jb", "jc", "jnae", "jnb", "jnc",
-    "jae", "lahf", "pushf", "pushfw", "pushfd", "pushfq", "syscall", "sysenter", "int", "int1",
-    "int3", "into",
+    "aas", "aam", "aad", "daa", "das",
+    // CF-only setcc/cmovcc/jcc predicates (B/C/NAE, NB/NC/AE).
+    "setb", "setc", "setnae", "setnb", "setnc", "setae", "cmovb", "cmovc", "cmovnae", "cmovnb",
+    "cmovnc", "cmovae", "jb", "jc", "jnae", "jnb", "jnc", "jae",
+    // COMBINED CF+ZF predicates read CF too. These were missing: the
+    // `set`/`cmov`/`j` prefix skip below would otherwise classify them as
+    // ZF/SF/OF-only reads and skip over a live carry observation (the
+    // conditional branch forms are additionally caught as CFG barriers,
+    // but setcc/cmovcc are not barrier lines).
+    "seta", "setnbe", "setbe", "setna", "cmova", "cmovnbe", "cmovbe", "cmovna", "ja", "jnbe", "jbe",
+    "jna",
+    // x87 FCMOV after FCOMI/FUCOMI (those deposit the comparison directly
+    // in EFLAGS): the carry-conditional moves read EFLAGS CF. i387/i686
+    // shapes primarily; the suffixless names are what GAS emits.
+    "fcmova", "fcmovnbe", "fcmovae", "fcmovnb", "fcmovnc", "fcmovb", "fcmovc", "fcmovnae",
+    "fcmovbe", "fcmovna", "lahf", "pushf", "pushfw", "pushfd", "pushfq", "syscall", "sysenter",
+    "int", "int1", "int3", "into",
 ];
 
 /// Unconditional carry-flag writers (any operands): a scan hit ends the
@@ -1399,12 +1412,31 @@ const CF_CLOBBER: &[&str] = &[
     "bsrl",
     "bsrq",
     "rdrand",
+    "rdrandw",
+    "rdrandl",
+    "rdrandq",
     "rdseed",
+    "rdseedw",
+    "rdseedl",
+    "rdseedq",
     "andn",
+    "andnl",
+    "andnq",
     "bextr",
+    "bextrl",
+    "bextrq",
+    "bzhi",
+    "bzhil",
+    "bzhiq",
     "blsi",
+    "blsil",
+    "blsiq",
     "blsmsk",
+    "blsmskl",
+    "blsmskq",
     "blsr",
+    "blsrl",
+    "blsrq",
     "cmps",
     "cmpsb",
     "cmpsw",
@@ -1419,10 +1451,22 @@ const CF_CLOBBER: &[&str] = &[
     "comisd",
     "ucomiss",
     "ucomisd",
+    "vcomiss",
+    "vcomisd",
+    "vucomiss",
+    "vucomisd",
     "fcomi",
     "fcomip",
     "fucomi",
     "fucomip",
+    // SSE4.2 string/element compares deposit CF from the sign bit of the
+    // intermediate result; PTEST/VPTEST write CF from the masked-compare.
+    "pcmpistri",
+    "pcmpestri",
+    "pcmpistrm",
+    "pcmpestrm",
+    "ptest",
+    "vptest",
     "iret",
     "iretd",
     "iretq",
@@ -1462,8 +1506,16 @@ const CF_SKIP_EXACT: &[&str] = &[
     "cqto",
     "cltq",
     "mulx",
+    // PDEP/PEXT leave CF UNCHANGED (verified on silicon, Raptor Cove:
+    // STC/PDEP/SETC -> 1 and CLC/PDEP/SETC -> 0); the BMI2 manual table that
+    // suggests "CF cleared" describes SF/ZF/PF only. Skipping is sound and
+    // crediting them as clobbers would be unsound.
     "pdep",
+    "pdepl",
+    "pdepq",
     "pext",
+    "pextl",
+    "pextq",
     "sarx",
     "shlx",
     "shrx",
@@ -2456,6 +2508,136 @@ mod tests {
         assert!(out.contains("pushq %rbx"), "{out}");
         assert!(out.contains("movl %r8d, %r10d"), "{out}");
         assert!(out.contains("shlq $32, %r10"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_movl_shlq32_before_seta() {
+        // SETA is a COMBINED CF+ZF predicate; it must veto just like SETB.
+        // The `set` prefix-skip used to classify it as a non-CF read.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    shlq $32, %r10\n",
+            "    seta %cl\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+        assert!(out.contains("shlq $32, %r10"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_movl_shlq32_before_cmova() {
+        // CMOVA reads CF (and ZF); cmovcc lines are NOT CFG barriers, so
+        // the `cmov` prefix-skip was an actual carry audit hole.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    shlq $32, %r10\n",
+            "    cmova %r8d, %edx\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+        assert!(out.contains("shlq $32, %r10"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_movl_shlq32_before_setbe() {
+        // SETBE (CF OR ZF) is the second combined-predicate direction.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    shlq $32, %r10\n",
+            "    setbe %cl\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+        assert!(out.contains("shlq $32, %r10"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_movl_shlq32_when_andnl_kills_carry() {
+        // ANDN clears CF/OF (BMI1), so a later SETA observes only flags
+        // produced by ANDN — the divergent shift carry is dead and the
+        // pair folds. Regression: andnl/andnq carried no clobber credit
+        // (only the suffix-less token was listed).
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %r11d\n",
+            "    shlq $32, %r11\n",
+            "    andnl %edx, %edi, %edi\n",
+            "    seta %cl\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movl %ebx"), "{out}");
+        assert!(out.contains("shlq $32, %rbx"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_movl_shlq32_when_pdep_preserves_carry() {
+        // PDEP/PEXT leave CF untouched (silicon-verified), so a SETA after
+        // one still observes the shift's divergent carry: refuse.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    shlq $32, %r10\n",
+            "    pdepl %edx, %edi, %edi\n",
+            "    seta %cl\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+        assert!(out.contains("shlq $32, %r10"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_movl_shlq32_when_blsil_overwrites_carry() {
+        // BLSI writes CF=1 regardless of inputs (silicon-verified), so
+        // the divergent shift carry is dead once BLSI executes.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %r11d\n",
+            "    shlq $32, %r11\n",
+            "    blsil %edi, %edi\n",
+            "    seta %cl\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movl %ebx"), "{out}");
+        assert!(out.contains("shlq $32, %rbx"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_movl_shlq32_when_ptest_kills_carry() {
+        // PTEST/VPTEST write CF from the masked AND; clobber credit.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %r11d\n",
+            "    shlq $32, %r11\n",
+            "    ptest %xmm0, %xmm1\n",
+            "    seta %cl\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movl %ebx"), "{out}");
+        assert!(out.contains("shlq $32, %rbx"), "{out}");
     }
 
     #[test]

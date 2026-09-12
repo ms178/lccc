@@ -1241,6 +1241,59 @@ pub(super) fn vector_frame_move_extent(s: &str) -> Option<i32> {
 /// Returns `RBP_OFFSET_NONE` if no rbp reference or multiple references found.
 /// This is called once during classify_line and cached in LineInfo.rbp_offset,
 /// eliminating the expensive `str::contains` in eliminate_dead_stores.
+/// A parsed frame-base memory operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FrameMem {
+    /// Base register: `b'b'` for `%rbp`, `b's'` for `%rsp`.
+    pub base: u8,
+    /// Displacement immediately before `(`.
+    pub disp: i32,
+    /// True for the SIB form `disp(%base,%index,scale)` (array-style access),
+    /// false for the plain form `disp(%base)`.
+    pub sib: bool,
+}
+
+/// Parse the frame-base memory operand of an assembly line, if any:
+/// `disp(%rsp)` / `disp(%rbp)` (plain) or `disp(%rsp,%idx,scale)` (SIB).
+///
+/// x86 encodings allow at most one memory operand per instruction, so the
+/// first frame-base match is the only one. A `%rsp`/`%rbp` appearing as an
+/// INDEX (`(%rax,%rsp,s)`) is rejected via the preceding-comma guard.
+pub(super) fn parse_frame_mem(s: &str) -> Option<FrameMem> {
+    let b = s.as_bytes();
+    let mut i = 1;
+    while i + 5 <= b.len() {
+        if b[i] == b'('
+            && b[i + 1] == b'%'
+            && b[i + 2] == b'r'
+            && (b[i + 3] == b's' || b[i + 3] == b'b')
+            && b[i + 4] == b'p'
+            // Base component: either ')' (plain) or ',' (SIB base slot).
+            && (b[i + 5] == b')' || b[i + 5] == b',')
+            // An index/segment component would be preceded by ','.
+            && b[i - 1] != b','
+        {
+            let sib = b[i + 5] == b',';
+            let mut start = i;
+            while start > 0 && (b[start - 1].is_ascii_digit() || b[start - 1] == b'-') {
+                start -= 1;
+            }
+            let disp = if start == i {
+                0
+            } else {
+                fast_parse_i32(&s[start..i])
+            };
+            return Some(FrameMem {
+                base: b[i + 3],
+                disp,
+                sib,
+            });
+        }
+        i += 1;
+    }
+    None
+}
+
 pub(super) fn parse_rbp_offset(s: &str) -> i32 {
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -1894,10 +1947,24 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
             (RAX | RDI, RDI)
         }
         b"lodsb" | b"lodsw" | b"lodsl" | b"lodsq" => (RSI, RAX | RSI),
-        b"insb" | b"insw" | b"insl" => (RDX, RDI),
-        b"outsb" | b"outsw" | b"outsl" => (RDX | RSI, RSI),
+        // Suffix-less ATT spellings default to the attribute/operand width.
+        b"movs" => (RSI | RDI, RSI | RDI),
+        b"stos" => (RAX | RDI, RDI),
+        b"lods" => (RSI, RAX | RSI),
+        b"cmps" => (RSI | RDI, RSI | RDI),
+        b"scas" => (RAX | RDI, RDI),
+        b"ins" | b"insb" | b"insw" | b"insl" => (RDX, RDI),
+        b"outs" | b"outsb" | b"outsw" | b"outsl" => (RDX | RSI, RSI),
         b"in" | b"inb" | b"inw" | b"inl" => (RDX, RAX),
         b"out" | b"outb" | b"outw" | b"outl" => (RAX | RDX, 0),
+        // Legacy i386 BCD/accumulator adjust ops (invalid in 64-bit mode):
+        // all rewrite AL/AH from the accumulator.
+        b"aaa" | b"aas" | b"aam" | b"aad" | b"daa" | b"das" => (RAX, RAX),
+        // pusha/popa save/restore the eight legacy GPRs via %esp; POPAD
+        // deliberately does NOT restore ESP from the saved word (it skips it).
+        // GAS AT&T spellings: `pushaw`/`popaw` (16-bit), `pushal`/`popal`.
+        b"pusha" | b"pushaw" | b"pushal" => (RAX | RCX | RDX | RBX | RSP | RBP | RSI | RDI, RSP),
+        b"popa" | b"popaw" | b"popal" => (RSP, RAX | RCX | RDX | RBX | RSP | RBP | RSI | RDI),
         // Serialising / system instructions with fixed register interfaces.
         // cpuid takes the leaf in %eax AND the subleaf in %ecx — the subleaf
         // read was missing, so a definition of %rcx feeding cpuid could be
@@ -1924,13 +1991,65 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         // before a sysret whose %rax IS the syscall return value.)
         b"sysenter" => (0, 0),
         b"sysexit" => (RCX | RDX, 0),
-        b"sysret" | b"sysretq" => (RCX | R11, 0),
+        b"sysret" | b"sysretl" | b"sysretq" => (RCX | R11, 0),
         // Flags saved/restored through the stack: both forms implicitly
         // read and write %rsp (8 bytes per instruction).
         b"pushf" | b"pushfq" | b"pushfw" | b"pushfl" => (RSP, RSP),
         b"popf" | b"popfq" | b"popfw" | b"popfl" => (RSP, RSP),
         // Interrupt return pops through %rsp.
         b"iret" | b"iretq" | b"iretw" | b"iretl" => (RSP, RSP),
+        // User-interrupt return (CET user-IPI) likewise restores RIP/RSP/RFLAGS.
+        b"uiret" => (RSP, RSP),
+        // int1/int3 traps and INTO may return (a debugger advances past them),
+        // so their handler contract is unknown like `int`; the conservative
+        // union vetoes every family either way.
+        b"int1" | b"int3" | b"into" => (
+            RAX | RBX | RCX | RDX | RSI | RDI | RBP,
+            RAX | RBX | RCX | RDX | RSI | RDI | RBP,
+        ),
+        // SYSEXIT carries an l/q width suffix in 64-bit mode.
+        b"sysexitl" | b"sysexitq" => (RCX | RDX, 0),
+        // RSM returns from SMM by reloading the whole register state.
+        b"rsm" => (
+            0,
+            RAX | RCX
+                | RDX
+                | RBX
+                | RSP
+                | RBP
+                | RSI
+                | RDI
+                | R8
+                | R9
+                | R10
+                | R11
+                | (1 << 12)
+                | (1 << 13)
+                | (1 << 14)
+                | (1 << 15),
+        ),
+        // PCONFIG: leaf in EAX, payload/result across EBX/ECX/EDX.
+        b"pconfig" => (RAX | RBX | RCX | RDX, RAX | RBX | RCX | RDX),
+        // PKRU read: ECX must be zero, EAX receives the value; write reads
+        // ECX/EDX.
+        b"rdpkru" => (RCX, RAX),
+        b"wrpkru" | b"wrmsrns" => (RAX | RCX | RDX, 0),
+        // Hypervisor calls follow an unknown ABI like SYSCALL: leaf in RAX,
+        // caller-saved GPRs may be clobbered.
+        b"vmcall" | b"vmmcall" | b"tdcall" | b"seamcall" => (
+            RAX | RCX | RDX | RSI | RDI | R8 | R9 | R10,
+            RAX | RCX | RDX | RSI | RDI | R8 | R9 | R10 | R11,
+        ),
+        // SMX/SGX leaf calls: leaf in EAX, per-leaf payload in RBX/RCX/RDX.
+        b"getsec" | b"encls" | b"enclu" | b"enclv" => {
+            (RAX | RBX | RCX | RDX, RAX | RBX | RCX | RDX)
+        }
+        // MONITORX/MWAITX mirror MONITOR/MWAIT on EAX/ECX(/EDX); INVLPGA
+        // addresses by RAX with ASID in ECX; SKINIT jumps through EAX.
+        b"monitorx" => (RAX | RCX | RDX, 0),
+        b"mwaitx" => (RAX | RCX, 0),
+        b"invlpga" => (RAX | RCX, 0),
+        b"skinit" => (RAX, 0),
         // RTM: the abort status lands in %eax (only on the abort path — the
         // union keeps the family conservative; the exact full-write oracle
         // deliberately excludes this conditional write).
