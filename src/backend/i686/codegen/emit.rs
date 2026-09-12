@@ -213,6 +213,104 @@ pub(super) fn i686_clobber_to_phys(clobber: &str) -> Option<PhysReg> {
     }
 }
 
+/// A/B gate for [`I686Codegen::store_const_to_stack_arg`]: the presence of
+/// `CCC_NO_CONST_STACK_ARG` restores the historical two-instruction
+/// `operand_to_eax` + `movl %eax, N(%esp)` marshalling (same presence-means-off
+/// convention as the i686 slot forwarders' `CCC_NO_*` switches, so one harness
+/// can disable any subset of the S19 changes).  Read once and cached: the gate
+/// is consulted per call argument, and an uncached environment lookup on a
+/// codegen hot path is a compile-time regression, not a debugging aid.
+fn const_stack_arg_disabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var_os("CCC_NO_CONST_STACK_ARG").is_some())
+}
+
+/// The 32-bit value that materializing `c` into a register produces, i.e. the
+/// exact four bytes a direct `movl $imm, N(%esp)` must store to be
+/// indistinguishable from the historical `operand_to_eax` + store pair.
+///
+/// This is the single source of truth for both paths: [`I686Codegen::operand_to_eax`]
+/// emits `movl $imm` from it and [`I686Codegen::store_const_to_stack_arg`]
+/// stores the same `imm`, so the fold cannot drift from the sequence it
+/// replaces.  The per-arm conventions are the IR's, not this function's: i64 and
+/// i128 truncate to their low half (only 32 bits fit), `F32`/`F64` pass the
+/// IEEE bit pattern, `D32`/`D64` are BID containers converted numerically, and
+/// `LongDouble` passes its leading four bytes.
+pub(super) fn const_stack_arg_imm(c: &IrConst) -> i32 {
+    match c {
+        IrConst::I8(v) => *v as i32,
+        IrConst::I16(v) => *v as i32,
+        IrConst::I32(v) => *v,
+        IrConst::I64(v) => *v as i32,
+        IrConst::I128(v) => *v as i32,
+        IrConst::F32(fval) => fval.to_bits() as i32,
+        IrConst::D32(v) => *v as i32,
+        IrConst::D64(v) => *v as i32,
+        IrConst::F64(fval) => fval.to_bits() as i32,
+        IrConst::LongDouble(_, bytes) => {
+            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+        IrConst::Zero => 0,
+    }
+}
+
+/// Whether [`I686Codegen::operand_to_eax`] materializes a ZERO value of this
+/// constant's kind with `xorl %eax, %eax` (2 bytes) instead of `movl $0, %eax`
+/// (5 bytes).  Only the integer arms that special-case zero do; `I128`, the
+/// decimal containers, the floats and the narrow integers emit the `movl` even
+/// for zero -- and the i686 peephole then rewrites that `movl $0, %reg` into
+/// the same `xorl`, which is why the two forms are indistinguishable in final
+/// assembly and why [`const_stack_arg_fold_wins`] refuses every zero rather
+/// than only these arms'.
+pub(super) fn const_zero_uses_xorl(c: &IrConst) -> bool {
+    matches!(c, IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero)
+}
+
+/// Whether replacing `operand_to_eax(c)` + `movl %eax, N(%esp)` with the single
+/// `movl $imm, N(%esp)` makes the encoding smaller, i.e. whether the fold may
+/// fire at all.
+///
+/// ENCODING ARITHMETIC, not a heuristic.  With an 8-bit displacement:
+///
+/// ```text
+///   non-zero imm    movl $imm,%eax (5B) + movl %eax,d8(%esp) (4B) = 9B
+///                   -> movl $imm,d8(%esp)                    = 8B   WIN
+///   zero            xorl %eax,%eax (2B) + movl %eax,d8(%esp) (4B) = 6B
+///                   -> movl $0,d8(%esp)                      = 8B   LOSS
+/// ```
+///
+/// With a 32-bit displacement both sides grow by 3 bytes, so the ordering is
+/// unchanged.  The rule is therefore "fold every non-zero immediate, never a
+/// zero", which wins both metrics wherever it fires: one instruction fewer AND
+/// one byte fewer.
+///
+/// The zero row is arm-INDEPENDENT, and that is not obvious from this file:
+/// only `I32`, `I64` and `Zero` materialize zero with `xorl` here, so a
+/// per-arm predicate looks tempting -- `I8(0)`, `F32(0.0)`, `I128(0)` and the
+/// decimal containers emit `movl $0, %eax` (5B), for which the 8-byte folded
+/// store would seem to win.  It does not, because the i686 peephole normalizes
+/// `movl $0, %reg` to `xorl %reg, %reg` (`peephole.rs`, "saves 3 bytes"), so
+/// the zero that reaches the assembler is 2 bytes whichever arm produced it.
+/// Implementing the per-arm form anyway was measured, not reasoned about: 8
+/// corpus TUs changed and every change was `xorl %eax,%eax; movl %eax,N(%esp)`
+/// becoming `movl $0,N(%esp)`, i.e. +2 bytes and -1 instruction each
+/// (`tools/asm_identity.py`).  The cost model has to be the FINAL encoding, not
+/// the encoding at the point of emission.
+///
+/// Folding zeros as well was measured and rejected on the same grounds at
+/// corpus scale: -1,189 instructions but +1,344 `.text` bytes (+0.477%), with
+/// two memset TUs at +319 bytes each.  Runtime was neutral either way (paired
+/// geomean -0.24%), so there is no performance argument for paying bytes.  The
+/// two forms that would win BOTH metrics are documented in the S19 FOLLOWUP
+/// §8: push-based outgoing arguments (`pushl $0` is 2 bytes against an 8-byte
+/// displaced store -- how gcc gets 132 pushes into fewer bytes than 111
+/// stores), or a reliable "%eax already holds zero" cache, which is blocked by
+/// the incomplete i686 accumulator-cache contract noted in `operand_to_eax` (a
+/// stale zero claim would be a miscompile).
+pub(super) fn const_stack_arg_fold_wins(imm: i32) -> bool {
+    imm != 0
+}
+
 impl I686Codegen {
     /// Pop the cached x87 top-of-stack copy, if one is live. The slot copy
     /// was already written by the non-popping `fstl`, so this is purely an
@@ -531,55 +629,13 @@ impl I686Codegen {
 
         match op {
             Operand::Const(c) => {
-                match c {
-                    IrConst::I8(v) => emit!(self.state, "    movl ${}, %eax", *v as i32),
-                    IrConst::I16(v) => emit!(self.state, "    movl ${}, %eax", *v as i32),
-                    IrConst::I32(v) => {
-                        if *v == 0 {
-                            self.state.emit("    xorl %eax, %eax");
-                        } else {
-                            emit!(self.state, "    movl ${}, %eax", v);
-                        }
-                    }
-                    IrConst::I64(v) => {
-                        // On i686, we can only hold 32 bits in eax
-                        // Truncate to low 32 bits
-                        let low = *v as i32;
-                        if low == 0 {
-                            self.state.emit("    xorl %eax, %eax");
-                        } else {
-                            emit!(self.state, "    movl ${}, %eax", low);
-                        }
-                    }
-                    IrConst::I128(v) => {
-                        let low = *v as i32;
-                        emit!(self.state, "    movl ${}, %eax", low);
-                    }
-                    IrConst::F32(fval) => {
-                        emit!(self.state, "    movl ${}, %eax", fval.to_bits() as i32)
-                    }
-                    IrConst::D32(v) => {
-                        emit!(self.state, "    movl ${}, %eax", *v as i32)
-                    }
-                    IrConst::D64(v) => {
-                        // BID64 container: load low 32 bits (same convention
-                        // as the I64/F64 const arms in this 32-bit context).
-                        let low = *v as i32;
-                        emit!(self.state, "    movl ${}, %eax", low);
-                    }
-                    IrConst::F64(fval) => {
-                        // Store low 32 bits of the f64 bit pattern
-                        let low = fval.to_bits() as i32;
-                        emit!(self.state, "    movl ${}, %eax", low);
-                    }
-                    IrConst::LongDouble(_, bytes) => {
-                        // Load first 4 bytes of long double
-                        let low = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                        emit!(self.state, "    movl ${}, %eax", low);
-                    }
-                    IrConst::Zero => {
-                        self.state.emit("    xorl %eax, %eax");
-                    }
+                // Same value the direct stack-argument store uses, so the two
+                // marshalling paths cannot disagree about a constant's bits.
+                let imm = const_stack_arg_imm(c);
+                if imm == 0 && const_zero_uses_xorl(c) {
+                    self.state.emit("    xorl %eax, %eax");
+                } else {
+                    emit!(self.state, "    movl ${}, %eax", imm);
                 }
                 self.state.reg_cache.invalidate_acc();
             }
@@ -629,6 +685,62 @@ impl I686Codegen {
                 }
             }
         }
+    }
+
+    /// Store a constant call argument straight into the outgoing stack slot at
+    /// `offset(%esp)` instead of routing it through `%eax`.
+    ///
+    /// `emit_call_stack_args` historically did `operand_to_eax(arg)` followed by
+    /// `movl %eax, N(%esp)` for EVERY stack argument.  For an operand that is
+    /// already a constant that is two instructions plus a pointless `%eax`
+    /// clobber where one suffices: `movl $IMM, N(%esp)` stores the same four
+    /// bytes.  gcc, clang and icx all pass the constant directly
+    /// (`pushl $.LC1`), which is the dominant term in lccc's 403-instruction
+    /// `main` against gcc's 291 on `narrow_shift_count_ge_width.c` (both
+    /// `-O2 -m32 -fno-pic`): lccc emitted 236 `movl` (111 of them reg->slot,
+    /// 38 imm->reg, 13 imm->slot) against gcc's 22, and 37% of its
+    /// instructions carried a memory operand against gcc's 1%.  A corpus census
+    /// (`tools/dead_materialize_census.py`, 809 i686 TUs) counted **432**
+    /// constant sites — 327 of them a zero materialized as `xorl %eax, %eax` —
+    /// where the register is dead immediately after the store.
+    ///
+    /// Only the CONSTANT path is bypassed.  `%eax` is still genuinely required
+    /// for:
+    ///   * a value in a slot — x86 has no memory-to-memory move, and for an
+    ///     alloca what is passed is the slot's ADDRESS (a `leal`, or a
+    ///     `leal`/`addl`/`andl` triple when over-aligned), not its contents;
+    ///   * the legacy no-home acc-flow case, where the value is only implicitly
+    ///     in `%eax` and there is nothing else to store from.
+    ///
+    /// A value already in a callee-saved register could also be stored directly
+    /// (`movl %esi, N(%esp)`, 39 census sites), but `operand_to_eax` caches it
+    /// in `%eax` for reuse, so bypassing trades one instruction here for a
+    /// possible re-materialization after the call.  That trade is measured
+    /// separately rather than assumed — see the S19 FOLLOWUP.
+    ///
+    /// Returns false when `%eax` is required and the caller must fall back to
+    /// `operand_to_eax` + `movl %eax, N(%esp)`.
+    pub(super) fn store_const_to_stack_arg(&mut self, op: &Operand, offset: usize) -> bool {
+        if const_stack_arg_disabled() {
+            return false;
+        }
+        let Operand::Const(c) = op else {
+            return false;
+        };
+        // Bit-exactness and the fold predicate both live in the shared pure
+        // helpers above, next to `operand_to_eax`'s own use of them, so the
+        // stored bytes are by construction the bytes the two-instruction
+        // sequence would have stored.
+        let imm = const_stack_arg_imm(c);
+        if !const_stack_arg_fold_wins(imm) {
+            return false;
+        }
+        emit!(self.state, "    movl ${}, {}(%esp)", imm, offset);
+        // `%eax` is NOT written here, so the accumulator cache stays valid as
+        // it is; the old path had to `invalidate_acc()` because materializing
+        // the constant clobbered `%eax`.  Leaving the cache alone is strictly
+        // better: a value already cached in `%eax` survives the marshalling.
+        true
     }
 
     /// Load a 64-bit value's slot into %eax by OR'ing both 32-bit halves.
@@ -3687,5 +3799,217 @@ impl I686Codegen {
         s.emit("    popl %ebx");
         s.emit("    ret");
         s.emit(".size __moddi3, .-__moddi3");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One row per `IrConst` arm: the constant, the 32 bits a register
+    /// materialization of it produces (and therefore the 32 bits a direct
+    /// `movl $imm, N(%esp)` must store), and whether that arm's zero form is
+    /// the 2-byte `xorl %eax, %eax`.
+    fn arms() -> Vec<(&'static str, IrConst, i32, bool)> {
+        vec![
+            ("I8(-1) sign-extends", IrConst::I8(-1), -1, false),
+            ("I8(0)", IrConst::I8(0), 0, false),
+            ("I8(127)", IrConst::I8(127), 127, false),
+            ("I16(-2) sign-extends", IrConst::I16(-2), -2, false),
+            ("I16(0)", IrConst::I16(0), 0, false),
+            ("I32(1)", IrConst::I32(1), 1, true),
+            ("I32(0)", IrConst::I32(0), 0, true),
+            ("I32(i32::MIN)", IrConst::I32(i32::MIN), i32::MIN, true),
+            ("I32(i32::MAX)", IrConst::I32(i32::MAX), i32::MAX, true),
+            (
+                "I64 truncates to its low half",
+                IrConst::I64(0x0123_4567_89ab_cdef),
+                0x89ab_cdefu32 as i32,
+                true,
+            ),
+            ("I64(-1)", IrConst::I64(-1), -1, true),
+            (
+                "I64(i64::MIN) has a zero low half",
+                IrConst::I64(i64::MIN),
+                0,
+                true,
+            ),
+            (
+                "I128 truncates to its low half",
+                IrConst::I128(0x0123_4567_89ab_cdef_0000_0000_0000_0001),
+                1,
+                false,
+            ),
+            ("I128(0)", IrConst::I128(0), 0, false),
+            (
+                "F32 passes the IEEE bit pattern",
+                IrConst::F32(1.5),
+                1.5f32.to_bits() as i32,
+                false,
+            ),
+            (
+                "F32(-0.0) is the sign bit, not zero",
+                IrConst::F32(-0.0),
+                i32::MIN,
+                false,
+            ),
+            ("F32(0.0)", IrConst::F32(0.0), 0, false),
+            (
+                "F64 passes the LOW half of its bit pattern",
+                IrConst::F64(f64::from_bits(0x3ff8_0000_dead_beef)),
+                0xdead_beefu32 as i32,
+                false,
+            ),
+            ("F64(1.5) has a zero low half", IrConst::F64(1.5), 0, false),
+            ("F64(-0.0) low half is zero", IrConst::F64(-0.0), 0, false),
+            (
+                "D32 passes the BID pattern",
+                IrConst::D32(0xdead_beef),
+                0xdead_beefu32 as i32,
+                false,
+            ),
+            ("D32(0)", IrConst::D32(0), 0, false),
+            (
+                "D64 passes the BID pattern's low half",
+                IrConst::D64(0x1234_5678_9abc_def0),
+                0x9abc_def0u32 as i32,
+                false,
+            ),
+            ("D64(0)", IrConst::D64(0), 0, false),
+            (
+                "LongDouble passes its leading four bytes",
+                IrConst::LongDouble(1.5, ld_bytes()),
+                0xffc0_0000u32 as i32,
+                false,
+            ),
+            (
+                "LongDouble(0)",
+                IrConst::LongDouble(0.0, [0u8; 16]),
+                0,
+                false,
+            ),
+            ("Zero", IrConst::Zero, 0, true),
+        ]
+    }
+
+    /// x87 80-bit 1.5: sign/exponent 0x3fff, integer bit set, so the leading
+    /// four little-endian bytes are 00 00 c0 ff.
+    fn ld_bytes() -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&[0x00, 0x00, 0xc0, 0xff]);
+        b[8..10].copy_from_slice(&0x3fffu16.to_le_bytes());
+        b
+    }
+
+    /// Encoding sizes, i686, AT&T. `disp8` and `disp32` are the two forms of
+    /// the outgoing slot's displacement; both rows of the arithmetic differ by
+    /// the same +3 on each side, so the comparison is displacement-independent.
+    const MOV_IMM_TO_EAX: usize = 5; // movl $imm32, %eax
+    const XOR_EAX: usize = 2; // xorl %eax, %eax
+    const STORE_EAX_DISP8: usize = 4; // movl %eax, d8(%esp)
+    const STORE_EAX_DISP32: usize = 7; // movl %eax, d32(%esp)
+    const STORE_IMM_DISP8: usize = 8; // movl $imm32, d8(%esp)
+    const STORE_IMM_DISP32: usize = 11; // movl $imm32, d32(%esp)
+
+    #[test]
+    fn const_stack_arg_imm_matches_the_per_arm_convention() {
+        for (name, c, want_imm, _) in arms() {
+            assert_eq!(const_stack_arg_imm(&c), want_imm, "{name}");
+        }
+    }
+
+    #[test]
+    fn only_the_arms_that_special_case_zero_use_xorl() {
+        for (name, c, _, want_xorl) in arms() {
+            assert_eq!(const_zero_uses_xorl(&c), want_xorl, "{name}");
+        }
+    }
+
+    /// The fold predicate must be *exactly* "the folded encoding is smaller",
+    /// evaluated with the byte counts above rather than asserted from a
+    /// comment.  If either the predicate or an encoding size changes without
+    /// the other, this fails.
+    ///
+    /// The materialization cost is the POST-PEEPHOLE cost: the i686 peephole
+    /// rewrites `movl $0, %reg` to `xorl %reg, %reg`, so a zero costs 2 bytes
+    /// in every arm, not only in the three that emit `xorl` here.  Modelling
+    /// the emission-time cost instead makes the predicate look per-arm and
+    /// grows the code by 2 bytes at every zero site in the other arms.
+    #[test]
+    fn the_fold_predicate_is_the_encoding_arithmetic() {
+        for (name, c, imm, _) in arms() {
+            let materialize = if imm == 0 { XOR_EAX } else { MOV_IMM_TO_EAX };
+            let historical_disp8 = materialize + STORE_EAX_DISP8;
+            let historical_disp32 = materialize + STORE_EAX_DISP32;
+            let want = historical_disp8 > STORE_IMM_DISP8;
+            assert_eq!(const_stack_arg_fold_wins(imm), want, "{name}");
+            // The 32-bit displacement form must not change the answer.
+            assert_eq!(
+                historical_disp32 > STORE_IMM_DISP32,
+                want,
+                "{name}: disp32 disagrees with disp8"
+            );
+        }
+    }
+
+    /// No zero folds, in ANY arm -- including the arms whose emission-time form
+    /// is `movl $0, %eax` (5B), where a naive byte count says the 8-byte folded
+    /// store wins.  It does not, because the peephole turns that `movl $0` into
+    /// a 2-byte `xorl` before the assembler sees it.
+    ///
+    /// This is also the tripwire for that premise: if the `movl $0, %reg ->
+    /// xorl %reg, %reg` normalization is ever removed from `peephole.rs`, the
+    /// arms listed in the second loop genuinely become 9-byte sequences and the
+    /// fold predicate must be re-derived (and this test rewritten) rather than
+    /// left refusing a win.
+    #[test]
+    fn no_zero_folds_in_any_arm() {
+        // Arms that materialize zero with `xorl` at emission time.
+        for c in [IrConst::I32(0), IrConst::I64(0), IrConst::Zero] {
+            assert!(const_zero_uses_xorl(&c), "{c:?}");
+            assert!(!const_stack_arg_fold_wins(0), "{c:?}");
+        }
+        // Arms that emit `movl $0, %eax` at emission time and are normalized to
+        // `xorl` downstream: same verdict, different reason.
+        for c in [
+            IrConst::I8(0),
+            IrConst::I16(0),
+            IrConst::I128(0),
+            IrConst::D32(0),
+            IrConst::D64(0),
+            IrConst::F32(0.0),
+            IrConst::F64(0.0),
+            IrConst::LongDouble(0.0, [0u8; 16]),
+        ] {
+            assert!(!const_zero_uses_xorl(&c), "{c:?}");
+            assert!(
+                !const_stack_arg_fold_wins(const_stack_arg_imm(&c)),
+                "{c:?} folds, which costs 2 bytes per site"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_zero_is_a_nonzero_immediate_and_stores_its_sign_bit() {
+        // -0.0 must not be mistaken for a zero immediate: its bit pattern is
+        // 0x80000000, which is what the register path materializes and
+        // therefore what the direct store must write.
+        assert_eq!(const_stack_arg_imm(&IrConst::F32(-0.0)), i32::MIN);
+        assert!(const_stack_arg_fold_wins(i32::MIN));
+        // The f64 arm keeps only the low half, so -0.0 as an f64 argument does
+        // materialize zero -- and a zero never folds, whichever arm it came
+        // from.  Note the asymmetry with the f32 case above: whether -0.0 is a
+        // "zero immediate" depends on how many of its bits the arm keeps.
+        assert_eq!(const_stack_arg_imm(&IrConst::F64(-0.0)), 0);
+        assert!(!const_stack_arg_fold_wins(0));
+    }
+
+    #[test]
+    fn every_nonzero_immediate_folds_in_every_arm() {
+        for (name, c, imm, _) in arms() {
+            if imm != 0 {
+                assert!(const_stack_arg_fold_wins(imm), "{name}");
+            }
+        }
     }
 }
