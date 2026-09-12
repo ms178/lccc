@@ -172,7 +172,9 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
     // 1. label → index, detecting duplicates.
     let mut label_to_idx: FxHashMap<BlockId, usize> =
         FxHashMap::with_capacity_and_hasher(func.blocks.len(), Default::default());
+    let mut max_label: u32 = 0;
     for (i, block) in func.blocks.iter().enumerate() {
+        max_label = max_label.max(block.label.0);
         if let Some(&prev) = label_to_idx.get(&block.label) {
             push(
                 out,
@@ -184,6 +186,22 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
         } else {
             label_to_idx.insert(block.label, i);
         }
+    }
+
+    // 1b. label-counter health: the documented `IrFunction::next_label`
+    // invariant is that every live label is < next_label. A pass that mints
+    // blocks without writing the counter back (loop_unroll pre-fix) leaves a
+    // stale counter that hands a LATER pass colliding labels — the duplicate
+    // above then misattributes blame to the later pass. Naming the stale
+    // counter here points at the pass that actually broke the invariant.
+    if func.next_label <= max_label {
+        push(
+            out,
+            format!(
+                "stale label counter: next_label={} but live max label is {}",
+                func.next_label, max_label
+            ),
+        );
     }
 
     // 2. + build the real predecessor sets.

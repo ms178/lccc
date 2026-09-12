@@ -14,7 +14,7 @@ use crate::backend::state::StackSlot;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::emit;
-use crate::ir::reexports::{Instruction, IrFunction, Value};
+use crate::ir::reexports::{Instruction, IntrinsicOp, IrFunction, Value};
 
 impl I686Codegen {
     /// Does this function need the PIC GOT base in %ebx?
@@ -253,6 +253,34 @@ impl I686Codegen {
             asm_clobbered_regs.push(PhysReg(0));
         }
         let mut available_regs = filter_available_regs(callee_saved_set, &asm_clobbered_regs);
+        // __builtin_longjmp abandons the epilogue restores (`jmp` replaces
+        // the `ret` path), so any value homed in a callee-saved register
+        // permanently corrupts the setjmp caller's register (x86-64 twin:
+        // torture execute/pr84521.c, where the buf parameter spilled to %rbx
+        // clobbered main's live value). GNU non-local goto is the same
+        // class (the x86-64 backend already excludes both). Keep such
+        // functions out of the callee-saved pool; caller-saved homes and
+        // slots remain valid.
+        let has_longjmp = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    Instruction::Intrinsic {
+                        op: IntrinsicOp::BuiltinLongjmp,
+                        ..
+                    }
+                )
+            })
+        });
+        let has_nonlocal_goto = func.blocks.iter().any(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::NonlocalGoto { .. }))
+        });
+        if has_longjmp || has_nonlocal_goto {
+            available_regs.clear();
+        }
 
         let mut caller_saved_regs = I686_CALLER_SAVED.to_vec();
         if self.state.disable_regalloc {

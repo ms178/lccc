@@ -731,24 +731,13 @@ fn prune_dead_interior_pointers(
                     users.entry(v.0).or_default().push((bi, ii));
                 }
             });
-            match inst {
-                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
-                    users.entry(ptr.0).or_default().push((bi, ii));
-                }
-                Instruction::GetElementPtr { base, .. } => {
-                    users.entry(base.0).or_default().push((bi, ii));
-                }
-                Instruction::Memcpy { dest, src, .. } => {
-                    users.entry(dest.0).or_default().push((bi, ii));
-                    users.entry(src.0).or_default().push((bi, ii));
-                }
-                Instruction::Intrinsic {
-                    dest_ptr: Some(p), ..
-                } => {
-                    users.entry(p.0).or_default().push((bi, ii));
-                }
-                _ => {}
-            }
+            // Bare-Value positions (Load/Store ptr, GEP base, Memcpy,
+            // va_list, ...) are users too; the exhaustive walker covers
+            // them all (a hand-rolled match missed positions and understated
+            // the user map).
+            probe.for_each_value_use_mut(|v| {
+                users.entry(v.0).or_default().push((bi, ii));
+            });
         }
         for v in block.terminator.used_values() {
             in_terminator.insert(v);

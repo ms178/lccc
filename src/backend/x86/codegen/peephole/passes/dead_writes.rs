@@ -280,6 +280,35 @@ fn reuse_redundant_loads_with(
                 continue;
             }
             let t = infos[j].trimmed(store.get(j));
+            // i686: `classify_line` only recognizes 64-bit `pushq`/`popq`,
+            // so 32-bit pushes classify as `Other` and their implicit
+            // `%esp` motion is invisible both here and in `writes_family`
+            // (no effects-table row either). Break textually when the
+            // cached slot is `%esp`-relative; `%ebp`-relative scans may
+            // continue across pushes (ebp is stable). Scoped to this pass
+            // on purpose: classifying 32-bit pushes pipeline-wide would
+            // hand `pushl` to push/pop consumers that may assume 8-byte
+            // frames.
+            {
+                let mnemonic = t.split_whitespace().next().unwrap_or("");
+                if addr_fams.contains(&4)
+                    && matches!(
+                        mnemonic,
+                        "pushl"
+                            | "pushw"
+                            | "push"
+                            | "popl"
+                            | "popw"
+                            | "pop"
+                            | "pushfl"
+                            | "pushfw"
+                            | "popfl"
+                            | "popfw"
+                    )
+                {
+                    break;
+                }
+            }
             match infos[j].kind {
                 // A label is normally a join point: another predecessor may
                 // have stored to this address. A label nobody branches to is
@@ -428,14 +457,14 @@ fn reuse_redundant_loads_with(
 /// rejected: their effective address is not a fixed range, so nothing can be
 /// proven disjoint from them.
 #[derive(Clone, Copy)]
-struct FrameSlot {
+pub(super) struct FrameSlot {
     /// Register family of the base (`%rsp` = 4, `%rbp` = 5).
     base: RegId,
     disp: i64,
     width: i64,
 }
 
-fn parse_frame_slot(mem: &str, width: i64) -> Option<FrameSlot> {
+pub(super) fn parse_frame_slot(mem: &str, width: i64) -> Option<FrameSlot> {
     let open = mem.find('(')?;
     if !mem.ends_with(')') {
         return None;
@@ -454,9 +483,19 @@ fn parse_frame_slot(mem: &str, width: i64) -> Option<FrameSlot> {
     if mem.contains(':') {
         return None;
     }
+    // i686: `%esp`/`%ebp` are the same families 4/5 in `scan_register_refs`
+    // (types.rs, the `b'e'` arm), so the "base register cannot move inside
+    // the scan" barrier transfers verbatim: `subl $N, %esp` writes family 4
+    // and ends the scan exactly like `subq $N, %rsp`. Push/pop/call/ret/Jmp
+    // breaks are arch-independent `LineKind`s. The proof never uses the
+    // x86-64 red zone (disjoint displacements under a fixed base are disjoint
+    // bytes with or without one), so i686's lack of it is irrelevant; and
+    // call-arg staging windows always adjust `%esp` first, which breaks the
+    // scan before any staged store can be misjudged. Validated by executing
+    // every differing TU natively (32-bit ELF runs on the x86-64 host).
     let base = match inside {
-        "%rsp" => 4,
-        "%rbp" => 5,
+        "%rsp" | "%esp" => 4,
+        "%rbp" | "%ebp" => 5,
         _ => return None,
     };
     let disp_txt = mem[..open].trim();
@@ -548,8 +587,9 @@ fn store_destination(t: &str) -> Option<&str> {
 /// * a store to a different base (`(%rbp)` vs the cached `(%rsp)`) returns
 ///   false, since the two bases are not provably a fixed distance apart here;
 /// * an indexed or rip-relative destination returns false;
-/// * an unrecognized mnemonic is charged 16 bytes, so it overlaps almost
-///   everything.
+/// * an unrecognized mnemonic returns `None` from the width query (its
+///   footprint cannot be bounded from the mnemonic alone), so the store
+///   is treated as clashing with everything.
 ///
 /// The base register itself cannot move inside the scan: `%rsp`/`%rbp` are
 /// members of the cached load's `addr_fams`, and a write to any address family
@@ -676,7 +716,7 @@ fn bounded_store_mem_width(t: &str) -> Option<i64> {
     }
 }
 
-fn store_cannot_alias_slot(cached: Option<FrameSlot>, t: &str) -> bool {
+pub(super) fn store_cannot_alias_slot(cached: Option<FrameSlot>, t: &str) -> bool {
     let Some(slot) = cached else {
         return false;
     };
@@ -695,6 +735,91 @@ fn store_cannot_alias_slot(cached: Option<FrameSlot>, t: &str) -> bool {
         return false;
     }
     other.disp + other.width <= slot.disp || slot.disp + slot.width <= other.disp
+}
+
+/// True when frame slot `slot` (byte range from [`parse_frame_slot`]) is
+/// STABLE over `infos[lo..=hi]` and its base register cannot move there:
+/// no instruction in the range may write an overlapping byte, and nothing
+/// may write the base (`%rsp`/`%rbp`).
+///
+/// Shared by the loop-hoisting passes, whose hand-rolled writer scans each
+/// missed a clobber family and miscompiled loop-carried struct copies:
+/// `hoist_loop_invariant_gpr_load` only recognised `movq/movl/movb/movw`
+/// stores, so a `movdqu %xmm0, 136(%rsp)` inside the loop clobbered the
+/// hoisted `movq 136(%rsp), %r11` (torture execute/20030613-1.c at -O1);
+/// `promote_loop_invariant_fp_load` only recognised `movsd` stores, so a
+/// GPR or XMM store to the same slot broke the promoted `%xmm2` the same
+/// way. Both now call this instead of pattern-matching stores by hand.
+///
+/// Rules, all fail-closed:
+/// * any memory write ([`line_writes_memory`]: plain/XMM/RMW stores, string
+///   ops, atomics, `xsave`, ...) that cannot prove itself disjoint from the
+///   slot ([`store_cannot_alias_slot`]: same base, non-overlapping byte
+///   range) clashes — including stores through non-frame pointers, indexed
+///   and rip-relative destinations, and unrecognized mnemonics;
+/// * any write to the base ([`writes_family`]: `sub`/`add`/`mov`/`leave`,
+///   loads into the base, `setCC %spl/%bpl`) clashes — base motion
+///   re-points every base-relative address between the hoist point and the
+///   load. Push/pop move `%rsp` implicitly (invisible to `writes_family`,
+///   which sees only the classified destination plus the tabled implicits)
+///   and are refused explicitly for `%rsp`-addressed slots;
+/// * an unparseable slot (`None`) clashes against every memory write;
+/// * opaque lines (inline asm — [`writes_family`] answers "may write" for
+///   them, so the base-motion check below clashes) and
+///   unknown-destination instructions (`Other { REG_NONE }`: the
+///   implicit-operand table is exact-only, so a MAY model must fall back
+///   explicitly) clash;
+/// * a call clashes for a red-zone (`disp < 0`) `%rsp` slot — the callee
+///   owns those bytes. Ordinary frame slots survive calls (the callee
+///   cannot address the caller's frame except through an escaped pointer,
+///   which is the CALLER's problem: both current callers exclude calls
+///   from the range, GPR directly and FP via its `%xmm2` reservation).
+///
+/// Control flow needs no check: the scan covers every line of the range,
+/// hence every path through it.
+pub(super) fn frame_slot_stable_in_range(
+    store: &LineStore,
+    infos: &[LineInfo],
+    lo: usize,
+    hi: usize,
+    base: RegId,
+    slot: Option<FrameSlot>,
+) -> bool {
+    for chk in lo..=hi {
+        if infos[chk].is_nop() {
+            continue;
+        }
+        let t = infos[chk].trimmed(store.get(chk));
+        // Unknown-destination instruction: the implicit-operand table yields
+        // `(0, 0)` for unknown mnemonics, so the MAY model falls back here.
+        if matches!(infos[chk].kind, LineKind::Other { dest_reg } if dest_reg == REG_NONE) {
+            return false;
+        }
+        // Push/pop move %rsp implicitly (invisible to `writes_family`).
+        if base == 4
+            && matches!(
+                infos[chk].kind,
+                LineKind::Push { .. } | LineKind::Pop { .. }
+            )
+        {
+            return false;
+        }
+        if writes_family(&infos[chk], t, base) {
+            return false;
+        }
+        // The callee owns the red zone; ordinary frame slots are call-safe
+        // (escaped pointers are the caller's contract — see above).
+        if base == 4
+            && matches!(infos[chk].kind, LineKind::Call)
+            && slot.map_or(true, |s| s.disp < 0)
+        {
+            return false;
+        }
+        if line_writes_memory(t) && !store_cannot_alias_slot(slot, t) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Conservative "this instruction writes memory" test: any instruction whose
@@ -726,7 +851,7 @@ fn store_cannot_alias_slot(cached: Option<FrameSlot>, t: &str) -> bool {
 /// operands and so the rewrite never became eligible. Hoisting a shared
 /// `GlobalAddr` base into a register — a legitimate, profitable mid-end
 /// transform — exposed it. Regression: `pic_indexed_store_static_global.c`.
-fn line_writes_memory(t: &str) -> bool {
+pub(super) fn line_writes_memory(t: &str) -> bool {
     if t.starts_with("lock") || t.starts_with("rep") || t.starts_with("movs") && !t.contains('%') {
         return true;
     }
@@ -1873,6 +1998,153 @@ mod tests {
         assert!(
             !out.contains("movzbl (%r13,%rsi), %r10d"),
             "redundant load was not eliminated: {out}"
+        );
+    }
+
+    /// i686: same-destination reload through `%esp` is deleted, mirroring
+    /// `same_destination_reload_is_deleted`.
+    #[test]
+    fn i686_same_destination_reload_through_esp_is_deleted() {
+        let out = run_reuse(
+            &frame("    movl 12(%esp), %eax\n    movl %edx, %esi\n    movl 12(%esp), %eax\n"),
+            ReusePolicy::full(),
+        );
+        assert_eq!(
+            slot_refs(&out, "12(%esp)"),
+            1,
+            "second same-dst reload must go:\n{out}"
+        );
+    }
+
+    /// i686: a store to a disjoint `%esp` slot does not break reuse.
+    #[test]
+    fn i686_store_to_a_different_esp_slot_does_not_break_reuse() {
+        let body = "    movl 12(%esp), %eax\n    movl %edx, 24(%esp)\n    movl 12(%esp), %ecx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert!(
+            out.contains("movl %eax, %ecx"),
+            "must forward from the register:\n{out}"
+        );
+        assert_eq!(slot_refs(&out, "12(%esp)"), 1, "only one slot read:\n{out}");
+    }
+
+    /// i686: a dword store at 14 overlaps the cached dword at [12,16).
+    #[test]
+    fn i686_overlapping_esp_store_breaks_reuse() {
+        let body = "    movl 12(%esp), %eax\n    movl %edx, 14(%esp)\n    movl 12(%esp), %ecx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "12(%esp)"),
+            2,
+            "overlap must keep both reads:\n{out}"
+        );
+    }
+
+    /// i686: `%esp` movement ends the scan. This is the barrier staging
+    /// windows rely on: `subl $N, %esp` writes family 4, so no cached slot
+    /// survives it.
+    #[test]
+    fn i686_esp_movement_breaks_reuse() {
+        let body = "    movl 12(%esp), %eax\n    subl $16, %esp\n    movl 12(%esp), %ecx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "12(%esp)"),
+            2,
+            "esp moved: both reads must survive:\n{out}"
+        );
+    }
+
+    /// i686: push/pop end the scan like any other `%esp` motion.
+    #[test]
+    fn i686_push_breaks_reuse() {
+        let body = "    movl 12(%esp), %eax\n    pushl %ebx\n    movl 12(%esp), %ecx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "12(%esp)"),
+            2,
+            "push moved esp: both reads must survive:\n{out}"
+        );
+    }
+
+    /// i686: `%esp` vs `%ebp` are different bases (families 4/5), not a
+    /// provable fixed distance apart here — stays conservative.
+    #[test]
+    fn i686_esp_vs_ebp_bases_stay_conservative() {
+        let body = "    movl 12(%esp), %eax\n    movl %edx, 12(%ebp)\n    movl 12(%esp), %ecx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "12(%esp)"),
+            2,
+            "different base: both reads must survive:\n{out}"
+        );
+    }
+
+    /// i686: disjoint `%ebp` slots forward, mirroring the `%rsp` case.
+    #[test]
+    fn i686_store_to_a_different_ebp_slot_does_not_break_reuse() {
+        let body = "    movl 12(%ebp), %eax\n    movl %edx, 24(%ebp)\n    movl 12(%ebp), %ecx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert!(
+            out.contains("movl %eax, %ecx"),
+            "must forward from the register:\n{out}"
+        );
+        assert_eq!(slot_refs(&out, "12(%ebp)"), 1, "only one slot read:\n{out}");
+    }
+
+    /// i686: pushes do NOT disturb `%ebp`-relative scans (ebp is stable
+    /// across them) — the break above is scoped to `%esp`-cached slots.
+    #[test]
+    fn i686_push_does_not_break_ebp_cached_reuse() {
+        let body = "    movl 12(%ebp), %eax\n    pushl %ebx\n    movl %edx, 24(%ebp)\n    movl 12(%ebp), %ecx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert!(
+            out.contains("movl %eax, %ecx"),
+            "ebp scan must survive the push:\n{out}"
+        );
+    }
+
+    /// i686: `leave` moves both `%esp` and `%ebp` (effects table), so it
+    /// ends any frame-slot scan.
+    #[test]
+    fn i686_leave_breaks_reuse() {
+        let body = "    movl 12(%ebp), %eax\n    leave\n    movl 12(%ebp), %ecx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "12(%ebp)"),
+            2,
+            "leave moved the base: both reads must survive:\n{out}"
+        );
+    }
+
+    /// i686 end-to-end through the FULL pipeline: an `%ebp`-cached reload
+    /// separated by a disjoint-slot store survives a `pushl` (ebp is stable
+    /// across pushes) and only one slot read remains. (The consumer is a
+    /// store on purpose: an arithmetic consumer would let a downstream
+    /// load-fold reintroduce the memory operand while deleting an
+    /// instruction — a legitimate pre-existing pipeline interaction, but
+    /// one that hides this pass's firing.) Guards the integration, not
+    /// just the pass in isolation.
+    #[test]
+    fn i686_ebp_reuse_across_push_end_to_end() {
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebp\n",
+            "    movl %esp, %ebp\n",
+            "    movl 12(%ebp), %eax\n",
+            "    pushl %ebx\n",
+            "    movl %edx, 24(%ebp)\n",
+            "    movl 12(%ebp), %ecx\n",
+            "    movl %ecx, 4(%esp)\n",
+            "    popl %ebx\n",
+            "    popl %ebp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert_eq!(
+            slot_refs(&out, "12(%ebp)"),
+            1,
+            "full pipeline must eliminate the second slot read:\n{out}"
         );
     }
 }

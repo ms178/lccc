@@ -351,6 +351,10 @@ impl<'a> Scan<'a> {
                 self.touch(src, idx, RefKind::Read, false);
                 self.touch(dst, idx, RefKind::PureWrite, false);
             }
+            MachInst::Rorx { src, dst, .. } => {
+                self.touch(src, idx, RefKind::Read, false);
+                self.touch(dst, idx, RefKind::PureWrite, false);
+            }
             MachInst::Lea {
                 base, index, dst, ..
             } => {
@@ -471,6 +475,10 @@ fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
             count, src, dst, ..
         } => {
             reg_of(count, &mut v);
+            reg_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Rorx { src, dst, .. } => {
             reg_of(src, &mut v);
             reg_of(dst, &mut v);
         }
@@ -862,6 +870,10 @@ fn rewrite_inst(inst: &mut MachInst, assignments: &FxHashMap<u32, u8>) {
             count, src, dst, ..
         } => {
             *count = r(count);
+            *src = r(src);
+            *dst = r(dst);
+        }
+        MachInst::Rorx { src, dst, .. } => {
             *src = r(src);
             *dst = r(dst);
         }

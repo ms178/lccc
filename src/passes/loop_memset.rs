@@ -102,6 +102,24 @@ pub fn run(func: &mut IrFunction) -> usize {
     total
 }
 
+/// Mint two fresh block labels, defensively: a stale `next_label` (any pass
+/// that mints blocks without writing the counter back) must never produce
+/// colliding labels here — a collision silently misroutes the CFG the
+/// surgery builds (strcmp-1: the guard chain detached and v250/v295 were
+/// orphaned). When the counter is healthy this is exactly `next_label` /
+/// `next_label + 1`, so healthy-pipeline behavior is unchanged.
+fn fresh_labels(
+    func: &mut IrFunction,
+) -> (crate::ir::reexports::BlockId, crate::ir::reexports::BlockId) {
+    let live_max = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    let base = func.next_label.max(live_max.saturating_add(1));
+    func.next_label = base.saturating_add(2);
+    (
+        crate::ir::reexports::BlockId(base),
+        crate::ir::reexports::BlockId(base.saturating_add(1)),
+    )
+}
+
 fn run_once(func: &mut IrFunction) -> usize {
     let Some(plan) = find_idiom(func) else {
         return 0;
@@ -1648,16 +1666,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
         guard_insts.extend(recon_insts);
 
         // ── Block surgery ────────────────────────────────────────────────────
-        let guard_label = {
-            let l = func.next_label;
-            func.next_label += 1;
-            crate::ir::reexports::BlockId(l)
-        };
-        let call_label = {
-            let l = func.next_label;
-            func.next_label += 1;
-            crate::ir::reexports::BlockId(l)
-        };
+        let (guard_label, call_label) = fresh_labels(func);
 
         let header_idx = plan.header_idx;
         let guard_idx = plan.guard_idx;
@@ -1814,16 +1823,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
         guard_insts.extend(recon_insts);
 
         // ── Block surgery (while-form) ───────────────────────────────────────
-        let guard_label = {
-            let l = func.next_label;
-            func.next_label += 1;
-            crate::ir::reexports::BlockId(l)
-        };
-        let call_label = {
-            let l = func.next_label;
-            func.next_label += 1;
-            crate::ir::reexports::BlockId(l)
-        };
+        let (guard_label, call_label) = fresh_labels(func);
 
         let header_idx = plan.header_idx;
         let body_idx = plan.body_idx;
@@ -1952,6 +1952,17 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
                             if let Some(&(_, dest)) = new_phis.iter().find(|(id, _)| *id == v.0) {
                                 *op = Operand::Value(Value(dest));
                             }
+                        }
+                    });
+                    // Bare-Value positions (Store/Load ptr, GEP base, Memcpy,
+                    // va_list, ...) are NOT visited by for_each_operand_mut;
+                    // without this second walk they keep naming the deleted iv
+                    // phis (strcmp-1: v250/v295 Store-ptr/GEP-base uses
+                    // orphaned here). This is the same two-walk substitution
+                    // contract global_addr_cse documents.
+                    inst.for_each_value_use_mut(|v| {
+                        if let Some(&(_, dest)) = new_phis.iter().find(|(id, _)| *id == v.0) {
+                            *v = Value(dest);
                         }
                     });
                 }
