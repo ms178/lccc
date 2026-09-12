@@ -1707,6 +1707,49 @@ impl Driver {
             }
         }
 
+        // Global Location Allocation (P0-A): cross-block call splitting with
+        // dominance + SSA repair, grouped deterministically. Default-on for -O2+.
+        if std::env::var("CCC_NO_GLOBAL_LOCATION").is_err()
+            && std::env::var("CCC_RA_GLOBAL_LOCATION").is_err()
+        {
+            // Gate behind opt_level >=2 to avoid O0 stack-home interference.
+            if self.opt_level >= 2 {
+                let gmax = std::env::var("CCC_GLOBAL_SPLIT_MAX")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4);
+                let mut gtotal = 0;
+                for func in &mut module.functions {
+                    if !func.is_declaration && func.blocks.len() >= 2 {
+                        let n = crate::backend::global_alloc::run_global_location_pass(func);
+                        gtotal += n;
+                        if gtotal >= gmax {
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if let Ok(v) = std::env::var("CCC_RA_GLOBAL_LOCATION") {
+            // Explicit opt-in via CCC_RA_GLOBAL_LOCATION=1 (legacy)
+            let v = v.to_ascii_lowercase();
+            if v == "1" || v == "true" || v == "yes" || v == "on" {
+                let gmax = std::env::var("CCC_GLOBAL_SPLIT_MAX")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4);
+                let mut gtotal = 0;
+                for func in &mut module.functions {
+                    if !func.is_declaration && func.blocks.len() >= 2 {
+                        let n = crate::backend::global_alloc::run_global_location_pass(func);
+                        gtotal += n;
+                        if gtotal >= gmax {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // Live range splitting: split call-spanning values, then clean up
         if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
             let max_splits = std::env::var("CCC_SPLIT_MAX")

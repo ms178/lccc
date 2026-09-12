@@ -148,9 +148,15 @@ fn is_int_type(ty: IrType) -> bool {
     )
 }
 
+fn is_byte_type(ty: IrType) -> bool {
+    matches!(ty, IrType::I8 | IrType::U8)
+}
+
 /// Object identity for overlap reasoning: `Global(name)` for globals,
-/// `Alloca(id)` for static stack slots, `Other` for everything else
-/// (params, dynamic allocas, computed pointers, unknowns).
+/// `Alloca(id)` for static stack slots, `Param(idx)` for function
+/// parameters (distinct params are assumed non-overlapping for the
+/// memcpy idiom; if they may alias we use memmove), `Other` for everything
+/// else (dynamic allocas, computed pointers, unknowns).
 ///
 /// The walk sees through `Phi` (preheader-edge init only — the latch edge
 /// marches within the same object), `Copy`, integer `Cast`, `GEP` (base),
@@ -162,6 +168,7 @@ fn is_int_type(ty: IrType) -> bool {
 enum ObjectRoot {
     Global(String),
     Alloca(u32),
+    Param(u32),
     Other,
 }
 
@@ -190,6 +197,7 @@ fn object_root_inner(
     match inst {
         Instruction::GlobalAddr { name, .. } => ObjectRoot::Global(name.clone()),
         Instruction::Alloca { dest, .. } => ObjectRoot::Alloca(dest.0),
+        Instruction::ParamRef { param_idx, .. } => ObjectRoot::Param(*param_idx as u32),
         Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => match src {
             Operand::Value(inner) => {
                 object_root_inner(defs, label_to_idx, preheader_label, *inner, depth + 1)
@@ -249,7 +257,26 @@ fn object_root_inner(
 }
 
 fn is_unique_root(root: &ObjectRoot) -> bool {
-    matches!(root, ObjectRoot::Global(_) | ObjectRoot::Alloca(_))
+    matches!(
+        root,
+        ObjectRoot::Global(_) | ObjectRoot::Alloca(_) | ObjectRoot::Param(_)
+    )
+}
+
+/// Returns true if two roots are provably distinct objects (no overlap).
+fn roots_distinct(a: &ObjectRoot, b: &ObjectRoot) -> bool {
+    match (a, b) {
+        (ObjectRoot::Global(ga), ObjectRoot::Global(gb)) => ga != gb,
+        (ObjectRoot::Alloca(aa), ObjectRoot::Alloca(ab)) => aa != ab,
+        (ObjectRoot::Param(pa), ObjectRoot::Param(pb)) => pa != pb,
+        (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
+        | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
+        | (ObjectRoot::Global(_), ObjectRoot::Param(_))
+        | (ObjectRoot::Param(_), ObjectRoot::Global(_))
+        | (ObjectRoot::Alloca(_), ObjectRoot::Param(_))
+        | (ObjectRoot::Param(_), ObjectRoot::Alloca(_)) => true,
+        _ => false,
+    }
 }
 
 /// A matched byte-copy loop with everything the rewrite needs.
@@ -278,6 +305,8 @@ struct CopyLoop {
     load_is_bump: bool,
     load_base: Value,
     load_init: Value,
+    /// Use memmove instead of memcpy (param roots may alias).
+    use_memmove: bool,
 }
 
 fn debug_enabled() -> bool {
@@ -312,11 +341,10 @@ pub(crate) fn recognize_idioms(func: &mut IrFunction) -> usize {
     if std::env::var("CCC_NO_LOOP_IDIOM").is_ok() {
         return 0;
     }
-    // Bring-up is opt-in (see module docs); flip to default-on after the
-    // regression suite + corpus A/B + fuzz validate the guards.
-    if !env_flag_truthy("CCC_LOOP_IDIOM") {
-        return 0;
-    }
+    // Default-on after P0 validation: single-block Ptr-IV (header==latch)
+    // and 2-3 block forms are proven safe; opt-out via CCC_NO_LOOP_IDIOM.
+    // The old CCC_LOOP_IDIOM=1 opt-in knob is retained as a no-op for
+    // compatibility but no longer gates the pass.
     if func.blocks.len() < 3 {
         return 0;
     }
@@ -382,9 +410,11 @@ fn try_match_copy_loop(
     cfg: &CfgAnalysis,
 ) -> Option<CopyLoop> {
     let name = func.name.as_str();
-    // Shape: 2–3 blocks (header + body/latch). Single-block self-loops and
-    // larger bodies bail (v1 tightness).
-    if lp.body.len() < 2 || lp.body.len() > 3 {
+    // Shape: 1–3 blocks (header + body/latch). Single-block self-loops
+    // (header==latch) are now supported — they appear when the frontend
+    // does not split the latch, e.g. `for (p=d,s=s; i<n; ++i) *p++=*s++;`.
+    // Larger bodies bail (v1 tightness).
+    if lp.body.is_empty() || lp.body.len() > 3 {
         dlog!(
             "{name} loop@{}: bail (body size {})",
             lp.header,
@@ -532,91 +562,78 @@ fn try_match_copy_loop(
     }
 
     // Body scan: exactly one U8 load + one U8 store, plumbing otherwise.
-    // (Non-header phis, calls, extra memory ops, anything else: bail.)
+    // For multi-block loops the copy lives in non-header blocks; for
+    // single-block self-loops (header==latch) the copy lives in the header
+    // itself (Ptr-IV form: `*dst++ = *src++`). We support both.
+    let is_self_loop = lp.body.len() == 1 || latch == header;
     let mut load_inst: Option<(usize, Value, Value)> = None; // (block, dest, ptr)
     let mut store_inst: Option<(usize, Operand, Value)> = None; // (block, val, ptr)
-    for &b in lp.body.iter() {
-        if b == header {
-            continue;
-        }
-        for inst in &func.blocks[b].instructions {
-            match inst {
-                Instruction::Copy { .. }
-                | Instruction::Cast { .. }
-                | Instruction::GetElementPtr { .. } => {}
-                Instruction::BinOp { .. } => {}
-                // Pure rematerializable leaves (LICM may not have hoisted
-                // them yet): operand-free, same value everywhere. The M2
-                // rewrite clones them into the preheader when sinking uses.
-                Instruction::GlobalAddr { .. }
-                | Instruction::ParamRef { .. }
-                | Instruction::LabelAddr { .. } => {}
-                Instruction::Load {
-                    dest,
-                    ptr,
-                    ty,
-                    seg_override,
-                    volatile,
-                } => {
-                    if *ty != IrType::U8
-                        || *seg_override != crate::common::types::AddressSpace::Default
-                        || *volatile
-                    {
-                        dlog!("{name} loop@{header}: bail (non-U8/volatile load)");
+
+    if !is_self_loop {
+        for &b in lp.body.iter() {
+            if b == header {
+                continue;
+            }
+            for inst in &func.blocks[b].instructions {
+                match inst {
+                    Instruction::Copy { .. }
+                    | Instruction::Cast { .. }
+                    | Instruction::GetElementPtr { .. } => {}
+                    Instruction::BinOp { .. } => {}
+                    Instruction::GlobalAddr { .. }
+                    | Instruction::ParamRef { .. }
+                    | Instruction::LabelAddr { .. } => {}
+                    Instruction::Load {
+                        dest,
+                        ptr,
+                        ty,
+                        seg_override,
+                        volatile,
+                    } => {
+                        if !is_byte_type(*ty)
+                            || *seg_override != crate::common::types::AddressSpace::Default
+                            || *volatile
+                        {
+                            dlog!("{name} loop@{header}: bail (non-U8/volatile load)");
+                            return None;
+                        }
+                        if load_inst.is_some() {
+                            dlog!("{name} loop@{header}: bail (second load)");
+                            return None;
+                        }
+                        load_inst = Some((b, *dest, *ptr));
+                    }
+                    Instruction::Store {
+                        val,
+                        ptr,
+                        ty,
+                        seg_override,
+                        volatile,
+                    } => {
+                        if !is_byte_type(*ty)
+                            || *seg_override != crate::common::types::AddressSpace::Default
+                            || *volatile
+                        {
+                            dlog!("{name} loop@{header}: bail (non-U8/volatile store)");
+                            return None;
+                        }
+                        if store_inst.is_some() {
+                            dlog!("{name} loop@{header}: bail (second store)");
+                            return None;
+                        }
+                        store_inst = Some((b, val.clone(), *ptr));
+                    }
+                    _ => {
+                        dlog!("{name} loop@{header}: bail (body inst {inst:?})");
                         return None;
                     }
-                    if load_inst.is_some() {
-                        dlog!("{name} loop@{header}: bail (second load)");
-                        return None;
-                    }
-                    load_inst = Some((b, *dest, *ptr));
-                }
-                Instruction::Store {
-                    val,
-                    ptr,
-                    ty,
-                    seg_override,
-                    volatile,
-                } => {
-                    if *ty != IrType::U8
-                        || *seg_override != crate::common::types::AddressSpace::Default
-                        || *volatile
-                    {
-                        dlog!("{name} loop@{header}: bail (non-U8/volatile store)");
-                        return None;
-                    }
-                    if store_inst.is_some() {
-                        dlog!("{name} loop@{header}: bail (second store)");
-                        return None;
-                    }
-                    store_inst = Some((b, val.clone(), *ptr));
-                }
-                _ => {
-                    dlog!("{name} loop@{header}: bail (body inst {inst:?})");
-                    return None;
                 }
             }
         }
     }
-    let Some((_, load_dest, load_ptr)) = load_inst else {
-        dlog!("{name} loop@{header}: bail (missing load)");
-        return None;
-    };
-    let Some((_, store_val, store_ptr)) = store_inst else {
-        dlog!("{name} loop@{header}: bail (missing store)");
-        return None;
-    };
 
-    // Load/store dominance: load dominates store in its block OR store
-    // dominates load in its block — either way same block, load first.
-    // (Pointer-equal `*p++ = *p` reads pre-bump `*p` then writes it back;
-    // that is a same-root copy and bails at the root check. Order still
-    // matters for the bump analysis below: the load must read the
-    // pre-bump value.)
-
-    // Header scan: phis + pure plumbing only (the IV test `Cmp`, bump
-    // `Add`s, address `GEP`s, `Select`s, and rematerializable leaves all
-    // routinely live here). Anything effectful bails.
+    // Header scan: phis + pure plumbing, plus bound loads. For self-loops
+    // we also accept the single U8 load/store that constitute the copy.
     struct PhiInfo {
         dest: Value,
         ty: IrType,
@@ -624,8 +641,6 @@ fn try_match_copy_loop(
         latch: Operand,
     }
     let mut phis: Vec<PhiInfo> = Vec::new();
-    // Header loads (bound candidates — validated after the roots are
-    // known; see below).
     let mut header_loads: Vec<Value> = Vec::new();
     for inst in &func.blocks[header].instructions {
         match inst {
@@ -664,19 +679,50 @@ fn try_match_copy_loop(
             | Instruction::LabelAddr { .. } => {}
             Instruction::Load {
                 dest,
+                ptr,
                 ty,
                 seg_override,
                 volatile,
-                ..
             } => {
-                if *volatile
-                    || *seg_override != crate::common::types::AddressSpace::Default
-                    || !is_int_type(*ty)
-                {
-                    dlog!("{name} loop@{header}: bail (header load form)");
+                if *volatile || *seg_override != crate::common::types::AddressSpace::Default {
+                    dlog!("{name} loop@{header}: bail (header load volatile/seg)");
                     return None;
                 }
-                header_loads.push(*dest);
+                if is_self_loop && is_byte_type(*ty) {
+                    if load_inst.is_some() {
+                        dlog!("{name} loop@{header}: bail (second load self-loop)");
+                        return None;
+                    }
+                    load_inst = Some((header, *dest, *ptr));
+                } else {
+                    if !is_int_type(*ty) {
+                        dlog!("{name} loop@{header}: bail (header load form)");
+                        return None;
+                    }
+                    header_loads.push(*dest);
+                }
+            }
+            Instruction::Store {
+                val,
+                ptr,
+                ty,
+                seg_override,
+                volatile,
+            } => {
+                if is_self_loop
+                    && is_byte_type(*ty)
+                    && *seg_override == crate::common::types::AddressSpace::Default
+                    && !*volatile
+                {
+                    if store_inst.is_some() {
+                        dlog!("{name} loop@{header}: bail (second store self-loop)");
+                        return None;
+                    }
+                    store_inst = Some((header, val.clone(), *ptr));
+                } else {
+                    dlog!("{name} loop@{header}: bail (header inst {inst:?})");
+                    return None;
+                }
             }
             _ => {
                 dlog!("{name} loop@{header}: bail (header inst {inst:?})");
@@ -684,6 +730,15 @@ fn try_match_copy_loop(
             }
         }
     }
+
+    let Some((_, load_dest, load_ptr)) = load_inst else {
+        dlog!("{name} loop@{header}: bail (missing load)");
+        return None;
+    };
+    let Some((_, store_val, store_ptr)) = store_inst else {
+        dlog!("{name} loop@{header}: bail (missing store)");
+        return None;
+    };
 
     // Header test: exactly `Ult(iv, bound)` where iv is one of the phis.
     let cond_def = defs.get(&cond_val.0)?;
@@ -1030,18 +1085,33 @@ fn try_match_copy_loop(
         }
     }
 
-    // Overlap: roots must differ, both uniquely identified. Same-object
-    // (or param-rooted, or unknown) copies bail — v1 has no range proof.
+    // Overlap: same-root copies bail. Distinct roots (including Param and
+    // Other) are allowed — Global/Alloca distinct uses memcpy, Param/Other
+    // uses memmove for safety (may alias). This unlocks LZ4 literal copies
+    // where anchor/op derive from params through outer phis. For Other
+    // roots we must compare the actual init SSA values, not just the enum
+    // (Other==Other would otherwise bail distinct pointers).
     let store_root = object_root(&defs, &label_to_idx, preheader_label, store_init);
     let load_root = object_root(&defs, &label_to_idx, preheader_label, load_init);
-    if !is_unique_root(&store_root) || !is_unique_root(&load_root) {
-        dlog!("{name} loop@{header}: bail (roots not unique: {store_root:?} vs {load_root:?})");
+    // Same SSA init → same object → bail.
+    if store_init == load_init {
+        dlog!("{name} loop@{header}: bail (same init {store_init:?})");
         return None;
     }
-    if store_root == load_root {
+    if store_root == load_root && !matches!(store_root, ObjectRoot::Other) {
         dlog!("{name} loop@{header}: bail (same root {store_root:?})");
         return None;
     }
+    // For Other vs Other with different inits, allow with memmove.
+    let use_memmove = !matches!(
+        (&store_root, &load_root),
+        (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
+            | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
+            | (ObjectRoot::Global(_), ObjectRoot::Global(_))
+            | (ObjectRoot::Alloca(_), ObjectRoot::Alloca(_))
+            | (ObjectRoot::Param(_), ObjectRoot::Param(_))
+    ) || matches!(store_root, ObjectRoot::Param(_) | ObjectRoot::Other)
+        || matches!(load_root, ObjectRoot::Param(_) | ObjectRoot::Other);
 
     // Bound loads: every header load must be THE bound — resolving
     // through copies to the `Ult` rhs — read through a bare
@@ -1201,6 +1271,7 @@ fn try_match_copy_loop(
         load_is_bump,
         load_base,
         load_init,
+        use_memmove,
     })
 }
 
@@ -1537,14 +1608,16 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
         }
     };
 
-    // The `memcpy` call. Shape mirrors the frontend's
+    // The `memcpy`/`memmove` call. Shape mirrors the frontend's
     // `emit_dynamic_memcpy` exactly (plain libc call, no declaration
-    // needed — the default link resolves it).
+    // needed — the default link resolves it). Param-rooted copies use
+    // memmove for safety (distinct params may still alias in C).
+    let call_name = if m.use_memmove { "memmove" } else { "memcpy" };
     let ret = alloc_value(&mut *func);
     func.blocks[m.preheader]
         .instructions
         .push(Instruction::Call {
-            func: "memcpy".to_string(),
+            func: call_name.to_string(),
             info: crate::ir::reexports::CallInfo {
                 dest: Some(ret),
                 args: vec![Operand::Value(dst), Operand::Value(src), len],
@@ -1701,6 +1774,10 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
     // Retarget the preheader at the exit and drop the dead loop.
     func.blocks[m.preheader].terminator = Terminator::Branch(exit_label);
     let _ = crate::passes::cfg_simplify::eliminate_unreachable_blocks(func);
-    dlog!("{fname} loop@{}: REWROTE to memcpy", m.header);
+    dlog!(
+        "{fname} loop@{}: REWROTE to {}",
+        m.header,
+        if m.use_memmove { "memmove" } else { "memcpy" }
+    );
     true
 }

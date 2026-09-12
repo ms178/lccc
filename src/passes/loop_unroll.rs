@@ -46,10 +46,12 @@ fn choose_unroll_factor(body_inst_count: usize) -> u32 {
     match body_inst_count {
         // Tiny bodies (e.g. a single FmaF64x4 after vectorize): aggressive
         // unroll exposes independent accumulators without code-size blow-up.
+        // Raised 13..=40 to 4× for hot crypto loops (SHA-256 30-40 insns) to
+        // match GCC 4× vs previous 2×.
         0..=4 => 8,
-        5..=8 => 4,
-        9..=20 => 4,
-        21..=60 => 2,
+        5..=12 => 4,
+        13..=40 => 4,
+        41..=80 => 2,
         _ => 1, // too large — skip
     }
 }
@@ -4237,10 +4239,11 @@ mod tests {
 
     #[test]
     fn test_no_unroll_large_body() {
-        // Build a loop whose body has > 60 instructions → factor = 1 → no unroll.
+        // Build a loop whose body has > 80 instructions → factor = 1 → no unroll.
+        // Threshold raised to 80 for hot crypto loops (SHA-256).
         let mut func = make_counting_loop(100);
-        // Pad body (B2) with NOPs (Copy %0 = %0) until > 60 instructions.
-        for _ in 0..65 {
+        // Pad body (B2) with NOPs (Copy %0 = %0) until > 80 instructions.
+        for _ in 0..85 {
             func.blocks[2].instructions.push(Instruction::Copy {
                 dest: Value(0),
                 src: Operand::Value(Value(0)),
@@ -4249,7 +4252,7 @@ mod tests {
         let n = unroll_loops(&mut func);
         assert_eq!(
             n, 0,
-            "loop with > 60 body instructions should not be unrolled"
+            "loop with > 80 body instructions should not be unrolled"
         );
     }
 

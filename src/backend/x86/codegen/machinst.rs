@@ -299,6 +299,17 @@ pub enum MachInst {
         size: OpSize,
     },
 
+    /// BMI2 rotate-right logical with immediate: dst = rorx(src, amount).
+    /// VEX-encoded, 3-operand, flag-preserving. Right-only, immediate-only,
+    /// so left rotates are lowered as `rorx $(width-n)`. Selected when BMI2
+    /// is enabled and the rotate amount is an immediate.
+    Rorx {
+        amount: i64,
+        src: MachReg,
+        dst: MachReg,
+        size: OpSize,
+    },
+
     /// LEA: dst = base + index*scale + offset (3-address add).
     /// x86 form: `leaq offset(%base, %index, scale), %dst`
     Lea {

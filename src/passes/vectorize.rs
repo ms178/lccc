@@ -21165,7 +21165,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
                 continue;
             };
             if !matches!(&pattern.limit, Operand::Const(c)
-                if c.to_i64().is_some_and(|t| (5..=16).contains(&t)))
+                if c.to_i64().is_some_and(|t| (5..=64).contains(&t)))
             {
                 continue;
             }

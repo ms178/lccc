@@ -578,6 +578,53 @@ pub fn lower_binop(
     // ── Shift operations ─────────────────────────────────────────────
     if let Some(shift_op) = binop_to_shift(op) {
         if let Some(imm) = const_as_imm32(rhs) {
+            // BMI2 rorx: immediate-only, right-only, flag-preserving, 3-operand.
+            // For SHA-256/ChaCha ARX idioms, rorx beats rol/ror (no flags, better scheduling).
+            // Rol(x,n) = Ror(x, width-n) => rorx.
+            if matches!(shift_op, ShiftOp::Rol | ShiftOp::Ror)
+                && matches!(size, OpSize::S32 | OpSize::S64)
+                && shlx_mode() != ShlxMode::Never
+            {
+                let width = if size == OpSize::S32 { 32 } else { 64 };
+                let amt = (imm as i64).rem_euclid(width as i64);
+                if amt != 0 {
+                    let ror_amt = match shift_op {
+                        ShiftOp::Rol => (width as i64 - amt) % width as i64,
+                        ShiftOp::Ror => amt,
+                        _ => amt,
+                    };
+                    if ror_amt != 0 {
+                        // Try to keep src in its home to avoid extra mov.
+                        let src_reg = match lhs {
+                            Operand::Value(v) => value_to_reg(v, ra),
+                            _ => {
+                                emit_mov_operand_r(lhs, dst, size, ra, out);
+                                dst
+                            }
+                        };
+                        let src_final = match src_reg {
+                            MachReg::Phys(_) => src_reg,
+                            _ => {
+                                emit_mov_operand_r(lhs, dst, size, ra, out);
+                                dst
+                            }
+                        };
+                        out.push(MachInst::Rorx {
+                            amount: ror_amt,
+                            src: src_final,
+                            dst,
+                            size,
+                        });
+                        return true;
+                    } else {
+                        emit_mov_operand_r(lhs, dst, size, ra, out);
+                        return true;
+                    }
+                } else {
+                    emit_mov_operand_r(lhs, dst, size, ra, out);
+                    return true;
+                }
+            }
             emit_mov_operand_r(lhs, dst, size, ra, out);
             let mask = if size == OpSize::S32 { 31 } else { 63 };
             out.push(MachInst::Shift {

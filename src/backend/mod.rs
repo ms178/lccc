@@ -21,6 +21,7 @@ pub(crate) mod traits; // ArchCodegen trait with default implementations
 pub(crate) mod x86_common; // Shared x86/i686 register names, condition codes, asm template parsing
 
 // Register allocation and liveness analysis
+pub(crate) mod global_alloc; // Global Location Allocation — P0-A
 pub(crate) mod live_range; // Linear scan data structures (LiveRange, LinearScanAllocator)
 pub(crate) mod liveness; // Live interval computation
 pub(crate) mod regalloc; // Linear scan register allocator
