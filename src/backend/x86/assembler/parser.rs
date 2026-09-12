@@ -291,8 +291,14 @@ pub enum ImmediateValue {
     /// Symbol with integer offset, e.g., init_top_pgt - 0xffffffff80000000
     SymbolPlusOffset(String, i64),
     /// Symbol with @modifier, e.g., symbol@GOTPCREL
-    #[cfg_attr(not(feature = "gcc_assembler"), expect(dead_code))]
-    // Constructed by parser; handled by encoder for GOT/TLS relocations
+    // Constructed by parser; handled by encoder for GOT/TLS relocations.
+    // The expectation is scoped to the shipped build, mirroring
+    // `Displacement::SymbolMod` below: any unit test that drives the
+    // full `encode()` dispatch makes the encoder's `SymbolMod` match
+    // arms reachable, which keeps the variant live under `cfg(test)` —
+    // leaving the expectation asserted there would fail `-D warnings`
+    // on the `lib test` target.
+    #[cfg_attr(all(not(feature = "gcc_assembler"), not(test)), expect(dead_code))]
     SymbolMod(String, String),
     /// Symbol difference: sym_a - sym_b (e.g., $_DYNAMIC-1b)
     SymbolDiff(String, String),
@@ -354,14 +360,13 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
     let mut irp_depth = 0; // Track .irp nesting to avoid consuming their .endr
     while i < lines.len() {
         let trimmed = strip_comment(lines[i]).trim().to_string();
-        if trimmed.starts_with(".rept ") || trimmed.starts_with(".rept\t") {
+        if let Some(count_str) = directive_arg(&trimmed, ".rept") {
             if irp_depth > 0 {
                 // Inside .irp block - pass through as-is
                 result.push(lines[i].to_string());
                 i += 1;
                 continue;
             }
-            let count_str = trimmed[".rept".len()..].trim();
             let count = parse_integer_expr(count_str)
                 .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?
                 as usize;
@@ -370,7 +375,7 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             i += 1;
             while i < lines.len() {
                 let inner = strip_comment(lines[i]).trim().to_string();
-                if inner.starts_with(".rept ") || inner.starts_with(".rept\t") {
+                if directive_arg(&inner, ".rept").is_some() {
                     depth += 1;
                 } else if inner == ".endr" {
                     depth -= 1;
@@ -388,10 +393,8 @@ fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
             for _ in 0..count {
                 result.extend(expanded_body.iter().cloned());
             }
-        } else if trimmed.starts_with(".irp ")
-            || trimmed.starts_with(".irp\t")
-            || trimmed.starts_with(".irpc ")
-            || trimmed.starts_with(".irpc\t")
+        } else if directive_arg(&trimmed, ".irp").is_some()
+            || directive_arg(&trimmed, ".irpc").is_some()
         {
             // .irpc must be tracked exactly like .irp here: this pre-pass
             // only expands .rept, and treating .irpc's .endr as a stray
@@ -477,6 +480,32 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
 /// Strip trailing comment from a line using x86 comment style (`#`).
 fn strip_comment(line: &str) -> &str {
     asm_preprocess::strip_comment(line, &COMMENT_STYLE)
+}
+
+/// Match a GAS directive and return its argument, whitespace-insensitively.
+///
+/// GAS accepts any ASCII whitespace between a directive and its argument
+/// (`.ifb %1`, `.ifb\t%1`, `.ifb  %1` are all identical). The historical
+/// pattern at every call site was `starts_with(".X ") ||
+/// starts_with(".X\t")` — an enumeration that (a) forgot the tab variant
+/// in three matchers during a refactor and silently broke `.ifb\t%1`
+/// macro conditionals, and (b) could not accept a `.X` followed by any
+/// other whitespace. This helper closes the class once: it matches
+/// `line` exactly equal to the directive (bare form, `Some("")`) or the
+/// directive followed by any single ASCII whitespace character, returning
+/// the trimmed argument. Directives are always dot-prefixed and matched
+/// case-sensitively, like GAS.
+fn directive_arg<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
+    if let Some(rest) = line.strip_prefix(directive) {
+        match rest.chars().next() {
+            None => return Some(""),
+            Some(c) if c.is_ascii_whitespace() => return Some(rest.trim_start()),
+            // `.ifbfoo` is a different directive, not `.ifb` with an
+            // argument; a prefix match would silently mis-dispatch it.
+            Some(_) => {}
+        }
+    }
+    None
 }
 
 /// Parse a single non-empty assembly line into one or more AsmItems.
@@ -2350,6 +2379,42 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
                     }
                 }
             }
+            // `1b - 8 - .` (the kernel's runtime-const entries in
+            // arch/x86/include/asm/runtime-const.h): the RHS is a
+            // CONSTANT-minus-dot chain. The probes above only understand
+            // `sym ± N` shapes; the digit-only "8" is not a real label and
+            // parse_integer_expr(".") fails, so the fall-through below
+            // dropped the constant entirely — the retained relocation lost
+            // its `- 8`, runtime_const_fixup patched the movabs immediate
+            // EIGHT BYTES LATE, and the overwritten code took a #UD on
+            // boot (kernel 6.18.50: d_lookup → "invalid opcode", init
+            // killed, exitcode 0x0b). Fold the chain:
+            //   lhs - N - .  =>  (lhs - N) vs .
+            //   lhs - (. - N) =>  (lhs + N) vs .
+            if let Some(m) = rhs_full.rfind(" - ") {
+                let rl = rhs_full[..m].trim();
+                let rr = rhs_full[m + 3..].trim();
+                if rr == "." {
+                    if let Ok(n) = parse_integer_expr(rl) {
+                        vals.push(DataValue::SymbolDiffAddend(
+                            lhs,
+                            ".".to_string(),
+                            lhs_addend - n,
+                        ));
+                        continue;
+                    }
+                }
+                if rl == "." {
+                    if let Ok(n) = parse_integer_expr(rr) {
+                        vals.push(DataValue::SymbolDiffAddend(
+                            lhs,
+                            ".".to_string(),
+                            lhs_addend + n,
+                        ));
+                        continue;
+                    }
+                }
+            }
             if lhs_addend != 0 {
                 vals.push(DataValue::SymbolDiffAddend(
                     lhs,
@@ -2847,15 +2912,14 @@ fn expand_gas_macros_with_state(
         let trimmed = strip_comment(&lines[i]).trim().to_string();
 
         // .macro name param1:req param2:req ...
-        if trimmed.starts_with(".macro ") || trimmed.starts_with(".macro\t") {
-            let rest = trimmed[".macro".len()..].trim();
+        if let Some(rest) = directive_arg(&trimmed, ".macro") {
             let (name, params) = parse_macro_def(rest)?;
             let mut body = Vec::new();
             let mut depth = 1;
             i += 1;
             while i < lines.len() {
                 let inner = strip_comment(&lines[i]).trim().to_string();
-                if inner.starts_with(".macro ") || inner.starts_with(".macro\t") {
+                if directive_arg(&inner, ".macro").is_some() {
                     depth += 1;
                 } else if inner == ".endm" {
                     depth -= 1;
@@ -2875,16 +2939,14 @@ fn expand_gas_macros_with_state(
         }
 
         // .purgem name
-        if trimmed.starts_with(".purgem ") || trimmed.starts_with(".purgem\t") {
-            let name = trimmed[".purgem".len()..].trim().to_string();
-            macros.remove(&name);
+        if let Some(name) = directive_arg(&trimmed, ".purgem") {
+            macros.remove(name);
             i += 1;
             continue;
         }
 
         // .set symbol, expr (with symbol resolution)
-        if trimmed.starts_with(".set ") || trimmed.starts_with(".set\t") {
-            let rest = trimmed[".set".len()..].trim();
+        if let Some(rest) = directive_arg(&trimmed, ".set") {
             if let Some(comma_pos) = rest.find(',') {
                 let sym_name = rest[..comma_pos].trim().to_string();
                 let expr_str = rest[comma_pos + 1..].trim();
@@ -2961,8 +3023,7 @@ fn expand_gas_macros_with_state(
         // `.irpc l, 0123` to unroll four page-table-entry stores with
         // `\l * 8(%eax)` displacements; without this the raw `\l` leaked
         // into the object as a relocation symbol named "\l * 8".
-        if trimmed.starts_with(".irpc ") || trimmed.starts_with(".irpc\t") {
-            let rest = trimmed[".irpc".len()..].trim();
+        if let Some(rest) = directive_arg(&trimmed, ".irpc") {
             let comma = rest
                 .find(',')
                 .ok_or(".irpc: missing comma after variable")?;
@@ -2978,12 +3039,9 @@ fn expand_gas_macros_with_state(
             i += 1;
             while i < lines.len() {
                 let inner = strip_comment(&lines[i]).trim().to_string();
-                if inner.starts_with(".irp ")
-                    || inner.starts_with(".irp\t")
-                    || inner.starts_with(".irpc ")
-                    || inner.starts_with(".irpc\t")
-                    || inner.starts_with(".rept ")
-                    || inner.starts_with(".rept\t")
+                if directive_arg(&inner, ".irp").is_some()
+                    || directive_arg(&inner, ".irpc").is_some()
+                    || directive_arg(&inner, ".rept").is_some()
                 {
                     depth += 1;
                 } else if inner == ".endr" {
@@ -3012,18 +3070,15 @@ fn expand_gas_macros_with_state(
         }
 
         // .irp var, item1, item2, ...  /  .endr
-        if trimmed.starts_with(".irp ") || trimmed.starts_with(".irp\t") {
-            let rest = trimmed[".irp".len()..].trim();
+        if let Some(rest) = directive_arg(&trimmed, ".irp") {
             let (var, items) = parse_irp_header(rest)?;
             let mut body = Vec::new();
             let mut depth = 1;
             i += 1;
             while i < lines.len() {
                 let inner = strip_comment(&lines[i]).trim().to_string();
-                if inner.starts_with(".irp ")
-                    || inner.starts_with(".irp\t")
-                    || inner.starts_with(".rept ")
-                    || inner.starts_with(".rept\t")
+                if directive_arg(&inner, ".irp").is_some()
+                    || directive_arg(&inner, ".rept").is_some()
                 {
                     depth += 1;
                 } else if inner == ".endr" {
@@ -3053,15 +3108,11 @@ fn expand_gas_macros_with_state(
         }
 
         // .if expr / .elseif expr / .else / .endif
-        if trimmed.starts_with(".if ")
-            || trimmed.starts_with(".if\t")
-            || trimmed.starts_with(".if(")
+        // (`.if(` — a paren directly after the directive, no whitespace — is
+        // legal GAS tokenization and kept as an explicit fallback form.)
+        if let Some(rest) = directive_arg(&trimmed, ".if")
+            .or_else(|| trimmed.starts_with(".if(").then(|| &trimmed[".if".len()..]))
         {
-            let rest = if trimmed.starts_with(".if(") {
-                &trimmed[".if".len()..]
-            } else {
-                trimmed[".if".len()..].trim()
-            };
             let cond = eval_if_expr(rest, symbols);
             // Collect branches: a chain of (condition, lines) pairs ending with optional else
             let mut branches: Vec<(bool, Vec<String>)> = vec![(cond, Vec::new())];
@@ -3079,10 +3130,8 @@ fn expand_gas_macros_with_state(
                         break;
                     }
                     branches[current_idx].1.push(lines[i].clone());
-                } else if depth == 1
-                    && (inner.starts_with(".elseif ") || inner.starts_with(".elseif\t"))
-                {
-                    let elseif_rest = inner[".elseif".len()..].trim();
+                } else if depth == 1 && directive_arg(&inner, ".elseif").is_some() {
+                    let elseif_rest = directive_arg(&inner, ".elseif").unwrap_or("");
                     // All branch conditions are evaluated eagerly; harmless for pure comparisons.
                     let elseif_cond = eval_if_expr(elseif_rest, symbols);
                     branches.push((elseif_cond, Vec::new()));
@@ -3114,19 +3163,12 @@ fn expand_gas_macros_with_state(
         // .ifb string / .ifnb string / .endif
         // GAS tests whether the argument text is blank after macro substitution.
         // Linux/FFmpeg x86 macro code uses these heavily for optional operands.
-        if trimmed == ".ifb"
-            || trimmed.starts_with(".ifb ")
-            || trimmed.starts_with(".ifb	")
-            || trimmed == ".ifnb"
-            || trimmed.starts_with(".ifnb ")
-            || trimmed.starts_with(".ifnb	")
-        {
-            let is_ifnb = trimmed.starts_with(".ifnb");
-            let rest = if is_ifnb {
-                trimmed[".ifnb".len()..].trim()
-            } else {
-                trimmed[".ifb".len()..].trim()
-            };
+        // (`.ifb\t%1` — tab-separated — was silently dropped by this matcher
+        // once before; `directive_arg` makes the whole whitespace family
+        // unreachable as a defect class.)
+        let ifb_form = directive_arg(&trimmed, ".ifb").map(|rest| (rest, false));
+        let ifnb_form = directive_arg(&trimmed, ".ifnb").map(|rest| (rest, true));
+        if let Some((rest, is_ifnb)) = ifb_form.or(ifnb_form) {
             let cond = if is_ifnb {
                 !eval_ifb(rest)
             } else {
@@ -3147,10 +3189,8 @@ fn expand_gas_macros_with_state(
                         break;
                     }
                     branches[current_idx].1.push(lines[i].clone());
-                } else if depth == 1
-                    && (inner.starts_with(".elseif ") || inner.starts_with(".elseif	"))
-                {
-                    let elseif_rest = inner[".elseif".len()..].trim();
+                } else if depth == 1 && directive_arg(&inner, ".elseif").is_some() {
+                    let elseif_rest = directive_arg(&inner, ".elseif").unwrap_or("");
                     let elseif_cond = eval_if_expr(elseif_rest, symbols);
                     branches.push((elseif_cond, Vec::new()));
                     current_idx += 1;
@@ -3177,8 +3217,7 @@ fn expand_gas_macros_with_state(
         }
 
         // .ifc str1, str2 / .endif
-        if trimmed.starts_with(".ifc ") || trimmed.starts_with(".ifc\t") {
-            let rest = trimmed[".ifc".len()..].trim();
+        if let Some(rest) = directive_arg(&trimmed, ".ifc") {
             let cond = eval_ifc(rest);
             let mut branches: Vec<(bool, Vec<String>)> = vec![(cond, Vec::new())];
             let mut current_idx = 0;
@@ -3195,10 +3234,8 @@ fn expand_gas_macros_with_state(
                         break;
                     }
                     branches[current_idx].1.push(lines[i].clone());
-                } else if depth == 1
-                    && (inner.starts_with(".elseif ") || inner.starts_with(".elseif\t"))
-                {
-                    let elseif_rest = inner[".elseif".len()..].trim();
+                } else if depth == 1 && directive_arg(&inner, ".elseif").is_some() {
+                    let elseif_rest = directive_arg(&inner, ".elseif").unwrap_or("");
                     // All branch conditions are evaluated eagerly; harmless for pure comparisons.
                     let elseif_cond = eval_if_expr(elseif_rest, symbols);
                     branches.push((elseif_cond, Vec::new()));
@@ -3226,11 +3263,25 @@ fn expand_gas_macros_with_state(
         }
 
         // .error "message" - assembler error directive
-        if trimmed.starts_with(".error ") || trimmed.starts_with(".error\t") {
-            return Err(format!(
-                "assembler error: {}",
-                trimmed[".error".len()..].trim()
-            ));
+        if let Some(rest) = directive_arg(&trimmed, ".error") {
+            return Err(format!("assembler error: {}", rest));
+        }
+
+        // Stray conditional terminators are a hard error, exactly like GAS
+        // (`".else" without matching ".if"`): a conditional-family line that
+        // reaches this point has no open .if block. Before this check, a
+        // malformed conditional head (anything the arms above did not
+        // recognize) fell through and the assembler SILENTLY emitted every
+        // branch — a wrong-code failure mode with no diagnostic. The kernel's
+        // macro-heavy asm must never mis-assemble silently.
+        if trimmed == ".else" {
+            return Err("\".else\" without matching \".if\"".to_string());
+        }
+        if trimmed == ".endif" {
+            return Err("\".endif\" without \".if\"".to_string());
+        }
+        if directive_arg(&trimmed, ".elseif").is_some() {
+            return Err("\".elseif\" without matching \".if\"".to_string());
         }
 
         // Check if line is a macro invocation.
@@ -3784,19 +3835,19 @@ fn is_ident_char(b: u8) -> bool {
 
 /// Check if a line starts a new conditional assembly block (.if, .ifc, .ifdef, .ifndef).
 fn is_if_start(trimmed: &str) -> bool {
-    trimmed.starts_with(".if ")
-        || trimmed.starts_with(".if\t")
-        || trimmed.starts_with(".if(")
-        || trimmed.starts_with(".ifc ")
-        || trimmed.starts_with(".ifc\t")
-        || trimmed == ".ifb"
-        || trimmed.starts_with(".ifb ")
-        || trimmed.starts_with(".ifb\t")
-        || trimmed == ".ifnb"
-        || trimmed.starts_with(".ifnb ")
-        || trimmed.starts_with(".ifnb\t")
-        || trimmed.starts_with(".ifdef ")
-        || trimmed.starts_with(".ifndef ")
+    // All conditional directives, whitespace-insensitively (`.ifb\t%1`
+    // matched here too — a nested conditional whose tab form was dropped
+    // mis-nested the whole `.if/.endif` stack). `.if(` is legal GAS
+    // tokenization without whitespace; `.ifdef`/`.ifndef` are separate
+    // directives (the whitespace requirement of `directive_arg` keeps
+    // `.if` from swallowing them).
+    trimmed.starts_with(".if(")
+        || directive_arg(trimmed, ".if").is_some()
+        || directive_arg(trimmed, ".ifc").is_some()
+        || directive_arg(trimmed, ".ifb").is_some()
+        || directive_arg(trimmed, ".ifnb").is_some()
+        || directive_arg(trimmed, ".ifdef").is_some()
+        || directive_arg(trimmed, ".ifndef").is_some()
 }
 
 /// Evaluate a `.if` expression for the x86 assembler.

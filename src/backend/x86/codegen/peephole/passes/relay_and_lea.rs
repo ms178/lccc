@@ -2335,21 +2335,26 @@ mod tests {
         // A 32-bit consumer under a 64-bit copy reads only the established
         // low half: sound, and the rewrite zero-extends identically. (The
         // wide mask defeats `copy_mask_movz`; the later %r12 redefinition
-        // defeats whole-function `copy_coalesce`.)
+        // defeats whole-function `copy_coalesce`. The consumer lands in the
+        // CALLEE-SAVED %ebx and is used after the call: a caller-saved
+        // destination would be dead at the call — non-variadic calls write
+        // %rax and read no accumulator — and would be eliminated, not
+        // retargeted; keeping it live pins the retarget itself.)
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
             "    movq %r12, %r11\n",
             "    andl $2080895, %r11d\n",
-            "    movl %r11d, %eax\n",
+            "    movl %r11d, %ebx\n",
             "    call bar\n",
+            "    addq %rbx, %rax\n",
             "    movq $5, %r12\n",
             "    addq %r12, %rax\n",
             "    ret\n",
             ".cfi_endproc\n",
         ));
         assert!(out.contains("andl $2080895, %r12d"), "{out}");
-        assert!(out.contains("movl %r12d, %eax"), "{out}");
+        assert!(out.contains("movl %r12d, %ebx"), "{out}");
         assert!(!out.contains("%r11"), "{out}");
     }
 

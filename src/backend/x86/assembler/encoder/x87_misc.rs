@@ -37,7 +37,6 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Memory(mem)) => {
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(size, "", mem);
                 let rc = self.relocations.len();
                 self.bytes.extend_from_slice(&[0x0F, 0xBA]);
@@ -57,7 +56,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Register(src), Operand::Memory(mem)) => {
                 let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(size, &src.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, reg_opcode]);
                 self.encode_modrm_mem(src_num, mem)
@@ -101,7 +99,6 @@ impl super::InstructionEncoder {
             Operand::Memory(mem) => {
                 // x87 memory forms accept the normal memory-prefix machinery (FS/GS
                 // segment overrides and REX.B/X for r8-r15 addressing), but never REX.W.
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(0, "", mem);
                 self.bytes.extend_from_slice(opcode);
                 self.encode_modrm_mem(ext, mem)
@@ -309,7 +306,6 @@ impl super::InstructionEncoder {
                 }
                 Operand::Memory(mem) => {
                     // fcom m32: D8 /2 (default for a bare memory operand).
-                    self.emit_segment_prefix(mem)?;
                     self.emit_rex_rm(0, "", mem);
                     self.bytes.extend_from_slice(&[0xD8]);
                     self.encode_modrm_mem(2, mem)
@@ -334,7 +330,6 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(0, "", mem);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(ext, mem)
@@ -358,7 +353,6 @@ impl super::InstructionEncoder {
                 }
                 Operand::Memory(mem) => {
                     // fcomp m32: D8 /3 (default for a bare memory operand).
-                    self.emit_segment_prefix(mem)?;
                     self.emit_rex_rm(0, "", mem);
                     self.bytes.extend_from_slice(&[0xD8]);
                     self.encode_modrm_mem(3, mem)

@@ -311,6 +311,55 @@ fn family_of_reg_name(name: &str) -> Option<RegId> {
     None
 }
 
+/// Parse `movz{b,w,l}{l,q}` / `movs{b,w}{w,l,q}` (zero/sign extension) with
+/// both operands plain registers. Returns `(src_width, src_family,
+/// dst_family)` — the SOURCE width is what consumers may read, because an
+/// extension preserves the source lane bit-for-bit and the upper bits are
+/// the extension's own product. `movsd`/`movss` (scalar FP moves) and the
+/// string ops (`movsb`, …) are rejected by the two-width-suffix shape and
+/// the register-operand requirement.
+fn parse_reg_to_reg_ext(trimmed: &str) -> Option<(usize, RegId, RegId)> {
+    let rest = if let Some(r) = trimmed.strip_prefix("movz") {
+        r
+    } else if let Some(r) = trimmed.strip_prefix("movs") {
+        r
+    } else {
+        return None;
+    };
+    let (suffix, operands) = rest.split_once(' ')?;
+    if suffix.len() != 2 {
+        return None;
+    }
+    let sw = match suffix.as_bytes()[0] {
+        b'b' => W8,
+        b'w' => W16,
+        b'l' => W32,
+        _ => return None,
+    };
+    let dw = match suffix.as_bytes()[1] {
+        b'w' => W16,
+        b'l' => W32,
+        b'q' => W64,
+        _ => return None,
+    };
+    // Width indices count DOWN: W64=0 .. W8=3, so a genuine extension has a
+    // numerically SMALLER destination index than its source index.
+    if dw >= sw {
+        return None; // not an extension
+    }
+    let (src_part, dst_part) = operands.split_once(',')?;
+    let src = src_part.trim();
+    let dst = dst_part.trim();
+    if !src.starts_with('%') || !dst.starts_with('%') || src.contains('(') || dst.contains('(') {
+        return None;
+    }
+    // The source must be spelled at the mnemonic's source width, the
+    // destination at its (wider) destination width.
+    let sfam = REG_NAMES[sw].iter().position(|n| *n == src)? as RegId;
+    let dfam = REG_NAMES[dw].iter().position(|n| *n == dst)? as RegId;
+    Some((sw, sfam, dfam))
+}
+
 // ── B. copy folding ─────────────────────────────────────────────────────────
 
 pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
@@ -326,9 +375,21 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
             continue;
         }
         let trimmed = infos[i].trimmed(store.get(i));
-        let Some((width, sfam, dfam)) = parse_reg_to_reg_mov(trimmed) else {
-            continue;
-        };
+        // Either a plain same-width register copy (consumers may read at the
+        // copy's width) or a zero/sign extension (consumers may read only at
+        // the SOURCE width: the extension's upper bits are its own product,
+        // but the low lane is preserved bit-for-bit — so a `movzbl %dil, %r9d`
+        // whose only consumer is `movb %r9b, …` folds the store straight
+        // onto `%dil`, which is exactly the shape GCC emits for byte
+        // truncation stores).
+        let (rule_width, sfam, dfam) =
+            if let Some((width, sfam, dfam)) = parse_reg_to_reg_mov(trimmed) {
+                (width, sfam, dfam)
+            } else if let Some((sw, sfam, dfam)) = parse_reg_to_reg_ext(trimmed) {
+                (sw, sfam, dfam)
+            } else {
+                continue;
+            };
         if sfam == dfam || is_frame_family(sfam) || is_frame_family(dfam) {
             continue;
         }
@@ -390,7 +451,7 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
             // Width rule. An address operand is a 64-bit read, so a narrower
             // copy cannot cover it; `mentions_only_within` rejects that
             // automatically because the address spells the 64-bit name.
-            if !mentions_only_within(line, dfam, width) {
+            if !mentions_only_within(line, dfam, rule_width) {
                 ok = false;
                 break;
             }
@@ -408,7 +469,7 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
         let mut any = false;
         for &j in &uses {
             let line = infos[j].trimmed(store.get(j)).to_string();
-            let rewritten = rename_within(&line, dfam, sfam, width);
+            let rewritten = rename_within(&line, dfam, sfam, rule_width);
             if rewritten != line {
                 replace_line(store, &mut infos[j], j, format!("    {}", rewritten));
                 any = true;

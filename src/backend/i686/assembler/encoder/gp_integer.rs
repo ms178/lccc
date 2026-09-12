@@ -70,13 +70,11 @@ impl super::InstructionEncoder {
                     if size == 2 {
                         self.bytes.push(0x66);
                     }
-                    self.emit_segment_prefix(mem);
                     self.bytes.push(0xA1);
                     return self.encode_i686_moffs(&mem.displacement);
                 }
                 if dst.name == "al" && mem.base.is_none() && mem.index.is_none() && size == 1 {
                     self.sized_op = false;
-                    self.emit_segment_prefix(mem);
                     self.bytes.push(0xA0);
                     return self.encode_i686_moffs(&mem.displacement);
                 }
@@ -91,13 +89,11 @@ impl super::InstructionEncoder {
                     if size == 2 {
                         self.bytes.push(0x66);
                     }
-                    self.emit_segment_prefix(mem);
                     self.bytes.push(0xA3);
                     return self.encode_i686_moffs(&mem.displacement);
                 }
                 if src.name == "al" && mem.base.is_none() && mem.index.is_none() && size == 1 {
                     self.sized_op = false;
-                    self.emit_segment_prefix(mem);
                     self.bytes.push(0xA2);
                     return self.encode_i686_moffs(&mem.displacement);
                 }
@@ -359,7 +355,6 @@ impl super::InstructionEncoder {
         // All six segment overrides are legal; emit_segment_prefix drops
         // one that names the addressing form's default segment (GAS
         // parity) and emits the others before any size prefix.
-        self.emit_segment_prefix(mem);
 
         if size == 2 || size == 4 {
             self.sized_op = true;
@@ -386,7 +381,6 @@ impl super::InstructionEncoder {
         // All six segment overrides are legal; emit_segment_prefix drops
         // one that names the addressing form's default segment (GAS
         // parity) and emits the others before any size prefix.
-        self.emit_segment_prefix(mem);
 
         if size == 2 || size == 4 {
             self.sized_op = true;
@@ -408,7 +402,6 @@ impl super::InstructionEncoder {
         mem: &MemoryOperand,
         size: u8,
     ) -> Result<(), String> {
-        self.emit_segment_prefix(mem);
         if size == 2 || size == 4 {
             self.sized_op = true;
         }
@@ -483,7 +476,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
             }
@@ -532,7 +524,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
             }
@@ -576,7 +567,6 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.emit_segment_prefix(mem);
                 self.bytes.push(0x8D);
                 self.encode_modrm_mem(dst_num, mem)
             }
@@ -622,7 +612,6 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
-                self.emit_segment_prefix(mem);
                 self.bytes.push(0xFF);
                 self.encode_modrm_mem(6, mem)
             }
@@ -679,7 +668,6 @@ impl super::InstructionEncoder {
             }
             // `pushw mem` -- 0x66 FF /6.
             Operand::Memory(mem) => {
-                self.emit_segment_prefix(mem);
                 self.sized_op = true;
                 self.bytes.push(0x66);
                 self.bytes.push(0xFF);
@@ -760,7 +748,6 @@ impl super::InstructionEncoder {
             }
             Operand::Memory(mem) => {
                 // pop m32: 0x8F /0
-                self.emit_segment_prefix(mem);
                 self.bytes.push(0x8F);
                 self.encode_modrm_mem(0, mem)
             }
@@ -870,7 +857,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -883,7 +869,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Register(src), Operand::Memory(mem)) => {
                 let src_num = reg_num(&src.name).ok_or("bad src register")?;
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -896,7 +881,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {
                 let val = *val;
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -949,7 +933,6 @@ impl super::InstructionEncoder {
                 Operand::Immediate(ImmediateValue::SymbolMod(sym, modifier)),
                 Operand::Memory(mem),
             ) => {
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -968,7 +951,6 @@ impl super::InstructionEncoder {
                 Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _)),
                 Operand::Memory(mem),
             ) => {
-                self.emit_segment_prefix(mem);
                 let addend = match &ops[0] {
                     Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) => *a,
                     _ => 0,
@@ -991,7 +973,6 @@ impl super::InstructionEncoder {
                 Operand::Immediate(ImmediateValue::SymbolDiff(sym_a, sym_b)),
                 Operand::Memory(mem),
             ) => {
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -1141,7 +1122,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {
                 let val = *val;
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -1205,7 +1185,6 @@ impl super::InstructionEncoder {
                     }
                     (Operand::Memory(mem), Operand::Register(dst)) => {
                         let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                        self.emit_segment_prefix(mem);
                         self.bytes.extend_from_slice(&[0x0F, 0xAF]);
                         self.encode_modrm_mem(dst_num, mem)
                     }
@@ -1251,7 +1230,6 @@ impl super::InstructionEncoder {
                     Operand::Register(dst),
                 ) => {
                     let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                    self.emit_segment_prefix(mem);
                     if *val >= -128 && *val <= 127 {
                         self.bytes.push(0x6B);
                         self.encode_modrm_mem(dst_num, mem)?;
@@ -1292,7 +1270,6 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
-                self.emit_segment_prefix(mem);
                 self.bytes.push(if size == 1 { 0xF6 } else { 0xF7 });
                 self.encode_modrm_mem(op_ext, mem)
             }
@@ -1340,7 +1317,6 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -1391,7 +1367,6 @@ impl super::InstructionEncoder {
                     return Ok(());
                 }
                 Operand::Memory(mem) => {
-                    self.emit_segment_prefix(mem);
                     if size == 2 || size == 4 {
                         self.sized_op = true;
                     }
@@ -1445,7 +1420,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Immediate(ImmediateValue::Integer(count)), Operand::Memory(mem)) => {
                 let count = *count as u8;
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -1463,7 +1437,6 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Register(cl), Operand::Memory(mem)) if cl.name == "cl" => {
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -1589,7 +1562,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&opcode);
                 self.encode_modrm_mem(dst_num, mem)
             }
@@ -1623,7 +1595,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Register(src), Operand::Memory(mem)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, opcode_rr]);
                 self.encode_modrm_mem(src_num, mem)
             }
@@ -1635,7 +1606,6 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Memory(mem)) => {
-                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0xBA]);
                 self.encode_modrm_mem(ext, mem)?;
                 self.bytes.push(*val as u8);
@@ -1676,7 +1646,6 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             Operand::Memory(mem) => {
-                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x90 + cc]);
                 self.encode_modrm_mem(0, mem)
             }
@@ -1726,7 +1695,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem);
                 self.sized_op = true;
                 if is_16bit {
                     self.bytes.push(0x66);
@@ -1774,7 +1742,6 @@ impl super::InstructionEncoder {
                         Ok(())
                     }
                     Operand::Memory(mem) => {
-                        self.emit_segment_prefix(mem);
                         self.bytes.push(0xFF);
                         self.encode_modrm_mem(4, mem)
                     }
@@ -1803,7 +1770,6 @@ impl super::InstructionEncoder {
             1 => match &ops[0] {
                 Operand::Indirect(inner) => match inner.as_ref() {
                     Operand::Memory(mem) => {
-                        self.emit_segment_prefix(mem);
                         self.bytes.push(0xFF);
                         self.encode_modrm_mem(3, mem)
                     }
@@ -1817,7 +1783,6 @@ impl super::InstructionEncoder {
                     _ => Err("lcall indirect requires memory or label operand".to_string()),
                 },
                 Operand::Memory(mem) => {
-                    self.emit_segment_prefix(mem);
                     self.bytes.push(0xFF);
                     self.encode_modrm_mem(3, mem)
                 }
@@ -1857,7 +1822,6 @@ impl super::InstructionEncoder {
                     Operand::Indirect(inner) => {
                         match inner.as_ref() {
                             Operand::Memory(mem) => {
-                                self.emit_segment_prefix(mem);
                                 self.bytes.push(0xFF);
                                 self.encode_modrm_mem(5, mem)
                             }
@@ -1874,7 +1838,6 @@ impl super::InstructionEncoder {
                     }
                     Operand::Memory(mem) => {
                         // ljmp *mem (without explicit indirect prefix)
-                        self.emit_segment_prefix(mem);
                         self.bytes.push(0xFF);
                         self.encode_modrm_mem(5, mem)
                     }
@@ -2021,7 +1984,6 @@ impl super::InstructionEncoder {
                         Ok(())
                     }
                     Operand::Memory(mem) => {
-                        self.emit_segment_prefix(mem);
                         self.bytes.push(0xFF);
                         self.encode_modrm_mem(2, mem)
                     }
@@ -2051,7 +2013,6 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Memory(mem)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -2087,7 +2048,6 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Memory(mem)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -2111,7 +2071,6 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Memory(mem)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem);
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
@@ -2132,7 +2091,6 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0xAE]);
                 self.encode_modrm_mem(7, mem)
             }
@@ -2148,7 +2106,6 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                self.emit_segment_prefix(mem);
                 self.bytes.extend_from_slice(&[0x0F, 0xAE]);
                 self.encode_modrm_mem(ext, mem)
             }

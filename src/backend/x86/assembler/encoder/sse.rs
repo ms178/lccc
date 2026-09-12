@@ -104,7 +104,6 @@ impl super::InstructionEncoder {
                         self.bytes.push(b);
                     }
                 }
-                self.emit_segment_prefix(mem)?;
                 if use_mmx {
                     // MMX has no extended register bank, but 64-bit addressing
                     // still needs REX.X/REX.B for r8-r15 base/index registers.
@@ -144,7 +143,6 @@ impl super::InstructionEncoder {
                         self.bytes.push(b);
                     }
                 }
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(0, &src.name, mem);
                 self.bytes.extend_from_slice(&opcode[prefix_len..]);
                 self.encode_modrm_mem(src_num, mem)
@@ -196,7 +194,6 @@ impl super::InstructionEncoder {
                         self.bytes.push(b);
                     }
                 }
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(0, if use_mmx { "" } else { dst.name.as_str() }, mem);
                 self.bytes.extend_from_slice(&opcode[prefix_len..]);
                 self.encode_modrm_mem(dst_num, mem)?;
@@ -237,7 +234,6 @@ impl super::InstructionEncoder {
             // mem -> MMX: 0F 6E /r
             (Operand::Memory(mem), Operand::Register(dst)) if is_mmx(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(0, &dst.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x6E]);
                 self.encode_modrm_mem(dst_num, mem)
@@ -245,7 +241,6 @@ impl super::InstructionEncoder {
             // MMX -> mem: 0F 7E /r
             (Operand::Register(src), Operand::Memory(mem)) if is_mmx(&src.name) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(0, &src.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x7E]);
                 self.encode_modrm_mem(src_num, mem)
@@ -277,7 +272,6 @@ impl super::InstructionEncoder {
             // mem -> XMM: 66 0F 6E /r
             (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 self.bytes.push(0x66);
                 self.emit_rex_rm(0, &dst.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x6E]);
@@ -286,7 +280,6 @@ impl super::InstructionEncoder {
             // XMM -> mem: 66 0F 7E /r
             (Operand::Register(src), Operand::Memory(mem)) if is_xmm(&src.name) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 self.bytes.push(0x66);
                 self.emit_rex_rm(0, &src.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x7E]);
@@ -367,13 +360,11 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 if use_evex {
-                    self.emit_segment_prefix(mem)?;
                     self.emit_apx_evex_rm_pp(size == 8, &dst.name, mem, None, false, pp)?;
                     self.bytes.push(0x66);
                     return self.encode_modrm_mem(dst_num, mem);
                 }
                 self.bytes.push(prefix);
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(size, &dst.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF6]);
                 self.encode_modrm_mem(dst_num, mem)
@@ -400,7 +391,6 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Memory(mem), Operand::Register(reg)) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 if use_evex {
                     self.emit_apx_evex_rm_pp(size == 8, &reg.name, mem, None, false, pp)?;
                     self.bytes.push(0x60);
@@ -415,7 +405,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Register(reg), Operand::Memory(mem)) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 if use_evex {
                     self.emit_apx_evex_rm_pp(size == 8, &reg.name, mem, None, false, pp)?;
                     self.bytes.push(0x61);
@@ -544,7 +533,6 @@ impl super::InstructionEncoder {
                 for &b in &opcode[..prefix_len] {
                     self.bytes.push(b);
                 }
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(gp_size, &dst.name, mem);
                 self.bytes.extend_from_slice(&opcode[prefix_len..]);
                 self.encode_modrm_mem(dst_num, mem)
@@ -574,6 +562,20 @@ impl super::InstructionEncoder {
                 self.bytes.extend_from_slice(&opcode[prefix_len..]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
+            }
+            // Memory source: `cvttss2si (%rax),%eax` reads the 32-bit
+            // float from memory directly (GAS: f3 0f 2c 00); the 64-bit
+            // `cvttsd2siq` reads a double. GAS accepts the memory form
+            // for the whole cvt*-2si family and so do we.
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                self.emit_rex_rm(gp_size, &dst.name, mem);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.encode_modrm_mem(dst_num, mem)
             }
             _ => Err("unsupported cvt operands".to_string()),
         }
@@ -894,7 +896,6 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let w = is_reg64(&dst.name);
-                self.emit_segment_prefix(mem)?;
                 if use_evex {
                     self.emit_apx_evex_rm_pp(w, &dst.name, mem, None, false, pp)?;
                     self.bytes.push(opc);
@@ -928,7 +929,6 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                self.emit_segment_prefix(mem)?;
                 // No REX.W needed for 32-bit memory operations
                 self.emit_rex_rm(0, "", mem);
                 self.bytes.extend_from_slice(opcode);
@@ -951,7 +951,6 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Memory(mem) => {
-                self.emit_segment_prefix(mem)?;
                 let x_bit = mem.index.as_ref().is_some_and(|i| needs_rex_ext(&i.name));
                 let b_bit = mem.base.as_ref().is_some_and(|b| needs_rex_ext(&b.name));
                 self.emit_vex(false, x_bit, b_bit, 1, 0, 0, 0, 0);
@@ -990,7 +989,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.emit_segment_prefix(mem)?;
                 self.emit_rex_rm(size, &dst.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, opcode_byte]);
                 self.encode_modrm_mem(dst_num, mem)
@@ -1025,8 +1023,6 @@ impl super::InstructionEncoder {
         mem: &MemoryOperand,
         scale_n: u32,
     ) -> Result<(), String> {
-        self.emit_segment_prefix(mem)?;
-
         // RIP-relative: same ModRM (mod=00 rm=101 + disp32) as the legacy
         // encoder, including `sym@GOTPCREL` / `@GOTTPOFF` / `@TLSDESC`.
         // `gotpcrel_x_type` then classifies AVX-512 EVEX as plain

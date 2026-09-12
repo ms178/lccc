@@ -174,7 +174,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_n = reg_num(&dst.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 self.emit_evex_ccmp_rm(w, &dst.name, mem, dfv, scc, pp)?;
                 let opc = if is_test {
                     if size == 1 { 0x84 } else { 0x85 }
@@ -188,7 +187,6 @@ impl super::InstructionEncoder {
             }
             (Operand::Register(src), Operand::Memory(mem)) => {
                 let src_n = reg_num(&src.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 self.emit_evex_ccmp_rm(w, &src.name, mem, dfv, scc, pp)?;
                 let opc = if is_test {
                     if size == 1 { 0x84 } else { 0x85 }
@@ -231,7 +229,6 @@ impl super::InstructionEncoder {
                 if !is_test {
                     Self::check_imm32s_q("ccmp", size, val)?;
                 }
-                self.emit_segment_prefix(mem)?;
                 self.emit_evex_ccmp_rm(w, "", mem, dfv, scc, pp)?;
                 if is_test {
                     self.bytes.push(if size == 1 { 0xF6 } else { 0xF7 });
@@ -287,14 +284,12 @@ impl super::InstructionEncoder {
             }
             [Operand::Memory(mem), Operand::Register(dst)] => {
                 let dst_n = reg_num(&dst.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 self.emit_apx_evex_rm(size, &dst.name, mem, None, false)?;
                 self.bytes.push(0x40 + cc);
                 self.encode_modrm_mem(dst_n, mem)
             }
             [Operand::Register(src), Operand::Memory(mem)] => {
                 let src_n = reg_num(&src.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 self.emit_apx_evex_rm(size, &src.name, mem, None, true)?;
                 self.bytes.push(0x40 + cc);
                 self.encode_modrm_mem(src_n, mem)
@@ -317,7 +312,6 @@ impl super::InstructionEncoder {
                 Operand::Register(ndd),
             ] => {
                 let src1_n = reg_num(&src1.name).ok_or("bad register")?;
-                self.emit_segment_prefix(mem)?;
                 self.emit_apx_evex_rm(size, &src1.name, mem, Some(&ndd.name), true)?;
                 self.bytes.push(0x40 + cc);
                 self.encode_modrm_mem(src1_n, mem)
@@ -362,7 +356,6 @@ impl super::InstructionEncoder {
                 Self::check_imm32s_q("imulzu", size, *v)?;
                 let dst_n = reg_num(&d.name).ok_or("bad register")?;
                 let short = fits_imm8(*v, size);
-                self.emit_segment_prefix(mem)?;
                 self.emit_apx_evex_rm_nd1(size, &d.name, mem, nf)?;
                 let rc = self.relocations.len();
                 self.bytes.push(if short { 0x6B } else { 0x69 });

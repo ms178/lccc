@@ -3082,7 +3082,6 @@ impl super::InstructionEncoder {
                 }
                 (Operand::Memory(mem), Operand::Register(dst)) => {
                     let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                    self.emit_segment_prefix(mem)?;
                     self.emit_apx_evex_vvvv_rm(
                         w != 0,
                         &dst.name,
@@ -3349,7 +3348,6 @@ impl super::InstructionEncoder {
                     Ok(())
                 }
                 Operand::Memory(mem) => {
-                    self.emit_segment_prefix(mem)?;
                     self.emit_apx_evex_vvvv_rm(w != 0, "", mem, &dst.name, self.apx_nf, 0, 2)?;
                     self.bytes.push(0xF3);
                     self.encode_modrm_mem(ext, mem)
@@ -3414,7 +3412,6 @@ impl super::InstructionEncoder {
                 }
                 (Operand::Memory(mem), Operand::Register(dst)) => {
                     let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                    self.emit_segment_prefix(mem)?;
                     self.emit_apx_evex_vvvv_rm(
                         w != 0,
                         &dst.name,
@@ -3488,7 +3485,6 @@ impl super::InstructionEncoder {
                 }
                 (Operand::Memory(mem), Operand::Register(dst)) => {
                     let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                    self.emit_segment_prefix(mem)?;
                     self.emit_apx_evex_vvvv_rm(w != 0, &dst.name, mem, "rax", false, 3, 3)?;
                     self.bytes.push(0xF0);
                     let rc = self.relocations.len();

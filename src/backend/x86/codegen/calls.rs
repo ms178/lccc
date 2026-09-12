@@ -1142,6 +1142,21 @@ impl X86Codegen {
                 self.emit_retpoline_call("r10");
             }
         }
+        // Variadic-call marker (same authority contract as the
+        // `# LCCC_RET_*` prologue markers): a variadic callee reads %rax
+        // (the live SSE register count in %al — SysV AMD64 3.5.7); a
+        // prototyped non-variadic callee reads NOTHING from the
+        // accumulator. The late text peephole's GP liveness oracle cannot
+        // see the callee's signature, so it conservatively read %rax at
+        // EVERY call — pinning values in %rax across whole loops and
+        // blocking the copy/extension folds (the gzip_crc32 harness kept
+        // `movzbl+movq+movb` chains live solely on this false read). The
+        // marker lands immediately after the call text (before any
+        // subsequent emission), and absent marker ⇒ non-variadic ⇒ %rax
+        // unread.
+        if self.state.call_is_variadic {
+            self.state.emit("    # LCCC_VA_CALL");
+        }
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();

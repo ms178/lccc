@@ -186,6 +186,74 @@ impl InstructionEncoder {
 
         let result = self.encode_mnemonic(instr);
 
+        // ── Operand segment override, spliced ONCE at the single choke
+        // point. ───────────────────────────────────────────────────────────
+        //
+        // The historical per-arm `emit_segment_prefix` calls left the same
+        // open defect class as the 64-bit encoder (any arm that forgot the
+        // call silently dropped the override). Emission now lives HERE:
+        // after the body (so the x87 FWAIT byte 0x9B the body may have
+        // pushed stays ahead of it, GAS: `9b 26 67 d9 7f 08`), spliced in
+        // front of the 0x66/0x67 size overrides the body pushed, and after
+        // the group-1 (lock/rep) run this function pushed before the body.
+        // GNU as 2.44-verified positions:
+        //   `mov %es:8(%bx), %ax` (.code32) -> 26 67 66 8b 47 08
+        //   `fstcw %es:8(%bx)`    (.code32) -> 9b 26 67 d9 7f 08
+        // The i686 default-segment rule (GAS-parity: SS default for
+        // ebp/esp/bp-based forms, DS otherwise) drops redundant overrides
+        // (`mov %ds:8(%eax),%ebx` -> 8b 58 08).
+        //
+        // The splice happens BEFORE the .code16/.code32-addr16 fixups below
+        // so those passes see the complete legacy-prefix run and re-order
+        // it as a whole.
+        if result.is_ok() {
+            for op in &instr.operands {
+                let Operand::Memory(mem) = op else { continue };
+                let Some(seg) = &mem.segment else { continue };
+                let prefix = match seg.as_str() {
+                    "es" => 0x26u8,
+                    "cs" => 0x2E,
+                    "ss" => 0x36,
+                    "ds" => 0x3E,
+                    "fs" => 0x64,
+                    "gs" => 0x65,
+                    other => return Err(format!("unsupported segment override: %{}", other)),
+                };
+                let default = self::core::i686_default_segment(
+                    mem.base.as_ref().map(|reg| reg.name.as_str()),
+                    mem.index.as_ref().map(|reg| reg.name.as_str()),
+                );
+                if prefix == default {
+                    // Redundant override: GAS drops it.
+                    break;
+                }
+                // Insertion point: past the FWAIT byte (GAS keeps 0x9B ahead
+                // of every prefix: `9b 26 67 d9 7f 08`), then IN FRONT of
+                // the group-1 (lock/rep) run this function pushed before
+                // the body — GAS orders the segment override outermost
+                // (`65 f0 ff 00` for `lock incl %gs:(%eax)`, GNU as
+                // 2.44-verified) and in front of any 0x66/0x67 the body
+                // pushed (`26 67 66 8b 47 08`).
+                let mut at = start_len;
+                if self.bytes.get(at) == Some(&0x9B) {
+                    at += 1;
+                }
+                // A body that used the old per-arm emission left its own
+                // override in place: idempotence guard (defensive; all
+                // per-arm calls were removed).
+                if self.bytes.get(at) == Some(&prefix) {
+                    break;
+                }
+                self.bytes.insert(at, prefix);
+                for relocation in self.relocations.iter_mut() {
+                    if relocation.offset >= at as u64 {
+                        relocation.offset += 1;
+                    }
+                }
+                break;
+            }
+        }
+
         // `.code16`: invert the operand-size prefix.
         //
         // Every encoder below is written for 32-bit mode, where the default
