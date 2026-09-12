@@ -56,6 +56,10 @@ WORKLOADS = [
     # what the x86 boot path decompresses with, so it belongs in the golden set.
     ("zstd_count.c", "zstd_count"),
     ("fp_memfold_stencil5.c", "stencil5"),
+    # chacha20: the largest hot-function oracle gap (core 178 vs 63 insns).
+    # Tracked so the gap-closure project measures against a pinned floor and
+    # no change regresses it silently while the gap is open.
+    ("chacha20_block.c", "chacha20_block"),
 ]
 
 # Metric -> default max regression (fraction). A metric that got BETTER

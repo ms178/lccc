@@ -732,6 +732,17 @@ fn fold_phi_diamonds(
                         }
                     }
                 });
+                // Bare-Value positions (Store ptr, GEP base, ...) are not
+                // Operands: the phi is deleted below, so any naming it here
+                // must be rewritten too (same two-walk contract as
+                // loop_memset; the replacement is always a Value).
+                if let Operand::Value(replacement_val) = replacement {
+                    inst.for_each_value_use_mut(|v: &mut Value| {
+                        if v.0 == phi_dest.0 {
+                            *v = replacement_val;
+                        }
+                    });
+                }
                 if let Some(d) = inst.dest() {
                     if d.0 == phi_dest.0 {
                         // The phi itself is handled below; other redefs of

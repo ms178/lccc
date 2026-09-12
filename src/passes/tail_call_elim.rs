@@ -684,6 +684,10 @@ pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
         terminator: header_terminator,
         source_spans: header_source_spans,
     });
+    // The header label was minted above max-live; keep the counter ahead of
+    // it so later passes cannot collide (`.max()` never regresses a healthy
+    // already-ahead counter).
+    func.next_label = func.next_label.max(loop_header_label.0.saturating_add(1));
 
     tail_calls.len()
 }

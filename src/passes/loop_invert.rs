@@ -343,6 +343,15 @@ fn apply(func: &mut IrFunction, plan: &Plan) {
                 }
             }
         });
+        // Bare-Value positions (Load/Store ptr, GEP base, ...) are not
+        // Operands: without this walk a clone keeps naming the guard's
+        // definitions instead of its own fresh ones (separate-live-range
+        // violation). Same two-walk substitution contract as loop_memset.
+        c.for_each_value_use_mut(|v| {
+            if let Some(&n) = remap.get(&v.0) {
+                *v = Value(n);
+            }
+        });
         if let Some(d) = c.dest() {
             let fresh = next_id;
             next_id += 1;

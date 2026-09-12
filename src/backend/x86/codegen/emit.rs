@@ -1914,6 +1914,11 @@ impl X86Codegen {
     }
 
     /// Handles constants, register-allocated values, and stack values.
+    ///
+    /// MIRROR WARNING: `fused_madd_acc_stages_without_rax` (alu.rs) mirrors
+    /// every arm's %rax behavior ("stages without writing %rax") by hand —
+    /// any new %rax-relaying staging shape added here must update that
+    /// predicate the same day, or the fused madd silently miscompiles.
     pub(super) fn operand_to_callee_reg(&mut self, op: &Operand, target: PhysReg) {
         // Staging-write accounting (SOUNDNESS, see note_staging_target): this
         // call writes `target` with the operand's content. Registering the
@@ -2095,12 +2100,29 @@ impl X86Codegen {
                         .emit_instr_reg_reg("    movq", "rax", target_name);
                 } else {
                     // Value not in any register, stack slot, or accumulator cache.
-                    // Fall back to loading via the accumulator path instead of
-                    // silently zeroing the register.
-                    self.operand_to_rax(op);
-                    self.state
-                        .out
-                        .emit_instr_reg_reg("    movq", "rax", target_name);
+                    // A rematerialisable GlobalAddr stages straight into
+                    // @target (`leaq sym,%target`, GOT/TLS/absolute-aware):
+                    // the %rax relay below wastes a move and — worse —
+                    // clobbers %rax for callers with live content there (the
+                    // fused integer madd holds the product in %rax across
+                    // acc staging; torture strlen-4). The direct form must
+                    // not target %rax itself (value_to_reg leaves the
+                    // acc-cache untouched, which would strand a stale
+                    // entry); every other homeless value still relays
+                    // through the accumulator path (which fails loudly if
+                    // genuinely unmaterialisable).
+                    let direct_global_addr = target_name != "rax"
+                        && self.get_defining_instruction(v.0).is_some_and(|inst| {
+                            matches!(inst, crate::ir::reexports::Instruction::GlobalAddr { .. })
+                        });
+                    if direct_global_addr {
+                        self.value_to_reg(v, target_name);
+                    } else {
+                        self.operand_to_rax(op);
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", "rax", target_name);
+                    }
                 }
             }
         }
@@ -4596,15 +4618,37 @@ impl X86Codegen {
             // no-op.
             let amount = (imm as i64).rem_euclid(width);
             if amount != 0 {
-                self.state
-                    .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, dest_typed));
-                if width == 32 {
-                    // A rotate can move any bit into bit 31, so a signed I32
-                    // result needs the same upper-half normalization a signed
-                    // `shl` does. No-op for the unsigned types rotate idioms
-                    // actually use. Sub-word results keep their zero-extended
-                    // homes: `rolw`/`rolb` only write the low bits.
-                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                if self.bmi2_enabled && super::isel::rorx_allowed() && (width == 32 || width == 64)
+                {
+                    // Prefer BMI2 rorx: non-destructive, flag-preserving.
+                    let ror_amount = match op {
+                        IrBinOp::RotateLeft => (width - amount) % width,
+                        IrBinOp::RotateRight => amount,
+                        _ => amount,
+                    };
+                    // amount != 0 above proves ror_amount != 0 (and a
+                    // hypothetical 0 is still a correct no-op: `rorx $0`
+                    // is the identity on the already-moved value).
+                    debug_assert!(ror_amount != 0);
+                    let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, %{}, %{}",
+                        ror_mnem, ror_amount, dest_typed, dest_typed
+                    ));
+                    if width == 32 {
+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                    }
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, dest_typed));
+                    if width == 32 {
+                        // A rotate can move any bit into bit 31, so a signed I32
+                        // result needs the same upper-half normalization a signed
+                        // `shl` does. No-op for the unsigned types rotate idioms
+                        // actually use. Sub-word results keep their zero-extended
+                        // homes: `rolw`/`rolb` only write the low bits.
+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                    }
                 }
             }
             self.state.reg_cache.invalidate_acc();

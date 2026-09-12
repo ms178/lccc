@@ -809,6 +809,26 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             ));
         }
 
+        MachInst::Rorx {
+            amount,
+            src,
+            dst,
+            size,
+        } => {
+            let mnem = match size {
+                OpSize::S32 => "rorxl",
+                OpSize::S64 => "rorxq",
+                _ => unreachable!("rorx only for S32/S64"),
+            };
+            out.emit_fmt(format_args!(
+                "    {} ${}, {}, {}",
+                mnem,
+                amount,
+                fmt_reg(src, *size),
+                fmt_reg(dst, *size)
+            ));
+        }
+
         MachInst::Lea {
             base,
             index,

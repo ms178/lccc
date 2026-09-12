@@ -242,12 +242,13 @@ fn scan(func: &IrFunction) -> Scan {
                             s.escapes.insert(v.0);
                         }
                     });
-                    if let Instruction::Intrinsic {
-                        dest_ptr: Some(p), ..
-                    } = other
-                    {
-                        s.escapes.insert(p.0);
-                    }
+                    // Bare-Value positions (va_list ptrs, StackRestore,
+                    // InlineAsm outputs, ...) escape too; the exhaustive
+                    // walker covers them all (a manual Intrinsic-only check
+                    // missed the rest, understating escapes).
+                    esc.for_each_value_use_mut(|v| {
+                        s.escapes.insert(v.0);
+                    });
                 }
             }
         }
@@ -1037,25 +1038,13 @@ fn run_function(func: &mut IrFunction) -> usize {
                         referenced.insert(v.0);
                     }
                 });
-                // Pointer fields are not Operands, so collect them explicitly.
-                match inst {
-                    Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
-                        referenced.insert(ptr.0);
-                    }
-                    Instruction::GetElementPtr { base, .. } => {
-                        referenced.insert(base.0);
-                    }
-                    Instruction::Memcpy { dest, src, .. } => {
-                        referenced.insert(dest.0);
-                        referenced.insert(src.0);
-                    }
-                    Instruction::Intrinsic {
-                        dest_ptr: Some(p), ..
-                    } => {
-                        referenced.insert(p.0);
-                    }
-                    _ => {}
-                }
+                // Pointer fields are not Operands: collect them with the
+                // exhaustive walker (Load/Store ptr, GEP base, Memcpy,
+                // Intrinsic dest_ptr, va_list, ...) so a use in any of them
+                // keeps the alloca alive.
+                probe.for_each_value_use_mut(|v| {
+                    referenced.insert(v.0);
+                });
             }
             if let crate::ir::reexports::Terminator::Return(Some(Operand::Value(v))) =
                 &block.terminator

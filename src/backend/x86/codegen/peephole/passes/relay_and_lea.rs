@@ -247,6 +247,65 @@ fn implicit_at_return(fam: RegId) -> bool {
     matches!(fam, 0 | 2)
 }
 
+/// `true` when `fam` is caller-saved under SysV (`%rax/%rcx/%rdx/%rsi/
+/// %rdi/%r8-%r11`): no `ret` must-restore obligation, calls clobber it
+/// anyway. Only for such families can whole-function textual uniqueness
+/// justify a NEW write (Guard 1 below): a callee-saved source is owed its
+/// entry value at every `ret`, an obligation no text scan can see.
+#[inline]
+fn is_caller_saved_family(fam: RegId) -> bool {
+    matches!(fam, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10 | 11)
+}
+
+/// `true` when line `idx` may sit inside a loop: some control edge from
+/// after `idx` targets `idx` or an earlier line, so the copy re-executes.
+/// Textual and deliberately conservative: an unresolvable function shape or
+/// any indirect jump (`jmp *...`, e.g. a jump table or tail call) answers
+/// `true`, direct jumps to labels outside the function are ignored (a tail
+/// call never re-executes `idx`).
+fn copy_in_loop(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool {
+    let Some((start, end)) = function_range(store, infos, idx) else {
+        return true;
+    };
+    // Label map mirrors FileLiveness::analyse_function: label text carries
+    // the trailing colon, jump targets do not.
+    let mut labels: Vec<(&str, usize)> = Vec::new();
+    for n in start..end {
+        if infos[n].is_nop() || infos[n].kind != LineKind::Label {
+            continue;
+        }
+        if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
+            labels.push((name, n));
+        }
+    }
+    let resolve = |name: &str| -> Option<usize> {
+        labels.iter().find(|(l, _)| *l == name).map(|&(_, pos)| pos)
+    };
+    for q in idx + 1..end {
+        match infos[q].kind {
+            LineKind::Jmp | LineKind::CondJmp => {
+                let t = infos[q].trimmed(store.get(q));
+                let Some(target) = t.split_whitespace().nth(1) else {
+                    continue;
+                };
+                // A misclassified indirect target fails closed (FileLiveness
+                // declines the whole function on these).
+                if target.starts_with('*') {
+                    return true;
+                }
+                if let Some(pos) = resolve(target)
+                    && pos <= idx
+                {
+                    return true;
+                }
+            }
+            LineKind::JmpIndirect => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Proof 2: inside the enclosing function, `fam` is mentioned ONLY by the
 /// lines in `owned` (the ones the caller rewrites or deletes), and no
 /// instruction reads the family implicitly.
@@ -2069,8 +2128,27 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
         };
         let orig_cons = store.get(j).to_string();
         // The consumer's write unconditionally clobbers the source family,
-        // so the source's OLD value must be dead at the copy.
-        if !provably_dead_lv(&lv, store, infos, li, s_fam, &[li]) {
+        // so the source's OLD value must be dead at the copy: dataflow
+        // (loop-aware, RET_LIVE-aware) or barrier-conservative block-local
+        // reasoning. Whole-function textual uniqueness additionally justifies
+        // the NEW write to %S ONLY for caller-saved %S outside loops: (a) in
+        // a loop the copy re-executes and iteration N+1 rereads %S even
+        // though %S is mentioned only at the copy (torture
+        // execute/builtin-bitops-1.c: `movq %rdi,%r9; andq %r8,%r9` with
+        // loop-invariant %rdi folded into `andq %r8,%rdi`, corrupting every
+        // iteration past the first); (b) a callee-saved %S is owed its entry
+        // value at every `ret`, an obligation no text scan can see.
+        // Invisible back-edges (a libc longjmp landing above the copy) need
+        // no extra arm: they ride on `call`, calls clobber caller-saved %S
+        // and force a mentioning redefinition between the call and the copy,
+        // which already fails uniqueness — the textual loop scan is complete
+        // for caller-saved sources.
+        if !(matches!(lv.live_after(li, s_fam), Some(false))
+            || dead_in_block_after(store, infos, li + 1, s_fam)
+            || (is_caller_saved_family(s_fam)
+                && !copy_in_loop(store, infos, li)
+                && family_private_to(store, infos, li, s_fam, &[li])))
+        {
             continue;
         }
         // --- rename window: plain-register reads of %D until the first full
@@ -2449,6 +2527,32 @@ mod tests {
     }
 
     #[test]
+    fn rmw_coalesce_refuses_loop_carried_source() {
+        // Torture builtin-bitops-1: the copy sits in a loop with a
+        // loop-invariant source (%rdi mentioned only here). Coalescing
+        // would retarget the consumer into %rdi, so iteration N+1 reads
+        // iteration N's result instead of the invariant.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB2:\n",
+            "    movq %rdi, %r9\n",
+            "    andq %r8, %r9\n",
+            "    testq %r9, %r9\n",
+            "    cmovneq %r11, %rdx\n",
+            "    addq $1, %rsi\n",
+            "    cmpq $64, %rsi\n",
+            "    jl .LBB2\n",
+            "    movq %rdx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movq %rdi, %r9"), "{out}");
+        assert!(out.contains("andq %r8, %r9"), "{out}");
+        assert!(!out.contains("andq %r8, %rdi"), "{out}");
+    }
+
+    #[test]
     fn rmw_coalesce_refuses_movl_shlq64_count_masking() {
         // Silicon shifts by `imm & 63`: `$64` shifts by ZERO (a no-op), so
         // unfolded `%r9` is zero-extended while folded `%r8` is not. A naive
@@ -2662,10 +2766,36 @@ mod tests {
     fn rmw_coalesce_folds_movl_shlq32_before_call() {
         // Calls kill flag knowledge (LLVM parity: the callee observes
         // scratch flags), so the divergent CF is dead at the `call` and the
-        // pair folds. The source is callee-saved (transparent to the call:
-        // preserved and unread after, hence dead); an argument-register or
-        // static-chain (`%r10`) source would stay live into the call and
-        // refuse on the value proof instead — see the next test.
+        // pair folds. The push/pop spill makes the snippet ABI-valid: dataflow
+        // proves %ebx dead after the copy (the pop kills it, nothing rereads
+        // it) even though uniqueness must refuse callee-saved sources (see
+        // the next test). An argument-register or static-chain (`%r10`)
+        // source would stay live into the call and refuse on the value proof
+        // instead.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    movl %ebx, %r11d\n",
+            "    shlq $32, %r11\n",
+            "    movq %r11, %rdi\n",
+            "    call bar\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movl %ebx"), "{out}");
+        assert!(out.contains("shlq $32, %rbx"), "{out}");
+        assert!(out.contains("movq %rbx, %rdi"), "{out}");
+        assert!(out.contains("call bar"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_callee_saved_source_without_spill() {
+        // %ebx is owed its entry value at `ret` (RET_LIVE must-restore), an
+        // obligation no text scan can see: whole-function uniqueness must not
+        // justify the new write even though %ebx is mentioned only at the
+        // copy. (The pre-fix test above folded this exact shape.)
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -2676,10 +2806,9 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(!out.contains("movl %ebx"), "{out}");
-        assert!(out.contains("shlq $32, %rbx"), "{out}");
-        assert!(out.contains("movq %rbx, %rdi"), "{out}");
-        assert!(out.contains("call bar"), "{out}");
+        assert!(out.contains("movl %ebx, %r11d"), "{out}");
+        assert!(out.contains("shlq $32, %r11"), "{out}");
+        assert!(!out.contains("shlq $32, %rbx"), "{out}");
     }
 
     #[test]

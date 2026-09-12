@@ -15451,21 +15451,15 @@ fn rewrite_value_use(inst: &mut Instruction, old: Value, new: Value) {
             *op = Operand::Value(new);
         }
     });
-    // Operand-shaped fields are covered above; the pointer-like fields that
-    // hold a bare `Value` are not.
-    match inst {
-        Instruction::Load { ptr, .. } => {
-            if *ptr == old {
-                *ptr = new;
-            }
+    // Pointer-like fields holding a bare `Value` (Store/Load ptr, GEP base,
+    // Memcpy, va_list, ...) are not Operands; the exhaustive walker covers
+    // them all (a hand-rolled Load/GEP-only match left Store-ptr and other
+    // positions naming the pre-rewrite value).
+    inst.for_each_value_use_mut(|v| {
+        if *v == old {
+            *v = new;
         }
-        Instruction::GetElementPtr { base, .. } => {
-            if *base == old {
-                *base = new;
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
 fn terminator_uses_value(term: &Terminator, v: Value) -> bool {

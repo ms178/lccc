@@ -876,6 +876,12 @@ fn build_outlined_function(
 
     let return_type = if has_exits { IrType::I32 } else { IrType::Void };
 
+    // The outlined blocks carry labels from the module-wide counter, so the
+    // new function must inherit a counter ahead of them — `0` would hand any
+    // later pass colliding labels (documented invariant on
+    // `IrFunction::next_label`: every live label is < next_label).
+    let outlined_next_label = outlined_blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1;
+
     IrFunction {
         name: name.to_string(),
         return_type,
@@ -889,7 +895,7 @@ fn build_outlined_function(
         is_noinline: true, // Do NOT inline back — that defeats the purpose
         next_value_id,
         fp_expr_tags: Default::default(),
-        next_label: 0,
+        next_label: outlined_next_label,
         section: func.section.clone(),
         visibility: None,
         is_weak: false,

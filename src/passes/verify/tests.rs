@@ -25,6 +25,11 @@ fn func_of(blocks: Vec<BasicBlock>) -> IrFunction {
     }
     f.blocks = blocks;
     f.next_value_id = max + 1;
+    // Well-formed IR honors the documented `next_label` invariant (every
+    // live label < next_label); fixtures must too, or the counter-health
+    // check fires on every test.
+    let max_label = f.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    f.next_label = max_label + 1;
     f
 }
 
@@ -673,5 +678,31 @@ fn a_read_write_asm_output_naming_an_alloca_is_a_memory_home_not_a_redefinition(
         ],
         Terminator::Return(Some(Operand::Value(Value(3)))),
     )]);
+    assert_clean(&f);
+}
+
+#[test]
+fn stale_label_counter_is_reported() {
+    // strcmp-1: loop_unroll minted blocks without writing back `next_label`,
+    // so a later pass (loop_memset) re-minted a live label, duplicating
+    // BlockId(50) and detaching the memset guard chain. The duplicate-label
+    // check blames the later pass; the counter-health check names the pass
+    // that actually broke the invariant.
+    let mut f = func_of(vec![
+        blk(0, vec![], Terminator::Branch(BlockId(7))),
+        blk(7, vec![], Terminator::Return(None)),
+    ]);
+    // func_of establishes a healthy counter; stale it deliberately.
+    f.next_label = 7;
+    assert_reports(&f, "stale label counter");
+}
+
+#[test]
+fn healthy_label_counter_is_clean() {
+    let f = func_of(vec![
+        blk(0, vec![], Terminator::Branch(BlockId(7))),
+        blk(7, vec![], Terminator::Return(None)),
+    ]);
+    assert_eq!(f.next_label, 8);
     assert_clean(&f);
 }
