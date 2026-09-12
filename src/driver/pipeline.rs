@@ -1723,13 +1723,34 @@ impl Driver {
                     }
                 }
             }
+            // P0-A global location allocation: cross-block Belady-MIN
+            // spill gaps, immutable capture slots with reload-at-next-use,
+            // and source-less rematerialization, all behind the A/B gate
+            // `CCC_RA_GLOBAL_LOCATION=1`. This is the cross-block successor
+            // of the intra-block RA-06 splitter below; when it runs it
+            // subsumes the intra-block pass for the same function (double
+            // splitting would pay for both stores).
+            let mut global_location_split = false;
+            if crate::backend::location_alloc::gate_enabled() {
+                let gmax = crate::backend::location_alloc::max_splits_from_env();
+                for func in &mut module.functions {
+                    if !func.is_declaration && !func.blocks.is_empty() {
+                        let n = crate::backend::location_alloc::run(func, gmax, self.opt_level);
+                        if n > 0 {
+                            did_split = true;
+                            global_location_split = true;
+                        }
+                    }
+                }
+            }
             // RA-06: pressure-driven reload-at-next-use. Unlike the call
             // splitter above, this targets CALL-FREE high-pressure blocks —
             // the shape the measurement showed the call splitter can never
             // reach (`CCC_SPLIT_MAX=200` moved exactly zero counters on the
             // benchmark corpus because the loops that spill contain no
-            // calls). Opt-in until the A/B census says otherwise.
-            if std::env::var("CCC_PRESSURE_SPLIT").is_ok() {
+            // calls). Opt-in until the A/B census says otherwise. Skipped
+            // when the global location allocator already split a function.
+            if std::env::var("CCC_PRESSURE_SPLIT").is_ok() && !global_location_split {
                 let pmax = std::env::var("CCC_PRESSURE_SPLIT_MAX")
                     .ok()
                     .and_then(|s| s.parse().ok())
@@ -1779,7 +1800,11 @@ impl Driver {
             crate::passes::validate_unique_defs(&module, "backend:pre-eliminate_phis");
         }
         let t7 = std::time::Instant::now();
-        eliminate_phis(&mut module);
+        // i686's 6-free-GPR economy cannot hold the back-edge-spanning
+        // ranges the cycle-accurate phi resolver creates; it defaults to
+        // the legacy resolver (measured -7.4% sha256_transform if forced).
+        let narrow_gprs = self.target.ptr_size() == 4;
+        eliminate_phis(&mut module, narrow_gprs);
         if std::env::var("CCC_DUMP_IR_PHI").is_ok() {
             eprintln!("==== IR after eliminate_phis ====");
             eprintln!("{:#?}", module);

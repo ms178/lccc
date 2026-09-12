@@ -94,7 +94,7 @@ fn set_dominates(sets: &[FxHashSet<usize>], a: usize, b: usize) -> bool {
     sets.get(a).is_some_and(|s| s.contains(&b))
 }
 
-fn split_debug_enabled() -> bool {
+pub(crate) fn split_debug_enabled() -> bool {
     static FLAG: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_SPLIT").is_some());
     *FLAG
@@ -102,7 +102,7 @@ fn split_debug_enabled() -> bool {
 
 /// Insert `inst` at `idx`, keeping `source_spans` 1:1 when it already was.
 /// Never `clear()`s the span vector (that wiped DWARF for the whole block).
-fn insert_instruction(block: &mut BasicBlock, idx: usize, inst: Instruction) {
+pub(crate) fn insert_instruction(block: &mut BasicBlock, idx: usize, inst: Instruction) {
     let n_inst = block.instructions.len();
     let n_span = block.source_spans.len();
     let idx = idx.min(n_inst);
@@ -114,7 +114,7 @@ fn insert_instruction(block: &mut BasicBlock, idx: usize, inst: Instruction) {
     }
 }
 
-fn first_non_alloca(block: &BasicBlock) -> usize {
+pub(crate) fn first_non_alloca(block: &BasicBlock) -> usize {
     block
         .instructions
         .iter()
@@ -122,7 +122,7 @@ fn first_non_alloca(block: &BasicBlock) -> usize {
         .unwrap_or(block.instructions.len())
 }
 
-fn first_non_phi(block: &BasicBlock) -> usize {
+pub(crate) fn first_non_phi(block: &BasicBlock) -> usize {
     block
         .instructions
         .iter()
@@ -130,7 +130,7 @@ fn first_non_phi(block: &BasicBlock) -> usize {
         .unwrap_or(block.instructions.len())
 }
 
-fn abi_align(ty: IrType) -> usize {
+pub(crate) fn abi_align(ty: IrType) -> usize {
     match ty.size() {
         0 => 1,
         1 => 1,
@@ -140,11 +140,11 @@ fn abi_align(ty: IrType) -> usize {
     }
 }
 
-fn is_simple_gpr_type(ty: IrType) -> bool {
+pub(crate) fn is_simple_gpr_type(ty: IrType) -> bool {
     !ty.is_float() && !ty.is_long_double() && !ty.is_128bit()
 }
 
-fn next_value(next_val: &mut u32) -> Option<Value> {
+pub(crate) fn next_value(next_val: &mut u32) -> Option<Value> {
     let id = *next_val;
     if id == u32::MAX {
         return None;
@@ -155,7 +155,7 @@ fn next_value(next_val: &mut u32) -> Option<Value> {
 
 // ── Use / type / replace ─────────────────────────────────────────────────────
 
-fn instruction_uses_value(inst: &Instruction, vid: u32) -> bool {
+pub(crate) fn instruction_uses_value(inst: &Instruction, vid: u32) -> bool {
     let mut hit = false;
     super::liveness::for_each_operand_in_instruction(inst, |op| {
         if matches!(op, Operand::Value(v) if v.0 == vid) {
@@ -173,7 +173,7 @@ fn instruction_uses_value(inst: &Instruction, vid: u32) -> bool {
     hit
 }
 
-fn terminator_uses_value(term: &Terminator, vid: u32) -> bool {
+pub(crate) fn terminator_uses_value(term: &Terminator, vid: u32) -> bool {
     let mut hit = false;
     super::liveness::for_each_operand_in_terminator(term, |op| {
         if matches!(op, Operand::Value(v) if v.0 == vid) {
@@ -200,7 +200,11 @@ fn rewrite_value(v: &mut Value, map: &FxHashMap<u32, u32>) {
 /// Rewrite every *use* of a mapped value. Destinations are left alone.
 /// Phi incoming is rewritten only when `rewrite_phi` is true — callers that
 /// just defined a replacement in *this* block must pass false (use-before-def).
-fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>, rewrite_phi: bool) {
+pub(crate) fn replace_values_in_inst(
+    inst: &mut Instruction,
+    map: &FxHashMap<u32, u32>,
+    rewrite_phi: bool,
+) {
     match inst {
         Instruction::Alloca { .. }
         | Instruction::PgoCounterInc { .. }
@@ -328,7 +332,7 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>, rew
     }
 }
 
-fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
+pub(crate) fn replace_values_in_terminator(term: &mut Terminator, map: &FxHashMap<u32, u32>) {
     match term {
         Terminator::Return(Some(op)) => rewrite_operand(op, map),
         Terminator::CondBranch { cond, .. } => rewrite_operand(cond, map),
@@ -378,7 +382,7 @@ fn inst_result_type(inst: &Instruction) -> Option<(u32, IrType)> {
 }
 
 /// Def-site types, then a bounded chase of `Copy dest, %src` / `Copy dest, const`.
-fn collect_value_types(func: &IrFunction) -> FxHashMap<u32, IrType> {
+pub(crate) fn collect_value_types(func: &IrFunction) -> FxHashMap<u32, IrType> {
     let mut types: FxHashMap<u32, IrType> = FxHashMap::default();
     let mut copies: Vec<(u32, u32)> = Vec::new();
     for block in &func.blocks {
@@ -417,7 +421,7 @@ fn find_value_type(func: &IrFunction, val_id: u32) -> Option<IrType> {
     collect_value_types(func).get(&val_id).copied()
 }
 
-fn is_explicit_call(inst: &Instruction) -> bool {
+pub(crate) fn is_explicit_call(inst: &Instruction) -> bool {
     matches!(
         inst,
         Instruction::Call { .. } | Instruction::CallIndirect { .. }
@@ -455,7 +459,7 @@ fn collect_alloca_ids(func: &IrFunction) -> FxHashSet<u32> {
     s
 }
 
-fn insert_entry_alloca(func: &mut IrFunction, dest: Value, ty: IrType, volatile: bool) {
+pub(crate) fn insert_entry_alloca(func: &mut IrFunction, dest: Value, ty: IrType, volatile: bool) {
     let inst = Instruction::Alloca {
         dest,
         ty,
@@ -914,13 +918,26 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         return None;
     }
 
-    let alloca_val = next_value(next_val)?;
-    insert_entry_alloca(func, alloca_val, ty, true);
-
     // Last call first so earlier indices stay valid.
     sites.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+    // The entry alloca is minted LAZILY at the first confirmed wrap. Minting
+    // it up front leaked it when every site was subsequently skipped: when
+    // the site block is the entry block, inserting the alloca shifts every
+    // site index by one, the call-like guards below then rejected all
+    // sites, `Some(0)` returned, and the alloca's id was never synced to
+    // `func.next_value_id` — a later pass minted colliding value ids.
+    let mut alloca_val: Option<Value> = None;
+    // Position the entry alloca will take; an insert there shifts site
+    // indices at or after it by one (only possible when site_block == 0).
+    let alloca_pos = first_non_alloca(&func.blocks[0]);
     let mut wrapped = 0usize;
-    for &(_, ci) in &sites {
+    for &(_, raw_ci) in &sites {
+        // A confirmed wrap in block 0 shifts all not-yet-visited indices by
+        // one as well. Earlier per-site inserts land at LARGER indices and
+        // therefore never move a smaller (pending) index.
+        let entry_shift = usize::from(alloca_val.is_some() && site_block == 0);
+        let ci = raw_ci + entry_shift;
         let block = &func.blocks[site_block];
         if ci >= block.instructions.len() {
             continue;
@@ -930,6 +947,20 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         {
             continue;
         }
+
+        // First confirmed wrap: mint and insert the entry alloca, then
+        // re-derive this site's index across the shift.
+        if alloca_val.is_none() {
+            let slot = next_value(next_val)?;
+            insert_entry_alloca(func, slot, ty, true);
+            alloca_val = Some(slot);
+        }
+        let alloca_val = alloca_val.unwrap();
+        let ci = if site_block == 0 && raw_ci >= alloca_pos {
+            raw_ci + 1
+        } else {
+            raw_ci
+        };
         let new_val = match next_value(next_val) {
             Some(v) => v,
             None => break,
@@ -971,7 +1002,12 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
         wrapped += 1;
     }
 
-    if split_debug_enabled() && wrapped > 0 {
+    if wrapped == 0 {
+        // No IR was mutated (the alloca is created lazily).
+        return None;
+    }
+
+    if split_debug_enabled() {
         eprintln!(
             "[SPLIT-CALL] func {} value {} wrapped {} call(s) in block {}",
             func.name, vid, wrapped, site_block
@@ -983,7 +1019,7 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
 /// Instructions that liveness treats as call points even when they are not
 /// `Call`/`CallIndirect`. Wrapping them is what makes the interval actually
 /// stop before the clobber (i128 div, F128 libcall, `rep movsb`, …).
-fn is_liveness_call_like(inst: &Instruction) -> bool {
+pub(crate) fn is_liveness_call_like(inst: &Instruction) -> bool {
     match inst {
         Instruction::Memcpy { .. }
         | Instruction::VaArg { .. }
@@ -1329,6 +1365,18 @@ mod tests {
         assert!(b.source_spans.is_empty());
     }
 
+    fn plain_call(dest: Option<Value>) -> Instruction {
+        Instruction::Call {
+            func: "clobber".to_string(),
+            info: CallInfo {
+                dest,
+                args: vec![],
+                return_type: IrType::I32,
+                ..CallInfo::default()
+            },
+        }
+    }
+
     #[test]
     fn local_call_split_rewrites_post_call_uses() {
         // v0 = 1+2; call(); v1 = v0+v0 ... (enough uses to pass the heuristic
@@ -1343,6 +1391,120 @@ mod tests {
         // the struct can be built; we also exercise the helper path that
         // does not need a real call.
         let _ = call_info;
+    }
+
+    /// Regression: a call site in the ENTRY block. The entry-alloca insert
+    /// shifts every subsequent index in block 0; the old code minted and
+    /// inserted the alloca before wrapping, then the shifted call-site
+    /// guards skipped every site. It returned `Some(0)` while the alloca
+    /// was already in the IR with an id never synced to `next_value_id`,
+    /// which made a later pass mint colliding value ids (duplicate defs).
+    #[test]
+    fn local_call_split_in_entry_block_does_not_leak_alloca() {
+        let mut func = IrFunction::new("entrycall".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![block(
+            0,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I32(1)),
+                    rhs: Operand::Const(IrConst::I32(2)),
+                    ty: IrType::I32,
+                },
+                plain_call(Some(Value(1))),
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(3)))),
+        )];
+        func.next_value_id = 4;
+
+        let mut next_val = func.next_value_id;
+        let n = apply_local_call_split(&mut func, 0, &mut next_val).expect("split applies");
+        assert_eq!(n, 1, "the one call must be wrapped");
+        func.next_value_id = next_val;
+
+        // Exactly one alloca, and every definition id stays unique and
+        // strictly below next_value_id.
+        let mut seen = FxHashSet::default();
+        for b in &func.blocks {
+            for i in &b.instructions {
+                if let Some(d) = i.dest() {
+                    assert!(
+                        d.0 < func.next_value_id,
+                        "id {} leaked past next_value_id {}",
+                        d.0,
+                        func.next_value_id
+                    );
+                    assert!(seen.insert(d.0), "duplicate definition of v{}", d.0);
+                }
+            }
+        }
+        let allocas = func.blocks[0]
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Alloca { .. }))
+            .count();
+        assert_eq!(allocas, 1, "one entry alloca, no leak");
+        // The store must precede the call and the reload follow it.
+        let b0: Vec<_> = func.blocks[0].instructions.iter().collect();
+        let store = b0
+            .iter()
+            .position(|i| matches!(i, Instruction::Store { .. }))
+            .expect("store");
+        let call = b0
+            .iter()
+            .position(|i| matches!(i, Instruction::Call { .. }))
+            .expect("call");
+        let load = b0
+            .iter()
+            .position(|i| matches!(i, Instruction::Load { .. }))
+            .expect("load");
+        assert!(
+            store < call && call < load,
+            "store/call/load ordering: {store},{call},{load}"
+        );
+    }
+
+    /// When the call list races empty (no wrappable site), the function
+    /// returns None with zero IR mutation and no minted ids.
+    #[test]
+    fn local_call_split_without_site_is_clean() {
+        let mut func = IrFunction::new("nocall".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![block(
+            0,
+            vec![Instruction::BinOp {
+                dest: Value(0),
+                op: IrBinOp::Add,
+                lhs: Operand::Const(IrConst::I32(1)),
+                rhs: Operand::Const(IrConst::I32(2)),
+                ty: IrType::I32,
+            }],
+            Terminator::Return(Some(Operand::Value(Value(0)))),
+        )];
+        func.next_value_id = 1;
+        let mut next_val = 1u32;
+        assert!(apply_local_call_split(&mut func, 0, &mut next_val).is_none());
+        assert_eq!(next_val, 1, "no ids minted on the clean-reject path");
+        assert!(
+            !func.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { .. }))
+        );
     }
 }
 
@@ -1430,7 +1592,7 @@ mod edge_layout_tests {
 /// block is genuinely over-subscribed, and a budget equal to the pool would
 /// churn on blocks that the colorer can already satisfy. Tunable through
 /// `CCC_PRESSURE_BUDGET` for A/B measurement.
-fn pressure_budget() -> usize {
+pub(crate) fn pressure_budget() -> usize {
     static B: OnceLock<usize> = OnceLock::new();
     *B.get_or_init(|| {
         if let Ok(v) = std::env::var("CCC_PRESSURE_BUDGET") {
@@ -1449,7 +1611,7 @@ fn pressure_budget() -> usize {
 /// Minimum number of instructions a split must span to be worth a
 /// store/reload pair. A short gap frees a register for too few cycles to pay
 /// for the two memory operations.
-fn pressure_min_gap() -> usize {
+pub(crate) fn pressure_min_gap() -> usize {
     static G: OnceLock<usize> = OnceLock::new();
     *G.get_or_init(|| {
         std::env::var("CCC_PRESSURE_MIN_GAP")

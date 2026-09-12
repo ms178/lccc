@@ -489,6 +489,331 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
 
 // ── Global dead store elimination for never-read stack slots ─────────────────
 
+/// Frame base register used by the frame operand in `line`: b'b' for `%rbp`,
+/// b's' for `%rsp`. `default` when no frame operand is present.
+fn frame_base(line: &str, default: u8) -> u8 {
+    if line.contains("(%rbp)") || line.contains("(%rbp,") {
+        b'b'
+    } else if line.contains("(%rsp)") || line.contains("(%rsp,") {
+        b's'
+    } else {
+        default
+    }
+}
+
+/// Effective byte range read by an SIB frame operand
+/// `disp(%base,%idx,scale)` when `%idx` is a structurally-recognised loop
+/// induction variable, or `None` when its bounds cannot be proven.
+///
+/// Shifted-displacement SIB operands are common in message-schedule /
+/// sliding-window kernels: `movl -24(%rsp,%r10,4),%edx` with `%r10` counting
+/// iterations 16..64 reads `[40+4*16-24, 40+4*64-24)` — the textual
+/// displacement `-24` is NOT a frame address by itself. A naive
+/// "from displacement upward" floor would either pin unrelated low home
+/// slots or miss the true (downward) reach. We recognize the codegen shape:
+///
+/// ```text
+/// preheader: movq $A,%rX           (xorl %rXd,%rXd == A=0)
+/// header:    cmpq $B,%rX ; j<cc> out
+/// body:      <SIB use>; ...; addq $step,%rX; cmpq $B,%rX; jl loop
+/// ```
+///
+/// and return `[disp + A*scale, disp + B*scale + width)`. Any unrecognized
+/// WRITE to the index family inside the loop body, or a missing constant
+/// init / upper bound, returns `None`; the caller then fails closed.
+fn sib_frame_read_range(
+    store: &LineStore,
+    infos: &[LineInfo],
+    use_idx: usize,
+    line: &str,
+    fm: FrameMem,
+) -> Option<(i32, i32)> {
+    // Parse "disp(%base,%idx,scale)".
+    let lp = line.find('(')?;
+    let rp = line[lp..].find(')')? + lp;
+    let inside = &line[lp + 1..rp];
+    let mut fields = inside.split(',');
+    let _base = fields.next()?;
+    let idx = fields.next()?.trim();
+    let scale: i32 = match fields.next().map(str::trim) {
+        None | Some("") => 1,
+        Some(s) => s.parse().ok()?,
+    };
+    let family = register_family_fast(idx);
+    if family as usize > 15 {
+        return None;
+    }
+
+    // Access width: an UPPER bound on the bytes read. An under-estimate here
+    // could leave an aliased store deletable, so the suffix table only
+    // accepts mnemonics whose suffix truthfully gives the memory width.
+    let mnem = line.split_whitespace().next()?;
+    // x87 suffixes do NOT follow the GP convention (`fmull` reads an 8-byte
+    // double, not 4; `fstpt` a 10-byte tbyte) and bit-string ops reach
+    // beyond the operand word (`bts $bit,m32` accesses m32 + bit/32 word);
+    // neither is ever emitted into a frame-SIB operand — refuse.
+    let mnem_body = mnem.trim_start_matches('v');
+    if mnem_body.starts_with('f')
+        // bt/bts/btr/btc (incl. their l/q suffix spellings) address a
+        // bitstring that may extend into the next operand word; state
+        // saves/restores write/read areas far wider than any suffix says.
+        || mnem_body.starts_with("bt")
+        || mnem_body.starts_with("xsave")
+        || mnem_body.starts_with("xrstor")
+    {
+        return None;
+    }
+    let width: i32 = match mnem_body {
+        m if m.ends_with("b") && !m.starts_with("bt") => 1,
+        m if m.ends_with("w") => 2,
+        m if m.ends_with("l") => 4,
+        m if m.ends_with("q") => 8,
+        // Packed vector forms: widen by the widest vector register named;
+        // an over-estimate only enlarges the protected read range.
+        _ if line.contains("%zmm") => 64,
+        _ if line.contains("%ymm") => 32,
+        _ if line.contains("%xmm") => 16,
+        _ => return None,
+    };
+
+    // Enclosing basic block.
+    let mut block_start = use_idx;
+    while block_start > 0 && !matches!(infos[block_start - 1].kind, LineKind::Label) {
+        block_start -= 1;
+    }
+    let mut block_end = use_idx + 1;
+    while block_end < infos.len() && !matches!(infos[block_end].kind, LineKind::Label) {
+        block_end += 1;
+    }
+
+    // Label line indices for deciding whether a conditional jump is a
+    // back-edge (continue predicate) or a forward exit guard.
+    let mut label_pos: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (li, info) in infos.iter().enumerate() {
+        if matches!(info.kind, LineKind::Label) {
+            let t = info.trimmed(store.get(li));
+            label_pos.entry(t.trim_end_matches(':')).or_insert(li);
+        }
+    }
+
+    /// Parse `$N` (decimal or 0x hex) into a positive i64.
+    fn pos_imm(s: &str) -> Option<i64> {
+        let s = s.trim();
+        let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            i64::from_str_radix(h, 16).ok()?
+        } else {
+            s.parse::<i64>().ok()?
+        };
+        (v >= 1).then_some(v)
+    }
+
+    let mut upper: Option<i32> = None;
+    for k in block_start..block_end {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let t = infos[k].trimmed(store.get(k));
+        // A write to the index family inside the loop body: only a
+        // monotonically POSITIVE CONSTANT induction step is legal. cmp/test
+        // READ operands even though the compared register is the last
+        // textual operand; anything else (mov from a variable, variable
+        // stride, mul, …) makes the index range unprovable.
+        let is_compare = t.starts_with("cmp") || t.starts_with("test");
+        let dest = if is_compare {
+            REG_NONE
+        } else {
+            parse_dest_reg_fast(t)
+        };
+        if dest == family {
+            let mut legal_step = t.starts_with("incq") || t.starts_with("incl");
+            if !legal_step {
+                for pre in ["addq $", "addl $"] {
+                    if let Some(rest) = t.strip_prefix(pre) {
+                        let (imm_str, dst) = rest.split_once(',')?;
+                        if register_family_fast(dst.trim()) == family {
+                            legal_step = pos_imm(imm_str).is_some();
+                        }
+                        break;
+                    }
+                }
+            }
+            // A self-lea `leaq N(%rX),%rX` or the scale strides
+            // `leaq (%rX,%rX,S),%rX` / `leaq N(%rX,%rX,S),%rX` with a
+            // positive constant N (S defaults to 1 when omitted). Any other
+            // index register makes the stride variable — refuse.
+            if !legal_step && t.starts_with("leaq ") {
+                let rest = t.strip_prefix("leaq ").unwrap_or("");
+                if let Some((mem, dst)) = rest.split_once(',') {
+                    if register_family_fast(dst.trim()) == family {
+                        let open = mem.find('(')?;
+                        let close = mem.rfind(')')?;
+                        let inside = &mem[open + 1..close];
+                        let mut comps = inside.split(',');
+                        let base = comps.next().unwrap_or("").trim();
+                        let stride_idx = comps.next().map(str::trim);
+                        let stride = if let Some(si) = stride_idx {
+                            if !si.is_empty() && si != idx {
+                                false
+                            } else {
+                                let sc = comps.next().map(str::trim).unwrap_or("1");
+                                sc.parse::<i64>().map(|v| v >= 1).unwrap_or(false)
+                                    && (si.is_empty() || si == idx)
+                            }
+                        } else {
+                            true
+                        };
+                        let disp_txt = mem[..open].trim();
+                        let disp = if disp_txt.is_empty() {
+                            Some(0i64)
+                        } else {
+                            if let Some(h) = disp_txt
+                                .strip_prefix("0x")
+                                .or_else(|| disp_txt.strip_prefix("0X"))
+                            {
+                                i64::from_str_radix(h, 16).ok()
+                            } else {
+                                disp_txt.parse::<i64>().ok()
+                            }
+                        };
+                        legal_step = stride
+                            && base == idx
+                            && disp.is_some_and(|d| d >= 0)
+                            && (stride_idx.is_some() || disp.unwrap() >= 1);
+                    }
+                }
+            }
+            if !legal_step {
+                return None;
+            }
+        }
+        // Loop test: cmpq $B,%rX / cmpl $B,%rXd, followed by a jcc.
+        if let Some(rest) = t
+            .strip_prefix("cmpq $")
+            .or_else(|| t.strip_prefix("cmpl $"))
+        {
+            let (imm_str, cmp_reg) = rest.split_once(',')?;
+            if register_family_fast(cmp_reg.trim()) == family {
+                let imm: i32 = imm_str.trim().parse().ok()?;
+                // Find the next non-nop conditional jump.
+                let mut j = k + 1;
+                while j < block_end && infos[j].is_nop() {
+                    j += 1;
+                }
+                let jt = if j < block_end {
+                    infos[j].trimmed(store.get(j))
+                } else {
+                    ""
+                };
+                let jcc = jt.split_whitespace().next().unwrap_or("");
+                // Back-edge (target at or before this block): the condition
+                // CONTINUES the loop. Forward guard: the condition EXITS.
+                let target = jt.split_whitespace().nth(1).unwrap_or("");
+                let target_pos = label_pos.get(target).copied();
+                let backward = target_pos.is_some_and(|p| p <= k);
+                // Exclusive upper B (in-loop values satisfy idx < B), or
+                // inclusive (idx <= B, hence B+1).
+                let b: Option<i32> = if backward {
+                    match jcc {
+                        "jl" | "jb" | "jne" | "jnz" => Some(imm),
+                        "jle" | "jbe" => Some(imm + 1),
+                        _ => None,
+                    }
+                } else {
+                    match jcc {
+                        "jge" | "jae" => Some(imm),
+                        "jg" | "ja" => Some(imm + 1),
+                        _ => None,
+                    }
+                };
+                let Some(b) = b else { return None };
+                upper = Some(upper.map_or(b, |u| u.max(b)));
+            }
+        }
+    }
+    let b = upper?;
+
+    // Constant init in the (recent) preheader: min A over matching constant
+    // inits within 80 lines before the block start (widest downward reach).
+    let win_start = block_start.saturating_sub(80);
+    let mut lower: Option<i32> = None;
+    for k in (win_start..block_start).rev() {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let t = infos[k].trimmed(store.get(k));
+        if parse_dest_reg_fast(t) != family {
+            continue;
+        }
+        let a = if t.starts_with("movq $") || t.starts_with("movl $") {
+            t.split(',').next().and_then(|p| {
+                p.trim()
+                    .trim_start_matches("movq $")
+                    .trim_start_matches("movl $")
+                    .parse::<i32>()
+                    .ok()
+            })
+        } else if t.starts_with("xorl ") || t.starts_with("xorq ") {
+            let ps: Vec<&str> = t.split(',').map(str::trim).collect();
+            (ps.len() == 2 && ps[0] == ps[1]).then_some(0)
+        } else {
+            None
+        };
+        if let Some(a) = a {
+            lower = Some(lower.map_or(a, |l| l.min(a)));
+        }
+    }
+    let a = lower?;
+
+    let lo = fm.disp + a * scale;
+    let hi = fm.disp + b * scale + width;
+    if hi <= lo {
+        return None;
+    }
+    Some((lo, hi - lo))
+}
+
+/// What an SIB frame reference conservatively observes.
+/// Returns `(base, off, len, is_floor)`: `is_floor` marks the unbounded
+/// `[off, +∞)` model (only safe for non-negative displacements — a negative
+/// textual displacement with an unbounded index can reach below the frame's
+/// home slots, and the caller must bail).
+fn sib_frame_observation(
+    store: &LineStore,
+    infos: &[LineInfo],
+    use_idx: usize,
+    line: &str,
+) -> Option<(u8, i32, i32, bool)> {
+    let fm = parse_frame_mem(line)?;
+    if !fm.sib {
+        return None;
+    }
+    if let Some((off, len)) = sib_frame_read_range(store, infos, use_idx, line, fm) {
+        return Some((fm.base, off, len, false));
+    }
+    if fm.disp >= 0 {
+        Some((fm.base, fm.disp, 0, true))
+    } else {
+        None
+    }
+}
+
+/// True if a store to `[offset, offset+store_bytes)` on `base` is observed by
+/// any collected read range or unbounded-upward read floor.
+fn slot_is_ever_read(
+    base: u8,
+    offset: i32,
+    store_bytes: i32,
+    read_ranges: &[(u8, i32, i32)],
+    read_floors: &[(u8, i32)],
+) -> bool {
+    read_ranges
+        .iter()
+        .any(|&(rb, ro, rs)| rb == base && ranges_overlap(offset, store_bytes, ro, rs))
+        || read_floors
+            .iter()
+            .any(|&(rb, d)| rb == base && offset + store_bytes > d)
+}
+
 pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
     let len = store.len();
     if len == 0 {
@@ -677,44 +1002,53 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         //
         // Pre-scan for escape events before collecting reads.
         let mut has_unparseable_indirect = false;
+        // Base-tagged frame reads and unbounded-upward "floors" (escaped
+        // addresses and SIB array accesses). Base: b'b' = %rbp, b's' = %rsp.
+        let mut read_ranges: Vec<(u8, i32, i32)> = Vec::new();
+        // A floor at displacement D conservatively observes every frame
+        // byte from D upward: an escaped `leaq D(%base)` pointer or an SIB
+        // operand `D(%base,%idx,scale)` names an array whose element
+        // addressing only extends upward (a negative index would be an
+        // out-of-bounds access of a DIFFERENT object — C UB — so codegen
+        // never relies on downward reach). Stores ending at or below D stay
+        // deletable; this is what distinguishes the home-slot spills at
+        // 16/32(%rsp) from a frame buffer based at 40(%rsp).
+        let mut read_floors: Vec<(u8, i32)> = Vec::new();
         for k in body_start..func_end {
             if infos[k].is_nop() {
                 continue;
             }
             let t = infos[k].trimmed(store.get(k));
-            // leaq of a frame slot = address taken.
-            if t.starts_with("leaq ")
-                && (t.contains("(%rsp)") || (rbp_is_frame && t.contains("(%rbp)")))
-            {
-                has_unparseable_indirect = true;
-                break;
-            }
-            // Raw %rsp value flowing into a register (movq %rsp, %reg etc.).
-            // Frame adjustments (subq/addq $N,%rsp; pushq/popq) and the
-            // FP prologue mov are not escapes.
-            if t.contains("%rsp")
-                && !t.contains("(%rsp)")
-                && !is_rsp_shift_line(t)
-                && t != "movq %rsp, %rbp"
-            {
-                has_unparseable_indirect = true;
-                break;
-            }
-            // Same for %rbp when it is the frame pointer.
-            if rbp_is_frame
-                && t.contains("%rbp")
-                && !t.contains("(%rbp)")
-                && t != "movq %rsp, %rbp"
-                && !matches!(
-                    infos[k].kind,
-                    LineKind::Push { reg: 5 } | LineKind::Pop { reg: 5 }
-                )
-            {
-                has_unparseable_indirect = true;
-                break;
+            // Only a RAW copy of the frame base value (movq %rsp, %reg with
+            // no memory operand) escapes the ENTIRE frame. A frame memory
+            // operand, plain or SIB, names a specific displacement and is
+            // handled with ranges/floors in the read scan below — the old
+            // text checks matched only "(%rsp)" and treated every SIB form
+            // (`40(%rsp,%r11,4)`) as a raw-base escape, bailing on the
+            // common "frame buffer + scalar home slots" layout (sha, chacha).
+            let frame_mem = parse_frame_mem(t);
+            if frame_mem.is_none() {
+                // Raw %rsp value flowing into a register (movq %rsp, %reg etc.).
+                // Frame adjustments (subq/addq $N,%rsp; pushq/popq) and the
+                // FP prologue mov are not escapes.
+                if t.contains("%rsp") && !is_rsp_shift_line(t) && t != "movq %rsp, %rbp" {
+                    has_unparseable_indirect = true;
+                    break;
+                }
+                // Same for %rbp when it is the frame pointer.
+                if rbp_is_frame
+                    && t.contains("%rbp")
+                    && t != "movq %rsp, %rbp"
+                    && !matches!(
+                        infos[k].kind,
+                        LineKind::Push { reg: 5 } | LineKind::Pop { reg: 5 }
+                    )
+                {
+                    has_unparseable_indirect = true;
+                    break;
+                }
             }
         }
-        let mut read_ranges: Vec<(i32, i32)> = Vec::new();
 
         for k in body_start..func_end {
             if infos[k].is_nop() {
@@ -772,33 +1106,53 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     }
                 }
                 LineKind::LoadRbp { offset, size, .. } => {
-                    if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
+                    let line = infos[k].trimmed(store.get(k));
+                    if !rbp_is_frame && uses_rbp_mem_operand(line) {
                         has_unparseable_indirect = true;
                         break;
                     }
-                    read_ranges.push((offset, size.byte_size()));
+                    let base = frame_base(line, b's');
+                    read_ranges.push((base, offset, size.byte_size()));
                 }
                 LineKind::LoadXmmRbp { offset, size } => {
-                    if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
+                    let line = infos[k].trimmed(store.get(k));
+                    if !rbp_is_frame && uses_rbp_mem_operand(line) {
                         has_unparseable_indirect = true;
                         break;
                     }
-                    read_ranges.push((offset, size.byte_size()));
+                    let base = frame_base(line, b's');
+                    read_ranges.push((base, offset, size.byte_size()));
                 }
                 LineKind::Other { .. } => {
                     let rbp_off = infos[k].rbp_offset;
-                    if rbp_off != RBP_OFFSET_NONE {
-                        let line = infos[k].trimmed(store.get(k));
-                        if line.starts_with("leaq ") {
-                            // Address taken — conservatively mark 64 bytes as "read"
-                            // to protect this slot and nearby slots.
-                            read_ranges.push((rbp_off, 64));
-                        } else {
-                            read_ranges.push((rbp_off, 32));
+                    let line = infos[k].trimmed(store.get(k));
+                    if line.starts_with("leaq ") {
+                        // Address taken at a frame slot: the derived pointer
+                        // may reach an unbounded upward span (passed to a
+                        // callee, indexed later) — record a floor, not a
+                        // fixed-width range.
+                        if let Some(fm) = parse_frame_mem(line) {
+                            read_floors.push((fm.base, fm.disp));
+                        } else if rbp_off != RBP_OFFSET_NONE {
+                            let base = frame_base(line, b's');
+                            read_floors.push((base, rbp_off));
                         }
-                    } else {
-                        let line = infos[k].trimmed(store.get(k));
-                        if line.contains("(%rbp)") || line.contains("(%rsp)") {
+                    } else if rbp_off != RBP_OFFSET_NONE {
+                        let base = frame_base(line, b's');
+                        read_ranges.push((base, rbp_off, 32));
+                    } else if parse_frame_mem(line).is_some() {
+                        // Frame operand that was neither a leaq, a cached
+                        // plain access, nor a provably bounded SIB: fail
+                        // closed (unbounded negative-reach SIB).
+                        if let Some((base, off, len, is_floor)) =
+                            sib_frame_observation(store, infos, k, line)
+                        {
+                            if is_floor {
+                                read_floors.push((base, off));
+                            } else {
+                                read_ranges.push((base, off, len));
+                            }
+                        } else {
                             has_unparseable_indirect = true;
                             break;
                         }
@@ -813,6 +1167,26 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 | LineKind::JmpIndirect
                 | LineKind::Ret
                 | LineKind::Directive => {}
+                LineKind::InlineAsm => {
+                    let line = infos[k].trimmed(store.get(k));
+                    // User asm naming a fixed frame slot can read/write that
+                    // location with an unknown mnemonic width. x86 memory
+                    // operands only ever extend UPWARD from the effective
+                    // address (max 64 bytes for AVX-512), so a 64-byte range
+                    // at the displacement is exact-sound without disabling
+                    // DSE for unrelated home slots (`vstmxcsr 48(%rsp)`
+                    // must not pin a counter store at 8(%rsp)).
+                    if let Some(fm) = parse_frame_mem(line) {
+                        if fm.sib {
+                            // Raw asm index values are not bound by C UB: a
+                            // negative or arbitrary index can name every
+                            // lower slot. Fail closed.
+                            has_unparseable_indirect = true;
+                            break;
+                        }
+                        read_ranges.push((fm.base, fm.disp, 64));
+                    }
+                }
                 _ => {
                     let line = infos[k].trimmed(store.get(k));
                     let rbp_off = parse_rbp_offset(line);
@@ -820,10 +1194,21 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         // Range, not point: x87 folded operands read past
                         // the named offset (fldt = 10 bytes, movdqu = 16).
                         // 8 bytes missed the tail of a long double slot.
-                        read_ranges.push((rbp_off, 16));
-                    } else if line.contains("(%rbp)") || line.contains("(%rsp)") {
-                        has_unparseable_indirect = true;
-                        break;
+                        let base = frame_base(line, b's');
+                        read_ranges.push((base, rbp_off, 16));
+                    } else if parse_frame_mem(line).is_some() {
+                        if let Some((base, off, len, is_floor)) =
+                            sib_frame_observation(store, infos, k, line)
+                        {
+                            if is_floor {
+                                read_floors.push((base, off));
+                            } else {
+                                read_ranges.push((base, off, len));
+                            }
+                        } else {
+                            has_unparseable_indirect = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -858,10 +1243,8 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     continue;
                 }
                 let store_bytes = size.byte_size();
-                let is_read = read_ranges
-                    .iter()
-                    .any(|&(r_off, r_sz)| ranges_overlap(offset, store_bytes, r_off, r_sz));
-                if !is_read {
+                let base = frame_base(store_text, b's');
+                if !slot_is_ever_read(base, offset, store_bytes, &read_ranges, &read_floors) {
                     mark_nop(&mut infos[k]);
                 }
             }
@@ -886,10 +1269,8 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     continue;
                 }
                 let store_bytes = size.byte_size();
-                let is_read = read_ranges
-                    .iter()
-                    .any(|&(r_off, r_sz)| ranges_overlap(offset, store_bytes, r_off, r_sz));
-                if !is_read {
+                let base = frame_base(store_text, b's');
+                if !slot_is_ever_read(base, offset, store_bytes, &read_ranges, &read_floors) {
                     mark_nop(&mut infos[k]);
                 }
             }

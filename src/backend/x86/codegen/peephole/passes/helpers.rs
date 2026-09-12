@@ -176,81 +176,47 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     has_bare_implicit_gp_effect(trimmed)
 }
 
-/// Bare instructions with implicit GP effects the textual `%reg` scans cannot
-/// see. `has_implicit_reg_usage` covers `rep`-prefixed string ops; this covers
-/// the rest: bare string ops (`movsq` reads/writes `%rsi`/`%rdi`), the
-/// `repe`/`repz`/`repnz` prefix spellings GAS accepts on `cmps`/`scas`, `loop*`
-/// (`%rcx`), `xlat` (writes `%al`), `rdpmc` (reads `%ecx`, writes `%edx`:`%eax`),
-/// `sysret`/`sysexit`/`iret*`/`uiret` (restore paths clobbering everything), `int*`
-/// (trap into unknown code), `xgetbv` (writes `%edx`:`%eax`) and `encls`/`enclu`
-/// (implicit `%eax`/`%ebx`/`%ecx`/`%edx`). Exact whole-token matches only:
-/// `movswl` (sign-extend) must NOT match the `movs` string op, so prefix tests
-/// are banned here. Soundness-critical: the coalescing window and the
-/// zero-upper scan skip lines mentioning no `%reg`, and must stop at these
-/// instead (`xsetbv`/`monitor`/`mwait` only *read* GP regs implicitly, so
-/// skipping them stays sound — reads don't modify).
+/// Bare instructions that implicitly WRITE a GP register (or transfer
+/// control to an unknown ABI), with no `%reg` in the operand text. The
+/// authoritative operand table is [`classify_implicit_operands`] (kept exact
+/// against the ISA in `types.rs`); this boolean asks its WRITE projection
+/// directly so the two lists never drift apart again.
+///
+/// The write projection is the deliberate contract of every caller: these
+/// scans track whether a cached register VALUE can survive a line, and an
+/// implicit READ alone is transparent here — family-specific reads are
+/// already visible through `LineInfo::reg_refs` (which unions the read half),
+/// and the copy/RMW coalescers consult the full read|write mask
+/// (`implicit_reg_refs`) themselves before renaming. The residual sets cover
+/// (1) control-exit lines whose GP write the table models as zero because
+/// their ABI is unknowable (`sysret`/`sysexit` consume rcx/rdx), (2)
+/// MSR/launch writes whose effect the exact table deliberately reports on
+/// the read half only (`wrmsr`), and (3) x87 control/environment
+/// loads/stores that invalidate windows through their MEMORY operand.
 fn has_bare_implicit_gp_effect(trimmed: &str) -> bool {
-    let tok = trimmed.split_whitespace().next().unwrap_or("");
-    // Prefix position (`repe cmpsb`): the string op follows.
-    if tok == "repe" || tok == "repz" || tok == "repnz" {
+    if implicit_write_refs(trimmed.as_bytes()) != 0 {
         return true;
     }
+    let tok = trimmed.split_whitespace().next().unwrap_or("");
+    if matches!(
+        tok,
+        "sysret"
+            | "sysretl"
+            | "sysretq"
+            | "sysexit"
+            | "sysexitl"
+            | "sysexitq"
+            | "wrmsr"
+            | "wrmsrns"
+            | "skinit"
+    ) {
+        return true;
+    }
+    // x87 control/environment loads/stores: memory-only operands, no implicit
+    // GP register, but they read/write the FPU environment through memory.
     matches!(
         tok,
-        "movs"
-            | "movsb"
-            | "movsw"
-            | "movsl"
-            | "movsq"
-            | "stos"
-            | "stosb"
-            | "stosw"
-            | "stosl"
-            | "stosq"
-            | "lods"
-            | "lodsb"
-            | "lodsw"
-            | "lodsl"
-            | "lodsq"
-            | "cmps"
-            | "cmpsb"
-            | "cmpsw"
-            | "cmpsl"
-            | "cmpsq"
-            | "scas"
-            | "scasb"
-            | "scasw"
-            | "scasl"
-            | "scasq"
-            | "ins"
-            | "insb"
-            | "insw"
-            | "insl"
-            | "outs"
-            | "outsb"
-            | "outsw"
-            | "outsl"
-            | "loop"
-            | "loope"
-            | "loopne"
-            | "loopz"
-            | "loopnz"
-            | "xlat"
-            | "xlatb"
-            | "rdpmc"
-            | "sysret"
-            | "sysexit"
-            | "iret"
-            | "iretd"
-            | "iretq"
-            | "uiret"
-            | "int"
-            | "int1"
-            | "int3"
-            | "into"
-            | "xgetbv"
-            | "encls"
-            | "enclu"
+        "fnstcw" | "fstcw" | "fldcw" | "fnstenv" | "fstenv" | "fldenv"
     )
 }
 
@@ -817,17 +783,60 @@ mod writes_family_tests {
             "xlatb",
             "rdpmc",
             "sysret",
+            "sysretq",
+            "sysretl",
             "sysexit",
+            "sysexitq",
+            "sysexitl",
             "iretq",
             "uiret",
             "int $3",
             "int3",
+            "int1",
+            "into",
             "xgetbv",
+            "rdpkru",
+            "pconfig",
+            "rsm",
+            "vmcall",
+            "vmmcall",
+            "tdcall",
+            "seamcall",
+            "getsec",
             "enclu",
             "encls",
+            "enclv",
+            "pushal",
+            "popal",
+            "pushaw",
+            "popaw",
+            "aaa",
+            "aam",
+            "daa",
+            "das",
+            "leaveq",
+            "skinit %eax",
         ] {
             assert!(has_implicit_reg_usage(t), "{t}");
         }
+    }
+
+    #[test]
+    fn implicit_read_only_system_ops_stay_transparent() {
+        // Read-only implicit GP traffic (the family-specific mask is what
+        // gates these) must not trip the coarse write/ABI veto, matching
+        // xsetbv/monitor/mwait.
+        for t in ["wrpkru", "monitorx", "mwaitx", "invlpga %rax, %ecx"] {
+            assert!(!has_implicit_reg_usage(t), "{t}");
+        }
+        // …but the read mask itself must still name the families.
+        assert!(implicit_read_refs(b"wrpkru") & (1u16 << 0) != 0);
+        assert!(implicit_read_refs(b"monitorx") & (1u16 << 1) != 0);
+        assert!(implicit_read_refs(b"invlpga") & (1u16 << 1) != 0);
+        // And the new writers land in the write projection.
+        assert!(implicit_write_refs(b"rdpkru") & 1u16 != 0);
+        assert!(implicit_write_refs(b"popal") & (1u16 << 3) != 0);
+        assert!(implicit_write_refs(b"daa") & 1u16 != 0);
     }
 
     #[test]
