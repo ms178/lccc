@@ -543,6 +543,17 @@ fn sib_frame_read_range(
     if family as usize > 15 {
         return None;
     }
+    // Defense in depth: the index register is identified by its POSITION
+    // in the SIB operand — the `reg_refs` mention bitmask cannot tell the
+    // index apart from the base or the destination, so the text parse
+    // stays authoritative for roles. The mask CAN prove the family is
+    // mentioned at all; a disagreement means either parser is wrong, and
+    // analyzing the wrong family could under-protect a frame read and
+    // make a store wrongly deletable.
+    debug_assert!(
+        infos[use_idx].reg_refs & (1u16 << family as u16) != 0,
+        "SIB index {idx} (family {family}) absent from line reg_refs: {line}"
+    );
 
     // Access width: an UPPER bound on the bytes read. An under-estimate here
     // could leave an aliased store deletable, so the suffix table only

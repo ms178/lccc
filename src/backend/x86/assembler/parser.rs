@@ -47,6 +47,15 @@ pub enum AsmItem {
         fill: Option<u8>,
         max_skip: Option<u64>,
     },
+    /// lccc-internal tight-loop marker emitted by `passes::loop_align`
+    /// immediately BEFORE the ordinary `.p2align` cascade at a loop
+    /// header that passed the structural tight-loop audit. Resolved by
+    /// the integrated assembler's alignment fixed point: measure the
+    /// exact encoded span from `header` to the first backward branch to
+    /// it and pad to `2^ceil(log2(span))` (clamped to 8..=64 bytes) when
+    /// the span fits in one cache line. NEVER emitted into portable
+    /// `-S` output and unknown to GNU as by design.
+    TightLoopAlign { header: String },
     /// Emit bytes: `.byte val, val, ...` (can contain label expressions)
     Byte(Vec<DataValue>),
     /// Emit 16-bit values: `.short val, ...` (can be symbol references)
@@ -640,6 +649,26 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         ".internal" => Ok(AsmItem::Internal(args.trim().to_string())),
         ".type" => parse_type_directive(args),
         ".size" => parse_size_directive(args),
+        ".lccc_tight_loop" => {
+            // Exactly one argument: the local header label immediately
+            // following the marker in the text stream. This is a
+            // lccc-private directive, never hand-written or seen by GNU
+            // as, so malformed spellings are errors rather than silent
+            // no-ops (a typo would otherwise just lose the alignment).
+            let header = args.trim();
+            let well_formed = header.starts_with('.')
+                && header.len() > 1
+                && header[1..]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+                && header.split_whitespace().count() == 1;
+            if !well_formed {
+                return Err(format!("bad .lccc_tight_loop argument: {args}"));
+            }
+            Ok(AsmItem::TightLoopAlign {
+                header: header.to_string(),
+            })
+        }
         ".align" | ".p2align" | ".balign" => {
             // GAS grammar (read.c, verified against binutils 2.47):
             //   `.p2align EXP [, fill [, max-skip]]` — exponent form; an
@@ -4209,5 +4238,26 @@ main:
         assert_eq!(parse_integer_expr("-1").unwrap(), -1);
         assert_eq!(parse_integer_expr("0xff").unwrap(), 255);
         assert_eq!(parse_integer_expr("0").unwrap(), 0);
+    }
+
+    /// The lccc-private tight-loop marker carries exactly one local label.
+    /// It must survive the parser verbatim (the ELF writer resolves it);
+    /// malformed forms are rejected rather than silently dropped.
+    #[test]
+    fn test_parse_tight_loop_marker() {
+        let items = parse_asm("\t.lccc_tight_loop\t.LBB3\n").unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, AsmItem::TightLoopAlign { header } if header == ".LBB3")),
+            "marker missing: {items:?}"
+        );
+        // Exactly one token, and it must be a well-formed local label.
+        assert!(parse_asm("\t.lccc_tight_loop\n").is_err());
+        assert!(parse_asm("\t.lccc_tight_loop .LBB3 .LBB4\n").is_err());
+        assert!(parse_asm("\t.lccc_tight_loop 16\n").is_err());
+        assert!(parse_asm("\t.lccc_tight_loop .LBB3,\n").is_err());
+        assert!(parse_asm("\t.lccc_tight_loop LBB3\n").is_err());
+        assert!(parse_asm("\t.lccc_tight_loop .LBB3\nnop\n").is_ok());
     }
 }

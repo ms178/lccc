@@ -469,9 +469,19 @@ fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Opt
         if let (Some(kv), Some(iv0)) = (const_to_u64(k), const_to_u64(i)) {
             let width_bits = (cmp_ty.size() as u64) * 8;
             if width_bits > 0 && width_bits <= 64 {
-                let modulus = 1u64 << width_bits;
                 let n = match cmp_op {
-                    IrCmpOp::Ne => kv.wrapping_sub(iv0) % modulus,
+                    // `Ne` trip count = (limit - start) reduced modulo the
+                    // compare type's modulus 2^width. At width 64 that
+                    // modulus is not representable (1 << 64 overflows); the
+                    // wrapping subtraction itself IS the modulo-2^64 form.
+                    IrCmpOp::Ne => {
+                        let diff = kv.wrapping_sub(iv0);
+                        if width_bits == 64 {
+                            diff
+                        } else {
+                            diff % (1u64 << width_bits)
+                        }
+                    }
                     _ => kv.checked_sub(iv0).unwrap_or(0),
                 };
                 if n > 0 && n > u64::MAX / u64::from(store_width) {
@@ -942,9 +952,19 @@ fn try_recognize_while(
         if let (Some(kv), Some(iv0)) = (const_to_u64(k), const_to_u64(i)) {
             let width_bits = (cmp_ty.size() as u64) * 8;
             if width_bits > 0 && width_bits <= 64 {
-                let modulus = 1u64 << width_bits;
                 let n = match cmp_op {
-                    IrCmpOp::Ne => kv.wrapping_sub(iv0) % modulus,
+                    // `Ne` trip count = (limit - start) reduced modulo the
+                    // compare type's modulus 2^width. At width 64 that
+                    // modulus is not representable (1 << 64 overflows); the
+                    // wrapping subtraction itself IS the modulo-2^64 form.
+                    IrCmpOp::Ne => {
+                        let diff = kv.wrapping_sub(iv0);
+                        if width_bits == 64 {
+                            diff
+                        } else {
+                            diff % (1u64 << width_bits)
+                        }
+                    }
                     _ => kv.checked_sub(iv0).unwrap_or(0),
                 };
                 if n > 0 && n > u64::MAX / u64::from(store_width) {

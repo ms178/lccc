@@ -2091,6 +2091,18 @@ impl Driver {
         // emission order. The recorded directives are consumed by codegen
         // immediately before each block label. With a profile in use, the
         // PGO hotness map recorded by pgo::layout gates which loops pad.
+        // The tight-loop policy's final size bucket is resolved by the
+        // integrated x86 assembler from exact encoded lengths. It must not
+        // be enabled when the emitted assembly leaves the process (`-S`) or
+        // goes to an external assembler (the `gcc_assembler` feature, or a
+        // non-x86 target): the private `.lccc_tight_loop` directive is only
+        // understood by lccc's own parser.
+        let integrated_assembler = cfg!(not(feature = "gcc_assembler"))
+            && !matches!(self.mode, CompileMode::AssemblyOnly)
+            && matches!(
+                self.target,
+                crate::backend::Target::X86_64 | crate::backend::Target::I686
+            );
         crate::passes::loop_align::align_module(
             &module,
             &crate::passes::loop_align::LoopAlignConfig {
@@ -2099,6 +2111,7 @@ impl Driver {
                 pgo_active: crate::pgo::get_pgo_profile().is_some(),
                 loops: self.align_loops,
                 jumps: self.align_jumps,
+                integrated_assembler,
             },
         );
         if std::env::var_os("LCCC_NO_SCHEDULE").is_none()
