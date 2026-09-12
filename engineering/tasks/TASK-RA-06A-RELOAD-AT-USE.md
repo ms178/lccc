@@ -169,3 +169,44 @@ amplified benchmark, not by instruction count alone (see "Do not" below).
 - **Do not relax `has_indirect_mem → invalidate_all_mappings` for read-only indirect
   operands** (`addl (%rcx), %eax`) to unlock the above: it widens the risk surface of
   every slot-tracking pass for a measured payoff of nil.
+
+## 2026-09-12 — reload-reuse precision landed; next increment is displacement propagation
+
+Two precisions were added to `reuse_redundant_loads` (same-destination reload deletion, and
+frame-slot range disjointness), worth 100 instructions and 143 frame-slot loads across the
+corpus and runtime-neutral. Full record: `engineering/evidence/reuse-precision-2026-09-12/`.
+
+### The metric warning in this task just reproduced itself
+
+With that precision on, the *smallest* `sha256_transform` (192 insns, 47 slot refs) is the
+arm with the web-wide supply **OFF** — and it is **6.06 % slower** at runtime than the
+194-instruction arm with the supply ON (15 amplified interleaved reps, low3 1.062). This is
+the third independent confirmation of "do not judge the fix by instruction count".
+`check_ra_web_inloop_use.sh` encoded the instruction-count proxy and correctly failed; it
+was fixed by holding the new confounder constant on both arms, not by relaxing a threshold.
+
+### Next increment, with the mechanism already identified
+
+What is left of the gap is the write-back epilogue, which per state word emits
+
+```asm
+    movq 360(%rsp), %rax      ; reload the spilled base
+    leaq 4(%rax), %rax        ; DESTRUCTIVE: overwrites the base with base+4
+    movq %rax, %r8            ; relay copy of the address
+    movl (%r8), %eax
+    addl 24(%rsp), %eax
+    movl %eax, (%r8)
+```
+
+where clang emits `movl 4(%rbase), %eax` / `movl %eax, 4(%rbase)` with the base held in a
+callee-saved register across the whole block.
+
+`fold_lea_into_load` bails on this shape at `addr_fams.contains(&dst_fam)` — correctly,
+because splicing the LEA's own address text into a later use would compute `base + 2D`.
+The valid dual is **displacement propagation**: delete `leaq D(%B), %B` and add `D` to each
+of `%B`'s uses in the window (register-operand uses become `leaq D(%B), %X`), which both
+removes an instruction per group and *preserves the base*, after which the reload-reuse
+precision above can collapse the remaining reloads. The existing liveness contract
+(`dead_in_block_after`, `family_private_to`, `provably_dead_lv`) is what must gate it.
+
+Oracle target, whole-function `-O2`: frame-slot refs **52 → 20**, insns **194 → 126**.

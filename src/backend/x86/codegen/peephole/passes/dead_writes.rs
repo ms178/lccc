@@ -164,6 +164,51 @@ fn load_operand(t: &str) -> Option<(&'static str, &str, &str, Vec<RegId>)> {
 
 /// Replace a repeated load of the same address with a register copy.
 pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    // Bisect switches for the two precisions added here, read once per
+    // invocation. Both default ON; each can be disabled independently so a
+    // miscompile can be attributed to exactly one of them.
+    let policy = ReusePolicy {
+        same_dst_reload: std::env::var("CCC_NO_SAME_DST_RELOAD").is_err(),
+        frame_slot_aliasing: std::env::var("CCC_NO_FRAME_SLOT_ALIASING").is_err(),
+    };
+    reuse_redundant_loads_with(store, infos, policy)
+}
+
+/// The two precisions this pass can apply, as explicit policy so both arms are
+/// unit-testable without mutating the process environment (env mutation in
+/// tests is racy: every test in the binary shares one environment).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct ReusePolicy {
+    /// Delete a reload of the same operand into the same destination.
+    pub(super) same_dst_reload: bool,
+    /// Let a store to a different, non-overlapping frame slot survive the scan.
+    pub(super) frame_slot_aliasing: bool,
+}
+
+impl ReusePolicy {
+    /// Both precisions on: the shipping configuration.
+    pub(super) const fn full() -> Self {
+        Self {
+            same_dst_reload: true,
+            frame_slot_aliasing: true,
+        }
+    }
+    /// Both off: the historical behaviour, kept testable as a baseline.
+    pub(super) const fn legacy() -> Self {
+        Self {
+            same_dst_reload: false,
+            frame_slot_aliasing: false,
+        }
+    }
+}
+
+fn reuse_redundant_loads_with(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    policy: ReusePolicy,
+) -> bool {
+    let redundant_same_dst_reload = policy.same_dst_reload;
+    let frame_slot_aliasing = policy.frame_slot_aliasing;
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
@@ -208,6 +253,15 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
         let dst_mask = 1u16 << dst_fam;
         let mem_owned = mem.to_string();
         let dst_owned = dst.to_string();
+        // Frame-slot precision for the aliasing test below (see
+        // `store_cannot_alias_slot`). `None` for anything that is not a plain
+        // `D(%rsp)` / `D(%rbp)` operand, which restores the historical
+        // "every store invalidates" behaviour verbatim.
+        let cached_slot = if frame_slot_aliasing {
+            parse_frame_slot(&mem_owned, mnemonic_mem_width(op))
+        } else {
+            None
+        };
 
         let mut j = i + 1;
         while j < len {
@@ -239,8 +293,11 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
                 break;
             }
             // Any write to memory invalidates the cached value: without alias
-            // analysis every store is assumed to hit this address.
-            if line_writes_memory(t) {
+            // analysis every store is assumed to hit this address. The one
+            // exception is a store to a DIFFERENT, non-overlapping frame slot,
+            // which is not an aliasing claim but a fact about the static frame
+            // layout (see `store_cannot_alias_slot`).
+            if line_writes_memory(t) && !store_cannot_alias_slot(cached_slot, t) {
                 break;
             }
             // A write to an address register invalidates the operand. The
@@ -251,6 +308,24 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
                 && addr_fams.iter().any(|&f| writes_family(&infos[j], t, f))
             {
                 break;
+            }
+            // A reload of the SAME operand into the SAME destination is wholly
+            // redundant: the address registers are unchanged, no aliasing store
+            // intervened, and it writes the destination the value it already
+            // holds. Delete it rather than rewriting it. This must be tested
+            // BEFORE the destination-write break below, because that break is
+            // exactly what otherwise ends the scan on this line -- which is why
+            // same-register reloads survived here while different-register ones
+            // were already being folded into copies.
+            if redundant_same_dst_reload {
+                if let Some((op2, mem2, dst2, _)) = load_operand(t) {
+                    if op2 == op && mem2 == mem_owned && dst2 == dst_owned {
+                        mark_nop(&mut infos[j]);
+                        changed = true;
+                        j += 1;
+                        continue;
+                    }
+                }
             }
             // The first load's destination must still hold the value.
             if infos[j].reg_refs & dst_mask != 0 && writes_family(&infos[j], t, dst_fam) {
@@ -322,6 +397,153 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
         i += 1;
     }
     changed
+}
+
+/// A plain frame-relative operand `D(%rsp)` / `D(%rbp)` and the byte range it
+/// accesses. Indexed forms (`D(%rsp,%rax,4)`) and rip-relative forms are
+/// rejected: their effective address is not a fixed range, so nothing can be
+/// proven disjoint from them.
+#[derive(Clone, Copy)]
+struct FrameSlot {
+    /// Register family of the base (`%rsp` = 4, `%rbp` = 5).
+    base: RegId,
+    disp: i64,
+    width: i64,
+}
+
+fn parse_frame_slot(mem: &str, width: i64) -> Option<FrameSlot> {
+    let open = mem.find('(')?;
+    if !mem.ends_with(')') {
+        return None;
+    }
+    let inside = &mem[open + 1..mem.len() - 1];
+    // Reject SIB (base,index[,scale]) and anything that is not exactly the
+    // stack pointer or the frame pointer.
+    if inside.contains(',') {
+        return None;
+    }
+    // Reject a segment override (`%fs:360(%rsp)`) EXPLICITLY. It happens to be
+    // rejected anyway, because the displacement text then parses as "%fs:360"
+    // and `parse::<i64>` fails - but soundness should not rest on a parse
+    // failure in a different field. A segmented stack access is a different
+    // address space as far as this proof is concerned.
+    if mem.contains(':') {
+        return None;
+    }
+    let base = match inside {
+        "%rsp" => 4,
+        "%rbp" => 5,
+        _ => return None,
+    };
+    let disp_txt = mem[..open].trim();
+    let disp = if disp_txt.is_empty() {
+        0
+    } else {
+        disp_txt.parse::<i64>().ok()?
+    };
+    Some(FrameSlot { base, disp, width })
+}
+
+/// Bytes an instruction touches in memory.
+///
+/// Two independent estimates, combined with `max` so the answer is never an
+/// underestimate — an underestimate here is a miscompile, because it can make
+/// two overlapping accesses look disjoint:
+///
+/// 1. The FIRST width suffix letter of the mnemonic, which in AT&T names the
+///    memory operand's width for both plain (`movl`, `addq`, `incl`) and
+///    extending (`movzbl`, `movslq`) forms. Unrecognized mnemonics (string ops,
+///    x87 `fstpt`, no suffix) get 16, the widest scalar access.
+/// 2. The width of any vector register mentioned on the line. This is the half
+///    the suffix cannot supply: `vmovdqu %ymm0, 24(%rsp)` has a `d` in the
+///    suffix position, so rule 1 charges it 16 bytes while it really writes 32.
+///    Charging only 16 would report a cached load at slot 48 as disjoint from
+///    it. `%zmm` (AVX-512) writes 64.
+///
+/// The register scan is deliberately textual and over-broad: a `%xmm` appearing
+/// anywhere on the line forces at least 16 bytes even if it is only a source.
+/// Over-estimating merely loses an optimization.
+fn mnemonic_mem_width(t: &str) -> i64 {
+    let start = if t.starts_with("lock ") { 5 } else { 0 };
+    let suffix = match t.as_bytes().get(start + 3) {
+        Some(b'b') => 1,
+        Some(b'w') => 2,
+        Some(b'l') => 4,
+        Some(b'q') => 8,
+        _ => 16,
+    };
+    let vector = if t.contains("%zmm") {
+        64
+    } else if t.contains("%ymm") {
+        32
+    } else if t.contains("%xmm") {
+        16
+    } else {
+        0
+    };
+    suffix.max(vector)
+}
+
+/// The memory operand a store writes to, or `None`. Mirrors
+/// [`line_writes_memory`]'s destination-finding rules (which must use
+/// [`last_top_level_comma`], not `rfind`, because an AT&T memory operand
+/// carries its own commas) but returns the operand instead of a bool.
+fn store_destination(t: &str) -> Option<&str> {
+    if t.starts_with("lea") {
+        return None;
+    }
+    if let Some(comma) = last_top_level_comma(t.as_bytes()) {
+        let dst = t[comma + 1..].trim();
+        return if dst.contains('(') { Some(dst) } else { None };
+    }
+    // Single-operand read-modify-write form: `incl 24(%rsp)`, `negq (%rax)`.
+    let sp = t.find(' ')?;
+    let only = t[sp + 1..].trim();
+    if !t.starts_with('j') && only.contains('(') {
+        Some(only)
+    } else {
+        None
+    }
+}
+
+/// True when a store on this line provably cannot touch the byte range of
+/// `cached`, so it must not invalidate a load cached from that frame slot.
+///
+/// This is the precision [`reuse_redundant_loads`] lacked: it broke the scan on
+/// *every* memory write, on the (sound but blunt) principle that without alias
+/// analysis any store may hit the cached address. For a FRAME-SLOT operand that
+/// principle gives away too much, because the frame layout is static and known:
+/// two distinct, non-overlapping `D(%rsp)` ranges are different bytes, full
+/// stop. Spill-heavy code interleaves slot accesses constantly, so this is what
+/// lets a cached reload survive the neighbouring spills around it.
+///
+/// Everything not provably disjoint stays conservative:
+///
+/// * a store through a register (`movl %eax, (%r8)`) has no parseable frame
+///   destination and returns false — no points-to claim is attempted;
+/// * a store to a different base (`(%rbp)` vs the cached `(%rsp)`) returns
+///   false, since the two bases are not provably a fixed distance apart here;
+/// * an indexed or rip-relative destination returns false;
+/// * an unrecognized mnemonic is charged 16 bytes, so it overlaps almost
+///   everything.
+///
+/// The base register itself cannot move inside the scan: `%rsp`/`%rbp` are
+/// members of the cached load's `addr_fams`, and a write to any address family
+/// already ends the scan above. So the displacements compared here are stable.
+fn store_cannot_alias_slot(cached: Option<FrameSlot>, t: &str) -> bool {
+    let Some(slot) = cached else {
+        return false;
+    };
+    let Some(dst) = store_destination(t) else {
+        return false;
+    };
+    let Some(other) = parse_frame_slot(dst, mnemonic_mem_width(t)) else {
+        return false;
+    };
+    if other.base != slot.base {
+        return false;
+    }
+    other.disp + other.width <= slot.disp || slot.disp + slot.width <= other.disp
 }
 
 /// Conservative "this instruction writes memory" test: any instruction whose
@@ -637,6 +859,191 @@ mod tests {
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
+    }
+
+    /// Run ONLY `reuse_redundant_loads` and return the surviving lines, so an
+    /// assertion is about this pass rather than about whatever the rest of the
+    /// pipeline would do to the same input.
+    fn run_reuse(asm: &str, policy: ReusePolicy) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        reuse_redundant_loads_with(&mut store, &mut infos, policy);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn frame(body: &str) -> String {
+        format!("f:\n.cfi_startproc\n{body}    ret\n.cfi_endproc\n")
+    }
+
+    fn slot_refs(out: &str, slot: &str) -> usize {
+        out.lines().filter(|l| l.contains(slot)).count()
+    }
+
+    /// A reload of the same operand into the SAME register is pure waste: it
+    /// writes the destination the value it already holds. This is the shape the
+    /// pass used to miss, because the destination-write break below fired on
+    /// exactly that line before the match was ever attempted.
+    #[test]
+    fn same_destination_reload_is_deleted() {
+        let out = run_reuse(
+            &frame("    movq 360(%rsp), %rax\n    movl %edx, %esi\n    movq 360(%rsp), %rax\n"),
+            ReusePolicy::full(),
+        );
+        assert_eq!(
+            slot_refs(&out, "360(%rsp)"),
+            1,
+            "second same-dst reload must go:\n{out}"
+        );
+    }
+
+    /// Same input under the legacy policy: the reload must survive, which is
+    /// what proves the deletion above is the new precision and not something
+    /// the pass already did.
+    #[test]
+    fn same_destination_reload_survives_under_legacy_policy() {
+        let out = run_reuse(
+            &frame("    movq 360(%rsp), %rax\n    movl %edx, %esi\n    movq 360(%rsp), %rax\n"),
+            ReusePolicy::legacy(),
+        );
+        assert_eq!(
+            slot_refs(&out, "360(%rsp)"),
+            2,
+            "legacy arm must keep both:\n{out}"
+        );
+    }
+
+    /// The headline precision: a spill to a DIFFERENT frame slot is not an
+    /// aliasing hazard for a cached reload. Slot ranges in a static frame are
+    /// a fact, not a points-to guess.
+    #[test]
+    fn store_to_a_different_frame_slot_does_not_break_reuse() {
+        let body = "    movq 360(%rsp), %rax\n    movl %edx, 24(%rsp)\n    movq 360(%rsp), %rcx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert!(
+            out.contains("movq %rax, %rcx"),
+            "must forward from the register:\n{out}"
+        );
+        assert_eq!(
+            slot_refs(&out, "360(%rsp)"),
+            1,
+            "only one slot read:\n{out}"
+        );
+    }
+
+    /// The same input under the legacy policy breaks on the intervening store.
+    #[test]
+    fn store_to_a_different_frame_slot_breaks_reuse_under_legacy_policy() {
+        let body = "    movq 360(%rsp), %rax\n    movl %edx, 24(%rsp)\n    movq 360(%rsp), %rcx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::legacy());
+        assert!(
+            !out.contains("movq %rax, %rcx"),
+            "legacy arm must not forward:\n{out}"
+        );
+        assert_eq!(
+            slot_refs(&out, "360(%rsp)"),
+            2,
+            "legacy arm keeps both reads:\n{out}"
+        );
+    }
+
+    /// A dword store at 364 overlaps the cached qword at [360,368).
+    #[test]
+    fn overlapping_frame_slot_store_breaks_reuse() {
+        let body = "    movq 360(%rsp), %rax\n    movl %edx, 364(%rsp)\n    movq 360(%rsp), %rcx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "360(%rsp)"),
+            2,
+            "overlapping store must break reuse:\n{out}"
+        );
+    }
+
+    /// A store through a register makes no claim at all: without points-to
+    /// analysis it may write anywhere, including the cached slot.
+    #[test]
+    fn indirect_store_breaks_reuse() {
+        let body = "    movq 360(%rsp), %rax\n    movl %edx, (%rbx)\n    movq 360(%rsp), %rcx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "360(%rsp)"),
+            2,
+            "indirect store must break reuse:\n{out}"
+        );
+    }
+
+    /// `%rsp` and `%rbp` are not provably a fixed distance apart in this scan,
+    /// so a store to an `%rbp` slot must not be reasoned about.
+    #[test]
+    fn store_through_a_different_frame_base_breaks_reuse() {
+        let body = "    movq 360(%rsp), %rax\n    movl %edx, 24(%rbp)\n    movq 360(%rsp), %rcx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "360(%rsp)"),
+            2,
+            "different frame base must break reuse:\n{out}"
+        );
+    }
+
+    /// Moving the stack pointer renames every displacement, so the offsets
+    /// compared by the disjointness test would no longer name the same bytes.
+    #[test]
+    fn stack_pointer_movement_breaks_reuse() {
+        let body = "    movq 360(%rsp), %rax\n    subq $8, %rsp\n    movq 360(%rsp), %rcx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "360(%rsp)"),
+            2,
+            "an %rsp write must break reuse:\n{out}"
+        );
+    }
+
+    /// `vmovdqu %ymm0, 24(%rsp)` writes 32 bytes, i.e. [24,56), which reaches
+    /// the cached qword at 48. The mnemonic's suffix position holds a `v`-class
+    /// letter, so the suffix rule alone charges 16 bytes and would report the
+    /// two as disjoint. This test is what keeps the vector-register half of
+    /// `mnemonic_mem_width` from being "simplified" away.
+    #[test]
+    fn wide_vector_store_reaches_a_distant_slot() {
+        let body =
+            "    movq 48(%rsp), %rax\n    vmovdqu %ymm0, 24(%rsp)\n    movq 48(%rsp), %rcx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "48(%rsp)"),
+            2,
+            "a 32-byte store must break reuse of slot 48:\n{out}"
+        );
+    }
+
+    /// AVX-512: `%zmm` reaches 64 bytes.
+    #[test]
+    fn zmm_store_reaches_even_further() {
+        let body =
+            "    movq 80(%rsp), %rax\n    vmovdqu64 %zmm0, 24(%rsp)\n    movq 80(%rsp), %rcx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert_eq!(
+            slot_refs(&out, "80(%rsp)"),
+            2,
+            "a 64-byte store must break reuse of slot 80:\n{out}"
+        );
+    }
+
+    /// A narrow store genuinely outside the cached range still permits reuse,
+    /// so the vector rule is not simply "any vector register blocks everything".
+    #[test]
+    fn narrow_vector_store_clear_of_the_slot_permits_reuse() {
+        let body =
+            "    movq 360(%rsp), %rax\n    movdqu %xmm0, 24(%rsp)\n    movq 360(%rsp), %rcx\n";
+        let out = run_reuse(&frame(body), ReusePolicy::full());
+        assert!(
+            out.contains("movq %rax, %rcx"),
+            "a 16-byte store at 24 cannot touch slot 360:\n{out}"
+        );
     }
 
     #[test]

@@ -792,6 +792,32 @@ pub(crate) fn mark_loop_spanning(
             }
         }
     }
+    // Per-WEB resolution of the boolean, keyed by coalesce owner.
+    //
+    // The supply above answers "does this web have a read inside an extent?".
+    // Asking it only through `members_of.get(range.value_id)` makes the answer
+    // depend on WHICH member of the web happens to own the range being marked:
+    // an owner's range heard about its members, but a member that owns a range
+    // of its own heard about nobody, so two ranges of one web could disagree
+    // about a property that is physically shared -- coalesced members occupy one
+    // register, so a hot reload either happens for the whole web or not at all.
+    // Resolve the flag once per web and let every range in it read the same
+    // answer. Ranges that belong to no web are simply absent from this map and
+    // keep falling back to their own count, so nothing widens for them.
+    // "Does value `v` get read inside any measured extent?" A member that owns a
+    // range is answered by `uses_in_extents`; a merged member by
+    // `member_in_extent`. Shared by the web precompute and the per-range lookup
+    // below so the two can never drift.
+    let has_extent_use = |v: u32| -> bool {
+        member_in_extent.contains(&v) || uses_in_extents.get(&v).copied().unwrap_or(0) > 0
+    };
+    let mut web_in_loop_use_of: FxHashMap<u32, bool> = FxHashMap::default();
+    if web_inloop_use {
+        for (&owner, members) in members_of.iter() {
+            let flag = has_extent_use(owner) || members.iter().any(|&m| has_extent_use(m));
+            web_in_loop_use_of.insert(owner, flag);
+        }
+    }
     for range in ranges.iter_mut() {
         let mut spans = false;
         let mut reserve = 0u32;
@@ -847,16 +873,31 @@ pub(crate) fn mark_loop_spanning(
             .get(&range.value_id)
             .copied()
             .unwrap_or(0);
-        // (a), web-wide: this range's own reads, or any member's. A member that
-        // owns a range is already accounted for in `uses_in_extents`; a merged
-        // member is in `member_in_extent`.
-        let mut web_in_loop_use = in_loop_uses > 0;
+        // (a), web-wide: this range's own reads, or any web-mate's. A member
+        // that owns a range is accounted for in `uses_in_extents`; a merged
+        // member is in `member_in_extent`; and the union over the whole web was
+        // precomputed above so a member's range gets the same answer its owner
+        // would (F3 -- the lookup used to be owner-only).
+        //
+        // Monotone by construction, not by measurement: the answer is the OR of
+        // this range's own reads, the web it belongs to (via its coalesce
+        // owner), and -- retained deliberately -- the members it owns itself.
+        // The third term is redundant whenever `coalesce_member_of` is flattened
+        // to roots, which it is today; keeping it means a value that is BOTH an
+        // owner and a member can never see its sub-web dropped, so the fix can
+        // only ever widen the flag and can never narrow it. Verified
+        // output-neutral across all 805 corpus TUs.
+        let mut web_in_loop_use = in_loop_uses > 0 || has_extent_use(range.value_id);
+        if !web_in_loop_use {
+            let owner = coalesce_member_of
+                .get(&range.value_id)
+                .copied()
+                .unwrap_or(range.value_id);
+            web_in_loop_use = web_in_loop_use_of.get(&owner).copied().unwrap_or(false);
+        }
         if !web_in_loop_use {
             if let Some(members) = members_of.get(&range.value_id) {
-                web_in_loop_use = members.iter().any(|&m| {
-                    member_in_extent.contains(&m)
-                        || uses_in_extents.get(&m).copied().unwrap_or(0) > 0
-                });
+                web_in_loop_use = members.iter().any(|&m| has_extent_use(m));
             }
         }
         if !in_loop_use {

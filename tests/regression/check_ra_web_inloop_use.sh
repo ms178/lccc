@@ -136,8 +136,21 @@ fi
 # 2 + 3. The mechanism fires, and the kill switch is wired.
 # --------------------------------------------------------------------------
 echo "$SELF: structural contract on sha256_transform"
-"$CCC" -O2 -S "$sha" -o "$work/on.s"
-CCC_NO_WEB_INLOOP_USE=1 "$CCC" -O2 -S "$sha" -o "$work/off.s"
+# These two arms hold an INDEPENDENT optimization constant. The contract below
+# discriminates the supply by instruction count and stack traffic, and an
+# unrelated pass can mask that proxy: `reuse_redundant_loads` now deletes a
+# reload of a frame slot that survives a store to a *different*, non-overlapping
+# slot, which strips stack traffic from BOTH arms. With it enabled the
+# kill-switch arm came out SMALLER (192 insns / 47 slot refs) than the default
+# arm (194 / 52) even though the supply was still worth +6.06% at runtime
+# (15 amplified interleaved reps, low3 1.062 in agreement) -- the exact
+# "fewer instructions and stack refs, yet slower" trap RA-06B warns about.
+# So the structural arms disable that pass on both sides and measure the supply
+# in isolation. The shipping configuration is still what the correctness-vs-gcc
+# and lz4 blast-radius sections exercise.
+ISO="CCC_NO_SAME_DST_RELOAD=1 CCC_NO_FRAME_SLOT_ALIASING=1"
+env $ISO "$CCC" -O2 -S "$sha" -o "$work/on.s"
+env $ISO CCC_NO_WEB_INLOOP_USE=1 "$CCC" -O2 -S "$sha" -o "$work/off.s"
 "$GCC" -O2 -S "$sha" -o "$work/gcc.s"
 
 if cmp -s "$work/on.s" "$work/off.s"; then
@@ -252,10 +265,13 @@ if [[ $rc != 0 ]]; then fail=1; else note "web-wide supply fires: smaller functi
 #    leaves the fix on. Assert both directions.
 # --------------------------------------------------------------------------
 echo "$SELF: kill switch is presence-based and consistent"
-CCC_NO_WEB_INLOOP_USE=0        "$CCC" -O2 -S "$sha" -o "$work/v0.s"
-CCC_NO_WEB_INLOOP_USE=         "$CCC" -O2 -S "$sha" -o "$work/vempty.s"
-CCC_NO_WEB_INLOOP_USE=true     "$CCC" -O2 -S "$sha" -o "$work/vtrue.s"
-CCC_NO_WEB_INLOOP_USE=enabled  "$CCC" -O2 -S "$sha" -o "$work/venabled.s"
+# Compiled under the same isolation as on.s/off.s above, so that this section
+# compares like with like: it is testing the SWITCH's presence semantics, not
+# the independent reload-reuse precision.
+env $ISO CCC_NO_WEB_INLOOP_USE=0        "$CCC" -O2 -S "$sha" -o "$work/v0.s"
+env $ISO CCC_NO_WEB_INLOOP_USE=         "$CCC" -O2 -S "$sha" -o "$work/vempty.s"
+env $ISO CCC_NO_WEB_INLOOP_USE=true     "$CCC" -O2 -S "$sha" -o "$work/vtrue.s"
+env $ISO CCC_NO_WEB_INLOOP_USE=enabled  "$CCC" -O2 -S "$sha" -o "$work/venabled.s"
 for v in v0 vempty vtrue venabled; do
     if ! cmp -s "$work/off.s" "$work/$v.s"; then
         bad "presence semantics broken: CCC_NO_WEB_INLOOP_USE='$v' does not reproduce the kill-switch arm"
