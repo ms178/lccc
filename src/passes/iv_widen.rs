@@ -2566,6 +2566,7 @@ mod tests {
             source_spans: Vec::new(),
         });
         func.next_value_id = 100;
+        func.next_label = 5;
         func
     }
 
@@ -3679,6 +3680,7 @@ mod tests {
             source_spans: Vec::new(),
         });
         func.next_value_id = 100;
+        func.next_label = 3;
         check(&mut func, 1);
         assert!(matches!(
             &func.blocks[1].instructions[0],
@@ -3778,6 +3780,7 @@ mod tests {
             source_spans: Vec::new(),
         });
         func.next_value_id = 100;
+        func.next_label = 3;
         check(&mut func, 1);
         // The step was widened in place...
         assert!(matches!(
@@ -4100,6 +4103,7 @@ mod tests {
             source_spans: Vec::new(),
         });
         func.next_value_id = 100;
+        func.next_label = 5;
         check(&mut func, 1);
         assert!(matches!(
             &func.blocks[1].instructions[1],

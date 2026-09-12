@@ -1,0 +1,97 @@
+{
+  "label": "sha {dead-only} vs OFF",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_f49i5m1z/arm_a",
+    "sha256": "20fc42135db539d98140b5c4f1367e8f72e1b33ac4b372d258e0b3c1454ad233",
+    "env": "CCC_SPAN_STEAL_NO_LOCKED=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_f49i5m1z/arm_b",
+    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
+    "env": "CCC_NO_X64_SPAN_STEAL=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 2,
+  "arm_a_timings": {
+    "arm": "DEAD",
+    "n": 15,
+    "min_ms": 525.978,
+    "median_ms": 532.005,
+    "mean_ms": 552.821,
+    "stdev_ms": 39.265,
+    "samples_ms": [
+      637.188,
+      532.928,
+      527.408,
+      531.469,
+      633.696,
+      566.964,
+      525.978,
+      538.253,
+      527.49,
+      532.005,
+      535.459,
+      614.728,
+      531.681,
+      529.42,
+      527.647
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "OFF",
+    "n": 15,
+    "min_ms": 405.852,
+    "median_ms": 417.777,
+    "mean_ms": 463.462,
+    "stdev_ms": 90.721,
+    "samples_ms": [
+      419.265,
+      412.324,
+      410.09,
+      405.852,
+      570.122,
+      729.977,
+      417.777,
+      410.553,
+      424.992,
+      408.399,
+      510.131,
+      574.143,
+      406.996,
+      440.455,
+      410.857
+    ]
+  },
+  "paired_diffs_ms": [
+    217.923,
+    120.604,
+    117.318,
+    125.617,
+    63.575,
+    -163.013,
+    108.201,
+    127.7,
+    102.498,
+    123.606,
+    25.328,
+    40.585,
+    124.685,
+    88.965,
+    116.789
+  ],
+  "median_ratio_b_over_a": 0.78529,
+  "min_ratio_b_over_a": 0.77161,
+  "sign_test_p": 0.00195,
+  "median_and_min_agree": true,
+  "significant": true,
+  "verdict": "DEAD SLOWER by 21.47% (median)"
+}

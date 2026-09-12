@@ -15451,21 +15451,15 @@ fn rewrite_value_use(inst: &mut Instruction, old: Value, new: Value) {
             *op = Operand::Value(new);
         }
     });
-    // Operand-shaped fields are covered above; the pointer-like fields that
-    // hold a bare `Value` are not.
-    match inst {
-        Instruction::Load { ptr, .. } => {
-            if *ptr == old {
-                *ptr = new;
-            }
+    // Pointer-like fields holding a bare `Value` (Store/Load ptr, GEP base,
+    // Memcpy, va_list, ...) are not Operands; the exhaustive walker covers
+    // them all (a hand-rolled Load/GEP-only match left Store-ptr and other
+    // positions naming the pre-rewrite value).
+    inst.for_each_value_use_mut(|v| {
+        if *v == old {
+            *v = new;
         }
-        Instruction::GetElementPtr { base, .. } => {
-            if *base == old {
-                *base = new;
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
 fn terminator_uses_value(term: &Terminator, v: Value) -> bool {
@@ -15601,6 +15595,57 @@ fn reduction_remainder_references_sound(func: &IrFunction, pattern: &ReductionPa
     invariant(&pattern.limit) && pattern.guard_rhs.as_ref().is_none_or(|op| invariant(op))
 }
 
+/// Pure divisibility check for the no-remainder fast path: does a constant
+/// trip count `[start, limit)` divide evenly into vector iterations covering
+/// `coverage_elems` elements each, so that the scalar remainder loop would
+/// execute zero iterations and can be omitted?
+///
+/// `start` is the induction variable's preheader value (reductions require
+/// `0` — see below; the map flavor passes its own absolute start). Every
+/// non-obvious shape fails closed (`false` ⇒ the remainder is emitted
+/// exactly as before):
+/// - non-constant or negative limits, or a limit below `start`;
+/// - limits above `i32::MAX / elem_size`: the vector loop's byte induction
+///   variable reaches `(n - start) * elem_size` as an `I32`, and signed
+///   overflow there would make the exit value — and hence the
+///   remainder-start identity the skip relies on — undefined;
+/// - zero/negative coverage or element size (defensive; widths are 2/4/8).
+///
+/// Reduction callers must pass `start == 0`: a `Max` reduction with a nonzero
+/// IV init addresses its remainder RELATIVE to the init, so the remainder-IV
+/// exit value (`n - c`) would not equal the source counter's final value (`n`)
+/// the escaping-IV rewrite promises. Zero-start loops have no such
+/// distinction (coverage `== n` is both).
+fn const_trip_covers_exactly(
+    limit: &Operand,
+    start: i64,
+    coverage_elems: u64,
+    elem_size: i64,
+) -> bool {
+    if elem_size <= 0 || start < 0 {
+        return false;
+    }
+    let Ok(width) = i64::try_from(coverage_elems) else {
+        return false;
+    };
+    if width <= 0 {
+        return false;
+    }
+    let Operand::Const(k) = limit else {
+        return false;
+    };
+    let Some(n) = k.to_i64() else {
+        return false;
+    };
+    if n < start {
+        return false;
+    }
+    if n > i32::MAX as i64 / elem_size {
+        return false;
+    }
+    (n - start) % width == 0
+}
+
 fn insert_reduction_remainder_loop(
     func: &mut IrFunction,
     pattern: &ReductionPattern,
@@ -15724,6 +15769,169 @@ fn insert_reduction_remainder_loop(
         }
         return 0;
     };
+
+    // Map to register-based horizontal reduction intrinsic (hoisted: shared
+    // by the no-remainder fast path and Step 2 below).
+    let vec_horizontal_op = match horizontal_intrinsic {
+        IntrinsicOp::HorizontalAddF64x4 => IntrinsicOp::VecHorizontalAddF64x4,
+        IntrinsicOp::HorizontalAddF64x2 => IntrinsicOp::VecHorizontalAddF64x2,
+        IntrinsicOp::HorizontalAddI32x8 => IntrinsicOp::VecHorizontalAddI32x8,
+        IntrinsicOp::HorizontalAddI32x4 => IntrinsicOp::VecHorizontalAddI32x4,
+        _ => horizontal_intrinsic, // Fallback
+    };
+
+    // ── No-remainder fast path ──────────────────────────────────────────
+    // If the trip count is a compile-time constant exactly divisible by the
+    // vector coverage, the scalar remainder would run zero iterations:
+    //   start = coverage = n == limit  ⇒  `start < limit` is false on entry.
+    // Omit the remainder header/body/latch entirely and wire outside uses
+    // to the horizontal-reduce results (a zero-trip remainder passes its
+    // `scalar_sum` incoming through unchanged, so this is value-identical).
+    // Escaping IV uses take `i_rem_start`, which EQUALS `n` here — the same
+    // final counter value the remainder IV would have carried to the exit.
+    // Unrolling (before or after vectorization) cannot invalidate this: it
+    // preserves the covered element set, whose cardinality stays a multiple
+    // of the width. See `const_trip_covers_exactly` for the proof's bounds.
+    let iv_starts_at_zero = {
+        let latch_label = func.blocks[pattern.latch_idx].label;
+        let mut saw_preheader = false;
+        let mut all_zero = true;
+        for inst in &func.blocks[pattern.header_idx].instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest == pattern.iv {
+                    for (op, lbl) in incoming {
+                        if *lbl == latch_label {
+                            continue;
+                        }
+                        saw_preheader = true;
+                        if !matches!(op, Operand::Const(k) if k.to_i64() == Some(0)) {
+                            all_zero = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        saw_preheader && all_zero
+    };
+    if iv_starts_at_zero && const_trip_covers_exactly(&pattern.limit, 0, vec_width, element_size) {
+        if debug {
+            eprintln!(
+                "[VEC-RED] exact coverage (limit {:?}, width {}): omitting scalar remainder",
+                pattern.limit, vec_width
+            );
+        }
+        // Ids for the single retained block (vec_exit) and its values.
+        let vec_exit_label = BlockId(*next_label);
+        *next_label += 1;
+        let scalar_sum = Value(*next_val_id);
+        *next_val_id += 1;
+        let i_rem_start = Value(*next_val_id);
+        *next_val_id += 1;
+        let mut extra_sums = Vec::with_capacity(seconds.len());
+        for _ in seconds {
+            extra_sums.push(Value(*next_val_id));
+            *next_val_id += 1;
+        }
+
+        // Step 1 (shared): redirect the vectorized header's exit to vec_exit.
+        if let Terminator::CondBranch { false_label, .. } =
+            &mut func.blocks[pattern.header_idx].terminator
+        {
+            *false_label = vec_exit_label;
+        }
+
+        // Step 2 (reduced): horizontal reductions plus the remainder-start
+        // index (retained: it doubles as the escaping-IV value). The
+        // dominance rematerializations in `vec_exit_prefix` fed only the
+        // remainder GEPs, so they are dropped with it. `max_shift` handling
+        // is absent deliberately: the skip requires a zero IV start, which
+        // is exactly `max_shift == 0`.
+        let mut instructions = Vec::with_capacity(8 + seconds.len());
+        let horiz_src = if let Some(acc2) = second_acc {
+            let combined = Value(*next_val_id);
+            *next_val_id += 1;
+            instructions.push(Instruction::Intrinsic {
+                dest: Some(combined),
+                op: IntrinsicOp::VecAddI64x2,
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(pattern.accumulator_phi),
+                    Operand::Value(acc2),
+                ],
+            });
+            combined
+        } else {
+            pattern.accumulator_phi
+        };
+        instructions.push(Instruction::Intrinsic {
+            dest: Some(scalar_sum),
+            op: vec_horizontal_op,
+            dest_ptr: None,
+            args: vec![Operand::Value(horiz_src)],
+        });
+        for (sec, sum) in seconds.iter().zip(extra_sums.iter()) {
+            instructions.push(Instruction::Intrinsic {
+                dest: Some(*sum),
+                op: vec_horizontal_op,
+                dest_ptr: None,
+                args: vec![Operand::Value(sec.accumulator_phi)],
+            });
+        }
+        // `i_rem_start == n` is PROVEN by the divisibility gate (byte IV:
+        // exit value `(n - 0) * elem_size`, exact — the `i32::MAX /
+        // elem_size` bound rules out signed overflow; element IV: `n / w`
+        // iterations times `w`), so the shape mirrors Step 2 exactly.
+        instructions.push(if byte_offset_iv {
+            Instruction::BinOp {
+                dest: i_rem_start,
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(pattern.iv),
+                rhs: Operand::Const(IrConst::I32(element_size.trailing_zeros() as i32)),
+                ty: IrType::I32,
+            }
+        } else {
+            Instruction::BinOp {
+                dest: i_rem_start,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(pattern.iv),
+                rhs: Operand::Const(IrConst::I32(vec_width as i32)),
+                ty: IrType::I32,
+            }
+        });
+        let exit_label = func.blocks[pattern.exit_idx].label;
+        func.blocks.push(BasicBlock {
+            label: vec_exit_label,
+            instructions,
+            terminator: Terminator::Branch(exit_label),
+            source_spans: vec![],
+        });
+
+        // Step 7 with the horizontal results standing in for the (zero-trip,
+        // hence pass-through) remainder phis.
+        let primary_updates = rewrite_accumulator_uses_outside_loop(
+            func,
+            &pattern.loop_blocks,
+            pattern.accumulator_phi.0,
+            scalar_sum,
+        );
+        for (sec, sum) in seconds.iter().zip(extra_sums.iter()) {
+            rewrite_accumulator_uses_outside_loop(
+                func,
+                &pattern.loop_blocks,
+                sec.accumulator_phi.0,
+                *sum,
+            );
+        }
+        *rem_iv_out = Some(i_rem_start);
+        if debug {
+            eprintln!(
+                "[VEC-RED]   no-remainder rewrite: {} accumulator uses → h-reduce",
+                primary_updates
+            );
+        }
+        return 1; // 1 new block added
+    }
 
     // Allocate new block IDs
     let vec_exit_label = BlockId(*next_label);
@@ -15864,15 +16072,7 @@ fn insert_reduction_remainder_loop(
     // Step 2: Create vec_exit block
     // Performs horizontal reduction and computes remainder start index
 
-    // Map to register-based horizontal reduction intrinsic
-    let vec_horizontal_op = match horizontal_intrinsic {
-        IntrinsicOp::HorizontalAddF64x4 => IntrinsicOp::VecHorizontalAddF64x4,
-        IntrinsicOp::HorizontalAddF64x2 => IntrinsicOp::VecHorizontalAddF64x2,
-        IntrinsicOp::HorizontalAddI32x8 => IntrinsicOp::VecHorizontalAddI32x8,
-        IntrinsicOp::HorizontalAddI32x4 => IntrinsicOp::VecHorizontalAddI32x4,
-        _ => horizontal_intrinsic, // Fallback
-    };
-
+    // `vec_horizontal_op` is hoisted above the no-remainder fast path.
     let vec_exit_block = {
         // When a second NEON accumulator was used (smlal/smlal2 split), fold
         // the two vector accumulators together before the horizontal reduce.
@@ -23578,5 +23778,87 @@ mod map_expr_interpreter_tests {
             "the reduced tree uses a mask as a value; if it were ever handed \
              to the scalar mirror the tail would compute `x + (0 or 1) & k`"
         );
+    }
+}
+
+#[cfg(test)]
+mod no_remainder_tests {
+    use super::*;
+
+    fn c32(n: i32) -> Operand {
+        Operand::Const(IrConst::I32(n))
+    }
+
+    #[test]
+    fn exact_coverage_divisible_trips() {
+        // 8-wide i32 reductions: the double_reduction shape (N = 1M).
+        assert!(const_trip_covers_exactly(&c32(1024), 0, 8, 4));
+        assert!(const_trip_covers_exactly(
+            &Operand::Const(IrConst::I64(1 << 20)),
+            0,
+            8,
+            4
+        ));
+        // Empty trip: the h-reduce identity flows to outside uses.
+        assert!(const_trip_covers_exactly(&c32(0), 0, 8, 4));
+        // Nonzero absolute start (map-flavor form): (100 - 4) % 8 == 0.
+        assert!(const_trip_covers_exactly(&c32(100), 4, 8, 4));
+        // Empty nonzero range is exactly covered.
+        assert!(const_trip_covers_exactly(&c32(8), 8, 8, 4));
+        // 4-wide f64: 256 % 4 == 0.
+        assert!(const_trip_covers_exactly(&c32(256), 0, 4, 8));
+    }
+
+    #[test]
+    fn exact_coverage_rejects_remainder_trips() {
+        assert!(!const_trip_covers_exactly(&c32(1023), 0, 8, 4));
+        assert!(!const_trip_covers_exactly(&c32(1025), 0, 8, 4));
+        assert!(!const_trip_covers_exactly(&c32(7), 0, 8, 4));
+        assert!(!const_trip_covers_exactly(&c32(100), 5, 8, 4));
+    }
+
+    #[test]
+    fn exact_coverage_fails_closed() {
+        // Dynamic limit.
+        assert!(!const_trip_covers_exactly(
+            &Operand::Value(Value(7)),
+            0,
+            8,
+            4
+        ));
+        // Negative limit / start, limit below start.
+        assert!(!const_trip_covers_exactly(&c32(-8), 0, 8, 4));
+        assert!(!const_trip_covers_exactly(&c32(8), -1, 8, 4));
+        assert!(!const_trip_covers_exactly(&c32(4), 8, 8, 4));
+        // Degenerate widths.
+        assert!(!const_trip_covers_exactly(&c32(8), 0, 0, 4));
+        assert!(!const_trip_covers_exactly(&c32(16), 0, 8, 0));
+        assert!(!const_trip_covers_exactly(&c32(8), 0, u64::MAX, 4));
+        // Non-integer constants.
+        assert!(!const_trip_covers_exactly(
+            &Operand::Const(IrConst::F64(8.0)),
+            0,
+            8,
+            4
+        ));
+    }
+
+    #[test]
+    fn exact_coverage_byte_iv_overflow_bound() {
+        // i32::MAX / 4 = 536870911: divisible trips at the bound are safe
+        // (536870904 % 8 == 0), while divisible trips above it would
+        // overflow the vector loop's I32 byte IV ((n - 0) * 4).
+        assert!(const_trip_covers_exactly(&c32(536870904), 0, 8, 4));
+        assert!(!const_trip_covers_exactly(&c32(536870912), 0, 8, 4));
+        assert!(!const_trip_covers_exactly(
+            &Operand::Const(IrConst::I64(i64::MAX)),
+            0,
+            8,
+            4
+        ));
+        // The bound scales with the element size (f64: i32::MAX / 8 =
+        // 268435455; 268435452 % 4 == 0 is the largest divisible trip).
+        assert!(const_trip_covers_exactly(&c32(268435452), 0, 4, 8));
+        assert!(!const_trip_covers_exactly(&c32(268435456), 0, 4, 8));
     }
 }

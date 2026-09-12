@@ -69,6 +69,14 @@ cat > "$work/m_nested.c" <<'EOF'
 unsigned char G[4096]; unsigned N;
 void f(unsigned k) { for (unsigned i = 0; i < N; i++) for (unsigned j = 0; j < k; j++) G[j] = 0; }
 EOF
+cat > "$work/m_u64_for.c" <<'EOF'
+unsigned char G[4096]; unsigned long N;
+void f(void) { for (unsigned long i = 0; i < N; i++) G[i] = 0; }
+EOF
+cat > "$work/m_u64_while.c" <<'EOF'
+unsigned char G[4096]; unsigned long N;
+void f(void) { unsigned long i = 0; while (i < N) { G[i] = 0; i++; } }
+EOF
 
 # --- must NOT rewrite ---
 cat > "$work/n_computed.c" <<'EOF'
@@ -96,6 +104,8 @@ check wide_pattern     1 "$work/m_wide_pattern.c"
 check bump_fill        1 "$work/m_bump.c"
 check exit_value_fill  1 "$work/m_exituse.c"
 check nested_fill      1 "$work/m_nested.c"
+check u64_for_fill     1 "$work/m_u64_for.c"
+check u64_while_fill   1 "$work/m_u64_while.c"
 
 check keep_computed    0 "$work/n_computed.c"
 check keep_copy        0 "$work/n_copy.c"

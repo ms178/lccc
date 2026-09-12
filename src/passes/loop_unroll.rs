@@ -1892,6 +1892,12 @@ fn try_complete_unroll_general(
     }
 
     func.next_value_id = next_val;
+    // Keep the label counter ahead of the clone labels minted above: every
+    // `BlockId(next_label)` handed out here must stay unique for the rest of
+    // the pipeline (a stale counter gave loop_memset colliding labels and
+    // detached its guard chain on strcmp-1). `.max()` never moves a healthy
+    // (already-ahead) counter backwards.
+    func.next_label = next_label.max(func.next_label);
 
     // ── Mutate the originals ────────────────────────────────────────────────
     // Iteration 0 keeps the original header + body. The header's terminator
@@ -2305,6 +2311,10 @@ fn try_complete_unroll_two_block(
         });
     }
     func.next_value_id = next_val;
+    // Label-counter writeback (see the clone-label note in
+    // try_complete_unroll_general): the clone labels minted from the local
+    // counter must stay unique pipeline-wide.
+    func.next_label = next_label.max(func.next_label);
 
     func.blocks[header].terminator = Terminator::Branch(labels[0]);
     // The latch is now UNREACHABLE: the header branches into the clone chain
@@ -3354,6 +3364,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
         let exit_idx = match func.blocks.iter().position(|b| b.label == c.exit_target) {
             Some(i) => i,
             None => {
+                func.next_label = next_label.max(func.next_label);
                 func.blocks.extend(new_blocks);
                 return true;
             }
@@ -3533,6 +3544,10 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
     }
 
     // Step 6: Append all new blocks.
+    // Label-counter writeback: the exit-check/clone labels minted from the
+    // local counter must stay unique pipeline-wide (stale counters hand
+    // later passes colliding labels).
+    func.next_label = next_label.max(func.next_label);
     func.blocks.extend(new_blocks);
 
     true
@@ -3769,6 +3784,7 @@ mod tests {
         });
 
         func.next_value_id = 11; // 0–10 used (10 = arr placeholder)
+        func.next_label = 5; // labels 0–4 used
         func
     }
 

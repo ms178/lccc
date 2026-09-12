@@ -1,0 +1,97 @@
+{
+  "label": "E5: sha single-shot(v392-win) vs OFF",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_hfjz2q4y/arm_a",
+    "sha256": "09d36ae8a51e2997f3c5c92e495a38ba428bd92d6e928f071b06b96cb07e8fc3",
+    "env": "CCC_SPAN_STEAL_FIRST_ONLY=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_hfjz2q4y/arm_b",
+    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
+    "env": "CCC_NO_X64_SPAN_STEAL=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 2,
+  "arm_a_timings": {
+    "arm": "SHOT1",
+    "n": 15,
+    "min_ms": 807.765,
+    "median_ms": 813.511,
+    "mean_ms": 817.222,
+    "stdev_ms": 10.363,
+    "samples_ms": [
+      810.44,
+      827.53,
+      813.511,
+      846.061,
+      834.424,
+      812.163,
+      812.476,
+      811.42,
+      815.417,
+      816.215,
+      818.044,
+      814.875,
+      809.345,
+      807.765,
+      808.64
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "OFF",
+    "n": 15,
+    "min_ms": 405.564,
+    "median_ms": 407.618,
+    "mean_ms": 412.629,
+    "stdev_ms": 13.972,
+    "samples_ms": [
+      405.834,
+      405.564,
+      436.962,
+      406.842,
+      407.618,
+      407.412,
+      408.083,
+      406.693,
+      411.733,
+      407.999,
+      407.915,
+      407.619,
+      406.774,
+      405.648,
+      456.742
+    ]
+  },
+  "paired_diffs_ms": [
+    404.606,
+    421.967,
+    376.548,
+    439.22,
+    426.806,
+    404.751,
+    404.394,
+    404.728,
+    403.684,
+    408.216,
+    410.129,
+    407.256,
+    402.571,
+    402.116,
+    351.898
+  ],
+  "median_ratio_b_over_a": 0.50106,
+  "min_ratio_b_over_a": 0.50208,
+  "sign_test_p": 0.0003,
+  "median_and_min_agree": true,
+  "significant": true,
+  "verdict": "SHOT1 SLOWER by 49.89% (median)"
+}

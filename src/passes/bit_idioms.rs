@@ -316,6 +316,9 @@ fn narrow_width_bits(ty: IrType) -> Option<u64> {
 fn high_bits_zero(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> bool {
     let v = peel_copies(opnd, defs);
     if let Some(c) = const_u64(v) {
+        if width >= 64 {
+            return true;
+        }
         return c < (1u64 << width);
     }
     let Operand::Value(id) = v else {
@@ -1695,5 +1698,23 @@ mod tests {
             16,
             &defs
         ));
+    }
+
+    #[test]
+    fn high_bits_zero_width64_accepts_any_const() {
+        // At width >= 64 a u64 has no upper bits: every constant passes.
+        // (Before the fix this computed `1u64 << 64`: debug panic, and in
+        // release `c < 1`, wrongly rejecting every nonzero constant.)
+        let defs: Vec<Option<Instruction>> = Vec::new();
+        assert!(high_bits_zero(Operand::Const(IrConst::I64(5)), 64, &defs));
+        assert!(high_bits_zero(Operand::Const(IrConst::I64(-1)), 64, &defs));
+        assert!(high_bits_zero(Operand::Const(IrConst::I64(0)), 64, &defs));
+        // Narrow widths still enforce the bound.
+        assert!(!high_bits_zero(
+            Operand::Const(IrConst::I64(1 << 33)),
+            32,
+            &defs
+        ));
+        assert!(high_bits_zero(Operand::Const(IrConst::I64(0)), 0, &defs));
     }
 }

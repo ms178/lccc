@@ -697,6 +697,20 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 );
                 changed |= c;
             }
+            // Broadcast half: fold a dead staged scalar load into an AVX
+            // broadcast-from-memory (`vmovsd MEM,%xmmD; vbroadcastsd %xmmD,%ymmM`
+            // -> `vbroadcastsd MEM,%ymmM`). Same skip key: one VEX mem-fold family.
+            {
+                let c = local_patterns::fold_broadcast_load_into_broadcast(&mut store, &mut infos);
+                trace(
+                    "fold_broadcast_load_into_broadcast",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
         }
         if !sk("fp_roundtrips") {
             {
@@ -1162,19 +1176,6 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed |= c;
             }
         }
-        if !sk("fp_broadcast") {
-            {
-                let c = local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
-                trace(
-                    "hoist_loop_invariant_fp_broadcast",
-                    pass_count,
-                    c,
-                    &store,
-                    &infos,
-                );
-                changed |= c;
-            }
-        }
         if local_changed || pass_count == 0 {
             if !sk("push_pop") {
                 {
@@ -1439,9 +1440,6 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
     // Phase 4c: Late loop-invariant hoisting.
     if !skip_phase4 && !sk("gpr_hoist") {
         local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
-    }
-    if !skip_phase4 && !sk("fp_broadcast") {
-        local_patterns::hoist_loop_invariant_fp_broadcast(&mut store, &mut infos);
     }
 
     // Phase 4d: Loop rotation — move condition from header to latch.

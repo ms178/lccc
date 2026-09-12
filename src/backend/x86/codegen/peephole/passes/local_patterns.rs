@@ -14,6 +14,7 @@
 //!   7. eliminate_redundant_xorl_zero: xorl %eax,%eax when %rax already zero
 
 use super::super::types::*;
+use super::dead_writes::{frame_slot_stable_in_range, parse_frame_slot};
 use super::flag_peepholes::flags_dead_after;
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
@@ -22,6 +23,7 @@ use super::helpers::{
     writes_family_full,
 };
 use super::liveness::FileLiveness;
+use super::relay_and_lea::function_range;
 
 /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
 /// Used to ensure an adjacent store and load refer to the SAME slot (same base),
@@ -2978,29 +2980,27 @@ pub(super) fn promote_loop_invariant_fp_load(
             }
             let offset_str = src.to_string();
 
-            // Check -O(%rbp) is NOT written in the loop body [body_start..=i].
-            // Extract numeric offset from the source string (e.g., "-24(%rbp)" → -24)
+            // The slot must be STABLE over the whole loop: the promoted
+            // `%xmm2` holds the pre-loop value, so any in-loop write (GPR,
+            // XMM, RMW, atomic, ...) to an overlapping byte breaks it. The
+            // old scan recognised only `movsd` stores (same hole class as
+            // gpr_hoist's torture execute/20030613-1.c miscompile); the
+            // shared engine covers every writer family plus base motion.
+            // (The FpLiveness `slot_dead_after` backstop below guards the
+            // READERS of the redirected slot, not its writers: a pure write
+            // kills slot liveness and is invisible to it.)
             let numeric_offset_end = offset_str.find('(').unwrap_or(offset_str.len());
             let numeric_offset: i32 = offset_str[..numeric_offset_end].parse().unwrap_or(0);
-            let mut written_in_body = false;
-            for chk in body_start + 1..i {
-                if infos[chk].is_nop() {
-                    continue;
-                }
-                if let LineKind::StoreRbp { offset: o, .. } = infos[chk].kind {
-                    if o == numeric_offset {
-                        written_in_body = true;
-                        break;
-                    }
-                }
-                // Also check text for movsd stores to this offset.
-                let ct = infos[chk].trimmed(store.get(chk));
-                if ct.ends_with(&offset_str) && ct.starts_with("movsd ") {
-                    written_in_body = true;
-                    break;
-                }
+            let slot_base: RegId = if src.ends_with("(%rsp)") { 4 } else { 5 };
+            // The preheader store below only matches `StoreRbp` (an rbp
+            // base): an rsp-relative load must not pair with an
+            // rbp-relative store that merely shares the numeric offset —
+            // the promoted %xmm2 would carry the wrong slot's value.
+            if slot_base != 5 {
+                continue;
             }
-            if written_in_body {
+            let slot = parse_frame_slot(src, 8);
+            if !frame_slot_stable_in_range(store, infos, header, i, slot_base, slot) {
                 continue;
             }
 
@@ -3020,7 +3020,17 @@ pub(super) fn promote_loop_invariant_fp_load(
                     break;
                 }
                 let ct = infos[chk].trimmed(store.get(chk));
-                if ct.contains("%xmm2") {
+                // All three widths alias the same register: a %ymm2/%zmm2
+                // mention reads or clobbers the promoted %xmm2 too.  (Today
+                // this is defense in depth: any VEX line in range already
+                // vetoes via the stability engine's `Other { REG_NONE }`
+                // rule (vector dests are unrepresentable there), and the
+                // width-aware FpLiveness oracle independently refuses READS
+                // of %ymm2.  These arms become load-bearing if the
+                // classifier ever learns vector dest_regs — then a pure
+                // in-loop WRITE of %ymm2 would pass the oracle (a write
+                // kills liveness) and corrupt iteration 2+.)
+                if ct.contains("%xmm2") || ct.contains("%ymm2") || ct.contains("%zmm2") {
                     xmm2_used = true;
                     break;
                 }
@@ -4049,26 +4059,114 @@ pub(super) fn coalesce_phi_register_copies(store: &mut LineStore, infos: &mut [L
     changed
 }
 
-// ── Loop-invariant GPR load hoisting ─────────────────────────────────────────
+/// Rule 1 for `hoist_loop_invariant_gpr_load`: the loop `[header..=latch]`
+/// has exactly one entry edge from outside, and it is the preheader jump at
+/// `entry` (whose replacement falls through into the header). Any second
+/// outside branch into any loop label, any indirect jump, any jump-table
+/// reference to a loop label, or any inline asm (opaque control flow) inside
+/// the enclosing function vetoes the hoist. (`loop_is_single_entry` is the
+/// fall-through-entry variant — it forbids the entry edge itself — so it
+/// cannot be reused here.)
+fn loop_entry_is_unique(
+    store: &LineStore,
+    infos: &[LineInfo],
+    header: usize,
+    latch: usize,
+    entry: usize,
+) -> bool {
+    let (func_start, func_end) = function_range(store, infos, header).unwrap_or((0, store.len()));
+    let mut labels: Vec<&str> = Vec::new();
+    for n in header..=latch {
+        if !infos[n].is_nop() && infos[n].kind == LineKind::Label {
+            if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
+                labels.push(name);
+            }
+        }
+    }
+    let mut entries = 0u32;
+    for n in func_start..func_end {
+        if n >= header && n <= latch {
+            continue;
+        }
+        if infos[n].is_nop() {
+            continue;
+        }
+        match infos[n].kind {
+            LineKind::Jmp | LineKind::CondJmp => {
+                let t = infos[n].trimmed(store.get(n));
+                let tgt = t.split_whitespace().nth(1).unwrap_or("");
+                if labels.contains(&tgt) {
+                    if n != entry {
+                        return false;
+                    }
+                    entries += 1;
+                }
+            }
+            LineKind::JmpIndirect | LineKind::InlineAsm => return false,
+            LineKind::Directive => {
+                // Jump tables: `.quad .LBBn` / `.long .LBBn-...` entries.
+                let t = infos[n].trimmed(store.get(n));
+                if t.starts_with(".quad ") || t.starts_with(".long ") {
+                    if labels.iter().any(|l| t.contains(l)) {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    entries == 1
+}
+
+// ── Loop-invariant GPR load hoisting ────────────────────────────────────────
 //
-// Hoists stack loads that are invariant across a loop body to just before the
-// loop header. Generalizes promote_loop_invariant_fp_load to GPR loads.
+// Hoists stack loads that are invariant across a loop body into the loop
+// preheader, by replacing the preheader's entry `jmp <header>` with the
+// load (execution then falls through into the header, so the load runs on
+// every entry into the loop).
 //
 // Pattern:
+//   ..preheader..
+//   jmp .LBB_header           ← replaced by the hoisted load
 //   .LBB_header:
 //     ...
 //   .LBB_body:
-//     movq OFFSET(%rsp), %REG   ← invariant load (OFFSET not written in loop)
+//     movq OFFSET(%rsp), %REG ← invariant load (deleted)
 //     ...use %REG...
-//     jmp .LBB_header            ← back-edge
+//     jmp .LBB_header          ← back-edge
 //
-// Transformed to:
-//   movq OFFSET(%rsp), %REG     ← hoisted before header
-//   .LBB_header:
-//     ...
-//   .LBB_body:
-//     ...use %REG...             ← load removed
-//     jmp .LBB_header
+// Six proof obligations, each with a regression behind it:
+// 1. unique entry: `loop_entry_is_unique` — the preheader jump is the
+//    only outside edge into any loop label, so every path into the loop
+//    runs the hoisted load (a `je` into the header from a second
+//    predecessor bypassed the preheader and read an uninitialized
+//    register: gzip's `rsync` guard into the deflate hash loop);
+// 2. slot stability: `frame_slot_stable_in_range` — no overlapping write
+//    and no base motion anywhere in `[entry..=i]`. The old scan recognised
+//    only `movq/movl/movb/movw` stores, so a `movdqu %xmm0, 136(%rsp)`
+//    struct copy inside the loop clobbered the hoisted load (torture
+//    execute/20030613-1.c at -O1). The scan starts at the ENTRY jump, not
+//    the header: up to 8 gap instructions can sit between them;
+// 3. no calls, no `ret` in `[entry..=i]` (calls clobber caller-saved
+//    destinations and own the red zone; a `ret` means the range is not a
+//    natural loop);
+// 4. the destination is written nowhere else in `[entry..=i]` —
+//    `writes_family` (exact implicits: `div`/`mul` → `%rdx`, `cpuid`,
+//    `pop %dst`, `setCC %dst`, ...) plus an explicit unknown-destination
+//    fallback (the implicit-operand table is exact-only);
+// 5. the destination's OLD value is dead at the hoist point: no mention of
+//    it in `[entry..pos)` (any mention there is a read — rule 4 proved no
+//    writes), with an implicit-usage backstop for `%rcx/%rdx/%rbx` and the
+//    wide family range (`div`, shifts, `cpuid`, `syscall`, ... read them
+//    without naming them, and `reg_refs` is textual);
+// 6. the destination is not observed after the loop: no mention in
+//    `(back-edge..function-end]` except `pop %dst` restores (a pure kill,
+//    not a read), same implicit backstop, and `ret` counts as a `%rdx`
+//    read (128-bit returns). Reads after a clobbering call are refused
+//    too — conservatively (dominance would need a CFG).
+//
+// Pinned candidates (volatile / address-taken slots, param-ABI reads) are
+// never touched.
 
 pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
@@ -4126,12 +4224,55 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
             }
         };
 
-        // Validate this is a real loop: the range [header..=i] must not contain
-        // a ret instruction (which would indicate the range spans the epilogue
-        // and is not a natural loop body).
+        // The preheader's last instruction must be the unique unconditional
+        // forward `jmp <header>`: the hoisted load takes its place and falls
+        // through into the header, which guarantees the load runs on every
+        // path that enters the loop. Scan backward from just before the
+        // header, skipping NOPs; stop at anything that ends the preheader
+        // block. (Found once per loop: the entry is loop-invariant.)
+        // The scan never crosses the enclosing function's start (without
+        // CFI the range defaults to the whole file, i.e. today's behavior):
+        // an entry above the function label would rewrite another function.
+        let func_start = function_range(store, infos, header)
+            .map(|(s, _)| s)
+            .unwrap_or(0);
+        let mut entry_jmp: Option<usize> = None;
+        let mut p = header;
+        while p > func_start {
+            p -= 1;
+            if infos[p].is_nop() {
+                continue;
+            }
+            let t = infos[p].trimmed(store.get(p));
+            if t == format!("jmp {}", target) {
+                entry_jmp = Some(p);
+                break;
+            }
+            if infos[p].kind == LineKind::Jmp
+                || infos[p].kind == LineKind::CondJmp
+                || infos[p].kind == LineKind::Label
+                || infos[p].kind == LineKind::Call
+                || infos[p].kind == LineKind::Ret
+            {
+                break;
+            }
+            if p == func_start || p + 8 < header {
+                break;
+            }
+        }
+        // Fall-through or multiple-entry: no dominating placement exists.
+        let Some(entry) = entry_jmp else {
+            i += 1;
+            continue;
+        };
+
+        // Rules 1+3: single entry (no second edge into ANY loop label, no
+        // indirect jumps, no jump tables, no inline asm in the file) and no
+        // calls/`ret` in `[entry..=i]` (the gap between the entry jump and
+        // the header executes too, so it is part of every scan).
         let mut has_ret = false;
         let mut has_call = false;
-        for chk in header..=i {
+        for chk in entry..=i {
             if infos[chk].is_nop() {
                 continue;
             }
@@ -4146,7 +4287,7 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
                 _ => {}
             }
         }
-        if has_ret {
+        if has_ret || has_call || !loop_entry_is_unique(store, infos, header, i, entry) {
             i += 1;
             continue;
         }
@@ -4159,14 +4300,14 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
                 break;
             }
         }
+        // Rule 6 scans to the enclosing function's end (past-the-end on
+        // missing CFI: scanning into the next function only over-refuses).
+        let func_end = function_range(store, infos, i)
+            .map(|(_, e)| e)
+            .unwrap_or(len);
 
         // Scan body for movq OFFSET(%rsp), %REG (or %rbp) candidates.
         // Only hoist one load per loop per pass (to avoid interactions).
-        // Skip loops with function calls — caller-saved regs could be clobbered.
-        if has_call {
-            i += 1;
-            continue;
-        }
         let mut hoisted_one = false;
         for pos in body_start + 1..i {
             if hoisted_one {
@@ -4181,6 +4322,11 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
             if !t.starts_with("movq ") {
                 continue;
             }
+            // Pinned lines (volatile / address-taken slots, param-ABI
+            // reads) are never hoisted.
+            if infos[pos].pinned {
+                continue;
+            }
             // Parse: "movq SRC, %DST"
             let after_movq = &t[5..];
             let comma = match after_movq.find(", %") {
@@ -4191,12 +4337,20 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
             let dst_part = &after_movq[comma + 2..]; // includes %
 
             // Source must be a stack slot
-            if !src_part.ends_with("(%rsp)") && !src_part.ends_with("(%rbp)") {
+            let base: RegId = if src_part.ends_with("(%rsp)") {
+                4
+            } else if src_part.ends_with("(%rbp)") {
+                5
+            } else {
                 continue;
-            }
-            // Destination must be a GP register
+            };
+            // Destination must be a GP register — and never %rsp (family 4):
+            // the backend never allocates it, and writing it moves every
+            // rsp-relative address. (%rbp stays legal: under
+            // -fomit-frame-pointer it is an ordinary callee-saved register,
+            // and with a frame pointer the allocator never deals it.)
             let dst_family = register_family_fast(dst_part);
-            if dst_family == REG_NONE || dst_family > REG_GP_MAX {
+            if dst_family == REG_NONE || dst_family > REG_GP_MAX || dst_family == 4 {
                 continue;
             }
             // Don't hoist into rax/rcx (accumulator) or rsp/rbp
@@ -4205,171 +4359,146 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
                 continue;
             }
 
-            // Parse the numeric offset
-            let offset_end = src_part.find('(').unwrap_or(src_part.len());
-            let numeric_offset: i32 = src_part[..offset_end].parse().unwrap_or(i32::MIN);
-            if numeric_offset == i32::MIN {
+            // Rule 2: the slot is stable and its base cannot move in
+            // `[entry..=i]` (shared engine: XMM/RMW/string/atomic stores,
+            // pointer stores, push/pop, rsp arithmetic, ...).
+            let slot = parse_frame_slot(src_part, 8);
+            if !frame_slot_stable_in_range(store, infos, entry, i, base, slot) {
                 continue;
             }
 
-            // Check: the stack slot is NOT written anywhere in [header..=i]
-            let mut slot_written = false;
-            for chk in header..=i {
-                if infos[chk].is_nop() {
-                    continue;
-                }
-                if let LineKind::StoreRbp { offset: o, .. } = infos[chk].kind {
-                    if o == numeric_offset {
-                        slot_written = true;
-                        break;
-                    }
-                }
-                // Also check Other instructions that store to this offset
-                let ct = infos[chk].trimmed(store.get(chk));
-                if ct.ends_with(src_part)
-                    && (ct.starts_with("movq ")
-                        || ct.starts_with("movl ")
-                        || ct.starts_with("movb ")
-                        || ct.starts_with("movw "))
-                {
-                    // This could be a store TO this slot
-                    if let Some(c) = ct.find(", ") {
-                        if ct[c + 2..] == *src_part {
-                            slot_written = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if slot_written {
-                continue;
-            }
-
-            // Check: the destination register is NOT written by any other instruction
-            // in [header..=i] besides this load. Also check it's not used as a
-            // destination in any other instruction.
-            let dst_bit = 1u16 << dst_family;
+            // Rule 4: the destination is written nowhere else in
+            // `[entry..=i]` — exact implicits plus an unknown-destination
+            // fallback (the implicit-operand table yields `(0, 0)` for
+            // unknown mnemonics).
             let mut reg_written_elsewhere = false;
-            for chk in header..=i {
+            for chk in entry..=i {
                 if chk == pos {
                     continue;
                 } // skip the load itself
                 if infos[chk].is_nop() {
                     continue;
                 }
-                match infos[chk].kind {
-                    LineKind::Other { dest_reg } if dest_reg == dst_family => {
-                        reg_written_elsewhere = true;
-                        break;
-                    }
-                    LineKind::LoadRbp { reg, .. } if reg == dst_family => {
-                        reg_written_elsewhere = true;
-                        break;
-                    }
-                    LineKind::Call => {
-                        // Calls clobber caller-saved regs. If dst is caller-saved, bail.
-                        if !is_callee_saved_reg(dst_family) {
-                            reg_written_elsewhere = true;
-                            break;
-                        }
-                    }
-                    _ => {}
+                if matches!(infos[chk].kind, LineKind::Other { dest_reg }
+                    if dest_reg == REG_NONE)
+                    || writes_family(&infos[chk], infos[chk].trimmed(store.get(chk)), dst_family)
+                {
+                    reg_written_elsewhere = true;
+                    break;
                 }
             }
             if reg_written_elsewhere {
                 continue;
             }
 
-            // All checks passed. Hoist the load into the PREHEADER.
-            //
-            // SOUND FIX: the previous implementation placed the hoisted load
-            // either in a NOP slot before the header or prepended to the header
-            // label line. Both are wrong: the header label sits AFTER the entry
-            // `jmp .LBB1`, so a load prepended to the header label (or placed in
-            // a NOP between the entry jump and the label) is in a DEAD gap that is
-            // skipped on entry — the destination register is never loaded and the
-            // body reads an uninitialized register.
-            //
-            // Correct approach: the preheader's last instruction is an unconditional
-            // forward `jmp <header>`. Replace THAT jmp with the hoisted load, so the
-            // load executes in the preheader and then FALLS THROUGH into the header.
-            // This guarantees the load runs on every path that enters the loop.
-            //
-            // We only hoist when there is a unique unconditional forward entry jump
-            // to the header (the natural single-entry preheader). If the entry is a
-            // fall-through (no jmp) or has multiple entry edges, we cannot place a
-            // dominating load safely and we skip the candidate.
-            let load_text = store.get(pos).to_string();
-            let header_label = format!("{}:", target);
-            // Scan backward from just before the header, skipping NOPs, for the
-            // unconditional `jmp <header>` entry jump.
-            let mut entry_jmp: Option<usize> = None;
-            let mut p = header;
-            while p > 0 {
-                p -= 1;
-                if infos[p].is_nop() {
+            // Rule 4b (skip-edge veto): no forward edge in `[header..pos)`
+            // may jump over the candidate into `(pos..i]`. Such an edge
+            // would let a use below `pos` read the pre-loop value while
+            // the hoisted load overwrites it (a backend-valid
+            // partial-redefinition shape: the skipped `dst` definition
+            // normally forces a join copy that Rule 4 vetoes, but this
+            // rule must not depend on that producer invariant).
+            // Backward edges (target at/above the jump) cannot skip `pos`
+            // and are exempt; indirect jumps and inline asm are already
+            // vetoed function-wide by Rule 1.
+            let mut skips_pos = false;
+            'rule4b: for chk in header..pos {
+                if infos[chk].is_nop() {
                     continue;
                 }
-                let t = infos[p].trimmed(store.get(p));
-                if t == format!("jmp {}", target) || t == format!("jmp {}", target_label) {
-                    // Must be an unconditional forward jump to the header.
-                    entry_jmp = Some(p);
-                    break;
-                }
-                // Stop at a directive boundary or another branch/label (not the
-                // immediately-preceding preheader block).
-                if infos[p].kind == LineKind::Jmp
-                    || infos[p].kind == LineKind::CondJmp
-                    || infos[p].kind == LineKind::Label
-                    || infos[p].kind == LineKind::Call
-                    || infos[p].kind == LineKind::Ret
-                {
-                    break;
-                }
-                if p == 0 || p + 8 < header {
-                    break;
-                }
-            }
-            // If we didn't find the entry jump right before the header (fall-through
-            // or multiple-entry), do NOT hoist (can't place a dominating load safely).
-            let Some(entry) = entry_jmp else {
-                i += 1;
-                continue;
-            };
-            // SAFETY: replacing the preheader's `jmp <header>` with the hoisted
-            // load relies on that load executing on EVERY entry into the loop via
-            // fall-through from the preheader. That is only sound when the header
-            // has NO other FORWARD entry edge: a conditional branch (e.g.
-            // `je <header>`) from a different predecessor enters the loop
-            // directly, bypassing the preheader, and would observe an
-            // uninitialized destination register. (gzip's deflate: the `rsync`
-            // guard's `je` into the hash-table loop header — `head` was reloaded
-            // into %rcx only on the fall-through edge, so `head[ins_h]=strstart`
-            // wrote through `&rsync`, corrupted globals and SIGSEGV'd.) Back-edges
-            // (position > header) are fine: the load is invariant and the
-            // destination is not written inside the loop (verified above).
-            let mut forward_entries = 0u32;
-            for idx in 0..header {
-                if infos[idx].is_nop() {
+                if !matches!(infos[chk].kind, LineKind::Jmp | LineKind::CondJmp) {
                     continue;
                 }
-                if matches!(infos[idx].kind, LineKind::Jmp | LineKind::CondJmp) {
-                    let t = infos[idx].trimmed(store.get(idx));
-                    if let Some(tg) = extract_jump_target(t) {
-                        if tg == target.as_str() {
-                            forward_entries += 1;
-                        }
+                let jt = infos[chk].trimmed(store.get(chk));
+                let Some(tgt) = jt.split_whitespace().nth(1) else {
+                    continue;
+                };
+                // Locate the target label; an unresolvable target fails
+                // closed (direct jumps always name a file-local label, so
+                // this only fires on shapes the classifier misjudged).
+                let tgt_label = format!("{tgt}:");
+                let mut tgt_pos = None;
+                for l in 0..len {
+                    if infos[l].kind == LineKind::Label
+                        && infos[l].trimmed(store.get(l)) == tgt_label
+                    {
+                        tgt_pos = Some(l);
+                        break;
                     }
                 }
+                let Some(tp) = tgt_pos else {
+                    skips_pos = true;
+                    break;
+                };
+                if tp <= chk {
+                    continue; // backward edge: cannot skip pos
+                }
+                if tp > pos && tp <= i {
+                    skips_pos = true;
+                    break 'rule4b;
+                }
             }
-            // Exactly one forward reference (the entry jmp itself) is allowed.
-            if forward_entries != 1 {
-                i += 1;
+            if skips_pos {
                 continue;
             }
-            // Replace the entry jmp with the load; execution falls through into the
-            // header. The load is invariant (slot not written in loop, no calls) and
-            // the dest register is not written in the loop (checked above).
+
+            // Rule 5: the old value is dead at the hoist point — any mention
+            // in `[entry..pos)` is a read (rule 4 proved no writes there).
+            // `reg_refs` is textual, so instructions with implicit register
+            // operands additionally veto when the destination is in the
+            // implicitly-readable range (`div`, shifts, `cpuid`, `syscall`,
+            // ... only ever touch families below `%r12`).
+            let dst_bit = 1u16 << dst_family;
+            let mut old_value_observed = false;
+            for chk in entry..pos {
+                if infos[chk].is_nop() {
+                    continue;
+                }
+                if infos[chk].reg_refs & dst_bit != 0 {
+                    old_value_observed = true;
+                    break;
+                }
+                if dst_family < 12 && has_implicit_reg_usage(infos[chk].trimmed(store.get(chk))) {
+                    old_value_observed = true;
+                    break;
+                }
+            }
+            if old_value_observed {
+                continue;
+            }
+
+            // Rule 6: the destination is not observed after the loop — no
+            // mention past the back-edge (same implicit backstop; `ret`
+            // reads `%rdx` for 128-bit returns). `pop %dst` restores are
+            // pure kills, not reads, and are skipped.
+            let mut observed_after_loop = false;
+            for k in i + 1..func_end {
+                if infos[k].is_nop() {
+                    continue;
+                }
+                if matches!(infos[k].kind, LineKind::Pop { reg } if reg == dst_family) {
+                    continue;
+                }
+                if infos[k].reg_refs & dst_bit != 0 {
+                    observed_after_loop = true;
+                    break;
+                }
+                if matches!(infos[k].kind, LineKind::Ret) && dst_family == 2 {
+                    observed_after_loop = true;
+                    break;
+                }
+                if dst_family < 12 && has_implicit_reg_usage(infos[k].trimmed(store.get(k))) {
+                    observed_after_loop = true;
+                    break;
+                }
+            }
+            if observed_after_loop {
+                continue;
+            }
+
+            // All checks passed. Replace the entry jmp with the load;
+            // execution falls through into the header.
+            let load_text = store.get(pos).to_string();
             replace_line(
                 store,
                 &mut infos[entry],
@@ -4379,187 +4508,6 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
             mark_nop(&mut infos[pos]); // remove original in-loop load
             changed = true;
             hoisted_one = true;
-        }
-
-        i += 1;
-    }
-    changed
-}
-
-// ── Loop-invariant broadcast hoisting ────────────────────────────────────────
-//
-// Hoists loop-invariant movsd+vbroadcastsd pairs out of the inner loop:
-//
-//   .loop:
-//     movsd (%REG), %xmm1          →  (NOPed, hoisted before loop)
-//     vbroadcastsd %xmm1, %ymm1    →  (NOPed, hoisted before loop)
-//     vmovupd ...                      vmovupd ...
-//     vfmadd231pd ...                  vfmadd231pd ...
-//
-// The hoist is safe when %REG is not modified within the loop body.
-
-pub(super) fn hoist_loop_invariant_fp_broadcast(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
-    let len = store.len();
-    let mut changed = false;
-    let mut i = 0;
-
-    while i < len {
-        if infos[i].is_nop() {
-            i += 1;
-            continue;
-        }
-        // Find back-edge: jl/jle/jne/jb/ja/jmp to a label before this instruction
-        let jmp_text = infos[i].trimmed(store.get(i));
-        let target = if jmp_text.starts_with("jl ") {
-            &jmp_text[3..]
-        } else if jmp_text.starts_with("jle ") {
-            &jmp_text[4..]
-        } else if jmp_text.starts_with("jne ") {
-            &jmp_text[4..]
-        } else if jmp_text.starts_with("jmp ") {
-            &jmp_text[4..]
-        } else {
-            i += 1;
-            continue;
-        };
-        if !target.starts_with(".L") {
-            i += 1;
-            continue;
-        }
-
-        let target_label = format!("{}:", target);
-        let mut header_pos = None;
-        for lbl in 0..i {
-            if infos[lbl].kind == LineKind::Label
-                && infos[lbl].trimmed(store.get(lbl)) == target_label
-            {
-                header_pos = Some(lbl);
-                break;
-            }
-        }
-        let header = match header_pos {
-            Some(h) => h,
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-
-        // Validate: no ret or call in loop
-        let mut has_ret = false;
-        let mut has_call = false;
-        for chk in header..=i {
-            if infos[chk].is_nop() {
-                continue;
-            }
-            match infos[chk].kind {
-                LineKind::Ret => {
-                    has_ret = true;
-                    break;
-                }
-                LineKind::Call => {
-                    has_call = true;
-                }
-                _ => {}
-            }
-        }
-        if has_ret || has_call {
-            i += 1;
-            continue;
-        }
-
-        // Scan loop body for: movsd (%REG), %xmm1 followed by vbroadcastsd %xmm1, %ymm1
-        let mut hoisted_one = false;
-        for pos in header + 1..i {
-            if hoisted_one {
-                break;
-            }
-            if infos[pos].is_nop() {
-                continue;
-            }
-            let t1 = infos[pos].trimmed(store.get(pos));
-            if !t1.starts_with("movsd (%") || !t1.ends_with("), %xmm1") {
-                continue;
-            }
-
-            // Extract the source register
-            let reg_start = 7; // after "movsd (%"
-            let reg_end = t1.find("), %xmm1").unwrap_or(0);
-            if reg_end <= reg_start {
-                continue;
-            }
-            let src_reg = &t1[reg_start..reg_end];
-
-            // Next non-NOP must be vbroadcastsd
-            let mut pos2 = pos + 1;
-            while pos2 < i && infos[pos2].is_nop() {
-                pos2 += 1;
-            }
-            if pos2 >= i {
-                continue;
-            }
-            let t2 = infos[pos2].trimmed(store.get(pos2));
-            if t2 != "vbroadcastsd %xmm1, %ymm1" {
-                continue;
-            }
-
-            // Check that src_reg is NOT modified within the loop
-            let write_pattern = format!(", %{}", src_reg);
-            let mut reg_modified = false;
-            for chk in header..=i {
-                if chk == pos || chk == pos2 {
-                    continue;
-                }
-                if infos[chk].is_nop() {
-                    continue;
-                }
-                let ct = infos[chk].trimmed(store.get(chk));
-                if ct.contains(&write_pattern) || ct.ends_with(&format!("%{}", src_reg)) {
-                    // Check if it's a destination (after last comma)
-                    if let Some(last_comma) = ct.rfind(", ") {
-                        let dest_part = &ct[last_comma + 2..];
-                        if dest_part.contains(src_reg) {
-                            reg_modified = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if reg_modified {
-                continue;
-            }
-
-            // Find a NOP slot JUST before the header (within 10 lines) to place
-            // both hoisted instructions as a combined two-line string.
-            let mut slot = None;
-            for p in (0..header).rev() {
-                if infos[p].is_nop() {
-                    slot = Some(p);
-                    break;
-                }
-                // Only search in the immediate preheader
-                if p < header.saturating_sub(10) {
-                    break;
-                }
-                if infos[p].kind == LineKind::Label {
-                    break;
-                }
-            }
-
-            if let Some(s) = slot {
-                let movsd_text = store.get(pos).trim_end().to_string();
-                let bcast_text = store.get(pos2).trim_end().to_string();
-                // Combine both instructions into one slot
-                let combined = format!("{}\n{}", movsd_text, bcast_text);
-                replace_line(store, &mut infos[s], s, combined);
-                mark_nop(&mut infos[pos]);
-                mark_nop(&mut infos[pos2]);
-                changed = true;
-                hoisted_one = true;
-            }
         }
 
         i += 1;
@@ -6629,6 +6577,157 @@ pub(super) fn fold_scalar_fp_memory_into_vex_op(
     changed
 }
 
+/// Fold `(v)movs{d,s} MEM, %xmmD` + `vbroadcasts{d,s} %xmmD, %DST` into
+/// `vbroadcasts{d,s} MEM, %DST`.
+///
+/// The vectorizer stages a scalar load into an XMM register and broadcasts
+/// it separately (matmul k-loop: `vmovsd (%r10), %xmm1` +
+/// `vbroadcastsd %xmm1, %ymm1`); AVX encodes the broadcast-from-memory form
+/// directly (`encode_avx_broadcast` handles the `(Memory, Register)` shape
+/// through the generic VEX memory encoder, and the backend already emits it
+/// for slot-direct `VecBroadcastF64x4`), so the staging load is one
+/// redundant uop per execution of the pair — per iteration when it sits in
+/// a loop, which is where the vectorizer puts it.
+///
+/// Correctness: the broadcast reads only the low 64/32 bits of %xmmD, which
+/// the staging load has just set to MEM; after the rewrite the same MEM
+/// feeds the same broadcast destination, so every lane of %DST is
+/// bit-identical. %xmmD itself needs a deadness proof EXCEPT in one case:
+/// a VEX staging load (`vmovsd`/`vmovss`, which zero the upper lanes like
+/// the broadcast itself does) broadcasting back into its own register
+/// (`%xmmD` -> `%ymmD`/`%xmmD`). There the broadcast fully defines D in
+/// both forms — later readers observe the broadcast's own output either
+/// way, so the post-state is bit-identical with or without the staging
+/// load. Every other shape needs `%xmmD` dead after the broadcast, proved
+/// by the CFG-aware `FpLiveness::xmm_dead_after` oracle (the same proof the
+/// sibling scalar fold uses): a different destination leaves the loaded
+/// value in D only in the original sequence, and a LEGACY staging load
+/// (`movsd`/`movss`) preserves bits 255:64 of `%ymmD` where the VEX
+/// broadcast zeroes them, so a later `%ymmD` read could observe the
+/// difference. Adjacency is exact
+/// (only NOP/empty lines may sit between): a label between the two lines
+/// fails the shape match, so no branch can target the broadcast with a
+/// stale %xmmD. Neither instruction touches flags and the faulting address
+/// is unchanged. Widths must agree (`sd` with `vbroadcastsd`, `ss` with
+/// `vbroadcastss`); the destination keeps its verbatim `%xmmM`/`%ymmM` form
+/// (both encodable; `%zmm` excluded — no EVEX broadcast encoder exists).
+pub(super) fn fold_broadcast_load_into_broadcast(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut lv: Option<FpLiveness> = None;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        // Match: `(v)movsd <MEM>, %xmmD` / `(v)movss <MEM>, %xmmD`.
+        let line_i = infos[i].trimmed(store.get(i));
+        let (width, rest, vex_load) = if let Some(rest) = line_i.strip_prefix("vmovsd ") {
+            ("sd", rest, true)
+        } else if let Some(rest) = line_i.strip_prefix("movsd ") {
+            ("sd", rest, false)
+        } else if let Some(rest) = line_i.strip_prefix("vmovss ") {
+            ("ss", rest, true)
+        } else if let Some(rest) = line_i.strip_prefix("movss ") {
+            ("ss", rest, false)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((mem, dst_d)) = rest.split_once(", %") else {
+            i += 1;
+            continue;
+        };
+        let dst_d = dst_d.trim();
+        let mem = mem.trim();
+        if !dst_d.starts_with("xmm")
+            || !dst_d[3..].chars().all(|c| c.is_ascii_digit())
+            || mem.starts_with('%')
+            || !mem.contains('(')
+            || mem.contains("%xmm")
+            || mem.contains("%ymm")
+        {
+            i += 1;
+            continue;
+        }
+        let d_full = format!("%{}", dst_d);
+
+        // Next active line (a label between the two fails the shape match
+        // below, which is exactly the safety property: no stale-register
+        // entry path into the broadcast can exist).
+        let mut j = i + 1;
+        while j < len && (infos[j].is_nop() || matches!(infos[j].kind, LineKind::Empty)) {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+        let line_j = infos[j].trimmed(store.get(j));
+        let bcast_prefix = format!("vbroadcast{} ", width);
+        let Some(body) = line_j.strip_prefix(bcast_prefix.as_str()) else {
+            i += 1;
+            continue;
+        };
+        let Some((src, dst_m)) = body.split_once(',') else {
+            i += 1;
+            continue;
+        };
+        if src.trim() != d_full {
+            i += 1;
+            continue;
+        }
+        let dst_m = dst_m.trim();
+        let dst_is_vec_reg = dst_m
+            .strip_prefix("%xmm")
+            .or_else(|| dst_m.strip_prefix("%ymm"))
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        if !dst_is_vec_reg {
+            i += 1;
+            continue;
+        }
+
+        // Deadness proof, unless the shape makes it unnecessary: a VEX
+        // staging load broadcasting back into its own register fully
+        // defines D in both forms (see the doc comment), so later readers
+        // observe the broadcast's own output either way.
+        let d_num: u32 = dst_d[3..].parse().unwrap_or(u32::MAX);
+        let m_num: u32 = dst_m
+            .strip_prefix("%xmm")
+            .or_else(|| dst_m.strip_prefix("%ymm"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(u32::MAX);
+        if !(vex_load && m_num == d_num) {
+            let oracle = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+            if !oracle.xmm_dead_after(store, infos, j, d_num, &[i, j]) {
+                i += 1;
+                continue;
+            }
+        }
+
+        // Rewrite: fold MEM into the broadcast; delete the staging load.
+        let replacement = format!("    vbroadcast{} {}, {}", width, mem, dst_m);
+        crate::backend::x86::codegen::peephole::types::mark_nop(&mut infos[i]);
+        crate::backend::x86::codegen::peephole::types::replace_line(
+            store,
+            &mut infos[j],
+            j,
+            replacement,
+        );
+        if let Some(oracle) = lv.as_mut() {
+            oracle.refresh_at(store, infos, i);
+        }
+        changed = true;
+        i = j;
+    }
+    changed
+}
+
 /// Commutative scalar VEX mnemonics (operand roles may be swapped, which
 /// the memory fold relies on). Returns (mnemonic, rest-of-line).
 fn commutative_vex_scalar<'a>(line: &'a str, width: &str) -> Option<(&'static str, &'a str)> {
@@ -7306,4 +7405,507 @@ fn loop_is_single_entry(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod loop_hoist_tests {
+    use super::*;
+
+    fn run_gpr(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    fn run_promote(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        promote_loop_invariant_fp_load(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    /// Torture execute/20030613-1.c at -O1, reduced: a `movdqu` struct copy
+    /// inside the loop clobbers the loaded slot, so the load must stay.
+    #[test]
+    fn gpr_hoist_refuses_movdqu_clobbered_slot() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    testl %ebx, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    movdqu 152(%rsp), %xmm0\n",
+            "    movdqu %xmm0, 136(%rsp)\n",
+            "    movq 136(%rsp), %r11\n",
+            "    movq %r11, %rcx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movq %rcx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movq 136(%rsp), %r11"),
+            "clobbered load must stay:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| l == "jmp .LBB2"),
+            "entry jump must stay:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A `push` in the loop moves `%rsp`: the hoisted address would differ
+    /// from the in-loop address.
+    #[test]
+    fn gpr_hoist_refuses_push_in_loop() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    pushq %rax\n",
+            "    movq 136(%rsp), %r11\n",
+            "    addq %r11, %rcx\n",
+            "    popq %rax\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movq %rcx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movq 136(%rsp), %r11"),
+            "load under moving %rsp must stay:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// `%r11` is read after the loop: hoisting would replace the last
+    /// iteration's value with the pre-loop one on paths skipping the load.
+    #[test]
+    fn gpr_hoist_refuses_dest_observed_after_loop() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    testl %edx, %edx\n",
+            "    je .LBB5\n",
+            "    movq 136(%rsp), %r11\n",
+            ".LBB5:\n",
+            "    addq %r11, %rcx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movq 136(%rsp), %r11"),
+            "load with live-after-loop dest must stay:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// The sound shape still fires: no stores, invariant slot, dead dest.
+    #[test]
+    fn gpr_hoist_fires_on_invariant_load() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    movq 136(%rsp), %r11\n",
+            "    addq %r11, %rcx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movq %rcx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movq 136(%rsp), %r11")
+                && out.iter().position(|l| l == "movq 136(%rsp), %r11")
+                    < out.iter().position(|l| l == ".LBB2:"),
+            "invariant load must hoist above the header:\n{}",
+            out.join("\n")
+        );
+        assert_eq!(
+            out.iter().filter(|l| *l == "jmp .LBB2").count(),
+            1,
+            "only the back-edge jump remains:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A second entry edge (`je` into the body) bypasses the preheader.
+    #[test]
+    fn gpr_hoist_refuses_second_entry_edge() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB3\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    movq 136(%rsp), %r11\n",
+            "    addq %r11, %rcx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movq %rcx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movq 136(%rsp), %r11")
+                && out.iter().position(|l| l == "movq 136(%rsp), %r11")
+                    > out.iter().position(|l| l == ".LBB3:"),
+            "load with a second entry edge must stay in the loop:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Rule 4b: a forward edge skipping over the candidate to a use below
+    /// vetoes the hoist — the use would read the pre-loop value while the
+    /// hoisted load overwrites it.
+    #[test]
+    fn gpr_hoist_refuses_skip_edge_over_load() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            ".LBBbody:\n",
+            "    testl %edx, %edx\n",
+            "    je .LBBskip\n",
+            "    movq 48(%rsp), %r11\n",
+            ".LBBskip:\n",
+            "    addq %r11, %rcx\n",
+            "    subl $1, %ebx\n",
+            "    jl .LBB2\n",
+            ".LBB4:\n",
+            "    movq %rcx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movq 48(%rsp), %r11")
+                && out.iter().position(|l| l == "movq 48(%rsp), %r11")
+                    > out.iter().position(|l| l == ".LBBbody:"),
+            "load under a skip edge must stay in the loop:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Rule 4b precision: an inner backward edge cannot skip the
+    /// candidate, so the hoist still fires past it.
+    #[test]
+    fn gpr_hoist_fires_past_inner_backward_edge() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            ".LBBbody:\n",
+            ".LBBinner:\n",
+            "    subl $1, %ebx\n",
+            "    jg .LBBinner\n",
+            "    movq 48(%rsp), %r11\n",
+            "    addq %r11, %rcx\n",
+            "    jl .LBB2\n",
+            ".LBB4:\n",
+            "    movq %rcx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movq 48(%rsp), %r11")
+                && out.iter().position(|l| l == "movq 48(%rsp), %r11")
+                    < out.iter().position(|l| l == ".LBB2:"),
+            "load past an inner backward edge must hoist:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Same hole class in the FP promoter: a GPR store to the slot breaks
+    /// the promoted `%xmm2`.
+    #[test]
+    fn promote_refuses_gpr_clobbered_slot() {
+        let out = run_promote(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movq %rax, -24(%rbp)\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    movsd -24(%rbp), %xmm0\n",
+            "    addsd %xmm0, %xmm1\n",
+            "    movq %rdx, -24(%rbp)\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movapd %xmm1, %xmm0\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movsd -24(%rbp), %xmm0"),
+            "clobbered FP load must stay:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l == "movapd %xmm2, %xmm0"),
+            "no promotion redirect may appear:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// An rsp-relative load must not pair with an rbp-relative preheader
+    /// store that merely shares the numeric offset: the promoted %xmm2
+    /// would carry the wrong slot's value.
+    #[test]
+    fn promote_refuses_base_mismatched_preheader_store() {
+        let out = run_promote(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movq %rax, -24(%rbp)\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    movsd -24(%rsp), %xmm0\n",
+            "    addsd %xmm0, %xmm1\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movapd %xmm1, %xmm0\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movsd -24(%rsp), %xmm0"),
+            "base-mismatched load must stay:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l == "movapd %xmm2, %xmm0"),
+            "no promotion redirect may appear:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Textbook promotion shape (with a real frame-pointer prologue, which
+    /// the slot-liveness oracle requires): the preheader store becomes the
+    /// %xmm2 definition and the body load becomes a register copy.
+    #[test]
+    fn promote_fires_on_textbook_shape() {
+        let out = run_promote(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movq %rax, -24(%rbp)\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    movsd -24(%rbp), %xmm0\n",
+            "    addsd %xmm0, %xmm1\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movapd %xmm1, %xmm0\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movq %rax, %xmm2"),
+            "preheader store must become the %xmm2 definition:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| l == "movapd %xmm2, %xmm0"),
+            "body load must redirect to %xmm2:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l == "movsd -24(%rbp), %xmm0"),
+            "original body load must be gone:\n{}",
+            out.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod broadcast_fold_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fold_broadcast_load_into_broadcast(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    /// matmul k-loop shape: the staged load dies at the broadcast.
+    #[test]
+    fn fires_on_staged_matmul_pair() {
+        // Staged on %xmm2 (not the matmul-verbatim %xmm1: %xmm0/%xmm1 are
+        // FP-return registers, live at a signature-less fragment's `ret`).
+        let out = run(concat!(
+            "    vmovsd (%r10), %xmm2\n",
+            "    vbroadcastsd %xmm2, %ymm2\n",
+            "    vfmadd231pd (%r8), %ymm2, %ymm0\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "vbroadcastsd (%r10), %ymm2"),
+            "staged load must fold into the broadcast:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("vmovsd ")),
+            "staging load must be gone:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Cross-register staging (`%xmm3` -> `%ymm7`) folds when dead.
+    #[test]
+    fn fires_cross_register_with_dead_stage() {
+        let out = run(concat!(
+            "    movsd 16(%rax), %xmm3\n",
+            "    vbroadcastsd %xmm3, %ymm7\n",
+            "    vmovupd %ymm7, (%rdx)\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "vbroadcastsd 16(%rax), %ymm7"),
+            "cross-register staged load must fold:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// `ss` width pair folds into `vbroadcastss`-from-memory.
+    #[test]
+    fn fires_ss_pair() {
+        let out = run(concat!(
+            "    vmovss (%rsi), %xmm4\n",
+            "    vbroadcastss %xmm4, %ymm5\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "vbroadcastss (%rsi), %ymm5"),
+            "ss pair must fold:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A later reader of the staging register vetoes the fold (DST != D
+    /// leaves the loaded value in D in the original sequence).
+    #[test]
+    fn refuses_live_stage_register() {
+        let out = run(concat!(
+            "    vmovsd (%r10), %xmm3\n",
+            "    vbroadcastsd %xmm3, %ymm7\n",
+            "    vaddsd %xmm3, %xmm0, %xmm0\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "vmovsd (%r10), %xmm3"),
+            "live staging load must survive:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| l == "vbroadcastsd %xmm3, %ymm7"),
+            "broadcast must keep its register source:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Width mismatch (`ss` load, `sd` broadcast) must not fold.
+    #[test]
+    fn refuses_width_mismatch() {
+        let out = run(concat!(
+            "    vmovss (%rsi), %xmm0\n",
+            "    vbroadcastsd %xmm0, %ymm5\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "vmovss (%rsi), %xmm0"),
+            "mismatched-width load must survive:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Legacy `movsd` preserves bits 255:64 of %ymmD where the VEX
+    /// broadcast zeroes them: same-register staging plus a later %ymmD
+    /// read must NOT fold.
+    #[test]
+    fn refuses_legacy_self_broadcast_with_later_ymm_read() {
+        let out = run(concat!(
+            "    movsd (%r10), %xmm2\n",
+            "    vbroadcastsd %xmm2, %ymm2\n",
+            "    vmovupd %ymm2, (%rdx)\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "movsd (%r10), %xmm2"),
+            "legacy self-broadcast with a later ymm read must survive:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Register-to-register staging has no memory to fold.
+    #[test]
+    fn refuses_register_source() {
+        let out = run(concat!(
+            "    vmovsd %xmm2, %xmm1\n",
+            "    vbroadcastsd %xmm1, %ymm1\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.iter().any(|l| l == "vmovsd %xmm2, %xmm1"),
+            "register staging must survive:\n{}",
+            out.join("\n")
+        );
+    }
 }

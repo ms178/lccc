@@ -1,0 +1,97 @@
+{
+  "label": "S22-steal adler (new main)",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_mxh_dfkt/arm_a",
+    "sha256": "3c0fe4b2db75b91a828435c0b2890ad7bdc66f21229b0ac783c992c0fcde590e",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "75892c2c22fb049af2b61a68d7942d191ca8abb62c94b307c1bb7ab724562017"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_mxh_dfkt/arm_b",
+    "sha256": "491235eff8ed0f2e4c50a5c9f01aed17439c15adb5f191f36a76d417bb33be49",
+    "env": "CCC_NO_X64_SPAN_STEAL=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "75892c2c22fb049af2b61a68d7942d191ca8abb62c94b307c1bb7ab724562017"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 2,
+  "arm_a_timings": {
+    "arm": "stealON",
+    "n": 15,
+    "min_ms": 38.494,
+    "median_ms": 38.627,
+    "mean_ms": 38.68,
+    "stdev_ms": 0.137,
+    "samples_ms": [
+      38.733,
+      38.785,
+      38.727,
+      39.032,
+      38.864,
+      38.627,
+      38.66,
+      38.592,
+      38.532,
+      38.775,
+      38.584,
+      38.494,
+      38.567,
+      38.607,
+      38.618
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "stealOFF",
+    "n": 15,
+    "min_ms": 38.774,
+    "median_ms": 38.904,
+    "mean_ms": 39.246,
+    "stdev_ms": 1.15,
+    "samples_ms": [
+      38.936,
+      38.897,
+      39.08,
+      39.475,
+      38.998,
+      38.964,
+      38.815,
+      38.874,
+      43.507,
+      38.904,
+      38.861,
+      38.862,
+      38.774,
+      38.829,
+      38.911
+    ]
+  },
+  "paired_diffs_ms": [
+    -0.203,
+    -0.112,
+    -0.353,
+    -0.443,
+    -0.134,
+    -0.336,
+    -0.156,
+    -0.283,
+    -4.975,
+    -0.129,
+    -0.277,
+    -0.368,
+    -0.207,
+    -0.223,
+    -0.292
+  ],
+  "median_ratio_b_over_a": 1.00716,
+  "min_ratio_b_over_a": 1.00726,
+  "sign_test_p": 0.0003,
+  "median_and_min_agree": true,
+  "significant": true,
+  "verdict": "stealON FASTER by 0.72% (median)"
+}

@@ -4,7 +4,7 @@ use super::emit::{X86Codegen, phys_reg_name, shift_mnemonic};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
-use crate::ir::reexports::{IrBinOp, Operand, Value};
+use crate::ir::reexports::{IrBinOp, IrConst, Operand, Value};
 
 impl X86Codegen {
     // ---- Unary ----
@@ -916,8 +916,30 @@ impl X86Codegen {
                 Some(imm) => {
                     let amount = (imm as i64).rem_euclid(width);
                     if amount != 0 {
-                        self.state
-                            .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
+                        if self.bmi2_enabled
+                            && super::isel::rorx_allowed()
+                            && (width == 32 || width == 64)
+                        {
+                            let ror_amount = match op {
+                                IrBinOp::RotateLeft => (width - amount) % width,
+                                IrBinOp::RotateRight => amount,
+                                _ => amount,
+                            };
+                            // amount != 0 above proves ror_amount != 0 (and a
+                            // hypothetical 0 is still a correct no-op: the
+                            // value is already in acc, `rorx $0` the identity).
+                            debug_assert!(ror_amount != 0);
+                            let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
+                            // acc_typed is al/ax/eax/rax, but rorx needs 3-operand form with src==dst
+                            // For accumulator path, src and dst are same accumulator.
+                            self.state.emit_fmt(format_args!(
+                                "    {} ${}, %{}, %{}",
+                                ror_mnem, ror_amount, acc_typed, acc_typed
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
+                        }
                     }
                 }
                 None => {
@@ -1421,7 +1443,7 @@ impl X86Codegen {
     /// accumulator (register-dest or memory-dest).
     pub(super) fn emit_fused_mul_add_impl(
         &mut self,
-        _mul_dest: &Value,
+        mul_dest: &Value,
         mul_lhs: &Operand,
         mul_rhs: &Operand,
         acc: &Operand,
@@ -1475,7 +1497,7 @@ impl X86Codegen {
                                 .emit_fmt(format_args!("    imulq ${}, %{}, %rax", imm, lhs_name));
                         }
                     }
-                    self.emit_fused_add_acc(acc, add_dest, use_32bit);
+                    self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
                     return;
                 }
             }
@@ -1510,7 +1532,7 @@ impl X86Codegen {
                             .emit_fmt(format_args!("    imulq {}, %rax", sref));
                     }
                     // Fall through to add
-                    self.emit_fused_add_acc(acc, add_dest, use_32bit);
+                    self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
                     return;
                 }
             }
@@ -1526,7 +1548,7 @@ impl X86Codegen {
                 self.state
                     .emit_fmt(format_args!("    imulq ${}, %rax, %rax", imm));
             }
-            self.emit_fused_add_acc(acc, add_dest, use_32bit);
+            self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
             return;
         }
 
@@ -1538,11 +1560,59 @@ impl X86Codegen {
             self.state.emit("    imulq %rcx, %rax");
         }
 
-        self.emit_fused_add_acc(acc, add_dest, use_32bit);
+        self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
+    }
+
+    /// True when `operand_to_callee_reg(acc, _)` stages without writing %rax.
+    ///
+    /// The fused integer madd holds the product live in %rax across acc
+    /// staging; any staging shape that relays through %rax would destroy
+    /// it, so the caller routes those through the %rcx fallback instead.
+    /// Mirrors operand_to_callee_reg's arms exactly:
+    /// - integer/zero consts stage inline; every other const (floats, i128,
+    ///   decimals) relays via %rax;
+    /// - a fresh home or a stack slot stages straight into the target; a
+    ///   stale home stages via def-chain remat, whose recursion can relay
+    ///   through %rax (Copy-of-remat-GlobalAddr) — refused;
+    /// - an acc-cached acc reads %rax (exact: the caller registered the
+    ///   product there);
+    /// - a rematerialisable GlobalAddr stages `leaq sym,%target` straight
+    ///   into the destination (see operand_to_callee_reg).
+    fn fused_madd_acc_stages_without_rax(&self, acc: &Operand) -> bool {
+        match acc {
+            Operand::Const(c) => matches!(
+                c,
+                IrConst::I8(_)
+                    | IrConst::I16(_)
+                    | IrConst::I32(_)
+                    | IrConst::I64(_)
+                    | IrConst::Zero
+            ),
+            Operand::Value(v) => {
+                if self.reg_assignments.contains_key(&v.0) {
+                    return self.fresh_home_of(v.0).is_some();
+                }
+                if self.state.get_slot(v.0).is_some() {
+                    return true;
+                }
+                if self.state.reg_cache.acc_has(v.0, self.state.is_alloca(v.0)) {
+                    return true;
+                }
+                self.get_defining_instruction(v.0).is_some_and(|inst| {
+                    matches!(inst, crate::ir::reexports::Instruction::GlobalAddr { .. })
+                })
+            }
+        }
     }
 
     /// Helper for fused mul-add: add %eax to the accumulator operand and store to dest.
-    fn emit_fused_add_acc(&mut self, acc: &Operand, add_dest: &Value, use_32bit: bool) {
+    fn emit_fused_add_acc(
+        &mut self,
+        mul_dest: &Value,
+        acc: &Operand,
+        add_dest: &Value,
+        use_32bit: bool,
+    ) {
         // v12 Fix B improvement 2: constant accumulator with a REGISTER-HOMED
         // dest. Adding the immediate directly to %eax (`addl $imm, %eax`) then
         // moving to the dest register avoids staging the constant through the
@@ -1551,10 +1621,19 @@ impl X86Codegen {
         // memory-dest / GEP-dest paths keep the original, well-exercised store
         // sequencing — the LCG loop (the hot beneficiary) is register-homed by
         // Fix A's precise-span seed.
-        if let Some(dest_phys) = self
+        //
+        // Ground truth: every mul path above leaves the fresh product in
+        // %rax/%eax (= mul_dest's value) but the imul emission itself never
+        // updates the cache, so the entry still names the LHS (or older).
+        // Register the product before any staging decision consults the
+        // cache — a stale entry here silently redirected acc staging into
+        // reading the product AS the acc.
+        self.state.reg_cache.set_acc(mul_dest.0, false);
+
+        let dest_phys = self
             .dest_reg(add_dest)
-            .filter(|r| !super::emit::is_xmm_reg(*r))
-        {
+            .filter(|r| !super::emit::is_xmm_reg(*r));
+        if let Some(dest_phys) = dest_phys {
             if let Some(imm) = Self::const_as_imm32_typed(acc, use_32bit) {
                 if use_32bit {
                     self.state.emit_fmt(format_args!("    addl ${}, %eax", imm));
@@ -1581,30 +1660,41 @@ impl X86Codegen {
             }
 
             // Register-dest, non-constant acc: stage acc into dest, then add %eax.
-            self.operand_to_callee_reg(acc, dest_phys);
-            if use_32bit {
-                self.state.emit_fmt(format_args!(
-                    "    addl %eax, %{}",
-                    super::emit::phys_reg_name_32(dest_phys)
-                ));
-            } else {
-                self.state.emit_fmt(format_args!(
-                    "    addq %rax, %{}",
-                    super::emit::phys_reg_name(dest_phys)
-                ));
+            //
+            // SOUNDNESS (torture execute/strlen-4.c @O2): the product is
+            // live in %rax across the staging, but operand_to_callee_reg
+            // relays some shapes through %rax — a homeless+slotless acc (a
+            // rematerialisable GlobalAddr: `leaq sym,%rax; movq %rax,%dest`)
+            // destroyed the product, so the trailing `addq %rax,%dest`
+            // doubled the base (`strlen(2*&a+2)` SIGSEGV). Only stage what
+            // provably avoids %rax; the rest bypasses the memory-dest shape
+            // (dest's HOME must be written, not just its slot) and falls
+            // into the %rcx fallback below, which never writes %rax.
+            if self.fused_madd_acc_stages_without_rax(acc) {
+                self.operand_to_callee_reg(acc, dest_phys);
+                if use_32bit {
+                    self.state.emit_fmt(format_args!(
+                        "    addl %eax, %{}",
+                        super::emit::phys_reg_name_32(dest_phys)
+                    ));
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    addq %rax, %{}",
+                        super::emit::phys_reg_name(dest_phys)
+                    ));
+                }
+                self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting: the staging + in-place add
+                // derived the fused add's dest into its home; without this note
+                // the acc-staging eviction (mulacc tail's patched segment) stuck
+                // and the consumer hit the stale-home refusal (PR #487,
+                // crash_synth_20260908: `movq %r10, %rsi; addq %rax, %rsi`).
+                self.note_inplace_compute(dest_phys, add_dest.0);
+                return;
             }
-            self.state.reg_cache.invalidate_acc();
-            // Definition-writes-home accounting: the staging + in-place add
-            // derived the fused add's dest into its home; without this note
-            // the acc-staging eviction (mulacc tail's patched segment) stuck
-            // and the consumer hit the stale-home refusal (PR #487,
-            // crash_synth_20260908: `movq %r10, %rsi; addq %rax, %rsi`).
-            self.note_inplace_compute(dest_phys, add_dest.0);
-            return;
-        }
-
-        // Memory-dest add: if acc and dest share the same stack slot, use addl %eax, mem.
-        if let Operand::Value(acc_val) = acc {
+            // Rax-relaying acc with a register-homed dest: skip the
+            // memory-dest shape straight into the %rcx fallback.
+        } else if let Operand::Value(acc_val) = acc {
             if self.dest_reg(acc_val).is_none() {
                 if let (Some(dest_slot), Some(acc_slot)) = (
                     self.state.get_slot(add_dest.0),
