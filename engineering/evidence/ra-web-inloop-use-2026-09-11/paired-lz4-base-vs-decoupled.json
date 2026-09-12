@@ -1,0 +1,25 @@
+{
+  "label": "web-wide in-loop-use boolean: lz4",
+  "arm_a": {
+    "binary": "/var/tmp/ab2/lz4_a.bin",
+    "sha256": "1ca0bb337ca5b9b010334b4cb4dc0757e7870e6d93273d2cdb4ebb69ce21f68c",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "66b711fc591860f1dccb6914d3e6890c9e50930ffdfcf3f7dac0f15c0f7ed5df"
+    }
+  },
+  "arm_b": {
+    "binary": "/var/tmp/ab2/lz4_b.bin",
+    "sha256": "1ca0bb337ca5b9b010334b4cb4dc0757e7870e6d93273d2cdb4ebb69ce21f68c",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "66b711fc591860f1dccb6914d3e6890c9e50930ffdfcf3f7dac0f15c0f7ed5df"
+    }
+  },
+  "identical_binaries": true,
+  "rounds": 41,
+  "warmup": 2,
+  "verdict": "uninformative-identical-binaries"
+}

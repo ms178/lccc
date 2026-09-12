@@ -1427,3 +1427,254 @@ C regressions, focused IR tests, the structural lowering checks, and the full
 suite (`638 pass, 0 fail`) all pass.  The complete evidence, compiler-oracle
 gap, and follow-up guardrails are in
 `engineering/FOLLOWUP-2026-09-06-pf15-widened-byte-carriers.md`.
+
+## Session 15 — cycle-accurate phi copy ordering landed opt-in; the removed copy was a live-range splitter
+
+Phi elimination decided "needs a temporary" by the predicate *my source is
+somebody's destination*, which is true of every copy in a rotation.  SHA-256's
+eight-word state rotation is acyclic — two chains — yet went through the
+two-phase scheme in full, costing not one redundant instruction but a redundant
+*web*: twice the loop-carried values and twice the unconditional copies per
+round, which pushed the allocator over budget and staged the rotation through
+the stack.  Replacing the predicate with an exact Kahn decomposition of the
+precedence graph (`i -> j` iff `i` reads the destination `j` writes) takes the
+reduced rotation kernel from `73` instructions / `27` stack refs to `55 / 0`,
+against gcc's `71 / 0`, and `sha256_transform` from `210 / 62` to `188 / 45`.
+An exhaustive oracle over `18,240` copy graphs checks every plan against the
+simultaneous-assignment semantics, asserts non-degeneracy, and holds *both* arms
+to it, so the retained legacy path is proved sound rather than merely
+conservative.
+
+It is **not shipped as the default**, because it is `~5–7%` slower at runtime on
+`sha256_transform` *despite* the lower static counts.  The mechanism is
+measured: with the two-phase temps the loop-carried word exists as two short
+complementary ranges (phi input latch→header, body value header→latch) and the
+allocator assigns both; merging them into one range that spans the back edge
+loses, and `CCC_DEBUG_RA_PHASES` then shows that range in neither `assigned` nor
+`spilled` — left stack-homed and unassigned.  The demoted values are exactly the
+two recurrence words, re-read `7` times per iteration because a destructive
+rotate needs a fresh destination register per use: `14` memops concentrated on
+`2` slots, against the default's `25` spread over `11` at `2` reads/slot max.
+The default arm has *higher* register pressure and still wins, so the operative
+variable is range structure, not live-value count.  **Eliminating redundant
+copies is not monotone in code quality while ranges split only at phi
+boundaries** — the redundant copy was performing a back-edge live-range split.
+The prerequisite for enabling it is a profitable back-edge split in the
+allocator (RA-06 location pieces).
+
+Falsified, do not retry: the `movq`-store/`movl`-load width mismatch in the
+rotation is *not* the cause (hand-rewriting the loop's moves to 32-bit moves
+runtime by `1.8%`, i.e. noise, and leaves the gap at `5.5%`); `CCC_EVICT_MODE`
+and `CCC_NO_TIER2_GRAPH` do not change the victim set.
+
+Harness lesson: `perf_ab.py`'s corpus geomean reported a verdict over arms of
+which **6 of 8 compiled byte-identically** — their deltas are pure noise, and the
+noise floor on a 2-core VM is `±4%`.  MD5-compare arm binaries before trusting
+any ratio, and assert only on kernels whose binaries actually differ.
+`scripts/paired_ab.py` now enforces this instead of leaving it to discipline: it
+builds and hashes both arms, exits `3` *UNINFORMATIVE* with no verdict when they
+are byte-identical, exits `4` on a stdout/status disagreement (a correctness
+failure is never reported as a timing result), interleaves with alternated
+order, reports `min` beside `median` and flags directional disagreement, and
+runs a paired sign test.  With `--allow-identical` it reproduces the noise floor
+on demand, and the result is worse than "noisy": two **byte-identical**
+`base64_enc` arms, whose true effect is exactly zero, measure a `5.67%` median
+delta at paired sign-test `p = 0.0164` — *nominally significant*.  Interleaving
+and order alternation do not remove it, because on a 2-core shared VM the bias
+is systematic and correlates within a round, so a paired test inherits it
+instead of averaging it out.  **Statistical significance does not imply a real
+effect, and no amount of paired-round discipline substitutes for hashing the
+arms first** — which is why the identity guard is a hard exit, not a warning.
+Raw evidence for the whole decision is frozen under
+`engineering/evidence/phi-acyclic-copy-order-2026-09-11/`.
+
+The shipping default arm is **byte-identical to base `4f527199` across `450`
+translation units**, so the regression is entirely contained behind
+`CCC_PHI_ACYCLIC_ORDER=1`.  The CI gate `phi-acyclic-copy-order` pins four
+properties — mechanism fires and beats gcc, cyclic near misses stay correct in
+both arms, the flag is wired, and the opt-in does not leak (unset/`0`/empty/
+`true` all reproduce the default byte for byte) — and is mutation-verified in
+both directions.  Full evidence, the census tables, and the two independent
+allocator leads found while diagnosing are in
+`engineering/FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md`.  One of those leads
+is recorded there as **corrected and closed**: `MACHINST_ALLOCATABLE_GPRS` has
+`15` entries and *does* include `rax`/`rcx` (an earlier reading of this session
+said `13` with the two reserved — wrong; only the *main* RA never homes them).
+Widening the round loop's budget would mean forcing MachInst on a large loop,
+which `agent/RULES.md` item 16 already measured negative (gzip `-3%`), so it was
+not pursued.  The surviving lead is that x86 has no slot-load dedup —
+`CCC_NO_SLOT_LOAD_DEDUP` exists only in the ARM peephole.
+
+## Session 16 — web-wide in-loop-use supply landed; the phi-resolver default is withdrawn
+
+Rebased onto `25ed36de` (upstream landed four commits, one of which adds a
+cost-ratio escape to `select_evict_victim`), and the whole phi-acyclic
+disposition from Session 15 had to be re-derived rather than carried across.
+
+**Landed:** `mark_loop_spanning` now supplies merged coalesce members into
+`uses_in_extents` from a per-value use-point map.  The aggregation was documented
+as web-wide — "the member map carries the web-wide in-loop-use flag: a leader's
+own `uses` under-count a phi web exactly the way its priority does" — but was
+built from a pass over `ranges`, and a merged member owns no `LiveRange`, so it
+was a silent no-op.  The flag therefore degraded to *does the leader have an
+in-extent use*, which is false for every phi web led by a cold preheader
+definition, i.e. every loop-carried recurrence.  The in-loop-USELESS-span
+admission rule then demoted the hottest values in the loop: on
+`sha256_transform`, `leader=v166 members=[166,389]` and `leader=v182
+members=[182,392]`, each reloaded 7x per iteration, 14 of the round loop's 15
+memory operations on two slots.  Span flags only — `LiveRange::uses` and
+`priority` are untouched, because inflating a coalesce web's priority in the main
+scan waves is a recorded negative (expat -30%, adler32 -23%, arith_loop -12%,
+sha256 -56%).  Kill switch `CCC_NO_WEB_INLOOP_USE`
+(`RaConfig::no_web_inloop_use`), which reproduces base assembly byte for byte;
+gate `tests/regression/check_ra_web_inloop_use.sh`; unit test pins both arms of
+the switch.
+
+**Measured** (amplified to ~430 ms/arm, `PASSES=8 BLOCK_COUNT=131072`, paired
+interleaved, arms byte-distinct and digest-identical to gcc, two replicates at 51
+and 41 rounds): base -> RA fix alone **+3.63% / +4.33%** (p=0.0000 both, median
+and min agreeing both times); RA fix -> + phi resolver **-1.99% / -0.71%**;
+base -> both **+1.88% / +1.98%**.  The legs compose (0.9637 x 1.0199 = 0.9828 vs
+0.9812 measured), so the decomposition is consistent rather than three noise
+draws.  Static: 210 -> 198 insns, hottest-loop most-reloaded slot 17 -> 10.
+
+**Withdrawn:** Session 15's plan to default-enable the resolver, and the
+`+8.21%` "both together" reading taken earlier the same day.  That reading was
+un-amplified (~55 ms/arm) and its median disagreed with its own min ratio
+(+3.8%), violating the harness's `median_and_min_agree` criterion; it did not
+survive a rebase onto a main that changes eviction.  Shipping the allocator fix
+alone is worth roughly twice as much as shipping both.  Recorded as
+`agent/RULES.md` item 30: re-derive factorial conclusions after every rebase,
+amplify to >=200 ms/arm, and never let a median-only result choose what ships.
+
+**Also corrected:** the gcc oracle comparison.  A function extractor matching
+`^\s*\.size <name>` with a literal space silently falls back to the whole
+translation unit on gcc's tab-separated `.size\tsha256_transform`, which produced
+a bogus "gcc 240 insns / 31 stack refs" and a false claim that LCCC's 178 / 28
+beat it.  The truth is gcc **142 / 8** against LCCC's shipping 198 / 62, and gcc is
+**44.10% faster** at runtime (31-round amplified paired A/B, median ratio 1.4410,
+min 1.4361, p=0.0000).  Both compilers emit the same number of loops here (2
+backward jumps each), so the gap is not loop structure: it is 54 extra
+frame-relative stack references, ~40 extra `mov`s, 9 extra labels and 6 extra
+compares.  Per-loop attribution by backward-jump span is unreliable in LCCC's
+output (one span covers most of the function) and an early "LCCC's round loop is
+176 insns / 58 memops vs gcc's 47 / 0, so the loops are fused" reading is
+withdrawn on the strength of those jump counts.  Both gate scripts now use
+`\.size\s+<name>\b` and fail loudly instead of falling back.  The remaining P0-B
+gap is spill traffic, not instruction count, and RA-06B's back-edge-split framing
+is superseded in `tasks/TASK-RA-06A-RELOAD-AT-USE.md`.
+
+**Upstream interaction, measured not assumed:** the new `evict_short_k` escape
+(default 16) helps the legacy `rot()` arm (71/33 -> 71/27) and costs the resolver
+arm (56/2 -> 61/4).  The resolver's own contribution is large at both settings, so
+`check_phi_acyclic_order.sh` now pins that contribution at production settings
+*and* at `CCC_EVICT_SHORT_K=0`, instead of an absolute "0 stack refs" that now
+belongs to a different component.
+
+**Gates:** `cargo test --lib` 2386/0, `ci_local.sh --fast` 24/0/3 (including the
+new `ra-web-inloop-use` gate), clippy clean, rustfmt clean.
+
+## Session 17 — auditing our own RA fix found a 40 % regression we had shipped; the supply is now boolean-only
+
+Session 16 landed the web-wide in-loop-use supply on the strength of
+`sha256_transform` alone.  This session re-examined it critically, and the audit
+produced two separate results: the implementation was defective in five ways, and
+the *design* was feeding a decision it should not have touched.
+
+**Implementation, fixed with no change to machine code.**  The supply hand-rolled
+a use-point walk over `func.blocks`, re-implementing `collect_range_metadata`;
+that walk iterated instructions only and so dropped terminator uses, which
+`record_terminator_uses` records at the block-end point — and the block-end point
+is exactly `loop_extents`' latch end, so a value read only by a loop's terminating
+branch was invisible on the member side while visible on the leader side.  It
+counted operand occurrences where leaders count deduplicated distinct points
+(`set_uses_weighted` sorts and merges duplicates by summing weights), putting the
+two sides of one sum in different units — and `span_exposed_uses` is thresholded
+against `MAX_SPAN_EXPOSED_USES`, not tested for non-zero, so that asymmetry can
+flip demotability.  Its `loop_extents.is_empty()` bail-out sat after both full IR
+walks, and a write-only `any_use_in_extent` map was left behind.
+
+The canonical `RangeMetadata::uses` is now threaded out of
+`build_live_ranges_with_config_and_meta` and passed into `mark_loop_spanning`, so
+both sides share one numbering by construction rather than by convention; the
+dead `collect_uses_for_values` wrapper and the dead map are deleted; the bail-out
+is first and the supply is skipped entirely when there is no coalescing.
+`meta_uses` is guaranteed non-decreasing per value because **Phi is an instruction
+in this IR, not a terminator**, so every `record_use` happens at the current
+monotonic point — which is also what makes adjacency-based dedup sound.  Note the
+leader side's own `last_point` guard is vestigial, since `set_uses_weighted` has
+already deduplicated `r.uses`.
+
+Two of the five were latent bugs, not style, and both are now pinned by tests that
+were mutation-verified: `mark_loop_spanning_member_terminator_use_supplies_the_flag`
+fails against a terminator-blind mutant, and the dedup test failed against a
+dedup-removed mutant.  A test that cannot fail is not evidence.
+
+The refactor is provably output-neutral.  `scripts/differential_corpus.sh` (new)
+byte-compares `-O2 -S` output for every `.c` under `tests/`: **805 of 807 compile,
+0 exit-status differences, identical 2-file failure set, 0 assembly differences**.
+Identical machine code is why no runtime A/B was re-run for the refactor itself —
+the arms would be byte-identical and `paired_ab.py` exits 3 on those by design.
+
+**Design, changed.**  Screening the whole corpus instead of re-timing only the
+benchmark the fix was aimed at named 13 changed translation units, one of which
+was `lz4_compress`.  Timed: **base is 40.53 % faster** (median 1.4053, min
+1.4078, p=0.0000, 41 rounds, ~186 ms/arm) at **identical instruction count** —
+251 instructions in `main` for both arms.  That is the §22/§23 case, and the
+allocator's own trace gave the mechanism: with counts fed web-wide, v212's
+`span_exposed_uses` goes 1 → 3, past `MAX_SPAN_EXPOSED_USES = 2`, so
+`worth_capping` vetoes it at the admission cap (remcost 100, site 2); the pressure
+falls through to the span-pressure valve, which selects on
+`MAX_VALVE_SPAN_FUTURE_USES` with **no cost term** and spills v133 at remcost
+1110 — an 11× more expensive victim.  `main`'s hot loop goes 25 → 29 frame refs.
+
+The count is not lying: coalesced members share one register, so those three reads
+really would become hot reloads.  The defect is that `worth_capping` is a veto with
+no cost-aware replacement, so a more accurate input produced a worse global
+decision.  Base gets the right answer here by accident — it under-counts the web,
+which keeps the cheap span demotable.  Recorded in
+`FOLLOWUP-2026-09-11-valve-cost-blindness.md` with the required sequencing: make
+the valve cost-ordered **first**, then re-feed web-wide counts.  It is deliberately
+not bundled here, because the valve is core victim selection whose measured history
+(chacha20's ARX webs, adler32's inlined NMAX loop, glibc_memcmp's address span)
+would all have to be re-derived.
+
+What ships is the strictly smaller change: the member supply feeds the web-wide
+BOOLEAN `span_has_in_loop_use` — which is where the sha256 win comes from — and
+leaves the cap's per-range counts as calibrated.  Blast radius drops 13 → 10 of
+805 TUs; `lz4_compress` becomes byte-identical to base; `divrem_pair_opposite_flavour.c`
+and `o0_phi_multidef.c` stop being touched at all; and `sha256_transform`'s and
+`linux_rbtree`'s assembly is **byte-identical to the count-coupled build**, so
+every sha256 number published in Session 16 still describes the shipping compiler.
+
+**Measured, base → shipping:** `sha256_transform` +3.63 % median / +3.81 % min
+(31 rounds, p=0.0000); `linux_rbtree` +1.05 % / +1.06 % (61 rounds, p=0.0000 —
+amplification is only ~65 ms because larger `NODE_COUNT` or any `LOOKUP_ROUNDS`
+change makes the codegen difference vanish, so read it as "not a regression,
+probably a small win"); `strlen_bench` +1.18 % / +2.89 % (31 rounds, p=0.0012,
+sd ≈ 9 % so the magnitude is soft); `adler32_do8` neutral at 1.001× against the
+kill-switch arm (`bench_kernels.py`, 69 instructions both arms) — worth checking
+because adler32's checksum webs are the counter-example that calibrated
+`MAX_SPAN_REMCOST`; `k01_adler` improved 62 → 59 instructions.  `lz4_compress`
+arms are byte-identical, so the harness correctly reports UNINFORMATIVE.
+
+**Guards:** `check_ra_web_inloop_use.sh` gains property 5 — `lz4_compress` must be
+byte-identical with the supply on and off.  Mutation-verified: against a
+count-coupled build it exits 1 reporting "224 differing lines" while still
+confirming the sha256 mechanism fires.  Unit twin:
+`mark_loop_spanning_member_uses_do_not_inflate_the_cap_counts`, where a member read
+at four distinct in-extent points must set the boolean and leave both counts at
+the leader's own zero.  The `SPILL-TRACE` diagnostic now prints
+`in_loop_uses`/`exposed`/`recur` at all six demotion sites; without those fields
+the lz4 mechanism was not visible in the trace at all, which is why the first
+hypothesis (sites 0/4) was wrong and had to be retracted.
+
+**Method lesson, recorded because it generalises:** the regression was invisible
+to two prior rounds of review because both re-timed only the benchmark the fix
+targeted.  Screening the corpus for *which translation units changed codegen* is
+cheap (~70 s for 807 files) and names exactly which benchmarks are worth timing.
+That screen is now a tool, and it should run before any runtime A/B of an
+allocator change.
+
+**Gates:** `cargo test --lib` 2388/0 (was 2386; +3 new, one later replaced by the
+cap-counts pin), `ci_local.sh --fast` 24/0/3, clippy clean, rustfmt clean.

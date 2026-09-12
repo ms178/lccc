@@ -1,0 +1,19 @@
+# scripts/paired_ab.py --src tests/benchmark/programs/base64_enc.c \
+#   --ccc target/fastbuild/lccc --cflags -O2 \
+#   --env-a '' --env-b 'CCC_PHI_ACYCLIC_ORDER=1' \
+#   --name-a default --name-b opt-in --rounds 25 --allow-identical \
+#   --json engineering/evidence/phi-acyclic-copy-order-2026-09-11/noise-floor-base64-identical-arms.json
+# DELIBERATE NOISE-FLOOR MEASUREMENT. The knob does not affect this kernel: both
+# arms hash to the SAME sha256 (see below), so the true effect is exactly zero.
+# --allow-identical is required to get past the harness's uninformative guard.
+base64_enc NOISE FLOOR: both arms byte-identical, --allow-identical
+  arm default: /tmp/paired_ab_qtxw3jjv/arm_a
+    sha256 32f391fd0386db9b8aa366876422f07f962807af6d408946d0025e004af038ce   env=<default>
+  arm opt-in: /tmp/paired_ab_qtxw3jjv/arm_b
+    sha256 32f391fd0386db9b8aa366876422f07f962807af6d408946d0025e004af038ce   env=CCC_PHI_ACYCLIC_ORDER=1
+  both arms agree: rc=0, stdout 17 bytes
+  default: min=    0.98 med=    1.09 mean=    1.13 sd=  0.13 n=25
+  opt-in: min=    0.99 med=    1.15 mean=    1.18 sd=  0.12 n=25
+  median ratio opt-in/default = 1.0567   min ratio = 1.0106   sign-test p = 0.0164
+  => default FASTER by 5.67% (median)
+  raw samples -> engineering/evidence/phi-acyclic-copy-order-2026-09-11/noise-floor-base64-identical-arms.json
