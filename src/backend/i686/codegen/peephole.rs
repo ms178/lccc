@@ -394,6 +394,38 @@ fn parse_offset(s: &str) -> i32 {
     s.parse::<i32>().unwrap_or(EBP_OFFSET_NONE)
 }
 
+/// The x86 string-operation family: `movs`, `stos`, `lods`, `scas`, `cmps`,
+/// `ins`, `outs`, each with an optional `rep`/`repe`/`repne` prefix and an
+/// optional size suffix.
+///
+/// These write (and read) memory through IMPLICIT pointer registers with no
+/// parenthesised operand in the text, so [`has_indirect_memory_access`] -- which
+/// scans for `(%reg)` -- cannot see them at all: `rep stosl` stores four bytes
+/// per iteration through `%edi` and, to a textual scan, touches no memory. The
+/// i686 backend emits them (`emit_memcpy` lowers an inline `memcpy` to
+/// `rep movsb` with `%esi`/`%edi`, and inline `memset` to `rep stosb`), so a
+/// frame slot they overwrite is invisible to both slot forwarders unless the
+/// family is named explicitly.
+///
+/// Enumerated rather than derived by stripping a trailing size letter from a
+/// `movs` prefix: `movsbl`, `movsbw` and `movzbl` are sign/zero-extending
+/// REGISTER moves, and a prefix rule would classify them as memory writes and
+/// kill slot state at every byte load in the corpus.
+fn is_string_op(t: &str) -> bool {
+    let mut words = t.trim_start().split_ascii_whitespace();
+    let first = words.next().unwrap_or("");
+    let mn = match first {
+        "rep" | "repe" | "repz" | "repne" | "repnz" => words.next().unwrap_or(""),
+        _ => first,
+    };
+    const STRING_OPS: [&str; 28] = [
+        "movsb", "movsw", "movsl", "movsq", "stosb", "stosw", "stosl", "stosq", "lodsb", "lodsw",
+        "lodsl", "lodsq", "scasb", "scasw", "scasl", "scasq", "cmpsb", "cmpsw", "cmpsl", "cmpsq",
+        "insb", "insw", "insl", "outsb", "outsw", "outsl", "movs", "stos",
+    ];
+    STRING_OPS.contains(&mn)
+}
+
 /// Check if a line has indirect memory access (pointer dereference through a register).
 fn has_indirect_memory_access(s: &str) -> bool {
     // Pattern: offset(%eXX) where XX is not bp or sp
@@ -909,7 +941,9 @@ fn classify_line(raw: &str) -> LineInfo {
             }
         }
     }
-    let has_indirect = has_indirect_memory_access(s);
+    // A string op writes through an implicit pointer; see `is_string_op`.
+    // Setting the shared flag closes the blind spot for the windowed pass too.
+    let has_indirect = has_indirect_memory_access(s) || is_string_op(s);
     let ebp_off = if has_indirect {
         EBP_OFFSET_NONE
     } else {
@@ -3023,6 +3057,38 @@ impl SlotState {
         }
     }
 
+    /// The lattice bottom: no facts, and every register's provenance
+    /// unresolved. This is the only correct initial value for `OUT` in a
+    /// fixpoint iteration -- `new()` carries `REG_DEF_ENTRY` stamps, which
+    /// *claim* a register was defined at function entry, and starting an
+    /// iteration from that optimistic value would let a rewrite rest on a fact
+    /// a later iteration retracts.
+    fn bottom() -> Self {
+        SlotState {
+            slots: Vec::new(),
+            regs: [REG_DEF_CONFLICT; 8],
+        }
+    }
+
+    /// Drop entries that name the CALLER's region, keeping this function's own
+    /// frame.
+    ///
+    /// A positive `%ebp` displacement is the incoming argument area: those
+    /// bytes belong to the caller's frame, and a pointer naming them can exist
+    /// entirely outside this function (a varargs `va_list` is exactly that), so
+    /// a write through a register can reach them even when no frame address was
+    /// formed here. `%esp`-relative slots and non-positive `%ebp` slots are
+    /// inside this function's own frame: a pointer to those can only come from
+    /// forming a frame address (which the `escape` analysis excludes) or from
+    /// the caller, which cannot know an address this activation created at run
+    /// time. Note this is the opposite of the intuition that "positive offset
+    /// means caller-owned" for both bases -- for `%esp` the function's own
+    /// locals are the positive displacements.
+    fn drop_caller_owned_slots(&mut self) {
+        self.slots
+            .retain(|e| e.slot >= ESP_SLOT_BIAS || e.slot <= 0);
+    }
+
     fn kill_all(&mut self) {
         self.slots.clear();
     }
@@ -3160,6 +3226,277 @@ fn forward_slot_loads_cfg(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
     changed
 }
 
+/// One basic block's transfer function for the slot-forwarding dataflow.
+///
+/// Shared by the analysis sweep and the application sweep, which differ only in
+/// `apply`. Sharing is the point: two copies of a transfer this size drift, and
+/// a drift between "what was proved" and "what was rewritten" is a miscompile
+/// rather than a missed optimisation. The transition for line `j` is computed
+/// from line `j`'s original text and classification BEFORE any rewrite of that
+/// line, so the replayed state evolution is identical to the analysed one even
+/// though the text changes underneath it.
+///
+/// `budget` bounds the work. When it reaches zero the block returns early and
+/// the caller abandons the whole function without applying anything, which is
+/// why a partial analysis can never be half-applied.
+#[allow(clippy::too_many_arguments)]
+fn slot_fwd_block(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    a: usize,
+    e: usize,
+    st: &mut SlotState,
+    precise: bool,
+    escape: bool,
+    source_regs: u16,
+    implicit: &mut [u16],
+    implicit_base: usize,
+    apply: bool,
+    budget: &mut usize,
+) -> bool {
+    let mut changed = false;
+    let mut ext = [(0i32, 0i32); 4];
+    for j in a..e {
+        if *budget == 0 {
+            return changed;
+        }
+        *budget -= 1;
+        if infos[j].is_nop() || infos[j].kind == LineKind::Empty {
+            continue;
+        }
+        if is_debug_location(store, infos, j) {
+            continue;
+        }
+        let kind = infos[j].kind;
+        let mut forward: Option<(RegId, RegId, MoveSize)> = None;
+        {
+            let t = trimmed(store, &infos[j], j);
+            // %esp arithmetic renumbers slots; it is not a LineKind of its
+            // own, so it is recognised from the text like everywhere else.
+            let esp_delta = esp_adjustment(t);
+            // A string op writes an unbounded range through an implicit
+            // pointer. `classify_line` already sets `has_indirect_mem` for
+            // the family (which is what the windowed pass keys on); this is
+            // the check that does not depend on how the line was classified,
+            // and it applies the same rule as an indirect write.
+            if is_string_op(t) {
+                // A string op writes an UNBOUNDED range: `rep stosl` covers
+                // %ecx dwords from %edi, `rep movsb` likewise. The argument that
+                // lets a bounded indirect store keep our own frame slots -- that
+                // a register holding no frame address cannot NAME one, so the
+                // write address cannot equal a tracked slot -- needs equality.
+                // A range only needs to OVERLAP, and a pointer merely near the
+                // frame (a callee's local that escaped into a global, say, which
+                // sits just below our outgoing-argument area) reaches into it
+                // once the count is large enough. So this kills everything,
+                // escape or not; the family is rare enough that the precision is
+                // not worth an argument this thin.
+                st.kill_all();
+            }
+            match kind {
+                LineKind::Label => {}
+                LineKind::Directive => {
+                    // `.cfi_*`, `.loc`, `.p2align` and friends describe the
+                    // code, they do not execute: killing the state at every
+                    // one of them (they follow each call and each prologue
+                    // step) would throw away exactly the cross-call forwards
+                    // this pass exists for. Anything else -- `.byte`,
+                    // `.long`, `.ascii`, a nested `.section` -- may be data
+                    // this text scan cannot reason about, so it kills.
+                    if !is_metadata_directive(t) {
+                        st.kill_all();
+                    }
+                }
+                LineKind::InlineAsm => st.kill_all(),
+                LineKind::Ret | LineKind::RetN => st.kill_all(),
+                LineKind::Call => {
+                    if escape || is_indirect_call(t) {
+                        st.kill_all();
+                    } else {
+                        // A `ret $N` callee pops its own arguments, so %esp
+                        // RISES by N and every %esp-relative displacement
+                        // SHRINKS by N. The sign matters: getting it
+                        // backwards renumbers every slot to bytes that were
+                        // never stored.
+                        let pop = callee_esp_pop(t);
+                        if pop != 0 {
+                            st.shift_esp(-pop);
+                        }
+                        for r in [REG_EAX, REG_ECX, REG_EDX] {
+                            st.conflict(r);
+                        }
+                        st.drop_stale();
+                    }
+                    // The callee may clobber caller-saved registers even
+                    // when nothing is tracked through them.
+                    for r in [REG_EAX, REG_ECX, REG_EDX] {
+                        st.stamp(r, j as u32);
+                    }
+                    st.drop_stale();
+                }
+                LineKind::Push { reg } => {
+                    // A push READS its operand and writes 4 bytes below the
+                    // new top: the pushed register keeps its value, so it
+                    // must NOT be stamped (stamping it would kill every
+                    // entry sourced from it).
+                    let _ = reg;
+                    st.shift_esp(4);
+                    st.kill_range(ESP_SLOT_BIAS, 4);
+                    st.stamp(REG_ESP, j as u32);
+                    st.drop_stale();
+                }
+                LineKind::Pop { reg } => {
+                    st.shift_esp(-4);
+                    st.stamp(reg, j as u32);
+                    st.stamp(REG_ESP, j as u32);
+                    st.drop_stale();
+                }
+                LineKind::StoreEbp { reg, offset, size } => {
+                    let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
+                    for &(o, w) in &ext[..n] {
+                        if o != offset || w != size.byte_size() {
+                            st.kill_range(o, w);
+                        }
+                    }
+                    st.kill_range(offset, size.byte_size());
+                    let stamp = if reg <= REG_GP_MAX {
+                        st.regs[reg as usize]
+                    } else {
+                        REG_DEF_CONFLICT
+                    };
+                    st.add(offset, size.byte_size(), reg, stamp);
+                    st.drop_stale();
+                }
+                LineKind::LoadEbp { reg, offset, size } => {
+                    // LOOK UP FIRST, then kill: in the imprecise (legacy)
+                    // mode `frame_write_extents` reports a 16-byte window
+                    // around this line's own displacement, which would
+                    // erase the very entry being forwarded. In precise mode
+                    // a load reports no extents at all, so the order only
+                    // matters for the fallback -- but it must be right in
+                    // both, because the fallback is what the kill switch
+                    // reverts to.
+                    if let Some(src) = st.lookup(offset, size.byte_size()) {
+                        forward = Some((src, reg, size));
+                    }
+                    let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
+                    for &(o, w) in &ext[..n] {
+                        st.kill_range(o, w);
+                    }
+                    st.stamp(reg, j as u32);
+                    st.drop_stale();
+                }
+                LineKind::Jmp | LineKind::CondJmp | LineKind::JmpIndirect | LineKind::Cmp => {
+                    let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
+                    for &(o, w) in &ext[..n] {
+                        st.kill_range(o, w);
+                    }
+                }
+                LineKind::Move { dst, src } => {
+                    let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
+                    for &(o, w) in &ext[..n] {
+                        st.kill_range(o, w);
+                    }
+                    st.stamp(dst, j as u32);
+                    let _ = src;
+                    st.drop_stale();
+                }
+                LineKind::SetCC { reg } => {
+                    let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
+                    for &(o, w) in &ext[..n] {
+                        st.kill_range(o, w);
+                    }
+                    st.stamp(reg, j as u32);
+                    st.drop_stale();
+                }
+                LineKind::SelfMove | LineKind::Nop | LineKind::Empty => {}
+                LineKind::Other { dest_reg } => {
+                    let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
+                    for &(o, w) in &ext[..n] {
+                        st.kill_range(o, w);
+                    }
+                    if infos[j].has_indirect_mem {
+                        if escape || has_indexed_frame_access(t) {
+                            st.kill_all();
+                        } else {
+                            // No frame address is formed anywhere in this
+                            // function and this operand computes none, so
+                            // the write cannot name a slot THIS activation
+                            // allocated. It can still name the caller's
+                            // outgoing area -- positive-%ebp slots -- where
+                            // a pointer may exist entirely outside this
+                            // function (a varargs `va_list` is one), so
+                            // those entries die and our own survive.
+                            st.drop_caller_owned_slots();
+                        }
+                    }
+                    if dest_reg == REG_ESP && esp_delta.is_none() {
+                        // `movl %eax, %esp` and friends: unknown renumbering.
+                        st.kill_all();
+                    }
+                    // Architectural implicit writes (cltd -> %edx,
+                    // idivl -> %eax:%edx, rep stosb -> %edi:%ecx, xchg/xadd
+                    // both operands, single-operand RMW) go through the
+                    // central oracle rather than a second table here.
+                    //
+                    // The candidate register set is FUNCTION-level (every
+                    // register any store in this function sources an entry
+                    // from), NOT the set tracked in the current state. That
+                    // is what makes this arm independent of IN: restricted
+                    // by the live state, a stronger IN stamped more
+                    // registers and so produced a WEAKER OUT, which is
+                    // anti-monotone -- chaotic iteration over an
+                    // anti-monotone transfer need not converge, and if it
+                    // does it need not converge to a state that is safe to
+                    // rewrite from. The oracle result is memoized per line,
+                    // so it still runs once per line rather than once per
+                    // line per iteration, and restricting to `source_regs`
+                    // keeps the precision the state-restricted probe had for
+                    // every register that can matter.
+                    if source_regs != 0 {
+                        let cache = &mut implicit[j - implicit_base];
+                        if *cache == u16::MAX {
+                            let mut m = 0u16;
+                            for r in 0..=REG_GP_MAX {
+                                if source_regs & (1u16 << r) != 0
+                                    && line_writes_reg_implicitly(t, r)
+                                {
+                                    m |= 1u16 << r;
+                                }
+                            }
+                            *cache = m;
+                        }
+                        let mask = *cache;
+                        for r in 0..=REG_GP_MAX {
+                            if mask & (1u16 << r) != 0 {
+                                st.stamp(r, j as u32);
+                            }
+                        }
+                    }
+                    if dest_reg <= REG_GP_MAX {
+                        st.stamp(dest_reg, j as u32);
+                    }
+                    st.drop_stale();
+                }
+            }
+            if let Some(d) = esp_delta {
+                st.shift_esp(d);
+                if d > 0 {
+                    // The bytes just below the old top are now addressable
+                    // as slots; nothing tracked may claim them.
+                    st.kill_range(ESP_SLOT_BIAS, d);
+                }
+            }
+        }
+        if apply {
+            if let Some((src, dst, size)) = forward {
+                changed |= rewrite_slot_reload(store, infos, j, src, dst, size);
+            }
+        }
+    }
+    changed
+}
+
 fn forward_slot_loads_cfg_range(
     store: &mut LineStore,
     infos: &mut [LineInfo],
@@ -3256,7 +3593,18 @@ fn forward_slot_loads_cfg_range(
                     _ => {}
                 }
             }
-            LineKind::JmpIndirect => {}
+            LineKind::JmpIndirect => {
+                // A computed branch may target ANY block in the function: the
+                // jump table lives in .rodata and its contents are not visible
+                // to a text scan. Giving it no successors under-approximates the
+                // CFG, and then a block that is also reachable by a direct edge
+                // -- a switch case a `goto` or a loop back edge also enters --
+                // meets only the direct predecessors and forwards a register the
+                // dispatch block redefined. Over-approximating to every block is
+                // sound (the meet does the conservatising) and keeps switch
+                // forwarding alive where all paths do agree.
+                succ[b].extend(0..nb);
+            }
             LineKind::CondJmp => {
                 let t = trimmed(store, &infos[lj], lj);
                 if let Some(target) = direct_jump_target(t).and_then(|n| labels.get(n).copied()) {
@@ -3284,250 +3632,268 @@ fn forward_slot_loads_cfg_range(
     }
     succ.iter_mut().for_each(|v| v.dedup());
 
-    // ── dataflow ────────────────────────────────────────────────────────────
-    let mut out: Vec<Option<SlotState>> = vec![None; nb];
+    // ── registers a slot entry can ever be sourced from ─────────────────────
+    // Function-level, and therefore independent of the dataflow state; see the
+    // implicit-write arm in `slot_fwd_block`, which is the one place the
+    // transfer would otherwise consult the state it is computing.
+    let mut source_regs = 0u16;
+    for j in fs..fe {
+        if let LineKind::StoreEbp { reg, .. } = infos[j].kind {
+            if reg <= REG_GP_MAX {
+                source_regs |= 1u16 << reg;
+            }
+        }
+    }
+    if source_regs == 0 {
+        // No store in this function can create a tracked entry, so there is
+        // nothing to forward from and nothing to prove.
+        return false;
+    }
+    let mut implicit = vec![u16::MAX; fe - fs];
+
+    // ── DFS order and back edges ────────────────────────────────────────────
+    // An edge to a block still on the DFS stack closes a cycle: a back edge.
+    // Reverse postorder has the property that every NON-back edge p->b orders p
+    // before b, so a single pass in that order computes each block from inputs
+    // that are already final for the acyclic part of the CFG. Blocks the DFS
+    // never reaches are unreachable and take no part in anything below: a block
+    // that cannot execute must contribute no constraint to a meet, and leaving
+    // it at bottom while meeting it in would erase every forward into its
+    // successors.
+    let mut rpo: Vec<usize> = Vec::with_capacity(nb);
+    let mut visited = vec![false; nb];
+    let mut on_stack = vec![false; nb];
+    let mut back_edges: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    {
+        // Iterative: a deeply nested CFG must not overflow the real stack.
+        let mut dfs: Vec<(usize, usize)> = vec![(0, 0)];
+        visited[0] = true;
+        on_stack[0] = true;
+        while let Some(top) = dfs.last_mut() {
+            let (b, k) = *top;
+            if k < succ[b].len() {
+                top.1 += 1;
+                let s = succ[b][k];
+                if !visited[s] {
+                    visited[s] = true;
+                    on_stack[s] = true;
+                    dfs.push((s, 0));
+                } else if on_stack[s] {
+                    back_edges.insert((b as u32, s as u32));
+                }
+            } else {
+                dfs.pop();
+                on_stack[b] = false;
+                rpo.push(b);
+            }
+        }
+        rpo.reverse();
+    }
+
+    // ── the iteration, and why it starts optimistic ─────────────────────────
+    //
+    // Soundness needs three things and only three: a sound boundary (IN of the
+    // entry block claims nothing this function stored), a sound transfer (facts
+    // it produces really hold at the block's end), and the equations holding
+    // EXACTLY at the point the result is used -- IN[b] is the meet over every
+    // reachable predecessor's OUT, and OUT[b] is the transfer of IN[b]. Given
+    // those, every fact in IN[b] holds on every real arrival at b, by induction
+    // on the length of the executed prefix: the last step came from some
+    // predecessor p whose IN held by hypothesis, so p's OUT held at its end, and
+    // IN[b] is a subset of that OUT. Cycles need no special argument -- the
+    // induction is on the execution, not on the CFG.
+    //
+    // What the equations do NOT determine is WHICH fixpoint, and the choice is
+    // the whole difference between a pass that works and one that does not.
+    // Starting every OUT at bottom and growing meets a cycle head-on: a slot
+    // stored before a loop and left alone inside it is available at the head on
+    // every real iteration, but the body neither creates nor destroys the fact,
+    // so the meet over the back edge yields nothing and the least fixpoint says
+    // "not available" -- inside the loop AND everywhere downstream of it, which
+    // is where the reload of a loop-carried value actually sits. That is not a
+    // corner case; it is the common shape.
+    //
+    // So the seed pass meets over non-back predecessors only, i.e. it assumes a
+    // cycle's closing edge preserves whatever entered it, and the fixpoint pass
+    // then TESTS that assumption against the transfer, re-enqueueing successors
+    // whenever a value moves. Values can only shrink after the seed, the lattice
+    // is finite -- at most SLOT_STATE_CAP entries and eight stamps over line
+    // indices -- so this converges, and it converges to a fixpoint that keeps
+    // exactly the facts the loop body really does preserve.
+    //
+    // The transfer itself must be monotone for the iteration to converge to a
+    // fixpoint at all, which is why the implicit-write arm probes a
+    // function-level register set rather than the registers the current state
+    // happens to track: restricted by the state, a stronger IN would stamp more
+    // registers and so produce a WEAKER OUT, and an anti-monotone transfer has
+    // no such guarantee.
+    //
+    // `budget` is the hard stop for pathological CFGs. Exhausting it abandons
+    // the function WITHOUT applying anything, because a truncated iteration is
+    // not a fixpoint and the soundness argument above needs one.
+    let mut out: Vec<SlotState> = vec![SlotState::bottom(); nb];
+    let mut inn: Vec<SlotState> = vec![SlotState::bottom(); nb];
+    // At function entry no register holds a value this function stored. Pinned,
+    // never derived: a back edge to the function's own label makes block 0 its
+    // own predecessor, and meeting there would assume the previous iteration's
+    // facts on entry to the function.
+    inn[0] = SlotState::new();
+    let mut budget = 40_000usize;
+
+    // Seed pass: RPO, non-back predecessors only.
+    for &b in &rpo {
+        if b == 0 {
+            let mut st = inn[0].clone();
+            slot_fwd_block(
+                store,
+                infos,
+                starts[b],
+                end_of(b),
+                &mut st,
+                precise,
+                escape,
+                source_regs,
+                &mut implicit,
+                fs,
+                false,
+                &mut budget,
+            );
+            if budget == 0 {
+                return false;
+            }
+            out[b] = st;
+            continue;
+        }
+        let mut meet: Option<SlotState> = None;
+        for &p in &pred[b] {
+            if back_edges.contains(&(p as u32, b as u32)) {
+                continue;
+            }
+            meet = Some(match meet {
+                Some(cur) => SlotState::meet(&cur, &out[p]),
+                None => out[p].clone(),
+            });
+        }
+        // Every reachable block but the entry has a non-back predecessor: the
+        // DFS tree edge that first reached it.
+        let Some(st0) = meet else { continue };
+        inn[b] = st0.clone();
+        let mut st = st0;
+        slot_fwd_block(
+            store,
+            infos,
+            starts[b],
+            end_of(b),
+            &mut st,
+            precise,
+            escape,
+            source_regs,
+            &mut implicit,
+            fs,
+            false,
+            &mut budget,
+        );
+        if budget == 0 {
+            return false;
+        }
+        out[b] = st;
+    }
+
+    // Fixpoint pass: every reachable predecessor, back edges included.
+    //
+    // In RPO every non-back edge p->b orders p before b, so a CFG with no back
+    // edges has nothing left to prove: the seed pass already met each block over
+    // final inputs and IS the fixpoint. With cycles, only a back-edge target
+    // starts out with an incomplete IN, so the worklist is seeded with those and
+    // grows only where a value actually moves -- a block's IN can change only if
+    // some predecessor's OUT did. Acyclic functions therefore pay exactly what
+    // they paid before this pass became a fixpoint iteration, which is the whole
+    // reason the extra compile time stays inside measurement noise on the corpus.
     let mut work: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     let mut inq = vec![false; nb];
-    work.push_back(0);
-    inq[0] = true;
-    // IN of the entry block is the empty state: at function entry no register
-    // holds a value this function stored, and no slot holds one either.
-    let mut inn: Vec<Option<SlotState>> = vec![None; nb];
-    inn[0] = Some(SlotState::new());
-    let mut budget = 40_000usize;
-    let mut changed = false;
-
+    if !back_edges.is_empty() {
+        for &b in &rpo {
+            if pred[b]
+                .iter()
+                .any(|&p| back_edges.contains(&(p as u32, b as u32)))
+            {
+                inq[b] = true;
+                work.push_back(b);
+            }
+        }
+    }
     while let Some(b) = work.pop_front() {
         inq[b] = false;
         if budget == 0 {
-            break;
+            return false;
         }
-        budget -= 1;
         if b != 0 {
-            let mut st: Option<SlotState> = None;
-            let mut ready = true;
+            let mut meet: Option<SlotState> = None;
             for &p in &pred[b] {
-                match &out[p] {
-                    Some(ps) => {
-                        st = Some(match st {
-                            Some(cur) => SlotState::meet(&cur, ps),
-                            None => ps.clone(),
-                        });
-                    }
-                    None => {
-                        ready = false;
-                        break;
-                    }
+                if !visited[p] {
+                    continue;
+                }
+                meet = Some(match meet {
+                    Some(cur) => SlotState::meet(&cur, &out[p]),
+                    None => out[p].clone(),
+                });
+            }
+            let Some(st0) = meet else { continue };
+            if inn[b] == st0 {
+                continue; // IN unchanged, so OUT cannot change either
+            }
+            inn[b] = st0;
+        }
+        let mut st = inn[b].clone();
+        slot_fwd_block(
+            store,
+            infos,
+            starts[b],
+            end_of(b),
+            &mut st,
+            precise,
+            escape,
+            source_regs,
+            &mut implicit,
+            fs,
+            false,
+            &mut budget,
+        );
+        if budget == 0 {
+            return false;
+        }
+        if out[b] != st {
+            out[b] = st;
+            for &s in &succ[b] {
+                if visited[s] && !inq[s] {
+                    inq[s] = true;
+                    work.push_back(s);
                 }
             }
-            if !ready {
-                continue; // a predecessor has not been analysed yet
-            }
-            let Some(st) = st else { continue }; // no predecessors: unreachable
-            if inn[b].as_ref() == Some(&st) {
-                // IN unchanged, so OUT is unchanged (it was computed with this
-                // same IN on an earlier iteration) and successors cannot change
-                // either: the fixpoint has converged through this block.
-                continue;
-            }
-            inn[b] = Some(st);
         }
-        let mut st = inn[b].clone().unwrap_or_else(SlotState::new);
-        let (a, e) = (starts[b], end_of(b));
-        let mut ext = [(0i32, 0i32); 4];
-        for j in a..e {
-            if budget == 0 {
-                break;
-            }
-            budget -= 1;
-            if infos[j].is_nop() || infos[j].kind == LineKind::Empty {
-                continue;
-            }
-            if is_debug_location(store, infos, j) {
-                continue;
-            }
-            let kind = infos[j].kind;
-            let mut forward: Option<(RegId, RegId, MoveSize)> = None;
-            {
-                let t = trimmed(store, &infos[j], j);
-                // %esp arithmetic renumbers slots; it is not a LineKind of its
-                // own, so it is recognised from the text like everywhere else.
-                let esp_delta = esp_adjustment(t);
-                match kind {
-                    LineKind::Label => {}
-                    LineKind::Directive => {
-                        // `.cfi_*`, `.loc`, `.p2align` and friends describe the
-                        // code, they do not execute: killing the state at every
-                        // one of them (they follow each call and each prologue
-                        // step) would throw away exactly the cross-call forwards
-                        // this pass exists for. Anything else -- `.byte`,
-                        // `.long`, `.ascii`, a nested `.section` -- may be data
-                        // this text scan cannot reason about, so it kills.
-                        if !is_metadata_directive(t) {
-                            st.kill_all();
-                        }
-                    }
-                    LineKind::InlineAsm => st.kill_all(),
-                    LineKind::Ret | LineKind::RetN => st.kill_all(),
-                    LineKind::Call => {
-                        if escape || is_indirect_call(t) {
-                            st.kill_all();
-                        } else {
-                            // A `ret $N` callee pops its own arguments, so %esp
-                            // RISES by N and every %esp-relative displacement
-                            // SHRINKS by N. The sign matters: getting it
-                            // backwards renumbers every slot to bytes that were
-                            // never stored.
-                            let pop = callee_esp_pop(t);
-                            if pop != 0 {
-                                st.shift_esp(-pop);
-                            }
-                            for r in [REG_EAX, REG_ECX, REG_EDX] {
-                                st.conflict(r);
-                            }
-                            st.drop_stale();
-                        }
-                        // The callee may clobber caller-saved registers even
-                        // when nothing is tracked through them.
-                        for r in [REG_EAX, REG_ECX, REG_EDX] {
-                            st.stamp(r, j as u32);
-                        }
-                        st.drop_stale();
-                    }
-                    LineKind::Push { reg } => {
-                        // A push READS its operand and writes 4 bytes below the
-                        // new top: the pushed register keeps its value, so it
-                        // must NOT be stamped (stamping it would kill every
-                        // entry sourced from it).
-                        let _ = reg;
-                        st.shift_esp(4);
-                        st.kill_range(ESP_SLOT_BIAS, 4);
-                        st.stamp(REG_ESP, j as u32);
-                        st.drop_stale();
-                    }
-                    LineKind::Pop { reg } => {
-                        st.shift_esp(-4);
-                        st.stamp(reg, j as u32);
-                        st.stamp(REG_ESP, j as u32);
-                        st.drop_stale();
-                    }
-                    LineKind::StoreEbp { reg, offset, size } => {
-                        let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
-                        for &(o, w) in &ext[..n] {
-                            if o != offset || w != size.byte_size() {
-                                st.kill_range(o, w);
-                            }
-                        }
-                        st.kill_range(offset, size.byte_size());
-                        let stamp = if reg <= REG_GP_MAX {
-                            st.regs[reg as usize]
-                        } else {
-                            REG_DEF_CONFLICT
-                        };
-                        st.add(offset, size.byte_size(), reg, stamp);
-                        st.drop_stale();
-                    }
-                    LineKind::LoadEbp { reg, offset, size } => {
-                        // LOOK UP FIRST, then kill: in the imprecise (legacy)
-                        // mode `frame_write_extents` reports a 16-byte window
-                        // around this line's own displacement, which would
-                        // erase the very entry being forwarded. In precise mode
-                        // a load reports no extents at all, so the order only
-                        // matters for the fallback -- but it must be right in
-                        // both, because the fallback is what the kill switch
-                        // reverts to.
-                        if let Some(src) = st.lookup(offset, size.byte_size()) {
-                            forward = Some((src, reg, size));
-                        }
-                        let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
-                        for &(o, w) in &ext[..n] {
-                            st.kill_range(o, w);
-                        }
-                        st.stamp(reg, j as u32);
-                        st.drop_stale();
-                    }
-                    LineKind::Jmp | LineKind::CondJmp | LineKind::JmpIndirect | LineKind::Cmp => {
-                        let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
-                        for &(o, w) in &ext[..n] {
-                            st.kill_range(o, w);
-                        }
-                    }
-                    LineKind::Move { dst, src } => {
-                        let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
-                        for &(o, w) in &ext[..n] {
-                            st.kill_range(o, w);
-                        }
-                        st.stamp(dst, j as u32);
-                        let _ = src;
-                        st.drop_stale();
-                    }
-                    LineKind::SetCC { reg } => {
-                        let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
-                        for &(o, w) in &ext[..n] {
-                            st.kill_range(o, w);
-                        }
-                        st.stamp(reg, j as u32);
-                        st.drop_stale();
-                    }
-                    LineKind::SelfMove | LineKind::Nop | LineKind::Empty => {}
-                    LineKind::Other { dest_reg } => {
-                        let n = frame_kill_extents(t, &infos[j], precise, &mut ext);
-                        for &(o, w) in &ext[..n] {
-                            st.kill_range(o, w);
-                        }
-                        if infos[j].has_indirect_mem && (escape || has_indexed_frame_access(t)) {
-                            st.kill_all();
-                        }
-                        if dest_reg == REG_ESP && esp_delta.is_none() {
-                            // `movl %eax, %esp` and friends: unknown renumbering.
-                            st.kill_all();
-                        }
-                        // Architectural implicit writes (cltd -> %edx,
-                        // idivl -> %eax:%edx, rep stosb -> %edi:%ecx, xchg/xadd
-                        // both operands, single-operand RMW) go through the
-                        // central oracle rather than a second table here.
-                        // Only probe registers an entry is actually tracked
-                        // through: the oracle scans the line text per register,
-                        // and calling it for all eight on every line of every
-                        // function is a compile-time cost with no benefit when
-                        // nothing is tracked.
-                        if !st.slots.is_empty() {
-                            let mut probe = 0u16;
-                            for e in &st.slots {
-                                probe |= 1u16 << e.reg;
-                            }
-                            for r in 0..=REG_GP_MAX {
-                                if probe & (1u16 << r) != 0 && line_writes_reg_implicitly(t, r) {
-                                    st.stamp(r, j as u32);
-                                }
-                            }
-                        }
-                        if dest_reg <= REG_GP_MAX {
-                            st.stamp(dest_reg, j as u32);
-                        }
-                        st.drop_stale();
-                    }
-                }
-                if let Some(d) = esp_delta {
-                    st.shift_esp(d);
-                    if d > 0 {
-                        // The bytes just below the old top are now addressable
-                        // as slots; nothing tracked may claim them.
-                        st.kill_range(ESP_SLOT_BIAS, d);
-                    }
-                }
-            }
-            if let Some((src, dst, size)) = forward {
-                changed |= rewrite_slot_reload(store, infos, j, src, dst, size);
-            }
-        }
-        out[b] = Some(st);
-        for &s in &succ[b] {
-            if !inq[s] {
-                inq[s] = true;
-                work.push_back(s);
-            }
-        }
+    }
+
+    // ── application from the converged IN ───────────────────────────────────
+    // One visit per block, in any order: IN is final, so nothing here depends on
+    // the order in which blocks are rewritten.
+    let mut changed = false;
+    let mut apply_budget = fe - fs + nb;
+    for &b in &rpo {
+        let mut st = inn[b].clone();
+        changed |= slot_fwd_block(
+            store,
+            infos,
+            starts[b],
+            end_of(b),
+            &mut st,
+            precise,
+            escape,
+            source_regs,
+            &mut implicit,
+            fs,
+            true,
+            &mut apply_budget,
+        );
     }
     changed
 }
@@ -16880,6 +17246,294 @@ mod tests {
         assert!(
             out.contains("movl %ebx, %ecx"),
             "a stdcall callee pop did not renumber the slots: {out}"
+        );
+    }
+
+    // ── Pins added by the S20 review of PR #512 (audit findings F1-F4) ───────
+    //
+    // Each is a refusal/positive-control pair in the suite's existing style.
+    // They were written BEFORE the fixes and observed to fail, so none of them
+    // is a tautology: the assertion is the behaviour the pass ought to have.
+
+    #[test]
+    fn cfg_fwd_loop_carried_store_is_forwarded() {
+        // F1. The store dominates the loop head and nothing in the body
+        // redefines %ebx or the slot, so the reload is forwardable on every
+        // path INCLUDING the back edge. A ready-gated single sweep never
+        // processes this loop at all: head and tail wait on each other, and
+        // neither is ever requeued.
+        let out = run_cfg_slot_fwd(&[
+            "f:",
+            "    movl %ebx, 20(%esp)",
+            ".Lloop:",
+            "    movl 20(%esp), %ecx",
+            "    addl %ecx, %edx",
+            "    cmpl $0, %edx",
+            "    jne .Lloop",
+            "    ret",
+        ]);
+        assert!(
+            out.contains("movl %ebx, %ecx"),
+            "loop-body reload was not forwarded (loop starved the worklist): {out}"
+        );
+    }
+
+    #[test]
+    fn cfg_fwd_back_edge_redef_stops_forwarding() {
+        // F1 soundness pin. The body redefines the source register, so on the
+        // back-edge path the slot's provenance is stale. The fixpoint must
+        // converge to NOT forwardable: a single sweep that processed the body
+        // once from the entry state would forward on iteration 1 and be wrong
+        // on every iteration after it.
+        let out = run_cfg_slot_fwd(&[
+            "f:",
+            "    movl %ebx, 20(%esp)",
+            ".Lloop:",
+            "    movl 20(%esp), %ecx",
+            "    movl %edi, %ebx",
+            "    cmpl $0, %ecx",
+            "    jne .Lloop",
+            "    ret",
+        ]);
+        assert!(
+            !out.contains("movl %ebx, %ecx"),
+            "forwarded across a back edge that redefines the source: {out}"
+        );
+        assert!(
+            out.contains("movl 20(%esp), %ecx"),
+            "the reload must survive when it cannot be forwarded: {out}"
+        );
+    }
+
+    #[test]
+    fn cfg_fwd_post_loop_block_forwards() {
+        // F1. The most common reload site in real C is the block AFTER a loop
+        // (the loop carried the value in a slot). It has a loop block among its
+        // predecessors, so under the ready gate it starves too.
+        let out = run_cfg_slot_fwd(&[
+            "f:",
+            "    movl %esi, 24(%esp)",
+            ".Lloop:",
+            "    addl $1, %eax",
+            "    cmpl $10, %eax",
+            "    jne .Lloop",
+            "    movl 24(%esp), %ecx",
+            "    ret",
+        ]);
+        assert!(
+            out.contains("movl %esi, %ecx"),
+            "post-loop reload was not forwarded: {out}"
+        );
+    }
+
+    #[test]
+    fn cfg_fwd_indirect_dispatch_meet_is_conservative() {
+        // F2, refusal. The dispatch block redefines %eax, the register the slot
+        // entry is sourced from, and the case block is reachable from the jump
+        // table as well as by fall-through. Its IN must be the meet of both
+        // paths; the dispatch path is stale, so nothing may be forwarded. An
+        // indirect branch with an empty successor set hides that path.
+        let out = run_cfg_slot_fwd(&[
+            "f:",
+            "    movl %eax, 20(%esp)",
+            "    movl 8(%ebp), %eax",
+            "    sall $2, %eax",
+            "    jmp *.Ltab(,%eax,1)",
+            ".Lcase1:",
+            "    nop",
+            ".Lcase2:",
+            "    movl 20(%esp), %ecx",
+            "    ret",
+            ".Ltab:",
+            "    .long .Lcase1",
+            "    .long .Lcase2",
+        ]);
+        assert!(
+            !out.contains("movl %eax, %ecx"),
+            "forwarded through an indirect dispatch that redefined the source: {out}"
+        );
+    }
+
+    #[test]
+    fn cfg_fwd_indirect_dispatch_target_reachable_directly_is_not_forwarded() {
+        // F2, and the shape that is NOT saved by the worklist starvation: a
+        // block reachable from the indirect branch AND by a direct edge is
+        // processed today, with a meet that omits the indirect predecessor
+        // entirely. Computed-goto dispatch inside a loop has exactly this
+        // shape, and so does any switch case that a direct branch also enters.
+        let out = run_cfg_slot_fwd(&[
+            "f:",
+            "    movl %eax, 20(%esp)",
+            "    cmpl $1, %edx",
+            "    jg .Ldispatch",
+            "    jmp .Lcase1",
+            ".Ldispatch:",
+            "    movl 8(%ebp), %eax",
+            "    sall $2, %eax",
+            "    jmp *.Ltab(,%eax,1)",
+            ".Lcase1:",
+            "    nop",
+            ".Lcase2:",
+            "    movl 20(%esp), %ecx",
+            "    ret",
+            ".Ltab:",
+            "    .long .Lcase1",
+            "    .long .Lcase2",
+        ]);
+        assert!(
+            !out.contains("movl %eax, %ecx"),
+            "forwarded a stale source into a block the indirect branch also reaches: {out}"
+        );
+        assert!(
+            out.contains("movl 20(%esp), %ecx"),
+            "the reload must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn cfg_fwd_indirect_dispatch_without_a_redef_still_forwards() {
+        // F2, positive control. Over-approximating an indirect branch's
+        // successors to every block in the function must not turn into a bail:
+        // when no path redefines the source or the slot, the meet still agrees
+        // and the forward must happen. Without this, I-2 could be "fixed" by
+        // refusing all functions containing a jump table.
+        let out = run_cfg_slot_fwd(&[
+            "f:",
+            "    movl %ebx, 20(%esp)",
+            "    jmp *.Ltab(,%eax,1)",
+            ".Lcase1:",
+            "    nop",
+            ".Lcase2:",
+            "    movl 20(%esp), %ecx",
+            "    ret",
+            ".Ltab:",
+            "    .long .Lcase1",
+            "    .long .Lcase2",
+        ]);
+        assert!(
+            out.contains("movl %ebx, %ecx"),
+            "an indirect branch suppressed a forward that every path agrees on: {out}"
+        );
+    }
+
+    #[test]
+    fn cfg_fwd_string_op_kills_slot_state() {
+        // F3. `rep stosl` writes four bytes per iteration through %edi with no
+        // parenthesised operand in the text, so a textual `(%reg)` scan does not
+        // see it as an indirect memory access and no frame extent covers it:
+        // the write is invisible even though this function forms a frame
+        // address (escape = true), which is precisely the flag meant to catch
+        // it. The reload after the edge must NOT be forwarded.
+        let out = run_cfg_slot_fwd(&[
+            "f:",
+            "    movl %esi, -4(%ebp)",
+            "    leal -4(%ebp), %edi",
+            "    movl $1, %ecx",
+            "    rep stosl",
+            "    jmp .L2",
+            ".L2:",
+            "    movl -4(%ebp), %eax",
+            "    ret",
+        ]);
+        assert!(
+            !out.contains("movl %esi, %eax"),
+            "a string-op memory write was invisible and the stale value was forwarded: {out}"
+        );
+        assert!(
+            out.contains("movl -4(%ebp), %eax"),
+            "the reload must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn cfg_fwd_indirect_write_drops_caller_owned_slots_without_an_escape() {
+        // F4, first half. With no frame address formed anywhere in the function,
+        // an indirect write cannot NAME a slot this activation allocated: for
+        // `%edi` to point into our frame it would have to have been formed from
+        // %esp/%ebp, which is exactly what `escape` detects. Our own slots
+        // therefore survive -- see the companion pin -- but a POSITIVE-%ebp slot
+        // is not ours. It is the incoming-argument area, owned by the caller,
+        // which a `va_list` two frames up can name without anything in this
+        // function ever forming a frame address. Those die.
+        let out = run_cfg_slot_fwd(&[
+            "f:",
+            "    movl %esi, 12(%ebp)",
+            "    cmpl $0, %eax",
+            "    je .L2",
+            "    movl %eax, (%edi)",
+            "    jmp .L3",
+            ".L2:",
+            "    nop",
+            ".L3:",
+            "    movl 12(%ebp), %ecx",
+            "    ret",
+        ]);
+        assert!(
+            !out.contains("movl %esi, %ecx"),
+            "a caller-owned slot survived an indirect write: {out}"
+        );
+    }
+
+    #[test]
+    fn cfg_fwd_indirect_write_keeps_own_frame_slots_without_an_escape() {
+        // F4, second half, and the reason the rule is precise instead of a
+        // blanket kill. This is the shape the corpus is full of -- 74 TUs and
+        // 166 instructions turn on it -- taken from tests/regression/
+        // pgo_sections.c: update a global through the PIC register, then reload
+        // a frame temporary that the global store could not have reached.
+        //
+        //     movl %eax, 12(%esp)     <- our own frame
+        //     movl %eax, (%esi)       <- %esi = leal state@GOTOFF(%ebx)
+        //     movl 12(%esp), %eax     <- redundant
+        //
+        // The store is on one path and the reload is at the join, so a blanket
+        // kill loses the entry through the meet even though the path that skips
+        // the write still has it: the two rules are distinguishable here.
+        //
+        // Killing everything is not just imprecise, it does not buy the
+        // safety it appears to: a pointer into our outgoing-argument area can be
+        // leaked by a CALLEE that writes through it during the call, a site this
+        // arm does not govern. The premise "no frame address was formed here, so
+        // nothing outside can name our frame" is the same premise the Call arm
+        // already runs on; applying it uniformly is what makes the two arms
+        // agree, where a stricter rule at one site and a laxer one at the other
+        // would only hide the assumption.
+        let out = run_cfg_slot_fwd(&[
+            "f:",
+            "    movl %esi, 20(%esp)",
+            "    leal state@GOTOFF(%ebx), %edi",
+            "    cmpl $0, %eax",
+            "    je .L2",
+            "    movl %eax, (%edi)",
+            ".L2:",
+            "    movl 20(%esp), %ecx",
+            "    ret",
+        ]);
+        assert!(
+            out.contains("movl %esi, %ecx"),
+            "a write through a non-frame pointer killed our own frame slot: {out}"
+        );
+    }
+    #[test]
+    fn cfg_fwd_entry_block_state_is_never_derived_from_its_own_back_edge() {
+        // A back edge to the function's own label makes block 0 its own
+        // predecessor. IN[0] is the empty state by definition -- at function
+        // entry no register holds a value this function stored -- and the
+        // fixpoint must not "improve" it from OUT[0], or the first iteration's
+        // facts would be assumed on entry. Forwarding inside the body from a
+        // store in the body is still correct and must survive.
+        let out = run_cfg_slot_fwd(&[
+            "f:",
+            "    movl %ebx, 20(%esp)",
+            "    movl 20(%esp), %ecx",
+            "    addl %ecx, %edx",
+            "    cmpl $0, %edx",
+            "    jne f",
+            "    ret",
+        ]);
+        assert!(
+            out.contains("movl %ebx, %ecx"),
+            "within-block forward lost in a self-loop at entry: {out}"
         );
     }
 

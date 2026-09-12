@@ -58,7 +58,8 @@ Keeping it invited a future "fix and enable" that would duplicate a sound pass
 and reintroduce four miscompiles. The adjudication is recorded in-file where
 the pass used to be.
 
-> **ADJUDICATED IN S19 (2026-09-12, commit `8d4ad8fc`) — PARTLY REVERSED.**
+> **ADJUDICATED IN S19 (2026-09-12, upstream as `bcfeeefe`, PR #512) — PARTLY
+> REVERSED.**
 >
 > The four defects and their diagnosis stand; each is reproduced and closed by
 > construction in the new design. Two conclusions do not stand.

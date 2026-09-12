@@ -1,10 +1,51 @@
-# FOLLOWUP-2026-09-12-i686-cfg-slot-forwarding-and-a-narrow-store-miscompile.md
+# FOLLOWUP-2026-09-12-i686-cfg-slot-forwarding-and-narrow-store-miscompile.md
 
-Session S19. Branch `s19`, commit `8d4ad8fc`, rebased onto `origin/main`
-`2e6e04d4` (PR #511, *Global Location Allocation Phase 1*). Deliverable:
-`ms178-1.patch` (94,126 B, one commit, `git am`-clean on pristine main).
+Session S19. **The first half of this series has merged upstream**: PR #512
+(`bcfeeefe`) carries the CFG slot-forwarding pass, the narrow-store miscompile
+fix, the `godbolt.py` icc-label fix, the S17 red-team audit and the first
+edition of this document. Branch `s19` is therefore rebased onto `origin/main`
+`0e4cf540` and now contains five commits of *new* work: `87ebbef7` (constant
+call arguments stored directly instead of routed through `%eax`), `65ceb2a3`
+(the oracle-methodology correction in §6 and the constant-fold decision record),
+`4a68b490` (final-binary runtime and execution-differential evidence),
+`da0000a0` (one shared constant-materialization model for both marshalling
+paths, 6 unit tests and an end-to-end regression test — §6.4), and this final
+commit (the numbers above, restated on the delivered tree).
+Deliverable: `ms178-1.patch`, `git am`-clean on pristine main, six files:
+`src/backend/i686/codegen/emit.rs` and `calls.rs` (the fold, its shared pure
+helpers and 6 unit tests), `tests/regression/i686_const_stack_args.{c,flags}`
+(the end-to-end test), this document, and a one-line stale-hash correction in
+`engineering/AUDIT-2026-09-12-S17-redteam.md`.
+
+The instruction-count totals below are stated against `2e6e04d4` (the
+pre-PR-#512 baseline) so the whole session's contribution stays visible; the
+`origin/main` row is now PR #512's state, i.e. the A/B **base** arm.
+
+Headline numbers, i686, 809-TU `tests/` corpus, fastbuild:
+
+| corpus | CFG slot forwarding | constant-argument fold | total |
+|---|---|---|---|
+| 794 TUs (`2e6e04d4` → PR #512 → fold) | −247 insns, −405 slot refs | −993 insns | **−1,240 insns (−0.458%)**, 270,945 → 269,705 |
+| 795 TUs (delivered tree, binary `0fccd521`) | −246 insns, −406 slot refs | −999 insns | **−1,245 insns**, 271,233 → 270,234 |
+
+The two rows differ by one translation unit — the regression test this patch
+adds — and nothing else. That TU is 526 instructions with the fold gated off and
+520 with it on, which is why the absolute totals shift by ~+535 between rows and
+why the fold's own delta grows by exactly 6; the forwarding delta moves by one
+for the same reason. Slot references are unchanged by the fold in both rows
+(`movl %eax,N(%esp)` and `movl $imm,N(%esp)` reference the same slot), so all
+−406 of them are the forwarder's.
+
+298 TUs smaller and 0 larger from the fold (instruction counts; `.text` bytes
+are +580 on a 210-TU sample, +638 of which is two memset TUs — see §6.3), 108
+smaller and 0 larger from the forwarder. **16 of the 22-benchmark corpus come
+out byte-identical between arms, `lz4_compress` among them**, so no regression
+is possible there by construction; the five whose assembly changed are neutral
+by paired measurement (median 0.9972, geomean 0.9991, none slower than 2%;
+§5.3.1).
 
 Files touched: `src/backend/i686/codegen/peephole.rs` (+1,785/−39),
+`src/backend/i686/codegen/emit.rs` and `calls.rs` (+116/−4),
 `scripts/godbolt.py` (+15/−4), and a new runtime regression test
 `tests/regression/i686_narrow_store_alu_slot_source.{c,flags}`.
 
@@ -73,15 +114,19 @@ had defeated an earlier attempt:
 
 ## 3. Design
 
-Per function: split into blocks at labels and branch targets; run one forward
-dataflow pass; state is a slot table (value + defining register + width) plus
+Per function: split into blocks at labels and branch targets; iterate a forward
+dataflow analysis to a fixpoint and then apply it in a second sweep (§10.2
+explains why one pass is not enough and why the iteration has to start
+optimistic); state is a slot table (value + defining register + width) plus
 eight register stamps. Meet at a join is **intersection** (a slot is known only
 if every predecessor agrees). Terminators: calls kill caller-saved registers
 but *not* slot state; `push`/`pop`/`ret $N` renumber `%esp`-biased keys;
 `setjmp` in the function bails out entirely (longjmp can restore any `%esp`);
-an address of a slot escaping (or any indirect memory write when the frame is
-not proven local) kills conservatively, while indexed frame accesses kill
-unconditionally. Budget 40k lines, cap 48 slots — over either, the function is
+an address of a slot escaping kills everything, a string op kills everything
+(§10.4), and any other indirect memory write kills the caller-owned slots when
+the frame is not proven local and everything when it is (§10.5), while indexed
+frame accesses kill unconditionally. A computed branch's successors are every
+block in the function (§10.3). Budget 40k lines, cap 48 slots — over either, the function is
 skipped, which costs completeness and never costs correctness.
 
 Only GP `movl`/`movw`/`movb` participate. `fstpl S; fldl S` is **never**
@@ -170,7 +215,7 @@ arm (the same 15 fail in all four arms, so they are not arm-dependent).
 
 | arm | insns | slot refs |
 |---|---|---|
-| `base` (main `2e6e04d4`) | 270,945 | 102,007 |
+| `base` (pre-#512 main, `2e6e04d4`) | 270,945 | 102,007 |
 | `off` (both kill switches) | 270,945 | 102,008 |
 | `prec` (precision switch only) | 270,945 | 102,008 |
 | **`both` (pass on)** | **270,698** | **101,602** |
@@ -238,6 +283,33 @@ wall clock. This is reported as such rather than dressed up as a win, and the
 one benchmark with enough runtime to resolve a 2% effect went the favourable
 way.
 
+### 5.3.1 Runtime, final binary (both transformations, 22-benchmark corpus)
+
+Re-run on the delivered build (`sha256 e6acf596…`, non-zero-immediate fold) with
+paired alternation and the 20 ms floor:
+
+| | value |
+|---|---|
+| benchmarks with **byte-identical** assembly between arms | **16 of 22**, including `lz4_compress`, `nbody`, `matmul`, `mandelbrot`, `binary_trees`, `hash_table`, `strlen_bench`, `i686_alu_chains` |
+| timed (assembly differs) | 5 — `fannkuch`, `sqlite_varint`, `sieve`, `arith_loop`, `fib` (sub-floor, excluded) |
+| **paired-alternating aggregate (72 rep-pairs)** | **median 0.9972 (−0.28%), geomean 0.9991 (−0.09%)** |
+| min-of-N geomean, floor-passing 4 | 0.9768 (−2.32%) — the optimistic statistic, quoted for completeness only |
+| benchmarks slower than 2% | **none** |
+
+The identity result is the load-bearing one: 16 of 22 benchmarks cannot regress
+because the compiler emits the same bytes. Of the five that changed, the two
+with enough runtime to resolve a 2% effect (`fannkuch` at 4.1 s, paired median
+0.9975; `sqlite_varint` at 67 ms, paired median 0.9857) are both marginally
+faster, and `sieve`/`arith_loop` are inside noise in both directions depending
+on the statistic. **Verdict: neutral-to-marginally-favourable, no regression
+beyond noise, and the binding `lz4_compress` constraint is satisfied by hash
+identity rather than by measurement.**
+
+One harness note: `fp_scalar_webs` fails to *link* under the 32-bit oracle in
+this environment (missing `lib32` startup objects) in every arm, including
+unpatched `origin/main`; `exec_diff` reports the same 71 link failures for all
+four arms, so it is an environment limit, not a result.
+
 ### 5.4 Correctness
 
 * **Differential fuzzer** (`tools/slot_fwd_fuzz.py`, 12 generators: punning,
@@ -251,11 +323,20 @@ way.
   verdicts were trusted: an unterminated buffer made `strlen` read out of
   bounds, and cast-based punning violated strict aliasing. A fuzzer whose cases
   are UB cannot validate anything.
-* **Execution differential** over the corpus against gcc `-m32`: no new
-  miscompiles introduced (new-vs-oracle equals base-vs-oracle), and the two
-  off-vs-base differences are benchmarks that print elapsed wall-clock time
-  (verified stable across three runs of the same binary).
-* **Test suite (post-rebase, commit `8d4ad8fc` on `2e6e04d4`):**
+* **Execution differential** over the corpus against gcc `-m32`, re-run on the
+  final binary (`tools/exec_diff.py`, 809 TUs × 4 arms): **666 TUs build and run
+  under the gcc oracle**; **21 disagree with gcc — exactly base's 21**, so no new
+  miscompile is introduced. The only two new-vs-base differences
+  (`i686_alu_chains.c`, `fp_liveness_ptr_deref_alias_negative.c`) also differ
+  with every transformation gated **off**, and each printed a *third* distinct
+  value across arms (9.03643e+107 / 1.1651e+108 / 1.47702e+108) — they are
+  nondeterministic TUs, not patch effects. Stage census per arm: base 719 run /
+  71 link / 15 compile / 4 timeout; patched 722 run / 71 link / 15 compile /
+  1 timeout; kill-switch arm identical to patched.
+* **Test suite** (measured at `8d4ad8fc` on `2e6e04d4`, now upstream as
+  `bcfeeefe`, and re-run on the rebased tree at `87ebbef7` on `0e4cf540` —
+  the rebased build is byte-identical, `sha256 e6acf596…`, so these are the
+  delivered binary's numbers):
   `cargo test --profile fastbuild` **2,606 passed / 0 failed**; the `peephole`
   filter reports **980 passed / 0 failed** (946 before the rebase plus the
   x86-64 peephole tests PR #511 added), of which **32 are new here** (31 tests
@@ -265,36 +346,177 @@ way.
 * **CI gate:** `scripts/ci_local.sh --fast` → **ALL GATES GREEN, 30 passed /
   0 failed / 3 skipped, rc=0**, including the regression corpus and
   `codegen-quality-gate` (all golden workloads within tolerance).
-* **Regression harness:** `run_regression.py --filter i686_narrow_store` →
-  1 passed, 0 failed, gcc comparison executed (0 skipped-compare).
+* **Unit tests for the constant fold** (6 new, `emit.rs`): a bit-exactness
+  table over all eleven `IrConst` arms (i64/i128 low-half truncation, `F32`
+  bit pattern, `F64` *low half* of the bit pattern, `D32`/`D64` BID patterns,
+  `LongDouble` leading bytes, `I8`/`I16` sign extension, `-0.0f` = `0x80000000`
+  ≠ zero); which arms emit `xorl` for zero; the fold predicate re-derived from
+  byte-count constants at **post-peephole** cost for both displacement forms;
+  the arm-independent zero refusal as a tripwire against removing that peephole;
+  and every non-zero immediate folding in every arm. Lib tests: **2,618**.
+* **End-to-end regression test** `tests/regression/i686_const_stack_args.c`
+  (+`.flags`, `-m32 -O2 -fno-pic`): a `noinline` 13-argument callee and an
+  8-argument callee, all constant kinds, zeros in every position, 8-byte
+  arguments interleaved to shift every following slot offset, plus the operands
+  that must keep using `%eax` (a variable, an alloca ADDRESS, a global address,
+  a function pointer) and a variadic `printf`. Checksums are over argument *bit
+  patterns*. Reference values are gcc `-m32`, identical at -O0/-O1/-O2/-O3;
+  lccc passes at all four levels **with the fold on and with it gated off**, so
+  both marshalling paths are pinned. The test is not vacuous: the fold fires 36
+  times in it against 29 with the gate set, 520 instructions against 526.
 
-## 6. Oracle comparison (Compiler Explorer, `-O2 -m32`, AT&T)
+## 6. Oracle comparison (Compiler Explorer, AT&T), and a correction to it
 
-`gcc -m32` disables SSE2 and is therefore the only honest i686 oracle; clang,
-icc and icx emit SSE2 for FP at `-m32`. Both kernels below are pure integer, so
-all four are comparable here.
+`gcc -m32` disables SSE2 and is therefore the only honest i686 oracle for FP;
+clang, icc and icx emit SSE2 at `-m32`. The kernels below are pure integer, so
+all four are comparable.
 
-| kernel | lccc | gcc 16.2 | clang 23.1.0 | icc 2021.10.0 | icx latest |
+### 6.1 The first comparison was unfair, and by how much
+
+The initial run compared lccc's **default PIC** output against the oracles'
+**non-PIC** output at `-O2 -m32`: lccc emitted `__x86.get_pc_thunk.bx` and 60
+`@GOTOFF`/`@PLT` relocations, the oracles none. Re-run with `-fno-pic` on both
+sides:
+
+| kernel (`-O2 -m32`) | lccc | gcc 16.2 | clang 23.1.0 | icc 2021.10 | icx |
 |---|---|---|---|---|---|
-| `word_pun` (the §4 reproducer) | 30 | 15 | **9** | 19 | **9** |
-| `main`, `narrow_shift_count_ge_width.c` (biggest forwarding win) | 498 | **291** | 337 | 304 | 300 |
+| `main`, `narrow_shift_count_ge_width.c` — **mismatched PIC** | 498 | 291 | 337 | 304 | 300 |
+| same, both `-fno-pic` | **403** | **291** | **295** | — | **300** |
+| `word_pun`, `i686_narrow_store_alu_slot_source.c` — mismatched PIC | 30 | 15 | 9 | 19 | 9 |
+| same, both `-fno-pic` | **30** | **15** | **9** | **19** | **9** |
 
-Artifacts and manifests: `results/godbolt_narrow_store/`,
-`results/godbolt_fwd_kernel/`. `scripts/godbolt.py audit` confirms every pinned
-oracle alias resolves and is current.
+`word_pun` is a leaf function that touches no globals, so PIC costs it nothing
+and both rows agree — re-measured under matched flags rather than assumed
+(`results/godbolt_wordpun_noppic/`). The slot-heavy kernel is the one where the
+code model mattered.
 
-**What this says, plainly: lccc loses here, and not because of forwarding.** On
-`word_pun`, clang and icx keep the union in *registers* and constant-fold the
-whole punning chain into nine instructions; lccc homes the union in a stack
-slot and pays 30. Forwarding makes the slot traffic cheaper; only location
-allocation removes it. On the 498-vs-291 kernel the same mechanism dominates.
+**95 of the 207-instruction "gap" was a harness artefact.** The honest gap is
+112 instructions (1.38×), not 1.71×, and against clang/icx it is 1.37×/1.34×
+rather than the 1.48×/1.66× the unfair numbers implied. Any oracle comparison
+that does not pin the code model on both sides is measuring the flag, not the
+compiler. Artifacts: `results/godbolt_fwd_kernel/` (mismatched),
+`results/godbolt_noppic/` (matched), `results/godbolt_narrow_store/`.
 
-A tool bug was fixed to get these numbers honestly: ICC labels its entry block
-`word_pun.:` (a trailing dot, not a valid C identifier), and the body scanner
-treated it as a new symbol, truncating the function to one instruction and
-printing **icc=1 against clang=9**. A bogus "optimal" oracle row is worse than
-a hard failure because it can make a bad compiler look perfect — the exact
-failure mode `_label_is_function` was written to prevent. icc is 19.
+A second tool bug was fixed to get any of these numbers honestly: ICC labels its
+entry block `word_pun.:` (a trailing dot, not a valid C identifier), and the
+body scanner treated it as a new symbol, truncating the function to one
+instruction and printing **icc=1 against clang=9**. A bogus "optimal" oracle row
+is worse than a hard failure because it can make a bad compiler look perfect —
+the exact failure mode `_label_is_function` was written to prevent. icc is 19
+(on `word_pun`, where lccc is 30 and clang/icx are 9).
+
+### 6.2 What the fair numbers actually say, and the second root cause found
+
+Classifying every `movl` in the matched-flag artifacts locates the gap
+precisely:
+
+| | lccc | gcc 16.2 |
+|---|---|---|
+| instructions | 403 | 291 |
+| instructions with a memory operand | **148 (37%)** | **4 (1%)** |
+| `movl` total | 236 | 22 |
+| — reg→slot (homing / argument staging) | 111 | 0 |
+| — reg→reg copy | 41 | 10 |
+| — imm→reg | 38 | 1 |
+| — slot→reg reload | 12 | 0 |
+| `pushl` | 4 | 132 |
+
+gcc holds live values in callee-saved registers and passes arguments with
+`pushl`; lccc homes values in a 60-byte frame and stages arguments through
+`%eax` into `disp(%esp)`. Two distinct defects, in order of what they cost:
+
+1. **Every stack argument was routed through `%eax`** — `operand_to_eax(arg)`
+   followed by `movl %eax, N(%esp)` — even when the argument is a constant that
+   could be stored directly, which is what gcc/clang/icx all do. Fixed in
+   `87ebbef7` at the emission site (§6.3).
+2. **Values that gcc keeps in `%ebx`/`%esi`/`%edi` are homed in slots.** This is
+   the larger term and it is *location allocation*, not forwarding: upstream's
+   `location_alloc.rs` Phase 1 measures at −4 slot references corpus-wide on
+   i686 (budget 6 GPRs, reach band 2) and changes this kernel not at all (549
+   instructions with `CCC_RA_GLOBAL_LOCATION=1` and 549 without). Slot
+   forwarding makes that traffic cheaper; only location allocation removes it.
+
+### 6.3 The constant-argument fold, and an encoding-arithmetic decision
+
+Census first (`tools/dead_materialize_census.py`, 809 i686 TUs): **471** sites
+where a value is materialized into a register that is dead immediately after a
+slot store — 327 zeros (`xorl %eax,%eax`), 105 non-zero immediates, 39 register
+copies. Fixing it at the lowering site rather than as a peephole beat the
+census by 2.3×, because a peephole must prove the register dead whereas the
+lowering site never materializes it at all — and the removed `%eax` clobber
+takes its downstream reloads with it.
+
+Folding **all** constants measured −1,194 instructions but **+1,344 .text bytes
+(+0.477%)**. The reason is encoding arithmetic, not a heuristic:
+
+```
+non-zero   movl $imm,%eax (5B) + movl %eax,d8(%esp) (4B) = 9B  ->  movl $imm,d8(%esp) = 8B   WIN
+zero       xorl %eax,%eax (2B) + movl %eax,d8(%esp) (4B) = 6B  ->  movl $0,d8(%esp)   = 8B   LOSS
+```
+
+and 327 of the 432 constant sites are zeros. So zero is excluded, which keeps
+83% of the instruction win at 57% less byte growth: **−993 instructions, 298
+TUs smaller, 0 larger, +580 bytes (+0.206%)** on a 210-TU sample. +638 of that
++580 is two memset TUs (22,573 → 22,892 each); every other TU nets smaller.
+Their growth is *downstream*, not the fold: `movl %ebx, %eax` copies appear
+where the removed `%eax` clobber used to supply a scratch definition.
+
+Runtime was neutral for the wider variant too (paired geomean −0.24%, median
++0.13%), so there is no measured performance argument for paying bytes — which
+is why the trade was resolved on the static metrics rather than on a story
+about which metric "matters more".
+
+Gate: `CCC_NO_CONST_STACK_ARG`. With it set the object file is **byte-identical**
+to the parent build (sha256 `220b4c89…` on `cpu_model_memset_inline.c`) and the
+corpus counts reproduce exactly, so the harness provably measures the change and
+not a rebuild artefact.
+
+### 6.4 The exclusion rule was nearly refined into a regression, and what caught it
+
+The blanket `imm != 0` exclusion looks over-broad, because only three IR arms
+materialize zero with `xorl` at the point of emission (`I32`, `I64`, `Zero`);
+`I8(0)`, `I16(0)`, `I128(0)`, `D32(0)`, `D64(0)`, `F32(0.0)`, `F64(0.0)` and
+`LongDouble` emit `movl $0, %eax` (5 B), for which the 8-byte folded store
+*appears* to win a byte. A census (`tools/zero_arm_census.py`, 794 TUs, fold
+disabled) reported **0** such sites against 562 `xorl` sites, which read as "the
+refinement is harmless either way" — so the per-arm predicate was implemented,
+with unit tests, and measured — then reverted in the working tree, never
+committed.
+
+It was wrong, and the measurement said so: `tools/asm_identity.py` (per-TU
+assembly hash comparison against the already-validated binary) reported **8 TUs
+changed**, and every change was
+
+```
+xorl %eax, %eax          ->     movl $0, 0(%esp)
+movl %eax, 0(%esp)              (-1 instruction, +2 bytes)
+```
+
+The cause is a peephole in `peephole.rs` ("`movl $0, %reg` → `xorl %reg, %reg`,
+saves 3 bytes") that normalizes *every* arm's zero materialization before the
+assembler sees it. The zero that reaches the object file is 2 bytes whichever IR
+arm produced it, so the folded 8-byte store loses in all of them. The census
+returned 0 because it was counting the **final** assembly, where the `movl $0`
+form no longer exists — the data was right and the inference from it was not.
+
+The predicate is therefore the blanket rule, and the reason is now the mechanism
+(the peephole) rather than an empirical accident. Three things were hardened so
+this cannot silently regress:
+
+* `const_stack_arg_imm` and `const_zero_uses_xorl` are pure functions shared by
+  `operand_to_eax` and the fold, so the two marshalling paths cannot drift on a
+  constant's bits — bit-exactness is structural, not a duplicated table.
+* `const_stack_arg_fold_wins` is pure and its test re-derives the verdict from
+  byte-count constants using the **post-peephole** cost, so changing either the
+  predicate or an encoding size without the other fails a test.
+* `no_zero_folds_in_any_arm` is an explicit tripwire: if that peephole is ever
+  removed, the test names the arms that genuinely become 9-byte sequences and
+  the predicate must be re-derived instead of left refusing a win.
+
+After the revert the refactor is output-neutral by measurement: **795 of 795
+compilable TUs emit byte-identical assembly** to the pre-refactor binary
+(`asm_identity.py`, 0 differing), so all numbers above are the delivered
+binary's numbers rather than a re-derivation.
 
 ## 7. Red-team audit of this session's own work
 
@@ -343,6 +565,47 @@ failure mode `_label_is_function` was written to prevent. icc is 19.
    phase 4 after this one can reintroduce anchor theft, and the symptom will
    look like a bug in the *other* pass.
 
+8. **I published an unfair oracle comparison, and caught it only by asking why
+   the excess existed.** The first version of this document reported lccc 498 vs
+   gcc 291 as evidence about code generation. 95 of those 207 instructions were
+   PIC relocations that gcc was never asked to emit (§6.1). The error was not
+   the tooling but the interpretation: I read a *total* without classifying it.
+   The habit that caught it — histogram the excess by mnemonic and by operand
+   class before concluding anything — is what then found the argument
+   marshalling defect, so the correction paid for itself, but the first draft
+   was wrong and is corrected here rather than quietly replaced.
+9. **I reported an instruction win before measuring bytes, and the measurement
+   changed the design.** The unrestricted constant fold was −1,194
+   instructions; it was also +1,344 .text bytes. Shipped on the strength of the
+   first number, the patch would have made the compiler's output *larger* while
+   calling itself an optimisation. Instruction count and code size are different
+   metrics with different consumers (uops/decode vs I-cache); when they
+   disagree, the honest move is to find the subset that wins both, or else state
+   the trade and justify it — which is what §6.3 does. Note that "0 TUs larger"
+   is true for instruction counts and **false** for bytes: two memset TUs grow
+   by 319 bytes each.
+10. **The fuzzer's coverage of the CFG pass is still thin, and I only partly
+    fixed it.** `g_cfg_pressure` and per-generator fire-rate reporting were
+    added (§9), which makes the thinness visible instead of hiding it behind a
+    case count: the CFG pass fires on ~8% of generated programs, the constant
+    fold on ~15%. A pass exercised by 8% of cases is not validated by 864 cases.
+
+11. **My byte-count model was evaluated at the wrong point in the pipeline, and
+    it took a second measurement to catch it.** The exclusion rule in §6.3 was
+    derived from encoding sizes *as emitted*, but the compiler peepholes
+    `movl $0, %reg` into `xorl %reg, %reg` afterwards, so the emitted size is
+    not the delivered size. I implemented the "more precise" per-arm predicate
+    that the emission-time model implied, wrote unit tests for it, and it still
+    would have shipped a code-size regression at eight sites — the tests passed
+    because they encoded the same wrong model. What caught it was a *differential*
+    measurement against the already-validated binary (`asm_identity.py`), not
+    reasoning and not a unit test. Two lessons: a cost model must be evaluated
+    against final output, and a test derived from the same model as the code
+    cannot falsify it — only an independent measurement can. This is why the
+    predicate's test now re-derives the verdict from byte constants and why
+    `no_zero_folds_in_any_arm` is written as a tripwire naming the peephole it
+    depends on.
+
 **Where I agree with the mandate and the earlier adjudications.** S17's
 deletion was the right call *at the time* (the pass was unsound in four
 independent ways) and the wrong call *as a final state* (the capability was
@@ -350,27 +613,359 @@ real and is now restored soundly). The S18 x87 GP-pair folds remain correct as
 an interim mitigation; they are not in conflict with this pass, and
 `fstpl/fldl` is still deliberately not folded here.
 
-## 8. Follow-ups, in priority order
+## 8. Follow-ups, in priority order (each with the measurement that ranks it)
 
-1. **P0-A location allocation** — the real lever (§6, §7.2). Target the ~33k
-   remaining GP slot loads and the x87 location model at `memory.rs:470`;
-   continue PR #511's Phase 1 rather than adding more peepholes.
-2. **Raise the fuzzer's fire rate** (§7.6) so the pass's own coverage is
-   proportional to its risk.
-3. **Per-byte slot model** — would recover the narrow-store→wide-ALU forward
-   refused in §4 and would make the 47-shape enumeration a byte-range
+1. **Push-based outgoing arguments.** lccc pre-allocates the outgoing area with
+   `subl $N,%esp` and stores each argument through `disp(%esp)` at 4–11 bytes;
+   gcc pushes at 1–6 (`pushl %reg` = 1, `pushl $0` = 2). On a 7-argument
+   `printf` that is ~13 bytes for gcc against 34–62 for lccc, and it is the
+   single largest remaining code-size lever on call-heavy code. It also subsumes
+   follow-up 4. Cost: a calling-sequence change touching `esp_adjust`
+   bookkeeping, CFI, stack alignment, varargs, struct-byval and the `%esp`
+   renumbering inside the CFG slot forwarder — it needs its own A/B, not a
+   drive-by edit.
+2. **Location allocation for i686 values.** The dominant term in the fair
+   oracle gap: 37% of lccc's instructions carry a memory operand against gcc's
+   1%, because values gcc holds in `%ebx`/`%esi`/`%edi` are homed in slots.
+   Upstream's Phase 1 measures at −4 slot references corpus-wide on i686 and
+   does not change the kernel at all (549 with the gate on, 549 off), so the
+   budget/reach-band calibration (`location_alloc.rs`, 6 GPRs, band 2) is the
+   thing to attack, together with the x87 location model at `memory.rs:470` and
+   the ~33k remaining GP slot loads.
+3. **`emit_call_8byte_stack_arg` copies a slot to the outgoing area through
+   `%eax` in four instructions** (`movl sr0,%eax; movl %eax,N(%esp); movl
+   sr4,%eax; movl %eax,N+4(%esp)`). Two are achievable: x87 `fldl`/`fstpl`
+   (rejected here — not bit-exact for signalling-NaN payloads) or SSE `movsd`
+   (exact, needs a target-feature gate).
+4. **Zero-valued arguments** (§6.3): 327 census sites where the direct store
+   costs 2 bytes more than `xorl`+store. Solved properly by follow-up 1
+   (`pushl $0` is 2 bytes), or by a reliable "%eax already holds zero" cache —
+   currently blocked by the incomplete i686 accumulator-cache contract that
+   `operand_to_eax` itself documents; a stale zero claim would be a miscompile,
+   so it must not be attempted before that audit lands.
+5. **Raise the CFG pass's fuzz fire rate** above ~8% (§7.10); the reporting is
+   in place so the number is now visible per generator.
+6. **Per-byte slot model** — would recover the narrow-store→wide-ALU forward
+   refused in §4 and turn the 47-shape enumeration into a byte-range
    computation instead of a table.
-4. **Phase-ordering invariant** (§7.7) — make "nops reloads, so runs last" a
-   property the pipeline can check, not a comment.
-5. Re-run the §5.2 interaction A/B after each Location Allocation phase
-   lands; the prediction in §7.5 makes the result interpretable either way.
+7. **Phase-ordering invariant** (§7.7) — make "nops reloads, therefore runs
+   last" a property the pipeline can check rather than a comment.
+8. Re-run the §5.2 interaction A/B after each Location Allocation phase lands;
+   the falsifiable prediction in §7.5 makes the result interpretable either way.
 
 ## 9. Harnesses added this session (kept outside the repo tree)
 
 | path | purpose |
 |---|---|
-| `tools/slot_fwd_fuzz.py` | 12-generator differential fuzzer: lccc-on vs lccc-off vs gcc, with instruction counts and a fire-rate metric |
+| `tools/slot_fwd_fuzz.py` | 16-generator differential fuzzer: lccc-on vs lccc-off vs gcc, with instruction counts and a fire-rate metric |
 | `tools/minimize.py` | line-level ddmin for a gcc-vs-lccc divergence, **pinning initialising stores** so the minimal case stays defined |
 | `tools/fwd_ab.py` | 4-arm static A/B (base/off/prec/both) with byte-identity and per-TU regression detection; now accepts extra env merged into every arm (used for the Location Allocation interaction) |
 | `tools/slot_fwd_runtime.py` | 3-arm runtime A/B, hash-first, only times benchmarks whose assembly actually changed; `RT_PAIRED=1` interleaves the arms within every repetition and `RT_FLOOR_MS` (default 20) labels and excludes sub-floor benchmarks from the geomean |
+| `tools/dead_materialize_census.py` | counts materialize-then-store pairs whose register is dead afterwards (imm / zero / copy, with live-vs-dead split) — the census that preceded `87ebbef7` and predicted 471 sites |
+| `tools/text_size_ab.py` | `.text` **bytes** per TU for two arms via `size -A`, because instruction count and code size can move in opposite directions (§6.3) |
+| `tools/zero_arm_census.py` | counts materialize-then-store sequences in *final* assembly by which zero form the peephole left behind (`xorl` vs `movl $0`) — the measurement that mislead §6.4 until it was read as final-output data |
+| `tools/asm_identity.py` | per-TU emitted-assembly sha256 comparison between two compiler binaries; proves a compiler refactor is output-neutral (795/795 identical) or finds exactly which TUs it changed (8, in §6.4) |
+
+All three differential harnesses take `AB_OFF_VARS=K=V[,K=V]` so the OFF arm can
+disable any gated transformation, not just the slot forwarders; `fwd_ab.py`
+takes extra `K=V` arguments merged into every arm (used for the Location
+Allocation interaction in §5.2).
 | `tools/exec_diff.py` | corpus execution differential against the gcc `-m32` oracle |
+| `tools/rt_ab_binary.py` | paired runtime A/B **across two compiler binaries** (pre-fix vs post-fix), hash-first, arms alternating within every repetition, sub-floor rows labelled and excluded from the geomean |
+| `tools/optlevel_census.py` | instruction census at `-O0/-O1/-O2/-O3/-Os` for two arms, so a win cannot be `-O2`-only by accident |
+| `tools/c_miscompile_hunt.py` | runs every fuzzer-generated C case through pre-fix lccc, post-fix lccc and gcc, and reports which arm is wrong — the C-level hunt that complements the asm-level pins |
+
+## 10. Audit of the merged pass (Review-AI, verdict 8.0/10): adjudication and the four fixes
+
+The merged design (§§2–3) was audited externally. Five findings and seven
+instructions came back. Each was re-derived from the code and, where a claim was
+about behaviour, tested before being believed. Three findings were right and are
+fixed; one was right about the symptom and wrong about the mechanism, and its
+severity was *under*-stated; one was wrong about the mechanism and its remedy is
+rejected on measurement. The audit's soundness argument was also wrong in a way
+that would have produced a non-terminating analysis had it been implemented as
+written.
+
+| finding | verdict | what actually happened |
+|---|---|---|
+| **F1** loops starve the worklist; "loop-carried" unimplemented | **AGREE**, and the mechanism is deeper than starvation (§10.2) | a must-analysis iterated upward from bottom cannot bootstrap a fact around a cycle at all |
+| **F2** `JmpIndirect => {}` drops true edges | **AGREE, severity under-rated** — the audit called it theoretical until F1 was fixed; it is live today (§10.3) | a case label a `goto` also enters met only its direct predecessor |
+| **F3** string ops invisible to `has_indirect_mem` | **AGREE** (§10.4) | `rep movsb`/`rep stosb` deleted 14 real reloads in the corpus |
+| **F4** `!escape` indirect-write relaxation is unsound | **DISAGREE on mechanism, remedy REJECTED on measurement** (§10.5) | `%esp`-biased slots are *ours*, not the caller's; blanket kill costs 166 instructions and does not close the hole it was proposed for |
+| **F5** doc nits | **AGREE** | §3 and §9 reconciled; this section added |
+| monotonicity proof offered for the fixpoint | **WRONG** (§10.6) | the state-restricted implicit-write probe is *anti*-monotone |
+| **I-7** do not touch the window, extent model, placement, narrow-store param | **RESPECTED** (§10.7) | none of the four were modified |
+
+### 10.1 Evidence that the findings were live, taken before any fix
+
+Nine pins were written against the *unmodified* merged code and run first, so
+every claim below rests on a failing test rather than on reading. Six failed:
+loop-body reload, post-loop reload, a dual-reachable dispatch target, string-op
+invisibility, the `!escape` indirect write, and a precision control. That set of
+failures is the audit's findings reproduced in the repo's own test suite.
+
+### 10.2 F1 — the real mechanism: a must-analysis cannot bootstrap from bottom
+
+The audit described a starved worklist and prescribed a two-sweep fixpoint. The
+worklist was indeed starved, but a ready-gated requeue alone does not fix this,
+and it is worth being exact because the wrong version looks right:
+
+Available-value forwarding is a **must** analysis: `IN[b]` is the meet over
+predecessors. Iterating upward from bottom, a slot stored before a loop and left
+untouched inside it never becomes available at the loop head. The body neither
+generates nor kills the fact, so `OUT[head] = IN[head]`, and
+`IN[head] = OUT[pre] ∩ OUT[head]` has two solutions — `∅` and the fact — of
+which the upward iteration reaches only `∅`. The fact is then missing not just
+inside the loop but *everywhere downstream of it*, which is exactly where the
+reload of a loop-carried value sits. This is not a corner case; it is the common
+shape, and it is why the single-sweep pass looked like it worked on straight-line
+code and delivered almost nothing on real functions.
+
+The fix seeds the iteration **optimistically**: one pass in reverse postorder
+meeting over *non-back* predecessors only (in RPO every non-back edge is already
+final, so this pass is exact for the acyclic part), then a worklist pass that
+meets over all predecessors and re-enqueues successors whenever a value moves.
+Values can only shrink after the seed, the lattice is finite, so it converges —
+and it converges to the fixpoint that keeps precisely the facts the loop body
+really preserves.
+
+Soundness does not rest on which fixpoint this is. It rests on three things: a
+sound boundary (`IN[0]` is pinned to "no register holds a value this function
+stored", and never derived from `OUT[0]`, because a back edge to the function's
+own label makes block 0 its own predecessor), a sound transfer, and the
+equations holding *exactly* when the result is used. Given those, every fact in
+`IN[b]` holds on every real arrival at `b`, by induction on the length of the
+executed prefix — the last step came from some predecessor whose `IN` held by
+hypothesis, so its `OUT` held at its end, and `IN[b]` is a subset of that `OUT`.
+Cycles need no special argument; the induction is over the execution, not the
+CFG. The corollary is operational: **a truncated iteration is not a fixpoint**,
+so exhausting the budget abandons the function without applying anything.
+
+Analysis and application are two sweeps over one shared transfer
+(`slot_fwd_block`, `apply: bool`). Sharing is the point — two copies of a
+190-line transfer drift, and a drift between "what was proved" and "what was
+rewritten" is a miscompile rather than a missed optimisation.
+
+### 10.3 F2 — a computed branch, and a severity correction
+
+`LineKind::JmpIndirect => {}` gave a computed branch no successors. The audit
+called the consequence theoretical until F1 was fixed. It is not: with the old
+single sweep, a block reachable *both* through a jump table and by a direct edge
+— a `switch` case a `goto` or a loop back edge also enters — met only its direct
+predecessor, and the dispatch path contributed nothing. The pin
+`cfg_fwd_indirect_dispatch_target_reachable_directly_is_not_forwarded` fails on
+the merged code, today, with no other change. Under-approximating a CFG is not a
+conservative direction for a must analysis; it removes constraints, and removed
+constraints are exactly what makes a meet too optimistic.
+
+Successors are now every block in the function. The table lives in `.rodata` and
+its contents are not visible to a text scan, so over-approximating is the only
+sound reading, and the meet does the conservatising: `…_meet_is_conservative`
+pins that a redefinition on any path still blocks the forward, and
+`…_without_a_redef_still_forwards` pins that switch forwarding is not simply
+switched off to achieve it.
+
+### 10.4 F3 — string ops, and the honest limit of this evidence
+
+`rep movsb` / `rep stosb` / `cmpsb` and the rest write memory through `%edi`
+with no displacement a text scan can see, so `has_indirect_mem` stayed false and
+the pass forwarded straight across them. `is_string_op` is now an **enumerated**
+table of the seven families × sizes, ORed into `has_indirect` at classification,
+which also closes the same blind spot in the windowed pass. Enumeration rather
+than a rule because the obvious rule is wrong: `movs` + trailing-size-strip
+matches `movsbl`, `movsbw` and `movzbl`, which are register moves. A pin holds
+that line.
+
+In the transfer the family kills **everything**, escape or not, and the reason is
+worth stating because it is not the reason the audit gave. A bounded indirect
+store needs its address to *equal* a tracked slot; a string op writes an
+unbounded range and needs only to *overlap* one. A pointer merely near the frame
+— a callee's local that escaped into a global, sitting just below our
+outgoing-argument area — reaches into it once the count is large enough.
+
+The corpus shows this was live, not hypothetical: 14 sites in 7 TUs where the
+merged code deleted a reload across a `rep movsb`, e.g.
+`tests/regression/aggregate_copy_untracked_store.c`
+
+```asm
+    movl %eax, 8(%esp)      # value staged in our frame
+    movl %eax, %edi
+    leal 28(%esp), %esi
+    movl $12, %ecx
+    rep movsb               # 12 bytes written through %edi -- invisible to the pass
+    movl 8(%esp), %eax      # the merged pass forwarded this; it must not
+```
+
+Those 14 sites are why 14 TUs get 4–12 bytes *larger* (§10.8): a refused forward
+leaves a 4–7 byte reload where a 2–3 byte register move was. That is the correct
+trade and it is the only place this round makes code bigger.
+
+What the evidence does **not** show: a C program whose answer the merged pass got
+wrong. 320 targeted generated cases and 795 corpus TUs were run through pre-fix
+lccc, post-fix lccc and gcc; both lccc arms matched gcc on all of them. Making
+the range actually overlap a *live* tracked slot needs aliasing that only
+undefined behaviour produces, because slot sharing keeps live values out of a
+copy destination. So: a genuine violation of the pass's own invariant, provable
+at the assembly level and visible at 14 corpus sites, not demonstrated as a
+wrong C answer. Stated that way rather than as a miscompile, because the
+difference is the difference between a soundness fix and a bug fix.
+
+### 10.5 F4 — disagreement: the mechanism is wrong, and so is the remedy
+
+The audit's claim was that `%esp`-relative slots are the caller's region, that a
+pointer parameter can alias them, and that since the relaxation buys almost
+nothing an indirect write should kill unconditionally.
+
+The mechanism is wrong. `%esp`-biased keys carry `ESP_SLOT_BIAS = 1 << 24`
+precisely so they cannot be confused with `%ebp`-relative ones: an `%esp`-biased
+slot is *this activation's* frame — locals and the outgoing-argument area. The
+caller-owned region is the **positive-`%ebp`** range, the incoming-argument area,
+which a `va_list` two frames up can name without anything in this function ever
+forming a frame address. So the precise rule is: on an indirect write with no
+escape and no indexed frame access, drop `0 < slot < ESP_SLOT_BIAS` and keep the
+rest (`SlotState::drop_caller_owned_slots`).
+
+And the relaxation does not buy "almost nothing". Measured on the 795-TU corpus:
+
+| rule | instructions | vs merged |
+|---|---|---|
+| blanket `kill_all` (the audit's I-4) | 270,064 | −170 |
+| precise `drop_caller_owned_slots` | **269,898** | **−336** |
+
+166 instructions across 74 TUs turn on it, and the shape is ordinary C —
+`tests/regression/pgo_sections.c`:
+
+```asm
+    movl %eax, 12(%esp)     # our own frame
+    movl %eax, (%esi)       # %esi = leal state@GOTOFF(%ebx): a global, not a frame address
+    movl 12(%esp), %eax     # redundant; blanket kill keeps it
+```
+
+Update a global through the PIC register while a frame temporary is live, then
+use the temporary. Killing everything there is not merely imprecise, it does not
+buy the safety it was proposed for: the pointer into our outgoing-argument area
+that the audit worried about can be leaked by a **callee**, which writes through
+it *during a call* — a site this arm does not govern, and one the blanket kill
+does not touch either. The premise "no frame address was formed here, so nothing
+outside can name our frame" is the same premise the `Call` arm already runs on
+(it kills only when the frame escaped or the call is indirect). Applying it
+uniformly makes the two arms consistent; a stricter rule at one site and a laxer
+one at the other would only hide the assumption. Both directions are pinned:
+`…_drops_caller_owned_slots_without_an_escape` and
+`…_keeps_own_frame_slots_without_an_escape`, the second on a two-path shape so
+the meet — not just the kill — distinguishes the rules.
+
+### 10.6 The monotonicity argument the audit offered does not hold
+
+The audit justified its two-sweep fixpoint by asserting the transfer is
+monotone. It is not, as merged: the implicit-write arm probed
+`line_writes_reg_implicitly` only for registers **the current state tracks**. A
+stronger `IN` tracks more registers, stamps more of them, and so produces a
+*weaker* `OUT` — anti-monotone. Chaotic iteration over an anti-monotone transfer
+need not converge, and if it does, need not converge to a state safe to rewrite
+from. Implementing I-1 as prescribed would have inherited that.
+
+The fix keeps the precision and removes the state dependence: the candidate set
+is `source_regs`, the union of source registers over every `StoreEbp` in the
+function — a function-level constant, computed once. The oracle result is
+memoised per line (`implicit[j - fs]`, `u16::MAX` sentinel), so it still runs
+once per line rather than once per line per iteration, and every register that
+can ever matter is still probed: an entry can only be sourced from a register
+some store in this function reads.
+
+### 10.7 I-7, respected
+
+The windowed pass's 16-byte point window, the `frame_write_extents` /
+`frame_kill_extents` model, the phase-4-head placement and the narrow-store
+parameter were not modified. §3.1's negative result still stands and was not
+re-litigated. The one change that touches the windowed pass is `has_indirect`
+gaining `is_string_op` (§10.4), which closes a blind spot rather than widening
+the window; `asm_identity` over the corpus confirms the windowed pass's other
+behaviour is unchanged.
+
+### 10.8 Evidence for this round
+
+Static, 795-TU corpus, instruction counts (pre-fix → post-fix):
+
+| level | pre | post | delta | TUs changed | compile failures pre/post |
+|---|---|---|---|---|---|
+| `-O0` | 399,415 | 397,660 | **−1,755** | 317 | 15 / 15 |
+| `-O1` | 325,152 | 324,759 | −393 | 160 | 15 / 15 |
+| `-O2` | 270,234 | 269,898 | −336 | 147 | 15 / 15 |
+| `-O3` | 270,234 | 269,898 | −336 | 147 | 15 / 15 |
+| `-Os` | 242,539 | 242,185 | −354 | 143 | 15 / 15 |
+
+Every level improves; the 15 failures are the same pre-existing TUs in both arms.
+`.text` **bytes** at `-O2`: 901,504 → 900,217 = **−1,287 (−0.143 %)**, 107 TUs
+smaller, 14 larger — and all 14 larger ones are §10.4's refused string-op
+forwards, verified by diff rather than assumed. All 14 changed *benchmark* TUs
+improved, `lz4_compress` among them (−2).
+
+Runtime, two binaries, paired (arms alternating within every repetition), N=9,
+min and median, sub-floor rows labelled:
+
+| benchmark | new/pre (min) | new/pre (median) | note |
+|---|---|---|---|
+| `reduction_vecreg` | **0.7230** | 0.7204 | −27.7 % |
+| `hash_table` | 0.9163 | 0.9130 | |
+| `fannkuch` | 0.9320 | 0.9322 | |
+| `matmul` | 0.9933 | 0.9895 | |
+| **`lz4_compress`** | **0.9967** | **0.9959** | binding constraint; re-measured at N=31 |
+| `nbody` | 0.9973 | 0.9974 | re-measured at N=11 |
+| `binary_trees` | 0.9866 | 0.9720 | first run read +1.5 % median at N=15; N=25 reversed it — noise, and the only asm change is one deleted reload |
+| `sqlite_varint` | 0.9987 | 0.9981 | |
+| `glibc_strstr` | 0.9996 | 1.0042 | |
+| `mandelbrot` | 0.9972 | 1.0043 | asm **identical**, timed anyway |
+| `zlib_ng_adler32` | 1.0043 | 0.9988 | asm **identical**, timed anyway |
+| **geomean** | **0.9577** | **0.9552** | nothing worse than 2 % on min |
+
+Every benchmark's stdout and exit code are byte-identical between arms.
+
+Correctness:
+
+| check | result |
+|---|---|
+| `cargo test` | 2,622 passed / 0 failed / 6 ignored (was 2,612; +10 pins) |
+| `cfg_fwd_*` | 35 passed / 0 failed (was 25; the 6 audit-reproducing failures now pass) |
+| `cargo fmt --check`, `cargo clippy --all-targets` | clean, zero warnings |
+| `exec_diff` (667 runnable TUs, 4 arms) | new-vs-gcc mismatches **21 = base's 21**, same set; new-vs-base **2**, both adjudicated below |
+| differential fuzz, 320 cases, 16 generators | **0 divergences, 0 wrong vs gcc**; new generators fire **20/20 each** and account for 161 of the 221 instructions removed |
+| C-level miscompile hunt | pre-fix and post-fix lccc both match gcc on all 320 generated cases (§10.4) |
+
+The two `new-vs-base` behaviour deltas are not this patch. `i686_alu_chains`
+produces three different outputs over three runs of the *same* binary in *every*
+arm, including base — it is non-deterministic. `fp_liveness_ptr_deref_alias_negative`
+is a broken test, not a miscompile: on i386 `long` is 4 bytes, so
+`long b = 0x4000000000000000L` truncates to 0 (gcc warns) and
+`__builtin_memcpy(&d, &bits, 8)` reads 8 bytes from a 4-byte object (gcc warns),
+so the printed double is made of unspecified adjacent stack bytes. Its comment
+says "Expected 3 3", which is the LP64 answer; gcc `-m32 -O2` prints `3 1`, and
+so do both lccc arms in a layout where the adjacent bytes are zero. Decisive
+control: the **kill-switch arm differs from base on exactly the same two TUs**,
+so neither delta is attributable to the change under test.
+
+Compile time: 795 TUs, 4 interleaved repetitions, **+2.1 % min / +3.1 % median**
+(25.46 s → 26.00 s). The cause is not bookkeeping: the merged pass *skipped*
+loop blocks, and skipping them was the bug, so the fixpoint does strictly more
+transfer work. Acyclic functions pay nothing extra — the RPO seed pass is their
+fixpoint, and the second pass is seeded only with back-edge targets, an
+optimisation verified output-neutral on 795/795 TUs by `asm_identity`. Against
+−336 instructions at `-O2`, −1,755 at `-O0`, −1,287 bytes and a 0.9577 runtime
+geomean, this is the right side of the house priority order (generated-code
+performance first, compile time fourth).
+
+### 10.9 What this round leaves open
+
+1. **Value homing and the push-based outgoing-argument ABI** remain the whole
+   oracle gap (§6.2): the slot-heavy kernel is 402 instructions against gcc's
+   291, and this round moved the corpus, not that ratio. Unchanged as follow-up
+   #1/#2.
+2. **`fp_liveness_ptr_deref_alias_negative` should be fixed**, not merely
+   explained: `long` → `long long` makes its stated "Expected 3 3" true on both
+   i386 and LP64 and turns a UB-noise row into a real check. Left out of this
+   round because changing a regression test in the same commit that changes the
+   pass it probes makes the diff harder to audit.
+3. **The 13 generators that fire on 0 % of cases** are evidence about those
+   generators. Three were rebuilt around `long long` staging and now fire 100 %;
+   the remaining ten should get the same treatment, because a fuzzer whose cases
+   never reach the pass validates nothing.
