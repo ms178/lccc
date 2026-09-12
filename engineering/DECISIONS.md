@@ -1678,3 +1678,215 @@ allocator change.
 
 **Gates:** `cargo test --lib` 2388/0 (was 2386; +3 new, one later replaced by the
 cap-counts pin), `ci_local.sh --fast` 24/0/3, clippy clean, rustfmt clean.
+
+## RA-GLA-01 (2026-09-12) — Global Location Allocation Phase 1: environment contract and fail-closed knobs
+
+**Code:** `src/backend/location_alloc/` (directory module:
+`mod.rs` gate/run, `policy.rs`, `pressure.rs`, `planner.rs`,
+`materializer.rs`, `verifier.rs`), gate in `src/driver/pipeline.rs`,
+shared helpers in `src/backend/split_ranges.rs`. Full design and
+calibration record:
+`FOLLOWUP-2026-09-11-global-location-allocation-phase1.md`,
+`AUDIT-2026-09-12-S16-redteam.md`.
+
+The feature ships **off** (`CCC_RA_GLOBAL_LOCATION=1` to enable). Every
+knob is fail-closed in the safe direction: loosening a filter can only
+ADD edits; numeric knobs are parsed once per process (`OnceLock`), an
+unparseable value keeps the default, and every value is clamped to the
+range below so no parse result can drive an unbounded plan.
+
+### Master gate and budget
+
+| Variable | Default | Clamp | Effect / fail-closed direction |
+|---|---|---|---|
+| `CCC_RA_GLOBAL_LOCATION` | off | truthy except `0/off/no/false` | Master gate. Off = zero GLA edits. |
+| `CCC_RA_GLOBAL_LOCATION_MAX` | 64 | 0..=4096 | Per-function edit budget (remats + gaps). 0 disables planning. Raising ADDS edits. |
+| `CCC_PRESSURE_BUDGET` | 12 (x86-64) / 6 (i686) | 2..=64 | GPR color-class budget the planner and the intra-block pressure splitter treat as "colorable". Lowering ADDS edits. Shared with RA-06. |
+| `CCC_PRESSURE_MIN_GAP` | 4 | 1..=256 | Minimum program points a gap must span (RA-06 helper). Lowering ADDS edits. |
+| `CCC_PRESSURE_SPLIT` | off | presence-gated | Enables the intra-block pressure splitter; `CCC_PRESSURE_SPLIT_MAX` (default 64, unclamped) is its per-function budget. Skipped in a function GLA already split. |
+
+### Planner policy knobs
+
+| Variable | Default | Clamp | Effect / fail-closed direction |
+|---|---|---|---|
+| `CCC_GLA_REACH` | derived: Speed 6 (x86-64) / 2 (i686); Debug 64; Size 0 | 0..=64 | Salvageable excess over budget. Derived from the named buyable callee-saved GPR sets (`X86_64_BUYABLE_CALLEE_SAVED_GPRS` = rbx/rbp/r12–r15; `I686_BUYABLE_CALLEE_SAVED_GPRS` = esi/edi, with ebx reserved for the PIC GOT and ebp for the frame pointer). i686 stays at 2 despite theoretical non-PIC capacity: bands 3/6 measured 1.038×/1.053× on loop_patterns. Raising ADDS edits. |
+| `CCC_GLA_REMAT_MAX_SEGMENTS` | 1 | 1..=1024 | Max hole-aware live segments a rematerialized value may have. Raising ADDS edits (multi-segment globals were measured net-negative: nbody format-string base). |
+| `CCC_RA_REMAT_MAX_USES` | 3 | 1..=64 | Max dynamic use weight for a rematerialized value; hotter source-less defs keep a register. Lowering ADDS edits. |
+| `CCC_GLA_MIN_BENEFIT` | 40 | 1..=1_000_000 | Minimum weighted benefit a gap must promise. Lowering ADDS edits. |
+| `CCC_RA_GLA_RATIO` | 2.0 | 1.0..=10.0 (stored in tenths, 10..=100) | Required benefit/cost ratio for a gap. Lowering ADDS edits. |
+| `CCC_GLA_SPILL_GAPS` | off (`0`/`false` disable) | bool | Capture-store/reload gaps. Shipped OFF: pre-allocation gaps measured net-negative everywhere because the proxy cannot see residency the colorer already resolves; retained as the post-allocation P0-B substrate. |
+| `CCC_GLA_ALLOW_INTRA` | off (`0`/`false` disable) | bool | Allow gaps whose register pieces share a block. Shipped OFF per the RA-06 intra-block negative result. |
+| `CCC_GLA_TRACE` | off | presence-gated (requires split debug) | Per-plan tracing; no effect on decisions. |
+| `CCC_SPLIT_MAX` | 30 | unbounded | Pre-existing cap for the call-spanning live-range splitter (also consumed by RA-06's high-pressure splitter); unrelated to the GLA edit budget. |
+| `CCC_DEBUG_SPLIT` | off | presence-gated | Tracing for the range/GLA splitters; no effect on decisions. |
+| `CCC_VERIFY_REGALLOC` | off | presence-gated | Runs the fail-closed structural verifier after a GLA rewrite (and the production allocator); a violation aborts rather than emitting bad code. |
+| `CCC_VALIDATE_SSA` | off | presence-gated | SSA validation gate around IR rewrites; diagnostics only, never changes a decision. |
+
+Tier rules: `-O0` → Debug (coloring tier disabled; band effectively
+unbanded, remat is direct stack-traffic relief); `-Os/-Oz` (opt levels
+4/5) → Size, GLA plans nothing; `-O1..-O3` → Speed with the calibrated
+band. At `CCC_RA_GLOBAL_LOCATION=1` the shipped Speed policy fires on
+two -O2 programs in the current corpus: zlib_ng_adler32 main (−12 stack
+references, spills 19→7, frame 56→40 bytes, +4 cold instructions — the
+calibrated win) and strlen_bench main (3 globaladdr remats; identical
+on pristine 0e4cf54, so it predates the phase-1 follow-up refactor; its
+on/off program output is identical). The full multi-corpus static
+census (`scripts/census_full_delta.sh`, gate enabled on BOTH compilers)
+shows zero TU deltas from the follow-up refactor itself. Callgrind A/B
+of the gated path (2026-09-12, final binary, gate on vs off at -O2):
+zlib_ng_adler32 Ir **0.9855 (−1.45 %)**; strlen_bench Ir 1.00000 with
+all simulated events identical (its three remats land in cold setup
+outside the hot region) — the A/B path wins where the calibration
+predicted and is neutral everywhere else it fires.
+
+### Fail-closed id exhaustion
+
+Fresh SSA ids come from `next_value()` (`split_ranges.rs`), which
+returns `None` at `u32::MAX`. The materializer builds every edit in
+local structures before its first IR mutation; an exhausted value- or
+block-id space now aborts the plan with zero edits and a `[GLA] …
+fresh id space exhausted` warning instead of panicking (`expect` was
+removed from all three mint sites). `liveness::collect_values_and_allocas`
+caps its capacity hint by real instruction content, so an inflated
+`next_value_id` counter (upstream id leak) cannot reserve gigabytes.
+
+**Pins:** `tests/regression/check_gla_remat_policy.sh` (2×2 segment/band
+matrix), `location_alloc::tests::reach_band_equals_buyable_callee_saved_count`,
+`location_alloc::tests::next_value_exhaustion_fails_closed`.
+
+## ALIGN-01 (2026-09-12) — structural hot-loop alignment ("tight loops"): two-layer GCC 16.2 mirror with exact encoded spans
+
+**Code:** structural audit in `src/passes/loop_align.rs`
+(`audit_tight_loop_inner`, `tight_bucket_log2`, `TightLoopMode`),
+private marker `.lccc_tight_loop` parsed in
+`src/backend/x86/assembler/parser.rs`, emitted in
+`src/backend/generation.rs`, resolved by the branch-relaxation fixed
+point in `src/backend/elf_writer_common.rs`; the integrated-assembler
+gate lives in `src/driver/pipeline.rs`. Research tooling:
+`scripts/tight_loop_oracle.py` (GCC 16.2 / Clang / ICX census on Godbolt),
+`scripts/align_size_calibrate.py` (ground-truth GNU-as span validator),
+`scripts/callgrind_ab.py` (deterministic A/B), gate
+`tests/regression/check_tight_loop_align.sh`.
+
+### What the oracle actually does (gcc/config/i386/i386-features.cc,
+`ix86_align_loops`, read in full)
+
+The pass bails unless `TARGET_ALIGN_TIGHT_LOOPS && optimize &&
+optimize_function_for_speed_p` and the tuning cost has a non-zero
+`prefetch_block`. Static-guess mode qualifies a loop by predicted
+iteration counts (header fallthrough vs. taken counts against
+`align-threshold`=100 and `align-loop-iterations`=4). It then walks the
+basic blocks of ONE loop contiguously from the header, requiring the
+same `loop_father` throughout, summing `ix86_min_insn_size` (the
+**minimum** encodable instruction length), rejecting inline asm and
+real calls (size −1), stopping at the first edge back to the header,
+rejecting an unconditional transfer before that edge and any second
+conditional branch. Success emits, immediately before the header label,
+`gen_max_skip_align(ceil_log2(size), 0)` — an UNCONDITIONAL
+`.p2align K` — and the normal `.p2align 4,,10` / `.p2align 3` cascade
+follows. The RTL comment states the goal: the whole loop fits one
+instruction-cache line / fewer DSB misses.
+
+### lccc's two layers
+
+1. **Structural audit (IR, post-layout).** Mirrors the RTL structural
+   half: innermost loop in the natural-loop nest; header physically
+   first and the body contiguous in emission order; last body block is
+   the latch; no call / call-indirect / inline asm / trampoline init /
+   nonlocal transfer; at most one conditional branch before the latch;
+   a header compare proving ≤4 trips excludes the loop (the same
+   `-param=align-loop-iterations` bound). Only x86-64/i686 builds going
+   through the integrated assembler are eligible; `-S` and the optional
+   external-GAS toolchain never see the private marker and keep the
+   portable bounded cascade, as do `-Os/-Oz` and `-O0`.
+2. **Exact-span bucket (assembler).** The marker is resolved inside the
+   existing jump-relaxation / marker-fixup fixed point: span = header
+   label → end of the first backward branch to it, measured in the exact
+   encoded bytes of the settled layout. Bucket =
+   `ceil(log2(span))` clamped to 8/16/32/64 (`tight_bucket_log2`, the
+   single shared table); an empty body or a span > 64 B fails closed to
+   the cascade. Re-derived on every sweep, so a deferred `.skip` that
+   grows the body past 64 B after an earlier acceptance revokes BOTH the
+   padding and the section-alignment raise
+   (`reconcile_section_alignments`), which earlier prototypes leaked.
+
+**Deliberate divergence from GCC, same hardware goal.** GCC's size is a
+*minimum-encodable* estimate; lccc buckets the *actual* encoded span.
+The stated purpose is "the whole loop fits one cache line", and the
+minimum-size estimate demonstrably under-measures real encodings (the
+old in-tree linear opcode estimator mis-bucketed ≈25 % of corpus
+loops). `align_size_calibrate.py` builds marker-free assembly, assembles
+with GNU as, measures true spans, and compares with every writer
+decision: **0 bucket mismatches, 0 span disagreements, 0 cache-line
+leaks, 0 missed promotions** on the full 51-program corpus for both
+x86-64 (132 candidates) and i686 (131). We do NOT switch to minimum-size
+estimates to chase per-label GCC equality: generated CFGs differ
+between the compilers, and the corpus-wide rule behavior is what
+matches.
+
+### Full-corpus oracle census (2026-09-12, -O2, -march=raptorlake)
+
+Strongest unconditional `.p2align` log2 per backward-branch header over
+`tests/benchmark/programs/*.c`: GCC 16.2: 2^3:83, 2^4:12, 2^5:49,
+2^6:38 (plus 167 bounded-cascade groups); Clang 23.1: 2^4:269; ICX
+2^4-heavy; lccc: 2^3:248 (cascade tail), 2^4:22, 2^5:51, 2^6:47, with
+31 over-64-B bodies refused to the cascade. Strong-tier coverage is
+therefore GCC 87 (49@32 + 38@64) vs lccc 98 (51@32 + 47@64): the same
+shape at the same frequencies; exact sizing moves near-boundary bodies
+up one tier (the faithful decision for the one-cacheline goal) and the
+writer refuses bodies GCC's estimator under-sizes. sqlite_varint is the
+worked label-mismatch example: GCC aligns three loops the lccc CFG
+marks for documented reasons (call/inline-asm, unconditional transfer
+before the latch, outer loop) while lccc promotes the one inner
+digit loop; same rules on different CFG shapes, not a policy bug.
+
+### Deterministic A/B (Callgrind, DEFAULT_FAST corpus vs pristine 0e4cf54)
+
+Geomean executed instructions mine/ref = **1.00037 at -O2 and -O3**
+(identical tables), **0.99999 at -Os** (fully inert; sub-1e-5 noise on
+118k-Ir micro-benchmarks). Five benches show small Ir INCREASES
+(tls_seg_access 1.0055, linux_find_bit 1.0031, expat_xml_scan 1.0017,
+sqlite_varint 1.0010, sha256_transform 1.0004): the unconditional pad
+can sit on the loop-guard FALLTHROUGH executed once per entry, and
+Callgrind Ir counts the NOPs while being blind to the DSB/decode win the
+alignment buys. Every one of the five loops is tight-aligned by GCC 16.2
+with the same (or stronger — tls_seg_access is an exact `.p2align 6`
+match) unconditional directive; padding is amortized over each loop's
+trip count (tls: 63 inner iterations/entry). sqlite_varint additionally
+cuts conditional-branch-mispredict counts 6.06 M → 5.22 M (confirmed again
+in an isolated policy-on vs `CCC_LOOP_ALIGN_HOT=off` run, which reproduces
+the exact same table). The pre-feature baseline geomean is 0.99322 with
+worst-case sha256 0.824; no benchmark shows an Ir regression beyond the
+oracle-matched padding.
+
+### Knobs and fail-closed contract
+
+`CCC_LOOP_ALIGN_HOT` (A/B ladder, default `gcc`): `gcc` = exact-span
+policy; `off` = bounded cascade only; `5`/`6` = force unconditional
+32/64 + cascade (resolved at IR level, visible under `-S`);
+`5skip` = bounded 32 with a 16 fallback. An unrecognized value warns
+and falls back to `gcc` (never pads more). `CCC_DEBUG_TIGHT` prints the
+span/bucket/reject per fixup sweep; `CCC_DUMP_ALIGN` prints structural
+verdicts; `CCC_NO_LOOP_ALIGN` disables the whole pass. The marker parser
+rejects a malformed directive with a hard error (a private directive
+that silently no-ops would just lose alignment). Relaxation interaction
+is covered by `tight_loop_padding_and_relaxation_reach_fixed_point`
+(marker padding can re-grow an outer short backedge to long form and
+the fixed point must converge).
+
+### Validation matrix (2026-09-12)
+
+Full library `cargo test --lib`: 2627 passed / 0 failed / 6 ignored
+(incl. 13 new `loop_align` policy tests and 8 tight writer/parser
+tests); `location_alloc` 28/28; rustfmt clean; clippy
+`-D warnings` clean for lib and `--tests`; `scripts/ci_local.sh --fast`
+green incl. the new gate. Deterministic fuzzing: phi-CFG 1000/1000 and
+m32 differential 1000/1000 programs, zero mismatches. Output
+equivalence vs the pristine compiler: 51/51 programs byte-identical on
+both x86-64 and i686. Debug-assertion-enabled build (fastbuild with
+`-C debug-assertions=on`): 510 corpus compiles (51 programs × 5 opt
+levels × both targets) and 707 regression/bug compiles assert-clean;
+this sweep also found and fixed one pre-existing, unrelated
+`1u64 << 64` overflow in `loop_memset.rs`'s Ne-trip-count gate
+(64-bit compare type). GNU-as byte-equivalence suites: i686 20/20,
+x86-64 failure set identical to pristine main (zero regressions).

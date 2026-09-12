@@ -4160,6 +4160,18 @@ fn generate_function(
             cg.state().sse_last_store_slot = None;
             cg.state().sse_last_store_val = None;
             cg.state().sse_last_store_reg = false;
+            // Tight-loop marker: the structural audit in
+            // passes::loop_align qualified this header; the integrated
+            // assembler measures the exact encoded body span during its
+            // branch-relaxation fixed point and inserts the
+            // unconditional size-bucketed `.p2align K` (16/32/64) in
+            // front of the ordinary bounded cascade below. Only present
+            // in code destined for the integrated assembler (-S keeps
+            // portable directives only).
+            if crate::passes::loop_align::tight_header(block.label.0) {
+                cg.state()
+                    .emit_fmt(format_args!(".lccc_tight_loop .LBB{}", block.label.0));
+            }
             // Loop-header / hot-join alignment directives decided by
             // passes::loop_align (post-layout, oracle-calibrated policy;
             // empty on -O0/-Os builds).

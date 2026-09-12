@@ -155,12 +155,17 @@ def compiler_metadata(compiler_id: str, *, compilers: list[dict[str, Any]] | Non
 
 
 def compile_on_godbolt(compiler_id: str, source: str, flags: str,
-                        *, intel: bool = False, timeout: int = 120) -> dict[str, Any] | None:
+                        *, intel: bool = False, timeout: int = 120,
+                        keep_directives: bool = False) -> dict[str, Any] | None:
     """Compile C source on CE and return its JSON result.
 
     ``None`` is retained for backward compatibility with the original helper;
     diagnostics are emitted to stderr. New code should generally use the
     returned ``code``/``stderr`` fields or the higher-level CLI.
+
+    ``keep_directives`` keeps assembler directives (``.p2align``/``.p2alignr``
+    and friends) in the returned ``asm`` lines; the default follows the
+    research-UI convention and filters them out.
     """
     cid = resolve_compiler(compiler_id)
     body = {
@@ -175,7 +180,10 @@ def compile_on_godbolt(compiler_id: str, source: str, flags: str,
                 "execute": False,
                 "intel": intel,
                 "demangle": True,
-                "directives": True,
+                # CE filter booleans are REMOVE switches: true hides the
+                # category. Directive alignment lines are data for
+                # alignment-policy research.
+                "directives": not keep_directives,
                 "labels": True,
                 "commentOnly": True,
                 "trim": True,

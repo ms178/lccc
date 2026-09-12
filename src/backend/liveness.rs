@@ -579,7 +579,18 @@ fn collect_values_and_allocas(
     let mut alloca_set: FxHashSet<u32> = FxHashSet::default();
     let mut value_ids: Vec<u32> = Vec::new();
     let mut seen: FxHashSet<u32> = FxHashSet::default();
-    let hint = func.next_value_id as usize;
+    // The counter is only a capacity HINT. An upstream pass that minted a
+    // high id without syncing (or genuine id exhaustion near u32::MAX)
+    // makes it far exceed the actual value count; reserving that much
+    // OOMs on a sparse function. Cap by real content: each instruction
+    // contributes at most one def plus a handful of operand ids, and the
+    // dense structures below are sized by actual values anyway.
+    let content_hint = func
+        .blocks
+        .iter()
+        .map(|b| b.instructions.len() * 4 + 8)
+        .sum::<usize>();
+    let hint = (func.next_value_id as usize).min(content_hint);
     value_ids.reserve(hint);
     seen.reserve(hint);
 

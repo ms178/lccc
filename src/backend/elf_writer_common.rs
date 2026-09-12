@@ -221,6 +221,13 @@ struct AlignMarker {
     /// GAS emits one plain `0x90` before the long-NOP run; we match that so
     /// padding is byte-identical and equally decoder-safe.
     after_insn: bool,
+    /// The tight-loop bucket (16/32/64) resolved by the LAST fixup sweep,
+    /// or `None` when the marker finally rejected (or has not resolved
+    /// yet). It feeds the post-fixed-point section-alignment reconciliation
+    /// so an accept -> reject flip cannot leave a stale 64-byte section
+    /// alignment behind (`AlignMarkerKind::Align` records its fixed
+    /// alignment textually and needs no field here).
+    tight_resolved_align: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +254,14 @@ enum AlignMarkerKind {
         addend: i64,
         fill: u8,
     },
+    /// lccc-internal tight-loop marker (`.lccc_tight_loop HEADER`).
+    /// Resolved during the alignment fixed point: the header is padded
+    /// to `2^ceil(log2(encoded body span))`, clamped to 8..=64 bytes,
+    /// but only when the body — from the header to its first backward
+    /// branch — fits one instruction-cache line (`TIGHT_LOOP_MAX_BYTES`).
+    /// Mirrors GCC's `align_tight_loops` RTL pass using lccc's exact
+    /// post-relaxation encoded lengths instead of RTL estimates.
+    TightLoop { header: String },
 }
 
 /// A pending `(a - b) * scale + addend` datum, folded once both labels are
@@ -343,6 +358,14 @@ const MAX_NOP: usize = NOP_PATTERNS.len();
 /// NOPs, 99 bytes becomes `jmp` + NOPs), where a predicted-taken branch
 /// clearly beats decoding more NOP µops.
 const MAX_NOP_RUN: usize = 7; // GAS 2.47: jump-over at count/11 > 7 (2.44 used > 8)
+
+// The tight-loop size bucket is owned by `passes::loop_align` (the
+// structural audit) and imported here so the assembler-side size decision
+// can never silently drift from the IR-side policy: a promoted tight loop
+// whose encoded body fits one instruction-cache line is aligned to
+// `2^ceil(log2(span))`, exponent clamped to 8..=64; larger bodies fail
+// closed (no extra padding, ordinary cascade only).
+use crate::passes::loop_align::tight_bucket_log2;
 
 /// Build `count` bytes of executable padding.
 ///
@@ -1036,6 +1059,29 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
                 self.ensure_symbol(name, sec_idx, offset);
             }
+            AsmItem::TightLoopAlign { header } => {
+                // Recorded at the pre-header position with zero initial
+                // padding; the actual size-bucketed alignment is chosen
+                // inside `fixup_alignment_markers` once the branch
+                // relaxation fixed point knows every encoded length and
+                // label offset. No bytes are emitted here.
+                let after_insn = self.last_item_was_insn;
+                if let Some(sec_idx) = self.current_section {
+                    let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
+                    if is_exec {
+                        let current = self.sections[sec_idx].data.len();
+                        self.sections[sec_idx].align_markers.push(AlignMarker {
+                            offset: current,
+                            padding: 0,
+                            kind: AlignMarkerKind::TightLoop {
+                                header: header.clone(),
+                            },
+                            after_insn,
+                            tight_resolved_align: None,
+                        });
+                    }
+                }
+            }
             AsmItem::Align {
                 align,
                 fill,
@@ -1107,6 +1153,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                                 max_skip: *max_skip,
                             },
                             after_insn,
+                            tight_resolved_align: None,
                         });
                     }
                     let is_exec = section.flags & SHF_EXECINSTR != 0;
@@ -1373,6 +1420,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     fill,
                 },
                 after_insn,
+                tight_resolved_align: None,
             });
         }
         if padding > 0 {
@@ -2488,6 +2536,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
             self.fixup_alignment_markers(sec_idx);
         }
 
+        // Now that the tight buckets are final, recompute section header
+        // alignments: an ordinary `.p2align` records its (fixed) alignment at
+        // parse time, but a tight marker's bucket can flip accept -> reject
+        // when a deferred skip grows the body past one cache line, and the
+        // section-alignment raise of an earlier sweep must be revoked along
+        // with its padding (a stale sh_addralign of 64 is not a correctness
+        // bug, but it over-promises the section placement and diverges from
+        // GAS's 16 after the rejection).
+        self.reconcile_section_alignments();
+
         // Fold symbol differences LAST, once the layout is frozen.
         //
         // `.byte`/`.word` label differences MEASURE code that jump relaxation
@@ -3165,6 +3223,33 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
     }
 
+    /// Recompute each section's header alignment from the FINAL marker
+    /// decisions. Ordinary `.p2align`/`.balign` carry fixed textual
+    /// alignments (matching GAS, including the 2^63 non-recording case);
+    /// tight markers contribute the bucket their last fixup sweep
+    /// resolved (`tight_resolved_align`), or nothing after a reject.
+    fn reconcile_section_alignments(&mut self) {
+        for section in &mut self.sections {
+            let mut alignment = 1u64;
+            for marker in &section.align_markers {
+                match &marker.kind {
+                    AlignMarkerKind::Align { align, .. } => {
+                        if *align > alignment && *align < 1u64 << 63 {
+                            alignment = *align;
+                        }
+                    }
+                    AlignMarkerKind::TightLoop { .. } => {
+                        if let Some(a) = marker.tight_resolved_align {
+                            alignment = alignment.max(a);
+                        }
+                    }
+                    AlignMarkerKind::Org { .. } => {}
+                }
+            }
+            section.alignment = alignment;
+        }
+    }
+
     fn fixup_alignment_markers(&mut self, sec_idx: usize) {
         if self.sections[sec_idx].align_markers.is_empty() {
             return;
@@ -3186,6 +3271,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             let kind = self.sections[sec_idx].align_markers[marker_idx]
                 .kind
                 .clone();
+            // Set by the tight arm below; persisted on the marker AFTER the
+            // padding run is rebuilt so the last sweep's decision (which may
+            // flip accept -> reject when a deferred skip grows the body) is
+            // the only one that reaches the section-alignment reconciliation.
+            let mut tight_resolved_align: Option<u64> =
+                self.sections[sec_idx].align_markers[marker_idx].tight_resolved_align;
 
             let needed_end = match &kind {
                 AlignMarkerKind::Align { align, .. } => {
@@ -3216,6 +3307,75 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         marker_idx += 1;
                         continue;
                     }
+                }
+                AlignMarkerKind::TightLoop { header } => {
+                    // Resolve the exact encoded loop span from the
+                    // post-relaxation layout: header label .. end of
+                    // the first branch jumping back to it (the latch),
+                    // which is precisely the body GCC's
+                    // align_tight_loops measures with ix86_min_insn_size.
+                    //
+                    // The decision is re-derived on EVERY fixup sweep
+                    // (deferred `.skip` resolution can grow a span that
+                    // was measured earlier), so a rejection must collapse
+                    // any padding a previous sweep inserted: it yields the
+                    // marker's own offset (needed padding 0) and the common
+                    // splice path below then removes the stale NOP run.
+                    let dbg = std::env::var("CCC_DEBUG_TIGHT").is_ok();
+                    let mut reject_reason: Option<&'static str> = None;
+                    // Start every sweep from None: an earlier sweep's
+                    // acceptance must not survive a later rejection (the
+                    // padding run is rebuilt the same way below).
+                    tight_resolved_align = None;
+                    let (target, bucket): (Option<u64>, Option<u64>) = 'arm: {
+                        let Some(&(h_sec, h_off)) = self.label_positions.get(header.as_str())
+                        else {
+                            reject_reason = Some("unresolved-header");
+                            break 'arm (None, None);
+                        };
+                        if h_sec != sec_idx {
+                            reject_reason = Some("cross-section");
+                            break 'arm (None, None);
+                        }
+                        let Some(jump) = self.sections[sec_idx]
+                            .jumps
+                            .iter()
+                            .filter(|j| j.target == *header && (j.offset as u64) >= h_off)
+                            .min_by_key(|j| j.offset)
+                        else {
+                            reject_reason = Some("no-backedge");
+                            break 'arm (None, None);
+                        };
+                        let body_end = jump.offset + jump.len;
+                        let size = body_end.saturating_sub(h_off as usize);
+                        let Some(log2) = tight_bucket_log2(size as u64) else {
+                            reject_reason = Some(if size == 0 { "empty" } else { "span>64" });
+                            break 'arm (None, None);
+                        };
+                        let align = 1u64 << log2;
+                        if dbg {
+                            eprintln!(
+                                "[TIGHT] sec{} header={} span={} log2={} align={}",
+                                sec_idx, header, size, log2, align
+                            );
+                        }
+                        (
+                            Some((current_offset as u64).div_ceil(align) * align),
+                            Some(align),
+                        )
+                    };
+                    if let Some(why) = reject_reason {
+                        if dbg {
+                            eprintln!("[TIGHT] sec{} header={} reject={}", sec_idx, header, why);
+                        }
+                    }
+                    // Record this sweep's bucket (None on reject); the
+                    // section header alignment is reconciled after the
+                    // fixed point so a later reject revokes the raise.
+                    tight_resolved_align = bucket;
+                    // None: keep/restore zero padding; the ordinary scalar
+                    // cascade markers following this one still apply.
+                    target.unwrap_or(current_offset as u64)
                 }
             };
 
@@ -3256,6 +3416,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         Some(f) if !is_exec => vec![*f; needed_padding],
                         _ => section_padding(needed_padding, is_exec, after_insn),
                     },
+                    // Tight-loop padding is unconditional max-skip-0 style
+                    // alignment and always uses optimal multi-byte NOPs.
+                    AlignMarkerKind::TightLoop { .. } => {
+                        section_padding(needed_padding, is_exec, after_insn)
+                    }
                 };
                 debug_assert_eq!(new_bytes.len(), needed_padding);
                 if old_end <= self.sections[sec_idx].data.len() {
@@ -3273,6 +3438,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
             }
             // Persist the adjusted size so repeated fixup passes are idempotent.
             self.sections[sec_idx].align_markers[marker_idx].padding = needed_padding;
+            if matches!(kind, AlignMarkerKind::TightLoop { .. }) {
+                self.sections[sec_idx].align_markers[marker_idx].tight_resolved_align =
+                    tight_resolved_align;
+            }
 
             marker_idx += 1;
         }
@@ -3843,5 +4012,226 @@ mod tests {
         assert_eq!(parse_org_style_skip("array - ."), Some(("array".into(), 0)));
         assert_eq!(parse_org_style_skip("0b + 16 - ."), None);
         assert_eq!(parse_org_style_skip("16"), None);
+    }
+
+    /// Assemble a text blob and return the raw `.text` bytes (test-only).
+    fn assemble_object(asm: &str) -> Vec<u8> {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_tight_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("m.o");
+        assemble(asm, out.to_str().unwrap()).unwrap();
+        let data = std::fs::read(&out).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        data
+    }
+
+    fn assemble_text(asm: &str) -> Vec<u8> {
+        let data = assemble_object(asm);
+        section_bytes(&data, ".text").expect(".text present")
+    }
+
+    /// `sh_addralign` of `name` from an ELF64 object written by this module.
+    fn section_addralign(obj: &[u8], name: &str) -> Option<u64> {
+        let e_shoff = u64::from_le_bytes(obj[40..48].try_into().unwrap()) as usize;
+        let e_shentsize = u16::from_le_bytes(obj[58..60].try_into().unwrap()) as usize;
+        let e_shnum = u16::from_le_bytes(obj[60..62].try_into().unwrap()) as usize;
+        let shstr = {
+            let shstr_idx = u16::from_le_bytes(obj[62..64].try_into().unwrap()) as usize;
+            let off = e_shoff + shstr_idx * e_shentsize;
+            let sh_offset =
+                u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
+            let sh_size = u64::from_le_bytes(obj[off + 32..off + 40].try_into().unwrap()) as usize;
+            &obj[sh_offset..sh_offset + sh_size]
+        };
+        for i in 0..e_shnum {
+            let off = e_shoff + i * e_shentsize;
+            let name_off = u32::from_le_bytes(obj[off..off + 4].try_into().unwrap()) as usize;
+            let mut end = name_off;
+            while shstr[end] != 0 {
+                end += 1;
+            }
+            if &shstr[name_off..end] == name.as_bytes() {
+                return Some(u64::from_le_bytes(
+                    obj[off + 48..off + 56].try_into().unwrap(),
+                ));
+            }
+        }
+        None
+    }
+
+    /// A synthetic tight loop: one odd preamble byte, the marker, a body
+    /// whose exact encoded span is `body_nops + 4` bytes
+    /// (`xor %eax,%eax` = 2, `jmp .L1` relaxed to 2 short), and the latch.
+    fn tight_loop_text(body_nops: usize) -> String {
+        format!(
+            ".text\n\
+             .globl f\n\
+             f:\n\
+             \tnop\n\
+             \t.lccc_tight_loop .L1\n\
+             .L1:\n\
+             \txor %eax,%eax\n\
+             \t.rept {n}\n\
+             \tnop\n\
+             \t.endr\n\
+             \tjmp .L1\n",
+            n = body_nops
+        )
+    }
+
+    /// Offset of the 2-byte `xor %eax,%eax` (31 c0) marker sentinel — the
+    /// loop header's first body instruction.
+    fn body_offset(text: &[u8]) -> usize {
+        text.windows(2)
+            .position(|w| w == [0x31, 0xc0])
+            .expect("xor body sentinel present")
+    }
+
+    #[test]
+    fn tight_loop_marker_buckets_match_encoded_span() {
+        // span = body_nops + 4: buckets 3/4/5/6 at the inclusive 8/16/32/64
+        // cache-line bucket edges.
+        for (n, align) in [(4usize, 8usize), (12, 16), (28, 32), (60, 64)] {
+            let obj = assemble_object(&tight_loop_text(n));
+            let text = section_bytes(&obj, ".text").unwrap();
+            let off = body_offset(&text);
+            assert_eq!(
+                off % align,
+                0,
+                "span={} body must start at a {align}-byte boundary, got {off}",
+                n + 4
+            );
+            // The accepted marker raises sh_addralign to its bucket.
+            assert_eq!(
+                section_addralign(&obj, ".text"),
+                Some(align as u64),
+                "span={} must record {align}-byte section alignment",
+                n + 4
+            );
+        }
+    }
+
+    #[test]
+    fn tight_loop_marker_rejects_oversize_body() {
+        // span 65 (61 + 4): one byte past a cache line -> fail closed, the
+        // marker contributes ZERO padding (header follows the 1-byte
+        // preamble directly).
+        let text = assemble_text(&tight_loop_text(61));
+        let off = body_offset(&text);
+        assert_eq!(off, 1, "oversize span must not pad, header at {off}");
+    }
+
+    #[test]
+    fn tight_loop_marker_rejects_without_backedge() {
+        // No branch jumps back to the marker's header: no padding.
+        let asm = ".text\n\
+                   .globl f\n\
+                   f:\n\
+                   \tnop\n\
+                   \t.lccc_tight_loop .L1\n\
+                   .L1:\n\
+                   \txor %eax,%eax\n\
+                   \tnop\n";
+        let text = assemble_text(asm);
+        assert_eq!(body_offset(&text), 1);
+
+        // An unresolved header label is skipped, not an error: the private
+        // marker must never break the assembly by itself.
+        let asm2 = ".text\n\
+                    .globl g\n\
+                    g:\n\
+                    \t.lccc_tight_loop .Lghost\n\
+                    \txor %eax,%eax\n";
+        let text2 = assemble_text(asm2);
+        assert_eq!(body_offset(&text2), 0);
+    }
+
+    #[test]
+    fn tight_loop_rejected_after_skip_growth_removes_its_padding() {
+        // A genuinely symbolic (deferred) `.skip Lz - Lb` inside the body
+        // only resolves AFTER the first fixup sweep: the marker first
+        // accepts a 44-byte span (bucket 64) and pads the pre-header byte
+        // up to the 64 boundary (63 NOPs), then the 90-byte skip splices
+        // into the body, growing the span well past one cache line. The
+        // later reject must COLLAPSE that already-inserted tight padding
+        // — no stale NOP run may survive an accepted -> rejected flip
+        // (verified via CCC_DEBUG_TIGHT: accept, accept, reject x3).
+        let asm = ".text\n\
+                   .globl f\n\
+                   f:\n\
+                   \tnop\n\
+                   \t.lccc_tight_loop .L1\n\
+                   .L1:\n\
+                   \txor %eax,%eax\n\
+                   \t.rept 40\n\
+                   \tnop\n\
+                   \t.endr\n\
+                   \t.skip .Lz - .Lb\n\
+                   \tjmp .L1\n\
+                   .Lb:\n\
+                   \t.rept 90\n\
+                   \tnop\n\
+                   \t.endr\n\
+                   .Lz:\n\
+                   \tret\n";
+        let obj = assemble_object(asm);
+        let text = section_bytes(&obj, ".text").unwrap();
+        // No scalar cascade exists in this hand-written text, so the
+        // collapsed marker leaves the header one byte after f.
+        assert_eq!(
+            body_offset(&text),
+            1,
+            "stale tight padding survived an accept -> reject flip"
+        );
+        // The rejected marker must also REVOKE its section-alignment raise:
+        // this text requests no other alignment, so sh_addralign returns to
+        // its 1-byte default rather than staying at 64 from an early sweep.
+        assert_eq!(
+            section_addralign(&obj, ".text"),
+            Some(1),
+            "stale 64-byte sh_addralign survived an accept -> reject flip"
+        );
+    }
+
+    #[test]
+    fn tight_loop_padding_and_relaxation_reach_fixed_point() {
+        // The tight marker can insert up to 63 bytes. An OUTER loop whose
+        // backedge jumps over the aligned inner loop must be re-grown from
+        // its relaxed short form when the padding pushes it past disp8
+        // range. Here the outer backedge spans 126 bytes without padding
+        // (short `eb` fits at disp -126) and 130 once the marker pads the
+        // inner header to 64 (must become a near `e9` rel32). The relax ->
+        // pad -> grow -> pad fixed point must converge; the inner header
+        // still lands on its 64-byte bucket boundary.
+        let asm = ".text\n\
+                   .globl f\n\
+                   f:\n\
+                   .Louter:\n\
+                   \t.rept 58\n\
+                   \tnop\n\
+                   \t.endr\n\
+                   \ttest %ecx,%ecx\n\
+                   \t.lccc_tight_loop .Lin\n\
+                   .Lin:\n\
+                   \txor %eax,%eax\n\
+                   \t.rept 60\n\
+                   \tnop\n\
+                   \t.endr\n\
+                   \tjmp .Lin\n\
+                   \tjmp .Louter\n";
+        let text = assemble_text(asm);
+        let off = body_offset(&text);
+        assert_eq!(off, 64, "64-byte inner body header must align to 64");
+        // The inner infinite loop is 64 bytes (2 xor + 60 nop + 2 jmp).
+        let outer_jmp = 64 + 64;
+        assert_eq!(
+            text[outer_jmp], 0xe9,
+            "outer backedge at {outer_jmp} must be near jmp rel32 after padding, got {:02x}",
+            text[outer_jmp]
+        );
     }
 }

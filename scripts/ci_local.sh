@@ -177,6 +177,9 @@ gate "store-alu-cross-join" fast \
 gate "gla-remat-policy" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_gla_remat_policy.sh
 
+gate "tight-loop-align" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_tight_loop_align.sh
+
 gate "replay-gap-home-rewrite" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_replay_gap_home_rewrite.sh
 
