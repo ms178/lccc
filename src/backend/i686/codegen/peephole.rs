@@ -2018,200 +2018,50 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     changed
 }
 
-// ── Pass 2: Global store forwarding ──────────────────────────────────────────
-
-/// Track which register value is stored at each stack slot.
-/// When we see `movl %eax, -8(%ebp)`, record that slot -8 contains eax.
-/// When we see `movl -8(%ebp), %ecx`, forward to `movl %eax, %ecx` or eliminate if same reg.
-// TODO: Disabled - causes 21 regressions in FP computation tests (matrix/FP operations
-// produce wrong numerical results). Needs investigation into FP load/store forwarding patterns.
-#[expect(dead_code)]
-fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-    let len = infos.len();
-    let mut changed = false;
-
-    // Mapping: offset → (reg, line_idx)
-    // Small flat array for common offsets (-256..0)
-    const SLOT_COUNT: usize = 256;
-    let mut slots: [(RegId, MoveSize); SLOT_COUNT] = [(REG_NONE, MoveSize::L); SLOT_COUNT];
-
-    // Collect jump targets so we can invalidate at them
-    let mut jump_targets = crate::common::fx_hash::FxHashSet::default();
-    for i in 0..len {
-        if infos[i].is_nop() {
-            continue;
-        }
-        let s = trimmed(store, &infos[i], i);
-        match infos[i].kind {
-            LineKind::Jmp | LineKind::JmpIndirect => {
-                if let Some(target) = parse_jmp_target(s) {
-                    jump_targets.insert(target.trim().to_string());
-                }
-            }
-            LineKind::CondJmp => {
-                if let Some((_, target)) = parse_condjmp(s) {
-                    jump_targets.insert(target.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    for i in 0..len {
-        if infos[i].is_nop() {
-            continue;
-        }
-
-        match infos[i].kind {
-            LineKind::Label => {
-                // Check if this label is a jump target (invalidate all)
-                let s = trimmed(store, &infos[i], i);
-                if let Some(name) = s.strip_suffix(':') {
-                    if jump_targets.contains(name) {
-                        // This label is a jump target - invalidate all mappings
-                        slots = [(REG_NONE, MoveSize::L); SLOT_COUNT];
-                    }
-                    // If it's just a fallthrough label, keep mappings
-                }
-            }
-            LineKind::StoreEbp { reg, offset, size } => {
-                // Record that this slot now contains this register's value
-                if offset < 0 && (-offset as usize) <= SLOT_COUNT {
-                    slots[(-offset - 1) as usize] = (reg, size);
-                }
-            }
-            LineKind::LoadEbp {
-                reg: load_reg,
-                offset,
-                size: load_size,
-            } => {
-                // Check if we know what register value is in this slot
-                let mut forwarded = false;
-                if offset < 0 && (-offset as usize) <= SLOT_COUNT {
-                    let (stored_reg, stored_size) = slots[(-offset - 1) as usize];
-                    if stored_reg != REG_NONE && stored_size == load_size {
-                        if stored_reg == load_reg {
-                            // Same register - just eliminate the load
-                            infos[i].kind = LineKind::Nop;
-                            changed = true;
-                            forwarded = true;
-                        } else {
-                            // Different register - forward as reg-reg move
-                            let new_line = format!(
-                                "    {} {}, {}",
-                                load_size.mnemonic(),
-                                reg32_name(stored_reg),
-                                reg32_name(load_reg)
-                            );
-                            store.replace(i, new_line);
-                            infos[i] = LineInfo {
-                                kind: LineKind::Move {
-                                    dst: load_reg,
-                                    src: stored_reg,
-                                },
-                                trim_start: 4,
-                                has_indirect_mem: false,
-                                ebp_offset: EBP_OFFSET_NONE,
-                            };
-                            changed = true;
-                            forwarded = true;
-                        }
-                    }
-                }
-                // The load writes to load_reg, so invalidate any slot
-                // that maps to load_reg (its value has changed).
-                // This must happen even if we forwarded, because the
-                // destination register now has a new value.
-                for slot in slots.iter_mut() {
-                    if slot.0 == load_reg {
-                        *slot = (REG_NONE, MoveSize::L);
-                    }
-                }
-                if forwarded {
-                    continue;
-                }
-            }
-            LineKind::Call => {
-                // Calls clobber caller-saved registers (eax, ecx, edx)
-                // Invalidate all mappings involving these registers
-                for slot in slots.iter_mut() {
-                    if is_caller_saved(slot.0) {
-                        *slot = (REG_NONE, MoveSize::L);
-                    }
-                }
-            }
-            LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret | LineKind::RetN => {
-                // Control flow change - invalidate all
-                slots = [(REG_NONE, MoveSize::L); SLOT_COUNT];
-            }
-            LineKind::Move { dst, .. } => {
-                // Invalidate any slot that was mapped to the overwritten register
-                for slot in slots.iter_mut() {
-                    if slot.0 == dst {
-                        *slot = (REG_NONE, MoveSize::L);
-                    }
-                }
-            }
-            LineKind::SetCC { reg } => {
-                // setCC modifies a byte register, invalidate its family
-                for slot in slots.iter_mut() {
-                    if slot.0 == reg {
-                        *slot = (REG_NONE, MoveSize::L);
-                    }
-                }
-            }
-            LineKind::Other { dest_reg } => {
-                // Invalidate any slot mapped to the destination register
-                if dest_reg != REG_NONE {
-                    for slot in slots.iter_mut() {
-                        if slot.0 == dest_reg {
-                            *slot = (REG_NONE, MoveSize::L);
-                        }
-                    }
-                }
-                // If line has indirect memory access or might clobber stack,
-                // invalidate all (conservative)
-                let s = trimmed(store, &infos[i], i);
-                if infos[i].has_indirect_mem || s.contains("(%ebp)") {
-                    // Only invalidate the specific slot if we can parse it
-                    let off = infos[i].ebp_offset;
-                    if off != EBP_OFFSET_NONE && off < 0 && (-off as usize) <= SLOT_COUNT {
-                        slots[(-off - 1) as usize] = (REG_NONE, MoveSize::L);
-                    } else if infos[i].has_indirect_mem {
-                        // Indirect memory - could write anywhere, invalidate all
-                        slots = [(REG_NONE, MoveSize::L); SLOT_COUNT];
-                    }
-                }
-                // Check for inline asm or instructions that clobber multiple regs
-                if s.contains(';')
-                    || s.starts_with("rdmsr")
-                    || s.starts_with("cpuid")
-                    || s.starts_with("syscall")
-                    || s.starts_with("int ")
-                    || s.starts_with("int$")
-                    || s.starts_with("rep")
-                    || s.starts_with("cld")
-                {
-                    slots = [(REG_NONE, MoveSize::L); SLOT_COUNT];
-                }
-            }
-            LineKind::Push { .. } | LineKind::Pop { .. } => {
-                // Push/pop modify esp but don't affect ebp-relative slots
-                if let LineKind::Pop { reg } = infos[i].kind {
-                    // Pop writes to a register, invalidate mappings
-                    for slot in slots.iter_mut() {
-                        if slot.0 == reg {
-                            *slot = (REG_NONE, MoveSize::L);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    changed
-}
+// ── Pass: Global store forwarding (REMOVED — superseded) ─────────────────────
+//
+// A `global_store_forwarding` pass used to live here, shipped disabled behind
+// `#[expect(dead_code)]` with:
+//
+//   TODO: Disabled - causes 21 regressions in FP computation tests
+//   (matrix/FP operations produce wrong numerical results). Needs
+//   investigation into FP load/store forwarding patterns.
+//
+// The investigation happened (2026-09-12) and the TODO's diagnosis was wrong,
+// so the code is deleted rather than fixed: `forward_slot_loads` below already
+// implements store-to-load slot forwarding, is enabled, and is sound in
+// exactly the places this one was not.
+//
+// Why it produced wrong FP results — nothing to do with forwarding FP values.
+// `parse_store_to_ebp`/`parse_load_from_ebp` only ever accepted
+// `movl`/`movw`/`movb`, so an x87 or SSE value was never forwarded. The defect
+// was in the INVALIDATION model, which cleared one byte-offset entry per
+// memory write:
+//
+//     movl %eax, -4(%ebp)     // tracked: slot -4 holds %eax
+//     fstpl  -8(%ebp)         // writes 8 bytes, -8..-1; cleared only entry -8
+//     movl -4(%ebp), %ecx     // forwarded to `movl %eax, %ecx`  -- STALE
+//
+// `%ecx` received the old integer instead of the high half of the stored
+// double: precisely "matrix/FP operations produce wrong numerical results".
+// Three further defects: the write check was gated on `s.contains("(%ebp)")`
+// so `%esp`-slot writes were invisible; the map was indexed by `-off - 1`
+// under `off < 0`, so every `%esp` slot (biased positive by ESP_SLOT_BIAS) was
+// silently rejected — 100,442 `%esp` operands vs 2,085 `%ebp` on the 792-TU
+// i686 corpus; and it never fenced `%esp` movement, which matters the moment
+// `%esp` slots participate.
+//
+// `forward_slot_loads` handles all four: it keys on the biased offset so both
+// bases are tracked, breaks on `is_barrier()` (which includes push/pop and any
+// write to %esp), breaks on `has_indirect_mem`, uses `ranges_overlap` for
+// partial-overlap reads and stores, and kills the window on ANY line with a
+// parseable frame offset overlapping the slot using a conservative 16-byte
+// width — wide enough for every x87 (10B) and SSE (16B) store the backend
+// emits. The only stores wider than 16 bytes are block ops (`fxsave` 512B,
+// `fnsave` 108B, `fldenv` 28B); none appear in the 792-TU corpus, and they can
+// only arrive via inline asm, which `LineKind::InlineAsm` already makes a
+// barrier. Keeping the dead pass invited a future "fix and enable" that would
+// duplicate a sound pass and reintroduce these four bugs.
 
 // ── Pass: Dead store elimination ─────────────────────────────────────────────
 
@@ -2703,6 +2553,1241 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         }
     }
     changed
+}
+
+// ── Pass: fold GP-pair F64 staging into a direct x87 memory operand ─────────
+//
+// The i686 backend lowers an F64 load from a computed address exactly like an
+// I64/U64 load (`memory.rs` lumps `IrType::F64` in with `I64 | U64 | D64` when
+// it chooses a location), so a `double` read through a pointer is materialised
+// as a GP register pair, homed to a stack slot, and only then handed to the x87
+// unit:
+//
+//     movl 24(%esi), %eax      movl 24(%esi)  ... eventually ...
+//     movl 28(%esi), %edx  ->  fldl 24(%esi)
+//     movl %eax, 68(%esp)
+//     movl %edx, 72(%esp)
+//     ...
+//     fldl 68(%esp)
+//
+// Five instructions and a stack round-trip where GAS accepts one. GCC -m32
+// emits the one-instruction form and additionally keeps loop-invariant x87
+// operands on the stack, which is why `matmul`'s inner loop is 7 instructions
+// against lccc's ~24 and why the runtime gap reaches 13.80x (matmul) and 16.05x
+// (nbody) -- measured over 7 runs with min and median agreeing, in
+// FOLLOWUP-2026-09-12-i686-x87-gp-pair-staging.md.
+//
+// This pass recovers the instruction count without changing where values live.
+// The root fix is an x87 location model in the backend; see §3.1 of that
+// document. If that is ever built, this pass should be DELETED rather than
+// kept: it would then have nothing left to fold.
+//
+// # Soundness
+//
+// The `fldl` is rewritten IN PLACE and the four staging lines are nopped, so
+// the x87 push happens at the same program point: stack depth, operand order
+// and every subsequent `fmulp`/`faddp` pairing are untouched. What has to be
+// proven is that the value read at that later point is the one the staging
+// read, and that nothing else observed the staging. Five conditions, each of
+// which was derived from a measured failure of a weaker version:
+//
+//  1. **Address stability** — no register appearing in the source addressing
+//     expression (base OR index: `(%ebx,%edi,8)` has two) is written anywhere
+//     between the staging and the `fldl`, and no barrier intervenes. Checking
+//     only the base register is unsound: `addl $4, %edi` rewrites an indexed
+//     address and is not a memory access, so no memory-operand guard catches
+//     it.
+//  2. **Contents stability of the source** — the window may READ any address it
+//     likes (a read cannot change the bytes the fold consults) but may not
+//     WRITE one, unless the address is a bare `%esp` slot. Writes to bare slots
+//     are permitted because condition 4 proves no register in the function
+//     holds a frame address, so a slot address cannot coincide with the source
+//     operand; and a write to THIS slot pair is caught by condition 3.
+//  3. **Contents stability of the slot** — nothing references `S(%esp)` or
+//     `S+4(%esp)` between the staging stores and the `fldl`.
+//  4. **No aliasing pointer to the slot exists** — the whole function must
+//     never form a frame address into a register (`leal D(%esp), %r`,
+//     `movl %esp, %r`, or a copy/arithmetic chain from either), and must not
+//     use `%ebp` as a frame pointer. This is the load-bearing condition: it is
+//     what makes the purely TEXTUAL, `%esp`-relative slot tracking in (3) and
+//     (5) complete. If no register ever holds a frame address, then no
+//     `D(%reg)` operand anywhere in the function can name the slot bytes, so
+//     every access to them is spelled `D(%esp)` and the displacement comparison
+//     sees it. Measured on the shapes that matter: 0 of 4 hot functions use a
+//     frame pointer, and none contains `lea`/`mov` of `%esp` into a register.
+//  5. **The staged bytes are dead after the load** — scanning forward from the
+//     `fldl`, both halves must be completely overwritten before anything reads
+//     them. Two details make this scan work where a naive one does not:
+//       * `%esp` shifts are TRACKED, not treated as a barrier. `subl $8, %esp`
+//         renumbers every slot, so the tracked bytes move to `S+8`; a bare
+//         textual match past that point compares against the wrong address.
+//         nbody stages a constant with `subl $8,%esp; movl $0,(%esp); ...;
+//         addl $8,%esp` right after the load, and an untracked scan gave up on
+//         all 37 of its sites.
+//       * An x87 store counts as an overwrite. The first reference after the
+//         load in nbody is `fstl 68(%esp)`, a full 8-byte store that retires
+//         both halves at once; requiring a `movl` pair rejected it.
+//     Leaving this to the existing `eliminate_never_read_stores` does NOT work,
+//     and that was measured: rewriting the `fldl` alone removed 129 slot
+//     references and changed the corpus instruction count by exactly ZERO,
+//     because that pass reasons per OFFSET and these offsets are reused later
+//     in the same function for different values (`68(%esp)` appears 14 times in
+//     nbody), so it never sees the slot as unread.
+//  6. **The pair registers are dead** — `GprLiveness::dead_after` proves `%r1`
+//     and `%r2` are dead once the two stores have executed, so deleting the
+//     loads is invisible. There is deliberately no textual "the pair registers
+//     are not mentioned in the window" test: it is redundant with this and
+//     WRONG, because the dominant real shape reuses the same scratch pair for
+//     the next double immediately (`movl (%edi),%eax` redefines the `%eax` the
+//     previous block's store just read). That single over-strict test rejected
+//     27 sites in vectorize_matmul_n16 alone.
+//  7. **Exact widths** — two 4-byte `movl` stores and an 8-byte `fldl`. The
+//     `float` form (one `movl` + `flds`) and the 80-bit form (`fstpt`/`fldt`)
+//     are different transformations and are deliberately not matched here.
+//
+// Reading the source at the `fldl` instead of at the staging site is safe even
+// if an address register is dead there: condition 1 guarantees nothing
+// overwrote it, and reading a dead register has no effect.
+//
+// # Volatile
+//
+// The i686 backend emits no volatile marker at the asm level, so no asm-level
+// pass can distinguish a volatile access. This fold turns two 4-byte reads of
+// the object into one 8-byte read, which changes the access pattern a signal-
+// or thread-racing observer could see. It does not make volatility LESS
+// observable than the status quo: the unfolded code already splits a volatile
+// `double` into two non-atomic 4-byte reads, so it can already observe a torn
+// value, and one 8-byte read is strictly closer to the single access the
+// standard wants. Making this precise needs a volatile marker in the backend's
+// asm output; that is filed in the FOLLOWUP document rather than papered over
+// here.
+/// Next line index that carries an instruction (nops and `-g` `.loc`
+/// markers are transparent; other directives are not).
+fn next_insn(infos: &[LineInfo], from: usize) -> usize {
+    let mut k = from;
+    while k < infos.len() && (infos[k].is_nop() || infos[k].kind == LineKind::Empty) {
+        k += 1;
+    }
+    k
+}
+
+/// `movl A, B` -> ("A", "B").
+///
+/// The split has to respect parentheses: an indexed source operand carries
+/// commas of its own (`movl (%ebx,%edi,8), %eax`), and splitting on the first
+/// comma silently rejected EVERY SIB-addressed staging site -- which is the
+/// shape a loop-carried load has, i.e. the hot one.
+fn movl_operands(s: &str) -> Option<(&str, &str)> {
+    let rest = s.strip_prefix("movl ")?;
+    let mut depth = 0usize;
+    let at = rest
+        .char_indices()
+        .find(|(_, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => return true,
+                _ => {}
+            }
+            false
+        })?
+        .0;
+    Some((rest[..at].trim(), rest[at + 1..].trim()))
+}
+
+fn fold_x87_gp_pair_staging(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var("CCC_NO_X87_PAIR_FOLD").is_ok() {
+        return false;
+    }
+    let len = infos.len();
+    let mut changed = false;
+    let mut liveness: Option<GprLiveness> = None;
+    let mut extents: Option<Vec<(usize, usize)>> = None;
+    // Both whole-function oracles are O(function), and one function can hold
+    // dozens of staging sites (nbody's `main` holds 37), so memoise per extent.
+    let mut fn_cache: Option<(usize, usize, bool, std::collections::HashMap<String, usize>)> = None;
+
+    let mut i = 0;
+    while i + 3 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        // ---- locate the four staging lines ----
+        let l0 = i;
+        let l1 = next_insn(infos, l0 + 1);
+        let l2 = next_insn(infos, l1 + 1);
+        let l3 = next_insn(infos, l2 + 1);
+        if l3 >= len {
+            i += 1;
+            continue;
+        }
+        let t0 = trimmed(store, &infos[l0], l0);
+        let t1 = trimmed(store, &infos[l1], l1);
+        let t2 = trimmed(store, &infos[l2], l2);
+        let t3 = trimmed(store, &infos[l3], l3);
+        let (mlo, r1) = match movl_operands(t0) {
+            Some(v) => v,
+            None => {
+                i = l1.max(i + 1);
+                continue;
+            }
+        };
+        let (mhi, r2) = match movl_operands(t1) {
+            Some(v) => v,
+            None => {
+                i = l1 + 1;
+                continue;
+            }
+        };
+        let (s1, slot_lo) = match movl_operands(t2) {
+            Some(v) => v,
+            None => {
+                i = l1 + 1;
+                continue;
+            }
+        };
+        let (s2, slot_hi) = match movl_operands(t3) {
+            Some(v) => v,
+            None => {
+                i = l1 + 1;
+                continue;
+            }
+        };
+        // The stores must consume exactly the two loaded registers.
+        if s1 != r1 || s2 != r2 || r1 == r2 || !r1.starts_with('%') || !r2.starts_with('%') {
+            i = l1 + 1;
+            continue;
+        }
+        // Both slot operands must be base-only %esp slots, S and S+4.
+        let (dlo, plo) = match split_mem_operand(slot_lo) {
+            Some(v) => v,
+            None => {
+                i = l1 + 1;
+                continue;
+            }
+        };
+        let (dhi, phi) = match split_mem_operand(slot_hi) {
+            Some(v) => v,
+            None => {
+                i = l1 + 1;
+                continue;
+            }
+        };
+        if plo != "(%esp)" || phi != "(%esp)" || dhi != dlo + 4 {
+            i = l1 + 1;
+            continue;
+        }
+        // The source must be a memory operand pair: the same addressing
+        // expression, displacements 4 apart, and NOT frame-relative (a frame
+        // source would make condition 2 unprovable).
+        let (sdisp_lo, sp_lo) = match split_mem_operand(mlo) {
+            Some(v) => v,
+            None => {
+                i = l1 + 1;
+                continue;
+            }
+        };
+        let (sdisp_hi, sp_hi) = match split_mem_operand(mhi) {
+            Some(v) => v,
+            None => {
+                i = l1 + 1;
+                continue;
+            }
+        };
+        if sp_lo != sp_hi || sdisp_hi != sdisp_lo + 4 {
+            i = l1 + 1;
+            continue;
+        }
+        if sp_lo.contains("%esp") || sp_lo.contains("%ebp") {
+            i = l1 + 1;
+            continue;
+        }
+        // (1) EVERY register in the addressing expression has to stay put, not
+        // just the base: `(%ebx,%edi,8)` computes its address from two.
+        let addr_regs = mem_addr_regs(sp_lo);
+        let r1_id = reg_id_from_name(r1);
+        let r2_id = reg_id_from_name(r2);
+        if addr_regs.is_empty() || r1_id > REG_GP_MAX || r2_id > REG_GP_MAX {
+            i = l1 + 1;
+            continue;
+        }
+        let addr_mask = addr_regs.iter().fold(0u16, |m, &r| m | (1u16 << r));
+
+        // ---- scan forward for the consuming `fldl S` ----
+        let slot = dlo as i32;
+        let mut k = next_insn(infos, l3 + 1);
+        let mut target: Option<usize> = None;
+        while k < len {
+            if infos[k].is_nop() || infos[k].kind == LineKind::Empty {
+                k += 1;
+                continue;
+            }
+            let tk = trimmed(store, &infos[k], k);
+            if tk == format!("fldl {}", slot_lo) {
+                target = Some(k);
+                break;
+            }
+            // (1) no barrier: labels that are branch targets, calls, jumps,
+            // returns, push/pop, inline asm, any write to %esp.
+            if infos[k].is_barrier() {
+                break;
+            }
+            // (2) reads are fine; a write to anything but a bare frame slot is
+            // not, because it could land on the source bytes.
+            if writes_non_slot_memory(tk) {
+                break;
+            }
+            // (3) nobody else touches the slot pair before the load.
+            if references_esp_slot(tk, slot) || references_esp_slot(tk, slot + 4) {
+                break;
+            }
+            // (1) no address register may be rewritten.
+            let (_, defs) = line_reg_use_def(store, infos, k);
+            if defs & addr_mask != 0 {
+                break;
+            }
+            k += 1;
+        }
+        let k = match target {
+            Some(k) => k,
+            None => {
+                i = l1 + 1;
+                continue;
+            }
+        };
+
+        // ---- whole-function conditions ----
+        let ext = extents.get_or_insert_with(|| function_extents(store, infos));
+        let (fs, fe) = match ext.iter().find(|&&(s, e)| l0 >= s && l0 < e) {
+            Some(&(s, e)) => (s, e),
+            None => {
+                i = l1 + 1;
+                continue;
+            }
+        };
+        if fn_cache
+            .as_ref()
+            .is_none_or(|(cfs, cfe, _, _)| (*cfs, *cfe) != (fs, fe))
+        {
+            let forms = function_forms_frame_addr(store, infos, fs, fe);
+            let labels = label_map(store, infos, fs, fe);
+            fn_cache = Some((fs, fe, forms, labels));
+        }
+        let (forms_frame_addr, labels) = match &fn_cache {
+            Some((_, _, fm, lb)) => (*fm, lb),
+            None => unreachable!("fn_cache was just populated"),
+        };
+        // (4) If any register in this function may hold a frame address, then a
+        // `D(%reg)` operand could name the slot bytes and the textual,
+        // %esp-relative tracking in (3) and (5) would be incomplete. Refusing
+        // the whole function is what makes that tracking sound. It also covers
+        // the slot address escaping through `leal S(%esp), %r`, so no separate
+        // escape check is needed.
+        if forms_frame_addr {
+            i = l1 + 1;
+            continue;
+        }
+
+        // (5) The staged bytes must be dead after the load: on EVERY path from
+        // the `fldl`, both halves must be completely overwritten before
+        // anything reads them. The scan starts AFTER the load, which consumes
+        // the staged value by definition.
+        if !slot_pair_dead_on_all_paths(store, infos, fs, fe, next_insn(infos, k + 1), slot, labels)
+        {
+            i = l1 + 1;
+            continue;
+        }
+        // (6) Both pair registers provably dead once the stores have run, since
+        // this fold deletes the loads as well as the stores.
+        let lv = liveness.get_or_insert_with(|| GprLiveness::compute(store, infos));
+        if !lv.dead_after(l3, r1_id) || !lv.dead_after(l3, r2_id) {
+            i = l1 + 1;
+            continue;
+        }
+
+        // ---- apply: rewrite the fldl in place, nop the four staging lines ----
+        let folded = format!("    fldl {}", mlo);
+        store.replace(k, folded);
+        infos[k] = classify_line(store.get(k));
+        for &d in &[l0, l1, l2, l3] {
+            infos[d].kind = LineKind::Nop;
+        }
+        changed = true;
+        i = k + 1;
+    }
+
+    changed
+}
+
+/// Fold the STORE-side mirror of GP-pair staging: a double the x87 unit has
+/// already produced is popped into a frame slot, read straight back out through
+/// a GP register pair, and written to its real destination four bytes at a time.
+///
+/// ```text
+///     fstpl S                  fstpl M
+///     movl S,   %r1       ->
+///     movl S+4, %r2
+///     movl %r1, M
+///     movl %r2, M+4
+/// ```
+///
+/// Five instructions and a full stack round-trip where GAS accepts one, for the
+/// same reason as the load side: `memory.rs` gives an F64 a GP-pair location, so
+/// the value travels x87 -> stack -> GP pair -> memory instead of x87 -> memory.
+/// `fstpl` already stores all eight bytes in exactly the little-endian layout the
+/// two `movl`s produce, so the rewrite changes the operand and deletes the four
+/// GP lines. The mnemonic is kept verbatim, which preserves the x87 pop (and
+/// lets the non-popping `fstl` ride the same path with no extra argument).
+///
+/// Measured opportunity on the 792-TU i686 corpus: **247 strictly adjacent
+/// sites, every one `fstpl`** — 125 with a base or indexed destination, 122 with
+/// another `%esp` slot as the destination; concentrated in
+/// `iv_widen_float_conversion_closure` (47), `fp_domain_crossing` (27),
+/// `expr_sink_vecstore_barrier` (24), `vectorize_matmul_param_alias` (18),
+/// `loop_promote_affine_alias` (14).
+///
+/// Soundness conditions, each one a measured or constructed failure of a weaker
+/// version:
+///
+/// 1. The five lines are adjacent in instruction order. `next_insn` is
+///    transparent to nops and `-g` `.loc` markers only, so a label between them
+///    fails the match — something could branch into the middle of the sequence.
+///    Measured: 0 non-adjacent variants exist corpus-wide, so this costs nothing.
+/// 2. `%r1 != %r2`, both GP and neither `%esp` nor `%ebp`, and the two stores
+///    consume exactly those two registers.
+/// 3. `M` and `M+4` share one addressing expression with displacements exactly 4
+///    apart, so the eight bytes the pair writes are the eight bytes `fstpl`
+///    writes.
+/// 4. `M` must not be able to name the slot bytes. A `%ebp` component is refused
+///    outright (an `%ebp` frame pointer is refused function-wide by (6) anyway,
+///    and a non-frame `%ebp` cannot be shown disjoint). An `%esp` destination is
+///    accepted only when `ranges_overlap(M, 8, S, 8)` is false. Partial overlap
+///    is the miscompile: with `M = S+2` the original leaves the pair's bytes at
+///    `S+2..S+10` while `fstpl S+2` would write the same double in a different
+///    layout. Exact equality is harmless but is refused along with the rest — it
+///    needs a separate argument and has 0 occurrences.
+/// 5. No register in `M`'s addressing expression may be `%r1` or `%r2`: the fold
+///    moves the write to `M` BEFORE the two loads that define them, so a
+///    destination addressed by the pair would be computed from a stale value.
+/// 6. Whole function: no register may hold a frame address (the same taint
+///    fixpoint as the load side), which is what makes the purely textual,
+///    `%esp`-relative slot tracking in (7) complete.
+/// 7. `S` and `S+4` are dead after the second load: on EVERY path from there both
+///    halves are completely overwritten before anything reads them. After the
+///    fold nothing ever writes them, so a surviving reader would see garbage.
+///    This is the load side's post-condition, started after the instruction that
+///    consumes the value.
+/// 8. `%r1`/`%r2` are dead after the last store, because both loads are deleted.
+///    This is also what makes condition 2's `%esp` exclusion belt-and-braces:
+///    `ret` is modelled as reading `%esp`, so a pair register that was `%esp`
+///    could never satisfy (8) — but deleting a write to the stack pointer is
+///    catastrophic enough not to leave it to a modelled ABI detail.
+///
+/// Kill switch: `CCC_NO_X87_PAIR_UNSTAGE`, deliberately independent of the load
+/// side's `CCC_NO_X87_PAIR_FOLD` so each half can be attributed — and reverted —
+/// on its own.
+fn fold_x87_gp_pair_unstaging(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var("CCC_NO_X87_PAIR_UNSTAGE").is_ok() {
+        return false;
+    }
+    let len = infos.len();
+    let mut changed = false;
+    let mut liveness: Option<GprLiveness> = None;
+    let mut extents: Option<Vec<(usize, usize)>> = None;
+    let mut fn_cache: Option<(usize, usize, bool, std::collections::HashMap<String, usize>)> = None;
+
+    let mut i = 0;
+    while i + 4 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        let a0 = i;
+        let a1 = next_insn(infos, a0 + 1);
+        let a2 = next_insn(infos, a1 + 1);
+        let a3 = next_insn(infos, a2 + 1);
+        let a4 = next_insn(infos, a3 + 1);
+        if a4 >= len {
+            i += 1;
+            continue;
+        }
+        // (0) an 8-byte x87 store into an %esp slot. `fstps`/`fstpt` are 4- and
+        // 10-byte forms: different transformations, and GAS has no `fstt`, so
+        // they must not share this path.
+        let t0 = trimmed(store, &infos[a0], a0);
+        let mn0 = t0.split_ascii_whitespace().next().unwrap_or("");
+        if mn0 != "fstpl" && mn0 != "fstl" {
+            i += 1;
+            continue;
+        }
+        let (sdlo, sp) = match split_mem_operand(t0[mn0.len()..].trim()) {
+            Some(v) => v,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if sp != "(%esp)" {
+            i += 1;
+            continue;
+        }
+        let t1 = trimmed(store, &infos[a1], a1);
+        let t2 = trimmed(store, &infos[a2], a2);
+        let t3 = trimmed(store, &infos[a3], a3);
+        let t4 = trimmed(store, &infos[a4], a4);
+        // (1)(2) the slot is read straight back into a GP pair ...
+        let (l1s, r1) = match movl_operands(t1) {
+            Some(v) => v,
+            None => {
+                i = a0 + 1;
+                continue;
+            }
+        };
+        let (l2s, r2) = match movl_operands(t2) {
+            Some(v) => v,
+            None => {
+                i = a0 + 1;
+                continue;
+            }
+        };
+        let (ld1, lp1) = match split_mem_operand(l1s) {
+            Some(v) => v,
+            None => {
+                i = a0 + 1;
+                continue;
+            }
+        };
+        let (ld2, lp2) = match split_mem_operand(l2s) {
+            Some(v) => v,
+            None => {
+                i = a0 + 1;
+                continue;
+            }
+        };
+        if lp1 != "(%esp)" || lp2 != "(%esp)" || ld1 != sdlo || ld2 != sdlo + 4 {
+            i = a0 + 1;
+            continue;
+        }
+        let r1_id = reg_id_from_name(r1);
+        let r2_id = reg_id_from_name(r2);
+        if r1 == r2
+            || r1_id > REG_GP_MAX
+            || r2_id > REG_GP_MAX
+            || r1_id == REG_ESP
+            || r2_id == REG_ESP
+            || r1_id == REG_EBP
+            || r2_id == REG_EBP
+        {
+            i = a0 + 1;
+            continue;
+        }
+        // ... and written out through exactly that pair.
+        let (s1, mlo) = match movl_operands(t3) {
+            Some(v) => v,
+            None => {
+                i = a0 + 1;
+                continue;
+            }
+        };
+        let (s2, mhi) = match movl_operands(t4) {
+            Some(v) => v,
+            None => {
+                i = a0 + 1;
+                continue;
+            }
+        };
+        if s1 != r1 || s2 != r2 {
+            i = a0 + 1;
+            continue;
+        }
+        // (3) one addressing expression, displacements exactly 4 apart.
+        let (md1, mp1) = match split_mem_operand(mlo) {
+            Some(v) => v,
+            None => {
+                i = a0 + 1;
+                continue;
+            }
+        };
+        let (md2, mp2) = match split_mem_operand(mhi) {
+            Some(v) => v,
+            None => {
+                i = a0 + 1;
+                continue;
+            }
+        };
+        if mp1 != mp2 || md2 != md1 + 4 {
+            i = a0 + 1;
+            continue;
+        }
+        // (4) the destination must not be able to name the slot bytes.
+        if mp1.contains("%ebp") {
+            i = a0 + 1;
+            continue;
+        }
+        if mp1 == "(%esp)" && ranges_overlap(md1 as i32, 8, sdlo as i32, 8) {
+            i = a0 + 1;
+            continue;
+        }
+        // (5) the pair must not address its own destination: the write to `M`
+        // moves ahead of the loads that define the pair.
+        if mem_addr_regs(mp1).iter().any(|&r| r == r1_id || r == r2_id) {
+            i = a0 + 1;
+            continue;
+        }
+
+        // ---- whole-function conditions ----
+        let ext = extents.get_or_insert_with(|| function_extents(store, infos));
+        let (fs, fe) = match ext.iter().find(|&&(s, e)| a0 >= s && a0 < e) {
+            Some(&(s, e)) => (s, e),
+            None => {
+                i = a0 + 1;
+                continue;
+            }
+        };
+        if fn_cache
+            .as_ref()
+            .is_none_or(|(cfs, cfe, _, _)| (*cfs, *cfe) != (fs, fe))
+        {
+            let forms = function_forms_frame_addr(store, infos, fs, fe);
+            let labels = label_map(store, infos, fs, fe);
+            fn_cache = Some((fs, fe, forms, labels));
+        }
+        let (forms_frame_addr, labels) = match &fn_cache {
+            Some((_, _, fm, lb)) => (*fm, lb),
+            None => unreachable!("fn_cache was just populated"),
+        };
+        // (6)
+        if forms_frame_addr {
+            i = a0 + 1;
+            continue;
+        }
+        // (7) the staged bytes must be dead once the pair has read them.
+        if !slot_pair_dead_on_all_paths(
+            store,
+            infos,
+            fs,
+            fe,
+            next_insn(infos, a2 + 1),
+            sdlo as i32,
+            labels,
+        ) {
+            i = a0 + 1;
+            continue;
+        }
+        // (8)
+        let lv = liveness.get_or_insert_with(|| GprLiveness::compute(store, infos));
+        if !lv.dead_after(a4, r1_id) || !lv.dead_after(a4, r2_id) {
+            i = a0 + 1;
+            continue;
+        }
+
+        // ---- apply: retarget the x87 store, nop the four GP lines ----
+        let folded = format!("    {} {}", mn0, mlo);
+        store.replace(a0, folded);
+        infos[a0] = classify_line(store.get(a0));
+        for &d in &[a1, a2, a3, a4] {
+            infos[d].kind = LineKind::Nop;
+        }
+        changed = true;
+        i = a0 + 1;
+    }
+
+    changed
+}
+
+/// Split an AT&T memory operand into (displacement, paren-part). The paren
+/// part is returned verbatim so indexed forms compare correctly:
+/// `4(%ebx,%edi,8)` -> `(4, "(%ebx,%edi,8)")`.
+fn split_mem_operand(s: &str) -> Option<(i64, &str)> {
+    let open = s.find('(')?;
+    if !s.ends_with(')') {
+        return None;
+    }
+    let disp_txt = s[..open].trim();
+    let disp = if disp_txt.is_empty() {
+        0
+    } else {
+        disp_txt.parse::<i64>().ok()?
+    };
+    Some((disp, &s[open..]))
+}
+
+/// Every GP register an addressing expression computes its address from:
+/// `(%esi)` -> [%esi], `(%ebx,%edi,8)` -> [%ebx, %edi].
+///
+/// A fold that moves a memory read to a later program point has to keep the
+/// WHOLE address stable, and an indexed form has two registers in it. Only
+/// checking the base is unsound: `addl $4, %edi` changes the address, is not a
+/// memory access, and so is invisible to any memory-operand guard.
+fn mem_addr_regs(paren: &str) -> Vec<RegId> {
+    let inner = match paren.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    inner
+        .split(',')
+        .map(str::trim)
+        .filter(|o| o.starts_with('%'))
+        .map(reg_id_from_name)
+        .filter(|&r| r <= REG_GP_MAX)
+        .collect()
+}
+
+/// Operand list of an AT&T instruction: the mnemonic removed, split at
+/// top-level commas only, so an indexed operand like `(%esp,%eax,4)` survives as
+/// one operand. Comments are stripped first.
+fn operand_list(t: &str) -> Vec<String> {
+    let code = match t.split_once('#') {
+        Some((c, _)) => c,
+        None => t,
+    };
+    let mut raw: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    for c in code.trim().chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            ',' if depth == 0 => {
+                let t = cur.trim().to_string();
+                if !t.is_empty() {
+                    raw.push(t);
+                }
+                cur.clear();
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() && !cur.ends_with(' ') {
+                    cur.push(' ');
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    let tail = cur.trim().to_string();
+    if !tail.is_empty() {
+        raw.push(tail);
+    }
+    // The first token of the first entry is the mnemonic.
+    if let Some(first) = raw.first_mut() {
+        match first.split_once(' ') {
+            Some((_, rest)) => *first = rest.trim().to_string(),
+            None => {
+                raw.remove(0);
+            }
+        }
+    }
+    raw.retain(|o| !o.is_empty());
+    raw
+}
+
+/// Strip every parenthesised memory-operand group from an instruction line,
+/// leaving only the immediate and register operands: `movl 48(%esp), %esi`
+/// becomes `movl 48, %esi`. Used wherever the question is which VALUE flows
+/// into a destination, and a memory operand's base register is a read of that
+/// register rather than a value flowing anywhere.
+fn strip_mem_groups(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Does this function ever put a FRAME ADDRESS into a general register?
+///
+/// This is the load-bearing question behind `fold_x87_gp_pair_staging`, and the
+/// answer is what makes its purely textual, `%esp`-relative slot tracking
+/// complete: if no register holds a frame address, no `D(%reg)` operand can
+/// name the slot bytes, so every access to them is spelled `D(%esp)` and a
+/// displacement comparison sees it. It also covers the slot address escaping
+/// through `leal S(%esp), %r`, so no separate escape check is needed.
+///
+/// `%esp` is always a frame address. `%ebp` is one ONLY if the function
+/// establishes it as a frame pointer (`movl %esp, %ebp` / `enter`); otherwise it
+/// is an ordinary callee-saved register holding a program pointer, and treating
+/// it as a frame address unconditionally is measurably catastrophic: on nbody a
+/// single `movl %ebp, %eax` then spreads through `mull %edx` (whose implicit
+/// operands are %eax/%edx) and `movl %eax, %esi` until 7 of the 8 GP registers
+/// look frame-derived, refusing all 37 staging sites in the function that is
+/// 16x slower than GCC. None of the four hot shapes here uses a frame pointer,
+/// and none forms a frame address at all.
+///
+/// Taint spreads only through register operands, never through memory operands:
+/// `movl 48(%esp), %esi` loads a pointer VALUE out of a slot (typically a
+/// global or parameter address) and does not make `%esi` point into the frame,
+/// while `leal 56(%esp), %esi` and `movl %esp, %esi` genuinely do.
+fn function_forms_frame_addr(store: &LineStore, infos: &[LineInfo], fs: usize, fe: usize) -> bool {
+    let mut taint = 1u16 << REG_ESP;
+    let mut frame_ptr = false;
+    for j in fs..fe {
+        if infos[j].is_nop() || infos[j].kind == LineKind::Empty {
+            continue;
+        }
+        let t = trimmed(store, &infos[j], j);
+        let mn = t.split_ascii_whitespace().next().unwrap_or("");
+        let bare = strip_mem_groups(t);
+        let ops = operand_list(&bare);
+        if ops.len() == 2 && ops[0] == "%esp" && reg_id_from_name(&ops[1]) == REG_EBP {
+            frame_ptr = true;
+        }
+        if mn == "enter" {
+            frame_ptr = true;
+        }
+    }
+    if frame_ptr {
+        taint |= 1u16 << REG_EBP;
+    }
+    let seeds = taint;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for j in fs..fe {
+            if infos[j].is_nop() || infos[j].kind == LineKind::Empty {
+                continue;
+            }
+            let t = trimmed(store, &infos[j], j);
+            let mn = t.split_ascii_whitespace().next().unwrap_or("");
+            let bare = strip_mem_groups(t);
+            let ops = operand_list(&bare);
+            let dest = match ops.last().map(|o| reg_id_from_name(o)) {
+                Some(d) if d <= REG_GP_MAX => d,
+                _ => continue,
+            };
+            let mut uses = 0u16;
+            for r in 0..=REG_GP_MAX {
+                if line_references_reg(&bare, r) {
+                    uses |= 1u16 << r;
+                }
+            }
+            // Forming an address out of the frame/stack pointer taints the
+            // destination whatever else the line reads.
+            let forms = mn.starts_with("lea")
+                && (t.contains("(%esp)") || (frame_ptr && t.contains("(%ebp)")));
+            if forms || uses & taint != 0 {
+                let bit = 1u16 << dest;
+                if taint & bit == 0 {
+                    taint |= bit;
+                    changed = true;
+                }
+            }
+        }
+    }
+    taint & !seeds != 0
+}
+
+/// Label name -> line index, for `[fs, fe)`.
+fn label_map(
+    store: &LineStore,
+    infos: &[LineInfo],
+    fs: usize,
+    fe: usize,
+) -> std::collections::HashMap<String, usize> {
+    let mut out = std::collections::HashMap::new();
+    for j in fs..fe {
+        if infos[j].kind == LineKind::Label {
+            let t = trimmed(store, &infos[j], j);
+            out.insert(t.trim_end_matches(':').to_string(), j);
+        }
+    }
+    out
+}
+
+/// Are the 8 bytes at `%esp`-relative displacement `slot` dead from line
+/// `start` onward -- overwritten completely, on EVERY path, before anything
+/// reads them?
+///
+/// This is the post-condition that lets `fold_x87_gp_pair_staging` delete the
+/// staging stores, and it is a forward reachability search over the function's
+/// control flow rather than a linear scan, for a measured reason: the hot
+/// staging sites are inside loops, and a linear scan has to give up at the back
+/// edge. On the canonical `double` dot-product kernel that refusal is the whole
+/// remaining gap -- GCC 16.2 `-m32 -O2` compiles the loop to 8 instructions
+/// against lccc's 18, and 4 of lccc's are a staging block whose slot is plainly
+/// rewritten by the next iteration before anyone reads it.
+///
+/// The search state is "these bytes still hold the staged value at this program
+/// point", which is monotone, so a worklist with a visited set terminates; the
+/// visited key includes the whole state because the tracked displacement moves
+/// when `%esp` does.
+///
+/// Only a FAILURE is global. A path that retires both halves, or that leaves the
+/// function, proves nothing about the paths still queued -- the question is
+/// all-paths -- so those paths simply stop and the answer is `true` only once
+/// the worklist drains.
+///
+/// Soundness rests on condition (4) of the caller: no register in this function
+/// holds a frame address. That is what makes the search purely textual -- with
+/// no aliasing pointer in existence, the ONLY operand that can name these bytes
+/// is `D(%esp)` at the displacement the current `%esp` shift implies, so every
+/// read and write of them is visible to `references_esp_slot`. It also makes
+/// `ret` a success: the function ends, so nothing can read the slot again.
+/// Calls stay a failure even though the same argument would cover a callee
+/// touching our frame, because a `ret $N` callee changes `%esp` by an amount
+/// this scan cannot see.
+///
+/// Overwrites are recognised by WIDTH, not by mnemonic shape: two `movl` stores
+/// to the halves, or a single 8-byte store (`fstl`/`fstpl`), or a 10-byte one
+/// (`fstt`/`fstpt`). nbody's hot loop retires the pair with one `fstl 68(%esp)`,
+/// and a scan that only accepted a `movl` pair rejected all 37 of its sites.
+fn slot_pair_dead_on_all_paths(
+    store: &LineStore,
+    infos: &[LineInfo],
+    fs: usize,
+    fe: usize,
+    start: usize,
+    slot: i32,
+    labels: &std::collections::HashMap<String, usize>,
+) -> bool {
+    // (position, %esp shift since `start`, low half retired, high half retired)
+    type State = (usize, i32, bool, bool);
+    let mut work: Vec<State> = vec![(start, 0, false, false)];
+    let mut visited: std::collections::HashSet<State> = std::collections::HashSet::new();
+    let mut budget = 20_000usize;
+    while let Some((mut pos, mut shift, mut lo, mut hi)) = work.pop() {
+        loop {
+            if budget == 0 {
+                return false;
+            }
+            budget -= 1;
+            if pos >= fe {
+                // Off the end of the function: nothing can read the slot again.
+                break;
+            }
+            if infos[pos].is_nop() || infos[pos].kind == LineKind::Empty {
+                pos += 1;
+                continue;
+            }
+            let t = trimmed(store, &infos[pos], pos);
+            // %esp movement renames every slot; track it instead of giving up.
+            // `subl $8, %esp` moves the tracked bytes to `slot + 8`.
+            if let Some(d) = esp_adjustment(t) {
+                shift += d;
+                pos += 1;
+                continue;
+            }
+            let state: State = (pos, shift, lo, hi);
+            if !visited.insert(state) {
+                break; // merged into a state another path already explored
+            }
+            let slo = slot + shift;
+            let shi = slot + 4 + shift;
+            match infos[pos].kind {
+                LineKind::Ret | LineKind::RetN => break,
+                LineKind::Call | LineKind::InlineAsm | LineKind::JmpIndirect => return false,
+                LineKind::Jmp => {
+                    match direct_jump_target(t).and_then(|n| labels.get(n).copied()) {
+                        Some(target) if target >= fs && target < fe => {
+                            pos = target;
+                            continue;
+                        }
+                        // A direct jump leaving the function is a tail call.
+                        _ => break,
+                    }
+                }
+                LineKind::CondJmp => {
+                    // Both successors must satisfy the property: queue the
+                    // fallthrough and follow the branch.
+                    work.push((pos + 1, shift, lo, hi));
+                    match direct_jump_target(t).and_then(|n| labels.get(n).copied()) {
+                        Some(target) if target >= fs && target < fe => {
+                            pos = target;
+                            continue;
+                        }
+                        _ => return false,
+                    }
+                }
+                LineKind::Push { .. } => {
+                    shift += 4;
+                    pos += 1;
+                    continue;
+                }
+                LineKind::Pop { .. } => {
+                    shift -= 4;
+                    pos += 1;
+                    continue;
+                }
+                LineKind::Directive => {
+                    // `.cfi_def_cfa_offset` follows every %esp adjustment this
+                    // backend emits, so treating directives as barriers would
+                    // end the proof right after any shift. A directive that is
+                    // not known to be code-free is not modelled.
+                    if !is_code_free_directive(t) {
+                        return false;
+                    }
+                    pos += 1;
+                    continue;
+                }
+                // A non-constant %esp rewrite makes every displacement
+                // unnameable from here on.
+                LineKind::Move { dst, .. } if dst == REG_ESP => return false,
+                LineKind::Other { dest_reg } if dest_reg == REG_ESP => return false,
+                _ => {}
+            }
+            // With condition (4) proven, a bare `D(%esp)` operand is the only
+            // spelling that can name these bytes, so this comparison sees every
+            // read and every write of them.
+            if references_esp_slot(t, slo) || references_esp_slot(t, shi) {
+                match slot_write_extent(t, slo, shi) {
+                    SlotWrite::Lo => lo = true,
+                    SlotWrite::Hi => hi = true,
+                    SlotWrite::Both => {
+                        lo = true;
+                        hi = true;
+                    }
+                    // A read, or a write that does not completely cover a half:
+                    // the staged value is observable, so it is not dead.
+                    SlotWrite::ReadOrUnknown => return false,
+                }
+                if lo && hi {
+                    break; // this path retired both halves
+                }
+            }
+            pos += 1;
+        }
+    }
+    // The worklist drained without a single failing path.
+    true
+}
+
+/// A directive that emits no instruction and so cannot read or write memory:
+/// the `.cfi_*` unwind annotations this backend writes after every %esp
+/// adjustment, debug location markers, and alignment padding.
+fn is_code_free_directive(t: &str) -> bool {
+    let t = t.trim();
+    [
+        ".cfi", ".loc", ".p2align", ".align", ".balign", ".file", ".LFB", ".LFE",
+    ]
+    .iter()
+    .any(|p| t.starts_with(p))
+}
+
+/// The constant `%esp` adjustment of a single instruction, expressed as the
+/// change it makes to every slot DISPLACEMENT: `subl $8, %esp` lowers the stack
+/// pointer, so a byte that was at `68(%esp)` is now at `76(%esp)` and the answer
+/// is `+8`. `addl $8, %esp` is `-8`. Anything else -- a register source, `andl`,
+/// a scale -- is `None`, which ends the proof.
+fn esp_adjustment(s: &str) -> Option<i32> {
+    let t = s.trim();
+    let sp = t.find(char::is_whitespace)?;
+    let sign = match &t[..sp] {
+        "subl" | "sub" => 1,
+        "addl" | "add" => -1,
+        _ => return None,
+    };
+    let mut ops = t[sp + 1..].split(',').map(str::trim);
+    let amt = ops.next()?.strip_prefix('$')?;
+    if ops.next()? != "%esp" || ops.next().is_some() {
+        return None;
+    }
+    let n: i32 = if let Some(hex) = amt.strip_prefix("0x") {
+        i64::from_str_radix(hex, 16).ok()? as i32
+    } else {
+        amt.parse().ok()?
+    };
+    if n <= 0 {
+        return None;
+    }
+    Some(sign * n)
+}
+
+/// The displacement of a bare `%esp` memory operand, if `s` is exactly one:
+/// `68(%esp)` -> 68, `(%esp)` -> 0, `(%esp,%eax,4)` -> None, `68(%ebp)` -> None.
+fn esp_slot_displacement(s: &str) -> Option<i32> {
+    let open = s.find("(%esp)")?;
+    if !s[open + 6..].trim().is_empty() {
+        return None;
+    }
+    let disp = s[..open].trim();
+    if disp.is_empty() {
+        return Some(0);
+    }
+    if let Some(hex) = disp.strip_prefix("0x") {
+        return i64::from_str_radix(hex, 16).ok().map(|v| v as i32);
+    }
+    disp.parse().ok()
+}
+
+/// Does this line WRITE memory at an address that is not a bare `%esp` slot?
+///
+/// Used to bound the window between a GP-pair staging block and the `fldl` that
+/// consumes it. Reads are irrelevant there -- a read cannot change the bytes
+/// being folded -- so only the destination operand is examined, and only a store
+/// mnemonic counts. Anything unrecognised is treated as a write, which is the
+/// safe direction: the cost is a missed fold, not a miscompile.
+///
+/// A write to a bare `D(%esp)` slot is allowed because the caller has proven
+/// that no register in the function holds a frame address, so no slot address
+/// can coincide with the folded source operand, and a write to the slot pair
+/// itself is caught separately by displacement comparison.
+///
+/// Three details matter on real output:
+///  * `%st(N)` is an x87 REGISTER, not a memory operand, so `fmulp %st, %st(1)`
+///    -- whose last operand is parenthesised -- must not look like a store;
+///  * a segment override (`%fs:40(%esp)`) is a different address than
+///    `40(%esp)`, so it is never treated as a bare slot;
+///  * `%ebp`-relative stores are NOT bare slots here: whether `%ebp` is a frame
+///    pointer is a whole-function question the caller answers, and this
+///    predicate stays local and conservative.
+fn writes_non_slot_memory(t: &str) -> bool {
+    if t.contains("%fs:") || t.contains("%gs:") {
+        return true;
+    }
+    let ops = operand_list(t);
+    let last = match ops.last() {
+        Some(l) => l.as_str(),
+        None => return false,
+    };
+    if !last.contains('(') || last.starts_with("%st") {
+        return false; // no memory destination
+    }
+    if esp_slot_displacement(last).is_some() && !last.contains(',') {
+        return false; // a bare frame slot
+    }
+    let mn = t.split_ascii_whitespace().next().unwrap_or("");
+    !mnemonic_only_reads_memory(mn)
+}
+
+/// True for mnemonics whose memory operand is always a SOURCE, never a
+/// destination. Everything else -- including `mov`, which goes both ways and is
+/// disambiguated by operand position at the call site -- is treated as a
+/// possible store.
+fn mnemonic_only_reads_memory(mn: &str) -> bool {
+    matches!(
+        mn,
+        "fld"
+            | "flds"
+            | "fldl"
+            | "fldt"
+            | "fild"
+            | "fildl"
+            | "fildll"
+            | "fildq"
+            | "fadd"
+            | "fadds"
+            | "faddl"
+            | "fsub"
+            | "fsubs"
+            | "fsubl"
+            | "fsubr"
+            | "fsubrs"
+            | "fsubrl"
+            | "fmul"
+            | "fmuls"
+            | "fmull"
+            | "fdiv"
+            | "fdivs"
+            | "fdivl"
+            | "fdivr"
+            | "fdivrs"
+            | "fdivrl"
+            | "fcom"
+            | "fcoms"
+            | "fcoml"
+            | "fcomp"
+            | "fcomps"
+            | "fcompl"
+            | "fucom"
+            | "fucoml"
+            | "fucomp"
+            | "fucompl"
+            | "cmp"
+            | "cmpb"
+            | "cmpw"
+            | "cmpl"
+            | "test"
+            | "testb"
+            | "testw"
+            | "testl"
+            | "lea"
+            | "leal"
+            | "leaw"
+            | "movzbl"
+            | "movzbw"
+            | "movzwl"
+            | "movsbl"
+            | "movsbw"
+            | "movswl"
+            | "bsf"
+            | "bsr"
+            | "bsfl"
+            | "bsrl"
+            | "popcntl"
+            | "lzcntl"
+            | "tzcntl"
+            | "cvtsi2ssl"
+            | "cvtsi2sdl"
+            | "cvttsd2sil"
+            | "cvtsd2sil"
+            | "cvtss2sil"
+    )
+}
+
+/// What a line that references a tracked stack slot does to the 8 bytes at
+/// `[lo, lo+8)`: overwrite the low half, the high half, both, or neither.
+enum SlotWrite {
+    Lo,
+    Hi,
+    Both,
+    ReadOrUnknown,
+}
+
+/// `(displacement, byte width)` of a store to a bare `%esp` slot, if this
+/// mnemonic stores and `op` is that store's memory operand.
+fn esp_store_operand(mn: &str, op: &str) -> Option<(i32, i32)> {
+    let width = match mn {
+        "movl" => 4,
+        "movw" => 2,
+        "movb" => 1,
+        "movq" | "movsd" | "movlps" | "movups" | "movaps" | "movapd" | "movupd" => 8,
+        "movdqa" | "movdqu" => 16,
+        "fstl" | "fstpl" | "fistpl" => 8,
+        "fsts" | "fstps" | "fistl" => 4,
+        "fstt" | "fstpt" | "fisttpl" => 10,
+        _ => return None,
+    };
+    let disp = esp_slot_displacement(op)?;
+    Some((disp, width))
+}
+
+/// The answer is `ReadOrUnknown` unless the line is a recognisable STORE whose
+/// memory operand is in destination position and whose byte range completely
+/// covers at least one half. x87 stores count: `fstl`/`fstpl` write 8 bytes and
+/// `fstt`/`fstpt` write 10, so a single one can retire both halves -- which is
+/// exactly the shape nbody's hot loop has (`fldl 68(%esp)` ... `fstl
+/// 68(%esp)`). Partial-width stores (`movw`, `movb`, `fsts`) and anything not in
+/// the table end the proof.
+fn slot_write_extent(s: &str, lo: i32, hi: i32) -> SlotWrite {
+    let t = s.trim();
+    let mn = t.split_ascii_whitespace().next().unwrap_or("");
+    let ops = operand_list(t);
+    let last = match ops.last() {
+        Some(l) => l.as_str(),
+        None => return SlotWrite::ReadOrUnknown,
+    };
+    let (disp, width) = match esp_store_operand(mn, last) {
+        Some(v) => v,
+        None => return SlotWrite::ReadOrUnknown,
+    };
+    let covers = |start: i32| disp <= start && start + 4 <= disp + width;
+    match (covers(lo), covers(hi)) {
+        (true, true) => SlotWrite::Both,
+        (true, false) => SlotWrite::Lo,
+        (false, true) => SlotWrite::Hi,
+        (false, false) => SlotWrite::ReadOrUnknown,
+    }
 }
 
 /// Canonical operand text for an ebp-space slot offset: esp-relative slots
@@ -3363,7 +4448,14 @@ fn line_reg_use_def(store: &LineStore, infos: &[LineInfo], idx: usize) -> (u16, 
     uses |= u16::from(imp_reads);
     defs |= u16::from(imp_writes);
     let mnemonic = line.split_ascii_whitespace().next().unwrap_or("");
-    if matches!(mnemonic, "xchgl" | "xchgw" | "xchgb") {
+    // The width suffix is OPTIONAL in GAS: `xchg %esp, %ebx` assembles and means
+    // the same thing as `xchgl %esp, %ebx`. Matching only the suffixed forms left
+    // the bare mnemonic with uses but NO defs at all (measured: uses=0x18,
+    // defs=0x000), so every guard built on this oracle -- dead-register proofs,
+    // copy propagation, slot windows -- saw it as a plain read. It is only ever
+    // reachable through inline asm or hand-written .s (the emitter always
+    // suffixes), which is exactly why it went unnoticed.
+    if mnemonic.starts_with("xchg") {
         for reg in 0..=REG_GP_MAX {
             if line_references_reg(line, reg) {
                 uses |= bit(reg);
@@ -9016,6 +10108,19 @@ pub fn peephole_optimize(asm: String) -> String {
     let global_changed = propagate_reg_copies(&mut store, &mut infos);
     let global_changed = global_changed | forward_slot_loads(&mut store, &mut infos);
     let global_changed = global_changed | forward_immediate_slot_loads(&mut store, &mut infos);
+    // x87 GP-pair staging runs after slot-load forwarding (which can already
+    // have retired some of the staging) and before the dead-move/dead-store
+    // cleanup, so the lines it nops are reclaimed in the same phase. It runs
+    // ONCE, not in the Phase 3 fixpoint: the shape it matches comes from the
+    // backend's location choice, not from another peephole, so a second sweep
+    // can only re-scan text it already rejected.
+    let global_changed = global_changed | fold_x87_gp_pair_staging(&mut store, &mut infos);
+    // The store-side mirror runs immediately after. It matches a shape the load
+    // side cannot (its first line is an x87 store, not a `movl`), and both must
+    // run before the dead-move/dead-store cleanup so the lines they nop are
+    // reclaimed in the same phase. Separate kill switch, so each half can be
+    // attributed on its own: CCC_NO_X87_PAIR_UNSTAGE.
+    let global_changed = global_changed | fold_x87_gp_pair_unstaging(&mut store, &mut infos);
     let global_changed = global_changed | eliminate_dead_reg_moves(&store, &mut infos);
     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
@@ -12262,8 +13367,145 @@ mod tests {
         );
     }
 
-    // Note: store forwarding tests removed - global_store_forwarding is disabled
-    // due to FP computation regressions.
+    // ── Slot store-to-load forwarding: soundness regression tests ───────────
+    //
+    // These replace the note "store forwarding tests removed -
+    // global_store_forwarding is disabled due to FP computation regressions".
+    // Deleting the tests along with the pass removed the only coverage of the
+    // failure mode, so it is restored here against the LIVE pass
+    // (`forward_slot_loads`). The mechanism under test is the one that made
+    // matrix/FP code compute wrong numbers: a memory write WIDER than the
+    // tracked integer slot, which a one-entry-per-offset invalidation model
+    // cannot see.
+
+    /// Positive control: an untouched same-width slot round-trip still
+    /// forwards. Without this the negative tests below could pass vacuously
+    /// (e.g. if forwarding stopped happening for an unrelated reason).
+    ///
+    /// The assertion is on the MEMORY RELOAD being gone, not on the forwarded
+    /// `movl %eax, %ecx` surviving: %ecx is dead at the end of this snippet, so
+    /// `eliminate_dead_reg_moves` deletes the forwarded move (it never deletes
+    /// a load — only reg-to-reg moves — which is exactly why the negative tests
+    /// can assert that a fenced reload SURVIVES). The two assertions are
+    /// complements, so together they discriminate.
+    #[test]
+    fn slot_forwarding_positive_control() {
+        let asm = ["    movl %eax, -4(%ebp)", "    movl -4(%ebp), %ecx"].join("\n") + "\n";
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            !result.contains("movl -4(%ebp), %ecx"),
+            "same-width slot round-trip should forward, leaving no memory \
+             reload: {result}"
+        );
+    }
+
+    /// The original FP regression, reduced: `fstpl -8(%ebp)` writes 8 bytes
+    /// (-8..-1) and therefore clobbers the 4-byte slot at -4. Clearing only
+    /// the entry for offset -8 forwards a stale %eax into %ecx instead of the
+    /// high half of the stored double.
+    #[test]
+    fn wide_x87_store_kills_overlapping_integer_slot_forwarding() {
+        let asm = [
+            "    movl %eax, -4(%ebp)",
+            "    fstpl -8(%ebp)",
+            "    movl -4(%ebp), %ecx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("movl -4(%ebp), %ecx"),
+            "the 8-byte x87 store overlaps the tracked 4-byte slot, so the \
+             reload must NOT be forwarded: {result}"
+        );
+        assert!(
+            !result.contains("movl %eax, %ecx"),
+            "stale forwarding across a wide x87 store: {result}"
+        );
+    }
+
+    /// Same mechanism, SSE width: `movaps` writes 16 bytes at -16..0, covering
+    /// the slot at -4. This is the width the window-kill in `forward_slot_loads`
+    /// assumes for an unrecognised frame-offset line, so it also pins that
+    /// constant against a silent reduction.
+    #[test]
+    fn wide_sse_store_kills_overlapping_integer_slot_forwarding() {
+        let asm = [
+            "    movl %eax, -4(%ebp)",
+            "    movaps %xmm0, -16(%ebp)",
+            "    movl -4(%ebp), %ecx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("movl -4(%ebp), %ecx"),
+            "a 16-byte SSE store overlaps the tracked slot: {result}"
+        );
+    }
+
+    /// `%esp`-relative slots participate in forwarding (100,442 of the 102,527
+    /// frame operands in the 792-TU i686 corpus), and every `%esp` change
+    /// renumbers them. `subl $4, %esp` must fence the window even though it
+    /// writes no slot and clobbers no value register.
+    #[test]
+    fn esp_adjustment_fences_esp_slot_forwarding() {
+        let asm = [
+            "    movl %eax, 8(%esp)",
+            "    subl $4, %esp",
+            "    movl 8(%esp), %ecx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("movl 8(%esp), %ecx"),
+            "8(%esp) names different memory after the adjustment: {result}"
+        );
+    }
+
+    /// `pushl`/`popl` move `%esp` implicitly — the mnemonic text never mentions
+    /// it — so they must fence `%esp` slots.
+    ///
+    /// They fence `%ebp` slots too, and this test pins that CONSERVATISM rather
+    /// than treating it as a defect. Narrowing the fence to the `%esp` half
+    /// needs the proof "the push area cannot overlap any `%ebp`-relative
+    /// local", which holds only while `%esp <= %ebp - locals_extent`; a text
+    /// peephole has no frame layout to check that against. The payoff is also
+    /// negligible: 2,085 `%ebp` operands against 100,442 `%esp` ones across the
+    /// 792-TU i686 corpus, and only 17 files set up a frame pointer at all.
+    /// Buying an unprovable-to-a-text-pass invariant for 2% of the operand
+    /// population is a bad trade, so both bases stay fenced.
+    #[test]
+    fn push_pop_fence_esp_and_ebp_slots() {
+        let esp_asm = [
+            "    movl %eax, 8(%esp)",
+            "    pushl %edx",
+            "    movl 8(%esp), %ecx",
+        ]
+        .join("\n")
+            + "\n";
+        let esp_result = peephole_optimize(esp_asm.to_string());
+        assert!(
+            esp_result.contains("movl 8(%esp), %ecx"),
+            "a push renumbers every %esp slot: {esp_result}"
+        );
+
+        let ebp_asm = [
+            "    movl %eax, -4(%ebp)",
+            "    pushl %edx",
+            "    movl -4(%ebp), %ecx",
+        ]
+        .join("\n")
+            + "\n";
+        let ebp_result = peephole_optimize(ebp_asm.to_string());
+        assert!(
+            ebp_result.contains("movl -4(%ebp), %ecx"),
+            "push/pop are unconditional barriers (see the doc comment): the \
+             %ebp reload is kept even though forwarding across it would in \
+             fact be sound: {ebp_result}"
+        );
+    }
 
     // ── P17 else-hoist: the else store hoists and the ORIGINAL condition
     // jumps to the join; the jmp disappears.  The inverted mnemonic would
@@ -13486,6 +14728,536 @@ mod tests {
         assert!(
             !result.contains("movl 20(%esp), %esi"),
             "the dead load must be gone:\n{result}"
+        );
+    }
+
+    // ── fold_x87_gp_pair_staging ─────────────────────────────────────────────
+    //
+    // Driven through the pass directly rather than through `peephole_optimize`,
+    // for the reason `forward_slot_loads` is tested the same way: later pipeline
+    // passes rewrite the same text and would mask which pass produced the shape
+    // under test.
+    //
+    // Two framing details are load-bearing and mirror what the emitter really
+    // produces:
+    //  * `ret` is modelled as reading `%eax` (the ABI return register), so a
+    //    test function that leaves the staged pair live into the `ret` genuinely
+    //    IS unfoldable -- the loaded value would be the returned one. Real
+    //    staging uses scratch registers that are redefined before the return,
+    //    which the `xorl`s below stand in for.
+    //  * the slot pair is retired by an 8-byte store (`fstpl 4(%esp)`), the
+    //    shape nbody's hot loop has, so the post-condition is exercised on the
+    //    wide-overwrite path by default.
+
+    /// Run only [`fold_x87_gp_pair_staging`] and return the surviving lines.
+    fn x87_fold_lines(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<LineInfo> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        fold_x87_gp_pair_staging(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    /// The staging shape with a hook for the window (between the stores and the
+    /// `fldl`) and the tail (after it), so every negative case can be diffed
+    /// against the same function without the offending line.
+    fn x87_stage(src_lo: &str, src_hi: &str, window: &str, tail: &str) -> String {
+        let tail = if tail.is_empty() {
+            "    faddp %st, %st(1)\n    fstpl 4(%esp)\n"
+        } else {
+            tail
+        };
+        format!(
+            "f:\n    subl $8, %esp\n    movl {src_lo}, %eax\n    movl {src_hi}, %edx\n    \
+             movl %eax, 4(%esp)\n    movl %edx, 8(%esp)\n{window}    fldl 4(%esp)\n{tail}\
+             xorl %eax, %eax\n    xorl %edx, %edx\n    addl $8, %esp\n    ret\n"
+        )
+    }
+
+    fn assert_folded(asm: &str, ctx: &str, direct: &str) {
+        let out = x87_fold_lines(asm);
+        let want = format!("fldl {direct}");
+        assert!(
+            out.iter().any(|l| *l == want),
+            "{ctx}: expected `{want}` in {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l == "movl %eax, 4(%esp)"),
+            "{ctx}: the staging store must be gone: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l == "fldl 4(%esp)"),
+            "{ctx}: the slot load must be gone: {out:?}"
+        );
+    }
+
+    fn assert_not_folded(asm: &str, ctx: &str) {
+        let out = x87_fold_lines(asm);
+        assert!(
+            out.iter().any(|l| l == "fldl 4(%esp)"),
+            "{ctx}: the slot load must survive: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "movl %eax, 4(%esp)")
+                && out.iter().any(|l| l == "movl %edx, 8(%esp)"),
+            "{ctx}: both staging stores must survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_folds_to_a_direct_memory_operand() {
+        assert_folded(
+            &x87_stage("24(%esi)", "28(%esi)", "", ""),
+            "straight-line staging",
+            "24(%esi)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_folds_when_one_wide_store_retires_the_pair() {
+        // nbody's hot loop overwrites the slot pair with a single 8-byte
+        // `fstl`, not with two `movl`s; a scan that only accepted a `movl` pair
+        // rejected all 37 of its sites.
+        assert_folded(
+            &x87_stage(
+                "24(%esi)",
+                "28(%esi)",
+                "",
+                "    fmul %st(1), %st\n    fstl 4(%esp)\n",
+            ),
+            "wide x87 overwrite",
+            "24(%esi)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_folds_across_a_loop_back_edge() {
+        // The slot is only rewritten by the NEXT iteration's staging, so a
+        // linear post-condition scan has to give up at the `jl` -- and that is
+        // the shape of every hot FP loop in the corpus.
+        let asm = concat!(
+            "f:\n",
+            "    subl $8, %esp\n",
+            "    xorl %ecx, %ecx\n",
+            ".Lloop:\n",
+            "    movl (%esi,%ecx,8), %eax\n",
+            "    movl 4(%esi,%ecx,8), %edx\n",
+            "    movl %eax, 4(%esp)\n",
+            "    movl %edx, 8(%esp)\n",
+            "    fldl 4(%esp)\n",
+            "    faddp %st, %st(1)\n",
+            "    incl %ecx\n",
+            "    cmpl $10, %ecx\n",
+            "    jl .Lloop\n",
+            "    fstpl 16(%esi)\n",
+            "    xorl %eax, %eax\n",
+            "    xorl %edx, %edx\n",
+            "    addl $8, %esp\n",
+            "    ret\n",
+        );
+        let out = x87_fold_lines(asm);
+        assert!(
+            out.iter().any(|l| l == "fldl (%esi,%ecx,8)"),
+            "the loop-carried site must fold: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l == "movl %eax, 4(%esp)"),
+            "the staging store must be gone: {out:?}"
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_folds_across_an_esp_shift() {
+        // `subl $8, %esp` renumbers every slot: the tracked bytes move to
+        // 76(%esp) and back. A scan that treats the shift as a barrier, or that
+        // does not renumber, loses the site.
+        let asm = concat!(
+            "f:\n",
+            "    subl $88, %esp\n",
+            "    movl 24(%esi), %eax\n",
+            "    movl 28(%esi), %edx\n",
+            "    movl %eax, 68(%esp)\n",
+            "    movl %edx, 72(%esp)\n",
+            "    fldl 68(%esp)\n",
+            "    subl $8, %esp\n",
+            "    movl $0, (%esp)\n",
+            "    fldl (%esp)\n",
+            "    addl $8, %esp\n",
+            "    fstl 68(%esp)\n",
+            "    xorl %eax, %eax\n",
+            "    xorl %edx, %edx\n",
+            "    addl $88, %esp\n",
+            "    ret\n",
+        );
+        let out = x87_fold_lines(asm);
+        assert!(
+            out.iter().any(|l| l == "fldl 24(%esi)"),
+            "must fold across the %esp shift: {out:?}"
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_not_folded_when_the_slot_is_read_again() {
+        // The staged value is still needed, so the stores must survive.
+        assert_not_folded(
+            &x87_stage(
+                "24(%esi)",
+                "28(%esi)",
+                "",
+                "    faddp %st, %st(1)\n    fldl 4(%esp)\n    faddp %st, %st(1)\n    fstpl 4(%esp)\n",
+            ),
+            "slot re-read before any overwrite",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_not_folded_when_the_base_is_rewritten() {
+        let bad = x87_stage("24(%esi)", "28(%esi)", "    movl %ebx, %esi\n", "");
+        assert_not_folded(&bad, "base rewritten in the window");
+        // Control: the same function without the offending line does fold, so
+        // the refusal above is attributable to it and not to the framing.
+        assert_folded(
+            &x87_stage("24(%esi)", "28(%esi)", "", ""),
+            "control",
+            "24(%esi)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_not_folded_when_the_index_is_rewritten() {
+        // Checking only the BASE register is unsound for an indexed source:
+        // `addl $1, %edi` changes the address, is not a memory access, and so is
+        // invisible to any memory-operand guard.
+        let bad = x87_stage("(%ebx,%edi,8)", "4(%ebx,%edi,8)", "    addl $1, %edi\n", "");
+        assert_not_folded(&bad, "index register rewritten in the window");
+        assert_folded(
+            &x87_stage("(%ebx,%edi,8)", "4(%ebx,%edi,8)", "", ""),
+            "indexed source control",
+            "(%ebx,%edi,8)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_not_folded_when_a_frame_address_is_formed() {
+        // With `leal 4(%esp), %ecx` in the function a `D(%reg)` operand could
+        // name the slot, and the textual %esp-relative tracking the fold relies
+        // on would be incomplete. The refusal is function-wide by design.
+        let bad = x87_stage("24(%esi)", "28(%esi)", "    leal 4(%esp), %ecx\n", "");
+        assert_not_folded(&bad, "frame address formed");
+        assert_folded(
+            &x87_stage("24(%esi)", "28(%esi)", "", ""),
+            "control",
+            "24(%esi)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_not_folded_across_a_non_slot_write() {
+        // A store through another register could land on the source bytes, so
+        // the value read at the `fldl` would not be the value staging read.
+        let bad = x87_stage("24(%esi)", "28(%esi)", "    movl %ebx, (%edi)\n", "");
+        assert_not_folded(&bad, "unmodelled write in the window");
+        assert_folded(
+            &x87_stage("24(%esi)", "28(%esi)", "", ""),
+            "control",
+            "24(%esi)",
+        );
+    }
+
+    #[test]
+    fn reg_use_def_models_the_unsuffixed_xchg() {
+        // Both operands of an `xchg` are destinations, and GAS accepts the
+        // mnemonic without a width suffix. The suffixed form was already
+        // handled; the bare one reported no definitions at all.
+        for line in [
+            "    xchg %esp, %ebx",
+            "    xchgl %esp, %ebx",
+            "    xchgb %al, %bl",
+        ] {
+            let st = LineStore::new(format!("f:\n{}\n    ret\n", line));
+            let inf: Vec<LineInfo> = (0..st.len()).map(|i| classify_line(st.get(i))).collect();
+            let (uses, defs) = line_reg_use_def(&st, &inf, 1);
+            let ops: Vec<RegId> = (0..=REG_GP_MAX)
+                .filter(|r| line_references_reg(line, *r))
+                .collect();
+            assert_eq!(ops.len(), 2, "{line}: expected two register operands");
+            for r in ops {
+                assert!(
+                    uses & (1u16 << r) != 0 && defs & (1u16 << r) != 0,
+                    "{line}: %{:?} must be BOTH read and written (uses={:09b} defs={:09b})",
+                    r,
+                    uses,
+                    defs
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_not_folded_when_esp_is_exchanged_in_the_window() {
+        // `xchg %esp, %ebx` renumbers every slot, but it is not a push/pop and
+        // its AT&T DESTINATION operand is %ebx -- a guard keyed on the
+        // classified destination register alone walks straight through it.
+        let bad = x87_stage("24(%esi)", "28(%esi)", "    xchg %esp, %ebx\n", "");
+        assert_not_folded(&bad, "%esp exchanged in the window");
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_not_folded_when_esp_is_exchanged_after_the_load() {
+        // After an unmodelled %esp change the post-condition's textual slot
+        // tracking no longer names the same physical bytes, so it cannot prove
+        // the slot dead: `movl 104(%esp), %eax` below may read exactly the bytes
+        // the deleted stores wrote.
+        let bad = x87_stage(
+            "24(%esi)",
+            "28(%esi)",
+            "",
+            "    faddp %st, %st(1)\n    xchg %esp, %ebx\n    movl 104(%esp), %eax\n    fstpl 4(%esp)\n",
+        );
+        assert_not_folded(&bad, "%esp exchanged after the load");
+    }
+
+    #[test]
+    fn x87_gp_pair_staging_not_folded_across_a_call() {
+        let bad = x87_stage("24(%esi)", "28(%esi)", "    call g\n", "");
+        assert_not_folded(&bad, "call in the window");
+        assert_folded(
+            &x87_stage("24(%esi)", "28(%esi)", "", ""),
+            "control",
+            "24(%esi)",
+        );
+    }
+
+    // ── fold_x87_gp_pair_unstaging ───────────────────────────────────────────
+    //
+    // The store-side mirror. Same framing as the load side: driven through the
+    // pass directly, the slot retired by an 8-byte `fstpl` (the shape the corpus
+    // actually has), and the pair redefined before the `ret` because `ret` is
+    // modelled as reading `%eax`.
+
+    /// Run only [`fold_x87_gp_pair_unstaging`] and return the surviving lines.
+    fn x87_unstage_lines(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<LineInfo> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        fold_x87_gp_pair_unstaging(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    /// The un-staging shape: an x87 pop into `4(%esp)`, the GP read-back, and the
+    /// two writes to `dest_lo`/`dest_hi`. `mid` sits between the x87 store and the
+    /// read-back (adjacency is condition 1); `tail` follows the stores and defaults
+    /// to retiring the slot, which is what the post-condition requires.
+    fn x87_unstage(fst: &str, dest_lo: &str, dest_hi: &str, mid: &str, tail: &str) -> String {
+        // Retired with two GP writes rather than another `fstpl 4(%esp)`: the
+        // retirement line would otherwise be textually identical to the staging
+        // store under test, and "the slot store is gone" would be unprovable.
+        let tail = if tail.is_empty() {
+            "    movl $0, 4(%esp)\n    movl $0, 8(%esp)\n"
+        } else {
+            tail
+        };
+        format!(
+            "f:\n    subl $24, %esp\n    fldl 32(%esi)\n    {fst} 4(%esp)\n{mid}\
+             movl 4(%esp), %eax\n    movl 8(%esp), %edx\n    movl %eax, {dest_lo}\n    \
+             movl %edx, {dest_hi}\n{tail}    xorl %eax, %eax\n    xorl %edx, %edx\n    \
+             addl $24, %esp\n    ret\n"
+        )
+    }
+
+    fn assert_unstaged(asm: &str, ctx: &str, want: &str) {
+        let out = x87_unstage_lines(asm);
+        assert!(
+            out.iter().any(|l| l == want),
+            "{ctx}: expected `{want}` in {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l == "movl 4(%esp), %eax"),
+            "{ctx}: the GP read-back must be gone: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|l| l.starts_with("fstpl 4(%esp)") || l.starts_with("fstl 4(%esp)")),
+            "{ctx}: the slot store must be gone: {out:?}"
+        );
+    }
+
+    fn assert_not_unstaged(asm: &str, ctx: &str) {
+        let out = x87_unstage_lines(asm);
+        assert!(
+            out.iter().any(|l| l == "fstpl 4(%esp)"),
+            "{ctx}: the x87 store must survive: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "movl 4(%esp), %eax")
+                && out.iter().any(|l| l == "movl 8(%esp), %edx"),
+            "{ctx}: the GP read-back must survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_folds_to_a_direct_memory_operand() {
+        assert_unstaged(
+            &x87_unstage("fstpl", "16(%ebx)", "20(%ebx)", "", ""),
+            "straight-line un-staging",
+            "fstpl 16(%ebx)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_folds_an_indexed_destination() {
+        assert_unstaged(
+            &x87_unstage("fstpl", "(%edi,%ecx,8)", "4(%edi,%ecx,8)", "", ""),
+            "SIB destination",
+            "fstpl (%edi,%ecx,8)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_folds_when_the_destination_is_another_slot() {
+        // 122 of the 247 corpus sites write the pair to a DIFFERENT %esp slot.
+        // That is foldable exactly when the two 8-byte ranges are disjoint.
+        assert_unstaged(
+            &x87_unstage("fstpl", "40(%esp)", "44(%esp)", "", ""),
+            "disjoint frame destination",
+            "fstpl 40(%esp)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_preserves_the_non_popping_form() {
+        // The rewrite changes the operand only, so `fstl` (which does not pop)
+        // must stay `fstl`: turning it into `fstpl` would silently drop an x87
+        // register.
+        assert_unstaged(
+            &x87_unstage("fstl", "16(%ebx)", "20(%ebx)", "", ""),
+            "non-popping store",
+            "fstl 16(%ebx)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_folds_across_a_loop_back_edge() {
+        // The slot is retired by the NEXT iteration's x87 store, so the
+        // post-condition has to follow the back edge.
+        let asm = concat!(
+            "f:\n",
+            "    subl $24, %esp\n",
+            "    xorl %ecx, %ecx\n",
+            ".Lloop:\n",
+            "    fldl (%esi,%ecx,8)\n",
+            "    fstpl 4(%esp)\n",
+            "    movl 4(%esp), %eax\n",
+            "    movl 8(%esp), %edx\n",
+            "    movl %eax, (%edi,%ecx,8)\n",
+            "    movl %edx, 4(%edi,%ecx,8)\n",
+            "    incl %ecx\n",
+            "    cmpl $10, %ecx\n",
+            "    jl .Lloop\n",
+            "    xorl %eax, %eax\n",
+            "    xorl %edx, %edx\n",
+            "    addl $24, %esp\n",
+            "    ret\n",
+        );
+        let out = x87_unstage_lines(asm);
+        assert!(
+            out.iter().any(|l| l == "fstpl (%edi,%ecx,8)"),
+            "the loop-carried site must fold: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l == "movl 4(%esp), %eax"),
+            "the GP read-back must be gone: {out:?}"
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_not_folded_when_the_destination_overlaps_the_slot() {
+        // `M = S+2`: the original leaves the pair's bytes at S+2..S+10, while
+        // `fstpl 6(%esp)` would write the same double in a different layout.
+        let bad = x87_unstage("fstpl", "6(%esp)", "10(%esp)", "", "");
+        assert_not_unstaged(&bad, "partially overlapping frame destination");
+        assert_unstaged(
+            &x87_unstage("fstpl", "40(%esp)", "44(%esp)", "", ""),
+            "control",
+            "fstpl 40(%esp)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_not_folded_when_the_pair_addresses_the_destination() {
+        // The write to `M` moves AHEAD of the loads that define the pair, so a
+        // destination addressed by the pair would use a stale register.
+        let bad = x87_unstage("fstpl", "(%eax)", "4(%eax)", "", "");
+        assert_not_unstaged(&bad, "destination addressed by %eax");
+        assert_unstaged(
+            &x87_unstage("fstpl", "(%ebx)", "4(%ebx)", "", ""),
+            "control",
+            "fstpl (%ebx)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_not_folded_to_an_ebp_destination() {
+        let bad = x87_unstage("fstpl", "16(%ebp)", "20(%ebp)", "", "");
+        assert_not_unstaged(&bad, "%ebp destination");
+        assert_unstaged(
+            &x87_unstage("fstpl", "16(%ebx)", "20(%ebx)", "", ""),
+            "control",
+            "fstpl 16(%ebx)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_not_folded_when_the_slot_is_read_again() {
+        // After the fold nothing ever writes the slot, so a surviving reader
+        // would see garbage.
+        let bad = x87_unstage(
+            "fstpl",
+            "16(%ebx)",
+            "20(%ebx)",
+            "",
+            "    fldl 4(%esp)\n    fstpl 4(%esp)\n",
+        );
+        assert_not_unstaged(&bad, "slot read before it is retired");
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_not_folded_when_the_pair_is_still_live() {
+        // Both read-back loads are deleted, so the pair has to be dead after the
+        // stores. `addl %eax, %ecx` reads %eax and writes no memory, which keeps
+        // this attributable to the liveness condition and not to the
+        // post-condition.
+        let bad = x87_unstage(
+            "fstpl",
+            "16(%ebx)",
+            "20(%ebx)",
+            "",
+            "    addl %eax, %ecx\n    movl $0, 4(%esp)\n    movl $0, 8(%esp)\n",
+        );
+        assert_not_unstaged(&bad, "%eax still live after the stores");
+        assert_unstaged(
+            &x87_unstage("fstpl", "16(%ebx)", "20(%ebx)", "", ""),
+            "control",
+            "fstpl 16(%ebx)",
+        );
+    }
+
+    #[test]
+    fn x87_gp_pair_unstaging_not_folded_when_the_sequence_is_not_adjacent() {
+        // A label between the x87 store and the read-back means something can
+        // branch into the middle of the sequence.
+        let bad = x87_unstage("fstpl", "16(%ebx)", "20(%ebx)", ".Lmid:\n", "");
+        assert_not_unstaged(&bad, "label inside the sequence");
+        assert_unstaged(
+            &x87_unstage("fstpl", "16(%ebx)", "20(%ebx)", "", ""),
+            "control",
+            "fstpl 16(%ebx)",
         );
     }
 }
