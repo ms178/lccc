@@ -155,8 +155,13 @@ impl I686Codegen {
                         self.emit_call_8byte_stack_arg(&args[i], ty, stack_offset);
                         stack_offset += 8;
                     } else {
-                        self.operand_to_eax(&args[i]);
-                        emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
+                        // A constant argument is stored directly; only operands
+                        // that genuinely need `%eax` take the two-instruction
+                        // path (see store_const_to_stack_arg).
+                        if !self.store_const_to_stack_arg(&args[i], stack_offset) {
+                            self.operand_to_eax(&args[i]);
+                            emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
+                        }
                         stack_offset += 4;
                     }
                 }
@@ -165,8 +170,10 @@ impl I686Codegen {
                 call_abi::CallArgClass::I64RegPair { .. } => {} // regparm: register pair
                 call_abi::CallArgClass::StructByValReg { .. } => {} // regparm: struct in registers
                 _ => {
-                    self.operand_to_eax(&args[i]);
-                    emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
+                    if !self.store_const_to_stack_arg(&args[i], stack_offset) {
+                        self.operand_to_eax(&args[i]);
+                        emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
+                    }
                     stack_offset += 4;
                 }
             }
