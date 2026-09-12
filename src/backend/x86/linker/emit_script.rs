@@ -3213,6 +3213,23 @@ fn link_with_script_machine(
             } else {
                 0u8
             };
+            // --emit-relocs: script-defined symbols are first-class
+            // relocation targets. The Linux kernel's realmode link
+            // (arch/x86/realmode/rm) defines every `pa_*` symbol in the
+            // linker script via pasyms.h and emits R_386_32 relocations
+            // against them; without this index entry each retained
+            // relocation fell back to STN_UNDEF with the value folded into
+            // the addend, the kernel's arch/x86/tools/relocs pass dropped
+            // the unnamed records (its do_reloc_real only whitelists named
+            // `^pa_` / S_LIN symbols), the trampoline header's absolute
+            // fields (text_start, ro_end, ...) stayed at their link-time
+            // values, and set_real_mode_permissions computed
+            // `PAGE_ALIGN(ro_end) - __pa(base)` with a size_t underflow —
+            // numpages wrapped to a giant unsigned value and the CPA pass
+            // read-only-ified the ENTIRE direct map until it faulted
+            // writing its own split page-table pages (6.18.50 boot death
+            // in init_real_mode).
+            global_sym_index.insert(name.clone(), symtab.len() as u32);
             add_sym_vis(
                 machine,
                 name,

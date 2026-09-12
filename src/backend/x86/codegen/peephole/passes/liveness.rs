@@ -374,6 +374,38 @@ impl FileLiveness {
         None
     }
 
+    /// The prologue's `# LCCC_RET_RAX 0|1` marker (see `prologue.rs`):
+    /// whether `%rax` is read by this function's `ret`s at all. Void and
+    /// pure-SSE/x87-returning functions publish 0; every integer, pointer,
+    /// struct (in-register or sret), and I128 return publishes 1. `Some`
+    /// (either way) is authoritative; `None` means absent (hand-written
+    /// fragments, unit tests) — the caller keeps the conservative
+    /// RET_LIVE. Same scan contract as `ret_rdx_marker`.
+    pub(super) fn ret_rax_marker(
+        store: &LineStore,
+        infos: &[LineInfo],
+        start: usize,
+        end: usize,
+    ) -> Option<bool> {
+        for n in start..end {
+            if infos[n].is_nop() {
+                continue;
+            }
+            let t = infos[n].trimmed(store.get(n));
+            if let Some(m) = t.strip_prefix("# LCCC_RET_RAX ") {
+                match m.trim() {
+                    "1" => return Some(true),
+                    "0" => return Some(false),
+                    _ => {} // illegible: keep looking, then fall back
+                }
+            }
+            if infos[n].kind == LineKind::Ret {
+                break;
+            }
+        }
+        None
+    }
+
     #[expect(clippy::needless_range_loop)]
     fn analyse_function(
         &mut self,
@@ -399,6 +431,17 @@ impl FileLiveness {
                     RET_LIVE
                 }
             }
+        };
+        // The RAX marker governs the `%rax` bit the same way: a void or
+        // pure-SSE/x87-returning function reads NOTHING from the
+        // accumulator at `ret` (the SysV psABI only defines %rax's value at
+        // the call boundary for integer/sret returns), so dropping it is
+        // sound and unlocks the copy-folding of the RA's phi-convergence
+        // copies into %rax in exactly those functions. Absent marker (or
+        // illegible) keeps the conservative live bit.
+        let ret_live = match Self::ret_rax_marker(store, infos, start, end) {
+            Some(false) => ret_live & !RAX,
+            _ => ret_live,
         };
         // ── labels ───────────────────────────────────────────────────────────
         let mut labels: Vec<(String, usize)> = Vec::new();
@@ -427,11 +470,42 @@ impl FileLiveness {
             }
             lines.push(n);
         }
+
+        // ── jump-table dispatch resolution ─────────────────────────────────
+        // The codegen lowers dense integer switches to exactly:
+        //     leaq .LjtN(%rip), %rcx
+        //     movslq (%rcx,%rax,4), %rdx
+        //     addq %rcx, %rdx
+        //     jmpq *%rdx
+        // with the table emitted INLINE as an interleaved .rodata island:
+        //     .LjtN: .long .LBBa - .LjtN   (× k entries)
+        // A `jmpq *` is generically unresolvable, and ONE such line marks
+        // the whole function unanalysable — silently disabling every
+        // liveness-gated transform in it. The sqlite_varint / glibc_memcmp
+        // switch shapes lost 2–4 instructions per arm exactly this way
+        // (movzbl+movq+movb chains that fold fine in jump-table-free
+        // functions). The TABLE is static data in the same file, so the
+        // successor set is exactly the table's target labels: resolving
+        // it keeps the function fully analysable. Any OTHER indirect
+        // jump (computed goto, tail call through a register) still
+        // refuses analysis.
+        let jump_table_succs: Vec<Option<Vec<usize>>> =
+            Self::resolve_jump_tables(store, infos, &lines, &labels, start, end);
         for (pos, &n) in lines.iter().enumerate() {
             let t = infos[n].trimmed(store.get(n));
             let next = lines.get(pos + 1).copied();
             let rel = n - start;
-            let (eff, edges) = match self.classify(store, infos, n, t, &resolve, next, ret_live) {
+            let (eff, edges) = match self.classify(
+                store,
+                infos,
+                n,
+                t,
+                &resolve,
+                next,
+                ret_live,
+                &jump_table_succs,
+                start,
+            ) {
                 Some(v) => v,
                 None => return, // unanalysable control flow: leave `known` false
             };
@@ -475,6 +549,135 @@ impl FileLiveness {
         }
     }
 
+    /// Resolve the codegen's jump-table dispatch sites to their static
+    /// successor sets. Returns a slot per line (`None` = not a resolved
+    /// table dispatch). See the call site for the shape being matched:
+    /// `leaq .LjtN(%rip), %rB; movslq (%rB,%rA,4), %rT; addq %rB, %rT;
+    /// jmpq *%rT` with the table `.LjtN: .long target - .LjtN …` emitted
+    /// inline. The match is deliberately exact: a computed goto or a tail
+    /// call sharing a register with a nearby leaq must NOT be mistaken
+    /// for a table (that would invent CFG edges).
+    fn resolve_jump_tables(
+        store: &LineStore,
+        infos: &[LineInfo],
+        lines: &[usize],
+        labels: &[(String, usize)],
+        start: usize,
+        end: usize,
+    ) -> Vec<Option<Vec<usize>>> {
+        let mut out: Vec<Option<Vec<usize>>> = vec![None; end.saturating_sub(start)];
+        let resolve = |name: &str| -> Option<usize> {
+            labels.iter().find(|(l, _)| l == name).map(|&(_, idx)| idx)
+        };
+        for (pos, &n) in lines.iter().enumerate() {
+            if infos[n].kind != LineKind::JmpIndirect {
+                continue;
+            }
+            let t = infos[n].trimmed(store.get(n));
+            // `jmpq *%rT` — take the target register.
+            let Some(target_reg) = t.strip_prefix("jmpq *") else {
+                continue;
+            };
+            // The two preceding instructions must be `addq %rB, %rT` and
+            // `movslq (%rB,%rA,4), %rT`.
+            let (Some(add_idx), Some(mov_idx)) = (pos.checked_sub(1), pos.checked_sub(2)) else {
+                continue;
+            };
+            let add_t = infos[lines[add_idx]].trimmed(store.get(lines[add_idx]));
+            let mov_t = infos[lines[mov_idx]].trimmed(store.get(lines[mov_idx]));
+            let Some(add_rest) = add_t.strip_prefix("addq ") else {
+                continue;
+            };
+            let (Some(base_reg), Some(add_dst)) = (
+                add_rest.split_once(',').map(|(b, _)| b.trim()),
+                add_rest.split_once(',').map(|(_, d)| d.trim()),
+            ) else {
+                continue;
+            };
+            if add_dst != target_reg {
+                continue;
+            }
+            let Some(mov_rest) = mov_t.strip_prefix("movslq (") else {
+                continue;
+            };
+            let Some(close) = mov_rest.find(')') else {
+                continue;
+            };
+            let mem = &mov_rest[..close];
+            // `(%rB,%rA,4)` — the base must match the addq base.
+            let parts: Vec<&str> = mem.split(',').map(str::trim).collect();
+            if parts.len() != 3 || parts[0] != base_reg || parts[2] != "4" {
+                continue;
+            }
+            let mov_dst = mov_rest[close + 1..].trim_start_matches(',').trim();
+            if mov_dst != target_reg {
+                continue;
+            }
+            // Third preceding instruction: `leaq .LjtN(%rip), %rB`.
+            let Some(lea_idx) = pos.checked_sub(3) else {
+                continue;
+            };
+            let lea_t = infos[lines[lea_idx]].trimmed(store.get(lines[lea_idx]));
+            let Some(lea_rest) = lea_t.strip_prefix("leaq ") else {
+                continue;
+            };
+            let Some((lea_op, lea_dst)) = lea_rest.split_once(',') else {
+                continue;
+            };
+            if lea_dst.trim() != base_reg {
+                continue;
+            }
+            let lea_op = lea_op.trim();
+            let Some(table_name) = lea_op.strip_suffix("(%rip)") else {
+                continue;
+            };
+            // Find the table label in the function and parse its .long
+            // entries. The table island sits between the dispatch and the
+            // arm labels (interleaved sections), still inside
+            // [start, end). Directives are skipped from `lines`, so scan
+            // the RAW line range for the label.
+            let Some(&(_, tbl_line)) = labels.iter().find(|(l, _)| l == table_name) else {
+                continue;
+            };
+            let mut targets: Vec<usize> = Vec::new();
+            let mut k = tbl_line + 1;
+            let mut ok = true;
+            while k < end {
+                if infos[k].is_nop() {
+                    k += 1;
+                    continue;
+                }
+                let kt = infos[k].trimmed(store.get(k));
+                if let Some(entry) = kt.strip_prefix(".long ") {
+                    // `.long .LBBa - .LjtN` (the subtractand is the table
+                    // itself; accept the plain `.long .LBBa` spelling too).
+                    let sym = entry.split('-').next().unwrap_or(entry).trim();
+                    match resolve(sym) {
+                        Some(idx) => targets.push(idx),
+                        None => {
+                            ok = false;
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                    k += 1;
+                    continue;
+                }
+                if kt.starts_with('.') {
+                    // `.section .text`, `.align` — table island boundaries.
+                    break;
+                }
+                break;
+            }
+            if !ok || targets.is_empty() {
+                continue;
+            }
+            out[n - start] = Some(targets);
+        }
+        out
+    }
+
     /// Effects and successors of one instruction, or `None` when the control
     /// transfer cannot be resolved.
     fn classify(
@@ -486,6 +689,8 @@ impl FileLiveness {
         resolve: &dyn Fn(&str) -> Option<usize>,
         next: Option<usize>,
         ret_live: u16,
+        jump_table_succs: &[Option<Vec<usize>>],
+        jump_table_base: usize,
     ) -> Option<(Effect, Vec<usize>)> {
         let mentioned = infos[n].reg_refs;
         let fall: Vec<usize> = next.into_iter().collect();
@@ -517,14 +722,50 @@ impl FileLiveness {
                 },
                 Vec::new(),
             )),
-            LineKind::Call => Some((
-                Effect {
-                    reads: CALL_READS | mentioned,
-                    writes: CALLER_SAVED,
-                },
-                fall,
-            )),
-            LineKind::JmpIndirect => None,
+            LineKind::Call => {
+                // A VARIADIC callee reads %rax (the live SSE register count
+                // in %al — SysV AMD64 3.5.7); a prototyped non-variadic
+                // callee reads nothing from the accumulator. The codegen
+                // marks every variadic site with `# LCCC_VA_CALL`
+                // immediately after the call text (same authority contract
+                // as the `# LCCC_RET_*` prologue markers): absent marker ⇒
+                // the accumulator is unread here. Dropping the false read
+                // unlocks copy/extension folding up to the call in every
+                // non-variadic caller (the gzip_crc32 harness kept
+                // `movzbl+movq+movb` chains live solely on it).
+                let variadic = (n + 1..(n + 3).min(infos.len())).any(|k| {
+                    !infos[k].is_nop()
+                        && infos[k].trimmed(store.get(k)).starts_with("# LCCC_VA_CALL")
+                });
+                let reads = if variadic {
+                    CALL_READS | mentioned
+                } else {
+                    (CALL_READS & !RAX) | mentioned
+                };
+                Some((
+                    Effect {
+                        reads,
+                        writes: CALLER_SAVED,
+                    },
+                    fall,
+                ))
+            }
+            LineKind::JmpIndirect => {
+                // A resolved jump-table dispatch: successors are the table's
+                // target labels (see `resolve_jump_tables`). The dispatch
+                // registers are ordinary instructions classified on their
+                // own lines; this line only reads the target register.
+                if let Some(Some(targets)) = jump_table_succs.get(n - jump_table_base) {
+                    return Some((
+                        Effect {
+                            reads: mentioned,
+                            writes: 0,
+                        },
+                        targets.clone(),
+                    ));
+                }
+                None
+            }
             LineKind::Jmp => {
                 let target = t.split_whitespace().nth(1)?;
                 if target.starts_with('*') {
@@ -621,6 +862,30 @@ impl FileLiveness {
                         let full = dst_text == name64 || dst_text == name32;
                         if !src_reads_dest && full {
                             reads &= !bit;
+                        }
+                    } else if t.starts_with("xor") {
+                        // `xor{l,q} %rX, %rX` — a self-xor is a ZERO: the
+                        // result is independent of the old value, so a
+                        // full-width one reads nothing (the partial w/b
+                        // forms still preserve the upper bits and stay
+                        // conservative). The plain pure-write path cannot
+                        // express this: its source mentions the destination
+                        // by construction. This is the idiomatic %al=0
+                        // before variadic calls and every `xorl %eax,%eax`
+                        // zeroing — modelling them as reads pinned the
+                        // accumulator live across whole regions and blocked
+                        // every copy fold feeding a later zeroing.
+                        let ops = t.split_once(' ').and_then(|(_, rest)| {
+                            rest.split_once(',').map(|(a, b)| (a.trim(), b.trim()))
+                        });
+                        if let Some((a, b)) = ops {
+                            if a == b {
+                                let name64 = REG_NAMES[0][dest as usize];
+                                let name32 = REG_NAMES[1][dest as usize];
+                                if a == name64 || a == name32 {
+                                    reads &= !bit;
+                                }
+                            }
                         }
                     }
                 }

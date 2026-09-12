@@ -544,46 +544,14 @@ impl super::InstructionEncoder {
         self.apx_nf || self.apx_evex
     }
 
-    /// Emit segment override prefix (0x64 for %fs, 0x65 for %gs) if present.
-    /// Must be emitted before any operand-size override, REX prefix, or opcode.
-    // TODO: emit_segment_prefix is called in mov, ALU ops, push, and pop.
-    // Other instruction families that accept memory operands should also call this.
-    pub(crate) fn emit_segment_prefix(&mut self, mem: &MemoryOperand) -> Result<(), String> {
-        if let Some(ref seg) = mem.segment {
-            // All six segment override prefixes. In 64-bit mode only fs/gs
-            // change the effective address, but cs/ds/es/ss overrides remain
-            // legal encodings that appear in real code (the canonical long
-            // NOPs carry a %cs prefix), so refusing them rejected valid input.
-            let byte = match seg.as_str() {
-                "es" => Some(0x26u8),
-                "cs" => Some(0x2E),
-                // %ds is the default segment for every addressing form in
-                // 64-bit mode, so an explicit override is a pure no-op and GAS
-                // drops it.  %ss is NOT dropped: even though it selects the
-                // same flat segment, GAS still emits 0x36, and hardware treats
-                // the prefix as significant for a few corner cases (it is also
-                // the documented spelling of the CET no-track prefix).
-                // Verified against GAS 2.47: `mov %ds:8(%rax),%rbx` -> 48 8b 58
-                // 08, `mov %ss:8(%rax),%rbx` -> 36 48 8b 58 08.
-                "ds" => None,
-                "ss" => Some(0x36),
-                "fs" => Some(0x64),
-                "gs" => Some(0x65),
-                _ => return Err(format!("unsupported segment override: %{}", seg)),
-            };
-            if let Some(b) = byte {
-                // The segment override is the OUTERMOST legacy prefix: it must
-                // precede an operand-size (0x66) or address-size (0x67) prefix
-                // that an earlier stage may already have emitted.
-                let mut at = self.bytes.len();
-                while at > 0 && matches!(self.bytes[at - 1], 0x66 | 0x67) {
-                    at -= 1;
-                }
-                self.bytes.insert(at, b);
-            }
-        }
-        Ok(())
-    }
+    // Segment overrides are emitted ONCE at the instruction start by
+    // `InstructionEncoder::encode` (see the operand-scan block there); no
+    // per-arm emission exists anymore. The historical per-arm calls were the
+    // defect class: `mov`/ALU/push/pop carried the override while shifts,
+    // bt, cmpxchg, x87, SSE and every VEX memory form silently dropped it
+    // (kernel 6.18.50 "corrupted preempt_count" boot death). The full
+    // instruction × segment matrix is byte-diffed against GNU as by
+    // tests/regression/check_seg_prefix_full_matrix.sh.
 
     /// Emit REX prefix for a memory operand where 'reg' is the reg field.
     pub(crate) fn emit_rex_rm(&mut self, size: u8, reg: &str, mem: &MemoryOperand) {

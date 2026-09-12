@@ -137,7 +137,7 @@ impl InstructionEncoder {
         // against the reference assembler and breaks tools (including kernel
         // alternatives patchers) that assume the canonical form. Encode the
         // body first, then splice the group-1 prefix into its correct slot.
-        let group1: Option<u8> = match instr.prefix.as_deref() {
+        let mut group1: Option<u8> = match instr.prefix.as_deref() {
             None => None,
             Some("lock") => Some(0xF0),
             Some("rep") | Some("repz") | Some("repe") => Some(0xF3),
@@ -156,6 +156,81 @@ impl InstructionEncoder {
         };
 
         let reloc_base = self.relocations.len();
+
+        // ── Operand segment override: emitted ONCE, here, at the single
+        // choke point every instruction passes through. ────────────────────
+        //
+        // GAS places the segment override as the OUTERMOST legacy prefix
+        // (verified against GNU as 2.44 byte-for-byte across the whole
+        // memory-operand instruction matrix: `65 66 0f 6e 00` movd,
+        // `65 f2 0f 58 08` addsd, `65 f0 48 ff 00` lock incq, `65 c5 fd 6f
+        // 00` vmovdqa, `65 67 41 8b 40 40` addr32+REX — the override always
+        // precedes 0x66/0x67, F0/F2/F3, REX, and the VEX/EVEX prefix).
+        //
+        // Historically each encoder arm called `emit_segment_prefix` itself
+        // — and the class of "arm forgets the call" defects was OPEN for
+        // years (the kernel's per-CPU RMW family, every SSE load/store, all
+        // VEX memory forms, and the regular cmpxchg dropped %gs: silently;
+        // 6.18.50 died at PID 1 with "corrupted preempt_count"). Scanning
+        // the instruction's operands here is TOTAL: `mem.segment` is set by
+        // the parser only, no encoder synthesizes a segmented memory
+        // operand, and the byte is pushed before the body starts, so no
+        // body emission can precede it and no relocation fixup is needed.
+        // A standalone segment prefix (`gs movl ...`) deduplicates against
+        // the same override byte on the operand below.
+        //
+        // `%ds` is dropped exactly like GAS 64-bit (the default segment, a
+        // pure no-op override); ES/CS/SS remain encodable like GAS emits
+        // them (canonical long NOPs carry %cs).
+        let mut operand_seg: Option<u8> = None;
+        for op in &instr.operands {
+            if let Operand::Memory(mem) = op {
+                if let Some(seg) = &mem.segment {
+                    operand_seg = match seg.as_str() {
+                        "es" => Some(0x26),
+                        "cs" => Some(0x2E),
+                        // %ds is the default segment for every addressing
+                        // form in 64-bit mode: an explicit override is a
+                        // pure no-op and GAS drops it
+                        // (`mov %ds:8(%rax),%rbx` -> 48 8b 58 08).
+                        // %ss is NOT dropped: even though it selects the
+                        // same flat segment, GAS still emits 0x36, and
+                        // hardware treats the prefix as significant in a
+                        // few corner cases (it is also in the documented
+                        // CET no-track prefix's neighborhood). GAS
+                        // 2.47-verified.
+                        "ds" => None,
+                        "ss" => Some(0x36),
+                        "fs" => Some(0x64),
+                        "gs" => Some(0x65),
+                        other => return Err(format!("unsupported segment override: %{}", other)),
+                    };
+                    break;
+                }
+            }
+        }
+        if let Some(b) = operand_seg {
+            // Deduplicate the standalone form: an operand-less
+            // `gs movl (%eax),%eax` and an operand-carrying
+            // `movl %gs:(%eax),%eax` must both encode exactly one 0x65.
+            // A CONFLICTING standalone override (prefix "gs" on an
+            // instruction whose memory operand says %fs) is rejected —
+            // emitting only one of the two would silently drop the other
+            // (notrack, 0x3E, is exempt: it is a hint prefix, not a
+            // segment override, and GAS orders it after the segment).
+            match group1 {
+                Some(g) if g == b => group1 = None,
+                Some(g @ (0x26 | 0x2E | 0x36 | 0x64 | 0x65)) => {
+                    return Err(format!(
+                        "conflicting segment overrides: prefix byte {:#x} vs operand byte {:#x}",
+                        g, b
+                    ));
+                }
+                _ => {}
+            }
+            self.bytes.push(b);
+        }
+
         let mut result = self.encode_mnemonic(instr);
         if result.is_ok() {
             result = self.fixup_rex2_map1(start_len);
@@ -812,6 +887,10 @@ impl InstructionEncoder {
             // LEA
             "leaq" => self.encode_lea(ops, 8),
             "leal" => self.encode_lea(ops, 4),
+            // 16-bit LEA is a legal GAS form (66 8d 08 for
+            // `leaw (%rax),%cx`); routing it through the same encoder
+            // covers the kernel's mixed-width address arithmetic.
+            "leaw" => self.encode_lea(ops, 2),
 
             // Stack ops
             "pushq" | "pushl" => self.encode_push(ops),
@@ -1940,7 +2019,6 @@ impl InstructionEncoder {
                         // raw low memory instead of the per-CPU area, the
                         // cmpxchg never matched, and the SLUB fastpath
                         // spun forever (boot stalled after pid_max).
-                        self.emit_segment_prefix(mem)?;
                         self.emit_rex_rm(8, "", mem); // REX.W
                         self.bytes.extend_from_slice(&[0x0F, 0xC7]);
                         self.encode_modrm_mem(1, mem)
@@ -2110,6 +2188,21 @@ impl InstructionEncoder {
             "vcvtsi2sdq" => self.encode_avx_cvt_from_gp(ops, 0x2A, 3, 1),
             "vcvtsi2ssl" => self.encode_avx_cvt_from_gp(ops, 0x2A, 2, 0),
             "vcvtsi2ssq" => self.encode_avx_cvt_from_gp(ops, 0x2A, 2, 1),
+            // Unsuffixed spellings are legal GAS: VEX.W comes from the
+            // actual source — a 64-bit register selects W1, a 32-bit
+            // register or a memory operand (no width of its own) selects
+            // the 32-bit W0 form (GAS: `vcvtsi2sd (%rax),%xmm1,%xmm2`
+            // -> c5 f3 2a 10).
+            "vcvtsi2sd" => {
+                let w = u8::from(matches!(&ops.first(), Some(Operand::Register(r))
+                    if is_reg64(&r.name)));
+                self.encode_avx_cvt_from_gp(ops, 0x2A, 3, w)
+            }
+            "vcvtsi2ss" => {
+                let w = u8::from(matches!(&ops.first(), Some(Operand::Register(r))
+                    if is_reg64(&r.name)));
+                self.encode_avx_cvt_from_gp(ops, 0x2A, 2, w)
+            }
             // Conditional vector load/store.
             "vmaskmovps" => self.encode_avx_maskmov(ops, 0x2C, 0x2E, 0),
             "vmaskmovpd" => self.encode_avx_maskmov(ops, 0x2D, 0x2F, 0),
@@ -2945,7 +3038,6 @@ impl InstructionEncoder {
                 }
                 match &ops[0] {
                     Operand::Memory(mem) => {
-                        self.emit_segment_prefix(mem)?;
                         self.emit_rex_rm(0, "", mem);
                         self.bytes.extend_from_slice(&[0x0F, 0xC7]);
                         self.encode_modrm_mem(1, mem)

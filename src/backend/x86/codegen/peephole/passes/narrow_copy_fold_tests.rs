@@ -112,6 +112,10 @@ fn a_32_bit_self_move_survives_across_a_call() {
 fn a_32_bit_copy_folds_into_a_32_bit_compare() {
     // The byte-scan shape: a load already zero-extends, so the Cast that
     // follows is a register move whose destination dies at the compare.
+    // (The self-xor that closes the function reads nothing, so the LOAD's
+    // destination dies together with the copy: the fold retargets the load
+    // into the copy's home %esi and the compare keeps its own operand —
+    // the copy is gone either way, one value fewer in flight.)
     let out = run(&f(concat!(
         "    movzbl (%rdi), %eax\n",
         "    movl %eax, %esi\n",
@@ -123,8 +127,8 @@ fn a_32_bit_copy_folds_into_a_32_bit_compare() {
     )));
     assert_eq!(count(&out, "movl %eax, %esi"), 0, "copy must go:\n{}", out);
     assert!(
-        out.contains("cmpl %r8d, %eax"),
-        "use must retarget:\n{}",
+        out.contains("movzbl (%rdi), %esi") && out.contains("cmpl %r8d, %esi"),
+        "load must fold into the surviving home:\n{}",
         out
     );
 }
@@ -560,4 +564,55 @@ fn a_copy_out_of_rax_folds_across_cqto_which_only_reads_it() {
         "use must retarget at the copy source:\n{}",
         out
     );
+}
+
+// ── C. extension folding (movz/movs feeding narrower consumers) ─────────────
+
+#[test]
+fn movzbl_feeding_only_a_byte_store_folds_onto_the_source_lane() {
+    // The oracle shape (GCC: `buf[i] = (uint8_t)(x >> 24)`):
+    //   shrl $24, %edi; movzbl %dil, %r9d; movb %r9b, (%rcx,%rsi)
+    // must become
+    //   shrl $24, %edi; movb %dil, (%rcx,%rsi)
+    // The extension's upper bits are its own product; the low byte is the
+    // source lane bit-for-bit, and the store reads only that lane.
+    let out = run(&f(
+        "    shrl $24, %edi\n    movzbl %dil, %r9d\n    movb %r9b, (%rcx, %rsi)\n    ret",
+    ));
+    assert_eq!(count(&out, "movzbl"), 0, "{}", out);
+    assert_eq!(count(&out, "movb %r9b"), 0, "{}", out);
+    assert_eq!(count(&out, "movb %dil, (%rcx, %rsi)"), 1, "{}", out);
+}
+
+#[test]
+fn movzbl_survives_when_a_wide_read_consumes_the_extension() {
+    // SOUNDNESS: a 32-bit read of the extension result needs the
+    // zero-extended bits; the fold must refuse.
+    let out = run(&f(
+        "    shrl $24, %edi\n    movzbl %dil, %r9d\n    movl %r9d, %eax\n    ret",
+    ));
+    assert_eq!(count(&out, "movzbl"), 1, "{}", out);
+}
+
+#[test]
+fn movzbl_with_rip_relative_byte_store_folds() {
+    // f() shape: movzbl %dil, %esi; movb %sil, buf+3(%rip) -> movb %dil, ...
+    let out = run(&f(
+        "    shrl $24, %edi\n    movzbl %dil, %esi\n    movb %sil, buf+3(%rip)\n    ret",
+    ));
+    assert_eq!(count(&out, "movzbl"), 0, "{}", out);
+    assert_eq!(count(&out, "movb %dil, buf+3(%rip)"), 1, "{}", out);
+}
+
+#[test]
+fn ext_parse_shapes_unit() {
+    use super::parse_reg_to_reg_ext;
+    assert!(parse_reg_to_reg_ext("movzbl %dil, %r9d").is_some());
+    assert!(parse_reg_to_reg_ext("movsbq %sil, %rax").is_some());
+    assert!(parse_reg_to_reg_ext("movzwl %si, %edi").is_some());
+    // Non-extensions and look-alikes.
+    assert!(parse_reg_to_reg_ext("movsd %xmm0, (%rax)").is_none());
+    assert!(parse_reg_to_reg_ext("movss %xmm0, %xmm1").is_none());
+    assert!(parse_reg_to_reg_ext("movl %eax, %ecx").is_none());
+    assert!(parse_reg_to_reg_ext("rep movsb").is_none());
 }

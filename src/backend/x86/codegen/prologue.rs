@@ -924,6 +924,7 @@ impl X86Codegen {
             self.cmp_replay_operand_links = replay_scan.operand_links;
             self.cmp_replay = replay_scan.replay;
             self.cmp_replay_multi = replay_scan.replay_multi;
+            self.cmp_replay_gaps = replay_scan.replay_gaps;
             // FP-SELECT (S05): float Cmps whose boolean feeds only Selects.
             // The Cmp emitter skips the ucomisd/setcc boolean entirely; every
             // select re-derives a vcmpsd/vcmpss mask from the recorded
@@ -1479,6 +1480,97 @@ impl X86Codegen {
         //     spill slot (every non-never-materialized value gets one).
         //     never-materialized values have no home at all: reading one at
         //     the replay would consume stale register/slot state — prune.
+
+        // ── Replay-family emission-gap audit (home soundness) ───────────────
+        //
+        // A register-homed replay operand was historically declared
+        // readable on the strength of the folded-index interval extension:
+        // "live at the consumer ⇒ the home survives". That implication is
+        // FALSE when a coalesce sibling sharing the register is DEFINED
+        // inside the emission gap. The RA's latch/phi-web exemptions
+        // deliberately allow a Select result and its loop-carried
+        // accumulator to share one register (the latch copy IS the value
+        // transition), so the select's own cmov legitimately overwrites
+        // the shared home while the accumulator is still live for a LATER
+        // consumer — a second select re-emitting the compare reads the
+        // operand AFTER the sibling's definition. The read then panics
+        // ("no register, stack slot, Copy, or GlobalAddr definition") or,
+        // where a def-chain chase happens to succeed, silently compares
+        // the WRONG value (kernel 6.18.50 kernel/irq/affinity.c
+        // get_pcore_mask: {v2345, v237} shared r15; the second min/max
+        // select's replay died on the first select's cmov). Calls in the
+        // gap invalidate caller-saved homes the same way (Phase-2b spans
+        // normally cover call-crossing values; the check stays as local,
+        // cheap belt-and-braces).
+        //
+        // The audit walks the gap positions recorded by the scan (see
+        // CmpReplayScan::replay_gaps) and prunes any record whose
+        // register-homed operand can be re-written inside the gap; the Cmp
+        // then materializes its boolean at its own position — always
+        // correct, one instruction more. Sibling "definitions" are
+        // over-approximated: a gap instruction's DEST counts even when its
+        // emission is itself skipped (a replayed Cmp) — over-pruning only
+        // loses the optimization, never correctness. RA interference makes
+        // a non-exemption sibling def inside the gap impossible (V live at
+        // the consumer spans the whole gap), so the check fires exactly on
+        // the exemption-granted shapes it exists for.
+        let reg_def_sites: crate::common::fx_hash::FxHashMap<u32, Vec<(usize, usize)>> = {
+            let mut sites: crate::common::fx_hash::FxHashMap<u32, Vec<(usize, usize)>> =
+                crate::common::fx_hash::FxHashMap::default();
+            for (bi, block) in func.blocks.iter().enumerate() {
+                for (ii, inst) in block.instructions.iter().enumerate() {
+                    if let Some(d) = inst.dest() {
+                        sites.entry(d.0).or_default().push((bi, ii));
+                    }
+                }
+            }
+            sites
+        };
+        let home_invalidated_in_gap = |op: &Operand, gap: Option<&(usize, usize, usize)>| -> bool {
+            let (Operand::Value(v), Some(&(bi, ci, li))) = (op, gap) else {
+                return false;
+            };
+            let Some(&phys) = self.reg_assignments.get(&v.0) else {
+                // Slot-homed or homeless: the readability closures
+                // above already decided those.
+                return false;
+            };
+            // (a) Call in the gap on a caller-saved home. The
+            // callee-saved GPR bank is PhysReg 1..=6 (rbx, r12-r15,
+            // rbp); every other allocatable bank — r8-r11/rdi/rsi/rdx,
+            // XMM 20..=33, APX EGPR 40..=55 — is caller-saved.
+            if !(1..=6).contains(&phys.0) {
+                if let Some(block) = func.blocks.get(bi) {
+                    if let Some(mid) = block.instructions.get(ci + 1..li) {
+                        for inst in mid {
+                            if matches!(
+                                inst,
+                                crate::ir::reexports::Instruction::Call { .. }
+                                    | crate::ir::reexports::Instruction::InlineAsm { .. }
+                            ) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            // (b) A coalesce sibling sharing this register is defined
+            // inside the gap: its home write (definition, cmov,
+            // in-place compute) evicts every live sharer.
+            if let Some(sharers) = self.home_sharers.get(&phys.0) {
+                for &w in sharers {
+                    if w == v.0 {
+                        continue;
+                    }
+                    if reg_def_sites.get(&w).is_some_and(|sites| {
+                        sites.iter().any(|&(b, i)| b == bi && i > ci && i < li)
+                    }) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
         {
             let ext_active = !self.state.ra_config.no_folded_index_liveness;
             // The RA-verified accumulator assignments: single-use values
@@ -1524,6 +1616,18 @@ impl X86Codegen {
                 };
                 if !readable(lhs) || !readable(rhs) {
                     prune.push(*cdest);
+                    continue;
+                }
+                // Register-homed operands that survived the readability
+                // closure still need the gap audit: a coalesce sibling
+                // defined between the Cmp and the last consumer rewrites
+                // the shared home out from under the replay.
+                let gap = self.cmp_replay_gaps.get(cdest);
+                if home_invalidated_in_gap(lhs, gap) || home_invalidated_in_gap(rhs, gap) {
+                    if std::env::var_os("LCCC_DEBUG_REPLAY").is_some() {
+                        eprintln!("[replay] gap-audit prune cdest={cdest} (home rewrite in gap)");
+                    }
+                    prune.push(*cdest);
                 }
             }
             for d in prune {
@@ -1563,6 +1667,15 @@ impl X86Codegen {
                         }
                     };
                     if !readable(lhs) || !readable(rhs) {
+                        prune_fp.push(*cdest);
+                        continue;
+                    }
+                    // Same gap audit as the integer replay: the blend
+                    // re-derivation reads the Cmp operands at the select
+                    // position, so a home rewrite inside the gap
+                    // (coalesce sibling / call) invalidates the record.
+                    let gap = self.cmp_replay_gaps.get(cdest);
+                    if home_invalidated_in_gap(lhs, gap) || home_invalidated_in_gap(rhs, gap) {
                         prune_fp.push(*cdest);
                     }
                 }
@@ -1970,7 +2083,16 @@ impl X86Codegen {
                 // replays, passthru skipped) or is the branch itself.
                 // Only the OPERAND readability above matters (an acc-only
                 // operand has no readable home at the replay distance).
-                if ops.iter().any(|op| !readable(op)) {
+                // The gap audit applies per-Cmp: cmpA's operands must
+                // survive from cmpA to the terminator, cmpB's from cmpB.
+                let gap_a = self.cmp_replay_gaps.get(&rec.cmp_dests[0]);
+                let gap_b = self.cmp_replay_gaps.get(&rec.cmp_dests[1]);
+                if ops.iter().any(|op| !readable(op))
+                    || home_invalidated_in_gap(&rec.a.1, gap_a)
+                    || home_invalidated_in_gap(&rec.a.2, gap_a)
+                    || home_invalidated_in_gap(&rec.b.1, gap_b)
+                    || home_invalidated_in_gap(&rec.b.2, gap_b)
+                {
                     if debug {
                         eprintln!("[demorgan] prune andor={}", andor_id);
                     }
@@ -2258,6 +2380,34 @@ impl X86Codegen {
         self.state.emit_fmt(format_args!(
             "    # LCCC_RET_RDX {}",
             u8::from(ret_rdx_live)
+        ));
+
+        // Publish whether `%rax` is read by `ret` AT ALL, so the late text
+        // peephole's GP liveness oracle need not keep the accumulator
+        // artificially live in void and FP-only functions. This is the
+        // same contract as the RDX marker above, and it unlocks a large
+        // copy-folding class: the RA's phi-convergence copies
+        // (`movq %r9, %rax` feeding one byte store) were unconditionally
+        // retained because RET_LIVE contains %rax and the text liveness
+        // cannot see the C signature. Oracle evidence: gcc's g() for
+        // `buf[i] = (uint8_t)(x >> 24)` stores `%dil` directly (4 insns)
+        // where lccc kept movzbl + movq + movb (6 insns).
+        //
+        // %rax is read by `ret` for every INTEGER/POINTER return, every
+        // in-register struct return (INTEGER class eightbytes land in the
+        // accumulator), every MEMORY-class struct return (the sret
+        // pointer must be returned in %rax per the SysV psABI), and
+        // I128/U128 (low half). It is read by NOBODY for Void returns and
+        // for pure-SSE / x87 returns (F32/F64/D32/D64 in %xmm0, F128 in
+        // %st0). Naked functions fail closed (live), as with RDX.
+        let ret_rax_live = func.is_naked
+            || !matches!(
+                func.return_type,
+                IrType::Void | IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64 | IrType::F128
+            );
+        self.state.emit_fmt(format_args!(
+            "    # LCCC_RET_RAX {}",
+            u8::from(ret_rax_live)
         ));
 
         if func.is_variadic {

@@ -221,7 +221,7 @@ fn i686_scale_bits(scale: u8) -> Result<u8, String> {
 }
 
 /// Segment-override prefix byte, exact lowercase spelling as parsed.
-fn i686_segment_prefix(segment: &str) -> Option<u8> {
+pub(super) fn i686_segment_prefix(segment: &str) -> Option<u8> {
     match segment {
         "es" => Some(0x26),
         "cs" => Some(0x2E),
@@ -250,7 +250,7 @@ fn i686_segment_prefix(segment: &str) -> Option<u8> {
 /// SS; 32-bit forms default to SS exactly for `%esp`/`%ebp` bases. Index-only
 /// and absolute forms default to DS. Verified against GNU as 2.44 for both
 /// `.code32` and `.code16` (including the 0x67 fallback inside `.code16`).
-fn i686_default_segment(base: Option<&str>, index: Option<&str>) -> u8 {
+pub(super) fn i686_default_segment(base: Option<&str>, index: Option<&str>) -> u8 {
     let default_ss = match base {
         Some("ebp" | "esp" | "bp") => true,
         Some(_) => false,
@@ -805,44 +805,14 @@ impl super::InstructionEncoder {
         (scale_bits << 6) | (index << 3) | base
     }
 
-    /// Emit a segment override before the instruction opcode.
-    ///
-    /// Mirrors GNU as: an override that names the addressing form's
-    /// default segment is dropped (`%ds` on `(%eax)`-based forms, `%ss`
-    /// on `%ebp`/`%esp`-based forms), anything else is emitted. The old
-    /// code always emitted `%ds` — one wasted byte per occurrence — and
-    /// the caller-side `mov` paths rejected `%ds`/`%ss`/`%es`/`%cs`
-    /// outright.
-    ///
-    /// The `()` interface cannot propagate diagnostics; the parser only
-    /// produces the six valid segment names, so a miss is a programming
-    /// error. Fail fast rather than silently omit an override.
-    pub(super) fn emit_segment_prefix(&mut self, mem: &MemoryOperand) {
-        let Some(segment) = &mem.segment else {
-            return;
-        };
-
-        let Some(prefix) = i686_segment_prefix(segment.as_str()) else {
-            panic!("invalid i686 segment override: {}", segment);
-        };
-
-        let default = i686_default_segment(
-            mem.base.as_ref().map(|reg| reg.name.as_str()),
-            mem.index.as_ref().map(|reg| reg.name.as_str()),
-        );
-
-        if prefix != default {
-            // The segment override is the OUTERMOST legacy prefix: it must
-            // precede an operand-size (0x66) or address-size (0x67) prefix
-            // that the caller may already have emitted for this instruction
-            // (GAS order: `26 66 8b 58 08` for `movw %es:8(%eax),%bx`).
-            let mut at = self.bytes.len();
-            while at > 0 && matches!(self.bytes[at - 1], 0x66 | 0x67) {
-                at -= 1;
-            }
-            self.bytes.insert(at, prefix);
-        }
-    }
+    // Segment overrides are emitted ONCE by `InstructionEncoder::encode`
+    // (the operand-scan splice in mod.rs) — no per-arm emission exists
+    // anymore. The per-arm calls were the open defect class (an arm that
+    // forgot the call silently dropped the override); the default-segment
+    // drop rule (SS default for ebp/esp/bp-based forms, DS otherwise,
+    // GAS-parity: `%ds` on `(%eax)`-based forms and `%ss` on
+    // `%ebp`/`%esp`-based forms are dropped) and the FWAIT ordering
+    // (`9b 26 67 d9 7f 08`) live there, GAS 2.44-verified.
 
     fn emit_i686_address_plan(
         &mut self,
@@ -1431,82 +1401,60 @@ mod i686_encoding_helper_tests {
         assert_eq!(i686_default_segment(None, Some("si")), 0x3E);
     }
 
+    fn encode_mov_from_segmented_mem(base: Option<&str>, segment: Option<&str>) -> Vec<u8> {
+        // `mov <seg>:8(%<base>), %eax` through the FULL encode() path, so
+        // the test exercises the dispatch-level operand-segment splice in
+        // mod.rs (the single emission point) rather than any per-arm call.
+        let mem = memory_operand(Displacement::Integer(8), base, None, None, segment);
+        let instr = Instruction {
+            prefix: None,
+            mnemonic: "movl".to_string(),
+            operands: vec![Operand::Memory(mem), Operand::Register(register("eax"))],
+            nf: false,
+            force_evex: false,
+            force_rex2: false,
+            dfv: 0,
+        };
+        let mut encoder = InstructionEncoder::new();
+        encoder.encode(&instr).expect("encoding must succeed");
+        encoder.bytes
+    }
+
     #[test]
-    fn emit_segment_prefix_drops_redundant_overrides() {
-        // GAS: `mov %ds:8(%eax),%ebx` -> 8b 58 08 (ds dropped).
-        let mut encoder = InstructionEncoder::new();
-        let mem = memory_operand(
-            Displacement::Integer(8),
-            Some("eax"),
-            None,
-            None,
-            Some("ds"),
-        );
-        encoder.emit_segment_prefix(&mem);
-        assert!(encoder.bytes.is_empty());
+    fn encode_splices_segment_override_and_drops_redundant() {
+        // GAS: `mov %ds:8(%eax),%eax` -> 8b 40 08 (ds is the default for
+        // eax-based forms: dropped, no prefix byte at all; modrm 40 =
+        // mod01 reg000 rm000 for dst=%eax base=%eax).
+        let bytes = encode_mov_from_segmented_mem(Some("eax"), Some("ds"));
+        assert_eq!(bytes, [0x8B, 0x40, 0x08]);
 
-        // GAS: `mov %ss:8(%ebp),%eax` -> 8b 45 08 (ss dropped).
-        let mut encoder = InstructionEncoder::new();
-        let mem = memory_operand(
-            Displacement::Integer(8),
-            Some("ebp"),
-            None,
-            None,
-            Some("ss"),
-        );
-        encoder.emit_segment_prefix(&mem);
-        assert!(encoder.bytes.is_empty());
+        // GAS: `mov %ss:8(%ebp),%eax` -> 8b 45 08 (ss is the default for
+        // ebp-based forms: dropped; modrm 45 = mod01 reg000 rm101).
+        let bytes = encode_mov_from_segmented_mem(Some("ebp"), Some("ss"));
+        assert_eq!(bytes, [0x8B, 0x45, 0x08]);
 
-        // GAS: `mov %ds:8(%ebp),%eax` -> 3e 8b 45 08 (ds differs).
-        let mut encoder = InstructionEncoder::new();
-        let mem = memory_operand(
-            Displacement::Integer(8),
-            Some("ebp"),
-            None,
-            None,
-            Some("ds"),
-        );
-        encoder.emit_segment_prefix(&mem);
-        assert_eq!(encoder.bytes, [0x3E]);
+        // GAS: `mov %ds:8(%ebp),%eax` -> 3e 8b 45 08 (ds differs from the
+        // SS default: spliced as the OUTERMOST prefix).
+        let bytes = encode_mov_from_segmented_mem(Some("ebp"), Some("ds"));
+        assert_eq!(bytes, [0x3E, 0x8B, 0x45, 0x08]);
 
-        // GAS: `mov %ss:8(%eax),%ebx` -> 36 8b 58 08 (ss differs).
-        let mut encoder = InstructionEncoder::new();
-        let mem = memory_operand(
-            Displacement::Integer(8),
-            Some("eax"),
-            None,
-            None,
-            Some("ss"),
-        );
-        encoder.emit_segment_prefix(&mem);
-        assert_eq!(encoder.bytes, [0x36]);
+        // GAS: `mov %ss:8(%eax),%eax` -> 36 8b 40 08 (ss differs from the
+        // DS default).
+        let bytes = encode_mov_from_segmented_mem(Some("eax"), Some("ss"));
+        assert_eq!(bytes, [0x36, 0x8B, 0x40, 0x08]);
 
-        // All six names are otherwise emitted (verified byte values).
+        // All six names are emitted (verified byte values) for an
+        // eax-based (DS-default) form; `ds` alone is dropped.
         for (name, prefix) in [
             ("es", 0x26),
             ("cs", 0x2E),
             ("ss", 0x36),
-            ("ds", 0x3E),
             ("fs", 0x64),
             ("gs", 0x65),
         ] {
-            let mut encoder = InstructionEncoder::new();
-            let mem = memory_operand(
-                Displacement::Integer(8),
-                None,
-                Some("ecx"),
-                Some(4),
-                Some(name),
-            );
-            // Default segment for an index-only form is DS; only
-            // `ds` is dropped.
-            let expected = if prefix == 0x3E {
-                Vec::new()
-            } else {
-                vec![prefix]
-            };
-            encoder.emit_segment_prefix(&mem);
-            assert_eq!(encoder.bytes, expected, "segment {}", name);
+            let bytes = encode_mov_from_segmented_mem(Some("eax"), Some(name));
+            assert_eq!(bytes[0], prefix, "segment {}", name);
+            assert_eq!(&bytes[1..], &[0x8B, 0x40, 0x08], "segment {}", name);
         }
     }
 

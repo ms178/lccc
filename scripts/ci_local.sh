@@ -171,6 +171,17 @@ gate "phi-acyclic-copy-order" fast \
 gate "ra-web-inloop-use" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ra_web_inloop_use.sh
 
+gate "replay-gap-home-rewrite" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_replay_gap_home_rewrite.sh
+
+gate "seg-prefix-rmw-encoding" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_prefix_rmw_encoding.sh
+
+# Full instruction×segment matrix, byte-identical to GNU as (the contract
+# behind the dispatch-level segment emission; see the gate header).
+gate "seg-prefix-full-matrix" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_prefix_full_matrix.sh
+
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 

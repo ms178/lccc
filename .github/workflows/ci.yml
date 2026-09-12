@@ -224,6 +224,45 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_segfs_typeof_nosteal.sh
 
+      # Compare-replay home-rewrite contract: a multi-select compare-replay
+      # must never trust a register-homed operand across an emission gap
+      # that rewrites its home (the RA's latch/phi-web coalescing shares one
+      # register between a guarded-update Select result and the loop-carried
+      # accumulator; the first select's cmov invalidates the shared home for
+      # the second select's re-emitted compare — kernel 6.18.50
+      # kernel/irq/affinity.c get_pcore_mask ICE, and a silent
+      # wrong-accumulator-compare variant). The gap audit prunes the record;
+      # the Cmp materializes at its own position.
+      - name: Verify compare-replay gap home-rewrite audit
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_replay_gap_home_rewrite.sh
+
+      # Assembler segment-prefix contract for RMW memory encodings: the
+      # integrated assembler must not drop a %gs/%fs override from the
+      # template on unary/RMW arms (inc/dec/neg/not, xchg, xadd) — the
+      # kernel's per-CPU preempt_count ops are exactly this shape, and 1,125
+      # unprefixed incl/decl sites silently updated the STATIC percpu image
+      # while every %gs read saw the real per-CPU counter (6.18.50 boot
+      # died at PID 1 with "corrupted preempt_count").
+      - name: Verify RMW segment-prefix encoding
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_prefix_rmw_encoding.sh
+
+      # Full instruction×segment matrix: the integrated assembler's
+      # segment-qualified memory encodings must be BYTE-IDENTICAL to GNU as
+      # across every family (ALU sizes, shifts, bt, cmpxchg/8b/16b, x87,
+      # SSE, VEX, lock ordering, prefix ordering) plus the i686/code32
+      # default-segment rule, tab-separated macro conditionals, and the
+      # stray-.else/.endif hard error. Emission lives at ONE choke point
+      # (the operand scan in InstructionEncoder::encode); this gate is the
+      # contract that no encoder arm can regress it again.
+      - name: Verify segment-prefix full matrix vs GNU as
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_prefix_full_matrix.sh
+
       - name: Upload regression results
         if: always()
         uses: actions/upload-artifact@v7

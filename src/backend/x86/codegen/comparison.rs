@@ -50,6 +50,20 @@ pub(crate) struct CmpReplayScan {
     /// (see take_replay_cmp's countdown); entries without a count here
     /// are legacy single-consumer records, consumed by one take.
     pub replay_multi: crate::common::fx_hash::FxHashMap<u32, u32>,
+    /// Emission-gap positions for every replay-family record (replay,
+    /// fp_select, and both De Morgan Cmps): Cmp dest -> (block_idx,
+    /// cmp_idx, last_consumer_idx). The re-emission reads the Cmp's
+    /// operands at the CONSUMER position, so the open instruction range
+    /// (cmp_idx, last_consumer_idx) is the gap in which the operand's
+    /// machine home may be legitimately re-written (coalesce-sibling
+    /// definitions, calls). The IR-level redefinition guards in this
+    /// scan cannot see register-home sharing, so the post-RA prune in
+    /// the prologue audits this gap before trusting a register-homed
+    /// operand (kernel 6.18.50 get_pcore_mask: a min/max accumulator
+    /// coalesced with the Select result sharing r15 was evicted by the
+    /// select's own cmov and the second select's replay panicked — and
+    /// a silent variant would compare the WRONG value).
+    pub replay_gaps: crate::common::fx_hash::FxHashMap<u32, (usize, usize, usize)>,
 }
 
 /// One De Morgan branch-split candidate. See [`CmpReplayScan::demorgan`].
@@ -98,8 +112,10 @@ pub(crate) fn compute_cmp_replay_scan(
         crate::common::fx_hash::FxHashMap::default();
     let mut replay_multi: crate::common::fx_hash::FxHashMap<u32, u32> =
         crate::common::fx_hash::FxHashMap::default();
+    let mut replay_gaps: crate::common::fx_hash::FxHashMap<u32, (usize, usize, usize)> =
+        crate::common::fx_hash::FxHashMap::default();
     let demorgan_enabled = std::env::var("CCC_NO_DEMORGAN").is_err();
-    for block in &func.blocks {
+    for (bi, block) in func.blocks.iter().enumerate() {
         let insts = &block.instructions;
         for (ii, inst) in insts.iter().enumerate() {
             let (cdest, cop, clhs, crhs, cty) = match inst {
@@ -185,6 +201,12 @@ pub(crate) fn compute_cmp_replay_scan(
                             }
                             replay.insert(cdest, (cop, clhs, crhs, cty));
                             replay_multi.insert(cdest, n_consumers as u32);
+                            // The LAST consumer's emission is where the
+                            // final re-emission reads the operands; every
+                            // instruction strictly before it (including the
+                            // earlier selects of this record) is the gap the
+                            // prologue prune must audit.
+                            replay_gaps.insert(cdest, (bi, ii, last));
                         }
                     }
                 }
@@ -273,6 +295,7 @@ pub(crate) fn compute_cmp_replay_scan(
                         }
                     }
                     fp_select.insert(cdest, (cop, clhs, crhs, cty));
+                    replay_gaps.insert(cdest, (bi, ii, consumer_idx));
                 }
                 continue;
             }
@@ -294,6 +317,9 @@ pub(crate) fn compute_cmp_replay_scan(
                 }
             }
             replay.insert(cdest, (cop, clhs, crhs, cty));
+            // Single consumer: gap = (Cmp, consumer). A branch consumer
+            // sits at the terminator, i.e. index == insts.len().
+            replay_gaps.insert(cdest, (bi, ii, consumer_idx));
         }
         // De Morgan branch split: `CondBranch(And/Or(CmpA, CmpB))` with all
         // three single-use and same-block. The terminator re-emits cmpA,
@@ -321,6 +347,19 @@ pub(crate) fn compute_cmp_replay_scan(
                             operand_links.entry(v.0).or_default().push(cond_v.0);
                         }
                     }
+                    // Gap positions for the two Cmps (the branch re-reads
+                    // their operands at the terminator, so each Cmp's gap
+                    // ends at insts.len()). check_demorgan_pattern has
+                    // already proven exactly-one-def, so the position scan
+                    // cannot miss.
+                    for &cd in &rec.cmp_dests {
+                        if let Some(pos) = insts
+                            .iter()
+                            .position(|other| other.dest().is_some_and(|d| d.0 == cd))
+                        {
+                            replay_gaps.insert(cd, (bi, pos, insts.len()));
+                        }
+                    }
                     demorgan.insert(cond_v.0, rec);
                 }
             }
@@ -332,6 +371,7 @@ pub(crate) fn compute_cmp_replay_scan(
         fp_select,
         demorgan,
         replay_multi,
+        replay_gaps,
     }
 }
 

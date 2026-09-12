@@ -682,6 +682,12 @@ pub struct X86Codegen {
     /// Cleared after the merge; exists only to bridge the pre-RA scan and
     /// the RA invocation inside this very large prepare function.
     pub(super) cmp_replay_operand_links: FxHashMap<u32, Vec<u32>>,
+    /// Replay-family emission gaps from the scan (Cmp dest -> (block_idx,
+    /// cmp_idx, last_consumer_idx)). Consumed by the post-RA prune in
+    /// calculate_stack_space_impl to audit register-homed operands for
+    /// home rewrites inside the gap (coalesce-sibling definitions, calls
+    /// on caller-saved homes); see CmpReplayScan::replay_gaps.
+    pub(super) cmp_replay_gaps: FxHashMap<u32, (usize, usize, usize)>,
     /// FP-SELECT (S05): float Cmps whose single use is a Select. The Cmp
     /// emitter skips the ucomisd/setcc boolean entirely; every select
     /// re-derives a vcmpsd/vcmpss VEX blend mask from the recorded operands
@@ -1078,6 +1084,7 @@ impl X86Codegen {
             demorgan_branch: FxHashMap::default(),
             demorgan_skip: FxHashSet::default(),
             cmp_replay_operand_links: FxHashMap::default(),
+            cmp_replay_gaps: FxHashMap::default(),
             fp_select_cmps: FxHashMap::default(),
             value_use_counts: FxHashMap::default(),
             load_cast_fold: FxHashMap::default(),

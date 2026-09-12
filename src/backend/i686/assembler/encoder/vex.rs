@@ -117,7 +117,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(load_op);
                 self.encode_modrm_mem(dst_num, mem)
@@ -127,7 +126,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&src.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(store_op);
                 self.encode_modrm_mem(src_num, mem)
@@ -174,7 +172,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(load_op);
                 self.encode_modrm_mem(dst_num, mem)
@@ -184,7 +181,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&src.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(store_op);
                 self.encode_modrm_mem(src_num, mem)
@@ -211,7 +207,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&src.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(src_num, mem)
@@ -268,7 +263,6 @@ impl super::InstructionEncoder {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -319,7 +313,6 @@ impl super::InstructionEncoder {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -361,7 +354,6 @@ impl super::InstructionEncoder {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 2, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -431,7 +423,6 @@ impl super::InstructionEncoder {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -443,7 +434,6 @@ impl super::InstructionEncoder {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 2, 1, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -496,7 +486,6 @@ impl super::InstructionEncoder {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
@@ -539,7 +528,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
@@ -594,7 +582,6 @@ impl super::InstructionEncoder {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
@@ -636,7 +623,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 2, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -676,7 +662,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -781,7 +766,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
@@ -866,7 +850,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
@@ -914,7 +897,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&src.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, 0, 1, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(src_num, mem)?;
@@ -979,7 +961,6 @@ impl super::InstructionEncoder {
                     Operand::Memory(mem) => {
                         let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                         let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                        self.emit_segment_prefix(mem);
                         self.emit_vex(r, x, b_ext, 3, 0, 0, 0, pp);
                         self.bytes.push(opcode);
                         self.encode_modrm_mem(src_num, mem)?;
@@ -1041,7 +1022,6 @@ impl super::InstructionEncoder {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 3, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
@@ -1070,7 +1050,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 2, 0, 0, l, 1);
                 self.bytes.extend_from_slice(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -1246,7 +1225,6 @@ impl super::InstructionEncoder {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -1270,7 +1248,6 @@ impl super::InstructionEncoder {
                     let r = needs_vex_ext(&dst.name);
                     let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                     let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                    self.emit_segment_prefix(mem);
                     self.emit_vex(r, x, b_ext, 1, 0, 0, 0, pp);
                     self.bytes.push(load_op);
                     self.encode_modrm_mem(dst_num, mem)
@@ -1280,7 +1257,6 @@ impl super::InstructionEncoder {
                     let r = needs_vex_ext(&src.name);
                     let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                     let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                    self.emit_segment_prefix(mem);
                     self.emit_vex(r, x, b_ext, 1, 0, 0, 0, pp);
                     self.bytes.push(store_op);
                     self.encode_modrm_mem(src_num, mem)
@@ -1339,7 +1315,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, 0, 1);
                 self.bytes.push(0x6E);
                 self.encode_modrm_mem(dst_num, mem)
@@ -1349,7 +1324,6 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&src.name);
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, 0, 0, 0, 1);
                 self.bytes.push(0x7E);
                 self.encode_modrm_mem(src_num, mem)
@@ -1388,7 +1362,6 @@ impl super::InstructionEncoder {
             Operand::Memory(mem) => {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, w, 0, 0, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -1433,7 +1406,6 @@ impl super::InstructionEncoder {
             Operand::Memory(mem) => {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 1, w, vvvv, 0, pp);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
@@ -1469,7 +1441,6 @@ impl super::InstructionEncoder {
                 let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
                 let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
                 let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                self.emit_segment_prefix(mem);
                 self.emit_vex(r, x, b_ext, 2, w, vvvv_enc, l, 1);
                 self.bytes.push(opcode);
                 self.encode_modrm_mem(dst_num, mem)
