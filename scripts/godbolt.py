@@ -241,9 +241,20 @@ def _function_body(lines: list[str], wanted: str | None) -> list[str] | None:
     for line in lines:
         match = label.match(line)
         if match and not match.group(1).startswith("."):
+            name = match.group(1)
             if active:
-                break
-            active = _label_is_function(wanted, match.group(1))
+                # ICC labels its entry block `<function>.:` -- a trailing dot,
+                # which is not a valid C identifier, so it can never name a
+                # distinct symbol.  Breaking there truncated `word_pun` to one
+                # instruction and reported icc=1 against clang=9: a bogus
+                # "optimal" oracle row, which is the exact failure mode
+                # _label_is_function exists to prevent.  GCC's clone suffixes
+                # (`foo.constprop.0`) are the same family of same-function
+                # label; only a genuinely different symbol ends the body.
+                if not (name == wanted or name.startswith(wanted + ".")):
+                    break
+            else:
+                active = _label_is_function(wanted, name)
         if active and line.strip().startswith(".size "):
             break
         if active and line.strip().startswith(".cfi_endproc"):
