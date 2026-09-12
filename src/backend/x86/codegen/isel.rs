@@ -577,6 +577,57 @@ pub fn lower_binop(
 
     // ── Shift operations ─────────────────────────────────────────────
     if let Some(shift_op) = binop_to_shift(op) {
+        // BMI2 RORX for immediate rotates: flag-preserving, non-destructive,
+        // 3-operand VEX. Converts Rol(n) -> Ror(width-n). S32/S64 only,
+        // immediate-only right rotate. Removes mov + flags dep for SHA-256/ChaCha ARX.
+        if matches!(shift_op, ShiftOp::Rol | ShiftOp::Ror)
+            && matches!(size, OpSize::S32 | OpSize::S64)
+            && shlx_mode() != ShlxMode::Never
+            && rorx_allowed()
+        {
+            if let Some(imm) = const_as_imm32(rhs) {
+                let width = if size == OpSize::S32 { 32 } else { 64 };
+                let amt = (imm as i64).rem_euclid(width as i64);
+                if amt != 0 {
+                    let ror_amt = match shift_op {
+                        ShiftOp::Rol => (width as i64 - amt) % width as i64,
+                        ShiftOp::Ror => amt,
+                        _ => amt,
+                    };
+                    // amt != 0 proves ror_amt != 0 for both Rol and Ror (and a
+                    // hypothetical 0 would still be a correct no-op: `rorx $0`
+                    // is the identity). Single match, single mov at most: the
+                    // old double match could emit the mov twice (non-Value
+                    // lhs with a virtual dst) — idempotent but wasteful.
+                    debug_assert!(ror_amt != 0);
+                    // Keep src in its home when already physical (saves the
+                    // mov the legacy path always emits); otherwise move once.
+                    let src_final = match lhs {
+                        Operand::Value(v) => match value_to_reg(v, ra) {
+                            r @ MachReg::Phys(_) => r,
+                            _ => {
+                                emit_mov_operand_r(lhs, dst, size, ra, out);
+                                dst
+                            }
+                        },
+                        _ => {
+                            emit_mov_operand_r(lhs, dst, size, ra, out);
+                            dst
+                        }
+                    };
+                    out.push(MachInst::Rorx {
+                        amount: ror_amt,
+                        src: src_final,
+                        dst,
+                        size,
+                    });
+                    return true;
+                } else {
+                    emit_mov_operand_r(lhs, dst, size, ra, out);
+                    return true;
+                }
+            }
+        }
         if let Some(imm) = const_as_imm32(rhs) {
             emit_mov_operand_r(lhs, dst, size, ra, out);
             let mask = if size == OpSize::S32 { 31 } else { 63 };
@@ -1242,6 +1293,16 @@ pub fn shlx_mode() -> ShlxMode {
         2 => ShlxMode::Always,
         _ => ShlxMode::Never,
     }
+}
+
+/// Independent RORX kill switch: any `CCC_NO_RORX` value disables all
+/// BMI2 RORX selection (isel + legacy/acc text paths) so bisection can
+/// isolate RORX from SHLX without dropping the BMI2 gate. Cached: env
+/// is never unset mid-compile.
+pub fn rorx_allowed() -> bool {
+    static OPT_OUT: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_RORX").is_some());
+    !*OPT_OUT
 }
 
 thread_local! {

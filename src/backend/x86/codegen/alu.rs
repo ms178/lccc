@@ -916,8 +916,30 @@ impl X86Codegen {
                 Some(imm) => {
                     let amount = (imm as i64).rem_euclid(width);
                     if amount != 0 {
-                        self.state
-                            .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
+                        if self.bmi2_enabled
+                            && super::isel::rorx_allowed()
+                            && (width == 32 || width == 64)
+                        {
+                            let ror_amount = match op {
+                                IrBinOp::RotateLeft => (width - amount) % width,
+                                IrBinOp::RotateRight => amount,
+                                _ => amount,
+                            };
+                            // amount != 0 above proves ror_amount != 0 (and a
+                            // hypothetical 0 is still a correct no-op: the
+                            // value is already in acc, `rorx $0` the identity).
+                            debug_assert!(ror_amount != 0);
+                            let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
+                            // acc_typed is al/ax/eax/rax, but rorx needs 3-operand form with src==dst
+                            // For accumulator path, src and dst are same accumulator.
+                            self.state.emit_fmt(format_args!(
+                                "    {} ${}, %{}, %{}",
+                                ror_mnem, ror_amount, acc_typed, acc_typed
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
+                        }
                     }
                 }
                 None => {

@@ -6,7 +6,9 @@ use super::emit::{
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
-use crate::backend::liveness::{for_each_operand_in_instruction, for_each_operand_in_terminator};
+use crate::backend::liveness::{
+    LiveInterval, for_each_operand_in_instruction, for_each_operand_in_terminator,
+};
 use crate::backend::regalloc::PhysReg;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, EightbyteClass, IrType};
@@ -74,6 +76,222 @@ fn va_root_is_stable(func: &IrFunction, root: u32) -> bool {
         match next {
             Some(n) if n != cur => cur = n,
             _ => return false, // no def found (should not happen) or a cycle
+        }
+    }
+    false
+}
+
+/// Liveness inputs for [`replay_span_home_collision`], snapshotted before
+/// `cached_liveness` is moved into slot assignment. The veto runs after
+/// slots are final (coalesced webs included), so it cannot borrow the moved
+/// value; the snapshot clones only the pieces the veto reads. Empty when no
+/// replay-family record exists or RA is disabled — the veto then fails
+/// closed (every span def collides).
+struct ReplayLivSnapshot {
+    starts: Vec<u32>,
+    ends: Vec<u32>,
+    depth: Vec<u32>,
+    segments: Vec<LiveInterval>,
+    intervals: Vec<LiveInterval>,
+}
+
+/// Precomputed function-wide tables for [`replay_span_home_collision`],
+/// built once per function before the compare-replay prunes.
+struct ReplayCollisionTables {
+    /// Every definition position of every value: value -> [(block, inst)].
+    /// Multi-def phi-elimination webs contribute every Copy position and
+    /// inline-asm outputs are included (`Instruction::dest` omits them).
+    def_points: FxHashMap<u32, Vec<(usize, usize)>>,
+    /// Assigned stack slot (frame offset) per value.
+    slot_of: FxHashMap<u32, i64>,
+    /// Inverse of `slot_of`: slot offset -> homed values.
+    slot_members: FxHashMap<i64, Vec<u32>>,
+}
+
+/// One compare-replay read span for the home-collision veto: the operand
+/// homes must survive every definition from just after `start` through
+/// `end` (inclusive; `None` selects the end block's terminator point).
+struct ReplayCheckSpan<'a> {
+    operands: &'a [u32],
+    start: (usize, usize),
+    end: (usize, Option<usize>),
+    /// Defs that never collide: values whose in-span definition emits no
+    /// home write (skipped De Morgan Cmps/And-Or/passthru, the last Select
+    /// consumer — which replays its operands before writing its home). Only
+    /// defs inside a span block are excused, so a hypothetical out-of-span
+    /// redefinition of an excluded value still vetoes.
+    exclude_values: &'a FxHashSet<u32>,
+}
+
+/// Compare-replay home-collision veto (pr27285 class).
+///
+/// A replay record re-reads the Cmp's operands at every consumer position
+/// (each Select; the terminator branch for select+branch mixes and De
+/// Morgan splits) — backend reads with no IR operand at the read point.
+/// Those reads are sound only if no definition between the Cmp and the last
+/// consumer writes a home (register or stack slot) the operand lives in.
+///
+/// The scan-time redefinition guard covers IR redefinitions of the operand
+/// ITSELF in the same block, and `operand_links` stops the allocator from
+/// handing the register to an unrelated later value — but neither sees a
+/// coalesced phi-web member: phi coalescing (register AND slot) deliberately
+/// shares one home across overlapping live ranges, proven safe by an
+/// update-window argument that only considers IR-visible reads. When a web
+/// member is defined strictly between the Cmp and a later consumer
+/// (pr27285: the latch value and the second Select share r8d; the Select's
+/// false-arm staging overwrites the home, and the third Select's replay
+/// then reads the clobbered register), the later replay reads clobbered
+/// state: a loud home-freshness panic for register homes, a silent
+/// wrong-operand miscompile for slot homes (slots have no freshness gate).
+///
+/// This veto runs post-RA/post-slots in the replay/demorgan/fp-select
+/// prunes, where every home is known, and prunes the record when any
+/// definition D in the span (Cmp, last consumer] writes the operand's
+/// register home or slot:
+/// - same-block defs strictly between the Cmp and the last consumer
+///   (the last Select consumer's OWN def is excluded by the caller: it
+///   replays before writing, so its write cannot affect any replay read);
+/// - cross-block defs in loop blocks (the split-latch shape the scan's
+///   same-block redefinition guard cannot see): a latch copy of the operand
+///   itself, or a coalesced web member, executes between the Cmp and the
+///   consumer on some iteration — this also closes the scan guard's
+///   cross-block hole (silent next-iteration comparison);
+/// - every candidate def must also fall inside the operand's live coverage
+///   (hole-aware segments, fat intervals when segments are absent): a def
+///   in a liveness hole, or one sharing only a PACKED (disjoint-lifetime)
+///   slot, does not disturb the replay.
+/// Staging/scratch writes need no check: on x86-64 rax/rcx are never homes,
+/// call-clobbered homes are saved/restored around calls, and inline-asm
+/// clobbers are excluded from allocation — definitions are the only span
+/// writers of a home.
+///
+/// Fail-closed: any missing input (empty snapshot, no coverage for the
+/// operand, a home without a sharer entry, a sharer that is never defined)
+/// vetoes — pruning only ever falls back to the always-correct
+/// materialized-boolean path.
+fn replay_span_home_collision(
+    tables: &ReplayCollisionTables,
+    reg_assignments: &FxHashMap<u32, PhysReg>,
+    reg_sharers: &FxHashMap<u8, Vec<u32>>,
+    snap: &ReplayLivSnapshot,
+    func_name: &str,
+    span: &ReplayCheckSpan,
+) -> bool {
+    let debug = std::env::var_os("CCC_DEBUG_REPLAY_PRUNE").is_some();
+    let collide = |o: u32, d: u32, pos: (usize, usize), why: &str| -> bool {
+        if debug {
+            eprintln!(
+                "[replay-prune] fn={func_name} collide: operand=v{o} sharer=v{d} def={pos:?} ({why})"
+            );
+        }
+        true
+    };
+    // Live coverage of one operand: hole-aware segments when the value has
+    // any, else its fat interval (mirrors the machine_reg_busy convention).
+    // `None` means unknown — the caller fails closed (every span def
+    // collides).
+    let coverage_of = |o: u32| -> Option<Vec<(u32, u32)>> {
+        let mut cov: Vec<(u32, u32)> = snap
+            .segments
+            .iter()
+            .filter(|s| s.value_id == o)
+            .map(|s| (s.start, s.end))
+            .collect();
+        if cov.is_empty() {
+            cov = snap
+                .intervals
+                .iter()
+                .filter(|s| s.value_id == o)
+                .map(|s| (s.start, s.end))
+                .collect();
+        }
+        if cov.is_empty() {
+            None
+        } else {
+            Some(cov)
+        }
+    };
+    let point_of = |b: usize, i: usize| -> Option<u32> {
+        snap.starts.get(b).map(|s| s + i as u32)
+    };
+    let end_point = match span.end {
+        (eb, Some(ei)) => point_of(eb, ei),
+        (eb, None) => snap.ends.get(eb).copied(),
+    };
+    // Without liveness (empty snapshot: RA disabled) every cross-block
+    // def collides.
+    let depth_of = |b: usize| -> u32 {
+        snap.depth.get(b).copied().unwrap_or(u32::MAX)
+    };
+    for &o in span.operands {
+        // Sharers of the operand's homes (register + slot). The operand
+        // itself is included: an in-span redefinition of O collides (the
+        // split-latch shape the scan guard cannot see).
+        let mut sharers: Vec<u32> = Vec::new();
+        if let Some(reg) = reg_assignments.get(&o) {
+            match reg_sharers.get(&reg.0) {
+                Some(m) => sharers.extend(m.iter().copied()),
+                None => return collide(o, o, span.start, "home without sharer entry"),
+            }
+        }
+        if let Some(slot) = tables.slot_of.get(&o) {
+            match tables.slot_members.get(slot) {
+                Some(m) => sharers.extend(m.iter().copied()),
+                None => return collide(o, o, span.start, "slot without member entry"),
+            }
+        }
+        if sharers.is_empty() {
+            // No home at all: the readability prune owns this case.
+            continue;
+        }
+        let coverage = coverage_of(o);
+        for &d in &sharers {
+            let Some(defs) = tables.def_points.get(&d) else {
+                return collide(o, d, span.start, "sharer never defined");
+            };
+            for &(db, di) in defs {
+                if span.exclude_values.contains(&d) && (db == span.start.0 || db == span.end.0)
+                {
+                    continue;
+                }
+                let covered = match (coverage.as_ref(), point_of(db, di)) {
+                    (Some(cov), Some(p)) => cov.iter().any(|&(s, e)| s <= p && p <= e),
+                    // Unknown coverage or unmapped point: fail closed.
+                    _ => true,
+                };
+                if !covered {
+                    continue;
+                }
+                if db == span.start.0 {
+                    if di <= span.start.1 {
+                        continue;
+                    }
+                    if db == span.end.0 {
+                        if let Some(e) = span.end.1 {
+                            if di > e {
+                                continue;
+                            }
+                        }
+                    }
+                    return collide(o, d, (db, di), "same-block span def");
+                } else if db == span.end.0 {
+                    // Cross-block span with defs in the end block: at or
+                    // before the span end (position test, not loop depth:
+                    // the end block may sit outside any loop).
+                    match (end_point, point_of(db, di)) {
+                        (Some(end_p), Some(p)) if p <= end_p => {
+                            return collide(o, d, (db, di), "end-block span def");
+                        }
+                        (Some(_), Some(_)) => continue,
+                        _ => return collide(o, d, (db, di), "unmapped end-block def"),
+                    }
+                } else if depth_of(db) > 0 {
+                    // Elsewhere, in a loop: executes between the Cmp and
+                    // the consumer on some iteration (split-latch webs and
+                    // the scan guard's cross-block hole).
+                    return collide(o, d, (db, di), "in-loop cross-block def");
+                }
+            }
         }
     }
     false
@@ -1843,6 +2061,31 @@ impl X86Codegen {
         let fpo = self.state.omit_frame_pointer;
         self.state.ra_accumulator_values =
             accumulator_assignments.iter().map(|a| a.value_id).collect();
+        // Liveness snapshot for the post-slot replay home-collision veto
+        // (see replay_span_home_collision): cached_liveness is moved into
+        // calculate_stack_space_common below, while the veto must run after
+        // it — slots, including coalesced webs, are final only then.
+        // Snapshotted only when a replay-family record exists, so functions
+        // without one pay nothing.
+        let mut collision_liv = ReplayLivSnapshot {
+            starts: Vec::new(),
+            ends: Vec::new(),
+            depth: Vec::new(),
+            segments: Vec::new(),
+            intervals: Vec::new(),
+        };
+        if !(self.cmp_replay.is_empty()
+            && self.fp_select_cmps.is_empty()
+            && self.demorgan_branch.is_empty())
+        {
+            if let Some(l) = cached_liveness.as_ref() {
+                collision_liv.starts = l.block_starts.clone();
+                collision_liv.ends = l.block_ends.clone();
+                collision_liv.depth = l.block_loop_depth.clone();
+                collision_liv.segments = l.segments.clone();
+                collision_liv.intervals = l.intervals.clone();
+            }
+        }
         let mut space = calculate_stack_space_common(
             &mut self.state,
             func,
@@ -1896,6 +2139,216 @@ impl X86Codegen {
             },
             cached_liveness,
         );
+
+        // ── REPLAY home-collision veto (pr27285) ─────────────────
+        // Post-slot companion to the readability prunes above: a definition
+        // strictly between the Cmp and the last consumer that writes a
+        // replayed operand's register home or slot makes the later replay
+        // read clobbered state (see replay_span_home_collision). Runs here —
+        // after the tiered slot allocator — because coalesced slot webs only
+        // exist now; register homes were already final at the earlier prune.
+        // Pruning falls back to the always-correct materialized-boolean path.
+        let mut collision_tables = ReplayCollisionTables {
+            def_points: FxHashMap::default(),
+            slot_of: FxHashMap::default(),
+            slot_members: FxHashMap::default(),
+        };
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                if let Some(d) = inst.dest() {
+                    collision_tables
+                        .def_points
+                        .entry(d.0)
+                        .or_default()
+                        .push((bi, ii));
+                }
+                // Inline-asm outputs define values but Instruction::dest
+                // omits them; an in-span asm def of a sharer collides.
+                if let Instruction::InlineAsm { outputs, .. } = inst {
+                    for (_, v, _) in outputs {
+                        collision_tables
+                            .def_points
+                            .entry(v.0)
+                            .or_default()
+                            .push((bi, ii));
+                    }
+                }
+            }
+        }
+        let all_values: Vec<u32> = collision_tables.def_points.keys().copied().collect();
+        for v in all_values {
+            if let Some(slot) = self.state.get_slot(v) {
+                collision_tables.slot_of.insert(v, slot.0);
+                collision_tables
+                    .slot_members
+                    .entry(slot.0)
+                    .or_default()
+                    .push(v);
+            }
+        }
+        let func_name: &str = &func.name;
+        // Integer replay records surviving the readability prune.
+        {
+            let mut prune: Vec<u32> = Vec::new();
+            for (cdest, (_op, lhs, rhs, _ty)) in self.cmp_replay.iter() {
+                let cmp_pos: Option<(usize, usize)> =
+                    match collision_tables.def_points.get(cdest) {
+                        Some(v) if v.len() == 1 => Some(v[0]),
+                        _ => None,
+                    };
+                let Some((cb, ci)) = cmp_pos else {
+                    prune.push(*cdest);
+                    continue;
+                };
+                if !matches!(
+                    func.blocks[cb].instructions.get(ci),
+                    Some(Instruction::Cmp { .. })
+                ) {
+                    prune.push(*cdest);
+                    continue;
+                }
+                let block = &func.blocks[cb];
+                let mut select_count: usize = 0;
+                let mut last_select: Option<(usize, u32)> = None;
+                for (ii, inst) in block.instructions.iter().enumerate() {
+                    if let Instruction::Select {
+                        dest,
+                        cond: Operand::Value(v),
+                        ..
+                    } = inst
+                    {
+                        if v.0 == *cdest {
+                            select_count += 1;
+                            last_select = Some((ii, dest.0));
+                        }
+                    }
+                }
+                let term_consumer = matches!(
+                    &block.terminator,
+                    Terminator::CondBranch {
+                        cond: Operand::Value(v),
+                        ..
+                    } if v.0 == *cdest
+                );
+                let expected = self.cmp_replay_multi.get(cdest).copied().unwrap_or(1) as usize;
+                let found = select_count + usize::from(term_consumer);
+                if found != expected || found == 0 {
+                    // Inconsistent with the scan: fail closed.
+                    prune.push(*cdest);
+                    continue;
+                }
+                let mut exclude_values = FxHashSet::default();
+                let span_end: (usize, Option<usize>) = if term_consumer {
+                    (cb, None)
+                } else if let Some((li, ld)) = last_select {
+                    // The last Select replays before writing its home.
+                    exclude_values.insert(ld);
+                    (cb, Some(li))
+                } else {
+                    prune.push(*cdest);
+                    continue;
+                };
+                let mut operands: Vec<u32> = Vec::new();
+                for op in [lhs, rhs] {
+                    if let Operand::Value(v) = op {
+                        operands.push(v.0);
+                    }
+                }
+                let span = ReplayCheckSpan {
+                    operands: &operands,
+                    start: (cb, ci),
+                    end: span_end,
+                    exclude_values: &exclude_values,
+                };
+                if replay_span_home_collision(
+                    &collision_tables,
+                    &self.reg_assignments,
+                    &self.home_sharers,
+                    &collision_liv,
+                    func_name,
+                    &span,
+                ) {
+                    prune.push(*cdest);
+                }
+            }
+            for d in prune {
+                self.cmp_replay.remove(&d);
+                self.cmp_replay_multi.remove(&d);
+            }
+        }
+        // FP-select records surviving the readability prune (single Select
+        // consumer by construction; branches never take fp_select).
+        {
+            let mut prune_fp: Vec<u32> = Vec::new();
+            for (cdest, (_op, lhs, rhs, _ty)) in self.fp_select_cmps.iter() {
+                let cmp_pos: Option<(usize, usize)> =
+                    match collision_tables.def_points.get(cdest) {
+                        Some(v) if v.len() == 1 => Some(v[0]),
+                        _ => None,
+                    };
+                let Some((cb, ci)) = cmp_pos else {
+                    prune_fp.push(*cdest);
+                    continue;
+                };
+                if !matches!(
+                    func.blocks[cb].instructions.get(ci),
+                    Some(Instruction::Cmp { .. })
+                ) {
+                    prune_fp.push(*cdest);
+                    continue;
+                }
+                let mut consumer: Option<(usize, u32)> = None;
+                let mut consumer_count: usize = 0;
+                for (ii, inst) in func.blocks[cb].instructions.iter().enumerate() {
+                    if let Instruction::Select {
+                        dest,
+                        cond: Operand::Value(v),
+                        ..
+                    } = inst
+                    {
+                        if v.0 == *cdest {
+                            consumer_count += 1;
+                            consumer = Some((ii, dest.0));
+                        }
+                    }
+                }
+                let Some((sel_idx, sel_dest)) = consumer else {
+                    prune_fp.push(*cdest);
+                    continue;
+                };
+                if consumer_count != 1 {
+                    prune_fp.push(*cdest);
+                    continue;
+                }
+                let mut exclude_values = FxHashSet::default();
+                exclude_values.insert(sel_dest);
+                let mut operands: Vec<u32> = Vec::new();
+                for op in [lhs, rhs] {
+                    if let Operand::Value(v) = op {
+                        operands.push(v.0);
+                    }
+                }
+                let span = ReplayCheckSpan {
+                    operands: &operands,
+                    start: (cb, ci),
+                    end: (cb, Some(sel_idx)),
+                    exclude_values: &exclude_values,
+                };
+                if replay_span_home_collision(
+                    &collision_tables,
+                    &self.reg_assignments,
+                    &self.home_sharers,
+                    &collision_liv,
+                    func_name,
+                    &span,
+                ) {
+                    prune_fp.push(*cdest);
+                }
+            }
+            for d in prune_fp {
+                self.fp_select_cmps.remove(&d);
+            }
+        }
 
         // ── DE MORGAN post-slot-assignment prune ────────────────────────
         // Same readability contract as the compare-replay prune above
@@ -1973,6 +2426,58 @@ impl X86Codegen {
                 if ops.iter().any(|op| !readable(op)) {
                     if debug {
                         eprintln!("[demorgan] prune andor={}", andor_id);
+                    }
+                    prune_dm.push(*andor_id);
+                    continue;
+                }
+                // Home-collision veto (same pr27285 class as cmp_replay):
+                // the terminator replays both comparisons, re-reading all
+                // four operands there. The span runs from the earlier Cmp
+                // to the block terminator; the skipped defs (both Cmps,
+                // the And/Or, its passthru) emit nothing and are excluded.
+                let c0 = collision_tables.def_points.get(&rec.cmp_dests[0]);
+                let c1 = collision_tables.def_points.get(&rec.cmp_dests[1]);
+                let collides = match (c0, c1) {
+                    (Some(a), Some(b))
+                        if a.len() == 1 && b.len() == 1 && a[0].0 == b[0].0 =>
+                    {
+                        let (cb, start) = (a[0].0, a[0].1.min(b[0].1));
+                        let mut excludes = FxHashSet::default();
+                        excludes.insert(*andor_id);
+                        excludes.insert(rec.binop_id);
+                        excludes.insert(rec.cmp_dests[0]);
+                        excludes.insert(rec.cmp_dests[1]);
+                        if let Some(p) = rec.passthru {
+                            excludes.insert(p);
+                        }
+                        let mut operands = Vec::new();
+                        for op in [&rec.a.1, &rec.a.2, &rec.b.1, &rec.b.2] {
+                            if let Operand::Value(v) = op {
+                                operands.push(v.0);
+                            }
+                        }
+                        let span = ReplayCheckSpan {
+                            operands: &operands,
+                            start: (cb, start),
+                            end: (cb, None),
+                            exclude_values: &excludes,
+                        };
+                        let func_name: &str = &func.name;
+                        replay_span_home_collision(
+                            &collision_tables,
+                            &self.reg_assignments,
+                            &self.home_sharers,
+                            &collision_liv,
+                            func_name,
+                            &span,
+                        )
+                    }
+                    // Inconsistent with the scan: fail closed.
+                    _ => true,
+                };
+                if collides {
+                    if debug {
+                        eprintln!("[demorgan] prune andor={} (home collision)", andor_id);
                     }
                     prune_dm.push(*andor_id);
                 } else if debug {

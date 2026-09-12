@@ -299,6 +299,16 @@ pub enum MachInst {
         size: OpSize,
     },
 
+    /// BMI2 RORX: dst = ror(src, imm). Three-operand VEX, flag-preserving,
+    /// non-destructive, immediate-only right rotate. Removes a mov and the
+    /// flags dependency of `rol/ror`. Selected for S32/S64 when BMI2 enabled.
+    Rorx {
+        amount: i64,
+        src: MachReg,
+        dst: MachReg,
+        size: OpSize,
+    },
+
     /// LEA: dst = base + index*scale + offset (3-address add).
     /// x86 form: `leaq offset(%base, %index, scale), %dst`
     Lea {

@@ -1,0 +1,97 @@
+{
+  "label": "csv steal vs OFF",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_p4pg6e0t/arm_a",
+    "sha256": "91a0c3747bc488cd02514300dc51f61024a7660cc2ab12124f370c24170153b6",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "07fe34b2abab2669bf69e6a0ed325583c1f6d406105bea940e9981d03dd0daf1"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_p4pg6e0t/arm_b",
+    "sha256": "c058a81b933c77c500641c9d3589035fce7e5fc58c0570a9d7366c21ece6accf",
+    "env": "CCC_NO_X64_SPAN_STEAL=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "07fe34b2abab2669bf69e6a0ed325583c1f6d406105bea940e9981d03dd0daf1"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 2,
+  "arm_a_timings": {
+    "arm": "ON",
+    "n": 15,
+    "min_ms": 1.15,
+    "median_ms": 1.19,
+    "mean_ms": 1.227,
+    "stdev_ms": 0.092,
+    "samples_ms": [
+      1.178,
+      1.15,
+      1.157,
+      1.19,
+      1.357,
+      1.411,
+      1.196,
+      1.368,
+      1.152,
+      1.207,
+      1.161,
+      1.153,
+      1.362,
+      1.162,
+      1.193
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "OFF",
+    "n": 15,
+    "min_ms": 1.147,
+    "median_ms": 1.199,
+    "mean_ms": 1.208,
+    "stdev_ms": 0.058,
+    "samples_ms": [
+      1.214,
+      1.199,
+      1.28,
+      1.171,
+      1.295,
+      1.252,
+      1.152,
+      1.203,
+      1.147,
+      1.346,
+      1.213,
+      1.161,
+      1.166,
+      1.153,
+      1.167
+    ]
+  },
+  "paired_diffs_ms": [
+    -0.035,
+    -0.049,
+    -0.123,
+    0.019,
+    0.062,
+    0.159,
+    0.044,
+    0.166,
+    0.005,
+    -0.139,
+    -0.052,
+    -0.008,
+    0.196,
+    0.01,
+    0.026
+  ],
+  "median_ratio_b_over_a": 1.0075,
+  "min_ratio_b_over_a": 0.99745,
+  "sign_test_p": 0.60558,
+  "median_and_min_agree": false,
+  "significant": false,
+  "verdict": "ON FASTER by 0.75% (median) \u2014 NOT significant (sign test p > 0.05); treat as noise"
+}
