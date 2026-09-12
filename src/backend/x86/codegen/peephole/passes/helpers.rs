@@ -172,7 +172,86 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     // the x86 ISA only allows %ax or memory for fnstsw.
     trimmed.starts_with("fnstsw") || trimmed.starts_with("fnstcw") ||
     trimmed.starts_with("fstcw") || trimmed.starts_with("fnstenv") ||
-    trimmed.starts_with("fldenv") || trimmed.starts_with("fldcw")
+    trimmed.starts_with("fldenv") || trimmed.starts_with("fldcw") ||
+    has_bare_implicit_gp_effect(trimmed)
+}
+
+/// Bare instructions with implicit GP effects the textual `%reg` scans cannot
+/// see. `has_implicit_reg_usage` covers `rep`-prefixed string ops; this covers
+/// the rest: bare string ops (`movsq` reads/writes `%rsi`/`%rdi`), the
+/// `repe`/`repz`/`repnz` prefix spellings GAS accepts on `cmps`/`scas`, `loop*`
+/// (`%rcx`), `xlat` (writes `%al`), `rdpmc` (reads `%ecx`, writes `%edx`:`%eax`),
+/// `sysret`/`sysexit`/`iret*`/`uiret` (restore paths clobbering everything), `int*`
+/// (trap into unknown code), `xgetbv` (writes `%edx`:`%eax`) and `encls`/`enclu`
+/// (implicit `%eax`/`%ebx`/`%ecx`/`%edx`). Exact whole-token matches only:
+/// `movswl` (sign-extend) must NOT match the `movs` string op, so prefix tests
+/// are banned here. Soundness-critical: the coalescing window and the
+/// zero-upper scan skip lines mentioning no `%reg`, and must stop at these
+/// instead (`xsetbv`/`monitor`/`mwait` only *read* GP regs implicitly, so
+/// skipping them stays sound — reads don't modify).
+fn has_bare_implicit_gp_effect(trimmed: &str) -> bool {
+    let tok = trimmed.split_whitespace().next().unwrap_or("");
+    // Prefix position (`repe cmpsb`): the string op follows.
+    if tok == "repe" || tok == "repz" || tok == "repnz" {
+        return true;
+    }
+    matches!(
+        tok,
+        "movs"
+            | "movsb"
+            | "movsw"
+            | "movsl"
+            | "movsq"
+            | "stos"
+            | "stosb"
+            | "stosw"
+            | "stosl"
+            | "stosq"
+            | "lods"
+            | "lodsb"
+            | "lodsw"
+            | "lodsl"
+            | "lodsq"
+            | "cmps"
+            | "cmpsb"
+            | "cmpsw"
+            | "cmpsl"
+            | "cmpsq"
+            | "scas"
+            | "scasb"
+            | "scasw"
+            | "scasl"
+            | "scasq"
+            | "ins"
+            | "insb"
+            | "insw"
+            | "insl"
+            | "outs"
+            | "outsb"
+            | "outsw"
+            | "outsl"
+            | "loop"
+            | "loope"
+            | "loopne"
+            | "loopz"
+            | "loopnz"
+            | "xlat"
+            | "xlatb"
+            | "rdpmc"
+            | "sysret"
+            | "sysexit"
+            | "iret"
+            | "iretd"
+            | "iretq"
+            | "uiret"
+            | "int"
+            | "int1"
+            | "int3"
+            | "into"
+            | "xgetbv"
+            | "encls"
+            | "enclu"
+    )
 }
 
 /// Return the register FAMILY an instruction implicitly READS, when the
@@ -711,5 +790,61 @@ mod writes_family_tests {
         let info = classify_line("    int $0x80");
         assert!(!writes_family_full(&info, "int $0x80", 0));
         assert!(!writes_family_full(&info, "int $0x80", 5));
+    }
+
+    #[test]
+    fn bare_string_ops_flag_implicit() {
+        for t in [
+            "movsq", "movsb", "stosq", "stosl", "lodsq", "cmpsb", "scasq", "insl", "outsb",
+        ] {
+            assert!(has_implicit_reg_usage(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn repe_family_flags_implicit() {
+        for t in ["repe cmpsb", "repz scasb", "repnz scasb"] {
+            assert!(has_implicit_reg_usage(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn misc_implicit_gp_effects_flagged() {
+        for t in [
+            "loop .L1",
+            "loope .L1",
+            "xlat",
+            "xlatb",
+            "rdpmc",
+            "sysret",
+            "sysexit",
+            "iretq",
+            "uiret",
+            "int $3",
+            "int3",
+            "xgetbv",
+            "enclu",
+            "encls",
+        ] {
+            assert!(has_implicit_reg_usage(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn sign_extends_and_reads_stay_unflagged() {
+        // `movswl` shares a prefix with the `movs` string op but is a plain
+        // sign-extend with explicit operands; `xsetbv`/`monitor`/`mwait` only
+        // read GP regs implicitly (reads don't modify), so skipping them is
+        // sound and they must not abort the coalescing scans.
+        for t in [
+            "movswl %dx, %eax",
+            "movsbq %cl, %rax",
+            "xsetbv",
+            "monitor %rax, %rcx, %rdx",
+            "mwait %rax, %rcx",
+            "addl %eax, %ebx",
+        ] {
+            assert!(!has_implicit_reg_usage(t), "{t}");
+        }
     }
 }
