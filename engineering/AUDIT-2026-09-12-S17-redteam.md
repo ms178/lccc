@@ -58,6 +58,43 @@ Keeping it invited a future "fix and enable" that would duplicate a sound pass
 and reintroduce four miscompiles. The adjudication is recorded in-file where
 the pass used to be.
 
+> **ADJUDICATED IN S19 (2026-09-12, commit `8d4ad8fc`) — PARTLY REVERSED.**
+>
+> The four defects and their diagnosis stand; each is reproduced and closed by
+> construction in the new design. Two conclusions do not stand.
+>
+> 1. **"Deleted rather than fixed, because `forward_slot_loads` already
+>    implements the same transformation" — DISAGREE, and this was the costly
+>    error.** `forward_slot_loads` is *windowed*: it proves "this register still
+>    holds the stored value" across at most 48 lines of straight-line text. The
+>    deleted pass was the only thing able to forward across a basic-block
+>    boundary, a loop back edge, or a call. Deleting it did not remove a
+>    duplicate, it removed a **capability**, and neither the windowed pass nor
+>    the S18 x87 folds substitutes for it. S19 restores it as
+>    `forward_slot_loads_cfg` — see
+>    `FOLLOWUP-2026-09-12-i686-cfg-slot-forwarding-and-narrow-store-miscompile.md`:
+>    −247 instructions / −405 slot references over 794 i686 TUs, 108 TUs
+>    strictly smaller, 0 larger, and −260 / −415 with upstream's Location
+>    Allocation Phase 1 (`CCC_RA_GLOBAL_LOCATION=1`) enabled in both arms, i.e.
+>    complementary to it rather than obsoleted by it. The "invited a future
+>    fix-and-enable" argument was right about the risk and wrong about the
+>    premise: the surviving pass was neither equivalent nor sound.
+> 2. **§2.2's "The live pass is sound — now proven, not assumed" — DISAGREE,
+>    falsified by measurement.** Those five tests pin the *invalidation* model
+>    (wide x87/SSE stores, `%esp` movement). Not one of them compares the
+>    *width of a store* against the *width of its consumer*. A differential
+>    fuzzer found a live silent miscompile in that same pass inside its first 96
+>    cases: `movw %ax, 8(%esp) / addl 8(%esp), %esi` was rewritten to
+>    `addl %eax, %esi`, substituting a 16-bit value for a 32-bit slot read
+>    (S19 FOLLOWUP §4; wrong at `-O1`/`-Os`/`-O2`/`-O3`; i686 only; in C,
+>    `u.h[0] = acc & 0xffff; acc += u.w;`). "Proven, not assumed" was itself an
+>    assumption — five hand-written tests over the one mechanism already
+>    suspected are not a proof over the pass. The general lesson, and the reason
+>    `tools/slot_fwd_fuzz.py` now exists: a soundness claim about a peephole
+>    needs a differential oracle over *generated* programs, because the defects
+>    that survive an audit are the ones in the mechanisms nobody thought to
+>    enumerate.
+
 ### 2.2 The live pass is sound — now proven, not assumed
 
 When `global_store_forwarding` was disabled, its tests were deleted too
