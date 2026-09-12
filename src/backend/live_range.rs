@@ -517,12 +517,32 @@ pub(crate) fn loop_depth_weight(loop_depth: u32) -> u64 {
 /// distinction is what the loop-span admission cap trades on: when
 /// loop-spanning ranges outnumber the capped pool, excess ones spill at
 /// admission so the short ranges do not lose every register to them.
+///
+/// `meta_uses` is [`RangeMetadata::uses`] for this function — the *same* map the
+/// ranges' own `uses` were cut from in `build_live_ranges_with_config`. It is
+/// used to give merged coalesce members the in-extent accounting they cannot get
+/// from a range of their own; sharing the source is what makes the two sides of
+/// the web-wide sum comparable. Pass the map through rather than re-deriving it:
+/// a second walk risks drifting from this numbering.
+///
+/// `web_inloop_use` enables that supply (kill switch `CCC_NO_WEB_INLOOP_USE=1`,
+/// plumbed as `RaConfig::no_web_inloop_use`). With it off the flag is derived
+/// from each range's own `uses` alone — the historical behaviour, which silently
+/// under-counts every web whose leader is a cold preheader definition.
 pub(crate) fn mark_loop_spanning(
     ranges: &mut [LiveRange],
     loop_extents: &[(u32, u32)],
     coalesce_member_of: &FxHashMap<u32, u32>,
     func: &IrFunction,
+    meta_uses: &FxHashMap<u32, Vec<u32>>,
+    web_inloop_use: bool,
 ) {
+    // Nothing below is reachable without a loop, and the two IR walks that
+    // follow are O(instructions): bail out before paying for them. (`folded_at`,
+    // `def_uses` and the per-range pass all feed only the extent loop.)
+    if loop_extents.is_empty() {
+        return;
+    }
     // Def instruction per value id, and the set of operands each def
     // consumes, for the recurrence test below.
     let mut def_uses: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -576,9 +596,6 @@ pub(crate) fn mark_loop_spanning(
             }
             point = point.saturating_add(1);
         }
-    }
-    if loop_extents.is_empty() {
-        return;
     }
     // Per loop: the peak number of simultaneously-live BLOCK-LOCAL ranges
     // (born and dying strictly inside the loop). That is exactly how many
@@ -682,9 +699,12 @@ pub(crate) fn mark_loop_spanning(
     // extent, and how many of its uses fall inside the extents? Computed
     // once up front (read-only pass) so the mutation loop below can ask
     // about web members without re-borrowing `ranges`.
-    let mut any_use_in_extent: FxHashMap<u32, bool> = FxHashMap::default();
     let mut uses_in_extents: FxHashMap<u32, u32> = FxHashMap::default();
     let mut exposed_in_extents: FxHashMap<u32, u32> = FxHashMap::default();
+    // Merged coalesce members with at least one read inside a measured extent.
+    // Kept apart from the two count maps on purpose: these feed a boolean, not
+    // the cap's counts.
+    let mut member_in_extent: FxHashSet<u32> = FxHashSet::default();
     for r in ranges.iter() {
         let mut n = 0u32;
         let mut exposed = 0u32;
@@ -702,9 +722,74 @@ pub(crate) fn mark_loop_spanning(
             last_point = Some(u);
         }
         if n > 0 {
-            any_use_in_extent.insert(r.value_id, true);
             uses_in_extents.insert(r.value_id, n);
             exposed_in_extents.insert(r.value_id, exposed);
+        }
+    }
+    // Merged members: does any of them get read inside an extent the LEADER
+    // spans? That is a boolean question and it is the one the supply answers.
+    //
+    // A coalesced member is merged into its leader's interval and owns no
+    // `LiveRange`, so the per-range pass above never sees its reads. That is
+    // precisely the case the aggregation below is documented to handle — "the
+    // member map carries the web-wide in-loop-use flag: a leader's own `uses`
+    // under-count a phi web exactly the way its priority does" — and without
+    // this supply the sum adds nothing for every merged member, degrading the
+    // flag to "does the LEADER have an in-extent use". For a phi web led by a
+    // cold preheader definition — the shape every loop-carried recurrence has —
+    // that is always false, so the in-loop-USELESS-span demotion rule fired on
+    // the hottest values in the loop. Measured on `sha256_transform`: the
+    // recurrence words `a` and `e` are `leader=v166 members=[166,389]`
+    // (`Load state[0]`) and `leader=v182 members=[182,392]` (`Load state[4]`),
+    // each reloaded seven times per iteration — 14 of the round loop's 15
+    // memory operations on two slots.
+    //
+    // Two details matter:
+    //
+    // * The points come from `meta_uses`, the map the leaders' `uses` were cut
+    //   from, so the numbering cannot drift. It also carries terminator uses
+    //   (recorded at the block-end point), which a hand-rolled instruction walk
+    //   omits — and the block-end point is exactly `loop_extents`' latch end, so
+    //   a value read only by a loop's terminating branch is in-extent. Proven by
+    //   `mark_loop_spanning_member_terminator_use_supplies_the_flag`, which fails
+    //   against a terminator-blind mutant.
+    // * A leader's `uses` are clipped to its range envelope. A member has no
+    //   envelope, and borrowing the leader's would be redundant: this is only
+    //   read when the leader `spans` an extent, which means
+    //   `start <= header_start && end >= latch_end`, i.e. the extent lies wholly
+    //   inside the leader's envelope, so every in-extent point is in-envelope.
+    //
+    // What the supply deliberately does NOT do is feed the cap's use COUNTS
+    // (`span_in_loop_uses` / `span_exposed_uses`); see the aggregation below for
+    // the measured reason. Because a boolean is all that is needed, the member
+    // walk stops at the first in-extent point instead of tallying, and no dedup
+    // or fold attribution is required on this side.
+    //
+    // Members that DO own a range are skipped: their entry already came from
+    // `range.uses`, and recomputing it from unclipped points would change
+    // existing behaviour. This touches span flags only — never `LiveRange::uses`
+    // or `priority`, because inflating a web's priority in the main scan waves
+    // reorders the whole allocation and is a measured negative (expat -30%,
+    // adler32 -23%, arith_loop -12%, sha256_transform -56%).
+    if web_inloop_use && !coalesce_member_of.is_empty() {
+        let has_range: FxHashSet<u32> = ranges.iter().map(|r| r.value_id).collect();
+        for &member in coalesce_member_of.keys() {
+            // A member that owns a range was already accounted for by the
+            // per-range pass above. `uses_in_extents` only ever receives
+            // `r.value_id` for `r` in `ranges`, so its keys are a subset of
+            // `has_range` and no separate membership test is needed.
+            if has_range.contains(&member) {
+                continue;
+            }
+            let Some(points) = meta_uses.get(&member) else {
+                continue;
+            };
+            if points
+                .iter()
+                .any(|&u| loop_extents.iter().any(|&(hs, le)| u >= hs && u <= le))
+            {
+                member_in_extent.insert(member);
+            }
         }
     }
     for range in ranges.iter_mut() {
@@ -719,27 +804,63 @@ pub(crate) fn mark_loop_spanning(
                 reserve = reserve.max(*peak);
                 bar = bar.max(*b);
                 max_extent_len = max_extent_len.max(latch_end.saturating_sub(*header_start));
-                // (the leader's own in-extent uses are summarized in
-                // `any_use_in_extent`, consulted after the extent loop)
             }
         }
-        // Web-wide: a member's read inside any extent the LEADER spans
-        // counts (the member's range shares the leader's fat envelope).
-        let mut in_loop_uses = uses_in_extents.get(&range.value_id).copied().unwrap_or(0);
-        let mut exposed_uses = exposed_in_extents
+        // Two different questions are asked about a span, and they must not
+        // share one number.
+        //
+        // (a) "Would demoting this web stage a HOT reload?" — a boolean, and it
+        //     is WEB-WIDE by physics: coalesced members share one register, so a
+        //     read of any member inside an extent the leader spans becomes a hot
+        //     reload if the web is demoted. The in-loop-useless demotion sites
+        //     gate on this, and getting it wrong is what reloaded
+        //     `sha256_transform`'s recurrence words `a` and `e` seven times per
+        //     iteration each (measured +3.68% median / +3.92% min when fixed).
+        //
+        // (b) "How much latency-exposed in-loop traffic does THIS RANGE carry?"
+        //     — the counts the admission cap thresholds against
+        //     MAX_SPAN_EXPOSED_USES. These stay PER-RANGE, as calibrated
+        //     (2026-09-08: chacha20's ARX webs cost 11-21 against
+        //     zlib_ng_adler32's 110-1100).
+        //
+        // Making (b) web-wide too was implemented and measured, and it is a large
+        // negative — the single worst regression this fix produced anywhere in
+        // the corpus. On lz4_compress it lifts `main`'s v212 (remcost 100,
+        // exposed 1 -> 3, recur=false) out of `worth_capping`, so the cap stops
+        // demoting it; the pressure is then handed to the span-pressure valve,
+        // which picks v133 (remcost 1110) — an 11x more expensive victim, chosen
+        // on a future-use count with no cost term. Net: +4 frame refs inside the
+        // hot loop and 40.53% slower at IDENTICAL instruction count (251 insns
+        // both arms), median and min in agreement, sign-test p=0.0000.
+        // `mark_loop_spanning_member_uses_do_not_inflate_the_cap_counts` pins it.
+        //
+        // The cap is not wrong about v212 — a web-wide count really does mean
+        // three hot reloads per iteration. The defect it exposes is that a veto
+        // with no replacement policy hands victim selection to a cost-blind
+        // selector. Making the valve cost-aware is the real fix and is tracked
+        // separately (see FOLLOWUP-2026-09-11-valve-cost-blindness); it changes
+        // core RA victim selection, whose whole measured history (chacha20,
+        // adler32, glibc_memcmp) would have to be re-derived, so it is not
+        // bundled into this change.
+        let in_loop_uses = uses_in_extents.get(&range.value_id).copied().unwrap_or(0);
+        let exposed_uses = exposed_in_extents
             .get(&range.value_id)
             .copied()
             .unwrap_or(0);
-        if let Some(members) = members_of.get(&range.value_id) {
-            for &m in members {
-                in_loop_uses =
-                    in_loop_uses.saturating_add(uses_in_extents.get(&m).copied().unwrap_or(0));
-                exposed_uses =
-                    exposed_uses.saturating_add(exposed_in_extents.get(&m).copied().unwrap_or(0));
+        // (a), web-wide: this range's own reads, or any member's. A member that
+        // owns a range is already accounted for in `uses_in_extents`; a merged
+        // member is in `member_in_extent`.
+        let mut web_in_loop_use = in_loop_uses > 0;
+        if !web_in_loop_use {
+            if let Some(members) = members_of.get(&range.value_id) {
+                web_in_loop_use = members.iter().any(|&m| {
+                    member_in_extent.contains(&m)
+                        || uses_in_extents.get(&m).copied().unwrap_or(0) > 0
+                });
             }
         }
         if !in_loop_use {
-            in_loop_use = in_loop_uses > 0;
+            in_loop_use = web_in_loop_use;
         }
         // Recurrence test: does any non-phi member's def consume a member?
         let mut recurrence = false;
@@ -1600,11 +1721,14 @@ impl LinearScanAllocator {
         {
             if self.ra_config.trace_alloc {
                 eprintln!(
-                    "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}",
+                    "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                     range.value_id,
                     range.start,
                     range.spans_loop,
                     range.span_has_in_loop_use,
+                    range.span_in_loop_uses,
+                    range.span_exposed_uses,
+                    range.span_recurrence,
                     range.remaining_cost(range.start),
                     range.span_cost_bar,
                     range.span_reserve,
@@ -1681,14 +1805,27 @@ impl LinearScanAllocator {
             // would otherwise home the earliest-arriving spans
             // (function-entry pointers) and push the actually-read webs
             // out of the pool.
+            //
+            // "In-loop-useless" must be judged web-wide, not per range: a
+            // loop-carried recurrence whose hot reads are folded into its
+            // block-def point (sha256 state words a/e) has spans_loop=true
+            // while its own `uses` all sit in the preheader. `mark_loop_
+            // spanning` supplies merged coalesce members through the separate
+            // `member_in_extent` set — deliberately NOT through
+            // `uses_in_extents`, which stays per-range so the admission cap's
+            // counts are untouched — so the flag reflects the whole web and
+            // this rule no longer demotes the hottest values in the loop.
             if range.span_marked && !range.span_has_in_loop_use && self.total_spans > allowed {
                 if self.ra_config.trace_alloc {
                     eprintln!(
-                        "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}",
+                        "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                         range.value_id,
                         range.start,
                         range.spans_loop,
                         range.span_has_in_loop_use,
+                        range.span_in_loop_uses,
+                        range.span_exposed_uses,
+                        range.span_recurrence,
                         range.remaining_cost(range.start),
                         range.span_cost_bar,
                         range.span_reserve,
@@ -1764,11 +1901,14 @@ impl LinearScanAllocator {
                 if self.loop_spanned_register_count() >= allowed {
                     if self.ra_config.trace_alloc {
                         eprintln!(
-                            "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}",
+                            "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                             range.value_id,
                             range.start,
                             range.spans_loop,
                             range.span_has_in_loop_use,
+                            range.span_in_loop_uses,
+                            range.span_exposed_uses,
+                            range.span_recurrence,
                             range.remaining_cost(range.start),
                             range.span_cost_bar,
                             range.span_reserve,
@@ -1789,11 +1929,14 @@ impl LinearScanAllocator {
                 }
                 if self.ra_config.trace_alloc {
                     eprintln!(
-                        "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}",
+                        "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                         range.value_id,
                         range.start,
                         range.spans_loop,
                         range.span_has_in_loop_use,
+                        range.span_in_loop_uses,
+                        range.span_exposed_uses,
+                        range.span_recurrence,
                         range.remaining_cost(range.start),
                         range.span_cost_bar,
                         range.span_reserve,
@@ -1860,11 +2003,14 @@ impl LinearScanAllocator {
         if range.spans_loop && range.span_marked && !range.span_has_in_loop_use {
             if self.ra_config.trace_alloc {
                 eprintln!(
-                    "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}",
+                    "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                     range.value_id,
                     range.start,
                     range.spans_loop,
                     range.span_has_in_loop_use,
+                    range.span_in_loop_uses,
+                    range.span_exposed_uses,
+                    range.span_recurrence,
                     range.remaining_cost(range.start),
                     range.span_cost_bar,
                     range.span_reserve,
@@ -1932,11 +2078,14 @@ impl LinearScanAllocator {
             // `range` moved only on the success path above.
             if self.ra_config.trace_alloc {
                 eprintln!(
-                    "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} remcost={} bar={} reserve={} total_spans={} site={}",
+                    "[SPILL-TRACE] demote v{} @{} spans_loop={} in_loop_use={} in_loop_uses={} exposed={} recur={} remcost={} bar={} reserve={} total_spans={} site={}",
                     range.value_id,
                     range.start,
                     range.spans_loop,
                     range.span_has_in_loop_use,
+                    range.span_in_loop_uses,
+                    range.span_exposed_uses,
+                    range.span_recurrence,
                     range.remaining_cost(range.start),
                     range.span_cost_bar,
                     range.span_reserve,
@@ -2396,6 +2545,21 @@ pub(crate) fn build_live_ranges_with_config(
     func: &IrFunction,
     ra_config: &Arc<RaConfig>,
 ) -> Vec<LiveRange> {
+    build_live_ranges_with_config_and_meta(intervals, loop_depth, func, ra_config).0
+}
+
+/// As [`build_live_ranges_with_config`], but also hands back the
+/// [`RangeMetadata`] the ranges were built from. `mark_loop_spanning` needs
+/// `meta.uses` to account for merged coalesce members, which own no range;
+/// returning it here costs nothing (the walk already happened) and keeps the
+/// leader and member sides of that web-wide sum on one numbering by
+/// construction rather than by convention.
+pub(crate) fn build_live_ranges_with_config_and_meta(
+    intervals: &[LiveInterval],
+    loop_depth: &[u32],
+    func: &IrFunction,
+    ra_config: &Arc<RaConfig>,
+) -> (Vec<LiveRange>, RangeMetadata) {
     let meta = collect_range_metadata(func, loop_depth);
     let pgo_point_weights = pgo_point_weights(func, ra_config);
     let point_depths = point_loop_depths(func, loop_depth);
@@ -2456,7 +2620,7 @@ pub(crate) fn build_live_ranges_with_config(
             .then_with(|| b.priority.cmp(&a.priority))
             .then_with(|| a.value_id.cmp(&b.value_id))
     });
-    ranges
+    (ranges, meta)
 }
 
 /// Loop depth of the block owning each program point, in the dense numbering
@@ -2485,10 +2649,12 @@ fn point_loop_depths(func: &IrFunction, loop_depth: &[u32]) -> Vec<u32> {
     out
 }
 
-struct RangeMetadata {
+pub(crate) struct RangeMetadata {
     def_block: FxHashMap<u32, usize>,
     max_use_depth: FxHashMap<u32, u32>,
-    uses: FxHashMap<u32, Vec<u32>>,
+    /// Value id -> ascending use points (duplicates adjacent, one per operand
+    /// occurrence), in the same dense numbering as `loop_extents`.
+    pub(crate) uses: FxHashMap<u32, Vec<u32>>,
     hints: FxHashMap<u32, u32>,
 }
 
@@ -2705,11 +2871,6 @@ fn find_register_hints(func: &IrFunction) -> FxHashMap<u32, u32> {
     hints
 }
 
-#[expect(dead_code)]
-fn collect_uses_for_values(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
-    collect_range_metadata(func, &[]).uses
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2802,6 +2963,8 @@ mod tests {
             &[(100, 500)],
             &FxHashMap::default(),
             &empty_fn(),
+            &FxHashMap::default(),
+            true,
         );
         let web = ranges.iter().find(|r| r.value_id == 1).unwrap();
         assert!(web.spans_loop);
@@ -2819,6 +2982,8 @@ mod tests {
             &[(100, 500)],
             &FxHashMap::default(),
             &empty_fn(),
+            &FxHashMap::default(),
+            true,
         );
         assert_eq!(ranges[0].span_reserve, 1);
     }
@@ -2836,6 +3001,8 @@ mod tests {
             &[(50, 390)],
             &FxHashMap::default(),
             &empty_fn(),
+            &FxHashMap::default(),
+            true,
         );
         let flag =
             |rs: &[LiveRange], id: u32| rs.iter().find(|r| r.value_id == id).unwrap().spans_loop;
@@ -2846,7 +3013,14 @@ mod tests {
         assert!(!flag(&ranges, 4));
         // Empty extent list marks nothing.
         let mut x = vec![lr(9, 0, 100, vec![1], 1)];
-        mark_loop_spanning(&mut x, &[], &FxHashMap::default(), &empty_fn());
+        mark_loop_spanning(
+            &mut x,
+            &[],
+            &FxHashMap::default(),
+            &empty_fn(),
+            &FxHashMap::default(),
+            true,
+        );
         assert!(!x[0].spans_loop);
     }
 
@@ -3127,7 +3301,14 @@ mod tests {
             lr(1, 0, 900, vec![10, 900], 60),
             lr(3, 0, 900, vec![10, 900], 60),
         ];
-        mark_loop_spanning(&mut ranges, &[(100, 500)], &member_of, &f);
+        mark_loop_spanning(
+            &mut ranges,
+            &[(100, 500)],
+            &member_of,
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            true,
+        );
         let acc = ranges.iter().find(|r| r.value_id == 1).unwrap();
         let independent = ranges.iter().find(|r| r.value_id == 3).unwrap();
         assert!(
@@ -3139,6 +3320,264 @@ mod tests {
             "body-computed web is not carried"
         );
         assert!(acc.span_marked && independent.span_marked);
+    }
+
+    /// The web-wide in-loop-use supply, and its kill switch
+    /// (`CCC_NO_WEB_INLOOP_USE` -> `RaConfig::no_web_inloop_use`).
+    ///
+    /// A leader whose own uses all sit OUTSIDE the loop, but whose merged
+    /// coalesce member is read INSIDE it, must be flagged as having an in-loop
+    /// use. Before the fix the member owned no `LiveRange` — it was merged into
+    /// the leader's interval — so `uses_in_extents` had no entry for it and the
+    /// web-wide sum, whose own comment says the member map "carries the
+    /// web-wide in-loop-use flag", added nothing at all. The flag came out
+    /// false and the in-loop-USELESS-span demotion rule fired on the hottest
+    /// values in the loop: `sha256_transform`'s recurrence words `a` and `e`,
+    /// reloaded seven times per iteration each.
+    ///
+    /// Both arms are pinned. `false` must reproduce the historical
+    /// per-range-only behaviour exactly, so the kill switch is provably wired
+    /// rather than merely present, and a future regression can be attributed
+    /// without a rebuild.
+    #[test]
+    fn mark_loop_spanning_web_inloop_use_supplies_merged_members() {
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{BlockId, Instruction, IrBinOp, Operand, Value};
+        let mut f = empty_fn();
+        // Dense use-point numbering: instruction i sits at point i.
+        f.blocks[0].instructions = vec![
+            // point 0: the phi leader v1 collects member v2.
+            Instruction::Phi {
+                dest: Value(1),
+                ty: IrType::I32,
+                incoming: vec![(Operand::Value(Value(2)), BlockId(0))],
+            },
+            // point 1: v2 = v1 + v9, inside the extent.
+            Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(9)),
+                ty: IrType::I32,
+            },
+            // point 2: v5 = v2 + v8 — the MERGED MEMBER read inside the extent.
+            Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Value(Value(8)),
+                ty: IrType::I32,
+            },
+        ];
+        // coalesce_member_of is member -> web leader; v2 owns no range.
+        let member_of: FxHashMap<u32, u32> = [(2u32, 1u32)].into_iter().collect();
+        // The leader's own uses are all OUTSIDE the extent [1, 2].
+        let build = || vec![lr(1, 0, 900, vec![900], 60)];
+
+        let mut on = build();
+        mark_loop_spanning(
+            &mut on,
+            &[(1, 2)],
+            &member_of,
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            true,
+        );
+        let r = on.iter().find(|r| r.value_id == 1).unwrap();
+        assert!(r.span_marked, "the leader's envelope covers the extent");
+        assert!(
+            r.span_has_in_loop_use,
+            "the web-wide supply must see the merged member's in-extent read"
+        );
+        assert_eq!(
+            r.span_in_loop_uses, 0,
+            "the supply sets the boolean only; the cap's counts stay per-range"
+        );
+
+        let mut off = build();
+        mark_loop_spanning(
+            &mut off,
+            &[(1, 2)],
+            &member_of,
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            false,
+        );
+        let r = off.iter().find(|r| r.value_id == 1).unwrap();
+        assert!(r.span_marked, "marking is independent of the supply");
+        assert!(
+            !r.span_has_in_loop_use,
+            "kill switch must reproduce the historical per-range-only flag"
+        );
+        assert_eq!(
+            r.span_in_loop_uses, 0,
+            "kill switch must not supply the member's uses"
+        );
+    }
+
+    /// A merged member whose ONLY in-extent read is by the block terminator must
+    /// still supply the web-wide flag.
+    ///
+    /// `collect_range_metadata` records terminator operands at the block-end
+    /// point (`record_terminator_uses`), because a loop's terminating branch is
+    /// a canonical reader of the value it tests. The hand-rolled instruction
+    /// walk this replaced iterated `block.instructions` only and so dropped
+    /// exactly those reads — an asymmetry with the leader side of the same sum.
+    /// Here v2 is read at point 0 (the phi back edge, out of extent) and at
+    /// point 2 (the terminator, in extent); the extent is [1, 2], so the
+    /// terminator read is the only thing that can set the flag.
+    #[test]
+    fn mark_loop_spanning_member_terminator_use_supplies_the_flag() {
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{BlockId, Instruction, IrBinOp, Operand, Value};
+        let mut f = empty_fn();
+        f.blocks[0].instructions = vec![
+            // point 0: phi leader v1 <- member v2. Out of extent [1, 2].
+            Instruction::Phi {
+                dest: Value(1),
+                ty: IrType::I32,
+                incoming: vec![(Operand::Value(Value(2)), BlockId(0))],
+            },
+            // point 1: v2 = v1 + v9, the loop-carried update. Reads v1, not v2.
+            Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(9)),
+                ty: IrType::I32,
+            },
+        ];
+        // point 2: the terminator tests v2 — the ONLY in-extent read of the
+        // merged member.
+        f.blocks[0].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(2)),
+            true_label: BlockId(0),
+            false_label: BlockId(1),
+        };
+        let member_of: FxHashMap<u32, u32> = [(2u32, 1u32)].into_iter().collect();
+        // The leader's own uses are all OUTSIDE the extent.
+        let build = || vec![lr(1, 0, 900, vec![900], 60)];
+
+        let mut on = build();
+        mark_loop_spanning(
+            &mut on,
+            &[(1, 2)],
+            &member_of,
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            true,
+        );
+        let r = on.iter().find(|r| r.value_id == 1).unwrap();
+        assert!(r.span_marked, "the leader's envelope covers the extent");
+        assert!(
+            r.span_has_in_loop_use,
+            "a terminator read of a merged member is an in-extent use"
+        );
+        assert_eq!(
+            r.span_in_loop_uses, 0,
+            "the terminator read sets the boolean; it must not reach the cap's \
+             per-range count"
+        );
+
+        let mut off = build();
+        mark_loop_spanning(
+            &mut off,
+            &[(1, 2)],
+            &member_of,
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            false,
+        );
+        let r = off.iter().find(|r| r.value_id == 1).unwrap();
+        assert!(
+            !r.span_has_in_loop_use,
+            "kill switch must reproduce the historical per-range-only flag"
+        );
+    }
+
+    /// The web-wide supply must set the in-loop-use BOOLEAN without inflating
+    /// the admission cap's use COUNTS.
+    ///
+    /// Both are derived from the same member reads, but they gate different
+    /// decisions that were calibrated separately, and coupling them is the worst
+    /// regression this fix produced anywhere in the corpus. Counting a member's
+    /// in-extent reads into `span_exposed_uses` pushed lz4_compress `main`'s v212
+    /// (remcost 100, exposed 1 -> 3) past `MAX_SPAN_EXPOSED_USES`, so
+    /// `worth_capping` stopped demoting it and the span-pressure valve took the
+    /// pressure instead — picking v133 at remcost 1110, an 11x more expensive
+    /// victim selected on a future-use count with no cost term. lz4 came out
+    /// 40.53% slower at IDENTICAL instruction count (251 insns both arms,
+    /// median and min in agreement, p=0.0000), with +4 frame refs inside its hot
+    /// loop. The counts therefore stay per-range and only the boolean is
+    /// web-wide; see the aggregation comment for the full argument.
+    ///
+    /// Here the merged member is read at four distinct in-extent points — twice
+    /// the cap's ceiling — so a regression that re-couples them fails loudly
+    /// instead of showing up as a 40% benchmark loss.
+    #[test]
+    fn mark_loop_spanning_member_uses_do_not_inflate_the_cap_counts() {
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{BlockId, Instruction, IrBinOp, Operand, Value};
+        let mut f = empty_fn();
+        let read_v2 = |d: u32| Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Value(Value(8)),
+            ty: IrType::I32,
+        };
+        f.blocks[0].instructions = vec![
+            // point 0: phi leader v1 <- member v2 (out of extent [1, 5]).
+            Instruction::Phi {
+                dest: Value(1),
+                ty: IrType::I32,
+                incoming: vec![(Operand::Value(Value(2)), BlockId(0))],
+            },
+            // point 1: v2 = v1 + v9.
+            Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(9)),
+                ty: IrType::I32,
+            },
+            // points 2..5: the merged member read at FOUR distinct in-extent
+            // points, i.e. above MAX_SPAN_EXPOSED_USES.
+            read_v2(20),
+            read_v2(21),
+            read_v2(22),
+            read_v2(23),
+        ];
+        let member_of: FxHashMap<u32, u32> = [(2u32, 1u32)].into_iter().collect();
+        // The leader's own uses are all OUTSIDE the extent, so its per-range
+        // counts are zero and any leak from the member supply is visible.
+        let mut ranges = vec![lr(1, 0, 900, vec![900], 60)];
+        mark_loop_spanning(
+            &mut ranges,
+            &[(1, 5)],
+            &member_of,
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            true,
+        );
+        let r = &ranges[0];
+        assert!(r.span_marked);
+        assert!(
+            r.span_has_in_loop_use,
+            "the boolean IS web-wide: a member's in-extent read means demotion \
+             would stage a hot reload"
+        );
+        assert_eq!(
+            r.span_in_loop_uses, 0,
+            "the cap's count must stay per-range: four member reads must not \
+             reach span_in_loop_uses (lz4_compress v212, -40.53%)"
+        );
+        assert_eq!(
+            r.span_exposed_uses, 0,
+            "the cap's exposed count must stay per-range: inflating it past \
+             MAX_SPAN_EXPOSED_USES un-caps a cheap span and hands victim \
+             selection to the cost-blind valve"
+        );
     }
 
     /// Regression: put_dec Wave-4 (vsprintf.c). v39 [41,42] takes %r10-class

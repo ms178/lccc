@@ -37,9 +37,15 @@ work management lives in the engineering tree:
 ## Execution order (summary; details in the engineering tree)
 
 1. **P0 codegen** — RA-06 reload-at-use + arithmetic-chain copy webs
-   (adler 1.63×), OP-05b multi-store scatter (nbody/spectral), PF-17
-   loop-rotation hardening → default-enable (the systemic ~1 branch/iter
-   gap), RA-01b marching-pointer homes.
+   (adler 1.63×), RA-06 location pieces — on `sha256_transform` gcc is still
+   **44% faster** (measured) and emits 8 frame-relative stack refs against
+   LCCC's 62, with the *same* loop count, so the gap is spill traffic and
+   redundant moves rather than loop structure; the web-wide in-loop-use supply
+   landed (+3.6…+4.3% runtime, hottest slot 17→10 reloads) and RA-06B's
+   back-edge-split framing is superseded by it, OP-05b
+   multi-store scatter (nbody/spectral), PF-17 loop-rotation hardening →
+   default-enable (the systemic ~1 branch/iter gap), RA-01b
+   marching-pointer homes.
 2. **Platform gates** — LK-19 IFUNC end-to-end, LK-24 external-PIE startup
    SIGSEGV, kernel objtool interop + `net/*` statement-expression typing.
 3. **P1 measured gaps** — PF-06 isort secondary IV, IS-11 andn+cmov ffs,

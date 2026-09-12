@@ -112,12 +112,29 @@ the evidence. Re-oracle and check gzip `longest_match` stack-mem after
 29. Snapshot immediately after every validated change; verify patches apply
     to a pristine `origin/main` worktree; move `artifacts/.base_ref` on
     every rebase.
+30. Re-derive every factorial A/B conclusion after a rebase, and never let an
+    un-amplified median choose what ships. Measured: "the phi-acyclic resolver
+    and the RA in-loop-use fix are complementary, ship together (+8.21%)" was
+    taken un-amplified (~55 ms/arm, median +8.21% against its own min ratio
+    +3.8% — `median_and_min_agree` violated) on base `4f527199`. After rebasing
+    onto `25ed36de`, which changed eviction in `select_evict_victim`
+    (`evict_short_k`), the amplified factorial reads RA-fix-alone **+3.63% /
+    +4.33%** (p=0.0000, median and min agreeing in both replicates) and the
+    resolver on top of it **-1.99% / -0.71%**: the correct disposition is the
+    exact opposite of the earlier one. Complementarity between a copy-ordering
+    change and an allocator demotion rule is base-dependent by construction.
+    Amplify to >=200 ms/arm before believing any ratio. See
+    `engineering/evidence/ra-web-inloop-use-2026-09-11/`.
 
 ## Kill switches (bisection / soundness fallback)
 
 `CCC_NO_LOAD_CAST_FOLD`, `CCC_NO_X64_IMMED_NOHOME`, `CCC_MI_FORCE_LOOPS`,
 `CCC_MI_MAX_LOOP_INSTS`, `CCC_SROA_COPYOUT`, `CCC_EVICT_MODE`,
 `CCC_NO_COALESCE`, `CCC_DEBUG_RA`, `CCC_DUMP_IR`, `CCC_NO_PHI_COALESCE`,
+`CCC_PHI_ACYCLIC_ORDER` (opt-in; costs -0.7...-2.0% on `sha256_transform` on
+top of the web-wide in-loop-use supply, so it must not become default),
+`CCC_NO_WEB_INLOOP_USE` (kill switch for that supply; load-bearing at
++3.6...+4.3% on `sha256_transform`, must never become default),
 `CCC_NO_LEAF_PARAM_GPR`, `CCC_NO_FOLDED_INDEX_LIVENESS`,
 `CCC_NO_LOAD_HAZARD_REFINE`, `CCC_NO_EAX_ALLOC`, `CCC_NO_SEGMENT_FILL`,
 `CCC_NO_INDEX_HOME`, `CCC_NO_ABI_REG_HINTS`, `CCC_NO_LICM_ALIAS`,

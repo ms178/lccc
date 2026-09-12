@@ -36,6 +36,72 @@ It is intentionally stricter than the former best-of-*N* wall-clock script:
 - it probes PMU availability once.  A VM with no usable PMU is explicitly
   labelled *screening evidence*, never a microarchitectural performance claim.
 
+### Screen before you time: `scripts/differential_corpus.sh`
+
+Timing only the benchmark a change was aimed at is how a large regression survives
+review.  [`scripts/differential_corpus.sh`](../scripts/differential_corpus.sh)
+answers the prior question — *which translation units did this change actually
+touch?* — by compiling every `.c` under a corpus root (default `tests/`, 807
+files, ~70 s) with two compiler binaries at `-O2 -S` and reporting three things
+separately: exit-status differences, one-sided failures, and **byte differences in
+the assembly** among the files both compilers handle.  Exit 0 means output-neutral,
+exit 1 means codegen moved and the changed files are listed.
+
+Byte comparison rather than instruction counts, because a change claiming to be
+behaviour-preserving has exactly one honest test.  Counting instructions lets a
+semantic change hide behind a compensating one.  The converse also holds and is
+the point: when the arms come out byte-identical, a runtime A/B is uninformative by
+construction and `paired_ab.py` will refuse to emit a verdict for it.
+
+This is how the web-wide in-loop-use supply's **40.53 % `lz4_compress`
+regression** was found (Session 17, `engineering/DECISIONS.md`): the screen named
+13 changed translation units, `lz4_compress` was among them, and timing it showed
+base 40.53 % faster at *identical instruction count* — 251 instructions in `main`
+for both arms.  Two prior review rounds had missed it because both re-timed only
+`sha256_transform`.  The fix that shipped afterwards touches 10 translation units
+instead of 13 and leaves `lz4_compress` byte-identical to base.
+
+Always run a **negative control** with it: point it at two builds you know differ
+(e.g. pristine base vs the candidate) and confirm it reports the difference.  A
+screen that reports "neutral" without ever having been seen to report "changed" is
+not evidence.
+
+### Single-knob A/B: `scripts/paired_ab.py`
+
+For attributing one compile-time knob on one kernel — the shape of question a
+codegen change actually raises — [`scripts/paired_ab.py`](../scripts/paired_ab.py)
+is a lighter harness with the same discipline: it builds both arms itself,
+**hashes them, and refuses to emit a verdict when they are byte-identical**
+(exit 3, *uninformative*), checks that both arms agree on stdout and exit status
+before timing anything (exit 4, *correctness*, never reported as a perf result),
+interleaves the arms within each round with the order alternated round to round,
+reports `min` next to `median`/`mean` and flags it when the two disagree on
+direction, and runs a paired sign test so "consistent" is quantitative.
+
+The identity guard is not theoretical. Screening `CCC_PHI_ACYCLIC_ORDER` across
+the corpus with `perf_ab.py` produced a geomean verdict over arms of which
+**6 of 8 compiled byte-identically**; their deltas were noise, and the noise
+floor on this VM is ±4%. Measured deliberately with `--allow-identical`, two
+byte-identical `base64_enc` arms — a comparison whose true effect is exactly
+zero — still show a **5.67%** median delta at paired sign-test **`p = 0.0164`**,
+i.e. *nominally significant*. Interleaving and order alternation do not remove
+it: on a 2-core shared VM the bias is systematic and correlates within a round,
+so a paired test inherits it rather than averaging it out. **Statistical
+significance does not imply a real effect.** Always hash the arms before
+believing a ratio. See
+[`engineering/FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md`](../engineering/FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md).
+
+Size the workload as well as screening it. A second failure mode was measured on
+the same kernel: at the corpus default (~55 ms/arm) a paired 51-round A/B reported
+a **+8.21 %** median whose own min ratio said **+3.8 %** — the harness's
+`median_and_min_agree` criterion violated, so the headline was the contaminated
+estimator. Re-run amplified to ~430 ms/arm, the same pair reads **+1.9 %**, and the
+leg that actually wins (**+3.63 % / +4.33 %**, p=0.0000, median and min agreeing in
+both replicates) is a *different configuration* from the one the un-amplified run
+selected. If an arm runs in under ~200 ms, amplify it before believing any ratio,
+and never let a median-only result decide what ships. See
+[`engineering/evidence/ra-web-inloop-use-2026-09-11/`](../engineering/evidence/ra-web-inloop-use-2026-09-11/).
+
 The runner compares LCCC and GCC by default and includes Clang/ICX when they
 are installed. The original CCC is opt-in via `--compilers lccc,ccc,gcc` and
 `--ccc /path/to/ccc`. It uses the same explicit code-generation flag for every

@@ -1,0 +1,53 @@
+# Corpus blast-radius differential — base 25ed36de vs the two candidate designs
+#
+# Tool: scripts/differential_corpus.sh (byte-comparison of -O2 -S output over
+# every .c under tests/; reports exit-status diffs, one-sided failures and asm
+# diffs separately). Run 2026-09-11T21:18:34Z.
+
+## Design A: COUPLED (member reads fed into the cap's use counts) — 13 of 805 TUs changed
+  corpus           : 807 translation units
+  compiled by both : 805
+  failed by both   : 2  (pre-existing, not attributable)
+  exit-status diffs: 0
+  one-sided failures: 0
+  asm diffs        : 13 of 805
+      tests/bench/k_adler32_do8.c
+      tests/benchmark/kernel_corpus/k01_adler.c
+      tests/benchmark/programs/linux_rbtree.c
+      tests/benchmark/programs/lz4_compress.c
+      tests/benchmark/programs/sha256_transform.c
+      tests/benchmark/programs/strlen_bench.c
+      tests/regression/cmp_replay_acc_nohome.c
+      tests/regression/divrem_pair_opposite_flavour.c
+      tests/regression/huft_build_crash.c
+      tests/regression/iv_widen_float_conversion_closure.c
+      tests/regression/o0_phi_multidef.c
+      tests/regression/vector_defer_multidef_slot.c
+      tests/regression/vectorize_matmul_n17.c
+
+  VERDICT: the candidate CHANGES codegen for the files listed above
+
+## Design B: DECOUPLED / SHIPPED (member reads feed the boolean only) — 10 of 805 TUs changed
+  corpus           : 807 translation units
+  compiled by both : 805
+  failed by both   : 2  (pre-existing, not attributable)
+  exit-status diffs: 0
+  one-sided failures: 0
+  asm diffs        : 10 of 805
+      tests/bench/k_adler32_do8.c
+      tests/benchmark/kernel_corpus/k01_adler.c
+      tests/benchmark/programs/linux_rbtree.c
+      tests/benchmark/programs/sha256_transform.c
+      tests/benchmark/programs/strlen_bench.c
+      tests/regression/cmp_replay_acc_nohome.c
+      tests/regression/huft_build_crash.c
+      tests/regression/iv_widen_float_conversion_closure.c
+      tests/regression/vector_defer_multidef_slot.c
+      tests/regression/vectorize_matmul_n17.c
+
+  VERDICT: the candidate CHANGES codegen for the files listed above
+
+## Files Design A touched that Design B does NOT (the regression surface removed):
+  tests/benchmark/programs/lz4_compress.c
+  tests/regression/divrem_pair_opposite_flavour.c
+  tests/regression/o0_phi_multidef.c

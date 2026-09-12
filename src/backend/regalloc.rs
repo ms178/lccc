@@ -68,6 +68,13 @@ pub(crate) struct RaConfig {
     /// switch only: the valve is load-bearing (chacha20_core goes from
     /// 33 to 91 spills with it off), so this must never become default.
     pub(crate) no_span_valve: bool,
+    /// `CCC_NO_WEB_INLOOP_USE`: disable the web-wide in-loop-use supply for
+    /// merged coalesce members in `mark_loop_spanning` (default: false — the
+    /// supply is on). Diagnostic/A-B switch only: it is load-bearing
+    /// (`sha256_transform` loses 3.6-4.3% runtime with it off, and the round
+    /// loop's hottest slot goes back to 7 reloads per iteration), so this must
+    /// never become default.
+    pub(crate) no_web_inloop_use: bool,
     /// `CCC_NO_LOAD_HAZARD_REFINE`: disable i686 load hazard refinement (default: false).
     pub(crate) no_load_hazard_refine: bool,
     /// `CCC_NO_EAX_ALLOC`: disable the i686 eax allocation phase (default: false).
@@ -283,6 +290,7 @@ impl RaConfig {
             leaf_strict_call_free: present("CCC_LEAF_STRICT_CALL_FREE"),
             no_leaf_caller_home: present("CCC_NO_LEAF_CALLER_HOME"),
             no_span_valve: present("CCC_NO_SPAN_VALVE"),
+            no_web_inloop_use: present("CCC_NO_WEB_INLOOP_USE"),
             no_load_hazard_refine: present("CCC_NO_LOAD_HAZARD_REFINE"),
             no_eax_alloc: present("CCC_NO_EAX_ALLOC"),
             no_loop_pin: present("CCC_NO_LOOP_PIN"),
@@ -3589,7 +3597,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let scan_ivs =
         collect_gpr_scan_intervals(&liveness, &eligible, &merged_of, &coalesce_member_of);
     let build_gpr_ranges = |intervals: &[LiveInterval]| {
-        let mut ranges = live_range::build_live_ranges_with_config(
+        let (mut ranges, range_meta) = live_range::build_live_ranges_with_config_and_meta(
             intervals,
             &liveness.block_loop_depth,
             func,
@@ -3620,12 +3628,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         // every iteration and are subject to the admission cap. The
         // member map carries the web-wide in-loop-use flag: a leader's
         // own `uses` under-count a phi web exactly the way its priority
-        // does.
+        // does. A merged member owns no range, so its in-extent uses are
+        // taken from the same `RangeMetadata::uses` these ranges were cut
+        // from — one numbering, and terminator uses included.
         live_range::mark_loop_spanning(
             &mut ranges,
             &liveness.loop_extents,
             &coalesce_member_of,
             func,
+            &range_meta.uses,
+            !config.ra_config.no_web_inloop_use,
         );
         ranges
     };
@@ -10369,6 +10381,7 @@ mod ra_config_tests {
         switch!(leaf_strict_call_free, "CCC_LEAF_STRICT_CALL_FREE");
         switch!(no_leaf_caller_home, "CCC_NO_LEAF_CALLER_HOME");
         switch!(no_span_valve, "CCC_NO_SPAN_VALVE");
+        switch!(no_web_inloop_use, "CCC_NO_WEB_INLOOP_USE");
         switch!(no_load_hazard_refine, "CCC_NO_LOAD_HAZARD_REFINE");
         switch!(no_eax_alloc, "CCC_NO_EAX_ALLOC");
         switch!(no_loop_pin, "CCC_NO_LOOP_PIN");
