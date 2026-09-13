@@ -1689,7 +1689,9 @@ calibration record:
 `FOLLOWUP-2026-09-11-global-location-allocation-phase1.md`,
 `AUDIT-2026-09-12-S16-redteam.md`.
 
-The feature ships **off** (`CCC_RA_GLOBAL_LOCATION=1` to enable). Every
+The feature originally shipped **off**; **source-less rematerialization
+graduated to default ON under RA-GLA-02 below** (2026-09-12) — the env var
+is now the emergency kill switch. Spill/intra-block gaps remain OFF. Every
 knob is fail-closed in the safe direction: loosening a filter can only
 ADD edits; numeric knobs are parsed once per process (`OnceLock`), an
 unparseable value keeps the default, and every value is clamped to the
@@ -1699,7 +1701,7 @@ range below so no parse result can drive an unbounded plan.
 
 | Variable | Default | Clamp | Effect / fail-closed direction |
 |---|---|---|---|
-| `CCC_RA_GLOBAL_LOCATION` | off | truthy except `0/off/no/false` | Master gate. Off = zero GLA edits. |
+| `CCC_RA_GLOBAL_LOCATION` | **ON** (RA-GLA-02; was off) | unset/`1`/`on` enable; `0/off/no/false/empty` disable | Master gate / kill switch. Off = zero GLA edits. |
 | `CCC_RA_GLOBAL_LOCATION_MAX` | 64 | 0..=4096 | Per-function edit budget (remats + gaps). 0 disables planning. Raising ADDS edits. |
 | `CCC_PRESSURE_BUDGET` | 12 (x86-64) / 6 (i686) | 2..=64 | GPR color-class budget the planner and the intra-block pressure splitter treat as "colorable". Lowering ADDS edits. Shared with RA-06. |
 | `CCC_PRESSURE_MIN_GAP` | 4 | 1..=256 | Minimum program points a gap must span (RA-06 helper). Lowering ADDS edits. |
@@ -1754,7 +1756,127 @@ caps its capacity hint by real instruction content, so an inflated
 matrix), `location_alloc::tests::reach_band_equals_buyable_callee_saved_count`,
 `location_alloc::tests::next_value_exhaustion_fails_closed`.
 
-## ALIGN-01 (2026-09-12) — structural hot-loop alignment ("tight loops"): two-layer GCC 16.2 mirror with exact encoded spans
+## RA-GLA-02 (2026-09-12) — GLA source-less rematerialization graduates to default ON
+
+Supersedes RA-GLA-01's ship-OFF status for the source-less rematerialization
+vocabulary only. Spill gaps, intra-block gaps, and the Size tier stay OFF
+exactly as before; every other RA-GLA-01 knob and fail-closed direction is
+unchanged.
+
+**Gate semantics after this record:** `CCC_RA_GLOBAL_LOCATION` is an
+emergency kill switch. Unset ⇒ ON; `0`/`off`/`no`/`false`/empty (any case)
+⇒ OFF; anything else (incl. `1`/`on`) ⇒ ON.
+
+### Fire census (what default-ON actually changes)
+
+`scripts/gla_fire_census.py` over the compiler corpus (785 TUs ×
+{-O0,-O1,-O2,-O3,-Os} × {x86-64,i686}), gate ON:
+
+| opt | x64 TUs/edits | i686 TUs/edits | capture slots | aborts/hard failures |
+|---|---|---|---|---|
+| -O0 | 29 / 353 | 108 / 637 | 0 | 0 |
+| -O1 | 26 / 150 | 61 / 145 | 0 | 0 (see tramps below) |
+| -O2 | 22 / 37 | 78 / 172 | 0 | 0 |
+| -O3 | 22 / 37 | 78 / 172 | 0 | 0 |
+| -Os | 0 / 0 | 0 / 0 | 0 | 0 (`Tier::Size` plans nothing) |
+
+Every applied edit is a source-less rematerialization
+(`GlobalAddr` or `Copy`-of-`Const`, simple GPR types only): edits == remat
+counts in every row. Zero capture slots, zero id-space aborts, zero
+gate-induced hard failures on both targets. One fan-out edge trampoline
+traced at i686 -O1 in `tests/regression/peephole_inline_asm_barrier.c`, a TU
+that does not assemble for i686 even with the gate OFF (x86-64-only inline
+asm) — the emitter therefore had no successful end-to-end coverage and
+motivated the tests below.
+
+### Static emitted-text deltas (gate ON minus OFF)
+
+`scripts/census_full_delta.sh` (adds `--32` mode): totals over changed TUs.
+
+| target/opt | changed TUs | Δ instructions | Δ stack refs |
+|---|---|---:|---:|
+| x64 -O0 | 24 | −473 | −258 |
+| x64 -O1 | 4 | −60 | −15 |
+| x64 -O2 | 7 | −22 | −46 |
+| x64 -O3 | 7 | −22 | −46 |
+| i686 -O0 | 86 | −559 | −835 |
+| i686 -O1 | 34 | −129 | −151 |
+| i686 -O2 | 40 | +6 | −284 |
+| i686 -O3 | 40 | +6 | −284 |
+
+Positive deltas were triaged one by one; each is the policy-model-gated
+LEA/mov-for-stack-ref trade (benefit/cost ≥ 2.0, min benefit 40) or debug
+tier slot churn, and every positive TU is output-equivalent on/off (see
+below): i686 -O2 vectorization regression TUs spend ≤+21 ALU insns for
+−18…−33 stack refs (`affine_map_vectorization` +21/−33,
+`vex_promote_semantic` +18/−14, `phi_coalesce_folded_shl_index` +15/−12,
+`arm_fp_homed_int_binop` +10/−18, `vectorize_map_expr_tree` +6/−30,
+benchmark `matmul` +6/−2); i686 -O0 two synthetic GEP-chain TUs
+(`gep_chain_fold_root_liveness`, `peephole_load_reuse_self_addr`) each
++58 movl/−19 stack refs in functions containing ~30 global clones — the
+i686 -O0 aggregate is still −559 insns/−835 stack refs over 86 TUs; x64 -O0
+`vec_signed_range_fusion{,_sse2}` −31 insns/+14 stack refs in debug SSE
+slot reshuffles. No positive delta occurs in a hot benchmark loop at -O2.
+
+### Runtime equivalence (deterministic, both targets, all opts)
+
+`scripts/gla_equiv_check.sh` compiles+RUNS every `tests/regression/*.c`
+(honoring `.flags`/`.env`), three repetitions per side for stability:
+x86-64 **3465 stable pairs, zero divergence**; i686 **3317 stable pairs,
+zero divergence**. Skips are honest baseline issues independent of the
+gate: `simd_new_hw_ops` at -O0 -mavx2 is nondeterministic with the gate
+OFF too (pre-existing AVX2 backend bug; stable and identical on/off at
+-O1…-Os), and `unroll_unsigned_domain_trip` times out on i686 under gcc
+-m32 as well (32-bit domain loops).
+
+Callgrind (-O2, x86-64, `scripts/callgrind_ab.py`): 31-program fast corpus
+geomean Ir mine/ref **0.99953**; zlib_ng_adler32 **0.98548 (−1.45%)**;
+every other program exactly 1.00000 or within ±0.002% (≤14 Ir in one-off
+setup, hot loops identical, I1/LLi/branch events identical). Heavy fire
+sites strlen_bench and binary_trees Ir 1.00000. (Tables:
+`results/callgrind-20260912-gla-default-on-o2.md`.) -O0 heavy Callgrind is
+impractical (>15.9 B Ir × ~30 instrumentation) and Debug-tier static
+deltas above cover it.
+
+### Edge-trampoline path: new coverage
+
+- Unit: `remat_on_fanout_phi_edge_isolates_edge_with_trampoline` builds the
+  fan-out φ shape, asserts exactly one singleton trampoline block (global
+  clone + unconditional branch), edge-specific terminator retargeting, φ
+  incoming rename/relabel, untouched other edges, and verifier acceptance.
+- End-to-end: `tests/regression/gla_remat_trampoline.c` — two tuned
+  functions so the path fires in successful builds on BOTH targets
+  (`select_ptr_32`: i686 -O1/-O2/-O3; `select_ptr_64`: x86-64 -O1/-O2/-O3).
+  All 16 target/opt/gate builds link and print `56862`, identical to gcc
+  and gcc -m32. Assembly shows the isolated singleton (i686:
+  `lea .data@GOTOFF` + `jmp` merge reached only from the true edge).
+- Fail-closed hardening: an `IndirectBranch` predecessor computes its
+  successor at runtime (blockaddress operand), so a trampoline could never
+  be reached by retargeting the static edge list. The materializer now
+  refuses edge service on such edges (φ incoming stays on the original
+  source-less value; in-block clusters elsewhere in the value still
+  remat), pinned by `remat_through_indirect_branch_edge_is_refused`. The
+  shape never occurred in the census; the gate is now provably incapable of
+  miscompiling it. `Switch` jump-table edges remain supported (codegen
+  rebuilds tables from terminator labels at emission).
+- Hygiene: appending trampoline blocks now also bumps
+  `IrFunction.next_label`.
+
+### Tooling and gates
+
+New/updated: `scripts/gla_fire_census.py` (per-opt/--32 fire census with
+hard-failure tripwires), `scripts/census_full_delta.sh --32`,
+`scripts/gla_equiv_check.sh` (on/off runtime differential, stability
+repeats, honest ELF32 handling); `run_regression_suite.sh` gains an
+explicit GLA-off A/B arm at -O2; `check_gla_remat_policy.sh` now proves
+default-ON on a firing TU and that every off token silences the pass.
+Validation: `cargo test --lib` 2645 passed / 0 failed / 6 ignored
+(`location_alloc` 30/30), rustfmt + clippy `-D warnings` clean,
+`ci_local.sh --fast` 31/0/3; φ-CFG and m32 differential fuzzing 1000+1000
+with the gate forced on, zero mismatches; gate on/off equivalence was
+re-run with the final binary on both targets.
+
+
 
 **Code:** structural audit in `src/passes/loop_align.rs`
 (`audit_tight_loop_inner`, `tight_bucket_log2`, `TightLoopMode`),

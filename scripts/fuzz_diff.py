@@ -89,6 +89,7 @@ import itertools
 import json
 import os
 import random
+import shlex
 import shutil
 import subprocess
 import sys
@@ -291,6 +292,9 @@ def evaluate_single_test(
     env_extra: dict[str, str] | None = None,
     ref_level_map: dict[str, str] | None = None,
 ) -> DiffResult:
+    # Runner prefixes carry arguments ("qemu-riscv64 -L /usr/riscv64-linux-gnu");
+    # they must be tokenized or the whole string is treated as one argv[0].
+    runner_prefix = shlex.split(runner) if runner else []
     with tempfile.TemporaryDirectory(prefix=f"diff_{test_id}_") as tmpdir:
         tmp = Path(tmpdir)
         for name, contents in unit.files.items():
@@ -319,7 +323,7 @@ def evaluate_single_test(
                 if rc != 0:
                     return DiffResult(test_id, "SKIP", f"reference {ref_cc} build failed: {err.strip()}",
                                       opt_level=opt)
-                ref_run_cmd = ([runner] if runner else []) + [str(ref_bin)]
+                ref_run_cmd = runner_prefix + [str(ref_bin)]
                 ref_rc, ref_out, ref_err = run_command(ref_run_cmd, timeout=run_timeout,
                                                        env_extra=env_extra)
                 if ref_rc == 124:
@@ -336,7 +340,7 @@ def evaluate_single_test(
                         b_rc, _, _ = run_command(sig_build_cmd, timeout=compile_timeout, cwd=tmp,
                                                  env_extra=env_extra)
                         if b_rc == 0:
-                            sig_run_cmd = ([runner] if runner else []) + [str(sig_bin)]
+                            sig_run_cmd = runner_prefix + [str(sig_bin)]
                             l_rc, _, _ = run_command(sig_run_cmd, timeout=run_timeout,
                                                      env_extra=env_extra)
                             if l_rc == ref_rc:
@@ -383,7 +387,7 @@ def evaluate_single_test(
                     opt_level=opt,
                 )
 
-            lccc_run_cmd = ([runner] if runner else []) + [str(lccc_bin)]
+            lccc_run_cmd = runner_prefix + [str(lccc_bin)]
             lccc_rc, lccc_out, lccc_err = run_command(lccc_run_cmd, timeout=run_timeout,
                                                       env_extra=env_extra)
 

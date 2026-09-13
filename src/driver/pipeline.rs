@@ -1725,9 +1725,12 @@ impl Driver {
             }
             // P0-A global location allocation: cross-block Belady-MIN
             // spill gaps, immutable capture slots with reload-at-next-use,
-            // and source-less rematerialization, all behind the A/B gate
-            // `CCC_RA_GLOBAL_LOCATION=1`. This is the cross-block successor
-            // of the intra-block RA-06 splitter below; when it runs it
+            // and source-less rematerialization. Default ON; the master gate
+            // `CCC_RA_GLOBAL_LOCATION` is an emergency kill switch
+            // (0/off/no/false disables). Only source-less rematerialization
+            // is enabled by the shipped policy (spill gaps stay off by
+            // default, see GlaPolicy). This is the cross-block successor of
+            // the intra-block RA-06 splitter below; when it runs it
             // subsumes the intra-block pass for the same function (double
             // splitting would pay for both stores).
             let mut global_location_split = false;
