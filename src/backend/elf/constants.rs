@@ -163,6 +163,10 @@ pub const DT_VERNEED: i64 = 0x6fff_fffe;
 pub const DT_VERNEEDNUM: i64 = 0x6fff_ffff;
 pub const DT_FLAGS_1: i64 = 0x6fff_fffb;
 pub const DF_1_NOW: i64 = 1;
+/// `DF_1_PIE`: marks an `ET_DYN` that is a position-independent *executable*
+/// rather than a shared object, so `ld.so` applies the executable's stricter
+/// symbol-lookup rules (no symbol interposition from the global scope).
+pub const DF_1_PIE: i64 = 0x0800_0000;
 
 // ── ELF sizes ────────────────────────────────────────────────────────────────
 

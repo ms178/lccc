@@ -309,8 +309,8 @@ impl super::InstructionEncoder {
     /// Map TLS modifier string to relocation type.
     pub(super) fn tls_reloc_type(&self, modifier: &str) -> u32 {
         match modifier {
-            "NTPOFF" => R_386_TLS_LE_32,
-            "TPOFF" => R_386_32S,
+            "NTPOFF" => R_386_TLS_LE,
+            "TPOFF" => R_386_TLS_LE_32,
             "TLSGD" => R_386_TLS_GD,
             "TLSLDM" => R_386_TLS_LDM,
             "DTPOFF" => R_386_TLS_LDO_32,

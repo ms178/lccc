@@ -1828,8 +1828,8 @@ mod i686_encoding_helper_tests {
     #[test]
     fn known_tls_modifiers_reach_the_existing_mapper() {
         for (modifier, expected) in [
-            ("NTPOFF", R_386_TLS_LE_32),
-            ("TPOFF", R_386_32S),
+            ("NTPOFF", R_386_TLS_LE),
+            ("TPOFF", R_386_TLS_LE_32),
             ("TLSGD", R_386_TLS_GD),
             ("TLSLDM", R_386_TLS_LDM),
             ("DTPOFF", R_386_TLS_LDO_32),

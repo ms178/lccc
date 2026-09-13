@@ -116,13 +116,24 @@ pub const R_386_16: u32 = 20;
 pub const R_386_PC16: u32 = 21;
 pub const R_386_GOTOFF: u32 = 9;
 pub const R_386_GOTPC: u32 = 10;
-pub const R_386_TLS_LE_32: u32 = 37;
+// Measured against GAS, not recalled: `@NTPOFF` assembles to R_386_TLS_LE (17)
+// and `@TPOFF` to R_386_TLS_LE_32 (34). This constant used to be 37, which is
+// R_386_TLS_TPOFF32 -- a different type, so objects written by this assembler
+// disagreed with the i686 linker's own table (linker/types.rs has 34) and with
+// every other tool reading the file.
+pub const R_386_TLS_LE: u32 = 17;
+pub const R_386_TLS_LE_32: u32 = 34;
 pub const R_386_TLS_IE: u32 = 15;
 pub const R_386_TLS_GD: u32 = 18;
 pub const R_386_TLS_LDM: u32 = 19;
 pub const R_386_TLS_LDO_32: u32 = 32;
 pub const R_386_TLS_GOTIE: u32 = 16;
-pub const R_386_32S: u32 = 38; // R_386_TLS_LE (negative offset from TP)
+// There is no R_386_32S in the i386 ABI -- that is an x86-64 type. This constant
+// held 38, which <elf.h> defines as R_386_SIZE32 (a symbol-size relocation), and
+// the `@TPOFF` modifier was emitted as it: an i386 object asking for a TLS offset
+// that every other linker reads as "the size of this symbol". Deleted rather than
+// renumbered, because a name that does not exist in the ABI will be wrong again
+// the moment somebody trusts it.
 
 /// Instruction encoding context for i686.
 pub struct InstructionEncoder {

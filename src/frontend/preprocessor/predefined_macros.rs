@@ -1184,6 +1184,42 @@ impl Preprocessor {
                 self.define_simple_macro("__INT_FAST32_WIDTH__", "32");
                 // i686 uses the same x87 80-bit long double format as x86-64
                 // (LDBL macros are already set correctly), but sizeof differs (12 vs 16)
+
+                // Swap the x86-64 multiarch include dir for the i386 one.
+                // Debian puts the 32-bit `bits/` headers under
+                // /usr/include/i386-linux-gnu, and the arm above deliberately
+                // ships only arch-neutral paths, so without this every 32-bit
+                // compile fails at `#include <stdio.h>` with
+                // "bits/libc-header-start.h: No such file or directory" -- the
+                // x86-64 dir would be searched first and is wrong for the ABI.
+                // Order is preserved: the i386 dir takes the slot the x86-64
+                // one occupied, so /usr/local/include still wins and /usr/include
+                // is still the fallback.
+                // Exact match on the /usr/include multiarch dir only.  A
+                // substring test also caught /usr/lib/gcc/x86_64-linux-gnu/<ver>
+                // /include, which holds GCC's own freestanding headers
+                // (stddef.h, stdarg.h) and is *shared* between -m32 and -m64 --
+                // replacing it broke every 32-bit compile on <stdio.h>.
+                let mut swapped = false;
+                for slot in self.system_include_paths.iter_mut() {
+                    if slot == std::path::Path::new("/usr/include/x86_64-linux-gnu") {
+                        *slot = std::path::PathBuf::from("/usr/include/i386-linux-gnu");
+                        swapped = true;
+                        break;
+                    }
+                }
+                if !swapped {
+                    // No x86-64 multiarch dir was present (e.g. a bare
+                    // /usr/include install); insert the i386 dir ahead of
+                    // /usr/include so the 32-bit headers win.
+                    let at = self
+                        .system_include_paths
+                        .iter()
+                        .position(|p| p == std::path::Path::new("/usr/include"))
+                        .unwrap_or(self.system_include_paths.len());
+                    self.system_include_paths
+                        .insert(at, std::path::PathBuf::from("/usr/include/i386-linux-gnu"));
+                }
             }
             _ => {
                 // x86_64 is already the default

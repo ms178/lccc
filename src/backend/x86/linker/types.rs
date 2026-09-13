@@ -47,6 +47,9 @@ impl GlobalSymbolOps for GlobalSymbol {
     fn section_idx(&self) -> u16 {
         self.section_idx
     }
+    fn has_copy_reloc(&self) -> bool {
+        self.copy_reloc
+    }
     fn value(&self) -> u64 {
         self.value
     }

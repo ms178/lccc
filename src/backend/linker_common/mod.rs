@@ -58,6 +58,7 @@ mod args;
 pub mod build_id;
 mod check;
 pub mod comdat;
+pub mod defsym;
 mod dynamic;
 mod dynstr;
 mod eh_frame;
@@ -69,6 +70,7 @@ mod mapfile;
 mod merge;
 pub mod parse_object;
 mod parse_shared;
+pub mod reloc_field;
 mod resolve_lib;
 mod secdata;
 mod section_map;
@@ -98,7 +100,7 @@ pub use parse_shared::{parse_shared_library_symbols, parse_soname};
 pub use dynstr::DynStrTab;
 
 // hash.rs
-pub use hash::{gnu_hash, sysv_hash};
+pub use hash::{SysvHash, build_sysv_hash, gnu_hash, sysv_hash, write_sysv_hash};
 
 // symstr.rs
 pub use secdata::SectionData;
@@ -112,8 +114,9 @@ pub use mapfile::{LinkMap, MapArchiveMember, MapSectionContribution, build_link_
 
 // symbols.rs
 pub use symbols::{
-    GlobalSymbolOps, InputSection, OutputSection, is_layout_anchor_symbol,
-    is_linker_defined_symbol, is_valid_c_identifier_for_section, resolve_start_stop_symbols,
+    GlobalSymbolOps, InputSection, OutputSection, is_exported_dynamic_symbol,
+    is_layout_anchor_symbol, is_linker_defined_symbol, is_valid_c_identifier_for_section,
+    resolve_start_stop_symbols,
 };
 
 // merge.rs
@@ -138,13 +141,13 @@ pub use resolve_lib::resolve_lib;
 pub use write::{align_up_64, pad_to, write_elf64_phdr, write_elf64_phdr_at, write_elf64_shdr};
 
 // args.rs
-pub use args::{exclude_libs_matches, parse_linker_args};
+pub use args::{HashStyle, exclude_libs_matches, parse_linker_args};
 
 // check.rs
 pub use check::{check_undefined_symbols_elf64, check_undefined_symbols_elf64_verbose};
 
 // eh_frame.rs
-pub use eh_frame::{build_eh_frame_hdr, count_eh_frame_fdes};
+pub use eh_frame::{build_eh_frame_hdr, count_eh_frame_fdes, prune_dead_fdes};
 
 // gc_sections.rs
 pub use gc_sections::{
