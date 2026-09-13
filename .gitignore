@@ -61,6 +61,17 @@ bench_*
 regression-results.json
 inline-asm-utf8.json
 ci-regression-environment.txt
+# bench.yml writes these as job artifacts (`--artifact-dir bench-artifacts`,
+# `tee codegen-gate.txt`, `tee bench-terminal.txt`, `--json bench-results.json`,
+# `--markdown bench-summary.md`), so a local replication of the bench workflow
+# leaves them in the tree. `bench_*` above covers NONE of the three hyphenated
+# names: the glob needs an underscore. All three were found untracked by
+# `git status` after replicating both workflows, not by reading patterns.
+bench-artifacts/
+bench-results.json
+bench-summary.md
+bench-terminal.txt
+codegen-gate.txt
 
 # Misc
 .tmp

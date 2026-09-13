@@ -71,8 +71,11 @@ problem. So "superior" was given a concrete meaning here:
    reverted.
 2. **CFG-wide**, with a real meet operator at joins and correct handling of
    `%esp` movement, callee-pop, calls, `setjmp` and escaping addresses.
-3. **Cheap enough to run unconditionally**: one linear dataflow pass per
-   function, 40k-line budget, 48-slot cap, no fixpoint iteration over the CFG.
+3. **Cheap enough to run unconditionally**: one shared transfer, run as an
+   optimistic RPO seed plus a worklist iteration to the fixpoint and then a
+   single application sweep (see 10.2 -- this bullet claimed "no fixpoint
+   iteration" while 10.2 describes exactly that, and the code iterates),
+   40k-line budget, 48-slot cap.
 4. **Measured against the oracle compilers**, not against itself (§6).
 
 ## 2. The four defects of the deleted pass, and how each is closed

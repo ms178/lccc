@@ -952,12 +952,18 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
         //   * any zero-extending load (byte 0x80: test SF=0, cmpb SF=1);
         //   * `movsbl`/`movswl` + `testq` (the 32-bit write zero-extends,
         //     so testq SF is bit 63 = 0 for a negative byte).
-        // ZF is identical in every case, so ZF-only consumers stay legal.
+        // ZF, PF, CF and OF are identical in every case and both forms leave AF
+        // undefined, so SF is the ONLY flag this rewrite can change. The
+        // consumers that matter are therefore exactly the ones that read SF --
+        // a narrower question than "is every consumer ZF-only", which keeps the
+        // fold alive under a downstream `jc`, `jo`, `jp` or `adc`. The walk
+        // covers the taken edges of conditional jumps too, where a linear scan
+        // would stop at the first writer on the fall-through path.
         let signed_64 = matches!(*prefix, "movsbq " | "movswq " | "movslq ");
         let signed_32 = matches!(*prefix, "movsbl " | "movswl ");
         let test_is_q = test.starts_with("testq ");
         if !(signed_64 || (signed_32 && !test_is_q))
-            && !super::flag_peepholes::flag_consumers_are_zf_only(store, infos, j + 1)
+            && super::flag_peepholes::flags_reach_an_sf_consumer(store, infos, j + 1)
         {
             i += 1;
             continue;
@@ -1507,6 +1513,57 @@ mod tests {
         ));
         assert!(out.contains("cmpb $0, (%rbx)"), "{out}");
         assert!(!out.contains("movzbl"), "{out}");
+    }
+
+    #[test]
+    fn unsigned_load_test_folds_for_a_carry_consumer() {
+        // SF is the only flag this rewrite can change, so a CF-only consumer is
+        // not a reason to refuse: `testq` and `cmpb $0` both clear CF. The
+        // older guard asked for ZF-only consumers and lost this fold.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%rbx), %esi\n",
+            "    testq %rsi, %rsi\n",
+            "    jc .LBB3\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB3:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpb $0, (%rbx)"), "{out}");
+        assert!(!out.contains("movzbl"), "{out}");
+    }
+
+    #[test]
+    fn unsigned_load_test_is_kept_when_the_sign_consumer_is_on_the_taken_edge() {
+        // The fall-through path kills the flags at `addl`, so a linear scan
+        // stopped there having seen only the ZF-only `je` and folded. But the
+        // TAKEN edge of that `je` carries the very same flags into .LBB3, where
+        // `js` reads SF -- bit 7 of the byte for `cmpb $0`, bit 63 (always 0) of
+        // the zero-extended register for `testq`. Walking the edge refuses it.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%rbx), %esi\n",
+            "    testq %rsi, %rsi\n",
+            "    je .LBB3\n",
+            "    addl $1, %edi\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".LBB3:\n",
+            "    js .LBB4\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movzbl (%rbx), %esi"), "{out}");
+        assert!(!out.contains("cmpb $0"), "{out}");
     }
 
     #[test]
