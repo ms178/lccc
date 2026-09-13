@@ -1963,7 +1963,20 @@ pub trait ArchCodegen {
     }
 
     /// Emit an unconditional branch to a BlockId, avoiding String allocation.
+    ///
+    /// Fall-through elision: when the branch target is the physically next
+    /// emitted block (the driver records it in `next_block_label` before
+    /// each terminator), the transfer is implicit — the `jmp` is dead
+    /// weight. This is semantics-preserving on every block-based ISA the
+    /// driver lowers (sequential fall-through between adjacent blocks), and
+    /// the text-level CFG consumers (peephole liveness) model a `jmp` as
+    /// *only* the target edge and every other line as fall-through to the
+    /// next line, so a block that now ends without a jump is still modeled
+    /// exactly: the next block's label is reachable via the fall edge.
     fn emit_branch_to_block(&mut self, block: BlockId) {
+        if self.state().next_block_label == Some(block) {
+            return;
+        }
         // Cache the mnemonic first to avoid borrow conflict with state()
         let mnemonic = self.jump_mnemonic();
         let out = &mut self.state().out;
@@ -1978,6 +1991,20 @@ pub trait ArchCodegen {
     fn emit_unreachable(&mut self) {
         let trap = self.trap_instruction();
         self.state().emit_fmt(format_args!("    {}", trap));
+    }
+
+    /// Run this backend's text peephole pipeline on a single-function text
+    /// fragment, for the dual-layout size metric. The default is the
+    /// identity (backends without a text peephole keep the raw metric).
+    /// The RESULT IS ONLY A METRIC INPUT: emitted assembly is always
+    /// produced by the real whole-file pipeline; this exists so the
+    /// keep/revert decision measures what the peephole will actually do
+    /// to each candidate order (measured: `zstd_count` — the raw count
+    /// prefers the chain order, the post-peephole count reverses it, and
+    /// the dynamic icount damage (+9.5 %) follows the post-peephole
+    /// shape, not the raw one).
+    fn peephole_for_metric(&self, text: String) -> String {
+        text
     }
 
     /// Emit a conditional select: dest = cond != 0 ? true_val : false_val.

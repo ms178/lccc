@@ -3101,6 +3101,14 @@ pub fn generate_module(
         cg.state().emit(".section .note.GNU-stack,\"\",@progbits");
     }
 
+    // Drain any dual-layout records that were never consumed (functions
+    // the emission loop skips — e.g. gnu_inline definitions): a stale
+    // record must not outlive this module's emission, or a later
+    // translation unit compiled by this process could take it by name and
+    // reconstruct a garbage "original" order from the wrong block count
+    // (the count check would catch it, but draining closes the class).
+    crate::passes::block_layout::clear_chain_candidates();
+
     std::mem::take(&mut cg.state().out.buf)
 }
 
@@ -3325,6 +3333,9 @@ fn emit_functions_and_sections(
         cg.state().emit(".text");
         cg.state().current_text_section = ".text".to_string();
     }
+    // Dual-layout selection records are keyed by function name and CONSUMED
+    // (taken) by the emission loop below, so the side channel drains as the
+    // module is emitted and cannot leak into a later translation unit.
     for func in &module.functions {
         // GNU89/gnu_inline: `extern inline __attribute__((gnu_inline))`
         // bodies exist ONLY for inlining. Match GCC: never emit a standalone
@@ -3341,7 +3352,81 @@ fn emit_functions_and_sections(
                         .emit_fmt(format_args!(".p2align {}", alignment.trailing_zeros()));
                 }
             }
-            generate_function(cg, func, source_mgr, file_table);
+            // Dual-layout emission: when the static chain pass reordered this
+            // function's blocks, emit it with BOTH the chain order and the
+            // pre-chain order, and keep whichever compiles smaller. The
+            // register allocator's interval decisions are linearized over
+            // the block order, and their response to the reorder is not
+            // predictable from static structure (measured: the same
+            // branch-quality reorder won -42 instructions on linux_rbtree
+            // and lost +38 on strlen_bench). Measurement beats modeling;
+            // cost is one extra emission for the chain-fired functions only.
+            // CCC_NO_DUAL_LAYOUT=1 keeps the chain order unconditionally
+            // (A/B bisection surface).
+            let chain_perm = if std::env::var_os("CCC_NO_DUAL_LAYOUT").is_none() {
+                crate::passes::block_layout::take_chain_candidate(&func.name)
+            } else {
+                // Consume the record either way so the side channel
+                // drains deterministically.
+                let _ = crate::passes::block_layout::take_chain_candidate(&func.name);
+                None
+            };
+            if let Some(perm) = chain_perm {
+                // Exploratory phase: emit both orders, measure each through
+                // the backend's peephole (the metric must see what the
+                // peephole does — zstd_count's damage only appears
+                // post-peephole). Debug traces are suppressed (the flag)
+                // because these emissions are not the shipped code.
+                let mark = cg.state().out.buf.len();
+                crate::backend::state::EXPLORATORY_EMISSION
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                generate_function(cg, func, source_mgr, file_table);
+                let chain_peep = cg.peephole_for_metric(cg.state_ref().out.buf[mark..].to_string());
+                let chain_count = crate::passes::block_layout::count_instruction_lines(&chain_peep);
+                cg.state().out.buf.truncate(mark);
+                // Rebuild the pre-chain order: perm[j] is the ORIGINAL
+                // position of the block now at position j, so
+                // orig[perm[j]] = chain[j] restores it exactly.
+                let mut alt = func.clone();
+                let perm_ok =
+                    perm.len() == func.blocks.len() && perm.iter().all(|&p| p < func.blocks.len());
+                if perm_ok {
+                    let mut orig: Vec<Option<crate::ir::reexports::BasicBlock>> =
+                        (0..func.blocks.len()).map(|_| None).collect();
+                    for (j, &orig_pos) in perm.iter().enumerate() {
+                        orig[orig_pos] = Some(func.blocks[j].clone());
+                    }
+                    alt.blocks = orig
+                        .into_iter()
+                        .map(|b| b.expect("permutation covers every block"))
+                        .collect();
+                    generate_function(cg, &alt, source_mgr, file_table);
+                    let orig_peep =
+                        cg.peephole_for_metric(cg.state_ref().out.buf[mark..].to_string());
+                    let orig_count =
+                        crate::passes::block_layout::count_instruction_lines(&orig_peep);
+                    cg.state().out.buf.truncate(mark);
+                    crate::backend::state::EXPLORATORY_EMISSION
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    // Emit the measured winner for real: debug traces fire
+                    // exactly once per site (count-based test assertions),
+                    // and the shipped text comes from a non-exploratory
+                    // emission in both arms.
+                    if chain_count < orig_count {
+                        generate_function(cg, func, source_mgr, file_table);
+                    } else {
+                        generate_function(cg, &alt, source_mgr, file_table);
+                    }
+                } else {
+                    // Malformed record (block count changed after the layout
+                    // pass — defensive): emit once with the live order.
+                    crate::backend::state::EXPLORATORY_EMISSION
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    generate_function(cg, func, source_mgr, file_table);
+                }
+            } else {
+                generate_function(cg, func, source_mgr, file_table);
+            }
         }
     }
 }
