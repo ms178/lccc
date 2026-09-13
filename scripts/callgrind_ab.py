@@ -13,6 +13,7 @@ Usage:
 
 Writes /tmp/cg_<opt>/{mine,ref}/<bench>.* and prints a markdown table.
 """
+import functools
 import os
 import subprocess
 import sys
@@ -20,7 +21,17 @@ import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-INCLUDE = "-I/usr/lib/gcc/x86_64-linux-gnu/14/include"
+
+
+@functools.lru_cache(maxsize=1)
+def gcc_include() -> str:
+    """Resolved freestanding include path (never a hardcoded gcc version)."""
+    out = subprocess.run(["gcc", "-print-file-name=include"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    return f"-I{out}"
+
+
+INCLUDE = gcc_include()
 
 # Fast/medium corpus; heavy multi-second drivers are opt-in (they take
 # minutes each under ~30x Callgrind instrumentation).

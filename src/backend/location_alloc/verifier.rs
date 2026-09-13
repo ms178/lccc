@@ -133,5 +133,121 @@ pub(crate) fn verify_rewrite(
             }
         }
     }
+
+    // 5. Unique block labels; every static terminator edge resolves to a
+    // real block. A trampoline that stranded a successor label would
+    // manifest here as a dangling branch or a duplicate singleton label.
+    let mut block_labels: FxHashSet<u32> = FxHashSet::default();
+    for b in &after.blocks {
+        if !block_labels.insert(b.label.0) {
+            return Err(format!("duplicate block label {}", b.label.0));
+        }
+        let mut check_target = |t: BlockId| -> Result<(), String> {
+            if label_map.get(&t).is_none() {
+                return Err(format!(
+                    "block {} terminator targets missing block {}",
+                    b.label.0, t.0
+                ));
+            }
+            Ok(())
+        };
+        match &b.terminator {
+            Terminator::Branch(t) => check_target(*t)?,
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                check_target(*true_label)?;
+                check_target(*false_label)?;
+            }
+            Terminator::Switch { cases, default, .. } => {
+                check_target(*default)?;
+                for (_, t) in cases {
+                    check_target(*t)?;
+                }
+            }
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => {
+                for t in possible_targets {
+                    check_target(*t)?;
+                }
+            }
+            Terminator::Return(_) | Terminator::Unreachable => {}
+        }
+    }
+
+    // 6. Every φ incoming names an actual CFG predecessor of its block,
+    // and each (pred, φ) pair is unambiguous per predecessor (phi
+    // elimination emits one edge copy per such pair). Trampoline
+    // rewiring that relabelled an edge without rerouting the terminator
+    // (or vice versa) is rejected here.
+    for (bi, b) in after.blocks.iter().enumerate() {
+        for i in &b.instructions {
+            let Instruction::Phi { incoming, .. } = i else {
+                break;
+            };
+            let mut seen_preds: FxHashSet<u32> = FxHashSet::default();
+            for (_, pred) in incoming {
+                let Some(&pidx) = label_map.get(pred) else {
+                    return Err(format!(
+                        "φ in block {} names missing predecessor {}",
+                        b.label.0, pred.0
+                    ));
+                };
+                if !preds.row(bi).iter().any(|&p| p == pidx as u32) {
+                    return Err(format!(
+                        "φ in block {} names {} which is not a CFG predecessor",
+                        b.label.0, pred.0
+                    ));
+                }
+                if !seen_preds.insert(pred.0) {
+                    return Err(format!(
+                        "φ in block {} has two incoming entries for predecessor {}",
+                        b.label.0, pred.0
+                    ));
+                }
+            }
+        }
+    }
+
+    // 7. φ arity vs the CFG: every φ names exactly the block's predecessor
+    // SET (compared as sets — build_cfg records both arms of a CondBranch
+    // that targets the same block). A trampoline retarget that strands an
+    // edge leaves a predecessor with no incoming (phi elimination would
+    // feed it undef), which check 6 cannot see.
+    for (bi, b) in after.blocks.iter().enumerate() {
+        let phis: Vec<_> = b
+            .instructions
+            .iter()
+            .take_while(|i| matches!(i, Instruction::Phi { .. }))
+            .collect();
+        if phis.is_empty() {
+            continue;
+        }
+        let mut cfg_preds: FxHashSet<u32> = FxHashSet::default();
+        for &p in preds.row(bi) {
+            let pidx = p as usize;
+            if pidx < after.blocks.len() {
+                cfg_preds.insert(after.blocks[pidx].label.0);
+            }
+        }
+        for phi in phis {
+            let Instruction::Phi { incoming, .. } = phi else {
+                unreachable!()
+            };
+            let named: FxHashSet<u32> = incoming.iter().map(|(_, p)| p.0).collect();
+            if named != cfg_preds {
+                let missing: Vec<u32> = cfg_preds.difference(&named).copied().collect();
+                let extra: Vec<u32> = named.difference(&cfg_preds).copied().collect();
+                return Err(format!(
+                    "φ in block {} incoming set mismatches CFG preds (missing {missing:?}, extra {extra:?})",
+                    b.label.0
+                ));
+            }
+        }
+    }
+
     Ok(())
 }

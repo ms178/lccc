@@ -219,6 +219,19 @@ for src in "$REG"/*.c; do
             echo "      notier2  : $(echo "$res_t2" | head -2)"
             fail=$((fail+1)); ab_fail=$((ab_fail+1)); FAILED+=("$name:ab-tier2"); continue
         fi
+
+        # 3c. A/B differential: global location allocation default ON vs
+        # the emergency kill switch (CCC_RA_GLOBAL_LOCATION=0). Rematerialized
+        # source-less values must produce identical program output. The full
+        # opt/target matrix is covered by scripts/gla_equiv_check.sh; this arm
+        # guards the default-on policy at the suite's -O2.
+        res_gla=$(env ${env_vars[@]:-} CCC_RA_GLOBAL_LOCATION=0 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32'; run_one '$src'")
+        if [[ $res_gla != "$res" ]]; then
+            echo "FAIL  $name (A/B GLA gate differential)"
+            echo "      default(on) : $(echo "$res" | head -2)"
+            echo "      gate=off     : $(echo "$res_gla" | head -2)"
+            fail=$((fail+1)); ab_fail=$((ab_fail+1)); FAILED+=("$name:ab-gla"); continue
+        fi
     fi
 
     pass=$((pass+1))

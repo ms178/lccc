@@ -7,15 +7,51 @@ use super::*;
 // Tunables (env-overridable for A/B work; clamped)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Master A/B gate: `CCC_RA_GLOBAL_LOCATION` set to a truthy value. An
-/// explicit `0`/`false`/`off`/empty means OFF (a bare presence check would
-/// let `CCC_RA_GLOBAL_LOCATION=0` silently enable the feature).
-pub(crate) fn gate_enabled() -> bool {
+/// Master gate for the global location allocator.
+///
+/// **Default: ON.** The source-less rematerialization policy this gate
+/// controls shipped after a full-corpus census (785 TUs × {-O0..-O3,-Os} ×
+/// {x86-64,i686}): every applied edit was a source-less remat (GlobalAddr or
+/// Copy-of-const) with zero capture slots, zero failed rewrites and gate
+/// on/off runtime equivalence; static deltas are net-negative on both
+/// targets and hot-loop Callgrind is at worst neutral (-1.45% Ir on
+/// zlib_ng_adler32, geomean 0.99953, see engineering/DECISIONS.md
+/// RA-GLA-01).
+///
+/// The gate remains available as an emergency kill switch: setting
+/// `CCC_RA_GLOBAL_LOCATION` to `0`, `off`, `no`, `false` (any case) or the
+/// empty string disables the pass. Any other value (incl. `1`/`on`)
+/// enables it; an unset variable follows the default (enabled).
+/// Whether `value` is one of the documented OFF tokens (case-insensitive):
+/// `0`, `off`, `no`, `false` or the empty string. Every GLA boolean knob
+/// parses through this one helper so the emergency-kill-switch vocabulary
+/// cannot drift between knobs.
+fn is_off_token(value: &str) -> bool {
     matches!(
-        std::env::var("CCC_RA_GLOBAL_LOCATION").as_deref(),
-        Ok(v) if !matches!(v, "" | "0" | "off" | "no")
-            && !v.eq_ignore_ascii_case("false")
+        value.to_ascii_lowercase().as_str(),
+        "0" | "off" | "no" | "false" | ""
     )
+}
+
+pub(crate) fn gate_enabled() -> bool {
+    // Unset follows the default (enabled); only an explicit off token
+    // disables the pass.
+    match std::env::var("CCC_RA_GLOBAL_LOCATION").as_deref() {
+        Err(_) => true,
+        Ok(v) => !is_off_token(v),
+    }
+}
+
+/// Parse an opt-in boolean knob: unset and every off token ⇒ `default`;
+/// any other value enables it. Used for the shipped-OFF experimental
+/// switches so an emergency `=off`/`=no`/empty works exactly like the
+/// master gate instead of silently enabling the feature.
+fn opt_in_env(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(v) if is_off_token(&v) => false,
+        Ok(_) => true,
+    }
 }
 
 /// Per-function edit budget (`CCC_RA_GLOBAL_LOCATION_MAX`, default 64).
@@ -67,11 +103,7 @@ pub(super) fn benefit_ratio10() -> u64 {
 /// OFF; the whole feature is additionally behind `CCC_RA_GLOBAL_LOCATION`.
 pub(super) fn allow_spill_gaps() -> bool {
     static S: OnceLock<bool> = OnceLock::new();
-    *S.get_or_init(|| {
-        std::env::var("CCC_GLA_SPILL_GAPS")
-            .map(|v| v != "0" && v != "false")
-            .unwrap_or(false)
-    })
+    *S.get_or_init(|| opt_in_env("CCC_GLA_SPILL_GAPS", false))
 }
 
 /// Whether same-block reload gaps are allowed. The RA-06 decision record
@@ -83,11 +115,7 @@ pub(super) fn allow_spill_gaps() -> bool {
 /// same-block gaps are rejected unless explicitly re-enabled for A/B work.
 pub(super) fn allow_intra_block_gaps() -> bool {
     static A: OnceLock<bool> = OnceLock::new();
-    *A.get_or_init(|| {
-        std::env::var("CCC_GLA_ALLOW_INTRA")
-            .map(|v| v != "0" && v != "false")
-            .unwrap_or(false)
-    })
+    *A.get_or_init(|| opt_in_env("CCC_GLA_ALLOW_INTRA", false))
 }
 
 /// Which production allocator tier the planner prepares code for. See
@@ -103,7 +131,7 @@ pub(super) fn tier_for(opt_level: u32) -> Tier {
 /// Callee-saved GPRs the production allocator can additionally BUY with
 /// prologue/epilogue push/pop traffic on x86-64 SysV: %rbx, %rbp and
 /// %r12–%r15 — exactly six homes beyond the caller-saved scan budget.
-/// The reach band's Speed value is derived from this set so the
+/// The x86-64 reach band's Speed value is derived from this set so the
 /// accounting cannot silently drift from the ABI facts.
 pub(super) const X86_64_BUYABLE_CALLEE_SAVED_GPRS: &[&str] =
     &["rbx", "rbp", "r12", "r13", "r14", "r15"];
@@ -119,9 +147,14 @@ pub(super) const I686_BUYABLE_CALLEE_SAVED_GPRS: &[&str] = &["esi", "edi"];
 /// Residual GPR residency the production allocator can bring to bear
 /// beyond [`pressure_budget`] by buying callee-saved homes — the physical
 /// quantity the Speed reach band proxies (see the band calibration in
-/// [`reach_band`]). Other 64-bit targets keep the x86-64-derived
-/// calibration until a target-specific census exists; the GLA gate ships
-/// off by default.
+/// [`reach_band`]). aarch64 and riscv64 deliberately inherit the
+/// x86-64-derived band and the conservative GPR scan budget (12 vs ~27
+/// allocatable GPRs on either ISA): the model then fires only at pressure
+/// levels that are genuinely extreme for those register files, i.e. it
+/// can only UNDER-fire, never over-fire. Both targets carry full
+/// gate-on/gate-off/gcc equivalence matrices under qemu-user plus a
+/// trampoline trace proof in RA-GLA-02; a target-specific calibration is
+/// a future optimization, not a safety prerequisite.
 pub(super) fn buyable_callee_saved_gprs() -> usize {
     if crate::common::types::target_is_32bit() {
         I686_BUYABLE_CALLEE_SAVED_GPRS.len()
@@ -330,3 +363,45 @@ impl GlaPolicy {
 // ─────────────────────────────────────────────────────────────────────────────
 // Location model (planning vocabulary; also the public audit surface)
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod token_tests {
+    use super::{is_off_token, opt_in_env};
+
+    #[test]
+    fn off_tokens_are_case_insensitive_and_exhaustive() {
+        for tok in [
+            "0", "off", "OFF", "Off", "no", "NO", "false", "FALSE", "False", "",
+        ] {
+            assert!(is_off_token(tok), "expected {tok:?} to be an off token");
+        }
+    }
+
+    #[test]
+    fn on_tokens_are_everything_else() {
+        for tok in ["1", "on", "ON", "true", "yes", "2", "enable"] {
+            assert!(!is_off_token(tok), "expected {tok:?} to enable");
+        }
+    }
+
+    #[test]
+    fn opt_in_env_defaults_off_for_unset_and_honors_both_vocabularies() {
+        // Unique throwaway vars: no OnceLock caches these call sites, so
+        // mutation cannot race other tests (edition 2024 marks env
+        // mutation unsafe for that reason).
+        // SAFETY: test-only, uniquely named variables, no concurrent reader.
+        unsafe {
+            const NAME: &str = "CCC_GLA_TEST_OPT_IN_TOKEN_PARSER";
+            std::env::remove_var(NAME);
+            assert!(!opt_in_env(NAME, false));
+            assert!(opt_in_env("CCC_GLA_TEST_OPT_IN_TOKEN_PARSER_ON", true));
+            std::env::set_var(NAME, "1");
+            assert!(opt_in_env(NAME, false));
+            std::env::set_var(NAME, "No");
+            assert!(!opt_in_env(NAME, true));
+            std::env::set_var(NAME, "");
+            assert!(!opt_in_env(NAME, true));
+            std::env::remove_var(NAME);
+        }
+    }
+}

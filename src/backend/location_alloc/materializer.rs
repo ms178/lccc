@@ -3,17 +3,32 @@
 
 use super::*;
 
+/// Instantiate a planner-certified remat template at a fresh destination.
+/// Templates come exclusively from [`rematerializable_template`], i.e.
+/// `GlobalAddr` or a `Copy` of a constant — there is deliberately no
+/// `Load`/`GetElementPtr` arm: re-reading memory at a later program point
+/// is not a sound reproduction of an SSA value (the memory may have been
+/// written since), and GEP inputs are not static. The catch-all fails loud
+/// rather than cloning with the OLD dest, which would mint a duplicate
+/// definition that fails verification in a far less obvious place.
 pub(super) fn clone_remat(template: &Instruction, name: Value) -> Instruction {
     match template {
         Instruction::GlobalAddr { name: gname, .. } => Instruction::GlobalAddr {
             dest: name,
             name: gname.clone(),
         },
-        Instruction::Copy { src, .. } => Instruction::Copy {
+        Instruction::Copy {
+            src: src @ Operand::Const(_),
+            ..
+        } => Instruction::Copy {
             dest: name,
             src: src.clone(),
         },
-        _ => template.clone(),
+        other => {
+            unreachable!(
+                "rematerializable_template certifies only GlobalAddr/const-Copy, got {other:?}"
+            )
+        }
     }
 }
 
@@ -75,6 +90,15 @@ pub(super) fn materialize(
     let remat_ids: FxHashSet<u32> = plan.remats.iter().copied().collect();
     let gap_ids: FxHashSet<u32> = plan.gaps.iter().map(|g| g.vid).collect();
     let split_vids: Vec<u32> = gap_ids.union(&remat_ids).copied().collect();
+
+    // Fail-closed rollback state: every mutation below touches only the
+    // blocks and the two id counters. If the unconditional structural
+    // verification fails after materialization, the function is restored
+    // verbatim and the plan applies ZERO edits (equivalent to the gate
+    // being off) rather than emitting malformed IR downstream.
+    let saved_blocks = func.blocks.clone();
+    let saved_next_value_id = func.next_value_id;
+    let saved_next_label = func.next_label;
 
     // Checked fresh-id allocator. The whole plan is built into local
     // structures BEFORE the first IR mutation (the block sweeps below), so
@@ -244,6 +268,29 @@ pub(super) fn materialize(
             } else if !deferred.is_empty() {
                 // Fan-out edge: isolate it with a trampoline so the reload
                 // never executes on the other edges.
+                //
+                // Fail closed for an IndirectBranch predecessor: its jump
+                // target is a RUNTIME blockaddress operand, not a static
+                // terminator edge, so retargeting `possible_targets` would
+                // not redirect execution (the jump still lands in the
+                // successor with the φ expecting a name only defined in the
+                // trampoline). Leave that φ incoming on the original
+                // source-less value; the un-rewritten def stays resident
+                // along the edge exactly as without GLA. This shape has
+                // never been observed, but the gate must be incapable of
+                // miscompiling it.
+                if matches!(
+                    func.blocks[bi].terminator,
+                    Terminator::IndirectBranch { .. }
+                ) {
+                    if split_debug_enabled() {
+                        eprintln!(
+                            "[GLA] {}: skip edge remat b{}->b{}: indirect-branch pred",
+                            func.name, bi, s
+                        );
+                    }
+                    continue;
+                }
                 if next_block_id == u32::MAX {
                     id_overflow.set(true);
                     continue;
@@ -420,14 +467,31 @@ pub(super) fn materialize(
     }
 
     func.next_value_id = next_val;
+    // Keep the module-level "next unused label" honest for any trampoline
+    // block we appended (next_block_id starts at max(label)+1).
+    func.next_label = func.next_label.max(next_block_id);
     let n_applied = applied.len();
-    // Fail-closed structural verification under the same gate as the
-    // production allocator verifier.
-    if std::env::var_os("CCC_VERIFY_REGALLOC").is_some() {
-        let slots: FxHashSet<u32> = slot_of.values().map(|v| v.0).collect();
-        if let Err(msg) = verify_rewrite(func, &slots) {
+    // Unconditional fail-closed structural verification: the shipped
+    // feature must never emit malformed IR regardless of environment
+    // knobs. On any violation the function is restored byte-for-byte and
+    // zero edits are reported (gate-off behavior). With CCC_VERIFY_REGALLOC
+    // set, a violation panics instead, for backtraces in development.
+    let slots: FxHashSet<u32> = slot_of.values().map(|v| v.0).collect();
+    if let Err(msg) = verify_rewrite(func, &slots) {
+        if std::env::var_os("CCC_VERIFY_REGALLOC").is_some() {
             panic!("[GLA] {}: rewrite failed verification: {}", func.name, msg);
         }
+        eprintln!(
+            "[GLA] {name}: rewrite failed structural verification ({msg}); \
+             aborting plan with zero edits",
+            name = func.name
+        );
+        // Every mutation above touches only blocks and the two id
+        // counters; restore exactly those members.
+        func.blocks = saved_blocks;
+        func.next_value_id = saved_next_value_id;
+        func.next_label = saved_next_label;
+        return 0;
     }
     if split_debug_enabled() {
         eprintln!(
@@ -510,7 +574,14 @@ pub(super) fn rewrite_phi_edge(
     }
 }
 
-/// Retarget exactly one terminator edge `old -> new`.
+/// Reroute every static occurrence of terminator edge target `old` to
+/// `new` (a fan-out trampoline). The edge
+/// planner builds exactly one trampoline per unique (pred, succ) pair
+/// (build_cfg deduplicates successor labels), so a CondBranch whose two
+/// arms — or two Switch cases — name the same block are the SAME edge with
+/// one shared φ incoming; leaving a duplicate arm on the old target would
+/// enter the successor expecting names that are only defined in the
+/// trampoline. All occurrences must move together.
 pub(super) fn retarget_edge(term: &mut Terminator, old: BlockId, new: BlockId) {
     match term {
         Terminator::Branch(t) if *t == old => *t = new,
@@ -521,18 +592,18 @@ pub(super) fn retarget_edge(term: &mut Terminator, old: BlockId, new: BlockId) {
         } => {
             if *true_label == old {
                 *true_label = new;
-            } else if *false_label == old {
+            }
+            if *false_label == old {
                 *false_label = new;
             }
         }
         Terminator::Switch { cases, default, .. } => {
             if *default == old {
                 *default = new;
-            } else {
-                for (_, t) in cases.iter_mut() {
-                    if *t == old {
-                        *t = new;
-                    }
+            }
+            for (_, t) in cases.iter_mut() {
+                if *t == old {
+                    *t = new;
                 }
             }
         }

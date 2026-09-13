@@ -82,8 +82,11 @@
 //! (c) a weighted benefit above the weighted store/reload traffic. The
 //! transform never rewrites a shape it did not model.
 //!
-//! Enable with `CCC_RA_GLOBAL_LOCATION=1` (A/B gate, default off; an explicit
-//! `=0`/`false`/`off` also means off).
+//! The master gate `CCC_RA_GLOBAL_LOCATION` is **default ON** (graduated
+//! 2026-09-12 after a 785-TU × 5-opt × 2-target census, see RA-GLA-01); set
+//! it to `0`/`off`/`no`/`false`/empty as an emergency kill switch. Only the
+//! source-less rematerialization vocabulary ships enabled; cross-block spill
+//! gaps and intra-block gaps remain policy-OFF by default.
 //!
 //! # Shipped Phase-1 policy (A/B calibrated 2026-09-11, post PR #499)
 //!
@@ -143,6 +146,28 @@
 //! setup the only +insn sites. Gap-enabled fuzz (synthetic / phi_cfg /
 //! differential, verifier forced) and full gap unit tests keep the
 //! dormant substrate covered.
+//!
+//! # Structural verification and rollback
+//!
+//! Every applied rewrite is verified unconditionally — no environment
+//! gate — before it is committed (`verifier::verify_rewrite`):
+//!
+//! 1. exactly one static definition per SSA id;
+//! 2. every capture-slot reload is dominated by its store;
+//! 3. every fresh id is below `next_value_id`;
+//! 4. φ nodes remain a contiguous block prefix;
+//! 5. block labels are unique and every static terminator edge
+//!    (Branch/CondBranch/Switch/IndirectBranch) resolves to a real block;
+//! 6. each φ incoming names a real CFG predecessor, once;
+//! 7. the set of φ predecessor labels equals the block's CFG
+//!    predecessor set.
+//!
+//! The function's blocks and both id counters are snapshotted before
+//! the first mutation; any failure restores them byte-for-byte and the
+//! pass reports zero edits for the function (gate-off behavior), with a
+//! warning. `CCC_VERIFY_REGALLOC=1` upgrades the warning to a panic for
+//! development backtraces. The default-on feature therefore fails
+//! closed in production regardless of debug knobs.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
@@ -880,6 +905,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retarget_edge_moves_both_equal_cond_arms_together() {
+        // A CondBranch whose two arms name the SAME block is one unique
+        // CFG edge (build_cfg dedups successor labels) and shares one φ
+        // incoming; a fan-out trampoline must reroute BOTH arms or the
+        // un-rewired arm enters a merge expecting trampoline-defined
+        // names.
+        let mut term = Terminator::CondBranch {
+            cond: Operand::Const(IrConst::I64(1)),
+            true_label: BlockId(7),
+            false_label: BlockId(7),
+        };
+        retarget_edge(&mut term, BlockId(7), BlockId(42));
+        match term {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                assert_eq!(true_label, BlockId(42));
+                assert_eq!(false_label, BlockId(42));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn retarget_edge_moves_all_duplicate_switch_cases() {
+        let mut term = Terminator::Switch {
+            val: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+            default: BlockId(9),
+            cases: vec![(1, BlockId(7)), (2, BlockId(7)), (3, BlockId(8))],
+        };
+        retarget_edge(&mut term, BlockId(7), BlockId(42));
+        if let Terminator::Switch { default, cases, .. } = term {
+            assert_eq!(default, BlockId(9));
+            assert_eq!(
+                cases,
+                vec![(1, BlockId(42)), (2, BlockId(42)), (3, BlockId(8)),]
+            );
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn verifier_catches_phi_missing_predecessor_incoming() {
+        // b1 has two CFG predecessors (b0, b2) but its φ lists only b0 —
+        // the shape a stranded edge after a careless retarget produces.
+        let func = func_with(
+            vec![
+                blk(0, vec![], Terminator::Branch(BlockId(1))),
+                blk(
+                    1,
+                    vec![Instruction::Phi {
+                        dest: Value(50),
+                        ty: IrType::I64,
+                        incoming: vec![(Operand::Const(IrConst::I64(1)), BlockId(0))],
+                    }],
+                    Terminator::Return(Some(Operand::Value(Value(50)))),
+                ),
+                blk(2, vec![], Terminator::Branch(BlockId(1))),
+            ],
+            60,
+        );
+        let err = verify_rewrite(&func, &FxHashSet::default()).unwrap_err();
+        assert!(
+            err.contains("incoming set mismatches"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ── determinism ──
 
     #[test]
@@ -926,6 +1024,76 @@ mod tests {
         let mut slots = FxHashSet::default();
         slots.insert(5);
         assert!(verify_rewrite(&f, &slots).is_err());
+    }
+
+    #[test]
+    fn verifier_catches_dangling_terminator_target() {
+        // A terminator that branches to a nonexistent block label.
+        let f = func_with(
+            vec![blk(
+                0,
+                Vec::new(),
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I64(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(99),
+                },
+            )],
+            1,
+        );
+        let err = verify_rewrite(&f, &FxHashSet::default()).unwrap_err();
+        assert!(err.contains("targets missing block"), "{err}");
+    }
+
+    #[test]
+    fn verifier_catches_phi_naming_non_predecessor() {
+        // The φ claims block 2 as a predecessor, but block 0 branches to
+        // block 1: a trampoline that renamed an incoming without
+        // rerouting the terminator would produce exactly this shape.
+        let blocks = vec![
+            blk(0, Vec::new(), Terminator::Branch(BlockId(1))),
+            blk(
+                1,
+                vec![Instruction::Phi {
+                    dest: Value(9),
+                    ty: IrType::I64,
+                    incoming: vec![(Operand::Value(Value(1)), BlockId(2))],
+                }],
+                Terminator::Return(Some(Operand::Value(Value(9)))),
+            ),
+            blk(2, Vec::new(), Terminator::Return(None)),
+        ];
+        let f = func_with(blocks, 10);
+        let err = verify_rewrite(&f, &FxHashSet::default()).unwrap_err();
+        assert!(err.contains("not a CFG predecessor"), "{err}");
+        // A duplicate incoming for the same predecessor is also rejected.
+        let g_blocks = vec![
+            blk(
+                0,
+                Vec::new(),
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I64(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            blk(
+                1,
+                vec![Instruction::Phi {
+                    dest: Value(9),
+                    ty: IrType::I64,
+                    incoming: vec![
+                        (Operand::Value(Value(1)), BlockId(0)),
+                        (Operand::Value(Value(2)), BlockId(0)),
+                    ],
+                }],
+                Terminator::Return(Some(Operand::Value(Value(9)))),
+            ),
+            blk(2, Vec::new(), Terminator::Branch(BlockId(1))),
+        ];
+        let g = func_with(g_blocks, 10);
+        let err2 = verify_rewrite(&g, &FxHashSet::default()).unwrap_err();
+        assert!(err2.contains("two incoming entries"), "{err2}");
     }
 
     #[test]
@@ -1381,5 +1549,459 @@ mod tests {
         );
         assert!(m >= 1, "permissive policy retains the gap capability");
         verify_rewrite(&g, &FxHashSet::default()).expect("permissive rewrite verifies");
+    }
+
+    #[test]
+    fn remat_on_fanout_phi_edge_isolates_edge_with_trampoline() {
+        // The ONLY edge-trampoline path with no successful build-time
+        // coverage at the time the master gate was enabled (the one corpus
+        // trace hit it in an x86-64-only inline-asm TU that does not even
+        // assemble for i686).  Shape:
+        //
+        //   block0 (fan-out pred, peak over budget): v1 = &G, then 12
+        //           independent producers; cond -> block1 : block2
+        //   block2 (false arm, laid out between pred and merge): one
+        //           in-body read of v1, derives v3; Branch -> block1
+        //   block1 (merge, φ block): v9 = φ(v1 from block0, v3 from
+        //           block2); consume the 12 producers; return.
+        //
+        // v1 is remattable and has net relief over block0's pressure
+        // plateau. Its true-edge read is the φ incoming on block0->block1;
+        // the false edge must NOT execute that clone. That forces a
+        // critical-edge trampoline: the true edge is rerouted to a fresh
+        // singleton block that materializes the global and then falls
+        // through to block1, and the φ incoming is renamed and
+        // re-predded onto the trampoline.
+        let mut b0 = vec![global(1, "G")];
+        for k in 0..12u32 {
+            b0.push(add(100 + k, 600 + k, 620 + k));
+        }
+        let cond0 = Terminator::CondBranch {
+            cond: Operand::Const(IrConst::I64(1)),
+            true_label: BlockId(1),
+            false_label: BlockId(2),
+        };
+        // False arm (laid out immediately after the fan-out pred): v1 has a
+        // real body use here, keeping its live interval ONE continuous
+        // segment across the diamond (as in the i686 peephole_inline_asm_
+        // barrier trace: weighted_uses=2, segments=1, b0..b2).
+        let b2 = vec![add(400, 1, 700), add(3, 400, 501)];
+        let mut b1 = vec![Instruction::Phi {
+            dest: Value(9),
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Value(Value(1)), BlockId(0)),
+                (Operand::Value(Value(3)), BlockId(2)),
+            ],
+        }];
+        b1.push(add(200, 9, 100));
+        for k in 1..12u32 {
+            b1.push(add(200 + k, 199 + k, 100 + k));
+        }
+        // Index order 0, 2, 1: the false arm lies between the fan-out pred
+        // and the φ merge in flat layout, matching the continuous interval.
+        let blocks = vec![
+            blk(0, b0, cond0),
+            blk(2, b2, Terminator::Branch(BlockId(1))),
+            blk(1, b1, Terminator::Return(Some(Operand::Value(Value(211))))),
+        ];
+        let mut f = func_with(blocks, 900);
+        f.next_label = 3;
+        let n = run_with_policy(&mut f, conservative_policy(64));
+        assert_eq!(n, 1, "global v1 must remat; nothing else is eligible");
+
+        // A fourth singleton block is the edge trampoline.
+        assert_eq!(f.blocks.len(), 4, "one trampoline block must be inserted");
+        let find = |label: u32| f.blocks.iter().position(|b| b.label.0 == label);
+        let (i0, i2, i1) = (find(0).unwrap(), find(2).unwrap(), find(1).unwrap());
+        let tramp = f
+            .blocks
+            .iter()
+            .find(|b| b.label.0 == 3)
+            .expect("trampoline block exists");
+        assert_eq!(tramp.instructions.len(), 1);
+        let cloned = match tramp.instructions[0] {
+            Instruction::GlobalAddr { dest, ref name } => {
+                assert_eq!(name, "G");
+                dest.0
+            }
+            ref other => panic!("trampoline must clone the global, got {other:?}"),
+        };
+        assert!(cloned >= 900, "clone must take a fresh id, got {cloned}");
+        match tramp.terminator {
+            Terminator::Branch(b) => assert_eq!(b, BlockId(1)),
+            ref other => panic!("trampoline must branch to the φ block, got {other:?}"),
+        }
+
+        // The fan-out pred's true edge is rerouted; the false edge keeps
+        // its original target, proving the trampoline is edge-specific.
+        match f.blocks[i0].terminator {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                assert_eq!(true_label, tramp.label);
+                assert_eq!(false_label, BlockId(2));
+            }
+            ref other => panic!("expected cond branch, got {other:?}"),
+        }
+
+        // The φ incoming from the isolated edge is renamed to the clone
+        // and attributed to the trampoline; the false-arm incoming is
+        // intact; no φ incoming may still reference the old fan-out pred.
+        match f.blocks[i1].instructions[0] {
+            Instruction::Phi {
+                dest,
+                ty: IrType::I64,
+                ref incoming,
+            } => {
+                assert_eq!(dest, Value(9));
+                assert_eq!(
+                    *incoming,
+                    vec![
+                        (Operand::Value(Value(cloned)), tramp.label),
+                        (Operand::Value(Value(3)), BlockId(2)),
+                    ]
+                );
+            }
+            ref other => panic!("expected φ, got {other:?}"),
+        }
+
+        // The false arm keeps an unconditional branch to the merge, and
+        // its in-body v1 use is served by a remat clone local to that
+        // block, never by the trampoline on the isolated edge.
+        match f.blocks[i2].terminator {
+            Terminator::Branch(b) => assert_eq!(b, BlockId(1)),
+            ref other => panic!("false arm terminator changed: {other:?}"),
+        }
+        let arm_clone = f.blocks[i2]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::GlobalAddr { dest, name } if name == "G" && dest.0 != 1 => {
+                    Some(dest.0)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(arm_clone.len(), 1, "false arm gets one in-body remat clone");
+        assert_ne!(
+            arm_clone[0], cloned,
+            "arm clone is distinct from edge clone"
+        );
+
+        verify_rewrite(&f, &FxHashSet::default()).expect("trampoline rewrite verifies");
+        assert!(f.next_value_id > 900);
+    }
+
+    #[test]
+    fn remat_on_switch_fanout_phi_edge_isolates_edge_with_trampoline() {
+        // Same fan-out contract as the CondBranch test above, but the fan-out
+        // terminator is a dense Switch: a case edge to the φ merge and the
+        // default edge to the arm. A retarget must move the case label (and
+        // EVERY occurrence of it — duplicate Switch cases share one unique
+        // CFG edge and one φ incoming) while leaving the default edge alone.
+        // Jump-table emission (`emit_switch_jump_table`) then references the
+        // appended trampoline block purely by symbolic label, exactly as for
+        // a CondBranch trampoline, so no fixed block list can strand it.
+        let mut b0 = vec![global(1, "G")];
+        for k in 0..12u32 {
+            b0.push(add(100 + k, 600 + k, 620 + k));
+        }
+        let switch0 = Terminator::Switch {
+            val: Operand::Const(IrConst::I64(1)),
+            cases: vec![(1, BlockId(1))],
+            default: BlockId(2),
+            ty: IrType::I64,
+        };
+        let b2 = vec![add(400, 1, 700), add(3, 400, 501)];
+        let mut b1 = vec![Instruction::Phi {
+            dest: Value(9),
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Value(Value(1)), BlockId(0)),
+                (Operand::Value(Value(3)), BlockId(2)),
+            ],
+        }];
+        b1.push(add(200, 9, 100));
+        for k in 1..12u32 {
+            b1.push(add(200 + k, 199 + k, 100 + k));
+        }
+        let blocks = vec![
+            blk(0, b0, switch0),
+            blk(2, b2, Terminator::Branch(BlockId(1))),
+            blk(1, b1, Terminator::Return(Some(Operand::Value(Value(211))))),
+        ];
+        let mut f = func_with(blocks, 900);
+        f.next_label = 3;
+        let n = run_with_policy(&mut f, conservative_policy(64));
+        assert_eq!(n, 1, "global v1 must remat; nothing else is eligible");
+        assert_eq!(f.blocks.len(), 4);
+
+        let find = |label: u32| f.blocks.iter().position(|b| b.label.0 == label);
+        let (i0, i2, i1) = (find(0).unwrap(), find(2).unwrap(), find(1).unwrap());
+        let tramp = f
+            .blocks
+            .iter()
+            .find(|b| b.label.0 == 3)
+            .expect("trampoline block exists");
+        assert_eq!(tramp.instructions.len(), 1);
+        let cloned = match tramp.instructions[0] {
+            Instruction::GlobalAddr { dest, ref name } => {
+                assert_eq!(name, "G");
+                dest.0
+            }
+            ref other => panic!("trampoline must clone the global, got {other:?}"),
+        };
+        assert!(cloned >= 900);
+        match tramp.terminator {
+            Terminator::Branch(b) => assert_eq!(b, BlockId(1)),
+            ref other => panic!("trampoline must branch to the φ block, got {other:?}"),
+        }
+
+        // The case edge is rerouted to the trampoline; the default edge is
+        // untouched, proving isolation on a Switch fan-out.
+        match &f.blocks[i0].terminator {
+            Terminator::Switch {
+                cases, default, ty, ..
+            } => {
+                assert_eq!(*ty, IrType::I64);
+                assert_eq!(*cases, vec![(1, BlockId(3))]);
+                assert_eq!(*default, BlockId(2));
+            }
+            ref other => panic!("expected switch, got {other:?}"),
+        }
+
+        match f.blocks[i1].instructions[0] {
+            Instruction::Phi {
+                dest,
+                ty: IrType::I64,
+                ref incoming,
+            } => {
+                assert_eq!(dest, Value(9));
+                assert_eq!(
+                    *incoming,
+                    vec![
+                        (Operand::Value(Value(cloned)), tramp.label),
+                        (Operand::Value(Value(3)), BlockId(2)),
+                    ]
+                );
+            }
+            ref other => panic!("expected φ, got {other:?}"),
+        }
+
+        // The default arm keeps its own in-body remat clone, distinct from
+        // the case-edge trampoline clone.
+        match f.blocks[i2].terminator {
+            Terminator::Branch(b) => assert_eq!(b, BlockId(1)),
+            ref other => panic!("default arm terminator changed: {other:?}"),
+        }
+        let arm_clone = f.blocks[i2]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::GlobalAddr { dest, name } if name == "G" && dest.0 != 1 => {
+                    Some(dest.0)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(arm_clone.len(), 1);
+        assert_ne!(arm_clone[0], cloned);
+
+        verify_rewrite(&f, &FxHashSet::default()).expect("trampoline rewrite verifies");
+        assert_eq!(f.next_label, 4);
+    }
+
+    #[test]
+    fn remat_through_indirect_branch_edge_is_refused() {
+        // An IndirectBranch predecessor picks its successor at RUNTIME via a
+        // blockaddress; an edge trampoline could never be reached because
+        // retargeting possible_targets does not rewrite the computed target.
+        // The fan-out edge service must skip (φ incoming left on the
+        // original def) rather than mint a name only a trampoline defines.
+        let mut b0 = vec![global(1, "G")];
+        for k in 0..12u32 {
+            b0.push(add(100 + k, 600 + k, 620 + k));
+        }
+        // Blockaddress value 500 (never defined here; static analysis
+        // tolerates undefined operands, as elsewhere in this suite).
+        let indirect = Terminator::IndirectBranch {
+            target: Operand::Value(Value(500)),
+            possible_targets: vec![BlockId(1), BlockId(2)],
+        };
+        let b2 = vec![add(400, 1, 700), add(3, 400, 501)];
+        let mut b1 = vec![Instruction::Phi {
+            dest: Value(9),
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Value(Value(1)), BlockId(0)),
+                (Operand::Value(Value(3)), BlockId(2)),
+            ],
+        }];
+        b1.push(add(200, 9, 100));
+        for k in 1..12u32 {
+            b1.push(add(200 + k, 199 + k, 100 + k));
+        }
+        let blocks = vec![
+            blk(0, b0, indirect),
+            blk(2, b2, Terminator::Branch(BlockId(1))),
+            blk(1, b1, Terminator::Return(Some(Operand::Value(Value(211))))),
+        ];
+        let mut f = func_with(blocks, 900);
+        f.next_label = 3;
+        let n = run_with_policy(&mut f, conservative_policy(64));
+        // v1 still remats for its false-arm in-body cluster, but no edge
+        // service and therefore no trampoline block.
+        assert_eq!(n, 1);
+        assert_eq!(f.blocks.len(), 3, "indirect edge must not be split");
+        let i1 = f.blocks.iter().position(|b| b.label.0 == 1).unwrap();
+        match f.blocks[i1].instructions[0] {
+            Instruction::Phi {
+                dest,
+                ty: IrType::I64,
+                ref incoming,
+            } => {
+                assert_eq!(dest, Value(9));
+                // The fan-out edge incoming stays on the ORIGINAL v1.
+                assert_eq!(
+                    *incoming,
+                    vec![
+                        (Operand::Value(Value(1)), BlockId(0)),
+                        (Operand::Value(Value(3)), BlockId(2)),
+                    ]
+                );
+            }
+            ref other => panic!("expected φ, got {other:?}"),
+        }
+        match f.blocks[0].terminator {
+            Terminator::IndirectBranch {
+                ref possible_targets,
+                ..
+            } => assert_eq!(*possible_targets, vec![BlockId(1), BlockId(2)]),
+            ref other => panic!("indirect terminator mutated: {other:?}"),
+        }
+        verify_rewrite(&f, &FxHashSet::default()).expect("rewrite verifies");
+    }
+
+    #[test]
+    fn remat_deferred_on_both_fanout_edges_gets_two_trampolines() {
+        // Same remattable v1 feeds a φ incoming on BOTH successors of a
+        // fan-out pred. Each edge must be isolated with its OWN trampoline
+        // (a clone on one edge must never be named by the other φ), and the
+        // conditional terminator must have BOTH arms rerouted.
+        let mut b0 = vec![global(1, "G")];
+        for k in 0..12u32 {
+            b0.push(add(100 + k, 600 + k, 620 + k));
+        }
+        // Extra predecessors with their own φ incoming.
+        let b3 = vec![add(5, 600, 601)];
+        let b4 = vec![add(6, 601, 602)];
+        let mut consumers1 = Vec::new();
+        for k in 0..12u32 {
+            consumers1.push(add(200 + k, 100 + k, 300 + k));
+        }
+        let mut consumers2 = Vec::new();
+        for k in 0..12u32 {
+            consumers2.push(add(220 + k, 100 + k, 320 + k));
+        }
+        let mut b1 = vec![Instruction::Phi {
+            dest: Value(9),
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Value(Value(1)), BlockId(0)),
+                (Operand::Value(Value(5)), BlockId(3)),
+            ],
+        }];
+        b1.extend(consumers1);
+        b1.push(add(300, 9, 200));
+        let mut b2 = vec![Instruction::Phi {
+            dest: Value(10),
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Value(Value(1)), BlockId(0)),
+                (Operand::Value(Value(6)), BlockId(4)),
+            ],
+        }];
+        b2.extend(consumers2);
+        b2.push(add(301, 10, 220));
+        let blocks = vec![
+            blk(
+                0,
+                b0,
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I64(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            blk(3, b3, Terminator::Branch(BlockId(1))),
+            blk(1, b1, Terminator::Return(Some(Operand::Value(Value(300))))),
+            blk(4, b4, Terminator::Branch(BlockId(2))),
+            blk(2, b2, Terminator::Return(Some(Operand::Value(Value(301))))),
+        ];
+        let mut f = func_with(blocks, 900);
+        f.next_label = 5;
+        let n = run_with_policy(&mut f, conservative_policy(64));
+        assert_eq!(n, 1, "only v1 is eligible");
+        assert_eq!(f.blocks.len(), 7, "two trampoline blocks appended");
+        let i0 = f.blocks.iter().position(|b| b.label.0 == 0).unwrap();
+        let i1 = f.blocks.iter().position(|b| b.label.0 == 1).unwrap();
+        let i2 = f.blocks.iter().position(|b| b.label.0 == 2).unwrap();
+        let (ttrue, tfalse) = match f.blocks[i0].terminator {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                assert_ne!(true_label, false_label);
+                (true_label, false_label)
+            }
+            ref other => panic!("cond branch mutated: {other:?}"),
+        };
+        for (merge_idx, expect_pred, other_pred, other_name, dest) in [
+            (i1, ttrue, BlockId(3), 5u32, 9u32),
+            (i2, tfalse, BlockId(4), 6u32, 10u32),
+        ] {
+            // Trampoline: one global clone, branch to the merge.
+            let ti = f
+                .blocks
+                .iter()
+                .position(|b| b.label == expect_pred)
+                .expect("trampoline exists");
+            let tb = &f.blocks[ti];
+            assert_eq!(tb.instructions.len(), 1);
+            let clone_id = match tb.instructions[0] {
+                Instruction::GlobalAddr { dest, ref name } => {
+                    assert_eq!(name, "G");
+                    dest.0
+                }
+                ref other => panic!("trampoline body wrong: {other:?}"),
+            };
+            match tb.terminator {
+                Terminator::Branch(b) => assert_eq!(b, f.blocks[merge_idx].label),
+                ref other => panic!("trampoline terminator: {other:?}"),
+            }
+            // φ: trampoline edge renamed to the clone; other incoming intact.
+            match f.blocks[merge_idx].instructions[0] {
+                Instruction::Phi {
+                    dest: d,
+                    ty: IrType::I64,
+                    ref incoming,
+                } => {
+                    assert_eq!(d.0, dest);
+                    assert_eq!(
+                        *incoming,
+                        vec![
+                            (Operand::Value(Value(clone_id)), expect_pred),
+                            (Operand::Value(Value(other_name)), other_pred),
+                        ]
+                    );
+                }
+                ref other => panic!("merge φ wrong: {other:?}"),
+            }
+        }
+        verify_rewrite(&f, &FxHashSet::default()).expect("two-trampoline rewrite verifies");
     }
 }
