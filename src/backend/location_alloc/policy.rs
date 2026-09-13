@@ -7,6 +7,17 @@ use super::*;
 // Tunables (env-overridable for A/B work; clamped)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Whether `value` is one of the documented OFF tokens (case-insensitive):
+/// `0`, `off`, `no`, `false` or the empty string. Every GLA boolean knob
+/// parses through this one helper so the emergency-kill-switch vocabulary
+/// cannot drift between knobs.
+fn is_off_token(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "off" | "no" | "false" | ""
+    )
+}
+
 /// Master gate for the global location allocator.
 ///
 /// **Default: ON.** The source-less rematerialization policy this gate
@@ -22,17 +33,6 @@ use super::*;
 /// `CCC_RA_GLOBAL_LOCATION` to `0`, `off`, `no`, `false` (any case) or the
 /// empty string disables the pass. Any other value (incl. `1`/`on`)
 /// enables it; an unset variable follows the default (enabled).
-/// Whether `value` is one of the documented OFF tokens (case-insensitive):
-/// `0`, `off`, `no`, `false` or the empty string. Every GLA boolean knob
-/// parses through this one helper so the emergency-kill-switch vocabulary
-/// cannot drift between knobs.
-fn is_off_token(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "0" | "off" | "no" | "false" | ""
-    )
-}
-
 pub(crate) fn gate_enabled() -> bool {
     // Unset follows the default (enabled); only an explicit off token
     // disables the pass.
