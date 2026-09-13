@@ -65,6 +65,14 @@ pub struct LinkerArgs {
     pub dynamic_linker: Option<String>,
     /// `-soname=NAME`: DT_SONAME recorded in a shared library.
     pub soname: Option<String>,
+    /// `--build-id[=STYLE]`: emit `.note.gnu.build-id`.
+    ///
+    /// Not a nicety.  Debian's gcc passes `--build-id` on *every* link, and
+    /// debuginfod, RPM/DEB debuginfo extraction, systemd-coredump matching and
+    /// `eu-unstrip` all key on it.  Silently honouring the flag while emitting
+    /// no note produces binaries that look linked but cannot be symbolised
+    /// after the fact.  `--build-id=none` (and `=0`) clears it, matching GNU ld.
+    pub build_id: bool,
     /// `-Bsymbolic` / `-Bsymbolic-functions`: bind global references inside a
     /// shared library to its own definitions.
     pub bsymbolic: bool,
@@ -80,6 +88,17 @@ pub struct LinkerArgs {
     /// `--no-whole-archive`. Link order also decides archive member selection,
     /// so any caller doing real archive resolution must use this list.
     pub inputs: Vec<InputItem>,
+    /// `-pie` / `--pic-executable`: emit a position-independent executable
+    /// (`ET_DYN` based at 0, `DF_1_PIE`, `R_X86_64_RELATIVE` for internal
+    /// absolute addresses).  Debian's gcc passes `-pie` on every link, so a
+    /// linker that ignores it silently ships every binary without ASLR.
+    pub is_pie: bool,
+    /// `-s` / `--strip-all`: omit `.symtab` and `.strtab` from the output.
+    pub strip_all: bool,
+    /// `--hash-style=gnu|sysv|both`.  `Gnu` is the default everywhere that
+    /// matters on x86-64; `both` is still requested by builds targeting
+    /// pre-2.23 glibc, which has no `DT_GNU_HASH` support.
+    pub hash_style: HashStyle,
 }
 
 /// One input file or `-l` library, with the positional flag state that applied
@@ -103,6 +122,70 @@ pub struct InputItem {
     pub as_needed: bool,
 }
 
+/// Which dynamic symbol hash tables to emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashStyle {
+    /// `.gnu.hash` + `DT_GNU_HASH` only.  The default.
+    #[default]
+    Gnu,
+    /// `.hash` + `DT_HASH` only.
+    Sysv,
+    /// Both tables, for loaders too old for `DT_GNU_HASH`.
+    Both,
+}
+
+impl HashStyle {
+    pub fn wants_gnu(self) -> bool {
+        matches!(self, HashStyle::Gnu | HashStyle::Both)
+    }
+    pub fn wants_sysv(self) -> bool {
+        matches!(self, HashStyle::Sysv | HashStyle::Both)
+    }
+}
+
+/// Parse the value of `--hash-style=`.
+///
+/// GNU ld accepts `gnu`, `sysv`, `both`, and a comma-separated combination
+/// (`gnu,sysv`).  Returns `None` for an unrecognised value so the caller can
+/// keep the default rather than silently guessing.
+pub fn parse_hash_style(v: &str) -> Option<HashStyle> {
+    let mut gnu = false;
+    let mut sysv = false;
+    for tok in v.to_ascii_lowercase().split(',') {
+        match tok.trim() {
+            "gnu" => gnu = true,
+            "sysv" => sysv = true,
+            "both" => {
+                gnu = true;
+                sysv = true;
+            }
+            _ => return None,
+        }
+    }
+    Some(match (gnu, sysv) {
+        (false, true) => HashStyle::Sysv,
+        (true, true) => HashStyle::Both,
+        _ => HashStyle::Gnu,
+    })
+}
+
+/// Apply a single linker flag that is a plain token-to-field mapping.
+///
+/// Returns `true` if the token was consumed.  Both the top-level argument loop
+/// and the `-Wl,` sub-argument loop call this, so a flag spelled either way is
+/// handled by one definition instead of two that can drift.  Flags needing a
+/// value or carrying positional state are handled inline by the callers.
+fn apply_plain_flag(result: &mut LinkerArgs, tok: &str) -> bool {
+    match tok {
+        "-pie" | "--pie" | "--pic-executable" => result.is_pie = true,
+        "-no-pie" | "--no-pie" | "--no-pic-executable" => result.is_pie = false,
+        // Exact match only, so `-soname`/`-shared` are not shadowed.
+        "-s" | "--strip-all" => result.strip_all = true,
+        _ => return false,
+    }
+    true
+}
+
 /// Parse user linker arguments into a structured `LinkerArgs`.
 ///
 /// Handles `-L`, `-l`, `-Wl,` (with nested flags like `--defsym`, `--export-dynamic`,
@@ -110,8 +193,68 @@ pub struct InputItem {
 pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     let mut result = LinkerArgs::default();
     result.z_relro = true; // RELRO is on by default, like GNU ld/mold
-    let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
-    let mut pending_rpath = false; // for -Wl,-rpath -Wl,/path two-arg form
+    // GNU ld accepts `--opt VALUE` alongside `--opt=VALUE`.  A driver that
+    // forwards them as `-Wl,--opt -Wl,VALUE` splits the pair across two
+    // arguments, and the `-Wl,` splitter below can only see one group at a
+    // time, so the value is silently dropped.  Re-join such a pair up front:
+    // `-Wl,--wrap -Wl,bv` becomes `-Wl,--wrap,bv`, which the group parser
+    // already handles.  This replaces the ad-hoc `pending_rpath` workaround
+    // and covers every two-argument option at once.
+    const VALUE_TAKING: &[&str] = &[
+        "--wrap",
+        "--defsym",
+        "--icf",
+        "-Map",
+        "--version-script",
+        "--exclude-libs",
+        "-rpath",
+        "--hash-style",
+        "--dynamic-linker",
+        "-dynamic-linker",
+        "-I",
+        "-soname",
+        "--entry",
+        "-e",
+        "--undefined",
+        "-u",
+        "-z",
+    ];
+    let joined: Vec<String> = {
+        let mut out: Vec<String> = Vec::with_capacity(user_args.len());
+        let mut k = 0;
+        while k < user_args.len() {
+            let mut cur = user_args[k].clone();
+            k += 1;
+            // Absorb following -Wl, groups while this one ends in an option
+            // that is still waiting for its value.
+            while k < user_args.len() {
+                let wl = match cur.strip_prefix("-Wl,") {
+                    Some(w) => w,
+                    None => break,
+                };
+                let last = match wl.split(',').last() {
+                    Some(l) => l,
+                    None => break,
+                };
+                if !VALUE_TAKING.contains(&last) {
+                    break;
+                }
+                let nxt = match user_args[k].strip_prefix("-Wl,") {
+                    Some(w) => w,
+                    None => break, // value is a separate argv entry; leave it
+                };
+                cur = format!("{},{}", cur, nxt);
+                k += 1;
+            }
+            out.push(cur);
+        }
+        out
+    };
+    let args: Vec<&str> = joined.iter().map(|s| s.as_str()).collect();
+    // Retained for a `-Wl,-rpath` whose path arrives as a *separate argv
+    // entry* (not another `-Wl,` group), which the join above deliberately
+    // does not merge.
+    let mut pending_rpath = false;
     // Positional state: --whole-archive applies to archives that FOLLOW it,
     // until --no-whole-archive turns it back off.
     let mut whole_archive = false;
@@ -340,6 +483,23 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     as_needed = true;
                 } else if part == "--no-as-needed" {
                     as_needed = false;
+                } else if let Some(v) = part.strip_prefix("--hash-style=") {
+                    if let Some(h) = parse_hash_style(v) {
+                        result.hash_style = h;
+                    }
+                } else if part == "--hash-style" && j + 1 < parts.len() {
+                    j += 1;
+                    if let Some(h) = parse_hash_style(parts[j]) {
+                        result.hash_style = h;
+                    }
+                } else if apply_plain_flag(&mut result, part) {
+                    // consumed
+                } else if let Some(style) = part.strip_prefix("--build-id=") {
+                    result.build_id = !matches!(style, "none" | "0");
+                } else if part == "--build-id" {
+                    result.build_id = true;
+                } else if part == "--no-build-id" {
+                    result.build_id = false;
                 }
                 j += 1;
             }
@@ -360,6 +520,23 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             as_needed = true;
         } else if arg == "--no-as-needed" {
             as_needed = false;
+        } else if let Some(v) = arg.strip_prefix("--hash-style=") {
+            if let Some(h) = parse_hash_style(v) {
+                result.hash_style = h;
+            }
+        } else if arg == "--hash-style" && i + 1 < args.len() {
+            i += 1;
+            if let Some(h) = parse_hash_style(args[i]) {
+                result.hash_style = h;
+            }
+        } else if apply_plain_flag(&mut result, arg) {
+            // consumed
+        } else if let Some(style) = arg.strip_prefix("--build-id=") {
+            result.build_id = !matches!(style, "none" | "0");
+        } else if arg == "--build-id" {
+            result.build_id = true;
+        } else if arg == "--no-build-id" {
+            result.build_id = false;
         } else if !arg.starts_with('-') && Path::new(arg).exists() {
             result.extra_object_files.push(arg.to_string());
             result.inputs.push(InputItem {

@@ -13,7 +13,7 @@ use super::emit_exec::emit_executable;
 use super::emit_shared::emit_shared_library;
 use super::icf;
 use super::input::{load_file, load_file_as_needed};
-use super::plt_got::{collect_ifunc_symbols, create_plt_got};
+use super::plt_got::{collect_ifunc_symbols, collect_local_ifuncs, create_plt_got};
 use super::types::{GlobalSymbol, INTERP};
 use crate::backend::linker_common::{self, OutputSection};
 
@@ -109,6 +109,15 @@ pub fn link_builtin(
         .iter()
         .map(|it| (it.name.clone(), it.as_needed))
         .collect();
+    // Same for --whole-archive, which is positional for exactly the same
+    // reason.  `link_shared` threads it through the ordered `inputs` vector;
+    // this path resolves through flat name lists, so the flag travels in a map
+    // keyed by the name as written.
+    let whole_archive_of: FxHashMap<String, bool> = parsed_args
+        .inputs
+        .iter()
+        .map(|it| (it.name.clone(), it.whole_archive))
+        .collect();
     // `-lfoo` resolves to some /path/libfoo.so.N; map a resolved path back to
     // the stem the user wrote so the flag can be recovered.
     let as_needed_for = |path_or_name: &str| -> bool {
@@ -125,6 +134,22 @@ pub fn link_builtin(
             return v;
         }
         true
+    };
+    // Recover the `--whole-archive` state for a resolved library path or the
+    // `-l` stem the user wrote.  Defaults to false: GNU ld's default is
+    // selective archive loading.
+    let whole_archive_for = |path_or_name: &str| -> bool {
+        if let Some(&v) = whole_archive_of.get(path_or_name) {
+            return v;
+        }
+        let base = std::path::Path::new(path_or_name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path_or_name);
+        let stem = base.strip_prefix("lib").unwrap_or(base);
+        let stem = stem.split(".so").next().unwrap_or(stem);
+        let stem = stem.strip_suffix(".a").unwrap_or(stem);
+        whole_archive_of.get(stem).copied().unwrap_or(false)
     };
 
     // Force-undefined symbols (-u SYM): enter them into the global table as
@@ -157,6 +182,21 @@ pub fn link_builtin(
     for path in &extra_object_files {
         if path.ends_with(".a") || path.ends_with(".so") || path.contains(".so.") {
             deferred_libs.push(path.clone());
+            // A positional archive under --whole-archive is force-loaded now,
+            // ahead of the group loop: the group loop only re-scans libraries
+            // for members that resolve an undefined symbol, which is precisely
+            // what --whole-archive opts out of.
+            if whole_archive_for(path) && path.ends_with(".a") {
+                load_file_as_needed(
+                    path,
+                    &mut objects,
+                    &mut globals,
+                    &mut needed_sonames,
+                    &lib_path_strings,
+                    true,
+                    as_needed_for(path),
+                )?;
+            }
         } else {
             load_file(
                 path,
@@ -222,25 +262,44 @@ pub fn link_builtin(
         // (from shared library resolution) since either can introduce work for
         // the other on the next iteration.
         let mut changed = true;
+        // A --whole-archive member is force-loaded in full on the first pass;
+        // re-loading it on every group iteration would duplicate every symbol.
+        let mut whole_archive_loaded: FxHashSet<String> = FxHashSet::default();
         while changed {
             changed = false;
             let prev_obj_count = objects.len();
             let prev_dyn_count = needed_sonames.len();
             for lib_path in &lib_paths_resolved {
+                let wa = whole_archive_for(lib_path);
+                if wa && whole_archive_loaded.contains(lib_path) {
+                    continue;
+                }
                 load_file_as_needed(
                     lib_path,
                     &mut objects,
                     &mut globals,
                     &mut needed_sonames,
                     &all_lib_paths,
-                    false,
+                    wa,
                     as_needed_for(lib_path),
                 )?;
+                if wa {
+                    whole_archive_loaded.insert(lib_path.clone());
+                }
             }
             if objects.len() != prev_obj_count || needed_sonames.len() != prev_dyn_count {
                 changed = true;
             }
         }
+    }
+
+    // --build-id: contribute a placeholder .note.gnu.build-id so the section
+    // takes part in layout like any other input section.  The digest itself is
+    // content-derived, so it can only be computed once the image is final;
+    // `emit_exec` overwrites the placeholder in place (see
+    // `patch_output_build_id`).  Debian's gcc passes --build-id on every link.
+    if parsed_args.build_id {
+        objects.push(linker_common::build_id::synthetic_note_object());
     }
 
     // Resolve remaining undefined symbols from default system libraries
@@ -309,6 +368,33 @@ pub fn link_builtin(
         let mut gc_roots: Vec<String> = undefined_symbols.clone();
         if let Some(ref e) = entry_symbol {
             gc_roots.push(e.clone());
+        }
+        // `--export-dynamic` makes every exported global reachable from
+        // *outside* the image (dlsym, a dlopen'd plugin, another DSO), so
+        // nothing inside the link references it and a pure reachability sweep
+        // collects it.  The link succeeds and the binary runs -- it just
+        // fails at the first dlsym.  GNU ld, lld and mold all root the
+        // exported set; see `is_exported_dynamic_symbol`, which the emitter
+        // uses for the very same set.
+        //
+        // A version script narrows the set identically in both places.
+        if export_dynamic {
+            let version_script = parsed_args
+                .version_script
+                .as_deref()
+                .and_then(linker_common::VersionScript::parse);
+            gc_roots.extend(globals.iter().filter_map(|(name, g)| {
+                if !linker_common::is_exported_dynamic_symbol(g) {
+                    return None;
+                }
+                if let Some(ref vs) = version_script
+                    && vs.any_local_star()
+                    && !vs.matches_global(name)
+                {
+                    return None;
+                }
+                Some(name.clone())
+            }));
         }
         linker_common::gc_collect_sections_elf64_roots(&objects, &gc_roots)
     } else {
@@ -397,6 +483,20 @@ pub fn link_builtin(
         }
     }
 
+    // Prune the FDEs whose functions the sweep collected.  `--gc-sections`
+    // works per input section, but a translation unit has ONE `.eh_frame`
+    // holding an FDE per function, so with `-ffunction-sections` the FDE set
+    // and the live-code set diverge inside a single section.  Must run before
+    // ICF: a folded function still exists (it aliases its representative), so
+    // its FDE is still needed, whereas a COMDAT/GC loser's is not.
+    let dropped_fdes = linker_common::prune_dead_fdes(&mut objects, &dead_sections);
+    if std::env::var("LCCC_DEBUG_GCEH").is_ok() {
+        eprintln!(
+            "[gceh] dropped_fdes={dropped_fdes} dead_sections={}",
+            dead_sections.len()
+        );
+    }
+
     phase!("strmerge");
     // Identical Code Folding: retire duplicate function sections and alias
     // them onto their surviving representative. Folded sections are added to
@@ -449,11 +549,16 @@ pub fn link_builtin(
 
     phase!("common");
     // Create PLT/GOT
-    let (plt_names, got_entries, abs_dyn_relocs) = create_plt_got(&objects, &mut globals);
+    let is_pie = parsed_args.is_pie;
+    let (plt_names, got_entries, abs_dyn_relocs, pie_relative) =
+        create_plt_got(&objects, &mut globals, is_pie);
 
     phase!("plt-got");
     // Collect IFUNC symbols for static linking
     let ifunc_symbols = collect_ifunc_symbols(&globals, is_static);
+    // Local IFUNCs are invisible to the above (it walks `globals`), and without
+    // an IPLT slot of their own their call sites bind to the resolver.
+    let local_ifuncs = collect_local_ifuncs(&objects, &dead_sections);
 
     phase!("ifunc");
     // Emit executable.  The target ABI interpreter is the default, but a
@@ -478,9 +583,11 @@ pub fn link_builtin(
         &mut globals,
         &mut output_sections,
         &section_map,
+        &dead_sections,
         &plt_names,
         &got_entries,
         &abs_dyn_relocs,
+        &pie_relative,
         &needed_sonames,
         output_path,
         export_dynamic,
@@ -493,6 +600,10 @@ pub fn link_builtin(
         parsed_args.z_relro,
         parsed_args.map_path.as_deref(),
         parsed_args.version_script.as_deref(),
+        is_pie,
+        parsed_args.strip_all,
+        &local_ifuncs,
+        parsed_args.hash_style,
     );
     phase!("emit-exec");
     if ld_time {
@@ -706,6 +817,7 @@ pub fn link_shared(
         &objects,
         &mut globals,
         &mut output_sections,
+        parsed.hash_style,
         &section_map,
         &needed_sonames,
         output_path,

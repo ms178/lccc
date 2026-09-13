@@ -45,9 +45,36 @@ PREFIX=${LCCC_ORACLE_PREFIX:-/home/user/tools}
 FORCE=0
 JOBS=${JOBS:-2}
 
+# Version pins.  Default stays git HEAD (see the policy note above: stale
+# oracles have produced false lccc failures).  Set these to a tag/SHA when a
+# specific upstream release must be compared against -- e.g.
+#     MOLD_REF=2.42.1 WILD_REF=main tests/linker/setup_oracles.sh
+# A pinned checkout is cloned into its own directory so a HEAD build and a
+# pinned build can coexist, and the installed binary is suffixed with the ref.
+# `--only mold,wild` builds a subset (comma-separated: mold wild bfd lld).
+# Default is all four.  Useful on a 2-core box where the bfd/lld source builds
+# cost far more than the comparison being run needs.
+ONLY=${ONLY:-mold,wild,bfd,lld}
+want() { [[ ",$ONLY," == *",$1,"* ]]; }
+
+MOLD_REF=${MOLD_REF:-HEAD}
+WILD_REF=${WILD_REF:-HEAD}
+ref_suffix() { [[ $1 == HEAD ]] && echo "" || echo "-$(echo "$1" | tr '/.' '__')"; }
+# Check out a tag/branch/SHA, tolerating the `v` prefix that upstream uses on
+# its release tags (mold tags `v2.42.1`, not `2.42.1`).
+checkout_ref() {
+  local dir=$1 ref=$2
+  if [[ $ref == HEAD ]]; then git -C "$dir" reset -q --hard origin/main; return; fi
+  git -C "$dir" checkout -q "refs/tags/$ref" 2>/dev/null && return
+  git -C "$dir" checkout -q "refs/tags/v$ref" 2>/dev/null && return
+  git -C "$dir" checkout -q "$ref" 2>/dev/null && return
+  echo "fatal: ref '$ref' not found in $dir" >&2; exit 1
+}
+
 while [[ $# -gt 0 ]]; do
   case $1 in
     --force)  FORCE=1; shift ;;
+    --only)   ONLY=$2; shift 2 ;;
     --prefix) PREFIX=$2; shift 2 ;;
     -j)       JOBS=$2; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -73,56 +100,64 @@ fi
 # ---------------------------------------------------------------------------
 # mold
 # ---------------------------------------------------------------------------
-if have mold; then
-  log "mold already present: $("$BIN/mold" --version | head -1)"
+MOLD_NAME="mold$(ref_suffix "$MOLD_REF")"
+if ! want mold; then
+  :
+elif have "$MOLD_NAME"; then
+  log "mold already present: $("$BIN/$MOLD_NAME" --version | head -1)"
 else
-  log "building mold from git HEAD (targets: X86_64;I386)"
+  log "building mold ${MOLD_REF} (targets: X86_64;I386)"
   command -v cmake >/dev/null || { echo "cmake is required" >&2; exit 1; }
-  if [[ ! -d "$SRC/mold-src/.git" ]]; then
-    rm -rf "$SRC/mold-src"
-    git clone --depth 1 https://github.com/rui314/mold.git "$SRC/mold-src"
-  else
-    git -C "$SRC/mold-src" fetch --depth 1 origin && \
-    git -C "$SRC/mold-src" reset --hard FETCH_HEAD
+  MOLD_DIR="$SRC/mold-src$(ref_suffix "$MOLD_REF")"
+  if [[ ! -d "$MOLD_DIR/.git" ]]; then
+    rm -rf "$MOLD_DIR"
+    git clone --filter=blob:none https://github.com/rui314/mold.git "$MOLD_DIR"
   fi
-  cmake -S "$SRC/mold-src" -B "$SRC/mold-src/build" \
+  git -C "$MOLD_DIR" fetch --filter=blob:none origin --tags >/dev/null 2>&1 || true
+  checkout_ref "$MOLD_DIR" "$MOLD_REF"
+  log "mold source: $(git -C "$MOLD_DIR" describe --tags --always) $(git -C "$MOLD_DIR" rev-parse --short HEAD)"
+  cmake -S "$MOLD_DIR" -B "$MOLD_DIR/build" \
         -DCMAKE_BUILD_TYPE=Release \
         -DMOLD_TARGETS='X86_64;I386' \
         -DMOLD_USE_MIMALLOC=OFF \
         -DMOLD_LTO=OFF \
         -DCMAKE_C_FLAGS="-O2 $NATIVE" \
         -DCMAKE_CXX_FLAGS="-O2 $NATIVE" \
-        -DCMAKE_INSTALL_PREFIX="$SRC/mold-inst"
-  cmake --build "$SRC/mold-src/build" -j "$JOBS"
-  cmake --install "$SRC/mold-src/build"
-  install -m755 "$SRC/mold-inst/bin/mold" "$BIN/mold"
-  ln -sf mold "$BIN/ld.mold"
-  log "mold: $("$BIN/mold" --version | head -1)"
+        -DCMAKE_INSTALL_PREFIX="$MOLD_DIR/inst"
+  cmake --build "$MOLD_DIR/build" -j "$JOBS"
+  cmake --install "$MOLD_DIR/build"
+  install -m755 "$MOLD_DIR/inst/bin/mold" "$BIN/$MOLD_NAME"
+  ln -sf "$MOLD_NAME" "$BIN/ld$(ref_suffix "$MOLD_REF").mold"
+  log "mold: $("$BIN/$MOLD_NAME" --version | head -1)"
 fi
 
 # ---------------------------------------------------------------------------
 # wild
 # ---------------------------------------------------------------------------
-if have wild; then
-  log "wild already present: $("$BIN/wild" --version | head -1)"
+WILD_NAME="wild$(ref_suffix "$WILD_REF")"
+if ! want wild; then
+  :
+elif have "$WILD_NAME"; then
+  log "wild already present: $("$BIN/$WILD_NAME" --version | head -1)"
 else
-  log "building wild from git HEAD (-C target-cpu=native)"
+  log "building wild ${WILD_REF} (-C target-cpu=native)"
   command -v cargo >/dev/null || { echo "cargo is required" >&2; exit 1; }
-  if [[ ! -d "$SRC/wild-src/.git" ]]; then
-    rm -rf "$SRC/wild-src"
-    git clone --depth 1 https://github.com/davidlattimore/wild.git "$SRC/wild-src"
-  else
-    git -C "$SRC/wild-src" fetch --depth 1 origin && \
-    git -C "$SRC/wild-src" reset --hard FETCH_HEAD
+  WILD_DIR="$SRC/wild-src$(ref_suffix "$WILD_REF")"
+  if [[ ! -d "$WILD_DIR/.git" ]]; then
+    rm -rf "$WILD_DIR"
+    git clone --filter=blob:none https://github.com/davidlattimore/wild.git "$WILD_DIR"
   fi
+  git -C "$WILD_DIR" fetch --filter=blob:none origin --tags >/dev/null 2>&1 || true
+  checkout_ref "$WILD_DIR" "$WILD_REF"
+  log "wild source: $(git -C "$WILD_DIR" describe --tags --always) $(git -C "$WILD_DIR" rev-parse --short HEAD)"
   # The binary lives in the `wild-linker` package; building the whole
   # workspace also builds linker-diff and the benchmark runner, which we
   # never invoke and which roughly doubles the build.
-  ( cd "$SRC/wild-src" && \
+  ( cd "$WILD_DIR" && \
     RUSTFLAGS="-C target-cpu=native" \
     cargo build --release -j "$JOBS" -p wild-linker --bin wild )
-  install -m755 "$SRC/wild-src/target/release/wild" "$BIN/wild"
-  log "wild: $("$BIN/wild" --version | head -1)"
+  install -m755 "$WILD_DIR/target/release/wild" "$BIN/$WILD_NAME"
+  log "wild: $("$BIN/$WILD_NAME" --version | head -1)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -134,7 +169,9 @@ fi
 # which is what the differential tools compare against. This honours the
 # "GAS / bfd 2.47" build preference instead of silently testing a stale oracle.
 BINUTILS_VERSION=2.47
-if have ld.bfd-2.47; then
+if ! want bfd; then
+  :
+elif have ld.bfd-2.47; then
   log "bfd 2.47 already present: $("$BIN/ld.bfd-2.47" --version | head -1)"
 elif command -v ld.bfd >/dev/null && ld.bfd --version | grep -q "$BINUTILS_VERSION"; then
   install -m755 "$(command -v ld.bfd)" "$BIN/ld.bfd-2.47"
@@ -174,8 +211,10 @@ fi
 LLD_MAJOR=23
 # `lld --version` output varies by distro ("lld version 23.1.0",
 # "Ubuntu lld version 14.0.6", "LLD 23.1.0"); match the major anywhere.
-if have lld; then
-  log "lld already present: $(\"$BIN/lld\" --version | head -1)"
+if ! want lld; then
+  :
+elif have lld; then
+  log "lld already present: $("$BIN/lld" --version | head -1)"
 elif command -v lld >/dev/null && lld --version 2>/dev/null | grep -Eq "(lld|LLD)[^-]*${LLD_MAJOR}\.[0-9]"; then
   install -m755 "$(command -v lld)" "$BIN/lld"
   ln -sf lld "$BIN/ld.lld"

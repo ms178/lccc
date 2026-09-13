@@ -1798,7 +1798,16 @@ impl Driver {
                 "-static" => self.static_link = true,
                 "-shared" => self.shared_lib = true,
                 "-r" | "-relocatable" => self.relocatable = true,
-                "-no-pie" | "-pie" => {}
+                // Codegen already defaults to PIC, but the *link* only becomes
+                // ET_DYN when the linker is told.  Record the flag positionally
+                // so `parse_linker_args` sees it; dropping it silently produced
+                // ET_EXEC at a fixed base, i.e. no ASLR on every binary.
+                "-pie" | "--pie" | "--pic-executable" => {
+                    self.linker_ordered_items.push("-pie".to_string());
+                }
+                "-no-pie" | "--no-pie" | "--no-pic-executable" => {
+                    self.linker_ordered_items.push("-no-pie".to_string());
+                }
                 "-nostdlib" => self.nostdlib = true,
                 "-nostdinc" => self.nostdinc = true,
                 "-nodefaultlibs" => {}
