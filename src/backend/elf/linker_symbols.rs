@@ -95,6 +95,14 @@ pub fn get_standard_linker_symbols(addrs: &LinkerSymbolAddresses) -> Vec<LinkerD
             value: addrs.bss_addr,
             binding: STB_GLOBAL,
         },
+        // Underscore-less spellings: GNU ld defines both forms, and
+        // `--defsym` expressions as well as hand assembly habitually use
+        // `end`/`edata` (measured: `nm` on a gcc+ld link lists both).
+        LinkerDefinedSym {
+            name: "edata",
+            value: addrs.bss_addr,
+            binding: STB_GLOBAL,
+        },
         LinkerDefinedSym {
             name: "_end",
             value: end_addr,
@@ -102,6 +110,11 @@ pub fn get_standard_linker_symbols(addrs: &LinkerSymbolAddresses) -> Vec<LinkerD
         },
         LinkerDefinedSym {
             name: "__end",
+            value: end_addr,
+            binding: STB_GLOBAL,
+        },
+        LinkerDefinedSym {
+            name: "end",
             value: end_addr,
             binding: STB_GLOBAL,
         },

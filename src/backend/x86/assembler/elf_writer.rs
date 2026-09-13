@@ -192,6 +192,19 @@ impl X86Arch for X86_64Arch {
         false
     }
 
+    fn is_tls_reloc(reloc_type: u32) -> bool {
+        // x86-64 TLS relocation types (elf.h, EM_X86_64):
+        //   16 DTPMOD64, 17 DTPOFF64, 18 TPOFF64, 19 TLSGD, 20 TLSLD,
+        //   21 DTPOFF32, 22 GOTTPOFF, 23 TPOFF32,
+        //   34 GOTPC32_TLSDESC, 35 TLSDESC_CALL, 36 TLSDESC
+        // The binutils 2.41+ relaxable extensions (R_X86_64_GOTPCRELAT
+        // family and R_X86_64_CODE_{1,4,5,6}_* from 43 up) are NOT
+        // emitted by the lccc assembler, and folding here only ever sees
+        // relocations produced by it — external .o files are linker
+        // inputs, not folding inputs.
+        matches!(reloc_type, 16..=23 | 34..=36)
+    }
+
     fn reloc_pc8_internal() -> Option<u32> {
         Some(R_X86_64_PC8_INTERNAL)
     }

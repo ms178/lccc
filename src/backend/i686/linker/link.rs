@@ -88,15 +88,19 @@ pub fn link_builtin(
         &mut global_symbols,
     );
 
+    // Apply --defsym definitions: alias, constant or arithmetic expression
+    // (see `apply_defsyms` below for the rationale; the classification lives
+    // in linker_common::defsym so the backends cannot disagree about what
+    // `--defsym a=b+4` means).
+    //
+    // Order matters: the placeholders must exist BEFORE `mark_plt_got_needs`
+    // scans the input relocations. A defsym'd symbol referenced from PIC code
+    // (GOT load) needs a GOT slot; created after the scan it never gets one
+    // and the link silently emits a load from an unallocated slot.
+    let pending_defsyms = apply_defsyms(&mut global_symbols, &defsym_defs)?;
+
     // Phase 7: Mark PLT/GOT needs and check undefined
     mark_plt_got_needs(&inputs, &mut global_symbols, is_static);
-
-    // Apply --defsym definitions: alias one symbol to another
-    for (alias, target) in &defsym_defs {
-        if let Some(target_sym) = global_symbols.get(target).cloned() {
-            global_symbols.insert(alias.clone(), target_sym);
-        }
-    }
 
     check_undefined_symbols(&global_symbols)?;
 
@@ -147,7 +151,112 @@ pub fn link_builtin(
         is_nostdlib,
         needed_libs_param,
         output_path,
+        &pending_defsyms,
     )
+}
+
+/// Apply `--defsym` definitions to the resolved symbol table.
+///
+/// The right-hand side is classified once, in `linker_common::defsym`, by
+/// every link path so the backends cannot disagree:
+/// * **Alias** (`a=b`): copy the target's whole symbol, exactly as the old
+///   alias-only loop did. Resolvable before layout.
+/// * **Constant** (`a=0x100`): a new absolute symbol with that value.
+///   Resolvable before layout.
+/// * **Expression** (`a=(b-c)/2`): validated now (a typo or a division by
+///   zero must fail the link here) but evaluated after layout, when the
+///   referenced symbols have their final addresses. The returned list is the
+///   set of pending `(name, expression)` pairs for the emitter.
+///
+/// Constants and expressions are inserted as defined absolute symbols
+/// (`output_section == usize::MAX` is this backend's "no section" marker);
+/// the undefined-symbol check and the PLT/GOT need scan both see them.
+fn apply_defsyms(
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
+    defs: &[(String, String)],
+) -> Result<Vec<(String, String)>, String> {
+    use crate::backend::linker_common::defsym::{self, Defsym};
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for (name, expr) in defs {
+        let shown = format!("--defsym {name}={expr}");
+        // "Defined" means the same thing it means to
+        // `check_undefined_symbols`: the symbol is resolved in this link.
+        let classified =
+            defsym::classify(expr, |n| global_symbols.get(n).is_some_and(|g| g.is_defined))
+                .map_err(|e| format!("{shown}: {}", e.message()))?;
+        let value = match classified {
+            Defsym::Alias(target) => {
+                let target_sym = global_symbols.get(&target).cloned().ok_or_else(|| {
+                    format!("{shown}: target symbol '{target}' is not defined in this link")
+                })?;
+                global_symbols.insert(name.clone(), target_sym);
+                continue;
+            }
+            Defsym::Constant(v) => v,
+            // Validated now, evaluated after layout.
+            Defsym::Expression(e) => {
+                pending.push((name.clone(), e));
+                0
+            }
+        };
+        global_symbols.insert(
+            name.clone(),
+            LinkerSymbol {
+                address: value as u32,
+                size: 0,
+                sym_type: STT_NOTYPE,
+                binding: STB_GLOBAL,
+                visibility: STV_DEFAULT,
+                is_defined: true,
+                needs_plt: false,
+                needs_got: false,
+                output_section: usize::MAX,
+                section_offset: 0,
+                plt_index: 0,
+                got_index: 0,
+                is_dynamic: false,
+                dynlib: String::new(),
+                needs_copy: false,
+                copy_addr: 0,
+                version: None,
+                uses_textrel: false,
+            },
+        );
+    }
+    Ok(pending)
+}
+
+/// Evaluate pending `--defsym` expressions against the finalised symbol
+/// table.
+///
+/// Must run inside the emitter, after (1) section addresses are assigned to
+/// every global symbol and (2) the linker-provided symbols (`_end`, `end`,
+/// `_etext`, `__bss_start`, …) are seeded, so the expression sees exactly
+/// the values GNU ld's language-symbol machinery would see.
+///
+/// Lookup mirrors the classification predicate: only defined symbols
+/// participate, an expression over an undefined name is an error rather
+/// than a silent zero, and arithmetic wraps as unsigned 64-bit.
+pub(super) fn evaluate_pending_defsyms(
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
+    pending: &[(String, String)],
+) -> Result<(), String> {
+    use crate::backend::linker_common::defsym;
+    for (name, expr) in pending {
+        let value = defsym::eval_with_symbols(expr, &|n| {
+            global_symbols
+                .get(n)
+                .filter(|g| g.is_defined)
+                .map(|g| g.address as u64)
+        })
+        .map_err(|err| format!("--defsym {name}={expr}: {}", err.message()))?;
+        let entry = global_symbols
+            .get_mut(name)
+            .ok_or_else(|| format!("--defsym {name}: symbol vanished before evaluation"))?;
+        entry.address = value as u32;
+        entry.is_defined = true;
+    }
+    Ok(())
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -169,6 +278,7 @@ pub fn link_shared(
     let mut libs_to_load: Vec<String> = Vec::new();
     let mut extra_object_files: Vec<String> = Vec::new();
     let mut soname: Option<String> = None;
+    let mut defsym_defs: Vec<(String, String)> = Vec::new();
     let mut i = 0;
     let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
     while i < args.len() {
@@ -203,6 +313,24 @@ pub fn link_shared(
                     extra_lib_paths.push(lpath.to_string());
                 } else if let Some(lib) = part.strip_prefix("-l") {
                     libs_to_load.push(lib.to_string());
+                } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
+                    // --defsym=SYM=EXPR: alias, constant or arithmetic
+                    // expression (same semantics as the executable path).
+                    if let Some(eq_pos) = defsym_arg.find('=') {
+                        defsym_defs.push((
+                            defsym_arg[..eq_pos].to_string(),
+                            defsym_arg[eq_pos + 1..].to_string(),
+                        ));
+                    }
+                } else if part == "--defsym" && j + 1 < parts.len() {
+                    // Two-argument form: --defsym SYM=EXPR
+                    j += 1;
+                    if let Some(eq_pos) = parts[j].find('=') {
+                        defsym_defs.push((
+                            parts[j][..eq_pos].to_string(),
+                            parts[j][eq_pos + 1..].to_string(),
+                        ));
+                    }
                 }
                 j += 1;
             }
@@ -221,7 +349,6 @@ pub fn link_shared(
     all_objs.extend(extra_object_files);
 
     // Parse all input objects
-    let defsym_defs: Vec<(String, String)> = Vec::new();
     let (inputs, _archive_pool) = load_and_parse_objects(&all_objs, &defsym_defs)?;
 
     // Merge sections
@@ -232,6 +359,11 @@ pub fn link_shared(
         FxHashMap::default();
     let (mut global_symbols, _sym_resolution) =
         resolve_symbols(&inputs, &output_sections, &section_map, &dynlib_syms);
+
+    // Apply --defsym definitions (same order and rationale as the executable
+    // path: aliases/constants take effect here, expressions are evaluated
+    // after the layout in `emit_shared_library_32`).
+    let pending_defsyms = apply_defsyms(&mut global_symbols, &defsym_defs)?;
 
     // Load -l libraries (resolve into archives and load them)
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
@@ -275,5 +407,6 @@ pub fn link_shared(
         &needed_sonames,
         output_path,
         soname,
+        &pending_defsyms,
     )
 }

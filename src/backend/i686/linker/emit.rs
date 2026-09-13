@@ -30,6 +30,7 @@ pub(super) fn emit_executable(
     is_nostdlib: bool,
     _needed_libs_param: &[&str],
     output_path: &str,
+    pending_defsyms: &[(String, String)],
 ) -> Result<(), String> {
     let num_ifunc = ifunc_symbols.len();
 
@@ -833,7 +834,8 @@ pub(super) fn emit_executable(
         fini_array_size,
         rel_iplt_vaddr,
         rel_iplt_size,
-    );
+        pending_defsyms,
+    )?;
 
     // Override IFUNC symbol addresses to point to IPLT entries
     let mut ifunc_resolver_addrs: Vec<u32> = Vec::new();
@@ -1505,7 +1507,8 @@ fn assign_symbol_addresses(
     fini_array_size: u32,
     rel_iplt_vaddr: u32,
     rel_iplt_size: u32,
-) {
+    pending_defsyms: &[(String, String)],
+) -> Result<(), String> {
     global_symbols
         .entry("_GLOBAL_OFFSET_TABLE_".to_string())
         .or_insert(LinkerSymbol {
@@ -1557,6 +1560,35 @@ fn assign_symbol_addresses(
         .map(|s| (s.name, s.value))
         .collect();
 
+    // GNU ld's language symbols (`_start`, `end`, `_etext`, …) always exist,
+    // whether or not the inputs reference them.  Seed the symbol table with
+    // all of them so that a `--defsym` expression naming one (e.g.
+    // `half=(end-_start)/2`) resolves even when nothing else did.  Seeding is
+    // harmless to the output: the executable carries no .symtab, and the
+    // dynsym writer only emits dynamic symbols.
+    for (name, value) in &linker_sym_map {
+        global_symbols.entry(name.to_string()).or_insert(LinkerSymbol {
+            address: *value as u32,
+            size: 0,
+            sym_type: STT_NOTYPE,
+            binding: STB_GLOBAL,
+            visibility: STV_DEFAULT,
+            is_defined: true,
+            needs_plt: false,
+            needs_got: false,
+            output_section: usize::MAX,
+            section_offset: 0,
+            plt_index: 0,
+            got_index: 0,
+            is_dynamic: false,
+            dynlib: String::new(),
+            needs_copy: false,
+            copy_addr: 0,
+            version: None,
+            uses_textrel: false,
+        });
+    }
+
     for (name, sym) in global_symbols.iter_mut() {
         if sym.is_dynamic {
             if sym.needs_plt {
@@ -1599,6 +1631,11 @@ fn assign_symbol_addresses(
             }
         }
     }
+
+    // Last: finalise --defsym constants/expressions, so they see the section
+    // addresses and the standard linker symbols, and so a user definition of
+    // a standard name (e.g. `--defsym _end=...`) wins over the auto value.
+    super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms)
 }
 
 pub(super) fn build_plt(

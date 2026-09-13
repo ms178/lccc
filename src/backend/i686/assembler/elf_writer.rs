@@ -133,6 +133,20 @@ impl X86Arch for I686Arch {
     fn uses_rel_format() -> bool {
         true
     }
+    fn is_tls_reloc(reloc_type: u32) -> bool {
+        // i386 TLS relocation types (elf.h, EM_386).  Every one resolves
+        // through the STT_TLS symbol (or a per-symbol TLS descriptor), so
+        // local-label folding must never apply to any of them:
+        //   14 TPOFF, 15 IE, 16 GOTIE, 17 LE, 18 GD, 19 LDM,
+        //   24 GD_32, 25 GD_PUSH, 26 GD_CALL, 27 GD_POP,
+        //   28 LDM_32, 29 LDM_PUSH, 30 LDM_CALL, 31 LDM_POP,
+        //   32 LDO_32, 33 IE_32, 34 LE_32,
+        //   35 DTPMOD32, 36 DTPOFF32, 37 TPOFF32,
+        //   39 GOTDESC, 40 DESC_CALL, 41 DESC
+        // (20-23 are R_386_{16,PC16,8,PC8} and 38 is R_386_SIZE32 —
+        // NOT TLS types.)
+        matches!(reloc_type, 14..=19 | 24..=37 | 39..=41)
+    }
     fn supports_deferred_skips() -> bool {
         true
     }
