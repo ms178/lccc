@@ -1139,6 +1139,72 @@ impl X86Codegen {
         if op == IrBinOp::Mul {
             let imm = Self::const_as_imm32_typed(rhs, use_32bit);
             if let Some(imm) = imm {
+                // A non-scratch register-homed lhs allows both GCC-parity
+                // forms with NO accumulator staging: ×(2^k±1) selects LEA
+                // (`leal (%r11d,%r11d,2), %eax` for ×3/×5/×9), everything
+                // else the three-operand imul (`imull $7, %r11d, %eax`) —
+                // the source register and destination may differ. The old
+                // path staged the lhs into %eax first (csv main:
+                // `movq %r11,%rax; leal (%eax,%eax,2), %eax` = 2 insns
+                // where GCC emits 1). LEA scale = imm-1 ∈ {2,4,8}; the
+                // 32-bit form's wraparound matches imull exactly.
+                let src_home = match lhs {
+                    Operand::Value(v) => self
+                        .reg_assignments
+                        .get(&v.0)
+                        .copied()
+                        .filter(|&r| {
+                            let name = super::emit::phys_reg_name(r);
+                            !super::emit::is_xmm_reg(r)
+                                && name != "rax"
+                                && name != "rcx"
+                                && name != "rdx"
+                        })
+                        .map(|r| {
+                            if use_32bit {
+                                super::emit::phys_reg_name_32(r).to_string()
+                            } else {
+                                super::emit::phys_reg_name(r).to_string()
+                            }
+                        }),
+                    _ => None,
+                };
+                if let Some(src) = src_home {
+                    let lea_scale = match imm {
+                        3 => Some(2),
+                        5 => Some(4),
+                        9 => Some(8),
+                        _ => None,
+                    };
+                    if let Some(scale) = lea_scale {
+                        if use_32bit {
+                            self.state.emit_fmt(format_args!(
+                                "    leal (%{s},%{s},{}), %eax",
+                                scale,
+                                s = src
+                            ));
+                            self.store_eax_to(dest);
+                        } else {
+                            self.state.emit_fmt(format_args!(
+                                "    leaq (%{s},%{s},{}), %rax",
+                                scale,
+                                s = src
+                            ));
+                            self.store_rax_to(dest);
+                        }
+                        return;
+                    }
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    imull ${}, %{}, %eax", imm, src));
+                        self.store_eax_to(dest);
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    imulq ${}, %{}, %rax", imm, src));
+                        self.store_rax_to(dest);
+                    }
+                    return;
+                }
                 if use_32bit {
                     self.operand_to_eax(lhs);
                     self.state

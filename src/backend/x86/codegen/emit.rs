@@ -4772,6 +4772,66 @@ impl X86Codegen {
         // Immediate multiply
         if op == IrBinOp::Mul {
             if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+                // Register-homed non-scratch lhs: emit straight from the
+                // home register (`leal (%r11d,%r11d,2), %eax` /
+                // `imull $7, %r11d, %eax`) instead of staging into the
+                // accumulator first — the staging copy was pure overhead
+                // (csv main: `movq %r11,%rax; leal (%eax,%eax,2), %eax`
+                // where GCC emits one instruction). Same non-scratch
+                // discipline as the alu shortcut: rax/rcx/rdx homes are
+                // point-insensitive and can be clobbered between the
+                // source's def and this use.
+                let src_home = match lhs {
+                    Operand::Value(v) => self
+                        .reg_assignments
+                        .get(&v.0)
+                        .copied()
+                        .filter(|&r| {
+                            let name = phys_reg_name(r);
+                            !is_xmm_reg(r) && name != "rax" && name != "rcx" && name != "rdx"
+                        })
+                        .map(|r| {
+                            if use_32bit {
+                                phys_reg_name_32(r).to_string()
+                            } else {
+                                phys_reg_name(r).to_string()
+                            }
+                        }),
+                    _ => None,
+                };
+                if let Some(src) = src_home {
+                    let scale = Self::lea_scale_for_mul(imm);
+                    if let Some(scale) = scale {
+                        if use_32bit {
+                            self.state.emit_fmt(format_args!(
+                                "    leal (%{s},%{s},{}), %eax",
+                                scale,
+                                s = src
+                            ));
+                        } else {
+                            self.state.emit_fmt(format_args!(
+                                "    leaq (%{s},%{s},{}), %rax",
+                                scale,
+                                s = src
+                            ));
+                        }
+                    } else if use_32bit {
+                        let imm32 = imm as i32 as i64;
+                        self.state
+                            .emit_fmt(format_args!("    imull ${}, %{}, %eax", imm32, src));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    imulq ${}, %{}, %rax", imm, src));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    if use_32bit && !is_unsigned {
+                        // The dest's canonical 64-bit slot value keeps the
+                        // sign-extended product (same contract as below).
+                        self.state.emit("    cltq");
+                    }
+                    self.store_rax_to(dest);
+                    return true;
+                }
                 self.operand_to_rax(lhs);
                 // LEA strength reduction: x*3/5/9 → lea (%rax, %rax, scale), %rax.
                 // lea has 1-cycle latency vs 3 cycles for imul on modern x86.
@@ -5525,6 +5585,19 @@ impl X86Codegen {
         let _ = folded_global_addrs; // subset needs no fold-map interaction
 
         if self.machinst_disabled_kinds & MI_CALL_TYPED != 0 {
+            return false;
+        }
+        // Static-chain calls stay on the mature path. The preceding
+        // SetStaticChain emission armed `state.chain_call`, and only
+        // `emit_call_instruction_impl` discharges that flag by publishing
+        // `# LCCC_CHAIN_CALL` after the call text. Lowering the call here
+        // instead would (a) emit the call WITHOUT the marker, entitling the
+        // text-liveness oracles to retire the chain staging as a dead write
+        // -- silently dropping the nested callee's static chain -- and
+        // (b) for indirect calls stage the callee pointer into r10/r11,
+        // clobbering the armed chain outright. (Reproduced live: the
+        // nested-chain corpus segfaulted exactly this way.)
+        if self.state.chain_call {
             return false;
         }
         // Inline fixed-size memcpy/__memcpy_chk must keep winning over any
@@ -6322,6 +6395,21 @@ impl ArchCodegen for X86Codegen {
         if let crate::ir::reexports::Instruction::Cast { dest, .. } = inst {
             if self.demorgan_skip.contains(&dest.0) {
                 return false;
+            }
+        }
+        // A Copy whose SOURCE is a skipped producer (rematerializable
+        // GlobalAddr root or a folded GEP) must keep the text path: the
+        // MachInst lowering would resolve the source through its home,
+        // which the skipped producer never wrote — the same contract the
+        // `gpr_ptr` gate enforces for Load/Store pointers ("reading its
+        // home is a segfault"). The text path's Copy arm rematerializes
+        // remat roots (`leaq sym(%rip), dest`) and folds GEP sources.
+        if let crate::ir::reexports::Instruction::Copy { src, .. } = inst {
+            if let crate::ir::reexports::Operand::Value(v) = src {
+                if folded_global_addrs.contains(&v.0) || self.state.folded_gep_values.contains(&v.0)
+                {
+                    return false;
+                }
             }
         }
         // TLS symbols must NOT take the MachInst LeaSym fast path: it lowers

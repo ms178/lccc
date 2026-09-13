@@ -922,6 +922,16 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             }
         }
         if !sk("lea_load_window") {
+            // Dead in-place extensions FIRST (same phase): `cltq` is an
+            // implicit-register instruction, so a surviving one aborts the
+            // window scan below and blocks the fold that would otherwise
+            // absorb the staged address (csv/rbtree main's
+            // `leaq 4(%r13),%r10; …; cltq; movl %eax,(%r10)` chain).
+            {
+                let c = narrow_copy_fold::eliminate_dead_inplace_ext(&mut store, &mut infos);
+                trace("eliminate_dead_inplace_ext", pass_count, c, &store, &infos);
+                changed |= c;
+            }
             {
                 let c = relay_and_lea::fold_lea_into_load(&mut store, &mut infos);
                 trace("fold_lea_into_load", pass_count, c, &store, &infos);
@@ -1237,6 +1247,12 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         // so the copies this fold orphans are retired in the same round.
         if !sk("copy_fold") {
             global_changed |= narrow_copy_fold::fold_register_copies(&mut store, &mut infos);
+        }
+        // Global passes can re-expose dead `cltq` shapes (store-forwarding
+        // substitutions, spill-deref folds); Phase 1's copy before the LEA
+        // window fold is the primary site, this is the mop-up. Idempotent.
+        if !sk("dead_inplace_ext") {
+            global_changed |= narrow_copy_fold::eliminate_dead_inplace_ext(&mut store, &mut infos);
         }
         if !sk("dead_regs") {
             global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
@@ -3209,13 +3225,24 @@ mod tests {
     }
 
     #[test]
-    fn test_cltq_backward_scan_blocked_by_call() {
+    fn test_cltq_before_call_is_dead_after_call_rewrites_rax() {
+        // A call WRITES %rax (the return-value register: every callee is
+        // entitled to clobber it, and a void callee leaves it undefined).
+        // The first cltq's widened bits therefore die at the call with no
+        // reader in between -- it is dead and must go. The second cltq
+        // survives: `ret` conservatively reads %rax, and nothing between
+        // the second cltq and the ret rewrites it.
         let asm = ["    cltq", "    call foo", "    cltq"].join("\n") + "\n";
         let result = peephole_optimize(asm);
         assert_eq!(
             result.matches("cltq").count(),
-            2,
-            "both cltq should survive when call intervenes: {}",
+            1,
+            "only the post-call cltq should survive: {}",
+            result
+        );
+        assert!(
+            result.trim_end().ends_with("cltq"),
+            "the surviving cltq must be the one after the call: {}",
             result
         );
     }

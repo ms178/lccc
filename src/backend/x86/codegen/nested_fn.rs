@@ -68,6 +68,11 @@ impl X86Codegen {
         // reg_cache.invalidate_all() is deliberately NOT called: the chain
         // register is not part of the accumulator cache contract, and the
         // immediate next instruction is the call.
+        // Arm the chain-call marker: the next Call/CallIndirect emission
+        // publishes `# LCCC_CHAIN_CALL` so the text-level liveness oracles
+        // model this ABI-invisible %r10 read exactly here (see
+        // state.chain_call's contract).
+        self.state.chain_call = true;
     }
 
     /// `InitTrampoline`: write the 24-byte trampoline into `buffer`:

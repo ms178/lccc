@@ -231,14 +231,26 @@ pub(super) fn function_range(
 
 /// Registers an ABI-visible control transfer can READ without naming them in
 /// the instruction text: the SysV argument registers (`%rdi %rsi %rdx %rcx
-/// %r8 %r9`), `%rax` (vector-argument count for variadic callees) and `%r10`
-/// (the static chain for nested functions — see
-/// `backend/x86/codegen/nested_fn.rs`). Whole-function textual uniqueness says
-/// nothing about those reads, so a function containing a call, a tail jump or
-/// an indirect jump cannot use proof 2 for these families.
+/// %r8 %r9`) and `%rax` (vector-argument count for variadic callees).
+/// Whole-function textual uniqueness says nothing about those reads, so a
+/// function containing a call, a tail jump or an indirect jump cannot use
+/// proof 2 for these families.
+///
+/// `%r10` (the static chain) is deliberately NOT in this set: LCCC's
+/// nested-call lowering stages the chain TEXTUALLY before every nested call
+/// and every tail call to a nested callee (`leaq/movq …, %r10` — verified on
+/// the nested_fn shape; the IR inserts SetStaticChain at each such call
+/// site). An invisible r10 read therefore requires a textual r10 writer in
+/// the same function, which `family_private_to` already treats as a
+/// non-owned mention and fails on. A function whose only r10 traffic is the
+/// transform's own LEA+consumer pair passes no chain and no callee can read
+/// one from it. Keeping r10 in the set made every r10-scratch temp
+/// unprovable across any call (the RA's most common scratch pick after
+/// rax/rcx/rdx), which blocked the LEA→memory window fold in the
+/// csv/rbtree loop bodies.
 #[inline]
 fn implicit_at_transfer(fam: RegId) -> bool {
-    matches!(fam, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10)
+    matches!(fam, 0 | 1 | 2 | 6 | 7 | 8 | 9)
 }
 
 /// Registers `ret` reads implicitly: the integer return value `%rax:%rdx`.
@@ -333,8 +345,38 @@ pub(super) fn family_private_to(
         if has_implicit_reg_usage(t) && fam <= 2 {
             return false;
         }
+        // Static-chain and external-retpoline %r10 reads are the TWO
+        // %r10 consumers invisible to the text scan AND to `reg_refs`
+        // (the marker is a comment; the thunk name encodes no `%r10`
+        // operand). They are exactly the reads whose staging writes the
+        // transforms in this module want to delete: `owned` may cover
+        // every textual %r10 mention (the staging itself plus the
+        // rewritten consumer) and still leave an invisible live reader.
+        // Mirror FileLiveness's protocol EXACTLY -- the marker within the
+        // next two non-nop lines after a call, and every
+        // `call __x86_indirect_thunk_*` reading the r10-staged target --
+        // so the two liveness oracles can never disagree about a chain
+        // call (a divergent pair is itself a miscompile-in-waiting).
+        if fam == 10 {
+            if t.starts_with("call __x86_indirect_thunk_") {
+                return false;
+            }
+            if matches!(infos[n].kind, LineKind::Call)
+                && (n + 1..(n + 3).min(infos.len())).any(|k| {
+                    !infos[k].is_nop()
+                        && infos[k]
+                            .trimmed(store.get(k))
+                            .starts_with("# LCCC_CHAIN_CALL")
+                })
+            {
+                return false;
+            }
+        }
         // ABI-implicit reads at control transfers are invisible to the text
-        // scan: `call foo` reads %rdi..%r9/%rax/%r10, `ret` reads %rax:%rdx.
+        // scan: `call foo` reads %rdi..%r9/%rax, `ret` reads %rax:%rdx.
+        // (Static-chain and external-retpoline %r10 reads are handled by
+        // the fam-10 case above -- the marker/thunk evidence, not textual
+        // traffic. See implicit_at_transfer's doc.)
         match infos[n].kind {
             LineKind::Call | LineKind::JmpIndirect if implicit_at_transfer(fam) => return false,
             // A jump to a non-local target is a tail call and reads the
@@ -2588,7 +2630,15 @@ mod tests {
     }
 
     #[test]
-    fn relay_is_kept_across_a_call() {
+    fn copy_to_caller_saved_scratch_is_dead_across_a_plain_call() {
+        // SysV: %r10 is caller-saved scratch. An UNMARKED `call bar` clobbers
+        // it, so the value staged by `movl %eax, %r10d` can never reach the
+        // post-call read -- the copy is dead under the ABI and must be
+        // eliminated. (Chain calls -- the only callees that read a staged
+        // %r10 -- carry `# LCCC_CHAIN_CALL`, see
+        // relay_is_kept_when_a_call_reads_the_static_chain.) The consumer
+        // itself must survive untouched: it reads whatever `bar` left in
+        // %r10d with or without the copy.
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -2598,7 +2648,27 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(out.contains("movl %eax, %r10d"), "{out}");
+        assert!(!out.contains("movl %eax, %r10d"), "{out}");
+        assert!(out.contains("addl %r10d, %r8d"), "{out}");
+    }
+
+    #[test]
+    fn relay_to_callee_saved_reg_survives_a_call() {
+        // The load-bearing inverse of the dead-scratch case: %ebx survives
+        // the call, so the staged value DOES reach the post-call consumer
+        // and the relay may be neither folded away (the source %eax dies
+        // at the call) nor dropped (the destination is read after it).
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %eax, %ebx\n",
+            "    call bar\n",
+            "    addl %ebx, %r8d\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %eax, %ebx"), "{out}");
+        assert!(out.contains("addl %ebx, %r8d"), "{out}");
     }
 
     #[test]
@@ -4114,13 +4184,21 @@ mod tests {
 
     #[test]
     fn relay_is_kept_when_a_call_reads_the_static_chain() {
-        // %r10 carries the static chain of a nested-function call.
+        // %r10 carries the static chain of a nested-function call. Only
+        // chain calls read it, and they are marked `# LCCC_CHAIN_CALL`
+        // right after the call text (calls.rs). Without the marker this
+        // call would be a plain scratch-clobbering call and the staging
+        // copy would be foldable -- the marker is what makes the
+        // ABI-invisible read visible to the text liveness oracle, so the
+        // `movq %rbx, %r10` staging must survive: the callee's chain
+        // depends on it.
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
             "    movq %rbx, %r10\n",
             "    addq %r10, %rsi\n",
             "    call nested.0\n",
+            "    # LCCC_CHAIN_CALL\n",
             "    ret\n",
             ".cfi_endproc\n",
         ));
