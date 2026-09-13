@@ -657,7 +657,7 @@ pub(super) fn emit_executable(
                 // AArch64 variant 1: tp_offset = (sym_addr - tls_base) + 16
                 if tls_addr != 0 {
                     let offset = (sym_addr as i64) - (tls_addr as i64) + 16;
-                    if std::env::var("LINKER_DEBUG_TLS").is_ok() {
+                    if reloc::tls_debug() {
                         eprintln!(
                             "  GOT TLS IE: key='{}' sym_addr=0x{:x} tls_addr=0x{:x} -> got_val=0x{:x}",
                             key, sym_addr, tls_addr, offset as u64

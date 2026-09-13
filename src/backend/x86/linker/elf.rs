@@ -12,10 +12,10 @@ pub use crate::backend::elf::{
     PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD,
     PT_PHDR, PT_TLS, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF,
     SHT_DYNAMIC, SHT_DYNSYM, SHT_FINI_ARRAY, SHT_GNU_HASH, SHT_GNU_VERDEF, SHT_GNU_VERNEED,
-    SHT_GNU_VERSYM, SHT_INIT_ARRAY, SHT_NOBITS, SHT_PREINIT_ARRAY, SHT_PROGBITS, SHT_RELA,
-    SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_OBJECT, STT_SECTION,
-    STT_TLS, get_standard_linker_symbols, is_thin_archive, parse_linker_script_entries, w16, w32,
-    w64, wphdr, write_bytes,
+    SHT_GNU_VERSYM, SHT_HASH, SHT_INIT_ARRAY, SHT_NOBITS, SHT_PREINIT_ARRAY, SHT_PROGBITS,
+    SHT_RELA, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_OBJECT,
+    STT_SECTION, STT_TLS, get_standard_linker_symbols, is_thin_archive,
+    parse_linker_script_entries, w16, w32, w64, wphdr, write_bytes,
 };
 
 use crate::backend::linker_common;
@@ -94,12 +94,25 @@ pub const R_X86_64_GOTOFF64: u32 = 25;
 pub const R_X86_64_GOTPC32: u32 = 26;
 pub const R_X86_64_SIZE32: u32 = 32;
 pub const R_X86_64_SIZE64: u32 = 33;
+// The 64-bit GOT family and RELATIVE64. Numbers verified against
+// /usr/include/elf.h (GOT64 27, GOTPCREL64 28, GOTPC64 29, GOTPLT64 30,
+// PLTOFF64 31, RELATIVE64 38) rather than recalled: a wrong constant here is
+// indistinguishable from a wrong relocation at link time. They are in the field
+// table so that `field()` answers truthfully for every x86-64 type the ABI
+// defines, and so a diagnostic can name a type this backend encounters in a
+// foreign object instead of printing "type 29".
+pub const R_X86_64_GOT64: u32 = 27;
+pub const R_X86_64_GOTPCREL64: u32 = 28;
+pub const R_X86_64_GOTPC64: u32 = 29;
+pub const R_X86_64_GOTPLT64: u32 = 30;
+pub const R_X86_64_PLTOFF64: u32 = 31;
+pub const R_X86_64_RELATIVE64: u32 = 38;
 
 // DT_* constants now in shared module - re-export them
 pub use crate::backend::elf::{
-    DF_1_NOW, DT_DEBUG, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_INIT_ARRAY,
-    DT_INIT_ARRAYSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELACOUNT, DT_RPATH, DT_RUNPATH,
-    DT_SONAME, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM,
+    DF_1_NOW, DF_1_PIE, DT_DEBUG, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1,
+    DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELACOUNT, DT_RPATH,
+    DT_RUNPATH, DT_SONAME, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM,
 };
 
 pub const DF_BIND_NOW: i64 = 0x8;

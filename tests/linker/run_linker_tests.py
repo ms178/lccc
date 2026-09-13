@@ -25,6 +25,7 @@ Usage:
 import argparse
 import ctypes
 import os
+import struct
 import re
 import shutil
 import subprocess
@@ -49,7 +50,10 @@ class Case:
                  run_args=None, expect_fail=False, expect_stdout=None,
                  expect_exit=0, compile_flags=None, setup=None,
                  oracle_only_flags=None, lccc_only_flags=None,
-                 skip_oracles=False, run_env=None, tags=()):
+                 skip_oracles=False, run_env=None, tags=(),
+                 expect_elf_type=None, known_defect=None,
+                 expect_no_zero_size_syms=False, expect_no_symtab=False,
+                 expect_dyn_tags=None):
         self.name = name
         self.sources = sources              # dict fname -> contents (.c or .s)
         self.link_inputs = link_inputs      # ordered link inputs; default: all objects
@@ -65,6 +69,25 @@ class Case:
         self.skip_oracles = skip_oracles
         self.run_env = run_env or {}
         self.tags = tags
+        # Expected ELF e_type of the lccc output ("EXEC" / "DYN").  This is what
+        # distinguishes a real position-independent image from a silent
+        # fixed-base fallback: a PIE test that only checks stdout passes either
+        # way, and losing ASLR is exactly the regression that must not hide.
+        self.expect_elf_type = expect_elf_type
+        # Set to a short description when the case documents a defect we have not
+        # fixed yet.  A documented failure is reported as WARN so it stays
+        # visible in the summary instead of being deleted or silently ignored;
+        # if it starts passing, the flag is stale and should be removed.
+        self.known_defect = known_defect
+        # Assert no symbol has st_value == 0 with st_size != 0.  That is the
+        # signature of a symbol from a section that was collected away.
+        self.expect_no_zero_size_syms = expect_no_zero_size_syms
+        # Assert the image carries no .symtab/.strtab at all (`-s`).
+        self.expect_no_symtab = expect_no_symtab
+        # Exact set of dynamic hash tags that must be present.  Checks the
+        # section headers too, so a table that is tagged but never written (or
+        # written over by the other table's writer) cannot pass.
+        self.expect_dyn_tags = expect_dyn_tags
 
 CASES = []
 def case(*a, **kw):
@@ -249,18 +272,43 @@ def _make_wa(td):
     r = sh(["ar", "rcs", "libwa.a", "wa.o"], cwd=td); assert r.returncode == 0
 
 case("whole_archive_exec",
+    # `main` deliberately does NOT reference anything in the archive.  It reads
+    # a side effect the constructor produced through a variable main.c *does*
+    # define, so lazy archive scanning can never pull the member in for us: the
+    # only way this member gets into the link is --whole-archive itself.  (An
+    # earlier version of this case had main.c declare `extern int
+    # flag_from_ctor`, which made it pass with --whole-archive entirely
+    # unimplemented.)
     {"main.c": """
         #include <stdio.h>
-        /* nothing references the archive member, but --whole-archive must pull
-           in its constructor */
-        extern int flag_from_ctor;
+        int flag_from_ctor;   /* defined here, so the archive is not pulled
+                                 in to satisfy an undefined symbol */
         int main(void){ printf("%d\\n", flag_from_ctor); return 0; }
      """,
      "wa.c": """
-        int flag_from_ctor;
+        extern int flag_from_ctor;
         __attribute__((constructor)) static void init(void){ flag_from_ctor = 42; }
      """},
     link_inputs=["main.o", "-Wl,--whole-archive", "libwa.a", "-Wl,--no-whole-archive"],
+    expect_stdout="42\n",
+    setup=_make_wa,
+    tags=("archive",))
+
+case("archive_lazy_loading_is_lazy",
+    # The complement of whole_archive_exec: with the flag absent the same
+    # archive member must stay out, or the flag would be indistinguishable from
+    # doing nothing.
+    {"main.c": """
+        #include <stdio.h>
+        int flag_from_ctor;
+        int main(void){ printf("%d\\n", flag_from_ctor); return 0; }
+     """,
+     "wa.c": """
+        extern int flag_from_ctor;
+        __attribute__((constructor)) static void init(void){ flag_from_ctor = 42; }
+     """},
+    link_inputs=["main.o", "libwa.a"],
+    expect_stdout="0\n",
     setup=_make_wa,
     tags=("archive",))
 
@@ -367,6 +415,91 @@ case("gc_sections_keep_start_stop",
     ldflags=["-Wl,--gc-sections"],
     compile_flags=["-O1", "-ffunction-sections", "-fdata-sections"],
     tags=("sections", "gc"))
+
+case("gc_sections_keeps_eh_frame",
+    # Regression: --gc-sections used to collect `.eh_frame` outright (nothing
+    # relocates *to* it), so a --gc-sections build silently lost all stack
+    # unwinding: backtrace() returned a single frame where every oracle
+    # returns the full depth.  `.eh_frame` is now a GC root, and the FDEs of
+    # genuinely collected functions are pruned rather than left stale.
+    {"a.c": """
+        #include <stdio.h>
+        #include <execinfo.h>
+        static int l4(void){ void *bt[16]; return backtrace(bt, 16); }
+        static int l3(void){ return l4(); }
+        static int l2(void){ return l3(); }
+        static int l1(void){ return l2(); }
+        int dead_a(void){ return 1; }
+        int dead_b(void){ return 2; }
+        int main(void){ printf("%d\\n", l1() >= 4); return 0; }
+     """},
+    ldflags=["-Wl,--gc-sections", "-rdynamic"],
+    compile_flags=["-O2", "-ffunction-sections", "-fdata-sections"],
+    expect_stdout="1\n",
+    tags=("sections", "gc", "unwind"))
+
+case("gc_sections_export_dynamic_dlsym",
+    # Regression: with --export-dynamic an exported global is reachable only
+    # from *outside* the image, so a reachability sweep collected it.  The
+    # link succeeded and the binary ran; it just failed at the first dlsym.
+    {"a.c": """
+        #include <stdio.h>
+        #include <dlfcn.h>
+        int plugin_entry(int x){ return x * 7; }
+        int main(void){
+            void *h = dlopen(0, RTLD_NOW);
+            int (*fn)(int) = (int (*)(int))dlsym(h, "plugin_entry");
+            printf("%d\\n", fn ? fn(6) : -1);
+            return 0;
+        }
+     """},
+    ldflags=["-Wl,--gc-sections", "-rdynamic", "-ldl"],
+    compile_flags=["-O2", "-ffunction-sections", "-fdata-sections"],
+    expect_stdout="42\n",
+    tags=("sections", "gc", "dynamic"))
+
+case("build_id_note_emitted",
+    # Debian's gcc passes --build-id on *every* link.  lccc-ld accepted the flag
+    # but emitted no note, so no binary could be matched to its debuginfo.
+    # The digest must be present, non-zero and reproducible; the assertion is a
+    # dedicated test below (build_id_note_present_test), this case just proves
+    # the flag does not break the link or the program.
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("ok\\n"); return 0; }
+     """},
+    ldflags=["-Wl,--build-id=sha1"],
+    expect_stdout="ok\n",
+    tags=("notes",))
+
+case("defsym_two_argument_form",
+    # GNU ld accepts both `--defsym=SYM=VAL` and `--defsym SYM=VAL`; only the
+    # joined spelling was parsed, so the two-argument form died as an unknown
+    # option (found via the differential oracle, census2).
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("ok\\n"); return 0; }
+     """},
+    ldflags=["-Wl,--defsym", "-Wl,aliased=main"],
+    expect_stdout="ok\n",
+    tags=("symbols",))
+
+case("wrap_two_argument_form",
+    # Same defect class as --defsym: `--wrap SYM` must work, not just
+    # `--wrap=SYM`.  __wrap_bv intercepts, __real_bv reaches the original.
+    {"a.c": """
+        #include <stdio.h>
+        extern int bv(void);
+        int main(void){ printf("%d\\n", bv()); return 0; }
+     """,
+     "b.c": "int bv(void){ return 7; }",
+     "w.c": """
+        extern int __real_bv(void);
+        int __wrap_bv(void){ return __real_bv() * 10; }
+     """},
+    ldflags=["-Wl,--wrap", "-Wl,bv"],
+    expect_stdout="70\n",
+    tags=("symbols",))
 
 case("bss_zeroed",
     {"a.c": """
@@ -720,6 +853,217 @@ case("large_got_pressure",
     tags=("got", "dynamic"))
 
 
+# ── PIE (S06): -pie must produce a genuinely position-independent ET_DYN, not a
+# fixed-base ET_EXEC.  These are the constructs that broke first when the image
+# was rebased at 0; each one exercises a distinct class of self-referential
+# address that has to be slid by the load base.
+
+case("pie_basic_et_dyn",
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("pie-ok\\n"); return 0; }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="pie-ok\n",
+    expect_elf_type="DYN",
+    tags=("pie",))
+
+case("pie_string_array",
+    # The regression that made a competing -pie implementation segfault: string
+    # merging rewrites these pointers to reference a synthetic pool symbol with
+    # shndx 0, so they look undefined while being entirely local.  Without an
+    # R_X86_64_RELATIVE per entry the array still holds link-time addresses and
+    # the first "%s" dereference faults under a random load base.
+    {"a.c": """
+        #include <stdio.h>
+        const char *msgs[] = {"alpha", "beta", "gamma", "delta"};
+        int main(void){ printf("%s %s\\n", msgs[1], msgs[3]); return 0; }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="beta delta\n",
+    expect_elf_type="DYN",
+    tags=("pie", "strmerge"))
+
+case("pie_jump_table",
+    # Address-taken labels in a read-only jump table: .text-relative pointers
+    # into the merged string/rodata sections plus .text itself.
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){
+            static const void *jt[] = { &&L0, &&L1, &&L2 };
+            int sum = 0;
+            for (int i = 0; i < 3; i++) { goto *jt[i]; L0: sum += 1; goto E; L1: sum += 2; goto E; L2: sum += 4; E: ; }
+            printf("%d\\n", sum);
+            return 0;
+        }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="7\n",
+    expect_elf_type="DYN",
+    tags=("pie",))
+
+case("pie_function_pointer_array",
+    {"a.c": """
+        #include <stdio.h>
+        static int f0(int x){ return x; }
+        static int f1(int x){ return x * 2; }
+        static int f2(int x){ return x * 3; }
+        static int f3(int x){ return x * 4; }
+        typedef int (*F)(int);
+        static F table[] = { f0, f1, f2, f3 };
+        int main(void){
+            int s = 0;
+            for (int i = 0; i < 4; i++) s += table[i](i + 1);
+            printf("%d\\n", s);
+            return 0;
+        }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="30\n",   # f0(1)+f1(2)+f2(3)+f3(4) = 1+4+9+16
+    expect_elf_type="DYN",
+    tags=("pie",))
+
+case("pie_main_via_got",
+    # crt1.o reaches main through R_X86_64_REX_GOTPCRELX, so _start loads it out
+    # of a GOT slot.  In an ET_EXEC the slot is just pre-filled; in a PIE it must
+    # carry an R_X86_64_RELATIVE or the program jumps to the unslid address.
+    # Covered implicitly by every PIE case, asserted explicitly here.
+    {"a.c": """
+        #include <stdio.h>
+        int answer(void){ return 42; }
+        int main(void){ printf("%d\\n", answer()); return 0; }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="42\n",
+    expect_elf_type="DYN",
+    tags=("pie", "got"))
+
+case("no_pie_stays_et_exec",
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("exec-ok\\n"); return 0; }
+     """},
+    ldflags=["-no-pie"],
+    expect_stdout="exec-ok\n",
+    expect_elf_type="EXEC",
+    tags=("pie",))
+
+case("local_ifunc",
+    # A *static* IFUNC.  This used to be a silent miscompile: local IFUNCs never
+    # reached collect_ifunc_symbols (it walks `globals`, and a static symbol is
+    # never promoted there), so they got no IPLT slot and no R_X86_64_IRELATIVE,
+    # and the call site bound straight to the RESOLVER -- the caller received
+    # the implementation's *address* as the call's return value and printed
+    # something like 4199558 where 1 was meant.  Local IFUNCs now get slots
+    # numbered after the global ones, keyed by (object, symbol) because local
+    # names legitimately repeat across objects.
+    {"a.c": """
+        #include <stdio.h>
+        static int impl(void){ return 1; }
+        static int (*rsv(void))(void){ return impl; }
+        static int fn(void) __attribute__((ifunc("rsv")));
+        int main(void){ printf("%d\\n", fn()); return 0; }
+     """},
+    expect_stdout="1\n",
+    tags=("ifunc",))
+
+
+# ── v3 defect fixes ──────────────────────────────────────────────────────────
+
+case("gc_sections_symtab_no_dead_locals",
+    # --gc-sections used to leave every symbol from a collected section in
+    # .symtab at address 0: the locals filter consulted section_map, which still
+    # holds an entry for dead sections (layout assigns a slot before collection
+    # decides they are unreachable).  On a 61-object -ffunction-sections link
+    # that was 2341 of 2551 entries -- 61 KB against bfd's 6 KB.
+    {"a.c": """
+        #include <stdio.h>
+        int used(int x){ return x + 1; }
+        static int dead_a(int x){ return x * 3; }
+        static int dead_b(int x){ return x * 5; }
+        static int dead_c(int x){ return x * 7; }
+        int main(void){ printf("%d\\n", used(1)); return 0; }
+     """},
+    compile_flags=["-O2", "-ffunction-sections", "-fdata-sections"],
+    ldflags=["--gc-sections"],
+    expect_stdout="2\n",
+    # Assert the invariant directly: no symbol may claim a non-zero size at
+    # address 0, which is what a collected-section local looks like.
+    expect_no_zero_size_syms=True,
+    tags=("gc", "symtab"))
+
+case("symtab_sh_info_equals_locals",
+    # sh_info must equal the number of STB_LOCAL entries (ELF: sh_info ==
+    # nlocals).  It used to be snapshotted between the local and global loops,
+    # so any global-loop entry carrying STB_LOCAL made it one short.
+    {"a.c": """
+        #include <stdio.h>
+        static int helper(int x){ return x; }
+        int global_fn(int x){ return helper(x); }
+        int main(void){ printf("%d\\n", global_fn(9)); return 0; }
+     """},
+    expect_stdout="9\n",
+    tags=("symtab",))
+
+case("strip_all_drops_symtab",
+    # `-s` was parsed into a local that only reached the linker-script path, so
+    # a "stripped" binary shipped with a full symbol table.  Worse than ignoring
+    # the flag: the user believes they removed the symbols.
+    {"a.c": """
+        #include <stdio.h>
+        int named_symbol(int x){ return x * 2; }
+        int main(void){ printf("%d\\n", named_symbol(21)); return 0; }
+     """},
+    ldflags=["-Wl,-s"],
+    expect_stdout="42\n",
+    expect_no_symtab=True,
+    tags=("strip",))
+
+case("hash_style_gnu",
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("hs\\n"); return 0; }
+     """},
+    ldflags=["-Wl,--hash-style=gnu"],
+    expect_stdout="hs\n",
+    expect_dyn_tags=["GNU_HASH"],
+    tags=("hash",))
+
+case("hash_style_sysv",
+    # SysV .hash.  With gnu_hash_size forced to 0 the two tables alias the same
+    # offset, so an ungated GNU-hash writer silently clobbers the SysV one.
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("hs\\n"); return 0; }
+     """},
+    ldflags=["-Wl,--hash-style=sysv"],
+    expect_stdout="hs\n",
+    expect_dyn_tags=["HASH"],
+    tags=("hash",))
+
+case("hash_style_both",
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("hs\\n"); return 0; }
+     """},
+    ldflags=["-Wl,--hash-style=both"],
+    expect_stdout="hs\n",
+    expect_dyn_tags=["GNU_HASH", "HASH"],
+    tags=("hash",))
+
+case("local_ifunc_static_link",
+    {"a.c": """
+        #include <stdio.h>
+        static int impl(void){ return 77; }
+        static int (*rsv(void))(void){ return impl; }
+        static int fn(void) __attribute__((ifunc("rsv")));
+        int main(void){ printf("%d\\n", fn()); return 0; }
+     """},
+    ldflags=["-static"],
+    expect_stdout="77\n",
+    tags=("ifunc", "static"))
+
+
 case("ifunc_resolver",
     {"a.c": """
         #include <stdio.h>
@@ -729,6 +1073,9 @@ case("ifunc_resolver",
         int pick(void) __attribute__((ifunc("resolve_pick")));
         int main(void){ printf("%d\\n", pick()); return 0; }
      """},
+    # Was a bare "runs with rc 0" check, which passed while the call bound to
+    # the RESOLVER and printed the implementation's *address*.  Assert the value.
+    expect_stdout="2\n",
     tags=("ifunc",))
 
 case("ifunc_static_link",
@@ -740,6 +1087,7 @@ case("ifunc_static_link",
         int main(void){ printf("%d\\n", f()); return 0; }
      """},
     ldflags=["-static"],
+    expect_stdout="33\n",
     tags=("ifunc", "static"))
 
 case("copy_reloc_libc_data",
@@ -2588,6 +2936,235 @@ def _elf32_script_gc_keep_test(args, oracles):
             nogc_bfd = f.read()
         if nogc_lccc != nogc_bfd:
             return Result(name, "FAIL", "--no-gc-sections image differs from bfd")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+def _shim_for(td, lccc_ld):
+    """A -B dir whose `ld` is lccc-ld (gcc only switches linkers on that name)."""
+    shim = os.path.join(td, "shim")
+    os.makedirs(shim, exist_ok=True)
+    link = os.path.join(shim, "ld")
+    if not os.path.exists(link):
+        os.symlink(os.path.abspath(lccc_ld), link)
+    return shim
+
+
+def _build_id_note_test(args, oracles):
+    """--build-id must emit a content-derived .note.gnu.build-id.
+
+    Regression for a defect the differential oracle found: Debian's gcc passes
+    --build-id on *every* link, lccc-ld accepted the flag, and the output had no
+    note at all -- so no binary could be matched to its debuginfo.  Also checks
+    the digest is reproducible, content-sensitive, and that --build-id=none
+    suppresses it.
+    """
+    name = "build_id_note"
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "a.c"), "w") as f:
+            f.write('#include <stdio.h>\nint main(void){ printf("ok\\n"); return 0; }\n')
+        with open(os.path.join(td, "b.c"), "w") as f:
+            f.write('#include <stdio.h>\nint main(void){ printf("other\\n"); return 0; }\n')
+        r = sh([CC, "-c", "-O1", "a.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "fixture compile failed")
+        sh([CC, "-c", "-O1", "b.c"], cwd=td)
+        shim = _shim_for(td, lccc_ld)
+
+        def digest(path):
+            if not os.path.exists(path):
+                return None
+            # -SW, not -S: plain -S wraps each section header over two lines,
+            # which splits long section names.
+            o = sh(["readelf", "-SW", path]).stdout.decode(errors="replace")
+            if ".note.gnu.build-id" not in o:
+                return None
+            n = sh(["readelf", "-n", path]).stdout.decode(errors="replace")
+            for ln in n.splitlines():
+                ln = ln.strip()
+                if ln.startswith("Build ID:"):
+                    return ln.split(":", 1)[1].strip()
+            return None
+
+        def link(obj, out, extra):
+            return sh([CC, "-B" + shim, obj, "-o", out] + extra, cwd=td)
+
+        out = os.path.join(td, "a.out")
+        r = link("a.o", out, ["-Wl,--build-id=sha1"])
+        if r.returncode != 0:
+            return Result(name, "FAIL",
+                          "link failed: " + r.stderr.decode(errors="replace")[-300:])
+        got = digest(out)
+        if got is None:
+            return Result(name, "FAIL", "no .note.gnu.build-id section")
+        if set(got) <= {"0"}:
+            return Result(name, "FAIL", "degenerate digest %r" % got)
+
+        out2 = os.path.join(td, "a2.out")
+        link("a.o", out2, ["-Wl,--build-id=sha1"])
+        if digest(out2) != got:
+            return Result(name, "FAIL",
+                          "not reproducible: %s vs %s" % (got, digest(out2)))
+
+        out3 = os.path.join(td, "b.out")
+        link("b.o", out3, ["-Wl,--build-id=sha1"])
+        if digest(out3) == got:
+            return Result(name, "FAIL", "digest does not depend on the inputs")
+
+        out4 = os.path.join(td, "c.out")
+        link("a.o", out4, ["-Wl,--build-id=none"])
+        if digest(out4) is not None:
+            return Result(name, "FAIL", "--build-id=none still emitted a note")
+
+        code, txt = run_bin(out, [], td)
+        if code != 0 or txt != "ok\n":
+            return Result(name, "FAIL", "binary broken: %s" % ((code, txt),))
+        return Result(name, "PASS", "digest %s" % got)
+
+
+def _static_pie_refusal_test(args, oracles):
+    """-static-pie must be refused with a diagnostic, not linked into a SIGSEGV.
+
+    lccc-ld has no position-independent static emitter: it used to write the
+    image anyway and the program died in the CRT self-relocation.  A linker that
+    cannot honour a request has to say so at link time.
+    """
+    name = "static_pie_refused"
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "a.c"), "w") as f:
+            f.write('#include <stdio.h>\nint main(void){ printf("ok\\n"); return 0; }\n')
+        r = sh([CC, "-c", "-O1", "a.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "fixture compile failed")
+        shim = _shim_for(td, lccc_ld)
+        out = os.path.join(td, "a.out")
+        r = sh([CC, "-B" + shim, "-static-pie", "a.o", "-o", out], cwd=td)
+        err = r.stderr.decode(errors="replace")
+        if r.returncode == 0:
+            # If it links it must also run: the old behaviour linked and then
+            # SIGSEGVed, which is strictly worse than refusing.
+            code, _ = run_bin(out, [], td)
+            if code != 0:
+                return Result(name, "FAIL",
+                              "linked a -static-pie image that fails at runtime "
+                              "(rc=%s); it must refuse at link time" % code)
+            return Result(name, "PASS", "supported and runs")
+        if "static-pie" not in err and "position-independent" not in err:
+            return Result(name, "FAIL",
+                          "refused without an explanatory diagnostic")
+        return Result(name, "PASS", "refused with a diagnostic")
+
+
+
+def _gc_eh_frame_invariant_test(args, oracles):
+    """`.eh_frame` must survive --gc-sections with exactly the live FDE set.
+
+    The runtime `gc_sections_keeps_eh_frame` case proves unwinding works; this
+    checks the *structure*, because the two failure modes are different: a
+    dropped `.eh_frame` breaks `backtrace()`, while a stale FDE left behind
+    hands the unwinder CFI for a function whose address range was recycled by
+    live code after compaction -- wrong unwinding rather than none, and only
+    on the paths that happen to hit it.
+
+    Invariants on the lccc image (bfd as cross-check):
+      * every STT_FUNC symbol in an executable section is covered by an FDE;
+      * no FDE describes a region that is not live code (PLT/.init/.fini
+        excepted: those FDEs are linker-synthesised by design).
+    """
+    name = "gc_eh_frame_invariant"
+    td = tempfile.mkdtemp(prefix="lccc-gceh-")
+    try:
+        src = r"""
+            #include <stdio.h>
+            #include <execinfo.h>
+            static int l4(void){ void *bt[16]; return backtrace(bt, 16); }
+            static int l3(void){ return l4(); }
+            static int l2(void){ return l3(); }
+            int live_a(void){ return l2(); }
+            int live_b(void){ return live_a() + 1; }
+            int dead_1(void){ return 111; }
+            int dead_2(void){ return 222; }
+            int dead_3(void){ return 333; }
+            int dead_4(void){ return 444; }
+            int main(void){ printf("%d\n", live_b()); return 0; }
+        """
+        with open(os.path.join(td, "a.c"), "w") as f:
+            f.write(src)
+        cf = ["-O0", "-ffunction-sections", "-fdata-sections"]
+        r = sh([CC, *cf, "-c", "a.c", "-o", "a.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", f"compile failed: {r.stderr.decode()[:200]}")
+
+        # lccc-ld is driven directly with the same flag surface gcc would use,
+        # so the test does not depend on a -B shim being installed.
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        crt = [sh([CC, "-print-file-name=" + n], cwd=td).stdout.decode().strip()
+               for n in ("crt1.o", "crti.o", "crtn.o")]
+        r = sh([lccc_ld, "-o", "a.lccc", crt[0], crt[1], "a.o", crt[2],
+                "--dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
+                "-L/usr/lib/x86_64-linux-gnu", "-lc",
+                "--gc-sections", "--export-dynamic"], cwd=td)
+        if r.returncode != 0 or not os.path.exists(os.path.join(td, "a.lccc")):
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:400]}")
+
+        images = {"lccc": "a.lccc"}
+        r = sh([CC, *cf, "-Wl,--gc-sections", "-rdynamic", "-o", "a.bfd", "a.o"], cwd=td)
+        if r.returncode == 0:
+            images["bfd"] = "a.bfd"
+
+        sys.path.insert(0, HERE)
+        import check_gc_eh_frame as inv  # noqa: PLC0415 - sibling module
+
+        failed = []
+        for tag, img in images.items():
+            path = os.path.join(td, img)
+            problems = inv.check(path)
+            if not inv.fde_ranges(path):
+                problems.append("no FDEs at all: unwinding is dead")
+            if problems:
+                failed.append(f"{tag}: " + "; ".join(problems))
+        if failed:
+            return Result(name, "FAIL", " | ".join(failed))
+
+        # GC must still collect: the link is not allowed to "pass" by simply
+        # keeping every FDE.  `--export-dynamic` exports the dead_* functions
+        # and so legitimately roots them, so compare against a link of the
+        # very same object without --gc-sections: the collected link must
+        # carry strictly fewer FDEs while still covering all live code.
+        # Neither link may use --export-dynamic here: it legitimately roots
+        # every global, so nothing would be collected and the comparison
+        # would prove nothing.
+        base = ["--dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
+                "-L/usr/lib/x86_64-linux-gnu", "-lc"]
+        r = sh([lccc_ld, "-o", "a.gc", crt[0], crt[1], "a.o", crt[2],
+                *base, "--gc-sections"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld GC link failed: {r.stderr.decode()[:300]}")
+        r = sh([lccc_ld, "-o", "a.nogc", crt[0], crt[1], "a.o", crt[2], *base], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld no-GC failed: {r.stderr.decode()[:300]}")
+        n_gc = len(inv.fde_ranges(os.path.join(td, "a.gc")))
+        n_nogc = len(inv.fde_ranges(os.path.join(td, "a.nogc")))
+        if not (0 < n_gc < n_nogc):
+            return Result(
+                name, "FAIL",
+                f"--gc-sections must prune FDEs but keep unwinding: "
+                f"{n_gc} with GC vs {n_nogc} without",
+            )
+        for tag in ("gc", "nogc"):
+            problems = inv.check(os.path.join(td, f"a.{tag}"))
+            if problems:
+                return Result(name, "FAIL", f"a.{tag}: " + "; ".join(problems))
         return Result(name, "PASS")
     except Exception as e:
         return Result(name, "FAIL", f"harness exception: {e!r}")
@@ -4497,6 +5074,573 @@ def run_bin(path, args, td, env=None):
     except subprocess.TimeoutExpired:
         return None, "<timeout>"
 
+# field kind -> (assembly directive, symbol, in-range value, out-of-range value)
+_FIELD_CASES = [
+    ("R_X86_64_32", ".long", "far32", 0x1000, 0x1_0000_0000),
+    ("R_X86_64_32S", ".long", "far32s", 0x1000, 0x1_0000_0000),
+    ("R_X86_64_16", ".word", "far16", 0x1000, 0x1_0000),
+    ("R_X86_64_8", ".byte", "far8", 0x40, 0x100),
+]
+
+
+def _reloc_range_fixture(td, directive, sym, signed=False):
+    """Assemble one object whose single relocation is `directive sym`.
+
+    Returns the object path, or None if the toolchain refused (reported as SKIP
+    by the caller rather than as a failure: a missing assembler feature is not a
+    linker defect).
+    """
+    src = os.path.join(td, "f.s")
+    # `.long sym - .` is the PC-relative spelling; a plain `.long sym` is the
+    # absolute one. GAS picks R_X86_64_PC32 for the former and R_X86_64_32/32S
+    # for the latter depending on whether the section is writable.
+    with open(src, "w") as f:
+        f.write(
+            "        .section .data.rel.ro,\"aw\"\n"
+            "        .globl slot\n"
+            f"slot:   {directive} {sym}\n"
+            "        .text\n"
+            "        .globl probe\n"
+            "probe:  ret\n"
+        )
+    obj = os.path.join(td, "f.o")
+    r = sh([CC, "-c", src, "-o", obj], cwd=td)
+    if r.returncode != 0 or not os.path.exists(obj):
+        return None
+    return obj
+
+
+def _kinds_in(obj):
+    out = sh(["readelf", "-rW", obj]).stdout.decode()
+    return {m for m in re.findall(r"R_X86_64_\w+", out)}
+
+
+def _reloc_field_range_tests(args, oracles):
+    """Diagnose a relocation value that does not fit its field, on every path."""
+    results = []
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return [Result("reloc_field_range", "SKIP", "lccc-ld not built")]
+
+    # ── 1. the PC-relative case on all three emit paths ────────────────────
+    # One fixture, three link paths: plain (emit_exec), -T (emit_script) and
+    # -shared (emit_shared). Before the fix only the first two diagnosed.
+    td = tempfile.mkdtemp(prefix="lnk.reloc_pc32.")
+    try:
+        with open(os.path.join(td, "p.s"), "w") as f:
+            f.write(
+                "        .section .data.rel.ro,\"aw\"\n"
+                "        .globl slot\n"
+                "slot:   .long farpc - .\n"      # R_X86_64_PC32
+                "        .text\n"
+                "        .globl probe\n"
+                "probe:  ret\n"
+            )
+        if sh([CC, "-c", "p.s", "-o", "p.o"], cwd=td).returncode != 0:
+            results.append(Result("reloc_pc32_fixture", "SKIP", "assembler refused"))
+        elif "R_X86_64_PC32" not in _kinds_in(os.path.join(td, "p.o")):
+            results.append(Result("reloc_pc32_fixture", "SKIP",
+                                  "fixture did not produce R_X86_64_PC32"))
+        else:
+            with open(os.path.join(td, "t.ld"), "w") as f:
+                f.write("ENTRY(probe)\nSECTIONS {\n  . = 0x400000;\n"
+                        "  .text : { *(.text) }\n"
+                        "  .data.rel.ro : { *(.data.rel.ro) }\n}\n")
+            far = "0x7fff00000000"     # outside +/- 2 GiB of any image address
+            paths = [
+                ("exec", [lccc_ld, "--defsym", f"farpc={far}", "p.o",
+                          "-o", "o.exe", "--no-dynamic-linker"]),
+                ("script", [lccc_ld, "-T", "t.ld", "--defsym", f"farpc={far}",
+                            "p.o", "-o", "o.script", "--no-dynamic-linker"]),
+                ("shared", [lccc_ld, "-shared", "--defsym", f"farpc={far}",
+                            "p.o", "-o", "o.so"]),
+            ]
+            for label, cmd in paths:
+                name = f"reloc_pc32_out_of_range_diagnosed_on_{label}_path"
+                r = sh(cmd, cwd=td)
+                if r.returncode == 0:
+                    results.append(Result(
+                        name, "FAIL",
+                        f"{label} path accepted an out-of-range R_X86_64_PC32 and "
+                        f"emitted {cmd[cmd.index('-o') + 1]}: the value would be "
+                        f"silently truncated"))
+                    continue
+                err = r.stderr.decode()
+                if "R_X86_64_PC32" not in err or "truncated" not in err:
+                    results.append(Result(
+                        name, "FAIL",
+                        f"{label} path failed but did not name the type and the "
+                        f"truncation: {err[:200]!r}"))
+                    continue
+                # The oracle must refuse the same input, or this is lccc
+                # inventing a restriction rather than conforming.
+                agree = []
+                for oname, ocmd in oracles:
+                    if label == "script":
+                        o = sh(ocmd + ["-T", "t.ld", "--defsym", f"farpc={far}",
+                                       "p.o", "-o", f"o.{oname}", "-nostdlib",
+                                       "--no-dynamic-linker"], cwd=td)
+                    elif label == "shared":
+                        o = sh(ocmd + ["-shared", "--defsym", f"farpc={far}",
+                                       "p.o", "-o", f"o.{oname}.so"], cwd=td)
+                    else:
+                        o = sh(ocmd + ["--defsym", f"farpc={far}", "p.o",
+                                       "-o", f"o.{oname}", "-nostdlib",
+                                       "--no-dynamic-linker"], cwd=td)
+                    agree.append((oname, o.returncode != 0))
+                if agree and not all(ok for _, ok in agree):
+                    results.append(Result(
+                        name, "FAIL",
+                        f"oracles disagree with the refusal: {agree}"))
+                else:
+                    results.append(Result(name, "PASS"))
+    except Exception as e:
+        results.append(Result("reloc_pc32_out_of_range", "FAIL", f"harness: {e!r}"))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+    # ── 2. every absolute field width, both verdicts ───────────────────────
+    for kind, directive, sym, good, bad in _FIELD_CASES:
+        td = tempfile.mkdtemp(prefix=f"lnk.reloc_{sym}.")
+        try:
+            obj = _reloc_range_fixture(td, directive, sym)
+            if obj is None:
+                results.append(Result(f"reloc_{sym}_fixture", "SKIP",
+                                      "assembler refused the fixture"))
+                continue
+            kinds = _kinds_in(obj)
+            if not kinds:
+                results.append(Result(f"reloc_{sym}_fixture", "SKIP",
+                                      "fixture produced no relocation"))
+                continue
+            # out of range: must be diagnosed, and the oracle must agree
+            name = f"reloc_out_of_range_diagnosed_{sorted(kinds)[0].lower()}"
+            r = sh([lccc_ld, "--defsym", f"{sym}={bad:#x}", os.path.basename(obj),
+                    "-o", "bad.exe", "--no-dynamic-linker"], cwd=td)
+            if r.returncode == 0:
+                results.append(Result(
+                    name, "FAIL",
+                    f"{sorted(kinds)} value {bad:#x} was accepted and truncated"))
+            else:
+                err = r.stderr.decode()
+                if "truncated" not in err and "out of range" not in err:
+                    results.append(Result(name, "FAIL",
+                                          f"refused without a range diagnostic: "
+                                          f"{err[:200]!r}"))
+                else:
+                    o = sh([CC, "-fuse-ld=bfd", "--defsym", f"{sym}={bad:#x}",
+                            os.path.basename(obj), "-o", "bad.bfd",
+                            "-nostdlib", "--no-dynamic-linker"], cwd=td)
+                    if o.returncode == 0:
+                        results.append(Result(
+                            name, "FAIL",
+                            f"bfd accepted {sorted(kinds)}={bad:#x} but lccc "
+                            f"refused: lccc is stricter than the ecosystem"))
+                    else:
+                        results.append(Result(name, "PASS"))
+
+            # in range: must link, and the field must hold the value
+            name = f"reloc_in_range_accepted_{sorted(kinds)[0].lower()}"
+            r = sh([lccc_ld, "--defsym", f"{sym}={good:#x}", os.path.basename(obj),
+                    "-o", "good.exe", "--no-dynamic-linker"], cwd=td)
+            if r.returncode != 0:
+                results.append(Result(
+                    name, "FAIL",
+                    f"{sorted(kinds)}={good:#x} fits its field but was refused: "
+                    f"{r.stderr.decode()[:200]!r}"))
+            else:
+                dump = sh(["readelf", "-x", ".data.rel.ro", "good.exe"],
+                          cwd=td).stdout.decode()
+                want = "".join(f"{(good >> (8 * i)) & 0xff:02x}" for i in range(4))
+                width = {"R_X86_64_8": 1, "R_X86_64_16": 2}.get(sorted(kinds)[0], 4)
+                want = want[:width * 2]
+                if want not in dump.replace(" ", ""):
+                    results.append(Result(
+                        name, "FAIL",
+                        f"linked but the field does not hold {good:#x} "
+                        f"(expected {want} in .data.rel.ro)"))
+                else:
+                    results.append(Result(name, "PASS"))
+        except Exception as e:
+            results.append(Result(f"reloc_{sym}", "FAIL", f"harness: {e!r}"))
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    # ── 3. a 64-bit field must still accept values above 4 GiB ─────────────
+    # The regression risk of adding range checks is rejecting what the ABI
+    # allows. This runs the binary, so it also proves the value survived.
+    td = tempfile.mkdtemp(prefix="lnk.reloc_64.")
+    try:
+        with open(os.path.join(td, "w.s"), "w") as f:
+            f.write("        .section .data.rel.ro,\"aw\"\n"
+                    "        .globl slot64\n"
+                    "slot64: .quad far64\n")
+        with open(os.path.join(td, "m.c"), "w") as f:
+            f.write("#include <stdio.h>\n#include <stdint.h>\n"
+                    "extern uint64_t slot64;\n"
+                    "int main(void){ printf(\"%llx\\n\", "
+                    "(unsigned long long)slot64); return 0; }\n")
+        ok = (sh([CC, "-c", "w.s", "-o", "w.o"], cwd=td).returncode == 0
+              and sh([CC, "-c", "-O1", "m.c", "-o", "m.o"], cwd=td).returncode == 0)
+        if not ok:
+            results.append(Result("reloc_64_accepts_above_4g", "SKIP",
+                                  "assembler refused the fixture"))
+        else:
+            big = "0x100000000"        # 4 GiB: legal in a 64-bit field
+            r = sh([args.lccc, "--defsym", f"far64={big}", "m.o", "w.o",
+                    "-o", "w.bin", "-Wl,--no-dynamic-linker"] , cwd=td)
+            if r.returncode != 0:
+                # fall back to lccc-ld with the C runtime pieces it needs
+                r = sh([CC, "-fuse-ld=bfd", "-c", "m.c", "-o", "m2.o"], cwd=td)
+                results.append(Result(
+                    "reloc_64_accepts_above_4g", "SKIP",
+                    f"driver link unavailable: {r.stderr.decode()[:120]!r}"))
+            else:
+                code, out = run_bin(os.path.join(td, "w.bin"), [], td)
+                if (code, out.strip()) != (0, "4294967296"):
+                    results.append(Result(
+                        "reloc_64_accepts_above_4g", "FAIL",
+                        f"64-bit field lost its value: {(code, out)!r}"))
+                else:
+                    results.append(Result("reloc_64_accepts_above_4g", "PASS"))
+    except Exception as e:
+        results.append(Result("reloc_64_accepts_above_4g", "FAIL", f"harness: {e!r}"))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+    return results
+
+def _elf64_sections(d):
+    """Section headers of a little-endian ELF64 image, with names resolved."""
+    shoff = int.from_bytes(d[0x28:0x30], "little")
+    shentsize = int.from_bytes(d[0x3A:0x3C], "little")
+    shnum = int.from_bytes(d[0x3C:0x3E], "little")
+    shstrndx = int.from_bytes(d[0x3E:0x40], "little")
+    secs = []
+    for i in range(shnum):
+        o = shoff + i * shentsize
+        secs.append(dict(
+            nameoff=int.from_bytes(d[o:o + 4], "little"),
+            off=int.from_bytes(d[o + 0x18:o + 0x20], "little"),
+            size=int.from_bytes(d[o + 0x20:o + 0x28], "little"),
+            entsize=int.from_bytes(d[o + 0x38:o + 0x40], "little")))
+    stro = secs[shstrndx]["off"]
+    for sec in secs:
+        end = d.index(b"\0", stro + sec["nameoff"])
+        sec["name"] = bytes(d[stro + sec["nameoff"]:end]).decode()
+    return secs
+
+
+def _reloc_offset_tests(args, oracles):
+    """r_offset comes from the input object, so it decides where we write.
+
+    Two failures were measured before this was validated, both with exit status 0:
+
+      * r_offset = 2^64 - 16 made the u64 sum wrap; the unchecked writer no-oped
+        and the image kept the unrelocated instruction -- `lea` loaded the address
+        of the next instruction instead of the symbol's;
+      * r_offset = section size wrote four bytes into whatever the layout had put
+        after that section.
+
+    GNU ld refuses both (bfd_reloc_outofrange, reported as "error 4"), and a sweep
+    of r_offset across the boundary established that its rule is not
+    `offset < size` but `offset + field width <= size`: with a 9-byte .text and a
+    4-byte field, 5 is accepted and 6 is refused. So this sweeps two field widths
+    and requires the accept boundary to move with the width -- a check that
+    ignored the width would pass one sweep and fail the other.
+    """
+    results = []
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return [Result("reloc_offset", "SKIP", "lccc-ld not built")]
+
+    src = textwrap.dedent("""
+        \t.text
+        \t.globl _start
+        _start:
+        \tleaq\ttgt(%rip), %rax
+        \tret
+        \t.globl tgt
+        tgt:
+        \tret
+        \t.section .data.rel.ro,"aw"
+        \t.quad\ttgt
+    """).lstrip()
+
+    for sec, width in ((".text", 4), (".data.rel.ro", 8)):
+        name = f"reloc_offset_{sec.strip('.')}_w{width}"
+        td = tempfile.mkdtemp()
+        try:
+            spath = os.path.join(td, "f.s")
+            with open(spath, "w") as f:
+                f.write(src)
+            opath = os.path.join(td, "f.o")
+            r = sh([CC, "-c", spath, "-o", opath], cwd=td)
+            if r.returncode != 0:
+                results.append(Result(name, "SKIP", f"assembler: {r.stderr.decode()[:100]!r}"))
+                continue
+            base = bytearray(open(opath, "rb").read())
+            secs = _elf64_sections(base)
+            rela = next(s for s in secs if s["name"] == ".rela" + sec)
+            target = next(s for s in secs if s["name"] == sec)
+            size = target["size"]
+
+            diverge = []
+            last_accept = None
+            for off in range(0, size + 4):
+                v = bytearray(base)
+                v[rela["off"]:rela["off"] + 8] = off.to_bytes(8, "little")
+                obj = os.path.join(td, f"s{off}.o")
+                open(obj, "wb").write(bytes(v))
+                g = sh(["ld", obj, "-o", os.path.join(td, "g.elf"), "-nostdlib"], cwd=td)
+                l = sh([lccc_ld, "-nostdlib", obj, "-o", os.path.join(td, "l.elf")], cwd=td)
+                gv, lv = g.returncode == 0, l.returncode == 0
+                if gv != lv:
+                    diverge.append((off, "ld accepts/lccc refuses" if gv else
+                                    "ld refuses/lccc ACCEPTS",
+                                    l.stderr.decode()[:110]))
+                if gv:
+                    last_accept = off
+
+            # The boundary itself is the assertion: the highest offset GNU ld
+            # accepts must be exactly size - width, which is where a
+            # width-unaware check would go wrong.
+            want = size - width
+            if diverge:
+                results.append(Result(name, "FAIL",
+                    f"{len(diverge)} divergence(s) vs GNU ld over offsets 0..{size+3}: "
+                    + "; ".join(f"0x{o:x} {why} ({msg!r})" for o, why, msg in diverge[:3])))
+            elif last_accept != want:
+                results.append(Result(name, "FAIL",
+                    f"GNU ld's last accepted offset was 0x{last_accept:x}, expected "
+                    f"0x{want:x} (size 0x{size:x} - width {width})"))
+            else:
+                results.append(Result(name, "PASS",
+                    f"{size+4} offsets swept, boundary 0x{want:x} matches GNU ld"))
+
+            # The value that wrapped: not merely refused, but refused for the
+            # offset reason rather than something incidental.
+            v = bytearray(base)
+            v[rela["off"]:rela["off"] + 8] = (2**64 - 16).to_bytes(8, "little")
+            obj = os.path.join(td, "wrap.o")
+            open(obj, "wb").write(bytes(v))
+            g = sh(["ld", obj, "-o", os.path.join(td, "g2.elf"), "-nostdlib"], cwd=td)
+            l = sh([lccc_ld, "-nostdlib", obj, "-o", os.path.join(td, "l2.elf")], cwd=td)
+            wname = f"reloc_offset_wrap_{sec.strip('.')}"
+            if g.returncode == 0:
+                results.append(Result(wname, "SKIP", "GNU ld accepted a wrapping r_offset"))
+            elif l.returncode == 0:
+                results.append(Result(wname, "FAIL",
+                    "lccc linked an object whose r_offset wraps the u64 sum; the image "
+                    "is missing a patch or patched at the wrong place"))
+            elif "offset" not in l.stderr.decode() and "outside" not in l.stderr.decode():
+                results.append(Result(wname, "FAIL",
+                    f"refused, but not for an offset reason: {l.stderr.decode()[:120]!r}"))
+            else:
+                results.append(Result(wname, "PASS"))
+        except Exception as e:
+            results.append(Result(name, "FAIL", f"harness: {e!r}"))
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+    return results
+
+
+def _sym_value(binary, name):
+    """Value of the first symtab entry called `name`, or None."""
+    out = sh(["readelf", "-sW", binary]).stdout.decode()
+    for line in out.splitlines():
+        m = re.match(r"\s*\d+: ([0-9a-f]+)\s+\d+\s+\S+\s+\S+\s+\S+\s+\S+\s+" +
+                     re.escape(name) + r"\s*$", line)
+        if m:
+            return int(m.group(1), 16)
+    return None
+
+
+def _defsym_layout_test(args, oracles):
+    """`--defsym` expressions must see FINAL addresses, not section-relative ones.
+
+    Regression: the expression was evaluated before layout, when every
+    section-resident symbol still carried its in-object offset.  With
+    `start_val` at offset 0 of its section, `--defsym X=start_val+8` produced
+    the absolute value 8 -- a plausible low address, wrong by the entire image
+    base.  GNU ld evaluates the same expression against layout addresses.
+
+    The check is differential on the DELTA between the defsym'd symbol and its
+    referent (layout bases legitimately differ between linkers, deltas do not),
+    plus a direct byte-level check that a relocation REFERENCING the defsym'd
+    symbol is patched with the final value.
+    """
+    results = []
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return [Result("defsym_layout_expr", "SKIP", "lccc-ld not built")]
+
+    td = tempfile.mkdtemp(prefix="lnk.defsym_layout.")
+    try:
+        with open(os.path.join(td, "d.c"), "w") as f:
+            f.write("int start_val = 0;\nint other = 1;\n")
+        with open(os.path.join(td, "ref.s"), "w") as f:
+            f.write(
+                "        .section .data\n"
+                "        .globl slot\n"
+                "slot:   .long X\n"     # R_X86_64_32 against the defsym'd symbol
+            )
+        if (sh([CC, "-c", "d.c", "-o", "d.o"], cwd=td).returncode != 0 or
+                sh([CC, "-c", "ref.s", "-o", "ref.o"], cwd=td).returncode != 0):
+            return [Result("defsym_layout_expr", "SKIP", "fixture compile failed")]
+
+        bfd = "ld"
+        # (name, defsym expr, referent, expected delta or None).
+        #
+        # The delta (sym - referent) is the assertion because the two images
+        # are linked at different bases; it is base-invariant for correct
+        # post-layout evaluation and COLLAPSES to `constant - base` under the
+        # old pre-layout evaluation, which cannot be confused with the right
+        # answer.  A hardcoded delta is only safe where it follows from the
+        # expression itself (see `want`); elsewhere lccc must agree with
+        # GNU ld, which evaluates these expressions against final values.
+        #
+        # `_end` is deliberately NOT in this table: GNU ld evaluates it at a
+        # mid-layout stage, so its E is _not_ final `_end` - 4 (measured:
+        # delta 8188).  lccc's semantics are the documented one -- expressions
+        # see the final value -- and are checked as an internal invariant
+        # below.
+        expr_cases = [
+            ("defsym_layout_plus",  "X=start_val+8",           "start_val", 8),
+            ("defsym_layout_arith", "H=(start_val+other*2)/3", "start_val", None),
+        ]
+        for name, expr, referent, want in expr_cases:
+            sym = expr.split("=")[0]
+            # Only d.o: the delta is an identity in the referent's own value,
+            # and ref.o would drag in an undefined X for every expr that does
+            # not define it.  ref.o is exercised by the reloc case below.
+            l = sh([lccc_ld, "--defsym", expr, "d.o",
+                    "-o", "l.elf", "--no-dynamic-linker"], cwd=td)
+            g = sh([bfd, "--defsym", expr, "d.o",
+                    "-o", "g.elf", "--no-dynamic-linker"], cwd=td)
+            if g.returncode != 0:
+                results.append(Result(name, "SKIP",
+                    f"GNU ld refused the fixture: {g.stderr.decode()[:120]}"))
+                continue
+            if l.returncode != 0:
+                results.append(Result(name, "FAIL",
+                    f"lccc-ld refused but GNU ld accepted: {l.stderr.decode()[:160]}"))
+                continue
+            lv, lv_ref = _sym_value(os.path.join(td, "l.elf"), sym), \
+                         _sym_value(os.path.join(td, "l.elf"), referent)
+            gv, gv_ref = _sym_value(os.path.join(td, "g.elf"), sym), \
+                         _sym_value(os.path.join(td, "g.elf"), referent)
+            if None in (lv, lv_ref, gv, gv_ref):
+                results.append(Result(name, "FAIL",
+                    f"symbol '{sym}' or '{referent}' missing from a symtab"))
+                continue
+            ldelta, gdelta = lv - lv_ref, gv - gv_ref
+            if want is not None and gdelta != want:
+                results.append(Result(name, "SKIP",
+                    f"oracle sanity: GNU delta {gdelta} != {want}"))
+            elif ldelta != gdelta:
+                results.append(Result(name, "FAIL",
+                    f"lccc delta {ldelta} != GNU delta {gdelta} for {expr}: "
+                    f"lccc {sym}={lv:#x} {referent}={lv_ref:#x} (pre-layout "
+                    f"evaluation would store {sym}={want if want is not None else 'a section-relative constant'}, "
+                    f"collapsing the delta to constant - base)"))
+            else:
+                results.append(Result(name, "PASS",
+                    f"delta {ldelta} matches GNU ld"))
+
+        # lccc's documented `_end` semantics: the expression sees the FINAL
+        # value, so E - _end is exactly -4 in lccc's own image.
+        name = "defsym_layout_end_final"
+        l = sh([lccc_ld, "--defsym", "E=_end-4", "d.o",
+                "-o", "le.elf", "--no-dynamic-linker"], cwd=td)
+        if l.returncode != 0:
+            results.append(Result(name, "FAIL",
+                f"lccc-ld refused: {l.stderr.decode()[:160]}"))
+        else:
+            ev, env_ = _sym_value(os.path.join(td, "le.elf"), "E"), \
+                       _sym_value(os.path.join(td, "le.elf"), "_end")
+            if None in (ev, env_) or ev - env_ != -4:
+                results.append(Result(name, "FAIL",
+                    f"E={ev and ev:#x} _end={env_ and env_:#x}, want delta -4"))
+            else:
+                results.append(Result(name, "PASS", f"E = final _end - 4 ({ev:#x})"))
+
+        # A relocation that REFERENCES the defsym'd symbol must be patched
+        # with the final value, not the pre-layout placeholder.
+        name = "defsym_layout_reloc_reference"
+        l = sh([lccc_ld, "--defsym", "X=start_val+8", "d.o", "ref.o",
+                "-o", "lr.elf", "--no-dynamic-linker"], cwd=td)
+        g = sh([bfd, "--defsym", "X=start_val+8", "d.o", "ref.o",
+                "-o", "gr.elf", "--no-dynamic-linker"], cwd=td)
+        if l.returncode != 0 or g.returncode != 0:
+            results.append(Result(name, "FAIL",
+                "link failed: " + (l.stderr.decode()[:120] if l.returncode else
+                                    g.stderr.decode()[:120])))
+        else:
+            lx, gx = _sym_value(os.path.join(td, "lr.elf"), "X"), \
+                     _sym_value(os.path.join(td, "gr.elf"), "X")
+            # The slot's file position is where the symbol says it is:
+            # (slot_vma - .data_vma) into the section dump.  Computing it from
+            # the symbols (rather than assuming a layout) keeps the test valid
+            # if the compiler moves `start_val` (e.g. a zero init landing in
+            # .bss) and reorders the .data contents.
+            def slot_bytes(binary):
+                hdr = sh(["readelf", "-SW", binary]).stdout.decode()
+                dm = re.search(r"\.data\s+PROGBITS\s+([0-9a-f]+)\s+([0-9a-f]+)", hdr)
+                sv = _sym_value(binary, "slot")
+                if not dm or sv is None:
+                    return None
+                off = sv - int(dm.group(1), 16)
+                out = sh(["readelf", "-x", ".data", binary]).stdout.decode()
+                words = []
+                for line in out.splitlines():
+                    m = re.match(r"\s*0x[0-9a-f]+\s+(.*)$", line)
+                    if m:
+                        words += re.findall(r"[0-9a-f]{8}", m.group(1))
+                b = bytes.fromhex("".join(words)) if words else b""
+                if off + 4 <= len(b):
+                    return struct.unpack("<I", b[off:off + 4])[0]
+                return None
+            # The slot holds an ABSOLUTE R_X86_64_32, so each image's bytes
+            # must equal that image's OWN X (the bases differ between
+            # linkers; comparing across them would be a false failure).
+            lb, gb = slot_bytes(os.path.join(td, "lr.elf")), slot_bytes(os.path.join(td, "gr.elf"))
+            if lb is None or gb is None:
+                results.append(Result(name, "FAIL", "could not read .data slot bytes"))
+            elif lb != lx or gb != gx:
+                results.append(Result(name, "FAIL",
+                    f"slot bytes lccc {lb:#x} != lccc X {lx:#x}, or "
+                    f"gnu {gb:#x} != gnu X {gx:#x}"))
+            else:
+                results.append(Result(name, "PASS",
+                    f"relocation against defsym'd symbol patched with the "
+                    f"final value (lccc {lx:#x} / gnu {gx:#x})"))
+
+        # Same invariant on the shared-object path.
+        name = "defsym_layout_shared"
+        l = sh([lccc_ld, "-shared", "--defsym", "X=start_val+8", "d.o",
+                "-o", "ls.so"], cwd=td)
+        g = sh([bfd, "-shared", "--defsym", "X=start_val+8", "d.o",
+                "-o", "gs.so"], cwd=td)
+        if l.returncode != 0 or g.returncode != 0:
+            results.append(Result(name, "FAIL", "shared link failed"))
+        else:
+            lx, lref = _sym_value(os.path.join(td, "ls.so"), "X"), \
+                       _sym_value(os.path.join(td, "ls.so"), "start_val")
+            gx, gref = _sym_value(os.path.join(td, "gs.so"), "X"), \
+                       _sym_value(os.path.join(td, "gs.so"), "start_val")
+            if None in (lx, lref, gx, gref):
+                results.append(Result(name, "FAIL", "symbol missing from shared symtab"))
+            elif (lx - lref) != (gx - gref):
+                results.append(Result(name, "FAIL",
+                    f"shared delta {lx - lref} != GNU delta {gx - gref}"))
+            else:
+                results.append(Result(name, "PASS"))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lccc", default=DEFAULT_LCCC)
@@ -4563,6 +5707,10 @@ def main():
         results.append(_elf32_script_test(args, oracles))
         results.append(_elf32_script_gc_keep_test(args, oracles))
         results.append(_elf32_vdso_test(args, oracles))
+    if (not args.tag or args.tag in ("gc", "sections")):
+        results.append(_gc_eh_frame_invariant_test(args, oracles))
+    results.append(_build_id_note_test(args, oracles))
+    results.append(_static_pie_refusal_test(args, oracles))
     if (not args.filter or "hidden" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_script_hidden_visibility_test(args, oracles))
     if (not args.filter or "gotpcrel" in args.filter) and (not args.tag or args.tag == "script"):
@@ -4626,6 +5774,15 @@ def main():
         if not args.filter or "malformed" in args.filter or "robust" in args.filter:
             results.extend(_robustness_tests(args, oracles))
 
+    if not args.tag or args.tag == "reloc":
+        if not args.filter or "reloc" in args.filter:
+            results.extend(_reloc_field_range_tests(args, oracles))
+            results.extend(_reloc_offset_tests(args, oracles))
+
+    if not args.tag or args.tag == "defsym":
+        if not args.filter or "defsym" in args.filter:
+            results.extend(_defsym_layout_test(args, oracles))
+
     npass = sum(1 for r in results if r.status == "PASS")
     nfail = sum(1 for r in results if r.status == "FAIL")
     nwarn = sum(1 for r in results if r.status == "WARN")
@@ -4646,6 +5803,103 @@ def _wild_shim(wildpath):
         _WILD_SHIM_DIR = tempfile.mkdtemp(prefix="wildshim.")
         os.symlink(wildpath, os.path.join(_WILD_SHIM_DIR, "ld"))
     return os.path.join(_WILD_SHIM_DIR, "ld")
+
+def symtab_problems(path):
+    """Inspect .symtab: presence, entry count, sh_info correctness, zero-size ghosts."""
+    out = {"present": False, "nsyms": 0, "zero_size": 0, "sh_info_bad": None}
+    try:
+        with open(path, "rb") as fh:
+            d = fh.read()
+    except OSError:
+        return out
+    if len(d) < 64 or d[:4] != b"\x7fELF":
+        return out
+    e_shoff, = struct.unpack_from("<Q", d, 0x28)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 0x3A)
+    secs = []
+    for i in range(e_shnum):
+        b = e_shoff + i * e_shentsize
+        if b + e_shentsize > len(d):
+            return out
+        n, t, fl, a, off, sz, lk, inf, al, es = struct.unpack_from("<IIQQQQIIQQ", d, b)
+        secs.append((n, t, off, sz, lk, inf))
+    for n, t, off, sz, lk, inf in secs:
+        if t != 2:  # SHT_SYMTAB
+            continue
+        out["present"] = True
+        out["nsyms"] = sz // 24
+        nlocal = 0
+        for k in range(sz // 24):
+            nm, info, other, shndx, val, size = struct.unpack_from("<IBBHQQ", d, off + k * 24)
+            if val == 0 and size != 0:
+                out["zero_size"] += 1
+            if (info >> 4) == 0:
+                nlocal += 1
+        if inf != nlocal:
+            out["sh_info_bad"] = (f".symtab sh_info is {inf} but there are "
+                                  f"{nlocal} STB_LOCAL entries (ELF requires sh_info == nlocals)")
+    return out
+
+
+def dyn_hash_tags(path):
+    """Sorted list of hash tags in .dynamic, plus a check that each has a section."""
+    tags = []
+    try:
+        with open(path, "rb") as fh:
+            d = fh.read()
+    except OSError:
+        return tags
+    if len(d) < 64 or d[:4] != b"\x7fELF":
+        return tags
+    e_shoff, = struct.unpack_from("<Q", d, 0x28)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 0x3A)
+    secs = []
+    for i in range(e_shnum):
+        b = e_shoff + i * e_shentsize
+        if b + e_shentsize > len(d):
+            return tags
+        n, t, fl, a, off, sz, lk, inf, al, es = struct.unpack_from("<IIQQQQIIQQ", d, b)
+        secs.append((n, t, off, sz))
+    shstr = secs[e_shstrndx] if e_shstrndx < len(secs) else None
+    def nm(x):
+        if shstr is None or x >= shstr[3]:
+            return ""
+        e = d.index(b"\0", shstr[2] + x)
+        return d[shstr[2] + x:e].decode("latin1", "replace")
+    names = {nm(s[0]) for s in secs}
+    dyn = next((s for s in secs if s[1] == 6), None)  # SHT_DYNAMIC
+    if dyn is None:
+        return tags
+    for k in range(dyn[3] // 16):
+        tag, val = struct.unpack_from("<qQ", d, dyn[2] + k * 16)
+        if tag == 0x6FFFFEF5:  # DT_GNU_HASH
+            if ".gnu.hash" in names:
+                tags.append("GNU_HASH")
+        elif tag == 4:  # DT_HASH
+            if ".hash" in names:
+                tags.append("HASH")
+    return sorted(tags)
+
+
+def elf_e_type(path):
+    """Return the ELF e_type of `path` as "EXEC"/"DYN"/"REL"/..., or None.
+
+    Parsed from the header directly rather than from `readelf` text: readelf's
+    section-table columns shift when a name is long enough to wrap.
+    """
+    try:
+        with open(path, "rb") as fh:
+            ident = fh.read(20)
+    except OSError:
+        return None
+    if len(ident) < 20 or ident[:4] != b"\x7fELF":
+        return None
+    is64 = ident[4] == 2
+    little = ident[5] == 1
+    fmt = ("<" if little else ">") + ("H" if is64 else "H")
+    etype = struct.unpack(fmt, ident[16:18])[0]
+    return {0: "NONE", 1: "REL", 2: "EXEC", 3: "DYN", 4: "CORE"}.get(etype, f"?{etype}")
+
 
 def run_case(c, args, oracles):
     td = tempfile.mkdtemp(prefix=f"lnk.{c.name}.")
@@ -4703,12 +5957,45 @@ def run_case(c, args, oracles):
                     f"lccc link failed but {oracle_outs[0][0]} succeeded: {lccc_link_err}")
             return Result(c.name, "SKIP", f"all linkers failed: {lccc_link_err}")
 
+        # --- symbol table shape ---
+        if c.expect_no_symtab or c.expect_no_zero_size_syms:
+            bad = symtab_problems(lccc_out)
+            if c.expect_no_symtab and bad.get("present"):
+                return Result(c.name, "FAIL",
+                    f"-s was requested but .symtab is still present ({bad['nsyms']} symbols)")
+            if c.expect_no_zero_size_syms and bad.get("zero_size"):
+                return Result(c.name, "FAIL",
+                    f"{bad['zero_size']} symbols have st_value==0 with st_size!=0 "
+                    f"(symbols from collected sections, out of {bad['nsyms']})")
+            if bad.get("sh_info_bad"):
+                return Result(c.name, "FAIL", bad["sh_info_bad"])
+        if c.expect_dyn_tags is not None:
+            got = dyn_hash_tags(lccc_out)
+            want = sorted(c.expect_dyn_tags)
+            if got != want:
+                return Result(c.name, "FAIL",
+                    f"dynamic hash tags are {got}, expected {want}")
+
+        # --- image shape ---
+        if c.expect_elf_type is not None:
+            got = elf_e_type(lccc_out)
+            if got != c.expect_elf_type:
+                return Result(c.name, "FAIL",
+                    f"e_type is {got!r}, expected {c.expect_elf_type!r} "
+                    f"(a fixed-base ET_EXEC here means -pie was silently downgraded)")
+
         # --- run & compare ---
         code, out = run_bin(lccc_out, c.run_args, td, c.run_env)
         if c.expect_stdout is not None:
             if out != c.expect_stdout or code != c.expect_exit:
-                return Result(c.name, "FAIL",
-                    f"lccc output {(code, out)!r} != expected {(c.expect_exit, c.expect_stdout)!r}")
+                detail = (f"lccc output {(code, out)!r} != expected "
+                          f"{(c.expect_exit, c.expect_stdout)!r}")
+                if c.known_defect:
+                    return Result(c.name, "WARN", f"KNOWN DEFECT ({c.known_defect}): {detail}")
+                return Result(c.name, "FAIL", detail)
+            if c.known_defect:
+                return Result(c.name, "WARN",
+                    f"expected defect now passes -- remove known_defect: {c.known_defect}")
             return Result(c.name, "PASS")
 
         mismatches = []

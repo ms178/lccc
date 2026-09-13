@@ -501,6 +501,261 @@ fn read_sleb128(data: &[u8], mut off: usize) -> (i64, usize) {
     (result, off - start)
 }
 
+// ---------------------------------------------------------------------------
+// Unrelocated .eh_frame record scanning and --gc-sections interaction
+// ---------------------------------------------------------------------------
+
+/// One CIE or FDE record inside an **unrelocated** input `.eh_frame` section.
+///
+/// [`parse_eh_frame_fdes`] decodes *values* and therefore only makes sense on
+/// already-relocated bytes.  Garbage collection runs long before that, on the
+/// raw input, where the `initial_location` field is still zero and only the
+/// relocation entry says which function the FDE describes.  This struct is the
+/// structural view needed at that stage: byte ranges plus the offset the
+/// linker will later patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EhFrameRecord {
+    /// Byte offset of the record's length field.
+    pub start: usize,
+    /// One past the last byte of the record.
+    pub end: usize,
+    /// True for an FDE, false for a CIE.
+    pub is_fde: bool,
+    /// For an FDE: byte offset of the `initial_location` field, i.e. the slot
+    /// a relocation patches with the address of the described function.
+    pub iloc_offset: Option<usize>,
+    /// Byte offset of the `CIE_id`/`CIE_pointer` field, which is 4 bytes for
+    /// the 32-bit DWARF format and 8 for the 64-bit one.
+    pub id_offset: usize,
+    /// Width in bytes of that field.
+    pub id_size: usize,
+}
+
+/// Walk an unrelocated `.eh_frame` section and return every CIE/FDE record.
+///
+/// Only length and `CIE_id` fields are read, so this is valid on raw input
+/// data.  Truncated or malformed input terminates the scan instead of
+/// panicking -- `.eh_frame` comes from arbitrary object files.
+pub fn scan_eh_frame_records(data: &[u8]) -> Vec<EhFrameRecord> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 <= data.len() {
+        let length = read_u32_le(data, pos) as u64;
+        if length == 0 {
+            // Zero terminator (input sections are concatenated with padding).
+            pos += 4;
+            continue;
+        }
+        let is_extended = length == 0xFFFF_FFFF;
+        let (actual_length, header_size, id_size) = if is_extended {
+            if pos + 12 > data.len() {
+                break;
+            }
+            (read_u64_le(data, pos + 4), 12usize, 8usize)
+        } else {
+            (length, 4usize, 4usize)
+        };
+        let data_start = pos + header_size;
+        let end = data_start + actual_length as usize;
+        if end > data.len() || data_start + id_size > data.len() {
+            break;
+        }
+        let cie_id = if is_extended {
+            read_u64_le(data, data_start)
+        } else {
+            read_u32_le(data, data_start) as u64
+        };
+        let is_fde = cie_id != 0;
+        out.push(EhFrameRecord {
+            start: pos,
+            end,
+            is_fde,
+            iloc_offset: if is_fde {
+                Some(data_start + id_size)
+            } else {
+                None
+            },
+            id_offset: data_start,
+            id_size,
+        });
+        pos = end;
+    }
+    out
+}
+
+/// Drop the FDEs that describe garbage-collected functions.
+///
+/// `--gc-sections` works at *input section* granularity, but a translation
+/// unit emits **one** `.eh_frame` section holding an FDE for every function it
+/// defines.  With `-ffunction-sections` the functions land in their own
+/// sections and are collected individually, so the FDE set and the live code
+/// set diverge inside a single input section.  Leaving the stale FDEs in place
+/// is not merely wasteful: after the dead sections are compacted away the
+/// addresses they describe are recycled by live code, so the `.eh_frame_hdr`
+/// binary-search table can hand the unwinder an FDE whose CFI belongs to a
+/// different function.
+///
+/// This is why the FDE set must be pruned rather than the section being kept
+/// or dropped wholesale.  bfd, lld and mold all do the equivalent.
+///
+/// # Why compaction and not zeroing
+///
+/// A zero-length record is the DWARF end-of-`.eh_frame` terminator.  Blanking
+/// a dead FDE in place therefore *truncates* the section for every consumer
+/// that walks it directly (gdb, `readelf --debug-dump=frames`, libgcc's
+/// `__register_frame` path): only the FDEs before the first pruned one remain
+/// visible.  The records are instead removed and the survivors compacted,
+/// which also reclaims the bytes.  That requires two fixups, both handled
+/// here:
+///
+/// * every surviving FDE's `CIE_pointer` is *relative to its own position*, so
+///   it is rewritten from the new offsets; and
+/// * relocations are shifted by the same delta, and those inside a pruned
+///   record are dropped.
+///
+/// Returns the number of FDEs dropped.  FDEs whose `initial_location` has no
+/// relocation (already-resolved inputs, e.g. the product of an earlier
+/// `ld -r`) are conservatively kept.
+pub fn prune_dead_fdes(
+    objects: &mut [crate::backend::linker_common::Elf64Object],
+    dead: &crate::common::fx_hash::FxHashSet<(usize, usize)>,
+) -> usize {
+    if dead.is_empty() {
+        return 0;
+    }
+    use crate::backend::elf::{SHN_ABS, SHN_COMMON, SHN_UNDEF};
+    let mut dropped = 0usize;
+    for (obj_idx, obj) in objects.iter_mut().enumerate() {
+        let crate::backend::linker_common::Elf64Object {
+            sections,
+            symbols,
+            section_data,
+            relocations,
+            ..
+        } = obj;
+        for sec_idx in 0..sections.len() {
+            let sec = &sections[sec_idx];
+            if !sec.name.starts_with(".eh_frame") || sec.name.ends_with("_hdr") {
+                continue;
+            }
+            let Some(data) = section_data.get(sec_idx) else {
+                continue;
+            };
+            let records = scan_eh_frame_records(data);
+            if records.is_empty() {
+                continue;
+            }
+            let relocs = relocations.get(sec_idx).map(Vec::as_slice).unwrap_or(&[]);
+
+            // Which FDEs describe a collected function?
+            let mut prune: Vec<bool> = vec![false; records.len()];
+            for (i, rec) in records.iter().enumerate() {
+                let Some(iloc) = rec.iloc_offset else {
+                    continue;
+                };
+                let Some(rela) = relocs.iter().find(|r| r.offset as usize == iloc) else {
+                    continue; // no relocation: cannot prove the target is dead
+                };
+                let Some(sym) = symbols.get(rela.sym_idx as usize) else {
+                    continue;
+                };
+                if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS || sym.shndx == SHN_COMMON {
+                    continue; // not defined in a collectable input section
+                }
+                if dead.contains(&(obj_idx, sym.shndx as usize)) {
+                    prune[i] = true;
+                }
+            }
+            if !prune.iter().any(|&p| p) {
+                continue;
+            }
+
+            // ---- compact -------------------------------------------------
+            // new_start[i] = offset of record i in the compacted section
+            // (usize::MAX for a pruned one).
+            let mut new_start = vec![usize::MAX; records.len()];
+            // CIEs are never pruned, so the CIE preceding record `i` is the
+            // same before and after compaction; only its offset moves.
+            let mut cie_of = vec![usize::MAX; records.len()];
+            let mut last_cie = usize::MAX;
+            for (i, rec) in records.iter().enumerate() {
+                if !rec.is_fde {
+                    last_cie = i;
+                }
+                cie_of[i] = last_cie;
+            }
+            let mut off = 0usize;
+            for (i, rec) in records.iter().enumerate() {
+                if prune[i] {
+                    continue;
+                }
+                new_start[i] = off;
+                off += rec.end - rec.start;
+            }
+            let mut out = vec![0u8; off + 4]; // + the end-of-section terminator
+            for (i, rec) in records.iter().enumerate() {
+                if prune[i] {
+                    continue;
+                }
+                let dst = new_start[i];
+                out[dst..dst + (rec.end - rec.start)].copy_from_slice(&data[rec.start..rec.end]);
+                // Rewrite the FDE's CIE_pointer: by definition it is
+                // `offset_of(CIE_pointer field) - offset_of(CIE record)`, so
+                // both operands change under compaction.
+                if rec.is_fde && rec.iloc_offset.is_some() {
+                    let cie_idx = cie_of[i];
+                    if cie_idx != usize::MAX {
+                        let field_pos = dst + (rec.id_offset - rec.start);
+                        let value = field_pos - new_start[cie_idx];
+                        if rec.id_size == 8 {
+                            out[field_pos..field_pos + 8]
+                                .copy_from_slice(&(value as u64).to_le_bytes());
+                        } else {
+                            out[field_pos..field_pos + 4]
+                                .copy_from_slice(&(value as u32).to_le_bytes());
+                        }
+                    }
+                }
+            }
+
+            // ---- shift / drop relocations --------------------------------
+            let mut new_relocs = Vec::with_capacity(relocs.len());
+            for (i, rec) in records.iter().enumerate() {
+                if prune[i] {
+                    dropped += 1;
+                    continue;
+                }
+                let delta = rec.start as i64 - new_start[i] as i64;
+                for r in relocs
+                    .iter()
+                    .filter(|r| (r.offset as usize) >= rec.start && (r.offset as usize) < rec.end)
+                {
+                    let mut r2 = r.clone();
+                    r2.offset = (r.offset as i64 - delta) as u64;
+                    new_relocs.push(r2);
+                }
+            }
+            // Relocations outside every record (malformed input) are kept at
+            // their original offset rather than silently dropped.
+            let covered = |o: usize| records.iter().any(|r| o >= r.start && o < r.end);
+            for r in relocs.iter().filter(|r| !covered(r.offset as usize)) {
+                new_relocs.push(r.clone());
+            }
+            new_relocs.sort_by_key(|r| r.offset);
+
+            // `SectionData` is immutable by design (it usually aliases the
+            // mmap of the input), so the compacted section is materialised as
+            // an owned buffer and the header size follows it.
+            sections[sec_idx].size = out.len() as u64;
+            section_data[sec_idx] = crate::backend::linker_common::SectionData::owned(out);
+            if sec_idx < relocations.len() {
+                relocations[sec_idx] = new_relocs;
+            }
+        }
+    }
+    dropped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +992,201 @@ mod tests {
             assert!(loc >= prev, "table not sorted at entry {i}: {loc} < {prev}");
             prev = loc;
         }
+    }
+
+    /// `scan_eh_frame_records` must classify CIE vs FDE and report the byte
+    /// offset of every FDE's `initial_location` slot -- that offset is the
+    /// only thing tying an unrelocated FDE to the function it describes.
+    #[test]
+    fn scan_classifies_records_and_finds_initial_location() {
+        let data = synth_eh_frame(4, PCREL_SDATA4);
+        let recs = scan_eh_frame_records(&data);
+        assert_eq!(recs.len(), 5, "1 CIE + 4 FDEs");
+        assert!(
+            !recs[0].is_fde && recs[0].iloc_offset.is_none(),
+            "first is the CIE"
+        );
+        assert_eq!(recs[0].start, 0);
+        for r in &recs[1..] {
+            assert!(r.is_fde, "rest are FDEs");
+            let iloc = r.iloc_offset.expect("FDE has initial_location");
+            assert!(iloc > r.start && iloc + 4 <= r.end, "iloc inside record");
+            assert!(r.end <= data.len());
+        }
+        // Records must tile the section without gaps or overlaps.
+        for w in recs.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "records are contiguous");
+        }
+        assert_eq!(recs.last().unwrap().end, data.len());
+    }
+
+    /// The core `--gc-sections` invariant: an FDE for a collected function is
+    /// dropped, its relocation with it, and every surviving FDE is untouched.
+    #[test]
+    fn prune_dead_fdes_drops_only_the_collected_fde() {
+        use crate::backend::linker_common::{Elf64Object, Elf64Rela, Elf64Section, SectionData};
+        use crate::common::fx_hash::FxHashSet;
+
+        let eh = synth_eh_frame(3, PCREL_SDATA4);
+        let recs = scan_eh_frame_records(&eh);
+        // Sections of the synthetic object: 0 NULL, 1..=3 code, 4 .eh_frame.
+        let mut sections = vec![Elf64Section {
+            name_idx: 0,
+            name: String::new(),
+            sh_type: 0,
+            flags: 0,
+            addr: 0,
+            offset: 0,
+            size: 0,
+            link: 0,
+            info: 0,
+            addralign: 0,
+            entsize: 0,
+        }];
+        for i in 1..=4u32 {
+            sections.push(Elf64Section {
+                name_idx: 0,
+                name: if i == 4 {
+                    ".eh_frame".into()
+                } else {
+                    format!(".text.f{i}")
+                },
+                sh_type: if i == 4 { 1 } else { 1 }, // SHT_PROGBITS
+                flags: if i == 4 { 0x2 } else { 0x6 },
+                addr: 0,
+                offset: 0,
+                size: eh.len() as u64,
+                link: 0,
+                info: 0,
+                addralign: 8,
+                entsize: 0,
+            });
+        }
+        // One relocation per FDE, aimed at its own code section, plus a
+        // relocation on the CIE that must never be dropped.
+        let relocs: Vec<Elf64Rela> = recs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| Elf64Rela {
+                offset: r.iloc_offset.unwrap_or(r.start + 4) as u64,
+                sym_idx: i as u32, // sym i has shndx i
+                rela_type: 2,
+                addend: 0,
+            })
+            .collect();
+        let mut symbols = Vec::new();
+        for i in 0..5u16 {
+            symbols.push(crate::backend::linker_common::Elf64Symbol {
+                name_idx: 0,
+                name: format!("s{i}").into(),
+                info: 0x10,
+                other: 0,
+                shndx: i,
+                value: 0,
+                size: 0,
+            });
+        }
+        let before = count_eh_frame_fdes(&eh);
+        assert_eq!(before, 3);
+        let mut objects = vec![Elf64Object {
+            sections,
+            symbols,
+            section_data: vec![
+                SectionData::empty(),
+                SectionData::owned(vec![0u8; 16]),
+                SectionData::owned(vec![0u8; 16]),
+                SectionData::owned(vec![0u8; 16]),
+                SectionData::owned(eh.clone()),
+            ],
+            relocations: vec![Vec::new(), Vec::new(), Vec::new(), Vec::new(), relocs],
+            source_name: "<test>".into(),
+        }];
+
+        // Collect `.text.f2` (section 2 -> FDE index 1).
+        let mut dead: FxHashSet<(usize, usize)> = FxHashSet::default();
+        dead.insert((0, 2));
+
+        let dropped = prune_dead_fdes(&mut objects, &dead);
+        assert_eq!(dropped, 1, "exactly one FDE pruned");
+
+        let after = count_eh_frame_fdes(&objects[0].section_data[4]);
+        assert_eq!(after, 2, "two FDEs remain");
+        assert!(
+            objects[0].section_data[4].len() < eh.len(),
+            "pruning compacts: the section shrinks"
+        );
+        assert_eq!(
+            objects[0].sections[4].size as usize,
+            objects[0].section_data[4].len(),
+            "header size must follow the compacted bytes"
+        );
+        // Every surviving FDE must still resolve its CIE, i.e. the relative
+        // CIE_pointer was rewritten rather than left pointing at the old
+        // offset.  `parse_eh_frame_fdes` returns an FDE only when its CIE
+        // decodes, so a full count proves the fixup.
+        assert_eq!(
+            parse_eh_frame_fdes(&objects[0].section_data[4], 0x40_0000, true).len(),
+            2,
+            "both surviving FDEs still decode against their CIE"
+        );
+        // A compacted section must remain a single contiguous record stream
+        // with no zero-length terminator before the end.
+        let recs_after = scan_eh_frame_records(&objects[0].section_data[4]);
+        assert_eq!(recs_after.len(), 3, "CIE + 2 FDEs, no gaps");
+        for w in recs_after.windows(2) {
+            assert_eq!(w[0].end, w[1].start);
+        }
+        // 4 records (1 CIE + 3 FDEs) -> 4 relocations, minus the one inside
+        // the pruned FDE.  The CIE's own relocation must survive.
+        assert_eq!(
+            objects[0].relocations[4].len(),
+            3,
+            "only the pruned FDE's relocation is removed"
+        );
+        // The surviving FDEs must still decode, and the pruned one must not
+        // appear in the header table.
+        let hdr = build_eh_frame_hdr(&objects[0].section_data[4], 0x40_0000, 0x3f_0000, true);
+        assert_eq!(
+            i32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]),
+            2,
+            "header table lists only surviving FDEs"
+        );
+    }
+
+    /// An FDE with no relocation on `initial_location` (the shape an earlier
+    /// `ld -r` leaves behind) cannot be proven dead, so it must survive.
+    #[test]
+    fn prune_dead_fdes_keeps_fdes_without_a_relocation() {
+        use crate::backend::linker_common::{Elf64Object, Elf64Section, SectionData};
+        use crate::common::fx_hash::FxHashSet;
+
+        let eh = synth_eh_frame(2, PCREL_SDATA4);
+        let mut dead: FxHashSet<(usize, usize)> = FxHashSet::default();
+        dead.insert((0, 1));
+        let mut objects = vec![Elf64Object {
+            sections: vec![
+                Elf64Section {
+                    name_idx: 0,
+                    name: ".eh_frame".into(),
+                    sh_type: 1,
+                    flags: 0x2,
+                    addr: 0,
+                    offset: 0,
+                    size: eh.len() as u64,
+                    link: 0,
+                    info: 0,
+                    addralign: 8,
+                    entsize: 0,
+                };
+                1
+            ],
+            symbols: Vec::new(),
+            section_data: vec![SectionData::owned(eh.clone())],
+            relocations: vec![Vec::new()],
+            source_name: "<test>".into(),
+        }];
+        assert_eq!(prune_dead_fdes(&mut objects, &dead), 0);
+        assert_eq!(count_eh_frame_fdes(&objects[0].section_data[0]), 2);
     }
 
     /// Malformed input must terminate, not hang or panic. The zero-length and

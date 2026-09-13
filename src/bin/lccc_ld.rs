@@ -169,6 +169,41 @@ fn is_lto_bytecode(path: &str) -> bool {
     head.windows(9).any(|w| w == b".gnu.lto_")
 }
 
+/// Take the value of `--opt VALUE` or `--opt=VALUE`.
+///
+/// GNU ld accepts both spellings for the options that take an argument, and a
+/// linker that only understands one of them rejects valid command lines.
+fn two_arg<'a>(a: &'a str, args: &'a [String], i: &mut usize) -> String {
+    if let Some((_, v)) = a.split_once('=') {
+        return v.to_string();
+    }
+    *i += 1;
+    args.get(*i).cloned().unwrap_or_default()
+}
+
+/// Warn once per distinct unimplemented option.
+///
+/// Every one of these is accepted by GNU ld and changes the output image or a
+/// requested diagnostic, so swallowing it quietly hands the caller a binary
+/// that is not what it asked for.  Deduplicating keeps recursive builds from
+/// drowning real diagnostics.
+fn warn_unimplemented(a: &str) {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    let key = a.split('=').next().unwrap_or(a).to_string();
+    if let Ok(mut guard) = seen.lock()
+        && guard.insert(key.clone())
+    {
+        eprintln!(
+            "lccc-ld: warning: '{}' is accepted but not implemented; \
+             the output image may differ from GNU ld",
+            key
+        );
+    }
+}
+
 fn is_benign_ignorable(a: &str) -> bool {
     // gcc's driver state stack around --as-needed groups.
     if a == "--push-state" || a == "--pop-state" {
@@ -189,9 +224,14 @@ fn is_benign_ignorable(a: &str) -> bool {
         | "--no-fatal-warnings"
         | "--disable-linker-version"
         | "--no-relax"
+        // Driver-level flags that reach a standalone linker when a build system
+        // hands the same list to both. A linker never adds default libraries on
+        // its own -- that is the driver's job -- so -nostdlib has no effect here,
+        // and warning about it on every kernel-style link is noise that hides the
+        // warnings that matter.
+        | "-nostdlib" | "-nostartfiles" | "-nodefaultlibs"
         | "-O0" | "-O1" | "-O2" | "-O3" // ld's own -O is a size/speed hint
-    ) || a.starts_with("--build-id=")
-        || a.starts_with("-plugin-opt=")
+    ) || a.starts_with("-plugin-opt=")
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -204,6 +244,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut emit_relocs = false;
     let mut gc_sections = false;
     let mut is_pie = false;
+    let mut is_static = false;
     let mut build_id = false;
     let mut entry_override: Option<String> = None;
     let mut shared = false;
@@ -215,6 +256,9 @@ fn run(args: &[String]) -> Result<(), String> {
     // Arguments forwarded verbatim into the builtin userspace pipeline
     // (parse_linker_args understands the GNU spellings directly).
     let mut passthrough: Vec<String> = Vec::new();
+    // --defsym definitions, kept separately from `passthrough` because the
+    // script-driven link never re-parses passthrough arguments.
+    let mut defsyms: Vec<(String, String)> = Vec::new();
     // `-u SYM` / `--undefined=SYM`: force-undefined names that pull archive
     // members. Script links (`-T`) never consult `passthrough`, so these must
     // be collected separately and handed to `load_inputs_x86`.
@@ -254,18 +298,47 @@ fn run(args: &[String]) -> Result<(), String> {
             // the KASLR relocation table; ignoring the flag produced a kernel
             // that linked cleanly and then failed to boot.
             "--emit-relocs" | "-q" => emit_relocs = true,
-            "-pie" | "--pic-executable" => is_pie = true,
-            "-no-pie" => is_pie = false,
+            // Forwarded as well as recorded: `is_pie` drives the local
+            // decisions below, while the copy in `passthrough` is what
+            // `parse_linker_args` reads to make the emitter produce ET_DYN.
+            "-pie" | "--pic-executable" => {
+                is_pie = true;
+                passthrough.push("--pic-executable".to_string());
+            }
+            "-no-pie" => {
+                is_pie = false;
+                passthrough.push("--no-pic-executable".to_string());
+            }
             "-shared" | "-Bshareable" => shared = true,
             "--no-dynamic-linker" | "--no-ld-generated-unwind-info" => {}
-            "--whole-archive" => whole_archive = true,
-            "--no-whole-archive" => whole_archive = false,
+            // --whole-archive is POSITIONAL: it applies to the archives that
+            // follow it.  The local flag covers positional inputs; the shared
+            // argument parser needs the flag too, because `-l` libraries are
+            // resolved there and would otherwise be loaded selectively -- the
+            // link succeeded while silently dropping the unreferenced members
+            // the user asked to keep (constructors, plugin registration).
+            "--whole-archive" => {
+                whole_archive = true;
+                passthrough.push("--whole-archive".to_string());
+            }
+            "--no-whole-archive" => {
+                whole_archive = false;
+                passthrough.push("--no-whole-archive".to_string());
+            }
             "--start-group" | "--end-group" | "-(" | "-)" => {
                 // Builtin archive loading already iterates to a fixpoint
                 // (global group semantics), which subsumes group regions.
             }
             "--strip-debug" | "-S" => {}
-            "--strip-all" | "-s" => emit_symtab = false,
+            // Recorded for the linker-script path AND forwarded: the built-in
+            // emitter reads `strip_all` out of `parse_linker_args`, so without
+            // the passthrough copy `-s` silently produced a fully-symbolled
+            // binary.  That is worse than ignoring the flag, because the user
+            // believes they shipped a stripped image.
+            "--strip-all" | "-s" => {
+                emit_symtab = false;
+                passthrough.push("--strip-all".to_string());
+            }
             "-v" | "-V" | "--version" => {
                 println!("{}", lccc::linker_entry::GNU_LD_VERSION_OUTPUT);
                 return Ok(());
@@ -328,6 +401,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
             }
             "-static" | "-Bstatic" | "-dn" | "-non_shared" => {
+                is_static = true;
                 passthrough.push("-static".to_string());
             }
             "-Bdynamic" | "-dy" | "-call_shared" => {}
@@ -419,10 +493,43 @@ fn run(args: &[String]) -> Result<(), String> {
                     } else {
                         passthrough.push(a.to_string());
                     }
-                } else if let Some(rest) = a.strip_prefix("--wrap=") {
-                    passthrough.push(format!("-Wl,--wrap={}", rest));
-                } else if let Some(rest) = a.strip_prefix("--defsym=") {
-                    passthrough.push(format!("-Wl,--defsym={}", rest));
+                } else if a.starts_with("--wrap") {
+                    // GNU ld accepts both --wrap=SYM and --wrap SYM.  Only the
+                    // joined form was handled, so `ld --wrap foo` fell through
+                    // to the unknown-option warning and the link then failed on
+                    // the undefined __wrap_foo.
+                    let val = two_arg(a, args, &mut i);
+                    if !val.is_empty() {
+                        passthrough.push(format!("-Wl,--wrap={}", val));
+                    }
+                } else if a.starts_with("--defsym") {
+                    // GNU ld accepts --defsym=SYM=EXPR and --defsym SYM=EXPR.
+                    // `two_arg` normalises both; the local `defsyms` copy feeds
+                    // the builtin link path (the passthrough copy feeds the
+                    // shared-argument parser, which re-classifies via
+                    // linker_common::defsym).  A missing `=` is an error rather
+                    // than a warning+continue: the next token would otherwise
+                    // be consumed as an input filename and the real problem
+                    // would scroll away as an unknown-option warning.
+                    let val = two_arg(a, args, &mut i);
+                    let (name, expr) = val
+                        .split_once('=')
+                        .ok_or_else(|| format!("--defsym needs SYMBOL=EXPRESSION, got '{val}'"))?;
+                    if !name.is_empty() {
+                        passthrough.push(format!("-Wl,--defsym={val}"));
+                        defsyms.push((name.to_string(), expr.to_string()));
+                    }
+                } else if a.starts_with("--icf") {
+                    // --icf=none|safe|all.  Identical Code Folding is
+                    // implemented in the shared pipeline; the driver simply did
+                    // not forward it, so `ld --icf=all` was a silent no-op.
+                    let val = two_arg(a, args, &mut i);
+                    let mode = if val.is_empty() {
+                        "all".to_string()
+                    } else {
+                        val
+                    };
+                    passthrough.push(format!("-Wl,--icf={}", mode));
                 } else if let Some(rest) = a.strip_prefix("-u") {
                     let sym = if rest.is_empty() {
                         i += 1;
@@ -453,7 +560,20 @@ fn run(args: &[String]) -> Result<(), String> {
                         passthrough.push(format!("-Wl,-soname,{}", val));
                     }
                 } else if a.starts_with("--build-id") {
-                    build_id = !a.ends_with("=none");
+                    // Two consumers: script links get a synthetic note object
+                    // here, and the userspace pipeline gets the flag through
+                    // the shared parser (it emits the note itself).  Previously
+                    // only the script path was wired, so every `gcc
+                    // -fuse-ld=lccc` build -- Debian's gcc passes --build-id on
+                    // every link -- produced a binary with no build-id, which
+                    // breaks debuginfod, distro debuginfo extraction and
+                    // coredump matching.
+                    build_id = !a.ends_with("=none") && !a.ends_with("=0");
+                    passthrough.push(if let Some((_, v)) = a.split_once('=') {
+                        format!("-Wl,--build-id={}", v)
+                    } else {
+                        "-Wl,--build-id".to_string()
+                    });
                 } else if a.starts_with("--exclude-libs") {
                     // Forward to the shared pipeline, normalising the
                     // two-argument form to the joined one.
@@ -476,14 +596,36 @@ fn run(args: &[String]) -> Result<(), String> {
                     if !val.is_empty() {
                         passthrough.push(format!("-Wl,--version-script={}", val));
                     }
+                } else if a.starts_with("--hash-style") {
+                    // Implemented: `gnu`, `sysv` and `both` all produce the
+                    // matching `.gnu.hash` / `.hash` sections and DT tags.
+                    // Forwarded so `parse_linker_args` sees it; this used to be
+                    // swallowed with a "not implemented" warning, which made
+                    // `--hash-style` a no-op no matter what the emitter could do.
+                    if let Some((_, v)) = a.split_once('=') {
+                        if !v.is_empty() {
+                            passthrough.push(format!("--hash-style={v}"));
+                        }
+                    } else {
+                        i += 1;
+                        if let Some(v) = args.get(i) {
+                            passthrough.push(format!("--hash-style={v}"));
+                        }
+                    }
                 } else if a.starts_with("--orphan-handling")
                     || a == "--no-warn-rwx-segments"
                     || a.starts_with("-z")
-                    || a.starts_with("--hash-style")
                     || a.starts_with("--sort-section")
                     || a.starts_with("--print-")
                 {
-                    // accepted, not needed for correctness of the static image
+                    // Accepted but NOT implemented.  These change the image
+                    // (or a diagnostic the user asked for), so ignoring them
+                    // silently is worse than saying so: the caller believes it
+                    // got SysV+GNU hash tables, sorted sections, or a
+                    // --print-gc-sections listing and got none of them.  Warn
+                    // once per distinct option rather than per invocation so a
+                    // recursive make does not scroll them off the screen.
+                    warn_unimplemented(a);
                 } else if is_benign_ignorable(a) {
                     // Options every GNU-compatible linker accepts and that do
                     // not change the image we produce. bfd and mold accept
@@ -511,6 +653,14 @@ fn run(args: &[String]) -> Result<(), String> {
                     // Unknown flag: warn (parity with ld's permissiveness would
                     // be an error, but warn keeps us usable during bring-up).
                     eprintln!("lccc-ld: warning: ignoring unknown option '{}'", a);
+                } else if whole_archive && a.ends_with(".a") {
+                    // Positional archives under --whole-archive must go through
+                    // the shared parser: it carries the positional state with
+                    // the input and force-loads every member.  The plain
+                    // `object_files` path always loads archives selectively.
+                    passthrough.push("--whole-archive".to_string());
+                    passthrough.push(a.to_string());
+                    passthrough.push("--no-whole-archive".to_string());
                 } else {
                     inputs.push((a.to_string(), whole_archive));
                 }
@@ -585,7 +735,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         if elf_i386 {
             return lccc::linker_entry::link_with_script_i386(
-                &objects,
+                &mut objects,
                 &script_src,
                 &output,
                 emit_symtab,
@@ -595,10 +745,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 soname.as_deref(),
                 bsymbolic,
                 max_page_size,
+                &defsyms,
             );
         }
         return lccc::linker_entry::link_with_script_x86(
-            &objects,
+            &mut objects,
             &script_src,
             &output,
             emit_symtab,
@@ -608,6 +759,7 @@ fn run(args: &[String]) -> Result<(), String> {
             soname.as_deref(),
             bsymbolic,
             max_page_size,
+            &defsyms,
         );
     }
 
@@ -621,19 +773,10 @@ fn run(args: &[String]) -> Result<(), String> {
     // positional inputs from the caller (gcc-style invocation), so no CRT
     // injection happens here; whole-archive members are force-loaded.
     // ------------------------------------------------------------------
+    // Whole-archive archives were routed to `passthrough` during argument
+    // parsing, so everything left here is an ordinary object or archive.
     let mut object_files: Vec<String> = Vec::new();
-    for (path, wa) in &inputs {
-        if *wa && path.ends_with(".a") {
-            // The builtin pipeline loads archives lazily (pull members only
-            // when they resolve an undefined). --whole-archive semantics are
-            // only needed by script links today; refuse loudly instead of
-            // producing a binary that silently dropped members.
-            return Err(format!(
-                "--whole-archive '{}' is only supported with -T/--script or -r; \
-                 pass the members as objects for a standard link",
-                path
-            ));
-        }
+    for (path, _wa) in &inputs {
         object_files.push(path.clone());
     }
     let object_refs: Vec<&str> = object_files.iter().map(|s| s.as_str()).collect();
@@ -641,8 +784,19 @@ fn run(args: &[String]) -> Result<(), String> {
     if shared {
         return lccc::linker_entry::link_shared_x86(&object_refs, &output, &passthrough);
     }
-    if is_pie {
-        eprintln!("lccc-ld: warning: -pie without -T uses the fixed-base executable emitter");
+    // A plain -pie is honoured by the built-in emitter: ET_DYN based at 0,
+    // DF_1_PIE, and an R_X86_64_RELATIVE for every internal absolute address,
+    // so the kernel may map it anywhere and ld.so slides it correctly.
+    //
+    // -static-pie is still refused.  A static PIE needs the same RELATIVE
+    // table *plus* the rcrt1.o self-relocation protocol, and the static emitter
+    // produces no .rela.dyn at all; writing the image anyway yields something
+    // that faults in the CRT before main, which is worse than saying no.
+    if is_pie && is_static {
+        return Err("-static-pie is not implemented: lccc-ld cannot yet emit a \
+             position-independent static executable (refusing rather than \
+             producing an image that faults in the CRT self-relocation)"
+            .to_string());
     }
     lccc::linker_entry::link_builtin_x86(&object_refs, &output, &passthrough)
 }
