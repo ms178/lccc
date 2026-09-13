@@ -1143,8 +1143,17 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         }
-        let zf_only = flag_consumers_are_zf_only(store, infos, j + 1);
-        let byte_form = zf_only && (0..=255).contains(&imm) && src_fam != 4 && src_fam != 5;
+        // The byte form is flag-exact unless the mask carries bit 7, which is
+        // the only bit whose test result lands in SF at byte width but not at
+        // dword width (see `flags_reach_an_sf_consumer`). Without bit 7 there is
+        // nothing to prove and no consumer walk to pay for; with it, an SF
+        // consumer anywhere in the flags' reach -- including one on the taken
+        // edge of a conditional jump, or a `pushf` that captures SF as data --
+        // refuses the narrow form and keeps the wide one.
+        let byte_form = (0..=255).contains(&imm)
+            && src_fam != 4
+            && src_fam != 5
+            && (imm & 0x80 == 0 || !flags_reach_an_sf_consumer(store, infos, j + 1));
         let new_line = if byte_form {
             format!("    testb ${}, {}", imm, REG_NAMES[3][src_fam as usize])
         } else if and_wide {
@@ -1334,61 +1343,277 @@ fn flags_are_block_local(
     true
 }
 
-/// True when every consumer of the current flags, up to the next flags writer,
-/// only tests ZF (`e`/`ne`).
+/// Condition-code predicates that read SF: `s`/`ns` test it directly, and the
+/// signed relations test it in combination with OF (`l`/`nl`/`le`/`nle` are
+/// SF != OF, `g`/`ng`/`ge`/`nge` are SF == OF). The unsigned relations
+/// (`b`/`ae`/`a`/`be`), the CF predicates, `o`/`no` and `p`/`np` do not.
+const SF_CCS: &[&str] = &["s", "ns", "l", "nl", "le", "nle", "g", "ng", "ge", "nge"];
+
+/// Flag readers that provably do NOT read SF, so a rewrite whose only flag
+/// divergence is SF cannot be observed through them: the CF-carry group
+/// (`adc`/`sbb` and the two rotates that take CF as carry-in, `cmc`, `salc`,
+/// the ADX twins `adcx` -- covered by the `adc` prefix -- and `adox`, which is
+/// listed on its own because no other entry prefixes it) and `into` (OF). Each
+/// was checked on silicon
+/// with the f10 flag sweep rather than read off a mnemonic table. Everything
+/// else `flags_effect` reports as a reader and this list does not name --
+/// `pushf*` and `lahf` (whole-flag forms that capture SF), `syscall`/`sysenter`
+/// (RFLAGS goes to R11), `int*` (RFLAGS goes on the handler stack), and any
+/// mnemonic the tables do not recognise -- counts as reading SF. Default-deny:
+/// an unknown reader is never assumed benign.
+const NON_SF_FLAG_READERS: &[&str] = &["adc", "adox", "sbb", "rcl", "rcr", "cmc", "salc", "into"];
+
+/// True when a flag reader also overwrites the flags, so the flags being
+/// tracked die at that line: `adc`/`sbb`/`rcl`/`rcr`/`cmc` write the arithmetic
+/// flags back, `syscall`/`sysenter` mask RFLAGS after saving it to R11, and
+/// `int*` hands RFLAGS to a handler that may rewrite it. `lahf`, `pushf*`,
+/// `salc` and `into` only read, so the walk continues past them. An
+/// unrecognised reader also ends the path: it has already been counted as an SF
+/// reader, so nothing downstream of that guess could license anything anyway.
+fn reader_also_writes_flags(t: &str) -> bool {
+    if !(t.starts_with("adc")
+        || t.starts_with("sbb")
+        || t.starts_with("rcl")
+        || t.starts_with("rcr")
+        || t.starts_with("cmc")
+        || t.starts_with("syscall")
+        || t.starts_with("sysenter")
+        || t.starts_with("int"))
+    {
+        return false;
+    }
+    // `into` reads OF and traps; it does not write flags. (`int3`, `int $n` do
+    // hand RFLAGS to a handler, which is the stronger reason to stop.)
+    !t.starts_with("into")
+}
+
+/// What a flag-consumer walk established about the flags live at its start.
+#[derive(Clone, Copy)]
+struct ConsumerFacts {
+    /// At least one consumer was reached.
+    saw_consumer: bool,
+    /// A consumer that reads something other than ZF was reached.
+    saw_non_zf: bool,
+    /// A consumer that reads SF -- or the whole EFLAGS word, which contains it
+    /// -- was reached.
+    saw_sf_reader: bool,
+    /// False when the walk had to give up: an indirect branch, a target it
+    /// could not resolve, or a branch leaving the function. The flags may then
+    /// reach consumers nobody looked at, so the facts are a lower bound and
+    /// must not license a flag-divergent rewrite on their own.
+    proved: bool,
+}
+
+/// Forward reachability over the flag flow that starts at `from`.
+///
+/// A linear text walk is not enough, and this is not a theoretical objection.
+/// Flags travel along the TAKEN edge of every conditional jump as well as down
+/// the fall-through, so a consumer can sit in a block the text walk never
+/// enters, and stopping at the first flag writer is unsound for exactly that
+/// reason: in `andl $128,%esi; je .L1; addl $1,%edi; .L1: js .L2` the `addl`
+/// kills the flags on the fall-through path only, while the taken edge still
+/// delivers them to the `js` that reads SF. So this walk follows direct branch
+/// targets in addition to fall-through, ends each path at the first line that
+/// writes the flags it is tracking (a writer, a call, a `ret`), and reports
+/// what it could not resolve in `proved` instead of guessing.
+///
+/// Merging paths are handled by the visited set: a line is expanded once, and
+/// every fact found there is shared by all paths that reach it. That
+/// over-approximates which flags a consumer sees -- at a join it may attribute
+/// another predecessor's flags to this walk -- and over-approximation here only
+/// ever reports MORE consumers, which fails closed.
+fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> ConsumerFacts {
+    let mut facts = ConsumerFacts {
+        saw_consumer: false,
+        saw_non_zf: false,
+        saw_sf_reader: false,
+        proved: true,
+    };
+    // Label table for the enclosing function, so a branch target can be turned
+    // into a line index. A target outside the function is a tail branch: the
+    // flags leave with it and nothing here can account for them.
+    let Some((fs, fe)) = function_range(store, infos, from) else {
+        facts.proved = false;
+        return facts;
+    };
+    let mut labels: Vec<(&str, usize)> = Vec::new();
+    for n in fs..fe {
+        if infos[n].kind == LineKind::Label {
+            let t = infos[n].trimmed(store.get(n));
+            if let Some(name) = t.strip_suffix(':').map(str::trim) {
+                labels.push((name, n));
+            }
+        }
+    }
+    let mut resolve = |t: &str, facts: &mut ConsumerFacts| -> Option<usize> {
+        let Some(target) = super::helpers::extract_jump_target(t) else {
+            facts.proved = false;
+            return None;
+        };
+        match labels.iter().find(|(name, _)| *name == target) {
+            Some((_, idx)) => Some(*idx),
+            None => {
+                facts.proved = false;
+                None
+            }
+        }
+    };
+
+    let mut seen = vec![false; fe - fs];
+    let mut work: Vec<usize> = vec![from];
+    while let Some(head) = work.pop() {
+        let mut n = head;
+        while n < fe {
+            if seen[n - fs] {
+                break; // this suffix was already expanded, facts included
+            }
+            seen[n - fs] = true;
+            if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+                n += 1;
+                continue;
+            }
+            let t = infos[n].trimmed(store.get(n));
+            match infos[n].kind {
+                // A label is a position, not an effect: fall through it.
+                LineKind::Label => {
+                    n += 1;
+                    continue;
+                }
+                // `ret` ends the flags' lifetime and a call leaves EFLAGS
+                // undefined, so this path stops either way.
+                LineKind::Ret | LineKind::Call => break,
+                // Targets live in jump-table data or a register: unknowable
+                // here, and saying so is what keeps the walk honest.
+                LineKind::JmpIndirect => {
+                    facts.proved = false;
+                    break;
+                }
+                // An unconditional jump has no fall-through; the flags go to
+                // the target only.
+                LineKind::Jmp => {
+                    if let Some(idx) = resolve(t, &mut facts) {
+                        work.push(idx);
+                    }
+                    break;
+                }
+                // A real register push/pop is a stack adjustment and leaves
+                // EFLAGS alone. `pushf*` shares `LineKind::Push` (with
+                // `REG_NONE`) purely for %rsp tracking, yet it READS every
+                // flag, and `popf*` replaces them: the kind alone says nothing
+                // about EFLAGS, so only the register forms are skipped and the
+                // flag forms fall through to `flags_effect`, which reports
+                // pushf as a reader and popf as a writer.
+                LineKind::Push { reg } | LineKind::Pop { reg } if reg != REG_NONE => {
+                    n += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            match flags_effect(t) {
+                // The flags die here on this path.
+                FlagsEffect::Writes => break,
+                FlagsEffect::Neutral => {
+                    n += 1;
+                    continue;
+                }
+                FlagsEffect::Reads => {
+                    facts.saw_consumer = true;
+                    // Condition-code consumers (`jcc`, `setcc`, `cmovcc`) name
+                    // exactly which flags they read; everything else is a
+                    // whole-flag or unknown reader and is charged with SF
+                    // unless `NON_SF_FLAG_READERS` vouches for it.
+                    let cc = condition_code_of(t);
+                    match cc {
+                        Some(cc) => {
+                            if !matches!(cc, "e" | "z" | "ne" | "nz") {
+                                facts.saw_non_zf = true;
+                            }
+                            if SF_CCS.contains(&cc) {
+                                facts.saw_sf_reader = true;
+                            }
+                        }
+                        None => {
+                            facts.saw_non_zf = true;
+                            if !NON_SF_FLAG_READERS.iter().any(|p| t.starts_with(p)) {
+                                facts.saw_sf_reader = true;
+                            }
+                        }
+                    }
+                    // A conditional jump is a consumer AND an edge: the same
+                    // flags are live at its target.
+                    if infos[n].kind == LineKind::CondJmp
+                        || (t.starts_with('j') && !t.starts_with("jmp"))
+                    {
+                        if let Some(idx) = resolve(t, &mut facts) {
+                            work.push(idx);
+                        }
+                    }
+                    if reader_also_writes_flags(t) {
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+        }
+    }
+    facts
+}
+
+/// The condition code of a `jcc`/`setcc`/`cmovcc` line, with any size suffix
+/// stripped (`cmovlq` -> `l`), or `None` for a reader that is not a
+/// condition-code form. Condition-code names collide with size suffixes, so
+/// `setl` must not be stripped to `set` and lose its predicate.
+fn condition_code_of(t: &str) -> Option<&str> {
+    if let Some(rest) = t.strip_prefix("set") {
+        return Some(rest.split_whitespace().next().unwrap_or(""));
+    }
+    if let Some(rest) = t.strip_prefix("cmov") {
+        let tag = rest.split_whitespace().next().unwrap_or("");
+        return Some(
+            tag.strip_suffix(|c| c == 'q' || c == 'l' || c == 'w')
+                .unwrap_or(tag),
+        );
+    }
+    if t.starts_with('j') && !t.starts_with("jmp") {
+        return Some(&t[1..t.find(' ').unwrap_or(t.len())]);
+    }
+    None
+}
+
+/// True when every consumer of the current flags only tests ZF (`e`/`ne`) and
+/// at least one consumer exists. False also covers "could not prove", which is
+/// the point: an incomplete walk must not license anything.
 pub(super) fn flag_consumers_are_zf_only(
     store: &LineStore,
     infos: &[LineInfo],
     from: usize,
 ) -> bool {
-    let mut n = from;
-    let mut saw_consumer = false;
-    while n < store.len() {
-        if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
-            n += 1;
-            continue;
-        }
-        // Structural cases first: `flags_effect` classifies anything it does
-        // not recognise as a READER, and a label line is exactly that.
-        match infos[n].kind {
-            // End of the block. Flags are block-local (verified by
-            // `flags_are_block_local`), so nothing beyond depends on them.
-            LineKind::Label | LineKind::Ret => return saw_consumer,
-            // A call leaves EFLAGS undefined: the value is dead from here.
-            LineKind::Call => return saw_consumer,
-            // Stack adjustments do not touch EFLAGS.
-            LineKind::Push { .. } | LineKind::Pop { .. } => {
-                n += 1;
-                continue;
-            }
-            LineKind::Jmp | LineKind::JmpIndirect => return false,
-            _ => {}
-        }
-        let t = infos[n].trimmed(store.get(n));
-        match flags_effect(t) {
-            FlagsEffect::Writes => return saw_consumer,
-            FlagsEffect::Neutral => {}
-            FlagsEffect::Reads => {
-                saw_consumer = true;
-                let cc = if let Some(rest) = t.strip_prefix("set") {
-                    rest.split_whitespace().next().unwrap_or("")
-                } else if let Some(rest) = t.strip_prefix("cmov") {
-                    let tag = rest.split_whitespace().next().unwrap_or("");
-                    tag.strip_suffix(|c| c == 'q' || c == 'l' || c == 'w')
-                        .unwrap_or(tag)
-                } else if t.starts_with('j') {
-                    &t[1..t.find(' ').unwrap_or(t.len())]
-                } else {
-                    return false; // adc/sbb/... consume CF
-                };
-                if !matches!(cc, "e" | "z" | "ne" | "nz") {
-                    return false;
-                }
-            }
-        }
-        n += 1;
-    }
-    saw_consumer
+    let f = walk_flag_consumers(store, infos, from);
+    f.proved && f.saw_consumer && !f.saw_non_zf
+}
+
+/// True when some consumer of the current flags reads SF, or when the walk
+/// could not prove that none does.
+///
+/// This is the guard a rewrite needs when SF is the ONLY flag it can change --
+/// which is narrower than "every consumer is ZF-only" and therefore keeps folds
+/// that a ZF-only test refuses: a `jc`, an `jo`, an `adc` or a `jp` downstream
+/// cannot observe an SF-only divergence. Both rewrites that use it diverge in
+/// SF alone, and both divergences are provable rather than empirical:
+///
+/// * `testb $imm, %Xb` for `andl $imm, %X` (mask <= 255): ZF, PF, CF and OF are
+///   identical, and SF is bit 7 of `imm & X` against bit 31 of a result that
+///   cannot exceed 255 -- so it differs only when the mask has bit 7;
+/// * `cmpb $0, mem` for a zero-extended load plus `test`: ZF, PF, CF and OF are
+///   identical, and SF is bit 7 of the byte against bit 63 of the extended
+///   register, which is 0.
+pub(super) fn flags_reach_an_sf_consumer(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from);
+    !f.proved || f.saw_sf_reader
 }
 
 /// Whole-name occurrence test: `%r8` must not match inside `%r8d`.
@@ -1498,7 +1723,8 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
-    use super::{FlagsEffect, flags_effect};
+    use super::{ConsumerFacts, FlagsEffect, flags_effect, walk_flag_consumers};
+    use crate::backend::x86::codegen::peephole::types::{LineInfo, LineStore, classify_line};
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
@@ -1872,6 +2098,194 @@ mod tests {
     }
 
     #[test]
+    fn copy_and_mask_refuses_byte_form_when_pushf_captures_sf_as_data() {
+        // `pushfq` reads EVERY flag (RFLAGS goes to the stack) and is
+        // classified `LineKind::Push { reg: REG_NONE }` for %rsp tracking. A
+        // consumer scan that skips Push/Pop lines STRUCTURALLY -- before
+        // consulting `flags_effect`, which classifies `pushf` as a reader --
+        // never sees this all-flags consumer. It finds only the ZF-only `je`,
+        // stops at the `xorl`, concludes "ZF-only" and licenses the byte form.
+        // But SF of `testb $128, %bl` is bit 7 of the mask result while SF of
+        // `andl $128, %esi` is bit 31 = 0, and here the pushed word is popped
+        // into %r12 and RETURNED as data: the divergence escapes through a
+        // register, where no flag reader in the block can reveal it. Note the
+        // function IS flag-block-local, so the block-locality guard cannot
+        // catch this shape -- only classifying pushf as the reader it is.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    pushfq\n",
+            "    popq %r12\n",
+            "    je .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    shrb $7, %r12b\n",
+            "    movzbl %r12b, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl $128, %ebx"), "{out}");
+        assert!(!out.contains("testb $128"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_refuses_byte_form_when_a_consumer_lives_past_the_scan_window() {
+        // The linear scan stops at the first flag WRITER, but flags also flow
+        // along the CONDITIONAL edge: `je .LBB5` carries the `and`'s flags
+        // into .LBB5, where `js` reads SF. The scan returns at the `addl` in
+        // the fall-through block having seen only the ZF-only `je`, so it
+        // licenses the byte form whose SF is bit 7 of the mask result instead
+        // of bit 31. No amount of care at labels fixes this -- the consumer is
+        // never visited. The invariant that makes a linear scan sound is
+        // flag-block-locality (every reader preceded by a writer inside its
+        // own block), which `flags_are_block_local` verifies and which is
+        // FALSE here: `js` follows `.LBB5` with no writer between.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    je .LBB5\n",
+            "    addl $1, %edi\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    js .LBB6\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB6:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl $128, %ebx"), "{out}");
+        assert!(!out.contains("testb $128"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_keeps_byte_form_for_a_sign_consumer_when_the_mask_has_no_bit7() {
+        // SF is the byte form's ONLY possible divergence, and it exists only
+        // when the mask has bit 7: `testb $15, %bl` puts bit 7 of the masked
+        // result in SF, which is 0 for every mask below 0x80 -- exactly what
+        // `andl $15, %esi` leaves in bit 31. So a sign consumer is not a reason
+        // to give up the narrow encoding here, and no consumer walk is needed to
+        // prove it. The older ZF-only guard refused this fold.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $15, %esi\n",
+            "    js .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testb $15, %bl"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_keeps_byte_form_for_a_carry_consumer() {
+        // A CF-only consumer cannot observe an SF-only divergence, and both
+        // forms clear CF. Narrowing the guard from "ZF-only" to "no SF reader"
+        // is what keeps this fold, at a mask that does carry bit 7.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    jc .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testb $128, %bl"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_keeps_byte_form_when_the_taken_edge_reads_no_flags() {
+        // Positive control for the indirect-jump pin below: identical shape, but
+        // the taken edge lands in a block that reads no flags, so the walk
+        // proves SF is unconsumed and the narrow form stands.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    je .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testb $128, %bl"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_keeps_byte_form_when_the_taken_edge_is_an_unconditional_jump() {
+        // Following edges must not turn into refusing everything: an
+        // unconditional jump's target is resolved exactly like a conditional
+        // one, and this one leads to a block that reads no flags. Measured
+        // alongside this pin: a target the walk cannot resolve (an indirect
+        // `jmpq *%rax`, a jump to an external symbol or to a label outside the
+        // function) never reaches the byte-form decision at all, because the
+        // liveness oracle the fold also requires already reports the masked
+        // register as not provably dead there. `proved=false` is defence in
+        // depth at this call site, and is pinned directly on the walk below.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    je .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    jmp .LBB6\n",
+            ".LBB6:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testb $128, %bl"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_refuses_byte_form_for_lahf_which_reads_sf() {
+        // LAHF loads SF:ZF:0:AF:0:PF:1:CF into AH -- a whole-flag reader, and
+        // one of the few that reads SF without being a condition-code form. It
+        // is not in `NON_SF_FLAG_READERS`, so the walk charges it with SF.
+        // (Its twin SAHF is a flag WRITER, not a reader, and notably does not
+        // restore OF -- the reason it belongs in no reader table at all.)
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    lahf\n",
+            "    movzbl %ah, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl $128, %ebx"), "{out}");
+        assert!(!out.contains("testb $128"), "{out}");
+    }
+
+    #[test]
     fn copy_and_mask_narrow_copy_wide_mask_is_left_alone() {
         // movl zero-extends; a 64-bit and afterwards tests bits the original
         // %rbx may have set — no fold.
@@ -2162,5 +2576,116 @@ mod tests {
             "full redefinition must retire the extension: {out}"
         );
         assert!(out.contains("movl $1, %eax"), "{out}");
+    }
+
+    fn build(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+
+    /// Walk the flags produced by the line containing `marker`.
+    fn facts_from(asm: &str, marker: &str) -> ConsumerFacts {
+        let (store, infos) = build(asm);
+        let at = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).contains(marker))
+            .expect("marker line not found");
+        walk_flag_consumers(&store, &infos, at + 1)
+    }
+
+    #[test]
+    fn walk_follows_the_taken_edge_of_a_conditional_jump() {
+        // The whole reason the walk is not a linear scan: the fall-through path
+        // kills the flags at the `xorl`, and the SF reader only exists on the
+        // edge the `je` takes.
+        let f = facts_from(
+            concat!(
+                ".cfi_startproc\n",
+                "    andl $128, %esi\n",
+                "    je .LBB5\n",
+                "    xorl %eax, %eax\n",
+                "    ret\n",
+                ".LBB5:\n",
+                "    js .LBB6\n",
+                ".LBB6:\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ),
+            "andl $128",
+        );
+        assert!(f.proved && f.saw_consumer && f.saw_sf_reader && f.saw_non_zf);
+    }
+
+    #[test]
+    fn walk_reports_unproved_when_it_cannot_resolve_a_target() {
+        // An indirect jump's targets are data; so is a jump to a symbol that is
+        // not a label of this function. Both must say "I do not know" rather
+        // than report a clean bill of health.
+        for tail in [
+            "    jmpq *%rax\n",
+            "    jmp ext_symbol\n",
+            "    jmp .LBB9\n",
+        ] {
+            let asm = format!(
+                ".cfi_startproc\n    andl $128, %esi\n    je .LBB5\n.LBB5:\n{tail}.cfi_endproc\n"
+            );
+            let f = facts_from(&asm, "andl $128");
+            assert!(!f.proved, "target {tail:?} was reported as proved");
+        }
+    }
+
+    #[test]
+    fn walk_charges_whole_flag_readers_with_sf_but_not_carry_readers() {
+        // `pushf*` and `lahf` capture SF; `adcx`/`adox`/`adc`/`sbb`/`into` read
+        // CF or OF only (silicon-verified), so they must not block an SF-only
+        // rewrite -- and the ones that write flags back also end the path.
+        let sf = |m: &str| {
+            let asm =
+                format!(".cfi_startproc\n    andl $128, %esi\n    {m}\n    ret\n.cfi_endproc\n");
+            facts_from(&asm, "andl $128")
+        };
+        for reader in ["pushfq", "pushf", "lahf", "syscall", "int3"] {
+            let f = sf(reader);
+            assert!(f.saw_sf_reader, "{reader} should be charged with SF");
+        }
+        for reader in [
+            "adcxq %rdx, %rbx",
+            "adoxq %rdx, %rbx",
+            "adcq %rdx, %rbx",
+            "sbbq %rdx, %rbx",
+            "into",
+        ] {
+            let f = sf(reader);
+            assert!(!f.saw_sf_reader, "{reader} does not read SF");
+            assert!(f.saw_non_zf, "{reader} is still a non-ZF consumer");
+        }
+    }
+
+    #[test]
+    fn walk_stops_each_path_at_a_writer_a_call_and_a_ret() {
+        let facts = |body: &str| {
+            let asm = format!(".cfi_startproc\n    andl $128, %esi\n{body}.cfi_endproc\n");
+            facts_from(&asm, "andl $128")
+        };
+        // A writer kills the flags: the `js` behind it reads the writer's flags.
+        let f = facts("    addl $1, %edi\n    js .LBB5\n.LBB5:\n    ret\n");
+        assert!(f.proved && !f.saw_consumer && !f.saw_sf_reader);
+        // A call leaves EFLAGS undefined, so nothing behind it is a consumer.
+        let f = facts("    call ext\n    js .LBB5\n.LBB5:\n    ret\n");
+        assert!(f.proved && !f.saw_consumer);
+        // `ret` ends the flags' lifetime at the ABI boundary.
+        let f = facts("    ret\n");
+        assert!(f.proved && !f.saw_consumer);
+        // A real register push/pop is flag-neutral and must NOT stop the walk,
+        // while `popf*` replaces the flags and must.
+        let f = facts("    pushq %rax\n    popq %rax\n    js .LBB5\n.LBB5:\n    ret\n");
+        assert!(
+            f.proved && f.saw_sf_reader,
+            "register push/pop must be transparent"
+        );
+        let f = facts("    popfq\n    js .LBB5\n.LBB5:\n    ret\n");
+        assert!(f.proved && !f.saw_sf_reader, "popf replaces the flags");
     }
 }

@@ -7088,10 +7088,22 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         // the flags entirely; jmp/ret leave the path; push/pop/esp fences
         // are handled by their own barrier classes) and at any flag-
         // preserving instruction it keeps scanning.
+        // The bound is a compile-time guard, not a proof. Exhausting it must
+        // REFUSE: a scan that stopped before finding either a writer or a
+        // reader has established nothing, and treating silence as consent is
+        // the same mistake as trusting a truncated dataflow iteration to be a
+        // fixpoint (see the CFG slot forwarder's budget, which abandons the
+        // whole function rather than apply partial facts). The emitter's
+        // produce-before-consume discipline puts a writer within a few lines on
+        // real output, so widening the bound costs nothing there and only
+        // changes the verdict for text that did not come from the emitter --
+        // where the old bound silently fused and handed a distant reader the
+        // producer's flags instead of the dropped test's.
+        const POST_JCC_SCAN_LIMIT: usize = 64;
         let mut ok_after = true;
         let mut m = t + 1;
         let mut cnt = 0;
-        while m < len && cnt < 16 {
+        while m < len && cnt < POST_JCC_SCAN_LIMIT {
             if infos[m].is_nop() || is_debug_location(store, infos, m) {
                 m += 1;
                 continue;
@@ -7113,6 +7125,10 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             }
             m += 1;
             cnt += 1;
+        }
+        // Truncated by the bound with text still ahead: nothing was proved.
+        if cnt >= POST_JCC_SCAN_LIMIT && m < len {
+            ok_after = false;
         }
         if !ok_after {
             i += 1;
@@ -15064,6 +15080,83 @@ mod tests {
         assert!(r.contains("testl"), "test kept: {}", r);
         // (je .L1 may additionally be deleted by the branch-to-next rule —
         // also sound: the target IS the fallthrough here.)
+    }
+
+    // The post-jcc scan is BOUNDED, and a bound is a compile-time guard, not a
+    // proof: exhausting it used to fall through with the guard satisfied, i.e.
+    // "I saw no reader in the first 16 lines" was accepted as "no reader". That
+    // is the same mistake as trusting a truncated dataflow iteration to be a
+    // fixpoint. Here the reader sits at line 19, past the old bound, so the
+    // fusion used to fire and hand `jc` the producer's flags instead of the
+    // dropped test's -- CF of `cmpl $1, %ebx` against CF of `testl`, which is
+    // always 0.
+    #[test]
+    fn setcc_fuse_refuses_when_the_post_branch_scan_is_truncated() {
+        // 18 opaque pointer stores: flag-neutral, not barriers, and not
+        // removable by dead-store elimination (distinct displacements through
+        // a pointer the analysis cannot see through). They put the `jc` reader
+        // at line 19 after the branch -- past the scan's old 16-line bound.
+        let mut asm = String::from(concat!(
+            "f:\n",
+            "    cmpl $1, %ebx\n",
+            "    sete %al\n",
+            "    movzbl %al, %eax\n",
+            "    movl %eax, %edx\n",
+            "    testl %eax, %edx\n",
+            "    je .L1\n",
+        ));
+        for k in 1..19 {
+            asm.push_str(&format!("    movl %eax, {}(%esi)\n", 4 * k));
+        }
+        asm.push_str(concat!(
+            "    jc .L2\n",
+            ".L1:\n",
+            "    xorl %ecx, %ecx\n",
+            "    jmp .L3\n",
+            ".L2:\n",
+            "    xorl %ecx, %ecx\n",
+            ".L3:\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+        ));
+        let r = peephole_optimize(asm);
+        assert!(!r.contains("jne .L1"), "fusion must be refused: {}", r);
+        assert!(r.contains("testl"), "test kept: {}", r);
+        assert!(r.contains("jc .L2"), "distant reader untouched: {}", r);
+    }
+
+    // The bound can never be "wide enough" -- what makes truncation sound is
+    // refusing on it, and this pins that rule separately from the widened
+    // bound: the reader sits past even the new limit, so only the
+    // exhaustion-refusal keeps the fusion from firing.
+    #[test]
+    fn setcc_fuse_refuses_when_the_post_branch_scan_exhausts_its_bound() {
+        let mut asm = String::from(concat!(
+            "f:\n",
+            "    cmpl $1, %ebx\n",
+            "    sete %al\n",
+            "    movzbl %al, %eax\n",
+            "    movl %eax, %edx\n",
+            "    testl %eax, %edx\n",
+            "    je .L1\n",
+        ));
+        for k in 1..67 {
+            asm.push_str(&format!("    movl %eax, {}(%esi)\n", 4 * k));
+        }
+        asm.push_str(concat!(
+            "    jc .L2\n",
+            ".L1:\n",
+            "    xorl %ecx, %ecx\n",
+            "    jmp .L3\n",
+            ".L2:\n",
+            "    xorl %ecx, %ecx\n",
+            ".L3:\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+        ));
+        let r = peephole_optimize(asm);
+        assert!(!r.contains("jne .L1"), "fusion must be refused: {}", r);
+        assert!(r.contains("testl"), "test kept: {}", r);
     }
 
     // A flags WRITER between the branch and a later reader makes the fuse

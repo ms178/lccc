@@ -1260,7 +1260,7 @@ const RMW_CONSUMER_OPS: &[&str] = &[
 ///    width — a 64-bit consumer under a 32-bit copy would read the source's
 ///    unknown upper half, with two proven exceptions: `movl %S, %D` +
 ///    `shlq $32, %D` folds (identical values; the divergent CF is
-///    compensated by `shift_cf_safe_after`), and ANY 64-bit consumer folds
+///    compensated by `shift_flags_safe_after`), and ANY 64-bit consumer folds
 ///    when `upper32_zero_at` proves the source's upper half zero (exact
 ///    value equality — flags included). For an extension copy the
 ///    consumer must be
@@ -1311,13 +1311,32 @@ fn parse_imm32(src: &str) -> Option<u32> {
 }
 
 /// P2.5's flag-compensation sets: the cross-family `movl; shlq $32` fold
-/// computes identical VALUES but divergent CF (0 vs the source's bit 32),
-/// so the fold stands only when the consumer's CF is provably unobservable
-/// (see `shift_cf_safe_after`). OF/AF-after-shift are undefined in BOTH
-/// spellings (LLVM models them as `undef` — reading them is garbage either
-/// way); only CF (defined-but-divergent) is audited. Comparisons are
-/// case-insensitive: the consumer matcher is case-sensitive (missed folds
-/// are safe), but a missed CF READER would be unsound.
+/// computes identical VALUES but divergent FLAGS, so the fold stands only
+/// when both divergent flags are provably unobservable (see
+/// `shift_flags_safe_after`). Exactly two flags diverge:
+/// * CF — defined by the ISA and divergent: 0 in the zero-extended spelling
+///   vs the source's bit 32 in the full-width one;
+/// * OF — architecturally UNDEFINED after a multi-bit shift, but
+///   silicon-deterministic and value-dependent (it tracks the pre-shift MSB),
+///   hence divergent whenever the source's bit 63 is set. Measured natively
+///   (x86-64, 2026-09-13, 9 source values): src `0x8000_0000_8000_0000`
+///   gives OF 0 unfolded vs 1 folded, and a following `adox` — which consumes
+///   OF as its carry-in — returned 0 vs 1, i.e. a wrong VALUE, not just a
+///   wrong flag. ZF/SF/PF need no audit: they are functions of the result and
+///   both spellings compute the identical result. AF is undefined in both and
+///   every AF reader (the BCD group) is already a `CF_READERS` veto.
+///
+/// "Undefined" licences a compiler to CLOBBER a flag, not to OBSERVE it: the
+/// text this pass rewrites is lccc's own output, and lccc emits OF readers —
+/// `setl`/`setle`/`setg`/`setge` for every signed compare
+/// (`backend/x86/codegen/comparison.rs`), and `adox` through its own
+/// assembler (`assembler/encoder/mod.rs`; `passes/liveness.rs` already lists
+/// adcx/adox). The CF-only audit did not merely fail to credit them:
+/// `cf_skip_prefix` skips the whole `set`/`cmov`/`j` prefix family, so an
+/// OF-reading `setl` was stepped over as flag-irrelevant.
+///
+/// Comparisons are case-insensitive: the consumer matcher is case-sensitive
+/// (missed folds are safe), but a missed flag READER would be unsound.
 ///
 /// Carry-flag readers: any of these vetoes the fold.
 /// * `adc`/`sbb`/`adcx` read CF as carry-in; `rcl`/`rcr` rotate through it;
@@ -1329,9 +1348,9 @@ fn parse_imm32(src: &str) -> Option<u32> {
 ///   read AF which the fold leaves undefined) and deliberate traps (`int*`
 ///   hands RFLAGS to a debugger/handler — stronger than industry, free).
 const CF_READERS: &[&str] = &[
-    "adc", "adcb", "adcw", "adcl", "adcq", "adcx", "sbb", "sbbb", "sbbw", "sbbl", "sbbq", "rcl",
-    "rclb", "rclw", "rcll", "rclq", "rcr", "rcrb", "rcrw", "rcrl", "rcrq", "salc", "cmc", "aaa",
-    "aas", "aam", "aad", "daa", "das",
+    "adc", "adcb", "adcw", "adcl", "adcq", "adcx", "adcxl", "adcxq", "sbb", "sbbb", "sbbw", "sbbl",
+    "sbbq", "rcl", "rclb", "rclw", "rcll", "rclq", "rcr", "rcrb", "rcrw", "rcrl", "rcrq", "salc",
+    "cmc", "aaa", "aas", "aam", "aad", "daa", "das",
     // CF-only setcc/cmovcc/jcc predicates (B/C/NAE, NB/NC/AE).
     "setb", "setc", "setnae", "setnb", "setnc", "setae", "cmovb", "cmovc", "cmovnae", "cmovnb",
     "cmovnc", "cmovae", "jb", "jc", "jnae", "jnb", "jnc", "jae",
@@ -1531,6 +1550,106 @@ const CF_CLOBBER: &[&str] = &[
     "iretq",
     "sysret",
     "sysexit",
+];
+
+/// Overflow-flag readers: each vetoes the fold exactly like a CF reader.
+/// Enumerated EXACTLY, with no suffix stripping — a missed reader is unsound,
+/// and condition-code names collide with size suffixes: `setl` stripped of
+/// its trailing `l` is `set`, which would silently drop the veto. The `j*`
+/// forms are redundant (the classifier barriers conditional jumps) and are
+/// listed so the set stays complete under a future classifier change.
+const OF_READERS: &[&str] = &[
+    // ADX: ADOX consumes OF as its carry-in and writes OF back (silicon:
+    // post-OF independent of the preset; the f8 probe shows its RESULT
+    // diverging with the shift's OF). ADCX is the CF twin and already vetoes
+    // through `CF_READERS`. Suffixed spellings are listed because the tables
+    // are exact-match: without them `adoxq` (what GAS emits) would fall
+    // through to default-deny instead of being vetoed for the right reason.
+    "adox", "adoxl", "adoxq",
+    // setcc / cmovcc whose predicate reads OF: O, NO, and the signed
+    // relations L/NL/LE/NLE/G/NG/GE/NGE (SF != OF, SF == OF).
+    "seto", "setno", "setl", "setnl", "setle", "setnle", "setg", "setng", "setge", "setnge",
+    "cmovo", "cmovno", "cmovl", "cmovnl", "cmovle", "cmovnle", "cmovg", "cmovng", "cmovge",
+    "cmovnge", "jo", "jno", "jl", "jnl", "jle", "jnle", "jg", "jng", "jge", "jnge",
+    // INTO traps on OF. (It also appears in `CF_READERS`, where it vetoes for
+    // the stronger reason that it hands RFLAGS to a handler.)
+    "into",
+    // Whole-RFLAGS readers: they observe OF as well as CF, so once CF is dead
+    // they must still veto on OF grounds instead of riding the `push` prefix
+    // skip. `lahf` is deliberately absent — it loads only flags bits 7..0
+    // (SF:ZF:0:AF:0:PF:1:CF), so OF (bit 11) is never read.
+    "pushf", "pushfw", "pushfd", "pushfq", "syscall", "sysenter", "int", "int1", "int3",
+    // The BCD group leaves every flag it does not define undefined; vetoing is
+    // the conservative reading (and they are invalid in 64-bit mode anyway).
+    "daa", "das", "aaa", "aam", "aad", "aas",
+];
+
+/// Instructions that provably WRITE OF, so an OF reader past one observes the
+/// writer's OF rather than the divergent shift OF. Verified on silicon
+/// (native x86-64, 2026-09-13): post-OF independent of a preset OF=1/OF=0 for
+/// every base below, with controls proving the harness could tell the
+/// difference (a `mov` showed 1/0, an `add` 0/0).
+///
+/// Membership is tested against the token itself and against the token with
+/// ONE trailing size letter removed, so `addq`/`andnl`/`popcntl` credit their
+/// base. The base list contains only names that can never be a condition-code
+/// or flag-neutral mnemonic, because the two failure modes are asymmetric: a
+/// false CREDIT accepts the fold with OF still live (unsound), while a false
+/// negative merely costs folds. Stripping is therefore safe here and unsafe
+/// for `OF_READERS`.
+///
+/// Deliberately absent, each measured or reasoned:
+/// * `clc`/`stc`/`cmc`/`sahf` and the `bt`/`bts`/`btr`/`btc` family — CF-only
+///   writers; silicon shows them preserving OF. These are exactly the shapes
+///   that made a single-flag audit unsound: they killed the CF credit and
+///   ended the scan with OF still live.
+/// * shifts and rotates — OF after a multi-bit shift/rotate is the very
+///   value-dependent quantity under audit, so a shift may not credit OF;
+/// * `div`/`idiv` (OF undefined), `mulx`/`pdep`/`pext`/`rorx`/`shlx`/`shrx`/
+///   `sarx`/`crc32`/`not`/`bswap`/`lea`/`xchg` (flag-neutral on silicon),
+///   `adcx` (writes CF, preserves OF);
+/// * all SSE/AVX arithmetic — writes no flags; the size-letter rule cannot
+///   miscredit them (`paddb` strips to `padd`, `psubb` to `psub`, neither a
+///   base).
+const OF_CLOBBER_BASE: &[&str] = &[
+    "add",
+    "sub",
+    "adc",
+    "sbb",
+    "cmp",
+    "test",
+    "and",
+    "or",
+    "xor",
+    "neg",
+    "inc",
+    "dec",
+    "imul",
+    "mul",
+    "xadd",
+    "cmpxchg",
+    "andn",
+    "blsi",
+    "blsr",
+    "blsmsk",
+    "bzhi",
+    "bextr",
+    "popcnt",
+    "lzcnt",
+    "tzcnt",
+    "ptest",
+    "vptest",
+    "pcmpistri",
+    "pcmpestri",
+    "pcmpistrm",
+    "pcmpestrm",
+    "popf",
+    "popfw",
+    "popfd",
+    "popfq",
+    "iret",
+    "iretd",
+    "iretq",
 ];
 
 /// Instructions with provably no RFLAGS effect: the scan skips them.
@@ -1734,6 +1853,31 @@ fn shift_proves_cf_clobber(tok: &str, t: &str) -> bool {
     imm & mask != 0
 }
 
+/// Strip ONE trailing x86 size letter (`b`/`w`/`l`/`q`) so a suffixed form
+/// can be matched against a base-mnemonic table. Length-guarded at 2 so `bt`,
+/// `or`, `jl` and `bt`-family short names are never truncated into a base.
+fn strip_one_size_letter(tok: &str) -> Option<&str> {
+    let b = tok.as_bytes();
+    let last = *b.last()?;
+    if b.len() > 2 && matches!(last, b'b' | b'w' | b'l' | b'q') {
+        Some(&tok[..b.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// Whether `tok` provably writes OF (see `OF_CLOBBER_BASE` for the contract
+/// and for why suffix stripping is safe on the credit side only).
+fn writes_of(tok: &str) -> bool {
+    let hit = |lit: &str| tok.eq_ignore_ascii_case(lit);
+    OF_CLOBBER_BASE.iter().any(|lit| hit(lit))
+        || strip_one_size_letter(tok).is_some_and(|base| {
+            OF_CLOBBER_BASE
+                .iter()
+                .any(|lit| base.eq_ignore_ascii_case(lit))
+        })
+}
+
 /// P2.5's flag-compensation audit: `true` when the consumer at line `j` may
 /// fold cross-family. The scan below the consumer succeeds on the first
 /// flag-clobbering instruction (whose own inputs — hence its CF — are
@@ -1745,7 +1889,15 @@ fn shift_proves_cf_clobber(tok: &str, t: &str) -> bool {
 /// never change opcodes, so this pre-rename scan stays valid. Default-deny:
 /// an unclassified mnemonic (all of SSE/AVX/x87, future ISA, typos in
 /// hand-written asm) vetoes — over-refusal costs folds, never correctness.
-fn shift_cf_safe_after(store: &LineStore, infos: &[LineInfo], j: usize, len: usize) -> bool {
+fn shift_flags_safe_after(store: &LineStore, infos: &[LineInfo], j: usize, len: usize) -> bool {
+    // CF and OF are tracked independently: each becomes dead at the first
+    // instruction that overwrites it, and the fold stands only once BOTH are
+    // dead before any reader of either can observe them. A flag that is
+    // already dead cannot be vetoed by a later reader — that reader sees the
+    // overwriting instruction's flag, identical in both spellings because its
+    // own inputs are.
+    let mut cf_dead = false;
+    let mut of_dead = false;
     let mut n = j + 1;
     while n < len {
         if infos[n].is_nop() {
@@ -1766,11 +1918,45 @@ fn shift_cf_safe_after(store: &LineStore, infos: &[LineInfo], j: usize, len: usi
         }
         let t = infos[n].trimmed(store.get(n));
         let tok = cf_effect_token(t);
-        if CF_READERS.iter().any(|lit| tok.eq_ignore_ascii_case(lit)) {
+        // Readers veto only while the flag they read is still live.
+        if !cf_dead && CF_READERS.iter().any(|lit| tok.eq_ignore_ascii_case(lit)) {
             return false;
         }
-        if CF_CLOBBER.iter().any(|lit| tok.eq_ignore_ascii_case(lit)) {
+        if !of_dead && OF_READERS.iter().any(|lit| tok.eq_ignore_ascii_case(lit)) {
+            return false;
+        }
+        let guarded_shift = SHIFTS_GUARDED
+            .iter()
+            .any(|lit| tok.eq_ignore_ascii_case(lit));
+        let credits_cf = CF_CLOBBER.iter().any(|lit| tok.eq_ignore_ascii_case(lit))
+            || (guarded_shift && shift_proves_cf_clobber(tok, t));
+        let credits_of = writes_of(tok);
+        if credits_cf {
+            cf_dead = true;
+        }
+        if credits_of {
+            of_dead = true;
+        }
+        if cf_dead && of_dead {
             return true;
+        }
+        // PARTIAL credit must keep the scan alive: an OF-blind CF writer
+        // (`clc`, `stc`, `sahf`, `bt*`) ends the CF question but leaves OF
+        // divergent, and falling through to default-deny here would refuse
+        // every shape whose first clobber happens to be one of them.
+        //
+        // This branch runs BEFORE default-deny, so it is sound only because
+        // both credit sets are explicit whitelists: matching one IS the
+        // classification of the line. Widening `writes_of` with a prefix rule
+        // (the way `cf_skip_prefix` works) would silently turn default-deny
+        // into continue for unclassified mnemonics. Mutation-verified: forcing
+        // `writes_of` to `true` and blanking `OF_READERS` fails the three OF
+        // refusals below AND
+        // `rmw_coalesce_refuses_movl_shlq32_before_unknown_mnemonic`, which is
+        // the guard that catches exactly that widening.
+        if credits_cf || credits_of {
+            n += 1;
+            continue;
         }
         if CF_SKIP_EXACT
             .iter()
@@ -1783,13 +1969,9 @@ fn shift_cf_safe_after(store: &LineStore, infos: &[LineInfo], j: usize, len: usi
             n += 1;
             continue;
         }
-        if SHIFTS_GUARDED
-            .iter()
-            .any(|lit| tok.eq_ignore_ascii_case(lit))
-        {
-            if shift_proves_cf_clobber(tok, t) {
-                return true;
-            }
+        if guarded_shift {
+            // A shift never READS CF, and a `%cl`/suffixless count proves no
+            // clobber: skipping loses credit but stays sound.
             n += 1;
             continue;
         }
@@ -2099,7 +2281,7 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
         // destroys exactly the bits the zero-extension had fixed (the old
         // upper half shifts out, the low half fills with zero). CF
         // diverges (0 vs the source's bit 32), so the fold additionally
-        // needs `shift_cf_safe_after`. The count check masks to 6 bits:
+        // needs `shift_flags_safe_after`. The count check masks to 6 bits:
         // silicon shifts by `imm & 63`, so a naive `imm >= 32` test would
         // miscompile `shlq $64` (a shift by zero: unfolded `%D` is
         // zero-extended, folded `%S` is not).
@@ -2112,7 +2294,7 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
                 && ext_bits.is_none()
                 && *op == "shlq "
                 && parse_imm32(cons_src).is_some_and(|c| c & 63 == 32)
-                && shift_cf_safe_after(store, infos, j, len))
+                && shift_flags_safe_after(store, infos, j, len))
             && !(copy_w == 32 && ext_bits.is_none() && upper32_zero_at(store, infos, li, s_fam))
         {
             continue;
@@ -2757,6 +2939,125 @@ mod tests {
         ));
         assert!(!out.contains("movl %ebx"), "{out}");
         assert!(out.contains("shlq $32, %rbx"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_movl_shlq32_before_setl_signed_compare() {
+        // `setl` is the OF reader lccc emits for every signed compare
+        // (backend/x86/codegen/comparison.rs, i128_ops.rs). It is not a CFG
+        // barrier, and the CF audit's `set` prefix skip stepped over it: with
+        // a CF+OF clobber (`addl`) waiting below, a CF-only audit ACCEPTED the
+        // fold and fed the divergent OF (the source's bit 63) into the signed
+        // relation. Refusing is what makes the prefix skip safe.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    shlq $32, %r10\n",
+            "    setl %cl\n",
+            "    addl %eax, %ebx\n",
+            "    movq %r10, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+        assert!(out.contains("shlq $32, %r10"), "{out}");
+        assert!(!out.contains("shlq $32, %r8"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_movl_shlq32_when_the_of_reader_is_replaced_by_a_writer() {
+        // Control for the test above, identical shape with `addl` where `setl`
+        // was: ADD writes OF (silicon-verified), so both divergent flags are
+        // dead before anything observes them and the fold stands. The refusal
+        // above is therefore the OF READ, not the mnemonic family or the shape.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    shlq $32, %r10\n",
+            "    addl %eax, %ebx\n",
+            "    movq %r10, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movl %r8d"), "{out}");
+        assert!(out.contains("shlq $32, %r8"), "{out}");
+        assert!(out.contains("movq %r8, %rax"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_movl_shlq32_before_adoxq_of_consumer() {
+        // ADOX consumes OF as its carry-in, so the divergence reaches a VALUE,
+        // not just a flag: measured natively, `shlq $32` unfolded vs folded
+        // with src `0x8000_0000_8000_0000` gives OF 0 vs 1 and a following
+        // `adoxq` returns 0 vs 1. `adox` sits in CF_SKIP_EXACT — correctly, it
+        // neither reads nor writes CF — so a CF-only audit skipped it and
+        // accepted at the `addl` below. The suffixed spelling is what GAS
+        // emits and what the exact-match table must name.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    shlq $32, %r10\n",
+            "    adoxq %r9, %rdi\n",
+            "    addl %eax, %ebx\n",
+            "    movq %r10, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+        assert!(out.contains("adoxq %r9, %rdi"), "{out}");
+        assert!(!out.contains("shlq $32, %r8"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_refuses_movl_shlq32_when_clc_kills_cf_but_not_of() {
+        // Partial credit must not end the audit. CLC writes CF — settling the
+        // CF question — and preserves OF (silicon-verified, as do `stc`,
+        // `sahf` and the `bt` family), so the divergent OF is still live at
+        // the `seto` below. A single-flag scan returned true at the CLC and
+        // folded; the dual-flag scan keeps going and vetoes at the reader.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    shlq $32, %r10\n",
+            "    clc\n",
+            "    seto %cl\n",
+            "    addl %eax, %ebx\n",
+            "    movq %r10, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %r8d, %r10d"), "{out}");
+        assert!(out.contains("seto %cl"), "{out}");
+        assert!(!out.contains("shlq $32, %r8"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_movl_shlq32_when_clc_then_addl_kill_both_flags() {
+        // The shape the partial-credit continuation exists for: CF dies at
+        // `clc`, OF dies at `addl`, so both divergent flags are dead before
+        // the `seto` observes them and the fold stands. Without the
+        // continuation the scan would default-deny at the CLC (it is neither a
+        // skip-list entry nor a prefix match), losing this fold.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r8d, %r10d\n",
+            "    shlq $32, %r10\n",
+            "    clc\n",
+            "    addl %eax, %ebx\n",
+            "    seto %cl\n",
+            "    movq %r10, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movl %r8d"), "{out}");
+        assert!(out.contains("shlq $32, %r8"), "{out}");
+        assert!(out.contains("clc"), "{out}");
+        assert!(out.contains("seto %cl"), "{out}");
     }
 
     #[test]
