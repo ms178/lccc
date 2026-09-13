@@ -2747,6 +2747,10 @@ impl ArchCodegen for I686Codegen {
         "ud2"
     }
 
+    fn peephole_for_metric(&self, text: String) -> String {
+        crate::backend::i686::codegen::peephole::peephole_optimize(text)
+    }
+
     fn emit_branch_nonzero(&mut self, label: &str) {
         self.state.emit("    testl %eax, %eax");
         emit!(self.state, "    jne {}", label);

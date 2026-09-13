@@ -1877,11 +1877,15 @@ impl Driver {
 
         if std::env::var("CCC_NO_BLOCK_RELAYOUT").is_err() {
             // Layout start order is optimization-level aware. The throughput
-            // pipeline (-O1..-O3) preserves the function's existing block
-            // order and only compacts loop spans (hot fall-throughs stay
-            // not-taken; measured ~19 % on zlib_ng_adler32). Size-optimized
+            // pipeline (-O1..-O3) runs the static chain layout
+            // (`relayout_blocks_static_chain`): greedy trace construction
+            // with structural edge weights, which keeps loop bodies
+            // contiguous AND places the estimated-hot successor as the
+            // fall-through (the historical `Existing` start preserved
+            // append-order, which on control-flow-heavy functions leaves
+            // every block transition an explicit `jmp`). Size-optimized
             // builds (-Os/-Oz — which includes all -m16 real-mode setup code
-            // via the size policy) instead start from reverse post-order:
+            // via the size policy) keep the reverse-post-order start:
             // mutually branching blocks stay adjacent, maximizing short rel8
             // branches. Measured ~570 B of .text on the linux-cachymod setup
             // corpus, which is the margin that keeps _end under the 32 KiB
@@ -1891,7 +1895,7 @@ impl Driver {
                     if self.optimize_size {
                         crate::passes::block_layout::relayout_blocks_loop_aware_rpo(func);
                     } else {
-                        crate::passes::block_layout::relayout_blocks_loop_aware(func);
+                        crate::passes::block_layout::relayout_blocks_static_chain(func);
                     }
                 }
             }

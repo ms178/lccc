@@ -96,6 +96,11 @@ pub(crate) struct DemorganRec {
 /// prune decisions, and emission fires to stderr. Zero cost when off.
 pub(crate) fn demorgan_debug_enabled() -> bool {
     std::env::var_os("LCCC_DEBUG_DEMORGAN").is_some()
+        // Exploratory (metric-only) emissions of the dual-layout selection
+        // do not describe shipped code: their traces would double the
+        // count-based assertions in check_demorgan_branch_split.
+        && !crate::backend::state::EXPLORATORY_EMISSION
+            .load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn compute_cmp_replay_scan(

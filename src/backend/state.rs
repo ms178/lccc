@@ -121,6 +121,15 @@ impl RegCache {
 }
 
 /// Shared codegen state, used by all backends.
+/// True while the backend emits an exploratory (metric-only) copy of a
+/// function for the dual-layout selection. Debug traces fire per emission;
+/// count-based assertions over those traces (`check_demorgan_branch_split`
+/// expects exactly one fire per site) would double under exploration, so
+/// the load-bearing debug helpers stay silent while this is set. The
+/// exploratory text never leaves the compiler.
+pub(crate) static EXPLORATORY_EMISSION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub struct CodegenState {
     pub out: AsmOutput,
     /// Set from CodegenOptions for -O0 non-SSA correctness.

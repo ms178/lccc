@@ -795,11 +795,21 @@ impl ArchCodegen for RiscvCodegen {
         "ebreak"
     }
 
+    fn peephole_for_metric(&self, text: String) -> String {
+        crate::backend::riscv::codegen::peephole::peephole_optimize(text)
+    }
+
     fn emit_branch(&mut self, label: &str) {
         self.state.emit_fmt(format_args!("    jump {}, t6", label));
     }
 
     fn emit_branch_to_block(&mut self, block: BlockId) {
+        // Fall-through elision, mirroring the shared default: RISC-V block
+        // code has sequential fall-through semantics between adjacent
+        // emitted blocks, so a `jump` to the physically next label is dead.
+        if self.state.next_block_label == Some(block) {
+            return;
+        }
         let out = &mut self.state.out;
         out.write_str("    jump .LBB");
         out.write_u64(block.0 as u64);

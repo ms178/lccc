@@ -2889,6 +2889,10 @@ impl ArchCodegen for ArmCodegen {
         "brk #0"
     }
 
+    fn peephole_for_metric(&self, text: String) -> String {
+        crate::backend::arm::codegen::peephole::peephole_optimize(text)
+    }
+
     fn emit_branch_nonzero(&mut self, label: &str) {
         let skip = self.state.fresh_label("skip");
         self.state.emit_fmt(format_args!("    cbz x0, {}", skip));

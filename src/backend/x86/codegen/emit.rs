@@ -7274,6 +7274,13 @@ impl ArchCodegen for X86Codegen {
         "ud2"
     }
 
+    fn peephole_for_metric(&self, text: String) -> String {
+        crate::backend::x86::codegen::peephole::peephole_optimize_with_config(
+            text,
+            self.state_ref().ra_config.as_ref(),
+        )
+    }
+
     fn emit_branch_nonzero(&mut self, label: &str) {
         self.state.emit("    testq %rax, %rax");
         self.state.out.emit_jcc_label("    jne", label);
