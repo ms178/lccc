@@ -300,7 +300,21 @@ fn parse_elf64_object_inner(
     let mut relocations = vec![Vec::new(); e_shnum];
     for i in 0..sections.len() {
         if sections[i].sh_type == SHT_RELA {
+            // `sh_info` is the index of the section this table applies to, and it
+            // comes from the input file. An out-of-range value used to make the
+            // whole table vanish silently, which is a wrong image with no
+            // diagnostic: relocations that are dropped are relocations that are
+            // not applied.
             let target_sec = sections[i].info as usize;
+            if target_sec >= sections.len() {
+                return Err(format!(
+                    "{source_name}: relocation section {} has sh_info {target_sec}, \
+                     but the object has only {} section(s)",
+                    sections[i].name,
+                    sections.len()
+                ));
+            }
+            let target_size = sections[target_sec].size;
             let rela_data: &[u8] = section_data[i].as_slice();
             let rela_count = rela_data.len() / 24; // sizeof(Elf64_Rela) = 24
             let mut relas = Vec::with_capacity(rela_count);
@@ -310,16 +324,42 @@ fn parse_elf64_object_inner(
                     break;
                 }
                 let r_info = read_u64(rela_data, off + 8);
+                let r_offset = read_u64(rela_data, off);
+                // `r_offset` is used downstream to compute an index into the
+                // output image, so an input file controls where we write. Two
+                // failures were measured before this check existed, both with an
+                // exit status of 0:
+                //
+                //   r_offset = 2^64 - 16  the u64 sum wrapped, the unchecked
+                //                         writer no-oped, and the image kept the
+                //                         unrelocated instruction -- `lea` loaded
+                //                         the address of the next instruction
+                //                         instead of the symbol's;
+                //   r_offset = size       the write landed at the attacker's
+                //                         chosen offset, four bytes into whatever
+                //                         follows the section.
+                //
+                // GNU ld refuses both ("reloc against `tgt': error 4", i.e.
+                // bfd_reloc_outofrange). The stricter half of its rule -- the
+                // field must not extend past the end of the section either --
+                // needs the field width, which is architecture-specific, so that
+                // half lives in reloc_field::offset_in_section and is applied
+                // where the relocations are used.
+                if r_offset >= target_size {
+                    return Err(format!(
+                        "{source_name}: relocation {j} in {} has offset 0x{r_offset:x}, \
+                         outside the section it patches (size 0x{target_size:x})",
+                        sections[target_sec].name,
+                    ));
+                }
                 relas.push(Elf64Rela {
-                    offset: read_u64(rela_data, off),
+                    offset: r_offset,
                     sym_idx: (r_info >> 32) as u32,
                     rela_type: (r_info & 0xffffffff) as u32,
                     addend: read_i64(rela_data, off + 16),
                 });
             }
-            if target_sec < relocations.len() {
-                relocations[target_sec] = relas;
-            }
+            relocations[target_sec] = relas;
         }
     }
 

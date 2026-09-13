@@ -94,6 +94,19 @@ pub const R_X86_64_GOTOFF64: u32 = 25;
 pub const R_X86_64_GOTPC32: u32 = 26;
 pub const R_X86_64_SIZE32: u32 = 32;
 pub const R_X86_64_SIZE64: u32 = 33;
+// The 64-bit GOT family and RELATIVE64. Numbers verified against
+// /usr/include/elf.h (GOT64 27, GOTPCREL64 28, GOTPC64 29, GOTPLT64 30,
+// PLTOFF64 31, RELATIVE64 38) rather than recalled: a wrong constant here is
+// indistinguishable from a wrong relocation at link time. They are in the field
+// table so that `field()` answers truthfully for every x86-64 type the ABI
+// defines, and so a diagnostic can name a type this backend encounters in a
+// foreign object instead of printing "type 29".
+pub const R_X86_64_GOT64: u32 = 27;
+pub const R_X86_64_GOTPCREL64: u32 = 28;
+pub const R_X86_64_GOTPC64: u32 = 29;
+pub const R_X86_64_GOTPLT64: u32 = 30;
+pub const R_X86_64_PLTOFF64: u32 = 31;
+pub const R_X86_64_RELATIVE64: u32 = 38;
 
 // DT_* constants now in shared module - re-export them
 pub use crate::backend::elf::{

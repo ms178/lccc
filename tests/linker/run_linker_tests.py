@@ -4497,6 +4497,377 @@ def run_bin(path, args, td, env=None):
     except subprocess.TimeoutExpired:
         return None, "<timeout>"
 
+# field kind -> (assembly directive, symbol, in-range value, out-of-range value)
+_FIELD_CASES = [
+    ("R_X86_64_32", ".long", "far32", 0x1000, 0x1_0000_0000),
+    ("R_X86_64_32S", ".long", "far32s", 0x1000, 0x1_0000_0000),
+    ("R_X86_64_16", ".word", "far16", 0x1000, 0x1_0000),
+    ("R_X86_64_8", ".byte", "far8", 0x40, 0x100),
+]
+
+
+def _reloc_range_fixture(td, directive, sym, signed=False):
+    """Assemble one object whose single relocation is `directive sym`.
+
+    Returns the object path, or None if the toolchain refused (reported as SKIP
+    by the caller rather than as a failure: a missing assembler feature is not a
+    linker defect).
+    """
+    src = os.path.join(td, "f.s")
+    # `.long sym - .` is the PC-relative spelling; a plain `.long sym` is the
+    # absolute one. GAS picks R_X86_64_PC32 for the former and R_X86_64_32/32S
+    # for the latter depending on whether the section is writable.
+    with open(src, "w") as f:
+        f.write(
+            "        .section .data.rel.ro,\"aw\"\n"
+            "        .globl slot\n"
+            f"slot:   {directive} {sym}\n"
+            "        .text\n"
+            "        .globl probe\n"
+            "probe:  ret\n"
+        )
+    obj = os.path.join(td, "f.o")
+    r = sh([CC, "-c", src, "-o", obj], cwd=td)
+    if r.returncode != 0 or not os.path.exists(obj):
+        return None
+    return obj
+
+
+def _kinds_in(obj):
+    out = sh(["readelf", "-rW", obj]).stdout.decode()
+    return {m for m in re.findall(r"R_X86_64_\w+", out)}
+
+
+def _reloc_field_range_tests(args, oracles):
+    """Diagnose a relocation value that does not fit its field, on every path."""
+    results = []
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return [Result("reloc_field_range", "SKIP", "lccc-ld not built")]
+
+    # ── 1. the PC-relative case on all three emit paths ────────────────────
+    # One fixture, three link paths: plain (emit_exec), -T (emit_script) and
+    # -shared (emit_shared). Before the fix only the first two diagnosed.
+    td = tempfile.mkdtemp(prefix="lnk.reloc_pc32.")
+    try:
+        with open(os.path.join(td, "p.s"), "w") as f:
+            f.write(
+                "        .section .data.rel.ro,\"aw\"\n"
+                "        .globl slot\n"
+                "slot:   .long farpc - .\n"      # R_X86_64_PC32
+                "        .text\n"
+                "        .globl probe\n"
+                "probe:  ret\n"
+            )
+        if sh([CC, "-c", "p.s", "-o", "p.o"], cwd=td).returncode != 0:
+            results.append(Result("reloc_pc32_fixture", "SKIP", "assembler refused"))
+        elif "R_X86_64_PC32" not in _kinds_in(os.path.join(td, "p.o")):
+            results.append(Result("reloc_pc32_fixture", "SKIP",
+                                  "fixture did not produce R_X86_64_PC32"))
+        else:
+            with open(os.path.join(td, "t.ld"), "w") as f:
+                f.write("ENTRY(probe)\nSECTIONS {\n  . = 0x400000;\n"
+                        "  .text : { *(.text) }\n"
+                        "  .data.rel.ro : { *(.data.rel.ro) }\n}\n")
+            far = "0x7fff00000000"     # outside +/- 2 GiB of any image address
+            paths = [
+                ("exec", [lccc_ld, "--defsym", f"farpc={far}", "p.o",
+                          "-o", "o.exe", "--no-dynamic-linker"]),
+                ("script", [lccc_ld, "-T", "t.ld", "--defsym", f"farpc={far}",
+                            "p.o", "-o", "o.script", "--no-dynamic-linker"]),
+                ("shared", [lccc_ld, "-shared", "--defsym", f"farpc={far}",
+                            "p.o", "-o", "o.so"]),
+            ]
+            for label, cmd in paths:
+                name = f"reloc_pc32_out_of_range_diagnosed_on_{label}_path"
+                r = sh(cmd, cwd=td)
+                if r.returncode == 0:
+                    results.append(Result(
+                        name, "FAIL",
+                        f"{label} path accepted an out-of-range R_X86_64_PC32 and "
+                        f"emitted {cmd[cmd.index('-o') + 1]}: the value would be "
+                        f"silently truncated"))
+                    continue
+                err = r.stderr.decode()
+                if "R_X86_64_PC32" not in err or "truncated" not in err:
+                    results.append(Result(
+                        name, "FAIL",
+                        f"{label} path failed but did not name the type and the "
+                        f"truncation: {err[:200]!r}"))
+                    continue
+                # The oracle must refuse the same input, or this is lccc
+                # inventing a restriction rather than conforming.
+                agree = []
+                for oname, ocmd in oracles:
+                    if label == "script":
+                        o = sh(ocmd + ["-T", "t.ld", "--defsym", f"farpc={far}",
+                                       "p.o", "-o", f"o.{oname}", "-nostdlib",
+                                       "--no-dynamic-linker"], cwd=td)
+                    elif label == "shared":
+                        o = sh(ocmd + ["-shared", "--defsym", f"farpc={far}",
+                                       "p.o", "-o", f"o.{oname}.so"], cwd=td)
+                    else:
+                        o = sh(ocmd + ["--defsym", f"farpc={far}", "p.o",
+                                       "-o", f"o.{oname}", "-nostdlib",
+                                       "--no-dynamic-linker"], cwd=td)
+                    agree.append((oname, o.returncode != 0))
+                if agree and not all(ok for _, ok in agree):
+                    results.append(Result(
+                        name, "FAIL",
+                        f"oracles disagree with the refusal: {agree}"))
+                else:
+                    results.append(Result(name, "PASS"))
+    except Exception as e:
+        results.append(Result("reloc_pc32_out_of_range", "FAIL", f"harness: {e!r}"))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+    # ── 2. every absolute field width, both verdicts ───────────────────────
+    for kind, directive, sym, good, bad in _FIELD_CASES:
+        td = tempfile.mkdtemp(prefix=f"lnk.reloc_{sym}.")
+        try:
+            obj = _reloc_range_fixture(td, directive, sym)
+            if obj is None:
+                results.append(Result(f"reloc_{sym}_fixture", "SKIP",
+                                      "assembler refused the fixture"))
+                continue
+            kinds = _kinds_in(obj)
+            if not kinds:
+                results.append(Result(f"reloc_{sym}_fixture", "SKIP",
+                                      "fixture produced no relocation"))
+                continue
+            # out of range: must be diagnosed, and the oracle must agree
+            name = f"reloc_out_of_range_diagnosed_{sorted(kinds)[0].lower()}"
+            r = sh([lccc_ld, "--defsym", f"{sym}={bad:#x}", os.path.basename(obj),
+                    "-o", "bad.exe", "--no-dynamic-linker"], cwd=td)
+            if r.returncode == 0:
+                results.append(Result(
+                    name, "FAIL",
+                    f"{sorted(kinds)} value {bad:#x} was accepted and truncated"))
+            else:
+                err = r.stderr.decode()
+                if "truncated" not in err and "out of range" not in err:
+                    results.append(Result(name, "FAIL",
+                                          f"refused without a range diagnostic: "
+                                          f"{err[:200]!r}"))
+                else:
+                    o = sh([CC, "-fuse-ld=bfd", "--defsym", f"{sym}={bad:#x}",
+                            os.path.basename(obj), "-o", "bad.bfd",
+                            "-nostdlib", "--no-dynamic-linker"], cwd=td)
+                    if o.returncode == 0:
+                        results.append(Result(
+                            name, "FAIL",
+                            f"bfd accepted {sorted(kinds)}={bad:#x} but lccc "
+                            f"refused: lccc is stricter than the ecosystem"))
+                    else:
+                        results.append(Result(name, "PASS"))
+
+            # in range: must link, and the field must hold the value
+            name = f"reloc_in_range_accepted_{sorted(kinds)[0].lower()}"
+            r = sh([lccc_ld, "--defsym", f"{sym}={good:#x}", os.path.basename(obj),
+                    "-o", "good.exe", "--no-dynamic-linker"], cwd=td)
+            if r.returncode != 0:
+                results.append(Result(
+                    name, "FAIL",
+                    f"{sorted(kinds)}={good:#x} fits its field but was refused: "
+                    f"{r.stderr.decode()[:200]!r}"))
+            else:
+                dump = sh(["readelf", "-x", ".data.rel.ro", "good.exe"],
+                          cwd=td).stdout.decode()
+                want = "".join(f"{(good >> (8 * i)) & 0xff:02x}" for i in range(4))
+                width = {"R_X86_64_8": 1, "R_X86_64_16": 2}.get(sorted(kinds)[0], 4)
+                want = want[:width * 2]
+                if want not in dump.replace(" ", ""):
+                    results.append(Result(
+                        name, "FAIL",
+                        f"linked but the field does not hold {good:#x} "
+                        f"(expected {want} in .data.rel.ro)"))
+                else:
+                    results.append(Result(name, "PASS"))
+        except Exception as e:
+            results.append(Result(f"reloc_{sym}", "FAIL", f"harness: {e!r}"))
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    # ── 3. a 64-bit field must still accept values above 4 GiB ─────────────
+    # The regression risk of adding range checks is rejecting what the ABI
+    # allows. This runs the binary, so it also proves the value survived.
+    td = tempfile.mkdtemp(prefix="lnk.reloc_64.")
+    try:
+        with open(os.path.join(td, "w.s"), "w") as f:
+            f.write("        .section .data.rel.ro,\"aw\"\n"
+                    "        .globl slot64\n"
+                    "slot64: .quad far64\n")
+        with open(os.path.join(td, "m.c"), "w") as f:
+            f.write("#include <stdio.h>\n#include <stdint.h>\n"
+                    "extern uint64_t slot64;\n"
+                    "int main(void){ printf(\"%llx\\n\", "
+                    "(unsigned long long)slot64); return 0; }\n")
+        ok = (sh([CC, "-c", "w.s", "-o", "w.o"], cwd=td).returncode == 0
+              and sh([CC, "-c", "-O1", "m.c", "-o", "m.o"], cwd=td).returncode == 0)
+        if not ok:
+            results.append(Result("reloc_64_accepts_above_4g", "SKIP",
+                                  "assembler refused the fixture"))
+        else:
+            big = "0x100000000"        # 4 GiB: legal in a 64-bit field
+            r = sh([args.lccc, "--defsym", f"far64={big}", "m.o", "w.o",
+                    "-o", "w.bin", "-Wl,--no-dynamic-linker"] , cwd=td)
+            if r.returncode != 0:
+                # fall back to lccc-ld with the C runtime pieces it needs
+                r = sh([CC, "-fuse-ld=bfd", "-c", "m.c", "-o", "m2.o"], cwd=td)
+                results.append(Result(
+                    "reloc_64_accepts_above_4g", "SKIP",
+                    f"driver link unavailable: {r.stderr.decode()[:120]!r}"))
+            else:
+                code, out = run_bin(os.path.join(td, "w.bin"), [], td)
+                if (code, out.strip()) != (0, "4294967296"):
+                    results.append(Result(
+                        "reloc_64_accepts_above_4g", "FAIL",
+                        f"64-bit field lost its value: {(code, out)!r}"))
+                else:
+                    results.append(Result("reloc_64_accepts_above_4g", "PASS"))
+    except Exception as e:
+        results.append(Result("reloc_64_accepts_above_4g", "FAIL", f"harness: {e!r}"))
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+    return results
+
+def _elf64_sections(d):
+    """Section headers of a little-endian ELF64 image, with names resolved."""
+    shoff = int.from_bytes(d[0x28:0x30], "little")
+    shentsize = int.from_bytes(d[0x3A:0x3C], "little")
+    shnum = int.from_bytes(d[0x3C:0x3E], "little")
+    shstrndx = int.from_bytes(d[0x3E:0x40], "little")
+    secs = []
+    for i in range(shnum):
+        o = shoff + i * shentsize
+        secs.append(dict(
+            nameoff=int.from_bytes(d[o:o + 4], "little"),
+            off=int.from_bytes(d[o + 0x18:o + 0x20], "little"),
+            size=int.from_bytes(d[o + 0x20:o + 0x28], "little"),
+            entsize=int.from_bytes(d[o + 0x38:o + 0x40], "little")))
+    stro = secs[shstrndx]["off"]
+    for sec in secs:
+        end = d.index(b"\0", stro + sec["nameoff"])
+        sec["name"] = bytes(d[stro + sec["nameoff"]:end]).decode()
+    return secs
+
+
+def _reloc_offset_tests(args, oracles):
+    """r_offset comes from the input object, so it decides where we write.
+
+    Two failures were measured before this was validated, both with exit status 0:
+
+      * r_offset = 2^64 - 16 made the u64 sum wrap; the unchecked writer no-oped
+        and the image kept the unrelocated instruction -- `lea` loaded the address
+        of the next instruction instead of the symbol's;
+      * r_offset = section size wrote four bytes into whatever the layout had put
+        after that section.
+
+    GNU ld refuses both (bfd_reloc_outofrange, reported as "error 4"), and a sweep
+    of r_offset across the boundary established that its rule is not
+    `offset < size` but `offset + field width <= size`: with a 9-byte .text and a
+    4-byte field, 5 is accepted and 6 is refused. So this sweeps two field widths
+    and requires the accept boundary to move with the width -- a check that
+    ignored the width would pass one sweep and fail the other.
+    """
+    results = []
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return [Result("reloc_offset", "SKIP", "lccc-ld not built")]
+
+    src = textwrap.dedent("""
+        \t.text
+        \t.globl _start
+        _start:
+        \tleaq\ttgt(%rip), %rax
+        \tret
+        \t.globl tgt
+        tgt:
+        \tret
+        \t.section .data.rel.ro,"aw"
+        \t.quad\ttgt
+    """).lstrip()
+
+    for sec, width in ((".text", 4), (".data.rel.ro", 8)):
+        name = f"reloc_offset_{sec.strip('.')}_w{width}"
+        td = tempfile.mkdtemp()
+        try:
+            spath = os.path.join(td, "f.s")
+            with open(spath, "w") as f:
+                f.write(src)
+            opath = os.path.join(td, "f.o")
+            r = sh([CC, "-c", spath, "-o", opath], cwd=td)
+            if r.returncode != 0:
+                results.append(Result(name, "SKIP", f"assembler: {r.stderr.decode()[:100]!r}"))
+                continue
+            base = bytearray(open(opath, "rb").read())
+            secs = _elf64_sections(base)
+            rela = next(s for s in secs if s["name"] == ".rela" + sec)
+            target = next(s for s in secs if s["name"] == sec)
+            size = target["size"]
+
+            diverge = []
+            last_accept = None
+            for off in range(0, size + 4):
+                v = bytearray(base)
+                v[rela["off"]:rela["off"] + 8] = off.to_bytes(8, "little")
+                obj = os.path.join(td, f"s{off}.o")
+                open(obj, "wb").write(bytes(v))
+                g = sh(["ld", obj, "-o", os.path.join(td, "g.elf"), "-nostdlib"], cwd=td)
+                l = sh([lccc_ld, "-nostdlib", obj, "-o", os.path.join(td, "l.elf")], cwd=td)
+                gv, lv = g.returncode == 0, l.returncode == 0
+                if gv != lv:
+                    diverge.append((off, "ld accepts/lccc refuses" if gv else
+                                    "ld refuses/lccc ACCEPTS",
+                                    l.stderr.decode()[:110]))
+                if gv:
+                    last_accept = off
+
+            # The boundary itself is the assertion: the highest offset GNU ld
+            # accepts must be exactly size - width, which is where a
+            # width-unaware check would go wrong.
+            want = size - width
+            if diverge:
+                results.append(Result(name, "FAIL",
+                    f"{len(diverge)} divergence(s) vs GNU ld over offsets 0..{size+3}: "
+                    + "; ".join(f"0x{o:x} {why} ({msg!r})" for o, why, msg in diverge[:3])))
+            elif last_accept != want:
+                results.append(Result(name, "FAIL",
+                    f"GNU ld's last accepted offset was 0x{last_accept:x}, expected "
+                    f"0x{want:x} (size 0x{size:x} - width {width})"))
+            else:
+                results.append(Result(name, "PASS",
+                    f"{size+4} offsets swept, boundary 0x{want:x} matches GNU ld"))
+
+            # The value that wrapped: not merely refused, but refused for the
+            # offset reason rather than something incidental.
+            v = bytearray(base)
+            v[rela["off"]:rela["off"] + 8] = (2**64 - 16).to_bytes(8, "little")
+            obj = os.path.join(td, "wrap.o")
+            open(obj, "wb").write(bytes(v))
+            g = sh(["ld", obj, "-o", os.path.join(td, "g2.elf"), "-nostdlib"], cwd=td)
+            l = sh([lccc_ld, "-nostdlib", obj, "-o", os.path.join(td, "l2.elf")], cwd=td)
+            wname = f"reloc_offset_wrap_{sec.strip('.')}"
+            if g.returncode == 0:
+                results.append(Result(wname, "SKIP", "GNU ld accepted a wrapping r_offset"))
+            elif l.returncode == 0:
+                results.append(Result(wname, "FAIL",
+                    "lccc linked an object whose r_offset wraps the u64 sum; the image "
+                    "is missing a patch or patched at the wrong place"))
+            elif "offset" not in l.stderr.decode() and "outside" not in l.stderr.decode():
+                results.append(Result(wname, "FAIL",
+                    f"refused, but not for an offset reason: {l.stderr.decode()[:120]!r}"))
+            else:
+                results.append(Result(wname, "PASS"))
+        except Exception as e:
+            results.append(Result(name, "FAIL", f"harness: {e!r}"))
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lccc", default=DEFAULT_LCCC)
@@ -4625,6 +4996,11 @@ def main():
     if not args.tag or args.tag == "robustness":
         if not args.filter or "malformed" in args.filter or "robust" in args.filter:
             results.extend(_robustness_tests(args, oracles))
+
+    if not args.tag or args.tag == "reloc":
+        if not args.filter or "reloc" in args.filter:
+            results.extend(_reloc_field_range_tests(args, oracles))
+            results.extend(_reloc_offset_tests(args, oracles))
 
     npass = sum(1 for r in results if r.status == "PASS")
     nfail = sum(1 for r in results if r.status == "FAIL")

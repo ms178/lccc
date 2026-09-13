@@ -189,6 +189,12 @@ fn is_benign_ignorable(a: &str) -> bool {
         | "--no-fatal-warnings"
         | "--disable-linker-version"
         | "--no-relax"
+        // Driver-level flags that reach a standalone linker when a build system
+        // hands the same list to both. A linker never adds default libraries on
+        // its own -- that is the driver's job -- so -nostdlib has no effect here,
+        // and warning about it on every kernel-style link is noise that hides the
+        // warnings that matter.
+        | "-nostdlib" | "-nostartfiles" | "-nodefaultlibs"
         | "-O0" | "-O1" | "-O2" | "-O3" // ld's own -O is a size/speed hint
     ) || a.starts_with("--build-id=")
         || a.starts_with("-plugin-opt=")
@@ -215,6 +221,9 @@ fn run(args: &[String]) -> Result<(), String> {
     // Arguments forwarded verbatim into the builtin userspace pipeline
     // (parse_linker_args understands the GNU spellings directly).
     let mut passthrough: Vec<String> = Vec::new();
+    // --defsym definitions, kept separately from `passthrough` because the
+    // script-driven link never re-parses passthrough arguments.
+    let mut defsyms: Vec<(String, String)> = Vec::new();
     // `-u SYM` / `--undefined=SYM`: force-undefined names that pull archive
     // members. Script links (`-T`) never consult `passthrough`, so these must
     // be collected separately and handed to `load_inputs_x86`.
@@ -423,6 +432,27 @@ fn run(args: &[String]) -> Result<(), String> {
                     passthrough.push(format!("-Wl,--wrap={}", rest));
                 } else if let Some(rest) = a.strip_prefix("--defsym=") {
                     passthrough.push(format!("-Wl,--defsym={}", rest));
+                    let (name, expr) = rest
+                        .split_once('=')
+                        .ok_or_else(|| format!("--defsym needs SYMBOL=EXPRESSION, got '{rest}'"))?;
+                    defsyms.push((name.to_string(), expr.to_string()));
+                } else if a == "--defsym" {
+                    // Two-argument form, `--defsym SYMBOL=EXPRESSION`, which GNU ld
+                    // accepts alongside `--defsym=`. Without this branch the option
+                    // fell through to the unknown-option warning and the expression
+                    // was then consumed as an input filename, so `--defsym
+                    // far=0x1000` reported "failed to read 'far=0x1000'" -- naming
+                    // the value as though the user had asked to link a file by that
+                    // name, with the real problem (an unrecognised option) already
+                    // scrolled past as a warning.
+                    i += 1;
+                    let def = args.get(i).cloned().unwrap_or_default();
+                    if !def.contains('=') {
+                        return Err(format!("--defsym needs SYMBOL=EXPRESSION, got '{def}'"));
+                    }
+                    passthrough.push(format!("-Wl,--defsym={def}"));
+                    let (name, expr) = def.split_once('=').unwrap();
+                    defsyms.push((name.to_string(), expr.to_string()));
                 } else if let Some(rest) = a.strip_prefix("-u") {
                     let sym = if rest.is_empty() {
                         i += 1;
@@ -595,6 +625,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 soname.as_deref(),
                 bsymbolic,
                 max_page_size,
+                &defsyms,
             );
         }
         return lccc::linker_entry::link_with_script_x86(
@@ -608,6 +639,7 @@ fn run(args: &[String]) -> Result<(), String> {
             soname.as_deref(),
             bsymbolic,
             max_page_size,
+            &defsyms,
         );
     }
 

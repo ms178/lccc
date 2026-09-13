@@ -100,6 +100,7 @@ pub fn link_with_script_x86(
     soname: Option<&str>,
     bsymbolic: bool,
     max_page_size: u64,
+    defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
     crate::backend::x86::linker::emit_script::link_with_script(
         objects,
@@ -112,6 +113,7 @@ pub fn link_with_script_x86(
         soname,
         bsymbolic,
         max_page_size,
+        defsym_defs,
     )
 }
 
@@ -127,6 +129,7 @@ pub fn link_with_script_i386(
     soname: Option<&str>,
     bsymbolic: bool,
     max_page_size: u64,
+    defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
     crate::backend::x86::linker::emit_script::link_with_script_i386(
         objects,
@@ -139,6 +142,7 @@ pub fn link_with_script_i386(
         soname,
         bsymbolic,
         max_page_size,
+        defsym_defs,
     )
 }
 

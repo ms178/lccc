@@ -12,11 +12,20 @@ use crate::common::fx_hash::FxHashMap;
 const R_AARCH64_TLSLE_ADD_TPREL_HI12: u32 = 549;
 const R_AARCH64_TLSLE_ADD_TPREL_LO12: u32 = 550;
 const R_AARCH64_TLSLE_ADD_TPREL_LO12_NC: u32 = 551;
-const R_AARCH64_TLSLE_MOVW_TPREL_G0: u32 = 544;
-const R_AARCH64_TLSLE_MOVW_TPREL_G0_NC: u32 = 545;
-const R_AARCH64_TLSLE_MOVW_TPREL_G1: u32 = 546;
-const R_AARCH64_TLSLE_MOVW_TPREL_G1_NC: u32 = 547;
-const R_AARCH64_TLSLE_MOVW_TPREL_G2: u32 = 548;
+// Numbers from <elf.h>, which assigns this family in order of DESCENDING
+// significance (G2 first). They were defined here in ascending name order, which
+// rotates all five: a real R_AARCH64_TLSLE_MOVW_TPREL_G0 (547) matched the arm
+// for G1_NC and was encoded with `tp >> 16` instead of `tp & 0xffff`, and a real
+// G0_NC (548) matched the G2 arm and got `tp >> 32`. Four of the five types were
+// therefore mis-encoded -- only G1 was unaffected, and only because the arm it
+// landed in happens to use the same shift. The `_NC` suffix made it silent: the
+// ABI exempts those forms from range checking, so nothing complained about a
+// wrong TLS offset.
+const R_AARCH64_TLSLE_MOVW_TPREL_G2: u32 = 544;
+const R_AARCH64_TLSLE_MOVW_TPREL_G1: u32 = 545;
+const R_AARCH64_TLSLE_MOVW_TPREL_G1_NC: u32 = 546;
+const R_AARCH64_TLSLE_MOVW_TPREL_G0: u32 = 547;
+const R_AARCH64_TLSLE_MOVW_TPREL_G0_NC: u32 = 548;
 
 // TLS descriptor / Initial exec (convert to LE for static linking)
 const R_AARCH64_TLSDESC_ADR_PAGE21: u32 = 562;
@@ -210,6 +219,19 @@ pub fn apply_relocations(
 /// Compute TP offset for AArch64. On AArch64, the TLS block starts at TP + 16
 /// (TP points to the DTV, TLS block is right after).
 /// For Local Exec: tp_offset = sym_addr - tls_start_addr + 16
+/// Whether `LINKER_DEBUG_TLS` is set, read once.
+///
+/// This was `std::env::var("LINKER_DEBUG_TLS").is_ok()` inline in the relocation
+/// arms, i.e. a lock, a scan of the environment block and a `String` allocation
+/// for *every TLS relocation in the link* -- paid whether or not anybody is
+/// debugging, on the path that runs millions of times for a kernel-sized link.
+/// The variable cannot change during a link, so `OnceLock` turns it into one
+/// atomic load after the first call.
+pub(super) fn tls_debug() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LINKER_DEBUG_TLS").is_ok())
+}
+
 fn tprel(s: u64, a: i64, tls_info: &TlsInfo) -> i64 {
     // AArch64 uses variant 1 TLS: TP points to start of TCB (16 bytes),
     // followed by TLS block. So offset from TP = (S+A - tls_base) + 16
@@ -416,7 +438,7 @@ pub fn apply_one_reloc(
         // On AArch64 variant 1, tp offset = sym_offset_in_tls + 16 (TCB size)
         R_AARCH64_TLSLE_ADD_TPREL_HI12 => {
             let tp = tprel(s, a, tls_info);
-            if std::env::var("LINKER_DEBUG_TLS").is_ok() {
+            if tls_debug() {
                 eprintln!(
                     "  TLSLE_HI12: sym='{}' s=0x{:x} a={} tls_addr=0x{:x} tls_size=0x{:x} -> tp=0x{:x}",
                     sym_name, s, a, tls_info.tls_addr, tls_info.tls_size, tp as u64
@@ -427,7 +449,7 @@ pub fn apply_one_reloc(
         }
         R_AARCH64_TLSLE_ADD_TPREL_LO12 | R_AARCH64_TLSLE_ADD_TPREL_LO12_NC => {
             let tp = tprel(s, a, tls_info);
-            if std::env::var("LINKER_DEBUG_TLS").is_ok() {
+            if tls_debug() {
                 eprintln!(
                     "  TLSLE_LO12: sym='{}' s=0x{:x} a={} tls_addr=0x{:x} -> tp=0x{:x}",
                     sym_name, s, a, tls_info.tls_addr, tp as u64
@@ -616,4 +638,92 @@ pub(super) fn encode_movw(out: &mut [u8], fp: usize, imm16: u32) {
     let mut insn = read_u32(out, fp);
     insn = (insn & 0xffe0001f) | ((imm16 & 0xffff) << 5);
     w32(out, fp, insn);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Apply one relocation to a `MOVZ x0, #imm` and return the immediate that
+    /// landed in bits 20:5.
+    ///
+    /// `tls_addr == 0` makes [`tprel`] return `s + a` unchanged, so the test
+    /// controls the TP offset exactly by passing it as `s`.
+    fn movw_imm(rtype: u32, tp: u64) -> u32 {
+        let mut out = 0xd280_0000u32.to_le_bytes().to_vec();
+        let tls = TlsInfo {
+            tls_addr: 0,
+            tls_size: 0,
+        };
+        let got = GotInfo {
+            got_addr: 0,
+            entries: FxHashMap::default(),
+        };
+        apply_one_reloc(
+            &mut out, 0, rtype, tp, 0, 0, "tlsvar", "t.o", &tls, &got, "",
+        )
+        .expect("a TLS local-exec MOVW relocation must apply");
+        let insn = u32::from_le_bytes(out[..4].try_into().unwrap());
+        (insn >> 5) & 0xffff
+    }
+
+    #[test]
+    fn tls_movw_tprel_numbers_are_the_elf_h_numbers() {
+        // <elf.h> assigns this family in order of descending significance, which
+        // is the opposite of what reading the names suggests. Pinning the numbers
+        // is the regression test for the rotation this file had: G0 was 544 and
+        // G2 was 548, so four of the five types were encoded with the wrong
+        // shift and the `_NC` forms suppressed the only diagnostic that could
+        // have caught it.
+        assert_eq!(R_AARCH64_TLSLE_MOVW_TPREL_G2, 544);
+        assert_eq!(R_AARCH64_TLSLE_MOVW_TPREL_G1, 545);
+        assert_eq!(R_AARCH64_TLSLE_MOVW_TPREL_G1_NC, 546);
+        assert_eq!(R_AARCH64_TLSLE_MOVW_TPREL_G0, 547);
+        assert_eq!(R_AARCH64_TLSLE_MOVW_TPREL_G0_NC, 548);
+        // The invariant behind the numbers, stated so a future edit cannot
+        // restore the rotation while keeping the test passing by renumbering:
+        // significance descends as the number ascends.
+        assert!(
+            R_AARCH64_TLSLE_MOVW_TPREL_G2 < R_AARCH64_TLSLE_MOVW_TPREL_G1
+                && R_AARCH64_TLSLE_MOVW_TPREL_G1 < R_AARCH64_TLSLE_MOVW_TPREL_G0
+        );
+        // A `_NC` form is the checked one plus 1, never minus 1.
+        assert_eq!(
+            R_AARCH64_TLSLE_MOVW_TPREL_G0_NC,
+            R_AARCH64_TLSLE_MOVW_TPREL_G0 + 1
+        );
+        assert_eq!(
+            R_AARCH64_TLSLE_MOVW_TPREL_G1_NC,
+            R_AARCH64_TLSLE_MOVW_TPREL_G1 + 1
+        );
+    }
+
+    #[test]
+    fn each_tls_movw_type_selects_its_own_16_bit_slice() {
+        // A different pattern in every slice, so a wrong shift is visible rather
+        // than merely plausible.
+        let tp: u64 = 0x0006_0005_0004_1234;
+        assert_eq!(movw_imm(R_AARCH64_TLSLE_MOVW_TPREL_G0, tp), 0x1234);
+        assert_eq!(movw_imm(R_AARCH64_TLSLE_MOVW_TPREL_G0_NC, tp), 0x1234);
+        assert_eq!(movw_imm(R_AARCH64_TLSLE_MOVW_TPREL_G1, tp), 0x0004);
+        assert_eq!(movw_imm(R_AARCH64_TLSLE_MOVW_TPREL_G1_NC, tp), 0x0004);
+        assert_eq!(movw_imm(R_AARCH64_TLSLE_MOVW_TPREL_G2, tp), 0x0005);
+    }
+
+    #[test]
+    fn the_rotation_this_replaced_is_excluded_by_number_not_by_name() {
+        // 547 is G0. Under the old numbering 547 named G1_NC, whose arm applies
+        // `tp >> 16` -- so this assertion fails if the numbers are ever rotated
+        // back, even though the arm bodies (which are keyed by name) never move.
+        let tp: u64 = 0x0000_0000_0007_0009;
+        assert_eq!(movw_imm(547, tp), 0x0009, "547 must take bits 15:0");
+        assert_ne!(
+            movw_imm(547, tp),
+            0x0007,
+            "547 must not take bits 31:16, which is what the rotation produced"
+        );
+        // And the other end of the family: 544 is G2, not G0.
+        let hi: u64 = 0x0000_00ab_0000_0000;
+        assert_eq!(movw_imm(544, hi), 0x00ab, "544 must take bits 47:32");
+    }
 }

@@ -10,10 +10,12 @@
 //! static ET_EXEC image with no dynamic sections; relocation types are the
 //! static x86-64 set (PC32/PLT32/32/32S/64 and TLS LE forms).
 
-use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
+use crate::backend::elf::{STT_NOTYPE, elf64_sym_entry, push_strtab_name};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::elf::*;
+use super::reloc_field::{self, w8_checked, w16_checked, w32_checked};
+use crate::backend::linker_common::defsym::{self, Defsym};
 use crate::backend::linker_common::{
     self,
     linker_script::{
@@ -773,6 +775,78 @@ struct OutSec {
     data_commands: Vec<(u64, u8, linker_script::Expr)>,
 }
 
+/// Apply `--defsym` to the script path's definition table.
+///
+/// The table maps a name to `(object index, shndx, value, size, info)`, and
+/// `lookup_sym` already returns `value` verbatim when `shndx == SHN_ABS` -- so an
+/// absolute definition is `(usize::MAX, SHN_ABS, value, 0, GLOBAL|NOTYPE)`, with
+/// the object index never read. `usize::MAX` rather than 0 keeps that visible: a
+/// stray 0 would name the first input object if the SHN_ABS test were reordered.
+///
+/// Classification comes from `linker_common::defsym`, the same module the
+/// executable and shared paths use, so all three agree on what a right-hand side
+/// means and a typo is reported identically everywhere.
+///
+/// Expressions are the one form this path cannot always honour: a name defined
+/// inside an output section has no address until layout, and this runs before it.
+/// Rather than guess, that case says so and names the alternative that works.
+fn apply_script_defsyms(
+    def_syms: &mut FxHashMap<String, (usize, u16, u64, u64, u8)>,
+    defs: &[(String, String)],
+) -> Result<(), String> {
+    for (name, expr) in defs {
+        let shown = format!("--defsym {name}={expr}");
+        let classified = defsym::classify(expr, |n| {
+            def_syms
+                .get(n)
+                .is_some_and(|&(_, shndx, _, _, _)| shndx != SHN_UNDEF)
+        })
+        .map_err(|e| format!("{shown}: {}", e.message()))?;
+        let value = match classified {
+            Defsym::Alias(target) => {
+                let target_def = *def_syms.get(&target).ok_or_else(|| {
+                    format!("{shown}: target symbol '{target}' is not defined in this link")
+                })?;
+                def_syms.insert(name.clone(), target_def);
+                continue;
+            }
+            Defsym::Constant(v) => v,
+            Defsym::Expression(e) => {
+                let absolute_only = |n: &str| {
+                    def_syms
+                        .get(n)
+                        .and_then(|&(_, shndx, value, _, _)| (shndx == SHN_ABS).then_some(value))
+                };
+                match defsym::eval_with_symbols(&e, &absolute_only) {
+                    Ok(v) => v,
+                    // The name exists but lives in a section that is not placed
+                    // yet. That is neither an undefined symbol nor a syntax
+                    // error, and claiming either would send the user after the
+                    // wrong thing.
+                    Err(defsym::DefsymError::UndefinedSymbol(n)) if def_syms.contains_key(&n) => {
+                        return Err(format!(
+                            "{shown}: {}",
+                            defsym::DefsymError::NeedsLayout(e).message()
+                        ));
+                    }
+                    Err(err) => return Err(format!("{shown}: {}", err.message())),
+                }
+            }
+        };
+        def_syms.insert(
+            name.clone(),
+            (
+                usize::MAX,
+                SHN_ABS,
+                value,
+                0,
+                (STB_GLOBAL << 4) | STT_NOTYPE,
+            ),
+        );
+    }
+    Ok(())
+}
+
 pub fn link_with_script(
     objects: &[Object],
     script_src: &str,
@@ -784,6 +858,7 @@ pub fn link_with_script(
     soname: Option<&str>,
     bsymbolic: bool,
     max_page_size: u64,
+    defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
     link_with_script_machine(
         objects,
@@ -796,6 +871,7 @@ pub fn link_with_script(
         soname,
         bsymbolic,
         max_page_size,
+        defsym_defs,
         ScriptMachine::X86_64,
     )
 }
@@ -814,6 +890,7 @@ pub fn link_with_script_i386(
     soname: Option<&str>,
     bsymbolic: bool,
     max_page_size: u64,
+    defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
     link_with_script_machine(
         objects,
@@ -826,6 +903,7 @@ pub fn link_with_script_i386(
         soname,
         bsymbolic,
         max_page_size,
+        defsym_defs,
         ScriptMachine::I386,
     )
 }
@@ -844,6 +922,7 @@ fn link_with_script_machine(
     soname: Option<&str>,
     bsymbolic: bool,
     max_page_size: u64,
+    defsym_defs: &[(String, String)],
     machine: ScriptMachine,
 ) -> Result<(), String> {
     let script: LinkerScript = linker_script::parse_linker_script(script_src)?;
@@ -912,6 +991,14 @@ fn link_with_script_machine(
             }
         }
     }
+
+    // ── --defsym SYMBOL=EXPRESSION ──
+    // Applied once the object-derived table is complete, so an alias can copy a
+    // real definition and an expression can read one. The script path used to
+    // ignore --defsym entirely: the name never entered def_syms, and the link
+    // failed later with "undefined symbols: <name>", blaming the reference for a
+    // definition the user had given on the command line.
+    apply_script_defsyms(&mut def_syms, defsym_defs)?;
 
     // Symbols the *inputs* declared STV_HIDDEN/STV_INTERNAL. Visibility is an
     // ABI property decided by the compiler; the linker must honour it before
@@ -2221,16 +2308,40 @@ fn link_with_script_machine(
     // A 32-bit displacement that does not fit is the classic way a large image
     // gets silently corrupted: the truncated value points somewhere plausible
     // and the failure surfaces much later as a wild jump. Diagnose instead.
+    /// The one shape every range diagnostic in this linker uses.
+    ///
+    /// It follows GNU ld ("relocation truncated to fit: R_X86_64_PC32 against
+    /// symbol `farpc'") and keeps the one piece of advice that actually helps
+    /// here. The executable and shared paths already said "truncated to fit"; a
+    /// third phrasing for the same failure means a user who learned to grep one
+    /// cannot find the other, and a tool that reports the same class of error
+    /// three different ways is three ways to be misread.
     fn reloc_range_err(kind: &str, v: i64, sym: &str, src: &str) -> String {
         format!(
-            "script link: {} against '{}' in {} does not fit: value {:#x} \
-                 is out of range (image too large or wrong load address?)",
-            kind, sym, src, v
+            "script link: relocation truncated to fit: {kind} against symbol '{sym}' \
+                 in {src}: value {v:#x} does not fit its field \
+                 (image too large or wrong load address?)"
         )
     }
-    fn check_pcrel32(v: i64, sym: &str, src: &str) -> Result<(), String> {
+
+    /// Range-check a 32-bit PC-relative displacement.
+    ///
+    /// The type name in the diagnostic comes from the table that defines the type
+    /// -- `reloc_field::name` for ELF64, `i386_field` for ELF32 -- rather than
+    /// from a literal here. This checker serves both machines, so a hardcoded
+    /// "R_X86_64_PC32" would name the wrong ABI on the i386 path, and a
+    /// diagnostic that points at the wrong relocation table sends the user after
+    /// a fix that cannot work. Deriving it makes the name unforgeable: it is the
+    /// same source the encoder itself consults.
+    fn check_pcrel32(v: i64, sym: &str, src: &str, rtype: u32, elf64: bool) -> Result<(), String> {
         if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
-            return Err(reloc_range_err("32-bit PC-relative reference", v, sym, src));
+            let kind = if elf64 {
+                reloc_field::name(rtype)
+            } else {
+                i386_field(rtype).map(|(n, _)| n)
+            }
+            .unwrap_or("32-bit PC-relative relocation");
+            return Err(reloc_range_err(kind, v, sym, src));
         }
         Ok(())
     }
@@ -2261,6 +2372,12 @@ fn link_with_script_machine(
             }
             let sec_foff = os.file_offset + (sec_vaddr - os.vaddr);
 
+            // Loop-invariant parts of the offset check below, hoisted out of the
+            // per-relocation loop.
+            let in_sec = &obj.sections[si];
+            let (sec_size, sec_name) = (in_sec.size, in_sec.name.as_str());
+            let obj_name = obj.source_name.as_str();
+
             for rela in relas {
                 let sidx = rela.sym_idx as usize;
                 if sidx >= obj.symbols.len() {
@@ -2276,6 +2393,42 @@ fn link_with_script_machine(
                 let p = sec_vaddr + rela.offset;
                 let fp = (sec_foff + rela.offset) as usize;
                 let a = rela.addend;
+                // GNU ld refuses a relocation whose field crosses the end of the
+                // section it patches (bfd_reloc_outofrange, reported as "error
+                // 4"). The parser already rejects an offset outside the section
+                // altogether; this is the width-aware half of the same rule, and
+                // it lives here because the field width is arch-specific while the
+                // parser is shared by four backends.
+                // The table is chosen by ELF class, not by backend: this function
+                // links both, and relocation type numbers mean different things in
+                // the two ABIs. Type 1 is R_X86_64_64 (an 8-byte field) and
+                // R_386_32 (a 4-byte field), so consulting the x86-64 table for an
+                // i386 object refuses valid links -- it reported a 4-byte section
+                // as too small for its own 4-byte relocation, because it thought
+                // the relocation was 8 bytes wide.
+                let (rtype_name, rwidth) = if machine == ScriptMachine::X86_64 {
+                    (
+                        reloc_field::name(rela.rela_type),
+                        reloc_field::patch_width(rela.rela_type),
+                    )
+                } else {
+                    match i386_field(rela.rela_type) {
+                        Some((n, w)) => (Some(n), w),
+                        // A type this file has no arm for is rejected by the
+                        // application match below with its own diagnostic, so
+                        // there is no field width to check here.
+                        None => (None, 0),
+                    }
+                };
+                reloc_field::offset_in_section(
+                    rela.rela_type,
+                    rtype_name,
+                    rela.offset,
+                    rwidth,
+                    sec_size,
+                    sec_name,
+                    obj_name,
+                )?;
                 let s = match resolve(oi, sym) {
                     Some(v) => v,
                     // DWARF commonly retains references to compiler metadata
@@ -2336,7 +2489,13 @@ fn link_with_script_machine(
                             w32(&mut out, fp, absolute as u32);
                         }
                         R_386_PC32 | R_386_PLT32 => {
-                            check_pcrel32(relative, &sym.name, &obj.source_name)?;
+                            check_pcrel32(
+                                relative,
+                                &sym.name,
+                                &obj.source_name,
+                                rela.rela_type,
+                                machine == ScriptMachine::X86_64,
+                            )?;
                             w32(&mut out, fp, relative as u32);
                         }
                         R_386_GOTPC => {
@@ -2345,7 +2504,13 @@ fn link_with_script_machine(
                                 .copied()
                                 .ok_or("R_386_GOTPC requires _GLOBAL_OFFSET_TABLE_")?;
                             let value = got as i64 + a - p as i64;
-                            check_pcrel32(value, &sym.name, &obj.source_name)?;
+                            check_pcrel32(
+                                value,
+                                &sym.name,
+                                &obj.source_name,
+                                rela.rela_type,
+                                machine == ScriptMachine::X86_64,
+                            )?;
                             w32(&mut out, fp, value as u32);
                         }
                         R_386_GOTOFF => {
@@ -2414,7 +2579,13 @@ fn link_with_script_machine(
                         // A -T link resolves every call directly; there is no
                         // PLT, so PLT32 degenerates to PC32.
                         let v = s as i64 + a - p as i64;
-                        check_pcrel32(v, &sym.name, &obj.source_name)?;
+                        check_pcrel32(
+                            v,
+                            &sym.name,
+                            &obj.source_name,
+                            rela.rela_type,
+                            machine == ScriptMachine::X86_64,
+                        )?;
                         w32(&mut out, fp, v as u32)
                     }
                     R_X86_64_32 => {
@@ -2441,22 +2612,57 @@ fn link_with_script_machine(
                         }
                         w32(&mut out, fp, v as u32)
                     }
-                    R_X86_64_16 => w16(&mut out, fp, (s as i64 + a) as u16),
-                    R_X86_64_PC16 => w16(&mut out, fp, (s as i64 + a - p as i64) as u16),
-                    R_X86_64_8 => {
-                        if fp < out.len() {
-                            out[fp] = (s as i64 + a) as u8;
-                        }
-                    }
-                    R_X86_64_PC8 => {
-                        if fp < out.len() {
-                            out[fp] = (s as i64 + a - p as i64) as u8;
-                        }
-                    }
+                    R_X86_64_16 => w16_checked(
+                        &mut out,
+                        fp,
+                        s as i64 + a,
+                        rela.rela_type,
+                        &sym.name,
+                        &obj.source_name,
+                    )?,
+                    R_X86_64_PC16 => w16_checked(
+                        &mut out,
+                        fp,
+                        s as i64 + a - p as i64,
+                        rela.rela_type,
+                        &sym.name,
+                        &obj.source_name,
+                    )?,
+                    // No `if fp < out.len()` guard: w8_checked already refuses an
+                    // offset outside the buffer, and a guard around it turns that
+                    // refusal into a silent success -- the link would report an
+                    // object it never patched.
+                    R_X86_64_8 => w8_checked(
+                        &mut out,
+                        fp,
+                        s as i64 + a,
+                        rela.rela_type,
+                        &sym.name,
+                        &obj.source_name,
+                    )?,
+                    // No `if fp < out.len()` guard: w8_checked already refuses an
+                    // offset outside the buffer, and a guard around it turns that
+                    // refusal into a silent success -- the link would report an
+                    // object it never patched.
+                    R_X86_64_PC8 => w8_checked(
+                        &mut out,
+                        fp,
+                        s as i64 + a - p as i64,
+                        rela.rela_type,
+                        &sym.name,
+                        &obj.source_name,
+                    )?,
                     R_X86_64_PC64 => w64(&mut out, fp, (s as i64 + a - p as i64) as u64),
                     // Symbol size, not address: used by some hand-written asm
                     // and by __builtin_object_size lowering.
-                    R_X86_64_SIZE32 => w32(&mut out, fp, (sym.size as i64 + a) as u32),
+                    R_X86_64_SIZE32 => w32_checked(
+                        &mut out,
+                        fp,
+                        sym.size as i64 + a,
+                        rela.rela_type,
+                        &sym.name,
+                        &obj.source_name,
+                    )?,
                     R_X86_64_SIZE64 => w64(&mut out, fp, (sym.size as i64 + a) as u64),
 
                     // ── GOT-relative forms ──
@@ -2499,7 +2705,14 @@ fn link_with_script_machine(
                     // sequences stay self-consistent.
                     R_X86_64_GOTPC32 => {
                         let got_base = symbols.get("_GLOBAL_OFFSET_TABLE_").copied().unwrap_or(p);
-                        w32(&mut out, fp, (got_base as i64 + a - p as i64) as u32)
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            got_base as i64 + a - p as i64,
+                            rela.rela_type,
+                            &sym.name,
+                            &obj.source_name,
+                        )?
                     }
                     R_X86_64_GOTOFF64 => {
                         let got_base = symbols.get("_GLOBAL_OFFSET_TABLE_").copied().unwrap_or(0);
@@ -2601,7 +2814,14 @@ fn link_with_script_machine(
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
                             out[fp - 2] = 0xc7;
                             out[fp - 1] = 0xc0;
-                            w32(&mut out, fp, tpoff as u32);
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                tpoff,
+                                rela.rela_type,
+                                &sym.name,
+                                &obj.source_name,
+                            )?;
                         } else {
                             return Err(format!(
                                 "script link: TLSDESC relaxation failed for '{}' in {}: \
@@ -2628,7 +2848,14 @@ fn link_with_script_machine(
                             let reg = (modrm >> 3) & 7;
                             out[fp - 2] = 0xc7;
                             out[fp - 1] = 0xc0 | reg;
-                            w32(&mut out, fp, tpoff as u32);
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                tpoff,
+                                rela.rela_type,
+                                &sym.name,
+                                &obj.source_name,
+                            )?;
                         } else {
                             return Err(format!(
                                 "script link: GOTTPOFF relaxation failed for '{}' in {}: \
@@ -2672,7 +2899,14 @@ fn link_with_script_machine(
                     // the wrong side of the thread pointer.
                     R_X86_64_DTPOFF32 => {
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                        w32(&mut out, fp, (tpoff + a) as u32)
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            tpoff + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &obj.source_name,
+                        )?
                     }
                     R_X86_64_DTPOFF64 => {
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
@@ -3235,7 +3469,7 @@ fn link_with_script_machine(
                 name,
                 v,
                 0,
-                (STB_GLOBAL << 4) | STT_NOTYPE_,
+                (STB_GLOBAL << 4) | STT_NOTYPE,
                 vis,
                 sx,
                 &mut symtab,
@@ -3768,12 +4002,42 @@ const SHF_EXECINSTR_: u64 = 0x4;
 const SHF_MERGE_: u64 = 0x10;
 const SHF_GROUP_: u64 = 0x200;
 const SHF_TLS_: u64 = 0x400;
-const STT_NOTYPE_: u8 = 0;
 const STT_FILE: u8 = 4;
 
 // i386 psABI relocation numbers used by ELF32 script links. Elf32_Rel carries
 // the addend in the relocated field; the i686 parser normalises it to i64 for
 // the shared layout engine before these formulas are applied.
+/// The i386 ABI name and field width of a relocation type, for the offset check.
+///
+/// This file's i386 constants are its own and were verified against `<elf.h>` by
+/// `tools/reloc_number_audit.py`; the x86-64 table lives in `reloc_field.rs`.
+/// Only names and widths are provided here, deliberately not field signedness:
+/// the i386 arms below already carry range checks whose semantics were reasoned
+/// out per type -- `R_386_32` accepts the union of the signed and unsigned
+/// 32-bit ranges, and `R_386_PC16` is intentionally unchecked because ELF i386
+/// defines it modulo 2^16 and Linux real-mode code depends on that. Imposing a
+/// generic table on those would undo decisions that have comments explaining
+/// them.
+///
+/// `None` means the type is not one this file applies; the match below rejects it
+/// with a diagnostic of its own, so there is no width to validate here.
+fn i386_field(rtype: u32) -> Option<(&'static str, usize)> {
+    Some(match rtype {
+        R_386_32 => ("R_386_32", 4),
+        R_386_PC32 => ("R_386_PC32", 4),
+        R_386_PLT32 => ("R_386_PLT32", 4),
+        R_386_GOTOFF => ("R_386_GOTOFF", 4),
+        R_386_GOTPC => ("R_386_GOTPC", 4),
+        R_386_16 => ("R_386_16", 2),
+        R_386_PC16 => ("R_386_PC16", 2),
+        R_386_8 => ("R_386_8", 1),
+        R_386_PC8 => ("R_386_PC8", 1),
+        R_386_SIZE32 => ("R_386_SIZE32", 4),
+        R_386_NONE => return None,
+        _ => return None,
+    })
+}
+
 const R_386_NONE: u32 = 0;
 const R_386_32: u32 = 1;
 const R_386_PC32: u32 = 2;

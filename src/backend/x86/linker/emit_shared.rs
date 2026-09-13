@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 
 use super::elf::*;
 use super::emit_exec::resolve_sym;
+use super::reloc_field::{self, w8_checked, w16_checked, w32_checked};
 use super::types::{GlobalSymbol, PAGE_SIZE};
 use crate::backend::linker_common::VersionScript;
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
@@ -1842,6 +1843,13 @@ pub(super) fn emit_shared_library(
             let sa = output_sections[out_idx].addr;
             let sfo = output_sections[out_idx].file_offset;
 
+            // Loop-invariant parts of the offset check below, hoisted: the
+            // section's size and name and the object's name do not change per
+            // relocation, and this loop runs once per relocation in the link.
+            let in_sec = &objects[obj_idx].sections[sec_idx];
+            let (sec_size, sec_name) = (in_sec.size, in_sec.name.as_str());
+            let obj_name = objects[obj_idx].source_name.as_str();
+
             for rela in relas {
                 let si = rela.sym_idx as usize;
                 if si >= objects[obj_idx].symbols.len() {
@@ -1851,6 +1859,21 @@ pub(super) fn emit_shared_library(
                 let p = sa + sec_off + rela.offset;
                 let fp = (sfo + sec_off + rela.offset) as usize;
                 let a = rela.addend;
+                // GNU ld refuses a relocation whose field crosses the end of the
+                // section it patches (bfd_reloc_outofrange, reported as "error
+                // 4"). The parser already rejects an offset outside the section
+                // altogether; this is the width-aware half of the same rule, and
+                // it lives here because the field width is arch-specific while the
+                // parser is shared by four backends.
+                reloc_field::offset_in_section(
+                    rela.rela_type,
+                    reloc_field::name(rela.rela_type),
+                    rela.offset,
+                    reloc_field::patch_width(rela.rela_type),
+                    sec_size,
+                    sec_name,
+                    obj_name,
+                )?;
                 let s = resolve_sym(
                     obj_idx,
                     sym,
@@ -1901,17 +1924,58 @@ pub(super) fn emit_shared_library(
                         } else {
                             s
                         };
-                        w32(&mut out, fp, (t as i64 + a - p as i64) as u32);
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            t as i64 + a - p as i64,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
                     }
                     // TODO: R_X86_64_32/32S are not position-independent and should
                     // ideally emit a diagnostic when used in shared libraries. For now
                     // we apply them statically which works for simple cases but may fail
                     // if the library is loaded at a high address.
                     R_X86_64_32 => {
-                        w32(&mut out, fp, (s as i64 + a) as u32);
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            s as i64 + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
+                    }
+                    R_X86_64_16 => {
+                        w16_checked(
+                            &mut out,
+                            fp,
+                            s as i64 + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
+                    }
+                    R_X86_64_8 => {
+                        w8_checked(
+                            &mut out,
+                            fp,
+                            s as i64 + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
                     }
                     R_X86_64_32S => {
-                        w32(&mut out, fp, (s as i64 + a) as u32);
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            s as i64 + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
                     }
                     R_X86_64_GOTPCREL
                     | R_X86_64_GOTPCRELX
@@ -1919,7 +1983,14 @@ pub(super) fn emit_shared_library(
                     | R_X86_64_CODE_4_GOTPCRELX
                     | R_X86_64_CODE_6_GOTPCRELX => {
                         if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
-                            w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                gea as i64 + a - p as i64,
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
                         } else if is_gotpcrelx_relaxable(rela.rela_type) && !sym.name.is_empty() {
                             // GOT relaxation: convert to LEA
                             if let Some(g) = globals_snap.get(sym.name.as_str()) {
@@ -1927,13 +1998,34 @@ pub(super) fn emit_shared_library(
                                     if fp >= 2 && fp < out.len() && out[fp - 2] == 0x8b {
                                         out[fp - 2] = 0x8d;
                                     }
-                                    w32(&mut out, fp, (s as i64 + a - p as i64) as u32);
+                                    w32_checked(
+                                        &mut out,
+                                        fp,
+                                        s as i64 + a - p as i64,
+                                        rela.rela_type,
+                                        &sym.name,
+                                        &objects[obj_idx].source_name,
+                                    )?;
                                     continue;
                                 }
                             }
-                            w32(&mut out, fp, (s as i64 + a - p as i64) as u32);
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                s as i64 + a - p as i64,
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
                         } else {
-                            w32(&mut out, fp, (s as i64 + a - p as i64) as u32);
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                s as i64 + a - p as i64,
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
                         }
                     }
                     R_X86_64_PC64 => {
@@ -1964,7 +2056,14 @@ pub(super) fn emit_shared_library(
                                 );
                             }
                             // Patch the instruction to reference the GOT entry
-                            w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                gea as i64 + a - p as i64,
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
                         } else {
                             // No GOT entry: IE-to-LE relaxation for locally-resolved symbols.
                             // Handles mov (8b) and add (03); transplants REX.R
@@ -1981,31 +2080,66 @@ pub(super) fn emit_shared_library(
                                 if (rex & 0xf0) == 0x40 {
                                     out[fp - 3] = (rex & 0b1111_1010) | ((rex >> 2) & 1);
                                 }
-                                w32(&mut out, fp, (tpoff + a) as u32);
+                                w32_checked(
+                                    &mut out,
+                                    fp,
+                                    tpoff + a,
+                                    rela.rela_type,
+                                    &sym.name,
+                                    &objects[obj_idx].source_name,
+                                )?;
                             }
                         }
                     }
                     R_X86_64_TPOFF32 => {
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                        w32(&mut out, fp, (tpoff + a) as u32);
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            tpoff + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
                     }
                     R_X86_64_TLSGD => {
                         // Point the lea at the (DTPMOD64, DTPOFF64) GOT pair.
                         if let Some(&slot) = tlsgd_slot_addr.get(sym.name.as_str()) {
-                            w32(&mut out, fp, (slot as i64 + a - p as i64) as u32);
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                slot as i64 + a - p as i64,
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
                         } else {
                             eprintln!("warning: TLSGD without GOT pair for '{}'", sym.name);
                         }
                     }
                     R_X86_64_TLSLD => {
                         if let Some(slot) = tlsld_slot {
-                            w32(&mut out, fp, (slot as i64 + a - p as i64) as u32);
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                slot as i64 + a - p as i64,
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
                         }
                     }
                     R_X86_64_DTPOFF32 => {
                         // Offset of the symbol within this module's TLS block.
                         let dtpoff = s as i64 - tls_addr as i64;
-                        w32(&mut out, fp, (dtpoff + a) as u32);
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            dtpoff + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
                     }
                     R_X86_64_DTPOFF64 => {
                         let dtpoff = s as i64 - tls_addr as i64;

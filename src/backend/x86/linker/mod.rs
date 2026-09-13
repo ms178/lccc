@@ -27,6 +27,7 @@ mod layout_plan;
 mod link;
 mod parallel_reloc;
 mod plt_got;
+pub mod reloc_field;
 pub mod types;
 pub use icf::parse_icf_mode;
 
