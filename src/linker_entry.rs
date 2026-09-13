@@ -90,7 +90,7 @@ pub fn link_relocatable_x86(objects: &[Elf64Object], output: &str) -> Result<(),
 
 /// Link pre-loaded objects with a full GNU linker script (x86-64).
 pub fn link_with_script_x86(
-    objects: &[Elf64Object],
+    objects: &mut [Elf64Object],
     script_src: &str,
     output: &str,
     emit_symtab: bool,
@@ -117,7 +117,7 @@ pub fn link_with_script_x86(
 
 /// Link pre-loaded ELF32/i386 objects with a full GNU linker script.
 pub fn link_with_script_i386(
-    objects: &[Elf64Object],
+    objects: &mut [Elf64Object],
     script_src: &str,
     output: &str,
     emit_symtab: bool,

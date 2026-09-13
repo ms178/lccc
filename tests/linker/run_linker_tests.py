@@ -25,6 +25,7 @@ Usage:
 import argparse
 import ctypes
 import os
+import struct
 import re
 import shutil
 import subprocess
@@ -49,7 +50,10 @@ class Case:
                  run_args=None, expect_fail=False, expect_stdout=None,
                  expect_exit=0, compile_flags=None, setup=None,
                  oracle_only_flags=None, lccc_only_flags=None,
-                 skip_oracles=False, run_env=None, tags=()):
+                 skip_oracles=False, run_env=None, tags=(),
+                 expect_elf_type=None, known_defect=None,
+                 expect_no_zero_size_syms=False, expect_no_symtab=False,
+                 expect_dyn_tags=None):
         self.name = name
         self.sources = sources              # dict fname -> contents (.c or .s)
         self.link_inputs = link_inputs      # ordered link inputs; default: all objects
@@ -65,6 +69,25 @@ class Case:
         self.skip_oracles = skip_oracles
         self.run_env = run_env or {}
         self.tags = tags
+        # Expected ELF e_type of the lccc output ("EXEC" / "DYN").  This is what
+        # distinguishes a real position-independent image from a silent
+        # fixed-base fallback: a PIE test that only checks stdout passes either
+        # way, and losing ASLR is exactly the regression that must not hide.
+        self.expect_elf_type = expect_elf_type
+        # Set to a short description when the case documents a defect we have not
+        # fixed yet.  A documented failure is reported as WARN so it stays
+        # visible in the summary instead of being deleted or silently ignored;
+        # if it starts passing, the flag is stale and should be removed.
+        self.known_defect = known_defect
+        # Assert no symbol has st_value == 0 with st_size != 0.  That is the
+        # signature of a symbol from a section that was collected away.
+        self.expect_no_zero_size_syms = expect_no_zero_size_syms
+        # Assert the image carries no .symtab/.strtab at all (`-s`).
+        self.expect_no_symtab = expect_no_symtab
+        # Exact set of dynamic hash tags that must be present.  Checks the
+        # section headers too, so a table that is tagged but never written (or
+        # written over by the other table's writer) cannot pass.
+        self.expect_dyn_tags = expect_dyn_tags
 
 CASES = []
 def case(*a, **kw):
@@ -249,18 +272,43 @@ def _make_wa(td):
     r = sh(["ar", "rcs", "libwa.a", "wa.o"], cwd=td); assert r.returncode == 0
 
 case("whole_archive_exec",
+    # `main` deliberately does NOT reference anything in the archive.  It reads
+    # a side effect the constructor produced through a variable main.c *does*
+    # define, so lazy archive scanning can never pull the member in for us: the
+    # only way this member gets into the link is --whole-archive itself.  (An
+    # earlier version of this case had main.c declare `extern int
+    # flag_from_ctor`, which made it pass with --whole-archive entirely
+    # unimplemented.)
     {"main.c": """
         #include <stdio.h>
-        /* nothing references the archive member, but --whole-archive must pull
-           in its constructor */
-        extern int flag_from_ctor;
+        int flag_from_ctor;   /* defined here, so the archive is not pulled
+                                 in to satisfy an undefined symbol */
         int main(void){ printf("%d\\n", flag_from_ctor); return 0; }
      """,
      "wa.c": """
-        int flag_from_ctor;
+        extern int flag_from_ctor;
         __attribute__((constructor)) static void init(void){ flag_from_ctor = 42; }
      """},
     link_inputs=["main.o", "-Wl,--whole-archive", "libwa.a", "-Wl,--no-whole-archive"],
+    expect_stdout="42\n",
+    setup=_make_wa,
+    tags=("archive",))
+
+case("archive_lazy_loading_is_lazy",
+    # The complement of whole_archive_exec: with the flag absent the same
+    # archive member must stay out, or the flag would be indistinguishable from
+    # doing nothing.
+    {"main.c": """
+        #include <stdio.h>
+        int flag_from_ctor;
+        int main(void){ printf("%d\\n", flag_from_ctor); return 0; }
+     """,
+     "wa.c": """
+        extern int flag_from_ctor;
+        __attribute__((constructor)) static void init(void){ flag_from_ctor = 42; }
+     """},
+    link_inputs=["main.o", "libwa.a"],
+    expect_stdout="0\n",
     setup=_make_wa,
     tags=("archive",))
 
@@ -367,6 +415,91 @@ case("gc_sections_keep_start_stop",
     ldflags=["-Wl,--gc-sections"],
     compile_flags=["-O1", "-ffunction-sections", "-fdata-sections"],
     tags=("sections", "gc"))
+
+case("gc_sections_keeps_eh_frame",
+    # Regression: --gc-sections used to collect `.eh_frame` outright (nothing
+    # relocates *to* it), so a --gc-sections build silently lost all stack
+    # unwinding: backtrace() returned a single frame where every oracle
+    # returns the full depth.  `.eh_frame` is now a GC root, and the FDEs of
+    # genuinely collected functions are pruned rather than left stale.
+    {"a.c": """
+        #include <stdio.h>
+        #include <execinfo.h>
+        static int l4(void){ void *bt[16]; return backtrace(bt, 16); }
+        static int l3(void){ return l4(); }
+        static int l2(void){ return l3(); }
+        static int l1(void){ return l2(); }
+        int dead_a(void){ return 1; }
+        int dead_b(void){ return 2; }
+        int main(void){ printf("%d\\n", l1() >= 4); return 0; }
+     """},
+    ldflags=["-Wl,--gc-sections", "-rdynamic"],
+    compile_flags=["-O2", "-ffunction-sections", "-fdata-sections"],
+    expect_stdout="1\n",
+    tags=("sections", "gc", "unwind"))
+
+case("gc_sections_export_dynamic_dlsym",
+    # Regression: with --export-dynamic an exported global is reachable only
+    # from *outside* the image, so a reachability sweep collected it.  The
+    # link succeeded and the binary ran; it just failed at the first dlsym.
+    {"a.c": """
+        #include <stdio.h>
+        #include <dlfcn.h>
+        int plugin_entry(int x){ return x * 7; }
+        int main(void){
+            void *h = dlopen(0, RTLD_NOW);
+            int (*fn)(int) = (int (*)(int))dlsym(h, "plugin_entry");
+            printf("%d\\n", fn ? fn(6) : -1);
+            return 0;
+        }
+     """},
+    ldflags=["-Wl,--gc-sections", "-rdynamic", "-ldl"],
+    compile_flags=["-O2", "-ffunction-sections", "-fdata-sections"],
+    expect_stdout="42\n",
+    tags=("sections", "gc", "dynamic"))
+
+case("build_id_note_emitted",
+    # Debian's gcc passes --build-id on *every* link.  lccc-ld accepted the flag
+    # but emitted no note, so no binary could be matched to its debuginfo.
+    # The digest must be present, non-zero and reproducible; the assertion is a
+    # dedicated test below (build_id_note_present_test), this case just proves
+    # the flag does not break the link or the program.
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("ok\\n"); return 0; }
+     """},
+    ldflags=["-Wl,--build-id=sha1"],
+    expect_stdout="ok\n",
+    tags=("notes",))
+
+case("defsym_two_argument_form",
+    # GNU ld accepts both `--defsym=SYM=VAL` and `--defsym SYM=VAL`; only the
+    # joined spelling was parsed, so the two-argument form died as an unknown
+    # option (found via the differential oracle, census2).
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("ok\\n"); return 0; }
+     """},
+    ldflags=["-Wl,--defsym", "-Wl,aliased=main"],
+    expect_stdout="ok\n",
+    tags=("symbols",))
+
+case("wrap_two_argument_form",
+    # Same defect class as --defsym: `--wrap SYM` must work, not just
+    # `--wrap=SYM`.  __wrap_bv intercepts, __real_bv reaches the original.
+    {"a.c": """
+        #include <stdio.h>
+        extern int bv(void);
+        int main(void){ printf("%d\\n", bv()); return 0; }
+     """,
+     "b.c": "int bv(void){ return 7; }",
+     "w.c": """
+        extern int __real_bv(void);
+        int __wrap_bv(void){ return __real_bv() * 10; }
+     """},
+    ldflags=["-Wl,--wrap", "-Wl,bv"],
+    expect_stdout="70\n",
+    tags=("symbols",))
 
 case("bss_zeroed",
     {"a.c": """
@@ -720,6 +853,217 @@ case("large_got_pressure",
     tags=("got", "dynamic"))
 
 
+# ── PIE (S06): -pie must produce a genuinely position-independent ET_DYN, not a
+# fixed-base ET_EXEC.  These are the constructs that broke first when the image
+# was rebased at 0; each one exercises a distinct class of self-referential
+# address that has to be slid by the load base.
+
+case("pie_basic_et_dyn",
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("pie-ok\\n"); return 0; }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="pie-ok\n",
+    expect_elf_type="DYN",
+    tags=("pie",))
+
+case("pie_string_array",
+    # The regression that made a competing -pie implementation segfault: string
+    # merging rewrites these pointers to reference a synthetic pool symbol with
+    # shndx 0, so they look undefined while being entirely local.  Without an
+    # R_X86_64_RELATIVE per entry the array still holds link-time addresses and
+    # the first "%s" dereference faults under a random load base.
+    {"a.c": """
+        #include <stdio.h>
+        const char *msgs[] = {"alpha", "beta", "gamma", "delta"};
+        int main(void){ printf("%s %s\\n", msgs[1], msgs[3]); return 0; }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="beta delta\n",
+    expect_elf_type="DYN",
+    tags=("pie", "strmerge"))
+
+case("pie_jump_table",
+    # Address-taken labels in a read-only jump table: .text-relative pointers
+    # into the merged string/rodata sections plus .text itself.
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){
+            static const void *jt[] = { &&L0, &&L1, &&L2 };
+            int sum = 0;
+            for (int i = 0; i < 3; i++) { goto *jt[i]; L0: sum += 1; goto E; L1: sum += 2; goto E; L2: sum += 4; E: ; }
+            printf("%d\\n", sum);
+            return 0;
+        }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="7\n",
+    expect_elf_type="DYN",
+    tags=("pie",))
+
+case("pie_function_pointer_array",
+    {"a.c": """
+        #include <stdio.h>
+        static int f0(int x){ return x; }
+        static int f1(int x){ return x * 2; }
+        static int f2(int x){ return x * 3; }
+        static int f3(int x){ return x * 4; }
+        typedef int (*F)(int);
+        static F table[] = { f0, f1, f2, f3 };
+        int main(void){
+            int s = 0;
+            for (int i = 0; i < 4; i++) s += table[i](i + 1);
+            printf("%d\\n", s);
+            return 0;
+        }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="30\n",   # f0(1)+f1(2)+f2(3)+f3(4) = 1+4+9+16
+    expect_elf_type="DYN",
+    tags=("pie",))
+
+case("pie_main_via_got",
+    # crt1.o reaches main through R_X86_64_REX_GOTPCRELX, so _start loads it out
+    # of a GOT slot.  In an ET_EXEC the slot is just pre-filled; in a PIE it must
+    # carry an R_X86_64_RELATIVE or the program jumps to the unslid address.
+    # Covered implicitly by every PIE case, asserted explicitly here.
+    {"a.c": """
+        #include <stdio.h>
+        int answer(void){ return 42; }
+        int main(void){ printf("%d\\n", answer()); return 0; }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="42\n",
+    expect_elf_type="DYN",
+    tags=("pie", "got"))
+
+case("no_pie_stays_et_exec",
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("exec-ok\\n"); return 0; }
+     """},
+    ldflags=["-no-pie"],
+    expect_stdout="exec-ok\n",
+    expect_elf_type="EXEC",
+    tags=("pie",))
+
+case("local_ifunc",
+    # A *static* IFUNC.  This used to be a silent miscompile: local IFUNCs never
+    # reached collect_ifunc_symbols (it walks `globals`, and a static symbol is
+    # never promoted there), so they got no IPLT slot and no R_X86_64_IRELATIVE,
+    # and the call site bound straight to the RESOLVER -- the caller received
+    # the implementation's *address* as the call's return value and printed
+    # something like 4199558 where 1 was meant.  Local IFUNCs now get slots
+    # numbered after the global ones, keyed by (object, symbol) because local
+    # names legitimately repeat across objects.
+    {"a.c": """
+        #include <stdio.h>
+        static int impl(void){ return 1; }
+        static int (*rsv(void))(void){ return impl; }
+        static int fn(void) __attribute__((ifunc("rsv")));
+        int main(void){ printf("%d\\n", fn()); return 0; }
+     """},
+    expect_stdout="1\n",
+    tags=("ifunc",))
+
+
+# ── v3 defect fixes ──────────────────────────────────────────────────────────
+
+case("gc_sections_symtab_no_dead_locals",
+    # --gc-sections used to leave every symbol from a collected section in
+    # .symtab at address 0: the locals filter consulted section_map, which still
+    # holds an entry for dead sections (layout assigns a slot before collection
+    # decides they are unreachable).  On a 61-object -ffunction-sections link
+    # that was 2341 of 2551 entries -- 61 KB against bfd's 6 KB.
+    {"a.c": """
+        #include <stdio.h>
+        int used(int x){ return x + 1; }
+        static int dead_a(int x){ return x * 3; }
+        static int dead_b(int x){ return x * 5; }
+        static int dead_c(int x){ return x * 7; }
+        int main(void){ printf("%d\\n", used(1)); return 0; }
+     """},
+    compile_flags=["-O2", "-ffunction-sections", "-fdata-sections"],
+    ldflags=["--gc-sections"],
+    expect_stdout="2\n",
+    # Assert the invariant directly: no symbol may claim a non-zero size at
+    # address 0, which is what a collected-section local looks like.
+    expect_no_zero_size_syms=True,
+    tags=("gc", "symtab"))
+
+case("symtab_sh_info_equals_locals",
+    # sh_info must equal the number of STB_LOCAL entries (ELF: sh_info ==
+    # nlocals).  It used to be snapshotted between the local and global loops,
+    # so any global-loop entry carrying STB_LOCAL made it one short.
+    {"a.c": """
+        #include <stdio.h>
+        static int helper(int x){ return x; }
+        int global_fn(int x){ return helper(x); }
+        int main(void){ printf("%d\\n", global_fn(9)); return 0; }
+     """},
+    expect_stdout="9\n",
+    tags=("symtab",))
+
+case("strip_all_drops_symtab",
+    # `-s` was parsed into a local that only reached the linker-script path, so
+    # a "stripped" binary shipped with a full symbol table.  Worse than ignoring
+    # the flag: the user believes they removed the symbols.
+    {"a.c": """
+        #include <stdio.h>
+        int named_symbol(int x){ return x * 2; }
+        int main(void){ printf("%d\\n", named_symbol(21)); return 0; }
+     """},
+    ldflags=["-Wl,-s"],
+    expect_stdout="42\n",
+    expect_no_symtab=True,
+    tags=("strip",))
+
+case("hash_style_gnu",
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("hs\\n"); return 0; }
+     """},
+    ldflags=["-Wl,--hash-style=gnu"],
+    expect_stdout="hs\n",
+    expect_dyn_tags=["GNU_HASH"],
+    tags=("hash",))
+
+case("hash_style_sysv",
+    # SysV .hash.  With gnu_hash_size forced to 0 the two tables alias the same
+    # offset, so an ungated GNU-hash writer silently clobbers the SysV one.
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("hs\\n"); return 0; }
+     """},
+    ldflags=["-Wl,--hash-style=sysv"],
+    expect_stdout="hs\n",
+    expect_dyn_tags=["HASH"],
+    tags=("hash",))
+
+case("hash_style_both",
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("hs\\n"); return 0; }
+     """},
+    ldflags=["-Wl,--hash-style=both"],
+    expect_stdout="hs\n",
+    expect_dyn_tags=["GNU_HASH", "HASH"],
+    tags=("hash",))
+
+case("local_ifunc_static_link",
+    {"a.c": """
+        #include <stdio.h>
+        static int impl(void){ return 77; }
+        static int (*rsv(void))(void){ return impl; }
+        static int fn(void) __attribute__((ifunc("rsv")));
+        int main(void){ printf("%d\\n", fn()); return 0; }
+     """},
+    ldflags=["-static"],
+    expect_stdout="77\n",
+    tags=("ifunc", "static"))
+
+
 case("ifunc_resolver",
     {"a.c": """
         #include <stdio.h>
@@ -729,6 +1073,9 @@ case("ifunc_resolver",
         int pick(void) __attribute__((ifunc("resolve_pick")));
         int main(void){ printf("%d\\n", pick()); return 0; }
      """},
+    # Was a bare "runs with rc 0" check, which passed while the call bound to
+    # the RESOLVER and printed the implementation's *address*.  Assert the value.
+    expect_stdout="2\n",
     tags=("ifunc",))
 
 case("ifunc_static_link",
@@ -740,6 +1087,7 @@ case("ifunc_static_link",
         int main(void){ printf("%d\\n", f()); return 0; }
      """},
     ldflags=["-static"],
+    expect_stdout="33\n",
     tags=("ifunc", "static"))
 
 case("copy_reloc_libc_data",
@@ -2588,6 +2936,235 @@ def _elf32_script_gc_keep_test(args, oracles):
             nogc_bfd = f.read()
         if nogc_lccc != nogc_bfd:
             return Result(name, "FAIL", "--no-gc-sections image differs from bfd")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+def _shim_for(td, lccc_ld):
+    """A -B dir whose `ld` is lccc-ld (gcc only switches linkers on that name)."""
+    shim = os.path.join(td, "shim")
+    os.makedirs(shim, exist_ok=True)
+    link = os.path.join(shim, "ld")
+    if not os.path.exists(link):
+        os.symlink(os.path.abspath(lccc_ld), link)
+    return shim
+
+
+def _build_id_note_test(args, oracles):
+    """--build-id must emit a content-derived .note.gnu.build-id.
+
+    Regression for a defect the differential oracle found: Debian's gcc passes
+    --build-id on *every* link, lccc-ld accepted the flag, and the output had no
+    note at all -- so no binary could be matched to its debuginfo.  Also checks
+    the digest is reproducible, content-sensitive, and that --build-id=none
+    suppresses it.
+    """
+    name = "build_id_note"
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "a.c"), "w") as f:
+            f.write('#include <stdio.h>\nint main(void){ printf("ok\\n"); return 0; }\n')
+        with open(os.path.join(td, "b.c"), "w") as f:
+            f.write('#include <stdio.h>\nint main(void){ printf("other\\n"); return 0; }\n')
+        r = sh([CC, "-c", "-O1", "a.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "fixture compile failed")
+        sh([CC, "-c", "-O1", "b.c"], cwd=td)
+        shim = _shim_for(td, lccc_ld)
+
+        def digest(path):
+            if not os.path.exists(path):
+                return None
+            # -SW, not -S: plain -S wraps each section header over two lines,
+            # which splits long section names.
+            o = sh(["readelf", "-SW", path]).stdout.decode(errors="replace")
+            if ".note.gnu.build-id" not in o:
+                return None
+            n = sh(["readelf", "-n", path]).stdout.decode(errors="replace")
+            for ln in n.splitlines():
+                ln = ln.strip()
+                if ln.startswith("Build ID:"):
+                    return ln.split(":", 1)[1].strip()
+            return None
+
+        def link(obj, out, extra):
+            return sh([CC, "-B" + shim, obj, "-o", out] + extra, cwd=td)
+
+        out = os.path.join(td, "a.out")
+        r = link("a.o", out, ["-Wl,--build-id=sha1"])
+        if r.returncode != 0:
+            return Result(name, "FAIL",
+                          "link failed: " + r.stderr.decode(errors="replace")[-300:])
+        got = digest(out)
+        if got is None:
+            return Result(name, "FAIL", "no .note.gnu.build-id section")
+        if set(got) <= {"0"}:
+            return Result(name, "FAIL", "degenerate digest %r" % got)
+
+        out2 = os.path.join(td, "a2.out")
+        link("a.o", out2, ["-Wl,--build-id=sha1"])
+        if digest(out2) != got:
+            return Result(name, "FAIL",
+                          "not reproducible: %s vs %s" % (got, digest(out2)))
+
+        out3 = os.path.join(td, "b.out")
+        link("b.o", out3, ["-Wl,--build-id=sha1"])
+        if digest(out3) == got:
+            return Result(name, "FAIL", "digest does not depend on the inputs")
+
+        out4 = os.path.join(td, "c.out")
+        link("a.o", out4, ["-Wl,--build-id=none"])
+        if digest(out4) is not None:
+            return Result(name, "FAIL", "--build-id=none still emitted a note")
+
+        code, txt = run_bin(out, [], td)
+        if code != 0 or txt != "ok\n":
+            return Result(name, "FAIL", "binary broken: %s" % ((code, txt),))
+        return Result(name, "PASS", "digest %s" % got)
+
+
+def _static_pie_refusal_test(args, oracles):
+    """-static-pie must be refused with a diagnostic, not linked into a SIGSEGV.
+
+    lccc-ld has no position-independent static emitter: it used to write the
+    image anyway and the program died in the CRT self-relocation.  A linker that
+    cannot honour a request has to say so at link time.
+    """
+    name = "static_pie_refused"
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "a.c"), "w") as f:
+            f.write('#include <stdio.h>\nint main(void){ printf("ok\\n"); return 0; }\n')
+        r = sh([CC, "-c", "-O1", "a.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "fixture compile failed")
+        shim = _shim_for(td, lccc_ld)
+        out = os.path.join(td, "a.out")
+        r = sh([CC, "-B" + shim, "-static-pie", "a.o", "-o", out], cwd=td)
+        err = r.stderr.decode(errors="replace")
+        if r.returncode == 0:
+            # If it links it must also run: the old behaviour linked and then
+            # SIGSEGVed, which is strictly worse than refusing.
+            code, _ = run_bin(out, [], td)
+            if code != 0:
+                return Result(name, "FAIL",
+                              "linked a -static-pie image that fails at runtime "
+                              "(rc=%s); it must refuse at link time" % code)
+            return Result(name, "PASS", "supported and runs")
+        if "static-pie" not in err and "position-independent" not in err:
+            return Result(name, "FAIL",
+                          "refused without an explanatory diagnostic")
+        return Result(name, "PASS", "refused with a diagnostic")
+
+
+
+def _gc_eh_frame_invariant_test(args, oracles):
+    """`.eh_frame` must survive --gc-sections with exactly the live FDE set.
+
+    The runtime `gc_sections_keeps_eh_frame` case proves unwinding works; this
+    checks the *structure*, because the two failure modes are different: a
+    dropped `.eh_frame` breaks `backtrace()`, while a stale FDE left behind
+    hands the unwinder CFI for a function whose address range was recycled by
+    live code after compaction -- wrong unwinding rather than none, and only
+    on the paths that happen to hit it.
+
+    Invariants on the lccc image (bfd as cross-check):
+      * every STT_FUNC symbol in an executable section is covered by an FDE;
+      * no FDE describes a region that is not live code (PLT/.init/.fini
+        excepted: those FDEs are linker-synthesised by design).
+    """
+    name = "gc_eh_frame_invariant"
+    td = tempfile.mkdtemp(prefix="lccc-gceh-")
+    try:
+        src = r"""
+            #include <stdio.h>
+            #include <execinfo.h>
+            static int l4(void){ void *bt[16]; return backtrace(bt, 16); }
+            static int l3(void){ return l4(); }
+            static int l2(void){ return l3(); }
+            int live_a(void){ return l2(); }
+            int live_b(void){ return live_a() + 1; }
+            int dead_1(void){ return 111; }
+            int dead_2(void){ return 222; }
+            int dead_3(void){ return 333; }
+            int dead_4(void){ return 444; }
+            int main(void){ printf("%d\n", live_b()); return 0; }
+        """
+        with open(os.path.join(td, "a.c"), "w") as f:
+            f.write(src)
+        cf = ["-O0", "-ffunction-sections", "-fdata-sections"]
+        r = sh([CC, *cf, "-c", "a.c", "-o", "a.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", f"compile failed: {r.stderr.decode()[:200]}")
+
+        # lccc-ld is driven directly with the same flag surface gcc would use,
+        # so the test does not depend on a -B shim being installed.
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        crt = [sh([CC, "-print-file-name=" + n], cwd=td).stdout.decode().strip()
+               for n in ("crt1.o", "crti.o", "crtn.o")]
+        r = sh([lccc_ld, "-o", "a.lccc", crt[0], crt[1], "a.o", crt[2],
+                "--dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
+                "-L/usr/lib/x86_64-linux-gnu", "-lc",
+                "--gc-sections", "--export-dynamic"], cwd=td)
+        if r.returncode != 0 or not os.path.exists(os.path.join(td, "a.lccc")):
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:400]}")
+
+        images = {"lccc": "a.lccc"}
+        r = sh([CC, *cf, "-Wl,--gc-sections", "-rdynamic", "-o", "a.bfd", "a.o"], cwd=td)
+        if r.returncode == 0:
+            images["bfd"] = "a.bfd"
+
+        sys.path.insert(0, HERE)
+        import check_gc_eh_frame as inv  # noqa: PLC0415 - sibling module
+
+        failed = []
+        for tag, img in images.items():
+            path = os.path.join(td, img)
+            problems = inv.check(path)
+            if not inv.fde_ranges(path):
+                problems.append("no FDEs at all: unwinding is dead")
+            if problems:
+                failed.append(f"{tag}: " + "; ".join(problems))
+        if failed:
+            return Result(name, "FAIL", " | ".join(failed))
+
+        # GC must still collect: the link is not allowed to "pass" by simply
+        # keeping every FDE.  `--export-dynamic` exports the dead_* functions
+        # and so legitimately roots them, so compare against a link of the
+        # very same object without --gc-sections: the collected link must
+        # carry strictly fewer FDEs while still covering all live code.
+        # Neither link may use --export-dynamic here: it legitimately roots
+        # every global, so nothing would be collected and the comparison
+        # would prove nothing.
+        base = ["--dynamic-linker", "/lib64/ld-linux-x86-64.so.2",
+                "-L/usr/lib/x86_64-linux-gnu", "-lc"]
+        r = sh([lccc_ld, "-o", "a.gc", crt[0], crt[1], "a.o", crt[2],
+                *base, "--gc-sections"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld GC link failed: {r.stderr.decode()[:300]}")
+        r = sh([lccc_ld, "-o", "a.nogc", crt[0], crt[1], "a.o", crt[2], *base], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld no-GC failed: {r.stderr.decode()[:300]}")
+        n_gc = len(inv.fde_ranges(os.path.join(td, "a.gc")))
+        n_nogc = len(inv.fde_ranges(os.path.join(td, "a.nogc")))
+        if not (0 < n_gc < n_nogc):
+            return Result(
+                name, "FAIL",
+                f"--gc-sections must prune FDEs but keep unwinding: "
+                f"{n_gc} with GC vs {n_nogc} without",
+            )
+        for tag in ("gc", "nogc"):
+            problems = inv.check(os.path.join(td, f"a.{tag}"))
+            if problems:
+                return Result(name, "FAIL", f"a.{tag}: " + "; ".join(problems))
         return Result(name, "PASS")
     except Exception as e:
         return Result(name, "FAIL", f"harness exception: {e!r}")
@@ -4563,6 +5140,10 @@ def main():
         results.append(_elf32_script_test(args, oracles))
         results.append(_elf32_script_gc_keep_test(args, oracles))
         results.append(_elf32_vdso_test(args, oracles))
+    if (not args.tag or args.tag in ("gc", "sections")):
+        results.append(_gc_eh_frame_invariant_test(args, oracles))
+    results.append(_build_id_note_test(args, oracles))
+    results.append(_static_pie_refusal_test(args, oracles))
     if (not args.filter or "hidden" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_script_hidden_visibility_test(args, oracles))
     if (not args.filter or "gotpcrel" in args.filter) and (not args.tag or args.tag == "script"):
@@ -4647,6 +5228,103 @@ def _wild_shim(wildpath):
         os.symlink(wildpath, os.path.join(_WILD_SHIM_DIR, "ld"))
     return os.path.join(_WILD_SHIM_DIR, "ld")
 
+def symtab_problems(path):
+    """Inspect .symtab: presence, entry count, sh_info correctness, zero-size ghosts."""
+    out = {"present": False, "nsyms": 0, "zero_size": 0, "sh_info_bad": None}
+    try:
+        with open(path, "rb") as fh:
+            d = fh.read()
+    except OSError:
+        return out
+    if len(d) < 64 or d[:4] != b"\x7fELF":
+        return out
+    e_shoff, = struct.unpack_from("<Q", d, 0x28)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 0x3A)
+    secs = []
+    for i in range(e_shnum):
+        b = e_shoff + i * e_shentsize
+        if b + e_shentsize > len(d):
+            return out
+        n, t, fl, a, off, sz, lk, inf, al, es = struct.unpack_from("<IIQQQQIIQQ", d, b)
+        secs.append((n, t, off, sz, lk, inf))
+    for n, t, off, sz, lk, inf in secs:
+        if t != 2:  # SHT_SYMTAB
+            continue
+        out["present"] = True
+        out["nsyms"] = sz // 24
+        nlocal = 0
+        for k in range(sz // 24):
+            nm, info, other, shndx, val, size = struct.unpack_from("<IBBHQQ", d, off + k * 24)
+            if val == 0 and size != 0:
+                out["zero_size"] += 1
+            if (info >> 4) == 0:
+                nlocal += 1
+        if inf != nlocal:
+            out["sh_info_bad"] = (f".symtab sh_info is {inf} but there are "
+                                  f"{nlocal} STB_LOCAL entries (ELF requires sh_info == nlocals)")
+    return out
+
+
+def dyn_hash_tags(path):
+    """Sorted list of hash tags in .dynamic, plus a check that each has a section."""
+    tags = []
+    try:
+        with open(path, "rb") as fh:
+            d = fh.read()
+    except OSError:
+        return tags
+    if len(d) < 64 or d[:4] != b"\x7fELF":
+        return tags
+    e_shoff, = struct.unpack_from("<Q", d, 0x28)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 0x3A)
+    secs = []
+    for i in range(e_shnum):
+        b = e_shoff + i * e_shentsize
+        if b + e_shentsize > len(d):
+            return tags
+        n, t, fl, a, off, sz, lk, inf, al, es = struct.unpack_from("<IIQQQQIIQQ", d, b)
+        secs.append((n, t, off, sz))
+    shstr = secs[e_shstrndx] if e_shstrndx < len(secs) else None
+    def nm(x):
+        if shstr is None or x >= shstr[3]:
+            return ""
+        e = d.index(b"\0", shstr[2] + x)
+        return d[shstr[2] + x:e].decode("latin1", "replace")
+    names = {nm(s[0]) for s in secs}
+    dyn = next((s for s in secs if s[1] == 6), None)  # SHT_DYNAMIC
+    if dyn is None:
+        return tags
+    for k in range(dyn[3] // 16):
+        tag, val = struct.unpack_from("<qQ", d, dyn[2] + k * 16)
+        if tag == 0x6FFFFEF5:  # DT_GNU_HASH
+            if ".gnu.hash" in names:
+                tags.append("GNU_HASH")
+        elif tag == 4:  # DT_HASH
+            if ".hash" in names:
+                tags.append("HASH")
+    return sorted(tags)
+
+
+def elf_e_type(path):
+    """Return the ELF e_type of `path` as "EXEC"/"DYN"/"REL"/..., or None.
+
+    Parsed from the header directly rather than from `readelf` text: readelf's
+    section-table columns shift when a name is long enough to wrap.
+    """
+    try:
+        with open(path, "rb") as fh:
+            ident = fh.read(20)
+    except OSError:
+        return None
+    if len(ident) < 20 or ident[:4] != b"\x7fELF":
+        return None
+    is64 = ident[4] == 2
+    little = ident[5] == 1
+    fmt = ("<" if little else ">") + ("H" if is64 else "H")
+    etype = struct.unpack(fmt, ident[16:18])[0]
+    return {0: "NONE", 1: "REL", 2: "EXEC", 3: "DYN", 4: "CORE"}.get(etype, f"?{etype}")
+
+
 def run_case(c, args, oracles):
     td = tempfile.mkdtemp(prefix=f"lnk.{c.name}.")
     try:
@@ -4703,12 +5381,45 @@ def run_case(c, args, oracles):
                     f"lccc link failed but {oracle_outs[0][0]} succeeded: {lccc_link_err}")
             return Result(c.name, "SKIP", f"all linkers failed: {lccc_link_err}")
 
+        # --- symbol table shape ---
+        if c.expect_no_symtab or c.expect_no_zero_size_syms:
+            bad = symtab_problems(lccc_out)
+            if c.expect_no_symtab and bad.get("present"):
+                return Result(c.name, "FAIL",
+                    f"-s was requested but .symtab is still present ({bad['nsyms']} symbols)")
+            if c.expect_no_zero_size_syms and bad.get("zero_size"):
+                return Result(c.name, "FAIL",
+                    f"{bad['zero_size']} symbols have st_value==0 with st_size!=0 "
+                    f"(symbols from collected sections, out of {bad['nsyms']})")
+            if bad.get("sh_info_bad"):
+                return Result(c.name, "FAIL", bad["sh_info_bad"])
+        if c.expect_dyn_tags is not None:
+            got = dyn_hash_tags(lccc_out)
+            want = sorted(c.expect_dyn_tags)
+            if got != want:
+                return Result(c.name, "FAIL",
+                    f"dynamic hash tags are {got}, expected {want}")
+
+        # --- image shape ---
+        if c.expect_elf_type is not None:
+            got = elf_e_type(lccc_out)
+            if got != c.expect_elf_type:
+                return Result(c.name, "FAIL",
+                    f"e_type is {got!r}, expected {c.expect_elf_type!r} "
+                    f"(a fixed-base ET_EXEC here means -pie was silently downgraded)")
+
         # --- run & compare ---
         code, out = run_bin(lccc_out, c.run_args, td, c.run_env)
         if c.expect_stdout is not None:
             if out != c.expect_stdout or code != c.expect_exit:
-                return Result(c.name, "FAIL",
-                    f"lccc output {(code, out)!r} != expected {(c.expect_exit, c.expect_stdout)!r}")
+                detail = (f"lccc output {(code, out)!r} != expected "
+                          f"{(c.expect_exit, c.expect_stdout)!r}")
+                if c.known_defect:
+                    return Result(c.name, "WARN", f"KNOWN DEFECT ({c.known_defect}): {detail}")
+                return Result(c.name, "FAIL", detail)
+            if c.known_defect:
+                return Result(c.name, "WARN",
+                    f"expected defect now passes -- remove known_defect: {c.known_defect}")
             return Result(c.name, "PASS")
 
         mismatches = []

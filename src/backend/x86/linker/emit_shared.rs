@@ -117,6 +117,7 @@ pub(super) fn emit_shared_library(
     objects: &[ElfObject],
     globals: &mut FxHashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
+    hash_style: crate::backend::linker_common::HashStyle,
     section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     needed_sonames: &[String],
     output_path: &str,
@@ -948,10 +949,30 @@ pub(super) fn emit_shared_library(
     let verneed_size = verneed_data.len() as u64;
     let verneed_count = sorted_needed_libs.len() as u64;
 
-    let gnu_hash_size: u64 = 16
-        + (gnu_hash_bloom_size as u64 * 8)
-        + (gnu_hash_nbuckets as u64 * 4)
-        + (num_hashed as u64 * 4);
+    let want_gnu_hash = hash_style.wants_gnu();
+    let want_sysv_hash = hash_style.wants_sysv();
+    // Built here, after the GNU-hash bucket sort has fixed the final dynsym
+    // order: the SysV table indexes `.dynsym` positions directly, so it must
+    // see the order the symbols are actually written in.  Same `sym_base`
+    // spelling the dynsym/GNU-hash paths use, so the two tables agree on names.
+    let sysv_hash: Option<crate::backend::linker_common::SysvHash> = if want_sysv_hash {
+        let owned: Vec<String> = dyn_sym_names.iter().map(|n| sym_base(n)).collect();
+        let names: Vec<&str> = owned.iter().map(|n| n.as_str()).collect();
+        Some(crate::backend::linker_common::build_sysv_hash(&names))
+    } else {
+        None
+    };
+    let sysv_hash_size: u64 = sysv_hash.as_ref().map(|h| h.size()).unwrap_or(0);
+    // `--hash-style=sysv` means no `.gnu.hash` at all: zero size, no section
+    // header, no DT_GNU_HASH.  An empty table left behind would be preferred by
+    // a loader that understands it, and would then resolve nothing.
+    let gnu_hash_size: u64 = if !want_gnu_hash {
+        0
+    } else {
+        16 + (gnu_hash_bloom_size as u64 * 8)
+            + (gnu_hash_nbuckets as u64 * 4)
+            + (num_hashed as u64 * 4)
+    };
 
     let plt_size = if plt_names.is_empty() {
         0u64
@@ -974,7 +995,15 @@ pub(super) fn emit_shared_library(
     let has_fini_array = output_sections
         .iter()
         .any(|s| s.name == ".fini_array" && s.mem_size > 0);
-    let mut dyn_count = needed_sonames.len() as u64 + 10; // 9 fixed entries + DT_NULL
+    // 8 fixed entries + DT_NULL.  DT_GNU_HASH is no longer unconditional (see
+    // --hash-style), so both hash tags are counted below instead.
+    let mut dyn_count = needed_sonames.len() as u64 + 9;
+    if want_gnu_hash {
+        dyn_count += 1;
+    }
+    if want_sysv_hash {
+        dyn_count += 1;
+    }
     if soname.is_some() {
         dyn_count += 1;
     }
@@ -1066,6 +1095,10 @@ pub(super) fn emit_shared_library(
     let gnu_hash_offset = offset;
     let gnu_hash_addr = vaddr!(offset);
     offset += gnu_hash_size;
+    offset = (offset + 3) & !3;
+    let sysv_hash_offset = offset;
+    let sysv_hash_addr = vaddr!(offset);
+    offset += sysv_hash_size;
     offset = (offset + 7) & !7;
     let dynsym_offset = offset;
     let dynsym_addr = vaddr!(offset);
@@ -1564,22 +1597,30 @@ pub(super) fn emit_shared_library(
     }
 
     // .gnu.hash
-    let gh = gnu_hash_offset as usize;
-    w32(&mut out, gh, gnu_hash_nbuckets);
-    w32(&mut out, gh + 4, gnu_hash_symoffset as u32);
-    w32(&mut out, gh + 8, gnu_hash_bloom_size);
-    w32(&mut out, gh + 12, gnu_hash_bloom_shift);
-    let bloom_off = gh + 16;
-    for (i, &bw) in bloom_words.iter().enumerate() {
-        w64(&mut out, bloom_off + i * 8, bw);
+    if let Some(sh) = &sysv_hash {
+        crate::backend::linker_common::write_sysv_hash(&mut out, sysv_hash_offset as usize, sh);
     }
-    let buckets_off = bloom_off + (gnu_hash_bloom_size as usize * 8);
-    for (i, &b) in gnu_hash_buckets.iter().enumerate() {
-        w32(&mut out, buckets_off + i * 4, b);
-    }
-    let chains_off = buckets_off + (gnu_hash_nbuckets as usize * 4);
-    for (i, &c) in gnu_hash_chains.iter().enumerate() {
-        w32(&mut out, chains_off + i * 4, c);
+    // Gated: with `--hash-style=sysv` the GNU table has zero size, so
+    // `gnu_hash_offset` and `sysv_hash_offset` are the *same* address and this
+    // writer would overwrite the SysV table that was just laid down.
+    if want_gnu_hash {
+        let gh = gnu_hash_offset as usize;
+        w32(&mut out, gh, gnu_hash_nbuckets);
+        w32(&mut out, gh + 4, gnu_hash_symoffset as u32);
+        w32(&mut out, gh + 8, gnu_hash_bloom_size);
+        w32(&mut out, gh + 12, gnu_hash_bloom_shift);
+        let bloom_off = gh + 16;
+        for (i, &bw) in bloom_words.iter().enumerate() {
+            w64(&mut out, bloom_off + i * 8, bw);
+        }
+        let buckets_off = bloom_off + (gnu_hash_bloom_size as usize * 8);
+        for (i, &b) in gnu_hash_buckets.iter().enumerate() {
+            w32(&mut out, buckets_off + i * 4, b);
+        }
+        let chains_off = buckets_off + (gnu_hash_nbuckets as usize * 4);
+        for (i, &c) in gnu_hash_chains.iter().enumerate() {
+            w32(&mut out, chains_off + i * 4, c);
+        }
     }
 
     // .dynsym
@@ -2123,11 +2164,22 @@ pub(super) fn emit_shared_library(
         (DT_RELASZ, rela_dyn_size),
         (DT_RELAENT, 24),
         (DT_RELACOUNT, relative_count as u64),
-        (DT_GNU_HASH, gnu_hash_addr),
         // DT_TEXTREL not needed since we use PIC
     ] {
         w64(&mut out, dd, tag as u64);
         w64(&mut out, dd + 8, val);
+        dd += 16;
+    }
+    // Hash tables, GNU first: a loader that understands DT_GNU_HASH prefers it
+    // and ignores DT_HASH, which is what `--hash-style=both` is for.
+    if want_gnu_hash {
+        w64(&mut out, dd, DT_GNU_HASH as u64);
+        w64(&mut out, dd + 8, gnu_hash_addr);
+        dd += 16;
+    }
+    if want_sysv_hash {
+        w64(&mut out, dd, DT_HASH as u64);
+        w64(&mut out, dd + 8, sysv_hash_addr);
         dd += 16;
     }
     if bsymbolic {
@@ -2207,6 +2259,7 @@ pub(super) fn emit_shared_library(
     let mut shstr_offsets: FxHashMap<String, u32> = FxHashMap::default();
     let known_names = [
         ".gnu.hash",
+        ".hash",
         ".dynsym",
         ".dynstr",
         ".gnu.version",
@@ -2250,12 +2303,20 @@ pub(super) fn emit_shared_library(
     let write_shdr_so = linker_common::write_elf64_shdr;
 
     // Pre-count section indices for cross-references
-    let dynsym_shidx: u32 = 2; // NULL=0, .gnu.hash=1, .dynsym=2
-    let dynstr_shidx: u32 = 3; // .dynstr=3
+    // Numbered, not hardcoded: `--hash-style=sysv` swaps `.gnu.hash` for
+    // `.hash`, and with both there are two hash headers before `.dynsym`.
+    let dynsym_shidx: u32 = 1 + want_gnu_hash as u32 + want_sysv_hash as u32;
+    // Derived, not hardcoded: `.dynstr` always follows `.dynsym`, whose own
+    // index depends on how many hash tables precede it.
+    let dynstr_shidx: u32 = dynsym_shidx + 1;
 
     // Map merged output sections to their final section-header indices.
     let mut out_sec_to_hdr: FxHashMap<usize, u16> = FxHashMap::default();
-    let mut next_hdr = 4usize;
+    // Must agree with `sh_count` above: NULL + .dynsym + .dynstr, plus one
+    // header per hash table emitted.  This was hardcoded to 4 (NULL +
+    // .gnu.hash + .dynsym + .dynstr), so `--hash-style=both` put `.symtab`'s
+    // sh_link on `.symtab` itself instead of `.strtab`.
+    let mut next_hdr = 3usize + want_gnu_hash as usize + want_sysv_hash as usize;
     if versym_size > 0 {
         next_hdr += 1;
     }
@@ -2393,7 +2454,8 @@ pub(super) fn emit_shared_library(
     }
 
     // Count total sections to determine .shstrtab index
-    let mut sh_count: u16 = 4; // NULL + .gnu.hash + .dynsym + .dynstr
+    // NULL + .dynsym + .dynstr, plus one header per hash table emitted.
+    let mut sh_count: u16 = 3 + want_gnu_hash as u16 + want_sysv_hash as u16;
     if versym_size > 0 {
         sh_count += 1;
     }
@@ -2486,19 +2548,39 @@ pub(super) fn emit_shared_library(
     // [0] NULL
     write_shdr_so(&mut out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     // .gnu.hash
-    write_shdr_so(
-        &mut out,
-        get_shname(".gnu.hash"),
-        SHT_GNU_HASH,
-        SHF_ALLOC,
-        gnu_hash_addr,
-        gnu_hash_offset,
-        gnu_hash_size,
-        dynsym_shidx,
-        0,
-        8,
-        0,
-    );
+    if want_gnu_hash {
+        write_shdr_so(
+            &mut out,
+            get_shname(".gnu.hash"),
+            SHT_GNU_HASH,
+            SHF_ALLOC,
+            gnu_hash_addr,
+            gnu_hash_offset,
+            gnu_hash_size,
+            dynsym_shidx,
+            0,
+            8,
+            0,
+        );
+    }
+    // .hash (SysV).  sh_info is unspecified for SHT_HASH by the ELF spec; GNU ld
+    // and every loader in the wild use 0, and readelf warns on anything else.
+    // (The "first global symbol index" reading of that field is SHT_DYNSYM's.)
+    if let Some(sh) = &sysv_hash {
+        write_shdr_so(
+            &mut out,
+            get_shname(".hash"),
+            SHT_HASH,
+            SHF_ALLOC,
+            sysv_hash_addr,
+            sysv_hash_offset,
+            sh.size(),
+            dynsym_shidx,
+            0,
+            4,
+            0,
+        );
+    }
     // .dynsym
     write_shdr_so(
         &mut out,

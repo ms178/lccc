@@ -46,6 +46,13 @@ pub trait GlobalSymbolOps: Clone {
 
     /// Create a GlobalSymbol representing a dynamic symbol resolved from a shared library.
     fn new_dynamic(dsym: &DynSymbol, soname: &str) -> Self;
+
+    /// True when the symbol is satisfied by an `R_*_COPY` relocation rather
+    /// than by a definition in this image.  Defaults to false because only
+    /// the backends that emit copy relocations need it.
+    fn has_copy_reloc(&self) -> bool {
+        false
+    }
 }
 
 // ── Linker-defined symbols ──────────────────────────────────────────────
@@ -215,4 +222,26 @@ pub fn resolve_start_stop_symbols(output_sections: &[OutputSection]) -> Vec<(Str
         }
     }
     result
+}
+
+/// Is this symbol part of the executable's exported (`.dynsym`) set under
+/// `--export-dynamic`?
+///
+/// Shared by two callers that must agree exactly:
+///
+/// * the emitter, which decides what actually lands in `.dynsym`; and
+/// * `--gc-sections`, which must treat every such symbol as a **root**.
+///
+/// The second point is a correctness requirement, not a nicety: an exported
+/// symbol is reachable from *outside* the image (`dlsym`, a `dlopen`ed plugin,
+/// another DSO), so nothing inside the link references it, and a pure
+/// reachability sweep collects it.  The link still succeeds and the binary
+/// still runs -- it just fails at the first `dlsym`.  Keeping the predicate in
+/// one place means a future change to the export rule cannot silently
+/// desynchronise the two.
+pub fn is_exported_dynamic_symbol<G: GlobalSymbolOps>(g: &G) -> bool {
+    g.section_idx() != 0 // SHN_UNDEF
+        && !g.is_dynamic()
+        && !g.has_copy_reloc()
+        && (g.info() >> 4) != 0 // not STB_LOCAL
 }

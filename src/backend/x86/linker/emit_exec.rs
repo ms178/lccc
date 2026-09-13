@@ -32,11 +32,23 @@ pub(super) fn emit_executable(
     globals: &mut FxHashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
     section_map: &FxHashMap<(usize, usize), (usize, u64)>,
+    // Sections dropped by `--gc-sections`, COMDAT dedup, ICF folding or dead-FDE
+    // pruning, keyed `(object, section)`.  They are still present in
+    // `section_map` -- the layout pass assigns them a slot before collection
+    // decides they are unreachable -- so a symbol filter that only consults
+    // `section_map` emits a `.symtab` full of entries pointing at address 0.
+    dead_sections: &crate::common::fx_hash::FxHashSet<(usize, usize)>,
+    // `-s` / `--strip-all`: omit `.symtab` and `.strtab` entirely.
     plt_names: &[String],
     got_entries: &[(String, bool)],
     // Absolute 64-bit relocations against dynamic data symbols; each becomes a
     // dynamic R_X86_64_64 in .rela.dyn (see AbsDynReloc).
     abs_dyn_relocs: &[super::plt_got::AbsDynReloc],
+    // Absolute 64-bit relocations that a PIE hands to the loader as
+    // R_X86_64_RELATIVE so it can slide them by the load base.  Collected by
+    // the same relocation walk that produces `abs_dyn_relocs`; see
+    // `plt_got::PieRelative` for why the count and the bytes cannot drift.
+    pie_relative: &[super::plt_got::PieRelative],
     needed_sonames: &[String],
     output_path: &str,
     export_dynamic: bool,
@@ -53,6 +65,16 @@ pub(super) fn emit_executable(
     // into .dynsym. Previously honoured only for shared objects, so a
     // `local: *;` script silently exported everything from an executable.
     version_script_path: Option<&str>,
+    // `-pie`: emit `ET_DYN` based at 0 so the kernel may map the image
+    // anywhere, and describe every internal absolute address to `ld.so` with
+    // `R_X86_64_RELATIVE`.
+    is_pie: bool,
+    strip_all: bool,
+    // Local IFUNCs as `(object, symbol index)`.  They get IPLT slots numbered
+    // after the global ones, so every IPLT/GOT/IRELATIVE table stays a single
+    // index space.
+    local_ifuncs: &[(usize, usize)],
+    hash_style: crate::backend::linker_common::HashStyle,
 ) -> Result<(), String> {
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
     let mut t_zone = std::time::Instant::now();
@@ -140,13 +162,10 @@ pub(super) fn emit_executable(
         let mut exported: Vec<String> = globals
             .iter()
             .filter(|(name, g)| {
-                // Export defined, non-dynamic (local to this executable) global symbols
-                if !(g.section_idx != SHN_UNDEF
-                    && !g.is_dynamic
-                    && !g.copy_reloc
-                    && (g.info >> 4) != 0)
-                // not STB_LOCAL
-                {
+                // Export defined, non-dynamic (local to this executable) global
+                // symbols.  The predicate is shared with `--gc-sections`'s root
+                // set so the two can never drift apart.
+                if !linker_common::is_exported_dynamic_symbol(*g) {
                     return false;
                 }
                 if let Some(ref vs) = version_script {
@@ -269,7 +288,15 @@ pub(super) fn emit_executable(
     // .rela.dyn (ld.so applies IRELATIVE last, matching GNU ld/mold layout).
     // Static executables use the separate .rela.iplt + __rela_iplt_start/end
     // protocol handled by glibc's static startup instead.
-    let dyn_irelative_count = if is_static { 0 } else { ifunc_symbols.len() };
+    // Every IFUNC slot needs an IRELATIVE, local ones included -- counting only
+    // the globals here left local IFUNCs with an IPLT stub whose GOT entry was
+    // never resolved, so the dynamic case kept binding to the resolver while
+    // the static case (which uses `num_ifunc` for `.rela.iplt`) worked.
+    let dyn_irelative_count = if is_static {
+        0
+    } else {
+        ifunc_symbols.len() + local_ifuncs.len()
+    };
     // Absolute relocations against dynamic data symbols also live in .rela.dyn.
     // Symbols that ended up copy-relocated are excluded: for those the storage
     // is a local BSS copy that ld.so fills via R_X86_64_COPY, so an additional
@@ -283,8 +310,64 @@ pub(super) fn emit_executable(
                 .unwrap_or(false)
         })
         .count();
-    let rela_dyn_count =
-        rela_dyn_glob_count + copy_reloc_syms.len() + dyn_irelative_count + abs_dyn_count;
+    // RELATIVE entries come first in .rela.dyn (the order bfd/mold use, and the
+    // one that keeps the loader's common case -- a run of RELATIVE at the head
+    // of the table -- cache-friendly).  The count is `pie_relative.len()`: the
+    // very same list the emitter below walks, so DT_RELASZ is exact by
+    // construction rather than by a second predicate happening to agree.
+    // Filter once, here, and use the *same* filtered list for the count and for
+    // the emission below.  `create_plt_got` walks every section of every input,
+    // including ones that never reach the output (non-alloc sections, and
+    // anything GC/COMDAT dropped), so a `RELATIVE` is only real if its storage
+    // was actually laid out.  Deriving the count from the filtered list rather
+    // than from `pie_relative.len()` is what makes `DT_RELASZ` exact: if the
+    // filter ever rejects an entry, the count shrinks with it.
+    let pie_relative: Vec<&super::plt_got::PieRelative> = if is_static || !is_pie {
+        Vec::new()
+    } else {
+        pie_relative
+            .iter()
+            .filter(|pr| section_map.contains_key(&(pr.obj_idx, pr.sec_idx)))
+            .collect()
+    };
+    // A PIE also has to slide the GOT slots that hold the address of a symbol
+    // *defined in this output*.  crt1.o reaches `main` through
+    // R_X86_64_REX_GOTPCRELX, so `_start` loads it out of a GOT slot; in an
+    // ET_EXEC that slot is simply pre-filled, but in a PIE it must carry a
+    // RELATIVE or the program jumps to the unslid link-time address of main.
+    // Collected by ordinal (position among the non-PLT GOT entries, which is
+    // how the emitter numbers the slots) so the count needs no addresses.
+    let pie_got_relative: Vec<usize> = if is_static || !is_pie {
+        Vec::new()
+    } else {
+        let mut v = Vec::new();
+        let mut ord = 0usize;
+        for (name, is_plt) in got_entries {
+            if name.is_empty() || *is_plt {
+                continue;
+            }
+            // Same rule as the data relocations: the slot needs sliding when
+            // what we put in it is one of our own addresses.  That covers both
+            // a locally-defined symbol and a dynamic function's PLT entry (the
+            // GLOB_DAT writer below deliberately skips those, filling the slot
+            // statically instead).
+            let needs_slide = globals
+                .get(name.as_str())
+                .map(super::plt_got::stored_value_is_local)
+                .unwrap_or(false);
+            if needs_slide {
+                v.push(ord);
+            }
+            ord += 1;
+        }
+        v
+    };
+    let pie_relative_count = pie_relative.len() + pie_got_relative.len();
+    let rela_dyn_count = rela_dyn_glob_count
+        + copy_reloc_syms.len()
+        + dyn_irelative_count
+        + abs_dyn_count
+        + pie_relative_count;
     let rela_dyn_size = rela_dyn_count as u64 * 24;
 
     // Build .gnu.hash table for hashed symbols (copy-reloc + exported)
@@ -377,6 +460,26 @@ pub(super) fn emit_executable(
         .collect();
 
     // Build buckets and chains
+    // SysV `.hash` sizing.  `nbucket` is at the linker's discretion; `nchain`
+    // is fixed by the ABI at the number of `.dynsym` entries *including* the
+    // NULL symbol at index 0, because `chain[]` is indexed by symbol index.
+    let want_gnu_hash = !is_static && hash_style.wants_gnu();
+    let want_sysv_hash = !is_static && hash_style.wants_sysv();
+    let sysv_hash_size: u64 = if want_sysv_hash {
+        let names: Vec<&str> = dyn_sym_names.iter().map(|n| dynsym_emit_name(n)).collect();
+        linker_common::build_sysv_hash(&names).size()
+    } else {
+        0
+    };
+
+    // SysV table, built by the helper shared with the shared-object emitter so
+    // the two cannot drift apart.
+    let sysv_hash: Option<linker_common::SysvHash> = if want_sysv_hash {
+        let names: Vec<&str> = dyn_sym_names.iter().map(|n| dynsym_emit_name(n)).collect();
+        Some(linker_common::build_sysv_hash(&names))
+    } else {
+        None
+    };
     let mut gnu_hash_buckets = vec![0u32; gnu_hash_nbuckets as usize];
     let mut gnu_hash_chains = vec![0u32; num_hashed];
     for (i, &h) in hashed_sym_hashes.iter().enumerate() {
@@ -409,6 +512,11 @@ pub(super) fn emit_executable(
             + (gnu_hash_nbuckets as u64 * 4)
             + (num_hashed as u64 * 4)
     };
+    // `--hash-style=sysv` means no `.gnu.hash` at all: zero size, no section
+    // header, no DT_GNU_HASH.  Leaving an empty table behind would make the
+    // loader prefer a hash that contains nothing.
+    let gnu_hash_size = if want_gnu_hash { gnu_hash_size } else { 0 };
+
     let plt_size = if is_static || plt_names.is_empty() {
         0u64
     } else {
@@ -437,7 +545,16 @@ pub(super) fn emit_executable(
     let dynamic_size = if is_static {
         0u64
     } else {
+        // 13 fixed entries + NULL.  DT_GNU_HASH moved out of the fixed set when
+        // --hash-style gained a sysv mode, so both hash tags are added here.
         let mut dyn_count = needed_sonames.len() as u64 + 14; // fixed entries + NULL
+        dyn_count -= 1; // DT_GNU_HASH is no longer unconditional
+        if want_gnu_hash {
+            dyn_count += 1;
+        }
+        if want_sysv_hash {
+            dyn_count += 1;
+        }
         if has_init_array {
             dyn_count += 2;
         }
@@ -447,9 +564,17 @@ pub(super) fn emit_executable(
         if has_preinit_array {
             dyn_count += 2;
         }
+        // DT_FLAGS carries BIND_NOW; DT_FLAGS_1 carries NOW and/or PIE.  A PIE
+        // needs DF_1_PIE even without `-z now`, so the two are counted
+        // independently -- and both conditions are spelled identically to the
+        // emission below, which is the only thing keeping DT_* count and bytes
+        // in agreement.
         if z_now {
-            dyn_count += 2;
-        } // DT_FLAGS(BIND_NOW) + DT_FLAGS_1(NOW)
+            dyn_count += 1; // DT_FLAGS
+        }
+        if z_now || is_pie {
+            dyn_count += 1; // DT_FLAGS_1
+        }
         if rpath_string.is_some() {
             dyn_count += 1;
         }
@@ -536,7 +661,12 @@ pub(super) fn emit_executable(
     // and a second, identical pair in emit_shared.rs — and that duplication is
     // precisely why the shared-library path stayed broken after the executable
     // path was fixed.
-    let mut packer = super::layout_plan::SegmentPacker::new(BASE_ADDR, PAGE_SIZE);
+    // A PIE is laid out from 0: every address in the image is then an offset
+    // from whatever base the kernel picks, and R_X86_64_RELATIVE tells ld.so
+    // which stored values need that base added.  A non-PIE keeps the
+    // traditional fixed base.
+    let base_addr = if is_pie { 0 } else { BASE_ADDR };
+    let mut packer = super::layout_plan::SegmentPacker::new(base_addr, PAGE_SIZE);
     macro_rules! vaddr {
         ($off:expr_2021) => {
             packer.vaddr($off)
@@ -558,6 +688,13 @@ pub(super) fn emit_executable(
     let gnu_hash_offset = offset;
     let gnu_hash_addr = vaddr!(offset);
     offset += gnu_hash_size;
+    // SysV `.hash`, for `--hash-style=sysv|both`.  Placed immediately after
+    // `.gnu.hash` so it lands inside the same read-only PT_LOAD (which runs
+    // from 0 to the end of `.rela.plt`) with no extra segment bookkeeping.
+    offset = (offset + 7) & !7;
+    let sysv_hash_offset = offset;
+    let sysv_hash_addr = vaddr!(offset);
+    offset += sysv_hash_size;
     offset = (offset + 7) & !7;
     let dynsym_offset = offset;
     let dynsym_addr = vaddr!(offset);
@@ -612,7 +749,7 @@ pub(super) fn emit_executable(
     };
 
     // .iplt (IFUNC PLT entries for static linking)
-    let num_ifunc = ifunc_symbols.len();
+    let num_ifunc = ifunc_symbols.len() + local_ifuncs.len();
     let iplt_entry_size: u64 = 16; // each IPLT entry: jmp *got(%rip) + padding
     let iplt_total_size = num_ifunc as u64 * iplt_entry_size;
     let (iplt_addr, iplt_offset) = if iplt_total_size > 0 {
@@ -901,7 +1038,7 @@ pub(super) fn emit_executable(
     let text_seg_end = text_page_addr + text_total_size;
     let data_seg_start = rw_page_addr;
     let linker_addrs = LinkerSymbolAddresses {
-        base_addr: BASE_ADDR,
+        base_addr,
         got_addr: got_plt_addr,
         dynamic_addr,
         bss_addr,
@@ -961,6 +1098,34 @@ pub(super) fn emit_executable(
             gsym.value = iplt_addr + (i as u64) * iplt_entry_size;
         }
     }
+    // Local IFUNCs: an IFUNC symbol's `st_value` *is* the resolver's address
+    // (the compiler points both `pick` and its `res` at the same offset), so
+    // resolving the symbol through the ordinary section path yields exactly the
+    // resolver address the IRELATIVE addend needs.  Unlike the globals above,
+    // these are not redirected in `globals` -- the applier is handed an
+    // explicit slot map below instead, because a local symbol must never be
+    // resolved by name.
+    let global_ifunc_slots = ifunc_resolver_addrs.len();
+    let mut local_ifunc_slots: FxHashMap<(usize, usize), u64> = FxHashMap::default();
+    for (i, &(obj_idx, sym_idx)) in local_ifuncs.iter().enumerate() {
+        let slot = global_ifunc_slots + i;
+        let Some(sym) = objects[obj_idx].symbols.get(sym_idx) else {
+            continue;
+        };
+        let resolver = resolve_sym(
+            obj_idx,
+            sym,
+            globals,
+            section_map,
+            output_sections,
+            plt_addr,
+        );
+        ifunc_resolver_addrs.push(resolver);
+        local_ifunc_slots.insert(
+            (obj_idx, sym_idx),
+            iplt_addr + slot as u64 * iplt_entry_size,
+        );
+    }
 
     let entry_name = entry_symbol.unwrap_or("_start");
     let entry_addr = globals
@@ -1000,14 +1165,43 @@ pub(super) fn emit_executable(
     // the historical ordering bugs `layout_plan.rs` was created to prevent, so
     // it is now a single pass whose count is reused.
     let mut out_sec_to_hdr: FxHashMap<usize, u16> = FxHashMap::default();
+    // `-s` / `--strip-all`: no `.symtab`/`.strtab` at all.  Filtering the
+    // builders below (rather than building and discarding) means a stripped
+    // link also skips the sort and the string-table construction.
+    let emit_symtab = !strip_all;
     let symtab_shidx;
     let strtab_shidx;
+    let dynsym_shidx: u32;
+    let dynstr_shidx: u32;
+    // Number of headers before the output sections; `sh_count` continues from
+    // here rather than re-deriving the same arithmetic.
+    let linker_hdr_count: u16;
     {
         // Linker-created headers that precede the output sections, in the
-        // order the write loop emits them.
+        // exact order the write loop emits them.
+        //
+        // Each one is *named* here instead of skipped over with `h += N`.  The
+        // previous form let `.dynsym`'s index be hardcoded as 3 further down,
+        // which silently broke the moment `--hash-style=sysv` replaced
+        // `.gnu.hash` with `.hash`: the header count stayed the same but the
+        // cross-references did not.  Assigning the index where the header is
+        // counted makes that class of bug unrepresentable.
         let mut h = 1usize; // [0] = NULL
         if !is_static {
-            h += 4; // .interp .gnu.hash .dynsym .dynstr
+            h += 1; // .interp
+            if want_gnu_hash {
+                h += 1; // .gnu.hash
+            }
+            if want_sysv_hash {
+                h += 1; // .hash
+            }
+            dynsym_shidx = h as u32;
+            h += 1; // .dynsym
+            dynstr_shidx = h as u32;
+            h += 1; // .dynstr
+        } else {
+            dynsym_shidx = 0;
+            dynstr_shidx = 0;
         }
         if !is_static && verneed_size > 0 {
             h += 2;
@@ -1024,6 +1218,10 @@ pub(super) fn emit_executable(
         if eh_frame_hdr_size > 0 {
             h += 1;
         } // .eh_frame_hdr
+        // Captured here, before the output sections are numbered: `sh_count`
+        // adds those itself, and taking the value after `assign` would count
+        // them twice.
+        linker_hdr_count = h as u16;
 
         // Output sections, in four ordered groups.
         let mut assign = |pred: &dyn Fn(&OutputSection) -> bool,
@@ -1100,8 +1298,11 @@ pub(super) fn emit_executable(
         );
 
         // .symtab and .strtab follow, then .shstrtab.
-        symtab_shidx = h as u16;
-        strtab_shidx = h as u16 + 1;
+        symtab_shidx = if emit_symtab { h as u16 } else { 0 };
+        strtab_shidx = if emit_symtab { h as u16 + 1 } else { 0 };
+        if emit_symtab {
+            h += 2;
+        }
     }
 
     // ELF requires every STB_LOCAL entry before the first global entry.
@@ -1116,11 +1317,18 @@ pub(super) fn emit_executable(
             obj.symbols
                 .iter()
                 .filter(move |sym| {
-                    sym.is_local()
+                    emit_symtab
+                        && sym.is_local()
                         && !sym.name.is_empty()
                         && sym.shndx != SHN_UNDEF
                         && sym.shndx != SHN_ABS
                         && section_map.contains_key(&(obj_idx, sym.shndx as usize))
+                        // Collected away: the section was never laid out, so the
+                        // symbol has no address.  Emitting it anyway produced a
+                        // `.symtab` dominated by value-0/size!=0 entries -- on a
+                        // 61-object `-ffunction-sections --gc-sections` link,
+                        // 2341 of 2551 symbols, 61 KB against bfd's 6 KB.
+                        && !dead_sections.contains(&(obj_idx, sym.shndx as usize))
                 })
                 .map(move |sym| (obj_idx, sym))
         })
@@ -1141,11 +1349,20 @@ pub(super) fn emit_executable(
             off, sym.info, sym.other, shndx, value, sym.size,
         ));
     }
-    let n_local = symtab_entries.len();
 
     let mut sym_names: Vec<(&String, &GlobalSymbol)> = globals
         .iter()
-        .filter(|(_, g)| g.defined_in.is_some() && !g.is_dynamic)
+        .filter(|(_, g)| {
+            emit_symtab
+                && g.defined_in.is_some()
+                && !g.is_dynamic
+                // Same rule as the locals above: a global defined in a section
+                // that was collected away has no address to report.
+                && !matches!(g.defined_in,
+                    Some(oi) if g.section_idx != SHN_ABS
+                        && g.section_idx != SHN_COMMON
+                        && dead_sections.contains(&(oi, g.section_idx as usize)))
+        })
         .collect();
     // Sort by a cached big-endian 8-byte prefix first: for symbol-heavy
     // objects the names share long prefixes ("F1", "F12", ...), so plain
@@ -1204,6 +1421,19 @@ pub(super) fn emit_executable(
             shndx, gsym.value, gsym.size,
         ));
     }
+    // `sh_info` must equal the number of STB_LOCAL entries, counting the NULL
+    // symbol at index 0.  It used to be snapshotted between the two loops below
+    // as `symtab_entries.len()`, which is only correct while the globals loop
+    // never appends an entry carrying STB_LOCAL -- and it does, for symbols
+    // whose binding came from the input object rather than from our own
+    // promotion.  Each such entry made `sh_info` one short, which is a hard ELF
+    // violation (the rule is `sh_info == nlocals`).  Deriving it from the
+    // finished table makes the invariant unbreakable instead of maintained by
+    // hand, and costs one linear scan over data that is already in cache.
+    let n_local = symtab_entries
+        .iter()
+        .filter(|e| (e[4] >> 4) == 0) // st_info >> 4 == STB_LOCAL
+        .count();
     zone!("symtab");
     // === Build output buffer ===
     let file_size = offset as usize;
@@ -1232,7 +1462,7 @@ pub(super) fn emit_executable(
     out[4] = ELFCLASS64;
     out[5] = ELFDATA2LSB;
     out[6] = 1;
-    w16(&mut out, 16, ET_EXEC);
+    w16(&mut out, 16, if is_pie { ET_DYN } else { ET_EXEC });
     w16(&mut out, 18, EM_X86_64);
     w32(&mut out, 20, 1);
     w64(&mut out, 24, entry_addr);
@@ -1254,7 +1484,7 @@ pub(super) fn emit_executable(
         PT_PHDR,
         PF_R,
         64,
-        BASE_ADDR + 64,
+        base_addr + 64,
         phdr_total_size,
         phdr_total_size,
         8,
@@ -1276,7 +1506,7 @@ pub(super) fn emit_executable(
     }
     let ro_seg_end = rela_plt_offset + rela_plt_size;
     wphdr(
-        &mut out, ph, PT_LOAD, PF_R, 0, BASE_ADDR, ro_seg_end, ro_seg_end, PAGE_SIZE,
+        &mut out, ph, PT_LOAD, PF_R, 0, base_addr, ro_seg_end, ro_seg_end, PAGE_SIZE,
     );
     ph += 56;
     wphdr(
@@ -1405,24 +1635,33 @@ pub(super) fn emit_executable(
         // .interp
         write_bytes(&mut out, interp_offset as usize, interp);
 
-        // .gnu.hash - proper hash table so dynamic linker can find copy-reloc symbols
+        // .gnu.hash - proper hash table so dynamic linker can find copy-reloc
+        // symbols.  Gated on `want_gnu_hash`: at zero size it aliases
+        // `sysv_hash_offset`, and writing here would clobber the SysV table.
         let gh = gnu_hash_offset as usize;
-        w32(&mut out, gh, gnu_hash_nbuckets);
-        w32(&mut out, gh + 4, gnu_hash_symoffset as u32);
-        w32(&mut out, gh + 8, gnu_hash_bloom_size);
-        w32(&mut out, gh + 12, gnu_hash_bloom_shift);
-        // Bloom filter
-        let bloom_off = gh + 16;
-        w64(&mut out, bloom_off, bloom_word);
-        // Buckets
-        let buckets_off = bloom_off + (gnu_hash_bloom_size as usize * 8);
-        for (i, &b) in gnu_hash_buckets.iter().enumerate() {
-            w32(&mut out, buckets_off + i * 4, b);
+        if want_gnu_hash {
+            w32(&mut out, gh, gnu_hash_nbuckets);
+            w32(&mut out, gh + 4, gnu_hash_symoffset as u32);
+            w32(&mut out, gh + 8, gnu_hash_bloom_size);
+            w32(&mut out, gh + 12, gnu_hash_bloom_shift);
+            // Bloom filter
+            let bloom_off = gh + 16;
+            w64(&mut out, bloom_off, bloom_word);
+            // Buckets
+            let buckets_off = bloom_off + (gnu_hash_bloom_size as usize * 8);
+            for (i, &b) in gnu_hash_buckets.iter().enumerate() {
+                w32(&mut out, buckets_off + i * 4, b);
+            }
+            // Chains
+            let chains_off = buckets_off + (gnu_hash_nbuckets as usize * 4);
+            for (i, &c) in gnu_hash_chains.iter().enumerate() {
+                w32(&mut out, chains_off + i * 4, c);
+            }
         }
-        // Chains
-        let chains_off = buckets_off + (gnu_hash_nbuckets as usize * 4);
-        for (i, &c) in gnu_hash_chains.iter().enumerate() {
-            w32(&mut out, chains_off + i * 4, c);
+
+        // .hash (SysV): nbucket, nchain, bucket[nbucket], chain[nchain]
+        if let Some(sh) = &sysv_hash {
+            linker_common::write_sysv_hash(&mut out, sysv_hash_offset as usize, sh);
         }
 
         // .dynsym
@@ -1496,6 +1735,64 @@ pub(super) fn emit_executable(
 
         // .rela.dyn (GLOB_DAT for dynamic GOT symbols, R_X86_64_COPY for copy relocs)
         let mut rd = rela_dyn_offset as usize;
+        // PIE slide entries first: ld.so's common case is a run of RELATIVE at
+        // the head of the table, and this is the order bfd and mold emit.
+        //
+        // Values come from the same `resolve_sym` the relocation applier below
+        // uses, so a target reached through a section symbol -- how the
+        // compiler points `const char *msgs[]` at merged string literals --
+        // resolves to its merged address rather than to 0.  Because
+        // `base_addr` is 0 for a PIE, that value is also what the applier
+        // stores in the file, so the addend and the stored bytes agree.
+        for pr in &pie_relative {
+            // Unwrap is safe: the list was filtered on exactly this key above.
+            let (out_idx, sec_off) = section_map[&(pr.obj_idx, pr.sec_idx)];
+            let obj = &objects[pr.obj_idx];
+            let s = resolve_sym(
+                pr.obj_idx,
+                &obj.symbols[pr.sym_idx],
+                globals,
+                section_map,
+                output_sections,
+                plt_addr,
+            );
+            w64(
+                &mut out,
+                rd,
+                output_sections[out_idx].addr + sec_off + pr.offset,
+            );
+            w64(&mut out, rd + 8, R_X86_64_RELATIVE as u64);
+            w64(&mut out, rd + 16, (s as i64 + pr.addend) as u64);
+            rd += 24;
+        }
+        // ...then the GOT slots holding locally-defined addresses.  Slot N of
+        // the non-PLT range lives at got_addr + N*8, matching the numbering the
+        // GLOB_DAT writer below uses.
+        for &ord in &pie_got_relative {
+            let name = &got_entries
+                .iter()
+                .filter(|(n, p)| !n.is_empty() && !*p)
+                .nth(ord)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default();
+            let addend = globals
+                .get(name.as_str())
+                .map(|g| {
+                    if g.is_dynamic && !g.copy_reloc {
+                        // The slot was filled with our PLT entry, not g.value.
+                        g.plt_idx
+                            .map(|pi| plt_addr + 16 + pi as u64 * 16)
+                            .unwrap_or(g.value)
+                    } else {
+                        g.value
+                    }
+                })
+                .unwrap_or(0);
+            w64(&mut out, rd, got_addr + ord as u64 * 8);
+            w64(&mut out, rd + 8, R_X86_64_RELATIVE as u64);
+            w64(&mut out, rd + 16, addend);
+            rd += 24;
+        }
         let mut gd_a = got_addr;
         for (name, is_plt) in got_entries {
             if name.is_empty() || *is_plt {
@@ -1649,10 +1946,21 @@ pub(super) fn emit_executable(
             (DT_RELA, rela_dyn_addr),
             (DT_RELASZ, rela_dyn_size),
             (DT_RELAENT, 24),
-            (DT_GNU_HASH, gnu_hash_addr),
         ] {
             w64(&mut out, dd, tag as u64);
             w64(&mut out, dd + 8, val);
+            dd += 16;
+        }
+        // Hash tables, in the order the loader probes them: DT_GNU_HASH first,
+        // because a loader that understands it prefers it and ignores DT_HASH.
+        if want_gnu_hash {
+            w64(&mut out, dd, DT_GNU_HASH as u64);
+            w64(&mut out, dd + 8, gnu_hash_addr);
+            dd += 16;
+        }
+        if want_sysv_hash {
+            w64(&mut out, dd, DT_HASH as u64);
+            w64(&mut out, dd + 8, sysv_hash_addr);
             dd += 16;
         }
         if has_init_array {
@@ -1701,8 +2009,20 @@ pub(super) fn emit_executable(
             w64(&mut out, dd, DT_FLAGS as u64);
             w64(&mut out, dd + 8, DF_BIND_NOW as u64);
             dd += 16;
+        }
+        if z_now || is_pie {
+            let mut flags1: i64 = 0;
+            if z_now {
+                flags1 |= DF_1_NOW;
+            }
+            if is_pie {
+                // Without DF_1_PIE an ET_DYN is treated as a shared object:
+                // ld.so would let the global scope interpose its symbols and
+                // would not apply the executable's lookup rules.
+                flags1 |= DF_1_PIE;
+            }
             w64(&mut out, dd, DT_FLAGS_1 as u64);
-            w64(&mut out, dd + 8, DF_1_NOW as u64);
+            w64(&mut out, dd + 8, flags1 as u64);
             dd += 16;
         }
         w64(&mut out, dd, DT_NULL as u64);
@@ -1908,6 +2228,14 @@ pub(super) fn emit_executable(
                     output_sections,
                     plt_addr,
                 );
+                // A reference to a local IFUNC must land on its IPLT stub, not
+                // on the resolver.  This has to apply to every relocation type
+                // that can name the symbol (PLT32, PC32, 64), so it happens
+                // once here rather than per arm.
+                let s = match local_ifunc_slots.get(&(obj_idx, si)) {
+                    Some(&slot) => slot,
+                    None => s,
+                };
 
                 match rela.rela_type {
                     R_X86_64_64 => {
@@ -2289,6 +2617,7 @@ pub(super) fn emit_executable(
         ".eh_frame_hdr",
         ".interp",
         ".gnu.hash",
+        ".hash",
         ".dynsym",
         ".dynstr",
         ".gnu.version",
@@ -2332,32 +2661,12 @@ pub(super) fn emit_executable(
     // Use shared write_elf64_shdr from linker_common (aliased locally for brevity)
     let write_shdr = linker_common::write_elf64_shdr;
 
-    // Pre-count section indices for cross-references (dynsym_shidx, dynstr_shidx)
-    // These are only meaningful for dynamic linking, but define them unconditionally for convenience
-    let dynsym_shidx: u32 = if is_static { 0 } else { 3 }; // NULL=0, .interp=1, .gnu.hash=2, .dynsym=3
-    let dynstr_shidx: u32 = if is_static { 0 } else { 4 }; // .dynstr=4
-
-    // Count total sections to determine .shstrtab index
-    let mut sh_count: u16 = if is_static {
-        1 // NULL only
-    } else {
-        5 // NULL + .interp + .gnu.hash + .dynsym + .dynstr
-    };
-    if !is_static && verneed_size > 0 {
-        sh_count += 2;
-    } // .gnu.version + .gnu.version_r
-    if !is_static && rela_dyn_size > 0 {
-        sh_count += 1;
-    }
-    if !is_static && rela_plt_size > 0 {
-        sh_count += 1;
-    }
-    if !is_static && plt_size > 0 {
-        sh_count += 1;
-    }
-    if eh_frame_hdr_size > 0 {
-        sh_count += 1;
-    } // .eh_frame_hdr
+    // Continue the count from the single header walk above.  This used to
+    // re-derive the same five conditionals a second time, and the two copies
+    // had to be kept in step by hand -- which is how `.dynsym`'s index ended up
+    // hardcoded as 3 and broke when `--hash-style=sysv` swapped `.gnu.hash` for
+    // `.hash`.  There is now exactly one place that numbers headers.
+    let mut sh_count: u16 = linker_hdr_count;
     // Merged output sections (non-BSS, non-TLS, non-init/fini)
     for sec in output_sections.iter() {
         if sec.flags & SHF_ALLOC != 0
@@ -2411,7 +2720,7 @@ pub(super) fn emit_executable(
             sh_count += 1;
         }
     }
-    sh_count += 2; // .symtab + .strtab
+    sh_count += if emit_symtab { 2 } else { 0 }; // .symtab + .strtab
     let shstrtab_shidx = sh_count; // .shstrtab is the last section
     sh_count += 1;
 
@@ -2426,6 +2735,8 @@ pub(super) fn emit_executable(
     }
     let strtab_data_offset = out.len() as u64;
     out.extend_from_slice(&symtab_names);
+    // When stripping, both are empty and no headers point at them, so the
+    // alignment padding above is the only residue (at most 7 bytes).
 
     // Align and append .shstrtab data
     while out.len() % 8 != 0 {
@@ -2460,19 +2771,42 @@ pub(super) fn emit_executable(
             0,
         );
         // .gnu.hash
-        write_shdr(
-            &mut out,
-            get_shname(".gnu.hash"),
-            SHT_GNU_HASH,
-            SHF_ALLOC,
-            gnu_hash_addr,
-            gnu_hash_offset,
-            gnu_hash_size,
-            dynsym_shidx,
-            0,
-            8,
-            0,
-        );
+        if want_gnu_hash {
+            write_shdr(
+                &mut out,
+                get_shname(".gnu.hash"),
+                SHT_GNU_HASH,
+                SHF_ALLOC,
+                gnu_hash_addr,
+                gnu_hash_offset,
+                gnu_hash_size,
+                dynsym_shidx,
+                0,
+                8,
+                0,
+            );
+        }
+        // .hash (SysV).  sh_link points at .dynsym and sh_info is the index of
+        // the first *global* symbol, exactly as for SHT_DYNSYM.
+        if want_sysv_hash {
+            write_shdr(
+                &mut out,
+                get_shname(".hash"),
+                SHT_HASH,
+                SHF_ALLOC,
+                sysv_hash_addr,
+                sysv_hash_offset,
+                sysv_hash_size,
+                dynsym_shidx,
+                // sh_info is unspecified for SHT_HASH by the ELF spec; GNU ld
+                // and every loader in the wild use 0, and readelf warns on
+                // anything else.  (The "first global symbol index" reading of
+                // this field belongs to SHT_DYNSYM, not here.)
+                0,
+                4,
+                0,
+            );
+        }
         // .dynsym
         write_shdr(
             &mut out,
@@ -2810,34 +3144,36 @@ pub(super) fn emit_executable(
             );
         }
     }
-    // .symtab (defined symbols for profilers/debuggers)
-    write_shdr(
-        &mut out,
-        get_shname(".symtab"),
-        SHT_SYMTAB,
-        0,
-        0,
-        symtab_data_offset,
-        symtab_data_size,
-        strtab_shidx as u32,
-        n_local as u32,
-        8,
-        24,
-    );
-    // .strtab
-    write_shdr(
-        &mut out,
-        get_shname(".strtab"),
-        SHT_STRTAB,
-        0,
-        0,
-        strtab_data_offset,
-        symtab_names.len() as u64,
-        0,
-        0,
-        1,
-        0,
-    );
+    if emit_symtab {
+        // .symtab (defined symbols for profilers/debuggers)
+        write_shdr(
+            &mut out,
+            get_shname(".symtab"),
+            SHT_SYMTAB,
+            0,
+            0,
+            symtab_data_offset,
+            symtab_data_size,
+            strtab_shidx as u32,
+            n_local as u32,
+            8,
+            24,
+        );
+        // .strtab
+        write_shdr(
+            &mut out,
+            get_shname(".strtab"),
+            SHT_STRTAB,
+            0,
+            0,
+            strtab_data_offset,
+            symtab_names.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        );
+    }
     // .shstrtab (last section)
     write_shdr(
         &mut out,
@@ -2904,6 +3240,17 @@ pub(super) fn emit_executable(
         lm.write_to_path(std::path::Path::new(mp))
             .map_err(|e| format!("failed to write map file '{}': {}", mp, e))?;
     }
+
+    // === .note.gnu.build-id ===
+    // Last thing before the write, because the digest covers the whole image
+    // (section headers included) with the descriptor field zeroed.  The note
+    // was laid out from the synthetic input object `link_builtin` appends when
+    // --build-id was requested; find where it landed and fill it in.
+    let build_id_offset = output_sections
+        .iter()
+        .find(|s| s.name == ".note.gnu.build-id" && s.mem_size > 0)
+        .map(|s| s.file_offset);
+    linker_common::build_id::patch_output_build_id(&mut out, build_id_offset);
 
     std::fs::write(output_path, &out)
         .map_err(|e| format!("failed to write '{}': {}", output_path, e))?;

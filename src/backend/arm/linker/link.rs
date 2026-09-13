@@ -325,6 +325,9 @@ pub fn link_builtin(
         ));
     }
 
+    // Prune FDEs whose functions were collected (see `eh_frame::prune_dead_fdes`).
+    linker_common::prune_dead_fdes(&mut objects, &dead_sections);
+
     // Merge sections (skip dead sections when gc-sections is active)
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();

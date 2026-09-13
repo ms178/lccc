@@ -167,3 +167,72 @@ mod tests {
         assert_eq!(d1, img[56..76].to_vec());
     }
 }
+
+/// A synthetic input object carrying one empty `.note.gnu.build-id` section.
+///
+/// The linker wants the note to be laid out by the ordinary section machinery
+/// (so it gets a real address, a section header and a place in the read-only
+/// segment) while its *contents* can only be computed once the image is
+/// final.  Appending this object achieves exactly that: the merge step
+/// reserves `BUILD_ID_NOTE_SIZE` bytes and the emitter patches the digest in
+/// afterwards via [`patch_build_id`].
+pub fn synthetic_note_object() -> super::Elf64Object {
+    use super::{Elf64Object, Elf64Section, SectionData};
+    let sections = vec![
+        Elf64Section {
+            name_idx: 0,
+            name: String::new(),
+            sh_type: 0,
+            flags: 0,
+            addr: 0,
+            offset: 0,
+            size: 0,
+            link: 0,
+            info: 0,
+            addralign: 0,
+            entsize: 0,
+        },
+        Elf64Section {
+            name_idx: 0,
+            name: ".note.gnu.build-id".into(),
+            sh_type: 7, // SHT_NOTE
+            flags: 0x2, // SHF_ALLOC
+            addr: 0,
+            offset: 0,
+            size: BUILD_ID_NOTE_SIZE,
+            link: 0,
+            info: 0,
+            addralign: 4,
+            entsize: 0,
+        },
+    ];
+    let section_data = vec![
+        SectionData::empty(),
+        SectionData::owned(vec![0u8; BUILD_ID_NOTE_SIZE as usize]),
+    ];
+    Elf64Object {
+        sections,
+        symbols: Vec::new(),
+        section_data,
+        relocations: vec![Vec::new(); 2],
+        source_name: "<build-id>".into(),
+    }
+}
+
+/// Patch the build-id note of an already-laid-out output section, if present.
+///
+/// Must run after every other byte of the image is final: the digest covers
+/// the whole file with the descriptor field zeroed.  Returns true when a note
+/// was patched, so callers can assert on it in tests.
+pub fn patch_output_build_id(out: &mut [u8], note_file_offset: Option<u64>) -> bool {
+    let Some(off) = note_file_offset else {
+        return false;
+    };
+    let off = off as usize;
+    if off + BUILD_ID_NOTE_SIZE as usize > out.len() {
+        return false;
+    }
+    write_build_id_skeleton(out, off);
+    patch_build_id(out, off);
+    true
+}

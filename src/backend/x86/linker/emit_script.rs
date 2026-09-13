@@ -774,7 +774,7 @@ struct OutSec {
 }
 
 pub fn link_with_script(
-    objects: &[Object],
+    objects: &mut [Object],
     script_src: &str,
     output_path: &str,
     emit_symtab: bool,
@@ -804,7 +804,7 @@ pub fn link_with_script(
 /// records have already been normalised by the i686 parser, but output field
 /// widths, REL relocation semantics and machine/class headers remain distinct.
 pub fn link_with_script_i386(
-    objects: &[Object],
+    objects: &mut [Object],
     script_src: &str,
     output_path: &str,
     emit_symtab: bool,
@@ -832,7 +832,7 @@ pub fn link_with_script_i386(
 
 #[expect(clippy::too_many_arguments)]
 fn link_with_script_machine(
-    objects: &[Object],
+    objects: &mut [Object],
     script_src: &str,
     output_path: &str,
     emit_symtab: bool,
@@ -881,7 +881,16 @@ fn link_with_script_machine(
             }
         }
         let roots: Vec<String> = script.entry.iter().cloned().collect();
-        linker_common::gc_collect_sections_elf64_roots_and_sections(objects, &roots, &kept)
+        let dead =
+            linker_common::gc_collect_sections_elf64_roots_and_sections(objects, &roots, &kept);
+        // Drop the FDEs describing collected functions (see
+        // `eh_frame::prune_dead_fdes`).  Kernel links with
+        // CONFIG_LD_DEAD_CODE_DATA_ELIMINATION pass --gc-sections and would
+        // otherwise ship an .eh_frame_hdr table full of stale entries.
+        if !dead.is_empty() {
+            linker_common::prune_dead_fdes(objects, &dead);
+        }
+        dead
     } else {
         FxHashSet::default()
     };
