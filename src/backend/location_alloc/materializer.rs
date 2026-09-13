@@ -2,6 +2,7 @@
 //! See the module docs in [`super`] for the full design and policy record.
 
 use super::*;
+use crate::common::source::Span;
 
 /// Instantiate a planner-certified remat template at a fresh destination.
 /// Templates come exclusively from [`rematerializable_template`], i.e.
@@ -89,7 +90,13 @@ pub(super) fn materialize(
 
     let remat_ids: FxHashSet<u32> = plan.remats.iter().copied().collect();
     let gap_ids: FxHashSet<u32> = plan.gaps.iter().map(|g| g.vid).collect();
-    let split_vids: Vec<u32> = gap_ids.union(&remat_ids).copied().collect();
+    // Sorted: this vector drives cluster/edge event construction, including
+    // the instruction order of freshly built trampoline blocks. HashSet
+    // iteration is randomized per process, so an unsorted union would make
+    // multi-definition trampolines build-nondeterministic even though every
+    // other event stream is sorted by point/vid below.
+    let mut split_vids: Vec<u32> = gap_ids.union(&remat_ids).copied().collect();
+    split_vids.sort_unstable();
 
     // Fail-closed rollback state: every mutation below touches only the
     // blocks and the two id counters. If the unconditional structural
@@ -283,7 +290,15 @@ pub(super) fn materialize(
                     func.blocks[bi].terminator,
                     Terminator::IndirectBranch { .. }
                 ) {
-                    if split_debug_enabled() {
+                    // The deferred values cannot be served (no static edge
+                    // to reroute), but `renames` already holds names that
+                    // ARE defined in this block before the terminator
+                    // (memory-served terminator reads); those rewrites are
+                    // valid on every runtime edge and must not be dropped.
+                    if !renames.is_empty() {
+                        inline_edge_rename.push((bi, s, std::mem::take(&mut renames)));
+                    }
+                    if split_debug_enabled() && !deferred.is_empty() {
                         eprintln!(
                             "[GLA] {}: skip edge remat b{}->b{}: indirect-branch pred",
                             func.name, bi, s
@@ -361,9 +376,37 @@ pub(super) fn materialize(
     for bi in 0..nblocks {
         let old = std::mem::take(&mut func.blocks[bi].instructions);
         let n = old.len();
+        // DWARF fidelity: when the block carried one source span per
+        // instruction, the rebuilt block must keep that 1:1 correspondence
+        // (the split_ranges precedent in `insert_instruction`: clearing or
+        // desynchronizing spans wiped/mis-attributed line info). Every
+        // inserted event clones the span of the instruction it executes
+        // before (the last span for terminator-boundary events).
+        let spanful = func.blocks[bi].source_spans.len() == n && n > 0;
+        let old_spans: Vec<Span> = if spanful {
+            std::mem::take(&mut func.blocks[bi].source_spans)
+        } else {
+            Vec::new()
+        };
         let mut out: Vec<Instruction> = Vec::with_capacity(old.len() + events[bi].len() + 2);
+        let mut out_spans: Vec<Span> = if spanful {
+            Vec::with_capacity(old.len() + events[bi].len() + 2)
+        } else {
+            Vec::new()
+        };
         let mut active: FxHashMap<u32, u32> = FxHashMap::default();
         let mut ev_idx = 0usize;
+
+        // Event point `p` precedes original instruction p; clone that
+        // instruction's span (the final span for the terminator point).
+        let span_for_event = |p: usize| -> Option<Span> {
+            if spanful {
+                let idx = p.min(n - 1);
+                Some(old_spans[idx].clone())
+            } else {
+                None
+            }
+        };
 
         for (i, mut inst) in old.into_iter().enumerate() {
             while ev_idx < events[bi].len() && events[bi][ev_idx].0 == i {
@@ -375,12 +418,18 @@ pub(super) fn materialize(
                     templates,
                     &mut active,
                 );
+                if let Some(sp) = span_for_event(i) {
+                    out_spans.push(sp);
+                }
                 ev_idx += 1;
             }
             if !matches!(inst, Instruction::Phi { .. }) && !active.is_empty() {
                 replace_values_in_inst(&mut inst, &active, false);
             }
             out.push(inst);
+            if spanful {
+                out_spans.push(old_spans[i].clone());
+            }
         }
         // Trailing events at point n (before the terminator).
         while ev_idx < events[bi].len() && events[bi][ev_idx].0 == n {
@@ -392,6 +441,9 @@ pub(super) fn materialize(
                 templates,
                 &mut active,
             );
+            if let Some(sp) = span_for_event(n) {
+                out_spans.push(sp);
+            }
             ev_idx += 1;
         }
         debug_assert_eq!(
@@ -400,6 +452,10 @@ pub(super) fn materialize(
             "all scheduled events must be consumed"
         );
         func.blocks[bi].instructions = out;
+        if spanful {
+            debug_assert_eq!(out_spans.len(), func.blocks[bi].instructions.len());
+            func.blocks[bi].source_spans = out_spans;
+        }
         if !active.is_empty() {
             replace_values_in_terminator(&mut func.blocks[bi].terminator, &active);
         }
@@ -461,7 +517,11 @@ pub(super) fn materialize(
     }
 
     // ── Insert volatile capture allocas (coordinates are now settled) ──
-    for (&vid, &slot) in &slot_of {
+    // Sorted by value id: HashMap iteration is randomized and alloca order
+    // feeds frame layout; bit-for-bit reproducible output is a project rule.
+    let mut slots_sorted: Vec<(u32, Value)> = slot_of.iter().map(|(v, s)| (*v, *s)).collect();
+    slots_sorted.sort_unstable_by_key(|(v, _)| *v);
+    for (vid, slot) in slots_sorted {
         let ty = all_types[&vid];
         insert_entry_alloca(func, slot, ty, true);
     }
@@ -607,15 +667,13 @@ pub(super) fn retarget_edge(term: &mut Terminator, old: BlockId, new: BlockId) {
                 }
             }
         }
-        Terminator::IndirectBranch {
-            possible_targets, ..
-        } => {
-            for t in possible_targets.iter_mut() {
-                if *t == old {
-                    *t = new;
-                }
-            }
-        }
+        // IndirectBranch is deliberately absent above: its
+        // possible_targets are runtime blockaddress operands rather than
+        // static terminator edges. The edge planner fails closed and never
+        // creates a trampoline off such a predecessor, and even if it
+        // somehow did, rewriting possible_targets would not redirect the
+        // jump — so it, like every other terminator without static edges
+        // (Return/Unreachable), falls through untouched.
         _ => {}
     }
 }

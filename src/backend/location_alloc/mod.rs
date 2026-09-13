@@ -952,6 +952,31 @@ mod tests {
     }
 
     #[test]
+    fn retarget_edge_never_rewrites_indirect_branch_targets() {
+        // IndirectBranch possible_targets are runtime blockaddress
+        // operands, not static edges: the edge planner fails closed and
+        // never builds a trampoline off such a predecessor, and even a
+        // stray retarget call must not mutate the table (doing so would
+        // not redirect the computed jump and would corrupt the target
+        // list's CFG contract).
+        let mut term = Terminator::IndirectBranch {
+            target: Operand::Value(Value(500)),
+            possible_targets: vec![BlockId(7), BlockId(8), BlockId(7)],
+        };
+        retarget_edge(&mut term, BlockId(7), BlockId(42));
+        match term {
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => assert_eq!(
+                possible_targets,
+                vec![BlockId(7), BlockId(8), BlockId(7)],
+                "indirect target table must be untouched"
+            ),
+            ref other => panic!("terminator variant changed: {other:?}"),
+        }
+    }
+
+    #[test]
     fn verifier_catches_phi_missing_predecessor_incoming() {
         // b1 has two CFG predecessors (b0, b2) but its φ lists only b0 —
         // the shape a stranded edge after a careless retarget produces.
@@ -1471,6 +1496,163 @@ mod tests {
         assert!(count(&f, |i| matches!(i, Instruction::GlobalAddr { .. })) >= 2);
         assert_eq!(count(&f, |i| matches!(i, Instruction::Alloca { .. })), 0);
         verify_rewrite(&f, &FxHashSet::default()).expect("rewrite verifies");
+    }
+
+    #[test]
+    fn zero_edit_budget_plans_nothing() {
+        // CCC_RA_GLOBAL_LOCATION_MAX=0 must be an emergency stop that is
+        // exactly as inert as the master gate: the same function that
+        // rematerializes under the shipped budget keeps every original
+        // instruction and gains no block.
+        let insts = remat_ladder();
+        let mut f = func_with(
+            vec![blk(
+                0,
+                insts,
+                Terminator::Return(Some(Operand::Value(Value(211)))),
+            )],
+            900,
+        );
+        let before = format!("{f:?}");
+        let n = run_with_policy(&mut f, conservative_policy(0));
+        assert_eq!(n, 0);
+        assert_eq!(format!("{f:?}"), before, "zero budget must be a no-op");
+    }
+
+    #[test]
+    fn inserted_remats_keep_source_spans_one_to_one() {
+        // DWARF line fidelity: a spanful block must leave materialize with
+        // exactly one span per instruction; original instructions keep
+        // their own spans and inserted clones duplicate the span of the
+        // instruction they execute before (the split_ranges precedent).
+        let insts = remat_ladder();
+        let mut f = func_with(
+            vec![blk(
+                0,
+                insts,
+                Terminator::Return(Some(Operand::Value(Value(211)))),
+            )],
+            900,
+        );
+        let n = f.blocks[0].instructions.len();
+        f.blocks[0].source_spans = (0..n)
+            .map(|i| crate::common::source::Span::new(100 + 10 * i as u32, 109 + 10 * i as u32, 7))
+            .collect();
+        let applied = run_with_policy(&mut f, conservative_policy(64));
+        assert!(applied >= 1);
+        let b = &f.blocks[0];
+        assert_eq!(
+            b.source_spans.len(),
+            b.instructions.len(),
+            "spans and instructions must stay 1:1 after insertion"
+        );
+        // Original instructions (dest id < 900) retain their own span in
+        // order; clones (fresh ids >= 900) borrow the following original's
+        // span (they are emitted immediately before their first use).
+        let mut orig_idx = 0usize;
+        for (ii, inst) in b.instructions.iter().enumerate() {
+            let id = inst.dest().map(|v| v.0).unwrap_or(0);
+            if id < 900 {
+                assert_eq!(b.source_spans[ii].start, 100 + 10 * orig_idx as u32);
+                orig_idx += 1;
+            } else if ii + 1 < b.instructions.len() {
+                assert_eq!(b.source_spans[ii], b.source_spans[ii + 1]);
+            }
+        }
+        assert_eq!(orig_idx, n, "every original instruction retained");
+    }
+
+    #[test]
+    fn remat_on_single_successor_phi_edge_is_inline_without_trampoline() {
+        // A φ incoming served from an unconditional-branch predecessor
+        // (unique successor) is rebuilt at the predecessor's terminator
+        // point and the φ incoming renamed IN PLACE: no critical-edge
+        // trampoline block is allowed (the edge is not critical — a
+        // trampoline would add a label, a jump, and I-cache footprint for
+        // zero isolation benefit).
+        let mut b0 = vec![global(1, "G")];
+        for k in 0..12u32 {
+            b0.push(add(100 + k, 600 + k, 620 + k));
+        }
+        let b2 = vec![add(3, 400, 501)];
+        let mut b1 = vec![Instruction::Phi {
+            dest: Value(9),
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Value(Value(1)), BlockId(0)),
+                (Operand::Value(Value(3)), BlockId(2)),
+            ],
+        }];
+        b1.push(add(200, 9, 100));
+        for k in 1..12u32 {
+            b1.push(add(200 + k, 199 + k, 100 + k));
+        }
+        let blocks = vec![
+            blk(0, b0, Terminator::Branch(BlockId(1))),
+            blk(2, b2, Terminator::Branch(BlockId(1))),
+            blk(1, b1, Terminator::Return(Some(Operand::Value(Value(211))))),
+        ];
+        let mut f = func_with(blocks, 900);
+        f.next_label = 3;
+        let n = run_with_policy(&mut f, conservative_policy(64));
+        assert_eq!(n, 1);
+        assert_eq!(
+            f.blocks.len(),
+            3,
+            "no trampoline block on a single-succ edge"
+        );
+
+        let find = |label: u32| f.blocks.iter().position(|b| b.label.0 == label);
+        let (i0, i1) = (find(0).unwrap(), find(1).unwrap());
+        match f.blocks[i0].terminator {
+            Terminator::Branch(b) => assert_eq!(b, BlockId(1)),
+            ref other => panic!("unconditional edge must not be rerouted: {other:?}"),
+        }
+        let (edge_name, edge_pred) = match f.blocks[i1].instructions[0] {
+            Instruction::Phi {
+                dest,
+                ty: IrType::I64,
+                ref incoming,
+            } => {
+                assert_eq!(dest, Value(9));
+                assert_eq!(incoming.len(), 2);
+                let from0 = incoming
+                    .iter()
+                    .find(|(_, p)| *p == BlockId(0))
+                    .expect("b0 incoming retained");
+                let name = match from0 {
+                    (Operand::Value(Value(v)), _) => *v,
+                    other => panic!("expected value operand, got {other:?}"),
+                };
+                assert!(name >= 900, "edge remat must use a fresh id, got {name}");
+                assert!(
+                    !incoming.iter().any(|(_, p)| *p == BlockId(3)),
+                    "no incoming may reference a non-existent trampoline label"
+                );
+                (name, from0.1)
+            }
+            ref other => panic!("expected φ, got {other:?}"),
+        };
+        assert_eq!(
+            edge_pred,
+            BlockId(0),
+            "inline rename keeps the real predecessor"
+        );
+
+        // The clone lives at b0's terminator boundary, distinct per edge.
+        let clones = f.blocks[i0]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::GlobalAddr { dest, name } if name == "G" && dest.0 != 1 => {
+                    Some(dest.0)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(clones.contains(&edge_name));
+        assert_eq!(clones.len(), 1, "exactly one end-of-block edge clone");
+        verify_rewrite(&f, &FxHashSet::default()).expect("inline edge rewrite verifies");
     }
 
     #[test]
@@ -2003,5 +2185,95 @@ mod tests {
             }
         }
         verify_rewrite(&f, &FxHashSet::default()).expect("two-trampoline rewrite verifies");
+    }
+
+    #[test]
+    fn trampoline_multiple_defs_are_sorted_by_value_id() {
+        // TWO remattable globals deferred onto the SAME fan-out edge share
+        // one trampoline; its clone instructions must appear in ascending
+        // value-id order regardless of the internal HashSet iteration order
+        // that produced the edge worklist (bit-for-bit reproducible output
+        // is a project rule).
+        let mut b0 = vec![global(1, "G1"), global(2, "G2")];
+        for k in 0..12u32 {
+            b0.push(add(100 + k, 600 + k, 620 + k));
+        }
+        // b1 has THREE predecessors (b0, b3, b4), so EVERY φ must list one
+        // incoming from each of them; each alternate pred supplies its own
+        // non-rematted values for both φs.
+        let b3 = vec![add(5, 600, 601), add(6, 604, 605)];
+        let b4 = vec![add(7, 602, 603), add(8, 606, 607)];
+        let mut b1 = vec![
+            Instruction::Phi {
+                dest: Value(9),
+                ty: IrType::I64,
+                incoming: vec![
+                    (Operand::Value(Value(1)), BlockId(0)),
+                    (Operand::Value(Value(5)), BlockId(3)),
+                    (Operand::Value(Value(8)), BlockId(4)),
+                ],
+            },
+            Instruction::Phi {
+                dest: Value(11),
+                ty: IrType::I64,
+                incoming: vec![
+                    (Operand::Value(Value(2)), BlockId(0)),
+                    (Operand::Value(Value(6)), BlockId(3)),
+                    (Operand::Value(Value(7)), BlockId(4)),
+                ],
+            },
+        ];
+        for k in 0..12u32 {
+            b1.push(add(200 + k, 100 + k, 300 + k));
+        }
+        b1.push(add(302, 9, 11));
+        let blocks = vec![
+            blk(
+                0,
+                b0,
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I64(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            blk(3, b3, Terminator::Branch(BlockId(1))),
+            blk(4, b4, Terminator::Branch(BlockId(1))),
+            blk(1, b1, Terminator::Return(Some(Operand::Value(Value(302))))),
+            blk(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
+            ),
+        ];
+        let mut f = func_with(blocks, 900);
+        f.next_label = 5;
+        let n = run_with_policy(&mut f, conservative_policy(64));
+        assert_eq!(n, 2, "both globals rematerialized");
+        // Exactly one trampoline on the b0->b1 edge, carrying two clones.
+        let tramp: Vec<_> = f
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Branch(t) if t == BlockId(1)))
+            .filter(|b| !matches!(b.label, BlockId(3) | BlockId(4)))
+            .collect();
+        assert_eq!(tramp.len(), 1, "one shared edge trampoline");
+        let ids: Vec<(u32, String)> = tramp[0]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::GlobalAddr { dest, name } => Some((dest.0, name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "both globals cloned in the trampoline");
+        let mut sorted = ids.clone();
+        sorted.sort_by_key(|(d, _)| *d);
+        assert_eq!(ids, sorted, "trampoline defs must be id-sorted");
+        assert_eq!(
+            ids.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(),
+            ["G1", "G2"]
+        );
+        verify_rewrite(&f, &FxHashSet::default()).expect("multi-def trampoline verifies");
     }
 }
