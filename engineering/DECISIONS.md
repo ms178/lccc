@@ -1876,7 +1876,300 @@ Validation: `cargo test --lib` 2645 passed / 0 failed / 6 ignored
 with the gate forced on, zero mismatches; gate on/off equivalence was
 re-run with the final binary on both targets.
 
+## RA-GLA-02 (2026-09-13) — source-less rematerialization default ON:
+## hardening, four-target evidence, structural verifier, Godbolt validation
 
+Supersedes RA-GLA-01 for the source-less rematerialization vocabulary
+only: GlobalAddr and const-Copy clones graduate from gated-OFF to
+default ON. Spill gaps, intra-block gaps and the Size tier stay OFF,
+and `CCC_RA_GLOBAL_LOCATION` becomes the emergency kill switch
+(0/off/no/false/empty disables; unset ⇒ ON). This record is the
+graduation evidence and the hardening delta; the addendum below is the
+second line-by-line red-team pass.
+
+**Unconditional post-rewrite verification with byte-for-byte rollback.**
+The structural verifier now runs for EVERY applied GLA rewrite with no
+environment gate (the graduation rule: a default-on feature cannot rely on
+an opt-in checker). Before the first mutation the materializer snapshots
+`blocks`, `next_value_id` and `next_label`; on any violation it restores
+all three verbatim, prints `[GLA] … rewrite failed structural verification
+… aborting plan with zero edits`, and reports zero edits — exact gate-off
+behavior. `CCC_VERIFY_REGALLOC=1` upgrades the warning to a panic for
+development backtraces. The seven invariants are: (1) unique definition
+sites; (2) every capture-slot reload dominated by its store (including the
+in-block ordering); (3) fresh ids bounded by `next_value_id`; (4) φ nodes
+remain a contiguous block prefix; (5) unique block labels and every static
+terminator edge (Branch/CondBranch/Switch/IndirectBranch) resolving to a
+real block; (6) each φ incoming names a real, distinct CFG predecessor;
+(7) the φ incoming predecessor SET equals the block's CFG predecessor set
+(set comparison, because `build_cfg` records both arms of a CondBranch
+that targets one block). Empirically zero rollbacks over the complete
+compiler corpus × {-O0..-O3,-Os} × all four targets (the fire census
+`aborts` column is 0 everywhere below).
+
+**Retarget fixes (red-team findings).** `retarget_edge` moved only one
+CondBranch arm (`if/else if`) and stopped at a matching Switch `default`
+without walking cases. A CondBranch whose two arms name the same block —
+or duplicate Switch cases — are ONE unique CFG edge (`build_cfg`
+deduplicates successor labels) with one shared φ incoming; a fan-out
+trampoline must reroute every occurrence or the un-rewired arm enters the
+merge expecting trampoline-defined names. Both arms / every matching case
+are now moved together; the Switch/default ordering is also corrected.
+Pinned by `retarget_edge_moves_both_equal_cond_arms_together`,
+`retarget_edge_moves_all_duplicate_switch_cases`, and
+`remat_on_switch_fanout_phi_edge_isolates_edge_with_trampoline` (full IR
+shape: case edge isolated, default edge untouched, φ rewired, jump-table
+emission references the appended block purely by symbolic label, which
+the block-iteration emission at `generation.rs` resolves like any other
+block). `clone_remat`'s silent catch-all (which would have cloned a
+template with the OLD destination) is now an `unreachable!` documenting
+that only `GlobalAddr`/const-`Copy` are ever certified — re-reading memory
+is not a sound rematerialization (the store may have happened since).
+
+**Knob vocabulary harmonized.** The experimental shipped-OFF switches
+`CCC_GLA_SPILL_GAPS`/`CCC_GLA_ALLOW_INTRA` parsed only `0`/`false`; an
+emergency `=off`/`=no`/`=FALSE`/empty would have ENABLED them. All boolean
+knobs now parse through one `is_off_token` helper with the master gate's
+full vocabulary (unit: `token_tests`).
+
+**Harness defects fixed.** `check_gla_remat_policy.sh`'s negative
+assertions were written as `! grep …` under `set -e`: negated commands are
+exempt from errexit, so every "must not apply" assertion was vacuous
+(including the default-policy nbody rejection). They are explicit
+`must_not_grep` helpers with diagnostics; the off-token sweep now covers
+`OFF/NO/False` as well, and the master-gate proof uses a known-firing TU
+for every token. The equiv runner's ELF32 smoke probe entered `int $0x80`
+with undefined registers and could never observe exit 42 (it segfaulted,
+which hid the decision between native and qemu-i386); the probe now sets
+eax=1/ebx=42. The fuzz harness passed multi-word runners
+(`qemu-riscv64 -L …`) as one argv element, making every cross synthetic
+case die with SIGHUP and get mis-filed as GEN-BUG; runners are now
+`shlex`-split (this unlocked real RISC-V fuzzing). GCC include paths are
+resolved via `-print-file-name=include` everywhere (fire census, callgrind
+A/B) instead of a hardcoded gcc-14 directory.
+
+**Module-wide cleanup coupling (the i686 positive-insn cases, root
+cause).** When ANY splitter edits ANY function, the pipeline's
+`did_split` flag runs copy propagation + DCE over every function in the
+TU. GLA merely became a new trigger for this pre-existing, sound cleanup.
+On i686 matmul -O2, GLA edits only the standalone `matmul` kernel; the
+`main` +6 insn / frame 60→44 change is that cleanup re-materializing two
+cold double constants around printf setup, not a GLA rewrite — proven by
+`CCC_RA_GLOBAL_LOCATION=1 CCC_GLA_REACH=0` (zero GLA edits) assembling
+byte-identical to gate-off. Runtime measured neutral-to-positive
+(matmul 0.992× in RA-GLA-01's paired run); the pre-existing coupling is
+intentionally left untouched (refactoring it changes all three splitters,
+out of scope for graduation).
+
+**Four-target fire census (rebase a361f26, 794 TUs × 5 opts, gate ON):**
+
+| target | firing TUs | edits | remat | capture slots | trampolines | rollbacks | gate-induced build failures |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| x86-64 | 106 | 586 | 586 | 0 | 3 | 0 | 0 |
+| i686 | 335 | 1170 | 1170 | 0 | 4 | 0 | 0 |
+| aarch64 | 128 | 496 | 496 | 0 | 3 | 0 | 0 |
+| riscv64 | 158 | 780 | 780 | 0 | 3 | 0 | 0 |
+
+**Godbolt oracle cross-validation** (live Compiler Explorer audit
+`scripts/godbolt.py audit`: gcc 16.2 / clang 23.1 / icc 2021.10 / icx
+latest all current; local gcc 14.2 is NOT used for oracle claims). Static
+per-function stats via `scripts/codegen_oracle.py`:
+
+* x86-64 zlib_ng_adler32 `main`, -O2: gate-off 242 insn / 40 loads / 6
+  stores / **19 spills** → gate-on 242 / 40 / 4 / **7 spills**; oracles
+  gcc16.2 156/20/3/2, clang23 148/30/0/0, icc 73/8/5/9, icx 147/23/4/3.
+  GLA closes part of the spill gap with zero added instructions; the
+  residual 7 are computed (non-source-less) values — out of the remat
+  vocabulary, P0-B territory; the trace confirms the remaining
+  global/const candidates fail the calibrated use-weight/segment gates
+  for good reason (v57 50 uses, v819 220 uses/2 segments).
+* aarch64 zlib_ng_adler32 `main`, -O2: 388/66/35/**80 spills** →
+  364/46/20/**45 spills** vs ARM64 gcc 16.1 126/20/5/6.
+* riscv64 same TU: 711/71/37/6 → 707/58/25/6 vs RISC-V gcc 16.1
+  151/22/7/10.
+* x86-64 strlen_bench: on/off text-identical (three cold setup remats,
+  Callgrind Ir 1.00000).
+* aarch64 sha256_transform: on/off function text identical (the one
+  remat is a relocation of a 1-use globaladdr; recurrence-carried φ
+  accumulators remain protected).
+
+The inherited x86-64-derived budget/band on the 30+ GPR targets is
+therefore validated as fail-safe in the right direction: it fires only at
+genuine pressure extremes and the measured changes are large spill
+reductions or neutral; per-ISA calibration remains future optimization
+headroom, not a safety question.
+
+**Runtime / performance evidence:** Callgrind -O2 31-program fast corpus
+rerun on the rebase: geomean Ir mine/ref **0.99952**, zlib_ng_adler32
+**0.98548 (−1.45 %)**, every other program 1.00000 or within ±0.002 %
+with I1/LLi/branch events unchanged (`results/callgrind-a361f26-o2.md`).
+Valgrind clean on the compiler while firing and on the resulting
+trampoline/adler binaries. Differential fuzz with the gate forced on:
+phi_cfg 1000/1000, x86-64 differential 600/600, i686 m32 1000 seeds
+(~3000 case-arms), aarch64 400 cases, riscv64 synthetic 400/400 — zero
+mismatches. The equiv runner now compiles/runs an independent gcc oracle
+best-effort in EVERY mode (host gcc, gcc -m32 under qemu-i386, cross gcc
+under qemu-user); cases where both gates agree but neither matches gcc
+are classified as pre-existing backend gaps and reported separately, so
+they never masquerade as gate divergences.
+
+**Test/CI state:** `location_alloc` 40 unit tests (was 30 at graduation);
+`cargo test --lib` 2716/0/6; clippy `-D warnings` and rustfmt clean;
+`ci_local.sh --fast` 31/0/3 with the codegen golden gate within tolerance.
+
+### Addendum — second red-team pass on the final binary (2026-09-13)
+
+A full line-by-line re-audit of planner/policy/materializer/verifier
+plus the definitive four-target matrix on the final binaries produced
+five additional hardenings, with no production behavior change for the
+shipped (remat-only) policy:
+
+1. **Indirect-branch edges, exact fail-closed semantics.** The edge
+   planner already refused to trampoline an `IndirectBranch` predecessor
+   (the jump target is a runtime blockaddress). Two refinements: (a) when
+   such an edge also carries a rename that IS fully defined before the
+   terminator (a name already emitted in the predecessor), that rename is
+   now applied in place instead of being discarded with the deferred set;
+   (b) `retarget_edge` no longer has an arm that rewrites
+   `IndirectBranch.possible_targets` — the edge planner never creates a
+   trampoline there, and rewriting the table would not redirect the
+   computed jump. Pinned by
+   `retarget_edge_never_rewrites_indirect_branch_targets` and the existing
+   `remat_through_indirect_branch_edge_is_refused` (which asserts both the
+   φ incoming and the target table are untouched).
+
+2. **Deterministic emission order, no dependence on FxHash table layout.**
+   The split value worklist (`gap_ids ∪ remat_ids`) and the capture-slot
+   alloca insertion iterated `FxHashMap`/`FxHashSet` collections; the
+   multi-definition fan-out trampoline body and the entry alloca order
+   therefore depended on table layout. Both are now sorted by value id
+   before emission, matching the deterministic ordering every other event
+   stream already uses (events sort by point/vid; candidate selection
+   tie-breaks on vid; blocks and tramps are built in index order). Pinned
+   by `trampoline_multiple_defs_are_sorted_by_value_id` (two globals
+   deferred onto one fan-out edge: one shared trampoline, clones in
+   ascending id order).
+
+3. **Equivalence harness: target-incompatible TUs are SKIPped and
+   argv[0] is fully controlled.** The four-target matrix found two
+   classes of false "output divergence" on byte-identical gate binaries:
+   (a) `builtin_avx256_raw` under qemu-aarch64 carries an
+   `-mavx -mavx2` sidecar that aarch64 cross-gcc rejects outright (the
+   x86-only vector ABI test is meaningless on aarch64); the program also
+   reads uninitialized stack and its garbage output under qemu-user
+   varies with the **argv[0] layout** (proven: copies of one binary named
+   `n2` vs `aaaa` print different denormals). Such TUs are now SKIPped
+   when the cross oracle cannot compile them rather than comparing
+   undefined-behavior output. (b) `arm_f128_param_preserves_gp_param`
+   on riscv64: both gate binaries are byte-identical and both fail to
+   run because lccc's riscv64 link lacks compiler-rt (`undefined symbol:
+   __trunctfdf2`), and the loader prints the program path TWICE in its
+   diagnostic — so differing artifact names manufacture a diff even at
+   equal basename lengths. The harness now runs every binary (both
+   gates and the oracle) with one fixed argv[0] (`lccc-equiv-prog`, via
+   qemu-user `-0`, native via `exec -a`) and scrubs the work directory
+   from captured output; equal-length artifact names remain as a third
+   layer. The loader-failure case then classifies correctly as a
+   gate-independent pre-existing oracle gap rather than a divergence.
+   Host and `-m32` modes keep the oracle-best-effort semantics;
+   shellcheck and `bash -n` clean.
+
+4. **DWARF source-span 1:1 discipline in the block sweep.** Materializing
+   events rebuilds each touched block's instruction vector; previously
+   `source_spans` was left untouched, so a spanful block (one entry per
+   instruction, which `generation.rs` walks when emitting `.debug_line`)
+   desynchronized after the first inserted clone — every following
+   instruction could be attributed to the wrong source line. The sweep
+   now mirrors the established `split_ranges::insert_instruction`
+   precedent: when a block was spanful it stays exactly spanful, each
+   inserted event clones the span of the instruction it executes before
+   (the last span for terminator-boundary events), originals keep their
+   own spans, and a `debug_assert!` pins the 1:1 correspondence. Snapshot
+   rollback already restores spans wholesale (they live in `blocks`).
+   Pinned by `inserted_remats_keep_source_spans_one_to_one`.
+
+5. **Doc-comment hygiene:** the shared `is_off_token` doc comment was
+   attached to the wrong item after the earlier insertion reorder; fixed.
+
+The i686 `loop_patterns` calibration site was re-checked on the final
+binary: GLA still fires there (one `globaladdr` remat in `main`) but the
+gate-on/gate-off emitted text is identical — the band-2 calibration keeps
+excluding the historical counter-spill edit; oracle A/B remains
+209/51/49/70 spills under both gates.
+
+**Rebase note (2026-09-13, upstream main `0ad4633`).** The addendum was
+rebased across PR #522 (S38: class-agnostic GEP CSE keys, x86-backend
+GlobalAddr rematerialization through `Copy`, static-chain call marker
+protocol, call-liveness ABI refinements). S38 changes only GVN and
+post-regalloc x86 codegen — all strictly DOWNSTREAM of GLA's pre-regalloc
+IR rewrites — and touches no `location_alloc/` file. Its backend
+Copy-remat is deliberately NOT mirrored into the IR-level planner: GLA
+is target-independent across all four targets, while the S38 remat is
+x86 text/MachInst specific; admitting `Copy <- GlobalAddr` to GLA's
+template set would be a new four-target policy needing its own census.
+The rebase changed no GLA fire site (see census below), and the
+equiv matrices remain failed=0. The rebase also repaired a documentation
+defect from the graduation commit: the `## ALIGN-01` section header had
+been overwritten by the RA-GLA-02 insertion, orphaning the whole
+tight-loop record under the wrong section; it is restored, and the
+RA-GLA-02 / addendum heading levels are fixed.
+
+**Test/CI state after addendum:** `location_alloc` **45** unit tests;
+`cargo test --lib` **2722/0/6** (one upstream-added test); clippy
+`-D warnings` and rustfmt clean. Rebased fastbuild binaries md5:
+x86-64 `aa78c076…`, lccc-i686 `f5da2fa2…`, lccc-arm `5507f212…`,
+lccc-riscv `bdabce5d…` (all four targets rebuilt via
+`scripts/build_lccc_fast.sh`).
+
+**Definitive gate on/off matrices (rebased binaries, five opt levels
+each), all `failed=0`:**
+
+| target | ran | oracle-confirmed | gate-indep. gaps | skipped | rc |
+|---|---|---|---|---|---|
+| x86-64 | 3499 | 3408 | 7 | 21 | 0 |
+| i686 | 3337 | 3103 | 70 | 48 | 0 |
+| aarch64 | 2687 | 2647 | 40 | 216 | 0 |
+| riscv64 | 2698 | 2584 | 114 | 522 | 0 |
+
+The i686 counts move by 2 ran / +4 gaps / −2 skips vs the pre-rebase run
+(S38 text-path changes flip two unstable/skippable cases into
+gate-independent gaps); all other targets are identical. The seven
+x86-64 gate-independent gaps are the same hand-verified set as before
+graduation (asm_alternative_length_template -O1, bitop_nonneg_zext -O0,
+bitops_builtins -O0/-O1/-Os, deflate_setparams_cmp_cast -O1,
+glibc_const_p_strlen -O1); cross-target gaps are cross-ABI / missing
+compiler-rt link shapes present under BOTH gates.
+Logs: `results/rerun-rebase-20260913/equiv-{x64,m32,arm64,riscv64}.log`.
+
+**Fire census on the rebased tree (gate forced on, 794 TUs × 5 opts,
+`aborts=0`, capture slots 0 everywhere):** x86-64 106 TUs / 586 remats /
+3 trampolines; i686 335 / 1170 / 4; aarch64 128 / 496 / 3; riscv64
+158 / 780 / 3 — bit-identical to the pre-rebase census, proving S38 did
+not move any GLA decision (`results/rerun-rebase-20260913/fire-*.json`).
+
+**Whole-corpus static emitted-text delta (gate OFF→ON, rebased
+binaries):** x86-64 **−450 instructions / −342 frame references** (S38
+improves the pre-rebase −436/−341 by another 14 insn/1 stkref; the lone
++insn row is the documented `-m32` TU at -O0 trading one compare for a
+56→40-byte frame); i686 **−570 / −1645** unchanged (the matmul `main`
++6/-2 row remains the documented, runtime-neutral copy-prop coupling).
+Logs `results/rerun-rebase-20260913/static-{x64,m32}.log`.
+
+**Gate-forced-ON fuzzing on rebased binaries, zero mismatches:**
+phi_cfg 1000/1000 (363 s), differential 600/600 (203 s), m32 forwarded
+engine 1000 seeds × 3 opts ≈ 3000 case-arms (267 s), aarch64 400 seeds ×
+{O2,Os} ≈ 800 case-arms (69 s), riscv64 synthetic 400 × -O2 under
+qemu-riscv64 vs riscv64 cross-gcc (48 s). Note the synthetic engine
+requires an explicit `--runner "qemu-riscv64 -L
+/usr/riscv64-linux-gnu" --refs riscv64-linux-gnu-gcc`; without them the
+lccc binaries are not executable on the host and every case reports a
+spurious rc=−1 "mismatch" — a harness-config failure, not a compiler one.
+
+Valgrind (`--error-exitcode=99 --leak-check=full`) on gate-on and
+gate-off zlib_ng_adler32 binaries is clean; lccc-ld linker fuzz gates
+(128 linker mutants + 64×7 ELF grammar links) report zero defects.
+
+## ALIGN-01 (2026-09-12) — structural hot-loop alignment ("tight loops"): two-layer GCC 16.2 mirror with exact encoded spans
 
 **Code:** structural audit in `src/passes/loop_align.rs`
 (`audit_tight_loop_inner`, `tight_bucket_log2`, `TightLoopMode`),

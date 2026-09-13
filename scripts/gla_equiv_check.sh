@@ -130,10 +130,32 @@ elif [ "$MODE" = cross ]; then
     read -ra RUN_PREFIX <<<"$QEMU"
 fi
 
+# Fixed guest argv[0] for EVERY binary (both gates and the oracle). The
+# dynamic loader, qemu-user diagnostics and several libc abort paths embed
+# argv[0] verbatim ("/path/gate1: symbol lookup error: …/gate1: …"), so two
+# BYTE-IDENTICAL gate binaries compared under different file names would
+# show a spurious "output divergence" (the arm_f128_param_preserves_gp_param
+# case on riscv64: the missing __trunctfdf2 lookup prints the path twice).
+# qemu-user gets it via `-0`; a native exec uses bash's `exec -a`.
+ARGV0="lccc-equiv-prog"
+
 run_bin() { # run_bin <bin> ; echoes "stdout|exitcode"
     local bin=$1 out ec
-    out=$(timeout 25 "${RUN_PREFIX[@]}" "$bin" 2>&1); ec=$?
+    if [ "$MODE" = cross ]; then
+        # QEMU is "<emulator> -L <sysroot>"; insert -0 before the binary.
+        local -a qa
+        read -ra qa <<<"$QEMU"
+        out=$(timeout 25 "${qa[@]}" -0 "$ARGV0" "$bin" 2>&1); ec=$?
+    elif [ ${#RUN_PREFIX[@]} -eq 0 ]; then
+        out=$(timeout 25 bash -c 'exec -a "$0" "$@"' "$ARGV0" "$bin" 2>&1); ec=$?
+    else
+        out=$(timeout 25 "${RUN_PREFIX[@]}" -0 "$ARGV0" "$bin" 2>&1); ec=$?
+    fi
     [ $ec -eq 124 ] && { echo "TIMEOUT"; return; }
+    # Defensive second layer: scrub every absolute work-dir path (and the
+    # current bin's path) so no diagnostic can leak the artifact name.
+    out=${out//$bin/PROG}
+    out=${out//$WORK/PROGDIR}
     printf '%s|%d' "$out" "$ec"
 }
 
@@ -182,18 +204,22 @@ for src in "$REG"/*.c; do
     fi
     if [ $skip -eq 1 ]; then nskip=$((nskip+1)); continue; fi
     for opt in $OPTS; do
-        bon="$WORK/on"; boff="$WORK/off"; bora="$WORK/oracle"
-        if ! build "$CC_ON" 1 "$opt" "$src" "$bon" "$WORK/on.err"; then
-            if build "$CC_OFF" 0 "$opt" "$src" "$boff" "$WORK/off.err"; then
+        # Equal-length basenames gate1/gate0: qemu-user binaries that read
+        # uninitialized stack can emit output that depends on the byte
+        # layout of argv/envp (e.g. $WORK/on vs $WORK/off differ in length);
+        # equal-length names remove that spurious perturbation.
+        bon="$WORK/gate1"; boff="$WORK/gate0"; bora="$WORK/gatex"
+        if ! build "$CC_ON" 1 "$opt" "$src" "$bon" "$WORK/gate1.err"; then
+            if build "$CC_OFF" 0 "$opt" "$src" "$boff" "$WORK/gate0.err"; then
                 echo "FAIL $name $opt: gate-ON build failed, gate-OFF built"
-                head -3 "$WORK/on.err" | sed 's/^/     /'
+                head -3 "$WORK/gate1.err" | sed 's/^/     /'
                 nfail=$((nfail+1)); FAILED+=("$name:$opt:build"); continue
             fi
             continue   # unsupported TU on this target
         fi
-        if ! build "$CC_OFF" 0 "$opt" "$src" "$boff" "$WORK/off.err"; then
+        if ! build "$CC_OFF" 0 "$opt" "$src" "$boff" "$WORK/gate0.err"; then
             echo "FAIL $name $opt: gate-OFF build failed, gate-ON built"
-            head -3 "$WORK/off.err" | sed 's/^/     /'
+            head -3 "$WORK/gate0.err" | sed 's/^/     /'
             nfail=$((nfail+1)); FAILED+=("$name:$opt:buildoff"); continue
         fi
         ron=$(run_stable "$bon"); roff=$(run_stable "$boff")
@@ -230,6 +256,16 @@ for src in "$REG"/*.c; do
                 nprexist=$((nprexist+1))
                 PREEXIST+=("$name:$opt")
             fi
+        elif [ -n "$CROSS" ]; then
+            # Cross mode: the cross-gcc oracle is the authority that this TU
+            # is meaningful for the target. A rejected TU (e.g. -mavx2
+            # sidecars or ia32 vector intrinsics on aarch64) is
+            # target-incompatible; its binary can depend on undefined or
+            # uninitialized state whose observed output even changes with
+            # argv[0] under qemu-user (stack garbage), so gate1/gate0 run
+            # comparison cannot prove anything. Skip rather than fail.
+            echo "SKIP $name $opt: cross oracle cannot build (target-incompatible)"
+            nskip=$((nskip+1)); continue
         fi
         nrun=$((nrun+1))
         if [ "$ron" != "$roff" ]; then
