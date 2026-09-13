@@ -8,6 +8,7 @@ use crate::common::fx_hash::FxHashMap;
 use std::collections::BTreeSet;
 
 use super::elf::*;
+use super::reloc_field::{self, w8_checked, w16_checked, w32_checked};
 use super::types::{BASE_ADDR, GlobalSymbol, PAGE_SIZE};
 use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
@@ -1885,6 +1886,13 @@ pub(super) fn emit_executable(
             let sa = output_sections[out_idx].addr;
             let sfo = output_sections[out_idx].file_offset;
 
+            // Loop-invariant parts of the offset check below, hoisted: the
+            // section's size and name and the object's name do not change per
+            // relocation, and this loop runs once per relocation in the link.
+            let in_sec = &objects[obj_idx].sections[sec_idx];
+            let (sec_size, sec_name) = (in_sec.size, in_sec.name.as_str());
+            let obj_name = objects[obj_idx].source_name.as_str();
+
             for rela in relas {
                 let si = rela.sym_idx as usize;
                 if si >= objects[obj_idx].symbols.len() {
@@ -1894,6 +1902,21 @@ pub(super) fn emit_executable(
                 let p = sa + sec_off + rela.offset;
                 let fp = (sfo + sec_off + rela.offset) as usize;
                 let a = rela.addend;
+                // GNU ld refuses a relocation whose field crosses the end of the
+                // section it patches (bfd_reloc_outofrange, reported as "error
+                // 4"). The parser already rejects an offset outside the section
+                // altogether; this is the width-aware half of the same rule, and
+                // it lives here because the field width is arch-specific while the
+                // parser is shared by four backends.
+                reloc_field::offset_in_section(
+                    rela.rela_type,
+                    reloc_field::name(rela.rela_type),
+                    rela.offset,
+                    reloc_field::patch_width(rela.rela_type),
+                    sec_size,
+                    sec_name,
+                    obj_name,
+                )?;
 
                 // Skip relocations whose bytes were consumed by a TLS GD/LD->LE
                 // rewrite (the __tls_get_addr call no longer exists).
@@ -1974,6 +1997,32 @@ pub(super) fn emit_executable(
                         }
                         w32(&mut out, fp, v as u32);
                     }
+                    // 16- and 8-bit zero-extended absolutes. These go through the
+                    // checked writers rather than a hand-rolled comparison so the
+                    // range comes from the one table that also names the type:
+                    // `field(R_X86_64_16)` is U16, so the check and the store
+                    // cannot drift apart, and an unsigned 0xffff is accepted
+                    // instead of being rejected by a signed 16-bit test.
+                    R_X86_64_16 => {
+                        w16_checked(
+                            &mut out,
+                            fp,
+                            s as i64 + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
+                    }
+                    R_X86_64_8 => {
+                        w8_checked(
+                            &mut out,
+                            fp,
+                            s as i64 + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
+                    }
                     R_X86_64_32S => {
                         // Sign-extended 32-bit absolute: value must fit signed.
                         let v = s as i64 + a;
@@ -1995,7 +2044,14 @@ pub(super) fn emit_executable(
                                         let nb = got_slot_ordinal[gi];
                                         got_addr + nb as u64 * 8
                                     };
-                                    w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
+                                    w32_checked(
+                                        &mut out,
+                                        fp,
+                                        gea as i64 + a - p as i64,
+                                        rela.rela_type,
+                                        &sym.name,
+                                        &objects[obj_idx].source_name,
+                                    )?;
                                     resolved = true;
                                 }
                             }
@@ -2035,7 +2091,14 @@ pub(super) fn emit_executable(
                                     // Keep W and X; move R into B.
                                     out[fp - 3] = (rex & 0b1111_1010) | ((rex >> 2) & 1);
                                 }
-                                w32(&mut out, fp, (tpoff + a) as u32);
+                                w32_checked(
+                                    &mut out,
+                                    fp,
+                                    tpoff + a,
+                                    rela.rela_type,
+                                    &sym.name,
+                                    &objects[obj_idx].source_name,
+                                )?;
                             } else {
                                 return Err(format!(
                                     "GOTTPOFF IE-to-LE relaxation failed: unrecognized instruction pattern at offset 0x{:x} for symbol '{}' (expected movq/addq GOT(%rip), %reg)",
@@ -2066,7 +2129,14 @@ pub(super) fn emit_executable(
                                             sym.name, gi, entry.1, nb, gea, got_addr, p, a
                                         );
                                     }
-                                    w32(&mut out, fp, (gea as i64 + a - p as i64) as u32);
+                                    w32_checked(
+                                        &mut out,
+                                        fp,
+                                        gea as i64 + a - p as i64,
+                                        rela.rela_type,
+                                        &sym.name,
+                                        &objects[obj_idx].source_name,
+                                    )?;
                                     continue;
                                 }
                                 if is_gotpcrelx_relaxable(rela.rela_type) && g.defined_in.is_some()
@@ -2074,7 +2144,14 @@ pub(super) fn emit_executable(
                                     if fp >= 2 && fp < out.len() && out[fp - 2] == 0x8b {
                                         out[fp - 2] = 0x8d;
                                     }
-                                    w32(&mut out, fp, (s as i64 + a - p as i64) as u32);
+                                    w32_checked(
+                                        &mut out,
+                                        fp,
+                                        s as i64 + a - p as i64,
+                                        rela.rela_type,
+                                        &sym.name,
+                                        &objects[obj_idx].source_name,
+                                    )?;
                                     continue;
                                 }
                             }
@@ -2094,7 +2171,14 @@ pub(super) fn emit_executable(
                         // silently corrupt binary.
                         if fp >= 2 && fp < out.len() && out[fp - 2] == 0x8b {
                             out[fp - 2] = 0x8d;
-                            w32(&mut out, fp, (s as i64 + a - p as i64) as u32);
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                s as i64 + a - p as i64,
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
                         } else {
                             return Err(format!(
                                 "GOTPCREL against '{}' has no GOT entry and the \
@@ -2112,7 +2196,14 @@ pub(super) fn emit_executable(
                         // Initial Exec TLS: value = (sym_addr - tls_addr) - tls_mem_size
                         // %fs:0 points past end of TLS block on x86-64
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                        w32(&mut out, fp, (tpoff + a) as u32);
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            tpoff + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
                     }
                     R_X86_64_TLSGD => {
                         // General-Dynamic TLS in an executable. Canonical sequence:
@@ -2149,7 +2240,14 @@ pub(super) fn emit_executable(
                             out[st + 9] = 0x48;
                             out[st + 10] = 0x8d;
                             out[st + 11] = 0x80;
-                            w32(&mut out, st + 12, tpoff as u32);
+                            w32_checked(
+                                &mut out,
+                                st + 12,
+                                tpoff,
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
                         } else {
                             // GD -> IE:  mov %fs:0,%rax ; add got(%rip),%rax
                             // Requires a GOT slot with an R_X86_64_TPOFF64 dynamic
@@ -2169,11 +2267,14 @@ pub(super) fn emit_executable(
                             out[st + 9] = 0x48;
                             out[st + 10] = 0x03;
                             out[st + 11] = 0x05;
-                            w32(
+                            w32_checked(
                                 &mut out,
                                 st + 12,
-                                (gea as i64 - (seq_addr as i64 + 16)) as u32,
-                            );
+                                gea as i64 - (seq_addr as i64 + 16),
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
                         }
                         tls_consumed.push(fp + 4, fp + 12);
                     }
@@ -2206,7 +2307,14 @@ pub(super) fn emit_executable(
                         // After LD->LE relaxation %rax holds TP, so DTPOFF becomes
                         // a TP-relative offset (same formula as TPOFF32).
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
-                        w32(&mut out, fp, (tpoff + a) as u32);
+                        w32_checked(
+                            &mut out,
+                            fp,
+                            tpoff + a,
+                            rela.rela_type,
+                            &sym.name,
+                            &objects[obj_idx].source_name,
+                        )?;
                     }
                     R_X86_64_DTPOFF64 => {
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
@@ -2223,7 +2331,14 @@ pub(super) fn emit_executable(
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
                             out[fp - 2] = 0xc7;
                             out[fp - 1] = 0xc0;
-                            w32(&mut out, fp, tpoff as u32);
+                            w32_checked(
+                                &mut out,
+                                fp,
+                                tpoff,
+                                rela.rela_type,
+                                &sym.name,
+                                &objects[obj_idx].source_name,
+                            )?;
                         } else {
                             return Err(format!(
                                 "TLSDESC relaxation failed: unrecognized sequence for '{}'",

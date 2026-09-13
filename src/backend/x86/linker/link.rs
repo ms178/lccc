@@ -4,7 +4,9 @@
 //! orchestrate the linking pipeline: load inputs, resolve symbols, merge sections,
 //! build PLT/GOT, and dispatch to the appropriate ELF emission path.
 
+use crate::backend::elf::{SHN_ABS, STB_GLOBAL, STT_NOTYPE};
 use crate::backend::linker_common::SymStr;
+use crate::backend::linker_common::defsym::{self, Defsym};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::path::Path;
 
@@ -16,6 +18,75 @@ use super::input::{load_file, load_file_as_needed};
 use super::plt_got::{collect_ifunc_symbols, create_plt_got};
 use super::types::{GlobalSymbol, INTERP};
 use crate::backend::linker_common::{self, OutputSection};
+
+/// Apply `--defsym SYMBOL=EXPRESSION` to the global symbol table.
+///
+/// Both link paths used to contain an alias-only loop: look the right-hand side
+/// up in `globals`, and if found copy its definition to the left-hand side. A
+/// constant (`--defsym far=0x1000`) and an arithmetic expression
+/// (`--defsym half=(_end-_start)/2`) both miss that lookup, and because the loop
+/// was `if let Some(..)` the miss was silent -- the symbol stayed undefined and
+/// the link failed later with "undefined symbols: far", blaming the reference
+/// for a definition the user had just given.
+///
+/// Classification lives in `linker_common::defsym` so the four ELF backends
+/// cannot disagree about what a right-hand side means. Definitions are applied in
+/// command-line order, which lets a later `--defsym` refer to an earlier one.
+fn apply_defsyms(
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    defs: &[(String, String)],
+) -> Result<(), String> {
+    for (name, expr) in defs {
+        let shown = format!("--defsym {name}={expr}");
+        // "Defined" means the same thing it means to `resolve_sym` and to the
+        // undefined-symbol check: the symbol belongs to some object, or is one
+        // this linker created (defined_in == Some(usize::MAX)).
+        let classified = defsym::classify(expr, |n| {
+            globals.get(n).is_some_and(|g| g.defined_in.is_some())
+        })
+        .map_err(|e| format!("{shown}: {}", e.message()))?;
+        let value = match classified {
+            // Alias: copy the target's whole definition, PLT/GOT slots included,
+            // exactly as the old loop did.
+            Defsym::Alias(target) => {
+                let target_sym = globals.get(&target).cloned().ok_or_else(|| {
+                    format!("{shown}: target symbol '{target}' is not defined in this link")
+                })?;
+                globals.insert(name.clone(), target_sym);
+                continue;
+            }
+            Defsym::Constant(v) => v,
+            Defsym::Expression(e) => defsym::eval_with_symbols(&e, &|n| {
+                globals
+                    .get(n)
+                    .and_then(|g| g.defined_in.is_some().then_some(g.value))
+            })
+            .map_err(|err| format!("{shown}: {}", err.message()))?,
+        };
+        globals.insert(
+            name.clone(),
+            GlobalSymbol {
+                value,
+                size: 0,
+                info: (STB_GLOBAL << 4) | STT_NOTYPE,
+                // `Some(usize::MAX)` is this linker's marker for a symbol it
+                // created itself: `resolve_sym` returns `value` verbatim for it
+                // and the symtab writer emits it as SHN_ABS, so the constant
+                // lands in no section and needs no relocation.
+                defined_in: Some(usize::MAX),
+                from_lib: None,
+                plt_idx: None,
+                got_idx: None,
+                section_idx: SHN_ABS,
+                is_dynamic: false,
+                copy_reloc: false,
+                lib_sym_value: 0,
+                version: None,
+            },
+        );
+    }
+    Ok(())
+}
 
 pub fn link_builtin(
     object_files: &[&str],
@@ -260,12 +331,8 @@ pub fn link_builtin(
         )?;
     }
 
-    // Apply --defsym definitions: alias one symbol to another
-    for (alias, target) in &defsym_defs {
-        if let Some(target_sym) = globals.get(target).cloned() {
-            globals.insert(alias.clone(), target_sym);
-        }
-    }
+    // Apply --defsym definitions: alias, constant or expression.
+    apply_defsyms(&mut globals, &defsym_defs)?;
 
     // Apply --wrap=SYM: undefined references to SYM become references to
     // __wrap_SYM, and undefined references to __real_SYM become references
@@ -684,14 +751,8 @@ pub fn link_shared(
         linker_common::check_undefined_symbols_elf64_verbose(&globals, 20, &objects)?;
     }
 
-    // --defsym=ALIAS=TARGET: alias one symbol to another. Same semantics as
-    // the executable path (link_builtin); it was simply unreachable here while
-    // link_shared parsed its own arguments and never looked at defsym_defs.
-    for (alias, target) in &parsed.defsym_defs {
-        if let Some(target_sym) = globals.get(target).cloned() {
-            globals.insert(alias.clone(), target_sym);
-        }
-    }
+    // --defsym SYMBOL=EXPRESSION, same semantics as the executable path.
+    apply_defsyms(&mut globals, &parsed.defsym_defs)?;
 
     // Merge sections (no gc-sections for shared libraries)
     let mut output_sections: Vec<OutputSection> = Vec::new();
