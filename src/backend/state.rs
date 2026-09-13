@@ -362,6 +362,18 @@ pub struct CodegenState {
     /// when the callee is variadic; for a prototyped non-variadic callee the
     /// `xorl %eax,%eax` is pure waste. GCC omits it there.
     pub call_is_variadic: bool,
+    /// Was a `SetStaticChain` emitted since the last call/transfer emission?
+    ///
+    /// The nested-call lowering stages the static chain into %r10 directly
+    /// before the call (the IR inserts `SetStaticChain` immediately ahead of
+    /// every nested call site). The next `Call`/`CallIndirect` consumes this
+    /// flag and publishes `# LCCC_CHAIN_CALL` after the call text, mirroring
+    /// `call_is_variadic`'s marker contract: the late text peephole's
+    /// liveness oracles then model the ABI-invisible %r10 read ONLY at chain
+    /// calls, instead of at every call (which pinned every %r10-scratch
+    /// value across calls and blocked the LEA→memory window fold on the
+    /// RA's favorite scratch register).
+    pub chain_call: bool,
     /// Patchable function entry: (total_nops, nops_before_entry).
     /// When set, emits NOP padding around function entry points and records
     /// them in __patchable_function_entries for runtime patching (ftrace).
@@ -570,6 +582,7 @@ impl CodegenState {
             indirect_branch_thunk: false,
             indirect_branch_thunk_inline: false,
             call_is_variadic: false,
+            chain_call: false,
             patchable_function_entry: None,
             mcount: None,
             pending_classic_mcount_label: None,
@@ -744,6 +757,19 @@ impl CodegenState {
 
     pub fn reset_for_function(&mut self) {
         self.stack_offset = 0;
+        // ABI-marker protocol hygiene: `chain_call` is armed by a
+        // SetStaticChain emission and discharged by the next
+        // Call/CallIndirect emission that publishes `# LCCC_CHAIN_CALL`
+        // (same authority contract as `call_is_variadic` and
+        // `# LCCC_VA_CALL`). A SetStaticChain whose call was removed by
+        // late IR cleanup would leave the flag armed at function end, and
+        // the FIRST call of the NEXT function would carry a false marker.
+        // A false chain/VA marker only adds a conservative register read
+        // (never unsound), but it makes the markers lie -- and the text
+        // liveness oracles' contract is "marker ⟺ ABI-invisible read".
+        // Reset both per function; value ids are already function-local.
+        self.chain_call = false;
+        self.call_is_variadic = false;
         self.value_locations.clear();
         self.alloca_values.clear();
         self.volatile_alloca_values.clear();

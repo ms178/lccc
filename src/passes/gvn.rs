@@ -694,7 +694,25 @@ impl GvnState {
                 // Copy/slot machinery keeps GEP results in a single coalesced
                 // slot, and the store-forwarding analysis keys on value
                 // numbers, which CSE only strengthens.
-                let base_vn = self.operand_to_vn(&Operand::Value(*base));
+                //
+                // Class-agnostic base (S38): the must_mat/site_local split
+                // on ExprKey::GlobalAddr exists to stop VALUE-level CSE of
+                // the address constant (a RIP-foldable use pinned into a
+                // GPR). A GEP RESULT is a different value: whether it
+                // materializes is decided by its OWN uses, and equal
+                // (symbol, offset) GEPs are the same address regardless of
+                // which class-mate provided the base. Normalizing the base
+                // to the symbol's canonical VN lets `&pool[i]`-for-store
+                // (foldable-class base) and `&pool[i]`-for-call
+                // (must-materialize-class base) CSE into ONE value — IVSR
+                // then builds one marching pointer instead of two parallel
+                // recurrences, which cost two registers plus two bumps per
+                // iteration and doubled live-range pressure (rbtree/csv
+                // main: the spilled-recurrence disease). Site-local bases
+                // keep their per-site identity: OP-34 exists precisely to
+                // protect `sym(,%idx,scale)` selection from exactly this
+                // kind of unification.
+                let base_vn = self.gep_key_base_vn(base);
                 let offset_vn = self.operand_to_vn(offset);
                 Some((
                     ExprKey::Gep {
@@ -802,6 +820,31 @@ impl GvnState {
         };
         let sym = self.vn_symbol.get(&vn)?.clone();
         self.symbol_canonical_vn.get(&sym).copied()
+    }
+
+    /// Class-agnostic base VN for the GEP CSE key (S38). Falls back to the
+    /// plain operand VN for every base that is not a non-site-local
+    /// GlobalAddr: only the deliberate foldable/must-materialize class split
+    /// of same-symbol GlobalAddr duplicates is bridged here, because a GEP
+    /// RESULT's materialization class is recomputed from its own uses and
+    /// equal (symbol, offset) GEPs denote one address. Site-local bases
+    /// (OP-34 SIB protection) and every non-symbol base keep their exact
+    /// identity.
+    fn gep_key_base_vn(&mut self, base: &Value) -> VNOperand {
+        let raw = self.operand_to_vn(&Operand::Value(*base));
+        if self.site_local_gaddrs.contains(&base.0) {
+            return raw;
+        }
+        let VNOperand::ValueNum(v) = raw else {
+            return raw;
+        };
+        match self.vn_symbol.get(&v).cloned() {
+            Some(sym) => match self.symbol_canonical_vn.get(&sym).copied() {
+                Some(c) => VNOperand::ValueNum(c),
+                None => raw,
+            },
+            None => raw,
+        }
     }
 
     /// Record a freshly numbered GlobalAddr's symbol identity.

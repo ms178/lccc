@@ -485,6 +485,83 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
     changed
 }
 
+// ── C. dead in-place extensions ─────────────────────────────────────────────
+
+/// Delete an in-place extension (`cltq`, `movslq %eax, %rax`) whose widened
+/// bits are never read: every family-0 mention until the next full-width
+/// write (or a call, which de-facto kills the caller-saved product) spells
+/// the register at 32 bits or narrower.
+///
+/// The accumulator-based backend stages narrow arithmetic into `%eax` and
+/// routinely appends `cltq` "to be safe" before a narrow store
+/// (`leal (%eax,%eax,2), %eax; cltq; movl %eax, (%r10)` — csv/rbtree main):
+/// the store reads only `%eax`, so the extension is dead weight, and it is
+/// additionally a window barrier for the LEA→memory fold
+/// ([`has_implicit_reg_usage`] aborts the scan at `cltq`).
+pub(super) fn eliminate_dead_inplace_ext(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i));
+        let is_inplace_ext = t == "cltq" || t == "movslq %eax, %rax";
+        if !is_inplace_ext {
+            i += 1;
+            continue;
+        }
+        let mut dead = false;
+        let mut j = i + 1;
+        while j < len {
+            if infos[j].is_nop() {
+                j += 1;
+                continue;
+            }
+            let l = infos[j].trimmed(store.get(j));
+            // Calls must be examined BEFORE the generic barrier break:
+            // LineKind::Call is a barrier, but %rax is caller-saved — any
+            // value the program could read there after the call belongs to
+            // the callee's return, not to the extension, so the widened
+            // bits are already unreachable. An INDIRECT call names its
+            // target (`callq *%rax`) and reads full width: keep.
+            if matches!(infos[j].kind, LineKind::Call) {
+                dead = !contains_reg(l, "%rax");
+                break;
+            }
+            if infos[j].is_barrier() || infos[j].pinned {
+                break;
+            }
+            if infos[j].kind == LineKind::InlineAsm {
+                break;
+            }
+            // Opaque/implicit-register instructions touch %rax in ways the
+            // textual width rule cannot see (idiv/cqto/mul/shld/…): keep.
+            if has_implicit_reg_usage(l) {
+                break;
+            }
+            if contains_reg(l, "%rax") {
+                // Full-width mention: either a 64-bit read (keep) or a
+                // full-width write (the product is overwritten: dead).
+                dead = writes_family(&infos[j], l, 0);
+                break;
+            }
+            // Family-0 mentions at ≤32 bits (movl/leal/cmpl on %eax,
+            // `(%rax)`-free address operands) or no mention at all: the
+            // widened bits stay unread so far.
+            j += 1;
+        }
+        if dead {
+            mark_nop(&mut infos[i]);
+            changed = true;
+        }
+        i += 1;
+    }
+    changed
+}
+
 #[cfg(test)]
 #[path = "narrow_copy_fold_tests.rs"]
 mod tests;

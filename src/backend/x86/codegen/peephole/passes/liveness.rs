@@ -42,10 +42,15 @@ const RCX: u16 = 1 << 1;
 const RDX: u16 = 1 << 2;
 const RSP: u16 = 1 << 4;
 /// Values an ABI-visible transfer reads without naming them: the six SysV
-/// argument registers, `%rax` (variadic vector count) and `%r10` (static chain
-/// for nested functions — family 10 in the peephole numbering, NOT 11 which is
-/// `%r11`; getting that wrong let a relay delete the chain set-up).
-const CALL_READS: u16 = RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10);
+/// argument registers and `%rax` (variadic vector count). `%r10` (the
+/// static chain) is NOT here: chain calls carry `# LCCC_CHAIN_CALL`
+/// (the codegen arms it from the SetStaticChain emission that stages the
+/// chain immediately before every nested call — LCCC's IR inserts that
+/// staging at every nested call site, so no other shape can pass a chain
+/// invisibly). Modeling every call as reading %r10 pinned each %r10
+/// scratch value across every call — the RA's most common scratch pick
+/// after rax/rcx/rdx — and blocked the LEA→memory window fold.
+const CALL_READS: u16 = RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9);
 /// Registers a call may destroy.
 const CALLER_SAVED: u16 =
     RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
@@ -737,18 +742,70 @@ impl FileLiveness {
                     !infos[k].is_nop()
                         && infos[k].trimmed(store.get(k)).starts_with("# LCCC_VA_CALL")
                 });
-                let reads = if variadic {
+                // A static-chain callee reads the chain staged in %r10 by
+                // the SetStaticChain emission directly before this call;
+                // `# LCCC_CHAIN_CALL` marks exactly those sites. The
+                // staging write's own liveness DEPENDS on this read: without
+                // it, dead-write elimination would retire the staging and
+                // silently drop the chain.
+                let chain = (n + 1..(n + 3).min(infos.len())).any(|k| {
+                    !infos[k].is_nop()
+                        && infos[k]
+                            .trimmed(store.get(k))
+                            .starts_with("# LCCC_CHAIN_CALL")
+                });
+                // External-retpoline indirect call: the target register is
+                // read by the THUNK symbol, not by this instruction's text
+                // (`call __x86_indirect_thunk_r10` names no register). The
+                // call-site lowering always stages the target in %r10
+                // (emit_call_spill_fptr_impl), so this form reads family 10.
+                // The inline-thunk and `call *%r10` forms mention %r10 in
+                // their own text (`mentioned` covers them).
+                let retpoline_r10 = t.starts_with("call __x86_indirect_thunk_");
+                let mut reads = if variadic {
                     CALL_READS | mentioned
                 } else {
                     (CALL_READS & !RAX) | mentioned
                 };
-                Some((
-                    Effect {
-                        reads,
-                        writes: CALLER_SAVED,
-                    },
-                    fall,
-                ))
+                if chain || retpoline_r10 {
+                    reads |= 1 << 10;
+                }
+                // Intra-function call target (the inline-retpoline
+                // `.Lrpl_set/.Lrpl_inner` pair, local trampolines): control
+                // transfers to the label, and the `ret` inside returns to
+                // this call's fallthrough. `resolve` only knows labels from
+                // THIS function's line range, so a successful resolution
+                // proves the target is local. WITHOUT the target edge the
+                // thunk blocks are unreachable in the CFG, their %r10 read
+                // never propagates back to the staging write, and the
+                // staged retpoline target gets dead-store-eliminated
+                // (`retpoline_thunk_inline` SIGSEGV — the exact hole the
+                // pre-marker every-call-reads-%r10 model had been papering
+                // over; the inline-thunk shape does NOT mention %r10 at the
+                // call site, the mention lives in the target block). A
+                // LOCAL target's register effects are modeled exactly by
+                // its own instructions through the edge, so the
+                // conservative CALLER_SAVED clobber is dropped for it:
+                // values live at either the target or the fallthrough stay
+                // live across the call (sound — dead is never concluded),
+                // while a real external callee keeps the ABI model.
+                let local_target = t.split_whitespace().nth(1).and_then(resolve);
+                match local_target {
+                    Some(target) => {
+                        let mut edges = fall;
+                        if !edges.contains(&target) {
+                            edges.push(target);
+                        }
+                        Some((Effect { reads, writes: 0 }, edges))
+                    }
+                    None => Some((
+                        Effect {
+                            reads,
+                            writes: CALLER_SAVED,
+                        },
+                        fall,
+                    )),
+                }
             }
             LineKind::JmpIndirect => {
                 // A resolved jump-table dispatch: successors are the table's

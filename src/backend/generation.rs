@@ -1911,6 +1911,19 @@ pub fn build_rematerializable_global_addr_set_for(
                             && x86_inline_memset_len(func.as_str(), &info.args, info.is_variadic)
                                 .is_none()
                     }
+                    // A Copy of the root forwards the ADDRESS VALUE into a
+                    // new SSA value (IVSR's recurrence initialization is
+                    // exactly `Copy rec ← GlobalAddr`). The copy emitter
+                    // rematerializes the root (`leaq sym(%rip), home`) at
+                    // the copy site (generate_instruction's Copy arm), so
+                    // the root itself needs no home. The copy DEST is an
+                    // ordinary homed value with unconstrained uses — the
+                    // audit only governs the root's own uses.
+                    // Pre-S38 this arm fell to `_ => false`, rejecting every
+                    // loop whose address is strength-reduced into a pointer
+                    // recurrence (rbtree main: eight node_pool roots, three
+                    // stack-homed, reloaded at every recurrence touch).
+                    Instruction::Copy { src, .. } => op_is_root(src, id),
                     Instruction::CallIndirect { func_ptr, info } => {
                         // Same audit as Call: indirect-call arguments stage
                         // through the identical IntReg/Stack paths. The root
@@ -5025,7 +5038,32 @@ pub(super) fn generate_instruction(
         }
         Instruction::Alloca { .. } => {}
         Instruction::Copy { dest, src } => {
-            generate_copy(cg, dest, src);
+            // A copy whose SOURCE is a rematerializable GlobalAddr root
+            // forwards the address value (IVSR recurrence init, plain
+            // address aliasing). The root has no home by design; rebuild it
+            // here instead of going through generate_copy's operand load
+            // (which would hit the home-less operand panic). The Copy arm of
+            // the remat audit admits exactly this use shape.
+            if let Operand::Value(v) = src {
+                if remat_global_addrs.contains(&v.0) {
+                    let sym = global_addr_map.get(&v.0).expect(
+                        "rematerializable GlobalAddr must retain its legal symbol identity",
+                    );
+                    assert!(
+                        cg.emit_rematerialized_global_addr(
+                            dest,
+                            sym,
+                            &Operand::Const(IrConst::I64(0)),
+                            false
+                        ),
+                        "backend accepted GlobalAddr rematerialisation but refused its audited Copy"
+                    );
+                } else {
+                    generate_copy(cg, dest, src);
+                }
+            } else {
+                generate_copy(cg, dest, src);
+            }
         }
 
         Instruction::Load {

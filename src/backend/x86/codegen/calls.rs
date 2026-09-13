@@ -1157,6 +1157,17 @@ impl X86Codegen {
         if self.state.call_is_variadic {
             self.state.emit("    # LCCC_VA_CALL");
         }
+        // Static-chain call marker (same authority contract): a chain call
+        // reads %r10 (the nested-callee's static chain, staged by the
+        // immediately preceding SetStaticChain emission). Absent marker ⇒
+        // the callee cannot read a chain this caller staged ⇒ %r10 scratch
+        // values may be proven dead across the call. This is what un-pins
+        // %r10 (the RA's most common scratch after rax/rcx/rdx) from every
+        // call in the text liveness oracles.
+        if self.state.chain_call {
+            self.state.emit("    # LCCC_CHAIN_CALL");
+            self.state.chain_call = false;
+        }
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
