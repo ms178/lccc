@@ -177,6 +177,16 @@ gate "store-alu-cross-join" fast \
 gate "gla-remat-policy" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_gla_remat_policy.sh
 
+# Per-target Speed reach-band derivation (aarch64 10, riscv64/x86-64 6,
+# i686 2); self-skips legs whose cross binary/toolchain is absent.
+gate "gla-cross-reach-band" fast \
+    bash tests/regression/check_gla_cross_reach_band.sh
+
+# Latch phi fed by a global address: even with every admitting knob forced
+# open, zero back-edge trampolines on all four targets (structural rule).
+gate "gla-backedge-no-trampoline" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_gla_backedge_no_trampoline.sh
+
 gate "tight-loop-align" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tight_loop_align.sh
 

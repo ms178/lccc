@@ -144,21 +144,46 @@ pub(super) const X86_64_BUYABLE_CALLEE_SAVED_GPRS: &[&str] =
 /// 6-wide is 1.053×) — the calibrated value stays fail-closed at two.
 pub(super) const I686_BUYABLE_CALLEE_SAVED_GPRS: &[&str] = &["esi", "edi"];
 
+/// Callee-saved GPRs buyable on AArch64 PCS (AAPCS64): x19–x28, exactly
+/// ten. x29/x30 are FP/LR rather than spare GPRs and x18 is the platform
+/// register.
+pub(super) const AARCH64_BUYABLE_CALLEE_SAVED_GPRS: &[&str] = &[
+    "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+];
+
 /// Residual GPR residency the production allocator can bring to bear
 /// beyond [`pressure_budget`] by buying callee-saved homes — the physical
 /// quantity the Speed reach band proxies (see the band calibration in
-/// [`reach_band`]). aarch64 and riscv64 deliberately inherit the
-/// x86-64-derived band and the conservative GPR scan budget (12 vs ~27
-/// allocatable GPRs on either ISA): the model then fires only at pressure
-/// levels that are genuinely extreme for those register files, i.e. it
-/// can only UNDER-fire, never over-fire. Both targets carry full
-/// gate-on/gate-off/gcc equivalence matrices under qemu-user plus a
-/// trampoline trace proof in RA-GLA-02; a target-specific calibration is
-/// a future optimization, not a safety prerequisite.
+/// [`reach_band`]).
+///
+/// RISC-V deliberately keeps the x86-64-derived value of 6 even though
+/// the SysV ABI preserves s0–s11 (11 usable callee-saved GPRs): the
+/// per-target fire-site calibration (RA-GLA-03) found the blocks admitted
+/// beyond band 6 on that ISA are dominated by loop-invariant constants
+/// that belong in s-registers — widening remats them inside hot loops
+/// (double_reduction, band 9: two 32-bit `li` pairs per loop iteration
+/// replacing one hoisted sd/ld) and moves lccc AWAY from the GCC Godbolt
+/// oracle. On AArch64 the admitted frontier at bands 7–10 is prologue/
+/// frame-setup pressure instead, so the full ABI-derived set applies.
+/// Both targets carry full gate-on/gate-off/gcc equivalence matrices
+/// under qemu-user plus the trampoline trace proof in RA-GLA-02.
+///
+/// The ELF machine defaults to EM_X86_64 in the thread-local target state
+/// and is set unconditionally by the driver before codegen, so an
+/// un-initialised AArch64 compile would read the x86-64 band and
+/// under-fire — the fail-closed direction. The wider band can never be
+/// selected on a non-AArch64 target by accident.
 pub(super) fn buyable_callee_saved_gprs() -> usize {
+    use crate::backend::elf::EM_AARCH64;
     if crate::common::types::target_is_32bit() {
+        // Every 32-bit target lccc currently drives is i686; a future ILP32
+        // port (rv32, arm32) lands on the conservative i686 value and can
+        // only under-fire until it gets its own ABI calibration.
         I686_BUYABLE_CALLEE_SAVED_GPRS.len()
+    } else if crate::common::types::target_elf_machine() == EM_AARCH64 {
+        AARCH64_BUYABLE_CALLEE_SAVED_GPRS.len()
     } else {
+        // x86-64 and RISC-V LP64: see the per-target calibration above.
         X86_64_BUYABLE_CALLEE_SAVED_GPRS.len()
     }
 }
@@ -190,6 +215,31 @@ pub(super) fn buyable_callee_saved_gprs() -> usize {
 ///   win (reduction_vecreg, fp_memfold_stencil5, tls_pass, prefix_scan;
 ///   matmul measured 0.992×). Band 3 already re-admits the counter spill
 ///   (1.038×); only 2 is correct for this target.
+/// * **AArch64, allocator tier (opt ≥ 1): 10** — the ten buyable
+///   callee-saved GPRs x19–x28 (see [`AARCH64_BUYABLE_CALLEE_SAVED_GPRS`]).
+///   Cross-target static screening of every benchmark/regression TU at
+///   -O0..-O3,-Os (RA-GLA-03) shows the blocks admitted between bands 6 and
+///   10 are frame-setup / callee-save-home pressure: e.g. the N=17
+///   matmul TU shrinks its frame 128→112 and loses one const slot
+///   round-trip (−1 load/−2 stores; the hot FMA loops are untouched),
+///   and every deltas row moves toward the GCC/Clang Godbolt per-function
+///   counts with no benchmark-program counter-row. The empirical knee is
+///   sharp: band 11 starts rematting `conv_u8_3x3` (a REAL benchmark
+///   program) for +9 insns/+5 sp-refs versus the gate-off/b10 output —
+///   the register-allocator cascade from three cold setup edits, the
+///   same failure shape RISC-V hits at band 9 — and band 12 trades
+///   loop_memset_fill's stack savings away. The ABI-derived 10 is
+///   therefore also the measured maximum.
+/// * **RISC-V LP64, allocator tier (opt ≥ 1): 6** — deliberately below
+///   the ABI's 11 usable s-registers. The marginal blocks bands 9–11
+///   admit are loop-invariant constants the production allocator keeps
+///   resident in s-registers for free; widening emits per-iteration
+///   remats in the hottest loop (double_reduction LCG: +5 static insns,
+///   two large-constant `li` pairs per iteration, vs one hoisted sd/ld),
+///   moving the whole-TU Godbolt ratio from 4.04× to 4.11× of GCC.
+///   The only sizeable further static win (outer_loop_shapes) enters at
+///   the same band 11 as that regression, and bands 7–8 move only
+///   synthetic TUs by ±2 insns, so the conservative value is kept.
 /// * **opt level 0: 64 (effectively unbanded)** — at -O0 the production
 ///   register allocator tier is disabled (`disable_regalloc` at level 0),
 ///   so there is no colorer/folding plan for pre-allocation edits to

@@ -1711,7 +1711,7 @@ range below so no parse result can drive an unbounded plan.
 
 | Variable | Default | Clamp | Effect / fail-closed direction |
 |---|---|---|---|
-| `CCC_GLA_REACH` | derived: Speed 6 (x86-64) / 2 (i686); Debug 64; Size 0 | 0..=64 | Salvageable excess over budget. Derived from the named buyable callee-saved GPR sets (`X86_64_BUYABLE_CALLEE_SAVED_GPRS` = rbx/rbp/r12–r15; `I686_BUYABLE_CALLEE_SAVED_GPRS` = esi/edi, with ebx reserved for the PIC GOT and ebp for the frame pointer). i686 stays at 2 despite theoretical non-PIC capacity: bands 3/6 measured 1.038×/1.053× on loop_patterns. Raising ADDS edits. |
+| `CCC_GLA_REACH` | derived: Speed **10 (aarch64)** / 6 (x86-64, riscv64) / 2 (i686); Debug 64; Size 0 | 0..=64 | Salvageable excess over budget. Derived from the named buyable callee-saved GPR sets (`X86_64_BUYABLE_CALLEE_SAVED_GPRS` = rbx/rbp/r12–r15; `AARCH64_BUYABLE_CALLEE_SAVED_GPRS` = x19–x28; `I686_BUYABLE...` = esi/edi, with ebx reserved for the PIC GOT and ebp for the frame pointer). i686 stays at 2 despite theoretical non-PIC capacity: bands 3/6 measured 1.038×/1.053× on loop_patterns. RISC-V stays at 6 despite 11 usable s-registers: band 9+ remats loop-invariant constants *inside* hot loops (RA-GLA-03). Raising ADDS edits. |
 | `CCC_GLA_REMAT_MAX_SEGMENTS` | 1 | 1..=1024 | Max hole-aware live segments a rematerialized value may have. Raising ADDS edits (multi-segment globals were measured net-negative: nbody format-string base). |
 | `CCC_RA_REMAT_MAX_USES` | 3 | 1..=64 | Max dynamic use weight for a rematerialized value; hotter source-less defs keep a register. Lowering ADDS edits. |
 | `CCC_GLA_MIN_BENEFIT` | 40 | 1..=1_000_000 | Minimum weighted benefit a gap must promise. Lowering ADDS edits. |
@@ -1993,11 +1993,15 @@ per-function stats via `scripts/codegen_oracle.py`:
   remat is a relocation of a 1-use globaladdr; recurrence-carried φ
   accumulators remain protected).
 
-The inherited x86-64-derived budget/band on the 30+ GPR targets is
+The inherited x86-64-derived budget/band on the 30+ GPR targets was
 therefore validated as fail-safe in the right direction: it fires only at
 genuine pressure extremes and the measured changes are large spill
-reductions or neutral; per-ISA calibration remains future optimization
-headroom, not a safety question.
+reductions or neutral. The follow-up per-ISA calibration that this
+paragraph left open has since been done (RA-GLA-03 below): AArch64 moves
+to the ABI-derived band 10 with static and oracle-confirmed cold-code
+wins and zero benchmark-program changes, while RISC-V stays at 6 because
+the band-9+ frontier demonstrably loses to the oracle (hot-loop constant
+remats).
 
 **Runtime / performance evidence:** Callgrind -O2 31-program fast corpus
 rerun on the rebase: geomean Ir mine/ref **0.99952**, zlib_ng_adler32
@@ -2168,6 +2172,150 @@ spurious rc=−1 "mismatch" — a harness-config failure, not a compiler one.
 Valgrind (`--error-exitcode=99 --leak-check=full`) on gate-on and
 gate-off zlib_ng_adler32 binaries is clean; lccc-ld linker fuzz gates
 (128 linker mutants + 64×7 ELF grammar links) report zero defects.
+
+## RA-GLA-03 (2026-09-13) — per-target reach bands: aarch64 6 → 10, RISC-V kept at 6 with evidence
+
+**Question.** RA-GLA-02 shipped every 64-bit target the x86-64-derived
+Speed reach band of 6. The band proxies residual register capacity the
+production colorer can still bring to bear beyond the GPR scan budget
+(12). Both non-x86 64-bit targets have materially larger register files
+(~27 usable AArch64 GPRs, 31 RISC-V GPRs with s1–s11 callee-saved), so
+the question is whether their bands should widen to match the actual
+callee-saved GPR sets.
+
+**Method.** Static screening of every TU in benchmark/{programs,
+kernel_corpus,patterns} + regression at -O0..-O3,-Os with gate off vs
+gate on for reach bands 6, 7, 8, 9, 10, 11, 12, 14, 22
+(`work/band_sweep.py`, `work/band_detail.py`, `work/band_knee.py`;
+`.flags` sidecars honored as the real harness and census do), Godbolt
+per-function oracle comparisons for every TU whose deltas move with the
+band, and per-function assembly attribution of each marginal change.
+
+**AArch64: widen to 10 (x19–x28).** The marginal blocks bands 7–10
+admit are *frame-setup / callee-save-home* pressure, not hot-loop work.
+Representative case, the N=17 double matmul TU at -O2: band 8+ removes
+the const slot round-trip (`mov x0,#136; str x0,[sp]; …; ldr x0,[sp]`
+→ rematerialized `mov` at the single use), shrinks the frame
+128 → 112, −1 load/−2 stores; the hot FP FMA loops are byte-identical.
+Godbolt rank (`codegen_oracle.py --arch aarch64 --function main`,
+carm64g1610/carm64gtrunk/cclang2210) moves 252 → 246 insns (2.02× →
+1.97× of the 125-insn GCC leader), spills 52 → 50: same direction as
+the oracle, zero counter-regression. Sidecar-aware whole-corpus census
+(off → on), numbers after the PR #526 block-layout rebase (main
+5ef3fe5): band 6 gives -O1 −122/−93, -O2 −691/−1096; band 10 gives
+-O1 −163/−123, -O2 −721/−1120 (same at -O3), i.e. a marginal
+**−71 insns / −52 sp-refs at -O2/-O3 and −41/−30 at -O1** over 12 more
+touched rows (the pre-rebase build measured −96/−76 aggregate; PR #526
+shifted the baselines slightly, the conclusion does not move). The only
+new positive rows are +1 insn/opt in
+`gep_chain_fold_root_liveness.c`, the dedicated long-GEP-chain root
+liveness torture TU (one extra reload among duplicated adrp+add
+materializations, characterized, no sp-ref change). -O0/−Os are flat
+(−165/−95 at -O0, −4 at -Os). The empirical knee is sharp and was
+re-confirmed after that rebase: band 11 starts rematting the REAL
+benchmark `conv_u8_3x3` for **+9 insns/+5 sp-refs** (a cold-setup
+cascade, the same failure shape RISC-V hits at band 9), and band 12
+trades `loop_memset_fill_basic`'s stack savings away; the ABI-derived
+10 is therefore also the measured maximum. The marginal
+benchmark-program rows at band 10 (sha256_transform −71/−22,
+sqlite_varint −77/−56, zlib_ng_adler32 −24/−35, strlen −10/−19,
+binary_search −10/−7) all already fire at band 6, and NO
+benchmark-program TU textually changes between bands 6 and 10 at any
+opt level (verified over programs/kernel_corpus/patterns).
+
+**RISC-V: keep 6, against the raw ABI count.** The SysV ABI preserves
+s0–s11 (11 usable s-GPRs, s0 being the frame pointer), so a mechanical
+ABI derivation suggests 11. The data rejects it: (1) the blocks bands
+9+ admit are dominated by *loop-invariant constants*, which on this
+backend the production allocator keeps resident in s-registers for
+free — band 9 remats the LCG generator constants 1664525/1013904223
+*inside* the hot loop of `double_reduction.c` (two 32-bit `li` pairs
+re-emitted per iteration; band 6 keeps them resident in s9/s10 with a
+single hoisted sd/ld pair), +5 static insns / −3 one-time sp-refs;
+Godbolt whole-TU comparison moves 299 → 304 insns, i.e. 4.04× → 4.11×
+of GCC's 74-insn solution — **away from the oracle**. (2) The only
+sizeable static win beyond 6 (`outer_loop_shapes` −12/−12) enters at
+band 11 in the same step as the hot-loop regression; bands 7–8 move
+only synthetic TUs by ±2 insns with no benchmark-program row at all.
+The conservative band therefore stays; the planner's weighted-use gate
+(which would ideally refuse these hot constant remats directly)
+undercounts these const-feeding-φ shapes, and the reach band is the
+load-bearing backstop — recorded as a known limitation, not worked
+around. A deeper red-team pass proved there is no planner-visible
+discriminator that would harvest the band-11 wins safely:
+`outer_loop_shapes` at band 11 applies exactly TWO cold weighted-1
+single-segment GlobalAddrs (b0..b2, setup) for −12 insns/−12 sp-refs,
+while `double_reduction` at band 9 applies the SAME class (THREE cold
+weighted-1 single-segment GlobalAddrs in b0..b2) and the downstream
+colorer's global reassignment then evicts the LCG constants for +5
+insns. The candidate plans are near-identical at the point GLA decides;
+the outcome difference lives entirely in allocator coloring the
+pre-pass cannot observe (the same structural reason pre-alloc spill
+gaps measured net-negative, RA-06). Any rule separating the two would
+have to name those programs — a forbidden benchmark-specific rule.
+The empirical band boundary is therefore the honest general backstop;
+post-allocation feedback (the P0-B gap substrate) is the recorded
+proper path to ever harvesting the outer-loop wins.
+
+**Fail-closed accounting.** The band is selected at runtime from
+`target_elf_machine()` (set by the driver pipeline for every compile,
+before any codegen): AArch64=183 → 10, ptr-32 (i686=3) → 2, everything
+else (x86-64=62, RISC-V=243) → 6. The thread-local machine defaults to
+62, so any path that forgot to initialise it would read the x86 band
+and *under-fire* on AArch64 — the wide band can never be selected
+off-target. `CCC_GLA_REACH` overrides for A/B exactly as before; the
+Debug tier remains unbanded (64) and the Size tier inert.
+
+**Validation (re-validated on the PR #526 block-layout rebase, main
+5ef3fe5, 2026-09-14).** Rust unit coverage extends
+`reach_band_equals_buyable_callee_saved_gprs` to a per-ELF-machine table
+(x86-64 6, aarch64 10, riscv64 6, i686 2, Debug 64, Size 0), and
+`tests/regression/check_gla_cross_reach_band.sh` (a new `ci_local.sh
+--fast` gate, hermetic under an ambient `CCC_GLA_REACH`) pins the arm
+frame win, the riscv band-11 cliff, and the x86 default end to end.
+Gate-on/gate-off/cross-gcc equivalence matrices under qemu-user:
+aarch64 ran=2687 (2647 oracle-confirmed, 40 known pre-existing gaps)
+failed=0; riscv64 ran=2698 (2585 oracle-confirmed, 113 gaps) failed=0;
+x86-64 ran=3499 failed=0; i686 ran=3338 failed=0. Differential synthetic
+fuzz 500 seeds × {-O1,-O2,-Os} on each cross target (seed 20260914):
+zero mismatches. A second, host-side round (same seed) ran the
+`phi_cfg` engine across 1200 seeds × {-O0,-O1,-O2,-O3,-Os} and the
+`differential` engine across 800 seeds × {-O1,-O2,-O3}: 2000/2000
+PASS, 0 mismatches. A dedicated structural gate
+(`check_gla_backedge_no_trampoline.sh`, also a `ci_local --fast`
+gate) constructs a loop-latch φ fed by the global base on the
+looping edge and a distinct p-derived incoming on the forward edge
+under heavy pressure, forces every admitting knob open (reach 999,
+segment cap 1024, weight cap 64), and requires **0 back-edge
+trampolines** on x86-64 (-O0..-O3), aarch64, riscv64 and i686 plus
+byte-identical gate-off/forced-wide output — the permanent encoding
+of the red-team result that the latch-edge remat/trampoline shape is
+unreachable by construction (φ-feeding weight ≥ 10 > cap 3, and the
+one-live-segment cap rejects the weaving form). Static off→on census (`.flags`-aware): the only new
+positive rows aarch64 bands 6→10 introduce are +1 instruction/opt in
+`gep_chain_fold_root_liveness.c`; x86-64 totals −455 insn/−342 stkref
+(31 rows, one +insn row), i686 −572/−1627 (211 rows, same pre-existing
+trade population as RA-GLA-02). The aarch64 fire census at the new
+default is bit-for-bit the pre-rebase plan: 544 remats / 0 capture
+slots / 0 aborts; the one non-harness forward-edge trampoline site
+(`narrow_shift_count_ge_width.c` -O1, a ten-remat depth-0 switch-arm
+function) emits no extra asm block or branch after layout, leaves
+frame/insn/sp-traffic counts identical, and is oracle-confirmed.
+A remat-weight-cap sweep on AArch64 (caps 3..8, reach 10) is a negative
+result: caps ≥4 introduce synthetic +5/+9 counter-rows and shrink
+existing wins while moving ZERO benchmark-program TUs, so the cap
+stays at 3 on all targets. The arm regression runner reports 528 pass
+with 56 failures that are byte-identical gate-off (x86-only inline asm
+and documented backend gaps); GLA is exonerated. Host kernel runtime
+A/B (`scripts/bench_kernels.py`, -O2 v3, 15 best-of reps, taskset, idle
+machine): all nine `bench_run` codegen hashes are identical gate
+on/off (hot bodies untouched; geomean 0.997×, every ratio 0.99–1.02,
+the single sub-0.99 row carries an identical body hash and is the
+harness's documented layout/timing noise). Valgrind on the compiler
+while firing: 0 invalid accesses, 0 definite leaks; the 140 "possibly
+lost" reports are gate-identical LazyLock builtin-table teardown
+false positives. The linker suite (`tests/linker/run_linker_tests.py`
+via the driver) is 206 pass / 0 fail / 1 environment skip.
 
 ## ALIGN-01 (2026-09-12) — structural hot-loop alignment ("tight loops"): two-layer GCC 16.2 mirror with exact encoded spans
 
