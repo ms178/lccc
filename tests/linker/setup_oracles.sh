@@ -242,7 +242,16 @@ else
     git -C "$SRC/llvm-src" fetch --depth 1 origin "release/${LLD_MAJOR}.x" && \
     git -C "$SRC/llvm-src" reset --hard FETCH_HEAD
   fi
-  cmake -S "$SRC/llvm-src/lld" -B "$SRC/llvm-src/lld/build" -G Ninja \
+  # Configure the MONOREPO root (llvm/), not the lld/ subdirectory: `cmake
+  # -S lld` runs find_package(LLVM) and happily adopts a DISTRO LLVM of a
+  # different major (e.g. Debian's llvm-19), after which lld's sources fail
+  # against their own newer headers (measured: DWARFDebugLine.h, 4-arg vs
+  # 5-arg constructor mismatch).  The monorepo build uses its own headers and
+  # libraries by construction — the only self-consistent setup.  The GCC
+  # driver is forced for the same reason: a distro clang can leak its private
+  # headers into the translation units.
+  cmake -S "$SRC/llvm-src/llvm" -B "$SRC/llvm-src/build" -G Ninja \
+        -DCMAKE_C_COMPILER=cc -DCMAKE_CXX_COMPILER=g++ \
         -DCMAKE_BUILD_TYPE=Release \
         -DLLVM_TARGETS_TO_BUILD=X86 \
         -DLLVM_ENABLE_PROJECTS=lld \
@@ -250,11 +259,15 @@ else
         -DLLVM_INCLUDE_BENCHMARKS=OFF \
         -DLLVM_INCLUDE_EXAMPLES=OFF \
         -DLLVM_ENABLE_ASSERTIONS=OFF \
+        -DLLVM_PARALLEL_LINK_JOBS=1 \
         -DCMAKE_C_FLAGS="-O2 $NATIVE" \
         -DCMAKE_CXX_FLAGS="-O2 $NATIVE" \
         -DCMAKE_INSTALL_PREFIX="$SRC/llvm-inst"
-  cmake --build "$SRC/llvm-src/lld/build" -j "$JOBS"
-  cmake --install "$SRC/llvm-src/lld/build"
+  # The `lld` target drags in exactly the LLVM libraries it links against,
+  # not the rest of the toolchain's targets.
+  cmake --build "$SRC/llvm-src/build" --target lld -j "$JOBS"
+  cmake --install "$SRC/llvm-src/build" --component lld \
+      2>/dev/null || cmake --install "$SRC/llvm-src/build"
   install -m755 "$SRC/llvm-inst/bin/lld" "$BIN/lld"
   ln -sf lld "$BIN/ld.lld"
   log "lld: $(\"$BIN/lld\" --version | head -1)"

@@ -174,10 +174,69 @@ fn apply_one_reloc(
             let tpoff = sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32;
             (tpoff + addend) as u32
         }
-        R_386_TLS_IE => resolve_tls_ie(sym, sym_addr, addend, ctx),
-        R_386_TLS_GOTIE => resolve_tls_gotie(sym, sym_addr, addend, ctx),
+        R_386_TLS_IE => {
+            // This function is reached only from the executable path
+            // (emit.rs).  The bare two-instruction IE form cannot be
+            // relaxed in place, so main-image locals are refused loudly
+            // instead of silently mislinked; everything else keeps the
+            // shared resolver's semantics.
+            if ctx.has_tls
+                && sym.sym_type == STT_TLS
+                && ctx.global_symbols.get(sym.name.as_str()).is_none()
+            {
+                return Err(format!(
+                    "TLS IE access to local symbol '{}' in {} is not supported; use @GOTNTPOFF",
+                    sym.name, obj.filename
+                ));
+            }
+            resolve_tls_ie(sym, sym_addr, addend, ctx)
+        }
+        R_386_TLS_GOTIE => {
+            // Executable-only relaxation: for a main-image TLS symbol
+            // (local, or a non-dynamic global) GNU ld rewrites the
+            // `mov slot(%ebx), %reg; add %gs:0, %reg` pair into the
+            // local-exec form; dynamic symbols keep the GOT slot path.
+            let main_image = match ctx.global_symbols.get(sym.name.as_str()) {
+                Some(gs) => !gs.is_dynamic,
+                None => sym.sym_type == STT_TLS,
+            };
+            if ctx.has_tls && main_image {
+                let tpoff =
+                    sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32 + addend;
+                relax_gotie_to_le(out_sec_idx, patch_offset, &sym.name, &obj.filename, ctx)?;
+                tpoff as u32
+            } else if ctx
+                .global_symbols
+                .get(sym.name.as_str())
+                .map(|gs| gs.is_dynamic)
+                .unwrap_or(false)
+            {
+                // A DSO variable reached through the one-instruction
+                // initial-exec form cannot be right at runtime: the slot
+                // would hold the variable's absolute address (GLOB_DAT) or
+                // its DSO-block offset, and the following `add %gs:0`
+                // adds the main executable's TP to whichever.  Only the
+                // GD sequence is valid for DSO TLS — refuse loudly.
+                return Err(format!(
+                    "initial-exec TLS access to dynamic symbol '{}' in {} is not valid for a shared-library TLS variable; the i686 linker supports main-image TLS (relaxed to local-exec) and nothing else",
+                    sym.name, obj.filename
+                ));
+            } else {
+                resolve_tls_gotie(sym, sym_addr, addend, ctx)
+            }
+        }
         R_386_TLS_GD => {
-            if ctx.has_tls && sym.sym_type == STT_TLS {
+            // Only main-image symbols can be relaxed (the relaxed form
+            // uses %gs:0, the main executable's TP).  A DSO TLS variable
+            // needs a tlsgd descriptor + ___tls_get_addr, which the i686
+            // linker does not emit — so a dynamic symbol here is refused
+            // loudly instead of being silently rewritten to an
+            // address that is off by the DSO's block position.
+            let gd_main_image = match ctx.global_symbols.get(sym.name.as_str()) {
+                Some(gs) => !gs.is_dynamic,
+                None => sym.sym_type == STT_TLS,
+            };
+            if ctx.has_tls && gd_main_image && sym.sym_type == STT_TLS {
                 let tpoff =
                     sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32 + addend;
                 // GD→LE relaxation for executables (matches GNU ld's
@@ -248,7 +307,10 @@ fn apply_one_reloc(
                 }
                 tpoff as u32
             } else {
-                addend as u32
+                return Err(format!(
+                    "general-dynamic TLS access to symbol '{}' in {}: the i686 linker has no tlsgd descriptor support for dynamic TLS symbols (main-image TLS is relaxed to local-exec instead)",
+                    sym.name, obj.filename
+                ));
             }
         }
         R_386_TLS_DTPMOD32 => 1u32,
@@ -357,6 +419,72 @@ pub(super) fn resolve_got_reloc(
     } else {
         (sym_addr as i32 + addend - ctx.got_base as i32) as u32
     }
+}
+
+/// Rewrite the `mov disp32(%ebx), %reg` + `add %gs:0, %reg` pair into the
+/// local-exec form.  The pair is the i386 initial-exec sequence for a TLS
+/// address in the main image:
+///     movl  slot(%ebx), %reg    ; 8b /r disp32  (6 bytes; reloc at disp)
+///     addl  %gs:0, %reg         ; 65 03 modrm [00000000]
+/// GNU ld relaxes exactly this pair for main-image symbols to
+///     movl  $tpoff, %reg        ; c7 /0 imm32  (6 bytes, same footprint)
+///     addl  %gs:0, %reg         ; untouched
+/// so `reg = tpoff + TP = &var` with no GOT reference.  Only the two
+/// instruction bytes change; the 4-byte imm32 sits exactly at the reloc
+/// offset, so the caller's generic patch writes the tpoff value.
+///
+/// Encoding trap: `C7 /0` fixes the ModRM REG field to 000 and puts the
+/// destination in the r/m field, so the byte is `0xC0 | reg` (NOT
+/// `0xC0 | (reg << 3)` — that would select the undefined `C7 /reg` form
+/// and #UD on every register except %eax, where the two fields happen
+/// to coincide).
+fn relax_gotie_to_le(
+    out_sec_idx: usize,
+    patch_offset: u32,
+    name: &str,
+    filename: &str,
+    ctx: &mut RelocContext,
+) -> Result<(), String> {
+    let out_sec = &mut ctx.output_sections[out_sec_idx];
+    let off = patch_offset as usize;
+    // `mov disp32(%ebx), %reg`: opcode 8b at off-2, modrm mod=10 (disp32),
+    // base=%ebx (rm=011, no index/SIB).  rm=101 would be the disp32-only
+    // (no-base) form — an absolute load, NOT a GOT reference — and must
+    // never be relaxed.
+    if !(off >= 2
+        && off + 4 <= out_sec.data.len()
+        && out_sec.data[off - 2] == 0x8b
+        && (out_sec.data[off - 1] & 0xC7) == 0x83)
+    {
+        return Err(format!(
+            "cannot relax GOTIE reloc for TLS symbol '{}' in {}: expected `mov disp32(%ebx), %reg` at offset 0x{:x}",
+            name, filename, patch_offset
+        ));
+    }
+    let reg = ((out_sec.data[off - 1] >> 3) & 7) as u8;
+    // `add %gs:0, %reg` immediately after the mov.  The absolute
+    // `%gs:0` memory operand needs a disp32 in every encoding (mod=00
+    // rm=101), so the 7-byte form is the ONLY possible encoding:
+    //   65 03 <modrm mod=00 reg=%reg rm=101> 00 00 00 00   (7 bytes)
+    // (verified byte-for-byte against both GAS and lccc-as output).
+    // Opcode 0x03 with the GS prefix adds the memory operand to the
+    // REG-field register.
+    let has_add = off + 11 <= out_sec.data.len()
+        && out_sec.data[off + 4] == 0x65
+        && out_sec.data[off + 5] == 0x03
+        && (out_sec.data[off + 6] & 0xC7) == 0x05
+        && ((out_sec.data[off + 6] >> 3) & 7) == reg
+        && out_sec.data[off + 7..off + 11] == [0u8; 4];
+    if !has_add {
+        return Err(format!(
+            "cannot relax GOTIE reloc for TLS symbol '{}' in {}: the `mov slot(%ebx)` at offset 0x{:x} is not followed by `add %gs:0`",
+            name, filename, patch_offset
+        ));
+    }
+    // The `add %gs:0, %reg` is left in place, untouched.
+    out_sec.data[off - 2] = 0xc7;
+    out_sec.data[off - 1] = 0xC0 | reg;
+    Ok(())
 }
 
 /// Resolve R_386_TLS_IE relocation.

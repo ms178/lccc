@@ -80,7 +80,7 @@ pub(super) fn emit_executable(
     // depends on final addresses, so they are evaluated here, after section
     // addresses and the linker-provided symbols exist.  See
     // `link::evaluate_pending_defsyms` for the full rationale.
-    pending_defsyms: &[(String, String)],
+    pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
     let mut t_zone = std::time::Instant::now();
@@ -636,6 +636,20 @@ pub(super) fn emit_executable(
     if has_relro {
         phdr_count += 1;
     }
+    // One PT_NOTE segment per allocated note section (property, build-id,
+    // ABI tag), plus a PT_GNU_PROPERTY alias for `.note.gnu.property` —
+    // GNU ld writes both and consumers (readelf -l, the kernel's note
+    // scanner) expect them.  `mem_size` is the pre-layout size; section
+    // `data` is only filled during the layout pass, so it must not be the
+    // condition here (it is still empty at this point).
+    let note_phdr_count = output_sections
+        .iter()
+        .filter(|s| s.sh_type == SHT_NOTE && s.flags & SHF_ALLOC != 0 && s.mem_size > 0)
+        .count() as u64;
+    let has_gnu_property_phdr = output_sections
+        .iter()
+        .any(|s| s.name == ".note.gnu.property" && s.flags & SHF_ALLOC != 0 && s.mem_size > 0);
+    phdr_count += note_phdr_count + has_gnu_property_phdr as u64;
     let phdr_total_size = phdr_count * 56;
 
     zone!("pre-layout");
@@ -1579,17 +1593,57 @@ pub(super) fn emit_executable(
         );
         ph += 56;
     }
-    if has_relro && relro_size > 0 {
+    // One PT_NOTE segment per allocated note section, spanning exactly its
+    // own section (alignment = the section's, minimum 4, as in GNU ld),
+    // followed by the PT_GNU_PROPERTY alias over `.note.gnu.property`
+    // (alignment 8).  Written after DYNAMIC, before the synthetic
+    // segments, matching GNU ld's program header order.
+    for sec in output_sections.iter() {
+        if sec.sh_type == SHT_NOTE && sec.flags & SHF_ALLOC != 0 && !sec.data.is_empty() {
+            wphdr(
+                &mut out,
+                ph,
+                PT_NOTE,
+                PF_R,
+                sec.file_offset,
+                sec.addr,
+                sec.data.len() as u64,
+                sec.mem_size,
+                sec.alignment.max(4),
+            );
+            ph += 56;
+        }
+    }
+    if has_gnu_property_phdr {
+        if let Some(sec) = output_sections
+            .iter()
+            .find(|s| s.name == ".note.gnu.property" && !s.data.is_empty())
+        {
+            wphdr(
+                &mut out,
+                ph,
+                PT_GNU_PROPERTY,
+                PF_R,
+                sec.file_offset,
+                sec.addr,
+                sec.data.len() as u64,
+                sec.mem_size,
+                8,
+            );
+            ph += 56;
+        }
+    }
+    if eh_frame_hdr_size > 0 {
         wphdr(
             &mut out,
             ph,
-            PT_GNU_RELRO,
+            PT_GNU_EH_FRAME,
             PF_R,
-            relro_start,
-            relro_start_addr,
-            relro_size,
-            relro_size,
-            1,
+            eh_frame_hdr_offset,
+            eh_frame_hdr_vaddr,
+            eh_frame_hdr_size,
+            eh_frame_hdr_size,
+            4,
         );
         ph += 56;
     }
@@ -1608,17 +1662,17 @@ pub(super) fn emit_executable(
     };
     wphdr(&mut out, ph, PT_GNU_STACK, stack_flags, 0, 0, 0, 0, 0x10);
     ph += 56;
-    if eh_frame_hdr_size > 0 {
+    if has_relro && relro_size > 0 {
         wphdr(
             &mut out,
             ph,
-            PT_GNU_EH_FRAME,
+            PT_GNU_RELRO,
             PF_R,
-            eh_frame_hdr_offset,
-            eh_frame_hdr_vaddr,
-            eh_frame_hdr_size,
-            eh_frame_hdr_size,
-            4,
+            relro_start,
+            relro_start_addr,
+            relro_size,
+            relro_size,
+            1,
         );
         ph += 56;
     }

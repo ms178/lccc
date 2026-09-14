@@ -29,6 +29,7 @@ type Object = linker_common::Elf64Object;
 const PT_LOAD_: u32 = 1;
 const PT_TLS_: u32 = 7;
 const PT_NOTE_: u32 = 4;
+const PT_GNU_PROPERTY_: u32 = 0x6474e553;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScriptMachine {
     X86_64,
@@ -794,19 +795,28 @@ fn apply_script_defsyms(
     def_syms: &mut FxHashMap<String, (usize, u16, u64, u64, u8)>,
     defs: &[(String, String)],
 ) -> Result<(), String> {
-    for (name, expr) in defs {
-        let shown = format!("--defsym {name}={expr}");
+    for (pos, (name, expr)) in defs.iter().enumerate() {
+        // GNU's `--defsym:N` counter (1-based position in the link's defsym
+        // list), so a script-link failure reads exactly like a builtin-link
+        // one — and like GNU ld's.  See `DefsymError::gnu_message`.
+        let index = pos + 1;
         let classified = defsym::classify(expr, |n| {
             def_syms
                 .get(n)
                 .is_some_and(|&(_, shndx, _, _, _)| shndx != SHN_UNDEF)
         })
-        .map_err(|e| format!("{shown}: {}", e.message()))?;
+        .map_err(|e| e.gnu_message(index))?;
         let value = match classified {
             Defsym::Alias(target) => {
-                let target_def = *def_syms.get(&target).ok_or_else(|| {
-                    format!("{shown}: target symbol '{target}' is not defined in this link")
-                })?;
+                // `classify` returns `Alias` only for names this same
+                // predicate found in `def_syms`, and nothing mutates the
+                // map between the two — so the lookup cannot miss.  (The
+                // builtin paths CAN miss here: their predicate additionally
+                // accepts layout-derived magic names via
+                // `is_linker_defined`, which is why they defer instead.)
+                let target_def = *def_syms
+                    .get(&target)
+                    .expect("defsym Alias target vanished between classify and lookup");
                 def_syms.insert(name.clone(), target_def);
                 continue;
             }
@@ -824,12 +834,9 @@ fn apply_script_defsyms(
                     // error, and claiming either would send the user after the
                     // wrong thing.
                     Err(defsym::DefsymError::UndefinedSymbol(n)) if def_syms.contains_key(&n) => {
-                        return Err(format!(
-                            "{shown}: {}",
-                            defsym::DefsymError::NeedsLayout(e).message()
-                        ));
+                        return Err(defsym::DefsymError::NeedsLayout(e).gnu_message(index));
                     }
-                    Err(err) => return Err(format!("{shown}: {}", err.message())),
+                    Err(err) => return Err(err.gnu_message(index)),
                 }
             }
         };
@@ -1171,9 +1178,40 @@ fn link_with_script_machine(
             .iter()
             .any(|sec| (sec.flags & SHF_TLS_) != 0 && (sec.flags & SHF_ALLOC_) != 0 && sec.size > 0)
     }) && !script.phdrs.iter().any(|d| d.ptype == PT_TLS_);
+    // GNU ld also writes one PT_NOTE program header per allocated note
+    // section, plus a PT_GNU_PROPERTY alias for `.note.gnu.property`.
+    // Predict the count from the (already merged) inputs, exactly as the
+    // PT_TLS prediction above does.  The prediction counts one header per
+    // input note section, which is always >= the number of output sections
+    // that end up holding note data (outputs may merge inputs), so
+    // SIZEOF_HEADERS can only over-reserve -- never under-reserve -- the
+    // header table.  The exact final count is recomputed after layout for
+    // `n_phdrs` and the section file offsets.
+    let has_note_property = objects.iter().flat_map(|o| o.sections.iter()).any(|sec| {
+        sec.name == ".note.gnu.property" && (sec.flags & SHF_ALLOC_) != 0 && sec.size > 0
+    });
+    let note_phdr_pred = if !script.phdrs.iter().any(|d| d.ptype == PT_NOTE_) {
+        objects
+            .iter()
+            .flat_map(|o| o.sections.iter())
+            .filter(|sec| {
+                sec.name.starts_with(".note")
+                    && (sec.flags & SHF_ALLOC_) != 0
+                    && sec.size > 0
+                    && !sec.name.contains('@')
+            })
+            .count()
+            + usize::from(has_note_property)
+    } else {
+        0
+    };
     symbols.insert(
         "__SIZEOF_HEADERS".into(),
-        script_header_size_with(&script, usize::from(will_add_tls_phdr), machine),
+        script_header_size_with(
+            &script,
+            usize::from(will_add_tls_phdr) + note_phdr_pred,
+            machine,
+        ),
     );
     // Script symbols carry expression relocatability, not merely a numeric
     // value or syntactic assignment scope.  In particular, a SECTIONS-scope
@@ -2019,8 +2057,33 @@ fn link_with_script_machine(
         needs_tls_phdr, will_add_tls_phdr,
         "PT_TLS prediction disagreed with the final layout; SIZEOF_HEADERS would be wrong"
     );
-    let n_phdrs = declared_phdrs.len().max(1) + usize::from(needs_tls_phdr);
-    let mut file_off = script_header_size_with(&script, usize::from(needs_tls_phdr), machine);
+    // The note segments (one PT_NOTE per allocated note output section
+    // plus the PT_GNU_PROPERTY alias) count toward the header table exactly
+    // like the synthesised PT_TLS does, or the first section's file offset
+    // would land inside the program header table.  Counted from the final
+    // layout so it is exact by construction.
+    let has_note_property_out = out_secs.iter().any(|o| {
+        o.is_alloc
+            && o.size > 0
+            && o.placed.iter().any(|pl| {
+                pl.size > 0
+                    && objects[pl.obj_idx]
+                        .sections
+                        .get(pl.sec_idx)
+                        .is_some_and(|s| s.name == ".note.gnu.property")
+            })
+    });
+    let note_phdr_actual = out_secs
+        .iter()
+        .filter(|o| o.is_alloc && o.size > 0 && o.name.starts_with(".note"))
+        .count()
+        + usize::from(has_note_property_out);
+    let n_phdrs = declared_phdrs.len().max(1) + usize::from(needs_tls_phdr) + note_phdr_actual;
+    let mut file_off = script_header_size_with(
+        &script,
+        usize::from(needs_tls_phdr) + note_phdr_actual,
+        machine,
+    );
 
     // Assign file offsets: alloc PROGBITS sections in vaddr order get offsets
     // congruent to their LMA modulo the requested maximum page size. The
@@ -3171,6 +3234,62 @@ fn link_with_script_machine(
             talign,
         )?;
     }
+    // One PT_NOTE segment per allocated note output section (each spanning
+    // exactly its own section, aligned to at least 4 as in GNU ld), plus
+    // the PT_GNU_PROPERTY alias over the output section holding the merged
+    // `.note.gnu.property` data (alignment 8).  Skipped entirely when the
+    // script itself declares PT_NOTE segments.  The count matches
+    // `note_phdr_actual` above by construction.
+    if !script.phdrs.iter().any(|d| d.ptype == PT_NOTE_) {
+        for os in out_secs.iter() {
+            if os.is_alloc && os.size > 0 && os.name.starts_with(".note") {
+                write_script_phdr(
+                    machine,
+                    &mut out,
+                    ph_off,
+                    PT_NOTE_,
+                    4, /* PF_R */
+                    os.file_offset,
+                    os.vaddr,
+                    os.lma,
+                    os.size,
+                    os.size,
+                    os.align.max(4),
+                )?;
+                ph_off += machine.phdr_size() as usize;
+            }
+        }
+        if has_note_property_out {
+            for os in out_secs.iter() {
+                if os.is_alloc
+                    && os.size > 0
+                    && os.placed.iter().any(|pl| {
+                        pl.size > 0
+                            && objects[pl.obj_idx]
+                                .sections
+                                .get(pl.sec_idx)
+                                .is_some_and(|s| s.name == ".note.gnu.property")
+                    })
+                {
+                    write_script_phdr(
+                        machine,
+                        &mut out,
+                        ph_off,
+                        PT_GNU_PROPERTY_,
+                        4, /* PF_R */
+                        os.file_offset,
+                        os.vaddr,
+                        os.lma,
+                        os.size,
+                        os.size,
+                        8,
+                    )?;
+                    ph_off += machine.phdr_size() as usize;
+                    break;
+                }
+            }
+        }
+    }
 
     // ── Section headers (+ optional symtab) ──
     let mut shstrtab: Vec<u8> = vec![0];
@@ -4058,3 +4177,85 @@ const R_386_PC16: u32 = 21;
 const R_386_8: u32 = 22;
 const R_386_PC8: u32 = 23;
 const R_386_SIZE32: u32 = 38;
+
+#[cfg(test)]
+mod tests {
+    use super::apply_script_defsyms;
+    use crate::backend::elf::{SHN_ABS, STB_GLOBAL, STT_NOTYPE};
+    use crate::common::fx_hash::FxHashMap;
+
+    /// One `def_syms` row: (object index, section index, value, size, info).
+    type DefSym = (usize, u16, u64, u64, u8);
+
+    fn abs(value: u64) -> DefSym {
+        (
+            usize::MAX,
+            SHN_ABS,
+            value,
+            0,
+            (STB_GLOBAL << 4) | STT_NOTYPE,
+        )
+    }
+
+    fn defs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, e)| (n.to_string(), e.to_string()))
+            .collect()
+    }
+
+    /// Constants land as defined ABS symbols (usable by later defsyms);
+    /// aliases copy the target's whole definition row; absolute
+    /// expressions evaluate immediately.
+    #[test]
+    fn constants_aliases_and_abs_expressions_land() {
+        let mut syms: FxHashMap<String, DefSym> = FxHashMap::default();
+        syms.insert("foo".to_string(), (3, 5, 0x401000, 0x20, 0x12));
+        syms.insert("base".to_string(), abs(100));
+        apply_script_defsyms(
+            &mut syms,
+            &defs(&[("k", "100"), ("bar", "foo"), ("off", "base+4")]),
+        )
+        .unwrap();
+        assert_eq!(syms.get("k").copied(), Some(abs(100)));
+        assert_eq!(syms.get("bar").copied(), Some((3, 5, 0x401000, 0x20, 0x12)));
+        assert_eq!(syms.get("off").copied(), Some(abs(104)));
+        // A later defsym can build on an earlier one (command-line order).
+        apply_script_defsyms(&mut syms, &defs(&[("off2", "off+1")])).unwrap();
+        assert_eq!(syms.get("off2").copied(), Some(abs(105)));
+    }
+
+    /// Failures render GNU-verbatim with the 1-based `--defsym:N` counter
+    /// — exactly like the builtin path, and like GNU ld.  The syntax
+    /// counter is always 0 (GNU's own quirk, measured on ld 2.44).
+    #[test]
+    fn failures_carry_gnu_counter_and_wording() {
+        let mut syms: FxHashMap<String, DefSym> = FxHashMap::default();
+        let err =
+            apply_script_defsyms(&mut syms, &defs(&[("ok", "1"), ("x", "nosuch")])).unwrap_err();
+        assert_eq!(
+            err,
+            "--defsym:2: undefined symbol `nosuch' referenced in expression"
+        );
+        let err = apply_script_defsyms(&mut syms, &defs(&[("x", "1/0")])).unwrap_err();
+        assert_eq!(err, "--defsym:1 / by zero");
+        let err = apply_script_defsyms(&mut syms, &defs(&[("x", "(1+")])).unwrap_err();
+        assert_eq!(err, "--defsym:0: syntax error");
+    }
+
+    /// An expression over a section-resident symbol (known, but with no
+    /// final address until layout) is `NeedsLayout` — neither "undefined
+    /// symbol" nor "syntax error", both of which would send the user
+    /// after the wrong thing.
+    #[test]
+    fn section_resident_expression_needs_layout() {
+        let mut syms: FxHashMap<String, DefSym> = FxHashMap::default();
+        syms.insert("placed_later".to_string(), (2, 1, 0, 0, 0x10));
+        let err = apply_script_defsyms(&mut syms, &defs(&[("x", "placed_later+4")])).unwrap_err();
+        assert_eq!(
+            err,
+            "--defsym:1: expression 'placed_later+4' needs final symbol addresses, \
+             which this link path does not have; use a constant or a symbol alias"
+        );
+    }
+}

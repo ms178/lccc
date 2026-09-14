@@ -181,12 +181,84 @@ fn two_arg<'a>(a: &'a str, args: &'a [String], i: &mut usize) -> String {
     args.get(*i).cloned().unwrap_or_default()
 }
 
+/// Handle one `-z KEYWORD`, shared by the space form (`-z relro`, a match
+/// arm below) and the joined form (`-zrelro`, caught in the catch-all
+/// chain): GNU ld accepts the two identically, and routing both through
+/// this one function keeps them from drifting apart.  `max-page-size=` is
+/// honoured locally (the script link reads it from here); every keyword,
+/// including `max-page-size=`, is also forwarded so the shared pipeline's
+/// `-z` parser sees exactly what the driver saw.
+fn handle_z_keyword(
+    kw: &str,
+    max_page_size: &mut u64,
+    max_page_size_explicit: &mut bool,
+    passthrough: &mut Vec<String>,
+) {
+    if let Some(value) = kw.strip_prefix("max-page-size=") {
+        *max_page_size_explicit = true;
+        *max_page_size = if let Some(hex) = value.strip_prefix("0x") {
+            u64::from_str_radix(hex, 16).unwrap_or(*max_page_size)
+        } else {
+            value.parse().unwrap_or(*max_page_size)
+        };
+    }
+    passthrough.push(format!("-Wl,-z,{kw}"));
+}
+
 /// Warn once per distinct unimplemented option.
 ///
 /// Every one of these is accepted by GNU ld and changes the output image or a
 /// requested diagnostic, so swallowing it quietly hands the caller a binary
 /// that is not what it asked for.  Deduplicating keeps recursive builds from
 /// drowning real diagnostics.
+/// Derive the GNU property note flags (CET / ISA level) from the
+/// passthrough arguments for script links, which never run
+/// `parse_linker_args`.  `-z` keywords reach this list joined as
+/// `-Wl,-z,<kw>` by the argument loop above.  Returns the flags plus any
+/// ignored `=<value>` forms (`-z ibt=func`), which GNU ld accepts and warns
+/// about.  An unparseable `-z x86-64-*` level is a hard error, as in GNU ld.
+fn passthrough_property_flags(
+    passthrough: &[String],
+) -> Result<(lccc::linker_entry::PropertyLinkFlags, Vec<String>), String> {
+    let mut flags = lccc::linker_entry::PropertyLinkFlags {
+        ibt: false,
+        shstk: false,
+        lam_u48: false,
+        lam_u57: false,
+        isa_level: 0,
+    };
+    let mut ignored: Vec<String> = Vec::new();
+    for a in passthrough {
+        if let Some(kw) = a.strip_prefix("-Wl,-z,") {
+            match kw {
+                "ibt" => flags.ibt = true,
+                "shstk" => flags.shstk = true,
+                "lam-u48" => flags.lam_u48 = true,
+                "lam-u57" => flags.lam_u57 = true,
+                // `-z x86-64-{baseline,v2,v3,v4}` (binutils
+                // `ld/emulparams/x86-64-level.sh`), with GNU's rule as in
+                // `parse_linker_args` (measured on ld 2.44): a bad
+                // `x86-64-v` suffix is the `invalid x86-64 ISA level`
+                // fatal, while any OTHER `x86-64-*` keyword is warned
+                // about and ignored — never fatal, never silent.
+                "x86-64-baseline" => flags.isa_level = 1,
+                k if k.starts_with("x86-64-v") => match k["x86-64-v".len()..].parse::<u32>() {
+                    Ok(n) if (2..=4).contains(&n) => flags.isa_level = n,
+                    _ => return Err(format!("invalid x86-64 ISA level: {k}")),
+                },
+                k if k.starts_with("x86-64-") => {
+                    ignored.push(k.to_string());
+                }
+                k if k.starts_with("ibt=") || k.starts_with("shstk=") || k.starts_with("lam-u") => {
+                    ignored.push(k.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((flags, ignored))
+}
+
 fn warn_unimplemented(a: &str) {
     use std::collections::HashSet;
     use std::sync::OnceLock;
@@ -298,6 +370,21 @@ fn run(args: &[String]) -> Result<(), String> {
             // the KASLR relocation table; ignoring the flag produced a kernel
             // that linked cleanly and then failed to boot.
             "--emit-relocs" | "-q" => emit_relocs = true,
+            // Forwarded so `parse_linker_args` records them: --no-emit-relocs
+            // resets, --threads/--no-threads are deterministic hints (lccc
+            // links single-threaded; the value is recorded, not acted on).
+            // (There is deliberately no --isa-level / -march forwarding:
+            // GNU ld has no such options — the ISA level is `-z
+            // x86-64-{baseline,v2,v3,v4}` — so those spellings fall through
+            // to the unknown-option warning below instead of being blessed
+            // here.  --no-undefined-version IS a real GNU flag, so it gets
+            // the accepted-but-not-implemented warning in the general flag
+            // dispatch instead — falling through to "unknown option" would
+            // be factually wrong.)
+            "--no-emit-relocs" | "--no-threads" | "--threads" => passthrough.push(a.to_string()),
+            a if a.starts_with("--threads=") => {
+                passthrough.push(a.to_string());
+            }
             // Forwarded as well as recorded: `is_pie` drives the local
             // decisions below, while the copy in `passthrough` is what
             // `parse_linker_args` reads to make the emitter produce ET_DYN.
@@ -389,15 +476,12 @@ fn run(args: &[String]) -> Result<(), String> {
             "-z" => {
                 i += 1;
                 if let Some(kw) = args.get(i) {
-                    if let Some(value) = kw.strip_prefix("max-page-size=") {
-                        max_page_size_explicit = true;
-                        max_page_size = if let Some(hex) = value.strip_prefix("0x") {
-                            u64::from_str_radix(hex, 16).unwrap_or(max_page_size)
-                        } else {
-                            value.parse().unwrap_or(max_page_size)
-                        };
-                    }
-                    passthrough.push(format!("-Wl,-z,{}", kw));
+                    handle_z_keyword(
+                        kw,
+                        &mut max_page_size,
+                        &mut max_page_size_explicit,
+                        &mut passthrough,
+                    );
                 }
             }
             "-static" | "-Bstatic" | "-dn" | "-non_shared" => {
@@ -612,11 +696,32 @@ fn run(args: &[String]) -> Result<(), String> {
                             passthrough.push(format!("--hash-style={v}"));
                         }
                     }
+                } else if let Some(kw) = a.strip_prefix("-z") {
+                    // Joined form `-z<kw>`: GNU ld accepts it exactly like
+                    // `-z <kw>`, so it funnels through the same handler as
+                    // the space-form match arm rather than warning that
+                    // `-z` is unimplemented.  (A bare `-z` never reaches
+                    // here — the match arm above consumes it — but an empty
+                    // keyword is harmlessly skipped rather than asserted on.)
+                    if !kw.is_empty() {
+                        handle_z_keyword(
+                            kw,
+                            &mut max_page_size,
+                            &mut max_page_size_explicit,
+                            &mut passthrough,
+                        );
+                    }
                 } else if a.starts_with("--orphan-handling")
                     || a == "--no-warn-rwx-segments"
-                    || a.starts_with("-z")
                     || a.starts_with("--sort-section")
                     || a.starts_with("--print-")
+                    // `--no-undefined-version` is a real GNU flag ("Disallow
+                    // undefined version"), so it must not fall through to the
+                    // unknown-option warning — but lccc does not check version
+                    // references, so accepting it silently would hide the
+                    // missing strictness.  Warn once, like the other
+                    // accepted-but-not-implemented diagnostics above.
+                    || a == "--no-undefined-version"
                 {
                     // Accepted but NOT implemented.  These change the image
                     // (or a diagnostic the user asked for), so ignoring them
@@ -727,6 +832,30 @@ fn run(args: &[String]) -> Result<(), String> {
         if build_id {
             lccc::linker_entry::append_build_id_object(&mut objects);
         }
+        // GNU property note merge (CET/ISA) for script links: done here,
+        // where the synthetic build-id object's index is known, so it is
+        // excluded from the "real inputs" (a synthetic object without the
+        // note would veto every AND-class type).  The merged note then
+        // flows through the script layout like any other input section.
+        let (cet_flags, z_ignored) = passthrough_property_flags(&passthrough)?;
+        for kw in z_ignored {
+            eprintln!("lccc-ld: warning: -z {kw} ignored");
+        }
+        let mut synthetic: lccc::linker_entry::FxHashSet<usize> = Default::default();
+        if build_id {
+            synthetic.insert(objects.len() - 1);
+        }
+        // `elf_i386` selects the note's entry stride (12-byte entries on
+        // 32-bit targets, 16 on 64-bit ones — see `cet::parse_property_note`).
+        if let Some(carrier) = lccc::linker_entry::merge_property_into_objects(
+            &mut objects,
+            &synthetic,
+            &cet_flags,
+            elf_i386,
+        )? {
+            synthetic.insert(objects.len());
+            objects.push(carrier);
+        }
         let mut script_src = std::fs::read_to_string(&script_path)
             .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
         if let Some(e) = entry_override {
@@ -799,4 +928,48 @@ fn run(args: &[String]) -> Result<(), String> {
             .to_string());
     }
     lccc::linker_entry::link_builtin_x86(&object_refs, &output, &passthrough)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_z_keyword;
+
+    /// Both `-z` spellings funnel through `handle_z_keyword`, so the
+    /// joined form (`-zrelro`) forwards exactly like the space form
+    /// (`-z relro`), and `max-page-size=` (decimal or hex) is honoured
+    /// locally either way.
+    #[test]
+    fn z_keyword_handler_forwards_and_honours_page_size() {
+        let mut max_page_size = 0x200000u64;
+        let mut explicit = false;
+        let mut passthrough = Vec::new();
+        handle_z_keyword("relro", &mut max_page_size, &mut explicit, &mut passthrough);
+        handle_z_keyword(
+            "max-page-size=0x1000",
+            &mut max_page_size,
+            &mut explicit,
+            &mut passthrough,
+        );
+        assert_eq!(
+            passthrough,
+            vec![
+                "-Wl,-z,relro".to_string(),
+                "-Wl,-z,max-page-size=0x1000".to_string()
+            ]
+        );
+        assert!(explicit);
+        assert_eq!(max_page_size, 0x1000);
+
+        let mut max_page_size = 0x200000u64;
+        let mut explicit = false;
+        let mut passthrough = Vec::new();
+        handle_z_keyword(
+            "max-page-size=4096",
+            &mut max_page_size,
+            &mut explicit,
+            &mut passthrough,
+        );
+        assert!(explicit);
+        assert_eq!(max_page_size, 4096);
+    }
 }

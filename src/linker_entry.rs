@@ -2,6 +2,13 @@
 
 use crate::backend::linker_common::Elf64Object;
 
+/// GNU property note flags, shared by every link path (built-in, shared
+/// object and linker-script links).
+pub use crate::backend::linker_common::cet::{PropertyLinkFlags, merge_property_into_objects};
+/// Small open-addressing hash sets, shared with the driver for the
+/// linker-synthesized-object tracking.
+pub use crate::common::fx_hash::FxHashSet;
+
 /// Version banner shared by the compiler driver's built-in linker query and
 /// the standalone `lccc-ld` binary.
 ///

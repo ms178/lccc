@@ -53,7 +53,7 @@ class Case:
                  skip_oracles=False, run_env=None, tags=(),
                  expect_elf_type=None, known_defect=None,
                  expect_no_zero_size_syms=False, expect_no_symtab=False,
-                 expect_dyn_tags=None):
+                 expect_dyn_tags=None, expect_prop_note_match=False):
         self.name = name
         self.sources = sources              # dict fname -> contents (.c or .s)
         self.link_inputs = link_inputs      # ordered link inputs; default: all objects
@@ -88,6 +88,11 @@ class Case:
         # section headers too, so a table that is tagged but never written (or
         # written over by the other table's writer) cannot pass.
         self.expect_dyn_tags = expect_dyn_tags
+        # Compare the merged `.note.gnu.property` of lccc's output against
+        # bfd's, entry for entry ({type: value} maps, so note-layout
+        # choices cannot hide a merge disagreement).  bfd is the reference;
+        # when it produced no output the case skips instead of guessing.
+        self.expect_prop_note_match = expect_prop_note_match
 
 CASES = []
 def case(*a, **kw):
@@ -5037,6 +5042,117 @@ int main(void){ printf("%d\\n", d1() + d2()); return 0; }
     tags=("icf",))
 
 # ============================================================================
+# 13. GNU PROPERTY NOTE (CET / ISA) MERGE — differential against bfd
+# ============================================================================
+# The `.s` fixtures carry hand-crafted `.note.gnu.property` notes (gcc emits
+# none for plain objects); the linker's merged output note must agree with
+# bfd's entry for entry.  Merge rules verified against binutils 2.47
+# (`_bfd_x86_elf_merge_gnu_properties`) and ld 2.44 behaviour.
+
+def _prop_note_asm(sym, entries):
+    """Assembly defining `sym` plus a `.note.gnu.property` with `entries`.
+
+    `entries` is [(type, value), ...]; each is emitted in the 16-byte
+    64-bit x86 form (type, datasz=4, value, pad).  Directives stay
+    indented and the label sits at column 0, exactly like COMDAT_ASM
+    above (the harness dedents fixtures, so the label must carry no
+    indentation of its own).
+    """
+    lines = [
+        '    .section .note.gnu.property,"a"',
+        "    .align 8",
+        "    .long 4",
+        f"    .long {16 * len(entries)}",
+        "    .long 5",
+        '    .asciz "GNU"',
+    ]
+    for t, v in entries:
+        lines += [
+            f"    .long {t:#x}",
+            "    .long 4",
+            f"    .long {v:#x}",
+            "    .long 0",
+        ]
+    lines += [
+        "    .text",
+        f"    .globl {sym}",
+        f"{sym}:",
+        "    .long 1",
+    ]
+    return "\n".join(lines) + "\n"
+
+_PROP_MAIN_C = """
+#include <stdio.h>
+int main(void){ printf("prop-ok\\\\n"); return 0; }
+"""
+
+case("prop_note_and_or_merge",
+    {"a.s": _prop_note_asm("note_a", [(0xC0000002, 0x3), (0xC0008002, 0x4)]),
+     "b.s": _prop_note_asm("note_b", [(0xC0000002, 0x1)]),
+     "main.c": _PROP_MAIN_C},
+    # AND class intersects (3 & 1 = IBT only); OR class keeps
+    # ISA_1_NEEDED from whichever input has it.
+    expect_prop_note_match=True,
+    tags=("propnote",))
+
+case("prop_note_or_survives_veto",
+    {"a.s": _prop_note_asm("note_a", [(0xC0000002, 0x3), (0xC0008002, 0x4)]),
+     "main.c": _PROP_MAIN_C},
+    # main.o carries no note: the AND type is vetoed (dropped) while the
+    # OR type survives — the shape every CET-less TU gives the merge.
+    expect_prop_note_match=True,
+    tags=("propnote",))
+
+case("prop_note_z_ibt_rescues_veto",
+    {"a.s": _prop_note_asm("note_a", [(0xC0000002, 0x3)]),
+     "main.c": _PROP_MAIN_C},
+    ldflags=["-Wl,-z,ibt"],
+    # `-z ibt` recreates the vetoed AND type with exactly the IBT bit.
+    expect_prop_note_match=True,
+    tags=("propnote",))
+
+case("prop_note_z_ibt_joined_form",
+    {"a.s": _prop_note_asm("note_a", [(0xC0000002, 0x3)]),
+     "main.c": _PROP_MAIN_C},
+    ldflags=["-Wl,-zibt"],
+    # Joined `-z<keyword>` inside the group: identical to the split form.
+    expect_prop_note_match=True,
+    tags=("propnote",))
+
+case("prop_note_isa_level_created",
+    {"a.c": "int helper(void){ return 41; }",
+     "main.c": """
+#include <stdio.h>
+extern int helper(void);
+int main(void){ printf("prop-ok %d\\\\n", helper()); return 0; }
+"""},
+    ldflags=["-Wl,-z,x86-64-v3"],
+    # No input carries a note; `-z x86-64-v3` creates ISA_1_NEEDED=V3.
+    expect_prop_note_match=True,
+    tags=("propnote",))
+
+case("prop_note_z_lam_u48_sets_both_bits",
+    {"a.c": "int helper(void){ return 41; }",
+     "main.c": """
+#include <stdio.h>
+extern int helper(void);
+int main(void){ printf("prop-ok %d\\\\n", helper()); return 0; }
+"""},
+    ldflags=["-Wl,-z,lam-u48"],
+    # No input carries a note; `-z lam-u48` creates FEATURE_1_AND with BOTH
+    # the LAM_U48 and LAM_U57 bits (0xC), not just U48 — the grouping GNU ld
+    # applies (measured on ld 2.44: `-z lam-u48` reports LAM_U48,LAM_U57).
+    expect_prop_note_match=True,
+    tags=("propnote",))
+
+case("prop_note_invalid_isa_rejected",
+    {"main.c": _PROP_MAIN_C},
+    ldflags=["-Wl,-z,x86-64-v9"],
+    # GNU fatals with `invalid x86-64 ISA level`; so must we.
+    expect_fail=True,
+    tags=("propnote",))
+
+# ============================================================================
 # Runner
 # ============================================================================
 
@@ -5881,6 +5997,66 @@ def dyn_hash_tags(path):
     return sorted(tags)
 
 
+def prop_note_map(path):
+    """{property-type: value} from the NT_GNU_PROPERTY_TYPE_0 note, or None.
+
+    Parsed from the section bytes directly (64-bit LE only — every link in
+    this harness is an x86-64 driver link): each entry is type(4) +
+    datasz(4) + value, padded to the 8-alignment, i.e. 16 bytes per x86
+    entry.  Entries whose datasz is not 4 are skipped, mirroring the
+    linker's own note parser.  None means absent or unparseable.
+    """
+    try:
+        with open(path, "rb") as fh:
+            d = fh.read()
+    except OSError:
+        return None
+    try:
+        if len(d) < 64 or d[:4] != b"\x7fELF" or d[4] != 2 or d[5] != 1:
+            return None
+        e_shoff, = struct.unpack_from("<Q", d, 0x28)
+        e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 0x3A)
+        secs = []
+        for i in range(e_shnum):
+            b = e_shoff + i * e_shentsize
+            if b + e_shentsize > len(d):
+                return None
+            n, t, fl, a, off, sz = struct.unpack_from("<IIQQQQ", d, b)[:6]
+            secs.append((n, off, sz))
+        if e_shstrndx >= len(secs):
+            return None
+        _, soff, ssz = secs[e_shstrndx]
+
+        def nm(x):
+            if x >= ssz:
+                return ""
+            e = d.index(b"\0", soff + x)
+            return d[soff + x:e].decode("latin1", "replace")
+
+        note = next((s for s in secs if nm(s[0]) == ".note.gnu.property"), None)
+        if note is None or note[2] < 16:
+            return None
+        _, off, sz = note
+        namesz, descsz, ntype = struct.unpack_from("<III", d, off)
+        if ntype != 5 or namesz != 4 or 16 + descsz > sz:
+            return None
+        out = {}
+        o = off + 16
+        end = off + 16 + descsz
+        while o + 8 <= end:
+            t, datasz = struct.unpack_from("<II", d, o)
+            step = 8 + ((datasz + 7) & ~7)
+            if o + step > end:
+                break
+            if datasz == 4:
+                v, = struct.unpack_from("<I", d, o + 8)
+                out[t] = v
+            o += step
+        return out
+    except (struct.error, ValueError, IndexError):
+        return None
+
+
 def elf_e_type(path):
     """Return the ELF e_type of `path` as "EXEC"/"DYN"/"REL"/..., or None.
 
@@ -5983,6 +6159,21 @@ def run_case(c, args, oracles):
                 return Result(c.name, "FAIL",
                     f"e_type is {got!r}, expected {c.expect_elf_type!r} "
                     f"(a fixed-base ET_EXEC here means -pie was silently downgraded)")
+
+        # --- GNU property note (CET/ISA) merge vs bfd ---
+        if c.expect_prop_note_match:
+            bfd_out = next((o for n, o in oracle_outs if n == "bfd"), None)
+            if bfd_out is None:
+                return Result(c.name, "SKIP",
+                    "bfd oracle produced no output to compare notes against")
+            lm = prop_note_map(lccc_out)
+            bm = prop_note_map(bfd_out)
+            if lm is None or bm is None:
+                return Result(c.name, "FAIL",
+                    f"property note unreadable: lccc={lm!r} bfd={bm!r}")
+            if lm != bm:
+                return Result(c.name, "FAIL",
+                    f"property note mismatch: lccc={lm!r} bfd={bm!r}")
 
         # --- run & compare ---
         code, out = run_bin(lccc_out, c.run_args, td, c.run_env)

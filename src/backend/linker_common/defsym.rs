@@ -21,6 +21,48 @@
 //! that is what bfd says and a user who typed it needs to hear which of the two
 //! mistakes they made.
 
+/// The symbols every lccc backend provides from its own layout, mirroring
+/// the name set of `backend::elf::get_standard_linker_symbols`.
+///
+/// A `--defsym` right-hand side that names one of these is legal in GNU ld:
+/// the magic symbol is resolved during expression evaluation, after
+/// addresses are final. Backends therefore classify such names as defined
+/// (so they are not rejected as typos) and defer them to post-layout
+/// evaluation instead of aliasing them at apply time.
+pub const LINKER_DEFINED_NAMES: &[&str] = &[
+    "_GLOBAL_OFFSET_TABLE_",
+    "_DYNAMIC",
+    "__bss_start",
+    // NOTE: no `__bss_end__` — GNU ld defines no such symbol on ELF targets
+    // (see linker_symbols.rs); listing it here would accept `--defsym`
+    // expressions GNU ld rejects as undefined symbols.
+    "_edata",
+    "edata",
+    "_end",
+    "__end",
+    "end",
+    "_etext",
+    "etext",
+    "__ehdr_start",
+    "__executable_start",
+    "__dso_handle",
+    "__data_start",
+    "data_start",
+    "__init_array_start",
+    "__init_array_end",
+    "__fini_array_start",
+    "__fini_array_end",
+    "__preinit_array_start",
+    "__preinit_array_end",
+    "__rela_iplt_start",
+    "__rela_iplt_end",
+];
+
+/// True if `name` is a layout-derived symbol the linker itself defines.
+pub fn is_linker_defined(name: &str) -> bool {
+    LINKER_DEFINED_NAMES.contains(&name)
+}
+
 /// What a `--defsym` right-hand side turned out to be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Defsym {
@@ -53,18 +95,42 @@ pub enum DefsymError {
 }
 
 impl DefsymError {
-    /// The user-facing text.
-    pub fn message(&self) -> String {
+    /// The text GNU ld 2.47 prints for this failure, including its `--defsym:N`
+    /// counter (binutils `ld/ldexp.c`, `ld/ldlex.l:lex_redirect` — and
+    /// measured byte-for-byte against `/usr/bin/ld`):
+    ///
+    /// ```text
+    /// --defsym:N: undefined symbol `X' referenced in expression
+    /// --defsym:N / by zero
+    /// --defsym:0: syntax error
+    /// ```
+    ///
+    /// Note the `` `X' `` quoting (backquote + quote, not two straight
+    /// quotes) and the missing colon in the divide-by-zero form — both are
+    /// GNU quirks reproduced exactly.  (`ld: ` itself is the caller's prefix
+    /// to add.)
+    ///
+    /// `N` is the 1-based position of the failing `--defsym` in the link's
+    /// defsym list. The counter is a GNU quirk worth reproducing exactly:
+    /// syntax errors always report 0 (the counter counts accepted symbols,
+    /// and a syntax error accepts none), while undefined-symbol and
+    /// division-by-zero failures report the defsym's own index.
+    ///
+    /// [`NeedsLayout`] is a link-path capability message with no GNU
+    /// counterpart; it keeps the descriptive form.
+    pub fn gnu_message(&self, index: usize) -> String {
         match self {
-            DefsymError::Syntax(what) => format!("syntax error in --defsym expression: {what}"),
-            DefsymError::DivByZero => "/ by zero in --defsym expression".to_string(),
+            DefsymError::Syntax(_) => "--defsym:0: syntax error".to_string(),
+            DefsymError::DivByZero => format!("--defsym:{index} / by zero"),
             DefsymError::UndefinedSymbol(name) => {
-                format!("undefined symbol '{name}' referenced in --defsym expression")
+                format!("--defsym:{index}: undefined symbol `{name}' referenced in expression")
             }
-            DefsymError::NeedsLayout(expr) => format!(
-                "--defsym expression '{expr}' needs final symbol addresses, which this \
-                 link path does not have; use a constant or a symbol alias"
-            ),
+            DefsymError::NeedsLayout(expr) => {
+                format!(
+                    "--defsym:{index}: expression '{expr}' needs final symbol addresses, \
+                         which this link path does not have; use a constant or a symbol alias"
+                )
+            }
         }
     }
 }
@@ -542,7 +608,11 @@ mod tests {
         assert_eq!(eval("1/0"), Err(DefsymError::DivByZero));
         assert_eq!(eval("1 % 0"), Err(DefsymError::DivByZero));
         assert_eq!(eval("(2+2)/(1-1)"), Err(DefsymError::DivByZero));
-        assert!(eval("1/0").unwrap_err().message().contains("/ by zero"));
+        // GNU-verbatim, including the missing colon (measured on /usr/bin/ld).
+        assert_eq!(
+            eval("1/0").unwrap_err().gnu_message(2),
+            "--defsym:2 / by zero"
+        );
     }
 
     #[test]
@@ -552,7 +622,11 @@ mod tests {
             DefsymError::UndefinedSymbol(n) => assert_eq!(n, "_start"),
             other => panic!("expected UndefinedSymbol, got {other:?}"),
         }
-        assert!(e.message().contains("undefined symbol '_start'"));
+        // GNU-verbatim, including the `X' quoting (binutils ld/ldexp.c).
+        assert_eq!(
+            e.gnu_message(1),
+            "--defsym:1: undefined symbol `_start' referenced in expression"
+        );
     }
 
     #[test]
@@ -595,9 +669,21 @@ mod tests {
 
     #[test]
     fn the_needs_layout_error_says_what_to_use_instead() {
-        let m = DefsymError::NeedsLayout("_start+4".into()).message();
+        // No GNU counterpart (a link-path capability message); keep the
+        // descriptive form, with the defsym counter for uniformity.
+        let m = DefsymError::NeedsLayout("_start+4".into()).gnu_message(3);
         assert!(m.contains("_start+4"), "{m}");
         assert!(m.contains("constant"), "{m}");
         assert!(m.contains("alias"), "{m}");
+        assert!(m.starts_with("--defsym:3:"), "{m}");
+    }
+
+    #[test]
+    fn syntax_errors_always_report_counter_zero() {
+        // GNU counts accepted symbols; a syntax error accepts none, so the
+        // counter is always 0 — even for the second --defsym (measured).
+        let e = classify("((", |_| true).unwrap_err();
+        assert!(matches!(e, DefsymError::Syntax(_)), "{e:?}");
+        assert_eq!(e.gnu_message(2), "--defsym:0: syntax error");
     }
 }
