@@ -771,6 +771,71 @@ fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
 /// next LEA a few instructions later, so the whole-function `fam_read_after`
 /// scan always reports it live.
 ///
+/// Is re-executing the self-base LEA at `idx` UNSAFE for the fold — i.e. can
+/// control return to (or before) `idx` while `fam` still carries a value that
+/// flowed around the back edge?
+///
+/// Sound answer via the dataflow oracle: for every back edge that can
+/// re-execute `idx` (a jump after `idx` targeting a label at or before it),
+/// the target label's block-entry liveness of `fam` must be DEAD. Dead at
+/// entry means every path from the landing point redefines `fam` before any
+/// read — and the LEA itself reads `fam` — so the LEA's input always comes
+/// from a fresh redefinition, never from the previous iteration's leftover.
+/// An unknown (declined function, stale after a refresh) or live answer is
+/// conservatively unsafe.
+fn self_base_reexec_unsafe(
+    store: &LineStore,
+    infos: &[LineInfo],
+    idx: usize,
+    fam: RegId,
+    lv: &FileLiveness,
+) -> bool {
+    let Some((start, end)) = function_range(store, infos, idx) else {
+        return true;
+    };
+    // Label map mirrors copy_in_loop: label text carries the trailing colon,
+    // jump targets do not.
+    let mut labels: Vec<(&str, usize)> = Vec::new();
+    for n in start..end {
+        if infos[n].is_nop() || infos[n].kind != LineKind::Label {
+            continue;
+        }
+        if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
+            labels.push((name, n));
+        }
+    }
+    if labels.is_empty() {
+        return false;
+    }
+    let resolve = |name: &str| -> Option<usize> {
+        labels.iter().find(|(l, _)| *l == name).map(|&(_, pos)| pos)
+    };
+    for q in idx + 1..end {
+        match infos[q].kind {
+            LineKind::Jmp | LineKind::CondJmp => {
+                let t = infos[q].trimmed(store.get(q));
+                let Some(target) = t.split_whitespace().nth(1) else {
+                    continue;
+                };
+                // An unresolvable indirect target fails closed, exactly as
+                // copy_in_loop does.
+                if target.starts_with('*') {
+                    return true;
+                }
+                if let Some(pos) = resolve(target)
+                    && pos <= idx
+                    && lv.live_after(pos, fam) != Some(false)
+                {
+                    return true;
+                }
+            }
+            LineKind::JmpIndirect => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Requirements: no barrier, no implicit register traffic and no write to
 /// `%base` between the two lines; the only mention of `%T` in the window is the
 /// bare `(%T)` operand being folded; the rewritten line no longer mentions
@@ -791,7 +856,40 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
             continue;
         };
         let dst_fam = register_family_fast(dst_text);
-        if !is_relayable_family(dst_fam) || addr_fams.contains(&dst_fam) {
+        // SELF-BASE LEAs (`leaq 16(%rax), %rax` — the strength-reduced
+        // marching pointer the RA emits for `&base[i]` webs) are foldable
+        // with three extra guarantees the normal form gets for free:
+        //
+        // 1. NO LIVE RE-EXECUTION: deleting the LEA leaves the register
+        //    holding the PRE-LEA value (the fold's consumer reads `16(%rax)`
+        //    as the base), so a back edge that re-enters the LEA while dst
+        //    still carries the previous iteration's value would freeze the
+        //    recurrence. The blanket `copy_in_loop` veto is refined to the
+        //    precise condition: the fold is safe iff EVERY back-edge target
+        //    that can re-execute the LEA sees dst DEAD at block entry —
+        //    dead-at-entry means every path to the LEA (which READS dst)
+        //    redefines dst first, so the LEA's input never flows around the
+        //    back edge. This is what makes the slot-reload form foldable
+        //    (linux_rbtree B2: `movq 80(%rsp), %rax; leaq 16(%rax), %rax;
+        //    movq $0, (%rax)` — the reload re-establishes the base every
+        //    iteration) while the carried form stays rejected.
+        // 2. WINDOW SOUNDNESS: an intermediate line that reads dst expects
+        //    base+K and must break the window (the existing dst_mask
+        //    branch), and one that writes dst makes the LEA irreproducible
+        //    (the existing addr_mask branch — which now includes dst
+        //    itself).
+        // 3. DEADNESS: `provably_dead_lv` after the consumer still proves
+        //    nothing reads the LEA's result (base+K) later; the base value
+        //    itself needs no proof — it is live by construction (the LEA
+        //    read it).
+        //
+        // The replacement necessarily MENTIONS dst (the folded address is
+        // `16(%rax)`), so the normal "dst fully removed from the consumer"
+        // check is replaced by "no dst mention OUTSIDE the spliced operand".
+        let self_base = addr_fams.contains(&dst_fam);
+        if !is_relayable_family(dst_fam)
+            || (self_base && self_base_reexec_unsafe(store, infos, i, dst_fam, &lv))
+        {
             i += 1;
             continue;
         }
@@ -890,8 +988,20 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
                 }
                 if let Some((op, cl, new_operand)) = matched {
                     let replacement = format!("{}{}{}", &t[..op], new_operand, &t[cl + 1..]);
+                    // Normal form: the consumer must not mention dst at all
+                    // after the splice. Self-base form: the folded address
+                    // IS `K(%dst)`, so only the text OUTSIDE the spliced
+                    // operand must be dst-free (a mention there would read
+                    // the LEA's result — base+K — which the fold no longer
+                    // produces).
+                    let mentions_ok = if self_base {
+                        !line_refs_family(&t[..op], dst_fam)
+                            && !line_refs_family(&t[cl + 1..], dst_fam)
+                    } else {
+                        !line_refs_family(&replacement, dst_fam)
+                    };
                     if replacement != t
-                        && !line_refs_family(&replacement, dst_fam)
+                        && mentions_ok
                         && provably_dead_lv(&lv, store, infos, j, dst_fam, &[i, j])
                     {
                         mark_nop(&mut infos[i]);

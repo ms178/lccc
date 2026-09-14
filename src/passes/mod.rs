@@ -72,6 +72,7 @@ pub(crate) mod vec_load_sink;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 pub(crate) mod verify;
+pub(crate) mod web_congruence;
 
 use crate::common::fp_contract::FpContract;
 use crate::common::fx_hash::FxHashSet;
