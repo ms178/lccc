@@ -4757,7 +4757,11 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    {}l ${}, %eax", mnemonic, imm));
                     if !is_unsigned {
-                        self.state.emit("    cltq");
+                        // Same needs_sext refinement as the general ALU path
+                        // (emit_sext32_for_value): a value with no 64-bit
+                        // consumer keeps the zero-extended form; the cltq
+                        // exists only to restore the canonical SEXT form.
+                        self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                     }
                 } else {
                     self.state
@@ -4826,8 +4830,11 @@ impl X86Codegen {
                     self.state.reg_cache.invalidate_acc();
                     if use_32bit && !is_unsigned {
                         // The dest's canonical 64-bit slot value keeps the
-                        // sign-extended product (same contract as below).
-                        self.state.emit("    cltq");
+                        // sign-extended product (same contract as below),
+                        // gated on the value actually having a 64-bit
+                        // consumer (needs_sext refinement — the general ALU
+                        // path's emit_sext32_for_value contract).
+                        self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                     }
                     self.store_rax_to(dest);
                     return true;
@@ -4840,7 +4847,7 @@ impl X86Codegen {
                         self.state
                             .emit_fmt(format_args!("    leal (%eax, %eax, {}), %eax", scale));
                         if !is_unsigned {
-                            self.state.emit("    cltq");
+                            self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                         }
                     } else {
                         self.state
@@ -4851,7 +4858,7 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    imull ${}, %eax, %eax", imm32));
                     if !is_unsigned {
-                        self.state.emit("    cltq");
+                        self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                     }
                 } else {
                     self.state

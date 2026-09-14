@@ -2042,8 +2042,9 @@ impl X86Codegen {
                         ..
                     } = &insts[ii]
                     {
-                        let ok_ty = matches!(ty, IrType::U8 | IrType::U16 | IrType::U32)
-                            && *seg_override == AddressSpace::Default;
+                        let ok_ty =
+                            matches!(ty, IrType::U8 | IrType::U16 | IrType::U32 | IrType::I32)
+                                && *seg_override == AddressSpace::Default;
                         let single_use =
                             self.value_use_counts.get(&dest.0).copied().unwrap_or(0) == 1;
                         let adjacent_cast = matches!(
@@ -2053,7 +2054,13 @@ impl X86Codegen {
                                 ..
                             }) if sv.0 == dest.0
                         );
-                        if ok_ty && single_use && adjacent_cast {
+                        // I32 sources load via `movslq` ONLY when the sext
+                        // convention marked them (the widening cast does);
+                        // an unmarked I32 would load `movl` (zero-extend) and
+                        // skipping a SIGN-extending cast would miscompile.
+                        let i32_sext_ready =
+                            *ty != IrType::I32 || self.needs_sext_values.contains(&dest.0);
+                        if ok_ty && single_use && adjacent_cast && i32_sext_ready {
                             if let Some((cd, from, to)) = cast_by_src.get(&dest.0) {
                                 let width_ok = *from == *ty
                                     && matches!(
@@ -2070,6 +2077,8 @@ impl X86Codegen {
                                             | (IrType::U32, IrType::U32)
                                             | (IrType::U32, IrType::I64)
                                             | (IrType::U32, IrType::U64)
+                                            | (IrType::I32, IrType::I64)
+                                            | (IrType::I32, IrType::U64)
                                     );
                                 if width_ok {
                                     if let Some(reg) = self.reg_assignments.get(&cd.0).copied() {

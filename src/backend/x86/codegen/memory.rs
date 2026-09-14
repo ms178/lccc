@@ -1770,6 +1770,13 @@ impl X86Codegen {
             self.state.reg_cache.invalidate_acc();
             return;
         }
+        // W2 Load->Cast fold (const-offset variant): a load whose single
+        // consumer is the adjacent widening Cast loads straight into the
+        // CAST's register; the cast emission then skips (fold_skip_cast
+        // handshake). `mov_load_for_type` already picks the extending opcode
+        // that matches every width_ok pair (movzbl/movzwl/movl zero-extend;
+        // movslq/movsbq/movswq sign-extend), so redirecting is value-exact.
+        let fold_target = self.load_cast_fold.get(&dest.0).copied();
         let addr = self.state.resolve_slot_addr(base.0);
         if let Some(addr) = addr {
             let load_instr = Self::mov_load_for_type(ty);
@@ -1788,8 +1795,12 @@ impl X86Codegen {
                         let reg_name = phys_reg_name(reg);
 
                         // Register-direct: if dest also has a register, load directly to it.
+                        // The W2 fold target takes precedence over dest's own home.
                         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
-                            if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
+                            if let Some(d_reg) = fold_target
+                                .map(|(r, _)| r)
+                                .or_else(|| self.reg_assignments.get(&dest.0).copied())
+                            {
                                 if !is_xmm_reg(d_reg) {
                                     // movslq/movsbq/movswq need 64-bit dest.
                                     // movl/movzbl/movzwl use 32-bit dest (implicit
@@ -1816,6 +1827,12 @@ impl X86Codegen {
                                             "    {} (%{}), %{}",
                                             load_instr, reg_name, d_name
                                         ));
+                                    }
+                                    if let Some((fr, fold_dest)) = fold_target {
+                                        self.fold_skip_cast = Some(fold_dest);
+                                        self.note_inplace_compute(fr, fold_dest);
+                                    } else {
+                                        self.note_inplace_compute(d_reg, dest.0);
                                     }
                                     return;
                                 }
@@ -1845,7 +1862,10 @@ impl X86Codegen {
                 SlotAddr::Reg(reg) => {
                     let r = phys_reg_name(reg);
                     if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
-                        if let Some(&dr) = self.reg_assignments.get(&dest.0) {
+                        if let Some(dr) = fold_target
+                            .map(|(reg, _)| reg)
+                            .or_else(|| self.reg_assignments.get(&dest.0).copied())
+                        {
                             if !is_xmm_reg(dr) {
                                 let u = matches!(load_instr, "movl" | "movzbl" | "movzwl");
                                 let d = if u {
@@ -1865,6 +1885,12 @@ impl X86Codegen {
                                         "    {} (%{}), %{}",
                                         load_instr, r, d
                                     ));
+                                }
+                                if let Some((fr, fold_dest)) = fold_target {
+                                    self.fold_skip_cast = Some(fold_dest);
+                                    self.note_inplace_compute(fr, fold_dest);
+                                } else {
+                                    self.note_inplace_compute(dr, dest.0);
                                 }
                                 return;
                             }
@@ -1889,7 +1915,10 @@ impl X86Codegen {
                 let load_instr = Self::mov_load_for_type(ty);
                 let reg_name = phys_reg_name(reg);
                 if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
-                    if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
+                    if let Some(d_reg) = fold_target
+                        .map(|(r, _)| r)
+                        .or_else(|| self.reg_assignments.get(&dest.0).copied())
+                    {
                         if !is_xmm_reg(d_reg) {
                             let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
                             let use_16bit_dest = load_instr == "movw";
@@ -1911,6 +1940,12 @@ impl X86Codegen {
                                     "    {} (%{}), %{}",
                                     load_instr, reg_name, d_name
                                 ));
+                            }
+                            if let Some((fr, fold_dest)) = fold_target {
+                                self.fold_skip_cast = Some(fold_dest);
+                                self.note_inplace_compute(fr, fold_dest);
+                            } else {
+                                self.note_inplace_compute(d_reg, dest.0);
                             }
                             return;
                         }

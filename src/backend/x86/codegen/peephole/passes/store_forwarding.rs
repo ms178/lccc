@@ -10,15 +10,21 @@
 
 use super::super::types::*;
 use super::helpers::*;
+use super::liveness::FileLiveness;
 
 // ── Data structures ──────────────────────────────────────────────────────────
 
 /// A tracked store mapping: we know that stack slot at `offset` contains the
-/// value that was in register `reg_id` with the given `size`.
+/// value that was in register `reg_id` with the given `size`, or — when
+/// `reg_id == REG_NONE` — the immediate `imm` that was stored (an
+/// `movX $imm, slot` line). Immediate-backed mappings are immune to
+/// register clobbers: memory does not change when a register does.
 #[derive(Clone, Copy)]
 struct SlotMapping {
     reg_id: RegId,
     size: MoveSize,
+    /// Valid iff `reg_id == REG_NONE` (immediate store).
+    imm: i64,
 }
 
 /// A slot entry for flat-array store forwarding.
@@ -126,12 +132,16 @@ fn invalidate_all_mappings(slot_entries: &mut Vec<SlotEntry>, reg_offsets: &mut 
     }
 }
 
-/// Deactivate a single slot entry and remove its offset from the per-register tracking.
+/// Deactivate a single slot entry and remove its offset from the per-register
+/// tracking. Immediate-backed entries (reg_id == REG_NONE) have no register
+/// bookkeeping to unwind.
 #[inline]
 fn deactivate_entry(entry: &mut SlotEntry, reg_offsets: &mut [SmallVec; 16]) {
-    let old_reg = entry.mapping.reg_id;
+    if entry.mapping.reg_id != REG_NONE {
+        let old_reg = entry.mapping.reg_id;
+        reg_offsets[old_reg as usize].remove_val(entry.offset);
+    }
     entry.active = false;
-    reg_offsets[old_reg as usize].remove_val(entry.offset);
 }
 
 /// Invalidate slot mappings at a given offset.
@@ -266,13 +276,71 @@ fn gsf_handle_store(
     if is_valid_gp_reg(reg) {
         slot_entries.push(SlotEntry {
             offset,
-            mapping: SlotMapping { reg_id: reg, size },
+            mapping: SlotMapping {
+                reg_id: reg,
+                size,
+                imm: 0,
+            },
             active: true,
         });
         reg_offsets[reg as usize].push(offset);
     }
     if slot_entries.len() > 64 {
         slot_entries.retain(|e| e.active);
+    }
+}
+
+/// Record an immediate store (`movX $imm, off(%rbp)`). The mapping is
+/// register-independent: no reg_offsets engagement, and only a store to an
+/// overlapping offset can kill it.
+fn gsf_handle_store_imm(
+    imm: i64,
+    offset: i32,
+    size: MoveSize,
+    slot_entries: &mut Vec<SlotEntry>,
+    reg_offsets: &mut [SmallVec; 16],
+) {
+    invalidate_slots_at(slot_entries, reg_offsets, offset, size.byte_size());
+    slot_entries.push(SlotEntry {
+        offset,
+        mapping: SlotMapping {
+            reg_id: REG_NONE,
+            size,
+            imm,
+        },
+        active: true,
+    });
+    if slot_entries.len() > 64 {
+        slot_entries.retain(|e| e.active);
+    }
+}
+
+/// Does `imm` fit the immediate field of a `mov<size> $imm, mem` store?
+/// Mirrors the emitter's `direct_store_imm` contract exactly:
+/// * Q — `movq $imm32` SIGN-extends, so only [i32::MIN, i32::MAX] is legal;
+/// * L — the raw imm32 field covers [i32::MIN, u32::MAX];
+/// * W/B — the width's own signed-or-unsigned field range.
+fn imm_fits_store(imm: i64, size: MoveSize) -> bool {
+    match size {
+        MoveSize::Q => (i32::MIN as i64..=i32::MAX as i64).contains(&imm),
+        MoveSize::L => (i32::MIN as i64..=u32::MAX as i64).contains(&imm),
+        MoveSize::W => (i16::MIN as i64..=u16::MAX as i64).contains(&imm),
+        MoveSize::B => (i8::MIN as i64..=u8::MAX as i64).contains(&imm),
+        // FP/SSE moves carry no immediate: an immediate-backed mapping can
+        // never be created for them (parse_imm_slot_store only matches the
+        // integer mov mnemonics).
+        MoveSize::SLQ | MoveSize::SD | MoveSize::SS => false,
+    }
+}
+
+/// Store mnemonic for a MoveSize with an AT&T immediate source.
+fn mov_imm_store_mnemonic(size: MoveSize) -> &'static str {
+    match size {
+        MoveSize::Q => "movq",
+        MoveSize::L => "movl",
+        MoveSize::W => "movw",
+        MoveSize::B => "movb",
+        MoveSize::SLQ | MoveSize::SD | MoveSize::SS => "movq",
     }
 }
 
@@ -285,8 +353,17 @@ fn gsf_handle_load(
     load_size: MoveSize,
     slot_entries: &mut [SlotEntry],
     reg_offsets: &mut [SmallVec; 16],
+    lv: &mut FileLiveness,
 ) -> bool {
     let mut changed = false;
+    // Whether the load instruction still writes its destination register
+    // after this handler. A DELETED load (nop'd by the same-register
+    // elision or a pair fusion) writes nothing: running the dest-register
+    // mapping invalidation anyway would spuriously kill mappings for a
+    // register whose value did not change (the cascaded relay class: the
+    // first fused copy load invalidated the source register's mappings for
+    // every later load that could have nop'd).
+    let mut load_still_writes_reg = true;
     let mapping = slot_entries
         .iter()
         .rev()
@@ -307,24 +384,181 @@ fn gsf_handle_load(
             if exact_width && load_reg == mapping.reg_id && !is_epilogue_restore {
                 mark_nop(&mut infos[i]);
                 changed = true;
+                load_still_writes_reg = false;
             } else if load_reg != REG_NONE {
-                let store_reg_str = reg_id_to_name(mapping.reg_id, load_size);
-                let load_reg_str = reg_id_to_name(load_reg, load_size);
-                let new_text = format!(
-                    "    {} {}, {}",
-                    load_size.mnemonic(),
-                    store_reg_str,
-                    load_reg_str
-                );
-                replace_line(store, &mut infos[i], i, new_text);
-                changed = true;
+                // PAIR FUSION (register-backed): when the very next
+                // instruction is a plain store of the loaded register to
+                // another slot (`movX %reg, slot2`), the load+store relay
+                // collapses to a single store of the MAPPING's source
+                // register straight to slot2. This is the load→reload relay
+                // the single-line forward cannot touch when the mapping's
+                // register differs from the load's destination.
+                if exact_width
+                    && try_pair_fuse_reg_store(
+                        store,
+                        infos,
+                        i,
+                        mapping.reg_id,
+                        load_reg,
+                        load_size,
+                        lv,
+                    )
+                {
+                    mark_nop(&mut infos[i]);
+                    changed = true;
+                    load_still_writes_reg = false;
+                } else {
+                    let store_reg_str = reg_id_to_name(mapping.reg_id, load_size);
+                    let load_reg_str = reg_id_to_name(load_reg, load_size);
+                    let new_text = format!(
+                        "    {} {}, {}",
+                        load_size.mnemonic(),
+                        store_reg_str,
+                        load_reg_str
+                    );
+                    replace_line(store, &mut infos[i], i, new_text);
+                    changed = true;
+                }
+            }
+        } else if exact_width && mapping.reg_id == REG_NONE && load_reg != REG_NONE {
+            // IMMEDIATE-BACKED mapping: the slot holds a known constant.
+            // Pair-fuse with a following `movX %reg, slot2` into a single
+            // `movX $imm, slot2` (the memcpy-shaped relay: a just-stored
+            // constant reloaded and re-stored). Immensities outside the
+            // store's immediate field keep the load (the single-line
+            // materialization `movabsq $imm, %reg` is count-neutral and
+            // would trade a 4-byte memory read for a 10-byte instruction).
+            if imm_fits_store(mapping.imm, load_size) {
+                if try_pair_fuse_imm_store(store, infos, i, mapping.imm, load_reg, load_size, lv) {
+                    mark_nop(&mut infos[i]);
+                    changed = true;
+                    load_still_writes_reg = false;
+                }
             }
         }
     }
-    if is_valid_gp_reg(load_reg) {
+    if load_still_writes_reg && is_valid_gp_reg(load_reg) {
         invalidate_reg_flat(slot_entries, reg_offsets, load_reg);
     }
     changed
+}
+
+/// PAIR FUSION register side: the next non-NOP line after `i` must be a
+/// plain same-width store `movX %load_reg, off2(%rbp)` (StoreRbp kind, exact
+/// text match on the source register), and `src_reg` must be a valid GP
+/// register distinct from the load's destination. Rewrite the store to use
+/// the mapping's source register directly.
+fn try_pair_fuse_reg_store(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    i: usize,
+    src_reg: RegId,
+    load_reg: RegId,
+    size: MoveSize,
+    lv: &mut FileLiveness,
+) -> bool {
+    if !is_valid_gp_reg(src_reg) || src_reg == load_reg {
+        return false;
+    }
+    let j = next_non_nop(infos, i + 1, infos.len());
+    if j >= infos.len() {
+        return false;
+    }
+    let LineKind::StoreRbp {
+        reg: st_reg,
+        offset: st_off,
+        size: st_size,
+    } = infos[j].kind
+    else {
+        return false;
+    };
+    if st_reg != load_reg || st_size != size {
+        return false;
+    }
+    // LIVENESS GATE: deleting the load removes the ONLY write of load_reg in
+    // this pair; the register's value must be dead on every path after the
+    // fused store, or a later read would observe the pre-load value (the
+    // -O0 alloca ping-pong miscompile class: the load's destination was
+    // re-read by a THIRD instruction after the pair). Only the exact
+    // dataflow answer is accepted — unanalysable functions keep the load.
+    if lv.live_after(j, load_reg) != Some(false) {
+        return false;
+    }
+    // The line must be a PLAIN register store (no flags side-channel, no
+    // extra operands): `    movX %src, off(%base)`. Preserve the matched
+    // addressing base verbatim — an rbp line must not silently become an
+    // rsp line (different physical slot).
+    let src_name = reg_id_to_name(load_reg, size);
+    for base in ["%rbp", "%rsp"] {
+        // `trimmed` strips the indentation: compare against the bare text.
+        let want = format!("{} {}, {}({})", size.mnemonic(), src_name, st_off, base);
+        if infos[j].trimmed(store.get(j)) == want {
+            let new_text = format!(
+                "    {} {}, {}({})",
+                size.mnemonic(),
+                reg_id_to_name(src_reg, size),
+                st_off,
+                base
+            );
+            replace_line(store, &mut infos[j], j, new_text);
+            lv.refresh_at(store, infos, j);
+            return true;
+        }
+    }
+    false
+}
+
+/// PAIR FUSION immediate side: the next non-NOP line after `i` must be a
+/// plain same-width store `movX %load_reg, off2(%rbp)`. Rewrite it to
+/// `movX $imm, off2(%rbp)` and report success (the caller NOPs the load).
+fn try_pair_fuse_imm_store(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    i: usize,
+    imm: i64,
+    load_reg: RegId,
+    size: MoveSize,
+    lv: &mut FileLiveness,
+) -> bool {
+    let j = next_non_nop(infos, i + 1, infos.len());
+    if j >= infos.len() {
+        return false;
+    }
+    let LineKind::StoreRbp {
+        reg: st_reg,
+        offset: st_off,
+        size: st_size,
+    } = infos[j].kind
+    else {
+        return false;
+    };
+    if st_reg != load_reg || st_size != size {
+        return false;
+    }
+    // LIVENESS GATE: same contract as the register-side fusion — the deleted
+    // load was the pair's write of load_reg, so the register must be dead on
+    // every path after the fused store.
+    if lv.live_after(j, load_reg) != Some(false) {
+        return false;
+    }
+    let src_name = reg_id_to_name(load_reg, size);
+    for base in ["%rbp", "%rsp"] {
+        // `trimmed` strips the indentation: compare against the bare text.
+        let want = format!("{} {}, {}({})", size.mnemonic(), src_name, st_off, base);
+        if infos[j].trimmed(store.get(j)) == want {
+            let new_text = format!(
+                "    {} ${}, {}({})",
+                mov_imm_store_mnemonic(size),
+                imm,
+                st_off,
+                base
+            );
+            replace_line(store, &mut infos[j], j, new_text);
+            lv.refresh_at(store, infos, j);
+            return true;
+        }
+    }
+    false
 }
 
 fn gsf_handle_other(
@@ -450,6 +684,49 @@ fn line_base_is_rbp(trimmed: &str) -> bool {
     false
 }
 
+/// Parse an immediate store line `    movX $imm, off(%rbp)` /
+/// `    movX $imm, off(%rsp)`. Returns (imm, offset, size) when the line is
+/// exactly that shape (two operands, plain mnemonic, stack-slot destination)
+/// and `preparsed_offset` matches the destination's offset. `None` otherwise.
+fn parse_imm_slot_store(raw: &str, preparsed_offset: i32) -> Option<(i64, i32, MoveSize)> {
+    if preparsed_offset == RBP_OFFSET_NONE {
+        return None;
+    }
+    let s = raw.trim_start();
+    // Two operands exactly.
+    let mut parts = s.split(", ");
+    let head = parts.next()?;
+    let tail = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    // `movX $imm` — the size rides the mnemonic suffix.
+    let Some((mnem, imm_str)) = head.split_once(' ') else {
+        return None;
+    };
+    let size = match mnem {
+        "movq" => MoveSize::Q,
+        "movl" => MoveSize::L,
+        "movw" => MoveSize::W,
+        "movb" => MoveSize::B,
+        _ => return None,
+    };
+    let imm_str = imm_str.strip_prefix('$')?;
+    let imm = if let Some(hex) = imm_str.strip_prefix("0x") {
+        i64::from_str_radix(hex, 16).ok()?
+    } else {
+        imm_str.parse::<i64>().ok()?
+    };
+    // The destination must be exactly `off(%rbp)` or `off(%rsp)`.
+    for base in ["(%rbp)", "(%rsp)"] {
+        let want = format!("{}{}", preparsed_offset, base);
+        if tail == want {
+            return Some((imm, preparsed_offset, size));
+        }
+    }
+    None
+}
+
 pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     if len == 0 {
@@ -468,6 +745,7 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
 
     let mut slot_entries: Vec<SlotEntry> = Vec::new();
     let mut reg_offsets: [SmallVec; 16] = Default::default();
+    let mut lv = FileLiveness::new(store, infos);
     let mut changed = false;
     let mut prev_was_unconditional_jump = false;
 
@@ -539,6 +817,7 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
                         load_size,
                         &mut slot_entries,
                         &mut reg_offsets,
+                        &mut lv,
                     );
                 }
             }
@@ -590,6 +869,24 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
             }
 
             LineKind::Other { dest_reg } => {
+                // Immediate store detection: `movX $imm, off(%rbp/%rsp)` — a
+                // plain two-operand constant store to a stack slot. These
+                // lines classify as Other (StoreRbp requires a register
+                // source); recording them gives the load side mappings that
+                // survive register clobbers (memory does not change when a
+                // register does) — the rax-relay copy pattern of a struct
+                // initialized with constants.
+                if let Some((imm, off, size)) =
+                    parse_imm_slot_store(store.get(i), infos[i].rbp_offset)
+                {
+                    let is_rbp_base = infos[i].trimmed(store.get(i)).contains("(%rbp)");
+                    if !is_rbp_base || rbp_is_frame {
+                        gsf_handle_store_imm(imm, off, size, &mut slot_entries, &mut reg_offsets);
+                        // An immediate store writes NO register and the slot
+                        // is recorded: nothing else to do for this line.
+                        continue;
+                    }
+                }
                 gsf_handle_other(
                     store,
                     infos,

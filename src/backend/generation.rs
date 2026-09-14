@@ -459,6 +459,66 @@ fn index_single_defs<'a>(
 /// Adjacent `(addr_producer, Load/Store-of-that-addr)` pairs whose producer
 /// is single-use. Only the producer dest is proven stable — NOT aliases
 /// introduced by later copy-propagation (`GEP; redef base; Copy; Load`).
+///
+/// "Adjacent" is a bounded same-block WINDOW, not strict instruction
+/// adjacency: the front-end materialises struct-field addresses eagerly
+/// (`p = GEP(base, 28); t = i * 3; store t -> p`), and the pure RHS
+/// computation between the producer and its single consuming access must not
+/// block the fold. The window admits only instructions the skip cannot
+/// observe (no memory writes, no phis, no redefinition of the producer's
+/// operands) and stays within the block — the base-liveness link
+/// (`collect_gep_fold_base_links`) extends the base's interval to the access
+/// wherever they sit, so the only question is whether anything between them
+/// could change the base's or the producer's meaning.
+const ADDR_FOLD_WINDOW: usize = 8;
+
+/// Instructions a folded-away address producer may safely slide across:
+/// pure, side-effect-free, and not a Phi (Phis only appear at block start,
+/// but the check keeps the invariant explicit if that ever changes).
+fn window_transparent_for_addr_fold(inst: &Instruction) -> bool {
+    !inst.may_write_memory()
+        && !matches!(
+            inst,
+            Instruction::Phi { .. }
+                | Instruction::Alloca { .. }
+                | Instruction::DynAlloca { .. }
+                | Instruction::StackRestore { .. }
+                | Instruction::Fence { .. }
+                | Instruction::AtomicLoad { .. }
+                | Instruction::AtomicStore { .. }
+                | Instruction::AtomicRmw { .. }
+                | Instruction::AtomicCmpxchg { .. }
+                | Instruction::Load { volatile: true, .. }
+                | Instruction::Call { .. }
+                | Instruction::CallIndirect { .. }
+        )
+}
+
+/// Operand value ids the candidate producer reads (GEP base/offset, the
+/// pointer operand of an Add/Sub identity). An intervening redefinition of
+/// any of them would change what the folded displacement computes.
+fn addr_producer_guard_operands(inst: &Instruction) -> Vec<u32> {
+    match inst {
+        Instruction::GetElementPtr { base, offset, .. } => {
+            let mut ops = vec![base.0];
+            if let Operand::Value(v) = offset {
+                ops.push(v.0);
+            }
+            ops
+        }
+        Instruction::BinOp { lhs, rhs, .. } => {
+            let mut ops = Vec::new();
+            for op in [lhs, rhs] {
+                if let Operand::Value(v) = op {
+                    ops.push(v.0);
+                }
+            }
+            ops
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn adjacent_addr_producers(
     func: &IrFunction,
     use_counts: &[u32],
@@ -466,18 +526,44 @@ fn adjacent_addr_producers(
 ) -> FxHashSet<u32> {
     let mut adjacent = FxHashSet::default();
     for block in &func.blocks {
-        for pair in block.instructions.windows(2) {
-            let Some(dest) = pair[0].dest() else { continue };
+        let insts = &block.instructions;
+        for i in 0..insts.len() {
+            let Some(dest) = insts[i].dest() else {
+                continue;
+            };
             if !candidates.contains(&dest.0)
                 || use_counts.get(dest.0 as usize).copied().unwrap_or(0) != 1
             {
                 continue;
             }
-            if matches!(
-                &pair[1],
-                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } if ptr.0 == dest.0
-            ) {
-                adjacent.insert(dest.0);
+            // Pure address producers only: the window skip must be
+            // unobservable, which starts with the producer itself.
+            if !window_transparent_for_addr_fold(&insts[i]) {
+                continue;
+            }
+            let guards = addr_producer_guard_operands(&insts[i]);
+            let end = (i + 1 + ADDR_FOLD_WINDOW).min(insts.len());
+            'window: for j in (i + 1)..end {
+                let mid = &insts[j];
+                // The consuming access: single-use is already established,
+                // so this is the producer's only consumer.
+                if matches!(
+                    mid,
+                    Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } if ptr.0 == dest.0
+                ) {
+                    adjacent.insert(dest.0);
+                    break 'window;
+                }
+                if !window_transparent_for_addr_fold(mid) {
+                    break 'window;
+                }
+                // Redefinition of a producer operand: the base/offset value
+                // at the access would differ from the one at the producer.
+                if let Some(d) = mid.dest() {
+                    if guards.contains(&d.0) || d.0 == dest.0 {
+                        break 'window;
+                    }
+                }
             }
         }
     }
