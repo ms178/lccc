@@ -75,6 +75,14 @@ pub(crate) struct RaConfig {
     /// loop's hottest slot goes back to 7 reloads per iteration), so this must
     /// never become default.
     pub(crate) no_web_inloop_use: bool,
+    /// `CCC_RA_NO_RECURRENCE_FLOOR`: disable the recurrence floor at the
+    /// no-victim demotion site (default: false — the floor is on). A loop
+    /// recurrence with in-loop reads that ordinary eviction cannot serve
+    /// steals the cheapest non-recurrence active instead of taking a slot;
+    /// the floor is what keeps loop-carried cursors/counters in registers
+    /// when function-spanning webs fill the pool (linux_rbtree's outer
+    /// loop). Diagnostic/A-B switch only: load-bearing, never default off.
+    pub(crate) no_recurrence_floor: bool,
     /// `CCC_NO_LOAD_HAZARD_REFINE`: disable i686 load hazard refinement (default: false).
     pub(crate) no_load_hazard_refine: bool,
     /// `CCC_NO_EAX_ALLOC`: disable the i686 eax allocation phase (default: false).
@@ -291,6 +299,7 @@ impl RaConfig {
             no_leaf_caller_home: present("CCC_NO_LEAF_CALLER_HOME"),
             no_span_valve: present("CCC_NO_SPAN_VALVE"),
             no_web_inloop_use: present("CCC_NO_WEB_INLOOP_USE"),
+            no_recurrence_floor: present("CCC_RA_NO_RECURRENCE_FLOOR"),
             no_load_hazard_refine: present("CCC_NO_LOAD_HAZARD_REFINE"),
             no_eax_alloc: present("CCC_NO_EAX_ALLOC"),
             no_loop_pin: present("CCC_NO_LOOP_PIN"),
@@ -3596,6 +3605,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     let scan_ivs =
         collect_gpr_scan_intervals(&liveness, &eligible, &merged_of, &coalesce_member_of);
+    // (phi_dest, backedge_src) pairs for the recurrence sight in
+    // `mark_loop_spanning`: the HOMELESS exclusion removes latch sources
+    // from the coalesce webs precisely for the recurrence shapes whose
+    // increment consumes the web, so the pairs must be fed directly.
+    let phi_backedges: Vec<(u32, u32)> = phi_coalesce
+        .iter()
+        .map(|c| (c.phi_dest, c.backedge_src))
+        .collect();
     let build_gpr_ranges = |intervals: &[LiveInterval]| {
         let (mut ranges, range_meta) = live_range::build_live_ranges_with_config_and_meta(
             intervals,
@@ -3638,6 +3655,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             func,
             &range_meta.uses,
             !config.ra_config.no_web_inloop_use,
+            &phi_backedges,
         );
         ranges
     };
@@ -10382,6 +10400,7 @@ mod ra_config_tests {
         switch!(no_leaf_caller_home, "CCC_NO_LEAF_CALLER_HOME");
         switch!(no_span_valve, "CCC_NO_SPAN_VALVE");
         switch!(no_web_inloop_use, "CCC_NO_WEB_INLOOP_USE");
+        switch!(no_recurrence_floor, "CCC_RA_NO_RECURRENCE_FLOOR");
         switch!(no_load_hazard_refine, "CCC_NO_LOAD_HAZARD_REFINE");
         switch!(no_eax_alloc, "CCC_NO_EAX_ALLOC");
         switch!(no_loop_pin, "CCC_NO_LOOP_PIN");

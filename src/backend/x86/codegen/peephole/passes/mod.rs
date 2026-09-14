@@ -1318,6 +1318,18 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             if !sk("lea_all_uses") {
                 changed2 |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
             }
+            // Phase 2's copy propagation creates the LEA→memory shapes
+            // phase 1's windowed folder never saw: `leaq K(%rax), %rax;
+            // movq %rax, %rsi; movq $0, (%rsi)` loses the relay there
+            // (`movq $0, (%rax)`), and only a fold round AFTER that point
+            // can absorb the LEA into the displacement
+            // (`movq $0, K(%rax)` — the strength-reduced marching-pointer
+            // stores of slot-homed address webs). Idempotent and
+            // liveness-checked; the self-base re-execution veto is inside
+            // the pass.
+            if !sk("lea_window") {
+                changed2 |= relay_and_lea::fold_lea_into_load(&mut store, &mut infos);
+            }
             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);

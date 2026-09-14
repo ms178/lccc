@@ -1842,6 +1842,36 @@ impl Driver {
             }
         }
 
+        // Congruent recurrence-web merging: phi elimination lowers
+        // loop-carried phis to copy webs, and structurally identical phis
+        // (same seed, same increment, same seed/latch blocks) produce webs
+        // that hold the SAME value at every point — three webs for
+        // linux_rbtree's single `&node_pool[i]`, each an independent RA
+        // recurrence paying its own slot round-trip. Merge them into one
+        // before the backend's liveness/RA sees the web set. Runs after the
+        // post-phi copy cleanup (which is calibrated on the original
+        // shapes) and before the edge-copy layout.
+        if std::env::var("CCC_NO_WEB_CONGRUENCE").is_err() {
+            let t7c = std::time::Instant::now();
+            let mut merged_webs = 0usize;
+            for func in &mut module.functions {
+                if !func.is_declaration && !func.blocks.is_empty() {
+                    let n = crate::passes::web_congruence::merge_congruent_recurrence_webs(func);
+                    if n > 0 {
+                        merged_webs += n;
+                        crate::passes::dce::eliminate_dead_code(func);
+                    }
+                }
+            }
+            if time_phases && merged_webs > 0 {
+                eprintln!(
+                    "[TIME] web congruence: {:.3}s ({} webs merged)",
+                    t7c.elapsed().as_secs_f64(),
+                    merged_webs
+                );
+            }
+        }
+
         // W5: phi elimination appends mutually-exclusive edge-copy blocks at
         // function end. Place each beside its sole predecessor so contiguous
         // live intervals reflect the real CFG lifetime rather than overlapping
