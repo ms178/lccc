@@ -6,7 +6,7 @@
 
 use crate::backend::elf::{SHN_ABS, STB_GLOBAL, STT_NOTYPE};
 use crate::backend::linker_common::SymStr;
-use crate::backend::linker_common::defsym::{self, Defsym};
+use crate::backend::linker_common::defsym::{self, Defsym, DefsymError};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::path::Path;
 
@@ -46,32 +46,55 @@ use crate::backend::linker_common::{self, OutputSection};
 fn apply_defsyms(
     globals: &mut FxHashMap<String, GlobalSymbol>,
     defs: &[(String, String)],
-) -> Result<Vec<(String, String)>, String> {
-    let mut pending: Vec<(String, String)> = Vec::new();
-    for (name, expr) in defs {
-        let shown = format!("--defsym {name}={expr}");
+) -> Result<Vec<(String, String, usize)>, String> {
+    let mut pending: Vec<(String, String, usize)> = Vec::new();
+    for (pos, (name, expr)) in defs.iter().enumerate() {
+        let index = pos + 1;
         // "Defined" means the same thing it means to `resolve_sym` and to the
         // undefined-symbol check: the symbol belongs to some object, or is one
         // this linker created (defined_in == Some(usize::MAX)).
+        // Layout-derived magic symbols (`_etext`, `end`, …) count as defined
+        // even though they only exist after layout — GNU ld resolves them
+        // during expression evaluation, and so do we (see
+        // `defsym::is_linker_defined`).
         let classified = defsym::classify(expr, |n| {
-            globals.get(n).is_some_and(|g| g.defined_in.is_some())
+            globals.get(n).is_some_and(|g| g.defined_in.is_some()) || defsym::is_linker_defined(n)
         })
-        .map_err(|e| format!("{shown}: {}", e.message()))?;
+        .map_err(|e| e.gnu_message(index))?;
         let value = match classified {
             // Alias: copy the target's whole definition, PLT/GOT slots included,
-            // exactly as the old loop did.
+            // exactly as the old loop did. A target only the linker defines
+            // (a magic symbol) has no address until layout, so it is deferred
+            // to evaluation like an expression.
             Defsym::Alias(target) => {
-                let target_sym = globals.get(&target).cloned().ok_or_else(|| {
-                    format!("{shown}: target symbol '{target}' is not defined in this link")
-                })?;
-                globals.insert(name.clone(), target_sym);
-                continue;
+                match globals.get(&target) {
+                    Some(sym) if sym.defined_in.is_some() => {
+                        if sym.is_dynamic {
+                            // GNU ld: a symbol visible only through a shared
+                            // library is not "defined in this link", so
+                            // aliasing it is an undefined-symbol error.
+                            return Err(DefsymError::UndefinedSymbol(target).gnu_message(index));
+                        }
+                        globals.insert(name.clone(), sym.clone());
+                        continue;
+                    }
+                    _ => {
+                        // Linker language symbol (`_etext`, `end`, …): the
+                        // arm's 0 becomes the usual placeholder (defined,
+                        // ABS) below, so the undefined-symbol check and the
+                        // PLT/GOT need scan see it;
+                        // `evaluate_pending_defsyms` overwrites the value
+                        // after layout.
+                        pending.push((name.clone(), target, index));
+                        0
+                    }
+                }
             }
             Defsym::Constant(v) => v,
             // Validated now (a typo must fail the link even though the value
             // cannot be computed until layout), evaluated later.
             Defsym::Expression(e) => {
-                pending.push((name.clone(), e));
+                pending.push((name.clone(), e, index));
                 0
             }
         };
@@ -118,15 +141,15 @@ fn apply_defsyms(
 /// expression means the two's-complement difference, never a complaint).
 pub(crate) fn evaluate_pending_defsyms(
     globals: &mut FxHashMap<String, GlobalSymbol>,
-    pending: &[(String, String)],
+    pending: &[(String, String, usize)],
 ) -> Result<(), String> {
-    for (name, expr) in pending {
+    for (name, expr, index) in pending {
         let value = defsym::eval_with_symbols(expr, &|n| {
             globals
                 .get(n)
                 .and_then(|g| g.defined_in.is_some().then_some(g.value))
         })
-        .map_err(|err| format!("--defsym {name}={expr}: {}", err.message()))?;
+        .map_err(|err| err.gnu_message(*index))?;
         let entry = globals
             .get_mut(name)
             .ok_or_else(|| format!("--defsym {name}: symbol vanished before evaluation"))?;
@@ -196,6 +219,11 @@ pub fn link_builtin(
     phase!("load-inputs");
     // Parse user args using shared infrastructure
     let parsed_args = linker_common::parse_linker_args(user_args);
+    // `-z ibt=func` & co: accepted, ignored, and warned about — verbatim
+    // GNU ld wording.
+    for kw in &parsed_args.z_ignored_keywords {
+        eprintln!("lccc-ld: warning: -z {kw} ignored");
+    }
     let extra_lib_paths = parsed_args.extra_lib_paths;
     let libs_to_load = parsed_args.libs_to_load;
     let extra_object_files = parsed_args.extra_object_files;
@@ -413,6 +441,11 @@ pub fn link_builtin(
         }
     }
 
+    // Linker-synthesized objects.  They must be excluded from the property
+    // note merge (a synthetic object without the note would veto every
+    // AND-class type) and from other "real input" decisions.
+    let mut synthetic_objects: FxHashSet<usize> = FxHashSet::default();
+
     // --build-id: contribute a placeholder .note.gnu.build-id so the section
     // takes part in layout like any other input section.  The digest itself is
     // content-derived, so it can only be computed once the image is final;
@@ -420,6 +453,7 @@ pub fn link_builtin(
     // `patch_output_build_id`).  Debian's gcc passes --build-id on every link.
     if parsed_args.build_id {
         objects.push(linker_common::build_id::synthetic_note_object());
+        synthetic_objects.insert(objects.len() - 1);
     }
 
     // Resolve remaining undefined symbols from default system libraries
@@ -629,6 +663,27 @@ pub fn link_builtin(
     }
 
     phase!("icf");
+    // GNU property note merge (CET/ISA): fold every real input's
+    // `.note.gnu.property` into a single note *in the input objects*
+    // before the section merge, so the layout, the note section size and
+    // the PT_NOTE/PT_GNU_PROPERTY segments all reflect the merged note.
+    // The AND/OR_AND classes clear the whole note when any real input
+    // lacks the type; `-z ibt`/`-z shstk`/`-z lam-u*` and the ISA level
+    // can still create it.  (Semantics: linker_common::cet, verified
+    // against binutils `_bfd_x86_elf_merge_gnu_properties`.)
+    let cet_flags = linker_common::cet::PropertyLinkFlags {
+        ibt: parsed_args.z_ibt,
+        shstk: parsed_args.z_shstk,
+        lam_u48: parsed_args.z_lam_u48,
+        lam_u57: parsed_args.z_lam_u57,
+    };
+    if let Some(carrier) =
+        linker_common::cet::merge_property_into_objects(&mut objects, &synthetic_objects, &cet_flags)?
+    {
+        synthetic_objects.insert(objects.len());
+        objects.push(carrier);
+    }
+
     // Merge sections (skip dead sections when gc-sections is active)
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
@@ -762,6 +817,11 @@ pub fn link_shared(
     // lccc did not). `LinkerArgs::inputs` now models the ordered, positional
     // input list -- the one thing that previously blocked the merge.
     let parsed = linker_common::parse_linker_args(user_args);
+    // `-z ibt=func` & co: accepted, ignored, and warned about — verbatim
+    // GNU ld wording.
+    for kw in &parsed.z_ignored_keywords {
+        eprintln!("lccc-ld: warning: -z {kw} ignored");
+    }
 
     let extra_lib_paths: Vec<String> = parsed.extra_lib_paths.clone();
     let soname: Option<String> = parsed.soname.clone();
@@ -917,6 +977,21 @@ pub fn link_shared(
     // Expressions come back pending; the emitter evaluates them once addresses
     // are final.
     let pending_defsyms = apply_defsyms(&mut globals, &parsed.defsym_defs)?;
+
+    // GNU property note merge, as on the executable path (input level,
+    // before the section merge — see the comment in `link_builtin`).
+    let cet_flags = linker_common::cet::PropertyLinkFlags {
+        ibt: parsed.z_ibt,
+        shstk: parsed.z_shstk,
+        lam_u48: parsed.z_lam_u48,
+        lam_u57: parsed.z_lam_u57,
+    };
+    let synthetic_objects: FxHashSet<usize> = FxHashSet::default();
+    if let Some(carrier) =
+        linker_common::cet::merge_property_into_objects(&mut objects, &synthetic_objects, &cet_flags)?
+    {
+        objects.push(carrier);
+    }
 
     // Merge sections (no gc-sections for shared libraries)
     let mut output_sections: Vec<OutputSection> = Vec::new();

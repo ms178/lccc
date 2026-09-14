@@ -30,6 +30,7 @@ pub(super) fn emit_executable(
     is_nostdlib: bool,
     _needed_libs_param: &[&str],
     output_path: &str,
+    pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let num_ifunc = ifunc_symbols.len();
 
@@ -833,7 +834,8 @@ pub(super) fn emit_executable(
         fini_array_size,
         rel_iplt_vaddr,
         rel_iplt_size,
-    );
+        pending_defsyms,
+    )?;
 
     // Override IFUNC symbol addresses to point to IPLT entries
     let mut ifunc_resolver_addrs: Vec<u32> = Vec::new();
@@ -935,12 +937,26 @@ pub(super) fn emit_executable(
                 got_data.extend_from_slice(&0u32.to_le_bytes());
             }
         }
-        // Local GOT symbols (filled at link time with resolved addresses)
-        for name in got_local_symbols {
+        // Local GOT symbols (filled at link time with resolved addresses).
+        //
+        // Absolute symbols (`--defsym k=100`, linker language symbols like
+        // `_end`) have no section, so `gs.address` is a *value*, not an
+        // address — a code path that reads the slot and dereferences it
+        // (`movl slot(%ebx),%edx; movl (%edx),%eax`) would fetch from
+        // address 100 and segfault. GNU ld gives every ABS GOT entry an
+        // R_386_RELATIVE, so the slot ends up holding its own vaddr; in a
+        // non-PIE i386 executable that final value is exactly the slot's
+        // vaddr, which we can write directly at link time (the dereference
+        // then reads the slot itself, as in GNU ld).
+        for (slot_i, name) in got_local_symbols.iter().enumerate() {
             if let Some(gs) = global_symbols.get(name) {
                 if has_tls && gs.sym_type == STT_TLS {
                     let tpoff = gs.address as i32 - tls_addr as i32 - tls_mem_size as i32;
                     got_data.extend_from_slice(&(tpoff as u32).to_le_bytes());
+                } else if gs.is_defined && gs.output_section == usize::MAX {
+                    // ABS: the slot's own vaddr (GNU RELATIVE semantics).
+                    let slot_vaddr = got_vaddr + (1 + got_dyn_symbols.len() + slot_i) as u32 * 4;
+                    got_data.extend_from_slice(&slot_vaddr.to_le_bytes());
                 } else {
                     got_data.extend_from_slice(&gs.address.to_le_bytes());
                 }
@@ -1505,7 +1521,8 @@ fn assign_symbol_addresses(
     fini_array_size: u32,
     rel_iplt_vaddr: u32,
     rel_iplt_size: u32,
-) {
+    pending_defsyms: &[(String, String, usize)],
+) -> Result<(), String> {
     global_symbols
         .entry("_GLOBAL_OFFSET_TABLE_".to_string())
         .or_insert(LinkerSymbol {
@@ -1557,6 +1574,37 @@ fn assign_symbol_addresses(
         .map(|s| (s.name, s.value))
         .collect();
 
+    // GNU ld's language symbols (`_start`, `end`, `_etext`, …) always exist,
+    // whether or not the inputs reference them.  Seed the symbol table with
+    // all of them so that a `--defsym` expression naming one (e.g.
+    // `half=(end-_start)/2`) resolves even when nothing else did.  Seeding is
+    // harmless to the output: the executable carries no .symtab, and the
+    // dynsym writer only emits dynamic symbols.
+    for (name, value) in &linker_sym_map {
+        global_symbols
+            .entry(name.to_string())
+            .or_insert(LinkerSymbol {
+                address: *value as u32,
+                size: 0,
+                sym_type: STT_NOTYPE,
+                binding: STB_GLOBAL,
+                visibility: STV_DEFAULT,
+                is_defined: true,
+                needs_plt: false,
+                needs_got: false,
+                output_section: usize::MAX,
+                section_offset: 0,
+                plt_index: 0,
+                got_index: 0,
+                is_dynamic: false,
+                dynlib: String::new(),
+                needs_copy: false,
+                copy_addr: 0,
+                version: None,
+                uses_textrel: false,
+            });
+    }
+
     for (name, sym) in global_symbols.iter_mut() {
         if sym.is_dynamic {
             if sym.needs_plt {
@@ -1599,6 +1647,11 @@ fn assign_symbol_addresses(
             }
         }
     }
+
+    // Last: finalise --defsym constants/expressions, so they see the section
+    // addresses and the standard linker symbols, and so a user definition of
+    // a standard name (e.g. `--defsym _end=...`) wins over the auto value.
+    super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms)
 }
 
 pub(super) fn build_plt(

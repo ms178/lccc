@@ -113,6 +113,9 @@ pub const PT_PHDR: u32 = 6;
 pub const PT_TLS: u32 = 7;
 pub const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 pub const PT_GNU_STACK: u32 = 0x6474_e551;
+/// `PT_GNU_PROPERTY`: carries the 64-bit property note
+/// (`.note.gnu.property`), aliasing the PT_NOTE segment that holds it.
+pub const PT_GNU_PROPERTY: u32 = 0x6474_e553;
 pub const PT_GNU_RELRO: u32 = 0x6474_e552;
 
 // ── Program header flags ─────────────────────────────────────────────────────

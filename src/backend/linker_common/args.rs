@@ -99,6 +99,35 @@ pub struct LinkerArgs {
     /// matters on x86-64; `both` is still requested by builds targeting
     /// pre-2.23 glibc, which has no `DT_GNU_HASH` support.
     pub hash_style: HashStyle,
+    /// `-z ibt`: indirect-branch tracking.  Sets the `GNU_PROPERTY_X86_
+    /// FEATURE_1_AND` IBT bit (1) in the merged property note, creating the
+    /// note when no input had one (GNU ld behaviour).
+    pub z_ibt: bool,
+    /// `-z shstk`: shadow-stack control (FEATURE_1_AND bit 2).
+    pub z_shstk: bool,
+    /// `-z lam-u48`: 48-bit linear-address masking (FEATURE_1_AND bits 4|8).
+    pub z_lam_u48: bool,
+    /// `-z lam-u57`: 57-bit linear-address masking (FEATURE_1_AND bit 8).
+    pub z_lam_u57: bool,
+    /// `-march=x86-64-vN` / `--isa-level=N` ISA level (1 = baseline).
+    /// Recorded for interface compatibility only: GNU ld has no
+    /// command-line ISA option, so the level is *not* injected into the
+    /// property note — the ISA bits come from the input objects' notes.
+    #[allow(dead_code)]
+    pub isa_level: u32,
+    /// `-z ibt=func` & co: keyword forms GNU ld accepts and ignores with a
+    /// warning.  Collected here so the driver can print the warning once.
+    pub z_ignored_keywords: Vec<String>,
+    /// `--no-undefined-version`: fail the link when a symbol's version
+    /// reference cannot be satisfied.
+    pub no_undefined_version: bool,
+    /// `--emit-relocs` / `-q`: keep the applied relocations in `.rela.*`
+    /// sections (the kernel's arch/x86/tools/relocs pass consumes them).
+    pub emit_relocs: bool,
+    /// `--threads=N`: recorded for interface compatibility; lccc links
+    /// single-threaded, so the value is accepted and not acted on.
+    #[allow(dead_code)]
+    pub threads: Option<u32>,
 }
 
 /// One input file or `-l` library, with the positional flag state that applied
@@ -175,6 +204,57 @@ pub fn parse_hash_style(v: &str) -> Option<HashStyle> {
 /// and the `-Wl,` sub-argument loop call this, so a flag spelled either way is
 /// handled by one definition instead of two that can drift.  Flags needing a
 /// value or carrying positional state are handled inline by the callers.
+/// Options whose spelling is a single token: ISA level, version checking,
+/// relocation retention and thread hints.  Returns true when consumed.
+fn isa_option(result: &mut LinkerArgs, tok: &str) -> bool {
+    if let Some(v) = tok.strip_prefix("--isa-level=") {
+        if let Ok(n) = v.parse::<u32>() {
+            result.isa_level = n.clamp(1, 4);
+        }
+        return true;
+    }
+    if let Some(v) = tok.strip_prefix("-march=") {
+        // `x86-64-vN` level; the baseline adds no feature bits.
+        if v.contains("v2") {
+            result.isa_level = result.isa_level.max(2);
+        } else if v.contains("v3") {
+            result.isa_level = result.isa_level.max(3);
+        } else if v.contains("v4") {
+            result.isa_level = result.isa_level.max(4);
+        }
+        return true;
+    }
+    match tok {
+        "--no-undefined-version" => {
+            result.no_undefined_version = true;
+        }
+        "--emit-relocs" | "-q" => {
+            result.emit_relocs = true;
+        }
+        "--no-emit-relocs" => {
+            result.emit_relocs = false;
+        }
+        "--no-threads" => {
+            result.threads = None;
+        }
+        "--threads" => {
+            // The value arrives as the next argument on the plain path;
+            // the group path joins it first (`--threads,N`).  Recording is
+            // best-effort: lccc links single-threaded.
+            return true;
+        }
+        _ => {
+            if let Some(v) = tok.strip_prefix("--threads=") {
+                // Lenient like GNU: a bad value is ignored, not fatal.
+                result.threads = v.parse().ok();
+                return true;
+            }
+            return false;
+        }
+    }
+    true
+}
+
 fn apply_plain_flag(result: &mut LinkerArgs, tok: &str) -> bool {
     match tok {
         "-pie" | "--pie" | "--pic-executable" => result.is_pie = true,
@@ -193,6 +273,7 @@ fn apply_plain_flag(result: &mut LinkerArgs, tok: &str) -> bool {
 pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     let mut result = LinkerArgs::default();
     result.z_relro = true; // RELRO is on by default, like GNU ld/mold
+    result.isa_level = 1; // baseline x86-64 unless -march/--isa-level says otherwise
     // GNU ld accepts `--opt VALUE` alongside `--opt=VALUE`.  A driver that
     // forwards them as `-Wl,--opt -Wl,VALUE` splits the pair across two
     // arguments, and the `-Wl,` splitter below can only see one group at a
@@ -435,6 +516,19 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                         // so_z_defs_rejects_undefined differential test caught it.
                         "defs" => result.no_undefined = true,
                         "undefs" => result.no_undefined = false,
+                        // CET property note bits (see linker_common::cet).
+                        "ibt" => result.z_ibt = true,
+                        "shstk" => result.z_shstk = true,
+                        "lam-u48" => result.z_lam_u48 = true,
+                        "lam-u57" => result.z_lam_u57 = true,
+                        k if k.starts_with("ibt=")
+                            || k.starts_with("shstk=")
+                            || k.starts_with("lam-u48=")
+                            || k.starts_with("lam-u57=") =>
+                        {
+                            // `-z ibt=func` & co: accepted, ignored, warned.
+                            result.z_ignored_keywords.push(k.to_string());
+                        }
                         _ => {} // noexecstack, origin, ... not layout-affecting
                     }
                 } else if let Some(sym) = part.strip_prefix("--entry=") {
@@ -492,6 +586,8 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     if let Some(h) = parse_hash_style(parts[j]) {
                         result.hash_style = h;
                     }
+                } else if isa_option(&mut result, part) {
+                    // consumed
                 } else if apply_plain_flag(&mut result, part) {
                     // consumed
                 } else if let Some(style) = part.strip_prefix("--build-id=") {
@@ -529,6 +625,13 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             if let Some(h) = parse_hash_style(args[i]) {
                 result.hash_style = h;
             }
+        } else if arg == "--threads" && i + 1 < args.len() {
+            i += 1;
+            // Lenient like GNU: a bad value is ignored, not fatal.  lccc
+            // links single-threaded; the value is recorded, not acted on.
+            result.threads = args[i].parse().ok();
+        } else if isa_option(&mut result, arg) {
+            // consumed
         } else if apply_plain_flag(&mut result, arg) {
             // consumed
         } else if let Some(style) = arg.strip_prefix("--build-id=") {

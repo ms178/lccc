@@ -20,6 +20,7 @@ pub(super) fn emit_shared_library(
     needed_sonames: &[String],
     output_path: &str,
     soname: Option<String>,
+    pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
 
@@ -301,12 +302,22 @@ pub(super) fn emit_shared_library(
             && s.flags & SHF_WRITE == 0
             && s.sh_type != SHT_NOBITS
     });
+    // An ET_DYN that defines _start is an executable shared object (a "main"
+    // .so): a dynamic loader can only run it as a program when it carries a
+    // PT_INTERP segment, exactly like a PIE. Plain .so files never define
+    // _start, so this never affects regular shared libraries.
+    let is_exec_dyn = globals.contains_key("_start");
+    const INTERP: &[u8] = b"/lib/ld-linux-aarch64.so.1\0";
+
     // PHDR, LOAD R, LOAD RX, [LOAD R(rodata)], LOAD RW, DYNAMIC, GNU_STACK, [TLS]
     let mut phdr_count: u64 = 6; // base: PHDR + LOAD R + LOAD RX + LOAD RW + DYNAMIC + GNU_STACK
     if has_rodata {
         phdr_count += 1;
     }
     if has_tls_sections {
+        phdr_count += 1;
+    }
+    if is_exec_dyn {
         phdr_count += 1;
     }
     let phdr_total_size = phdr_count * 56;
@@ -324,6 +335,18 @@ pub(super) fn emit_shared_library(
     let dynstr_offset = offset;
     let dynstr_addr = base_addr + offset;
     offset += dynstr_size;
+
+    // .interp (executable ET_DYN only), appended to the RO segment.
+    let interp_offset: u64;
+    let interp_addr: u64;
+    if is_exec_dyn {
+        interp_offset = offset;
+        interp_addr = base_addr + offset;
+        offset += INTERP.len() as u64;
+    } else {
+        interp_offset = 0;
+        interp_addr = 0;
+    }
 
     // Text segment
     offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -705,6 +728,10 @@ pub(super) fn emit_shared_library(
         }
     }
 
+    // --defsym: expressions deferred until now (after layout + standard
+    // symbols). See x86-64 emitter for the rationale.
+    super::link::evaluate_pending_defsyms(globals, pending_defsyms)?;
+
     // Save RW segment file size before appending section headers
     let rw_end_offset = offset;
 
@@ -721,6 +748,13 @@ pub(super) fn emit_shared_library(
     shstrtab_data.extend_from_slice(b".dynamic\0");
     let shname_rela_dyn = shstrtab_data.len() as u32;
     shstrtab_data.extend_from_slice(b".rela.dyn\0");
+    let shname_interp: u32;
+    if is_exec_dyn {
+        shname_interp = shstrtab_data.len() as u32;
+        shstrtab_data.extend_from_slice(b".interp\0");
+    } else {
+        shname_interp = 0;
+    }
     let shname_shstrtab = shstrtab_data.len() as u32;
     shstrtab_data.extend_from_slice(b".shstrtab\0");
 
@@ -731,7 +765,11 @@ pub(super) fn emit_shared_library(
     offset += shstrtab_size;
     offset = (offset + 7) & !7;
     let shdr_offset = offset;
-    let sh_count: u16 = 7; // null + .dynsym + .dynstr + .gnu.hash + .dynamic + .rela.dyn + .shstrtab
+    let sh_count: u16 = if is_exec_dyn {
+        8 // + .interp
+    } else {
+        7 // null + .dynsym + .dynstr + .gnu.hash + .dynamic + .rela.dyn + .shstrtab
+    };
     let shdr_total = sh_count as u64 * 64;
     offset += shdr_total;
 
@@ -747,7 +785,11 @@ pub(super) fn emit_shared_library(
     w16(&mut out, 16, ET_DYN);
     w16(&mut out, 18, EM_AARCH64);
     w32(&mut out, 20, 1);
-    w64(&mut out, 24, 0); // e_entry = 0
+    // e_entry: address of _start when the link defines one (executable
+    // ET_DYN, e.g. a shared-object main under a dynamic loader), else 0 —
+    // the normal .so case, matching GNU ld.
+    let e_entry = globals.get("_start").map(|g| g.value).unwrap_or(0);
+    w64(&mut out, 24, e_entry);
     w64(&mut out, 32, 64); // e_phoff
     w64(&mut out, 40, shdr_offset); // e_shoff
     w32(&mut out, 48, 0);
@@ -772,11 +814,29 @@ pub(super) fn emit_shared_library(
         8,
     );
     ph += 56;
-    let ro_seg_end = dynstr_offset + dynstr_size;
+    let ro_seg_end = if is_exec_dyn {
+        interp_offset + INTERP.len() as u64
+    } else {
+        dynstr_offset + dynstr_size
+    };
     wphdr(
         &mut out, ph, PT_LOAD, PF_R, 0, base_addr, ro_seg_end, ro_seg_end, PAGE_SIZE,
     );
     ph += 56;
+    if is_exec_dyn {
+        wphdr(
+            &mut out,
+            ph,
+            PT_INTERP,
+            PF_R,
+            interp_offset,
+            interp_addr,
+            INTERP.len() as u64,
+            INTERP.len() as u64,
+            1,
+        );
+        ph += 56;
+    }
     if text_total_size > 0 {
         wphdr(
             &mut out,
@@ -908,7 +968,16 @@ pub(super) fn emit_shared_library(
                     out[ds + 4] = gsym.info;
                     out[ds + 5] = 0;
                 }
-                w16(&mut out, ds + 6, 1);
+                // Absolute symbols (`--defsym k=77`) carry SHN_ABS so the
+                // loader uses the value verbatim; section-defined symbols use
+                // section 1 (the first section of this link) as in the
+                // i686 shared emitter.
+                let shndx = if gsym.section_idx == SHN_ABS {
+                    SHN_ABS
+                } else {
+                    1
+                };
+                w16(&mut out, ds + 6, shndx);
                 w64(&mut out, ds + 8, gsym.value);
                 w64(&mut out, ds + 16, gsym.size);
             } else {
@@ -949,6 +1018,11 @@ pub(super) fn emit_shared_library(
 
     // .dynstr
     write_bytes(&mut out, dynstr_offset as usize, dynstr.as_bytes());
+
+    // .interp (executable ET_DYN only)
+    if is_exec_dyn {
+        write_bytes(&mut out, interp_offset as usize, INTERP);
+    }
 
     // Section data
     for sec in output_sections.iter() {
@@ -1432,7 +1506,18 @@ pub(super) fn emit_shared_library(
     w64(&mut out, sh + 48, 8);
     w64(&mut out, sh + 56, 24); // sh_entsize
     sh += 64;
-    // [6] .shstrtab (SHT_STRTAB = 3)
+    if is_exec_dyn {
+        // [6] .interp (SHT_PROGBITS = 1)
+        w32(&mut out, sh, shname_interp);
+        w32(&mut out, sh + 4, 1); // SHT_PROGBITS
+        w64(&mut out, sh + 8, 0x2); // SHF_ALLOC
+        w64(&mut out, sh + 16, interp_addr);
+        w64(&mut out, sh + 24, interp_offset);
+        w64(&mut out, sh + 32, INTERP.len() as u64);
+        w64(&mut out, sh + 48, 1); // sh_addralign
+        sh += 64;
+    }
+    // [.shstrtab] (SHT_STRTAB = 3) — always the last section
     w32(&mut out, sh, shname_shstrtab);
     w32(&mut out, sh + 4, 3); // SHT_STRTAB
     w64(&mut out, sh + 24, shstrtab_offset);

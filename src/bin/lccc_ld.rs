@@ -187,6 +187,43 @@ fn two_arg<'a>(a: &'a str, args: &'a [String], i: &mut usize) -> String {
 /// requested diagnostic, so swallowing it quietly hands the caller a binary
 /// that is not what it asked for.  Deduplicating keeps recursive builds from
 /// drowning real diagnostics.
+/// Derive the GNU property note flags (CET / ISA level) from the
+/// passthrough arguments for script links, which never run
+/// `parse_linker_args`.  `-z` keywords reach this list joined as
+/// `-Wl,-z,<kw>` by the argument loop above, so both the joined and the
+/// bare forms are recognised.  Returns the flags plus any ignored
+/// `=<value>` forms (`-z ibt=func`), which GNU ld accepts and warns about.
+fn passthrough_property_flags(
+    passthrough: &[String],
+) -> (lccc::linker_entry::PropertyLinkFlags, Vec<String>) {
+    let mut flags = lccc::linker_entry::PropertyLinkFlags {
+        ibt: false,
+        shstk: false,
+        lam_u48: false,
+        lam_u57: false,
+    };
+    let mut ignored: Vec<String> = Vec::new();
+    for a in passthrough {
+        if let Some(kw) = a.strip_prefix("-Wl,-z,") {
+            match kw {
+                "ibt" => flags.ibt = true,
+                "shstk" => flags.shstk = true,
+                "lam-u48" => flags.lam_u48 = true,
+                "lam-u57" => flags.lam_u57 = true,
+                k if k.starts_with("ibt=") || k.starts_with("shstk=") || k.starts_with("lam-u") => {
+                    ignored.push(k.to_string());
+                }
+                _ => {}
+            }
+            continue;
+        }
+        // -march / --isa-level: accepted (the driver may forward them) but
+        // deliberately ignored — GNU ld has no command-line ISA option;
+        // the ISA bits come from the input objects' notes.
+    }
+    (flags, ignored)
+}
+
 fn warn_unimplemented(a: &str) {
     use std::collections::HashSet;
     use std::sync::OnceLock;
@@ -298,6 +335,22 @@ fn run(args: &[String]) -> Result<(), String> {
             // the KASLR relocation table; ignoring the flag produced a kernel
             // that linked cleanly and then failed to boot.
             "--emit-relocs" | "-q" => emit_relocs = true,
+            // Forwarded so `parse_linker_args` records them: --no-emit-relocs
+            // resets, --threads/--no-threads are deterministic hints (lccc
+            // links single-threaded; the value is recorded, not acted on),
+            // -march/--isa-level OR the ISA level into the property note,
+            // --no-undefined-version gates the version-script check.
+            "--no-emit-relocs"
+            | "--no-threads"
+            | "--no-undefined-version"
+            | "--threads"
+            | "--isa-level" => passthrough.push(a.to_string()),
+            a if a.starts_with("--threads=")
+                || a.starts_with("--isa-level=")
+                || a.starts_with("-march=") =>
+            {
+                passthrough.push(a.to_string());
+            }
             // Forwarded as well as recorded: `is_pie` drives the local
             // decisions below, while the copy in `passthrough` is what
             // `parse_linker_args` reads to make the emitter produce ET_DYN.
@@ -726,6 +779,25 @@ fn run(args: &[String]) -> Result<(), String> {
         };
         if build_id {
             lccc::linker_entry::append_build_id_object(&mut objects);
+        }
+        // GNU property note merge (CET/ISA) for script links: done here,
+        // where the synthetic build-id object's index is known, so it is
+        // excluded from the "real inputs" (a synthetic object without the
+        // note would veto every AND-class type).  The merged note then
+        // flows through the script layout like any other input section.
+        let (cet_flags, z_ignored) = passthrough_property_flags(&passthrough);
+        for kw in z_ignored {
+            eprintln!("lccc-ld: warning: -z {kw} ignored");
+        }
+        let mut synthetic: lccc::linker_entry::FxHashSet<usize> = Default::default();
+        if build_id {
+            synthetic.insert(objects.len() - 1);
+        }
+        if let Some(carrier) =
+            lccc::linker_entry::merge_property_into_objects(&mut objects, &synthetic, &cet_flags)?
+        {
+            synthetic.insert(objects.len());
+            objects.push(carrier);
         }
         let mut script_src = std::fs::read_to_string(&script_path)
             .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;

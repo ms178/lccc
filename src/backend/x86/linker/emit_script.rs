@@ -29,6 +29,7 @@ type Object = linker_common::Elf64Object;
 const PT_LOAD_: u32 = 1;
 const PT_TLS_: u32 = 7;
 const PT_NOTE_: u32 = 4;
+const PT_GNU_PROPERTY_: u32 = 0x6474e553;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScriptMachine {
     X86_64,
@@ -1171,9 +1172,37 @@ fn link_with_script_machine(
             .iter()
             .any(|sec| (sec.flags & SHF_TLS_) != 0 && (sec.flags & SHF_ALLOC_) != 0 && sec.size > 0)
     }) && !script.phdrs.iter().any(|d| d.ptype == PT_TLS_);
+    // GNU ld also writes one PT_NOTE program header per allocated note
+    // section, plus a PT_GNU_PROPERTY alias for `.note.gnu.property`.
+    // Predict the count from the (already merged) inputs, exactly as the
+    // PT_TLS prediction above does.  The prediction counts one header per
+    // input note section, which is always >= the number of output sections
+    // that end up holding note data (outputs may merge inputs), so
+    // SIZEOF_HEADERS can only over-reserve -- never under-reserve -- the
+    // header table.  The exact final count is recomputed after layout for
+    // `n_phdrs` and the section file offsets.
+    let has_note_property = objects
+        .iter()
+        .flat_map(|o| o.sections.iter())
+        .any(|sec| sec.name == ".note.gnu.property" && (sec.flags & SHF_ALLOC_) != 0 && sec.size > 0);
+    let note_phdr_pred = if !script.phdrs.iter().any(|d| d.ptype == PT_NOTE_) {
+        objects
+            .iter()
+            .flat_map(|o| o.sections.iter())
+            .filter(|sec| {
+                sec.name.starts_with(".note")
+                    && (sec.flags & SHF_ALLOC_) != 0
+                    && sec.size > 0
+                    && !sec.name.contains('@')
+            })
+            .count()
+            + usize::from(has_note_property)
+    } else {
+        0
+    };
     symbols.insert(
         "__SIZEOF_HEADERS".into(),
-        script_header_size_with(&script, usize::from(will_add_tls_phdr), machine),
+        script_header_size_with(&script, usize::from(will_add_tls_phdr) + note_phdr_pred, machine),
     );
     // Script symbols carry expression relocatability, not merely a numeric
     // value or syntactic assignment scope.  In particular, a SECTIONS-scope
@@ -2019,8 +2048,34 @@ fn link_with_script_machine(
         needs_tls_phdr, will_add_tls_phdr,
         "PT_TLS prediction disagreed with the final layout; SIZEOF_HEADERS would be wrong"
     );
-    let n_phdrs = declared_phdrs.len().max(1) + usize::from(needs_tls_phdr);
-    let mut file_off = script_header_size_with(&script, usize::from(needs_tls_phdr), machine);
+    // The note segments (one PT_NOTE per allocated note output section
+    // plus the PT_GNU_PROPERTY alias) count toward the header table exactly
+    // like the synthesised PT_TLS does, or the first section's file offset
+    // would land inside the program header table.  Counted from the final
+    // layout so it is exact by construction.
+    let has_note_property_out = out_secs.iter().any(|o| {
+        o.is_alloc
+            && o.size > 0
+            && o.placed.iter().any(|pl| {
+                pl.size > 0
+                    && objects[pl.obj_idx]
+                        .sections
+                        .get(pl.sec_idx)
+                        .is_some_and(|s| s.name == ".note.gnu.property")
+            })
+    });
+    let note_phdr_actual = out_secs
+        .iter()
+        .filter(|o| o.is_alloc && o.size > 0 && o.name.starts_with(".note"))
+        .count()
+        + usize::from(has_note_property_out);
+    let n_phdrs =
+        declared_phdrs.len().max(1) + usize::from(needs_tls_phdr) + note_phdr_actual;
+    let mut file_off = script_header_size_with(
+        &script,
+        usize::from(needs_tls_phdr) + note_phdr_actual,
+        machine,
+    );
 
     // Assign file offsets: alloc PROGBITS sections in vaddr order get offsets
     // congruent to their LMA modulo the requested maximum page size. The
@@ -3170,6 +3225,62 @@ fn link_with_script_machine(
             vhi - vlo,
             talign,
         )?;
+    }
+    // One PT_NOTE segment per allocated note output section (each spanning
+    // exactly its own section, aligned to at least 4 as in GNU ld), plus
+    // the PT_GNU_PROPERTY alias over the output section holding the merged
+    // `.note.gnu.property` data (alignment 8).  Skipped entirely when the
+    // script itself declares PT_NOTE segments.  The count matches
+    // `note_phdr_actual` above by construction.
+    if !script.phdrs.iter().any(|d| d.ptype == PT_NOTE_) {
+        for os in out_secs.iter() {
+            if os.is_alloc && os.size > 0 && os.name.starts_with(".note") {
+                write_script_phdr(
+                    machine,
+                    &mut out,
+                    ph_off,
+                    PT_NOTE_,
+                    4, /* PF_R */
+                    os.file_offset,
+                    os.vaddr,
+                    os.lma,
+                    os.size,
+                    os.size,
+                    os.align.max(4),
+                )?;
+                ph_off += machine.phdr_size() as usize;
+            }
+        }
+        if has_note_property_out {
+            for os in out_secs.iter() {
+                if os.is_alloc
+                    && os.size > 0
+                    && os.placed.iter().any(|pl| {
+                        pl.size > 0
+                            && objects[pl.obj_idx]
+                                .sections
+                                .get(pl.sec_idx)
+                                .is_some_and(|s| s.name == ".note.gnu.property")
+                    })
+                {
+                    write_script_phdr(
+                        machine,
+                        &mut out,
+                        ph_off,
+                        PT_GNU_PROPERTY_,
+                        4, /* PF_R */
+                        os.file_offset,
+                        os.vaddr,
+                        os.lma,
+                        os.size,
+                        os.size,
+                        8,
+                    )?;
+                    ph_off += machine.phdr_size() as usize;
+                    break;
+                }
+            }
+        }
     }
 
     // ── Section headers (+ optional symtab) ──

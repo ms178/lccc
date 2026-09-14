@@ -21,6 +21,46 @@
 //! that is what bfd says and a user who typed it needs to hear which of the two
 //! mistakes they made.
 
+/// The symbols every lccc backend provides from its own layout, mirroring
+/// the name set of `backend::elf::get_standard_linker_symbols`.
+///
+/// A `--defsym` right-hand side that names one of these is legal in GNU ld:
+/// the magic symbol is resolved during expression evaluation, after
+/// addresses are final. Backends therefore classify such names as defined
+/// (so they are not rejected as typos) and defer them to post-layout
+/// evaluation instead of aliasing them at apply time.
+pub const LINKER_DEFINED_NAMES: &[&str] = &[
+    "_GLOBAL_OFFSET_TABLE_",
+    "_DYNAMIC",
+    "__bss_start",
+    "__bss_end__",
+    "_edata",
+    "edata",
+    "_end",
+    "__end",
+    "end",
+    "_etext",
+    "etext",
+    "__ehdr_start",
+    "__executable_start",
+    "__dso_handle",
+    "__data_start",
+    "data_start",
+    "__init_array_start",
+    "__init_array_end",
+    "__fini_array_start",
+    "__fini_array_end",
+    "__preinit_array_start",
+    "__preinit_array_end",
+    "__rela_iplt_start",
+    "__rela_iplt_end",
+];
+
+/// True if `name` is a layout-derived symbol the linker itself defines.
+pub fn is_linker_defined(name: &str) -> bool {
+    LINKER_DEFINED_NAMES.contains(&name)
+}
+
 /// What a `--defsym` right-hand side turned out to be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Defsym {
@@ -65,6 +105,39 @@ impl DefsymError {
                 "--defsym expression '{expr}' needs final symbol addresses, which this \
                  link path does not have; use a constant or a symbol alias"
             ),
+        }
+    }
+
+    /// The text GNU ld 2.47 prints for this failure, including its `--defsym:N`
+    /// counter:
+    ///
+    /// ```text
+    /// --defsym:N: undefined symbol 'X' referenced in expression
+    /// --defsym:N / by zero
+    /// --defsym:0: syntax error
+    /// ```
+    ///
+    /// `N` is the 1-based position of the failing `--defsym` in the link's
+    /// defsym list. The counter is a GNU quirk worth reproducing exactly:
+    /// syntax errors always report 0 (the counter counts accepted symbols,
+    /// and a syntax error accepts none), while undefined-symbol and
+    /// division-by-zero failures report the defsym's own index.
+    ///
+    /// [`NeedsLayout`] is a link-path capability message with no GNU
+    /// counterpart; it keeps the descriptive form.
+    pub fn gnu_message(&self, index: usize) -> String {
+        match self {
+            DefsymError::Syntax(_) => "--defsym:0: syntax error".to_string(),
+            DefsymError::DivByZero => format!("--defsym:{index} / by zero"),
+            DefsymError::UndefinedSymbol(name) => {
+                format!("--defsym:{index}: undefined symbol '{name}' referenced in expression")
+            }
+            DefsymError::NeedsLayout(expr) => {
+                format!(
+                    "--defsym:{index}: expression '{expr}' needs final symbol addresses, \
+                         which this link path does not have; use a constant or a symbol alias"
+                )
+            }
         }
     }
 }

@@ -260,12 +260,10 @@ pub fn link_builtin(
         )?;
     }
 
-    // Apply --defsym definitions: alias one symbol to another
-    for (alias, target) in &defsym_defs {
-        if let Some(target_sym) = globals.get(target).cloned() {
-            globals.insert(alias.clone(), target_sym);
-        }
-    }
+    // Apply --defsym definitions: aliases are resolved here; constants and
+    // expressions are evaluated after layout in the emitter (same design as
+    // the x86-64 linker — classification lives in linker_common::defsym).
+    let pending_defsyms = apply_defsyms(&mut globals, &defsym_defs)?;
 
     // Garbage-collect unreferenced sections when --gc-sections is active.
     // This removes sections not reachable from entry points, which may also
@@ -359,6 +357,7 @@ pub fn link_builtin(
             &needed_sonames,
             output_path,
             export_dynamic,
+            &pending_defsyms,
         )
     } else {
         // Fall back to static emit
@@ -368,6 +367,7 @@ pub fn link_builtin(
             &mut output_sections,
             &section_map,
             output_path,
+            &pending_defsyms,
         )
     }
 }
@@ -391,6 +391,7 @@ pub fn link_shared(
     let mut libs_to_load: Vec<String> = Vec::new();
     let mut extra_object_files: Vec<String> = Vec::new();
     let mut soname: Option<String> = None;
+    let mut defsym_defs: Vec<(String, String)> = Vec::new();
     let mut i = 0;
     let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
     while i < args.len() {
@@ -419,6 +420,22 @@ pub fn link_shared(
                     soname = Some(sn.to_string());
                 } else if part == "-soname" && j + 1 < parts.len() {
                     soname = Some(parts[j + 1].to_string());
+                } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
+                    if let Some(eq_pos) = defsym_arg.find('=') {
+                        defsym_defs.push((
+                            defsym_arg[..eq_pos].to_string(),
+                            defsym_arg[eq_pos + 1..].to_string(),
+                        ));
+                    }
+                } else if part == "--defsym" && j + 1 < parts.len() {
+                    // Two-argument form: --defsym SYM=VAL
+                    let defsym_arg = parts[j + 1];
+                    if let Some(eq_pos) = defsym_arg.find('=') {
+                        defsym_defs.push((
+                            defsym_arg[..eq_pos].to_string(),
+                            defsym_arg[eq_pos + 1..].to_string(),
+                        ));
+                    }
                 } else if let Some(lpath) = part.strip_prefix("-L") {
                     extra_lib_paths.push(lpath.to_string());
                 } else if let Some(lib) = part.strip_prefix("-l") {
@@ -500,6 +517,10 @@ pub fn link_shared(
     // fail to resolve PLT symbols at runtime.
     resolve_dynamic_symbols_for_shared(&objects, &globals, &mut needed_sonames, &all_lib_paths);
 
+    // --defsym: aliases resolve here; expressions evaluate in the emitter
+    // after layout (same design as the x86-64 linker).
+    let pending_defsyms = apply_defsyms(&mut globals, &defsym_defs)?;
+
     // Emit shared library
     emit_shared_library(
         &objects,
@@ -509,7 +530,118 @@ pub fn link_shared(
         &needed_sonames,
         output_path,
         soname,
+        &pending_defsyms,
     )
+}
+
+/// Apply `--defsym` definitions (GNU `ld --defsym` semantics).
+///
+/// Mirrors the x86-64 linker's `apply_defsyms`: an expression that
+/// references only symbols already defined in the link is evaluated
+/// immediately; any other expression is recorded in `pending` and must be
+/// evaluated by the emitter after layout, via `evaluate_pending_defsyms`.
+/// (This matters for symbols defined by link-time mechanisms — e.g.
+/// `_etext`, which is computed from the final section layout.)
+fn apply_defsyms(
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    defs: &[(String, String)],
+) -> Result<Vec<(String, String, usize)>, String> {
+    use crate::backend::linker_common::defsym::{self, Defsym, DefsymError};
+    let mut pending: Vec<(String, String, usize)> = Vec::new();
+    for (pos, (name, expr)) in defs.iter().enumerate() {
+        let index = pos + 1;
+        // "Defined" means the same thing it means to the undefined-symbol
+        // check: the symbol belongs to some object, or is one this linker
+        // created (defined_in == Some(usize::MAX)). Layout-derived magic
+        // symbols (`_etext`, `end`, …) count as defined even though they
+        // only exist after layout — GNU ld resolves them during expression
+        // evaluation, and so do we (see `defsym::is_linker_defined`).
+        let classified = defsym::classify(expr, |n| {
+            globals.get(n).is_some_and(|g| g.defined_in.is_some()) || defsym::is_linker_defined(n)
+        })
+        .map_err(|e| e.gnu_message(index))?;
+        let value = match classified {
+            // Alias: copy the target's whole definition, exactly as the old
+            // alias-only loop did. A target only the linker defines (a magic
+            // symbol) has no address until layout, so it is deferred to
+            // evaluation like an expression.
+            Defsym::Alias(target) => {
+                match globals.get(&target) {
+                    Some(sym) if sym.defined_in.is_some() => {
+                        if sym.is_dynamic {
+                            // GNU ld: a symbol visible only through a shared
+                            // library is not "defined in this link", so
+                            // aliasing it is an undefined-symbol error.
+                            return Err(DefsymError::UndefinedSymbol(target).gnu_message(index));
+                        }
+                        globals.insert(name.clone(), sym.clone());
+                        continue;
+                    }
+                    _ => {
+                        // Linker language symbol (`_etext`, `end`, …): the
+                        // arm's 0 becomes the usual placeholder (defined,
+                        // ABS) below, so the undefined-symbol check and the
+                        // PLT/GOT need scan see it;
+                        // `evaluate_pending_defsyms` overwrites the value
+                        // after layout.
+                        pending.push((name.clone(), target, index));
+                        0
+                    }
+                }
+            }
+            Defsym::Constant(v) => v,
+            Defsym::Expression(e) => {
+                pending.push((name.clone(), e, index));
+                0
+            }
+        };
+        globals.insert(
+            name.clone(),
+            GlobalSymbol {
+                value,
+                size: 0,
+                info: (STB_GLOBAL << 4) | STT_NOTYPE,
+                defined_in: Some(usize::MAX),
+                section_idx: SHN_ABS,
+                from_lib: None,
+                plt_idx: None,
+                got_idx: None,
+                is_dynamic: false,
+                copy_reloc: false,
+                lib_sym_value: 0,
+            },
+        );
+    }
+    Ok(pending)
+}
+
+/// Evaluate defsym expressions that were deferred until after layout.
+///
+/// Call from the emitter, after section addresses and standard symbols
+/// (`_etext`, `end`, …) are known, before any section content is emitted.
+/// GNU `ld` evaluates expressions the same way — after layout — so
+/// `--defsym k=_etext` and any arithmetic over defined symbols produce
+/// GNU-identical values.
+pub(super) fn evaluate_pending_defsyms(
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    pending: &[(String, String, usize)],
+) -> Result<(), String> {
+    use crate::backend::linker_common::defsym;
+    for (name, expr, index) in pending {
+        let value = defsym::eval_with_symbols(expr, &|n| {
+            globals
+                .get(n)
+                .and_then(|g| g.defined_in.is_some().then_some(g.value))
+        })
+        .map_err(|err| err.gnu_message(*index))?;
+        let entry = globals
+            .get_mut(name)
+            .ok_or_else(|| format!("--defsym {name}: symbol vanished before evaluation"))?;
+        entry.value = value;
+        entry.defined_in = Some(usize::MAX);
+        entry.section_idx = SHN_ABS;
+    }
+    Ok(())
 }
 
 /// Discover NEEDED shared library dependencies for a shared library build.

@@ -129,6 +129,7 @@ pub(super) fn emit_shared_library_32(
     needed_sonames: &[String],
     output_path: &str,
     soname: Option<String>,
+    pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let base_addr: u32 = 0;
 
@@ -397,6 +398,21 @@ pub(super) fn emit_shared_library_32(
             }
         }
     }
+
+    // GOT entries for section-defined local symbols hold this image's own
+    // vaddrs and need R_386_RELATIVE (counted here because the layout must
+    // size .rel.dyn before the relocations are applied).  Absolute symbols
+    // (--defsym constants) are excluded: their slots hold the value itself,
+    // which must NOT receive the load bias.
+    let mut num_local_got_relative = 0usize;
+    for name in &got_names {
+        if let Some(gs) = global_symbols.get(name) {
+            if gs.is_defined && !gs.is_dynamic && gs.output_section < output_sections.len() {
+                num_local_got_relative += 1;
+            }
+        }
+    }
+    num_relative += num_local_got_relative;
 
     let num_rel_dyn = num_relative + num_glob_dat;
     let num_rel_plt = num_plt;
@@ -749,6 +765,61 @@ pub(super) fn emit_shared_library_32(
         }
     }
 
+    // Seed all standard linker symbols (`end`, `edata`, `_etext`, …) so a
+    // `--defsym` expression can name one even when nothing else did (same
+    // rationale as the executable emitter), then evaluate any deferred
+    // `--defsym` expressions against the final layout addresses.
+    let bss_addr = if let Some(&idx) = section_name_to_idx.get(".bss") {
+        output_sections[idx].addr
+    } else {
+        data_seg_vaddr_end
+    };
+    let linker_addrs = LinkerSymbolAddresses {
+        base_addr: 0,
+        got_addr: got_base as u64,
+        dynamic_addr: dynamic_vaddr as u64,
+        bss_addr: bss_addr as u64,
+        bss_size: (data_seg_vaddr_end - bss_addr) as u64,
+        text_end: text_seg_vaddr_end as u64,
+        data_start: data_seg_vaddr_start as u64,
+        init_array_start: init_array_vaddr as u64,
+        init_array_size: init_array_size as u64,
+        fini_array_start: fini_array_vaddr as u64,
+        fini_array_size: fini_array_size as u64,
+        preinit_array_start: 0,
+        preinit_array_size: 0,
+        rela_iplt_start: 0,
+        rela_iplt_size: 0,
+    };
+    for sym in &get_standard_linker_symbols(&linker_addrs) {
+        if sym.name.starts_with("__rela_iplt") {
+            continue;
+        }
+        global_symbols
+            .entry(sym.name.to_string())
+            .or_insert(LinkerSymbol {
+                address: sym.value as u32,
+                size: 0,
+                sym_type: STT_NOTYPE,
+                binding: STB_GLOBAL,
+                visibility: STV_DEFAULT,
+                is_defined: true,
+                needs_plt: false,
+                needs_got: false,
+                output_section: usize::MAX,
+                section_offset: 0,
+                plt_index: 0,
+                got_index: 0,
+                is_dynamic: false,
+                dynlib: String::new(),
+                needs_copy: false,
+                copy_addr: 0,
+                version: None,
+                uses_textrel: false,
+            });
+    }
+    super::link::evaluate_pending_defsyms(global_symbols, pending_defsyms)?;
+
     // ── Apply relocations ─────────────────────────────────────────────────
     // For shared libraries, we need to handle relocations differently:
     // R_386_32 -> write resolved value, emit R_386_RELATIVE
@@ -941,6 +1012,24 @@ pub(super) fn emit_shared_library_32(
         }
     }
 
+    // GOT entries for section-defined local symbols hold this image's own
+    // vaddrs.  The dynamic linker must add the load bias before the slot is
+    // usable, so each such slot needs an R_386_RELATIVE (the x86-64 emitter
+    // does the same for PIE self-references).  Without it, a PIC data load
+    // inside the .so dereferences the raw vaddr and segfaults (measured:
+    // a lccc-built .so's own `movl var@GOT(%ebx),%r; movl (%r),%r` read).
+    // Absolute symbols are excluded: their slots hold the value itself,
+    // which must NOT receive the load bias.
+    for name in &got_names {
+        if let Some(gs) = global_symbols.get(name) {
+            if gs.is_defined && !gs.is_dynamic && gs.output_section < output_sections.len() {
+                let got_entry_addr =
+                    got_vaddr + (got_reserved as u32 + (gs.got_index - num_plt) as u32) * 4;
+                relative_relocs.push(got_entry_addr);
+            }
+        }
+    }
+
     // ── Build PLT ────────────────────────────────────────────────────────
     let plt_data = build_plt(
         num_plt,
@@ -1048,13 +1137,21 @@ pub(super) fn emit_shared_library_32(
         if let Some(gs) = global_symbols.get(name) {
             if gs.is_defined {
                 dynsym_entries[i + 1].value = gs.address;
-                // Determine section index for dynsym
-                if gs.output_section < output_sections.len() {
-                    // Find the section number. For simplicity, mark as SHN_ABS=0xfff1
-                    // Real implementations map to proper section indices but
-                    // dynamic symbols usually don't need exact shndx
+                if gs.output_section >= output_sections.len() {
+                    // Absolute symbol (e.g. a --defsym constant or a
+                    // standard linker symbol): the dynamic linker uses the
+                    // value as-is, so it must be marked SHN_ABS.
                     dynsym_entries[i + 1].shndx = SHN_ABS;
                 }
+                // Section-defined symbols keep the placeholder shndx=1: it
+                // marks the symbol as defined (non-UNDEF), which is all the
+                // dynamic linker checks — it computes load-bias + value and
+                // never consults the actual section index (same convention
+                // as the x86-64 shared emitter).  Marking these SHN_ABS
+                // breaks position-independent resolution: the loader takes
+                // the raw value as an absolute address (measured: a call
+                // through such an entry jumped to a raw value and
+                // segfaulted).
             }
         }
     }
