@@ -897,6 +897,114 @@ pub(super) fn fold_general_relay(store: &mut LineStore, infos: &mut [LineInfo]) 
     changed
 }
 
+/// Fold any-family extension relays: a widening/narrowing extension whose
+/// result is immediately copied to another register, with the extension's
+/// destination dead after the copy, writes the copy's destination directly.
+///
+/// ```text
+///   movslq %eS, %rT        movslq %eS, %rD
+///   movq   %rT, %rD   →    <nop>
+/// ```
+///
+/// The `fold_extend_relay`/`fold_general_relay` passes above handle the
+/// rax-destination special cases; this pass is the general form observed in
+/// RA output (`movslq %ebp, %r15; movq %r15, %rbp` — the sign-extend of a
+/// loop-carried value staged through a scratch, the csv_field_sum shape).
+///
+/// Soundness:
+/// * the extension must not read `%rT` (it reads `%eS`; `S == T` is fine —
+///   the extension reads the low half before writing the whole family, and
+///   retargeting keeps the read intact);
+/// * `%rT` must be dead after the copy (`is_reg_dead_after`, fail-closed) —
+///   otherwise the extension's value is still observed in `%rT`;
+/// * the copy must be a PLAIN full-width register copy (exact text match),
+///   never a flags-producing or memory form;
+/// * `D` may equal `S` (fold `movslq %ebp, %r15; movq %r15, %rbp` to
+///   `movslq %ebp, %rbp`) and may be any valid GP family.
+///
+/// Covers `movslq` (I32→I64 sext). The sub-32 extends already have their
+/// rax-form handled by `fold_extend_relay`; the 32-bit copy form
+/// (`movl %eS, %eT; movq %rT, %rD`) is plain copy coalescing, not an
+/// extension fold.
+pub(super) fn fold_movslq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Step 1: `movslq %eS, %rT` — classify as Other (movslq is not a
+        // StoreRbp/LoadRbp form) and parse the two register operands.
+        let line_i = infos[i].trimmed(store.get(i));
+        let Some(rest) = line_i.strip_prefix("movslq %") else {
+            i += 1;
+            continue;
+        };
+        let Some((src32, dst64)) = rest.split_once(", %") else {
+            i += 1;
+            continue;
+        };
+        let src_fam = register_family_fast(&format!("%{}", src32));
+        let tmp_fam = register_family_fast(&format!("%{}", dst64));
+        if src_fam == REG_NONE
+            || src_fam > REG_GP_MAX
+            || tmp_fam == REG_NONE
+            || tmp_fam > REG_GP_MAX
+        {
+            i += 1;
+            continue;
+        }
+
+        // Step 2: the next non-NOP line must be exactly `movq %rT, %rD`
+        // with D a valid GP family distinct from T.
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+        let line_j = infos[j].trimmed(store.get(j));
+        let Some(relay_rest) = line_j.strip_prefix("movq %") else {
+            i += 1;
+            continue;
+        };
+        let Some((relay_src, relay_dst)) = relay_rest.split_once(", %") else {
+            i += 1;
+            continue;
+        };
+        if relay_src != dst64 || relay_dst.contains('(') {
+            i += 1;
+            continue;
+        }
+        let dest_fam = register_family_fast(&format!("%{}", relay_dst));
+        if dest_fam == REG_NONE || dest_fam > REG_GP_MAX || dest_fam == tmp_fam {
+            i += 1;
+            continue;
+        }
+
+        // Step 3: the extension's destination must be dead after the copy —
+        // no later reader observes the value in %rT (fail-closed scan).
+        if !is_reg_dead_after(store, infos, j + 1, len, tmp_fam) {
+            i += 1;
+            continue;
+        }
+
+        // Step 4: retarget the extension and delete the relay copy.
+        let new_inst = format!("    movslq %{}, %{}", src32, relay_dst);
+        replace_line(store, &mut infos[i], i, new_inst);
+        mark_nop(&mut infos[j]);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
 /// Fold store relay: `movq %reg, %rax; movq %rax, N(%rsp)` → `movq %reg, N(%rsp)`.
 /// Eliminates the intermediate %rax relay for register-to-stack stores.
 pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {

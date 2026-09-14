@@ -1279,6 +1279,9 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         if !sk("ext_relay") {
             global_changed |= memory_fold::fold_extend_relay(&mut store, &mut infos);
         }
+        if !sk("slq_relay") {
+            global_changed |= memory_fold::fold_movslq_relay(&mut store, &mut infos);
+        }
         if !sk("gen_relay") {
             global_changed |= memory_fold::fold_general_relay(&mut store, &mut infos);
         }
