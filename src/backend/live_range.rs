@@ -536,6 +536,7 @@ pub(crate) fn mark_loop_spanning(
     func: &IrFunction,
     meta_uses: &FxHashMap<u32, Vec<u32>>,
     web_inloop_use: bool,
+    phi_backedges: &[(u32, u32)],
 ) {
     // Nothing below is reachable without a loop, and the two IR walks that
     // follow are O(instructions): bail out before paying for them. (`folded_at`,
@@ -916,6 +917,39 @@ pub(crate) fn mark_loop_spanning(
                 }
                 if let Some(ops) = def_uses.get(&m) {
                     if ops.iter().any(|o| members.contains(o)) {
+                        recurrence = true;
+                        break;
+                    }
+                }
+            }
+            // Phi-coalesce backedge supply. The HOMELESS optimization
+            // (regalloc.rs: a backedge source whose only consumer is the
+            // latch copy is removed from `eligible` BEFORE
+            // `build_coalesce_groups`) excludes exactly the increment
+            // values from the coalesce webs, so the member walk above is
+            // blind to the most common recurrence shape in post-phi-IR:
+            //
+            //     v_next = GEP/BinOp(v_cur, k)   <- consumes the web
+            //     Copy  v_cur = v_next           <- the latch copy
+            //
+            // The web then reports `recur=false`, loses every
+            // recurrence protection (worth_capping, the span-pressure
+            // valve's victim guard, the span-steal victim guard) and is
+            // demoted at the no-victim site while loop-invariant spans
+            // keep registers — linux_rbtree's outer-loop cursors
+            // (v1003/v1006/v1009: &root, &node_pool[i], the search key)
+            // all measured `recur=false` with 5 in-loop uses each.
+            // Feed the candidate (dest, src) edges directly: when the
+            // source's def consumes a member of this web, the web IS a
+            // recurrence, whether or not the source was coalesced into
+            // it.
+            if !recurrence {
+                for &(dest, src) in phi_backedges {
+                    if members.contains(&dest)
+                        && def_uses
+                            .get(&src)
+                            .is_some_and(|ops| ops.iter().any(|o| members.contains(o)))
+                    {
                         recurrence = true;
                         break;
                     }
@@ -2111,7 +2145,30 @@ impl LinearScanAllocator {
         } else {
             self.select_evict_victim(&range, mode)
         };
-        if let Some(evict_idx) = victim {
+        // Recurrence floor (RA-RECURRENCE-FLOOR): the incoming is a loop
+        // recurrence with in-loop reads and ordinary eviction found no
+        // victim (the mode-3 next-use gate vetoes every active for a
+        // function-spanning incoming). Before slotting the loop's carried
+        // state, try the cost-ranked floor: the cheapest non-recurrence
+        // active is a strictly better victim than a hot chain's slot
+        // round-trip. Fail-closed (no victim -> slot) keeps today's
+        // behavior whenever every active is itself a recurrence, hinted,
+        // or steal-unsafe.
+        let floor_victim = if victim.is_none() {
+            let idx = self.find_recurrence_floor_victim(&range);
+            if idx.is_some() && self.ra_config.trace_alloc {
+                eprintln!(
+                    "[SPILL-TRACE] recurrence-floor steal for v{} @{} remcost={} site=6",
+                    range.value_id,
+                    range.start,
+                    range.remaining_cost(range.start),
+                );
+            }
+            idx
+        } else {
+            None
+        };
+        if let Some(evict_idx) = victim.or(floor_victim) {
             if self.try_evict(evict_idx, range) {
                 return;
             }
@@ -2187,6 +2244,96 @@ impl LinearScanAllocator {
             if fut < best_future || (fut == best_future && nxt > best_next_use) {
                 best_idx = Some(idx);
                 best_future = fut;
+                best_next_use = nxt;
+            }
+        }
+        best_idx
+    }
+
+    /// Recurrence floor victim: the cheapest non-recurrence, steal-safe,
+    /// non-hinted active range, for an incoming loop RECURRENCE that
+    /// ordinary eviction refused to serve.
+    ///
+    /// This is the second pass at the no-victim demotion site. The mode-3
+    /// next-use gate compares the victim's next use against the INCOMING's
+    /// death point; for a function-spanning recurrence every active's next
+    /// use lies inside its life, so the gate vetoes every steal and the
+    /// incoming — the loop's carried state, with reads ON the dependence
+    /// chain — is slotted while loop-invariant and cold spans keep their
+    /// registers. That inversion is the single most expensive shape this
+    /// allocator produces (linux_rbtree's outer-loop cursors: 4 slot
+    /// round-trips per iteration where GCC keeps 4 registers; the sha256
+    /// `a..h` lesson and the lz4 `ip` 3.3x are the same inversion at
+    /// different sites).
+    ///
+    /// The floor's victim policy is deliberately NARROWER than ordinary
+    /// eviction: recurrence-carried victims are never touched (their
+    /// reload sits on their own loop's carried chain — one hot chain is
+    /// never a fair price for another), ABI-hinted values are codegen
+    /// contracts, and the search is cost-ranked by the SAME
+    /// position-relative `spill_cost_at(pos)` the mode-6 rank uses, so the
+    /// victim chosen is the one whose reload traffic is cheapest at the
+    /// point of the steal. There is no churn risk: the incoming never held
+    /// a register (this path only runs when it would otherwise be slotted),
+    /// and the victim is demoted permanently — linear scan is single-pass.
+    ///
+    /// Gate: the incoming must be a MARKED span recurrence with in-loop
+    /// uses; `no_recurrence_floor` (`CCC_RA_NO_RECURRENCE_FLOOR`) is the
+    /// diagnostic kill switch.
+    fn find_recurrence_floor_victim(&self, incoming: &LiveRange) -> Option<usize> {
+        if self.active.is_empty() || self.ra_config.no_recurrence_floor {
+            return None;
+        }
+        if !(incoming.spans_loop
+            && incoming.span_marked
+            && incoming.span_recurrence
+            && incoming.span_has_in_loop_use)
+        {
+            return None;
+        }
+        let pos = incoming.start;
+        let incoming_cost = incoming.spill_cost_at(pos);
+        if incoming_cost == 0 {
+            return None;
+        }
+        let mut best_idx: Option<usize> = None;
+        let mut best_cost = u64::MAX;
+        let mut best_next_use = 0u32;
+        for (idx, interval) in self.active.iter().enumerate() {
+            // Never trade one hot chain for another.
+            if interval.range.span_marked && interval.range.span_recurrence {
+                continue;
+            }
+            // ABI-hinted values are a codegen contract (see
+            // select_evict_victim's hint guard for the corruption this
+            // prevents).
+            if interval.range.reg_hint.is_some() {
+                continue;
+            }
+            if !self.register_steal_is_safe(interval.range.value_id, incoming) {
+                continue;
+            }
+            // Same cascade bound the span-steal path uses: a span that won
+            // its register by eviction may only lose it to an incoming of
+            // equal-or-higher generation, so floor steals cannot ping-pong
+            // through the pool.
+            if interval.range.cascade > incoming.cascade {
+                continue;
+            }
+            let cost = interval.range.spill_cost_at(pos);
+            if cost == 0 {
+                // A zero-remaining-cost victim expires on its own; taking
+                // it would mask a real pressure signal for nothing. The
+                // ordinary scan reuses the register at expiry.
+                continue;
+            }
+            if cost >= incoming_cost {
+                continue;
+            }
+            let nxt = next_use_after(&interval.range, pos);
+            if cost < best_cost || (cost == best_cost && nxt > best_next_use) {
+                best_idx = Some(idx);
+                best_cost = cost;
                 best_next_use = nxt;
             }
         }
@@ -3006,6 +3153,7 @@ mod tests {
             &empty_fn(),
             &FxHashMap::default(),
             true,
+            &[],
         );
         let web = ranges.iter().find(|r| r.value_id == 1).unwrap();
         assert!(web.spans_loop);
@@ -3025,6 +3173,7 @@ mod tests {
             &empty_fn(),
             &FxHashMap::default(),
             true,
+            &[],
         );
         assert_eq!(ranges[0].span_reserve, 1);
     }
@@ -3044,6 +3193,7 @@ mod tests {
             &empty_fn(),
             &FxHashMap::default(),
             true,
+            &[],
         );
         let flag =
             |rs: &[LiveRange], id: u32| rs.iter().find(|r| r.value_id == id).unwrap().spans_loop;
@@ -3061,6 +3211,7 @@ mod tests {
             &empty_fn(),
             &FxHashMap::default(),
             true,
+            &[],
         );
         assert!(!x[0].spans_loop);
     }
@@ -3349,6 +3500,7 @@ mod tests {
             &f,
             &collect_range_metadata(&f, &[]).uses,
             true,
+            &[],
         );
         let acc = ranges.iter().find(|r| r.value_id == 1).unwrap();
         let independent = ranges.iter().find(|r| r.value_id == 3).unwrap();
@@ -3423,6 +3575,7 @@ mod tests {
             &f,
             &collect_range_metadata(&f, &[]).uses,
             true,
+            &[],
         );
         let r = on.iter().find(|r| r.value_id == 1).unwrap();
         assert!(r.span_marked, "the leader's envelope covers the extent");
@@ -3443,6 +3596,7 @@ mod tests {
             &f,
             &collect_range_metadata(&f, &[]).uses,
             false,
+            &[],
         );
         let r = off.iter().find(|r| r.value_id == 1).unwrap();
         assert!(r.span_marked, "marking is independent of the supply");
@@ -3467,6 +3621,150 @@ mod tests {
     /// Here v2 is read at point 0 (the phi back edge, out of extent) and at
     /// point 2 (the terminator, in extent); the extent is [1, 2], so the
     /// terminator read is the only thing that can set the flag.
+    /// RA-RECURRENCE-SIGHT: a HOMELESS backedge source (removed from the
+    /// coalesce webs before the member map is built) hides the recurrence
+    /// edge from the member walk. The (dest, src) pairs must be fed
+    /// directly: when the source's def consumes a member of the web, the
+    /// web IS a recurrence.
+    #[test]
+    fn mark_loop_spanning_phi_backedge_supplies_recurrence() {
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{BlockId, Instruction, Operand, Value};
+        let mut f = empty_fn();
+        f.blocks[0].instructions = vec![
+            // point 0: the increment. v2 = v1 + 8 reads the web member v1,
+            // but v2 is NOT a coalesce member (the HOMELESS exclusion), so
+            // the member walk cannot see this edge.
+            Instruction::GetElementPtr {
+                dest: Value(2),
+                base: Value(1),
+                offset: Operand::Const(crate::ir::constants::IrConst::I64(8)),
+                ty: IrType::I8,
+            },
+            // point 1: the latch copy the phi-coalesce machinery emitted.
+            Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Value(Value(2)),
+            },
+        ];
+        f.blocks[0].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(1)),
+            true_label: BlockId(0),
+            false_label: BlockId(1),
+        };
+        // No coalesce members: the HOMELESS shape.
+        let no_members: FxHashMap<u32, u32> = FxHashMap::default();
+        let build = || vec![lr(1, 0, 900, vec![100, 200, 900], 60)];
+
+        // Without the backedge supply the web is NOT a recurrence: no
+        // member's def consumes a member (v1's def is the Copy, whose
+        // operand v2 is not a member).
+        let mut off = build();
+        mark_loop_spanning(
+            &mut off,
+            &[(50, 250)],
+            &no_members,
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            true,
+            &[],
+        );
+        let r = off.iter().find(|r| r.value_id == 1).unwrap();
+        assert!(r.span_marked);
+        assert!(
+            !r.span_recurrence,
+            "no member edge: the Copy reads v2, not v1"
+        );
+
+        // With the (dest=v1, src=v2) backedge pair the recurrence is
+        // visible: v2's def (the GEP) consumes the member v1.
+        let mut on = build();
+        mark_loop_spanning(
+            &mut on,
+            &[(50, 250)],
+            &no_members,
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            true,
+            &[(1u32, 2u32)],
+        );
+        let r = on.iter().find(|r| r.value_id == 1).unwrap();
+        assert!(r.span_marked);
+        assert!(
+            r.span_recurrence,
+            "the backedge source v2 = v1 + 8 consumes the web member v1"
+        );
+    }
+
+    /// RA-RECURRENCE-FLOOR: a marked recurrence with in-loop uses that
+    /// ordinary eviction cannot serve (the mode-3 next-use gate vetoes every
+    /// active for a spanning incoming) steals the cheapest non-recurrence
+    /// active instead of taking a slot. The floor must refuse to trade one
+    /// recurrence for another.
+    #[test]
+    fn recurrence_floor_steals_cheapest_non_recurrence_active() {
+        // The cold span holds the only register; its next use lies inside
+        // the incoming's life, so mode 3 vetoes the ordinary steal.
+        let mut cold = spanned(1, 0, 900, vec![100, 900], 300);
+        cold.span_marked = true;
+        cold.span_recurrence = false;
+        // In-loop use keeps the cold span out of the admission demotion
+        // sites (it must genuinely HOLD the register when the recurrence
+        // arrives, or the test would pass vacuously via site 0).
+        cold.span_has_in_loop_use = true;
+        // The hot recurrence: marked, in-loop uses, higher remaining cost.
+        let mut hot = spanned(2, 50, 850, vec![100, 300, 500, 850], 500);
+        hot.span_marked = true;
+        hot.span_recurrence = true;
+        hot.span_has_in_loop_use = true;
+        let mut cfg = RaConfig::default();
+        cfg.loop_span_reserve = 1;
+        let mut alloc = LinearScanAllocator::new_with_config(
+            vec![cold, hot],
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(cfg),
+        );
+        alloc.run();
+        assert!(
+            alloc.assignments.contains_key(&2),
+            "the recurrence floor must home the marked recurrence"
+        );
+        assert!(
+            !alloc.assignments.contains_key(&1),
+            "the cold non-recurrence span is the floor's victim"
+        );
+        assert!(alloc.spill_slots.contains_key(&1));
+    }
+
+    /// The floor never trades one recurrence for another: with a recurrence
+    /// active and a recurrence incoming, both keep today's behavior (the
+    /// incoming takes the slot).
+    #[test]
+    fn recurrence_floor_never_steals_a_recurrence() {
+        let mut held = spanned(1, 0, 900, vec![100, 900], 300);
+        held.span_marked = true;
+        held.span_recurrence = true;
+        held.span_has_in_loop_use = true;
+        let mut incoming = spanned(2, 50, 850, vec![100, 300, 500, 850], 500);
+        incoming.span_marked = true;
+        incoming.span_recurrence = true;
+        incoming.span_has_in_loop_use = true;
+        let mut cfg = RaConfig::default();
+        cfg.loop_span_reserve = 1;
+        let mut alloc = LinearScanAllocator::new_with_config(
+            vec![held, incoming],
+            vec![PhysReg(1)],
+            &std::sync::Arc::new(cfg),
+        );
+        alloc.run();
+        assert!(alloc.assignments.contains_key(&1));
+        assert!(
+            !alloc.assignments.contains_key(&2),
+            "one hot chain is never a fair price for another"
+        );
+        assert!(alloc.spill_slots.contains_key(&2));
+    }
+
     #[test]
     fn mark_loop_spanning_member_terminator_use_supplies_the_flag() {
         use crate::common::types::IrType;
@@ -3507,6 +3805,7 @@ mod tests {
             &f,
             &collect_range_metadata(&f, &[]).uses,
             true,
+            &[],
         );
         let r = on.iter().find(|r| r.value_id == 1).unwrap();
         assert!(r.span_marked, "the leader's envelope covers the extent");
@@ -3528,6 +3827,7 @@ mod tests {
             &f,
             &collect_range_metadata(&f, &[]).uses,
             false,
+            &[],
         );
         let r = off.iter().find(|r| r.value_id == 1).unwrap();
         assert!(
@@ -3600,6 +3900,7 @@ mod tests {
             &f,
             &collect_range_metadata(&f, &[]).uses,
             true,
+            &[],
         );
         let r = &ranges[0];
         assert!(r.span_marked);
