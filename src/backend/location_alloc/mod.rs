@@ -113,14 +113,17 @@
 //!   peak exceeds the register budget by more than the band cannot be made
 //!   colorable by a handful of edits, and editing them can reshuffle the
 //!   colorer's choices in blocks it would have handled optimally. The band
-//!   proxies the production allocator's residual register capacity: 6 on
-//!   x86-64 (the six buyable callee-saved GPRs), **2 on i686** (under PIC
-//!   %ebx is the GOT base and %rbp the frame pointer, leaving %esi/%edi —
-//!   band 6 caused a measured 1.053× loop_patterns runtime regression from
-//!   an induction counter spilled in exchange for a buffer base, band 2
-//!   removes it while keeping every static win), and **64 (unbanded) at
-//!   -O0** where the coloring tier is disabled so there is no plan to
-//!   perturb and remat relief is a direct stack-traffic reduction. This is
+//!   proxies the production allocator's residual register capacity: **10 on
+//!   AArch64** (x19–x28, RA-GLA-03), 6 on x86-64 (the six buyable
+//!   callee-saved GPRs; RISC-V LP64 deliberately keeps the same 6 — bands
+//!   9+ remat loop-invariant constants inside hot loops and lose to the
+//!   GCC oracle), **2 on i686** (under PIC %ebx is the GOT base and %rbp
+//!   the frame pointer, leaving %esi/%edi — band 6 caused a measured
+//!   1.053× loop_patterns runtime regression from an induction counter
+//!   spilled in exchange for a buffer base, band 2 removes it while
+//!   keeping every static win), and **64 (unbanded) at -O0** where the
+//!   coloring tier is disabled so there is no plan to perturb and remat
+//!   relief is a direct stack-traffic reduction. This is
 //!   the nbody discriminator on x86-64: its FP inner loop peaks at 38–45
 //!   GPR classes and every edit there only perturbed the global coloring;
 //!   adler32 peaks at 14–16 and one remat tips it.
@@ -1203,26 +1206,46 @@ mod tests {
 
     /// The Speed reach band is DERIVED from the named buyable callee-saved
     /// register sets, and the sets carry their ABI/PIC facts: six on
-    /// x86-64, two on i686 (PIC owns %ebx, the frame owns %ebp).
+    /// x86-64, two on i686 (PIC owns %ebx, the frame owns %ebp), ten on
+    /// AArch64 (x19-x28). RISC-V keeps six deliberately: its ABI offers
+    /// eleven s-registers, but the band-9+ frontier is hot-loop constant
+    /// remat that loses to the GCC oracle (RA-GLA-03 in engineering/
+    /// DECISIONS.md).
     #[test]
     fn reach_band_equals_buyable_callee_saved_count() {
         if std::env::var("CCC_GLA_REACH").is_ok() {
             return; // explicit A/B override replaces the derivation
         }
-        use crate::common::types::{set_target_ptr_size, target_ptr_size};
-        let saved = target_ptr_size();
+        use crate::backend::elf::{EM_386, EM_AARCH64, EM_RISCV, EM_X86_64};
+        use crate::common::types::{
+            set_target_elf_machine, set_target_ptr_size, target_elf_machine, target_ptr_size,
+        };
+        let saved_ptr = target_ptr_size();
+        let saved_machine = target_elf_machine();
         set_target_ptr_size(8);
+        set_target_elf_machine(EM_X86_64);
         assert_eq!(X86_64_BUYABLE_CALLEE_SAVED_GPRS.len(), 6);
         assert_eq!(buyable_callee_saved_gprs(), 6);
         assert_eq!(reach_band(Tier::Speed), 6);
+        set_target_elf_machine(EM_AARCH64);
+        assert_eq!(AARCH64_BUYABLE_CALLEE_SAVED_GPRS.len(), 10);
+        assert_eq!(buyable_callee_saved_gprs(), 10);
+        assert_eq!(reach_band(Tier::Speed), 10);
+        set_target_elf_machine(EM_RISCV);
+        // Deliberately below the 11 usable s-registers: see policy.rs.
+        assert_eq!(buyable_callee_saved_gprs(), 6);
+        assert_eq!(reach_band(Tier::Speed), 6);
         set_target_ptr_size(4);
+        set_target_elf_machine(EM_386);
         assert_eq!(I686_BUYABLE_CALLEE_SAVED_GPRS.len(), 2);
         assert_eq!(buyable_callee_saved_gprs(), 2);
         assert_eq!(reach_band(Tier::Speed), 2);
         // Tier branches that never depend on the target stay fixed.
+        set_target_ptr_size(8);
         assert_eq!(reach_band(Tier::Debug), 64);
         assert_eq!(reach_band(Tier::Size), 0);
-        set_target_ptr_size(saved);
+        set_target_ptr_size(saved_ptr);
+        set_target_elf_machine(saved_machine);
     }
 
     /// An exhausted fresh-value id space aborts the whole plan BEFORE the
