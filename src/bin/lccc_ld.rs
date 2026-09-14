@@ -369,7 +369,14 @@ fn run(args: &[String]) -> Result<(), String> {
             // The kernel's arch/x86/tools/relocs pass consumes them to build
             // the KASLR relocation table; ignoring the flag produced a kernel
             // that linked cleanly and then failed to boot.
-            "--emit-relocs" | "-q" => emit_relocs = true,
+            "--emit-relocs" | "-q" => {
+                // Recorded for the `-T` script path (which implements
+                // retention) AND forwarded so the built-in/shared paths warn
+                // honestly (their emitters cannot retain — swallowing the
+                // flag here used to drop it silently on exactly those paths).
+                emit_relocs = true;
+                passthrough.push("--emit-relocs".to_string());
+            }
             // Forwarded so `parse_linker_args` records them: --no-emit-relocs
             // resets, --threads/--no-threads are deterministic hints (lccc
             // links single-threaded; the value is recorded, not acted on).
@@ -536,6 +543,15 @@ fn run(args: &[String]) -> Result<(), String> {
             // every library as-needed and silently discarded a DT_NEEDED the
             // user asked for with --no-as-needed).
             "--as-needed" | "--no-as-needed" => passthrough.push(a.to_string()),
+            // COMMON sorting (implemented in the shared allocator): forward
+            // every spelling so the shared parser sees it.  Without this arm
+            // the flag died here with an "unknown option" warning.
+            a if a == "--sort-common"
+                || a.starts_with("--sort-common=")
+                || a == "--no-sort-common" =>
+            {
+                passthrough.push(a.to_string())
+            }
             "--eh-frame-hdr"
             | "--fix-cortex-a53-843419"
             | "--no-copy-dt-needed-entries"

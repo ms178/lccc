@@ -337,7 +337,8 @@ pub fn link_builtin(
     );
 
     // Allocate COMMON symbols (using shared implementation)
-    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);
+    // No --sort-common on this path yet: default (unsorted) order.
+    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, false);
 
     // Check if we have any dynamic symbols
     let has_dynamic_syms = globals.values().any(|g| g.is_dynamic);
@@ -509,7 +510,8 @@ pub fn link_shared(
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     linker_common::merge_sections_elf64(&objects, &mut output_sections, &mut section_map);
-    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);
+    // No --sort-common on this path yet: default (unsorted) order.
+    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, false);
 
     // Resolve undefined symbols against system shared libraries to discover
     // NEEDED dependencies. Without this, the shared library would be missing

@@ -13,8 +13,9 @@ use super::resolve_lib::resolve_lib;
 use super::symbols::GlobalSymbolOps;
 use super::types::Elf64Object;
 use crate::backend::elf::{
-    ELF_MAGIC, ET_DYN, LinkerScriptEntry, STT_FILE, STT_SECTION, is_thin_archive,
-    parse_archive_members, parse_linker_script_entries, parse_thin_archive_members, read_u16,
+    ELF_MAGIC, ET_DYN, LinkerScriptEntry, SHN_UNDEF, STB_WEAK, STT_FILE, STT_SECTION,
+    is_thin_archive, parse_archive_members, parse_linker_script_entries,
+    parse_thin_archive_members, read_u16,
 };
 
 /// Check if an archive member defines any currently-undefined, non-dynamic symbol.
@@ -34,7 +35,21 @@ fn member_resolves_undefined_generic<G: GlobalSymbolOps>(
         }
         if let Some(existing) = globals.get(sym.name.as_str()) {
             if !existing.is_defined() && !existing.is_dynamic() {
-                return true;
+                // Weak-only undefined references (STB_WEAK, SHN_UNDEF) never
+                // pull a member: they legitimately resolve to zero, and GNU
+                // ld agrees. Pulling for them drags in entire library
+                // facets unasked (libio alone: +37 KiB of .text on a static
+                // hello, via vtables.o's `w _IO_cookie_read`).
+                // NOTE: COMMON entries (is_defined() but SHN_COMMON) keep
+                // the old behavior for now. GNU ld *does* pull a member
+                // that defines a common strongly; lccc currently does not.
+                // That is under-extraction (a separate compat gap), tracked
+                // as follow-up work, not changed here.
+                let weak_only =
+                    existing.section_idx() == SHN_UNDEF && existing.info() >> 4 == STB_WEAK;
+                if !weak_only {
+                    return true;
+                }
             }
         }
     }
