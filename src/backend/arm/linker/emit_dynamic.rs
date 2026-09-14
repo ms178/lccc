@@ -25,6 +25,7 @@ pub(super) fn emit_dynamic_executable(
     needed_sonames: &[String],
     output_path: &str,
     export_dynamic: bool,
+    pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames {
@@ -512,6 +513,11 @@ pub(super) fn emit_dynamic_executable(
             entry.section_idx = SHN_ABS;
         }
     }
+
+    // Auto-generate __start_<section> / __stop_<section> symbols (GNU ld feature)
+    // --defsym: expressions deferred until now (after layout + standard
+    // symbols). See x86-64 emitter for the rationale.
+    super::link::evaluate_pending_defsyms(globals, pending_defsyms)?;
 
     // Auto-generate __start_<section> / __stop_<section> symbols (GNU ld feature)
     for (name, addr) in linker_common::resolve_start_stop_symbols(output_sections) {

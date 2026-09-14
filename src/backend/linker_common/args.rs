@@ -99,6 +99,65 @@ pub struct LinkerArgs {
     /// matters on x86-64; `both` is still requested by builds targeting
     /// pre-2.23 glibc, which has no `DT_GNU_HASH` support.
     pub hash_style: HashStyle,
+    /// `-z ibt`: indirect-branch tracking.  Sets the `GNU_PROPERTY_X86_
+    /// FEATURE_1_AND` IBT bit (1) in the merged property note, creating the
+    /// note when no input had one (GNU ld behaviour).
+    pub z_ibt: bool,
+    /// `-z shstk`: shadow-stack control (FEATURE_1_AND bit 2).
+    pub z_shstk: bool,
+    /// `-z lam-u48`: 48-bit linear-address masking (FEATURE_1_AND bits 4|8).
+    pub z_lam_u48: bool,
+    /// `-z lam-u57`: 57-bit linear-address masking (FEATURE_1_AND bit 8).
+    pub z_lam_u57: bool,
+    /// `-z x86-64-{baseline,v2,v3,v4}` ISA level (binutils
+    /// `ld/emulparams/x86-64-level.sh`): 0 = unset (the default — nothing is
+    /// injected), 1 = baseline, 2/3/4 = v2/v3/v4.  ORed into
+    /// `GNU_PROPERTY_X86_ISA_1_NEEDED` by the property-note merge (see
+    /// `linker_common::cet`), creating the property when no input had one.
+    pub z_isa_level: u32,
+    /// An unparseable `-z x86-64-*` keyword (e.g. `-z x86-64-v9`), kept so
+    /// the link path can fail with GNU's `invalid x86-64 ISA level` fatal
+    /// instead of silently ignoring the typo.
+    pub z_isa_level_invalid: Option<String>,
+    /// `-z ibt=func` & co: keyword forms GNU ld accepts and ignores with a
+    /// warning.  Collected here so the driver can print the warning once.
+    pub z_ignored_keywords: Vec<String>,
+    /// `--emit-relocs` / `-q`: keep the applied relocations in `.rela.*`
+    /// sections (the kernel's arch/x86/tools/relocs pass consumes them).
+    pub emit_relocs: bool,
+    /// `--threads=N`: recorded for interface compatibility; lccc links
+    /// single-threaded, so the value is accepted and not acted on.
+    #[allow(dead_code)]
+    pub threads: Option<u32>,
+    /// `--no-undefined-version`: recorded for interface compatibility (GNU
+    /// ld "Disallow undefined version").  lccc accepts the flag but does
+    /// not enforce it: version references are never checked against the
+    /// version definitions, so the link succeeds where GNU ld would fail
+    /// an unsatisfiable version reference.  Same accepted-but-recorded
+    /// status as `threads`; enforcement needs version-script checking the
+    /// linker does not have yet.
+    #[allow(dead_code)]
+    pub no_undefined_version: bool,
+}
+
+impl LinkerArgs {
+    /// The GNU property-note merge flags (`linker_common::cet`) for this
+    /// link: CET bits plus the `-z x86-64-*` ISA level.  Fails on an
+    /// unparseable ISA level with GNU's message body (`invalid x86-64 ISA
+    /// level: ...`, measured on ld 2.44); the driver renders it with its
+    /// standard `lccc-ld: error: ` prefix like every other link failure.
+    pub fn property_link_flags(&self) -> Result<super::cet::PropertyLinkFlags, String> {
+        if let Some(bad) = &self.z_isa_level_invalid {
+            return Err(format!("invalid x86-64 ISA level: {bad}"));
+        }
+        Ok(super::cet::PropertyLinkFlags {
+            ibt: self.z_ibt,
+            shstk: self.z_shstk,
+            lam_u48: self.z_lam_u48,
+            lam_u57: self.z_lam_u57,
+            isa_level: self.z_isa_level,
+        })
+    }
 }
 
 /// One input file or `-l` library, with the positional flag state that applied
@@ -175,6 +234,45 @@ pub fn parse_hash_style(v: &str) -> Option<HashStyle> {
 /// and the `-Wl,` sub-argument loop call this, so a flag spelled either way is
 /// handled by one definition instead of two that can drift.  Flags needing a
 /// value or carrying positional state are handled inline by the callers.
+/// Options whose spelling is a single token: relocation retention and
+/// thread hints.  Returns true when consumed.
+///
+/// Deliberately NOT here: `--isa-level=` / `-march=`.  GNU ld has no such
+/// options (it errors on them); the real ISA-level interface is
+/// `-z x86-64-{baseline,v2,v3,v4}`, parsed with the other `-z` keywords
+/// below.  Accepting lookalike spellings would bless a non-GNU interface.
+fn misc_option(result: &mut LinkerArgs, tok: &str) -> bool {
+    match tok {
+        "--emit-relocs" | "-q" => {
+            result.emit_relocs = true;
+        }
+        "--no-emit-relocs" => {
+            result.emit_relocs = false;
+        }
+        "--no-undefined-version" => {
+            result.no_undefined_version = true;
+        }
+        "--no-threads" => {
+            result.threads = None;
+        }
+        "--threads" => {
+            // The value arrives as the next argument on the plain path;
+            // the group path joins it first (`--threads,N`).  Recording is
+            // best-effort: lccc links single-threaded.
+            return true;
+        }
+        _ => {
+            if let Some(v) = tok.strip_prefix("--threads=") {
+                // Lenient like GNU: a bad value is ignored, not fatal.
+                result.threads = v.parse().ok();
+                return true;
+            }
+            return false;
+        }
+    }
+    true
+}
+
 fn apply_plain_flag(result: &mut LinkerArgs, tok: &str) -> bool {
     match tok {
         "-pie" | "--pie" | "--pic-executable" => result.is_pie = true,
@@ -190,9 +288,65 @@ fn apply_plain_flag(result: &mut LinkerArgs, tok: &str) -> bool {
 ///
 /// Handles `-L`, `-l`, `-Wl,` (with nested flags like `--defsym`, `--export-dynamic`,
 /// `-rpath`, `--gc-sections`), `-rdynamic`, `-static`, and bare file paths.
+/// Apply one `-z KEYWORD` to the parsed arguments.
+///
+/// Both the split form (`-Wl,-z,relro`) and the joined form
+/// (`-Wl,-zrelro`) funnel through this one function so the two GNU
+/// spellings cannot drift apart.  There must be exactly ONE such
+/// function: `-z defs` (the spelling CMake/Qt use for --no-undefined)
+/// was once handled in a second `-z` arm that the first arm's match had
+/// already made unreachable, silently disabling it for shared
+/// libraries until the so_z_defs_rejects_undefined differential test
+/// caught it.
+fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
+    match kw {
+        "now" => result.z_now = true,
+        "lazy" => result.z_now = false,
+        "relro" => result.z_relro = true,
+        "norelro" => result.z_relro = false,
+        "defs" => result.no_undefined = true,
+        "undefs" => result.no_undefined = false,
+        // CET property note bits (see linker_common::cet).
+        "ibt" => result.z_ibt = true,
+        "shstk" => result.z_shstk = true,
+        "lam-u48" => result.z_lam_u48 = true,
+        "lam-u57" => result.z_lam_u57 = true,
+        // x86-64 ISA level (binutils `ld/emulparams/x86-64-level.sh`):
+        // `-z x86-64-{baseline,v2,v3,v4}` marks the level as needed in
+        // the property note.  GNU's rule, measured on ld 2.44:
+        //   * baseline / v2 / v3 / v4 set the level;
+        //   * `x86-64-v` + a bad suffix (v, v1, v2x, v9, ...) is the
+        //     `invalid x86-64 ISA level` fatal — the parser has no error
+        //     channel, so the keyword is kept for the link path to
+        //     reject via `property_link_flags`;
+        //   * any OTHER `x86-64-*` keyword (x86-64-foo, x86-64-,
+        //     x86-64-baselineX, wrong-case X86-64-v3) is warned about
+        //     and ignored (`-z <kw> ignored`), like every other
+        //     unrecognised `-z` keyword — NOT fatal.
+        "x86-64-baseline" => result.z_isa_level = 1,
+        k if k.starts_with("x86-64-v") => match k["x86-64-v".len()..].parse::<u32>() {
+            Ok(n) if (2..=4).contains(&n) => result.z_isa_level = n,
+            _ => result.z_isa_level_invalid = Some(k.to_string()),
+        },
+        k if k.starts_with("x86-64-") => {
+            result.z_ignored_keywords.push(k.to_string());
+        }
+        k if k.starts_with("ibt=")
+            || k.starts_with("shstk=")
+            || k.starts_with("lam-u48=")
+            || k.starts_with("lam-u57=") =>
+        {
+            // `-z ibt=func` & co: accepted, ignored, warned.
+            result.z_ignored_keywords.push(k.to_string());
+        }
+        _ => {} // noexecstack, origin, ... not layout-affecting
+    }
+}
+
 pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     let mut result = LinkerArgs::default();
     result.z_relro = true; // RELRO is on by default, like GNU ld/mold
+
     // GNU ld accepts `--opt VALUE` alongside `--opt=VALUE`.  A driver that
     // forwards them as `-Wl,--opt -Wl,VALUE` splits the pair across two
     // arguments, and the `-Wl,` splitter below can only see one group at a
@@ -420,22 +574,18 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     result.is_static = true;
                 } else if part == "-z" && j + 1 < parts.len() {
                     j += 1;
-                    match parts[j] {
-                        "now" => result.z_now = true,
-                        "lazy" => result.z_now = false,
-                        "relro" => result.z_relro = true,
-                        "norelro" => result.z_relro = false,
-                        // `-z defs` is the spelling CMake/Qt use for
-                        // --no-undefined. It must be handled *here*, in the
-                        // single `-z` arm: a later `else if part == "-z" ...`
-                        // branch is unreachable because this one already
-                        // matched and consumed the keyword. That exact trap
-                        // silently disabled -z defs for shared libraries when
-                        // link_shared's private parser was removed, and the
-                        // so_z_defs_rejects_undefined differential test caught it.
-                        "defs" => result.no_undefined = true,
-                        "undefs" => result.no_undefined = false,
-                        _ => {} // noexecstack, origin, ... not layout-affecting
+                    apply_z_keyword(&mut result, parts[j]);
+                } else if let Some(kw) = part.strip_prefix("-z") {
+                    // Joined form inside the group (`-Wl,-zrelro`): GNU ld
+                    // accepts `-z<keyword>` identically to `-z <keyword>`
+                    // (measured on 2.44, including through `-Wl,`, which
+                    // the compiler driver splits into the joined ld
+                    // argument), so it funnels through the same keyword
+                    // function.  A bare `-z` never reaches here — the arm
+                    // above consumes it — but an empty remainder is
+                    // skipped rather than asserted on.
+                    if !kw.is_empty() {
+                        apply_z_keyword(&mut result, kw);
                     }
                 } else if let Some(sym) = part.strip_prefix("--entry=") {
                     result.entry_symbol = Some(sym.to_string());
@@ -492,6 +642,8 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     if let Some(h) = parse_hash_style(parts[j]) {
                         result.hash_style = h;
                     }
+                } else if misc_option(&mut result, part) {
+                    // consumed
                 } else if apply_plain_flag(&mut result, part) {
                     // consumed
                 } else if let Some(style) = part.strip_prefix("--build-id=") {
@@ -529,6 +681,13 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             if let Some(h) = parse_hash_style(args[i]) {
                 result.hash_style = h;
             }
+        } else if arg == "--threads" && i + 1 < args.len() {
+            i += 1;
+            // Lenient like GNU: a bad value is ignored, not fatal.  lccc
+            // links single-threaded; the value is recorded, not acted on.
+            result.threads = args[i].parse().ok();
+        } else if misc_option(&mut result, arg) {
+            // consumed
         } else if apply_plain_flag(&mut result, arg) {
             // consumed
         } else if let Some(style) = arg.strip_prefix("--build-id=") {
@@ -799,5 +958,142 @@ mod ordered_input_tests {
             assert_eq!(r.extra_object_files.len(), 1);
             assert_eq!(r.inputs.len(), 3, "one entry per input, in order");
         });
+    }
+}
+
+#[cfg(test)]
+mod z_isa_level_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every `-z x86-64-*` level (binutils
+    /// `ld/emulparams/x86-64-level.sh`), spelled the way the driver
+    /// forwards it (`-Wl,-z,<kw>`): 0 = unset is the default, baseline =
+    /// 1, v2/v3/v4 = 2/3/4.  Last one wins, like the other `-z` toggles.
+    #[test]
+    fn isa_levels_parse_to_level_numbers() {
+        let d = parse_linker_args(&args(&[]));
+        assert_eq!(d.z_isa_level, 0, "unset by default");
+        assert_eq!(d.z_isa_level_invalid, None);
+        for (kw, want) in [
+            ("x86-64-baseline", 1),
+            ("x86-64-v2", 2),
+            ("x86-64-v3", 3),
+            ("x86-64-v4", 4),
+        ] {
+            let r = parse_linker_args(&args(&[&format!("-Wl,-z,{kw}")]));
+            assert_eq!(r.z_isa_level, want, "-z {kw}");
+            assert_eq!(r.z_isa_level_invalid, None, "-z {kw} must not flag invalid");
+        }
+        let r = parse_linker_args(&args(&["-Wl,-z,x86-64-v2", "-Wl,-z,x86-64-v4"]));
+        assert_eq!(r.z_isa_level, 4, "last level wins");
+    }
+
+    /// A bad `x86-64-v` suffix is kept for the link path to reject —
+    /// GNU fatals with `invalid x86-64 ISA level`, and silently ignoring
+    /// the typo would link an image for the wrong microarchitecture.
+    /// `v1` is invalid (baseline covers it); so are a bare `x86-64-v`,
+    /// out-of-range versions, and non-numeric suffixes.
+    #[test]
+    fn isa_level_v_typos_are_kept_for_rejection() {
+        for kw in [
+            "x86-64-v1",
+            "x86-64-v5",
+            "x86-64-v9",
+            "x86-64-v",
+            "x86-64-v2x",
+            "x86-64-v3x",
+        ] {
+            let r = parse_linker_args(&args(&[&format!("-Wl,-z,{kw}")]));
+            assert_eq!(r.z_isa_level, 0, "-z {kw} must not set a level");
+            assert_eq!(
+                r.z_isa_level_invalid.as_deref(),
+                Some(kw),
+                "-z {kw} must be kept for rejection"
+            );
+        }
+    }
+
+    /// Any OTHER `x86-64-*` keyword is warned about and ignored — GNU's
+    /// `-z <kw> ignored` (measured on ld 2.44), not the invalid-level
+    /// fatal.  That includes a non-`v` keyword, a bare prefix, and a
+    /// near-miss of baseline.  (Wrong-case `X86-64-v3` also warns under
+    /// GNU, but it misses the lowercase prefix and lands in the generic
+    /// silent-unknown bucket — the pre-existing unknown-`-z` gap, not
+    /// this rule; see the follow-up notes.)
+    #[test]
+    fn isa_level_non_v_keywords_warn_and_ignore() {
+        for kw in ["x86-64-avx512", "x86-64-", "x86-64-baselineX"] {
+            let r = parse_linker_args(&args(&[&format!("-Wl,-z,{kw}")]));
+            assert_eq!(r.z_isa_level, 0, "-z {kw} must not set a level");
+            assert_eq!(
+                r.z_isa_level_invalid, None,
+                "-z {kw} must not be a fatal error"
+            );
+            assert!(
+                r.z_ignored_keywords.iter().any(|k| k == kw),
+                "-z {kw} must land on the warn-and-ignore list"
+            );
+        }
+    }
+
+    /// The joined `-z<keyword>` spelling inside a `-Wl,` group behaves
+    /// exactly like the split `-Wl,-z,<keyword>` spelling (GNU accepts
+    /// both identically, measured on 2.44).
+    #[test]
+    fn joined_z_keywords_match_split_form() {
+        let r = parse_linker_args(&args(&["-Wl,-zrelro"]));
+        assert!(r.z_relro);
+        let r = parse_linker_args(&args(&["-Wl,-znorelro"]));
+        assert!(!r.z_relro);
+        let r = parse_linker_args(&args(&["-Wl,-zibt", "-Wl,-zshstk"]));
+        assert!(r.z_ibt && r.z_shstk);
+        let r = parse_linker_args(&args(&["-Wl,-zx86-64-v3"]));
+        assert_eq!(r.z_isa_level, 3);
+        assert_eq!(r.z_isa_level_invalid, None);
+        let r = parse_linker_args(&args(&["-Wl,-zx86-64-v9"]));
+        assert_eq!(r.z_isa_level_invalid.as_deref(), Some("x86-64-v9"));
+        let r = parse_linker_args(&args(&["-Wl,-zx86-64-foo"]));
+        assert_eq!(r.z_isa_level_invalid, None);
+        assert!(r.z_ignored_keywords.iter().any(|k| k == "x86-64-foo"));
+    }
+
+    /// `--no-undefined-version` is a real GNU flag ("Disallow undefined
+    /// version") so both the plain and the `-Wl,` spelling must parse —
+    /// it is recorded, not enforced (see the field docs).
+    #[test]
+    fn no_undefined_version_parses_but_is_record_only() {
+        let r = parse_linker_args(&args(&["--no-undefined-version"]));
+        assert!(r.no_undefined_version);
+        let r = parse_linker_args(&args(&["-Wl,--no-undefined-version"]));
+        assert!(r.no_undefined_version);
+        let r = parse_linker_args(&args(&[]));
+        assert!(!r.no_undefined_version);
+    }
+
+    /// `property_link_flags` maps the parsed `-z` state onto the CET
+    /// merge flags, and renders an invalid level with GNU's wording.
+    #[test]
+    fn property_link_flags_maps_levels_and_rejects_invalid() {
+        let r = parse_linker_args(&args(&["-Wl,-z,ibt", "-Wl,-z,shstk", "-Wl,-z,x86-64-v3"]));
+        let f = r.property_link_flags().expect("valid flags must convert");
+        assert!(f.ibt && f.shstk);
+        assert!(!f.lam_u48 && !f.lam_u57);
+        assert_eq!(f.isa_level, 3);
+
+        let bad = parse_linker_args(&args(&["-Wl,-z,x86-64-v9"]));
+        assert_eq!(
+            bad.property_link_flags().unwrap_err(),
+            "invalid x86-64 ISA level: x86-64-v9"
+        );
+        // Deferred rejection is any-invalid-wins: GNU would have fatalled
+        // at parse time on the bad keyword no matter what surrounds it.
+        let mixed = parse_linker_args(&args(&["-Wl,-z,x86-64-v3", "-Wl,-z,x86-64-v9"]));
+        assert!(mixed.property_link_flags().is_err());
+        let mixed2 = parse_linker_args(&args(&["-Wl,-z,x86-64-v9", "-Wl,-z,x86-64-v3"]));
+        assert!(mixed2.property_link_flags().is_err());
     }
 }

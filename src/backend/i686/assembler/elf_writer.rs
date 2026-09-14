@@ -133,6 +133,22 @@ impl X86Arch for I686Arch {
     fn uses_rel_format() -> bool {
         true
     }
+    fn is_tls_reloc(reloc_type: u32) -> bool {
+        // i386 TLS relocation types (binutils 2.47 `include/elf/i386.h`,
+        // EM_386 — the complete set, verified entry by entry).  Every one
+        // resolves through the STT_TLS symbol (or a per-symbol TLS
+        // descriptor), so local-label folding must never apply to any of
+        // them:
+        //   14 TPOFF, 15 IE, 16 GOTIE, 17 LE, 18 GD, 19 LDM,
+        //   24 GD_32, 25 GD_PUSH, 26 GD_CALL, 27 GD_POP,
+        //   28 LDM_32, 29 LDM_PUSH, 30 LDM_CALL, 31 LDM_POP,
+        //   32 LDO_32, 33 IE_32, 34 LE_32,
+        //   35 DTPMOD32, 36 DTPOFF32, 37 TPOFF32,
+        //   39 GOTDESC, 40 DESC_CALL, 41 DESC
+        // (20-23 are R_386_{16,PC16,8,PC8} and 38 is R_386_SIZE32 —
+        // NOT TLS types.)
+        matches!(reloc_type, 14..=19 | 24..=37 | 39..=41)
+    }
     fn supports_deferred_skips() -> bool {
         true
     }
@@ -366,5 +382,27 @@ mod tests {
             "R_386_16 addend patch clobbered bytes after the field"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The complete i386 TLS reloc set (binutils 2.47 `include/elf/i386.h`,
+    /// verified entry by entry): 14..=19, 24..=37, 39..=41.  Same hazard
+    /// as on x86-64 — a folded TLS reloc resolves through the section
+    /// instead of the thread pointer — and the same need to keep the gaps
+    /// foldable (20-23 are R_386_{16,PC16,8,PC8}, 38 is R_386_SIZE32).
+    #[test]
+    fn tls_reloc_classification_matches_elf_i386() {
+        use super::I686Arch;
+        use crate::backend::elf_writer_common::X86Arch;
+        let is_tls =
+            |t: u32| (14..=19).contains(&t) || (24..=37).contains(&t) || (39..=41).contains(&t);
+        for t in 0..=41 {
+            assert_eq!(
+                I686Arch::is_tls_reloc(t),
+                is_tls(t),
+                "reloc {t} misclassified"
+            );
+        }
+        assert!(!I686Arch::is_tls_reloc(42));
+        assert!(!I686Arch::is_tls_reloc(u32::MAX));
     }
 }

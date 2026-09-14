@@ -136,7 +136,7 @@ pub(super) fn emit_shared_library(
     // `--defsym` expressions deferred from `apply_defsyms`; evaluated here
     // once section addresses and the linker-provided symbols are final, so the
     // shared path and the executable path agree (see `link::evaluate_pending_defsyms`).
-    pending_defsyms: &[(String, String)],
+    pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
 
@@ -1082,7 +1082,8 @@ pub(super) fn emit_shared_library(
             && sections_with_abs_relocs.contains(&idx)
     };
 
-    // phdrs: PHDR, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC, GNU_STACK, [GNU_RELRO], [TLS]
+    // phdrs: PHDR, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC,
+    // NOTE* + GNU_PROPERTY, GNU_STACK, [GNU_RELRO], [TLS]
     let has_relro = !sections_with_abs_relocs.is_empty();
     let mut phdr_count: u64 = 7; // base count
     if has_tls_sections {
@@ -1091,6 +1092,18 @@ pub(super) fn emit_shared_library(
     if has_relro {
         phdr_count += 1;
     }
+    // One PT_NOTE segment per allocated note section plus the
+    // PT_GNU_PROPERTY alias — see `emit_exec` for the reasoning.  The count
+    // must use `mem_size`, which is set before layout; section `data` is
+    // only filled during the layout pass.
+    let note_phdr_count = output_sections
+        .iter()
+        .filter(|s| s.sh_type == SHT_NOTE && s.flags & SHF_ALLOC != 0 && s.mem_size > 0)
+        .count() as u64;
+    let has_gnu_property_phdr = output_sections
+        .iter()
+        .any(|s| s.name == ".note.gnu.property" && s.flags & SHF_ALLOC != 0 && s.mem_size > 0);
+    phdr_count += note_phdr_count + has_gnu_property_phdr as u64;
     let phdr_total_size = phdr_count * 56;
 
     // === Layout ===
@@ -1574,6 +1587,45 @@ pub(super) fn emit_shared_library(
         8,
     );
     ph += 56;
+    // One PT_NOTE segment per allocated note section (alignment = the
+    // section's, minimum 4), followed by the PT_GNU_PROPERTY alias over
+    // `.note.gnu.property` (alignment 8) — written after DYNAMIC, matching
+    // GNU ld's program header order for shared objects.
+    for sec in output_sections.iter() {
+        if sec.sh_type == SHT_NOTE && sec.flags & SHF_ALLOC != 0 && !sec.data.is_empty() {
+            wphdr(
+                &mut out,
+                ph,
+                PT_NOTE,
+                PF_R,
+                sec.file_offset,
+                sec.addr,
+                sec.data.len() as u64,
+                sec.mem_size,
+                sec.alignment.max(4),
+            );
+            ph += 56;
+        }
+    }
+    if has_gnu_property_phdr {
+        if let Some(sec) = output_sections
+            .iter()
+            .find(|s| s.name == ".note.gnu.property" && !s.data.is_empty())
+        {
+            wphdr(
+                &mut out,
+                ph,
+                PT_GNU_PROPERTY,
+                PF_R,
+                sec.file_offset,
+                sec.addr,
+                sec.data.len() as u64,
+                sec.mem_size,
+                8,
+            );
+            ph += 56;
+        }
+    }
     wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
     ph += 56;
     if has_relro {

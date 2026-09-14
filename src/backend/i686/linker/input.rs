@@ -41,6 +41,14 @@ pub(super) fn parse_user_args(
             extra_lib_paths.push(rest.to_string());
         } else if arg == "-rdynamic" || arg == "--export-dynamic" {
             // Accepted but not currently used
+        } else if arg == "--emit-relocs" || arg == "-q" {
+            // Relocation retention is implemented only for `-T` script
+            // links (the shared `emit_script` backend); the
+            // compiler-driver path cannot honour it, so warn rather than
+            // silently produce an image without retained relocations.
+            eprintln!(
+                "lccc-ld: warning: --emit-relocs ignored: relocation retention is only implemented for -T script links"
+            );
         } else if let Some(wl_args) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_args.split(',').collect();
             let mut j = 0;
@@ -54,9 +62,16 @@ pub(super) fn parse_user_args(
                     }
                 } else if let Some(rest) = part.strip_prefix("-L") {
                     extra_lib_paths.push(rest.to_string());
+                } else if part == "--emit-relocs" || part == "-q" {
+                    // As above: recognised so the user hears about it,
+                    // instead of the flag vanishing into the fallthrough.
+                    eprintln!(
+                        "lccc-ld: warning: --emit-relocs ignored: relocation retention is only implemented for -T script links"
+                    );
                 } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
-                    // --defsym=SYMBOL=EXPR: define a symbol alias
-                    // TODO: only supports symbol-to-symbol aliasing, not arbitrary expressions
+                    // --defsym=SYMBOL=EXPR: alias, constant, or arithmetic
+                    // expression, all handled downstream by `apply_defsyms`
+                    // + `evaluate_pending_defsyms` via `linker_common::defsym`.
                     if let Some(eq_pos) = defsym_arg.find('=') {
                         defsym_defs.push((
                             defsym_arg[..eq_pos].to_string(),

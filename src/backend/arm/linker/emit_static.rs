@@ -19,6 +19,7 @@ pub(super) fn emit_executable(
     output_sections: &mut [OutputSection],
     section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     output_path: &str,
+    pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
         eprintln!("output sections:");
@@ -523,6 +524,10 @@ pub(super) fn emit_executable(
             );
         }
     }
+
+    // --defsym: expressions deferred until now (after layout + standard
+    // symbols). See x86-64 emitter for the rationale.
+    super::link::evaluate_pending_defsyms(globals, pending_defsyms)?;
 
     // Auto-generate __start_<section> / __stop_<section> symbols (GNU ld feature)
     for (name, addr) in linker_common::resolve_start_stop_symbols(output_sections) {

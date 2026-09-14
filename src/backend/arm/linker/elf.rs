@@ -14,8 +14,9 @@ pub use crate::backend::elf::{
     ET_EXEC, LinkerScriptEntry, LinkerSymbolAddresses, PF_R, PF_W, PF_X, PT_DYNAMIC,
     PT_GNU_EH_FRAME, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHF_ALLOC, SHF_EXECINSTR,
     SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_NOBITS, STB_GLOBAL, STB_WEAK, STT_FUNC,
-    STT_GNU_IFUNC, STT_OBJECT, STT_SECTION, STT_TLS, get_standard_linker_symbols, is_thin_archive,
-    parse_linker_script_entries, read_u16, read_u32, w16, w32, w64, wphdr, write_bytes,
+    STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION, STT_TLS, get_standard_linker_symbols,
+    is_thin_archive, parse_linker_script_entries, read_u16, read_u32, w16, w32, w64, wphdr,
+    write_bytes,
 };
 
 use crate::backend::linker_common;

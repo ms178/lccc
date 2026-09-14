@@ -83,24 +83,38 @@ log "m32 oracle: $(gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/d
 # the repository first.
 #
 # Recovery keeps the restored worktree byte-for-byte and rebuilds only the index,
-# so uncommitted work reappears as ordinary modifications against latest
-# upstream. artifacts/lccc.bundle is NOT a reliable source: it is written from a
-# --depth 200 clone, so it is thin and `git fetch` from it fails with
-# "did not send all necessary objects". Clone upstream instead -- which also
-# re-bases the session onto current main for free.
+# so uncommitted work reappears as ordinary modifications.
+#
+# First choice is the session's own artifacts/lccc.bundle: transplanting its
+# .git preserves the work branch, the snapshot commits AND the base commit the
+# snapshot script diffs against. (An older revision of this script avoided the
+# bundle because `git fetch` from it can fail on thin packs; `git clone` from
+# it does not -- verified 2026-09-14 after a full .git loss, where the bundle
+# restored ms178-1-work with all commits and the base ref intact.)
+#
+# Fallback is a fresh upstream clone plus a MIXED reset (index rebuilt from
+# HEAD, worktree untouched). NEVER `git checkout -- .` / `git reset --hard`
+# here -- either one destroys the uncommitted work this script exists to
+# protect. Note the fallback does NOT preserve the session branch or the
+# snapshot base commit: the next snapshot must then be inspected by hand.
 if [[ ! -d .git ]]; then
     log 'RECOVERY: .git is missing entirely (not just .git/config)'
     tmp_git="$(mktemp -d)/lccc"
-    if git clone --depth 200 -q https://github.com/ms178/lccc.git "$tmp_git"; then
+    if [[ -f /home/user/artifacts/lccc.bundle ]] \
+        && git clone -q /home/user/artifacts/lccc.bundle "$tmp_git" 2>/dev/null; then
+        mv "$tmp_git/.git" ./.git
+        git remote set-url origin https://github.com/ms178/lccc.git 2>/dev/null || true
+        log "recovered from bundle: branch=$(git branch --show-current 2>/dev/null || echo detached) HEAD=$(git rev-parse --short HEAD)"
+        log "recovered: $(git status --porcelain | wc -l) worktree changes preserved as modifications"
+    elif git clone --depth 200 -q https://github.com/ms178/lccc.git "$tmp_git"; then
         mv "$tmp_git/.git" ./.git
         # MIXED reset: rebuilds the index from HEAD and leaves the worktree
-        # alone. NEVER `git checkout -- .` / `git reset --hard` here -- either
-        # one destroys the uncommitted work this script exists to protect.
+        # alone (see NEVER above).
         git reset -q
-        log "recovered: HEAD=$(git rev-parse --short HEAD) ($(git rev-list --count HEAD ^origin/main 2>/dev/null || echo 0) local commits)"
+        log "recovered from upstream: HEAD=$(git rev-parse --short HEAD) ($(git rev-list --count HEAD ^origin/main 2>/dev/null || echo 0) local commits)"
         log "recovered: $(git status --porcelain | wc -l) worktree changes preserved as modifications"
     else
-        log 'RECOVERY FAILED: could not clone upstream; worktree is intact but git is unavailable'
+        log 'RECOVERY FAILED: bundle and upstream clone both failed; worktree is intact but git is unavailable'
     fi
     rm -rf "$(dirname "$tmp_git")" 2>/dev/null || true
 fi
@@ -110,6 +124,26 @@ if ! git remote get-url origin >/dev/null 2>&1; then
 fi
 git config user.name  'LCCC Agent' 2>/dev/null || true
 git config user.email 'agent@lccc.local' 2>/dev/null || true
+# Restore worktree files the snapshot evicted (10k-file cap) WITHOUT touching
+# modified files: only paths git reports as DELETED are checked out, so
+# uncommitted content edits are never at risk (an absent file has no edits to
+# lose -- observed 2026-09-14: 1334 tracked files missing after a restore,
+# leaving the tree unbuildable until they were checked back out).
+#
+# A deliberately `rm`'d file looks identical to an evicted one, so the restore
+# only fires in bulk: more than 50 deletions is never a deliberate uncommitted
+# edit, it is snapshot eviction. At or below the threshold the deletions are
+# listed for the agent to judge instead.
+n_deleted=$(git diff --name-only --diff-filter=D -z 2>/dev/null | tr -cd '\0' | wc -c)
+if [[ "$n_deleted" -gt 50 ]]; then
+    n_restored=0
+    while IFS= read -r -d '' f; do
+        git checkout -q -- "$f" 2>/dev/null && n_restored=$((n_restored+1))
+    done < <(git diff --name-only --diff-filter=D -z)
+    log "evicted files restored: $n_restored (of $n_deleted deleted)"
+else
+    log "deleted-but-tracked files left alone: $n_deleted (below bulk threshold)"
+fi
 # Restore +x on tracked files recorded as executable.  NEVER `git checkout -- .`:
 # that would discard uncommitted content edits.
 n_modes=0

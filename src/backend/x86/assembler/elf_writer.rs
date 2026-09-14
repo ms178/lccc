@@ -192,6 +192,26 @@ impl X86Arch for X86_64Arch {
         false
     }
 
+    fn is_tls_reloc(reloc_type: u32) -> bool {
+        // x86-64 TLS relocation types (binutils 2.47
+        // `include/elf/x86-64.h`, EM_X86_64):
+        //   16 DTPMOD64, 17 DTPOFF64, 18 TPOFF64, 19 TLSGD, 20 TLSLD,
+        //   21 DTPOFF32, 22 GOTTPOFF, 23 TPOFF32,
+        //   34 GOTPC32_TLSDESC, 35 TLSDESC_CALL, 36 TLSDESC,
+        //   44 CODE_4_GOTTPOFF, 45 CODE_4_GOTPC32_TLSDESC,
+        //   47 CODE_5_GOTTPOFF, 48 CODE_5_GOTPC32_TLSDESC,
+        //   50 CODE_6_GOTTPOFF, 51 CODE_6_GOTPC32_TLSDESC.
+        // The CODE_4/CODE_6 TLS forms ARE emitted by the lccc assembler
+        // (`gottpoff_type`/`tlsdesc_type` select them for REX2/EVEX
+        // instructions), so excluding them would let local-label folding
+        // corrupt APX initial-exec sequences; the CODE_5 pair is included
+        // for the same reason although no encoder emits it yet (the
+        // folding hazard is a property of the reloc class, not of current
+        // emission).  The plain R_X86_64_GOTPCRELX family (41, 42, 43, 46,
+        // 49) is NOT TLS and stays foldable.
+        matches!(reloc_type, 16..=23 | 34..=36 | 44 | 45 | 47 | 48 | 50 | 51)
+    }
+
     fn reloc_pc8_internal() -> Option<u32> {
         Some(R_X86_64_PC8_INTERNAL)
     }
@@ -211,3 +231,54 @@ impl X86Arch for X86_64Arch {
 
 /// Builds an ELF relocatable object file from parsed assembly items.
 pub type ElfWriter = ElfWriterCore<X86_64Arch>;
+
+#[cfg(test)]
+mod tests {
+    use super::X86_64Arch;
+    use crate::backend::elf_writer_common::X86Arch;
+
+    /// Every known x86-64 TLS relocation (binutils 2.47
+    /// `include/elf/x86-64.h`) must classify as TLS: local-label folding
+    /// rewrites a reloc's symbol to the section symbol, which is only
+    /// sound when the value resolves through the section base — TLS
+    /// relocs resolve through the thread pointer / TLS descriptor
+    /// instead, and folding one silently mislinks.  The APX CODE_4/CODE_6
+    /// TLS forms are the critical members: the encoder emits them for
+    /// REX2/EVEX initial-exec sequences, and they were missing from this
+    /// table until the folding-corruption audit caught them.
+    #[test]
+    fn tls_reloc_classification_covers_all_tls_types() {
+        for t in (16..=23).chain(34..=36).chain([44, 45, 47, 48, 50, 51]) {
+            assert!(
+                X86_64Arch::is_tls_reloc(t),
+                "reloc {t} is TLS but classified foldable"
+            );
+        }
+    }
+
+    /// The neighbours that are NOT TLS must stay foldable — most
+    /// importantly the plain R_X86_64_GOTPCRELX family (41, 42, 43, 46,
+    /// 49), which resolves through the GOT exactly like any other
+    /// data relocation.  Over-classifying costs nothing at runtime when
+    /// nothing folds, but it disables a size optimisation the suite
+    /// pins elsewhere, and it hides the next genuinely-missing entry.
+    #[test]
+    fn tls_reloc_classification_excludes_non_tls_neighbours() {
+        let is_tls = |t: u32| {
+            (16..=23).contains(&t)
+                || (34..=36).contains(&t)
+                || [44, 45, 47, 48, 50, 51].contains(&t)
+        };
+        for t in 0..=51 {
+            assert_eq!(
+                X86_64Arch::is_tls_reloc(t),
+                is_tls(t),
+                "reloc {t} misclassified"
+            );
+        }
+        // Above the known range: unknown relocs stay foldable by default
+        // (the loader errors on truly unsupported types elsewhere).
+        assert!(!X86_64Arch::is_tls_reloc(52));
+        assert!(!X86_64Arch::is_tls_reloc(u32::MAX));
+    }
+}

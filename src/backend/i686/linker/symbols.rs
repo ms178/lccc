@@ -41,8 +41,21 @@ pub(super) fn resolve_symbols(
                     (usize::MAX, 0)
                 };
 
+            // SHN_ABS input definitions (`.set k, 100`, assembler-provided
+            // constants) carry their value in `st_value` with no section to
+            // add it to: the value IS the address, so materialise it here.
+            // Leaving it 0 mislinked every absolute reference (GOT slot,
+            // R_386_32) to address 0.  SHN_COMMON keeps address 0 — its
+            // `st_value` is an alignment, and `allocate_common_symbols`
+            // assigns the real address later.
+            let address = if sym.section_index == SHN_ABS {
+                sym.value
+            } else {
+                0
+            };
+
             let new_sym = LinkerSymbol {
-                address: 0,
+                address,
                 size: sym.size,
                 sym_type: sym.sym_type,
                 binding: sym.binding,
@@ -403,4 +416,67 @@ pub(super) fn collect_ifunc_symbols(
         .collect();
     ifunc_symbols.sort();
     ifunc_symbols
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::types::*;
+    use super::resolve_symbols;
+    use crate::common::fx_hash::FxHashMap;
+
+    fn sym(name: &str, value: u32, shndx: u16) -> InputSymbol {
+        InputSymbol {
+            name: name.to_string(),
+            value,
+            size: 0,
+            binding: STB_GLOBAL,
+            sym_type: STT_NOTYPE,
+            visibility: STV_DEFAULT,
+            section_index: shndx,
+        }
+    }
+
+    /// Input SHN_ABS definitions (`.set k, 100`, assembler constants)
+    /// resolve to their value: with no section to add `st_value` to, the
+    /// value IS the address.  Regression test — the address used to stay
+    /// 0, mislinking every absolute reference (GOT slot, R_386_32) to
+    /// address 0.  COMMON keeps address 0 (its `st_value` is an
+    /// alignment; `allocate_common_symbols` assigns the real address),
+    /// and sectioned symbols keep address 0 with the section offset
+    /// recorded (layout assigns the address later).
+    #[test]
+    fn abs_inputs_resolve_to_their_value() {
+        let inputs = [InputObject {
+            sections: vec![],
+            symbols: vec![
+                sym("k", 100, SHN_ABS),
+                sym("common_sym", 4, SHN_COMMON),
+                sym("in_section", 0x10, 1),
+            ],
+            filename: "test.o".to_string(),
+        }];
+        let mut section_map = SectionMap::default();
+        section_map.insert((0, 1), (0, 0x100));
+        let (globals, _) = resolve_symbols(&inputs, &[], &section_map, &FxHashMap::default());
+
+        let k = globals.get("k").expect("ABS symbol must resolve");
+        assert!(k.is_defined);
+        assert_eq!(k.address, 100, "ABS st_value is the address");
+        assert_eq!(k.output_section, usize::MAX);
+
+        let c = globals
+            .get("common_sym")
+            .expect("COMMON symbol must resolve");
+        assert_eq!(
+            c.address, 0,
+            "COMMON st_value is an alignment, not an address"
+        );
+
+        let s = globals
+            .get("in_section")
+            .expect("sectioned symbol must resolve");
+        assert_eq!(s.address, 0, "layout assigns sectioned addresses later");
+        assert_eq!(s.output_section, 0);
+        assert_eq!(s.section_offset, 0x110);
+    }
 }

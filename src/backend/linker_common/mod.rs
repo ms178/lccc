@@ -56,6 +56,7 @@
 mod archive;
 mod args;
 pub mod build_id;
+pub mod cet;
 mod check;
 pub mod comdat;
 pub mod defsym;

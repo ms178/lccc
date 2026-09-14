@@ -72,6 +72,26 @@ pub trait X86Arch {
     /// stored in the relocation entry.
     fn uses_rel_format() -> bool;
 
+    /// True for TLS relocation types (R_386_TLS_* / R_X86_64_*TLS*).
+    ///
+    /// TLS relocs are excluded from local-label folding: the fold rewrites a
+    /// relocation against a local symbol into (section symbol,
+    /// addend+offset), which is value-identical for plain/PC relocs but WRONG
+    /// for TLS ones.  A GOT-style TLS reloc (R_386_TLS_GOTIE, the i386
+    /// encoding of `@GOTNTPOFF`) is a pure GOT-slot reference — its addend
+    /// must stay 0 — and the linker computes the slot's contents from the
+    /// STT_TLS symbol's position in the TLS block, not from a section symbol.
+    /// Folding also destroys the offset for REL-format i686, where the
+    /// addend is baked into the instruction bytes and then clobbered by the
+    /// linker's write.  (Measured: lccc-i686 `movl lv@GOTNTPOFF(%ebx)`
+    /// folded to `.tdata@GOTIE` linked a zero into the displacement and
+    /// segfaulted on the first TLS touch; GAS keeps the STT_TLS symbol in
+    /// the reloc.)
+    fn is_tls_reloc(reloc_type: u32) -> bool {
+        let _ = reloc_type;
+        false
+    }
+
     /// Optional: PC8 internal relocation type for loop/jrcxz instructions.
     /// Only x86-64 has this; i686 returns None.
     fn reloc_pc8_internal() -> Option<u32> {
@@ -2591,9 +2611,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // their own symbol table entry ONLY if the reloc is
                 // PC-relative to a different section (identical to section+
                 // offset anyway), so folding is always safe here.
+                // TLS relocs are NOT foldable (see X86Arch::is_tls_reloc):
+                // the linker resolves them through the STT_TLS symbol, and a
+                // GOT-style TLS reloc's addend must remain 0.
                 let is_foldable_local = self.label_positions.contains_key(&reloc.symbol)
                     && !self.pending_globals.contains(&reloc.symbol)
-                    && !self.pending_weaks.contains(&reloc.symbol);
+                    && !self.pending_weaks.contains(&reloc.symbol)
+                    && !A::is_tls_reloc(reloc.reloc_type);
                 let (sym_name, mut addend) = if is_foldable_local {
                     let &(target_sec, target_off) =
                         self.label_positions.get(&reloc.symbol).unwrap();
