@@ -174,6 +174,21 @@ pub fn collect_candidates(objects: &[Elf64Object]) -> FxHashMap<u64, Vec<SecId>>
             if sec.sh_type != SHT_PROGBITS || (sec.flags & SHF_EXECINSTR) == 0 || sec.size == 0 {
                 continue;
             }
+            // ICF folds FUNCTIONS: only .text/.text.* sections are eligible.
+            // Other executable sections are concatenation-built or
+            // position-sensitive by design and must never fold — not even
+            // onto a byte-identical twin.  The instance of this class that
+            // bit: crtn.o's .init/.fini epilogues are the same 5 bytes
+            // (`add $8,%rsp; ret`), so `--icf=all` folded the .fini copy
+            // onto the .init one and `_fini` was left as a bare
+            // `sub $8,%rsp` with no `ret`.  Nothing called _fini, so the
+            // miscompile hid until DT_FINI was emitted; then every ICF
+            // binary crashed at exit.  (Same-output-section is the deeper
+            // invariant; on this path every .text* maps to .text, so the
+            // name check subsumes it.  ICF never runs for script links.)
+            if sec.name != ".text" && !sec.name.starts_with(".text.") {
+                continue;
+            }
             let data = match obj.section_data.get(si) {
                 Some(d) if !d.is_empty() => d.as_slice(),
                 _ => continue,
@@ -480,6 +495,32 @@ mod tests {
         assert!(
             plan(&[o], true).is_empty(),
             "addend must be part of identity"
+        );
+    }
+
+    /// crtn.o's .init/.fini epilogues are the same 5 bytes
+    /// (`add $8,%rsp; ret`) but concatenation-built into different output
+    /// sections: folding them deleted the .fini epilogue and left `_fini`
+    /// as a bare `sub $8,%rsp` with no `ret` — an exit-time crash under
+    /// `--icf=all` once DT_FINI was emitted.  ICF folds .text only.
+    #[test]
+    fn init_fini_epilogues_do_not_fold() {
+        let epilogue: &[u8] = &[0x48, 0x83, 0xc4, 0x08, 0xc3];
+        let o = Elf64Object {
+            sections: vec![sec(".init", epilogue, 4), sec(".fini", epilogue, 4)],
+            symbols: vec![],
+            section_data: vec![
+                SectionData::owned(epilogue.to_vec()),
+                SectionData::owned(epilogue.to_vec()),
+            ],
+            relocations: vec![Vec::new(), Vec::new()],
+            source_name: "<test>".into(),
+        };
+        let p = plan(&[o], false);
+        assert!(
+            p.is_empty(),
+            "cross-output-section fold must not happen: {:?}",
+            p.redirect
         );
     }
 

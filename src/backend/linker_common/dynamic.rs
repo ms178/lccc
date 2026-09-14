@@ -12,8 +12,8 @@ use super::resolve_lib::resolve_lib;
 use super::symbols::{GlobalSymbolOps, is_linker_defined_symbol};
 use super::types::{DynSymbol, Elf64Object};
 use crate::backend::elf::{
-    ELF_MAGIC, LinkerScriptEntry, SHN_COMMON, STB_WEAK, STT_FILE, STT_OBJECT, STT_SECTION,
-    parse_linker_script_entries,
+    ELF_MAGIC, LinkerScriptEntry, SHN_COMMON, SHN_UNDEF, STB_WEAK, STT_FILE, STT_OBJECT,
+    STT_SECTION, parse_linker_script_entries,
 };
 
 /// Match dynamic symbols from a shared library against undefined globals.
@@ -357,8 +357,26 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                     // COMMON vs real definition: the real definition wins; ignore.
                 }
             }
-        } else if !globals.contains_key(sym.name.as_str()) {
-            globals.insert(sym.name.to_string(), G::new_undefined(sym));
+        } else {
+            // Undefined reference (SHN_UNDEF, not COMMON). The first
+            // registrant wins, but a strong reference upgrades an existing
+            // weak-only entry: a member pulled in for a weak reference must
+            // not shadow a later strong demand for the same symbol. Archive
+            // extraction keys off this binding (see
+            // member_resolves_undefined_generic): weak-only entries never
+            // pull, strong ones always do.
+            let weak_ref = sym.info >> 4 == STB_WEAK;
+            match globals.get_mut(sym.name.as_str()) {
+                None => {
+                    globals.insert(sym.name.to_string(), G::new_undefined(sym));
+                }
+                Some(e)
+                    if !weak_ref && e.section_idx() == SHN_UNDEF && e.info() >> 4 == STB_WEAK =>
+                {
+                    *e = G::new_undefined(sym);
+                }
+                _ => {}
+            }
         }
     }
 

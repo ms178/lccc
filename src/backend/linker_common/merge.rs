@@ -200,14 +200,21 @@ pub fn merge_sections_elf64_gc(
 pub fn allocate_common_symbols_elf64<G: GlobalSymbolOps>(
     globals: &mut FxHashMap<String, G>,
     output_sections: &mut Vec<OutputSection>,
+    sort_common: bool,
 ) {
-    let common_syms: Vec<(String, u64, u64)> = globals
+    let mut common_syms: Vec<(String, u64, u64)> = globals
         .iter()
         .filter(|(_, sym)| sym.section_idx() == SHN_COMMON && sym.is_defined())
         .map(|(name, sym)| (name.clone(), sym.value().max(1), sym.size()))
         .collect();
     if common_syms.is_empty() {
         return;
+    }
+    // `--sort-common`: largest first, so big alignments pack without holes
+    // (bfd orders by size too).  bfd's order within one size is hash noise;
+    // lccc uses the name instead, so the layout is fully deterministic.
+    if sort_common {
+        common_syms.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
     }
 
     let bss_idx = output_sections
@@ -242,4 +249,94 @@ pub fn allocate_common_symbols_elf64<G: GlobalSymbolOps>(
         bss_off += size;
     }
     output_sections[bss_idx].mem_size = bss_off;
+}
+
+/// Merge `.comment` input sections (compiler version strings) into one blob.
+///
+/// Every toolchain object carries a `.comment` section (e.g. `GCC: (Debian
+/// 14.2.0-19) 14.2.0\0`).  The output keeps each distinct NUL-terminated
+/// string once, in first-seen input order: bfd, lld and mold all
+/// deduplicate (the section carries SHF_MERGE|SHF_STRINGS).  lld and mold
+/// additionally append their own identity string, bfd does not — lccc
+/// follows bfd (merge only, no identity string), so the output is a pure
+/// function of the inputs.  Empty fragments contribute nothing; a missing
+/// trailing NUL is repaired rather than dropped.
+pub fn merge_comment_sections(objects: &[Elf64Object]) -> Vec<u8> {
+    let mut seen: FxHashSet<&[u8]> = FxHashSet::default();
+    let mut out = Vec::new();
+    for obj in objects {
+        for (si, sec) in obj.sections.iter().enumerate() {
+            if sec.name != ".comment" {
+                continue;
+            }
+            let Some(data) = obj.section_data.get(si) else {
+                continue;
+            };
+            for frag in data.as_slice().split(|&b| b == 0) {
+                if frag.is_empty() || !seen.insert(frag) {
+                    continue;
+                }
+                out.extend_from_slice(frag);
+                out.push(0);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::backend::linker_common::{Elf64Section, SectionData};
+
+    use super::*;
+
+    fn obj_with_comment(data: &[u8]) -> Elf64Object {
+        Elf64Object {
+            sections: vec![Elf64Section {
+                name_idx: 0,
+                name: ".comment".to_string(),
+                sh_type: SHT_PROGBITS,
+                flags: 0x30, // SHF_MERGE | SHF_STRINGS
+                addr: 0,
+                offset: 0,
+                size: data.len() as u64,
+                link: 0,
+                info: 0,
+                addralign: 1,
+                entsize: 1,
+            }],
+            symbols: vec![],
+            section_data: vec![SectionData::owned(data.to_vec())],
+            relocations: vec![Vec::new()],
+            source_name: "<test>".to_string(),
+        }
+    }
+
+    #[test]
+    fn dedupes_identical_strings_in_first_seen_order() {
+        let a = obj_with_comment(b"toolchain-A\0toolchain-A\0");
+        let b = obj_with_comment(b"toolchain-B\0toolchain-A\0");
+        assert_eq!(
+            merge_comment_sections(&[a, b]),
+            b"toolchain-A\0toolchain-B\0"
+        );
+    }
+
+    #[test]
+    fn drops_empty_fragments_and_repairs_missing_nul() {
+        let a = obj_with_comment(b"\0toolchain-A\0\0");
+        let b = obj_with_comment(b"toolchain-B");
+        assert_eq!(
+            merge_comment_sections(&[a, b]),
+            b"toolchain-A\0toolchain-B\0"
+        );
+    }
+
+    #[test]
+    fn ignores_non_comment_sections_and_empty_input() {
+        let mut o = obj_with_comment(b"");
+        o.sections[0].name = ".text".to_string();
+        assert!(merge_comment_sections(&[o]).is_empty());
+        assert!(merge_comment_sections(&[]).is_empty());
+    }
 }

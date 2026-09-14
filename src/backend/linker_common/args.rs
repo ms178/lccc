@@ -21,8 +21,13 @@ pub struct LinkerArgs {
     pub export_dynamic: bool,
     /// RPATH entries from `-Wl,-rpath=` or `-Wl,-rpath,`.
     pub rpath_entries: Vec<String>,
-    /// Use DT_RUNPATH instead of DT_RPATH (from `--enable-new-dtags`).
+    /// Emit DT_RUNPATH instead of DT_RPATH.  Defaults to true (bfd/lld/mold
+    /// parity); `--disable-new-dtags` clears it, `--enable-new-dtags` sets it.
     pub use_runpath: bool,
+    /// Sort SHN_COMMON symbols by descending size before BSS allocation
+    /// (from `--sort-common[=yes]`; `--sort-common=no` / `--no-sort-common`
+    /// restore the default hash order).  Off by default, as in bfd.
+    pub sort_common: bool,
     /// Symbol definitions from `--defsym=SYM=VAL`.
     /// TODO: only supports symbol-to-symbol aliasing, not arbitrary expressions.
     pub defsym_defs: Vec<(String, String)>,
@@ -252,6 +257,12 @@ fn misc_option(result: &mut LinkerArgs, tok: &str) -> bool {
         "--no-undefined-version" => {
             result.no_undefined_version = true;
         }
+        "--sort-common" => {
+            result.sort_common = true;
+        }
+        "--no-sort-common" => {
+            result.sort_common = false;
+        }
         "--no-threads" => {
             result.threads = None;
         }
@@ -265,6 +276,16 @@ fn misc_option(result: &mut LinkerArgs, tok: &str) -> bool {
             if let Some(v) = tok.strip_prefix("--threads=") {
                 // Lenient like GNU: a bad value is ignored, not fatal.
                 result.threads = v.parse().ok();
+                return true;
+            }
+            if let Some(v) = tok.strip_prefix("--sort-common=") {
+                // Lenient like GNU: an unknown value keeps the current
+                // setting instead of erroring the whole link.
+                match v {
+                    "yes" => result.sort_common = true,
+                    "no" => result.sort_common = false,
+                    _ => {}
+                }
                 return true;
             }
             return false;
@@ -345,6 +366,13 @@ fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
 
 pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     let mut result = LinkerArgs::default();
+    // DT_RUNPATH is the default, not DT_RPATH: bfd (as configured by every
+    // major distro), lld and mold all emit RUNPATH for a plain `-rpath`.
+    // Upstream bfd's historic RPATH default only survives in niche
+    // configurations; matching the de-facto standard keeps
+    // `-Wl,-rpath,$ORIGIN` links behaving identically under every linker.
+    // `--disable-new-dtags` still opts back into DT_RPATH below.
+    result.use_runpath = true;
     result.z_relro = true; // RELRO is on by default, like GNU ld/mold
 
     // GNU ld accepts `--opt VALUE` alongside `--opt=VALUE`.  A driver that

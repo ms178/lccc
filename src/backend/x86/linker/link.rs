@@ -244,6 +244,7 @@ pub fn link_builtin(
     let export_dynamic = parsed_args.export_dynamic;
     let rpath_entries = parsed_args.rpath_entries;
     let use_runpath = parsed_args.use_runpath;
+    let sort_common = parsed_args.sort_common;
     let defsym_defs = parsed_args.defsym_defs;
     let gc_sections = parsed_args.gc_sections;
     // Command line wins; LCCC_LD_ICF is the fallback so the feature can be
@@ -729,7 +730,7 @@ pub fn link_builtin(
 
     phase!("merge-sections");
     // Allocate COMMON symbols
-    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);
+    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, sort_common);
 
     phase!("common");
     // Create PLT/GOT
@@ -768,6 +769,7 @@ pub fn link_builtin(
         &mut output_sections,
         &section_map,
         &dead_sections,
+        &icf_plan.redirect,
         &plt_names,
         &got_entries,
         &abs_dyn_relocs,
@@ -849,6 +851,7 @@ pub fn link_shared(
     let soname: Option<String> = parsed.soname.clone();
     let rpath_entries: Vec<String> = parsed.rpath_entries.clone();
     let use_runpath = parsed.use_runpath;
+    let sort_common = parsed.sort_common;
     let version_script: Option<String> = parsed.version_script.clone();
     let no_undefined = parsed.no_undefined;
     let bsymbolic = parsed.bsymbolic;
@@ -1019,7 +1022,7 @@ pub fn link_shared(
     linker_common::merge_sections_elf64(&objects, &mut output_sections, &mut section_map);
 
     // Allocate COMMON symbols
-    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);
+    linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, sort_common);
 
     // Emit shared library
     emit_shared_library(

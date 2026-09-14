@@ -121,7 +121,10 @@ pub use symbols::{
 };
 
 // merge.rs
-pub use merge::{allocate_common_symbols_elf64, merge_sections_elf64, merge_sections_elf64_gc};
+pub use merge::{
+    allocate_common_symbols_elf64, merge_comment_sections, merge_sections_elf64,
+    merge_sections_elf64_gc,
+};
 
 // dynamic.rs
 pub use dynamic::{

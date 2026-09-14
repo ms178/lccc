@@ -1000,6 +1000,14 @@ pub(super) fn emit_shared_library(
     let has_fini_array = output_sections
         .iter()
         .any(|s| s.name == ".fini_array" && s.mem_size > 0);
+    // `.init`/`.fini` (crti/crtn): addresses are not final yet (layout runs
+    // below), so only the predicates live here; emission looks them up.
+    let has_init = output_sections
+        .iter()
+        .any(|s| s.name == ".init" && s.mem_size > 0);
+    let has_fini = output_sections
+        .iter()
+        .any(|s| s.name == ".fini" && s.mem_size > 0);
     // 8 fixed entries + DT_NULL.  DT_GNU_HASH is no longer unconditional (see
     // --hash-style), so both hash tags are counted below instead.
     let mut dyn_count = needed_sonames.len() as u64 + 9;
@@ -1017,6 +1025,14 @@ pub(super) fn emit_shared_library(
     }
     if has_fini_array {
         dyn_count += 2;
+    }
+    // Spelled identically to the emission below: DT_INIT/DT_FINI when the
+    // sections exist with content.
+    if has_init {
+        dyn_count += 1;
+    }
+    if has_fini {
+        dyn_count += 1;
     }
     if !plt_names.is_empty() {
         dyn_count += 4;
@@ -1267,6 +1283,20 @@ pub(super) fn emit_shared_library(
     let dynamic_addr = vaddr!(offset);
     offset += dynamic_size;
 
+    // .data.rel.ro joins the RELRO window: it is const-after-relocation by
+    // construction, so leaving it in the generic RW loop below kept it
+    // writable at runtime for no reason (its entire purpose defeated).
+    for sec in output_sections.iter_mut() {
+        if sec.name == ".data.rel.ro" {
+            let a = sec.alignment.max(1);
+            offset = (offset + a - 1) & !(a - 1);
+            sec.addr = vaddr!(offset);
+            sec.file_offset = offset;
+            offset += sec.mem_size;
+            break;
+        }
+    }
+
     // End of RELRO region (page-aligned up for PT_GNU_RELRO).
     // Everything after this must be on a new page so that mprotect(PROT_READ)
     // on the RELRO region doesn't affect writable data (GOT.PLT, GOT, .data, .bss).
@@ -1302,6 +1332,7 @@ pub(super) fn emit_shared_library(
             && sec.sh_type != SHT_NOBITS
             && sec.name != ".init_array"
             && sec.name != ".fini_array"
+            && sec.name != ".data.rel.ro"
             && sec.flags & SHF_TLS == 0
         {
             let a = sec.alignment.max(1);
@@ -2349,6 +2380,29 @@ pub(super) fn emit_shared_library(
         w64(&mut out, dd + 8, so as u64);
         dd += 16;
     }
+    // DT_INIT/DT_FINI: the .init/.fini section addresses, right after SONAME
+    // as in bfd.  The lookups cannot miss (`has_init`/`has_fini` above test
+    // the same predicate on the same section list).
+    if has_init {
+        let init_addr = output_sections
+            .iter()
+            .find(|s| s.name == ".init")
+            .map(|s| s.addr)
+            .unwrap_or(0);
+        w64(&mut out, dd, DT_INIT as u64);
+        w64(&mut out, dd + 8, init_addr);
+        dd += 16;
+    }
+    if has_fini {
+        let fini_addr = output_sections
+            .iter()
+            .find(|s| s.name == ".fini")
+            .map(|s| s.addr)
+            .unwrap_or(0);
+        w64(&mut out, dd, DT_FINI as u64);
+        w64(&mut out, dd + 8, fini_addr);
+        dd += 16;
+    }
     for &(tag, val) in &[
         (DT_STRTAB, dynstr_addr),
         (DT_SYMTAB, dynsym_addr),
@@ -2357,6 +2411,11 @@ pub(super) fn emit_shared_library(
         (DT_RELA, rela_dyn_addr),
         (DT_RELASZ, rela_dyn_size),
         (DT_RELAENT, 24),
+        // DT_RELACOUNT stays unconditional here (unlike the exec writer):
+        // the RELATIVE entries are only discovered during relocation
+        // processing, long after dyn_count must be final, so no exact
+        // early predicate exists; ld.so treats a zero count exactly like
+        // an absent tag, and every real-world .so has relatives anyway.
         (DT_RELACOUNT, relative_count as u64),
         // DT_TEXTREL not needed since we use PIC
     ] {
@@ -2448,6 +2507,10 @@ pub(super) fn emit_shared_library(
     w64(&mut out, dd + 8, 0);
 
     // === Append section headers ===
+    // Merged `.comment` (compiler version strings, deduplicated).  Non-alloc
+    // metadata: section header plus file bytes, no address, no segment.
+    let comment_data = linker_common::merge_comment_sections(objects);
+
     // Build .shstrtab string table
     let mut shstrtab = vec![0u8]; // null byte at offset 0
     let mut shstr_offsets: FxHashMap<String, u32> = FxHashMap::default();
@@ -2473,6 +2536,7 @@ pub(super) fn emit_shared_library(
         ".symtab",
         ".strtab",
         ".shstrtab",
+        ".comment",
     ];
     for name in &known_names {
         let off = shstrtab.len() as u32;
@@ -2571,6 +2635,10 @@ pub(super) fn emit_shared_library(
             next_hdr += 1;
         }
     }
+    // .comment sits before .symtab, as in bfd.
+    if !comment_data.is_empty() {
+        next_hdr += 1;
+    }
     let symtab_shidx = next_hdr as u16;
     let strtab_shidx = symtab_shidx + 1;
 
@@ -2617,10 +2685,24 @@ pub(super) fn emit_shared_library(
         entry[16..24].copy_from_slice(&sym.size.to_le_bytes());
         symtab_entries.push(entry);
     }
-    let first_global = symtab_entries.len() as u32;
     let mut global_names: Vec<(&String, &GlobalSymbol)> = globals
         .iter()
-        .filter(|(_, sym)| sym.defined_in.is_some() && !sym.is_dynamic)
+        .filter(|(_, sym)| {
+            sym.defined_in.is_some()
+                && !sym.is_dynamic
+                // Same rule as `emit_exec`: a LOCAL-binding entry that is
+                // section-defined and laid out is already emitted by the
+                // locals loop above (synthetic `<string-merge>` pool symbols
+                // live in both the object symbol lists and the resolved
+                // map). Emitting it here too duplicates the symbol and breaks
+                // the locals-before-globals order.
+                && !matches!(sym.defined_in,
+                    Some(obj_idx)
+                        if (sym.info >> 4) == STB_LOCAL
+                            && sym.section_idx != SHN_ABS
+                            && sym.section_idx != SHN_COMMON
+                            && section_map.contains_key(&(obj_idx, sym.section_idx as usize)))
+        })
         .collect();
     global_names.sort_by(|a, b| a.0.cmp(b.0));
     for (name, sym) in global_names {
@@ -2646,6 +2728,20 @@ pub(super) fn emit_shared_library(
         entry[16..24].copy_from_slice(&sym.size.to_le_bytes());
         symtab_entries.push(entry);
     }
+
+    // ELF mandates every STB_LOCAL entry before the first global, and
+    // `sh_info` must name the first global index.  Snapshotting
+    // `symtab_entries.len()` between the loops is only correct while the
+    // globals loop never appends a STB_LOCAL entry — and it can (see the
+    // filter above).  Enforce the partition structurally instead: a STABLE
+    // sort keeps the NULL at index 0 and preserves each loop's order
+    // within its run, then `first_global` is derived from the finished
+    // table.  Same treatment as `emit_exec`.
+    symtab_entries.sort_by_key(|e| (e[4] >> 4) != STB_LOCAL);
+    let first_global = symtab_entries
+        .iter()
+        .filter(|e| (e[4] >> 4) == STB_LOCAL)
+        .count() as u32;
 
     // Count total sections to determine .shstrtab index
     // NULL + .dynsym + .dynstr, plus one header per hash table emitted.
@@ -2709,12 +2805,19 @@ pub(super) fn emit_shared_library(
             sh_count += 1;
         }
     }
+    if !comment_data.is_empty() {
+        sh_count += 1;
+    } // .comment
     sh_count += 2; // .symtab + .strtab
     debug_assert_eq!(symtab_shidx, sh_count - 2);
     debug_assert_eq!(strtab_shidx, sh_count - 1);
     let shstrtab_shidx = sh_count; // .shstrtab is the last section
     sh_count += 1;
 
+    // .comment data first (alignment 1, no padding needed), then the
+    // 8-aligned .symtab + .strtab data.
+    let comment_data_offset = out.len() as u64;
+    out.extend_from_slice(&comment_data);
     while out.len() % 8 != 0 {
         out.push(0);
     }
@@ -3054,6 +3157,22 @@ pub(super) fn emit_shared_library(
                 0,
             );
         }
+    }
+    // .comment (merged compiler version strings; non-alloc, addr 0).
+    if !comment_data.is_empty() {
+        write_shdr_so(
+            &mut out,
+            get_shname(".comment"),
+            SHT_PROGBITS,
+            SHF_MERGE | SHF_STRINGS,
+            0,
+            comment_data_offset,
+            comment_data.len() as u64,
+            0,
+            0,
+            1,
+            1,
+        );
     }
     // Non-allocated static symbols used by profilers and debuggers.
     write_shdr_so(

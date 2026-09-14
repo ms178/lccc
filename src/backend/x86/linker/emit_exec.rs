@@ -39,6 +39,15 @@ pub(super) fn emit_executable(
     // decides they are unreachable -- so a symbol filter that only consults
     // `section_map` emits a `.symtab` full of entries pointing at address 0.
     dead_sections: &crate::common::fx_hash::FxHashSet<(usize, usize)>,
+    // ICF-folded sections (a subset of `dead_sections`, keyed the same way):
+    // unlike GC/COMDAT losers these still EXIST — `section_map` remaps them
+    // onto the surviving representative — so their symbols must be emitted
+    // as aliases at the survivor's address, not dropped (lld keeps
+    // `dup_two` at `dup_one`'s address under `--icf=all`; dropping it also
+    // contradicts the aliasing `link.rs` installs just above).  Only the two
+    // `.symtab` filters below consult this; the merge must still skip
+    // folded sections — eliding the bytes is the point of folding.
+    folded_sections: &FxHashMap<(usize, usize), (usize, usize)>,
     // `-s` / `--strip-all`: omit `.symtab` and `.strtab` entirely.
     plt_names: &[String],
     got_entries: &[(String, bool)],
@@ -548,6 +557,22 @@ pub(super) fn emit_executable(
     let has_fini_array = output_sections
         .iter()
         .any(|s| s.name == ".fini_array" && s.mem_size > 0);
+    // `.init`/`.fini` (from crti/crtn): present with content on every normal
+    // dynamic link.  The addresses are NOT final yet (layout runs below), so
+    // only the predicates live here; emission looks the addresses up by name.
+    let has_init = output_sections
+        .iter()
+        .any(|s| s.name == ".init" && s.mem_size > 0);
+    let has_fini = output_sections
+        .iter()
+        .any(|s| s.name == ".fini" && s.mem_size > 0);
+    // DT_RELACOUNT: the count of leading R_X86_64_RELATIVE entries in
+    // .rela.dyn, which ld.so uses to bound the slide pass.  The writer
+    // below emits all RELATIVE entries first (pie_relative, then the GOT
+    // range), so the count is exact.  GNU emits the tag only when the
+    // count is non-zero (a non-PIE executable's .dynamic has no
+    // RELACOUNT); match that rather than ARM's unconditional form.
+    let relacount = pie_relative_count;
     let dynamic_size = if is_static {
         0u64
     } else {
@@ -569,6 +594,18 @@ pub(super) fn emit_executable(
         }
         if has_preinit_array {
             dyn_count += 2;
+        }
+        // Spelled identically to the emission below (see the DT_FLAGS note):
+        // DT_INIT/DT_FINI when the sections exist with content, DT_RELACOUNT
+        // when the .rela.dyn head run is non-empty.
+        if has_init {
+            dyn_count += 1;
+        }
+        if has_fini {
+            dyn_count += 1;
+        }
+        if relacount > 0 {
+            dyn_count += 1;
         }
         // DT_FLAGS carries BIND_NOW; DT_FLAGS_1 carries NOW and/or PIE.  A PIE
         // needs DF_1_PIE even without `-z now`, so the two are counted
@@ -630,9 +667,11 @@ pub(super) fn emit_executable(
         phdr_count += 1;
     }
     // PT_GNU_RELRO: covers the head of the RW segment (init/fini arrays,
-    // .dynamic, .got — plus .got.plt under -z now). Static executables get
-    // it too when they carry protectable content.
-    let has_relro = z_relro && !is_static;
+    // .data.rel.ro, .dynamic, .got — plus .got.plt under -z now). Static
+    // executables get it too: their .got/arrays/.data.rel.ro are
+    // link-time-final (startup writes only .data/.bss/ifunc_got, all past
+    // the boundary), and static glibc does mprotect the range.
+    let has_relro = z_relro;
     if has_relro {
         phdr_count += 1;
     }
@@ -861,6 +900,20 @@ pub(super) fn emit_executable(
         }
     }
 
+    // .data.rel.ro joins the RELRO window: it is const-after-relocation by
+    // construction, so leaving it in the generic RW loop below kept it
+    // writable at runtime for no reason (its entire purpose defeated).
+    for sec in output_sections.iter_mut() {
+        if sec.name == ".data.rel.ro" {
+            let a = sec.alignment.max(1);
+            offset = (offset + a - 1) & !(a - 1);
+            sec.addr = vaddr!(offset);
+            sec.file_offset = offset;
+            offset += sec.mem_size;
+            break;
+        }
+    }
+
     offset = (offset + 7) & !7;
     let dynamic_offset = offset;
     let dynamic_addr = vaddr!(offset);
@@ -924,6 +977,7 @@ pub(super) fn emit_executable(
             && sec.name != ".init_array"
             && sec.name != ".fini_array"
             && sec.name != ".preinit_array"
+            && sec.name != ".data.rel.ro"
             && sec.flags & SHF_TLS == 0
         {
             let a = sec.alignment.max(1);
@@ -1192,6 +1246,12 @@ pub(super) fn emit_executable(
     // two copies kept in step by hand. That is the duplication that produced
     // the historical ordering bugs `layout_plan.rs` was created to prevent, so
     // it is now a single pass whose count is reused.
+    // Merged `.comment` (compiler version strings, deduplicated).  Non-alloc
+    // metadata: it needs a section header and file bytes but no address and
+    // no segment.  Empty when no input carries a comment (or all are empty).
+    // Computed up here because the header walk below must count it.
+    let comment_data = linker_common::merge_comment_sections(objects);
+
     let mut out_sec_to_hdr: FxHashMap<usize, u16> = FxHashMap::default();
     // `-s` / `--strip-all`: no `.symtab`/`.strtab` at all.  Filtering the
     // builders below (rather than building and discarding) means a stripped
@@ -1325,6 +1385,11 @@ pub(super) fn emit_executable(
             &mut out_sec_to_hdr,
         );
 
+        // .comment precedes .symtab (as in bfd), shifting both indices.
+        if !comment_data.is_empty() {
+            h += 1;
+        }
+
         // .symtab and .strtab follow, then .shstrtab.
         symtab_shidx = if emit_symtab { h as u16 } else { 0 };
         strtab_shidx = if emit_symtab { h as u16 + 1 } else { 0 };
@@ -1356,7 +1421,13 @@ pub(super) fn emit_executable(
                         // `.symtab` dominated by value-0/size!=0 entries -- on a
                         // 61-object `-ffunction-sections --gc-sections` link,
                         // 2341 of 2551 symbols, 61 KB against bfd's 6 KB.
-                        && !dead_sections.contains(&(obj_idx, sym.shndx as usize))
+                        // ICF-folded is the exception: the section was laid
+                        // out once, under the representative, and
+                        // `section_map` already points there — the symbol is
+                        // alive as an alias and must be emitted (lld parity).
+                        && (!dead_sections.contains(&(obj_idx, sym.shndx as usize))
+                            || folded_sections
+                                .contains_key(&(obj_idx, sym.shndx as usize)))
                 })
                 .map(move |sym| (obj_idx, sym))
         })
@@ -1385,11 +1456,29 @@ pub(super) fn emit_executable(
                 && g.defined_in.is_some()
                 && !g.is_dynamic
                 // Same rule as the locals above: a global defined in a section
-                // that was collected away has no address to report.
+                // that was collected away has no address to report.  Folded
+                // globals are the exception — they alias the representative.
                 && !matches!(g.defined_in,
                     Some(oi) if g.section_idx != SHN_ABS
                         && g.section_idx != SHN_COMMON
-                        && dead_sections.contains(&(oi, g.section_idx as usize)))
+                        && dead_sections.contains(&(oi, g.section_idx as usize))
+                        && !folded_sections
+                            .contains_key(&(oi, g.section_idx as usize)))
+                // A LOCAL-binding entry that is section-defined and laid out
+                // is already emitted by the locals loop above (synthetic
+                // `<string-merge>` pool symbols live in BOTH the object
+                // symbol lists and the resolved map — that is how lookups
+                // find them). Emitting it here too duplicates the symbol AND
+                // breaks the locals-before-globals order (a STB_LOCAL entry
+                // after `sh_info` is a hard ELF violation `readelf` warns
+                // about). Skip exactly the covered case; an unmapped local
+                // still emits below and the partition step places it.
+                && !matches!(g.defined_in,
+                    Some(oi)
+                        if (g.info >> 4) == STB_LOCAL
+                            && g.section_idx != SHN_ABS
+                            && g.section_idx != SHN_COMMON
+                            && section_map.contains_key(&(oi, g.section_idx as usize)))
         })
         .collect();
     // Sort by a cached big-endian 8-byte prefix first: for symbol-heavy
@@ -1449,18 +1538,25 @@ pub(super) fn emit_executable(
             shndx, gsym.value, gsym.size,
         ));
     }
+    // ELF mandates every STB_LOCAL entry before the first global, and
+    // `sh_info` must equal the number of STB_LOCAL entries, counting the
+    // NULL symbol at index 0.  The globals filter above keeps covered
+    // locals out, but any future path that appends a STB_LOCAL entry here
+    // (this class has recurred: `sh_info` used to be snapshotted between
+    // the loops, then derived by counting — both still wrong when a local
+    // lands after a global) would silently re-break the order.  Enforce it
+    // structurally instead: a STABLE partition keeps the NULL at index 0
+    // and preserves each loop's order within its run, so the invariant
+    // holds no matter what the loops append.  Cost is one stable sort over
+    // a few hundred cache-resident 24-byte entries — noise next to the
+    // u128-prefixed global sort above.
+    symtab_entries.sort_by_key(|e| (e[4] >> 4) != STB_LOCAL);
     // `sh_info` must equal the number of STB_LOCAL entries, counting the NULL
-    // symbol at index 0.  It used to be snapshotted between the two loops below
-    // as `symtab_entries.len()`, which is only correct while the globals loop
-    // never appends an entry carrying STB_LOCAL -- and it does, for symbols
-    // whose binding came from the input object rather than from our own
-    // promotion.  Each such entry made `sh_info` one short, which is a hard ELF
-    // violation (the rule is `sh_info == nlocals`).  Deriving it from the
-    // finished table makes the invariant unbreakable instead of maintained by
-    // hand, and costs one linear scan over data that is already in cache.
+    // symbol at index 0.  Derived from the finished (now partitioned) table:
+    // correct by construction, and one linear scan over data already in cache.
     let n_local = symtab_entries
         .iter()
-        .filter(|e| (e[4] >> 4) == 0) // st_info >> 4 == STB_LOCAL
+        .filter(|e| (e[4] >> 4) == STB_LOCAL)
         .count();
     zone!("symtab");
     // === Build output buffer ===
@@ -2001,6 +2097,31 @@ pub(super) fn emit_executable(
             w64(&mut out, dd + 8, so as u64);
             dd += 16;
         }
+        // DT_INIT/DT_FINI: the .init/.fini section addresses (crti/crtn put
+        // _init/_fini at the section starts, so this equals the symbol
+        // values on every normal link — verified against bfd).  Placed
+        // right after NEEDED as in bfd.  The lookups cannot miss: `has_init`
+        // / `has_fini` above test the same predicate.
+        if has_init {
+            let init_addr = output_sections
+                .iter()
+                .find(|s| s.name == ".init")
+                .map(|s| s.addr)
+                .unwrap_or(0);
+            w64(&mut out, dd, DT_INIT as u64);
+            w64(&mut out, dd + 8, init_addr);
+            dd += 16;
+        }
+        if has_fini {
+            let fini_addr = output_sections
+                .iter()
+                .find(|s| s.name == ".fini")
+                .map(|s| s.addr)
+                .unwrap_or(0);
+            w64(&mut out, dd, DT_FINI as u64);
+            w64(&mut out, dd + 8, fini_addr);
+            dd += 16;
+        }
         for &(tag, val) in &[
             (DT_STRTAB, dynstr_addr),
             (DT_SYMTAB, dynsym_addr),
@@ -2017,6 +2138,14 @@ pub(super) fn emit_executable(
         ] {
             w64(&mut out, dd, tag as u64);
             w64(&mut out, dd + 8, val);
+            dd += 16;
+        }
+        // DT_RELACOUNT: size of the leading R_X86_64_RELATIVE run in
+        // .rela.dyn (both RELATIVE loops above run before any GLOB_DAT, so
+        // `relacount` is exact).  Omitted when zero, as GNU does.
+        if relacount > 0 {
+            w64(&mut out, dd, DT_RELACOUNT as u64);
+            w64(&mut out, dd + 8, relacount as u64);
             dd += 16;
         }
         // Hash tables, in the order the loader probes them: DT_GNU_HASH first,
@@ -2821,6 +2950,7 @@ pub(super) fn emit_executable(
         ".rela.iplt",
         ".symtab",
         ".strtab",
+        ".comment",
     ];
     for name in &known_names {
         let off = shstrtab.len() as u32;
@@ -2902,11 +3032,18 @@ pub(super) fn emit_executable(
             sh_count += 1;
         }
     }
+    // .comment sits before .symtab, as in bfd.
+    if !comment_data.is_empty() {
+        sh_count += 1;
+    }
     sh_count += if emit_symtab { 2 } else { 0 }; // .symtab + .strtab
     let shstrtab_shidx = sh_count; // .shstrtab is the last section
     sh_count += 1;
 
-    // Align and append .symtab + .strtab data (before .shstrtab)
+    // .comment data first (alignment 1, no padding needed), then the
+    // 8-aligned .symtab + .strtab data (before .shstrtab).
+    let comment_data_offset = out.len() as u64;
+    out.extend_from_slice(&comment_data);
     while out.len() % 8 != 0 {
         out.push(0);
     }
@@ -3325,6 +3462,22 @@ pub(super) fn emit_executable(
                 0,
             );
         }
+    }
+    // .comment (merged compiler version strings; non-alloc, addr 0).
+    if !comment_data.is_empty() {
+        write_shdr(
+            &mut out,
+            get_shname(".comment"),
+            SHT_PROGBITS,
+            SHF_MERGE | SHF_STRINGS,
+            0,
+            comment_data_offset,
+            comment_data.len() as u64,
+            0,
+            0,
+            1,
+            1,
+        );
     }
     if emit_symtab {
         // .symtab (defined symbols for profilers/debuggers)

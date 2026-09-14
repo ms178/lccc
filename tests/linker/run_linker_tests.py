@@ -53,7 +53,11 @@ class Case:
                  skip_oracles=False, run_env=None, tags=(),
                  expect_elf_type=None, known_defect=None,
                  expect_no_zero_size_syms=False, expect_no_symtab=False,
-                 expect_dyn_tags=None, expect_prop_note_match=False):
+                 expect_dyn_tags=None, expect_prop_note_match=False,
+                 expect_symtab_valid=False, expect_dyn_init_fini=False,
+                 expect_dyn_relacount=None, expect_same_address=None,
+                 expect_dyn_has=None, expect_dyn_missing=None,
+                 expect_comment=None, expect_symbol_order=None):
         self.name = name
         self.sources = sources              # dict fname -> contents (.c or .s)
         self.link_inputs = link_inputs      # ordered link inputs; default: all objects
@@ -93,6 +97,39 @@ class Case:
         # choices cannot hide a merge disagreement).  bfd is the reference;
         # when it produced no output the case skips instead of guessing.
         self.expect_prop_note_match = expect_prop_note_match
+        # Full `.symtab` shape check: sh_info == nlocals AND every LOCAL
+        # precedes the first global.  Subsumes the count-only check that
+        # `expect_no_zero_size_syms` runs as a side effect.
+        self.expect_symtab_valid = expect_symtab_valid
+        # DT_INIT/DT_FINI must be present AND equal the .init/.fini section
+        # addresses (crti/crtn place _init/_fini at the section starts, so a
+        # value check against the sections is the bfd behaviour, exactly).
+        self.expect_dyn_init_fini = expect_dyn_init_fini
+        # DT_RELACOUNT: True means present with a value equal to the leading
+        # R_X86_64_RELATIVE run of .rela.dyn (re-parsed, not trusted);
+        # False means the tag must be absent AND the run must be empty
+        # (a GLOB_DAT-only .rela.dyn, as in a non-PIE link).  None skips.
+        self.expect_dyn_relacount = expect_dyn_relacount
+        # Groups of symbol names that must share one st_value (ICF alias
+        # check): every name must be PRESENT in .symtab and all values in
+        # a group must be equal.  stdout alone cannot tell "folded" from
+        # "never folded" — or from "folded but the loser was dropped".
+        self.expect_same_address = expect_same_address
+        # Dynamic tags (by name, see _DT_NUMBERS) that must be present in
+        # or absent from .dynamic.  Presence-only — value checks live in
+        # the dedicated params above.
+        self.expect_dyn_has = expect_dyn_has
+        self.expect_dyn_missing = expect_dyn_missing
+        # Ordered .comment subsequence: every listed string must occur
+        # EXACTLY ONCE in the merged .comment section, in the listed
+        # relative order.  Extra entries (the toolchain's own ident from
+        # the crt objects) are allowed — the check pins dedup and order,
+        # not the toolchain string, so it stays robust across gcc builds.
+        self.expect_comment = expect_comment
+        # Symbol names in strictly ascending st_value order (--sort-common
+        # check).  Every name must exist; equal addresses fail (a folded
+        # alias is not an ordering).
+        self.expect_symbol_order = expect_symbol_order
 
 CASES = []
 def case(*a, **kw):
@@ -315,6 +352,30 @@ case("archive_lazy_loading_is_lazy",
     link_inputs=["main.o", "libwa.a"],
     expect_stdout="0\n",
     setup=_make_wa,
+    tags=("archive",))
+
+def _make_weakext(td):
+    for f in ("n1.c", "w2.c"):
+        r = sh([CC, "-c", f], cwd=td); assert r.returncode == 0
+    r = sh(["ar", "rcs", "libweakext.a", "n1.o", "w2.o"], cwd=td); assert r.returncode == 0
+
+case("archive_weak_ref_no_extract",
+    # A weak-undefined reference must NOT pull an archive member (GNU ld
+    # leaves it resolving to zero). The strong reference to `needed` in the
+    # same archive proves extraction itself still works: expect "7 0".
+    # Regression test: lccc used to pull w2.o for the weak ref, printing
+    # "7 1" and dragging +37 KiB of libio into every static link.
+    {"main.c": """
+        #include <stdio.h>
+        extern int needed(void);
+        __attribute__((weak)) int wref(void);
+        int main(void){ printf("%d %d\\n", needed(), wref ? 1 : 0); return 0; }
+     """,
+     "n1.c": "int needed(void){ return 7; }",
+     "w2.c": "int wref(void){ return 99; }"},
+    link_inputs=["main.o", "libweakext.a"],
+    expect_stdout="7 0\n",
+    setup=_make_weakext,
     tags=("archive",))
 
 def _make_thin(td):
@@ -995,6 +1056,7 @@ case("gc_sections_symtab_no_dead_locals",
     # Assert the invariant directly: no symbol may claim a non-zero size at
     # address 0, which is what a collected-section local looks like.
     expect_no_zero_size_syms=True,
+    expect_symtab_valid=True,
     tags=("gc", "symtab"))
 
 case("symtab_sh_info_equals_locals",
@@ -1008,6 +1070,29 @@ case("symtab_sh_info_equals_locals",
         int main(void){ printf("%d\\n", global_fn(9)); return 0; }
      """},
     expect_stdout="9\n",
+    expect_symtab_valid=True,
+    tags=("symtab",))
+
+case("symtab_locals_before_globals_with_pools",
+    # String merging creates synthetic pool symbols that live in BOTH the
+    # object symbol lists and the resolved globals map; the globals-loop
+    # copy used to be emitted a second time with its STB_LOCAL binding,
+    # after sh_info — a hard ELF violation (readelf warns, debuggers
+    # misclassify).  Two string-heavy objects guarantee pool formation.
+    {"a.c": """
+        #include <stdio.h>
+        static int helper1(int x){ return x + 1; }
+        int fn1(int x){ printf("fn1 sees %d\\n", helper1(x)); return helper1(x); }
+     """,
+     "b.c": """
+        #include <stdio.h>
+        int fn1(int);
+        static int helper2(int x){ return x + 2; }
+        int fn2(int x){ printf("fn2 sees %d\\n", helper2(x)); return helper2(x); }
+        int main(void){ printf("%d\\n", fn1(1) + fn2(10)); return 0; }
+     """},
+    expect_stdout="fn1 sees 2\nfn2 sees 12\n14\n",
+    expect_symtab_valid=True,
     tags=("symtab",))
 
 case("strip_all_drops_symtab",
@@ -1055,6 +1140,133 @@ case("hash_style_both",
     expect_stdout="hs\n",
     expect_dyn_tags=["GNU_HASH", "HASH"],
     tags=("hash",))
+
+case("dyn_init_fini_pie",
+    # A PIE executable's .dynamic must tag .init/.fini (values equal to the
+    # section addresses, as bfd emits) and count the leading RELATIVE run.
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("di\\n"); return 0; }
+     """},
+    ldflags=["-pie"],
+    expect_stdout="di\n",
+    expect_elf_type="DYN",
+    expect_dyn_init_fini=True,
+    expect_dyn_relacount=True,
+    tags=("dynamic",))
+
+case("dyn_init_fini_nopie",
+    # Non-PIE: INIT/FINI stay, but with an empty RELATIVE run DT_RELACOUNT
+    # must be omitted entirely (bfd parity: a non-PIE .dynamic has no
+    # RELACOUNT tag).  The check also fails if .rela.dyn secretly opens
+    # with RELATIVE entries while the tag is missing.
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("di\\n"); return 0; }
+     """},
+    ldflags=["-no-pie"],
+    expect_stdout="di\n",
+    expect_elf_type="EXEC",
+    expect_dyn_init_fini=True,
+    expect_dyn_relacount=False,
+    tags=("dynamic",))
+
+case("rpath_default_is_runpath",
+    # A plain -rpath must land in DT_RUNPATH, not DT_RPATH: bfd (as every
+    # major distro configures it), lld and mold all default to new dtags.
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("rp\\n"); return 0; }
+     """},
+    ldflags=["-Wl,-rpath,/opt/x"],
+    expect_stdout="rp\n",
+    expect_dyn_has=["RUNPATH"],
+    expect_dyn_missing=["RPATH"],
+    tags=("dynamic",))
+
+case("rpath_disable_new_dtags",
+    # --disable-new-dtags opts back into the historic DT_RPATH tag.
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("rp\\n"); return 0; }
+     """},
+    ldflags=["-Wl,-rpath,/opt/x", "-Wl,--disable-new-dtags"],
+    expect_stdout="rp\n",
+    expect_dyn_has=["RPATH"],
+    expect_dyn_missing=["RUNPATH"],
+    tags=("dynamic",))
+
+case("rpath_enable_new_dtags",
+    # Explicit --enable-new-dtags: DT_RUNPATH (documents the spelled-out
+    # form of the default).
+    {"a.c": """
+        #include <stdio.h>
+        int main(void){ printf("rp\\n"); return 0; }
+     """},
+    ldflags=["-Wl,-rpath,/opt/x", "-Wl,--enable-new-dtags"],
+    expect_stdout="rp\n",
+    expect_dyn_has=["RUNPATH"],
+    expect_dyn_missing=["RPATH"],
+    tags=("dynamic",))
+
+case("comment_merged_deduplicated",
+    # .comment inputs merge with dedup in link order, as in bfd: b.s
+    # repeats a.s's string, so "comment-A" must appear exactly once and
+    # before "comment-B".  Extra toolchain idents (from the crt objects)
+    # are tolerated — only the relative order and uniqueness are pinned.
+    {"main.c": """
+        #include <stdio.h>
+        int fa(void); int fb(void);
+        int main(void){ printf("%d\\n", fa() + fb()); return 0; }
+     """,
+     "a.s": """
+        .section .comment,"MS",@progbits,1
+        .string "comment-A"
+        .text
+        .globl fa
+        .type fa,@function
+fa:
+        movl $1, %eax
+        ret
+     """,
+     "b.s": """
+        .section .comment,"MS",@progbits,1
+        .string "comment-A"
+        .string "comment-B"
+        .text
+        .globl fb
+        .type fb,@function
+fb:
+        movl $2, %eax
+        ret
+     """},
+    compile_flags=["-O1", "-fno-ident"],
+    link_inputs=["main.o", "a.o", "b.o"],
+    expect_stdout="3\n",
+    expect_comment=["comment-A", "comment-B"],
+    tags=("sections",))
+
+case("sort_common_largest_first",
+    # --sort-common lays COMMONs out largest-first (bfd parity).  The
+    # source declares them smallest-first, so ascending addresses prove
+    # the sort ran.  Needs -fcommon: modern gcc defaults to -fno-common
+    # (.bss instead of SHN_COMMON).
+    {"a.c": """
+        #include <stdio.h>
+        char sc_c;
+        short sc_s;
+        long sc_l;
+        int main(void){
+            sc_c = 1; sc_s = 2; sc_l = 3;
+            printf("%ld\\n", (long)sc_c + sc_s + sc_l);
+            return 0;
+        }
+     """},
+    compile_flags=["-O1", "-fcommon"],
+    lccc_only_flags=["-Wl,--sort-common"],
+    expect_stdout="6\n",
+    expect_symbol_order=["sc_l", "sc_s", "sc_c"],
+    tags=("common",))
 
 case("local_ifunc_static_link",
     {"a.c": """
@@ -1376,6 +1588,67 @@ case("relro_write_protection",
     compile_flags=["-O0"],
     ldflags=["-Wl,-z,now"],
     tags=("special", "relro"))
+
+case("relro_data_rel_ro_dynamic",
+    # .data.rel.ro must live INSIDE PT_GNU_RELRO: a write into it has to
+    # SIGSEGV exactly like .init_array does. Regression test: lccc placed
+    # the section in the generic RW loop, past the RELRO boundary, leaving
+    # every vtable/const-pointer writable at runtime.
+    {"a.c": """
+        #include <stdio.h>
+        #include <signal.h>
+        #include <setjmp.h>
+        static sigjmp_buf jb;
+        static void segv(int s){ (void)s; siglongjmp(jb, 1); }
+        static const int x = 5;
+        static const int * const p = &x;
+        int main(void){
+            signal(SIGSEGV, segv);
+            if (sigsetjmp(jb, 1) == 0) {
+                *(const int **)&p = 0;
+                printf("WRITABLE\\\\n");
+                return 1;
+            }
+            printf("PROTECTED\\\\n");
+            return 0;
+        }
+     """},
+    compile_flags=["-O0"],
+    expect_stdout="PROTECTED\\n",
+    tags=("special", "relro"))
+
+case("relro_static_init_array",
+    # Static executables get PT_GNU_RELRO too, and static glibc enforces
+    # it: writing .init_array must SIGSEGV. The .data counter increment
+    # first proves writable data still works (RELRO must end before .data;
+    # if it covered .data the increment would crash before any handler).
+    {"a.c": """
+        #include <stdio.h>
+        #include <signal.h>
+        #include <setjmp.h>
+        static sigjmp_buf jb;
+        static int data_counter;
+        static void segv(int s){ (void)s; siglongjmp(jb, 1); }
+        typedef void (*fp)(void);
+        __attribute__((constructor)) static void c1(void){}
+        extern fp __init_array_start[] __attribute__((weak));
+        int main(void){
+            data_counter += 1;
+            if (data_counter != 1) { printf("DATA-BROKEN\\\\n"); return 2; }
+            signal(SIGSEGV, segv);
+            if (sigsetjmp(jb, 1) == 0) {
+                __init_array_start[0] = (fp)main;
+                printf("WRITABLE\\\\n");
+                return 1;
+            }
+            printf("PROTECTED\\\\n");
+            return 0;
+        }
+     """},
+    ldflags=["-static"],
+    compile_flags=["-O0"],
+    expect_stdout="PROTECTED\\n",
+    tags=("special", "relro", "static"))
 
 case("z_now_dynamic_flags",
     # -z now must emit DT_FLAGS=BIND_NOW and DT_FLAGS_1=NOW (checked by
@@ -3068,6 +3341,122 @@ def _static_pie_refusal_test(args, oracles):
             return Result(name, "FAIL",
                           "refused without an explanatory diagnostic")
         return Result(name, "PASS", "refused with a diagnostic")
+
+
+def _dyn_init_fini_shared_test(args, oracles):
+    """A lccc-linked .so must tag .init/.fini and count its RELATIVE run.
+
+    Same contract as the `dyn_init_fini_*` cases, but through the shared
+    writer (`-shared`), whose .dynamic is sized and laid out independently:
+    DT_INIT/DT_FINI must equal the .init/.fini section addresses, and
+    DT_RELACOUNT must equal the leading R_X86_64_RELATIVE run of .rela.dyn
+    (re-parsed, not trusted).  A consumer linked against the library by the
+    system linker must also run, proving the resized .dynamic did not
+    corrupt the image.
+    """
+    name = "dyn_init_fini_shared"
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "impl.c"), "w") as f:
+            f.write("int impl_var = 30;\n"
+                    "int impl_fn(int x){ return x * impl_var; }\n")
+        with open(os.path.join(td, "main.c"), "w") as f:
+            f.write("#include <stdio.h>\n"
+                    "extern int impl_fn(int);\n"
+                    "int main(void){ printf(\"%d\\n\", impl_fn(5)); return 0; }\n")
+        r = sh([CC, "-c", "-fpic", "-O1", "impl.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "fixture compile failed")
+        # Link through the system driver with a -B shim (not the bare lccc
+        # driver): only the full driver link pulls in crti/crtn, which are
+        # what give the .so its .init/.fini content.
+        shim = _shim_for(td, lccc_ld)
+        out = os.path.join(td, "libimpl.so")
+        r = sh([CC, "-B" + shim, "-shared", "impl.o", "-o", out], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL",
+                          "lccc -shared failed: %s" % r.stderr.decode(errors="replace")[:200])
+        tags, addrs = dyn_tag_map(out)
+        for tagname, tag, sec in (("INIT", _DT_INIT, ".init"),
+                                  ("FINI", _DT_FINI, ".fini")):
+            if tag not in tags:
+                return Result(name, "FAIL", f"DT_{tagname} missing from .dynamic")
+            if sec not in addrs:
+                return Result(name, "FAIL",
+                              f"DT_{tagname} present but {sec} section missing")
+            if tags[tag] != addrs[sec]:
+                return Result(name, "FAIL",
+                              f"DT_{tagname} is {tags[tag]:#x}, "
+                              f"{sec} section is at {addrs[sec]:#x}")
+        run = rela_dyn_relative_run(out)
+        if _DT_RELACOUNT not in tags:
+            return Result(name, "FAIL", "DT_RELACOUNT missing from .dynamic")
+        if run is None:
+            return Result(name, "FAIL",
+                          "DT_RELACOUNT present but no .rela.dyn to count")
+        if tags[_DT_RELACOUNT] != run:
+            return Result(name, "FAIL",
+                          f"DT_RELACOUNT is {tags[_DT_RELACOUNT]}, but the "
+                          f"leading RELATIVE run of .rela.dyn is {run}")
+        # The system linker consumes the library: it must link and run.
+        r = sh([CC, "-c", "-O1", "main.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "consumer compile failed")
+        r = sh([CC, "main.o", out, "-Wl,-rpath,$ORIGIN", "-o", "main"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL",
+                          "consumer link against lccc .so failed: %s"
+                          % r.stderr.decode(errors="replace")[:200])
+        code, prog_out = run_bin(os.path.join(td, "main"), [], td)
+        if code != 0 or prog_out != "150\n":
+            return Result(name, "FAIL",
+                          "consumer misbehaves: %r" % ((code, prog_out),))
+        return Result(name, "PASS")
+
+
+def _emit_relocs_warns_test(args, oracles):
+    """--emit-relocs on a non-script link must warn, never drop silently.
+
+    Relocation retention is only implemented for `-T` script links.  The
+    built-in/shared emitters cannot honour the flag, so they must say so:
+    lccc-ld used to swallow it (consumed into a bool that only the script
+    path reads) and link a `-q` image with no `.rela.*` and no diagnostic.
+    Both spellings (`--emit-relocs`, `-q`) are exercised.  Written to pass
+    either way once retention lands: if `.rela.text` appears the image must
+    run; otherwise the warning must be present.
+    """
+    name = "emit_relocs_warns_when_unimplemented"
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "a.c"), "w") as f:
+            f.write('#include <stdio.h>\nint main(void){ printf("ok\\n"); return 0; }\n')
+        r = sh([CC, "-c", "-O1", "a.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "fixture compile failed")
+        shim = _shim_for(td, lccc_ld)
+        for spelling in ("--emit-relocs", "-q"):
+            out = os.path.join(td, "a.out")
+            r = sh([CC, "-B" + shim, "-Wl," + spelling, "a.o", "-o", out], cwd=td)
+            err = r.stderr.decode(errors="replace")
+            if r.returncode != 0:
+                return Result(name, "FAIL",
+                              "%s: link failed: %s" % (spelling, err[:200]))
+            code, prog_out = run_bin(out, [], td)
+            if code != 0 or prog_out != "ok\n":
+                return Result(name, "FAIL",
+                              "%s: linked image misbehaves: %r" % (spelling, (code, prog_out)))
+            has_rela = b".rela.text" in open(out, "rb").read()
+            if has_rela:
+                continue  # retention implemented: image runs, nothing to warn
+            if "--emit-relocs ignored" not in err:
+                return Result(name, "FAIL",
+                              "%s: no .rela.text retained and no warning on stderr"
+                              % spelling)
+        return Result(name, "PASS")
 
 
 
@@ -4978,6 +5367,7 @@ int main(void){ printf("%d %d\\n", dup_one(), dup_two()); return 0; }
     compile_flags=["-O1", "-ffunction-sections"],
     lccc_only_flags=["-Wl,--icf=all"],
     expect_stdout="16 16\n",
+    expect_same_address=[["dup_one", "dup_two"]],
     tags=("icf",))
 
 # Differing addends are differing code even when the bytes match.
@@ -5827,6 +6217,9 @@ def main():
         results.append(_gc_eh_frame_invariant_test(args, oracles))
     results.append(_build_id_note_test(args, oracles))
     results.append(_static_pie_refusal_test(args, oracles))
+    results.append(_emit_relocs_warns_test(args, oracles))
+    if (not args.filter or "dyn_init_fini" in args.filter) and (not args.tag or args.tag == "dynamic"):
+        results.append(_dyn_init_fini_shared_test(args, oracles))
     if (not args.filter or "hidden" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_script_hidden_visibility_test(args, oracles))
     if (not args.filter or "gotpcrel" in args.filter) and (not args.tag or args.tag == "script"):
@@ -5922,7 +6315,8 @@ def _wild_shim(wildpath):
 
 def symtab_problems(path):
     """Inspect .symtab: presence, entry count, sh_info correctness, zero-size ghosts."""
-    out = {"present": False, "nsyms": 0, "zero_size": 0, "sh_info_bad": None}
+    out = {"present": False, "nsyms": 0, "zero_size": 0, "sh_info_bad": None,
+           "order_bad": None}
     try:
         with open(path, "rb") as fh:
             d = fh.read()
@@ -5945,15 +6339,29 @@ def symtab_problems(path):
         out["present"] = True
         out["nsyms"] = sz // 24
         nlocal = 0
+        maxlocal = -1
+        firstglob = None
         for k in range(sz // 24):
             nm, info, other, shndx, val, size = struct.unpack_from("<IBBHQQ", d, off + k * 24)
             if val == 0 and size != 0:
                 out["zero_size"] += 1
             if (info >> 4) == 0:
                 nlocal += 1
+                maxlocal = k
+            elif firstglob is None:
+                firstglob = k
         if inf != nlocal:
             out["sh_info_bad"] = (f".symtab sh_info is {inf} but there are "
                                   f"{nlocal} STB_LOCAL entries (ELF requires sh_info == nlocals)")
+        # sh_info == nlocals is necessary but NOT sufficient: every LOCAL
+        # must also precede the first global.  A STB_LOCAL entry appended by
+        # the globals loop (e.g. a synthetic pool symbol living in both the
+        # object symbol lists and the resolved map) passes the count check
+        # and still violates the spec — readelf warns, debuggers misread.
+        if firstglob is not None and maxlocal > firstglob:
+            out["order_bad"] = (f".symtab not partitioned: STB_LOCAL entry at index "
+                                f"{maxlocal} follows the first global at {firstglob} "
+                                f"(ELF requires all locals first)")
     return out
 
 
@@ -5995,6 +6403,161 @@ def dyn_hash_tags(path):
             if ".hash" in names:
                 tags.append("HASH")
     return sorted(tags)
+
+
+# Dynamic-tag numbers (ELF64, x86-64 System V ABI).
+_DT_INIT = 12
+_DT_FINI = 13
+_DT_RELACOUNT = 0x6FFFFFF9
+_DT_RPATH = 15
+_DT_RUNPATH = 29
+_DT_NUMBERS = {
+    "INIT": _DT_INIT,
+    "FINI": _DT_FINI,
+    "RELACOUNT": _DT_RELACOUNT,
+    "RPATH": _DT_RPATH,
+    "RUNPATH": _DT_RUNPATH,
+}
+_R_X86_64_RELATIVE = 8
+
+
+def _elf_sections(d):
+    """[(name_off, type, addr, off, size, link)], shstrndx — or None.
+
+    64-bit LE only: every link in this harness is an x86-64 driver link.
+    """
+    if len(d) < 64 or d[:4] != b"\x7fELF" or d[4] != 2 or d[5] != 1:
+        return None
+    e_shoff, = struct.unpack_from("<Q", d, 0x28)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 0x3A)
+    secs = []
+    for i in range(e_shnum):
+        b = e_shoff + i * e_shentsize
+        if b + e_shentsize > len(d):
+            return None
+        n, t, fl, a, off, sz, lk, inf, al, es = struct.unpack_from("<IIQQQQIIQQ", d, b)
+        secs.append((n, t, a, off, sz, lk))
+    return secs, e_shstrndx
+
+
+def _sec_name(d, shstr, x):
+    if shstr is None or x >= shstr[4]:
+        return ""
+    e = d.index(b"\0", shstr[3] + x)
+    return d[shstr[3] + x:e].decode("latin1", "replace")
+
+
+def dyn_tag_map(path):
+    """({tag: value} from SHT_DYNAMIC, {section-name: address}).
+
+    Either dict is empty when the image cannot be parsed.
+    """
+    tags, addrs = {}, {}
+    try:
+        with open(path, "rb") as fh:
+            d = fh.read()
+    except OSError:
+        return tags, addrs
+    parsed = _elf_sections(d)
+    if parsed is None:
+        return tags, addrs
+    secs, e_shstrndx = parsed
+    shstr = secs[e_shstrndx] if e_shstrndx < len(secs) else None
+    for n, t, a, off, sz, _lk in secs:
+        addrs[_sec_name(d, shstr, n)] = a
+    dyn = next((s for s in secs if s[1] == 6), None)  # SHT_DYNAMIC
+    if dyn is None:
+        return tags, addrs
+    for k in range(dyn[4] // 16):
+        tag, val = struct.unpack_from("<qQ", d, dyn[3] + k * 16)
+        tags.setdefault(tag, val)
+    return tags, addrs
+
+
+def rela_dyn_relative_run(path):
+    """Count of leading R_X86_64_RELATIVE entries in .rela.dyn, or None.
+
+    None means the section is absent (or the image unparseable) — distinct
+    from 0, so callers can tell "no .rela.dyn" from "GLOB_DAT-only".
+    """
+    try:
+        with open(path, "rb") as fh:
+            d = fh.read()
+    except OSError:
+        return None
+    parsed = _elf_sections(d)
+    if parsed is None:
+        return None
+    secs, e_shstrndx = parsed
+    shstr = secs[e_shstrndx] if e_shstrndx < len(secs) else None
+    rela = next((s for s in secs
+                 if s[1] == 4 and _sec_name(d, shstr, s[0]) == ".rela.dyn"), None)
+    if rela is None:
+        return None
+    run = 0
+    for k in range(rela[4] // 24):
+        r_info, = struct.unpack_from("<Q", d, rela[3] + k * 24 + 8)
+        if r_info & 0xFFFFFFFF != _R_X86_64_RELATIVE:
+            break
+        run += 1
+    return run
+
+
+def sym_values(path):
+    """{symbol name: st_value} from SHT_SYMTAB, or None if unparseable.
+
+    First definition wins: a folded-away duplicate that survives as an
+    alias keeps its name with the representative's address (that is the
+    property the ICF alias check asserts), while a dropped symbol is
+    simply absent.
+    """
+    try:
+        with open(path, "rb") as fh:
+            d = fh.read()
+    except OSError:
+        return None
+    parsed = _elf_sections(d)
+    if parsed is None:
+        return None
+    secs, e_shstrndx = parsed
+    shstr = secs[e_shstrndx] if e_shstrndx < len(secs) else None
+    symtab = next((s for s in secs
+                   if s[1] == 2 and _sec_name(d, shstr, s[0]) == ".symtab"), None)
+    if symtab is None or symtab[5] >= len(secs):
+        return None
+    strtab = secs[symtab[5]]
+    vals = {}
+    for k in range(symtab[4] // 24):
+        st_name, _, _, _, st_value, _ = struct.unpack_from(
+            "<IBBHQQ", d, symtab[3] + k * 24)
+        if st_name == 0 or st_name >= strtab[4]:
+            continue
+        e = d.index(b"\0", strtab[3] + st_name)
+        name = d[strtab[3] + st_name:e].decode("latin1", "replace")
+        vals.setdefault(name, st_value)
+    return vals
+
+
+def comment_strings(path):
+    """Ordered .comment strings (NUL-split, empties dropped), or None.
+
+    None means no .comment section at all — distinct from an empty one.
+    """
+    try:
+        with open(path, "rb") as fh:
+            d = fh.read()
+    except OSError:
+        return None
+    parsed = _elf_sections(d)
+    if parsed is None:
+        return None
+    secs, e_shstrndx = parsed
+    shstr = secs[e_shstrndx] if e_shstrndx < len(secs) else None
+    for s in secs:
+        if s[1] == 1 and _sec_name(d, shstr, s[0]) == ".comment":
+            return [p.decode("latin1", "replace")
+                    for p in d[s[3]:s[3] + s[4]].split(b"\0") if p]
+    return None
 
 
 def prop_note_map(path):
@@ -6134,7 +6697,7 @@ def run_case(c, args, oracles):
             return Result(c.name, "SKIP", f"all linkers failed: {lccc_link_err}")
 
         # --- symbol table shape ---
-        if c.expect_no_symtab or c.expect_no_zero_size_syms:
+        if c.expect_no_symtab or c.expect_no_zero_size_syms or c.expect_symtab_valid:
             bad = symtab_problems(lccc_out)
             if c.expect_no_symtab and bad.get("present"):
                 return Result(c.name, "FAIL",
@@ -6145,12 +6708,107 @@ def run_case(c, args, oracles):
                     f"(symbols from collected sections, out of {bad['nsyms']})")
             if bad.get("sh_info_bad"):
                 return Result(c.name, "FAIL", bad["sh_info_bad"])
+            if c.expect_symtab_valid and bad.get("order_bad"):
+                return Result(c.name, "FAIL", bad["order_bad"])
         if c.expect_dyn_tags is not None:
             got = dyn_hash_tags(lccc_out)
             want = sorted(c.expect_dyn_tags)
             if got != want:
                 return Result(c.name, "FAIL",
                     f"dynamic hash tags are {got}, expected {want}")
+        if c.expect_dyn_init_fini:
+            tags, addrs = dyn_tag_map(lccc_out)
+            for tagname, tag, sec in (("INIT", _DT_INIT, ".init"),
+                                      ("FINI", _DT_FINI, ".fini")):
+                if tag not in tags:
+                    return Result(c.name, "FAIL",
+                        f"DT_{tagname} missing from .dynamic")
+                if sec not in addrs:
+                    return Result(c.name, "FAIL",
+                        f"DT_{tagname} present but {sec} section missing")
+                if tags[tag] != addrs[sec]:
+                    return Result(c.name, "FAIL",
+                        f"DT_{tagname} is {tags[tag]:#x}, "
+                        f"{sec} section is at {addrs[sec]:#x}")
+        if c.expect_dyn_relacount is not None:
+            tags, _ = dyn_tag_map(lccc_out)
+            run = rela_dyn_relative_run(lccc_out)
+            if c.expect_dyn_relacount:
+                if _DT_RELACOUNT not in tags:
+                    return Result(c.name, "FAIL",
+                        "DT_RELACOUNT missing from .dynamic")
+                if run is None:
+                    return Result(c.name, "FAIL",
+                        "DT_RELACOUNT present but no .rela.dyn to count")
+                if tags[_DT_RELACOUNT] != run:
+                    return Result(c.name, "FAIL",
+                        f"DT_RELACOUNT is {tags[_DT_RELACOUNT]}, but the "
+                        f"leading RELATIVE run of .rela.dyn is {run}")
+            else:
+                if _DT_RELACOUNT in tags:
+                    return Result(c.name, "FAIL",
+                        "DT_RELACOUNT must be omitted when the RELATIVE run "
+                        f"is empty (value {tags[_DT_RELACOUNT]})")
+                if run not in (None, 0):
+                    return Result(c.name, "FAIL",
+                        f"no DT_RELACOUNT but .rela.dyn opens with {run} "
+                        "RELATIVE entries")
+        if c.expect_same_address is not None:
+            vals = sym_values(lccc_out)
+            if vals is None:
+                return Result(c.name, "FAIL",
+                    "cannot parse .symtab for the alias check")
+            for group in c.expect_same_address:
+                missing = [n for n in group if n not in vals]
+                if missing:
+                    return Result(c.name, "FAIL",
+                        f"symbols missing from .symtab: {missing} "
+                        "(a folded-away duplicate must survive as an alias)")
+                addrs = {vals[n] for n in group}
+                if len(addrs) != 1:
+                    return Result(c.name, "FAIL",
+                        f"symbols not folded onto one address: "
+                        + ", ".join(f"{n}={vals[n]:#x}" for n in group))
+        if c.expect_dyn_has is not None or c.expect_dyn_missing is not None:
+            tags, _ = dyn_tag_map(lccc_out)
+            for name in (c.expect_dyn_has or []):
+                if _DT_NUMBERS[name] not in tags:
+                    return Result(c.name, "FAIL",
+                        f"DT_{name} missing from .dynamic")
+            for name in (c.expect_dyn_missing or []):
+                if _DT_NUMBERS[name] in tags:
+                    return Result(c.name, "FAIL",
+                        f"DT_{name} must not be in .dynamic")
+        if c.expect_comment is not None:
+            got = comment_strings(lccc_out)
+            if got is None:
+                return Result(c.name, "FAIL",
+                    "no .comment section in output")
+            for want in c.expect_comment:
+                if got.count(want) != 1:
+                    return Result(c.name, "FAIL",
+                        f".comment contains {got.count(want)}x {want!r}, "
+                        f"want exactly once: {got}")
+            idx = [got.index(w) for w in c.expect_comment]
+            if idx != sorted(idx):
+                return Result(c.name, "FAIL",
+                    f".comment order wrong: {got} "
+                    f"(want {c.expect_comment} in order)")
+        if c.expect_symbol_order is not None:
+            vals = sym_values(lccc_out)
+            if vals is None:
+                return Result(c.name, "FAIL",
+                    "cannot parse .symtab for the order check")
+            missing = [n for n in c.expect_symbol_order if n not in vals]
+            if missing:
+                return Result(c.name, "FAIL",
+                    f"symbols missing from .symtab: {missing}")
+            addrs = [vals[n] for n in c.expect_symbol_order]
+            if any(b <= a for a, b in zip(addrs, addrs[1:])):
+                return Result(c.name, "FAIL",
+                    "symbols not in ascending address order: "
+                    + ", ".join(f"{n}={vals[n]:#x}"
+                                for n in c.expect_symbol_order))
 
         # --- image shape ---
         if c.expect_elf_type is not None:
