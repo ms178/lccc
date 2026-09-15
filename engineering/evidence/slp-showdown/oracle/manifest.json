@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "source": "engineering/evidence/slp-showdown/slp_showdown.c",
+  "source_sha256": "85bbbfe8dc6a37393b2fa0f9c830f80c23e35deaadfbbb22c54d156e8bf9f196",
+  "function": null,
+  "remote_flags": "-O2 -march=x86-64-v3",
+  "local_flags": "-O2 -march=x86-64-v3",
+  "oracles": [
+    {
+      "key": "lccc",
+      "id": "target/fastbuild/lccc",
+      "name": "local LCCC",
+      "flags": "-O2 -march=x86-64-v3",
+      "instructions": 69
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": "",
+      "flags": "-O2 -march=x86-64-v3",
+      "instructions": 50
+    },
+    {
+      "key": "clang",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang",
+      "flags": "-O2 -march=x86-64-v3",
+      "instructions": 50
+    }
+  ]
+}

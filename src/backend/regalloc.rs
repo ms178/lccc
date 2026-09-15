@@ -6542,6 +6542,20 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecRotlI32x4
             | O::VecShufdI32x4
             | O::VecShufbI32x4
+            // BB-SLP 128-bit families: the I16x8 mul/bitwise chains and
+            // the I64x2/I8x16 bitwise chains use the same two-operand
+            // emitters (emit_sse_binary_128), so the destructive chain
+            // homing applies unchanged (xmm-dest + first-operand handoff).
+            | O::VecMulI16x8
+            | O::VecAndI16x8
+            | O::VecOrI16x8
+            | O::VecXorI16x8
+            | O::VecAndI8x16
+            | O::VecOrI8x16
+            | O::VecXorI8x16
+            | O::VecAndI64x2
+            | O::VecOrI64x2
+            | O::VecXorI64x2
     )
 }
 
@@ -7242,6 +7256,33 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // the u64x4 accumulator, and the zero seeds it.  Class 8 so
             // the Copy-web can home the loop-carried accumulator.
             O::VecSadbwU8x32 | O::VecAddI64x4 | O::VecZeroI64x4 => Some(8),
+            // BB-SLP I64x4 copy/ALU chains: loads, sub/bitwise, splat.
+            O::VecLoadI64x4
+            | O::VecSubI64x4
+            | O::VecAndI64x4
+            | O::VecOrI64x4
+            | O::VecXorI64x4
+            | O::VecBroadcastI64x4 => Some(8),
+            // BB-SLP I64x2 bitwise + gather.
+            O::VecAndI64x2 | O::VecOrI64x2 | O::VecXorI64x2 | O::VecPackI64x2 => Some(7),
+            // BB-SLP F64x2 gather.
+            O::VecPackF64x2 => Some(4),
+            // BB-SLP I32x4 gather.
+            O::VecPackI32x4 => Some(6),
+            // BB-SLP byte/halfword copy + ALU chains (128-bit).
+            O::VecLoadI8x16
+            | O::VecAddI8x16
+            | O::VecSubI8x16
+            | O::VecAndI8x16
+            | O::VecOrI8x16
+            | O::VecXorI8x16 => Some(9),
+            O::VecLoadI16x8
+            | O::VecAddI16x8
+            | O::VecSubI16x8
+            | O::VecMulI16x8
+            | O::VecAndI16x8
+            | O::VecOrI16x8
+            | O::VecXorI16x8 => Some(10),
             _ => None,
         }
     };
@@ -7262,6 +7303,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             4 => matches!(
                 op,
                 O::VecAddF64x2 | O::VecMulF64x2 | O::VecHorizontalAddF64x2
+                    // BB-SLP sinks: the 128-bit store reads a homed source
+                    // directly (vec_store_source_128); the lane extract
+                    // stages through xmm1 only (sse_load_arg discipline).
+                    | O::VecStoreF64x2
+                    | O::VecExtractLaneF64x2
             ),
             5 => matches!(
                 op,
@@ -7291,6 +7337,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // register-home store path (vec_store_source_128)
                     // reads the homed register directly.
                     | O::VecStoreI32x4
+                    // BB-SLP lane extract: xmm1-only staging.
+                    | O::VecExtractLaneI32x4
             ),
             7 => matches!(
                 op,
@@ -7305,6 +7353,15 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // verification fixpoint does not evict the accumulator.
                     | O::VecWidenAddI32x4ToI64x2
                     | O::VecWidenMaskedAddI32x4ToI64x2
+                    // BB-SLP sinks: 128-bit store (register-home source)
+                    // and lane extract (xmm1-only staging).
+                    | O::VecStoreI64x2
+                    | O::VecExtractLaneI64x2
+                    // BB-SLP bitwise consumes a homed I64x2 through the
+                    // emit_sse_binary_128 home/memfold paths.
+                    | O::VecAndI64x2
+                    | O::VecOrI64x2
+                    | O::VecXorI64x2
             ),
             // I64x4 counting family: the sad partials are consumed by the
             // accumulator add, and the accumulator itself by the horizontal
@@ -7313,6 +7370,36 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             8 => matches!(
                 op,
                 O::VecAddI64x4 | O::VecHorizontalAddI64x4 | O::VecSadbwU8x32
+                    // BB-SLP 4×u64 copy chain: store reads the homed YMM
+                    // directly (vec_store_source_256); sub/bitwise go
+                    // through emit_avx_binary_256's home-aware paths.
+                    | O::VecStoreI64x4
+                    | O::VecSubI64x4
+                    | O::VecAndI64x4
+                    | O::VecOrI64x4
+                    | O::VecXorI64x4
+            ),
+            // BB-SLP byte/halfword chains: store (vec_store_source_128
+            // register-home path), add/sub/bitwise (emit_sse_binary_128
+            // home-aware paths).
+            9 => matches!(
+                op,
+                O::VecStoreI8x16
+                    | O::VecAddI8x16
+                    | O::VecSubI8x16
+                    | O::VecAndI8x16
+                    | O::VecOrI8x16
+                    | O::VecXorI8x16
+            ),
+            10 => matches!(
+                op,
+                O::VecStoreI16x8
+                    | O::VecAddI16x8
+                    | O::VecSubI16x8
+                    | O::VecMulI16x8
+                    | O::VecAndI16x8
+                    | O::VecOrI16x8
+                    | O::VecXorI16x8
             ),
             _ => false,
         }
@@ -7405,6 +7492,18 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecMaxU8x32
                                 | O::VecMinI8x32
                                 | O::VecMaxI8x32
+                                // BB-SLP sinks and lane extracts: no
+                                // accumulator of their own; scratch confined
+                                // to xmm0/xmm1 (or reading the home
+                                // directly). Without the exemption they
+                                // would poison every vector web in the
+                                // function back to protected slots.
+                                | O::VecStoreI64x4
+                                | O::VecStoreI16x8
+                                | O::VecStoreI8x16
+                                | O::VecExtractLaneI32x4
+                                | O::VecExtractLaneI64x2
+                                | O::VecExtractLaneF64x2
                         ) =>
                 {
                     return FxHashSet::default();

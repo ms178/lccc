@@ -360,6 +360,7 @@ impl X86Codegen {
             IntrinsicOp::VecLoadF64x4 => "vmovupd",
             IntrinsicOp::VecLoadF32x8 => "vmovups",
             IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI8x32 => "vmovdqu",
+            IntrinsicOp::VecLoadI64x4 => "vmovdqu",
             _ => return false,
         };
         // The allocator only hands out rbx/r8-r15 (never rsp/rbp/rdi/rsi/rdx
@@ -3987,6 +3988,43 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecStoreI64x2 => {
+                // Register-home source: store straight from the assigned XMM
+                // register (mirrors VecStoreI32x4). The old form hardcoded
+                // %xmm0 — correct only for deferred-slot chains; with an
+                // RA-homed source (the BB-SLP I64x2 families home load/sub
+                // results) it stored stale %xmm0 contents (miscompile:
+                // simd_vecreg_new_ops' reference w64 subtraction).
+                let src = self.vec_store_source_128(&args[0]);
+                if src != "xmm0" {
+                    if let Operand::Value(v) = &args[0] {
+                        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                            self.state.pending_vec_store = None;
+                        }
+                    }
+                    self.state.invalidate_vec_peephole();
+                    self.emit_vec_store_addr(args, dest_ptr, "movdqu", src);
+                    return;
+                }
+                let in_reg = matches!(&args[0], Operand::Value(v)
+                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                if !in_reg {
+                    self.flush_pending_vec_store_impl();
+                    if let Operand::Value(v) = &args[0] {
+                        if let Some(addr) = self.state.resolve_slot_addr(v.0) {
+                            if let crate::backend::state::SlotAddr::Direct(slot) = addr {
+                                self.state.emit_fmt(format_args!(
+                                    "    movdqu {}, %xmm0",
+                                    self.slot_ref(slot.0)
+                                ));
+                            }
+                        }
+                    }
+                } else if let Operand::Value(v) = &args[0] {
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    }
+                }
+                self.state.invalidate_vec_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "movdqu", "xmm0");
             }
             IntrinsicOp::VecBroadcastI64x2 => {
@@ -4026,8 +4064,347 @@ impl X86Codegen {
                     self.sse_store_dest(d, "xmm0");
                 }
             }
-            IntrinsicOp::VecLoadI64x4 | IntrinsicOp::VecZeroI64x4 => {
-                let _ = (dest, dest_ptr, args);
+            IntrinsicOp::VecLoadI64x4 => {
+                // 4×I64/U64 lanes (vmovdqu ymm) — the BB-SLP 32-byte copy
+                // load. Mirrors VecLoadF64x4's home-direct discipline: an
+                // XMM-homed destination loads straight into its YMM home.
+                // (This arm used to be a no-op placeholder shared with
+                // VecZeroI64x4; any IR reaching it silently did nothing.)
+                let disp = Self::vec_disp_arg(args, 2);
+                let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                self.state.dirty_upper_ymm = true;
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let mut loaded_home = false;
+                if let Some(d) = dest {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let name = phys_reg_name_256(reg);
+                            self.state
+                                .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(name);
+                            loaded_home = true;
+                        }
+                    }
+                }
+                if !loaded_home {
+                    self.state
+                        .emit_fmt(format_args!("    vmovdqu {}, %ymm0", mem));
+                }
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if !loaded_home {
+                        self.avx_store_dest(d);
+                    }
+                }
+            }
+            IntrinsicOp::VecZeroI64x4 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(&reg) = self.reg_assignments.get(&d.0).filter(|r| is_xmm_reg(**r)) {
+                        let name = phys_reg_name_256(reg);
+                        self.state
+                            .emit_fmt(format_args!("    vpxor %{}, %{}", name, name));
+                        self.state.dirty_upper_ymm = true;
+                        self.state.vec_live_regs.insert(d.0, name);
+                    } else {
+                        self.state.emit("    vpxor %ymm0, %ymm0");
+                        self.state.dirty_upper_ymm = true;
+                        self.avx_store_dest(d);
+                    }
+                }
+            }
+            IntrinsicOp::VecStoreI64x4 => {
+                // 4×I64/U64 store (vmovdqu ymm → mem): register-home source
+                // stores straight from the assigned YMM register, exactly
+                // like VecStoreI32x8. Without the home path an RA-homed
+                // source would store stale %ymm0 contents.
+                let src = self.vec_store_source_256(&args[0]);
+                if src != "ymm0" {
+                    if let Operand::Value(v) = &args[0] {
+                        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                            self.state.pending_vec_store = None;
+                        }
+                    }
+                    self.state.invalidate_vec_peephole();
+                    self.emit_vec_store_addr(args, dest_ptr, "vmovdqu", src);
+                    return;
+                }
+                let in_reg = matches!(&args[0], Operand::Value(v)
+                    if self.state.vec_last_store_reg && self.state.vec_last_store_val == Some(v.0));
+                if !in_reg {
+                    self.flush_pending_vec_store_impl();
+                    if let Operand::Value(v) = &args[0] {
+                        if let Some(addr) = self.state.resolve_slot_addr(v.0) {
+                            if let crate::backend::state::SlotAddr::Direct(slot) = addr {
+                                self.state.emit_fmt(format_args!(
+                                    "    vmovdqu {}, %ymm0",
+                                    self.slot_ref(slot.0)
+                                ));
+                            }
+                        }
+                    }
+                } else if let Operand::Value(v) = &args[0] {
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    }
+                }
+                self.state.invalidate_vec_peephole();
+                self.emit_vec_store_addr(args, dest_ptr, "vmovdqu", "ymm0");
+            }
+            IntrinsicOp::VecSubI64x4 => {
+                // Lane-wise 4×I64 subtract (vpsubq): non-commutative, so a
+                // folded memory operand is only legal in the src2 position.
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpsubq", false);
+                }
+            }
+            IntrinsicOp::VecAndI64x4 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpand", true);
+                }
+            }
+            IntrinsicOp::VecOrI64x4 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpor", true);
+                }
+            }
+            IntrinsicOp::VecXorI64x4 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpxor", true);
+                }
+            }
+            IntrinsicOp::VecBroadcastI64x4 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                match &args[0] {
+                    Operand::Value(v) => {
+                        if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                            if !is_xmm_reg(reg) {
+                                self.state.emit_fmt(format_args!(
+                                    "    movq %{}, %xmm0",
+                                    phys_reg_name(reg)
+                                ));
+                            } else {
+                                self.state.emit_fmt(format_args!(
+                                    "    vmovdqa %{}, %xmm0",
+                                    phys_reg_name_256(reg)
+                                ));
+                            }
+                        } else if let Some(slot) = self.state.get_slot(v.0) {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movq", slot.0 as i64, "xmm0");
+                        } else {
+                            self.operand_to_reg(&args[0], "rax");
+                            self.state.emit("    movq %rax, %xmm0");
+                        }
+                    }
+                    _ => {
+                        self.operand_to_reg(&args[0], "rax");
+                        self.state.emit("    movq %rax, %xmm0");
+                    }
+                }
+                self.state.emit("    vpbroadcastq %xmm0, %ymm0");
+                self.state.dirty_upper_ymm = true;
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.avx_store_dest(d);
+                }
+            }
+            IntrinsicOp::VecAndI64x2 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pand");
+                }
+            }
+            IntrinsicOp::VecOrI64x2 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "por");
+                }
+            }
+            IntrinsicOp::VecXorI64x2 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pxor");
+                }
+            }
+            IntrinsicOp::VecLoadI16x8 | IntrinsicOp::VecLoadI8x16 => {
+                // 8×I16 / 16×I8 lanes (movdqu xmm) — byte/halfword copy
+                // chains. Same home-direct discipline as VecLoadI64x2.
+                let disp = Self::vec_disp_arg(args, 2);
+                let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                let mut loaded_home = false;
+                if let Some(d) = dest {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let name = phys_reg_name(reg);
+                            self.state
+                                .emit_fmt(format_args!("    movdqu {}, %{}", mem, name));
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(name);
+                            loaded_home = true;
+                        }
+                    }
+                }
+                if !loaded_home {
+                    self.state
+                        .emit_fmt(format_args!("    movdqu {}, %xmm0", mem));
+                }
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if !loaded_home {
+                        self.sse_store_dest(d, "xmm0");
+                    }
+                }
+            }
+            IntrinsicOp::VecStoreI16x8 | IntrinsicOp::VecStoreI8x16 => {
+                // Register-home source: store straight from the assigned XMM
+                // register (mirrors VecStoreI32x4).
+                let src = self.vec_store_source_128(&args[0]);
+                if src != "xmm0" {
+                    if let Operand::Value(v) = &args[0] {
+                        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                            self.state.pending_vec_store = None;
+                        }
+                    }
+                    self.state.invalidate_vec_peephole();
+                    self.emit_vec_store_addr(args, dest_ptr, "movdqu", src);
+                    return;
+                }
+                let in_reg = matches!(&args[0], Operand::Value(v)
+                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                if !in_reg {
+                    self.flush_pending_vec_store_impl();
+                    if let Operand::Value(v) = &args[0] {
+                        if let Some(addr) = self.state.resolve_slot_addr(v.0) {
+                            if let crate::backend::state::SlotAddr::Direct(slot) = addr {
+                                self.state.emit_fmt(format_args!(
+                                    "    movdqu {}, %xmm0",
+                                    self.slot_ref(slot.0)
+                                ));
+                            }
+                        }
+                    }
+                } else if let Operand::Value(v) = &args[0] {
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    }
+                }
+                self.state.invalidate_vec_peephole();
+                self.emit_vec_store_addr(args, dest_ptr, "movdqu", "xmm0");
+            }
+            IntrinsicOp::VecAndI8x16 | IntrinsicOp::VecAndI16x8 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pand");
+                }
+            }
+            IntrinsicOp::VecOrI8x16 | IntrinsicOp::VecOrI16x8 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "por");
+                }
+            }
+            IntrinsicOp::VecXorI8x16 | IntrinsicOp::VecXorI16x8 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pxor");
+                }
+            }
+            IntrinsicOp::VecPackI64x2 | IntrinsicOp::VecPackF64x2 => {
+                // Gather two GPR-domain scalars into one 2-lane vector:
+                //   movq lo, %xmm0
+                //   movq hi, %rax ; movq %rax, %xmm1
+                //   punpcklqdq %xmm1, %xmm0
+                // Arguments are scalars, so the XMM scratch pair is safe.
+                // An XMM-homed FP source loads directly (movq xmm→xmm).
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let load_lane_to_xmm0 = |this: &mut Self, arg: &Operand| {
+                    if let Operand::Value(v) = arg {
+                        if let Some(&reg) = this.reg_assignments.get(&v.0) {
+                            if is_xmm_reg(reg) {
+                                let name = phys_reg_name(reg);
+                                this.state
+                                    .emit_fmt(format_args!("    movq %{}, %xmm0", name));
+                                return;
+                            }
+                        }
+                        if let Some(slot) = this.state.get_slot(v.0) {
+                            this.state
+                                .out
+                                .emit_instr_rbp_reg("    movq", slot.0 as i64, "xmm0");
+                            return;
+                        }
+                    }
+                    this.operand_to_reg(arg, "rax");
+                    this.state.emit("    movq %rax, %xmm0");
+                };
+                load_lane_to_xmm0(self, &args[0]);
+                // Second lane: stage through %rax/%xmm1 (never clobbers xmm0).
+                if let Operand::Value(v) = &args[1] {
+                    if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                        if is_xmm_reg(reg) {
+                            let name = phys_reg_name(reg);
+                            self.state
+                                .emit_fmt(format_args!("    movq %{}, %xmm1", name));
+                            self.state.emit("    punpcklqdq %xmm1, %xmm0");
+                            if let Some(d) = dest {
+                                self.state.vector_values.insert(d.0);
+                                self.sse_store_dest(d, "xmm0");
+                            }
+                            return;
+                        }
+                    }
+                }
+                self.operand_to_reg(&args[1], "rax");
+                self.state.emit("    movq %rax, %xmm1");
+                self.state.emit("    punpcklqdq %xmm1, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
+            IntrinsicOp::VecExtractLaneI64x2 => {
+                // Lane → GPR scalar. Lane 0: movq; lane 1: pshufd $0x0E
+                // first (SSE2 — no pextrq dependency). Scratch %xmm1 only.
+                let lane = match &args[1] {
+                    Operand::Const(c) => c.to_i64().unwrap_or(0),
+                    _ => 0,
+                };
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                self.sse_load_arg(&args[0], "xmm1");
+                if lane & 1 != 0 {
+                    self.state.emit("    pshufd $0x0E, %xmm1, %xmm1");
+                }
+                self.state.emit("    movq %xmm1, %rax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::VecExtractLaneF64x2 => {
+                // Lane → XMM scalar. Lane 0: identity move; lane 1:
+                // pshufd $0x0E. The dest is an ordinary F64 SSE value.
+                let lane = match &args[1] {
+                    Operand::Const(c) => c.to_i64().unwrap_or(0),
+                    _ => 0,
+                };
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                self.sse_load_arg(&args[0], "xmm1");
+                if lane & 1 != 0 {
+                    self.state.emit("    pshufd $0x0E, %xmm1, %xmm1");
+                }
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.sse_store_dest(d, "xmm1");
+                }
             }
             IntrinsicOp::VecAddI64x4 => {
                 // 4×I64 lane add (`vpaddq`): a plain commutative 3-operand

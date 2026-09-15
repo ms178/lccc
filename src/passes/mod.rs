@@ -62,6 +62,7 @@ mod resolve_asm;
 pub(crate) mod sccp;
 pub(crate) mod set_membership;
 pub(crate) mod simplify;
+pub(crate) mod slp_vectorizer;
 pub(crate) mod store_load_forward;
 pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
@@ -1640,6 +1641,31 @@ pub(crate) fn run_passes(
             // one sweep here removes every orphaned setup def regardless
             // of which bailout path produced it.
             module.for_each_function(dce::eliminate_dead_code);
+
+            // Phase 2c-slp: basic-block SLP vectorization — x86-64 only,
+            // -O2+, iter 0. Runs AFTER the post-vectorize unroll (unrolled
+            // bodies are the feedstock: 2-8 isomorphic stores per block)
+            // and its DCE (orphaned GEPs/lanes must not confuse the seed
+            // collector). Seeded from consecutive-address store runs; see
+            // passes/slp_vectorizer.rs for the legality and cost design.
+            // Pass name for CCC_DISABLE_PASSES: "slp"; kill switch
+            // CCC_NO_BB_SLP.
+            if iter == 0
+                && opt_level >= 2
+                && !optimize_for_size
+                && matches!(target, crate::backend::Target::X86_64)
+                && !pass_disabled(&disabled, "slp")
+            {
+                let n = timed_pass!(
+                    "slp",
+                    run_on_visited(module, &dirty, &mut changed, slp_vectorizer::run_bb_slp)
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+                if n > 0 {
+                    verify::verify_after_pass(module, "slp");
+                }
+            }
         }
 
         // Unroll/vectorize can clone loop bodies that still contained
@@ -1729,6 +1755,32 @@ pub(crate) fn run_passes(
             cur_pass_changes[2] = n;
             total_changes += n;
             total_changes_excl_dce += n;
+
+            // Phase 2c-slp-late: second basic-block SLP sweep, AFTER integer
+            // narrowing. C's integer promotion leaves sub-word lane math in
+            // the promoted width (`u16 * u16` is an I32 mul feeding a U16
+            // store); the narrow pass shrinks it to the store width, which
+            // is what the pack builder's strict lane-type match needs. The
+            // early sweep (Phase 2c-slp) still catches the f64/u64 chains
+            // before GVN reshapes them; this one catches byte/halfword ALU.
+            // Same gates as the early sweep.
+            if iter == 0
+                && n > 0
+                && opt_level >= 2
+                && !optimize_for_size
+                && matches!(target, crate::backend::Target::X86_64)
+                && !pass_disabled(&disabled, "slp")
+            {
+                let n = timed_pass!(
+                    "slp_late",
+                    run_on_visited(module, &dirty, &mut changed, slp_vectorizer::run_bb_slp)
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+                if n > 0 {
+                    verify::verify_after_pass(module, "slp_late");
+                }
+            }
         }
 
         // Phase 3: Algebraic simplification

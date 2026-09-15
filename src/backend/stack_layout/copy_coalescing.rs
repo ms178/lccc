@@ -1604,6 +1604,34 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecMulI16x8
             | O::VecMinI16x8
             | O::VecMaxI16x8
+            // BB-SLP families: the I64x2/I64x4 bitwise + add/sub chains
+            // (emit_sse_binary_128 / emit_avx_binary_256 two-operand
+            // forms), the byte/halfword bitwise, and the FP sub/div map
+            // ops — a deferred load in the scratch register folds into
+            // the destination operand exactly like the twins above.
+            | O::VecAddI64x2
+            | O::VecSubI64x2
+            | O::VecAndI64x2
+            | O::VecOrI64x2
+            | O::VecXorI64x2
+            | O::VecSubI64x4
+            | O::VecAndI64x4
+            | O::VecOrI64x4
+            | O::VecXorI64x4
+            | O::VecAndI8x16
+            | O::VecOrI8x16
+            | O::VecXorI8x16
+            | O::VecAndI16x8
+            | O::VecOrI16x8
+            | O::VecXorI16x8
+            | O::VecSubF64x2
+            | O::VecSubF64x4
+            | O::VecSubF32x4
+            | O::VecSubF32x8
+            | O::VecDivF64x2
+            | O::VecDivF64x4
+            | O::VecDivF32x4
+            | O::VecDivF32x8
             // ARX lane ops consume a 128-bit vector source directly
             // (scratch-only emission; see the x86 emitters).
             | O::VecRotlI32x4
@@ -1869,6 +1897,49 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecAndI8x32
             | O::VecOrI8x32
             | O::VecXorI8x32
+            // BB-SLP producer families: the I64x2/I64x4 copy + bitwise
+            // chains, the I16x8/I8x16 byte/halfword chains, and the
+            // 2-lane gathers. Their single-use results live in the
+            // scratch register until the adjacent consumer exactly like
+            // the map ops above — without this, the 4×u64 copy paid a
+            // dead `vmovdqu %ymm0, slot` round trip after every load.
+            | O::VecLoadI64x2
+            | O::VecLoadI64x4
+            | O::VecSubI64x4
+            | O::VecAndI64x4
+            | O::VecOrI64x4
+            | O::VecXorI64x4
+            | O::VecBroadcastI64x4
+            | O::VecBroadcastI64x2
+            | O::VecAndI64x2
+            | O::VecOrI64x2
+            | O::VecXorI64x2
+            | O::VecLoadI16x8
+            | O::VecLoadI8x16
+            | O::VecAndI16x8
+            | O::VecOrI16x8
+            | O::VecXorI16x8
+            | O::VecAndI8x16
+            | O::VecOrI8x16
+            | O::VecXorI8x16
+            | O::VecPackI64x2
+            | O::VecPackF64x2
+            | O::VecZeroI64x2
+            | O::VecZeroI64x4
+            | O::VecBroadcastI32x4
+            | O::VecBroadcastF32x4
+            | O::VecBroadcastF64x2
+            | O::VecBroadcastF64x4
+            | O::VecMulI32x4
+            | O::VecMulI64x2
+            | O::VecSubF64x2
+            | O::VecSubF64x4
+            | O::VecSubF32x4
+            | O::VecSubF32x8
+            | O::VecDivF64x2
+            | O::VecDivF64x4
+            | O::VecDivF32x4
+            | O::VecDivF32x8
     )
 }
 
@@ -1980,6 +2051,9 @@ pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool 
             | O::VecLoadF32x4
             | O::VecLoadI32x4
             | O::VecLoadI64x2
+            | O::VecLoadI64x4
+            | O::VecLoadI16x8
+            | O::VecLoadI8x16
             | O::VecLoadI8x32
     )
 }
@@ -1989,7 +2063,7 @@ pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bo
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
         op,
-        O::VecLoadF64x4 | O::VecLoadF32x8 | O::VecLoadI32x8 | O::VecLoadI8x32
+        O::VecLoadF64x4 | O::VecLoadF32x8 | O::VecLoadI32x8 | O::VecLoadI8x32 | O::VecLoadI64x4
     )
 }
 
@@ -2083,8 +2157,12 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecMinI8x32
         | O::VecMaxI8x32 => Some(true),
         // Counting binaries: `vpsadbw(a, b)` is symmetric (sum of absolute
-        // differences), `vpaddq` commutative.
+        // differences), `vpaddq` commutative. The BB-SLP I64x4 family
+        // follows the same contract: add/bitwise commutative, sub
+        // src1-src2 order-gated.
         O::VecSadbwU8x32 | O::VecAddI64x4 => Some(true),
+        O::VecAndI64x4 | O::VecOrI64x4 | O::VecXorI64x4 => Some(true),
+        O::VecSubI64x4 => Some(false),
         O::VecAddI16x16
         | O::VecMulI16x16
         | O::VecMinI16x16
