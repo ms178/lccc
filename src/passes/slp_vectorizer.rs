@@ -109,7 +109,24 @@ fn eval_sym_addr(
     def_pos: &FxHashMap<u32, usize>,
     ptr: Value,
 ) -> Option<SymAddr> {
-    let inst = block.instructions.get(*def_pos.get(&ptr.0)?)?;
+    // A pointer defined OUTSIDE this block (entry-block ParamRef or
+    // GlobalAddr, a foreign block's computation) is an opaque base:
+    // affine-equal to itself with no local offset structure. Returning
+    // None on the lookup miss instead silently dropped every offset-0
+    // store whose pointer is the raw global/param value — the frontend's
+    // spelling for `global[0]` — so multi-block functions (anything with
+    // a loop) never seeded those streams (D9).
+    let inst = match def_pos.get(&ptr.0).and_then(|&i| block.instructions.get(i)) {
+        Some(inst) => inst,
+        None => {
+            return Some(SymAddr {
+                base: ptr,
+                var: None,
+                mult: 1,
+                off: 0,
+            });
+        }
+    };
     match inst {
         Instruction::GetElementPtr { base, offset, .. } => {
             // Base of a GEP may itself be a const-offset GEP — fold one
@@ -208,7 +225,7 @@ fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
             zero: IntrinsicOp::VecZeroF64x4,
             pack2: None,
             pack4: None,
-            extract: None,
+            extract: Some(IntrinsicOp::VecExtractLaneF64x4),
             size: 8,
         }),
         (IrType::F32, 4) => Some(VecFamily {
@@ -268,7 +285,7 @@ fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
             zero: IntrinsicOp::VecZeroI64x4,
             pack2: None,
             pack4: None,
-            extract: None,
+            extract: Some(IntrinsicOp::VecExtractLaneI64x4),
             size: 8,
         }),
         (IrType::I16 | IrType::U16, 8) => Some(VecFamily {
@@ -283,11 +300,34 @@ fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
             extract: None,
             size: 2,
         }),
+        (IrType::I16 | IrType::U16, 16) if avx2 => Some(VecFamily {
+            load: IntrinsicOp::VecLoadI16x16,
+            store: IntrinsicOp::VecStoreI16x16,
+            broadcast: IntrinsicOp::VecBroadcastI16x16,
+            // 256-bit zero: no VecZeroI16x16 — the broadcast of a zero
+            // constant (movd+vpbroadcastw; the all-ones splat folds to
+            // one vpcmpeqd at emission).
+            zero: IntrinsicOp::VecBroadcastI16x16,
+            pack2: None,
+            pack4: None,
+            extract: None,
+            size: 2,
+        }),
         (IrType::I8 | IrType::U8, 16) => Some(VecFamily {
             load: IntrinsicOp::VecLoadI8x16,
             store: IntrinsicOp::VecStoreI8x16,
             broadcast: IntrinsicOp::VecBroadcastI8x16,
             zero: IntrinsicOp::VecBroadcastI8x16,
+            pack2: None,
+            pack4: None,
+            extract: None,
+            size: 1,
+        }),
+        (IrType::I8 | IrType::U8, 32) if avx2 => Some(VecFamily {
+            load: IntrinsicOp::VecLoadI8x32,
+            store: IntrinsicOp::VecStoreI8x32,
+            broadcast: IntrinsicOp::VecBroadcastI8x32,
+            zero: IntrinsicOp::VecBroadcastI8x32,
             pack2: None,
             pack4: None,
             extract: None,
@@ -373,12 +413,29 @@ fn packed_binop(op: IrBinOp, ty: IrType, width: usize) -> Option<IntrinsicOp> {
             IrBinOp::Xor => Some(IntrinsicOp::VecXorI16x8),
             _ => None,
         },
+        (IrType::I16 | IrType::U16, 16) => match op {
+            IrBinOp::Add => Some(IntrinsicOp::VecAddI16x16),
+            IrBinOp::Sub => Some(IntrinsicOp::VecSubI16x16),
+            IrBinOp::Mul => Some(IntrinsicOp::VecMulI16x16),
+            IrBinOp::And => Some(IntrinsicOp::VecAndI16x16),
+            IrBinOp::Or => Some(IntrinsicOp::VecOrI16x16),
+            IrBinOp::Xor => Some(IntrinsicOp::VecXorI16x16),
+            _ => None,
+        },
         (IrType::I8 | IrType::U8, 16) => match op {
             IrBinOp::Add => Some(IntrinsicOp::VecAddI8x16),
             IrBinOp::Sub => Some(IntrinsicOp::VecSubI8x16),
             IrBinOp::And => Some(IntrinsicOp::VecAndI8x16),
             IrBinOp::Or => Some(IntrinsicOp::VecOrI8x16),
             IrBinOp::Xor => Some(IntrinsicOp::VecXorI8x16),
+            _ => None,
+        },
+        (IrType::I8 | IrType::U8, 32) => match op {
+            IrBinOp::Add => Some(IntrinsicOp::VecAddI8x32),
+            IrBinOp::Sub => Some(IntrinsicOp::VecSubI8x32),
+            IrBinOp::And => Some(IntrinsicOp::VecAndI8x32),
+            IrBinOp::Or => Some(IntrinsicOp::VecOrI8x32),
+            IrBinOp::Xor => Some(IntrinsicOp::VecXorI8x32),
             _ => None,
         },
         _ => None,
@@ -481,11 +538,15 @@ pub(crate) fn run_bb_slp(func: &mut IrFunction) -> usize {
     }
     let debug = std::env::var("LCCC_DEBUG_SLP").is_ok();
     let mut total = 0usize;
+    // Shared cross-block-use map (invariant across this pass's rewrites —
+    // see `cross_block_use_map`); one O(function) pass instead of a
+    // rescan per fired seed.
+    let cross = cross_block_use_map(func);
     // Fixpoint: each fired seed rewrites its block, so re-scan afterwards.
     for _round in 0..24 {
         let mut fired = 0usize;
         for b in 0..func.blocks.len() {
-            while slp_block_once(func, b, debug) == 1 {
+            while slp_block_once(func, b, &cross, debug) == 1 {
                 fired += 1;
             }
         }
@@ -500,19 +561,68 @@ pub(crate) fn run_bb_slp(func: &mut IrFunction) -> usize {
     total
 }
 
+/// Values (function-wide) that have at least one use OUTSIDE their
+/// defining block — the shared authority for rule (b).
+///
+/// Computed ONCE per `run_bb_slp` invocation: the set is invariant across
+/// every rewrite this pass performs. A rewrite of block b only (1) removes
+/// IN-BLOCK uses of lanes (their defs are in b by construction) and
+/// (2) adds brand-new values (vector dests, extracts) used only within b;
+/// a rewrite of block c replaces uses of c-DEFINED lanes with extracts —
+/// it never touches uses of values defined elsewhere. Hence no value's
+/// use-block set ever gains or loses a FOREIGN-block use after this pass
+/// starts, and the entry-time answer stays exact for every later
+/// query.
+///
+/// (Before this map, `build_ctx` rescanned every other block per fired
+/// seed — O(function) per seed, O(seeds × function) per block, a
+/// measurable compile-time tax on large functions.)
+fn cross_block_use_map(func: &IrFunction) -> FxHashSet<u32> {
+    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                def_block.insert(d.0, bi);
+            }
+        }
+    }
+    let mut cross: FxHashSet<u32> = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|vid| {
+                if def_block.get(&vid).is_some_and(|&db| db != bi) {
+                    cross.insert(vid);
+                }
+            });
+        }
+        block.terminator.for_each_used_value(|vid| {
+            if def_block.get(&vid).is_some_and(|&db| db != bi) {
+                cross.insert(vid);
+            }
+        });
+    }
+    cross
+}
+
 struct BlockCtx<'a> {
     block: &'a BasicBlock,
     def_pos: FxHashMap<u32, usize>,
     /// Use positions (instruction indices; `usize::MAX` = terminator) of
     /// each value IN THIS BLOCK.
     uses: FxHashMap<u32, Vec<usize>>,
-    /// Values with uses in OTHER blocks of the function (phi edges,
-    /// later-block consumers). A packed lane in this set cannot be
-    /// replaced by a block-local extract — reject its seed.
-    external_uses: FxHashSet<u32>,
+    /// Values with uses outside their DEFINING block (the shared
+    /// cross-block map, see `cross_block_use_map`). For a lane defined
+    /// in this block this is exactly "used in some other block": a
+    /// packed lane in the set cannot be replaced by a block-local
+    /// extract — reject its seed.
+    external_uses: &'a FxHashSet<u32>,
 }
 
-fn build_ctx(func: &IrFunction, block_idx: usize) -> BlockCtx<'_> {
+fn build_ctx<'a>(
+    func: &'a IrFunction,
+    block_idx: usize,
+    cross: &'a FxHashSet<u32>,
+) -> BlockCtx<'a> {
     let block = &func.blocks[block_idx];
     let mut def_pos: FxHashMap<u32, usize> = FxHashMap::default();
     for (i, inst) in block.instructions.iter().enumerate() {
@@ -537,28 +647,11 @@ fn build_ctx(func: &IrFunction, block_idx: usize) -> BlockCtx<'_> {
     block
         .terminator
         .for_each_used_value(|vid| uses.entry(vid).or_default().push(usize::MAX));
-    // Cross-block uses: every OTHER block's instructions/terminators via
-    // the same canonical walker — including the Phi nodes the old scan
-    // missed entirely (rule (b) was vacuous for phi edges).
-    let mut external_uses: FxHashSet<u32> = FxHashSet::default();
-    for (bi, other) in func.blocks.iter().enumerate() {
-        if bi == block_idx {
-            continue;
-        }
-        for inst in &other.instructions {
-            inst.for_each_used_value(|vid| {
-                external_uses.insert(vid);
-            });
-        }
-        other.terminator.for_each_used_value(|vid| {
-            external_uses.insert(vid);
-        });
-    }
     BlockCtx {
         block,
         def_pos,
         uses,
-        external_uses,
+        external_uses: cross,
     }
 }
 
@@ -685,11 +778,12 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
 /// Pick the vector width (in lanes) for a run of `len` consecutive lanes
 /// of `size` bytes: the largest register class the FAMILY TABLE actually
 /// provides — 32-byte AVX2 first, then 16-byte SSE2 — capped by the run
-/// length. Family-aware: the byte/halfword families currently stop at
-/// 16 lanes, so a 32-byte byte-run falls back to I8x16 instead of being
-/// dropped outright (the old `preferred_width` returned 32 lanes for
-/// every ≥32-byte run and `family_for` then rejected the candidate —
-/// those runs never vectorized at all).
+/// length. Family-aware: every lane type now has both a 128-bit and a
+/// 256-bit family under AVX2 (the byte runs take I8x32, halfword runs
+/// I16x16), so the 32-byte runs pack at full width instead of falling
+/// back (the original `preferred_width` returned 32 lanes for every
+/// ≥32-byte run and `family_for` then rejected the candidate — those
+/// runs never vectorized at all until the family-aware fallback).
 fn preferred_width(len: usize, size: u64, ty: IrType, avx2: bool) -> Option<usize> {
     let w256 = (32 / size) as usize;
     let w128 = (16 / size) as usize;
@@ -720,6 +814,17 @@ struct RestrictBases {
     /// Values provably not based on any restrict parameter: parameter
     /// values, global addresses, frame allocas.
     independent: FxHashSet<u32>,
+    /// Named global objects: value id -> object name. Distinct names are
+    /// distinct objects (C11 object identity): the linker never merges
+    /// differently-named data objects, so their storage is provably
+    /// disjoint — the assumption GCC and Clang make for every pair of
+    /// file-scope objects. (Two GlobalAddr values for the SAME name are
+    /// the same object and stay "may alias".)
+    globals: FxHashMap<u32, String>,
+    /// Fresh frame objects (allocas): an alloca is created after entry,
+    /// so no pre-existing value can designate its storage; distinct
+    /// allocas are distinct objects.
+    allocas: FxHashSet<u32>,
 }
 
 impl RestrictBases {
@@ -736,8 +841,13 @@ impl RestrictBases {
                             rb.noalias.insert(dest.0);
                         }
                     }
-                    Instruction::GlobalAddr { dest, .. } | Instruction::Alloca { dest, .. } => {
+                    Instruction::GlobalAddr { dest, name } => {
                         rb.independent.insert(dest.0);
+                        rb.globals.insert(dest.0, name.clone());
+                    }
+                    Instruction::Alloca { dest, .. } => {
+                        rb.independent.insert(dest.0);
+                        rb.allocas.insert(dest.0);
                     }
                     _ => {}
                 }
@@ -746,22 +856,60 @@ impl RestrictBases {
         rb
     }
 
-    /// May the two base values be assumed to designate disjoint objects
-    /// under the caller's restrict contracts? Requires distinct values,
-    /// one carrying `restrict`, and the other provably not based on it.
+    /// May the two base values be assumed to designate disjoint objects?
+    /// Three provable-disjointness classes:
+    /// 1. C11 6.7.3.1 `restrict` contracts (the original rule: one base
+    ///    carries restrict, the other is provably not based on it).
+    /// 2. Object identity for NAMED GLOBALS: two distinct names are two
+    ///    distinct objects with disjoint storage (the linker never merges
+    ///    differently-named data objects — mergeable string-literal
+    ///    sections are not named-object `.data`/`.bss`, and ICF folds
+    ///    only code).
+    /// 3. Object identity for FRESH FRAME OBJECTS: an alloca's storage
+    ///    comes into existence at entry, so no global or parameter can
+    ///    designate it, and two distinct allocas never overlap.
+    /// A global and a NON-restrict parameter may still alias (the caller
+    /// can pass &global); two parameters may alias; a restrict parameter
+    /// and its own derived values are excluded by rule 1's independence
+    /// requirement. This extension is what lets the common two-global
+    /// shape (`pos[i] = k * vel[i]` with file-scope `pos`/`vel` arrays)
+    /// pass rule (e) — previously every cross-global seed was rejected
+    /// as "may alias".
     fn disjoint(&self, a: u32, b: u32) -> bool {
-        a != b
-            && ((self.noalias.contains(&a) && self.independent.contains(&b))
-                || (self.noalias.contains(&b) && self.independent.contains(&a)))
+        if a == b {
+            return false;
+        }
+        if (self.noalias.contains(&a) && self.independent.contains(&b))
+            || (self.noalias.contains(&b) && self.independent.contains(&a))
+        {
+            return true;
+        }
+        // Distinct named globals.
+        if let (Some(ga), Some(gb)) = (self.globals.get(&a), self.globals.get(&b)) {
+            return ga != gb;
+        }
+        // A named global and a fresh frame object never overlap.
+        if (self.globals.contains_key(&a) && self.allocas.contains(&b))
+            || (self.globals.contains_key(&b) && self.allocas.contains(&a))
+        {
+            return true;
+        }
+        // Two distinct fresh frame objects never overlap.
+        self.allocas.contains(&a) && self.allocas.contains(&b)
     }
 }
 
-fn slp_block_once(func: &mut IrFunction, block_idx: usize, debug: bool) -> usize {
+fn slp_block_once(
+    func: &mut IrFunction,
+    block_idx: usize,
+    cross: &FxHashSet<u32>,
+    debug: bool,
+) -> usize {
     // All analysis under one immutable borrow; the plans are fully owned
     // (no lifetimes into the block), so the mutable rewrite afterwards
     // is borrow-clean.
     let (candidates, plans): (Vec<SeedCandidate>, Vec<Option<Plan>>) = {
-        let ctx = build_ctx(func, block_idx);
+        let ctx = build_ctx(func, block_idx, cross);
         let bases = RestrictBases::build(func);
         let candidates = collect_seed_candidates(&ctx);
         let plans = candidates
@@ -820,19 +968,31 @@ fn build_pack(
     }
     let block = ctx.block;
 
-    // 1. Splat: all lanes the same operand.
-    if lanes.windows(2).all(|w| w[0] == w[1]) {
+    // 1. Splat: all lanes the same operand — BIT-EXACTLY. `Operand`'s
+    // derived equality compares `IrConst::F32/F64` as IEEE floats, under
+    // which `-0.0 == +0.0`; a mask like {-0.0, +0.0, -0.0, ...} would
+    // pass as a "splat" of +0.0, take the zero-vector path, and destroy
+    // the sign bits (simd_blendv256: the blend mask became all +0.0 and
+    // every lane selected operand a). `LaneKey` hashes the raw bits —
+    // exactly the predicate the dedup map already uses.
+    if lanes.windows(2).all(|w| lane_key(&w[0]) == lane_key(&w[1])) {
         let src = lanes[0].clone();
+        // Bit-exact zero test (`IrConst::is_all_zero_bits`): +0.0 is the
+        // all-zero bit pattern (exactly what the `VecZero*` lowerings
+        // produce), while `-0.0` has its sign bit set and must NOT take
+        // the zero path. `to_i64() == Some(0)` — the previous predicate —
+        // returns `None` for every float constant, so ALL FP constant
+        // splats (including `q[i] = 0.0` stores) stayed scalar.
         let is_zero = match &src {
-            Operand::Const(c) => c.to_i64() == Some(0),
+            Operand::Const(c) => c.is_all_zero_bits(),
             _ => false,
         };
-        // FP non-zero constant splats have no audited broadcast path for
-        // Const operands (FP constants do not go through the GPR staging
-        // the broadcast lowerings assume) — reject, they stay scalar.
-        if matches!(ty, IrType::F32 | IrType::F64) && !is_zero {
-            return None;
-        }
+        // FP constant splats ARE audited-sound at the backend: every FP
+        // broadcast arm stages through `emit_fp_operand_to_xmm`, whose
+        // Const arm materializes the exact bit pattern via the FP
+        // constant pool (`movsd label(%rip)`) or `xorpd` for +0.0. The
+        // old rejection here was based on the GPR-staging assumption
+        // that only ever applied to the INTEGER broadcast arms.
         let idx = packs.len();
         packs.push(Pack {
             kind: PackKind::Splat { src, is_zero },
@@ -862,47 +1022,68 @@ fn build_pack(
         // pmullw/paddw/... compute the wrapping low bits — identical to
         // truncating the exact promoted result). Strip the
         // truncation/widening casts and pack at the store's lane width.
+        //
+        // NESTED promoted trees (`q[i]*m[i]*k` — the intermediates stay
+        // I32 all the way to the store's trunc) demote level by level: a
+        // lane of this pack may itself be a same-op I32 binop whose
+        // operands are widening casts, fitting constants, or further
+        // nested I32 binops (passed through so the recursion demotes
+        // them). Exactness under nesting is modular arithmetic: for every
+        // op in the promotable set, low_n(A OP B) == low_n(low_n(A) OP_n
+        // low_n(B)) — two's-complement wrap is mod-2^32 and the low n
+        // bits commute with each level's mod-2^n reduction — so the
+        // STORED sub-word value is bit-identical whether the tree
+        // computes in I32 (with or without intermediate wrap, signed
+        // overflow being UB in C anyway) or at the lane width.
         if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
-            let truncs_ok = vals.iter().all(|v| {
+            // Lane defs: truncating casts (the root of a demoted tree),
+            // or direct I32 binops (a nested level reached through the
+            // recursion below).
+            let is_promotable_i32_binop = |v: &Value| {
+                matches!(
+                    ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]),
+                    Some(Instruction::BinOp { op, ty: bty, .. })
+                        if *bty == IrType::I32
+                            && matches!(
+                                op,
+                                IrBinOp::Add
+                                    | IrBinOp::Sub
+                                    | IrBinOp::Mul
+                                    | IrBinOp::And
+                                    | IrBinOp::Or
+                                    | IrBinOp::Xor
+                            )
+                )
+            };
+            let lanes_ok = vals.iter().all(|v| {
                 matches!(
                     ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]),
                     Some(Instruction::Cast { from_ty, to_ty, .. })
                         if *to_ty == ty && matches!(from_ty, IrType::I32 | IrType::I64)
-                )
+                ) || is_promotable_i32_binop(v)
             });
-            if truncs_ok {
-                // The truncated sources must be same-op I32 binops whose
-                // operands widen sub-word values of the same lane type.
+            if lanes_ok {
+                // The computing sources: the I32 binop feeding each
+                // truncation, or the nested binop lane itself.
                 let mut promoted: Vec<Value> = Vec::with_capacity(width);
                 let mut ok = true;
                 for v in &vals {
                     let i = ctx.def_pos[&v.0];
-                    let Instruction::Cast { src, .. } = &block.instructions[i] else {
-                        unreachable!()
+                    let sv = match &block.instructions[i] {
+                        Instruction::Cast { src, .. } => {
+                            let Operand::Value(sv) = src else {
+                                ok = false;
+                                break;
+                            };
+                            *sv
+                        }
+                        _ => *v, // nested binop lane computes itself
                     };
-                    let Operand::Value(sv) = src else {
+                    if is_promotable_i32_binop(&sv) {
+                        promoted.push(sv);
+                    } else {
                         ok = false;
                         break;
-                    };
-                    match ctx.def_pos.get(&sv.0).map(|&j| &block.instructions[j]) {
-                        Some(Instruction::BinOp { op, ty: bty, .. })
-                            if *bty == IrType::I32
-                                && matches!(
-                                    op,
-                                    IrBinOp::Add
-                                        | IrBinOp::Sub
-                                        | IrBinOp::Mul
-                                        | IrBinOp::And
-                                        | IrBinOp::Or
-                                        | IrBinOp::Xor
-                                ) =>
-                        {
-                            promoted.push(*sv);
-                        }
-                        _ => {
-                            ok = false;
-                            break;
-                        }
                     }
                 }
                 if ok {
@@ -927,7 +1108,10 @@ fn build_pack(
                         let strip = |o: &Operand| -> Option<Operand> {
                             match o {
                                 // Value operands must be widening casts of
-                                // the lane type (the zext/sext C promotion).
+                                // the lane type (the zext/sext C
+                                // promotion), or a nested same-set I32
+                                // binop — passed through unchanged so the
+                                // recursion demotes it one level deeper.
                                 Operand::Value(w) => {
                                     match ctx.def_pos.get(&w.0).map(|&k| &block.instructions[k]) {
                                         Some(Instruction::Cast {
@@ -940,6 +1124,7 @@ fn build_pack(
                                         {
                                             Some(src.clone())
                                         }
+                                        _ if is_promotable_i32_binop(w) => Some(Operand::Value(*w)),
                                         _ => None,
                                     }
                                 }
@@ -990,7 +1175,9 @@ fn build_pack(
                                         rhs,
                                     },
                                     // The removed lanes are the truncating
-                                    // casts; the widening casts and promoted
+                                    // casts (or, for a nested level, the
+                                    // demoted I32 binop itself); the
+                                    // widening casts and surviving promoted
                                     // muls stay (they may have other uses)
                                     // and become dead via DCE when not.
                                     lane_vals: vals.clone(),
@@ -1092,21 +1279,100 @@ fn build_pack(
                         lhs_lanes.push(lhs.clone());
                         rhs_lanes.push(rhs.clone());
                     }
-                    // Try (lhs, rhs); if an operand side cannot pack and
-                    // the op is commutative, retry swapped (`b[i]*a[i]`
-                    // spellings normalize).
+                    // Whole-side attempt, then (commutative) the swapped
+                    // spelling. GATHER-AWARE: a side that degenerated to a
+                    // gather is a low-quality success — the per-lane flip
+                    // below may still find a packable arrangement, so the
+                    // swap/flip attempts run whenever a side failed OR
+                    // gathered, and a flip that eliminates gathers wins.
+                    let is_gather = |packs: &[Pack], i: usize| {
+                        matches!(
+                            packs[i].kind,
+                            PackKind::Gather2 { .. } | PackKind::Gather4 { .. }
+                        )
+                    };
                     let mut lhs_pack =
                         build_pack(ctx, &lhs_lanes, ty, width, fam, packs, dedup, depth + 1);
                     let mut rhs_pack =
                         build_pack(ctx, &rhs_lanes, ty, width, fam, packs, dedup, depth + 1);
-                    if (lhs_pack.is_none() || rhs_pack.is_none()) && is_commutative(op) {
+                    let sides_gathered = |packs: &[Pack], l: Option<usize>, r: Option<usize>| {
+                        [l, r].iter().flatten().any(|&i| is_gather(packs, i))
+                    };
+                    let needs_retry = lhs_pack.is_none()
+                        || rhs_pack.is_none()
+                        || sides_gathered(packs, lhs_pack, rhs_pack);
+                    if is_commutative(op) && needs_retry {
                         let sw_lhs =
                             build_pack(ctx, &rhs_lanes, ty, width, fam, packs, dedup, depth + 1);
                         let sw_rhs =
                             build_pack(ctx, &lhs_lanes, ty, width, fam, packs, dedup, depth + 1);
                         if sw_lhs.is_some() && sw_rhs.is_some() {
-                            lhs_pack = sw_lhs;
-                            rhs_pack = sw_rhs;
+                            let improves = (lhs_pack.is_none() || rhs_pack.is_none())
+                                || (sides_gathered(packs, lhs_pack, rhs_pack)
+                                    && !sides_gathered(packs, sw_lhs, sw_rhs));
+                            if improves {
+                                lhs_pack = sw_lhs;
+                                rhs_pack = sw_rhs;
+                            }
+                        }
+                    }
+                    // Per-lane commutative reordering (the LLVM
+                    // Reassociate/SLP operand-shuffle subset): flip
+                    // individual lanes to align operand KINDS —
+                    // load-defined values on one side, constants on the
+                    // other — so the sides form packable sets
+                    // (consecutive-load runs, constant splats) that
+                    // mixed spellings hid (`q[i] = a[i]*k + k*a[i]`
+                    // chains: the identity/swap sides mix loads and
+                    // scalars, degrade to gathers, and the cost model
+                    // then rejects the whole seed). Sound because a
+                    // commutative op computes the same lane value under
+                    // any per-lane operand assignment. Bounded: one
+                    // extra attempt pair, only when the flip actually
+                    // changes the sides, preferred only when it removes
+                    // gathers or fixes a failure.
+                    let needs_retry = lhs_pack.is_none()
+                        || rhs_pack.is_none()
+                        || sides_gathered(packs, lhs_pack, rhs_pack);
+                    if is_commutative(op) && needs_retry {
+                        let kind = |o: &Operand| -> u8 {
+                            match o {
+                                Operand::Const(_) => 2,
+                                Operand::Value(v) => {
+                                    match ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]) {
+                                        Some(Instruction::Load { .. }) => 0,
+                                        _ => 1,
+                                    }
+                                }
+                            }
+                        };
+                        let mut flipped = false;
+                        let mut fa: Vec<Operand> = Vec::with_capacity(width);
+                        let mut fb: Vec<Operand> = Vec::with_capacity(width);
+                        for (l, r) in lhs_lanes.iter().zip(rhs_lanes.iter()) {
+                            if kind(l) > kind(r) {
+                                fa.push(r.clone());
+                                fb.push(l.clone());
+                                flipped = true;
+                            } else {
+                                fa.push(l.clone());
+                                fb.push(r.clone());
+                            }
+                        }
+                        if flipped {
+                            let fl_lhs =
+                                build_pack(ctx, &fa, ty, width, fam, packs, dedup, depth + 1);
+                            let fl_rhs =
+                                build_pack(ctx, &fb, ty, width, fam, packs, dedup, depth + 1);
+                            if fl_lhs.is_some() && fl_rhs.is_some() {
+                                let improves = (lhs_pack.is_none() || rhs_pack.is_none())
+                                    || (sides_gathered(packs, lhs_pack, rhs_pack)
+                                        && !sides_gathered(packs, fl_lhs, fl_rhs));
+                                if improves {
+                                    lhs_pack = fl_lhs;
+                                    rhs_pack = fl_rhs;
+                                }
+                            }
                         }
                     }
                     if let (Some(lhs), Some(rhs)) = (lhs_pack, rhs_pack) {
@@ -1174,7 +1440,7 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     let mut packs: Vec<Pack> = Vec::new();
     let mut dedup: FxHashMap<Vec<LaneKey>, usize> = FxHashMap::default();
 
-    let root = build_pack(
+    let mut root = build_pack(
         ctx,
         &cand.lane_ops,
         cand.ty,
@@ -1184,6 +1450,47 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         &mut dedup,
         0,
     )?;
+
+    // ── Orphan pruning ─────────────────────────────────────────────
+    // Failed recursion branches (whole-side, swap, flip attempts) leave
+    // successfully-built sub-packs behind whose parent was never
+    // created. Unpruned, such orphans would be scheduled, costed
+    // (+width-1 each — INFLATING the benefit model), and emitted as
+    // dead vector ops, and their lanes would be removed from the block.
+    // Keep exactly what the root reaches.
+    {
+        let mut keep = vec![false; packs.len()];
+        let mut stack = vec![root];
+        while let Some(i) = stack.pop() {
+            if keep[i] {
+                continue;
+            }
+            keep[i] = true;
+            if let PackKind::BinOp { lhs, rhs, .. } = packs[i].kind {
+                stack.push(lhs);
+                stack.push(rhs);
+            }
+        }
+        if keep.iter().any(|k| !k) {
+            let mut remap = vec![usize::MAX; packs.len()];
+            let mut new_packs: Vec<Pack> = Vec::with_capacity(packs.len());
+            for (i, p) in packs.into_iter().enumerate() {
+                if !keep[i] {
+                    continue;
+                }
+                remap[i] = new_packs.len();
+                new_packs.push(p);
+            }
+            for p in &mut new_packs {
+                if let PackKind::BinOp { lhs, rhs, .. } = &mut p.kind {
+                    *lhs = remap[*lhs];
+                    *rhs = remap[*rhs];
+                }
+            }
+            packs = new_packs;
+            root = remap[root];
+        }
+    }
 
     // ── Schedules ──────────────────────────────────────────────────────
     // Op/MemLoad packs: max lane def position (strictly before every
@@ -1233,8 +1540,19 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             break;
         }
     }
-    // Unresolved leaves mean a graph bug (the root always has the seed
-    // store as consumer via the tree) — bail.
+    // Unresolved leaves mean a graph bug — with one exception: the ROOT
+    // pack may itself be a Splat or Gather (empty `lane_vals`: an
+    // all-same or gatherable seed like `q[0..3] = 0`, `q[0..3] = -1`).
+    // Its ultimate consumer is the seed STORE, which the fixpoint above
+    // cannot see (stores are not packs). The vector value must simply be
+    // ready at the store's slot: default the root to the LAST seed store
+    // position. Before this default, every constant-store seed bailed
+    // here — `q[i] = 0` × N never vectorized at all (4 scalar stores or
+    // backend pair-merges instead of one vpxor/vmovdqu).
+    let store_max = *cand.store_idx.iter().max().unwrap();
+    if packs[root].sched == usize::MAX {
+        packs[root].sched = store_max;
+    }
     if packs.iter().any(|p| p.sched == usize::MAX) {
         return None;
     }

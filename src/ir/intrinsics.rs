@@ -592,6 +592,15 @@ pub enum IntrinsicOp {
     /// Extract one I64/U64 lane as a GPR scalar (movq / pshufd+movq).
     /// args = [vector, Const(lane)].
     VecExtractLaneI64x2,
+    /// Extract one I64/U64 lane of a 256-bit I64x4 source as a GPR
+    /// scalar. Lanes 0/1 read the low 128 bits (the XMM alias of the
+    /// YMM home); lanes 2/3 stage the high half with `vextracti128`.
+    /// Unlocks BB-SLP seeds with externally-used lanes on the 4×i64
+    /// copy family.
+    VecExtractLaneI64x4,
+    /// Extract one F64 lane of a 256-bit F64x4 source as an F64 scalar
+    /// (same half-selection choreography).
+    VecExtractLaneF64x4,
     /// Extract one F64 lane as an XMM scalar (lane 0: movq; lane 1:
     /// pshufd $0x0E first). args = [vector, Const(lane)].
     VecExtractLaneF64x2,
@@ -731,6 +740,19 @@ pub enum IntrinsicOp {
     VecMulI16x16,
     /// SSE2 lane-wise word multiply, low half: 8×I16/U16 (`pmullw`).
     VecMulI16x8,
+    /// AVX2 word bitwise and: 16×I16/U16 (`vpand`); same register-file
+    /// shape as the dword/byte forms.
+    VecAndI16x16,
+    /// AVX2 word bitwise or: 16×I16/U16 (`vpor`).
+    VecOrI16x16,
+    /// AVX2 word bitwise xor: 16×I16/U16 (`vpxor`).
+    VecXorI16x16,
+    /// AVX2 unaligned word load: 32 contiguous bytes → 16×I16/U16
+    /// (`vmovdqu %ymm`). The BB-SLP halfword-family endpoint.
+    VecLoadI16x16,
+    /// AVX2 unaligned word store: 16×I16/U16 → 32 contiguous bytes
+    /// (`vmovdqu %ymm`).
+    VecStoreI16x16,
     /// AVX2 packed word compare, 16 lanes (`vpcmpeqw`/`vpcmpgtw`), same
     /// predicate immediates as `VecCmpI32x8`; the unsigned forms bias both
     /// operands by 0x8000 per word.
@@ -1501,6 +1523,10 @@ impl IntrinsicOp {
             | VecAddI16x16
             | VecSubI16x16
             | VecMulI16x16
+            | VecAndI16x16
+            | VecOrI16x16
+            | VecXorI16x16
+            | VecLoadI16x16
             | VecCmpI16x16
             | VecMinI16x16
             | VecMaxI16x16
@@ -1696,6 +1722,8 @@ impl IntrinsicOp {
                 IntrinsicOp::VecExtractLaneI32x4
                     | IntrinsicOp::VecExtractLaneI64x2
                     | IntrinsicOp::VecExtractLaneF64x2
+                    | IntrinsicOp::VecExtractLaneI64x4
+                    | IntrinsicOp::VecExtractLaneF64x4
             )
     }
 
@@ -1734,6 +1762,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecStoreI16x8
                 | IntrinsicOp::VecStoreI8x16
                 | IntrinsicOp::VecStoreI8x32
+                | IntrinsicOp::VecStoreI16x16
         )
     }
 
@@ -1762,6 +1791,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadI64x4
                 | IntrinsicOp::VecLoadI16x8
                 | IntrinsicOp::VecLoadI8x16
+                | IntrinsicOp::VecLoadI16x16
                 | IntrinsicOp::Loadu256
                 | IntrinsicOp::Load256
                 | IntrinsicOp::LoaduPs256
@@ -1932,6 +1962,10 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecAndI8x32
                 | IntrinsicOp::VecOrI8x32
                 | IntrinsicOp::VecXorI8x32
+                | IntrinsicOp::VecAndI16x16
+                | IntrinsicOp::VecOrI16x16
+                | IntrinsicOp::VecXorI16x16
+                | IntrinsicOp::VecLoadI16x16
         )
     }
 }
@@ -2249,6 +2283,11 @@ mod vector_result_width_tests {
             "VecXorI64x2" => IntrinsicOp::VecXorI64x2,
             "VecLoadI16x8" => IntrinsicOp::VecLoadI16x8,
             "VecStoreI16x8" => IntrinsicOp::VecStoreI16x8,
+            "VecStoreI16x16" => IntrinsicOp::VecStoreI16x16,
+            "VecAndI16x16" => IntrinsicOp::VecAndI16x16,
+            "VecOrI16x16" => IntrinsicOp::VecOrI16x16,
+            "VecXorI16x16" => IntrinsicOp::VecXorI16x16,
+            "VecLoadI16x16" => IntrinsicOp::VecLoadI16x16,
             "VecAndI16x8" => IntrinsicOp::VecAndI16x8,
             "VecOrI16x8" => IntrinsicOp::VecOrI16x8,
             "VecXorI16x8" => IntrinsicOp::VecXorI16x8,
@@ -2259,6 +2298,8 @@ mod vector_result_width_tests {
             "VecXorI8x16" => IntrinsicOp::VecXorI8x16,
             "VecPackI64x2" => IntrinsicOp::VecPackI64x2,
             "VecPackF64x2" => IntrinsicOp::VecPackF64x2,
+            "VecExtractLaneI64x4" => IntrinsicOp::VecExtractLaneI64x4,
+            "VecExtractLaneF64x4" => IntrinsicOp::VecExtractLaneF64x4,
             "VecExtractLaneI64x2" => IntrinsicOp::VecExtractLaneI64x2,
             "VecExtractLaneF64x2" => IntrinsicOp::VecExtractLaneF64x2,
             _ => return None,
@@ -2289,6 +2330,7 @@ mod memory_classification_tests {
             O::VecStoreI16x8,
             O::VecStoreI8x16,
             O::VecStoreI8x32,
+            O::VecStoreI16x16,
         ] {
             assert!(
                 op.writes_memory_via_args(),
@@ -2315,6 +2357,7 @@ mod memory_classification_tests {
             O::VecLoadI16x8,
             O::VecLoadI8x16,
             O::VecLoadI8x32,
+            O::VecLoadI16x16,
             O::VecLoadWidenI32ToI64x2,
             O::Loadu256,
             O::Load256,
@@ -2340,6 +2383,9 @@ mod memory_classification_tests {
             O::VecZeroF32x4,
             O::VecPackI64x2,
             O::VecExtractLaneI64x2,
+            O::VecAndI16x16,
+            O::VecOrI16x16,
+            O::VecXorI16x16,
         ] {
             assert!(
                 !op.writes_memory_via_args() && !op.may_read_memory(),

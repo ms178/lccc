@@ -1562,6 +1562,7 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadI32x4
             | O::VecLoadI32x8
             | O::VecLoadI8x32
+            | O::VecLoadI16x16
             | O::VecLoadF32x4
             | O::VecLoadF32x8
             | O::VecHorizontalAddF64x2
@@ -1897,6 +1898,11 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecAndI8x32
             | O::VecOrI8x32
             | O::VecXorI8x32
+            // Halfword map ops (AVX2 16xI16): same contract.
+            | O::VecLoadI16x16
+            | O::VecAndI16x16
+            | O::VecOrI16x16
+            | O::VecXorI16x16
             // BB-SLP producer families: the I64x2/I64x4 copy + bitwise
             // chains, the I16x8/I8x16 byte/halfword chains, and the
             // 2-lane gathers. Their single-use results live in the
@@ -2055,6 +2061,7 @@ pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool 
             | O::VecLoadI16x8
             | O::VecLoadI8x16
             | O::VecLoadI8x32
+            | O::VecLoadI16x16
     )
 }
 
@@ -2063,7 +2070,12 @@ pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bo
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
         op,
-        O::VecLoadF64x4 | O::VecLoadF32x8 | O::VecLoadI32x8 | O::VecLoadI8x32 | O::VecLoadI64x4
+        O::VecLoadF64x4
+            | O::VecLoadF32x8
+            | O::VecLoadI32x8
+            | O::VecLoadI8x32
+            | O::VecLoadI64x4
+            | O::VecLoadI16x16
     )
 }
 
@@ -2168,7 +2180,10 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecMinI16x16
         | O::VecMaxI16x16
         | O::VecMinU16x16
-        | O::VecMaxU16x16 => Some(true),
+        | O::VecMaxU16x16
+        | O::VecAndI16x16
+        | O::VecOrI16x16
+        | O::VecXorI16x16 => Some(true),
         O::VecSubI16x16 => Some(false),
         O::VecSubI8x32 => Some(false),
         _ => None,

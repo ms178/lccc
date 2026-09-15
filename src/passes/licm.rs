@@ -86,7 +86,20 @@ fn is_hoistable(inst: &Instruction) -> bool {
             | Instruction::Copy { .. }
             | Instruction::GlobalAddr { .. }
             | Instruction::Select { .. }
-    ) || matches!(inst, Instruction::Intrinsic { op, .. } if op.is_pure())
+    ) || matches!(
+        inst,
+        // `is_pure` means SIDE-EFFECT-FREE (DCE-eligible) — it does NOT
+        // mean the result depends only on its operands. The `VecLoad*`
+        // families are pure in the first sense yet READ MEMORY: hoisting
+        // one out of a loop that writes the loaded bytes replays the
+        // step-0 value forever (nbody: the BB-SLP position-update loads
+        // left the step loop; the energy computed from frozen positions).
+        // Only intrinsics that neither read nor write memory may take
+        // the generic pure-hoist path; loads go through the dedicated
+        // load-hoisting analysis, which models stores.
+        Instruction::Intrinsic { op, .. }
+            if op.is_pure() && !op.may_read_memory() && !op.writes_memory_via_args()
+    )
 }
 
 /// Information about allocas in a function, used for load hoisting analysis.

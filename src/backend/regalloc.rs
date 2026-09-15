@@ -6154,6 +6154,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecLoadI32x4
                 | O::VecLoadI32x8
                 | O::VecLoadI8x32
+                | O::VecLoadI16x16
                 | O::VecLoadF32x4
                 | O::VecLoadF32x8
                 | O::VecAddF64x2
@@ -7295,6 +7296,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             2 => matches!(
                 op,
                 O::VecAddF64x4 | O::VecMulF64x4 | O::VecFmaF64x4 | O::VecHorizontalAddF64x4
+                    // BB-SLP 256-bit lane extract: reads the YMM home
+                    // through its XMM alias / vextracti128; scratch is
+                    // xmm1 only.
+                    | O::VecExtractLaneF64x4
             ),
             3 => matches!(
                 op,
@@ -7378,6 +7383,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAndI64x4
                     | O::VecOrI64x4
                     | O::VecXorI64x4
+                    // 256-bit lane extract: same home-reading contract.
+                    | O::VecExtractLaneI64x4
             ),
             // BB-SLP byte/halfword chains: store (vec_store_source_128
             // register-home path), add/sub/bitwise (emit_sse_binary_128
@@ -7455,6 +7462,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecBroadcastF64x2
                                 | O::VecBroadcastI64x2
                                 | O::VecBroadcastI8x32
+                                | O::VecBroadcastI16x16
                                 | O::VecStoreI32x8
                                 | O::VecStoreI32x4
                                 | O::VecStoreF32x8
@@ -7463,6 +7471,9 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecStoreF64x2
                                 | O::VecStoreI64x2
                                 | O::VecStoreI8x32
+                                | O::VecStoreI16x16
+                                | O::VecLoadI8x32
+                                | O::VecLoadI16x16
                                 // v12 Fix C: max reductions (find_max) and
                                 // their horizontal reduce — lowerings
                                 // confine scratch to xmm0/xmm1, exempt them.
@@ -7492,6 +7503,23 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecMaxU8x32
                                 | O::VecMinI8x32
                                 | O::VecMaxI8x32
+                                // 256-bit halfword map ops (OP-05g word
+                                // lanes): same scratch-pair discipline as
+                                // their byte twins — without the exemption
+                                // they poison every vector web in the
+                                // function back to protected slots.
+                                | O::VecAddI16x16
+                                | O::VecSubI16x16
+                                | O::VecMulI16x16
+                                | O::VecCmpI16x16
+                                | O::VecMinI16x16
+                                | O::VecMaxI16x16
+                                | O::VecMinU16x16
+                                | O::VecMaxU16x16
+                                | O::VecBlendvI16x16
+                                | O::VecAndI16x16
+                                | O::VecOrI16x16
+                                | O::VecXorI16x16
                                 // BB-SLP sinks and lane extracts: no
                                 // accumulator of their own; scratch confined
                                 // to xmm0/xmm1 (or reading the home
@@ -7504,6 +7532,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecExtractLaneI32x4
                                 | O::VecExtractLaneI64x2
                                 | O::VecExtractLaneF64x2
+                                | O::VecExtractLaneI64x4
+                                | O::VecExtractLaneF64x4
                         ) =>
                 {
                     return FxHashSet::default();
@@ -7920,6 +7950,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             // emit_avx_blendv_256, shared VecStore arm via
             // vec_store_source_256).
             | O::VecLoadI8x32
+            | O::VecLoadI16x16
             | O::VecSubI8x32
             | O::VecAddI8x32
             | O::VecAndI8x32
@@ -7941,7 +7972,10 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecMaxI16x16
             | O::VecMinU16x16
             | O::VecMaxU16x16
-            | O::VecBlendvI16x16 => Some(3),
+            | O::VecBlendvI16x16
+            | O::VecAndI16x16
+            | O::VecOrI16x16
+            | O::VecXorI16x16 => Some(3),
             O::VecLoadI32x4
             | O::VecSubI32x4
             | O::VecAddI32x4
@@ -8041,7 +8075,8 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecBlendvI8x32
                     | O::VecMinI8x32
                     | O::VecMaxI8x32
-                    // Word lanes (OP-05g) share the 256-bit integer class: same YMM file, same VecLoad/StoreI32x8 endpoints.
+                    // Word lanes (OP-05g) share the 256-bit integer class:
+                    // same YMM file, same VecLoad/StoreI32x8 endpoints.
                     | O::VecAddI16x16
                     | O::VecSubI16x16
                     | O::VecMulI16x16
@@ -8051,6 +8086,9 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinU16x16
                     | O::VecMaxU16x16
                     | O::VecBlendvI16x16
+                    | O::VecAndI16x16
+                    | O::VecOrI16x16
+                    | O::VecXorI16x16
                     | O::VecStoreI32x8
                     // Byte ops NOT in the list above: the bitwise byte ops
                     // (register-file identical to the dword forms) and the

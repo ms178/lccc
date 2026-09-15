@@ -11,8 +11,10 @@
 #   4. rt_precise (disjoint same-stream store/load byte ranges) MUST
 #      vectorize: rule (e)'s range check must not over-reject.
 #   5. rt_w16/rt_w8 (restrict-qualified 20-lane u16 / 34-lane u8 runs)
-#      MUST pack at the family the width fallback selects (I16x8 / I8x16),
-#      not be dropped.
+#      MUST pack at the widest family the run supports — under AVX2 that
+#      is I16x16 / I8x32 for the leading 16/32 lanes (one 256-bit op,
+#      strictly better than the two 128-bit seeds the pre-v3 fallback
+#      produced) — not be dropped.
 #   6. rt_phi must contain no vector store: cross-block phi uses reject.
 #      rt_w16_norestr (no restrict) must also stay scalar: rule (e)'s
 #      cross-stream hazard check — the shape GCC miscompiles under a
@@ -72,13 +74,15 @@ if [ -n "$march" ]; then
         exit 1
     fi
     n_w16=$(scoped rt_w16 | grep -cE "paddw|vpaddw" || true)
-    if [ "$n_w16" -lt 2 ]; then
-        echo "FAIL: rt_w16 did not pack as I16x8 seeds ($n_w16 paddw)"
+    n_w16_v=$(scoped rt_w16 | grep -cE "vpaddw" || true)
+    if [ "$n_w16_v" -lt 1 ] && [ "$n_w16" -lt 2 ]; then
+        echo "FAIL: rt_w16 did not pack (I16x16 preferred, I16x8 fallback: $n_w16 ops, $n_w16_v ymm)"
         exit 1
     fi
     n_w8=$(scoped rt_w8 | grep -cE "paddb|vpaddb" || true)
-    if [ "$n_w8" -lt 2 ]; then
-        echo "FAIL: rt_w8 did not pack as I8x16 seeds ($n_w8 paddb)"
+    n_w8_v=$(scoped rt_w8 | grep -cE "vpaddb" || true)
+    if [ "$n_w8_v" -lt 1 ] && [ "$n_w8" -lt 2 ]; then
+        echo "FAIL: rt_w8 did not pack (I8x32 preferred, I8x16 fallback: $n_w8 ops, $n_w8_v ymm)"
         exit 1
     fi
 fi
