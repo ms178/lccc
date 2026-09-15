@@ -669,12 +669,29 @@ pub fn link_builtin(
     // `dead_sections` so the merge step never lays them out; the alias is
     // installed into `section_map` afterwards, so every symbol address and
     // relocation that referred to a folded section resolves to the survivor.
+    // Sections already dead (gc/COMDAT/strmerge) are handed in so the plan
+    // never folds among the dead.
     let icf_plan = match icf_mode.as_deref() {
-        Some(mode) => icf::plan(&objects, mode == "safe"),
+        Some(mode) => icf::plan(&objects, mode == "safe", &dead_sections),
         None => icf::IcfPlan::default(),
     };
     for folded in icf_plan.redirect.keys() {
         dead_sections.insert(*folded);
+    }
+    // The loser's FDE duplicates the survivor's unwind rows: both describe
+    // the same bytes at the same (aliased) address, so the survivor's FDE
+    // already covers the range and the loser's only bloats `.eh_frame`.
+    // Drop them now that the plan names the losers (the pre-ICF prune above
+    // could not: a folded function is not dead — its symbols stay live as
+    // aliases — so its FDE was correctly kept then). Unwinding through
+    // folded twins stays covered: `icf_folded_code_still_unwinds` guards it.
+    if !icf_plan.is_empty() {
+        let folded: crate::common::fx_hash::FxHashSet<(usize, usize)> =
+            icf_plan.redirect.keys().copied().collect();
+        let dropped_folded_fdes = linker_common::prune_dead_fdes(&mut objects, &folded);
+        if std::env::var("LCCC_DEBUG_GCEH").is_ok() {
+            eprintln!("[gceh] dropped_folded_fdes={dropped_folded_fdes}");
+        }
     }
 
     phase!("icf");
@@ -718,12 +735,15 @@ pub fn link_builtin(
         }
         if std::env::var("LCCC_DEBUG_ICF").is_ok() {
             eprintln!(
-                "[icf] mode={} groups={} folded={} bytes_saved={} rejected_unsafe={}",
+                "[icf] mode={} groups={} folded={} bytes_saved={} rejected_unsafe={} iters={} comparisons={} shattered={}",
                 icf_mode.as_deref().unwrap_or("none"),
                 icf_plan.result.candidate_groups,
                 icf_plan.result.folded_sections,
                 icf_plan.result.bytes_saved,
-                icf_plan.result.rejected_unsafe
+                icf_plan.result.rejected_unsafe,
+                icf_plan.result.iterations,
+                icf_plan.result.comparisons,
+                icf_plan.result.shattered
             );
         }
     }

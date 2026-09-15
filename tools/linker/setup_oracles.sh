@@ -1,92 +1,103 @@
 #!/usr/bin/env bash
-# Build the comparison linkers used by tests/linker/run_linker_tests.py.
+# Build/restore the comparison linkers used by tests/linker/run_linker_tests.py
+# and the differential/ICF tooling.
 #
-# Policy, learned the hard way: mold and wild are built from git HEAD, never from
-# a release tarball. Two false "lccc is broken" verdicts earlier in this series
-# came from a tarball oracle that predated an upstream fix; an oracle you cannot
-# date is not an oracle. lld is pinned to release/23.x because that is the branch
-# the clang 23.1 driver on this machine expects.
+# Pinning policy (2026-09-15, user directive): the ONLY oracles are
+#   * GNU ld from binutils 2.47   (release tarball, ftp.gnu.org)
+#   * mold 2.42.1                 (release tarball, github.com/rui314/mold)
+#   * wild at git HEAD            (clone of github.com/davidlattimore/wild)
+# lld and the distro-default ld are NOT oracles: two false "lccc is broken"
+# verdicts earlier in this series came from stale oracle revisions, and an
+# oracle you cannot date is not an oracle. binutils/mold are pinned releases so
+# every verdict is reproducible; wild stays at HEAD because the project ships no
+# releases and we deliberately track its moving target (its REVISION file
+# records the exact commit every build/restore came from).
 #
-# Everything is built -march=native: these are comparison tools for one machine,
-# and a generic-baseline oracle can be slow enough that a differential sweep
-# stops being practical.
+# The harness wipes everything outside /home/user mid-session, so binaries live
+# under ARTIFACTS (= /home/user/artifacts/oracles by default): that tree is
+# part of the workspace snapshot and survives. Restoring = re-pointing symlinks;
+# full source rebuilds happen only when the pinned binaries are missing or the
+# checksums in ORACLES.md changed.
 #
-# Idempotent -- re-running skips whatever is already on PATH.
+# Idempotent: re-running verifies and skips whatever already checks out.
 set -euo pipefail
 
-JOBS="$(nproc)"
-PREFIX="${PREFIX:-$HOME/.local}"
-SRC="${SRC:-$HOME/oracles/src}"
-mkdir -p "$PREFIX/bin" "$SRC"
+JOBS="${JOBS:-2}"                      # research policy: -j2
+ARTIFACTS="${ARTIFACTS:-/home/user/artifacts/oracles}"
+PREFIX="${PREFIX:-$ARTIFACTS}"         # install root == persistent root
+SRC="${SRC:-$ARTIFACTS/src}"
+LINKDIR="${LINKDIR:-/home/user/artifacts/bin}"
 
-have() { command -v "$1" >/dev/null 2>&1; }
+BINUTILS_VER=2.47
+MOLD_VER=2.42.1
+WILD_REPO=https://github.com/davidlattimore/wild.git
 
-# ── GNU ld: the primary oracle, assumed installed ───────────────────────────
-# Every verdict in this series that claims "matches GNU ld" was produced with
-# this one, because it is the only oracle guaranteed to be present. The others
-# below are corroborating, not required.
-if have ld; then
-    echo "ld    : $(ld --version | head -1)"
+mkdir -p "$PREFIX" "$SRC" "$LINKDIR"
+
+note() { printf '%s\n' "$*"; }
+
+# ── GNU ld 2.47 (primary oracle) ────────────────────────────────────────────
+if [ -x "$PREFIX/bfd-$BINUTILS_VER/bin/ld" ]; then
+    note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (restored from $ARTIFACTS)"
 else
-    echo "ld    : MISSING. Install binutils; it is the primary oracle." >&2
-    exit 1
+    TARBALL="$SRC/binutils-$BINUTILS_VER.tar.xz"
+    [ -f "$TARBALL" ] || { note "ld    : fetching binutils $BINUTILS_VER"; \
+        curl -fsSL -o "$TARBALL" "https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VER.tar.xz"; }
+    BT="$SRC/binutils-$BINUTILS_VER"
+    rm -rf "$BT"; tar -xf "$TARBALL" -C "$SRC"
+    ( cd "$BT"
+      ./configure --prefix="$PREFIX/bfd-$BINUTILS_VER" \
+          --disable-nls --disable-gdb --disable-gdbserver --disable-sim \
+          --disable-libquadmath --enable-64-bit-bfd --disable-werror \
+          CFLAGS='-O2 -g0' CXXFLAGS='-O2 -g0'
+      make -j"$JOBS" && make install-strip )
+    note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (built)"
 fi
 
-# ── mold, from git HEAD ─────────────────────────────────────────────────────
-if have mold; then
-    echo "mold  : $(mold --version) (already on PATH, skipping)"
+# ── mold 2.42.1, MOLD_USE_SYSTEM_* defaults (self-contained binary) ─────────
+if [ -x "$PREFIX/mold-$MOLD_VER/bin/mold" ]; then
+    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (restored from $ARTIFACTS)"
 else
-    [ -d "$SRC/mold" ] || git clone https://github.com/rui314/mold "$SRC/mold"
-    (
-        cd "$SRC/mold"
-        git fetch origin main && git checkout main && git reset --hard origin/main
-        echo "mold  : building $(git rev-parse --short HEAD)"
-        cmake -B build -DCMAKE_BUILD_TYPE=Release \
-              -DMOLD_TARGETS='X86_64;I386' \
-              -DCMAKE_CXX_FLAGS='-march=native' \
-              -DCMAKE_INSTALL_PREFIX="$PREFIX"
-        cmake --build build -j "$JOBS"
-        cmake --install build
-    )
-    echo "mold  : $("$PREFIX/bin/mold" --version)"
+    TARBALL="$SRC/mold-$MOLD_VER.tar.gz"
+    [ -f "$TARBALL" ] || { note "mold  : fetching mold $MOLD_VER"; \
+        curl -fsSL -o "$TARBALL" "https://github.com/rui314/mold/archive/refs/tags/v$MOLD_VER.tar.gz"; }
+    MT="$SRC/mold-$MOLD_VER"
+    rm -rf "$MT"; tar -xzf "$TARBALL" -C "$SRC"
+    ( cd "$MT"
+      cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_CXX_FLAGS='-march=native' \
+            -DMOLD_TARGETS='X86_64;I386' \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX/mold-$MOLD_VER"
+      cmake --build build -j "$JOBS" && cmake --install build
+      strip "build/mold" 2>/dev/null || true )
+    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built)"
 fi
 
-# ── wild, from git HEAD (Rust) ──────────────────────────────────────────────
-if have wild; then
-    echo "wild  : $(wild --version 2>&1 | head -1) (already on PATH, skipping)"
+# ── wild, git HEAD (Rust; revision stamped in REVISION) ─────────────────────
+if [ -x "$PREFIX/wild-git/bin/wild" ] && [ -f "$PREFIX/wild-git/REVISION" ]; then
+    note "wild  : $("$PREFIX/wild-git/bin/wild" --version 2>&1 | head -1) (restored from $ARTIFACTS; rev $(cat "$PREFIX/wild-git/REVISION"))"
 else
-    [ -d "$SRC/wild" ] || git clone https://github.com/davidlattimore/wild "$SRC/wild"
-    (
-        cd "$SRC/wild"
-        git fetch origin main && git checkout main && git reset --hard origin/main
-        echo "wild  : building $(git rev-parse --short HEAD)"
-        RUSTFLAGS='-C target-cpu=native' cargo build --release
-        install -m 0755 target/release/wild "$PREFIX/bin/wild"
-    )
-    echo "wild  : $("$PREFIX/bin/wild" --version 2>&1 | head -1)"
+    WT="$SRC/wild"
+    rm -rf "$WT"; git clone --depth 1 "$WILD_REPO" "$WT"
+    ( cd "$WT"
+      REV="$(git rev-parse --short HEAD)"
+      note "wild  : building HEAD = $REV"
+      RUSTFLAGS='-C target-cpu=native' cargo build --release --locked -j "$JOBS"
+      mkdir -p "$PREFIX/wild-git/bin" && install -s target/release/wild "$PREFIX/wild-git/bin/wild"
+      echo "$REV" > "$PREFIX/wild-git/REVISION" )
+    note "wild  : $("$PREFIX/wild-git/bin/wild" --version 2>&1 | head -1) (built)"
 fi
 
-# ── lld, pinned to release/23.x ─────────────────────────────────────────────
-# X86 only: the tree's differential tests are x86-64/i386, and building every
-# LLVM target on a 2-core box costs hours for nothing.
-if have ld.lld; then
-    echo "lld   : $(ld.lld --version) (already on PATH, skipping)"
-else
-    [ -d "$SRC/llvm-project" ] ||
-        git clone --filter=blob:none https://github.com/llvm/llvm-project "$SRC/llvm-project"
-    (
-        cd "$SRC/llvm-project"
-        git fetch origin release/23.x && git checkout release/23.x
-        echo "lld   : building $(git rev-parse --short HEAD)"
-        cmake -B build -S llvm -G Ninja -DCMAKE_BUILD_TYPE=Release \
-              -DLLVM_ENABLE_PROJECTS=lld -DLLVM_TARGETS_TO_BUILD=X86 \
-              -DCMAKE_C_FLAGS='-march=native' -DCMAKE_CXX_FLAGS='-march=native' \
-              -DCMAKE_INSTALL_PREFIX="$PREFIX"
-        ninja -C build -j "$JOBS" install
-    )
-    echo "lld   : $("$PREFIX/bin/ld.lld" --version)"
-fi
+# ── convenience wrappers (stable names on PATH) ─────────────────────────────
+for pair in "ld-2.47:$PREFIX/bfd-$BINUTILS_VER/bin/ld" \
+            "mold-2.42.1:$PREFIX/mold-$MOLD_VER/bin/mold" \
+            "wild:$PREFIX/wild-git/bin/wild"; do
+    name="${pair%%:*}"; target="${pair#*:}"
+    printf '#!/bin/sh\nexec %s "$@"\n' "$target" > "$LINKDIR/$name"
+    chmod +x "$LINKDIR/$name"
+done
 
 echo
-echo "Oracles installed under $PREFIX/bin. Put it on PATH and re-run:"
-echo "  python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc-x86"
+note "Oracles under $PREFIX (wipe-safe); wrappers in $LINKDIR."
+note "Record new checksums in $PREFIX/ORACLES.md whenever a pin moves."
