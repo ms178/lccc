@@ -1880,6 +1880,25 @@ impl Driver {
                     self.explicit_language = explicit_language.clone();
                 }
 
+                // GCC hard-errors on a bare `-soname`/--soname (unrecognized
+                // option); the spelling it understands is `-Wl,-soname,NAME`.
+                // Swallowing it silently (the old behaviour) left the value
+                // behind as a phantom positional input — later producing a
+                // baffling "not a relocatable object" link diagnostic instead
+                // of GCC's early, clear error.
+                arg @ ("-soname" | "--soname") => {
+                    return Err(format!(
+                        "unrecognized command-line option '{}' (use -Wl,-soname,NAME)",
+                        arg
+                    ));
+                }
+                arg if arg.starts_with("-soname=") || arg.starts_with("--soname=") => {
+                    return Err(format!(
+                        "unrecognized command-line option '{}' (use -Wl,-soname,NAME)",
+                        arg
+                    ));
+                }
+
                 // Unknown flags
                 arg if arg.starts_with('-') => {
                     if self.verbose {

@@ -389,16 +389,24 @@ fn build_sysv_hash(names: &[String]) -> Vec<u8> {
 /// Build a GNU hash table and return the required dynsym order. GNU hash
 /// requires all symbols belonging to a bucket to be contiguous.
 fn build_gnu_hash(mut names: Vec<String>, machine: ScriptMachine) -> (Vec<u8>, Vec<String>) {
-    // Bucket count: a power of two near the symbol count, so chains stay
-    // short. GNU ld uses a load factor around 1 symbol per bucket for exactly
-    // this reason -- every ld.so lookup walks a chain, so an undersized table
-    // is a permanent runtime tax on the consumer, not a link-time saving.
+    // Bucket/bloom sizing shares the oracle-measured rule with every other
+    // emitter (linker_common/hash.rs GnuHashParams): bloom words =
+    // next_pow2(ceil(n/4)) — a hard glibc power-of-two requirement — and
+    // buckets = n/4 (measured lld parity; bfd's n/2 wastes table bytes,
+    // the old pow2(n) wasted 4x lld's).  The previous n/word_bits bloom
+    // here was ~86% full at scale: ~74% of miss lookups walked a chain.
     //
     // A fixed cap (an earlier revision clamped this to 64) is a trap: it looks
     // harmless on a vDSO with four exports and silently degrades to ~78-symbol
     // chains at 5 000 exports, versus ~1.5 uncapped -- measured. The table
     // costs 4 bytes per bucket, so sizing it properly is cheap.
-    let nbuckets = names.len().next_power_of_two().max(1);
+    let word_bits = if machine == ScriptMachine::X86_64 {
+        64u32
+    } else {
+        32u32
+    };
+    let gnu_hp = linker_common::gnu_hash_params(names.len(), word_bits);
+    let nbuckets = gnu_hp.nbuckets as usize;
     // Decorate once: `sort_by_key(... name.clone())` allocated and copied a
     // String on every comparator invocation (O(n log n) heap traffic), then
     // hashed every name again.  Hash once and compare borrowed names.
@@ -416,21 +424,11 @@ fn build_gnu_hash(mut names: Vec<String>, machine: ScriptMachine) -> (Vec<u8>, V
             .then(a_name.cmp(b_name))
     });
     let (names, hashes): (Vec<String>, Vec<u32>) = hashed.into_iter().unzip();
-    let word_bits = if machine == ScriptMachine::X86_64 {
-        64usize
-    } else {
-        32usize
-    };
-    let bloom_size = names.len().div_ceil(word_bits).next_power_of_two().max(1);
-    let bloom_shift = 6u32;
-    // Store bloom words in u64 while building; ELF32 serialises their low 32
-    // bits as Elf32_Addr words.
-    let mut bloom = vec![0u64; bloom_size];
-    for &hash in &hashes {
-        let word = (hash as usize / word_bits) % bloom_size;
-        bloom[word] |= 1u64 << (hash as usize % word_bits);
-        bloom[word] |= 1u64 << ((hash >> bloom_shift) as usize % word_bits);
-    }
+    let bloom_size = gnu_hp.bloom_size as usize;
+    let bloom_shift = gnu_hp.bloom_shift;
+    // Shared bloom builder: probe bits match glibc dl-lookup.c exactly
+    // (ELF32 uses the low 32 bits of each u64 word at serialisation).
+    let bloom = linker_common::build_gnu_bloom(&hashes, &gnu_hp, word_bits);
     let mut buckets = vec![0u32; nbuckets];
     let mut chains = vec![0u32; names.len()];
     for (i, &hash) in hashes.iter().enumerate() {

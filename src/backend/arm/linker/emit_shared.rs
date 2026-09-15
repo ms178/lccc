@@ -164,44 +164,34 @@ pub(super) fn emit_shared_library(
     let dynsym_size = dynsym_count as u64 * 24;
     let dynstr_size = dynstr.as_bytes().len() as u64;
 
-    // .gnu.hash - only covers defined symbols (after the undefined ones)
+    // .gnu.hash - only covers defined symbols (after the undefined ones).
+    // Shared oracle-measured sizing (linker_common/hash.rs); the previous
+    // single 64-bit word at shift 6 saturated beyond ~30 exports.
     let gnu_hash_symoffset: usize = 1 + so_undef_count;
     let num_hashed = dyn_sym_names.len() - so_undef_count;
-    let gnu_hash_nbuckets = if num_hashed == 0 {
-        1
-    } else {
-        num_hashed.next_power_of_two().max(1)
-    } as u32;
-    let gnu_hash_bloom_size: u32 = 1;
-    let gnu_hash_bloom_shift: u32 = 6;
+    let gnu_hp = linker_common::gnu_hash_params(num_hashed, 64);
+    let gnu_hash_nbuckets = gnu_hp.nbuckets;
+    let gnu_hash_bloom_size: u32 = gnu_hp.bloom_size;
+    let gnu_hash_bloom_shift: u32 = gnu_hp.bloom_shift;
 
-    let hashed_sym_hashes: Vec<u32> = dyn_sym_names[so_undef_count..]
+    // One hash pass feeds bloom, bucket sort and chains (index permutation
+    // tracks the reorder, so a pre/post-sort mismatch is impossible).
+    let mut hashed_sym_hashes: Vec<u32> = dyn_sym_names[so_undef_count..]
         .iter()
         .map(|name| linker_common::gnu_hash(name.as_bytes()))
         .collect();
-
-    let mut bloom_word: u64 = 0;
-    for &h in &hashed_sym_hashes {
-        bloom_word |= 1u64 << (h as u64 % 64);
-        bloom_word |= 1u64 << ((h >> gnu_hash_bloom_shift) as u64 % 64);
-    }
+    let bloom_words = linker_common::build_gnu_bloom(&hashed_sym_hashes, &gnu_hp, 64);
 
     if num_hashed > 0 {
-        let mut hashed_with_hash: Vec<(String, u32)> = dyn_sym_names[so_undef_count..]
-            .iter()
-            .zip(hashed_sym_hashes.iter())
-            .map(|(n, &h)| (n.clone(), h))
-            .collect();
-        hashed_with_hash.sort_by_key(|(_, h)| h % gnu_hash_nbuckets);
-        for (i, (name, _)) in hashed_with_hash.iter().enumerate() {
-            dyn_sym_names[so_undef_count + i] = name.clone();
+        let mut perm: Vec<usize> = (0..num_hashed).collect();
+        perm.sort_by_key(|&i| hashed_sym_hashes[i] % gnu_hash_nbuckets);
+        let names_before = dyn_sym_names[so_undef_count..].to_vec();
+        let hashes_before = hashed_sym_hashes.clone();
+        for (new_i, &old_i) in perm.iter().enumerate() {
+            dyn_sym_names[so_undef_count + new_i] = names_before[old_i].clone();
+            hashed_sym_hashes[new_i] = hashes_before[old_i];
         }
     }
-
-    let hashed_sym_hashes: Vec<u32> = dyn_sym_names[so_undef_count..]
-        .iter()
-        .map(|name| linker_common::gnu_hash(name.as_bytes()))
-        .collect();
 
     let mut gnu_hash_buckets = vec![0u32; gnu_hash_nbuckets as usize];
     let mut gnu_hash_chains = vec![0u32; num_hashed];
@@ -212,17 +202,15 @@ pub(super) fn emit_shared_library(
         }
         gnu_hash_chains[i] = h & !1;
     }
-    for bucket_idx in 0..gnu_hash_nbuckets as usize {
-        if gnu_hash_buckets[bucket_idx] == 0 {
-            continue;
+    // Chain-end marking in one linear pass (replaces the quadratic
+    // per-bucket rescan).
+    for i in 0..hashed_sym_hashes.len() {
+        let last = i + 1 == hashed_sym_hashes.len()
+            || (hashed_sym_hashes[i + 1] % gnu_hash_nbuckets)
+                != (hashed_sym_hashes[i] % gnu_hash_nbuckets);
+        if last {
+            gnu_hash_chains[i] |= 1;
         }
-        let mut last_in_bucket = 0;
-        for (i, &h) in hashed_sym_hashes.iter().enumerate() {
-            if (h % gnu_hash_nbuckets) as usize == bucket_idx {
-                last_in_bucket = i;
-            }
-        }
-        gnu_hash_chains[last_in_bucket] |= 1;
     }
 
     let gnu_hash_size: u64 = 16
@@ -310,7 +298,7 @@ pub(super) fn emit_shared_library(
     const INTERP: &[u8] = b"/lib/ld-linux-aarch64.so.1\0";
 
     // PHDR, LOAD R, LOAD RX, [LOAD R(rodata)], LOAD RW, DYNAMIC, GNU_STACK, [TLS]
-    let mut phdr_count: u64 = 6; // base: PHDR + LOAD R + LOAD RX + LOAD RW + DYNAMIC + GNU_STACK
+    let mut phdr_count: u64 = 7; // base: PHDR + LOAD R + LOAD RX + LOAD RW + DYNAMIC + GNU_STACK + GNU_RELRO
     if has_rodata {
         phdr_count += 1;
     }
@@ -498,20 +486,9 @@ pub(super) fn emit_shared_library(
     let dynamic_addr_so = base_addr + offset;
     offset += dynamic_size;
 
-    // GOT.PLT for PLT symbols
-    let so_got_plt_offset: u64;
-    let so_got_plt_addr: u64;
-    if so_got_plt_size > 0 {
-        offset = (offset + 7) & !7;
-        so_got_plt_offset = offset;
-        so_got_plt_addr = base_addr + offset;
-        offset += so_got_plt_size;
-    } else {
-        so_got_plt_offset = 0;
-        so_got_plt_addr = 0;
-    }
-
-    // RELA.PLT for JUMP_SLOT relocations
+    // RELA.PLT for JUMP_SLOT relocations.  Emitted inside the RELRO window:
+    // its content is link-time final (bfd keeps .rela.dyn/.rela.plt in the
+    // read-only part of the dynamic-info region).
     let so_rela_plt_offset: u64;
     let so_rela_plt_addr: u64;
     if so_rela_plt_size > 0 {
@@ -575,6 +552,41 @@ pub(super) fn emit_shared_library(
     }
     let got_size = got_needed.len() as u64 * 8;
     offset += got_size;
+
+    // GOT.PLT for PLT symbols — covered by RELRO: this emitter always runs
+    // eager binding (DT_FLAGS=DF_BIND_NOW / DT_FLAGS_1=DF_1_NOW are
+    // unconditional below), so the .got.plt slots are link-time final.
+    // bfd's `-z now` layout rule; lld/mold match it.
+    let so_got_plt_offset: u64;
+    let so_got_plt_addr: u64;
+    if so_got_plt_size > 0 {
+        offset = (offset + 7) & !7;
+        so_got_plt_offset = offset;
+        so_got_plt_addr = base_addr + offset;
+        offset += so_got_plt_size;
+    } else {
+        so_got_plt_offset = 0;
+        so_got_plt_addr = 0;
+    }
+
+    // RELRO boundary: [init/fini arrays, .dynamic, .rela.plt, .got, .got.plt]
+    // closes at the page edge.  ld.so rounds [vaddr, vaddr+memsz) down to
+    // page edges before mprotect(PROT_READ), so a boundary that does not
+    // reach the next page protects nothing — bfd/lld right-size identically.
+    let relro_boundary_offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+    // Writable tails (.data/TLS/.bss) start on the fresh page after the
+    // boundary; otherwise the page-rounded mprotect over-protects them
+    // (write faults) — or, if sized sub-page, protects nothing.
+    let any_writable_tail = output_sections.iter().any(|sec| {
+        sec.flags & SHF_ALLOC != 0
+            && (sec.flags & SHF_WRITE != 0 || sec.flags & SHF_TLS != 0)
+            && sec.name != ".init_array"
+            && sec.name != ".fini_array"
+    });
+    if any_writable_tail {
+        offset = relro_boundary_offset;
+    }
 
     for sec in output_sections.iter_mut() {
         if sec.flags & SHF_ALLOC != 0
@@ -908,6 +920,21 @@ pub(super) fn emit_shared_library(
         8,
     );
     ph += 56;
+    // GNU_RELRO: [RW page start, page-aligned boundary) mprotected read-only
+    // by ld.so after relocation — bfd's group composition. p_align=1 like
+    // bfd/lld; glibc consumes only vaddr/memsz.
+    wphdr(
+        &mut out,
+        ph,
+        PT_GNU_RELRO,
+        PF_R,
+        rw_page_offset,
+        rw_page_addr,
+        relro_boundary_offset - rw_page_offset,
+        relro_boundary_offset - rw_page_offset,
+        1,
+    );
+    ph += 56;
     // GNU_STACK — OR of all input notes (trampoline units mark the note
     // SHF_EXECINSTR). (Mirrors i686/linker/shared.rs.)
     let exec_stack = objects.iter().any(|obj| {
@@ -947,7 +974,9 @@ pub(super) fn emit_shared_library(
     w32(&mut out, gh + 4, gnu_hash_symoffset as u32);
     w32(&mut out, gh + 8, gnu_hash_bloom_size);
     w32(&mut out, gh + 12, gnu_hash_bloom_shift);
-    w64(&mut out, gh + 16, bloom_word);
+    for (i, &w) in bloom_words.iter().enumerate() {
+        w64(&mut out, gh + 16 + i * 8, w);
+    }
     let buckets_off = gh + 16 + (gnu_hash_bloom_size as usize * 8);
     for (i, &b) in gnu_hash_buckets.iter().enumerate() {
         w32(&mut out, buckets_off + i * 4, b);

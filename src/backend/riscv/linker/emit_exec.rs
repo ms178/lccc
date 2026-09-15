@@ -403,7 +403,16 @@ pub fn emit_executable(
         }
     }
 
-    // RELRO boundary
+    // RELRO boundary — ld.so rounds [vaddr, vaddr+memsz) down to page edges
+    // before mprotect(PROT_READ), so a memsz that does not reach the next
+    // page protects NOTHING (pre-fix riscv exes shipped .dynamic/.got
+    // writable; verified against Linux glibc under qemu). bfd/lld right-size
+    // the region to the page: close the RELRO group at the page boundary so
+    // the writable tail (·data, TLS, .bss, IFUNC slots) starts on a fresh
+    // page. PT_GNU_RELRO p_align stays 1 like bfd's — glibc consumes only
+    // vaddr/memsz.
+    file_offset = align_up(file_offset, PAGE_SIZE);
+    vaddr = align_up(vaddr, PAGE_SIZE);
     let relro_end_offset = file_offset;
     let relro_end_vaddr = vaddr;
 

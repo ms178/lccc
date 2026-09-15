@@ -605,51 +605,36 @@ pub(super) fn emit_shared_library(
 
     let gnu_hash_symoffset: usize = 1 + undef_syms.len(); // 1 for null entry + undefs
     let num_hashed = defined_syms.len();
-    let gnu_hash_nbuckets = if num_hashed == 0 {
-        1
-    } else {
-        num_hashed.next_power_of_two().max(1)
-    } as u32;
-    // Scale bloom filter size with number of symbols for efficient lookup.
-    // Each 64-bit bloom word can effectively track ~32 symbols (2 bits each).
-    // Use next power of two for the number of words needed, minimum 1.
-    let gnu_hash_bloom_size: u32 = if num_hashed <= 32 {
-        1
-    } else {
-        num_hashed.div_ceil(32).next_power_of_two() as u32
-    };
-    let gnu_hash_bloom_shift: u32 = 6;
+    // Oracle-measured sizing shared with the executable emitter: bloom
+    // words = next_pow2(n/4) (lld parity, FPR ~2% at glibc scale; the
+    // previous n/32 words saturated ~63% full, passing ~40% of misses)
+    // and buckets = n/4 expected chain length 4.
+    let gnu_hp = linker_common::gnu_hash_params(num_hashed, 64);
+    let gnu_hash_nbuckets = gnu_hp.nbuckets;
+    let gnu_hash_bloom_size: u32 = gnu_hp.bloom_size;
+    let gnu_hash_bloom_shift: u32 = gnu_hp.bloom_shift;
 
-    let hashed_sym_hashes: Vec<u32> = defined_syms
+    // Single hash pass over the *emitted* (version-stripped) names: the
+    // vector feeds the bloom filter, the bucket sort, and the chain table,
+    // so a pre/post-sort disagreement is impossible by construction.
+    let mut hashed_sym_hashes: Vec<u32> = defined_syms
         .iter()
         .map(|name| linker_common::gnu_hash(sym_base(name).as_bytes()))
         .collect();
+    let bloom_words = linker_common::build_gnu_bloom(&hashed_sym_hashes, &gnu_hp, 64);
 
-    let mut bloom_words: Vec<u64> = vec![0u64; gnu_hash_bloom_size as usize];
-    for &h in &hashed_sym_hashes {
-        let word_idx = ((h / 64) % gnu_hash_bloom_size) as usize;
-        bloom_words[word_idx] |= 1u64 << (h as u64 % 64);
-        bloom_words[word_idx] |= 1u64 << ((h >> gnu_hash_bloom_shift) as u64 % 64);
-    }
-
-    // Sort hashed (defined) symbols by bucket
+    // Sort hashed (defined) symbols by bucket, via an index permutation so
+    // the hash vector tracks the name reordering exactly.
     if num_hashed > 0 {
-        let mut hashed_with_hash: Vec<(String, u32)> = defined_syms
-            .iter()
-            .zip(hashed_sym_hashes.iter())
-            .map(|(n, &h)| (n.clone(), h))
-            .collect();
-        hashed_with_hash.sort_by_key(|(_, h)| h % gnu_hash_nbuckets);
-        // Update defined portion of dyn_sym_names
-        for (i, (name, _)) in hashed_with_hash.iter().enumerate() {
-            dyn_sym_names[undef_syms.len() + i] = name.clone();
+        let mut perm: Vec<usize> = (0..num_hashed).collect();
+        perm.sort_by_key(|&i| hashed_sym_hashes[i] % gnu_hash_nbuckets);
+        let names_before = defined_syms.clone();
+        let hashes_before = hashed_sym_hashes.clone();
+        for (new_i, &old_i) in perm.iter().enumerate() {
+            dyn_sym_names[undef_syms.len() + new_i] = names_before[old_i].clone();
+            hashed_sym_hashes[new_i] = hashes_before[old_i];
         }
     }
-
-    let hashed_sym_hashes: Vec<u32> = dyn_sym_names[undef_syms.len()..]
-        .iter()
-        .map(|name| linker_common::gnu_hash(sym_base(name).as_bytes()))
-        .collect();
 
     // O(1) name -> dynsym index (1-based), valid from this point on (after the
     // .gnu.hash bucket sort has frozen the final dynsym order).
@@ -1108,14 +1093,44 @@ pub(super) fn emit_shared_library(
     if has_relro {
         phdr_count += 1;
     }
-    // One PT_NOTE segment per allocated note section plus the
-    // PT_GNU_PROPERTY alias — see `emit_exec` for the reasoning.  The count
-    // must use `mem_size`, which is set before layout; section `data` is
-    // only filled during the layout pass.
-    let note_phdr_count = output_sections
-        .iter()
-        .filter(|s| s.sh_type == SHT_NOTE && s.flags & SHF_ALLOC != 0 && s.mem_size > 0)
-        .count() as u64;
+    // Split-RW predicate: anything (file bytes OR pure memory) laid out
+    // after the RELRO boundary below — .got.plt, the local/TLS GOT, writable
+    // sections, TLS, .bss.  Same contract as `emit_exec`: the RELRO window
+    // gets its own PT_LOAD and the page pad becomes NOBITS instead of a run
+    // of file zeros.  MUST match the layout pass exactly.
+    let has_post_relro_content = got_plt_size > 0
+        || !got_needed_names.is_empty()
+        || !tlsgd_names.is_empty()
+        || needs_tlsld_slot
+        || output_sections.iter().any(|s| {
+            s.flags & SHF_ALLOC != 0
+                && s.flags & SHF_WRITE != 0
+                && s.mem_size > 0
+                && s.name != ".init_array"
+                && s.name != ".fini_array"
+                && s.name != ".data.rel.ro"
+        });
+    let split_relro_load = has_relro && has_post_relro_content;
+    if split_relro_load {
+        phdr_count += 1; // second RW PT_LOAD (writable tail after RELRO)
+    }
+    // One PT_NOTE segment per contiguous RUN of allocated note sections plus
+    // the PT_GNU_PROPERTY alias — merged exactly like `emit_exec` (one phdr
+    // saved per adjacent note; count and write run the identical walk, so
+    // they cannot drift).  The count must use `mem_size`, which is set
+    // before layout; section `data` is only filled during the layout pass.
+    let is_alloc_note =
+        |s: &OutputSection| s.sh_type == SHT_NOTE && s.flags & SHF_ALLOC != 0 && s.mem_size > 0;
+    let mut note_phdr_count = 0u64;
+    {
+        let mut prev_note = false;
+        for s in output_sections.iter() {
+            if is_alloc_note(s) && !prev_note {
+                note_phdr_count += 1;
+            }
+            prev_note = is_alloc_note(s);
+        }
+    }
     let has_gnu_property_phdr = output_sections
         .iter()
         .any(|s| s.name == ".note.gnu.property" && s.flags & SHF_ALLOC != 0 && s.mem_size > 0);
@@ -1303,10 +1318,24 @@ pub(super) fn emit_shared_library(
     // With densely packed file offsets the RELRO end must be aligned in
     // ADDRESS space: ld.so mprotects page-rounded [vaddr, vaddr+memsz), so
     // aligning the file offset would leave the boundary mid-page and
-    // write-protect the head of the following section.
-    let relro_end_addr = vaddr!(offset) + packer.padding_to_page(offset);
+    // write-protect the head of the following section.  The pad up to the
+    // boundary page is NOBITS — address space only, zero file bytes (same
+    // contract as the executable emitter; before, up to one page of zeros
+    // was baked into every shared object with a .data.rel.ro).
+    // `relro_file_end` / `rw2_addr` are the two halves of the split-LOAD
+    // interface: file offset where RELRO content ends, and the address the
+    // writable tail's PT_LOAD starts at (post-bias-update).
+    let mut relro_file_end = offset;
+    let mut relro_mem_size = 0u64;
+    let mut rw2_addr = vaddr!(offset);
     if has_relro {
-        offset += packer.padding_to_page(offset); // advance to page boundary
+        relro_file_end = offset;
+        let relro_pad = packer.padding_to_page(offset);
+        relro_mem_size = vaddr!(offset) + relro_pad - rw_page_addr;
+        if split_relro_load && relro_pad > 0 {
+            packer.new_segment();
+        }
+        rw2_addr = vaddr!(offset);
     }
 
     // .got.plt entries - MUST be after RELRO boundary since dynamic linker
@@ -1588,24 +1617,62 @@ pub(super) fn emit_shared_library(
         PAGE_SIZE,
     );
     ph += 56;
-    let rw_filesz = offset - rw_page_offset;
-    let rw_memsz = if bss_size > 0 {
-        (bss_addr + bss_size) - rw_page_addr
+    if has_relro {
+        // RELRO LOAD (filesz = file content, memsz covering the NOBITS pad),
+        // then the writable tail at the same dense file offset on a fresh
+        // page — the executable emitter's split, see its rationale there.
+        wphdr(
+            &mut out,
+            ph,
+            PT_LOAD,
+            PF_R | PF_W,
+            rw_page_offset,
+            rw_page_addr,
+            relro_file_end - rw_page_offset,
+            relro_mem_size,
+            PAGE_SIZE,
+        );
+        ph += 56;
+        if split_relro_load {
+            let rw2_filesz = offset - relro_file_end;
+            let rw2_memsz = if bss_size > 0 {
+                (bss_addr + bss_size) - rw2_addr
+            } else {
+                rw2_filesz
+            };
+            wphdr(
+                &mut out,
+                ph,
+                PT_LOAD,
+                PF_R | PF_W,
+                relro_file_end,
+                rw2_addr,
+                rw2_filesz,
+                rw2_memsz,
+                PAGE_SIZE,
+            );
+            ph += 56;
+        }
     } else {
-        rw_filesz
-    };
-    wphdr(
-        &mut out,
-        ph,
-        PT_LOAD,
-        PF_R | PF_W,
-        rw_page_offset,
-        rw_page_addr,
-        rw_filesz,
-        rw_memsz,
-        PAGE_SIZE,
-    );
-    ph += 56;
+        let rw_filesz = offset - rw_page_offset;
+        let rw_memsz = if bss_size > 0 {
+            (bss_addr + bss_size) - rw_page_addr
+        } else {
+            rw_filesz
+        };
+        wphdr(
+            &mut out,
+            ph,
+            PT_LOAD,
+            PF_R | PF_W,
+            rw_page_offset,
+            rw_page_addr,
+            rw_filesz,
+            rw_memsz,
+            PAGE_SIZE,
+        );
+        ph += 56;
+    }
     wphdr(
         &mut out,
         ph,
@@ -1618,25 +1685,37 @@ pub(super) fn emit_shared_library(
         8,
     );
     ph += 56;
-    // One PT_NOTE segment per allocated note section (alignment = the
-    // section's, minimum 4), followed by the PT_GNU_PROPERTY alias over
-    // `.note.gnu.property` (alignment 8) — written after DYNAMIC, matching
-    // GNU ld's program header order for shared objects.
-    for sec in output_sections.iter() {
-        if sec.sh_type == SHT_NOTE && sec.flags & SHF_ALLOC != 0 && !sec.data.is_empty() {
-            wphdr(
-                &mut out,
-                ph,
-                PT_NOTE,
-                PF_R,
-                sec.file_offset,
-                sec.addr,
-                sec.data.len() as u64,
-                sec.mem_size,
-                sec.alignment.max(4),
-            );
-            ph += 56;
+    // One PT_NOTE per contiguous run of allocated note sections (p_align
+    // the maximum member alignment, minimum 4) — the same walk that counted
+    // them before layout, identical predicate and order.
+    {
+        let mut run_start: Option<(u64, u64, u64)> = None;
+        let mut run_end: Option<(u64, u64)> = None;
+        let mut flush = |run: Option<(u64, u64, u64)>,
+                         end: Option<(u64, u64)>,
+                         out: &mut Vec<u8>,
+                         ph: &mut usize| {
+            if let (Some((fo, va, al)), Some((fe, ae))) = (run, end) {
+                wphdr(out, *ph, PT_NOTE, PF_R, fo, va, fe - fo, ae - va, al);
+                *ph += 56;
+            }
+        };
+        for sec in output_sections.iter() {
+            if is_alloc_note(sec) {
+                if run_start.is_none() {
+                    run_start = Some((sec.file_offset, sec.addr, sec.alignment.max(4)));
+                } else if let Some(r) = &mut run_start {
+                    r.2 = r.2.max(sec.alignment.max(4));
+                }
+                run_end = Some((
+                    sec.file_offset + sec.data.len() as u64,
+                    sec.addr + sec.mem_size,
+                ));
+            } else {
+                flush(run_start.take(), run_end.take(), &mut out, &mut ph);
+            }
         }
+        flush(run_start.take(), run_end.take(), &mut out, &mut ph);
     }
     if has_gnu_property_phdr {
         if let Some(sec) = output_sections
@@ -1660,7 +1739,8 @@ pub(super) fn emit_shared_library(
     wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
     ph += 56;
     if has_relro {
-        let relro_filesz = relro_end_addr - rw_page_addr;
+        // filesz covers the RELRO file content; memsz reaches across the
+        // NOBITS page pad (ld.so rounds vaddr+memsz out to pages).
         wphdr(
             &mut out,
             ph,
@@ -1668,8 +1748,8 @@ pub(super) fn emit_shared_library(
             PF_R,
             rw_page_offset,
             rw_page_addr,
-            relro_filesz,
-            relro_filesz,
+            relro_file_end - rw_page_offset,
+            relro_mem_size,
             1,
         );
         ph += 56;

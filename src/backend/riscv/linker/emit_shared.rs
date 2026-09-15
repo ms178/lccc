@@ -192,45 +192,35 @@ pub fn emit_shared_library(
     let dynstr_bytes = dynstr.as_bytes();
     let dynstr_size = dynstr_bytes.len() as u64;
 
-    // Build .gnu.hash
+    // Build .gnu.hash — shared oracle-measured sizing (linker_common/hash.rs);
+    // the single 64-bit word at shift 6 used before saturated beyond ~30
+    // exports.
     let num_hashed = dyn_sym_names.len();
-    let gnu_hash_nbuckets = if num_hashed == 0 {
-        1
-    } else {
-        num_hashed.next_power_of_two().max(1)
-    } as u32;
-    let gnu_hash_bloom_size: u32 = 1;
-    let gnu_hash_bloom_shift: u32 = 6;
+    let gnu_hp = linker_common::gnu_hash_params(num_hashed, 64);
+    let gnu_hash_nbuckets = gnu_hp.nbuckets;
+    let gnu_hash_bloom_size: u32 = gnu_hp.bloom_size;
+    let gnu_hash_bloom_shift: u32 = gnu_hp.bloom_shift;
     let gnu_hash_symoffset: usize = 1;
 
-    let hashed_sym_hashes: Vec<u32> = dyn_sym_names
+    // One hash pass feeds bloom, bucket sort and chains (index permutation
+    // tracks the reorder, so a pre/post-sort mismatch is impossible).
+    let mut hashed_sym_hashes: Vec<u32> = dyn_sym_names
         .iter()
         .map(|name| linker_common::gnu_hash(name.as_bytes()))
         .collect();
-
-    let mut bloom_word: u64 = 0;
-    for &h in &hashed_sym_hashes {
-        bloom_word |= 1u64 << (h as u64 % 64);
-        bloom_word |= 1u64 << ((h >> gnu_hash_bloom_shift) as u64 % 64);
-    }
+    let bloom_words = linker_common::build_gnu_bloom(&hashed_sym_hashes, &gnu_hp, 64);
 
     // Sort hashed symbols by bucket
     if num_hashed > 0 {
-        let mut hashed_with_hash: Vec<(String, u32)> = dyn_sym_names
-            .iter()
-            .zip(hashed_sym_hashes.iter())
-            .map(|(n, &h)| (n.clone(), h))
-            .collect();
-        hashed_with_hash.sort_by_key(|(_, h)| h % gnu_hash_nbuckets);
-        for (i_idx, (name, _)) in hashed_with_hash.iter().enumerate() {
-            dyn_sym_names[i_idx] = name.clone();
+        let mut perm: Vec<usize> = (0..num_hashed).collect();
+        perm.sort_by_key(|&i| hashed_sym_hashes[i] % gnu_hash_nbuckets);
+        let names_before = dyn_sym_names.clone();
+        let hashes_before = hashed_sym_hashes.clone();
+        for (new_i, &old_i) in perm.iter().enumerate() {
+            dyn_sym_names[new_i] = names_before[old_i].clone();
+            hashed_sym_hashes[new_i] = hashes_before[old_i];
         }
     }
-
-    let hashed_sym_hashes: Vec<u32> = dyn_sym_names
-        .iter()
-        .map(|name| linker_common::gnu_hash(name.as_bytes()))
-        .collect();
 
     let mut gnu_hash_buckets = vec![0u32; gnu_hash_nbuckets as usize];
     let mut gnu_hash_chains = vec![0u32; num_hashed];
@@ -241,17 +231,15 @@ pub fn emit_shared_library(
         }
         gnu_hash_chains[i_idx] = h & !1;
     }
-    for bucket_idx in 0..gnu_hash_nbuckets as usize {
-        if gnu_hash_buckets[bucket_idx] == 0 {
-            continue;
+    // Chain-end marking in one linear pass (replaces the quadratic
+    // per-bucket rescan).
+    for i_idx in 0..hashed_sym_hashes.len() {
+        let last = i_idx + 1 == hashed_sym_hashes.len()
+            || (hashed_sym_hashes[i_idx + 1] % gnu_hash_nbuckets)
+                != (hashed_sym_hashes[i_idx] % gnu_hash_nbuckets);
+        if last {
+            gnu_hash_chains[i_idx] |= 1;
         }
-        let mut last_in_bucket = 0;
-        for (i_idx, &h) in hashed_sym_hashes.iter().enumerate() {
-            if (h % gnu_hash_nbuckets) as usize == bucket_idx {
-                last_in_bucket = i_idx;
-            }
-        }
-        gnu_hash_chains[last_in_bucket] |= 1;
     }
 
     let gnu_hash_size: u64 = 16
@@ -380,9 +368,13 @@ pub fn emit_shared_library(
     let got_vaddr = base_addr + offset;
     offset += got_size;
 
-    // GOT.PLT (NOT covered by RELRO)
+    // GOT.PLT (NOT covered by RELRO): starts on a fresh page so ld.so's
+    // page-rounded mprotect covers exactly [init arrays, .dynamic, .got] —
+    // never .got.plt or .data sharing that page.  (Pre-fix: when .got.plt
+    // shared the page the code dropped the padding and emitted a sub-page
+    // memsz, which glibc rounds down to zero protection.)
     let got_plt_offset = if got_plt_size > 0 {
-        offset = align_up(offset, 8);
+        offset = align_up(offset, PAGE_SIZE);
         let o = offset;
         offset += got_plt_size;
         o
@@ -390,6 +382,21 @@ pub fn emit_shared_library(
         0
     };
     let got_plt_vaddr = base_addr + got_plt_offset;
+
+    // When no .got.plt closed the RELRO page, any other writable tail
+    // (.data/TLS/.bss) must still start on a fresh page — otherwise ld.so's
+    // page-rounded mprotect would either over-protect it (write fault) or,
+    // if sized sub-page, protect nothing.
+    let any_writable_tail = sec_indices.iter().any(|&si| {
+        let ms = &merged_sections[si];
+        ms.sh_flags & SHF_ALLOC != 0
+            && (ms.sh_flags & SHF_WRITE != 0 || ms.sh_flags & SHF_TLS != 0)
+            && ms.name != ".init_array"
+            && ms.name != ".fini_array"
+    });
+    if got_plt_size == 0 && any_writable_tail {
+        offset = align_up(offset, PAGE_SIZE);
+    }
 
     // Writable data sections
     for &si in &sec_indices {
@@ -605,15 +612,14 @@ pub fn emit_shared_library(
     {
         let relro_start_offset = rw_page_offset;
         let relro_start_addr = rw_page_addr;
+        // The layout closes the [arrays, .dynamic, .got] group at the page
+        // boundary (every writable tail starts there) — exactly bfd/lld's
+        // PT_GNU_RELRO right-sizing. memsz reaches the page edge, so glibc's
+        // round-down mprotect covers the whole region.
         let relro_end = if got_size > 0 {
             align_up(got_vaddr + got_size, PAGE_SIZE)
         } else {
             align_up(dynamic_addr + dynamic_size, PAGE_SIZE)
-        };
-        let relro_end = if got_plt_size > 0 && relro_end > got_plt_vaddr {
-            got_vaddr + got_size
-        } else {
-            relro_end
         };
         let relro_filesz = relro_end - relro_start_addr;
         let relro_memsz = relro_filesz;
@@ -668,7 +674,9 @@ pub fn emit_shared_library(
         elf[gh + 8..gh + 12].copy_from_slice(&gnu_hash_bloom_size.to_le_bytes());
         elf[gh + 12..gh + 16].copy_from_slice(&gnu_hash_bloom_shift.to_le_bytes());
         let bloom_off = gh + 16;
-        elf[bloom_off..bloom_off + 8].copy_from_slice(&bloom_word.to_le_bytes());
+        for (i, &w) in bloom_words.iter().enumerate() {
+            elf[bloom_off + i * 8..bloom_off + i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+        }
         let buckets_off = bloom_off + (gnu_hash_bloom_size as usize * 8);
         for (bi, &b) in gnu_hash_buckets.iter().enumerate() {
             let off_b = buckets_off + bi * 4;

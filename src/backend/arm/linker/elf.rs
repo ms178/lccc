@@ -12,11 +12,11 @@ pub use crate::backend::elf::{
     DT_PLTREL, DT_PLTRELSZ, DT_RELA, DT_RELACOUNT, DT_RELAENT, DT_RELASZ, DT_SONAME, DT_STRSZ,
     DT_STRTAB, DT_SYMENT, DT_SYMTAB, ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, EM_AARCH64, ET_DYN,
     ET_EXEC, LinkerScriptEntry, LinkerSymbolAddresses, PF_R, PF_W, PF_X, PT_DYNAMIC,
-    PT_GNU_EH_FRAME, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHF_ALLOC, SHF_EXECINSTR,
-    SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_NOBITS, STB_GLOBAL, STB_WEAK, STT_FUNC,
-    STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION, STT_TLS, get_standard_linker_symbols,
-    is_thin_archive, parse_linker_script_entries, read_u16, read_u32, w16, w32, w64, wphdr,
-    write_bytes,
+    PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHF_ALLOC,
+    SHF_EXECINSTR, SHF_TLS, SHF_WRITE, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_NOBITS, STB_GLOBAL,
+    STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION, STT_TLS,
+    get_standard_linker_symbols, is_thin_archive, parse_linker_script_entries, read_u16, read_u32,
+    w16, w32, w64, wphdr, write_bytes,
 };
 
 use crate::backend::linker_common;

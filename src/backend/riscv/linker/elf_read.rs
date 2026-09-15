@@ -5,7 +5,7 @@
 //! shared module to avoid duplication with x86 and ARM.
 
 pub use crate::backend::elf::{
-    EM_RISCV, LinkerSymbolAddresses, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE, SHN_ABS,
+    EM_RISCV, ET_DYN, LinkerSymbolAddresses, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE, SHN_ABS,
     SHN_COMMON, SHN_UNDEF, SHT_GROUP, SHT_NOBITS, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
     STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_SECTION, STV_DEFAULT,
     get_standard_linker_symbols, is_thin_archive, parse_archive_members,

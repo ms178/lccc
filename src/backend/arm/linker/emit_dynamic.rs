@@ -100,44 +100,35 @@ pub(super) fn emit_dynamic_executable(
     let rela_dyn_count = rela_dyn_glob_count + copy_reloc_syms.len();
     let rela_dyn_size = rela_dyn_count as u64 * 24;
 
-    // Build .gnu.hash
+    // Build .gnu.hash — shared oracle-measured sizing (linker_common/hash.rs):
+    // bloom words = next_pow2(n/4), shift = log2(bloom_bits), buckets = n/4.
+    // The single 64-bit word at shift 6 used before saturated beyond ~30
+    // exports (measured FPR ~1.0 at 20k symbols).
     let num_hashed = dyn_sym_names.len() - (gnu_hash_symoffset - 1);
-    let gnu_hash_nbuckets = if num_hashed == 0 {
-        1
-    } else {
-        num_hashed.next_power_of_two().max(1)
-    } as u32;
-    let gnu_hash_bloom_size: u32 = 1;
-    let gnu_hash_bloom_shift: u32 = 6;
+    let gnu_hp = linker_common::gnu_hash_params(num_hashed, 64);
+    let gnu_hash_nbuckets = gnu_hp.nbuckets;
+    let gnu_hash_bloom_size: u32 = gnu_hp.bloom_size;
+    let gnu_hash_bloom_shift: u32 = gnu_hp.bloom_shift;
 
-    let hashed_sym_hashes: Vec<u32> = dyn_sym_names[gnu_hash_symoffset - 1..]
+    // One hash pass feeds bloom, bucket sort and chains (index permutation
+    // tracks the reorder, so a pre/post-sort mismatch is impossible).
+    let mut hashed_sym_hashes: Vec<u32> = dyn_sym_names[gnu_hash_symoffset - 1..]
         .iter()
         .map(|name| linker_common::gnu_hash(name.as_bytes()))
         .collect();
-
-    let mut bloom_word: u64 = 0;
-    for &h in &hashed_sym_hashes {
-        bloom_word |= 1u64 << (h as u64 % 64);
-        bloom_word |= 1u64 << ((h >> gnu_hash_bloom_shift) as u64 % 64);
-    }
+    let bloom_words = linker_common::build_gnu_bloom(&hashed_sym_hashes, &gnu_hp, 64);
 
     if num_hashed > 0 {
         let hashed_start = gnu_hash_symoffset - 1;
-        let mut hashed_with_hash: Vec<(String, u32)> = dyn_sym_names[hashed_start..]
-            .iter()
-            .zip(hashed_sym_hashes.iter())
-            .map(|(n, &h)| (n.clone(), h))
-            .collect();
-        hashed_with_hash.sort_by_key(|(_, h)| h % gnu_hash_nbuckets);
-        for (i, (name, _)) in hashed_with_hash.iter().enumerate() {
-            dyn_sym_names[hashed_start + i] = name.clone();
+        let mut perm: Vec<usize> = (0..num_hashed).collect();
+        perm.sort_by_key(|&i| hashed_sym_hashes[i] % gnu_hash_nbuckets);
+        let names_before = dyn_sym_names[hashed_start..].to_vec();
+        let hashes_before = hashed_sym_hashes.clone();
+        for (new_i, &old_i) in perm.iter().enumerate() {
+            dyn_sym_names[hashed_start + new_i] = names_before[old_i].clone();
+            hashed_sym_hashes[new_i] = hashes_before[old_i];
         }
     }
-
-    let hashed_sym_hashes: Vec<u32> = dyn_sym_names[gnu_hash_symoffset - 1..]
-        .iter()
-        .map(|name| linker_common::gnu_hash(name.as_bytes()))
-        .collect();
 
     let mut gnu_hash_buckets = vec![0u32; gnu_hash_nbuckets as usize];
     let mut gnu_hash_chains = vec![0u32; num_hashed];
@@ -148,17 +139,15 @@ pub(super) fn emit_dynamic_executable(
         }
         gnu_hash_chains[i] = h & !1;
     }
-    for bucket_idx in 0..gnu_hash_nbuckets as usize {
-        if gnu_hash_buckets[bucket_idx] == 0 {
-            continue;
+    // Chain-end marking in one linear pass: entry i ends its chain when the
+    // next entry hashes elsewhere (replaces a quadratic per-bucket rescan).
+    for i in 0..hashed_sym_hashes.len() {
+        let last = i + 1 == hashed_sym_hashes.len()
+            || (hashed_sym_hashes[i + 1] % gnu_hash_nbuckets)
+                != (hashed_sym_hashes[i] % gnu_hash_nbuckets);
+        if last {
+            gnu_hash_chains[i] |= 1;
         }
-        let mut last_in_bucket = 0;
-        for (i, &h) in hashed_sym_hashes.iter().enumerate() {
-            if (h % gnu_hash_nbuckets) as usize == bucket_idx {
-                last_in_bucket = i;
-            }
-        }
-        gnu_hash_chains[last_in_bucket] |= 1;
     }
 
     let gnu_hash_size: u64 = 16
@@ -197,8 +186,8 @@ pub(super) fn emit_dynamic_executable(
     let has_tls_sections = output_sections
         .iter()
         .any(|s| s.flags & SHF_TLS != 0 && s.flags & SHF_ALLOC != 0);
-    // phdrs: PHDR, INTERP, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC, GNU_STACK, [TLS]
-    let phdr_count: u64 = if has_tls_sections { 9 } else { 8 };
+    // phdrs: PHDR, INTERP, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC, GNU_STACK, GNU_RELRO, [TLS]
+    let phdr_count: u64 = if has_tls_sections { 10 } else { 9 };
     let phdr_total_size = phdr_count * 56;
 
     // === Layout ===
@@ -307,20 +296,8 @@ pub(super) fn emit_dynamic_executable(
         }
     }
 
-    offset = (offset + 7) & !7;
-    let dynamic_offset = offset;
-    let dynamic_addr = BASE_ADDR + offset;
-    offset += dynamic_size;
-    offset = (offset + 7) & !7;
-    let got_offset = offset;
-    let got_addr = BASE_ADDR + offset;
-    offset += got_size;
-    offset = (offset + 7) & !7;
-    let got_plt_offset = offset;
-    let got_plt_addr = BASE_ADDR + offset;
-    offset += got_plt_size;
-
-    // Data.rel.ro
+    // Data.rel.ro first — read-only after relocation, so it belongs inside
+    // the RELRO window (bfd's order), not after .got.plt.
     for sec in output_sections.iter_mut() {
         if sec.name == ".data.rel.ro" {
             let a = sec.alignment.max(1);
@@ -330,6 +307,30 @@ pub(super) fn emit_dynamic_executable(
             offset += sec.mem_size;
         }
     }
+
+    offset = (offset + 7) & !7;
+    let dynamic_offset = offset;
+    let dynamic_addr = BASE_ADDR + offset;
+    offset += dynamic_size;
+    offset = (offset + 7) & !7;
+    let got_offset = offset;
+    let got_addr = BASE_ADDR + offset;
+    offset += got_size;
+
+    // GOT.PLT — RELRO-covered: DT_FLAGS=DF_BIND_NOW / DT_FLAGS_1=DF_1_NOW
+    // are emitted unconditionally below, so the slots are link-time final.
+    // (bfd's `-z now` rule; lazy-binding toolchains leave .got.plt outside.)
+    offset = (offset + 7) & !7;
+    let got_plt_offset = offset;
+    let got_plt_addr = BASE_ADDR + offset;
+    offset += got_plt_size;
+
+    // RELRO window [arrays, .data.rel.ro, .dynamic, .got, .got.plt] closes at
+    // the page edge — ld.so rounds [vaddr, vaddr+memsz) down to pages before
+    // mprotect, so a boundary not reaching the next page protects nothing.
+    // bfd/lld right-size the region identically.
+    let relro_boundary_offset = (offset + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    offset = relro_boundary_offset;
 
     // Remaining data sections
     for sec in output_sections.iter_mut() {
@@ -654,6 +655,21 @@ pub(super) fn emit_dynamic_executable(
         8,
     );
     ph += 56;
+    // GNU_RELRO: [RW page start, page-aligned boundary) mprotected read-only
+    // by ld.so after relocation — bfd's group composition. p_align=1 like
+    // bfd/lld; glibc consumes only vaddr/memsz.
+    wphdr(
+        &mut out,
+        ph,
+        PT_GNU_RELRO,
+        PF_R,
+        rw_page_offset,
+        rw_page_addr,
+        relro_boundary_offset - rw_page_offset,
+        relro_boundary_offset - rw_page_offset,
+        1,
+    );
+    ph += 56;
     // GNU_STACK — OR of all input notes (trampoline units mark the note
     // SHF_EXECINSTR); without PF_X an address-taken nested function
     // segfaults on its first indirect call. (Mirrors i686/linker/emit.rs.)
@@ -698,7 +714,9 @@ pub(super) fn emit_dynamic_executable(
     w32(&mut out, gh + 8, gnu_hash_bloom_size);
     w32(&mut out, gh + 12, gnu_hash_bloom_shift);
     let bloom_off = gh + 16;
-    w64(&mut out, bloom_off, bloom_word);
+    for (i, &w) in bloom_words.iter().enumerate() {
+        w64(&mut out, bloom_off + i * 8, w);
+    }
     let buckets_off = bloom_off + (gnu_hash_bloom_size as usize * 8);
     for (i, &b) in gnu_hash_buckets.iter().enumerate() {
         w32(&mut out, buckets_off + i * 4, b);
