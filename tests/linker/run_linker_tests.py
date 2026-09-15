@@ -56,6 +56,7 @@ class Case:
                  expect_dyn_tags=None, expect_prop_note_match=False,
                  expect_symtab_valid=False, expect_dyn_init_fini=False,
                  expect_dyn_relacount=None, expect_same_address=None,
+                 expect_distinct_addresses=None,
                  expect_dyn_has=None, expect_dyn_missing=None,
                  expect_comment=None, expect_symbol_order=None):
         self.name = name
@@ -115,6 +116,11 @@ class Case:
         # a group must be equal.  stdout alone cannot tell "folded" from
         # "never folded" — or from "folded but the loser was dropped".
         self.expect_same_address = expect_same_address
+        # Mirror image: groups of symbol names that must all have DIFFERENT
+        # st_values (safe-ICF check).  Observes "not folded" without taking
+        # any address in the test program itself — which would perturb the
+        # very property under test.
+        self.expect_distinct_addresses = expect_distinct_addresses
         # Dynamic tags (by name, see _DT_NUMBERS) that must be present in
         # or absent from .dynamic.  Presence-only — value checks live in
         # the dedicated params above.
@@ -5431,6 +5437,230 @@ int main(void){ printf("%d\\n", d1() + d2()); return 0; }
     expect_stdout="6\n",
     tags=("icf",))
 
+# Two objects, byte-identical getters over same-indexed locals with DIFFERENT
+# bytes: folding swaps the tables (the unqualified-(shndx,value) trap that a
+# single-pass ICF cannot see). Must hold under safe AND all — local-target
+# identity is correctness, not safety mode.
+case("icf_cross_object_locals_safe",
+    {"a.c": 'static const int table_a[4] = {11, 22, 33, 44};\n'
+            'const int *get_a(void) { return table_a; }\n',
+     "b.c": 'static const int table_b[4] = {55, 66, 77, 88};\n'
+            'const int *get_b(void) { return table_b; }\n',
+     "main.c": """
+#include <stdio.h>
+const int *get_a(void);
+const int *get_b(void);
+int main(void){
+    const int *a = get_a(), *b = get_b();
+    printf("%d %d %d %d / %d %d %d %d\\n", a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+    return 0;
+}
+"""},
+    compile_flags=["-O2", "-ffunction-sections", "-fdata-sections"],
+    lccc_only_flags=["-Wl,--icf=safe"],
+    expect_stdout="11 22 33 44 / 55 66 77 88\n",
+    tags=("icf",)),
+
+case("icf_cross_object_locals_all",
+    {"a.c": 'static const int table_a[4] = {11, 22, 33, 44};\n'
+            'const int *get_a(void) { return table_a; }\n',
+     "b.c": 'static const int table_b[4] = {55, 66, 77, 88};\n'
+            'const int *get_b(void) { return table_b; }\n',
+     "main.c": """
+#include <stdio.h>
+const int *get_a(void);
+const int *get_b(void);
+int main(void){
+    const int *a = get_a(), *b = get_b();
+    printf("%d %d %d %d / %d %d %d %d\\n", a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+    return 0;
+}
+"""},
+    compile_flags=["-O2", "-ffunction-sections", "-fdata-sections"],
+    lccc_only_flags=["-Wl,--icf=all"],
+    expect_stdout="11 22 33 44 / 55 66 77 88\n",
+    tags=("icf",)),
+
+case("icf_transitive_cross_object_fold",
+    # Positive cross-object proof for iterative ICF: f1->g1 and f2->g2 fold
+    # only because the leaves are proven equivalent first (same global
+    # callee). Single-pass comparison folds these for the wrong reason or
+    # not at all; iteration folds them soundly — in safe mode, nothing taken.
+    # NOTE: `leaf` lives in a third object on purpose. A same-TU leaf lets
+    # gcc skip the call realignment (`call; ret`, 6 bytes) while an imported
+    # one forces `sub/add` — the chains would differ before the linker ever
+    # sees them and the test would assert a fold that must not happen.
+    {"a.c": """
+int leaf(void);
+__attribute__((noinline)) static int g1(void){ return leaf(); }
+__attribute__((noinline)) int f1(void){ return g1(); }
+""",
+     "b.c": """
+int leaf(void);
+__attribute__((noinline)) static int g2(void){ return leaf(); }
+__attribute__((noinline)) int f2(void){ return g2(); }
+""",
+     "leaf.c": "__attribute__((noinline)) int leaf(void){ return 42; }\n",
+     "main.c": """
+#include <stdio.h>
+int f1(void); int f2(void);
+int main(void){ printf("%d %d\\n", f1(), f2()); return 0; }
+"""},
+    compile_flags=["-O1", "-ffunction-sections"],
+    lccc_only_flags=["-Wl,--icf=safe"],
+    expect_stdout="42 42\n",
+    expect_same_address=[["f1", "f2"]],
+    tags=("icf",)),
+
+case("icf_hot_unlikely_stay_split",
+    # PGO partitioning is a linker-level contract (merge keeps .text.hot /
+    # .text.unlikely as separate outputs for I-cache locality). Byte-identical
+    # twins across the split must NOT fold — not even under `all`: same
+    # output section is the deep invariant, and folding hot onto unlikely
+    # would silently relocate hot code into the cold tail.
+    {"a.c": '__attribute__((section(".text.hot")))\n'
+            'int fa(void) { return 42; }\n',
+     "b.c": '__attribute__((section(".text.unlikely")))\n'
+            'int fb(void) { return 42; }\n',
+     "main.c": """
+#include <stdio.h>
+int fa(void); int fb(void);
+int main(void){ printf("%d\\n", fa() + fb()); return 0; }
+"""},
+    compile_flags=["-O2"],
+    lccc_only_flags=["-Wl,--icf=all"],
+    expect_stdout="84\n",
+    expect_distinct_addresses=[["fa", "fb"]],
+    tags=("icf",)),
+
+case("icf_local_ifunc_resolvers_survive",
+    # Twin resolvers (byte-identical, like the twin impls) must NEVER fold —
+    # not even under `all`. The IPLT slot allocator skips ifuncs in dead
+    # sections, so a folded resolver loses its slot while its ifunc still
+    # binds through it: the caller would run the resolver bytes as the
+    # target and print an address sum instead of 2.
+    {"a.c": """
+#include <stdio.h>
+static int impl1(void){ return 1; }
+static int impl2(void){ return 1; }
+static int (*rsv1(void))(void){ return impl1; }
+static int (*rsv2(void))(void){ return impl2; }
+static int fn1(void) __attribute__((ifunc("rsv1")));
+static int fn2(void) __attribute__((ifunc("rsv2")));
+int main(void){ printf("%d\\n", fn1() + fn2()); return 0; }
+"""},
+    compile_flags=["-O2", "-ffunction-sections"],
+    lccc_only_flags=["-Wl,--icf=all"],
+    expect_stdout="2\n",
+    tags=("icf", "ifunc")),
+
+case("icf_shifted_indices_fold",
+    # The discriminating iteration proof, live: f1 and f2 are byte-identical
+    # but reference their (also identical) callees through DIFFERENT section
+    # indices (6 vs 7 — the pad section shifts b.s). Index comparison cannot
+    # fold these; equivalence classes prove the callees identical first and
+    # fold both pairs. Assembly fixtures pin the layout exactly (gcc orders
+    # same-shaped TUs identically, which would hide the divergence).
+    {"a.s": """
+    .section .text.f1,"ax"
+    .globl f1
+    .type f1,@function
+f1:
+    call g1
+    ret
+    .size f1,.-f1
+    .section .text.g1,"ax"
+    .type g1,@function
+g1:
+    call leaf
+    ret
+    .size g1,.-g1
+""",
+     "b.s": """
+    .section .text.pad,"ax"
+    .type pad,@function
+pad:
+    mov $7, %eax
+    ret
+    .size pad,.-pad
+    .section .text.f2,"ax"
+    .globl f2
+    .type f2,@function
+f2:
+    call g2
+    ret
+    .size f2,.-f2
+    .section .text.g2,"ax"
+    .type g2,@function
+g2:
+    call leaf
+    ret
+    .size g2,.-g2
+""",
+     "leaf.s": """
+    .text
+    .globl leaf
+    .type leaf,@function
+leaf:
+    mov $42, %eax
+    ret
+    .size leaf,.-leaf
+""",
+     "main.c": """
+#include <stdio.h>
+int f1(void); int f2(void);
+int main(void){ printf("%d %d\\n", f1(), f2()); return 0; }
+"""},
+    link_inputs=["main.o", "a.o", "b.o", "leaf.o"],
+    lccc_only_flags=["-Wl,--icf=safe"],
+    expect_stdout="42 42\n",
+    expect_same_address=[["f1", "f2"]],
+    tags=("icf",)),
+
+case("icf_weak_strong_address_identity",
+    # Weak dup in A (byte-distinct), strong dup + identical twin in B, table
+    # observing dup's address: first-def-wins marked only the shadowed weak
+    # twin and folded the surviving strong address onto its twin. Safe mode
+    # must keep all three addresses distinct (observed via .symtab, so the
+    # test itself takes no address and cannot perturb the property).
+    {"a.c": "__attribute__((weak)) int dup(void){ return 1; }\n",
+     "b.c": """
+int dup(void){ return 0x10 + 0x20; }
+int twin(void){ return 0x10 + 0x20; }
+int (*tab[])(void) = { dup };
+""",
+     "main.c": """
+#include <stdio.h>
+int dup(void); int twin(void);
+int main(void){ printf("%d\\n", dup() + twin()); return 0; }
+"""},
+    compile_flags=["-O1", "-ffunction-sections"],
+    lccc_only_flags=["-Wl,--icf=safe"],
+    expect_stdout="96\n",
+    expect_distinct_addresses=[["dup", "twin"]],
+    tags=("icf",)),
+
+case("icf_lea_address_taken_safe",
+    # PC-relative lea of f (no absolute relocation anywhere; the volatile
+    # pins the materialization against devirtualization): the opcode check
+    # must see the address escape and keep f and g distinct. An
+    # absolute-only safe mode folds them.
+    {"a.c": """
+#include <stdio.h>
+__attribute__((noinline)) int f(void){ return 7; }
+__attribute__((noinline)) int g(void){ return 7; }
+int main(void){
+    int (*volatile p)(void) = f;
+    printf("%d\\n", p() + g());
+    return 0;
+}
+"""},
+    compile_flags=["-O1", "-ffunction-sections"],
+    lccc_only_flags=["-Wl,--icf=safe"],
+    expect_stdout="14\n",
+    expect_distinct_addresses=[["f", "g"]],
+    tags=("icf",)),
+
 # ============================================================================
 # 13. GNU PROPERTY NOTE (CET / ISA) MERGE — differential against bfd
 # ============================================================================
@@ -6768,6 +6998,21 @@ def run_case(c, args, oracles):
                 if len(addrs) != 1:
                     return Result(c.name, "FAIL",
                         f"symbols not folded onto one address: "
+                        + ", ".join(f"{n}={vals[n]:#x}" for n in group))
+        if c.expect_distinct_addresses is not None:
+            vals = sym_values(lccc_out)
+            if vals is None:
+                return Result(c.name, "FAIL",
+                    "cannot parse .symtab for the distinct-address check")
+            for group in c.expect_distinct_addresses:
+                missing = [n for n in group if n not in vals]
+                if missing:
+                    return Result(c.name, "FAIL",
+                        f"symbols missing from .symtab: {missing}")
+                addrs = [vals[n] for n in group]
+                if len(set(addrs)) != len(addrs):
+                    return Result(c.name, "FAIL",
+                        f"symbols wrongly folded onto one address: "
                         + ", ".join(f"{n}={vals[n]:#x}" for n in group))
         if c.expect_dyn_has is not None or c.expect_dyn_missing is not None:
             tags, _ = dyn_tag_map(lccc_out)
