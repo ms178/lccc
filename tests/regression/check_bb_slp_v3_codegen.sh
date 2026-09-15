@@ -24,7 +24,8 @@ trap 'rm -rf "$td"' EXIT
 march=$("$ccc" -march=x86-64-v3 -E -x c /dev/null -o /dev/null 2>/dev/null \
     && echo "-march=x86-64-v3" || echo "")
 
-# ── 1. runtime ──────────────────────────────────────────────────────────
+# ── 1. runtime ─────────────────────────────────────────────────────────
+# ISA-agnostic by design (the 128-bit fallback paths must keep passing).
 "$ccc" -O2 $march "$src" -o "$td/rt" -lm
 out=$("$td/rt")
 if [ "$out" != "bb_slp_v3: all pass (0 fails)" ]; then
@@ -32,7 +33,13 @@ if [ "$out" != "bb_slp_v3: all pass (0 fails)" ]; then
     exit 1
 fi
 
-# ── 2–5. per-function codegen contracts ────────────────────────────────
+# ── 2–9. per-function codegen contracts ──────────────────────────────
+# All asm assertions below are AVX2-specific. On a host/target without
+# -march=x86-64-v3 they would hard-fail against legitimately different
+# (128-bit / SSE2) codegen, so the section is guarded — the runtime
+# contracts above remain the unconditionally enforced floor (Review F4;
+# same guard as check_bb_slp_codegen.sh).
+if [ -n "$march" ]; then
 "$ccc" -O2 $march -S "$src" -o "$td/rt.s"
 
 scoped() {  # scoped <func> — the function's asm slice (label to next fn)
@@ -178,3 +185,6 @@ if [ "$n_ms_imul" -gt 0 ]; then
 fi
 
 echo "OK: bb_slp_v3 constant-lane contracts (gather bits, zero/ones splats, FP const broadcast, 256-bit families, live-out extracts, per-lane flip)"
+else
+    echo "OK: bb_slp_v3 runtime contracts (no x86-64-v3 on this target; asm section skipped)"
+fi

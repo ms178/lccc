@@ -601,6 +601,23 @@ pub enum IntrinsicOp {
     /// Extract one F64 lane of a 256-bit F64x4 source as an F64 scalar
     /// (same half-selection choreography).
     VecExtractLaneF64x4,
+    /// Extract one F32 lane of an F32x4 source as an F32 scalar (lane 0:
+    /// direct `movss`; lanes 1-3: `pshufd` select first). args = [vector,
+    /// Const(lane)].
+    VecExtractLaneF32x4,
+    /// Extract one F32 lane of a 256-bit F32x8 source as an F32 scalar:
+    /// lanes 0-3 read the low half (XMM alias), lanes 4-7 stage the high
+    /// half with `vextractf128`.
+    VecExtractLaneF32x8,
+    /// Extract one I32/U32 lane of a 256-bit I32x8 source as a GPR scalar
+    /// (`pextrd` from the staged half; SSE2 fallback `pshufd`+`movd`).
+    VecExtractLaneI32x8,
+    /// Extract one I16/U16 lane of an I16x8 source as a GPR scalar
+    /// (`pextrw`, SSE2 baseline). args = [vector, Const(lane)].
+    VecExtractLaneI16x8,
+    /// Extract one I16/U16 lane of a 256-bit I16x16 source as a GPR
+    /// scalar (half staging then `pextrw` of the in-half lane).
+    VecExtractLaneI16x16,
     /// Extract one F64 lane as an XMM scalar (lane 0: movq; lane 1:
     /// pshufd $0x0E first). args = [vector, Const(lane)].
     VecExtractLaneF64x2,
@@ -1724,6 +1741,11 @@ impl IntrinsicOp {
                     | IntrinsicOp::VecExtractLaneF64x2
                     | IntrinsicOp::VecExtractLaneI64x4
                     | IntrinsicOp::VecExtractLaneF64x4
+                    | IntrinsicOp::VecExtractLaneF32x4
+                    | IntrinsicOp::VecExtractLaneF32x8
+                    | IntrinsicOp::VecExtractLaneI32x8
+                    | IntrinsicOp::VecExtractLaneI16x8
+                    | IntrinsicOp::VecExtractLaneI16x16
             )
     }
 
@@ -2300,6 +2322,11 @@ mod vector_result_width_tests {
             "VecPackF64x2" => IntrinsicOp::VecPackF64x2,
             "VecExtractLaneI64x4" => IntrinsicOp::VecExtractLaneI64x4,
             "VecExtractLaneF64x4" => IntrinsicOp::VecExtractLaneF64x4,
+            "VecExtractLaneF32x4" => IntrinsicOp::VecExtractLaneF32x4,
+            "VecExtractLaneF32x8" => IntrinsicOp::VecExtractLaneF32x8,
+            "VecExtractLaneI32x8" => IntrinsicOp::VecExtractLaneI32x8,
+            "VecExtractLaneI16x8" => IntrinsicOp::VecExtractLaneI16x8,
+            "VecExtractLaneI16x16" => IntrinsicOp::VecExtractLaneI16x16,
             "VecExtractLaneI64x2" => IntrinsicOp::VecExtractLaneI64x2,
             "VecExtractLaneF64x2" => IntrinsicOp::VecExtractLaneF64x2,
             _ => return None,

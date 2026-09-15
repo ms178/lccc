@@ -217,6 +217,11 @@ gate "bb-slp-redteam" fast \
 gate "bb-slp-v3" fast \
     bash tests/regression/check_bb_slp_v3_codegen.sh
 
+# BB-SLP v4: affine window addressing, rule-(d) escape, extract
+# families, review follow-ups (F1/F2/F5).
+gate "bb-slp-v4" fast \
+    bash tests/regression/check_bb_slp_v4_codegen.sh
+
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
 
