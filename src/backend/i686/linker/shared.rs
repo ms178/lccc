@@ -1157,7 +1157,16 @@ pub(super) fn emit_shared_library_32(
     }
 
     // ── Write output file ─────────────────────────────────────────────────
-    let total_file_size = data_seg_file_end as usize;
+    // Section headers: bfd refuses a shared library as a *link-time* input
+    // when e_shoff == 0 (it locates SHT_DYNAMIC/.dynsym through the section
+    // table, not the dynamic array). glibc/qemu only consume phdrs and are
+    // unaffected either way. Keep the table minimal — the four dynamic-link
+    // sections plus the shstrtab naming them: (+<300 B) restores bfd
+    // consumer compatibility at zero runtime cost.
+    let shstrtab: &[u8] = b"\0.dynamic\0.dynsym\0.dynstr\0.gnu.hash\0.shstrtab\0";
+    let shstrtab_file_off = data_seg_file_end as usize;
+    let shdr_table_off = shstrtab_file_off + shstrtab.len();
+    let total_file_size = shdr_table_off + 6 * 40;
     let mut output = vec![0u8; total_file_size];
 
     // ELF header (ET_DYN, e_entry = 0)
@@ -1171,14 +1180,14 @@ pub(super) fn emit_shared_library_32(
     output[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
     output[24..28].copy_from_slice(&0u32.to_le_bytes()); // e_entry = 0 for .so
     output[28..32].copy_from_slice(&ehdr_size.to_le_bytes()); // e_phoff
-    output[32..36].copy_from_slice(&0u32.to_le_bytes()); // e_shoff = 0 (no section headers)
+    output[32..36].copy_from_slice(&(shdr_table_off as u32).to_le_bytes()); // e_shoff
     output[36..40].copy_from_slice(&0u32.to_le_bytes()); // e_flags
     output[40..42].copy_from_slice(&(ehdr_size as u16).to_le_bytes()); // e_ehsize
     output[42..44].copy_from_slice(&32u16.to_le_bytes()); // e_phentsize
     output[44..46].copy_from_slice(&(num_phdrs as u16).to_le_bytes()); // e_phnum
     output[46..48].copy_from_slice(&40u16.to_le_bytes()); // e_shentsize
-    output[48..50].copy_from_slice(&0u16.to_le_bytes()); // e_shnum
-    output[50..52].copy_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    output[48..50].copy_from_slice(&6u16.to_le_bytes()); // e_shnum
+    output[50..52].copy_from_slice(&5u16.to_le_bytes()); // e_shstrndx
 
     // Write program headers
     let mut ph_off = phdr_offset as usize;
@@ -1431,6 +1440,111 @@ pub(super) fn emit_shared_library_32(
     let off = dynamic_offset as usize;
     if off + dynamic_data.len() <= output.len() {
         output[off..off + dynamic_data.len()].copy_from_slice(&dynamic_data);
+    }
+
+    // Minimal section header table (see note at the top of the write path):
+    // bfd needs SHT_DYNAMIC/.dynsym locatable via sections on shared objects.
+    // sh_addr == sh_offset (this emitter's LOAD segments are 1:1
+    // file-offset ≡ vaddr throughout).
+    {
+        output[shstrtab_file_off..shstrtab_file_off + shstrtab.len()].copy_from_slice(shstrtab);
+        const SHT_DYNAMIC_: u32 = 6;
+        const SHT_DYNSYM_: u32 = 11;
+        const SHT_STRTAB_: u32 = 3;
+        const SHT_GNU_HASH_: u32 = 0x6ffffff6;
+        let write_shdr32 = |out: &mut [u8],
+                            idx: usize,
+                            name: u32,
+                            shtype: u32,
+                            flags: u32,
+                            addr: u32,
+                            off: u32,
+                            size: u32,
+                            link: u32,
+                            info: u32,
+                            align: u32,
+                            entsize: u32| {
+            let o = shdr_table_off + idx * 40;
+            for (i, v) in [
+                name, shtype, flags, addr, off, size, link, info, align, entsize,
+            ]
+            .iter()
+            .enumerate()
+            {
+                out[o + i * 4..o + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        };
+        write_shdr32(&mut output, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        write_shdr32(
+            &mut output,
+            1,
+            1, // ".dynamic"
+            SHT_DYNAMIC_,
+            0x3, // SHF_WRITE|SHF_ALLOC
+            dynamic_offset,
+            dynamic_offset,
+            dynamic_size,
+            3, // link -> .dynstr
+            0,
+            4,
+            8, // Elf32_Dyn
+        );
+        write_shdr32(
+            &mut output,
+            2,
+            10, // ".dynsym"
+            SHT_DYNSYM_,
+            0x2, // SHF_ALLOC
+            dynsym_offset,
+            dynsym_offset,
+            dynsym_size,
+            3, // link -> .dynstr
+            1, // first non-local dynsym index
+            4,
+            16, // Elf32_Sym
+        );
+        write_shdr32(
+            &mut output,
+            3,
+            18, // ".dynstr"
+            SHT_STRTAB_,
+            0x2, // SHF_ALLOC
+            dynstr_offset,
+            dynstr_offset,
+            dynstr_size,
+            0,
+            0,
+            1,
+            0,
+        );
+        write_shdr32(
+            &mut output,
+            4,
+            26, // ".gnu.hash"
+            SHT_GNU_HASH_,
+            0x2, // SHF_ALLOC
+            gnu_hash_offset,
+            gnu_hash_offset,
+            gnu_hash_size,
+            2, // link -> .dynsym
+            0,
+            4,
+            0,
+        );
+        write_shdr32(
+            &mut output,
+            5,
+            36, // ".shstrtab"
+            SHT_STRTAB_,
+            0,
+            0,
+            shstrtab_file_off as u32,
+            shstrtab.len() as u32,
+            0,
+            0,
+            1,
+            0,
+        );
     }
 
     // Write to file

@@ -101,7 +101,10 @@ pub use parse_shared::{parse_shared_library_symbols, parse_soname};
 pub use dynstr::DynStrTab;
 
 // hash.rs
-pub use hash::{SysvHash, build_sysv_hash, gnu_hash, sysv_hash, write_sysv_hash};
+pub use hash::{
+    GnuHashParams, SysvHash, build_gnu_bloom, build_sysv_hash, gnu_hash, gnu_hash_params,
+    sysv_hash, write_sysv_hash,
+};
 
 // symstr.rs
 pub use secdata::SectionData;

@@ -388,41 +388,40 @@ pub(super) fn emit_executable(
     // Build .gnu.hash table for hashed symbols (copy-reloc + exported)
     // Number of hashed symbols = total symbols after the non-hashed imports
     let num_hashed = dyn_sym_names.len() - (gnu_hash_symoffset - 1);
-    let gnu_hash_nbuckets = if num_hashed == 0 {
-        1
-    } else {
-        num_hashed.next_power_of_two().max(1)
-    } as u32;
-    let gnu_hash_bloom_size: u32 = 1;
-    let gnu_hash_bloom_shift: u32 = 6;
+    let gnu_hp = linker_common::gnu_hash_params(num_hashed, 64);
+    let gnu_hash_nbuckets = gnu_hp.nbuckets;
+    let gnu_hash_bloom_size: u32 = gnu_hp.bloom_size;
+    let gnu_hash_bloom_shift: u32 = gnu_hp.bloom_shift;
 
-    // Compute hashes for hashed symbols
-    let hashed_sym_hashes: Vec<u32> = dyn_sym_names[gnu_hash_symoffset - 1..]
+    // Compute hashes for hashed symbols ONCE, over the *emitted* dynsym
+    // names (version suffix stripped).  A `@`-suffixed name hashes
+    // differently from its emitted form; computing the pre-sort hash from
+    // the emitted name but the post-sort bucket/chain hashes from the raw
+    // name placed versioned exports into buckets ld.so never consults (it
+    // looks up the stripped name — a latent runtime resolution failure for
+    // versioned exports).  One vector now feeds the bucket sort, the bloom
+    // filter, and the chain table, so a mismatch is impossible by
+    // construction (and the duplicate pass is gone).
+    let mut hashed_sym_hashes: Vec<u32> = dyn_sym_names[gnu_hash_symoffset - 1..]
         .iter()
         .map(|name| linker_common::gnu_hash(dynsym_emit_name(name).as_bytes()))
         .collect();
+    let bloom_words = linker_common::build_gnu_bloom(&hashed_sym_hashes, &gnu_hp, 64);
 
-    // Build bloom filter (single 64-bit word)
-    let mut bloom_word: u64 = 0;
-    for &h in &hashed_sym_hashes {
-        let bit1 = h as u64 % 64;
-        let bit2 = (h >> gnu_hash_bloom_shift) as u64 % 64;
-        bloom_word |= 1u64 << bit1;
-        bloom_word |= 1u64 << bit2;
-    }
-
-    // Sort hashed symbols by bucket (hash % nbuckets) for proper chain grouping
-    // We need to reorder the hashed portion of dyn_sym_names
+    // Sort hashed symbols by bucket (hash % nbuckets) for proper chain
+    // grouping, via an index permutation so the hash vector tracks the name
+    // reordering exactly (no second hash pass, no drift between the two).
+    // Stable: same-bucket order keeps input order, so output is
+    // deterministic across runs and machines.
     if num_hashed > 0 {
         let hashed_start = gnu_hash_symoffset - 1;
-        let mut hashed_with_hash: Vec<(String, u32)> = dyn_sym_names[hashed_start..]
-            .iter()
-            .zip(hashed_sym_hashes.iter())
-            .map(|(n, &h)| (n.clone(), h))
-            .collect();
-        hashed_with_hash.sort_by_key(|(_, h)| h % gnu_hash_nbuckets);
-        for (i, (name, _)) in hashed_with_hash.iter().enumerate() {
-            dyn_sym_names[hashed_start + i] = name.clone();
+        let mut perm: Vec<usize> = (0..num_hashed).collect();
+        perm.sort_by_key(|&i| hashed_sym_hashes[i] % gnu_hash_nbuckets);
+        let names_before = dyn_sym_names[hashed_start..].to_vec();
+        let hashes_before = hashed_sym_hashes.clone();
+        for (new_i, &old_i) in perm.iter().enumerate() {
+            dyn_sym_names[hashed_start + new_i] = names_before[old_i].clone();
+            hashed_sym_hashes[new_i] = hashes_before[old_i];
         }
     }
 
@@ -468,11 +467,9 @@ pub(super) fn emit_executable(
         .map(|(i, n)| (n.as_str(), (i + 1) as u64))
         .collect();
 
-    // Recompute hashes after sorting
-    let hashed_sym_hashes: Vec<u32> = dyn_sym_names[gnu_hash_symoffset - 1..]
-        .iter()
-        .map(|name| linker_common::gnu_hash(name.as_bytes()))
-        .collect();
+    // `hashed_sym_hashes` is already in final dynsym order (the index
+    // permutation above tracked the bucket sort) — reuse it for the chain
+    // table.  This is the single-hash-pass contract.
 
     // Build buckets and chains
     // SysV `.hash` sizing.  `nbucket` is at the linker's discretion; `nchain`
@@ -675,16 +672,61 @@ pub(super) fn emit_executable(
     if has_relro {
         phdr_count += 1;
     }
-    // One PT_NOTE segment per allocated note section (property, build-id,
-    // ABI tag), plus a PT_GNU_PROPERTY alias for `.note.gnu.property` —
-    // GNU ld writes both and consumers (readelf -l, the kernel's note
-    // scanner) expect them.  `mem_size` is the pre-layout size; section
-    // `data` is only filled during the layout pass, so it must not be the
-    // condition here (it is still empty at this point).
-    let note_phdr_count = output_sections
-        .iter()
-        .filter(|s| s.sh_type == SHT_NOTE && s.flags & SHF_ALLOC != 0 && s.mem_size > 0)
-        .count() as u64;
+    // Split-RW predicate: anything (file bytes OR pure memory) that lands
+    // after the RELRO boundary in the layout pass below — lazy .got.plt, the
+    // IFUNC GOT (+ static .rela.iplt), writable PROGBITS, TLS, .bss, or
+    // copy-reloc slots.  When it exists, the RELRO window gets its own
+    // PT_LOAD so the page pad after const-after-relocation data can be
+    // NOBITS (virtual address space only) instead of a run of file zeros —
+    // the same trick lld and mold play with their synthetic `.relro_padding`
+    // section.  Measured: ~1.8 KiB saved on a hello-world PIE (7 872 →
+    // 6 064 B), up to one page per binary.  This predicate MUST match the
+    // layout pass exactly, or phdr_count and the emitted headers disagree.
+    let has_post_relro_content = (got_plt_size > 0 && !(has_relro && z_now))
+        || !ifunc_symbols.is_empty()
+        || !local_ifuncs.is_empty()
+        || !copy_reloc_syms.is_empty()
+        || output_sections.iter().any(|s| {
+            s.flags & SHF_ALLOC != 0
+                && s.flags & SHF_WRITE != 0
+                && s.mem_size > 0
+                && s.name != ".init_array"
+                && s.name != ".fini_array"
+                && s.name != ".preinit_array"
+                && s.name != ".data.rel.ro"
+        });
+    let split_relro_load = has_relro && has_post_relro_content;
+    if split_relro_load {
+        phdr_count += 1; // second RW PT_LOAD (writable tail after RELRO)
+    }
+    // One PT_NOTE segment per contiguous RUN of allocated note sections
+    // (property, build-id, ABI tag), plus a PT_GNU_PROPERTY alias for
+    // `.note.gnu.property`.  lld proves a merged note segment is fully
+    // compatible (its hello carries exactly one PT_NOTE) and each merged
+    // note saves a 56-byte phdr; GNU ld's three PT_NOTE entries exist only
+    // because ITS notes land in three different places.  A "run" =
+    // order-adjacent allocated note sections: the rodata layout loop places
+    // sections in `output_sections` order, so order-adjacent notes are also
+    // file-contiguous (section alignment inside a run is fine — a PT_NOTE
+    // span may cover padding bytes).  Sections that the flags place into a
+    // different segment break the walk conservatively (an extra PT_NOTE is
+    // wasted, never a wrong one).  The identical walk runs again at phdr
+    // WRITE time over the same order+predicates, so count and emission can
+    // never drift.  `mem_size` is the pre-layout size; section `data` is
+    // only filled during the layout pass, so it must not be the condition
+    // here (it is still empty at this point).
+    let is_alloc_note =
+        |s: &OutputSection| s.sh_type == SHT_NOTE && s.flags & SHF_ALLOC != 0 && s.mem_size > 0;
+    let mut note_phdr_count = 0u64;
+    {
+        let mut prev_note = false;
+        for s in output_sections.iter() {
+            if is_alloc_note(s) && !prev_note {
+                note_phdr_count += 1;
+            }
+            prev_note = is_alloc_note(s);
+        }
+    }
     let has_gnu_property_phdr = output_sections
         .iter()
         .any(|s| s.name == ".note.gnu.property" && s.flags & SHF_ALLOC != 0 && s.mem_size > 0);
@@ -937,15 +979,34 @@ pub(super) fn emit_executable(
     let relro_start = rw_page_offset;
     let relro_start_addr = rw_page_addr;
     let mut relro_size = 0u64;
+    // File offset where the RELRO content ends (= file size of the RELRO
+    // LOAD, and the start of the writable-tail LOAD when split_relro_load).
+    let mut relro_file_end = rw_page_offset;
+    // Virtual address assigned to `relro_file_end` after the boundary: the
+    // p_vaddr of the writable-tail LOAD.
+    let mut rw2_addr = rw_page_addr;
     if has_relro {
         // ld.so mprotects [vaddr, vaddr+memsz) rounded out to page bounds, so
         // it is the *virtual address* that must reach a page boundary, not the
-        // file offset. With file offsets packed densely (vaddr_bias != 0) the
-        // two are no longer the same number: aligning `offset` here would
-        // leave the RELRO end mid-page and let ld.so write-protect the first
-        // bytes of whatever follows.
-        offset += packer.padding_to_page(offset);
-        relro_size = vaddr!(offset) - relro_start_addr;
+        // file offset. The pad up to that page boundary is NOBITS: it must
+        // cost address space (ld.so will mprotect the tail page, so the
+        // writable tail must start on a fresh page) but NOT file space —
+        // advancing `offset` here used to bake up to one page of zeros into
+        // every linked binary.
+        relro_file_end = offset;
+        let relro_file_end_addr = vaddr!(offset);
+        let relro_pad = packer.padding_to_page(offset);
+        relro_size = relro_file_end_addr + relro_pad - relro_start_addr;
+        if split_relro_load && relro_pad > 0 {
+            // The writable tail continues at the same dense file offset but
+            // on a fresh page. Congruence is automatic (both file offset and
+            // address keep their mod-page residue — verified against lld's
+            // own two-RW-LOAD layout). The kernel side-effect mapping of the
+            // tail's first file page inside the RELRO page absorbs the
+            // mprotect; every real reference goes through the new bias.
+            packer.new_segment();
+        }
+        rw2_addr = vaddr!(offset);
     }
     if !(has_relro && z_now) {
         offset = (offset + 7) & !7;
@@ -1657,24 +1718,65 @@ pub(super) fn emit_executable(
         PAGE_SIZE,
     );
     ph += 56;
-    let rw_filesz = offset - rw_page_offset;
-    let rw_memsz = if bss_size > 0 {
-        (bss_addr + bss_size) - rw_page_addr
+    if has_relro {
+        // RELRO LOAD: const-after-relocation window. filesz covers only the
+        // file content; memsz reaches across the NOBITS page pad so the
+        // loader materialises the tail page that mprotect will cover.
+        wphdr(
+            &mut out,
+            ph,
+            PT_LOAD,
+            PF_R | PF_W,
+            rw_page_offset,
+            rw_page_addr,
+            relro_file_end - rw_page_offset,
+            relro_size,
+            PAGE_SIZE,
+        );
+        ph += 56;
+        if split_relro_load {
+            // Writable tail (lazy .got.plt / IFUNC GOT / .data / TLS / .bss):
+            // same dense file offset, one fresh page of address space.
+            // p_filesz can be 0 (pure-bss tail): an anonymous-zero segment.
+            let rw2_filesz = offset - relro_file_end;
+            let rw2_memsz = if bss_size > 0 {
+                (bss_addr + bss_size) - rw2_addr
+            } else {
+                rw2_filesz
+            };
+            wphdr(
+                &mut out,
+                ph,
+                PT_LOAD,
+                PF_R | PF_W,
+                relro_file_end,
+                rw2_addr,
+                rw2_filesz,
+                rw2_memsz,
+                PAGE_SIZE,
+            );
+            ph += 56;
+        }
     } else {
-        rw_filesz
-    };
-    wphdr(
-        &mut out,
-        ph,
-        PT_LOAD,
-        PF_R | PF_W,
-        rw_page_offset,
-        rw_page_addr,
-        rw_filesz,
-        rw_memsz,
-        PAGE_SIZE,
-    );
-    ph += 56;
+        let rw_filesz = offset - rw_page_offset;
+        let rw_memsz = if bss_size > 0 {
+            (bss_addr + bss_size) - rw_page_addr
+        } else {
+            rw_filesz
+        };
+        wphdr(
+            &mut out,
+            ph,
+            PT_LOAD,
+            PF_R | PF_W,
+            rw_page_offset,
+            rw_page_addr,
+            rw_filesz,
+            rw_memsz,
+            PAGE_SIZE,
+        );
+        ph += 56;
+    }
     if !is_static {
         wphdr(
             &mut out,
@@ -1689,26 +1791,41 @@ pub(super) fn emit_executable(
         );
         ph += 56;
     }
-    // One PT_NOTE segment per allocated note section, spanning exactly its
-    // own section (alignment = the section's, minimum 4, as in GNU ld),
-    // followed by the PT_GNU_PROPERTY alias over `.note.gnu.property`
-    // (alignment 8).  Written after DYNAMIC, before the synthetic
-    // segments, matching GNU ld's program header order.
-    for sec in output_sections.iter() {
-        if sec.sh_type == SHT_NOTE && sec.flags & SHF_ALLOC != 0 && !sec.data.is_empty() {
-            wphdr(
-                &mut out,
-                ph,
-                PT_NOTE,
-                PF_R,
-                sec.file_offset,
-                sec.addr,
-                sec.data.len() as u64,
-                sec.mem_size,
-                sec.alignment.max(4),
-            );
-            ph += 56;
+    // One PT_NOTE per contiguous run of allocated note sections — the same
+    // walk that counted them before layout (identical predicate and order,
+    // so emission can never disagree with e_phnum).  The span runs from the
+    // first note's start to the last note's end; p_align is the maximum
+    // member alignment (minimum 4, as in GNU ld).  Written after DYNAMIC,
+    // before the synthetic segments, matching GNU ld's program header
+    // order.
+    {
+        let mut run_start: Option<(u64, u64, u64)> = None; // (file_off, addr, align)
+        let mut run_end: Option<(u64, u64)> = None; // (file_end, addr_end)
+        let mut flush = |run: Option<(u64, u64, u64)>,
+                         end: Option<(u64, u64)>,
+                         out: &mut Vec<u8>,
+                         ph: &mut usize| {
+            if let (Some((fo, va, al)), Some((fe, ae))) = (run, end) {
+                wphdr(out, *ph, PT_NOTE, PF_R, fo, va, fe - fo, ae - va, al);
+                *ph += 56;
+            }
+        };
+        for sec in output_sections.iter() {
+            if is_alloc_note(sec) {
+                if run_start.is_none() {
+                    run_start = Some((sec.file_offset, sec.addr, sec.alignment.max(4)));
+                } else if let Some(r) = &mut run_start {
+                    r.2 = r.2.max(sec.alignment.max(4));
+                }
+                run_end = Some((
+                    sec.file_offset + sec.data.len() as u64,
+                    sec.addr + sec.mem_size,
+                ));
+            } else {
+                flush(run_start.take(), run_end.take(), &mut out, &mut ph);
+            }
         }
+        flush(run_start.take(), run_end.take(), &mut out, &mut ph);
     }
     if has_gnu_property_phdr {
         if let Some(sec) = output_sections
@@ -1766,7 +1883,9 @@ pub(super) fn emit_executable(
             PF_R,
             relro_start,
             relro_start_addr,
-            relro_size,
+            // filesz covers the file content only; ld.so reads vaddr+memsz
+            // and mprotects the page-rounded range. (lld emits the same pair.)
+            relro_file_end - relro_start,
             relro_size,
             1,
         );
@@ -1808,9 +1927,11 @@ pub(super) fn emit_executable(
             w32(&mut out, gh + 4, gnu_hash_symoffset as u32);
             w32(&mut out, gh + 8, gnu_hash_bloom_size);
             w32(&mut out, gh + 12, gnu_hash_bloom_shift);
-            // Bloom filter
+            // Bloom filter: `bloom_size` 64-bit words.
             let bloom_off = gh + 16;
-            w64(&mut out, bloom_off, bloom_word);
+            for (i, &w) in bloom_words.iter().enumerate() {
+                w64(&mut out, bloom_off + i * 8, w);
+            }
             // Buckets
             let buckets_off = bloom_off + (gnu_hash_bloom_size as usize * 8);
             for (i, &b) in gnu_hash_buckets.iter().enumerate() {

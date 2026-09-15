@@ -69,7 +69,13 @@ pub fn link_builtin(
 
     let mut input_objs: Vec<(String, ElfObject)> = Vec::new();
     let mut inline_archive_paths: Vec<String> = Vec::new();
-    input::load_input_files(&all_inputs, &mut input_objs, &mut inline_archive_paths)?;
+    let mut positional_shared_libs: Vec<String> = Vec::new();
+    input::load_input_files(
+        &all_inputs,
+        &mut input_objs,
+        &mut inline_archive_paths,
+        &mut positional_shared_libs,
+    )?;
 
     let mut defined_syms: FxHashSet<String> = FxHashSet::default();
     let mut undefined_syms: FxHashSet<String> = FxHashSet::default();
@@ -84,6 +90,13 @@ pub fn link_builtin(
             &mut input_objs,
             &mut defined_syms,
             &mut undefined_syms,
+            &mut shared_lib_syms,
+            &mut actual_needed_libs,
+        );
+        // Positionally-named .so inputs (./libfoo.so on the command line):
+        // same NEEDED/symbol treatment as -l-discovered libraries.
+        input::register_positional_shared_libs(
+            &positional_shared_libs,
             &mut shared_lib_syms,
             &mut actual_needed_libs,
         );

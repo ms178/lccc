@@ -525,8 +525,14 @@ pub fn build_gnu_hash(sym_names: &[String]) -> (Vec<u8>, Vec<usize>) {
         .map(|n| crate::backend::linker_common::gnu_hash(n.as_bytes()))
         .collect();
 
-    // Choose number of buckets: roughly nsyms, but at least 1
-    let nbuckets = nsyms.max(1) as u32;
+    // Shared oracle-measured sizing (linker_common/hash.rs): bloom words =
+    // next_pow2(n/4), buckets = n/4 — the previous n/2-word bloom was 4x
+    // lld's table at no measurable FPR benefit, and its shift 6 probed a
+    // bit window overlapping the low hash bits.
+    let gnu_hp = crate::backend::linker_common::gnu_hash_params(nsyms, 64);
+    let nbuckets = gnu_hp.nbuckets;
+    let bloom_shift = gnu_hp.bloom_shift;
+    let bloom_size = gnu_hp.bloom_size;
 
     // Sort symbols by bucket (hash % nbuckets), preserving relative order
     let mut indices: Vec<usize> = (0..nsyms).collect();
@@ -535,18 +541,9 @@ pub fn build_gnu_hash(sym_names: &[String]) -> (Vec<u8>, Vec<usize>) {
     // symoffset = 1 (first hashed symbol is at dynsym index 1, after null entry)
     let symoffset = 1u32;
 
-    // Build bloom filter.  ELF64 uses 64-bit bloom words.
-    let bloom_shift = 6u32;
-    let bloom_size = (nsyms / 2).max(1).next_power_of_two() as u32;
-    let mut bloom: Vec<u64> = vec![0u64; bloom_size as usize];
-    let c = 64u32; // bits per bloom word for ELF64
-    for &idx in &indices {
-        let h = hashes[idx];
-        let word_idx = ((h / c) % bloom_size) as usize;
-        let bit1 = (h % c) as u64;
-        let bit2 = ((h >> bloom_shift) % c) as u64;
-        bloom[word_idx] |= (1u64 << bit1) | (1u64 << bit2);
-    }
+    // Bloom filter (ELF64 words), built by the shared helper whose probe
+    // formulas match glibc dl-lookup.c verbatim.
+    let bloom = crate::backend::linker_common::build_gnu_bloom(&hashes, &gnu_hp, 64);
 
     // Build buckets and hash chain.
     // bucket[b] = first dynsym index in this bucket, or 0 if empty.

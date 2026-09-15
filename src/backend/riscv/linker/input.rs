@@ -11,11 +11,16 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Load a single input file (ELF object, archive, or thin archive) into
 /// `input_objs`. Archives are saved to `inline_archive_paths` for later
-/// demand-driven extraction.
+/// demand-driven extraction; ELF shared objects named positionally on the
+/// command line go to `positional_shared_libs` for DT_NEEDED and
+/// dynamic-symbol registration (bfd semantics) rather than being parsed as
+/// relocatable objects (that used to fail with a bogus
+/// "not a relocatable object (type=3)" diagnostic).
 pub fn load_input_files(
     all_inputs: &[String],
     input_objs: &mut Vec<(String, ElfObject)>,
     inline_archive_paths: &mut Vec<String>,
+    positional_shared_libs: &mut Vec<String>,
 ) -> Result<(), String> {
     for path in all_inputs {
         if !std::path::Path::new(path).exists() {
@@ -25,13 +30,48 @@ pub fn load_input_files(
 
         if (data.len() >= 8 && &data[0..8] == b"!<arch>\n") || is_thin_archive(&data) {
             inline_archive_paths.push(path.clone());
-        } else if data.len() >= 4 && &data[0..4] == b"\x7fELF" {
-            let obj = parse_object(&data, path).map_err(|e| format!("{}: {}", path, e))?;
-            input_objs.push((path.clone(), obj));
+        } else if data.len() >= 18 && &data[0..4] == b"\x7fELF" {
+            let e_type = u16::from_le_bytes([data[16], data[17]]);
+            if e_type == ET_DYN {
+                positional_shared_libs.push(path.clone());
+            } else {
+                let obj = parse_object(&data, path).map_err(|e| format!("{}: {}", path, e))?;
+                input_objs.push((path.clone(), obj));
+            }
         }
         // Skip non-ELF/non-archive files (e.g. linker scripts)
     }
     Ok(())
+}
+
+/// Register the dynamic symbols of positionally-named shared libraries and
+/// record their DT_NEEDED entries (DT_SONAME, else the file name — bfd's
+/// rule for literal paths too).
+pub fn register_positional_shared_libs(
+    positional_shared_libs: &[String],
+    shared_lib_syms: &mut FxHashMap<String, DynSymbol>,
+    actual_needed_libs: &mut Vec<String>,
+) {
+    for path in positional_shared_libs {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if let Ok(syms) = read_shared_lib_symbols(path) {
+            for si in syms {
+                shared_lib_syms.insert(si.name.clone(), si);
+            }
+        }
+        let needed = linker_common::parse_soname(&data).unwrap_or_else(|| {
+            std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
+        if !needed.is_empty() && !actual_needed_libs.contains(&needed) {
+            actual_needed_libs.push(needed);
+        }
+    }
 }
 
 /// Scan input objects to build initial defined/undefined symbol sets.
@@ -107,17 +147,29 @@ pub fn discover_shared_lib_symbols(
                     undefined_syms,
                     shared_lib_syms,
                 );
+                // Debian's lib*.so linker scripts (e.g. libc.so) stand in for
+                // the versioned runtime object next to them.
+                let versioned = find_versioned_soname(dir, libname);
+                if let Some(soname) = versioned {
+                    if !actual_needed_libs.contains(&soname) {
+                        actual_needed_libs.push(soname);
+                    }
+                }
             } else if data.len() >= 4 && &data[0..4] == b"\x7fELF" {
                 if let Ok(syms) = read_shared_lib_symbols(&path) {
                     for si in syms {
                         shared_lib_syms.insert(si.name.clone(), si);
                     }
                 }
-            }
-            let versioned = find_versioned_soname(dir, libname);
-            if let Some(soname) = versioned {
-                if !actual_needed_libs.contains(&soname) {
-                    actual_needed_libs.push(soname);
+                // DT_NEEDED for a real ELF .so: its DT_SONAME, else the file
+                // name we linked against — exactly bfd's behaviour.  (Pre-fix
+                // only the versioned-soname glob above added NEEDED entries,
+                // so `-lfoo` against an unversioned libfoo.so resolved its
+                // symbols at link time and then failed to find them at
+                // runtime — observed on real riscv64 glibc under qemu.)
+                let needed = linker_common::parse_soname(&data).unwrap_or_else(|| so_name.clone());
+                if !actual_needed_libs.contains(&needed) {
+                    actual_needed_libs.push(needed);
                 }
             }
             break;

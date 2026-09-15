@@ -3307,6 +3307,511 @@ def _build_id_note_test(args, oracles):
         return Result(name, "PASS", "digest %s" % got)
 
 
+_PT_LOAD = 1
+_PT_NOTE = 4
+_PT_GNU_RELRO = 0x6474E552
+_PT_GNU_PROPERTY = 0x6474E553
+_PF_W = 2  # ELF p_flags: X=1, W=2, R=4
+_SHT_NOTE = 7
+
+
+def _elf_bytes_phdrs(d):
+    """Parse all program headers from ELF bytes (class-agnostic)."""
+    if d[:4] != b"\x7fELF" or d[4] != 2 or d[5] != 1:
+        return None  # ELF64 LSB only (all fixtures here are)
+    e_phoff, = struct.unpack_from("<Q", d, 0x20)
+    e_phentsize, e_phnum = struct.unpack_from("<HH", d, 0x36)
+    out = []
+    for i in range(e_phnum):
+        p = e_phoff + i * e_phentsize
+        typ, flags = struct.unpack_from("<II", d, p)
+        off, va, pa, fsz, msz, al = struct.unpack_from("<QQQQQQ", d, p + 8)
+        out.append((typ, flags, off, va, fsz, msz, al))
+    return out
+
+
+def _elf_bytes_shdrs(d):
+    """Parse all section headers; returns list of (name, type, flags, addr, off, size, align)."""
+    e_shoff, = struct.unpack_from("<Q", d, 0x28)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 0x3A)
+    hdrs = []
+    for k in range(e_shnum):
+        b = e_shoff + k * e_shentsize
+        n, t, fl, a, off, sz, lk, inf, al, es = struct.unpack_from("<IIQQQQIIQQ", d, b)
+        hdrs.append([n, t, fl, a, off, sz, lk, inf, al])
+    if e_shstrndx < e_shnum:
+        str_off = hdrs[e_shstrndx][4]
+        for h in hdrs:
+            end = d.index(b"\0", str_off + h[0])
+            h[0] = d[str_off + h[0]:end].decode("ascii", errors="replace")
+    return hdrs
+
+
+def _relro_nobits_pad_test(args, oracles):
+    """RELRO page pad must cost address space, not file space (two RW LOADs).
+
+    Regression for a measured 1.8 KiB/binary defect: the RELRO boundary used
+    to advance the file offset by up to one page of zeros so the virtual
+    address reached a page boundary.  lld/mold instead give the RELRO window
+    its own PT_LOAD whose memsz covers a NOBITS pad, then continue the
+    writable tail at the SAME dense file offset on a fresh page.  After the
+    fix lccc's hello PIE is 6.2 KiB (lld 6.0, mold 8.4, bfd 15.8).
+
+    Asserts the full structural invariant, via a direct ELF parse (readelf
+    text layout is not a stable API):
+      * e_phnum matches the actual header table (no latent PT_NULL padding),
+      * GNU_RELRO: memsz >= filesz, memsz - filesz < one page, and
+        vaddr+memsz is page-aligned,
+      * two writable PT_LOADs: LOAD_W1 covers [relro.start, relro.fsz),
+        LOAD_W2 starts at the same dense file offset, and both obey the
+        gABI congruence rule off % page == vaddr % page,
+      * LOAD_W2's page does not intersect the RELRO mprotect range,
+      * the binary still runs.
+    """
+    name = "relro_nobits_pad"
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    page = 0x1000
+    with tempfile.TemporaryDirectory() as td:
+        # Writable .data AND .bss force post-RELRO content in every binding mode.
+        with open(os.path.join(td, "a.c"), "w") as f:
+            f.write('#include <stdio.h>\n'
+                    'int writable_global = 7; char bss_buf[64];\n'
+                    'int main(void){ bss_buf[0]=1; '
+                    'printf("%d\\n", writable_global + bss_buf[0]); return 0; }\n')
+        r = sh([CC, "-c", "-O1", "a.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "fixture compile failed")
+        shim = _shim_for(td, lccc_ld)
+        out = os.path.join(td, "a.out")
+        r = sh([CC, "-B" + shim, "a.o", "-o", out, "-Wl,--build-id=sha1"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL",
+                          "link failed: " + r.stderr.decode(errors="replace")[-300:])
+        d = open(out, "rb").read()
+        phdrs = _elf_bytes_phdrs(d)
+        if phdrs is None:
+            return Result(name, "FAIL", "not an ELF64 LSB file")
+        relro = [p for p in phdrs if p[0] == _PT_GNU_RELRO]
+        if len(relro) != 1:
+            return Result(name, "FAIL", "expected 1 GNU_RELRO, got %d" % len(relro))
+        _, _, r_off, r_va, r_fsz, r_msz, _ = relro[0]
+        if not (0 <= r_msz - r_fsz < page):
+            return Result(name, "FAIL",
+                          "relro memsz-filesz %#x not a sub-page NOBITS pad"
+                          % (r_msz - r_fsz))
+        if (r_va + r_msz) % page != 0:
+            return Result(name, "FAIL", "relro end %#x not page-aligned"
+                          % (r_va + r_msz))
+        wloads = [p for p in phdrs if p[0] == _PT_LOAD and (p[1] & _PF_W)]
+        if len(wloads) < 2:
+            return Result(name, "FAIL",
+                          "expected split RW loads, got %d writable LOAD(s)"
+                          % len(wloads))
+        wloads.sort(key=lambda p: p[2])
+        w1, w2 = wloads[0], wloads[1]
+        if w1[2] != r_off or w1[3] != r_va or w1[4] != r_fsz or w1[5] != r_msz:
+            return Result(name, "FAIL", "load W1 %r does not mirror GNU_RELRO %r"
+                          % (w1, relro[0]))
+        if w2[2] != w1[2] + w1[4]:
+            return Result(name, "FAIL",
+                          "writable tail not file-dense: w2.off=%#x want %#x"
+                          % (w2[2], w1[2] + w1[4]))
+        for p in phdrs:
+            if p[0] != _PT_LOAD:
+                continue
+            if p[6] and p[6] > 1 and (p[2] % p[6]) != (p[3] % p[6]):
+                return Result(name, "FAIL",
+                              "gABI congruence violated: off=%#x va=%#x align=%#x"
+                              % (p[2], p[3], p[6]))
+        # The mprotect range must not cover the writable tail's own mapping.
+        relro_end_page = (r_va + r_msz) // page
+        w2_first_page = w2[3] // page
+        if w2_first_page < relro_end_page:
+            return Result(name, "FAIL",
+                          "writable tail starts inside relro mprotect range")
+        code, txt = run_bin(out, [], td)
+        if code != 0 or txt != "8\n":
+            return Result(name, "FAIL", "binary broken: %s" % ((code, txt),))
+        return Result(name, "PASS",
+                      "relro fsz=%#x msz=%#x w2 off=%#x va=%#x"
+                      % (r_fsz, r_msz, w2[2], w2[3]))
+
+
+def _note_run_merge_test(args, oracles):
+    """Contiguous allocated note sections share ONE PT_NOTE (lld-style).
+
+    A PT_NOTE phdr per note section wastes a 56-byte header per extra note.
+    Validates: the number of PT_NOTE phdrs equals the number of maximal
+    file-contiguous runs of allocated SHT_NOTE sections (comparing against
+    an independently computed expectation, not a hardcoded 1); every note
+    section is covered by exactly one PT_NOTE; GNU_PROPERTY aliases
+    .note.gnu.property exactly; build-id stays readable through the merge.
+    """
+    name = "note_run_merge"
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "a.c"), "w") as f:
+            f.write('#include <stdio.h>\nint main(void){ printf("ok\\n"); return 0; }\n')
+        r = sh([CC, "-c", "-O1", "a.c"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "fixture compile failed")
+        shim = _shim_for(td, lccc_ld)
+        out = os.path.join(td, "a.out")
+        r = sh([CC, "-B" + shim, "a.o", "-o", out, "-Wl,--build-id=sha1"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL",
+                          "link failed: " + r.stderr.decode(errors="replace")[-300:])
+        d = open(out, "rb").read()
+        phdrs, shdrs = _elf_bytes_phdrs(d), _elf_bytes_shdrs(d)
+        if phdrs is None or shdrs is None:
+            return Result(name, "FAIL", "not an ELF64 LSB file")
+        SHF_ALLOC = 2
+        notes = sorted(
+            ([h[3], h[4], h[5], h[6]] for h in shdrs
+             if h[1] == _SHT_NOTE and (h[2] & SHF_ALLOC) and h[5] > 0),
+            key=lambda h: h[1])
+        if len(notes) < 2:
+            return Result(name, "SKIP", "fixture has <2 note sections")
+        # Independent expectation: maximal runs allowing <= 8-byte alignment
+        # gaps (section alignment inside a span is legal for one PT_NOTE).
+        runs = 1
+        prev_end = notes[0][1] + notes[0][2]
+        for _, off, sz, _al in notes[1:]:
+            if off - prev_end > 8:
+                runs += 1
+            prev_end = max(prev_end, off + sz)
+        ptn = [p for p in phdrs if p[0] == _PT_NOTE]
+        if len(ptn) != runs:
+            return Result(name, "FAIL",
+                          "%d PT_NOTE phdrs for %d contiguous run(s) of %d notes"
+                          % (len(ptn), runs, len(notes)))
+        covered = []
+        for _, _, off, _, fsz, msz, _ in ptn:
+            if fsz != msz:
+                return Result(name, "FAIL", "PT_NOTE fsz %#x != msz %#x"
+                              % (fsz, msz))
+            covered.append((off, off + fsz))
+        covered.sort()
+        for _, off, sz, _ in notes:
+            if not any(lo <= off and off + sz <= hi for lo, hi in covered):
+                return Result(name, "FAIL", "note section at %#x not covered"
+                              % off)
+        props = [p for p in phdrs if p[0] == _PT_GNU_PROPERTY]
+        prop_secs = [h for h in shdrs if h[0] == ".note.gnu.property"]
+        if prop_secs:
+            want = prop_secs[0]
+            if len(props) != 1 or props[0][2] != want[4] or props[0][4] != want[5]:
+                return Result(name, "FAIL", "GNU_PROPERTY does not alias "
+                              ".note.gnu.property exactly: %r vs %r"
+                              % (props, want))
+        n = sh(["readelf", "-n", out]).stdout.decode(errors="replace")
+        if "Build ID:" not in n:
+            return Result(name, "FAIL", "merged notes broke build-id parsing")
+        code, txt = run_bin(out, [], td)
+        if code != 0 or txt != "ok\n":
+            return Result(name, "FAIL", "binary broken: %s" % ((code, txt),))
+        return Result(name, "PASS", "%d notes in %d PT_NOTE run(s)"
+                      % (len(notes), runs))
+
+
+def _gnu_hash_sizing_test(args, oracles):
+    """differential .gnu.hash: oracle-measured sizing + glibc-walk correctness.
+
+    Locks in three measured facts (see linker_common/hash.rs GnuHashParams):
+      * bloom words = next_pow2(ceil(n/4)), a power of two (glibc derives
+        the word mask as bloom_size-1; the old single-word version saturated
+        beyond ~30 exports: measured FPR ~1.0 at 20k symbols),
+      * bloom_shift = log2(bloom_size * class_bits),
+      * nbuckets = max(1, n/4) (lld parity).
+
+    Then proves the table is *usable*, not just plausible: an independent
+    re-implementation of glibc's dl-lookup.c two-bit bloom walk resolves
+    every exported symbol through the emitted table, and a consumer
+    executable resolves one through the real ld.so at runtime.
+    """
+    name = "gnu_hash_sizing"
+    lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    N = 600
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "big.c")
+        with open(src, "w") as f:
+            for k in range(N):
+                f.write("int h%d(void){return %d;}\n" % (k, k))
+        r = sh([CC, "-c", "-O1", "-fPIC", src, "-o", os.path.join(td, "big.o")])
+        if r.returncode != 0:
+            return Result(name, "SKIP", "fixture compile failed")
+        so = os.path.join(td, "big.so")
+        r = sh([lccc_ld, "-shared", "-o", so, os.path.join(td, "big.o")])
+        if r.returncode != 0:
+            return Result(name, "FAIL", "lccc-ld -shared failed: "
+                          + r.stderr.decode(errors="replace")[-200:])
+        d = open(so, "rb").read()
+        shdrs = _elf_bytes_shdrs(d)
+        gh = None
+        dynsym = dynstr = None
+        sec_data = {}
+        for h in shdrs:
+            o, s = h[4], h[5]
+            if h[0] == ".gnu.hash":
+                gh = struct.unpack_from("<IIII", d, o)
+                sec_data["gh"] = d[o:o + s]
+            elif h[0] == ".dynsym":
+                sec_data["dynsym"] = d[o:o + s]
+            elif h[0] == ".dynstr":
+                sec_data["dynstr"] = d[o:o + s]
+        if gh is None or "dynsym" not in sec_data:
+            return Result(name, "FAIL", "no .gnu.hash / .dynsym in output")
+        nbuckets, symoffset, bloom_size, bloom_shift = gh
+        # Ground truth: measured lld sizing for n=600 is (150, 256, shift
+        # lg2(256*64)=14). Assert the rule, not the echo of our own value.
+        exp_bloom = max(1, 1 << ((N + 3) // 4 - 1).bit_length())
+        if (bloom_size & (bloom_size - 1)) != 0 or bloom_size != exp_bloom:
+            return Result(name, "FAIL", "bloom_size=%d, want power of 2 = %d"
+                          % (bloom_size, exp_bloom))
+        if bloom_shift != (bloom_size * 64).bit_length() - 1:
+            return Result(name, "FAIL", "bloom_shift=%d, want %d"
+                          % (bloom_shift, (bloom_size * 64).bit_length() - 1))
+        if nbuckets != max(1, N // 4):
+            return Result(name, "FAIL", "nbuckets=%d, want %d"
+                          % (nbuckets, N // 4))
+        # Independent glibc-walk resolution of EVERY exported symbol.
+        def gnu_hash(nm):
+            h = 5381
+            for c in nm.encode():
+                h = (h * 33 + c) & 0xFFFFFFFF
+            return h
+        ghb, syms, strs = sec_data["gh"], sec_data["dynsym"], sec_data["dynstr"]
+        bloom_off = 16
+        buckets_off = bloom_off + bloom_size * 8
+        chains_off = buckets_off + nbuckets * 4
+        nsym = len(syms) // 24
+        def lookup(want):
+            h = gnu_hash(want)
+            w_idx = (h // 64) & (bloom_size - 1)
+            w = struct.unpack_from("<Q", ghb, bloom_off + w_idx * 8)[0]
+            if not (w & (1 << (h % 64)) and
+                    w & (1 << ((h >> bloom_shift) % 64))):
+                return None
+            idx = struct.unpack_from("<I", ghb, buckets_off
+                                     + (h % nbuckets) * 4)[0]
+            while idx >= symoffset:
+                no = struct.unpack_from("<I", syms, idx * 24)[0]
+                nm = strs[no:strs.index(b"\0", no)].decode()
+                chain = struct.unpack_from("<I", ghb,
+                                           chains_off + (idx - symoffset) * 4)[0]
+                if nm == want:
+                    return idx
+                if chain & 1:
+                    return None
+                idx += 1
+            return None
+        bad = ["h%d" % k for k in range(N) if lookup("h%d" % k) is None]
+        if bad:
+            return Result(name, "FAIL",
+                          "%d symbols unresolvable through .gnu.hash, e.g. %s"
+                          % (len(bad), bad[:3]))
+        # Absent symbols must mostly be rejected by the two-bit bloom probe
+        # (pure filter check; a chain walk can never "find" an absent name).
+        def bloom_pass(want):
+            h = gnu_hash(want)
+            w = struct.unpack_from(
+                "<Q", ghb, bloom_off + ((h // 64) & (bloom_size - 1)) * 8)[0]
+            return bool(w & (1 << (h % 64)) and
+                        w & (1 << ((h >> bloom_shift) % 64)))
+        misses = sum(1 for k in range(N // 2) if bloom_pass("absent_%d" % k))
+        if misses > N // 20:
+            return Result(name, "FAIL",
+                          "bloom passed %d/%d absent symbols (FPR too high)"
+                          % (misses, N // 2))
+        # End-to-end: resolve one through the real dynamic loader.
+        with open(os.path.join(td, "use.c"), "w") as f:
+            f.write('extern int h%d(void);\n'
+                    '#include <stdio.h>\n'
+                    'int main(void){printf("%%d\\n", h%d());return 0;}\n'
+                    % (N - 1, N - 1))
+        if sh([CC, "-c", "-O1", os.path.join(td, "use.c"),
+               "-o", os.path.join(td, "use.o")]).returncode != 0:
+            return Result(name, "SKIP", "consumer compile failed")
+        exe = os.path.join(td, "use")
+        shim = _shim_for(td, lccc_ld)
+        r = sh([CC, "-B" + shim, os.path.join(td, "use.o"), so, "-o", exe])
+        if r.returncode != 0:
+            return Result(name, "FAIL", "consumer link failed: "
+                          + r.stderr.decode(errors="replace")[-200:])
+        code, txt = run_bin(exe, [], td, env={"LD_LIBRARY_PATH": td})
+        if code != 0 or txt != "%d\n" % (N - 1):
+            return Result(name, "FAIL", "runtime lookup broken: %s"
+                          % ((code, txt),))
+        return Result(name, "PASS", "n=%d buckets=%d bloom=%d shift=%d"
+                      % (N, nbuckets, bloom_size, bloom_shift))
+
+
+def _crossarch_gnu_hash_relro_test(args, oracles):
+    """cross-arch .gnu.hash sizing + RELRO page-boundary invariants.
+
+    The .gnu.hash sizing port and the RELRO page-rightsizing were ported to
+    every backend; this test compiles a 48-export shared object with each
+    arch driver's *own* linker (i686=aarch32-class ELF32, arm=AArch64 ELF64
+    @64K pages, riscv=RISC-V ELF64) and verifies, without section headers
+    (the i686 emitter writes none), purely from phdrs+DT entries:
+
+      * `.gnu.hash`: pow2 bloom words = next_pow2(ceil(n/4)), shift =
+        log2(words*class_bits), buckets = n/4 — the measured lld rule, at
+        the arch's class width; all 48 exports resolvable through an
+        independent glibc-walk; absent-name FPR bounded.
+      * RELRO (arm/riscv; i686 has no RELRO by design): PT_GNU_RELRO spans
+        [page, next page) — start page-aligned, memsz reaching the page
+        edge, so glibc's round-down mprotect actually covers the region
+        (pre-fix riscv exes shipped sub-page memsz = zero protection, and
+        aarch64 had no PT_GNU_RELRO at all).
+    """
+    name = "crossarch_gnu_hash_relro"
+    bindir = os.path.dirname(args.lccc)
+    drivers = [
+        ("lccc-i686", 32, 0x1000, False),
+        ("lccc-arm", 64, 0x10000, True),
+        ("lccc-riscv", 64, 0x1000, True),
+    ]
+    seen = 0
+    with tempfile.TemporaryDirectory() as td:
+        N = 48
+        src = os.path.join(td, "f.c")
+        with open(src, "w") as f:
+            for k in range(N):
+                f.write("int v%d(void){return %d;}\n" % (k, k * 3))
+        for drv, bits, page, want_relro in drivers:
+            path = os.path.join(bindir, drv)
+            if not os.path.exists(path):
+                continue
+            so = os.path.join(td, drv + ".so")
+            r = sh([path, "-O1", "-shared", "-fPIC", src, "-o", so],
+                   timeout=120)
+            if r.returncode != 0:
+                return Result(name, "FAIL", "%s -shared failed: %s"
+                              % (drv, r.stderr.decode(errors="replace")[-200:]))
+            d = open(so, "rb").read()
+            if d[:4] != b"\x7fELF" or (d[4] == 1) != (bits == 32):
+                return Result(name, "FAIL", "%s: bad ELF class" % drv)
+            # phdr walk (works without section headers), normalised to
+            # (type, offset, vaddr, filesz, memsz); 64-bit phdr has TWO
+            # 32-bit leading fields (type, flags) — never 8 qwords.
+            if bits == 32:
+                phoff = struct.unpack_from("<I", d, 28)[0]
+                phnum = struct.unpack_from("<H", d, 44)[0]
+                ph = [struct.unpack_from("<8I", d, phoff + i * 32)
+                      for i in range(phnum)]
+                ph = [(p[0], p[1], p[2], p[4], p[5]) for p in ph]
+            else:
+                phoff = struct.unpack_from("<Q", d, 32)[0]
+                phnum = struct.unpack_from("<H", d, 56)[0]
+                ph = [struct.unpack_from("<II6Q", d, phoff + i * 56)
+                      for i in range(phnum)]
+                ph = [(p[0], p[2], p[3], p[5], p[6]) for p in ph]
+            loads = [p for p in ph if p[0] == 1]
+            def v2o(va):
+                for _, off, v, fsz, _ in loads:
+                    if v <= va < v + fsz:
+                        return off + (va - v)
+                return None
+            dyn = None
+            for ptype, off, _, fsz, _ in ph:
+                if ptype == 2:  # PT_DYNAMIC
+                    step = 8 if bits == 32 else 16
+                    dyn = [struct.unpack_from(
+                        "<iI" if bits == 32 else "<qQ", d, off + i * step)
+                        for i in range(fsz // step)]
+            if dyn is None:
+                return Result(name, "FAIL", "%s: no PT_DYNAMIC" % drv)
+            ents = dict((t, v) for t, v in dyn)
+            gh_v = ents.get(0x6FFFFEF5)
+            sym_v, str_v = ents.get(6), ents.get(5)
+            syment = ents.get(11)
+            if gh_v is None or sym_v is None or str_v is None:
+                return Result(name, "FAIL", "%s: DT_GNU_HASH/SYMTAB missing"
+                              % drv)
+            gho = v2o(gh_v)
+            nb, so_off, bw, bsh = struct.unpack_from("<4I", d, gho)
+            exp_bw = max(1, 1 << ((N + 3) // 4 - 1).bit_length())
+            if (bw & (bw - 1)) or bw != exp_bw:
+                return Result(name, "FAIL", "%s: bloom_words=%d want %d"
+                              % (drv, bw, exp_bw))
+            if bsh != (bw * bits).bit_length() - 1:
+                return Result(name, "FAIL", "%s: bloom_shift=%d" % (drv, bsh))
+            if nb != N // 4:
+                return Result(name, "FAIL", "%s: nbuckets=%d want %d"
+                              % (drv, nb, N // 4))
+            kw = 4 if bits == 32 else 8
+            bloom_o = gho + 16
+            buckets_o = bloom_o + bw * kw
+            chains_o = buckets_o + nb * 4
+            syms_o, strs_o = v2o(sym_v), v2o(str_v)
+            def gnu_hash(nm):
+                h = 5381
+                for c in nm.encode():
+                    h = (h * 33 + c) & 0xFFFFFFFF
+                return h
+            def lookup(want):
+                h = gnu_hash(want)
+                wv = struct.unpack_from(
+                    "<I" if bits == 32 else "<Q", d,
+                    bloom_o + ((h // bits) & (bw - 1)) * kw)[0]
+                if not (wv >> (h % bits)) & 1 or \
+                   not (wv >> ((h >> bsh) % bits)) & 1:
+                    return None
+                idx = struct.unpack_from("<I", d,
+                                         buckets_o + (h % nb) * 4)[0]
+                while idx >= so_off:
+                    no = struct.unpack_from("<I", d, syms_o + idx * syment)[0]
+                    nm = d[strs_o + no:d.index(b"\0", strs_o + no)].decode()
+                    chain = struct.unpack_from(
+                        "<I", d, chains_o + (idx - so_off) * 4)[0]
+                    if nm == want:
+                        return idx
+                    if chain & 1:
+                        return None
+                    idx += 1
+                return None
+            bad = [k for k in range(N) if lookup("v%d" % k) is None]
+            if bad:
+                return Result(name, "FAIL",
+                              "%s: %d symbols unresolvable, e.g. v%d"
+                              % (drv, len(bad), bad[0]))
+            def bloom_pass(want):
+                h = gnu_hash(want)
+                wv = struct.unpack_from(
+                    "<I" if bits == 32 else "<Q", d,
+                    bloom_o + ((h // bits) & (bw - 1)) * kw)[0]
+                return bool((wv >> (h % bits)) & 1 and
+                            (wv >> ((h >> bsh) % bits)) & 1)
+            misses = sum(1 for k in range(3 * N)
+                         if bloom_pass("absent_%d" % k))
+            if misses > N:
+                return Result(name, "FAIL",
+                              "%s: absent-name FPR too high (%d/%d)"
+                              % (drv, misses, 3 * N))
+            if want_relro:
+                relro = [p for p in ph if p[0] == 0x6474E552]
+                if not relro:
+                    return Result(name, "FAIL", "%s: no PT_GNU_RELRO" % drv)
+                va, len_ = relro[0][2], relro[0][4]
+                if va % page != 0 or (va + len_) % page != 0 or len_ < page:
+                    return Result(name, "FAIL",
+                                  "%s: RELRO [%#x,+%#x) not page-spanning "
+                                  "(sub-page memsz => glibc protects nothing)"
+                                  % (drv, va, len_))
+            seen += 1
+    if seen < 2:
+        return Result(name, "SKIP", "arch drivers missing (built %d)" % seen)
+    return Result(name, "PASS", "%d arch drivers verified (@48 exports each)"
+                  % seen)
+
+
 def _static_pie_refusal_test(args, oracles):
     """-static-pie must be refused with a diagnostic, not linked into a SIGSEGV.
 
@@ -6216,6 +6721,17 @@ def main():
     if (not args.tag or args.tag in ("gc", "sections")):
         results.append(_gc_eh_frame_invariant_test(args, oracles))
     results.append(_build_id_note_test(args, oracles))
+    if (not args.filter or "relro" in args.filter) and not args.tag:
+        results.append(_relro_nobits_pad_test(args, oracles))
+    if (not args.filter or "note" in args.filter) and not args.tag:
+        results.append(_note_run_merge_test(args, oracles))
+    if (not args.filter or "gnu_hash" in args.filter or "hash" in args.filter) \
+            and (not args.tag or args.tag == "dynamic"):
+        results.append(_gnu_hash_sizing_test(args, oracles))
+    if (not args.filter or "crossarch" in args.filter or "relro" in args.filter
+            or "gnu_hash" in args.filter or "hash" in args.filter) \
+            and (not args.tag or args.tag == "dynamic"):
+        results.append(_crossarch_gnu_hash_relro_test(args, oracles))
     results.append(_static_pie_refusal_test(args, oracles))
     results.append(_emit_relocs_warns_test(args, oracles))
     if (not args.filter or "dyn_init_fini" in args.filter) and (not args.tag or args.tag == "dynamic"):
