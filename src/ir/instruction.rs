@@ -681,13 +681,16 @@ impl Instruction {
             // --- Intrinsics: the store class (VecStore*, Movnt*,
             // Storedqu, SaveApplyArgs, ...) writes through `dest_ptr`.
             // A small set writes through `args[0]` instead: the jump-buffer
-            // and apply-area ops. Everything else is pure compute/load.
+            // and apply-area ops. The `VecStore*` family may equally carry
+            // its destination in `args[1]` (the BB-SLP construction form),
+            // so `writes_memory_via_args()` is consulted as well.
             // CONTRACT: a new memory-writing intrinsic op MUST be
-            // constructed with `dest_ptr: Some(..)` (or added to the
-            // args-writing list below) — that is the construction-site
+            // constructed with `dest_ptr: Some(..)` (or added to one of
+            // the args-writing lists) — that is the construction-site
             // discipline this predicate keys on.
             Instruction::Intrinsic { dest_ptr, op, .. } => {
                 dest_ptr.is_some()
+                    || op.writes_memory_via_args()
                     || matches!(
                         op,
                         IntrinsicOp::BuiltinSetjmp

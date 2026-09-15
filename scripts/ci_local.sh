@@ -209,6 +209,9 @@ gate "i686-asm-diff" fast \
 gate "i686-tls-ie-relax" fast \
     bash tests/regression/check_i686_tls_ie_relax.sh
 
+gate "bb-slp-redteam" fast \
+    bash tests/regression/check_bb_slp_codegen.sh
+
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
 

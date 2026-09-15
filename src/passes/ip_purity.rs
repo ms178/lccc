@@ -316,8 +316,22 @@ fn analyze_function_purity(
                 | Instruction::GetReturnF128Second { .. }
                 | Instruction::SetReturnF128Second { .. }
                 | Instruction::GetStaticChain { .. }
-                | Instruction::SetStaticChain { .. }
-                | Instruction::Intrinsic { .. } => {}
+                | Instruction::SetStaticChain { .. } => {}
+                // Intrinsics: `is_pure()` is the single source of truth.
+                // A memory-writing intrinsic (Vec* stores, movnti, memcpy-
+                // shaped helpers) or an observable one (fences, rdtsc,
+                // clflush, vzeroupper) makes the function impure. The old
+                // catch-all treated EVERY unlisted intrinsic as purity-
+                // neutral, so a function whose memory writes all went
+                // through vectorizer intrinsics (e.g. a loop-vectorized
+                // `void fill(int*)`, or the BB-SLP 4×u64 copy) was marked
+                // pure and its calls deleted — a miscompile
+                // (tests/regression/bb_slp_pure_store_fn.c).
+                Instruction::Intrinsic { op, dest_ptr, .. } => {
+                    if !op.is_pure() || dest_ptr.is_some() {
+                        return (false, false);
+                    }
+                }
             }
         }
 

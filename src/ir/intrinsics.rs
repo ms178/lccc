@@ -548,6 +548,53 @@ pub enum IntrinsicOp {
     VecAddI64x4,
     VecHorizontalAddI64x4,
     VecZeroI64x4,
+    /// Store 4×I64/U64 lanes (vmovdqu ymm). BB-SLP sink for 32-byte
+    /// consecutive-field copy chains (the 4×u64 struct-copy epic).
+    /// args = [vector value, base ptr, byte offset] (SIB store form) or
+    /// dest_ptr + args = [vector value].
+    VecStoreI64x4,
+    /// Lane-wise 4×I64 subtract (`vpsubq`, AVX2). Non-commutative:
+    /// args[0] - args[1] per lane, operand order preserved.
+    VecSubI64x4,
+    /// Lane-wise 4×I64 bitwise (vpand/vpor/vpxor, AVX2). Commutative,
+    /// bit-exact, element-type agnostic.
+    VecAndI64x4,
+    VecOrI64x4,
+    VecXorI64x4,
+    /// Broadcast one scalar I64/U64 to all 4 lanes (movq + vpbroadcastq).
+    VecBroadcastI64x4,
+    /// Lane-wise 2×I64/U64 bitwise (pand/por/pxor, SSE2). Commutative.
+    VecAndI64x2,
+    VecOrI64x2,
+    VecXorI64x2,
+    /// Load 8×I16/U16 lanes (movdqu xmm). BB-SLP halfword copy chains.
+    VecLoadI16x8,
+    /// Store 8×I16/U16 lanes (movdqu xmm).
+    VecStoreI16x8,
+    /// Lane-wise 8×I16 bitwise (pand/por/pxor, SSE2).
+    VecAndI16x8,
+    VecOrI16x8,
+    VecXorI16x8,
+    /// Load 16×I8/U8 lanes (movdqu xmm). BB-SLP byte copy chains.
+    VecLoadI8x16,
+    /// Store 16×I8/U8 lanes (movdqu xmm).
+    VecStoreI8x16,
+    /// Lane-wise 16×I8 bitwise (pand/por/pxor, SSE2).
+    VecAndI8x16,
+    VecOrI8x16,
+    VecXorI8x16,
+    /// Gather two scalar I64/U64 GPR values into one 2-lane vector
+    /// (movq + movq + punpcklqdq, SSE2-exact). args = [lo, hi].
+    VecPackI64x2,
+    /// Gather two scalar F64 values into one 2-lane vector (bit-identical
+    /// register choreography to VecPackI64x2). args = [lo, hi].
+    VecPackF64x2,
+    /// Extract one I64/U64 lane as a GPR scalar (movq / pshufd+movq).
+    /// args = [vector, Const(lane)].
+    VecExtractLaneI64x2,
+    /// Extract one F64 lane as an XMM scalar (lane 0: movq; lane 1:
+    /// pshufd $0x0E first). args = [vector, Const(lane)].
+    VecExtractLaneF64x2,
     /// Byte sum-of-absolute-differences: `dest = SAD(args[0], args[1])` —
     /// for each 8-byte group, the sum of `|a[i] - b[i]|` as a u64 lane
     /// (4×u64 per YMM; `vpsadbw`).  COMMUTATIVE (sum of absolute
@@ -1495,7 +1542,11 @@ impl IntrinsicOp {
             // 16 bytes is a loaded gun: it hands the value a half-size
             // protected slot and makes every copy a legacy `movdqa %xmm`
             // that silently freezes the upper lanes. Classify by shape.
-            | VecLoadI64x4 | VecAddI64x4 | VecZeroI64x4 | VecSadbwU8x32 => Some(32),
+            | VecLoadI64x4 | VecAddI64x4 | VecZeroI64x4 | VecSadbwU8x32
+            // BB-SLP I64x4 family completion: sub/bitwise/broadcast and
+            // the 256-bit store round out the 4×u64 copy chains.
+            | VecSubI64x4 | VecAndI64x4 | VecOrI64x4 | VecXorI64x4
+            | VecBroadcastI64x4 => Some(32),
             // ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----
             Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
             | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
@@ -1540,6 +1591,12 @@ impl IntrinsicOp {
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
             | VecSubI32x4 | VecSubI64x2 | VecAndI32x4 | VecOrI32x4 | VecXorI32x4
             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
+            // BB-SLP 128-bit families: I64x2 bitwise, I16x8/I8x16
+            // load/store/bitwise, and the 2-lane gather/extract pairs.
+            | VecAndI64x2 | VecOrI64x2 | VecXorI64x2
+            | VecLoadI16x8 | VecAndI16x8 | VecOrI16x8 | VecXorI16x8
+            | VecLoadI8x16 | VecAndI8x16 | VecOrI8x16 | VecXorI8x16
+            | VecPackI64x2 | VecPackF64x2
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
             | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
@@ -1629,8 +1686,17 @@ impl IntrinsicOp {
         // home, and ICEd the intrinsic emitter (`gd[i] = gd[i]*k + c` over
         // a global array). VecStoreI64x2 is the one memory-writing op that
         // produces_vector_value() also lists (kept there for slot sizing);
-        // it is excluded here -- stores are never pure.
+        // it is excluded here -- stores are never pure. Lane extracts read
+        // a vector and produce a scalar; they are pure reads (an orphaned
+        // extract left by an SLP bailout must be DCE-eligible, not rooted
+        // as a side effect).
         (self.produces_vector_value() && !matches!(self, IntrinsicOp::VecStoreI64x2))
+            || matches!(
+                self,
+                IntrinsicOp::VecExtractLaneI32x4
+                    | IntrinsicOp::VecExtractLaneI64x2
+                    | IntrinsicOp::VecExtractLaneF64x2
+            )
     }
 
     /// True when this intrinsic moves or computes SIMD data: the `Vec*`
@@ -1644,16 +1710,64 @@ impl IntrinsicOp {
         // they are listed explicitly.
         self.produces_vector_value()
             || self.vector_result_width().is_some()
-            || matches!(
-                self,
-                IntrinsicOp::VecStoreI32x4
-                    | IntrinsicOp::VecStoreI32x8
-                    | IntrinsicOp::VecStoreF32x8
-                    | IntrinsicOp::VecStoreF32x4
-                    | IntrinsicOp::VecStoreF64x4
-                    | IntrinsicOp::VecStoreF64x2
-                    | IntrinsicOp::VecStoreI64x2
-            )
+            || self.writes_memory_via_args()
+    }
+
+    /// True when this intrinsic writes memory through its `args` rather
+    /// than `dest_ptr`: the `VecStore*` family, which carries the
+    /// destination pointer in `args[1]` (the loop vectorizers add
+    /// `dest_ptr` redundantly for the [`Instruction::may_write_memory`]
+    /// contract; the BB-SLP vectorizer constructs the pure args form).
+    /// This is the args-side supplement that contract's `dest_ptr` key
+    /// needs to classify every memory-writing vector store.
+    pub fn writes_memory_via_args(&self) -> bool {
+        matches!(
+            self,
+            IntrinsicOp::VecStoreI32x4
+                | IntrinsicOp::VecStoreI32x8
+                | IntrinsicOp::VecStoreF32x8
+                | IntrinsicOp::VecStoreF32x4
+                | IntrinsicOp::VecStoreF64x4
+                | IntrinsicOp::VecStoreF64x2
+                | IntrinsicOp::VecStoreI64x2
+                | IntrinsicOp::VecStoreI64x4
+                | IntrinsicOp::VecStoreI16x8
+                | IntrinsicOp::VecStoreI8x16
+                | IntrinsicOp::VecStoreI8x32
+        )
+    }
+
+    /// True when this intrinsic reads memory: the vector load families
+    /// (register-resident `VecLoad*`, the widening load, and the 256-bit
+    /// explicit-SIMD `Loadu*`/`Load*` family). Consumers that must not
+    /// reorder across a memory read (the BB-SLP vectorizer's
+    /// store-interval and load-interval legality rules) need this; writes
+    /// are covered by [`Instruction::may_write_memory`].
+    pub fn may_read_memory(&self) -> bool {
+        matches!(
+            self,
+            IntrinsicOp::LoadF64x4
+                | IntrinsicOp::LoadF64x2
+                | IntrinsicOp::LoadI32x8
+                | IntrinsicOp::LoadI32x4
+                | IntrinsicOp::VecLoadF64x4
+                | IntrinsicOp::VecLoadF64x2
+                | IntrinsicOp::VecLoadI32x8
+                | IntrinsicOp::VecLoadI32x4
+                | IntrinsicOp::VecLoadF32x8
+                | IntrinsicOp::VecLoadF32x4
+                | IntrinsicOp::VecLoadI8x32
+                | IntrinsicOp::VecLoadWidenI32ToI64x2
+                | IntrinsicOp::VecLoadI64x2
+                | IntrinsicOp::VecLoadI64x4
+                | IntrinsicOp::VecLoadI16x8
+                | IntrinsicOp::VecLoadI8x16
+                | IntrinsicOp::Loadu256
+                | IntrinsicOp::Load256
+                | IntrinsicOp::LoaduPs256
+                | IntrinsicOp::LoaduPd256
+                | IntrinsicOp::Loadu512
+        )
     }
 
     /// Returns true if this intrinsic produces a 128/256-bit vector value
@@ -1683,10 +1797,21 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecSubI32x8
                 | IntrinsicOp::VecSubI32x4
                 | IntrinsicOp::VecSubI64x2
+                | IntrinsicOp::VecAndI64x2
+                | IntrinsicOp::VecOrI64x2
+                | IntrinsicOp::VecXorI64x2
                 | IntrinsicOp::VecAddI8x32
                 | IntrinsicOp::VecAddI8x16
                 | IntrinsicOp::VecSubI8x32
                 | IntrinsicOp::VecSubI8x16
+                | IntrinsicOp::VecAndI8x16
+                | IntrinsicOp::VecOrI8x16
+                | IntrinsicOp::VecXorI8x16
+                | IntrinsicOp::VecLoadI8x16
+                | IntrinsicOp::VecAndI16x8
+                | IntrinsicOp::VecOrI16x8
+                | IntrinsicOp::VecXorI16x8
+                | IntrinsicOp::VecLoadI16x8
                 | IntrinsicOp::VecMinU8x32
                 | IntrinsicOp::VecMinU8x16
                 | IntrinsicOp::VecMaxU8x32
@@ -1764,6 +1889,13 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecHorizontalAddI64x4
                 | IntrinsicOp::VecZeroI64x4
                 | IntrinsicOp::VecSadbwU8x32
+                | IntrinsicOp::VecSubI64x4
+                | IntrinsicOp::VecAndI64x4
+                | IntrinsicOp::VecOrI64x4
+                | IntrinsicOp::VecXorI64x4
+                | IntrinsicOp::VecBroadcastI64x4
+                | IntrinsicOp::VecPackI64x2
+                | IntrinsicOp::VecPackF64x2
                 | IntrinsicOp::VecMulI32x4
                 | IntrinsicOp::VecMulI32x8
                 | IntrinsicOp::VecBroadcastI32x4
@@ -2106,7 +2238,113 @@ mod vector_result_width_tests {
             "VecZeroI32x8" => IntrinsicOp::VecZeroI32x8,
             "VecZeroI64x2" => IntrinsicOp::VecZeroI64x2,
             "VecZeroI64x4" => IntrinsicOp::VecZeroI64x4,
+            "VecStoreI64x4" => IntrinsicOp::VecStoreI64x4,
+            "VecSubI64x4" => IntrinsicOp::VecSubI64x4,
+            "VecAndI64x4" => IntrinsicOp::VecAndI64x4,
+            "VecOrI64x4" => IntrinsicOp::VecOrI64x4,
+            "VecXorI64x4" => IntrinsicOp::VecXorI64x4,
+            "VecBroadcastI64x4" => IntrinsicOp::VecBroadcastI64x4,
+            "VecAndI64x2" => IntrinsicOp::VecAndI64x2,
+            "VecOrI64x2" => IntrinsicOp::VecOrI64x2,
+            "VecXorI64x2" => IntrinsicOp::VecXorI64x2,
+            "VecLoadI16x8" => IntrinsicOp::VecLoadI16x8,
+            "VecStoreI16x8" => IntrinsicOp::VecStoreI16x8,
+            "VecAndI16x8" => IntrinsicOp::VecAndI16x8,
+            "VecOrI16x8" => IntrinsicOp::VecOrI16x8,
+            "VecXorI16x8" => IntrinsicOp::VecXorI16x8,
+            "VecLoadI8x16" => IntrinsicOp::VecLoadI8x16,
+            "VecStoreI8x16" => IntrinsicOp::VecStoreI8x16,
+            "VecAndI8x16" => IntrinsicOp::VecAndI8x16,
+            "VecOrI8x16" => IntrinsicOp::VecOrI8x16,
+            "VecXorI8x16" => IntrinsicOp::VecXorI8x16,
+            "VecPackI64x2" => IntrinsicOp::VecPackI64x2,
+            "VecPackF64x2" => IntrinsicOp::VecPackF64x2,
+            "VecExtractLaneI64x2" => IntrinsicOp::VecExtractLaneI64x2,
+            "VecExtractLaneF64x2" => IntrinsicOp::VecExtractLaneF64x2,
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod memory_classification_tests {
+    use super::IntrinsicOp as O;
+
+    /// The memory-classification predicates the BB-SLP vectorizer's legality
+    /// rules key on. A store misclassified as non-writing is a miscompile (a
+    /// seed could reorder loads across it); a load misclassified as
+    /// non-reading likewise. Both lists must stay complete for every family
+    /// the vectorizers emit.
+    #[test]
+    fn every_vec_store_family_writes_memory_via_args() {
+        for op in [
+            O::VecStoreI32x4,
+            O::VecStoreI32x8,
+            O::VecStoreF32x4,
+            O::VecStoreF32x8,
+            O::VecStoreF64x2,
+            O::VecStoreF64x4,
+            O::VecStoreI64x2,
+            O::VecStoreI64x4,
+            O::VecStoreI16x8,
+            O::VecStoreI8x16,
+            O::VecStoreI8x32,
+        ] {
+            assert!(
+                op.writes_memory_via_args(),
+                "{op:?} must classify as a memory write in the args form"
+            );
+            assert!(
+                !op.may_read_memory(),
+                "{op:?} is a store, not a memory reader"
+            );
+        }
+    }
+
+    #[test]
+    fn vec_load_families_read_memory_and_never_write_it() {
+        for op in [
+            O::VecLoadF64x2,
+            O::VecLoadF64x4,
+            O::VecLoadF32x4,
+            O::VecLoadF32x8,
+            O::VecLoadI32x4,
+            O::VecLoadI32x8,
+            O::VecLoadI64x2,
+            O::VecLoadI64x4,
+            O::VecLoadI16x8,
+            O::VecLoadI8x16,
+            O::VecLoadI8x32,
+            O::VecLoadWidenI32ToI64x2,
+            O::Loadu256,
+            O::Load256,
+        ] {
+            assert!(op.may_read_memory(), "{op:?} must classify as a read");
+            assert!(
+                !op.writes_memory_via_args(),
+                "{op:?} is a load, not a memory writer"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_alu_families_touch_no_memory() {
+        for op in [
+            O::VecAddI64x4,
+            O::VecSubI64x2,
+            O::VecMulF64x4,
+            O::VecAndI8x16,
+            O::VecOrI16x8,
+            O::VecXorI32x4,
+            O::VecBroadcastI64x4,
+            O::VecZeroF32x4,
+            O::VecPackI64x2,
+            O::VecExtractLaneI64x2,
+        ] {
+            assert!(
+                !op.writes_memory_via_args() && !op.may_read_memory(),
+                "{op:?} is pure compute and must not look like a memory op"
+            );
+        }
     }
 }

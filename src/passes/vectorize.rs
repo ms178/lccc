@@ -176,6 +176,12 @@ pub(crate) fn x86_simd_available_pub() -> bool {
     x86_simd_available()
 }
 
+/// AVX2 (256-bit ymm) availability for passes that emit YMM-shaped
+/// intrinsics directly (the BB-SLP vectorizer's width selection).
+pub(crate) fn x86_avx2_available_pub() -> bool {
+    x86_avx2_available()
+}
+
 fn x86_avx2_available() -> bool {
     X86_AVX2_AVAILABLE.with(|available| available.get())
 }

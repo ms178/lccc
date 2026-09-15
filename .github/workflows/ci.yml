@@ -224,6 +224,17 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_segfs_typeof_nosteal.sh
 
+      # BB-SLP red-team battery: the 2026-09-16 semantic audit closed three
+      # P0 soundness holes (dangling lane uses via Call/Phi/InlineAsm/
+      # atomics; the store->load forwarding hazard; cross-seed reordering
+      # across an emitted vector store). Runtime + per-function codegen
+      # contracts: hazards MUST stay scalar (GCC miscompiles the shifted-
+      # alias shape), disjoint-range/restrict shapes MUST vectorize.
+      - name: Verify basic-block SLP soundness contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_bb_slp_codegen.sh
+
       # Compare-replay home-rewrite contract: a multi-select compare-replay
       # must never trust a register-homed operand across an emission gap
       # that rewrites its home (the RA's latch/phi-web coalescing shares one
