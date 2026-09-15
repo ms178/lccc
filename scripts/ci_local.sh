@@ -212,6 +212,11 @@ gate "i686-tls-ie-relax" fast \
 gate "bb-slp-redteam" fast \
     bash tests/regression/check_bb_slp_codegen.sh
 
+# BB-SLP v3: constant-lane materialization contracts (FP gather bit
+# staging, zero/ones root-splat scheduling, FP const broadcasts).
+gate "bb-slp-v3" fast \
+    bash tests/regression/check_bb_slp_v3_codegen.sh
+
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
 

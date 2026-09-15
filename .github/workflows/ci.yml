@@ -235,6 +235,16 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_bb_slp_codegen.sh
 
+      # BB-SLP v3: constant-lane materialization contracts — FP gather
+      # lanes must stage through their bit pattern (the old path zeroed
+      # them), all-same constant store seeds (q[0..3]=0) must vectorize
+      # (root-Splat scheduling), all-ones splats must use the pcmpeqd
+      # self-compare, FP const splats must broadcast from the pool.
+      - name: Verify basic-block SLP v3 constant-lane contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_bb_slp_v3_codegen.sh
+
       # Compare-replay home-rewrite contract: a multi-select compare-replay
       # must never trust a register-homed operand across an emission gap
       # that rewrites its home (the RA's latch/phi-web coalescing shares one
