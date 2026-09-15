@@ -359,7 +359,14 @@ impl X86Codegen {
         let mnemonic = match op {
             IntrinsicOp::VecLoadF64x4 => "vmovupd",
             IntrinsicOp::VecLoadF32x8 => "vmovups",
-            IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI8x32 => "vmovdqu",
+            // VecLoadI16x16 is the halfword twin of VecLoadI8x32: the same
+            // vmovdqu %ymm stream load, the same vec_mem_operand arg layout
+            // (base, index, const disp). Without this arm the elision
+            // rejected every halfword map loop's stream load — one extra
+            // vmovdqu + register-home round trip per fold (Review F1).
+            IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI8x32 | IntrinsicOp::VecLoadI16x16 => {
+                "vmovdqu"
+            }
             IntrinsicOp::VecLoadI64x4 => "vmovdqu",
             _ => return false,
         };
@@ -805,6 +812,42 @@ impl X86Codegen {
         }
     }
 
+    /// Zero-splat fast path for the integer broadcast families that have no
+    /// dedicated `VecZero*` intrinsic (the byte/halfword families).
+    ///
+    /// `Splat(Const(0))` through the generic broadcast staging costs 3
+    /// instructions (`xorl`+`movd`+`vpbroadcastw`); a self-xor builds the
+    /// all-zero vector in ONE — the exact lowering the `VecZero*` families
+    /// use. The predicate is `is_all_zero_bits` (bit-exact, so an FP +0.0
+    /// can never route here — these are integer-only call sites anyway).
+    ///
+    /// The 256-bit form writes the full register and marks the upper half
+    /// dirty (the `VecZeroI64x4`/`VecZeroI32x8` convention: a later legacy
+    /// SSE op on the same register needs the `vzeroupper` hygiene).
+    fn try_zero_splat(&mut self, args: &[Operand], dest: &Option<Value>, avx: bool) -> bool {
+        match &args.first() {
+            Some(Operand::Const(c)) if c.is_all_zero_bits() => {}
+            _ => return false,
+        }
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        if avx {
+            self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
+            self.state.dirty_upper_ymm = true;
+        } else {
+            self.state.emit("    pxor %xmm0, %xmm0");
+        }
+        if let Some(d) = dest {
+            self.state.vector_values.insert(d.0);
+            if avx {
+                self.avx_store_dest(d);
+            } else {
+                self.sse_store_dest(d, "xmm0");
+            }
+        }
+        true
+    }
+
     /// All-ones splat fast path for the integer broadcast families.
     ///
     /// `Splat(Const(-1))` — BB-SLP seeds, the loop vectorizer's clamp
@@ -894,13 +937,16 @@ impl X86Codegen {
         }
     }
 
-    /// Resolve the 128-bit half of a 256-bit vector operand that holds
-    /// `lane`, into `%xmm1`. Home register: the XMM alias (low half) or
-    /// `vextracti128 $1` (high half). Slot-homed source: the relevant
-    /// half loads DIRECTLY from the slot (`vmovdqu +0/+16`), never
+    /// Resolve the 128-bit half of a 256-bit vector operand into `%xmm1`.
+    /// `half` selects which half (0 = low, 1 = high — the caller derives it
+    /// from the lane index and the family's lanes-per-half; dword families
+    /// have 4 lanes per half, qword families 2). Home register: the XMM alias
+    /// (low half) or `vextracti128 $1` (high half). Slot-homed source: the
+    /// relevant half loads DIRECTLY from the slot (`vmovdqu +0/+16`), never
     /// staging the full YMM. Returns false when nothing held the value
-    /// (caller falls back to scratch or refuses).
-    fn stage_256_half_to_xmm1(&mut self, arg: &Operand, lane: i64) -> bool {
+    /// (caller falls back to the pending-memfold materialization, which is
+    /// the only legal producer of an unheld value).
+    fn stage_256_half_to_xmm1(&mut self, arg: &Operand, half: usize) -> bool {
         let Operand::Value(v) = arg else {
             return false;
         };
@@ -911,7 +957,7 @@ impl X86Codegen {
             if is_xmm_reg(reg) {
                 let ymm = phys_reg_name_256(reg);
                 let xmm = phys_reg_name(reg);
-                if lane >= 2 {
+                if half == 1 {
                     self.state
                         .emit_fmt(format_args!("    vextracti128 $1, %{}, %xmm1", ymm));
                 } else if xmm != "xmm1" {
@@ -922,7 +968,7 @@ impl X86Codegen {
             }
         }
         if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
-            if lane >= 2 {
+            if half == 1 {
                 self.state
                     .emit_fmt(format_args!("    vextracti128 $1, %{}, %xmm1", held));
             } else {
@@ -936,7 +982,7 @@ impl X86Codegen {
         }
         if let Some(addr) = self.state.resolve_slot_addr(v.0) {
             if let crate::backend::state::SlotAddr::Direct(slot) = addr {
-                let disp = if lane >= 2 { 16 } else { 0 };
+                let disp = if half == 1 { 16 } else { 0 };
                 let mem = self.slot_ref(slot.0 + disp);
                 self.state
                     .emit_fmt(format_args!("    vmovdqu {}, %xmm1", mem));
@@ -944,6 +990,28 @@ impl X86Codegen {
             }
         }
         false
+    }
+
+    /// Store an extracted F32 lane (sitting in %xmm1) to its scalar dest.
+    /// The dest is an ordinary F32: a 4-BYTE slot or XMM home. The same
+    /// 16-byte-overflow discipline as `store_f64_lane_dest` (a `movdqu`
+    /// store would clobber the 4-byte slot's neighbours); the XMM-home
+    /// path goes direct from %xmm1 with `movaps`.
+    fn store_f32_lane_dest(&mut self, d: &Value) {
+        if let Some(&reg) = self.reg_assignments.get(&d.0) {
+            if is_xmm_reg(reg) {
+                let name = phys_reg_name(reg);
+                if name != "xmm1" {
+                    self.state
+                        .emit_fmt(format_args!("    movaps %xmm1, %{}", name));
+                }
+                self.state.reg_cache.invalidate_acc();
+                self.note_inplace_compute(reg, d.0);
+                return;
+            }
+        }
+        self.state.emit("    movaps %xmm1, %xmm0");
+        self.store_xmm0_fp_dest(d, IrType::F32);
     }
 
     pub(super) fn avx_store_dest(&mut self, dest_ptr: &Value) {
@@ -4663,7 +4731,7 @@ impl X86Codegen {
                 };
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                if self.stage_256_half_to_xmm1(&args[0], lane) {
+                if self.stage_256_half_to_xmm1(&args[0], (lane / 2) as usize) {
                     if lane & 1 != 0 {
                         self.state.emit("    pshufd $0x0E, %xmm1, %xmm1");
                     }
@@ -4676,7 +4744,7 @@ impl X86Codegen {
                     // was elided by VLFOLD. Materialize the pending load
                     // and retry once.
                     self.materialize_pending_memfold();
-                    if self.stage_256_half_to_xmm1(&args[0], lane) {
+                    if self.stage_256_half_to_xmm1(&args[0], (lane / 2) as usize) {
                         if lane & 1 != 0 {
                             self.state.emit("    pshufd $0x0E, %xmm1, %xmm1");
                         }
@@ -4684,6 +4752,16 @@ impl X86Codegen {
                         if let Some(d) = dest {
                             self.store_rax_to(d);
                         }
+                    } else {
+                        // Backend contract violation: every consumed
+                        // vector value is register-homed, live-held, or
+                        // slot-homed (VLFOLD materialization covers the
+                        // elided-load case). Emitting nothing would be a
+                        // SILENT MISCOMPILE — the dest would keep stale
+                        // bits. Refuse loudly instead.
+                        panic!(
+                            "VecExtractLaneI64x4: source has no register/live/slot home (lane {lane})"
+                        );
                     }
                 }
             }
@@ -4697,7 +4775,7 @@ impl X86Codegen {
                 };
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                if self.stage_256_half_to_xmm1(&args[0], lane) {
+                if self.stage_256_half_to_xmm1(&args[0], (lane / 2) as usize) {
                     if lane & 1 != 0 {
                         self.state.emit("    pshufd $0x0E, %xmm1, %xmm1");
                     }
@@ -4706,13 +4784,157 @@ impl X86Codegen {
                     }
                 } else {
                     self.materialize_pending_memfold();
-                    if self.stage_256_half_to_xmm1(&args[0], lane) {
+                    if self.stage_256_half_to_xmm1(&args[0], (lane / 2) as usize) {
                         if lane & 1 != 0 {
                             self.state.emit("    pshufd $0x0E, %xmm1, %xmm1");
                         }
                         if let Some(d) = dest {
                             self.store_f64_lane_dest(d);
                         }
+                    } else {
+                        panic!(
+                            "VecExtractLaneF64x4: source has no register/live/slot home (lane {lane})"
+                        );
+                    }
+                }
+            }
+            IntrinsicOp::VecExtractLaneF32x4 => {
+                // Lane → F32 scalar from a 128-bit source: stage into
+                // %xmm1, select the dword (lane 0 needs no shuffle), and
+                // store with the 4-byte movss discipline.
+                let lane = match &args[1] {
+                    Operand::Const(c) => c.to_i64().unwrap_or(0),
+                    _ => 0,
+                };
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                self.sse_load_arg(&args[0], "xmm1");
+                if lane != 0 {
+                    self.state
+                        .emit_fmt(format_args!("    pshufd ${}, %xmm1, %xmm1", lane & 3));
+                }
+                if let Some(d) = dest {
+                    self.store_f32_lane_dest(d);
+                }
+            }
+            IntrinsicOp::VecExtractLaneF32x8 => {
+                // Lane → F32 scalar from a 256-bit source: half staging
+                // (4 dwords per half), in-half dword select, movss store.
+                let lane = match &args[1] {
+                    Operand::Const(c) => c.to_i64().unwrap_or(0),
+                    _ => 0,
+                };
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                if self.stage_256_half_to_xmm1(&args[0], (lane / 4) as usize) {
+                    if lane & 3 != 0 {
+                        self.state
+                            .emit_fmt(format_args!("    pshufd ${}, %xmm1, %xmm1", lane & 3));
+                    }
+                    if let Some(d) = dest {
+                        self.store_f32_lane_dest(d);
+                    }
+                } else {
+                    self.materialize_pending_memfold();
+                    if self.stage_256_half_to_xmm1(&args[0], (lane / 4) as usize) {
+                        if lane & 3 != 0 {
+                            self.state
+                                .emit_fmt(format_args!("    pshufd ${}, %xmm1, %xmm1", lane & 3));
+                        }
+                        if let Some(d) = dest {
+                            self.store_f32_lane_dest(d);
+                        }
+                    } else {
+                        panic!(
+                            "VecExtractLaneF32x8: source has no register/live/slot home (lane {lane})"
+                        );
+                    }
+                }
+            }
+            IntrinsicOp::VecExtractLaneI32x8 => {
+                // Lane → GPR scalar from a 256-bit source: half staging
+                // (4 dwords per half), then the I32x4 finish — pextrd on
+                // SSE4.1 hosts, pshufd+movd on the SSE2 baseline.
+                let lane = match &args[1] {
+                    Operand::Const(c) => c.to_i64().unwrap_or(0),
+                    _ => 0,
+                };
+                let in_half = lane & 3;
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let mut finish = |this: &mut Self| {
+                    if this.isa.sse41 {
+                        this.state
+                            .emit_fmt(format_args!("    pextrd ${}, %xmm1, %eax", in_half));
+                    } else {
+                        if in_half != 0 {
+                            this.state
+                                .emit_fmt(format_args!("    pshufd ${}, %xmm1, %xmm1", in_half));
+                        }
+                        this.state.emit("    movd %xmm1, %eax");
+                    }
+                    if let Some(d) = &dest {
+                        this.store_rax_to(d);
+                    }
+                };
+                if self.stage_256_half_to_xmm1(&args[0], (lane / 4) as usize) {
+                    finish(self);
+                } else {
+                    self.materialize_pending_memfold();
+                    if self.stage_256_half_to_xmm1(&args[0], (lane / 4) as usize) {
+                        finish(self);
+                    } else {
+                        panic!(
+                            "VecExtractLaneI32x8: source has no register/live/slot home (lane {lane})"
+                        );
+                    }
+                }
+            }
+            IntrinsicOp::VecExtractLaneI16x8 => {
+                // Lane → GPR scalar from a 128-bit halfword source:
+                // `pextrw` (SSE2 baseline — no SSE4.1 dependency), then
+                // the canonical GPR-value store.
+                let lane = match &args[1] {
+                    Operand::Const(c) => c.to_i64().unwrap_or(0),
+                    _ => 0,
+                };
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                self.sse_load_arg(&args[0], "xmm1");
+                self.state
+                    .emit_fmt(format_args!("    pextrw ${}, %xmm1, %eax", lane & 7));
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::VecExtractLaneI16x16 => {
+                // Lane → GPR scalar from a 256-bit halfword source: half
+                // staging (8 words per half) then pextrw of the in-half
+                // lane.
+                let lane = match &args[1] {
+                    Operand::Const(c) => c.to_i64().unwrap_or(0),
+                    _ => 0,
+                };
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                if self.stage_256_half_to_xmm1(&args[0], (lane / 8) as usize) {
+                    self.state
+                        .emit_fmt(format_args!("    pextrw ${}, %xmm1, %eax", lane & 7));
+                    if let Some(d) = dest {
+                        self.store_rax_to(d);
+                    }
+                } else {
+                    self.materialize_pending_memfold();
+                    if self.stage_256_half_to_xmm1(&args[0], (lane / 8) as usize) {
+                        self.state
+                            .emit_fmt(format_args!("    pextrw ${}, %xmm1, %eax", lane & 7));
+                        if let Some(d) = dest {
+                            self.store_rax_to(d);
+                        }
+                    } else {
+                        panic!(
+                            "VecExtractLaneI16x16: source has no register/live/slot home (lane {lane})"
+                        );
                     }
                 }
             }
@@ -5079,8 +5301,12 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecBroadcastI16x16 => {
-                // All-ones splat: one vpcmpeqd instead of the staged chain.
-                if !self.try_all_ones_splat(args, dest, true) {
+                // Zero splat: one vpxor instead of the staged chain (the
+                // families with no VecZero intrinsic honor the same
+                // is_zero contract emitter-locally).
+                if !self.try_zero_splat(args, dest, true)
+                    && !self.try_all_ones_splat(args, dest, true)
+                {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
@@ -5095,9 +5321,11 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecBroadcastI16x8 => {
-                // All-ones splat: one self-compare instead of
-                // movd/punpcklwd/pshufd.
-                if !self.try_all_ones_splat(args, dest, false) {
+                // Zero splat then all-ones: one instruction each instead of
+                // the staged movd/punpcklwd/pshufd chain.
+                if !self.try_zero_splat(args, dest, false)
+                    && !self.try_all_ones_splat(args, dest, false)
+                {
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
                     self.state.emit("    movd %eax, %xmm0");
@@ -5112,8 +5340,11 @@ impl X86Codegen {
             // Byte splat of a RUNTIME value.  `vpbroadcastb` takes its source
             // from an XMM lane, so a GPR operand goes through `vmovd` first.
             IntrinsicOp::VecBroadcastI8x32 => {
-                // All-ones splat: one vpcmpeqd instead of the staged chain.
-                if !self.try_all_ones_splat(args, dest, true) {
+                // Zero splat then all-ones: one instruction each instead of
+                // the staged movd/vpbroadcastb chain.
+                if !self.try_zero_splat(args, dest, true)
+                    && !self.try_all_ones_splat(args, dest, true)
+                {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
@@ -5130,9 +5361,11 @@ impl X86Codegen {
             // SSE2 baseline byte splat: `pshufb` is SSSE3, so build the
             // broadcast from unpacks.  b -> {b,b} -> {b,b,b,b} -> all lanes.
             IntrinsicOp::VecBroadcastI8x16 => {
-                // All-ones splat: one self-compare instead of the
-                // movd/punpcklbw/punpcklwd/pshufd chain.
-                if !self.try_all_ones_splat(args, dest, false) {
+                // Zero splat then all-ones: one instruction each instead of
+                // the movd/punpcklbw/punpcklwd/pshufd chain.
+                if !self.try_zero_splat(args, dest, false)
+                    && !self.try_all_ones_splat(args, dest, false)
+                {
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
                     self.state.emit("    movd %eax, %xmm0");

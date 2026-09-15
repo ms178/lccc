@@ -101,13 +101,265 @@ struct SymAddr {
     off: i64,
 }
 
+/// Symbolic affine term `var*mult + off` for a GEP byte-offset operand,
+/// evaluated structurally over the SAME expression DAG the machine computes.
+///
+/// This is the generalization that unlocks indexed straight-line code
+/// (`a[i-1..i+2]` windows, stencils, inlined index math). The canonical
+/// pre-SLP shapes are produced by `simplify` + the lowering pipeline:
+///
+/// * `Cast(Add(i, k), I32→I64)` — the frontend's promoted index (and,
+///   after cast-absorption in the self-add fold, the raw I32 `Add(i,k)`
+///   used directly in an I64 add);
+/// * `Add(x, x)` — `simplify` canonicalizes `Mul(x, 2)` into a self-add,
+///   and the frontend's `Mul(Cast(i+k), sizeof)` is exactly that;
+/// * `Shl(x, k)` — `simplify` canonicalizes `Mul(x, 2^k)` into a shift;
+/// * `Mul(x, c)`, `Sub(v, const)` — the remaining scale/subtract forms;
+/// * nesting of all of the above (`2*((i+1) + (i+1))`).
+///
+/// **Soundness argument** (the same one the original `Add(var, Const)`
+/// recognition rests on): the term is a symbolic evaluation of the machine's
+/// own arithmetic. Every wrap an intermediate could take (I32 add mod 2^32,
+/// I64 add mod 2^64) corresponds to an index falling outside the accessed
+/// object's bounds — undefined behavior in C, exactly the assumption GCC,
+/// Clang, and LLVM's `inbounds` GEPs make. In every defined execution the
+/// intermediates do not wrap, the machine address equals
+/// `base + var*mult + off`, and two accesses the model calls consecutive
+/// really are `size` bytes apart. The sign/zero choice of the implicit
+/// widening is likewise immaterial: in a defined program the widened value
+/// is the mathematical index either way.
+///
+/// Terms are always kept canonical: `mult > 0` when `var` is `Some`
+/// (negative coefficients — `Sub(const, var)`, `Mul` by a negative —
+/// reject the whole GEP instead; they are never array strides), and all
+/// arithmetic is checked (a shape whose scale or offset does not fit an
+/// i64 was also unwieldy for the old recognizer — it stays opaque).
+#[derive(Clone, Copy, Debug)]
+struct AffineTerm {
+    var: Option<Value>,
+    /// Positive when `var` is `Some`; meaningless (0) for constants.
+    mult: i64,
+    off: i64,
+}
+
+/// Maximum structural depth of an offset expression. Real shapes nest at
+/// most four levels (Cast → Add/Sub → self-add/Shl/Mul → Cast); the cap only
+/// bounds pathological compile time, and a term hitting it degrades to an
+/// opaque variable leaf — never unsound.
+const AFFINE_DEPTH: usize = 8;
+
+fn ty_is_integer(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::I128
+            | IrType::U128
+    )
+}
+
+/// The opaque variable leaf: `v` itself as the unit-scale index.
+fn opaque_var(v: Value) -> AffineTerm {
+    AffineTerm {
+        var: Some(v),
+        mult: 1,
+        off: 0,
+    }
+}
+
+fn affine_term(
+    block: &BasicBlock,
+    def_pos: &FxHashMap<u32, usize>,
+    op: &Operand,
+    depth: usize,
+) -> Option<AffineTerm> {
+    match op {
+        Operand::Const(c) => Some(AffineTerm {
+            var: None,
+            mult: 0,
+            off: c.to_i64()?,
+        }),
+        Operand::Value(v) => {
+            let Some(&i) = def_pos.get(&v.0) else {
+                // Foreign value (param, other-block IV): an opaque index.
+                return Some(opaque_var(*v));
+            };
+            if depth == 0 {
+                return Some(opaque_var(*v));
+            }
+            match &block.instructions[i] {
+                // Widening / same-size integer cast: transparent — the
+                // widened value is the same number (see the soundness
+                // argument above). NARROWING casts truncate and float
+                // casts are not affine: both degrade to the opaque leaf
+                // of the cast RESULT (still an SSA value, still exact).
+                Instruction::Cast {
+                    src,
+                    from_ty,
+                    to_ty,
+                    ..
+                } if ty_is_integer(*from_ty)
+                    && ty_is_integer(*to_ty)
+                    && to_ty.size() >= from_ty.size() =>
+                {
+                    affine_term(block, def_pos, src, depth - 1)
+                }
+                // `x + y`: const+const folds, var+const shifts the offset,
+                // and the SAME variable on both sides composes the scale
+                // (`Add(x, x)` — the `Mul(x,2)` canonicalization — is the
+                // `mult = 2m` special case; `2i + 3i` shapes fold the same
+                // way). Two different variables cannot compose: opaque leaf.
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    let l = affine_term(block, def_pos, lhs, depth - 1)?;
+                    let r = affine_term(block, def_pos, rhs, depth - 1)?;
+                    match (&l.var, &r.var) {
+                        (None, None) => Some(AffineTerm {
+                            var: None,
+                            mult: 0,
+                            off: l.off.checked_add(r.off)?,
+                        }),
+                        (None, Some(_)) | (Some(_), None) => {
+                            let (mut t, c) = if l.var.is_none() {
+                                (r, l.off)
+                            } else {
+                                (l, r.off)
+                            };
+                            t.off = t.off.checked_add(c)?;
+                            Some(t)
+                        }
+                        (Some(lv), Some(rv)) if lv == rv => {
+                            let mult = l.mult.checked_add(r.mult)?;
+                            if mult == 0 {
+                                return Some(AffineTerm {
+                                    var: None,
+                                    mult: 0,
+                                    off: l.off.checked_add(r.off)?,
+                                });
+                            }
+                            Some(AffineTerm {
+                                var: l.var,
+                                mult,
+                                off: l.off.checked_add(r.off)?,
+                            })
+                        }
+                        (Some(_), Some(_)) => Some(opaque_var(*v)),
+                    }
+                }
+                // `v - k`: the `i - k` index form (`a[i-1]`). The
+                // coefficient of `v` stays positive.
+                Instruction::BinOp {
+                    op: IrBinOp::Sub,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    let mut t = affine_term(block, def_pos, lhs, depth - 1)?;
+                    let Operand::Const(c) = rhs else {
+                        // var - var or var - const-var: not a plain shift.
+                        return Some(opaque_var(*v));
+                    };
+                    t.off = t.off.checked_sub(c.to_i64()?)?;
+                    Some(t)
+                }
+                // `x * c` (either operand order): scale the whole term.
+                // A negative or zero scale cannot keep `mult` positive —
+                // the product becomes the opaque leaf.
+                Instruction::BinOp {
+                    op: IrBinOp::Mul,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    let (x, c) = match (lhs, rhs) {
+                        (x, Operand::Const(c)) => (x, c.to_i64()?),
+                        (Operand::Const(c), x) => (x, c.to_i64()?),
+                        _ => return Some(opaque_var(*v)),
+                    };
+                    let t = affine_term(block, def_pos, x, depth - 1)?;
+                    scale_term(t, c, *v)
+                }
+                // `x << k` == `x * 2^k` in wrapping two's complement —
+                // exact at every wrap width, so the affine scale is exact.
+                Instruction::BinOp {
+                    op: IrBinOp::Shl,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    let Operand::Const(c) = rhs else {
+                        return Some(opaque_var(*v));
+                    };
+                    let k = c.to_i64()?;
+                    if !(0..=62).contains(&k) {
+                        return Some(opaque_var(*v));
+                    }
+                    let t = affine_term(block, def_pos, lhs, depth - 1)?;
+                    scale_term(t, 1i64.checked_shl(k as u32)?, *v)
+                }
+                _ => Some(opaque_var(*v)),
+            }
+        }
+    }
+}
+
+/// Scale `t` by `s` (`s != 0`, `mult` stays positive) or degrade to the
+/// opaque leaf of `v`.
+fn scale_term(t: AffineTerm, s: i64, v: Value) -> Option<AffineTerm> {
+    if s == 0 {
+        return Some(AffineTerm {
+            var: None,
+            mult: 0,
+            off: 0,
+        });
+    }
+    match t.var {
+        None => Some(AffineTerm {
+            var: None,
+            mult: 0,
+            off: t.off.checked_mul(s)?,
+        }),
+        Some(var) => {
+            let mult = t.mult.checked_mul(s)?;
+            if mult <= 0 {
+                return Some(opaque_var(v));
+            }
+            Some(AffineTerm {
+                var: Some(var),
+                mult,
+                off: t.off.checked_mul(s)?,
+            })
+        }
+    }
+}
+
 /// Evaluate a pointer value to a symbolic address. Recognizes raw pointer
-/// values, `GEP(base, Const)` chains, and `GEP(base, Add(var, Const))`
-/// (the partially-unrolled `a[i+k]` shape). Everything else is opaque.
+/// values, `GEP(base, Const)` chains, and — through `affine_term` — every
+/// scaled/indexed offset shape the canonicalizer emits (`Add(x,x)`
+/// doubling, `Shl`, `Mul`, `Sub`, widening `Cast`s, and their nesting).
 fn eval_sym_addr(
     block: &BasicBlock,
     def_pos: &FxHashMap<u32, usize>,
     ptr: Value,
+) -> Option<SymAddr> {
+    eval_sym_addr_d(block, def_pos, ptr, 4)
+}
+
+fn eval_sym_addr_d(
+    block: &BasicBlock,
+    def_pos: &FxHashMap<u32, usize>,
+    ptr: Value,
+    depth: usize,
 ) -> Option<SymAddr> {
     // A pointer defined OUTSIDE this block (entry-block ParamRef or
     // GlobalAddr, a foreign block's computation) is an opaque base:
@@ -129,9 +381,12 @@ fn eval_sym_addr(
     };
     match inst {
         Instruction::GetElementPtr { base, offset, .. } => {
-            // Base of a GEP may itself be a const-offset GEP — fold one
-            // level; anything deeper treats the inner GEP as the base.
-            let mut addr = match eval_sym_addr(block, def_pos, *base) {
+            // Base of a GEP may itself be a const-offset GEP — fold
+            // recursively; a base that carries its own index variable
+            // degrades to the inner GEP's value as an opaque base (two
+            // accesses through the SAME base-GEP value still stream
+            // together — the `p = &a[i]; p[0..3]` shape).
+            let mut addr = match eval_sym_addr_d(block, def_pos, *base, depth.saturating_sub(1)) {
                 Some(a) if a.var.is_none() => a,
                 _ => SymAddr {
                     base: *base,
@@ -140,35 +395,25 @@ fn eval_sym_addr(
                     off: 0,
                 },
             };
-            match offset {
-                Operand::Const(c) => {
-                    addr.off = addr.off.checked_add(c.to_i64()?)?;
+            // The offset term: a constant folds into `off`; a variable
+            // term (with its scale and constant part from `affine_term`)
+            // becomes the stream's index. `addr` never carries a var at
+            // this point (var-carrying bases degraded above), so at most
+            // one index variable composes here.
+            let t = affine_term(block, def_pos, offset, AFFINE_DEPTH)?;
+            match t.var {
+                None => {
+                    addr.off = addr.off.checked_add(t.off)?;
                 }
-                Operand::Value(off_val) => {
-                    let off_inst = block.instructions.get(*def_pos.get(&off_val.0)?)?;
-                    match off_inst {
-                        Instruction::BinOp {
-                            op: IrBinOp::Add,
-                            lhs,
-                            rhs,
-                            ..
-                        } => match (lhs, rhs) {
-                            (Operand::Value(v), Operand::Const(c))
-                            | (Operand::Const(c), Operand::Value(v)) => {
-                                if addr.var.is_some() || addr.mult != 1 {
-                                    return None; // no affine index sums in v1
-                                }
-                                addr.var = Some(*v);
-                                addr.off = addr.off.checked_add(c.to_i64()?)?;
-                            }
-                            _ => return None,
-                        },
-                        // A bare variable index: `GEP(base, iv)` (mult 1).
-                        _ if addr.var.is_none() && addr.mult == 1 => {
-                            addr.var = Some(*off_val);
-                        }
-                        _ => return None,
+                Some(v) => {
+                    if addr.var.is_some() {
+                        // Two different index variables in one address
+                        // (`a[i][j]`): no single-stream model — skip.
+                        return None;
                     }
+                    addr.var = Some(v);
+                    addr.mult = t.mult as u64;
+                    addr.off = addr.off.checked_add(t.off)?;
                 }
             }
             Some(addr)
@@ -235,7 +480,7 @@ fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
             zero: IntrinsicOp::VecZeroF32x4,
             pack2: None,
             pack4: None,
-            extract: None,
+            extract: Some(IntrinsicOp::VecExtractLaneF32x4),
             size: 4,
         }),
         (IrType::F32, 8) if avx2 => Some(VecFamily {
@@ -245,7 +490,7 @@ fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
             zero: IntrinsicOp::VecZeroF32x8,
             pack2: None,
             pack4: None,
-            extract: None,
+            extract: Some(IntrinsicOp::VecExtractLaneF32x8),
             size: 4,
         }),
         (IrType::I32 | IrType::U32, 4) => Some(VecFamily {
@@ -265,7 +510,7 @@ fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
             zero: IntrinsicOp::VecZeroI32x8,
             pack2: None,
             pack4: None,
-            extract: None,
+            extract: Some(IntrinsicOp::VecExtractLaneI32x8),
             size: 4,
         }),
         (IrType::I64 | IrType::U64, 2) => Some(VecFamily {
@@ -297,7 +542,7 @@ fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
             zero: IntrinsicOp::VecBroadcastI16x8,
             pack2: None,
             pack4: None,
-            extract: None,
+            extract: Some(IntrinsicOp::VecExtractLaneI16x8),
             size: 2,
         }),
         (IrType::I16 | IrType::U16, 16) if avx2 => Some(VecFamily {
@@ -310,7 +555,7 @@ fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
             zero: IntrinsicOp::VecBroadcastI16x16,
             pack2: None,
             pack4: None,
-            extract: None,
+            extract: Some(IntrinsicOp::VecExtractLaneI16x16),
             size: 2,
         }),
         (IrType::I8 | IrType::U8, 16) => Some(VecFamily {
@@ -1036,14 +1281,21 @@ fn build_pack(
         // computes in I32 (with or without intermediate wrap, signed
         // overflow being UB in C anyway) or at the lane width.
         if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            // Is `t` an integer type strictly wider than the lane?
+            let wider_int = |t: IrType| ty_is_integer(t) && t.size() > ty.size();
             // Lane defs: truncating casts (the root of a demoted tree),
-            // or direct I32 binops (a nested level reached through the
-            // recursion below).
-            let is_promotable_i32_binop = |v: &Value| {
+            // or direct promoted-width binops (a nested level reached
+            // through the recursion below). The promoted width is ANY
+            // wider integer type: SIGNED promotion lands in I32, but the
+            // UNSIGNED spelling promotes to U32 — and explicit casts can
+            // build I16/U16 intermediates over byte lanes. The demotion
+            // is exact at every wider width (mod-2^lane arithmetic
+            // commutes with And/Or/Xor/Add/Sub/Mul).
+            let is_promotable_wide_binop = |v: &Value| {
                 matches!(
                     ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]),
                     Some(Instruction::BinOp { op, ty: bty, .. })
-                        if *bty == IrType::I32
+                        if wider_int(*bty)
                             && matches!(
                                 op,
                                 IrBinOp::Add
@@ -1059,12 +1311,13 @@ fn build_pack(
                 matches!(
                     ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]),
                     Some(Instruction::Cast { from_ty, to_ty, .. })
-                        if *to_ty == ty && matches!(from_ty, IrType::I32 | IrType::I64)
-                ) || is_promotable_i32_binop(v)
+                        if *to_ty == ty && wider_int(*from_ty)
+                ) || is_promotable_wide_binop(v)
             });
             if lanes_ok {
-                // The computing sources: the I32 binop feeding each
-                // truncation, or the nested binop lane itself.
+                // The computing sources: the promoted-width binop
+                // feeding each truncation, or the nested binop lane
+                // itself.
                 let mut promoted: Vec<Value> = Vec::with_capacity(width);
                 let mut ok = true;
                 for v in &vals {
@@ -1079,7 +1332,7 @@ fn build_pack(
                         }
                         _ => *v, // nested binop lane computes itself
                     };
-                    if is_promotable_i32_binop(&sv) {
+                    if is_promotable_wide_binop(&sv) {
                         promoted.push(sv);
                     } else {
                         ok = false;
@@ -1108,10 +1361,11 @@ fn build_pack(
                         let strip = |o: &Operand| -> Option<Operand> {
                             match o {
                                 // Value operands must be widening casts of
-                                // the lane type (the zext/sext C
-                                // promotion), or a nested same-set I32
-                                // binop — passed through unchanged so the
-                                // recursion demotes it one level deeper.
+                                // the lane type (the zext/sext C promotion —
+                                // into ANY wider integer width), or a nested
+                                // same-set promoted binop — passed through
+                                // unchanged so the recursion demotes it one
+                                // level deeper.
                                 Operand::Value(w) => {
                                     match ctx.def_pos.get(&w.0).map(|&k| &block.instructions[k]) {
                                         Some(Instruction::Cast {
@@ -1119,12 +1373,12 @@ fn build_pack(
                                             from_ty,
                                             to_ty,
                                             ..
-                                        }) if *from_ty == ty
-                                            && matches!(*to_ty, IrType::I32 | IrType::I64) =>
-                                        {
+                                        }) if *from_ty == ty && wider_int(*to_ty) => {
                                             Some(src.clone())
                                         }
-                                        _ if is_promotable_i32_binop(w) => Some(Operand::Value(*w)),
+                                        _ if is_promotable_wide_binop(w) => {
+                                            Some(Operand::Value(*w))
+                                        }
                                         _ => None,
                                     }
                                 }
@@ -1660,13 +1914,43 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         }
         // (c) No memory write strictly between the lane loads of a
         // MemLoad pack: an interleaved write could change which lanes see
-        // old vs. new values.
-        if let PackKind::MemLoad { .. } = &p.kind {
+        // old vs. new values. ESCAPE (rule (e)'s disjointness classes): a
+        // write whose bytes are PROVABLY disjoint from the loaded window
+        // [off0, off0 + width*size) cannot change any lane's observed
+        // value — the restrict contract / global / alloca object
+        // identity. Interleaved accumulations into other objects
+        // (`q[i] = a[i]; acc += other[i];`) are the unblocked shape.
+        // Same-stream writes get the exact byte-range test; anything not
+        // a plain Store (calls, atomics, asm, vector intrinsics) keeps
+        // the conservative rejection.
+        if let PackKind::MemLoad { ptrs, .. } = &p.kind {
             let positions: Vec<usize> = p.lane_vals.iter().map(|v| ctx.def_pos[&v.0]).collect();
             let lo = *positions.iter().min().unwrap();
             let hi = *positions.iter().max().unwrap();
+            let lane_addr = eval_sym_addr(block, &ctx.def_pos, ptrs[0]);
+            let lane_hi = lane_addr
+                .as_ref()
+                .map(|la| la.off as i128 + width as i128 * fam.size as i128)
+                .unwrap_or(0);
             for q in lo + 1..hi {
-                if is_memory_write(&block.instructions[q]) && !removed.contains(&q) {
+                if !is_memory_write(&block.instructions[q]) || removed.contains(&q) {
+                    continue;
+                }
+                let (ptr, acc_size) = match &block.instructions[q] {
+                    Instruction::Store { ptr, ty, .. } => (*ptr, ty.size() as i128),
+                    _ => return None,
+                };
+                let disjoint_from_lanes =
+                    match (&lane_addr, eval_sym_addr(block, &ctx.def_pos, ptr)) {
+                        (Some(la), Some(wa))
+                            if la.base == wa.base && la.var == wa.var && la.mult == wa.mult =>
+                        {
+                            wa.off as i128 >= lane_hi || la.off as i128 >= wa.off as i128 + acc_size
+                        }
+                        (Some(la), Some(wa)) => bases.disjoint(la.base.0, wa.base.0),
+                        _ => false,
+                    };
+                if !disjoint_from_lanes {
                     return None;
                 }
             }
@@ -1675,11 +1959,48 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     // (d) No memory access strictly between the seed stores other than
     // the removed lanes themselves: the vector store commits all lanes at
     // m_max, so an interleaved reader could observe a different
-    // half-stored state.
+    // half-stored state. ESCAPE (rule (e)'s disjointness classes): a
+    // scalar load/store whose bytes are PROVABLY disjoint from the seed
+    // window [off0, off0 + width*size) cannot observe or modify the seed
+    // bytes, so the batched commit is unobservable to it — the common
+    // `pos[i] = x; total += other[i]; pos[i+1] = y;` shapes stay
+    // vectorizable (GCC and Clang apply the same restrict/object-identity
+    // reasoning). Same-stream accesses get the exact byte-range test;
+    // foreign streams need the restrict/global/alloca disjointness proof;
+    // everything unanalyzable (calls, atomics, asm, vector intrinsics,
+    // opaque pointers) keeps the conservative rejection.
     let m_min = *cand.store_idx.iter().min().unwrap();
     let m_max = *cand.store_idx.iter().max().unwrap();
+    let seed_addr = eval_sym_addr(block, &ctx.def_pos, cand.anchor_ptr);
+    let seed_hi = seed_addr
+        .as_ref()
+        .map(|sa| sa.off as i128 + width as i128 * fam.size as i128)
+        .unwrap_or(0);
     for q in m_min + 1..m_max {
-        if is_memory_access(&block.instructions[q]) && !removed.contains(&q) {
+        if removed.contains(&q) {
+            continue;
+        }
+        let inst = &block.instructions[q];
+        if !is_memory_access(inst) {
+            continue;
+        }
+        let (ptr, acc_size) = match inst {
+            Instruction::Load { ptr, ty, .. } | Instruction::Store { ptr, ty, .. } => {
+                (*ptr, ty.size() as i128)
+            }
+            _ => return None,
+        };
+        let disjoint_from_seed = match (&seed_addr, eval_sym_addr(block, &ctx.def_pos, ptr)) {
+            (Some(sa), Some(aa))
+                if sa.base == aa.base && sa.var == aa.var && sa.mult == aa.mult =>
+            {
+                // Same stream: exact byte-range overlap.
+                aa.off as i128 >= seed_hi || sa.off as i128 >= aa.off as i128 + acc_size
+            }
+            (Some(sa), Some(aa)) => bases.disjoint(sa.base.0, aa.base.0),
+            _ => false,
+        };
+        if !disjoint_from_seed {
             return None;
         }
     }
@@ -1777,7 +2098,13 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             PackKind::Gather4 { .. } => benefit -= 7,
         }
     }
-    benefit -= extract_of.len() as i64;
+    // Extract costs: 1 move for a low-half lane; a 256-bit HIGH-half
+    // lane pays the vextracti128/f128 staging first (2 total).
+    let is_256 = fam.size * width as u64 == 32;
+    let half_lanes = width / 2;
+    for (_, (_, li)) in &extract_of {
+        benefit -= 1 + (is_256 && *li >= half_lanes) as i64;
+    }
     if benefit < 1 {
         return None;
     }

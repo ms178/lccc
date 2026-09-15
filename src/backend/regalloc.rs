@@ -7292,6 +7292,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             1 => matches!(
                 op,
                 O::VecAddF32x8 | O::VecMulF32x8 | O::VecFmaF32x8 | O::VecHorizontalAddF32x8
+                    // BB-SLP 256-bit lane extract: reads the YMM home
+                    // through its XMM alias / vextractf128; scratch is
+                    // xmm1 only.
+                    | O::VecExtractLaneF32x8
             ),
             2 => matches!(
                 op,
@@ -7304,6 +7308,9 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             3 => matches!(
                 op,
                 O::VecAddF32x4 | O::VecMulF32x4 | O::VecHorizontalAddF32x4
+                    // BB-SLP lane extract (128-bit F32): reads the XMM
+                    // home; scratch confined to xmm1.
+                    | O::VecExtractLaneF32x4
             ),
             4 => matches!(
                 op,
@@ -7326,6 +7333,9 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinI32x8
                     | O::VecHorizontalMaxI32x8
                     | O::VecMaskedAddI32x8
+                    // BB-SLP 256-bit lane extract: reads the YMM home
+                    // (half staging), scratch confined to xmm1.
+                    | O::VecExtractLaneI32x8
             ),
             6 => matches!(
                 op,
@@ -7407,6 +7417,9 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAndI16x8
                     | O::VecOrI16x8
                     | O::VecXorI16x8
+                    // BB-SLP halfword lane extract: `pextrw` from the
+                    // staged XMM source — reads the home, no write.
+                    | O::VecExtractLaneI16x8
             ),
             _ => false,
         }
@@ -7534,6 +7547,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecExtractLaneF64x2
                                 | O::VecExtractLaneI64x4
                                 | O::VecExtractLaneF64x4
+                                | O::VecExtractLaneF32x4
+                                | O::VecExtractLaneF32x8
+                                | O::VecExtractLaneI32x8
+                                | O::VecExtractLaneI16x8
+                                | O::VecExtractLaneI16x16
                         ) =>
                 {
                     return FxHashSet::default();
@@ -7767,6 +7785,14 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinU16x16
                     | O::VecMaxU16x16
                     | O::VecBlendvI16x16
+                    // Halfword bitwise maps — the word twins of the byte
+                    // entries above. Missing here, a `x & K` halfword
+                    // broadcast got no register home and re-read from the
+                    // stack every iteration (same defect class as the
+                    // dword fix above; Review F2).
+                    | O::VecAndI16x16
+                    | O::VecOrI16x16
+                    | O::VecXorI16x16
             ),
             4 => matches!(
                 op,

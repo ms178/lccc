@@ -170,8 +170,12 @@ static int io_ring_buffers_peek(struct io_kiocb *req, struct buf_sel_arg *arg,
 
 int main(void)
 {
-    /* buf_ring: 14 bytes pad + tail + ring array */
-    static unsigned char ring[64] __attribute__((aligned(8)));
+    /* buf_ring: 14 bytes pad + tail + ring array (sized for the 4
+ * initialized buffers — ring[64] left the 4th buf 16 bytes out of
+ * bounds; it survived only while the .bss layout left slack after the
+ * array, and faulted the moment the layout changed. Fixed per the
+ * in-bounds contract.) */
+    static unsigned char ring[96] __attribute__((aligned(8)));
     struct io_uring_buf_ring *brp = (void *)ring;
     volatile __u16 *t = (volatile __u16 *)(ring + 14);
     struct io_uring_buf *bufs = (void *)(ring + 16);

@@ -245,6 +245,15 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_bb_slp_v3_codegen.sh
 
+      # BB-SLP v4: affine window addressing (Add(x,x)/Shl/Mul/Sub/Cast
+      # offset recognition), rule-(d) disjointness escape, five lane-extract
+      # families, and the review follow-ups (VLFOLD I16x16, broadcast-home
+      # word bitwise, one-instruction zero/ones halfword splats).
+      - name: Verify basic-block SLP v4 contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_bb_slp_v4_codegen.sh
+
       # Compare-replay home-rewrite contract: a multi-select compare-replay
       # must never trust a register-homed operand across an emission gap
       # that rewrites its home (the RA's latch/phi-web coalescing shares one
