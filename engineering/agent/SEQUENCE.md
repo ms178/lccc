@@ -6,7 +6,7 @@ stack-mem after each item. Vetoes: sqlite/expat miscompiles.
 
 **Completed:** MS-08 landed on 2026-09-06; its 73-input invocation-owned
 `RaConfig` boundary and validation record are in
-[`../FOLLOWUP-2026-09-06-ms08-ra-config.md`](../FOLLOWUP-2026-09-06-ms08-ra-config.md).
+[`../journal/2026-09-W2.md`](../journal/2026-09-W2.md).
 MS-09 also closed on 2026-09-06: the bounded historic/publication audit,
 separate x86 reconstruction repair, and byte-level CI gate are recorded in
 [`../evidence/ms09-peephole-utf8-audit-2026-09-06.md`](../evidence/ms09-peephole-utf8-audit-2026-09-06.md).

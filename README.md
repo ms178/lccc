@@ -70,7 +70,7 @@ All 39 benchmark outputs are verified for **100% byte-for-byte correctness and a
 > while codec and parser kernels (`lz4_compress`, `chacha20_block`,
 > `sha256_transform`) are honest losses with root-cause analyses and fix
 > backlogs in
-> [`engineering/FOLLOWUP-2026-09-06-RUST-MODERNIZATION-AND-WORKLOAD-CORPUS.md`](engineering/FOLLOWUP-2026-09-06-RUST-MODERNIZATION-AND-WORKLOAD-CORPUS.md).
+> [`engineering/journal/2026-09-W2.md`](engineering/journal/2026-09-W2.md).
 
 ### Benchmark Results (39 Workloads & Kernels)
 
@@ -131,8 +131,8 @@ All 39 benchmark outputs are verified for **100% byte-for-byte correctness and a
 > startup-overhead artifact; root cause: byte-at-a-time match/copy loops —
 > loop-idiom project), mandelbrot is a vectorizer gap, expat's ifcombine
 > loss was already guarded. Full analysis, evidence and follow-ups:
-> [`FOLLOWUP-2026-09-11-rebase-perf-s04-s07.md`](FOLLOWUP-2026-09-11-rebase-perf-s04-s07.md)
-> and `backlog.md` session entry 2026-09-11.
+> [`engineering/journal/2026-09-W2.md`](engineering/journal/2026-09-W2.md)
+> (worst-12 triage) and the live queue in [`backlog.md`](backlog.md).
 
 ---
 

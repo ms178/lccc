@@ -88,7 +88,7 @@ parallel array.
 **Mode 6** keeps every soundness guard of mode 3 (steal-safety, never evict
 an ABI-hinted value, victim's next use strictly past `incoming.end`) and
 changes only the currency. It is opt-in pending a measured win; see
-`engineering/FOLLOWUP-2026-09-05-regalloc-cost-model-and-torture.md` §2.1 for
+`../engineering/journal/2026-09-W1.md` §2.1 for
 the exact measurement plan and the guard-rails (gzip and the Adler DO8 loop
 are where the previous eviction experiments died).
 

@@ -39,3 +39,31 @@ The headline win **survives and slightly improves** across the upstream merge
 (+4.7 % on `d03ca818` -> **+5.02 %** on `c62ae8526`), `linux_rbtree` and `strlen_bench`
 reproduce, and `lz4_compress` remains byte-identical. `cargo test --lib` and
 `ci_local.sh --fast` were re-run on the rebased tree; see the S14 ledger row.
+
+
+---
+
+<!-- folded from `rebase-c62ae852-2026-09-11/paired-lz4-guard.md` (consolidation 2026-09-16) -->
+
+# Benchmark Screen: A: lccc_base vs B: lccc_mine
+- **Flags**: `-O2 -DSRC_SIZE=(1UL<<22) -DPASSES=96U`
+- **Rounds**: `21`
+- **Aggregate B/A Geomean**: `0.9966`
+
+| Benchmark | A min (ms) | B min (ms) | B/A Ratio | B/A low3 | Note |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| `lz4_compress` | 183.63 | 183.01 | 0.997 | 0.999 |  |
+
+
+---
+
+<!-- folded from `rebase-c62ae852-2026-09-11/paired-sha256-amplified.md` (consolidation 2026-09-16) -->
+
+# Benchmark Screen: A: lccc_base vs B: lccc_mine
+- **Flags**: `-O2 -DPASSES=8 -DBLOCK_COUNT=131072`
+- **Rounds**: `11`
+- **Aggregate B/A Geomean**: `0.9498`
+
+| Benchmark | A min (ms) | B min (ms) | B/A Ratio | B/A low3 | Note |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| `sha256_transform` | 425.45 | 404.09 | 0.950 | 0.949 |  |

@@ -103,7 +103,7 @@ Update 2026-09-10 — `nbody` is bit-identical at every opt level, so it is no
 longer a blocker. The AArch64 `-O2`/`-O3` SIGSEGV it stood for was a register
 copy deleted while still live on the loop path; it is fixed by the exact-CFG
 alias fold described in
-`FOLLOWUP-2026-09-09-cross-backend-oracle-and-four-miscompiles.md` §2-§3.
+`../journal/2026-09-W2.md` §2-§3.
 
 Scope note: this task is about the **IR** pass `loop_rotate.rs`. Independently,
 the ARM backend peephole rotates simple loops **by default**

@@ -41,6 +41,6 @@ Two conclusions, both recorded against `engineering/tasks/TASK-RA-06A-RELOAD-AT-
    with the 64-round loop between them. This is a codegen gap, not an RA gap.
 2. The gap is **addressing-mode selection plus register residency**, not reload-CSE.
    Reload-CSE was implemented, proven sound and measured at 2 instructions out of 8414
-   (0.024 %); see `engineering/FOLLOWUP-2026-09-11-x86-slot-load-dedup.md`.
+   (0.024 %); see `../../journal/2026-09-W2.md`.
 
 Oracle target for the task: drive in-loop slot refs 52 → **0** and insns 198 → **126**.

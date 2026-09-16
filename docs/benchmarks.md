@@ -89,7 +89,7 @@ it: on a 2-core shared VM the bias is systematic and correlates within a round,
 so a paired test inherits it rather than averaging it out. **Statistical
 significance does not imply a real effect.** Always hash the arms before
 believing a ratio. See
-[`engineering/FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md`](../engineering/FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md).
+[`../engineering/journal/2026-09-W2.md`](../engineering/journal/2026-09-W2.md).
 
 Size the workload as well as screening it. A second failure mode was measured on
 the same kernel: at the corpus default (~55 ms/arm) a paired 51-round A/B reported

@@ -13,3 +13,11 @@ Do not invent a new allocator from scratch. Do not cite obsolete paths
 (`ccc/src`, `linear_scan.rs`, binary name `ccc`). Do not resurrect anything
 marked REVERTED in `../DECISIONS.md` without new evidence and the named
 oracles.
+
+**Session notes policy (2026-09-16+):** do NOT write new `FOLLOWUP-*.md` /
+`AUDIT-*.md` documents for a session. Append one entry — tagged with
+`<!-- src:` comments only if digesting an older document — to the current
+period file under [`../journal/`](../journal/README.md), and keep durable
+contracts in [`../subsystems/`](../subsystems/README.md). The doc-link gate
+(`scripts/ci_local.sh` gate `doc-link-integrity`, `scripts/check_doc_links.py`)
+rejects broken markdown references.

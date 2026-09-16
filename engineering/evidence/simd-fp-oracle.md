@@ -10,7 +10,7 @@
 This document records the reproducible static-code audit introduced by
 `tests/benchmark/patterns/simd_fp_oracle.c`, `scripts/godbolt.py`, and the
 whole-corpus ranking now shipped as `scripts/codegen_oracle.py --rank`
-(absorbed from the former `scripts/codegen_scoreboard.py`, same gaps JSON
+(absorbed from the former `scripts/codegen_scoreboard.py` (deleted/renamed), same gaps JSON
 schema and metric semantics).  It is deliberately not a claim that LCCC is
 faster than another compiler: instruction counts and mnemonic heuristics are
 triage signals, not cycle counts.  The research VM exposes no hardware PMU, so
@@ -167,7 +167,7 @@ A CPU-0-pinned, randomized 20-pair VM timing screen (100 million calls/sample)
 measured a paired geometric new/old ratio of **0.9851**, bootstrap 95% interval
 **[0.9670, 1.0012]**, with the new binary faster in 15/20 pairs.  The interval
 includes no change: this is suggestive screening, not a speedup claim.  Raw
-samples are retained in `artifacts/simd-fp-oracle/distance3/leaf-gpr-paired-timing.json`.
+samples lived in `artifacts/simd-fp-oracle/distance3/leaf-gpr-paired-timing.json` (wiped with the sandbox).
 Static code size/instruction count is proven; bare-metal PMU validation remains
 required.
 

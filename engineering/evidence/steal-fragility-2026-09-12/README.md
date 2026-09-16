@@ -18,7 +18,7 @@ The rule is a packing perturbation whose outcome is invisible to every
 decision-time quantity (cost, depth, lock state, cascade, recurrence all
 overlap between the harmed and helped cases). It second-guesses the
 validated span-pressure valve with an inferior cost model; the structural
-project is valve cost-awareness (FOLLOWUP-2026-09-11-valve-cost-blindness),
+project is valve cost-awareness (journal W2, valve entry — do-not-retry),
 not a parallel escape hatch.
 
 ## Shipping-config results (steal ON vs OFF, precision ON)
@@ -81,7 +81,7 @@ fires when deciding the first, and the first win alone is already -50 %.
 
 ## Follow-ups
 
-1. Valve cost-awareness (FOLLOWUP-2026-09-11-valve-cost-blindness): the
+1. Valve cost-awareness (journal W2, valve entry — do-not-retry): the
    original v184 complaint (prio 1600 demoted behind prio-100..400 spans)
    should be fixed IN the valve with its turnover model, not beside it.
 2. sqlite_varint oracle gap (lccc 121 vs gcc 116 / clang 115) is now a

@@ -6,7 +6,7 @@ IDs: LK-29 (kernel bring-up B2) · Priority: **P1** · Base: f657de55
 ## Objective
 
 lccc's type inference for `xchg`/`instrument_atomic_read_write` macro
-expansions (in `include/net/sock.h` etc.) produces `int *` where GCC
+expansions (in the kernel's `include/net/sock.h` and friends — out-of-tree path) <!-- dl-skip --> produces `int *` where GCC
 computes `struct dst_entry *`. The interim mitigation (non-fatal
 `IncompatiblePointerTypes` warning for statement-expr yields, landed in the
 kernel-bringup session) is visible but wrong; GCC computes the correct type

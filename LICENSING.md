@@ -329,7 +329,7 @@ Layered licensing is common for large compiler projects.
 - **Apache License**: [`LICENSE-APACHE`](./LICENSE-APACHE)
 - **BSD License**: [`LICENSE-BSD`](./LICENSE-BSD)
 - **Project README**: [`README.md`](./README.md) - Overview with licensing structure
-- **Contributing Guide**: [`CONTRIBUTING.md`](./CONTRIBUTING.md) - How to contribute
+- **Engineering handbook**: [`engineering/`](engineering/README.md) - contribution/workflow rules
 
 ## Summary Table
 

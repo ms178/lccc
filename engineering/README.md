@@ -2,8 +2,11 @@
 
 This directory is the single home of live engineering documentation.
 Everything outside it (`docs/`, root `README.md`) is user-facing or
-site-facing; everything historical lives in git history and is distilled
-into [`DECISIONS.md`](DECISIONS.md).
+site-facing. History is layered: session-day narratives in
+[`journal/`](journal/README.md) (append new session entries to the current
+period file — no new per-session markdown files), root causes and
+measured negatives in [`DECISIONS.md`](DECISIONS.md), raw numbers in
+[`evidence/`](evidence/README.md).
 
 ## Read order for an implementation agent
 
@@ -24,9 +27,10 @@ into [`DECISIONS.md`](DECISIONS.md).
 |------|------|
 | [`STATE.md`](STATE.md) | Current production state, gaps, constraints |
 | [`DECISIONS.md`](DECISIONS.md) | Decision & negative-results ledger (distilled from deleted session journals) |
+| [`journal/`](journal/README.md) | Period-file session digests, `src:` tagged entries |
 | [`agent/`](agent/README.md) | Agent workflow: rules, backlog, sequence |
 | [`tasks/`](tasks/README.md) | Active work queue — one file per actionable item |
-| [`subsystems/`](subsystems/) | Current design notes per subsystem |
+| [`subsystems/`](subsystems/README.md) | Per-subsystem handbooks (contracts, knobs, defect classes) |
 | [`evidence/godbolt/`](evidence/godbolt/) | Compiler Explorer oracle corpus + scoreboard |
 | [`evidence/workloads/`](evidence/workloads/) | gzip / zlib-ng / Expat LCCC vs GCC |
 | [`evidence/`](evidence/README.md) | Oracle corpus, workload measurements, frozen screening records; `evidence/pmu/` is the future MS-14 home |

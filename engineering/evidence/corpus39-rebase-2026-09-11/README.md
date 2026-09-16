@@ -7,7 +7,7 @@ Base: pristine `d03ca818` build. Candidate: the shipping `s11` build.
 |---|---|
 | `perf-ab-mine-vs-base.{json,md}` | full 39-benchmark corpus A/B, shipping vs base |
 | `ATTRIBUTION.md` | byte-level attribution of every reported delta |
-| `perf-ab-valve-vs-ship.{json,md}` | cost-ordered valve experiment vs shipping |
+| `perf-ab-valve-vs-ship.json` (table folded below) | cost-ordered valve experiment vs shipping |
 | `paired-*-coupled-plus-valve.json` | the falsification A/B for coupled counts + valve |
 
 ## Headline verdict
@@ -38,4 +38,23 @@ i686: **0 differing TUs over 292** compilable translation units (the sandbox has
   build, so the win is purely boolean-driven and count-coupling contributes nothing to it
   while costing lz4 dearly.
 
-Full reasoning: `engineering/FOLLOWUP-2026-09-11-valve-cost-blindness.md`.
+Full reasoning: `../../journal/2026-09-W2.md`.
+
+
+---
+
+<!-- folded from `corpus39-rebase-2026-09-11/perf-ab-valve-vs-ship.md` (consolidation 2026-09-16) -->
+
+# Benchmark Screen: A: lccc vs B: lccc_ship
+- **Flags**: `-O2`
+- **Rounds**: `9`
+- **Aggregate B/A Geomean**: `1.0052`
+
+| Benchmark | A min (ms) | B min (ms) | B/A Ratio | B/A low3 | Note |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| `chacha20_block` | 272.43 | 271.69 | 0.997 | 1.002 |  |
+| `double_reduction` | 88.25 | 89.25 | 1.011 | 0.997 |  |
+| `fannkuch` | 2770.47 | 2804.44 | 1.012 | 1.014 |  |
+| `glibc_strstr` | 4576.16 | 4566.63 | 0.998 | 1.000 |  |
+| `linux_rbtree` | 15.97 | 15.84 | 0.992 | 0.992 |  |
+| `nbody` | 321.26 | 327.96 | 1.021 | 1.017 |  |
