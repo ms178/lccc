@@ -800,6 +800,46 @@ pub enum IntrinsicOp {
     VecBroadcastI16x16,
     /// SSE2 word splat: 8×I16 (`movd` + `punpcklwd` + `pshufd`).
     VecBroadcastI16x8,
+    // -- BB-SLP packed lane shifts (uniform CONSTANT amount) -------------
+    // `dest[i] = args[0][i] OP amount` for every lane i, with args[1] a
+    // CONSTANT in [1, lane_bits-1] (0 is the identity and folds away; the
+    // range is the defined C domain, so the immediate form is lane-exact
+    // against the scalar lowering by construction). No packed BYTE shift
+    // exists before AVX-512 and no packed I64 arithmetic right shift
+    // exists before AVX-512, so those (type, op) pairs have no intrinsic
+    // and the SLP pack builder rejects the lanes.
+    /// AVX2 word logical shift left: 16×I16 by a constant (`vpsllw $imm`).
+    VecShlI16x16,
+    /// SSE2 word logical shift left: 8×I16 by a constant (`psllw $imm`).
+    VecShlI16x8,
+    /// AVX2 word logical shift right: 16×I16 (`vpsrlw $imm`).
+    VecLShrI16x16,
+    /// SSE2 word logical shift right: 8×I16 (`psrlw $imm`).
+    VecLShrI16x8,
+    /// AVX2 word arithmetic shift right: 16×I16 (`vpsraw $imm`).
+    VecAShrI16x16,
+    /// SSE2 word arithmetic shift right: 8×I16 (`psraw $imm`).
+    VecAShrI16x8,
+    /// AVX2 dword logical shift left: 8×I32 (`vpslld $imm`).
+    VecShlI32x8,
+    /// SSE2 dword logical shift left: 4×I32 (`pslld $imm`).
+    VecShlI32x4,
+    /// AVX2 dword logical shift right: 8×I32 (`vpsrld $imm`).
+    VecLShrI32x8,
+    /// SSE2 dword logical shift right: 4×I32 (`psrld $imm`).
+    VecLShrI32x4,
+    /// AVX2 dword arithmetic shift right: 8×I32 (`vpsrad $imm`).
+    VecAShrI32x8,
+    /// SSE2 dword arithmetic shift right: 4×I32 (`psrad $imm`).
+    VecAShrI32x4,
+    /// AVX2 qword logical shift left: 4×I64 (`vpsllq $imm`).
+    VecShlI64x4,
+    /// SSE2 qword logical shift left: 2×I64 (`psllq $imm`).
+    VecShlI64x2,
+    /// AVX2 qword logical shift right: 4×I64 (`vpsrlq $imm`).
+    VecLShrI64x4,
+    /// SSE2 qword logical shift right: 2×I64 (`vpsrlq $imm`).
+    VecLShrI64x2,
     /// AVX2 horizontal signed max: %scalar = max over all 8 I32 lanes of the
     /// source vector. x86 has no single smaxv; the lowering folds the 8 lanes
     /// with vextracti128 + vpmaxsd + vpshufd + vpmaxsd pairs, ending in vmovd
@@ -1551,6 +1591,15 @@ impl IntrinsicOp {
             | VecMaxU16x16
             | VecBlendvI16x16
             | VecBroadcastI16x16
+            // BB-SLP 256-bit packed lane shifts (word/dword/qword).
+            | VecShlI16x16
+            | VecLShrI16x16
+            | VecAShrI16x16
+            | VecShlI32x8
+            | VecLShrI32x8
+            | VecAShrI32x8
+            | VecShlI64x4
+            | VecLShrI64x4
             // Newly wired AVX/AVX2 ops (previously scalar header loops)
             | Pmulld256 | Psubd256 | Paddq256 | Psubq256 | Pandn256
             | Pcmpeqd256 | Pcmpeqq256 | Pcmpgtd256 | Pcmpgtq256
@@ -1629,6 +1678,15 @@ impl IntrinsicOp {
             | VecMaxI16x8
             | VecBlendvI16x8
             | VecBroadcastI16x8
+            // BB-SLP 128-bit packed lane shifts (word/dword/qword).
+            | VecShlI16x8
+            | VecLShrI16x8
+            | VecAShrI16x8
+            | VecShlI32x4
+            | VecLShrI32x4
+            | VecAShrI32x4
+            | VecShlI64x2
+            | VecLShrI64x2
             | VecWidenAddI32x4ToI64x2
             | VecWidenMaskedAddI32x4ToI64x2
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
@@ -1890,6 +1948,24 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecMaxI16x8
                 | IntrinsicOp::VecBlendvI16x8
                 | IntrinsicOp::VecBroadcastI16x8
+                // BB-SLP packed lane shifts (both widths; pure compute,
+                // vector SSA results).
+                | IntrinsicOp::VecShlI16x16
+                | IntrinsicOp::VecLShrI16x16
+                | IntrinsicOp::VecAShrI16x16
+                | IntrinsicOp::VecShlI16x8
+                | IntrinsicOp::VecLShrI16x8
+                | IntrinsicOp::VecAShrI16x8
+                | IntrinsicOp::VecShlI32x8
+                | IntrinsicOp::VecLShrI32x8
+                | IntrinsicOp::VecAShrI32x8
+                | IntrinsicOp::VecShlI32x4
+                | IntrinsicOp::VecLShrI32x4
+                | IntrinsicOp::VecAShrI32x4
+                | IntrinsicOp::VecShlI64x4
+                | IntrinsicOp::VecLShrI64x4
+                | IntrinsicOp::VecShlI64x2
+                | IntrinsicOp::VecLShrI64x2
                 | IntrinsicOp::VecAndI32x8
                 | IntrinsicOp::VecAndI32x4
                 | IntrinsicOp::VecOrI32x8
@@ -2265,6 +2341,22 @@ mod vector_result_width_tests {
             "VecBlendvI16x8" => IntrinsicOp::VecBlendvI16x8,
             "VecBroadcastI16x16" => IntrinsicOp::VecBroadcastI16x16,
             "VecBroadcastI16x8" => IntrinsicOp::VecBroadcastI16x8,
+            "VecShlI16x16" => IntrinsicOp::VecShlI16x16,
+            "VecShlI16x8" => IntrinsicOp::VecShlI16x8,
+            "VecLShrI16x16" => IntrinsicOp::VecLShrI16x16,
+            "VecLShrI16x8" => IntrinsicOp::VecLShrI16x8,
+            "VecAShrI16x16" => IntrinsicOp::VecAShrI16x16,
+            "VecAShrI16x8" => IntrinsicOp::VecAShrI16x8,
+            "VecShlI32x8" => IntrinsicOp::VecShlI32x8,
+            "VecShlI32x4" => IntrinsicOp::VecShlI32x4,
+            "VecLShrI32x8" => IntrinsicOp::VecLShrI32x8,
+            "VecLShrI32x4" => IntrinsicOp::VecLShrI32x4,
+            "VecAShrI32x8" => IntrinsicOp::VecAShrI32x8,
+            "VecAShrI32x4" => IntrinsicOp::VecAShrI32x4,
+            "VecShlI64x4" => IntrinsicOp::VecShlI64x4,
+            "VecShlI64x2" => IntrinsicOp::VecShlI64x2,
+            "VecLShrI64x4" => IntrinsicOp::VecLShrI64x4,
+            "VecLShrI64x2" => IntrinsicOp::VecLShrI64x2,
             "VecCmpI16x16" => IntrinsicOp::VecCmpI16x16,
             "VecCmpI16x8" => IntrinsicOp::VecCmpI16x8,
             "VecMaxI16x16" => IntrinsicOp::VecMaxI16x16,

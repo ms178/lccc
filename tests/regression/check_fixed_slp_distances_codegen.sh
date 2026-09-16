@@ -2,20 +2,23 @@
 # Profitable complete fixed vectors pack; strict, kill-switch, and partial-width
 # controls retain scalar source operations.
 set -euo pipefail
-CCC=${CCC:-./target/release/lccc}
+# Same binary-resolution convention as every other tests/regression/check_*
+# gate (LCCC_BIN, then CCC, then the fastbuild default) — the old hardcoded
+# ./target/release/lccc default made the gate unusable from a fastbuild tree.
+ccc=${LCCC_BIN:-${CCC:-target/fastbuild/lccc}}
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-fixed-slp.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 base=(-O3 -march=x86-64-v3)
 fast=(-ffast-math -ffp-contract=fast)
 
-"$CCC" "${base[@]}" -ffp-contract=off -S "$dir/fixed_slp_distances.c" -o "$tmp/strict.s"
-"$CCC" "${base[@]}" "${fast[@]}" -S "$dir/fixed_slp_distances.c" -o "$tmp/fast.s"
-CCC_NO_FIXED_SLP=1 "$CCC" "${base[@]}" "${fast[@]}" -S \
+"$ccc" "${base[@]}" -ffp-contract=off -S "$dir/fixed_slp_distances.c" -o "$tmp/strict.s"
+"$ccc" "${base[@]}" "${fast[@]}" -S "$dir/fixed_slp_distances.c" -o "$tmp/fast.s"
+CCC_NO_FIXED_SLP=1 "$ccc" "${base[@]}" "${fast[@]}" -S \
     "$dir/fixed_slp_distances.c" -o "$tmp/control.s"
 # Baseline x86-64 has no AVX.  Fast FP semantics alone must not introduce a
 # 256-bit instruction into an otherwise scalar function.
-"$CCC" -O3 "${fast[@]}" -S "$dir/fixed_slp_distances.c" -o "$tmp/baseline.s"
+"$ccc" -O3 "${fast[@]}" -S "$dir/fixed_slp_distances.c" -o "$tmp/baseline.s"
 
 python3 - "$tmp/strict.s" "$tmp/fast.s" "$tmp/control.s" \
     "$tmp/baseline.s" <<'PY'

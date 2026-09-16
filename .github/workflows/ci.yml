@@ -254,6 +254,15 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_bb_slp_v4_codegen.sh
 
+      # BB-SLP v5: packed shift families (both widths), rotate
+      # decomposition in both spellings with the shared-operand contract,
+      # Not/Neg composites, the Sub(x,1) all-ones idiom, the FP strict
+      # min/max fold, and the adversarial rejections.
+      - name: Verify basic-block SLP v5 contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_bb_slp_v5_codegen.sh
+
       # Compare-replay home-rewrite contract: a multi-select compare-replay
       # must never trust a register-homed operand across an emission gap
       # that rewrites its home (the RA's latch/phi-web coalescing shares one
