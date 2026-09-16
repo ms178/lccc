@@ -934,7 +934,25 @@ impl Lowerer {
             return Operand::Value(dest);
         }
 
-        self.lower_expr(inner)
+        // The remaining LEGAL operand class: string literals (`&"abc"` is
+        // the address of the array — C11 6.5.3.2 allows & on an lvalue and
+        // an array-literal designator is one). Everything else — `&-x`,
+        // `&(a + b)`, `&42` — is NOT an lvalue: C requires one, GCC rejects
+        // with "lvalue required as unary '&' operand", and silently
+        // lowering the operand as a VALUE here hands the program a pointer
+        // to whatever temporary the backend staged (undefined behaviour at
+        // the first dereference — observed as a segfault in the SLP test
+        // battery).
+        match inner {
+            Expr::StringLiteral(..)
+            | Expr::WideStringLiteral(..)
+            | Expr::Char16StringLiteral(..) => return self.lower_expr(inner),
+            _ => {}
+        }
+        self.diagnostics
+            .borrow_mut()
+            .error("lvalue required as unary '&' operand", inner.span());
+        Operand::Const(IrConst::I64(0))
     }
 
     /// Check if dereferencing the given expression is a no-op because the

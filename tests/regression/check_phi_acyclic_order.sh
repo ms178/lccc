@@ -39,6 +39,17 @@
 # ============================================================================
 set -euo pipefail
 
+# Visible skip when the i386 multilib is absent: CI installs gcc-multilib
+# + libc6-dev-i386 and runs the m32 legs for real; a headerless host
+# (container sandboxes without root) cannot run them at all, and a hard
+# failure there reports the ENVIRONMENT, not the code.
+i386_headers_ok() {
+    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
+        echo "SKIP: i686 leg ($1) — no i386 libc headers on this host (CI installs gcc-multilib)"
+        return 1
+    fi
+}
+
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 CCC=${CCC:-$here/../../target/fastbuild/lccc}
 GCC=${GCC:-gcc}
@@ -243,7 +254,7 @@ CCC32=""
 for c in "$(dirname "$CCC")/lccc-i686" target/fastbuild/lccc-i686 target/release/lccc-i686; do
   [[ -x $c ]] && CCC32=$c && break
 done
-if [[ -n $CCC32 ]]; then
+if [[ -n $CCC32 ]] && i386_headers_ok "$CCC32"; then
   echo "check_phi_acyclic_order: i686 target-aware default"
   "$CCC32" -O2 -S -o "$work/m32_def.s" "$here/../benchmark/programs/sha256_transform.c"
   CCC_PHI_ACYCLIC_ORDER=0 "$CCC32" -O2 -S -o "$work/m32_k.s" "$here/../benchmark/programs/sha256_transform.c"

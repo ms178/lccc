@@ -168,8 +168,6 @@ pub(crate) struct CodegenOptions {
     /// Gates the Popcount lowering; the fallback is an shr/adc bit loop
     /// in %rax/%rcx.
     pub(crate) popcnt: bool,
-    /// Whether the target has AVX2 (`-mavx2` or an enabling `-march`).
-    pub(crate) avx2: bool,
     /// Whether the target has AVX-512F (from -mavx512f / -march=*avx512*).
     /// Enables the 1-uop EVEX GPR-source vpbroadcast for scalar->vector splats.
     pub(crate) avx512: bool,

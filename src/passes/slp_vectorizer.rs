@@ -694,6 +694,127 @@ fn is_commutative(op: IrBinOp) -> bool {
     )
 }
 
+/// Map an FP lane type/width to its packed bitwise-XOR intrinsic (the
+/// exact packed spelling of every FP bit-manipulation idiom whose scalar
+/// lowering is an integer-domain XOR on the bit pattern).
+fn packed_fpxor(ty: IrType, width: usize) -> Option<IntrinsicOp> {
+    match (ty, width) {
+        (IrType::F32, 8) => Some(IntrinsicOp::VecXorF32x8),
+        (IrType::F32, 4) => Some(IntrinsicOp::VecXorF32x4),
+        (IrType::F64, 4) => Some(IntrinsicOp::VecXorF64x4),
+        (IrType::F64, 2) => Some(IntrinsicOp::VecXorF64x2),
+        _ => None,
+    }
+}
+
+/// The `-0.0` constant of an FP lane type — the sign-mask operand of the
+/// FP-Neg composite (bit pattern: sign bit set, everything else clear).
+fn minus_zero_const(ty: IrType) -> Option<IrConst> {
+    match ty {
+        IrType::F32 => Some(IrConst::F32(-0.0)),
+        IrType::F64 => Some(IrConst::F64(-0.0)),
+        _ => None,
+    }
+}
+
+/// Integer lane min/max packed intrinsics. Exact and commutative (no FP
+/// unordered/±0 asymmetry) — every spelling of the same-source ternary
+/// folds. Dword requires SSE4.1 (pminsd/pmaxsd); gate on AVX2 — the SLP
+/// pass's only feature accessor — which implies it (x86-64-v2-only builds
+/// simply keep the cmp+blendv two-op form, which is itself exact).
+/// Halfword (pminsw/pmaxsw) and byte (pminub/pmaxub) are SSE2.
+fn packed_int_minmax(is_max: bool, ty: IrType, width: usize) -> Option<IntrinsicOp> {
+    let avx2 = x86_avx2_available_pub();
+    match (ty, width) {
+        (IrType::I32 | IrType::U32, 8) => Some(if is_max {
+            IntrinsicOp::VecMaxI32x8
+        } else {
+            IntrinsicOp::VecMinI32x8
+        }),
+        (IrType::I32 | IrType::U32, 4) if avx2 => Some(if is_max {
+            IntrinsicOp::VecSmaxI32x4
+        } else {
+            IntrinsicOp::VecSminI32x4
+        }),
+        (IrType::I16 | IrType::U16, 16) => Some(if is_max {
+            IntrinsicOp::VecMaxI16x16
+        } else {
+            IntrinsicOp::VecMinI16x16
+        }),
+        (IrType::I16 | IrType::U16, 8) => Some(if is_max {
+            IntrinsicOp::VecMaxI16x8
+        } else {
+            IntrinsicOp::VecMinI16x8
+        }),
+        // Unsigned bytes: pminub/pmaxub (SSE2). Signed bytes have no
+        // pre-AVX512 packed min/max.
+        (IrType::U8, 16) => Some(if is_max {
+            IntrinsicOp::VecMaxU8x16
+        } else {
+            IntrinsicOp::VecMinU8x16
+        }),
+        (IrType::U8, 32) => Some(if is_max {
+            IntrinsicOp::VecMaxU8x32
+        } else {
+            IntrinsicOp::VecMinU8x32
+        }),
+        _ => None,
+    }
+}
+
+/// The packed compare + lane-mask-select intrinsic pair for a (lane type,
+/// width) family. `None` where no family exists (I64 lanes) — the lanes
+/// then degrade to the gather/binop paths.
+fn packed_cmp_blendv(ty: IrType, width: usize) -> Option<(IntrinsicOp, IntrinsicOp)> {
+    let avx2 = x86_avx2_available_pub();
+    match (ty, width) {
+        (IrType::F32, 8) if avx2 => Some((IntrinsicOp::VecCmpF32x8, IntrinsicOp::VecBlendvF32x8)),
+        (IrType::F32, 4) => Some((IntrinsicOp::VecCmpF32x4, IntrinsicOp::VecBlendvF32x4)),
+        (IrType::F64, 4) if avx2 => Some((IntrinsicOp::VecCmpF64x4, IntrinsicOp::VecBlendvF64x4)),
+        (IrType::F64, 2) => Some((IntrinsicOp::VecCmpF64x2, IntrinsicOp::VecBlendvF64x2)),
+        (IrType::I32 | IrType::U32, 8) if avx2 => {
+            Some((IntrinsicOp::VecCmpI32x8, IntrinsicOp::VecBlendvI32x8))
+        }
+        (IrType::I32 | IrType::U32, 4) => {
+            Some((IntrinsicOp::VecCmpI32x4, IntrinsicOp::VecBlendvI32x4))
+        }
+        (IrType::I16 | IrType::U16, 16) if avx2 => {
+            Some((IntrinsicOp::VecCmpI16x16, IntrinsicOp::VecBlendvI16x16))
+        }
+        (IrType::I16 | IrType::U16, 8) => {
+            Some((IntrinsicOp::VecCmpI16x8, IntrinsicOp::VecBlendvI16x8))
+        }
+        (IrType::I8 | IrType::U8, 32) if avx2 => {
+            Some((IntrinsicOp::VecCmpI8x32, IntrinsicOp::VecBlendvI8x32))
+        }
+        (IrType::I8 | IrType::U8, 16) => {
+            Some((IntrinsicOp::VecCmpI8x16, IntrinsicOp::VecBlendvI8x16))
+        }
+        _ => None,
+    }
+}
+
+/// The packed-compare predicate immediate for a scalar comparison, with
+/// the operand-swap flag for the mirrored relations. FP vocabulary:
+/// 0 = EQ_OQ, 1 = LT_OS, 2 = LE_OS, 4 = NEQ_UQ (exactly the C spellings —
+/// all false on NaN). Integer vocabulary: 0 = eq, 1 = lt.s, 2 = le.s,
+/// 4 = ne, 5 = lt.u, 6 = le.u. Unsigned relations are integer-only.
+fn cmp_predicate_imm(op: IrCmpOp, is_fp: bool) -> Option<(i64, bool)> {
+    match op {
+        IrCmpOp::Eq => Some((0, false)),
+        IrCmpOp::Ne => Some((4, false)),
+        IrCmpOp::Slt => Some((1, false)),
+        IrCmpOp::Sle => Some((2, false)),
+        IrCmpOp::Sgt => Some((1, true)),
+        IrCmpOp::Sge => Some((2, true)),
+        IrCmpOp::Ult if !is_fp => Some((5, false)),
+        IrCmpOp::Ule if !is_fp => Some((6, false)),
+        IrCmpOp::Ugt if !is_fp => Some((5, true)),
+        IrCmpOp::Uge if !is_fp => Some((6, true)),
+        _ => None,
+    }
+}
+
 /// Map a shift lane op to its packed intrinsic — the uniform CONSTANT
 /// amount forms only (`psllw/psrlw/psraw/pslld/psrld/psrad/psllq/psrlq`
 /// and their VEX counterparts). None where the ISA has no packed form:
@@ -974,6 +1095,33 @@ enum PackKind {
         vec_op: IntrinsicOp,
         lhs: usize,
         rhs: usize,
+        cond_lanes: Vec<Value>,
+    },
+    /// FP negation composite: `dest = VecXorF*(val, Const(-0.0))` — the
+    /// emitter folds the per-lane sign mask as a .rodata memory operand,
+    /// ONE instruction for the whole pack (the exact GCC spelling of
+    /// packed `-x` lanes). Bit-exactness proof: the scalar lowering
+    /// (alu.rs `emit_float_neg_impl`) XORs the GPR bit pattern with the
+    /// sign mask — a pure sign-bit flip, NOT `0.0 - x` — identical to the
+    /// packed XOR for every lane value incl. NaN payloads and ±0.
+    FpNeg { vec_op: IntrinsicOp, val: usize },
+    /// General compare+select composite: TWO intrinsics — a packed
+    /// compare (all-ones/all-zeros lane mask; `pred` follows the VecCmp*
+    /// immediate vocabulary) feeding a bitwise lane select
+    /// (`blendv args = [fv, tv, mask]`). Replaces W scalar cmp+select
+    /// pairs for EVERY predicate and mixed arms (the shapes the min/max
+    /// fold cannot take). `cond_lanes` are the Cmp defs that die with the
+    /// folded Select lanes (removed; every non-removed use rejects the
+    /// seed — a scalar bool cannot be reconstructed from the packed
+    /// mask cheaply).
+    CmpBlendv {
+        cmp_op: IntrinsicOp,
+        blend_op: IntrinsicOp,
+        pred: i64,
+        lhs: usize,
+        rhs: usize,
+        tv: usize,
+        fv: usize,
         cond_lanes: Vec<Value>,
     },
 }
@@ -1950,16 +2098,81 @@ fn build_pack(
             }
         }
 
-        // 2c. FP strict min/max Select lanes: every lane is
-        //     `Select(cond = Cmp(op, l, r), t, f)` in one of the four
-        //     STRICT-ORDERED foldable spellings (see PackKind::FpMinMax).
-        //     Operand identity is compared BIT-EXACTLY (`lane_key`), never
-        //     by `Operand`'s derived float equality — a {-0.0, +0.0}
-        //     mismatch under `==` would fold a ternary whose ±0 lanes the
-        //     packed op answers differently. Non-strict (<=, >=) compares
-        //     and mixed per-lane shapes reject the lanes (v2: per-lane
-        //     routing).
+        // 2b-FP. FP Negation lanes (UnaryOp{Neg, F32/F64} at the seed's
+        //       lane type): the composite `Neg(x) == Xor(x, -0.0)`.
+        //       Bit-exactness PROOF against the scalar lowering: the x86
+        //       scalar path (alu.rs `emit_float_neg_impl`) XORs the value's
+        //       GPR bit pattern with the sign mask — a pure sign-bit flip,
+        //       NOT a `0.0 - x` subtraction — so the packed `vxorps/vxorpd`
+        //       with the per-lane sign mask produces the identical lane
+        //       bits for EVERY value: normals, subnormals, infinities,
+        //       ±0 (the SIGN flips — exactly what unary minus means for
+        //       zeros), and every NaN payload (flipped sign, payload
+        //       preserved verbatim, no canonicalisation).
+        //       Emitted as ONE intrinsic with a Const(-0.0) second operand:
+        //       the backend folds the mask as a .rodata memory operand —
+        //       one instruction per pack, the exact GCC spelling.
         if matches!(ty, IrType::F32 | IrType::F64) {
+            let neg_lanes_ok = vals.iter().all(|v| {
+                matches!(
+                    ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]),
+                    Some(Instruction::UnaryOp {
+                        op: IrUnaryOp::Neg,
+                        ty: uty,
+                        ..
+                    }) if *uty == ty
+                )
+            });
+            if neg_lanes_ok {
+                if let Some(vec_op) = packed_fpxor(ty, width) {
+                    let srcs: Vec<Operand> = vals
+                        .iter()
+                        .map(|v| {
+                            let i = ctx.def_pos[&v.0];
+                            match &block.instructions[i] {
+                                Instruction::UnaryOp { src, .. } => src.clone(),
+                                _ => unreachable!(),
+                            }
+                        })
+                        .collect();
+                    if let Some(val) =
+                        build_pack(ctx, &srcs, ty, width, fam, packs, dedup, depth + 1)
+                    {
+                        let idx = packs.len();
+                        packs.push(Pack {
+                            kind: PackKind::FpNeg { vec_op, val },
+                            lane_vals: vals.clone(),
+                            sched: usize::MAX,
+                            order: 0,
+                        });
+                        dedup.insert(key, idx);
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+
+        // 2c. Select-of-Cmp lanes: every lane is
+        //     `Select(cond = Cmp(op, l, r), t, f)` with the compare at the
+        //     seed's lane type. Two folds, tried in order:
+        //     (a) MIN/MAX — the same-source-arm spellings. FP: the four
+        //         STRICT-ORDERED forms (the FpMinMax lane-exactness proof:
+        //         MINPS/MAXPS return src2 on unordered/both-zero, exactly
+        //         the false arm). INTEGER: every relational spelling is
+        //         exact (integer min/max is commutative with no NaN/±0
+        //         asymmetry, and `<=`/`>=` differ from `<`/`>` only on
+        //         equal values — where both arms ARE the same value).
+        //     (b) CMP+BLENDV — everything else (mixed arms, non-foldable
+        //         predicates): one packed compare producing an all-ones /
+        //         all-zeros lane mask (IEEE-exact for every FP predicate —
+        //         LT_OS is exactly C `<`, NEQ_UQ exactly C `!=`, all false
+        //         on NaN just like C) + one BITWISE lane select. Exact for
+        //         every predicate, every arm pair, integer and FP.
+        //     Operand identity in (a) is compared BIT-EXACTLY (`lane_key`),
+        //     never by `Operand`'s derived float equality — a {-0.0, +0.0}
+        //     mismatch under `==` would fold a ternary whose ±0 lanes the
+        //     packed op answers differently.
+        {
             let sel_shape =
                 |v: &Value| -> Option<(IrCmpOp, Operand, Operand, Operand, Operand, Value)> {
                     let i = ctx.def_pos.get(&v.0)?;
@@ -1999,7 +2212,8 @@ fn build_pack(
                     ))
                 };
             if vals.iter().all(|v| sel_shape(v).is_some()) {
-                // Uniform fold decision across lanes.
+                let is_fp = matches!(ty, IrType::F32 | IrType::F64);
+                // ── (a) the min/max fold ──────────────────────────────
                 #[derive(Clone, Copy, PartialEq)]
                 enum Fold {
                     Min,
@@ -2011,21 +2225,28 @@ fn build_pack(
                     let Some((op, l, r, t, f, _)) = sel_shape(v) else {
                         unreachable!()
                     };
-                    let this = match op {
-                        IrCmpOp::Slt => {
+                    // FP admits only the STRICT spellings (non-strict
+                    // differs on ±0); integer lanes admit every relational
+                    // spelling (exactness argument above).
+                    let spell = match op {
+                        IrCmpOp::Slt | IrCmpOp::Sle => Some(0),
+                        IrCmpOp::Sgt | IrCmpOp::Sge => Some(1),
+                        _ => None,
+                    };
+                    let this = match (spell, is_fp && matches!(op, IrCmpOp::Sle | IrCmpOp::Sge)) {
+                        (Some(s), false) => {
                             if same_source(ctx, &t, &l) && same_source(ctx, &f, &r) {
-                                Some((Fold::Min, false))
+                                Some(if s == 0 {
+                                    (Fold::Min, false)
+                                } else {
+                                    (Fold::Max, false)
+                                })
                             } else if same_source(ctx, &t, &r) && same_source(ctx, &f, &l) {
-                                Some((Fold::Max, true))
-                            } else {
-                                None
-                            }
-                        }
-                        IrCmpOp::Sgt => {
-                            if same_source(ctx, &t, &l) && same_source(ctx, &f, &r) {
-                                Some((Fold::Max, false))
-                            } else if same_source(ctx, &t, &r) && same_source(ctx, &f, &l) {
-                                Some((Fold::Min, true))
+                                Some(if s == 0 {
+                                    (Fold::Max, true)
+                                } else {
+                                    (Fold::Min, true)
+                                })
                             } else {
                                 None
                             }
@@ -2041,17 +2262,19 @@ fn build_pack(
                         }
                     }
                 }
-                let _dbg_trace = std::env::var("LCCC_DEBUG_SLP_TRACE").is_ok();
-                if _dbg_trace {
-                    eprintln!("[SLP-TRACE] 2c: sel_shapes ok, fold={}", fold.is_some());
-                }
                 if shapes_ok && fold.is_some() {
                     let (kind, arms_swapped) = fold.unwrap();
-                    let vec_op = packed_minmax(kind == Fold::Max, ty, width);
+                    let vec_op = if is_fp {
+                        packed_minmax(kind == Fold::Max, ty, width)
+                    } else {
+                        packed_int_minmax(kind == Fold::Max, ty, width)
+                    };
                     if let Some(vec_op) = vec_op {
                         // src1/src2 lanes per the fold's operand order:
                         // arms_swapped selects (r, l) for the mirrored
-                        // spellings — the FALSE arm must be src2.
+                        // spellings — the FALSE arm must be src2 (the FP
+                        // operand contract; integer min/max is commutative
+                        // so either order is exact there).
                         let mut src1: Vec<Operand> = Vec::with_capacity(width);
                         let mut src2: Vec<Operand> = Vec::with_capacity(width);
                         let mut conds: Vec<Value> = Vec::with_capacity(width);
@@ -2084,6 +2307,107 @@ fn build_pack(
                             });
                             dedup.insert(key, idx);
                             return Some(idx);
+                        }
+                    }
+                }
+                // ── (b) the general cmp+blendv fold ────────────────────
+                // Uniform compare op across lanes; the predicate immediate
+                // follows the VecCmp* vocabulary (mirrored relations swap
+                // the compare operands and use the primary predicate).
+                // FP admits the six C-spelling predicates; unsigned
+                // relations only exist for integer lanes.
+                if let Some(first) = vals.first() {
+                    let (op0, _, _, _, _, _) = sel_shape(first).unwrap();
+                    let pred = cmp_predicate_imm(op0, is_fp);
+                    if let Some((pred, swap)) = pred {
+                        if let Some((cmp_op, blend_op)) = packed_cmp_blendv(ty, width) {
+                            let mut l_lanes: Vec<Operand> = Vec::with_capacity(width);
+                            let mut r_lanes: Vec<Operand> = Vec::with_capacity(width);
+                            let mut t_lanes: Vec<Operand> = Vec::with_capacity(width);
+                            let mut f_lanes: Vec<Operand> = Vec::with_capacity(width);
+                            let mut conds: Vec<Value> = Vec::with_capacity(width);
+                            let mut uniform = true;
+                            for v in &vals {
+                                let (op, l, r, t, f, cv) = sel_shape(v).unwrap();
+                                if op != op0 {
+                                    uniform = false;
+                                    break;
+                                }
+                                l_lanes.push(strip_identity_casts(ctx, &l));
+                                r_lanes.push(strip_identity_casts(ctx, &r));
+                                t_lanes.push(t.clone());
+                                f_lanes.push(f.clone());
+                                conds.push(cv);
+                            }
+                            if uniform {
+                                // The mirrored relations compare (r, l).
+                                let (a_lanes, b_lanes) = if swap {
+                                    (&r_lanes, &l_lanes)
+                                } else {
+                                    (&l_lanes, &r_lanes)
+                                };
+                                if let (Some(lhs), Some(rhs), Some(tv), Some(fv)) = (
+                                    build_pack(
+                                        ctx,
+                                        a_lanes,
+                                        ty,
+                                        width,
+                                        fam,
+                                        packs,
+                                        dedup,
+                                        depth + 1,
+                                    ),
+                                    build_pack(
+                                        ctx,
+                                        b_lanes,
+                                        ty,
+                                        width,
+                                        fam,
+                                        packs,
+                                        dedup,
+                                        depth + 1,
+                                    ),
+                                    build_pack(
+                                        ctx,
+                                        &t_lanes,
+                                        ty,
+                                        width,
+                                        fam,
+                                        packs,
+                                        dedup,
+                                        depth + 1,
+                                    ),
+                                    build_pack(
+                                        ctx,
+                                        &f_lanes,
+                                        ty,
+                                        width,
+                                        fam,
+                                        packs,
+                                        dedup,
+                                        depth + 1,
+                                    ),
+                                ) {
+                                    let idx = packs.len();
+                                    packs.push(Pack {
+                                        kind: PackKind::CmpBlendv {
+                                            cmp_op,
+                                            blend_op,
+                                            pred,
+                                            lhs,
+                                            rhs,
+                                            tv,
+                                            fv,
+                                            cond_lanes: conds,
+                                        },
+                                        lane_vals: vals.clone(),
+                                        sched: usize::MAX,
+                                        order: 0,
+                                    });
+                                    dedup.insert(key, idx);
+                                    return Some(idx);
+                                }
+                            }
                         }
                     }
                 }
@@ -2646,6 +2970,17 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                     stack.push(lhs);
                     stack.push(rhs);
                 }
+                PackKind::FpNeg { val, .. } => {
+                    stack.push(val);
+                }
+                PackKind::CmpBlendv {
+                    lhs, rhs, tv, fv, ..
+                } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                    stack.push(tv);
+                    stack.push(fv);
+                }
                 _ => {}
             }
         }
@@ -2672,6 +3007,17 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                         *lhs = remap[*lhs];
                         *rhs = remap[*rhs];
                     }
+                    PackKind::FpNeg { val, .. } => {
+                        *val = remap[*val];
+                    }
+                    PackKind::CmpBlendv {
+                        lhs, rhs, tv, fv, ..
+                    } => {
+                        *lhs = remap[*lhs];
+                        *rhs = remap[*rhs];
+                        *tv = remap[*tv];
+                        *fv = remap[*fv];
+                    }
                     _ => {}
                 }
             }
@@ -2683,7 +3029,8 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     // ── Schedules ──────────────────────────────────────────────────────
     // Op/MemLoad packs: max lane def position (strictly before every
     // consumer — SSA within the block). Splat/gather leaves: min over
-    // consumers, resolved by fixpoint.
+    // consumers, resolved by fixpoint — EXCEPT splats, which take their
+    // EARLIEST valid position instead (see the splat block below).
     for p in packs.iter_mut() {
         if !p.lane_vals.is_empty() {
             p.sched = p
@@ -2692,6 +3039,61 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 .map(|v| ctx.def_pos[&v.0])
                 .max()
                 .unwrap_or(0);
+        }
+    }
+    // Splats: EARLIEST-valid scheduling. A splat is pure, so the only
+    // ordering constraints are (1) its scalar source's def and (2) the
+    // block's phi prefix (a non-phi must never be inserted before a phi).
+    // Placing splats at the earliest valid point — instead of the
+    // latest (min over consumers) — puts every MemLoad pack ADJACENT to
+    // the op pack that consumes it: the emitted IR reads
+    //   [splat, ..., load, op]
+    // instead of [load, splat, op], and the VLFOLD memory-fold analysis
+    // (which requires the load next to — or next-but-one across another
+    // pure load from — its consumer) fires for the streamed-load shapes
+    // (`q[i] = a[i] - 1`, `~a[i]`, ARX quarter-rounds) exactly like
+    // GCC/Clang schedule them: constant materialisation first, then
+    // `vop (%rdi), %xmmK, %xmmD`. A value splat's source is defined
+    // before the scalar lanes that consumed it (SSA), so
+    // src_def+1 ≤ every consumer's schedule — never a violation.
+    {
+        // The prologue-like prefix: phis, ParamRefs and Allocas. A non-
+        // prologue instruction inserted before a ParamRef breaks the
+        // `x86_param_caller_homes_safe` prefix walk — the params then lose
+        // their ABI-register homes and pay an entry copy + callee-save
+        // push/pop pair each (measured on the ksub showdown shape: +6
+        // instructions). Nothing but these three forms may precede the
+        // first real instruction.
+        let phi_prefix = block
+            .instructions
+            .iter()
+            .position(|i| {
+                !matches!(
+                    i,
+                    Instruction::Phi { .. }
+                        | Instruction::ParamRef { .. }
+                        | Instruction::Alloca { .. }
+                )
+            })
+            .unwrap_or(block.instructions.len());
+        for (pi, p) in packs.iter_mut().enumerate() {
+            // The ROOT splat (an all-constant seed like `q[0..3] = 0`)
+            // feeds only the seed STORE; early placement would needlessly
+            // extend its live range across the whole block, so it keeps
+            // the fixpoint/store-slot discipline.
+            if pi == root {
+                continue;
+            }
+            if let PackKind::Splat { src, .. } = &p.kind {
+                let earliest = match src {
+                    Operand::Value(v) => match ctx.def_pos.get(&v.0) {
+                        Some(&d) => (d + 1).max(phi_prefix),
+                        None => phi_prefix, // foreign value: dominates
+                    },
+                    Operand::Const(_) => phi_prefix,
+                };
+                p.sched = earliest;
+            }
         }
     }
     loop {
@@ -2712,6 +3114,10 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                     // BinOp consumes its sides.
                     PackKind::ShiftImm { val, .. } => Some(vec![*val]),
                     PackKind::FpMinMax { lhs, rhs, .. } => Some(vec![*lhs, *rhs]),
+                    PackKind::FpNeg { val, .. } => Some(vec![*val]),
+                    PackKind::CmpBlendv {
+                        lhs, rhs, tv, fv, ..
+                    } => Some(vec![*lhs, *rhs, *tv, *fv]),
                     _ => None,
                 };
                 if let Some(ins) = inputs {
@@ -2763,7 +3169,9 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         // folded Selects — their only remaining uses die with the select
         // lanes (an external use rejects the seed in the legality walk
         // below).
-        if let PackKind::FpMinMax { cond_lanes, .. } = &p.kind {
+        if let PackKind::FpMinMax { cond_lanes, .. } | PackKind::CmpBlendv { cond_lanes, .. } =
+            &p.kind
+        {
             for c in cond_lanes {
                 removed.insert(ctx.def_pos[&c.0]);
             }
@@ -2845,10 +3253,25 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     // ── Legality ───────────────────────────────────────────────────────
     for p in packs.iter() {
         for v in &p.lane_vals {
-            // (b) No cross-block uses of a replaced lane.
-            if ctx.external_uses.contains(&v.0) {
-                return None;
-            }
+            // (b) CROSS-BLOCK USES ARE PERMITTED (v6 relaxation of the
+            // original blanket rejection). Soundness PROOF: the extract
+            // is placed in the lane's defining block B at p.sched — the
+            // maximum of the pack's lane-def positions, i.e. AFTER every
+            // lane def and before B's terminator. For ANY use of the
+            // lane (an instruction in another block U, or a phi incoming
+            // on an edge P→U), SSA validity gives def(v) dom use; block
+            // linearity means any path containing def(v) executes all
+            // of B — including the later extract position — before
+            // leaving B, so the extract dominates the same use. The
+            // rewrite (apply_plan rewrites EVERY block's uses) replaces
+            // the use with the extract value; nothing reads a deleted
+            // def.
+            //
+            // The one EXCEPTION kept from the original rule: in-block
+            // uses BEFORE the pack's slot (rule (a) below) — including
+            // self-loop backedge phi incomings recorded at the phi's
+            // position.
+            //
             // (a) In-block external uses must be scheduled strictly after
             // the pack's vector op (the replacing extract is placed with
             // the vector op). Uses at usize::MAX (terminator) are always
@@ -2859,12 +3282,15 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 }
             }
         }
-        // The FP min/max fold's Cmp lanes: NO extract exists for them (a
-        // scalar bool cannot be reconstructed from the packed mask), so
-        // EVERY use outside the removed set — early OR late, terminator
-        // included — rejects the seed. (The early-only variant left the
-        // cmp's later consumers reading a deleted def: backend ICE.)
-        if let PackKind::FpMinMax { cond_lanes, .. } = &p.kind {
+        // The min/max and cmp+blendv folds' Cmp lanes: NO extract exists
+        // for them (a scalar bool cannot be reconstructed from the packed
+        // mask), so EVERY use outside the removed set — early OR late,
+        // terminator included — rejects the seed. (The early-only variant
+        // left the cmp's later consumers reading a deleted def: backend
+        // ICE.)
+        if let PackKind::FpMinMax { cond_lanes, .. } | PackKind::CmpBlendv { cond_lanes, .. } =
+            &p.kind
+        {
             for c in cond_lanes {
                 if ctx.external_uses.contains(&c.0) {
                     return None;
@@ -3038,10 +3464,14 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 .uses
                 .get(&v.0)
                 .map(|us| us.iter().any(|&u| u == usize::MAX || !removed.contains(&u)))
-                .unwrap_or(false);
+                .unwrap_or(false)
+                // Cross-block uses (rule (b)'s relaxation) need extracts
+                // exactly like surviving in-block uses: the extract lives
+                // with the pack and every rewritten external use reads it.
+                || ctx.external_uses.contains(&v.0);
             if has_external {
                 // Only families with an exact lane-extract intrinsic can
-                // service external uses in v1.
+                // service external uses.
                 if fam.extract.is_none() {
                     return None;
                 }
@@ -3072,6 +3502,16 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             // replacement (the cmp removal is uncounted headroom).
             PackKind::FpMinMax { .. } => {
                 benefit += width as i64 - 1;
+            }
+            // FP negation: W scalar negs → ONE packed XOR whose sign mask
+            // is a free .rodata memory operand (no splat, no register).
+            PackKind::FpNeg { .. } => {
+                benefit += width as i64 - 1;
+            }
+            // The cmp+blendv composite: W scalar compares AND W selects
+            // → TWO packed ops (the mask is exact for every predicate).
+            PackKind::CmpBlendv { .. } => {
+                benefit += 2 * (width as i64 - 1);
             }
             // Plain scalar shift lanes replace W ops with one vector op
             // (+W-1); the synthetic halves of a rotate decomposition
@@ -3111,6 +3551,15 @@ fn topo_depth(packs: &[Pack], idx: usize) -> usize {
             1 + topo_depth(packs, *lhs).max(topo_depth(packs, *rhs))
         }
         PackKind::ShiftImm { val, .. } => 1 + topo_depth(packs, *val),
+        PackKind::FpNeg { val, .. } => 1 + topo_depth(packs, *val),
+        PackKind::CmpBlendv {
+            lhs, rhs, tv, fv, ..
+        } => {
+            1 + topo_depth(packs, *lhs)
+                .max(topo_depth(packs, *rhs))
+                .max(topo_depth(packs, *tv))
+                .max(topo_depth(packs, *fv))
+        }
         PackKind::FpMinMax { lhs, rhs, .. } => {
             1 + topo_depth(packs, *lhs).max(topo_depth(packs, *rhs))
         }
@@ -3140,6 +3589,15 @@ fn apply_plan(
     for _ in 0..plan.packs.len() {
         vec_dest.push(Value(func.next_value_id));
         func.next_value_id += 1;
+    }
+    // The CmpBlendv packs carry TWO vector results (the compare mask and
+    // the blend output); the mask value gets its own SSA id here.
+    let mut cmp_mask_dest: FxHashMap<usize, Value> = FxHashMap::default();
+    for (pi, p) in plan.packs.iter().enumerate() {
+        if matches!(p.kind, PackKind::CmpBlendv { .. }) {
+            cmp_mask_dest.insert(pi, Value(func.next_value_id));
+            func.next_value_id += 1;
+        }
     }
     let mut extract_dest: FxHashMap<u32, Value> = FxHashMap::default();
     for (&vid, _) in &plan.extract_of {
@@ -3215,6 +3673,58 @@ fn apply_plan(
                     Operand::Value(vec_dest[*rhs]),
                 ],
             },
+            PackKind::FpNeg { vec_op, val } => {
+                // The Const(-0.0) operand selects the backend's sign-mask
+                // memory-operand fast path (one instruction, GCC parity).
+                let mz = minus_zero_const(cand.ty)
+                    .expect("FpNeg packs are only built for F32/F64 lanes");
+                Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: *vec_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(vec_dest[*val]), Operand::Const(mz)],
+                }
+            }
+            PackKind::CmpBlendv {
+                cmp_op,
+                blend_op,
+                pred,
+                lhs,
+                rhs,
+                tv,
+                fv,
+                ..
+            } => {
+                // TWO intrinsics at the same schedule slot: the compare
+                // first, then the select reading its mask (the stable
+                // (sched, order) sort preserves this push order; the
+                // extracts ride at p.order+1+li, after both).
+                let mask = cmp_mask_dest[&pi];
+                inserts.push((
+                    p.sched,
+                    p.order,
+                    Instruction::Intrinsic {
+                        dest: Some(mask),
+                        op: *cmp_op,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(vec_dest[*lhs]),
+                            Operand::Value(vec_dest[*rhs]),
+                            Operand::Const(IrConst::I32(*pred as i32)),
+                        ],
+                    },
+                ));
+                Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: *blend_op,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(vec_dest[*fv]),
+                        Operand::Value(vec_dest[*tv]),
+                        Operand::Value(mask),
+                    ],
+                }
+            }
         };
         inserts.push((p.sched, p.order, inst));
         // Extracts ride with their pack (pure reads; placement with the
@@ -3300,6 +3810,24 @@ fn apply_plan(
     func.blocks[block_idx].instructions = new_insts;
     func.blocks[block_idx].source_spans = new_spans;
 
+    // Cross-block use rewrite (rule (b)'s v6 relaxation): the extracts
+    // live in THIS block and dominate every external use (see the proof
+    // in the legality walk), so every OTHER block's uses of the replaced
+    // lanes — instructions, phi incomings, terminators — are rewritten to
+    // the extract values through the canonical mutation walkers. The map
+    // is usually tiny; the per-block scan is a cheap hash-miss walk.
+    if !extract_dest.is_empty() {
+        for (bi, blk) in func.blocks.iter_mut().enumerate() {
+            if bi == block_idx {
+                continue;
+            }
+            for inst in blk.instructions.iter_mut() {
+                rewrite_uses_in_place(inst, &extract_dest);
+            }
+            rewrite_term_uses_in_place(&mut blk.terminator, &extract_dest);
+        }
+    }
+
     // Terminator use rewrite.
     let term = std::mem::replace(
         &mut func.blocks[block_idx].terminator,
@@ -3323,6 +3851,8 @@ fn apply_plan(
                     format!("ShiftImm(v{} ${})", val, amount)
                 }
                 PackKind::FpMinMax { .. } => "FpMinMax".into(),
+                PackKind::FpNeg { .. } => "FpNeg".into(),
+                PackKind::CmpBlendv { .. } => "CmpBlendv".into(),
             })
             .collect();
         eprintln!(
@@ -3377,4 +3907,39 @@ fn rewrite_term_uses(mut term: Terminator, map: &FxHashMap<u32, Value>) -> Termi
         }
     });
     term
+}
+
+/// In-place variants of `rewrite_uses`/`rewrite_term_uses` for the
+/// cross-block rewrite (rule (b)'s v6 relaxation): the same canonical
+/// mutation walkers, applied to OTHER blocks' instructions and
+/// terminators without moving them.
+fn rewrite_uses_in_place(inst: &mut Instruction, map: &FxHashMap<u32, Value>) {
+    if map.is_empty() {
+        return;
+    }
+    inst.for_each_operand_mut(|op| {
+        if let Operand::Value(v) = op {
+            if let Some(&nv) = map.get(&v.0) {
+                *op = Operand::Value(nv);
+            }
+        }
+    });
+    inst.for_each_value_use_mut(|v| {
+        if let Some(&nv) = map.get(&v.0) {
+            *v = nv;
+        }
+    });
+}
+
+fn rewrite_term_uses_in_place(term: &mut Terminator, map: &FxHashMap<u32, Value>) {
+    if map.is_empty() {
+        return;
+    }
+    term.for_each_operand_mut(|op| {
+        if let Operand::Value(v) = op {
+            if let Some(&nv) = map.get(&v.0) {
+                *op = Operand::Value(nv);
+            }
+        }
+    });
 }

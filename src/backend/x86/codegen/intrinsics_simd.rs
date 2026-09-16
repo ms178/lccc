@@ -64,7 +64,7 @@ impl X86Codegen {
             self.value_to_reg(dest_ptr, "rax");
             self.state.emit("    vmovdqu64 %zmm0, (%rax)");
         }
-        self.state.vec_live_regs.insert(dest_ptr.0, "zmm0");
+        self.state.vec_claim_live_reg(dest_ptr.0, "zmm0");
     }
 
     /// Whether arg[0] may be folded as a memory operand (never if the value is
@@ -216,7 +216,7 @@ impl X86Codegen {
             "    {} ${}, %{}, %{}, %{}",
             inst, imm, r1, r2, r0
         ));
-        self.state.vec_live_regs.insert(dest_ptr.0, r0);
+        self.state.vec_claim_live_reg(dest_ptr.0, r0);
         let m = reg_width_move(r0);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state
@@ -271,7 +271,7 @@ impl X86Codegen {
             "    {} ${}, %{}, %{}, %{}",
             inst, imm, r1, r0, r0
         ));
-        self.state.vec_live_regs.insert(dest_ptr.0, r0);
+        self.state.vec_claim_live_reg(dest_ptr.0, r0);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state
                 .emit_fmt(format_args!("    {} %{}, {}", reg_width_move(r0), r0, mem));
@@ -1116,7 +1116,7 @@ impl X86Codegen {
         self.evex_load_arg(&args[0]);
         self.state
             .emit_fmt(format_args!("    {} ${}, %zmm0, %{}", inst, imm, dst_reg));
-        self.state.vec_live_regs.insert(dest_ptr.0, dst_reg);
+        self.state.vec_claim_live_reg(dest_ptr.0, dst_reg);
         let m = reg_width_move(dst_reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state
@@ -1185,7 +1185,7 @@ impl X86Codegen {
             self.value_to_reg(dest_ptr, "rax");
             self.state.emit("    vmovdqu %ymm0, (%rax)");
         }
-        self.state.vec_live_regs.insert(dest_ptr.0, "ymm0");
+        self.state.vec_claim_live_reg(dest_ptr.0, "ymm0");
     }
 
     /// 128 -> 512 cast (register move; upper bits undefined like GCC).
@@ -1240,7 +1240,7 @@ impl X86Codegen {
         self.operand_to_reg(&args[1], "rax");
         self.state
             .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}{{z}}", reg));
-        self.state.vec_live_regs.insert(dest_ptr.0, reg);
+        self.state.vec_claim_live_reg(dest_ptr.0, reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state.emit_fmt(format_args!(
                 "    {} %{}, {}",
@@ -1265,7 +1265,7 @@ impl X86Codegen {
         self.operand_to_reg(&args[1], "rax");
         self.state
             .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}", reg));
-        self.state.vec_live_regs.insert(dest_ptr.0, reg);
+        self.state.vec_claim_live_reg(dest_ptr.0, reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state.emit_fmt(format_args!(
                 "    {} %{}, {}",
@@ -1358,7 +1358,7 @@ impl X86Codegen {
             "    {} ${}, %zmm0, %{}{{k1}}{{z}}",
             inst, imm, dst_reg
         ));
-        self.state.vec_live_regs.insert(dest_ptr.0, dst_reg);
+        self.state.vec_claim_live_reg(dest_ptr.0, dst_reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state.emit_fmt(format_args!(
                 "    {} %{}, {}",
@@ -1400,7 +1400,7 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    vpshufb %xmm2, %xmm1, %xmm0{{k1}}"));
         }
-        self.state.vec_live_regs.insert(dest_ptr.0, "xmm0");
+        self.state.vec_claim_live_reg(dest_ptr.0, "xmm0");
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state
                 .emit_fmt(format_args!("    vmovdqu %xmm0, {}", mem));
@@ -1933,7 +1933,7 @@ impl X86Codegen {
                 self.avx_load_arg(&args[0]);
                 self.state
                     .emit_fmt(format_args!("    vextractf128 ${}, %ymm0, %xmm0", imm));
-                self.state.vec_live_regs.insert(dest_ptr.0, "xmm0");
+                self.state.vec_claim_live_reg(dest_ptr.0, "xmm0");
                 if let Some(m) = self.value_ptr_mem_operand(dest_ptr.0) {
                     self.state
                         .emit_fmt(format_args!("    vmovdqu %xmm0, {}", m));

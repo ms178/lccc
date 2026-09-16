@@ -44,6 +44,30 @@ pub(super) enum BlendvDomain {
 }
 
 impl X86Codegen {
+    /// Emitter-side commutativity table for the 128-bit VEX memfold: may the
+    /// folded load sit in the IR args[0] (src1) position? The IR analysis
+    /// (`memfold_consumer_128`) is the admission authority and only marks
+    /// args[0] for commutative ops; this table is the independent, fail-closed
+    /// defense at the point of emission — a mnemonic not listed here is
+    /// treated as non-commutative and the fold is materialised instead. The
+    /// vocabulary is exactly the set of legacy mnemonics the `Vec*` dispatch
+    /// passes to `emit_sse_binary_128` (an unknown mnemonic can only come
+    /// from a NEW dispatch site, which must be added here — or reviewed —
+    /// deliberately).
+    fn sse128_mnemonic_commutative(inst: &str) -> bool {
+        matches!(
+            inst,
+            // Integer/FP add and mul (wrapping/IEEE lane arithmetic).
+            "paddb" | "paddw" | "paddd" | "paddq"
+                | "pmullw" | "pmulld"
+                | "addps" | "addpd" | "mulps" | "mulpd"
+                // Bitwise (integer and FP domains alike — pure lane XOR).
+                | "pand" | "por" | "pxor" | "xorps" | "xorpd"
+                // Integer min/max (no FP unordered/±0 asymmetry).
+                | "pminub" | "pmaxub" | "pminsw" | "pmaxsw"
+                | "pminsd" | "pmaxsd"
+        )
+    }
     /// Load a float operand into %xmm0. Handles both Value operands (from stack)
     /// and float constants (loaded via their bit pattern into rax first).
     fn float_operand_to_xmm0(&mut self, op: &Operand, is_f32: bool) {
@@ -175,6 +199,9 @@ impl X86Codegen {
                     if name != xmm {
                         self.state
                             .emit_fmt(format_args!("    movdqa %{}, %{}", name, xmm));
+                        // The home->scratch copy overwrites `xmm`: every
+                        // OTHER value's claim on that bank just died.
+                        self.state.vec_evict_bank_except(xmm, v.0);
                     }
                     self.state.sse_last_store_reg = false;
                     return;
@@ -185,6 +212,9 @@ impl X86Codegen {
                 if held != xmm {
                     self.state
                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
+                    // The move-aside overwrites `xmm`: every OTHER value's
+                    // claim on that bank just died.
+                    self.state.vec_evict_bank_except(xmm, v.0);
                     self.state.sse_last_store_val = Some(v.0);
                     self.state.sse_last_store_reg = true;
                     self.state.sse_last_store_reg_name = Some(xmm);
@@ -200,6 +230,7 @@ impl X86Codegen {
                 if held != xmm {
                     self.state
                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
+                    self.state.vec_evict_bank_except(xmm, v.0);
                     self.state.sse_last_store_reg_name = Some(xmm);
                 } else {
                     self.state.sse_last_store_reg = false;
@@ -220,6 +251,9 @@ impl X86Codegen {
             if let Some(mem) = self.value_ptr_mem_operand(v.0) {
                 self.state
                     .emit_fmt(format_args!("    movdqu {}, %{}", mem, xmm));
+                // The load overwrites `xmm` with `v`'s data: every OTHER
+                // value's claim on that bank is now stale.
+                self.state.vec_evict_bank_except(xmm, v.0);
                 self.state.sse_last_store_reg = false;
                 return;
             }
@@ -228,6 +262,9 @@ impl X86Codegen {
         self.operand_to_reg(arg, "rax");
         self.state
             .emit_fmt(format_args!("    movdqu (%rax), %{}", xmm));
+        if let Operand::Value(v) = arg {
+            self.state.vec_evict_bank_except(xmm, v.0);
+        }
         self.state.sse_last_store_reg = false;
     }
 
@@ -242,7 +279,7 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    movdqa %{}, %{}", xmm, name));
                 }
-                self.state.vec_live_regs.insert(dest_ptr.0, name);
+                self.state.vec_claim_live_reg(dest_ptr.0, name);
                 self.state.sse_last_store_val = Some(dest_ptr.0);
                 self.state.sse_last_store_reg = true;
                 self.state.sse_last_store_reg_name = Some(name);
@@ -270,6 +307,12 @@ impl X86Codegen {
                     // value does not flow into its consumer via the register.
                     self.state.pending_vec_store = Some((dest_ptr.0, xmm, false));
                 }
+                // `xmm` now holds THIS value (stored or pending): every
+                // OTHER value's claim on that bank is stale — the producing
+                // op (pclmulqdq/blend/etc. destructive forms that stage
+                // through the scratch) overwrote it (the crc_fold_state1
+                // stale-claim class).
+                self.state.vec_evict_bank_except(xmm, dest_ptr.0);
                 self.state.sse_last_store_slot = Some(slot.0);
                 self.state.sse_last_store_val = Some(dest_ptr.0);
                 self.state.sse_last_store_reg = true;
@@ -284,6 +327,7 @@ impl X86Codegen {
         } else {
             self.state.pending_vec_store = Some((dest_ptr.0, xmm, false));
         }
+        self.state.vec_evict_bank_except(xmm, dest_ptr.0);
         self.state.sse_last_store_val = Some(dest_ptr.0);
         self.state.sse_last_store_reg = true;
         self.state.sse_last_store_reg_name = Some(xmm);
@@ -296,8 +340,8 @@ impl X86Codegen {
     /// store that was originally skipped, making deferred stores sound by
     /// construction. No-op when nothing is pending.
     /// VLFOLD entry (see `compute_vector_memfold_values`): elide an eligible
-    /// 256-bit load and remember its source memory operand for the adjacent
-    /// consumer. Returns `true` when nothing must be emitted for this
+    /// 256-bit or 128-bit load and remember its source memory operand for the
+    /// adjacent consumer. Returns `true` when nothing must be emitted for this
     /// intrinsic. Falls back to the ordinary load path unless base/index are
     /// RA-homed GPRs (or a zero constant) — scratch `%rax`/`%rcx` addressing
     /// would not survive the intervening load — and unless the destination
@@ -310,6 +354,12 @@ impl X86Codegen {
     ///
     /// one instruction and one live register fewer per iteration.  GCC's byte
     /// clamp is exactly the folded form (`vpminub (%rsi,%rax), %ymm3, %ymm0`).
+    ///
+    /// 128-bit loads join under `avx2_enabled`: the VEX.128 encoding of the
+    /// consumer reads r/m128 with NO alignment requirement, exactly like the
+    /// VEX.256 forms (the whole point of VEX). Legacy SSE memory operands
+    /// would require 16-byte alignment the streamed objects do not carry, so
+    /// the 128-bit families stay ordinary loads without AVX2.
     ///
     /// This used to bail on a homed destination, and that bail WAS
     /// load-bearing -- but the hazard was never the single-use census, it was
@@ -356,18 +406,30 @@ impl X86Codegen {
         {
             return false;
         }
-        let mnemonic = match op {
-            IntrinsicOp::VecLoadF64x4 => "vmovupd",
-            IntrinsicOp::VecLoadF32x8 => "vmovups",
+        let (mnemonic, width): (&'static str, u32) = match op {
+            IntrinsicOp::VecLoadF64x4 => ("vmovupd", 32),
+            IntrinsicOp::VecLoadF32x8 => ("vmovups", 32),
             // VecLoadI16x16 is the halfword twin of VecLoadI8x32: the same
             // vmovdqu %ymm stream load, the same vec_mem_operand arg layout
             // (base, index, const disp). Without this arm the elision
             // rejected every halfword map loop's stream load — one extra
             // vmovdqu + register-home round trip per fold (Review F1).
             IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI8x32 | IntrinsicOp::VecLoadI16x16 => {
-                "vmovdqu"
+                ("vmovdqu", 32)
             }
-            IntrinsicOp::VecLoadI64x4 => "vmovdqu",
+            IntrinsicOp::VecLoadI64x4 => ("vmovdqu", 32),
+            // The 128-bit twins (VEX.128 forms are alignment-free, hence the
+            // avx2 gate — see the doc comment above).
+            IntrinsicOp::VecLoadF64x2 if self.avx2_enabled => ("vmovupd", 16),
+            IntrinsicOp::VecLoadF32x4 if self.avx2_enabled => ("vmovups", 16),
+            IntrinsicOp::VecLoadI32x4
+            | IntrinsicOp::VecLoadI64x2
+            | IntrinsicOp::VecLoadI16x8
+            | IntrinsicOp::VecLoadI8x16
+                if self.avx2_enabled =>
+            {
+                ("vmovdqu", 16)
+            }
             _ => return false,
         };
         // The allocator only hands out rbx/r8-r15 (never rsp/rbp/rdi/rsi/rdx
@@ -403,33 +465,52 @@ impl X86Codegen {
             eprintln!("[VLFOLD-EMIT] elide load %{} <- {} {}", d.0, mnemonic, mem);
         }
         self.state.vector_values.insert(d.0);
-        self.state.pending_vec_memfold = Some((d.0, mem, mnemonic));
+        self.state.pending_vec_memfold = Some(crate::backend::state::PendingVecMemfold {
+            val: d.0,
+            mem,
+            mnemonic,
+            width,
+        });
         true
     }
 
     /// Memory operand of a pending VLFOLD load if `arg` is that value.
     fn memfold_operand(&self, arg: &Operand) -> Option<String> {
         match (arg, &self.state.pending_vec_memfold) {
-            (Operand::Value(v), Some((pv, mem, _))) if v.0 == *pv => Some(mem.clone()),
+            (Operand::Value(v), Some(pf)) if v.0 == pf.val => Some(pf.mem.clone()),
             _ => None,
         }
     }
 
-    /// Materialise a pending VLFOLD load through `%ymm0` and its ordinary
-    /// home (register or slot). Never expected on the analysed shapes; keeps
-    /// the elision sound if an unexpected instruction intervenes.
+    /// Materialise a pending VLFOLD load through the scratch register and
+    /// its ordinary home (register or slot). Never expected on the analysed
+    /// shapes; keeps the elision sound if an unexpected instruction
+    /// intervenes. WIDTH-EXACT: a 128-bit fold materialises through `%xmm0`
+    /// and the SSE store discipline reading ONLY 16 bytes — a 32-byte read
+    /// of a 16-byte object could cross a page the program never touched —
+    /// and a VEX.128 load zeroes the upper YMM half, so `dirty_upper_ymm`
+    /// stays clear exactly like every other 128-bit VEX load.
     pub(super) fn materialize_pending_memfold(&mut self) {
-        let Some((val, mem, mnemonic)) = self.state.pending_vec_memfold.take() else {
+        let Some(pf) = self.state.pending_vec_memfold.take() else {
             return;
         };
         if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
-            eprintln!("[VLFOLD-EMIT] materialising %{} (unexpected consumer)", val);
+            eprintln!(
+                "[VLFOLD-EMIT] materialising %{} (unexpected consumer)",
+                pf.val
+            );
         }
         self.flush_pending_vec_store_impl();
-        self.state
-            .emit_fmt(format_args!("    {} {}, %ymm0", mnemonic, mem));
-        self.state.dirty_upper_ymm = true;
-        self.avx_store_dest(&Value(val));
+        if pf.width == 16 {
+            self.state
+                .emit_fmt(format_args!("    {} {}, %xmm0", pf.mnemonic, pf.mem));
+            self.sse_store_dest(&Value(pf.val), "xmm0");
+        } else {
+            self.state
+                .emit_fmt(format_args!("    {} {}, %ymm0", pf.mnemonic, pf.mem));
+            self.state.dirty_upper_ymm = true;
+            self.avx_store_dest(&Value(pf.val));
+        }
         // The value now has a real home; a later deferral is not permitted
         // to skip the store again for this def.
         self.flush_pending_vec_store_impl();
@@ -531,6 +612,88 @@ impl X86Codegen {
             args.len()
         );
 
+        // VLFOLD (memfold-FIRST, before every in-place/accumulator path —
+        // the emit_avx_binary_256_inner discipline): an elided single-use
+        // 128-bit load becomes the consumer's r/m operand. AT&T VEX order
+        // is `vop src2, src1, dst` and only the FIRST textual operand may
+        // be memory, so:
+        //   * the fold in args[1] (src2) emits `vop MEM, src1, dst` —
+        //     legal for EVERY op (the r/m slot is exactly src2);
+        //   * the fold in args[0] (src1) is only admitted by the IR
+        //     analysis for COMMUTATIVE ops and emits `vop MEM, src2, dst`
+        //     (= src2 op MEM = src1 op src2); the mnemonic table below is
+        //     the emitter-side defense — an unknown mnemonic materialises
+        //     instead of guessing.
+        // Width-matched to 16: a foreign-width fold can never reach here
+        // (the safety net materialises it first); this is defense.
+        if self.avx2_enabled {
+            if let Some(pf) = self.state.pending_vec_memfold.clone() {
+                if pf.width == 16 {
+                    let at1 = matches!(&args[1], Operand::Value(v) if v.0 == pf.val);
+                    let at0 = matches!(&args[0], Operand::Value(v) if v.0 == pf.val);
+                    if at0 && at1 {
+                        // The SAME elided value in both operand positions:
+                        // the IR analysis rejects this shape (a0 == a1), so
+                        // reaching it means an unanalysed producer —
+                        // materialise rather than fold one side and read the
+                        // never-written register for the other.
+                        self.materialize_pending_memfold();
+                    } else if at1 || (at0 && Self::sse128_mnemonic_commutative(sse_inst)) {
+                        let dst_home = self.dest_xmm_home_name(dest_ptr);
+                        let (mem_operand, reg_operand) = if at1 {
+                            let src1 = self.vex128_source(&args[0], "xmm0");
+                            (pf.mem, src1)
+                        } else {
+                            let src2 = self.vex128_source(&args[1], "xmm1");
+                            (pf.mem, src2)
+                        };
+                        let dst = match dst_home {
+                            Some(name) => format!("%{}", name),
+                            None => "%xmm0".to_string(),
+                        };
+                        self.state.emit_fmt(format_args!(
+                            "    v{} {}, {}, {}",
+                            sse_inst, mem_operand, reg_operand, dst
+                        ));
+                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+                        // Commit BEFORE creating the dest's own deferred
+                        // store: the commit clears a pending that names the
+                        // committed value (a SOURCE whose data flowed through
+                        // the write), and a pending created here belongs to
+                        // THIS dest — creating it first made the commit kill
+                        // the dest's only written-home (the hsum stale-slot
+                        // miscompile).
+                        self.sse_commit_dest_direct(dest_ptr, dst_static);
+                        if dst_home.is_none() {
+                            let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
+                            use crate::backend::state::SlotAddr;
+                            if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                                self.state.resolve_slot_addr(dest_ptr.0)
+                            {
+                                if !deferred {
+                                    self.state.emit_fmt(format_args!(
+                                        "    movdqu %xmm0, {}",
+                                        self.slot_ref(slot.0)
+                                    ));
+                                } else {
+                                    self.state.pending_vec_store =
+                                        Some((dest_ptr.0, "xmm0", false));
+                                }
+                            }
+                        }
+                        self.state.pending_vec_memfold = None;
+                        return;
+                    } else if at0 || at1 {
+                        // The op names the folded value but cannot fold it
+                        // here (non-commutative src1 position, or an
+                        // unrecognised mnemonic): materialise the load and
+                        // fall through to the ordinary paths.
+                        self.materialize_pending_memfold();
+                    }
+                }
+            }
+        }
+
         // In-place two-operand form (destructive-form coalescing in the
         // RA): the destination shares the first operand's home — the first
         // operand's last mention is this very instruction — and the second
@@ -583,7 +746,7 @@ impl X86Codegen {
                         if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(fresh.0) {
                             self.state.pending_vec_store = None;
                         }
-                        self.state.vec_live_regs.insert(dest_ptr.0, target);
+                        self.state.vec_claim_live_reg(dest_ptr.0, target);
                         self.state.sse_last_store_val = Some(dest_ptr.0);
                         self.state.sse_last_store_reg = true;
                         self.state.sse_last_store_reg_name = Some(target);
@@ -615,6 +778,15 @@ impl X86Codegen {
                     "    v{} {}, {}, {}",
                     sse_inst, src2, src1, dst
                 ));
+                let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+                // Commit BEFORE creating the dest's own deferred store: the
+                // commit clears a pending naming the committed value (a SOURCE
+                // whose data flowed through this write), and a pending created
+                // here belongs to THIS dest — creating it first let the commit
+                // kill the dest's only materialization (the hsum stale-slot
+                // miscompile: the deferred store vanished, the later consumer
+                // reloaded never-written memory).
+                self.sse_commit_dest_direct(dest_ptr, dst_static);
                 if dst_home.is_none() {
                     let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
                     use crate::backend::state::SlotAddr;
@@ -631,8 +803,6 @@ impl X86Codegen {
                         }
                     }
                 }
-                let dst_static: &'static str = dst_home.unwrap_or("xmm0");
-                self.sse_commit_dest_direct(dest_ptr, dst_static);
                 return;
             }
         }
@@ -693,17 +863,36 @@ impl X86Codegen {
         if let Operand::Value(v) = arg {
             // VLFOLD: a consumer path that needs the elided load in a
             // register performs the load itself (from the recorded source
-            // operand, never from the never-written home slot).
-            if self.memfold_operand(arg).is_some() {
-                let (_, mem, mnemonic) = self.state.pending_vec_memfold.take().unwrap();
-                if self.state.pending_vec_store.map(|(_, r, _)| r) == Some(ymm) {
-                    self.flush_pending_vec_store_impl();
+            // operand, never from the never-written home slot). WIDTH-EXACT:
+            // a 128-bit fold re-issues a 16-byte load into the XMM view of
+            // the requested register (a 32-byte read of a 16-byte object
+            // could cross a page); the upper YMM half then holds nothing
+            // this family reads, so `dirty_upper_ymm` stays clear exactly
+            // like every other VEX.128 load.
+            if let Some(pf) = self.state.pending_vec_memfold.clone() {
+                if v.0 == pf.val {
+                    self.state.pending_vec_memfold = None;
+                    if self.state.pending_vec_store.map(|(_, r, _)| r) == Some(ymm) {
+                        self.flush_pending_vec_store_impl();
+                    }
+                    // `ymm` is always "ymmN" (the reserved scratch pair);
+                    // its 128-bit view is "xmmN".
+                    let dst = if pf.width == 16 {
+                        format!("x{}", &ymm[1..])
+                    } else {
+                        ymm.to_string()
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %{}", pf.mnemonic, pf.mem, dst));
+                    // The re-issued load overwrites the register: every
+                    // OTHER value's claim on that bank just died.
+                    self.state.vec_evict_bank_except(ymm, v.0);
+                    if pf.width != 16 {
+                        self.state.dirty_upper_ymm = true;
+                    }
+                    self.state.vec_last_store_reg = false;
+                    return;
                 }
-                self.state
-                    .emit_fmt(format_args!("    {} {}, %{}", mnemonic, mem, ymm));
-                self.state.dirty_upper_ymm = true;
-                self.state.vec_last_store_reg = false;
-                return;
             }
             // Width-aware register allocation: PhysReg 20..33 names the SIMD
             // register family; this AVX helper selects its YMM view. Consult
@@ -720,6 +909,9 @@ impl X86Codegen {
                     if name != ymm {
                         self.state
                             .emit_fmt(format_args!("    vmovdqa %{}, %{}", name, ymm));
+                        // The home->scratch copy overwrites `ymm`: every
+                        // OTHER value's claim on that bank just died.
+                        self.state.vec_evict_bank_except(ymm, v.0);
                     }
                     self.state.vec_last_store_reg = false;
                     return;
@@ -730,6 +922,9 @@ impl X86Codegen {
                 if held != ymm {
                     self.state
                         .emit_fmt(format_args!("    vmovdqa %{}, %{}", held, ymm));
+                    // The move-aside overwrites `ymm`: every OTHER value's
+                    // claim on that bank just died.
+                    self.state.vec_evict_bank_except(ymm, v.0);
                     self.state.vec_last_store_val = Some(v.0);
                     self.state.vec_last_store_reg = true;
                     self.state.vec_last_store_reg_name = Some(ymm);
@@ -748,6 +943,7 @@ impl X86Codegen {
                 if held != ymm {
                     self.state
                         .emit_fmt(format_args!("    vmovdqa %{}, %{}", held, ymm));
+                    self.state.vec_evict_bank_except(ymm, v.0);
                     self.state.vec_last_store_reg_name = Some(ymm);
                 } else {
                     self.state.vec_last_store_reg = false;
@@ -766,6 +962,9 @@ impl X86Codegen {
             if let Some(mem) = self.value_ptr_mem_operand(v.0) {
                 self.state
                     .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, ymm));
+                // The load overwrites `ymm` with `v`'s data: every OTHER
+                // value's claim on that bank is now stale.
+                self.state.vec_evict_bank_except(ymm, v.0);
                 self.state.vec_last_store_reg = false;
                 return;
             }
@@ -774,6 +973,9 @@ impl X86Codegen {
         self.operand_to_reg(arg, "rax");
         self.state
             .emit_fmt(format_args!("    vmovdqu (%rax), %{}", ymm));
+        if let Operand::Value(v) = arg {
+            self.state.vec_evict_bank_except(ymm, v.0);
+        }
         self.state.vec_last_store_reg = false;
     }
     pub(super) fn avx_load_arg(&mut self, arg: &Operand) {
@@ -871,8 +1073,42 @@ impl X86Codegen {
         }
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
+        // Homed destination: build the ones directly IN the home register —
+        // the self-compare's operands are the destination itself, so the
+        // legacy two-operand form writes it in place and the VEX form names
+        // it three times. This removes the xmm0 staging copy entirely (the
+        // `pcmpeqd %xmm0, %xmm0; movdqa %xmm0, %xmmN` pair the showdown
+        // shapes paid on every all-ones splat).
+        if let Some(d) = dest {
+            if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                if is_xmm_reg(reg) {
+                    if avx {
+                        let name = phys_reg_name_256(reg);
+                        self.state
+                            .emit_fmt(format_args!("    vpcmpeqd %{}, %{}, %{}", name, name, name));
+                        self.note_vec_dest_in_home(d, &format!("%{}", name));
+                    } else {
+                        let name: &'static str = phys_reg_name(reg);
+                        if self.avx2_enabled {
+                            self.state.emit_fmt(format_args!(
+                                "    vpcmpeqd %{}, %{}, %{}",
+                                name, name, name
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    pcmpeqd %{}, %{}", name, name));
+                        }
+                        self.sse_commit_dest_direct(d, name);
+                    }
+                    self.state.vector_values.insert(d.0);
+                    return true;
+                }
+            }
+        }
         if avx {
             self.state.emit("    vpcmpeqd %ymm0, %ymm0, %ymm0");
+        } else if self.avx2_enabled {
+            self.state.emit("    vpcmpeqd %xmm0, %xmm0, %xmm0");
         } else {
             self.state.emit("    pcmpeqd %xmm0, %xmm0");
         }
@@ -1026,7 +1262,7 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    vmovdqa %ymm0, %{}", name));
                 }
-                self.state.vec_live_regs.insert(dest_ptr.0, name);
+                self.state.vec_claim_live_reg(dest_ptr.0, name);
                 self.state.vec_last_store_val = Some(dest_ptr.0);
                 self.state.vec_last_store_reg = true;
                 self.state.vec_last_store_reg_name = Some(name);
@@ -1388,27 +1624,37 @@ impl X86Codegen {
         dest_ptr: &Option<Value>,
         args: &[Operand],
     ) {
-        // VLFOLD: an eligible single-use 256-bit load emits nothing; its
-        // adjacent consumer folds the source memory operand.
+        // VLFOLD: an eligible single-use 256-bit or 128-bit load emits
+        // nothing; its adjacent consumer folds the source memory operand.
         if self.try_elide_vec_load(dest, op, args) {
             return;
         }
         // VLFOLD safety net: only the registered consumer or an intervening
         // pure vector load may follow an elided load; anything else
         // materialises it first.
-        if let Some((pv, _, _)) = &self.state.pending_vec_memfold {
-            let pv = *pv;
+        if let Some(pf) = self.state.pending_vec_memfold.clone() {
             // "Consumes" must mean the op can actually FOLD the elided
             // load's memory operand — an args match alone is not enough.
             // A lane extract (or any future non-folding consumer) naming
             // the value would otherwise read the register the allocator
-            // reserved but the elided load never wrote.
+            // reserved but the elided load never wrote. The consumer set
+            // must ALSO match the fold's width: a 128-bit consumer cannot
+            // fold a 256-bit memory operand (wrong family) and vice versa.
+            use crate::backend::stack_layout::copy_coalescing as cc;
+            // Immediate-shift consumers are width-irrelevant here: they can
+            // never fold (VEX forms are register-only; see the ISA NOTE on
+            // memfold_consumer_128), so a pending fold before one is always
+            // materialised.
+            let width_matches = if pf.width == 16 {
+                cc::memfold_consumer_128(op).is_some()
+            } else {
+                cc::memfold_consumer_256(op).is_some()
+            };
             let consumes = args
                 .iter()
-                .any(|a| matches!(a, Operand::Value(v) if v.0 == pv))
-                && crate::backend::stack_layout::copy_coalescing::memfold_consumer_256(op)
-                    .is_some();
-            if !consumes && !crate::backend::stack_layout::copy_coalescing::is_pure_vec_load(op) {
+                .any(|a| matches!(a, Operand::Value(v) if v.0 == pf.val))
+                && width_matches;
+            if !consumes && !cc::is_pure_vec_load(op) {
                 self.materialize_pending_memfold();
             }
         }
@@ -3665,7 +3911,7 @@ impl X86Codegen {
                             // left the AVX-SSE transition penalty in place).
                             self.state.dirty_upper_ymm = true;
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_claim_live_reg(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(name);
@@ -3729,7 +3975,7 @@ impl X86Codegen {
                             self.state
                                 .emit_fmt(format_args!("    movdqu {}, %{}", mem, name));
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_claim_live_reg(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(name);
@@ -3762,7 +4008,7 @@ impl X86Codegen {
                             self.state
                                 .emit_fmt(format_args!("    movupd {}, %{}", mem, name));
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_claim_live_reg(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(name);
@@ -3797,7 +4043,7 @@ impl X86Codegen {
                                 .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
                             self.state.dirty_upper_ymm = true;
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_claim_live_reg(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(name);
@@ -3838,7 +4084,7 @@ impl X86Codegen {
                             self.state
                                 .emit_fmt(format_args!("    movdqu {}, %{}", mem, name));
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_claim_live_reg(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(name);
@@ -3877,7 +4123,7 @@ impl X86Codegen {
                                 .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
                             self.state.dirty_upper_ymm = true;
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_claim_live_reg(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(name);
@@ -3914,7 +4160,7 @@ impl X86Codegen {
                                 .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
                             self.state.dirty_upper_ymm = true;
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_claim_live_reg(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(name);
@@ -4003,7 +4249,7 @@ impl X86Codegen {
                             self.state
                                 .emit_fmt(format_args!("    vpaddq %xmm1, %{}, %{}", dst, dst));
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, dst);
+                            self.state.vec_claim_live_reg(d.0, dst);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(dst);
@@ -4116,7 +4362,7 @@ impl X86Codegen {
                             self.state
                                 .emit_fmt(format_args!("    vpaddq %xmm1, %{}, %{}", dst, dst));
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, dst);
+                            self.state.vec_claim_live_reg(d.0, dst);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(dst);
@@ -4219,7 +4465,7 @@ impl X86Codegen {
                             self.state
                                 .emit_fmt(format_args!("    vpaddd %ymm0, %{}, %{}", dst, dst));
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, dst);
+                            self.state.vec_claim_live_reg(d.0, dst);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(dst);
@@ -4371,7 +4617,7 @@ impl X86Codegen {
                             self.state
                                 .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_claim_live_reg(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(name);
@@ -4406,7 +4652,7 @@ impl X86Codegen {
                         self.state
                             .emit_fmt(format_args!("    vpxor %{}, %{}, %{}", name, name, name));
                         self.state.dirty_upper_ymm = true;
-                        self.state.vec_live_regs.insert(d.0, name);
+                        self.state.vec_claim_live_reg(d.0, name);
                     } else {
                         self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
                         self.state.dirty_upper_ymm = true;
@@ -4545,7 +4791,7 @@ impl X86Codegen {
                             self.state
                                 .emit_fmt(format_args!("    movdqu {}, %{}", mem, name));
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_claim_live_reg(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(name);
@@ -5002,6 +5248,37 @@ impl X86Codegen {
                     self.emit_avx_binary_256(d, args, "vsubps", false);
                 }
             }
+            IntrinsicOp::VecXorF32x8 => {
+                if let Some(d) = dest {
+                    // Bitwise lane XOR — commutative, pure, and the exact
+                    // packed spelling of FP sign-bit manipulation idioms
+                    // (see the IR enum doc on `VecXorF32x8`).
+                    if !self.try_emit_fpxor_sign_mask(d, args, 4, true, "vxorps") {
+                        self.emit_avx_binary_256(d, args, "vxorps", true);
+                    }
+                }
+            }
+            IntrinsicOp::VecXorF64x4 => {
+                if let Some(d) = dest {
+                    if !self.try_emit_fpxor_sign_mask(d, args, 8, true, "vxorpd") {
+                        self.emit_avx_binary_256(d, args, "vxorpd", true);
+                    }
+                }
+            }
+            IntrinsicOp::VecXorF32x4 => {
+                if let Some(d) = dest {
+                    if !self.try_emit_fpxor_sign_mask(d, args, 4, false, "vxorps") {
+                        self.emit_sse_binary_128(d, args, "xorps");
+                    }
+                }
+            }
+            IntrinsicOp::VecXorF64x2 => {
+                if let Some(d) = dest {
+                    if !self.try_emit_fpxor_sign_mask(d, args, 8, false, "vxorpd") {
+                        self.emit_sse_binary_128(d, args, "xorpd");
+                    }
+                }
+            }
             IntrinsicOp::VecSubF32x4 => {
                 if let Some(d) = dest {
                     self.emit_sse_binary_128(d, args, "subps");
@@ -5264,6 +5541,16 @@ impl X86Codegen {
             IntrinsicOp::VecMinI16x8 => {
                 if let Some(d) = dest {
                     self.emit_sse_binary_128(d, args, "pminsw");
+                }
+            }
+            IntrinsicOp::VecSminI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sminmax_i32x4(d, args, false);
+                }
+            }
+            IntrinsicOp::VecSmaxI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sminmax_i32x4(d, args, true);
                 }
             }
             IntrinsicOp::VecMaxI16x16 => {
@@ -5569,6 +5856,12 @@ impl X86Codegen {
                             .emit_fmt(format_args!("    vpslld ${}, {}, {}", n, src, dst));
                         self.state
                             .emit_fmt(format_args!("    vpor %xmm1, {}, {}", dst, dst));
+                        // Commit BEFORE creating the dest's own deferred store: the
+                        // commit clears a pending naming the committed value (a SOURCE
+                        // pending consumed by this write); the dest's own pending must
+                        // survive it (the hsum stale-slot miscompile class).
+                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+                        self.sse_commit_dest_direct(d, dst_static);
                         if dst_home.is_none() {
                             let deferred = self.state.vector_defer_values.contains(&d.0);
                             use crate::backend::state::SlotAddr;
@@ -5585,8 +5878,6 @@ impl X86Codegen {
                                 }
                             }
                         }
-                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
-                        self.sse_commit_dest_direct(d, dst_static);
                     } else {
                         // Legacy SSE2 discipline: the dest-homed fast path
                         // in the shared helper (coalesced in-place forms,
@@ -5618,6 +5909,12 @@ impl X86Codegen {
                         };
                         self.state
                             .emit_fmt(format_args!("    vpshufd ${}, {}, {}", imm, src, dst));
+                        // Commit BEFORE creating the dest's own deferred store: the
+                        // commit clears a pending naming the committed value (a SOURCE
+                        // pending consumed by this write); the dest's own pending must
+                        // survive it (the hsum stale-slot miscompile class).
+                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+                        self.sse_commit_dest_direct(d, dst_static);
                         if dst_home.is_none() {
                             let deferred = self.state.vector_defer_values.contains(&d.0);
                             use crate::backend::state::SlotAddr;
@@ -5634,8 +5931,6 @@ impl X86Codegen {
                                 }
                             }
                         }
-                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
-                        self.sse_commit_dest_direct(d, dst_static);
                     } else {
                         // Legacy SSE2 discipline: the dest-homed fast path
                         // in the shared helper (coalesced in-place forms,
@@ -5657,6 +5952,12 @@ impl X86Codegen {
                         };
                         self.state
                             .emit_fmt(format_args!("    vpshufb {}, {}, {}", mask, src, dst));
+                        // Commit BEFORE creating the dest's own deferred store: the
+                        // commit clears a pending naming the committed value (a SOURCE
+                        // pending consumed by this write); the dest's own pending must
+                        // survive it (the hsum stale-slot miscompile class).
+                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+                        self.sse_commit_dest_direct(d, dst_static);
                         if dst_home.is_none() {
                             let deferred = self.state.vector_defer_values.contains(&d.0);
                             use crate::backend::state::SlotAddr;
@@ -5673,8 +5974,6 @@ impl X86Codegen {
                                 }
                             }
                         }
-                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
-                        self.sse_commit_dest_direct(d, dst_static);
                     } else {
                         // Legacy SSE2 discipline: the dest-homed fast path
                         // in the shared helper (coalesced in-place forms,
@@ -6397,7 +6696,7 @@ impl X86Codegen {
                                     .emit_fmt(format_args!("    movups {}, %{}", mem, n128));
                             }
                             self.state.vector_values.insert(d.0);
-                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_claim_live_reg(d.0, name);
                             self.state.vec_last_store_val = Some(d.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(name);
@@ -6561,7 +6860,7 @@ impl X86Codegen {
                             self.state
                                 .emit_fmt(format_args!("    xorps %{}, %{}", name, name));
                         }
-                        self.state.vec_live_regs.insert(d.0, name);
+                        self.state.vec_claim_live_reg(d.0, name);
                     } else if is8 {
                         self.state.emit("    vxorps %ymm0, %ymm0, %ymm0");
                         self.avx_store_dest(d);
@@ -6581,7 +6880,7 @@ impl X86Codegen {
                         let name = phys_reg_name_256(reg);
                         self.state
                             .emit_fmt(format_args!("    vxorpd %{}, %{}, %{}", name, name, name));
-                        self.state.vec_live_regs.insert(d.0, name);
+                        self.state.vec_claim_live_reg(d.0, name);
                     } else {
                         self.state.emit("    vxorpd %ymm0, %ymm0, %ymm0");
                         self.avx_store_dest(d);
@@ -6598,7 +6897,7 @@ impl X86Codegen {
                         let name = phys_reg_name(reg);
                         self.state
                             .emit_fmt(format_args!("    xorpd %{}, %{}", name, name));
-                        self.state.vec_live_regs.insert(d.0, name);
+                        self.state.vec_claim_live_reg(d.0, name);
                     } else {
                         self.state.emit("    xorpd %xmm0, %xmm0");
                         self.sse_store_dest(d, "xmm0");
@@ -6614,7 +6913,7 @@ impl X86Codegen {
                         let name = phys_reg_name(reg);
                         self.state
                             .emit_fmt(format_args!("    pxor %{}, %{}", name, name));
-                        self.state.vec_live_regs.insert(d.0, name);
+                        self.state.vec_claim_live_reg(d.0, name);
                     } else {
                         self.state.emit("    pxor %xmm0, %xmm0");
                         self.sse_store_dest(d, "xmm0");
@@ -6631,7 +6930,7 @@ impl X86Codegen {
                         let name = phys_reg_name_256(reg);
                         self.state
                             .emit_fmt(format_args!("    vpxor %{}, %{}, %{}", name, name, name));
-                        self.state.vec_live_regs.insert(d.0, name);
+                        self.state.vec_claim_live_reg(d.0, name);
                     } else {
                         self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
                         self.avx_store_dest(d);
@@ -6648,7 +6947,7 @@ impl X86Codegen {
                         let name = phys_reg_name(reg);
                         self.state
                             .emit_fmt(format_args!("    pxor %{}, %{}", name, name));
-                        self.state.vec_live_regs.insert(d.0, name);
+                        self.state.vec_claim_live_reg(d.0, name);
                     } else {
                         self.state.emit("    pxor %xmm0, %xmm0");
                         self.sse_store_dest(d, "xmm0");
@@ -6764,7 +7063,7 @@ impl X86Codegen {
             .state
             .pending_vec_memfold
             .as_ref()
-            .map(|(pv, _, _)| *pv)
+            .map(|pf| pf.val)
             .filter(|pv| {
                 args.iter()
                     .any(|a| matches!(a, Operand::Value(v) if v.0 == *pv))
@@ -6782,12 +7081,13 @@ impl X86Codegen {
         //                 (= s*input + mem)
         //   input elided: bias  streams in %ymm0 → `vfmadd231 mem, %s, %ymm0`
         //                 (= s*mem + bias)
-        if let (Some((pv, mem, _)), Operand::Value(m0), Operand::Value(m1), Operand::Value(bias)) = (
+        if let (Some(pf), Operand::Value(m0), Operand::Value(m1), Operand::Value(bias)) = (
             self.state.pending_vec_memfold.clone(),
             &args[0],
             &args[1],
             &args[2],
         ) {
+            let (pv, mem) = (pf.val, pf.mem);
             // The multiplicands commute: whichever of args[0]/args[1] has an
             // XMM home (the loop-invariant broadcast) is the register source,
             // the other one is the streamed element vector.
@@ -6989,11 +7289,7 @@ impl X86Codegen {
     /// Returns the destination home last, so callers destructure
     /// `[src.., dest]`.
     fn all_vec_homes_256(&self, srcs: &[&Operand], dest: &Value) -> Option<Vec<String>> {
-        let pending_fold = self
-            .state
-            .pending_vec_memfold
-            .as_ref()
-            .map(|(pv, _, _)| *pv);
+        let pending_fold = self.state.pending_vec_memfold.as_ref().map(|pf| pf.val);
         let mut out = Vec::with_capacity(srcs.len() + 1);
         for s in srcs {
             let Operand::Value(v) = s else {
@@ -7026,7 +7322,7 @@ impl X86Codegen {
         );
         debug_assert_eq!(format!("%{}", name), dest_name);
         self.state.dirty_upper_ymm = true;
-        self.state.vec_live_regs.insert(dest.0, name);
+        self.state.vec_claim_live_reg(dest.0, name);
         self.state.vec_last_store_val = Some(dest.0);
         self.state.vec_last_store_reg = true;
         self.state.vec_last_store_reg_name = Some(name);
@@ -7056,6 +7352,20 @@ impl X86Codegen {
     /// `sse_load_arg`'s peepholes so a fast path that reads the location
     /// directly emits exactly what the staged path would have loaded.
     fn vec_operand_reg(&self, v: &Value) -> Option<&'static str> {
+        // VLFOLD defense (mirrors `vec_home_128`/`all_vec_homes_256`): a
+        // value whose load was elided into `pending_vec_memfold` has NO
+        // materialised contents — the register the allocator reserved was
+        // never written. Reporting it here would hand the in-place paths a
+        // garbage source; declining routes the caller through the memfold
+        // consumers or the materialisation paths.
+        if self
+            .state
+            .pending_vec_memfold
+            .as_ref()
+            .is_some_and(|pf| pf.val == v.0)
+        {
+            return None;
+        }
         if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0) {
             return Some(self.state.sse_last_store_reg_name.unwrap_or("xmm0"));
         }
@@ -7083,7 +7393,7 @@ impl X86Codegen {
     /// tracking + last-store peephole), exactly like the accumulator fast
     /// path.
     fn sse_mark_in_place(&mut self, dest: &Value, target: &'static str) {
-        self.state.vec_live_regs.insert(dest.0, target);
+        self.state.vec_claim_live_reg(dest.0, target);
         self.state.sse_last_store_val = Some(dest.0);
         self.state.sse_last_store_reg = true;
         self.state.sse_last_store_reg_name = Some(target);
@@ -7130,7 +7440,7 @@ impl X86Codegen {
     /// destination wrote it there): bookkeeping only, no copy. `reg` is
     /// the scratch/home register NAME ("xmm0", "xmm5").
     fn sse_commit_dest_direct(&mut self, d: &Value, reg: &'static str) {
-        self.state.vec_live_regs.insert(d.0, reg);
+        self.state.vec_claim_live_reg(d.0, reg);
         self.state.sse_last_store_val = Some(d.0);
         self.state.sse_last_store_reg = true;
         self.state.sse_last_store_reg_name = Some(reg);
@@ -7177,6 +7487,12 @@ impl X86Codegen {
         };
         self.state
             .emit_fmt(format_args!("    {} {}, {}, {}", inst, src2, src1, dst));
+        // Commit BEFORE creating the dest's own deferred store: the
+        // commit clears a pending naming the committed value (a SOURCE
+        // pending consumed by this write); the dest's own pending must
+        // survive it (the hsum stale-slot miscompile class).
+        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+        self.sse_commit_dest_direct(dest_ptr, dst_static);
         if dst_home.is_none() {
             // Unhomed destination: mirror sse_store_dest's slot discipline,
             // minus the register copy the VEX form made unnecessary.
@@ -7206,8 +7522,6 @@ impl X86Codegen {
                 self.state.pending_vec_store = Some((dest_ptr.0, "xmm0", false));
             }
         }
-        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
-        self.sse_commit_dest_direct(dest_ptr, dst_static);
     }
 
     /// Memory source for a non-homed vector operand AFTER every pending
@@ -7236,6 +7550,188 @@ impl X86Codegen {
     /// Load order mirrors the binary emitters: args[1] is resolved FIRST so a
     /// deferred args[1] still sitting in %ymm0 is moved to %ymm1 before the
     /// args[0] load can overwrite it.
+    ///
+    /// FP-Neg fast path: `VecXorF*(vec, Const(-0.0))` with the sign mask
+    /// folded as a .rodata MEMORY operand — ONE instruction for the whole
+    /// pack, exactly the form GCC emits for packed `-x` lanes
+    /// (`vxorps .LCVEC_0(%rip), %xmm0, %xmm0`). Returns false when the
+    /// second operand is not the family's `-0.0` constant (the caller
+    /// falls through to the generic two-value emitters).
+    ///
+    /// `lane_bytes` is 4 (F32) or 8 (F64); `wide` selects the 256-bit
+    /// family; `vex_mnemonic` is the VEX form (`vxorps`/`vxorpd`). Under
+    /// AVX the 3-operand VEX form takes the mask in the r/m slot; the
+    /// legacy-SSE2 fallback (128-bit only) stages the source into the
+    /// destination and uses the destructive 2-operand form
+    /// `xorps mask(%rip), %dst` — the pool's `.p2align 4` satisfies the
+    /// legacy 16-byte alignment requirement.
+    ///
+    /// Operand order: AT&T `vxorps MEM, src1, dst` — the mask takes the
+    /// r/m (first textual) slot, the vector source keeps its home or
+    /// streams through the scratch pair exactly like the memfold consumers
+    /// (a pending VLFOLD on args[0] is materialised first: this emitter
+    /// cannot fold a second memory operand into the same instruction).
+    fn try_emit_fpxor_sign_mask(
+        &mut self,
+        dest: &Value,
+        args: &[Operand],
+        lane_bytes: usize,
+        wide: bool,
+        vex_mnemonic: &str,
+    ) -> bool {
+        // The exact `-0.0` constant of the family's lane type.
+        let is_minus_zero = match args.get(1) {
+            Some(Operand::Const(IrConst::F32(v))) => lane_bytes == 4 && v.to_bits() == 0x8000_0000,
+            Some(Operand::Const(IrConst::F64(v))) => {
+                lane_bytes == 8 && v.to_bits() == 0x8000_0000_0000_0000
+            }
+            _ => false,
+        };
+        if !is_minus_zero {
+            return false;
+        }
+        // A pending VLFOLD names args[0] (the analysis admits Xor consumers
+        // in either position of the COMMUTATIVE op): this emitter's single
+        // memory slot is the sign mask, so the fold must be materialised —
+        // never read the elided value's never-written reserved register.
+        if let Some(pf) = self.state.pending_vec_memfold.clone() {
+            if matches!(&args[0], Operand::Value(v) if v.0 == pf.val) {
+                self.materialize_pending_memfold();
+            }
+        }
+        let total = if wide { 32 } else { 16 };
+        let mut mask = vec![0u8; total];
+        for l in 0..total / lane_bytes {
+            mask[l * lane_bytes + lane_bytes - 1] = 0x80;
+        }
+        let label = self.state.get_vec_const_label(&mask);
+        let mem = format!("{}(%rip)", label);
+        // Legacy SSE2 (128-bit only — the 256-bit families require AVX):
+        // the destructive two-operand form stages the source into the
+        // destination, then XORs the aligned mask memory in place.
+        if !self.avx2_enabled {
+            debug_assert!(!wide, "256-bit families require AVX");
+            let legacy = &vex_mnemonic[1..]; // "xorps" / "xorpd"
+            match self.dest_xmm_home_name(dest) {
+                Some(name) => {
+                    if let Some(h) = self.vec_home_128(&args[0]) {
+                        if h != format!("%{}", name) {
+                            self.state
+                                .emit_fmt(format_args!("    movdqa {}, %{}", h, name));
+                        }
+                    } else {
+                        self.sse_load_arg(&args[0], name);
+                    }
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %{}", legacy, mem, name));
+                    self.sse_mark_in_place(dest, name);
+                }
+                None => {
+                    self.sse_load_arg(&args[0], "xmm0");
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %xmm0", legacy, mem));
+                    self.sse_store_dest(dest, "xmm0");
+                }
+            }
+            return true;
+        }
+        if wide {
+            let dest_home = self
+                .reg_assignments
+                .get(&dest.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r));
+            let src1 = match self.vec_home_256(&args[0]) {
+                Some(h) => h,
+                None => {
+                    self.avx_load_arg(&args[0]);
+                    "%ymm0".to_string()
+                }
+            };
+            self.state.dirty_upper_ymm = true;
+            match dest_home {
+                Some(dr) => {
+                    let dst = phys_reg_name_256(dr);
+                    self.state.emit_fmt(format_args!(
+                        "    {} {}, {}, %{}",
+                        vex_mnemonic, mem, src1, dst
+                    ));
+                    self.state.vec_claim_live_reg(dest.0, dst);
+                    self.state.vec_last_store_val = Some(dest.0);
+                    self.state.vec_last_store_reg = true;
+                    self.state.vec_last_store_reg_name = Some(dst);
+                }
+                None => {
+                    self.flush_pending_vec_store_impl();
+                    self.state.emit_fmt(format_args!(
+                        "    {} {}, {}, %ymm0",
+                        vex_mnemonic, mem, src1
+                    ));
+                    self.state.vec_last_store_reg = false;
+                    self.avx_store_dest(dest);
+                }
+            }
+        } else {
+            let dst_home = self.dest_xmm_home_name(dest);
+            let src1 = match self.vec_home_128(&args[0]) {
+                Some(h) => h,
+                None => {
+                    self.sse_load_arg(&args[0], "xmm0");
+                    "%xmm0".to_string()
+                }
+            };
+            let dst = match dst_home {
+                Some(name) => format!("%{}", name),
+                None => "%xmm0".to_string(),
+            };
+            self.state.emit_fmt(format_args!(
+                "    {} {}, {}, {}",
+                vex_mnemonic, mem, src1, dst
+            ));
+            // Commit BEFORE creating the dest's own deferred store: the
+            // commit clears a pending naming the committed value (a SOURCE
+            // pending consumed by this write); the dest's own pending must
+            // survive it (the hsum stale-slot miscompile class).
+            let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+            self.sse_commit_dest_direct(dest, dst_static);
+            if dst_home.is_none() {
+                let deferred = self.state.vector_defer_values.contains(&dest.0);
+                use crate::backend::state::SlotAddr;
+                if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                    self.state.resolve_slot_addr(dest.0)
+                {
+                    if !deferred {
+                        self.state
+                            .emit_fmt(format_args!("    movdqu %xmm0, {}", self.slot_ref(slot.0)));
+                    } else {
+                        self.state.pending_vec_store = Some((dest.0, "xmm0", false));
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Lane-wise signed dword min/max, 128-bit (`VecSminI32x4`/`VecSmaxI32x4`).
+    /// SSE4.1 `pminsd`/`pmaxsd` (the VEX form under AVX2 — memory-foldable
+    /// through `emit_sse_binary_128`'s audited branch). x86 producers
+    /// (the BB-SLP min/max fold) gate on SSE4.1 exactly like the loop
+    /// vectorizer's dword min/max ("the SSE2 baseline lacks dword min/max
+    /// entirely — fails closed"); the NEON producer never runs on x86.
+    /// Reaching this emitter without SSE4.1 is a producer bug — panic
+    /// loudly rather than emit an instruction the CPU cannot decode (the
+    /// VecRotlI32x4 immediate-panic discipline).
+    fn emit_sminmax_i32x4(&mut self, dest: &Value, args: &[Operand], is_max: bool) {
+        assert!(
+            self.isa.sse41,
+            "VecS{}I32x4 requires SSE4.1 (pminsd/pmaxsd): an x86 producer \
+             admitted it without the feature gate",
+            if is_max { "max" } else { "min" }
+        );
+        let inst = if is_max { "pmaxsd" } else { "pminsd" };
+        self.emit_sse_binary_128(dest, args, inst);
+    }
+
     pub(super) fn emit_avx_cmp_256(&mut self, dest: &Value, args: &[Operand], inst: &str) {
         assert!(args.len() == 3, "{}: expects lhs, rhs, predicate", inst);
         let imm = match &args[2] {
@@ -7863,45 +8359,12 @@ impl X86Codegen {
         );
         self.state.invalidate_vec_peephole();
         if self.avx2_enabled {
-            // VLFOLD: the elided single-use load is the shift's source;
-            // the VEX.128 immediate form reads r/m128 with NO alignment
-            // requirement (unlike legacy SSE) — fold it exactly like the
-            // 256-bit shift emitter. Without this the staged path
-            // re-materialised the value from its SOURCE memory: a
-            // duplicate vector load.
-            if let Some((pv, mem, _)) = self.state.pending_vec_memfold.clone() {
-                if matches!(&args[0], Operand::Value(v) if v.0 == pv) {
-                    let dst_home = self.dest_xmm_home_name(dest_ptr);
-                    let dst = match dst_home {
-                        Some(name) => format!("%{}", name),
-                        None => "%xmm0".to_string(),
-                    };
-                    self.state.emit_fmt(format_args!(
-                        "    v{} ${}, {}, {}",
-                        sse_inst, amount, mem, dst
-                    ));
-                    if dst_home.is_none() {
-                        let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
-                        use crate::backend::state::SlotAddr;
-                        if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
-                            self.state.resolve_slot_addr(dest_ptr.0)
-                        {
-                            if !deferred {
-                                self.state.emit_fmt(format_args!(
-                                    "    movdqu %xmm0, {}",
-                                    self.slot_ref(slot.0)
-                                ));
-                            } else {
-                                self.state.pending_vec_store = Some((dest_ptr.0, "xmm0", false));
-                            }
-                        }
-                    }
-                    let dst_static: &'static str = dst_home.unwrap_or("xmm0");
-                    self.sse_commit_dest_direct(dest_ptr, dst_static);
-                    self.state.pending_vec_memfold = None;
-                    return;
-                }
-            }
+            // NO VLFOLD here, ever: the VEX.128 immediate-shift encoding is
+            // REGISTER-ONLY (the memory form exists solely under EVEX /
+            // AVX-512 — see the ISA NOTE on `memfold_consumer_128`). The
+            // analysis never admits a shift consumer, and the safety net
+            // materialises any pending fold before this emitter runs.
+            //
             // VEX.128 three-operand immediate form: `v<inst> $imm, %src,
             // %dst` — one instruction for every homed shape (the single
             // scratch cannot collide with itself, unlike the binary VEX
@@ -7916,6 +8379,12 @@ impl X86Codegen {
                 "    v{} ${}, {}, {}",
                 sse_inst, amount, src, dst
             ));
+            // Commit BEFORE creating the dest's own deferred store: the
+            // commit clears a pending naming the committed value (a SOURCE
+            // pending consumed by this write); the dest's own pending must
+            // survive it (the hsum stale-slot miscompile class).
+            let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+            self.sse_commit_dest_direct(dest_ptr, dst_static);
             if dst_home.is_none() {
                 let deferred = self.state.vector_defer_values.contains(&dest_ptr.0);
                 use crate::backend::state::SlotAddr;
@@ -7930,8 +8399,6 @@ impl X86Codegen {
                     }
                 }
             }
-            let dst_static: &'static str = dst_home.unwrap_or("xmm0");
-            self.sse_commit_dest_direct(dest_ptr, dst_static);
             return;
         }
         // SSE2-only: dest-homed in-place form. Bring the source into the
@@ -8017,39 +8484,12 @@ impl X86Codegen {
         );
         self.state.invalidate_vec_peephole();
         self.state.dirty_upper_ymm = true;
-        // VLFOLD: the single-use deferred load is the shift's source — the
-        // VEX immediate form reads r/m256 directly.
-        if let Some((pv, mem, _)) = self.state.pending_vec_memfold.clone() {
-            if matches!(&args[0], Operand::Value(v) if v.0 == pv) {
-                let dest_home = self
-                    .reg_assignments
-                    .get(&dest_ptr.0)
-                    .copied()
-                    .filter(|r| is_xmm_reg(*r));
-                if let Some(dest_reg) = dest_home {
-                    let dst = phys_reg_name_256(dest_reg);
-                    self.state.emit_fmt(format_args!(
-                        "    {} ${}, {}, %{}",
-                        avx_inst, amount, mem, dst
-                    ));
-                    self.state.vec_live_regs.insert(dest_ptr.0, dst);
-                    self.state.vec_last_store_val = Some(dest_ptr.0);
-                    self.state.vec_last_store_reg = true;
-                    self.state.vec_last_store_reg_name = Some(dst);
-                    self.state.reg_cache.invalidate_acc();
-                } else {
-                    // %ymm0 may hold a deferred value of a different def:
-                    // commit it before overwriting the scratch register.
-                    self.flush_pending_vec_store_impl();
-                    self.state
-                        .emit_fmt(format_args!("    {} ${}, {}, %ymm0", avx_inst, amount, mem));
-                    self.state.vec_last_store_reg = false;
-                    self.avx_store_dest(dest_ptr);
-                }
-                self.state.pending_vec_memfold = None;
-                return;
-            }
-        }
+        // NO VLFOLD here, ever: the VEX.256 immediate-shift encoding is
+        // REGISTER-ONLY (the memory form exists solely under EVEX /
+        // AVX-512 — see the ISA NOTE on `memfold_consumer_128`). The
+        // analysis never admits a shift consumer, and the safety net
+        // materialises any pending fold before this emitter runs.
+        //
         // All-homed fast path: `v<inst> $imm, %ymmS, %ymmD` with zero
         // staging (defer-overflow promoted chains).
         if let Operand::Value(v) = &args[0] {
@@ -8064,7 +8504,7 @@ impl X86Codegen {
                                 avx_inst, amount, n0, nd
                             ));
                             self.state.dirty_upper_ymm = true;
-                            self.state.vec_live_regs.insert(dest_ptr.0, nd);
+                            self.state.vec_claim_live_reg(dest_ptr.0, nd);
                             self.state.vec_last_store_val = Some(dest_ptr.0);
                             self.state.vec_last_store_reg = true;
                             self.state.vec_last_store_reg_name = Some(nd);
@@ -8288,7 +8728,7 @@ impl X86Codegen {
         self.state.dirty_upper_ymm = true;
         match dest_home {
             Some(name) => {
-                self.state.vec_live_regs.insert(dest.0, name);
+                self.state.vec_claim_live_reg(dest.0, name);
                 self.state.vec_last_store_val = Some(dest.0);
                 self.state.vec_last_store_reg = true;
                 self.state.vec_last_store_reg_name = Some(name);
@@ -8327,9 +8767,60 @@ impl X86Codegen {
     }
 
     /// Integer-domain lane-mask select (SSE2): pand/pandn/por — see
-    /// `emit_sse_blendv_128`.
+    /// `emit_sse_blendv_128`. SSE4.1+ takes the ONE-instruction
+    /// `vblendvps` form first (dword-lane bitwise select keyed on the
+    /// mask lane's sign bit — exact on integer payloads, the same
+    /// mnemonic the 256-bit path uses).
     pub(super) fn emit_sse_blendv_128_int(&mut self, dest: &Value, args: &[Operand]) {
+        // VEX form only under AVX2: the legacy SSE4.1 `blendvps` carries
+        // its mask IMPLICITLY in %xmm0 (a different, destructive encoding)
+        // — emitting `vblendvps` on an SSE4.1-only target (x86-64-v2!) is
+        // a guaranteed SIGILL. Those targets keep the correct 3-op
+        // bitwise select below.
+        if self.isa.sse41 && self.avx2_enabled {
+            self.emit_blendv_128_vexps(dest, args);
+            return;
+        }
         self.emit_sse_blendv_128_mnemonics(dest, args, "pand", "pandn", "por");
+    }
+
+    /// `vblendvps %mask, %true, %false, %dst` (128-bit, VEX — AVX2 gated):
+    /// all-homed fast path with zero staging; otherwise the mask and true
+    /// arms stream through the scratch pair with the false arm recovered
+    /// from its home or slot (the audited blendv discipline).
+    fn emit_blendv_128_vexps(&mut self, dest: &Value, args: &[Operand]) {
+        debug_assert!(args.len() == 3, "blendv128: expects false, true, mask");
+        self.state.invalidate_vec_peephole();
+        if matches!((&args[0], &args[1]), (Operand::Value(a), Operand::Value(b)) if a == b) {
+            self.sse_load_arg(&args[0], "xmm0");
+            self.sse_store_dest(dest, "xmm0");
+            return;
+        }
+        // All-homed: one instruction, no staging.
+        let f = self.vec_home_128(&args[0]);
+        let t = self.vec_home_128(&args[1]);
+        let m = self.vec_home_128(&args[2]);
+        if let (Some(f), Some(t), Some(m)) = (&f, &t, &m) {
+            if let Some(d) = self.dest_xmm_home_name(dest) {
+                self.state
+                    .emit_fmt(format_args!("    vblendvps {}, {}, {}, %{}", m, t, f, d));
+                self.sse_commit_dest_direct(dest, d);
+                return;
+            }
+        }
+        // Generic: mask and true into the scratch pair, false recovered
+        // from home/slot — mirror emit_sse_blendv_128_mnemonics' proven
+        // resolution order (mask first so a deferred cmp result keeps its
+        // cache hit).
+        self.sse_load_arg(&args[2], "xmm1");
+        self.sse_load_arg(&args[1], "xmm0");
+        let fsrc = match self.vec_home_128(&args[0]) {
+            Some(reg) => reg,
+            None => self.vec_mem_source_after_flush(&args[0], "vblendvps128"),
+        };
+        self.state
+            .emit_fmt(format_args!("    vblendvps %xmm1, %xmm0, {}, %xmm0", fsrc));
+        self.sse_store_dest(dest, "xmm0");
     }
 
     fn emit_sse_blendv_128_mnemonics(
@@ -8421,7 +8912,7 @@ impl X86Codegen {
         self.state.vector_values.insert(dest.0);
         if let Some(reg) = assigned {
             let name = phys_reg_name_256(reg);
-            self.state.vec_live_regs.insert(dest.0, name);
+            self.state.vec_claim_live_reg(dest.0, name);
             self.state.vec_last_store_val = Some(dest.0);
             self.state.vec_last_store_reg = true;
             self.state.vec_last_store_reg_name = Some(name);
@@ -8446,7 +8937,7 @@ impl X86Codegen {
             .state
             .pending_vec_memfold
             .as_ref()
-            .map(|(pv, _, _)| *pv)
+            .map(|pf| pf.val)
             .filter(|pv| {
                 args.iter()
                     .any(|a| matches!(a, Operand::Value(v) if v.0 == *pv))
@@ -8471,47 +8962,97 @@ impl X86Codegen {
         // `op mem, %ymmA, %ymmA`; a homed non-accumulator source (map
         // broadcast invariant) gives `op mem, %ymmS, %ymmD` for a homed
         // destination or `op mem, %ymmS, %ymm0` + home store otherwise —
-        // never a per-iteration `vmovdqa %ymmS, %ymm1` copy.
-        if let Some((pv, mem, _)) = self.state.pending_vec_memfold.clone() {
-            if let (Operand::Value(x), Operand::Value(y)) = (&args[0], &args[1]) {
-                let other = if y.0 == pv {
-                    Some(x)
-                } else if x.0 == pv && commutative {
-                    Some(y)
-                } else {
-                    None
-                };
-                let other_reg = other
-                    .and_then(|o| self.reg_assignments.get(&o.0).copied())
-                    .filter(|r| is_xmm_reg(*r));
-                if let Some(oreg) = other_reg {
-                    let src = phys_reg_name_256(oreg);
-                    self.state.dirty_upper_ymm = true;
-                    let dest_home = self
-                        .reg_assignments
-                        .get(&dest_ptr.0)
-                        .copied()
-                        .filter(|r| is_xmm_reg(*r));
-                    if let Some(dest_reg) = dest_home {
-                        let dst = phys_reg_name_256(dest_reg);
-                        self.state
-                            .emit_fmt(format_args!("    {} {}, %{}, %{}", avx_inst, mem, src, dst));
-                        self.state.vec_live_regs.insert(dest_ptr.0, dst);
-                        self.state.vec_last_store_val = Some(dest_ptr.0);
-                        self.state.vec_last_store_reg = true;
-                        self.state.vec_last_store_reg_name = Some(dst);
-                        self.state.reg_cache.invalidate_acc();
+        // never a per-iteration `vmovdqa %ymmS, %ymm1` copy. WIDTH-MATCHED:
+        // only a 32-byte fold belongs to this 256-bit family.
+        //
+        // RESOLUTION IS MANDATORY: when a width-matched fold names one of
+        // this op's operands (guaranteed by the emit_intrinsic_impl safety
+        // net — a non-consuming op materialises it first), this branch must
+        // either CONSUME the fold or MATERIALISE it. Falling through with
+        // the fold still pending lets every later fast path read the
+        // elided value's RA-reserved register, which the elided load never
+        // wrote (the v6 clamp miscompile: the map-kernel path read %ymm3
+        // directly). The register source is therefore resolved in THREE
+        // ways, in order: the other operand's RA home, the scratch
+        // register holding its DEFERRED store (the clamp shape: the zero
+        // splat deferred in %ymm0, consumed in place), or — failing both —
+        // a materialisation of the fold so the ordinary paths reload it.
+        if let Some(pf) = self.state.pending_vec_memfold.clone() {
+            if pf.width == 32 {
+                let pv = pf.val;
+                if let (Operand::Value(x), Operand::Value(y)) = (&args[0], &args[1]) {
+                    let other = if y.0 == pv {
+                        Some(x)
+                    } else if x.0 == pv && commutative {
+                        Some(y)
                     } else {
-                        // %ymm0 may hold a deferred value of a different def:
-                        // commit it before overwriting the scratch register.
-                        self.flush_pending_vec_store_impl();
+                        None
+                    };
+                    // The deferred-scratch register holding `other`, if its
+                    // single-use store is still pending (256-bit values only:
+                    // a 128-bit-named register would splice an illegal
+                    // mixed-width operand into this YMM instruction).
+                    let held: Option<&'static str> = other.and_then(|o| {
                         self.state
-                            .emit_fmt(format_args!("    {} {}, %{}, %ymm0", avx_inst, mem, src));
-                        self.state.vec_last_store_reg = false;
-                        self.avx_store_dest(dest_ptr);
+                            .pending_vec_store
+                            .filter(|(p, _, wide)| *p == o.0 && *wide)
+                            .map(|(_, r, _)| r)
+                    });
+                    let other_reg = other
+                        .and_then(|o| self.reg_assignments.get(&o.0).copied())
+                        .filter(|r| is_xmm_reg(*r));
+                    let src: Option<String> = other_reg
+                        .map(|oreg| phys_reg_name_256(oreg).to_string())
+                        .or_else(|| held.map(|h| h.to_string()));
+                    if let Some(src) = src {
+                        // A deferred `other` is consumed here: its pending
+                        // store never fires (pure win, exactly like the
+                        // register-cache consumers).
+                        if held.is_some() {
+                            self.state.pending_vec_store = None;
+                        }
+                        self.state.dirty_upper_ymm = true;
+                        let dest_home = self
+                            .reg_assignments
+                            .get(&dest_ptr.0)
+                            .copied()
+                            .filter(|r| is_xmm_reg(*r));
+                        if let Some(dest_reg) = dest_home {
+                            let dst = phys_reg_name_256(dest_reg);
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}, %{}, %{}",
+                                avx_inst, pf.mem, src, dst
+                            ));
+                            self.state.vec_claim_live_reg(dest_ptr.0, dst);
+                            self.state.vec_last_store_val = Some(dest_ptr.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(dst);
+                            self.state.reg_cache.invalidate_acc();
+                        } else {
+                            // The destination takes the scratch: any OTHER
+                            // def's deferred store in %ymm0 must be committed
+                            // first (a held-`other` was already consumed
+                            // above, so this flush can only be for a
+                            // different value).
+                            self.flush_pending_vec_store_impl();
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}, %{}, %ymm0",
+                                avx_inst, pf.mem, src
+                            ));
+                            self.state.vec_last_store_reg = false;
+                            self.avx_store_dest(dest_ptr);
+                        }
+                        self.state.pending_vec_memfold = None;
+                        return;
                     }
-                    self.state.pending_vec_memfold = None;
-                    return;
+                    // No register source for the other operand (slot-homed
+                    // splat, foreign-width... ): the fold cannot be consumed
+                    // here. MATERIALISE it — never fall through with the
+                    // elided value's reserved register still readable by the
+                    // fast paths below.
+                    if other.is_some() || x.0 == pv || y.0 == pv {
+                        self.materialize_pending_memfold();
+                    }
                 }
             }
         }
@@ -8555,7 +9096,7 @@ impl X86Codegen {
                         if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(fresh.0) {
                             self.state.pending_vec_store = None;
                         }
-                        self.state.vec_live_regs.insert(dest_ptr.0, target);
+                        self.state.vec_claim_live_reg(dest_ptr.0, target);
                         self.state.vec_last_store_val = Some(dest_ptr.0);
                         self.state.vec_last_store_reg = true;
                         self.state.vec_last_store_reg_name = Some(target);
@@ -8582,7 +9123,7 @@ impl X86Codegen {
                         self.state
                             .emit_fmt(format_args!("    {} %{}, %{}, %{}", avx_inst, n1, n0, nd));
                         self.state.dirty_upper_ymm = true;
-                        self.state.vec_live_regs.insert(dest_ptr.0, nd);
+                        self.state.vec_claim_live_reg(dest_ptr.0, nd);
                         self.state.vec_last_store_val = Some(dest_ptr.0);
                         self.state.vec_last_store_reg = true;
                         self.state.vec_last_store_reg_name = Some(nd);

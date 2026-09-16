@@ -83,6 +83,20 @@ long rt_phi(long *q, int cond, long w, long x) {
     return a + b;   // a/b are phi-merged here: cross-block lane uses
 }
 
+// ── RT5b: TRUE cross-block lane uses (v6 rule-(b) relaxation) — the
+// lanes are consumed by instructions in DOMINATED successor blocks with
+// no phi in between. The extracts ride with the pack in the defining
+// block and dominate every use (the soundness proof), so this MUST
+// vectorize; the self-check pins the values both sides compute.
+long rt_xblock(long * restrict q, long * restrict r, int cond) {
+    long a = q[0] + r[0], b = q[1] + r[1];
+    q[2] = a; q[3] = b;
+    if (cond) {
+        return a * b;
+    }
+    return a - b;
+}
+
 // ── RT6: lanes consumed by inline-asm inputs ───────────────────────────
 long rt_asm(long *q, long w, long x) {
     long a = q[0] + w, b = q[1] + x;
@@ -160,6 +174,13 @@ int main(void) {
     long qp[2] = {7, 9};
     CHECK(rt_phi(qp, 1, 1, 1) == 8 + 10, "rt_phi taken");
     CHECK(rt_phi(qp, 0, 1, 1) == 0, "rt_phi fallthrough");
+
+    long xq[4] = {1000000000L, -2000000000L, 0, 0};
+    long xr[4] = {123456789L, 987654321L, 0, 0};
+    long xa = 1000000000L + 123456789L, xbb = -2000000000L + 987654321L;
+    CHECK(rt_xblock(xq, xr, 1) == xa * xbb, "rt_xblock taken");
+    CHECK(rt_xblock(xq, xr, 0) == xa - xbb, "rt_xblock fallthrough");
+    CHECK(xq[2] == xa && xq[3] == xbb, "rt_xblock stores");
 
     long qa[2] = {4, 6};
     CHECK(rt_asm(qa, 10, 20) == 14 + 26, "rt_asm value");

@@ -15,8 +15,12 @@
 #      is I16x16 / I8x32 for the leading 16/32 lanes (one 256-bit op,
 #      strictly better than the two 128-bit seeds the pre-v3 fallback
 #      produced) — not be dropped.
-#   6. rt_phi must contain no vector store: cross-block phi uses reject.
-#      rt_w16_norestr (no restrict) must also stay scalar: rule (e)'s
+#   6. rt_phi stays scalar (two distinct runtime addends make the 2-lane
+#      gather cost-ineffective — the legitimate cost-model answer);
+#      rt_xblock (TRUE cross-block uses in dominated successor blocks,
+#      v6 rule-(b) relaxation) MUST vectorize — the extracts dominate
+#      every external use and the runtime battery verified the values.
+#      rt_w16_norestr (no restrict) must stay scalar: rule (e)'s
 #      cross-stream hazard check — the shape GCC miscompiles under a
 #      shifted alias.
 set -euo pipefail
@@ -54,9 +58,19 @@ if [ "$n_vec_fwd" -gt 0 ]; then
     exit 1
 fi
 
+# rt_phi: stays scalar — the two distinct runtime addends (w, x) make
+# the 2-lane gather cost-ineffective; the legitimate cost-model answer.
 n_vec_phi=$(scoped rt_phi | grep -cE "vmovdqu|movdqu" || true)
 if [ "$n_vec_phi" -gt 0 ]; then
-    echo "FAIL: rt_phi vectorized despite cross-block phi lane uses ($n_vec_phi vector stores)"
+    echo "FAIL: rt_phi vectorized through the gather (cost model regressed: $n_vec_phi)"
+    exit 1
+fi
+
+# rt_xblock: TRUE cross-block lane uses (v6 rule-(b) relaxation) — the
+# packed add plus the vector load/store pair that service the shape.
+n_vec_xb=$(scoped rt_xblock | grep -cE "vpaddq|vmovdqu|movdqu" || true)
+if [ "$n_vec_xb" -lt 3 ]; then
+    echo "FAIL: rt_xblock did not vectorize (rule (b) over-rejects: $n_vec_xb vector ops)"
     exit 1
 fi
 
@@ -67,10 +81,13 @@ if [ "$n_vec_nr" -gt 0 ]; then
 fi
 
 if [ -n "$march" ]; then
-    # 256-bit seed: one vmovdqu pair for the 4×i64 copy+add.
-    n_vec_precise=$(scoped rt_precise | grep -c "vmovdqu" || true)
+    # 256-bit seed: the 4×i64 copy+add packs. The VEX memfold may fold the
+    # stream load into the packed add (`vpaddq (%rdi), %ymm0, %ymm0`), so
+    # the vectorized signature is the packed op itself plus the store —
+    # counting only vmovdqu would reject the FOLDED (better) code.
+    n_vec_precise=$(scoped rt_precise | grep -cE "vpaddq|vmovdqu" || true)
     if [ "$n_vec_precise" -lt 2 ]; then
-        echo "FAIL: rt_precise did not vectorize (rule (e) over-rejects: $n_vec_precise vmovdqu)"
+        echo "FAIL: rt_precise did not vectorize (rule (e) over-rejects: $n_vec_precise vector ops)"
         exit 1
     fi
     n_w16=$(scoped rt_w16 | grep -cE "paddw|vpaddw" || true)

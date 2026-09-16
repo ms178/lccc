@@ -1615,6 +1615,12 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecAndI64x2
             | O::VecOrI64x2
             | O::VecXorI64x2
+            // W5: the SSE4.1 signed dword min/max is a two-operand
+            // emit_sse_binary_128 form — a deferred load in args[1]
+            // folds into the VEX.128 destination exactly like the
+            // unsigned byte twins above.
+            | O::VecSminI32x4
+            | O::VecSmaxI32x4
             | O::VecSubI64x4
             | O::VecAndI64x4
             | O::VecOrI64x4
@@ -1946,6 +1952,37 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecDivF64x4
             | O::VecDivF32x4
             | O::VecDivF32x8
+            // W5: the FP-Neg sign-mask Xor composite (try_emit_fpxor_
+            // sign_mask consumes args[0] via vec_home_256/128 →
+            // avx_load_arg/sse_load_arg — never a raw slot read), the
+            // SSE4.1 signed dword min/max, and the packed immediate
+            // shifts (emit_avx_shift_imm_256 / emit_sse_shift_imm_128 —
+            // all-homed fast path, held-in-scratch path, staged fallback:
+            // every path resolves args[0] through the register cache).
+            // Without these, every single-use result of these ops paid an
+            // eager dead store to its home slot.
+            | O::VecXorF32x8
+            | O::VecXorF64x4
+            | O::VecXorF32x4
+            | O::VecXorF64x2
+            | O::VecSminI32x4
+            | O::VecSmaxI32x4
+            | O::VecShlI16x16
+            | O::VecShlI16x8
+            | O::VecLShrI16x16
+            | O::VecLShrI16x8
+            | O::VecAShrI16x16
+            | O::VecAShrI16x8
+            | O::VecShlI32x8
+            | O::VecShlI32x4
+            | O::VecLShrI32x8
+            | O::VecLShrI32x4
+            | O::VecAShrI32x8
+            | O::VecAShrI32x4
+            | O::VecShlI64x4
+            | O::VecShlI64x2
+            | O::VecLShrI64x4
+            | O::VecLShrI64x2
     )
 }
 
@@ -2079,6 +2116,24 @@ pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bo
     )
 }
 
+/// 128-bit loads eligible for source-operand folding (VEX.128 VLFOLD).
+/// The emitter additionally gates the elision on `avx2_enabled` — legacy
+/// SSE memory operands require 16-byte alignment — so under a pre-AVX2
+/// target these values are simply never elided (membership alone elides
+/// nothing; the set also only ever *removes* deferral eligibility).
+pub(crate) fn is_memfold_vec_load_128(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecLoadF64x2
+            | O::VecLoadF32x4
+            | O::VecLoadI32x4
+            | O::VecLoadI64x2
+            | O::VecLoadI16x8
+            | O::VecLoadI8x16
+    )
+}
+
 /// Map FMA intrinsics `VecMadd*(input, scale, bias)` (`emit_avx_map_fma`):
 /// the bias folds through the 213 form (`vfmadd213ps mem, %scale, %ymm0` =
 /// scale*input + mem) and the input through the 231 form
@@ -2131,25 +2186,82 @@ pub(crate) fn is_cache_aware_3op(op: &crate::ir::intrinsics::IntrinsicOp) -> boo
     )
 }
 
-/// BB-SLP unary+immediate 256-bit consumers (packed lane shifts): the
-/// single vector operand is `args[0]` and the VEX immediate form reads it
-/// from memory (`vpslld $imm, MEM, %dst`). `emit_avx_shift_imm_256`
-/// consults `pending_vec_memfold` as its FIRST action and either emits the
-/// folded form or routes the operand through the memfold-aware loaders —
-/// the same audited contract as `emit_avx_binary_256_inner`.
-pub(crate) fn memfold_consumer_unary_imm_256(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+/// BB-SLP unary+immediate consumers (packed lane shifts) are NOT
+/// memory-foldable on this target — ISA limitation, see the note on
+/// `memfold_consumer_128`.
+
+/// Two-operand 128-bit VEX.128 arithmetic intrinsics that go through
+/// `emit_sse_binary_128` and therefore can take a memory operand in the
+/// AT&T-first (r/m) slot. Returns `Some(commutative)`. Mirrors
+/// `memfold_consumer_256` for the 128-bit families; the audited-emitter
+/// discipline is the same — `emit_sse_binary_128`'s VEX path consumes the
+/// pending fold as its FIRST action (width-matched to 16).
+///
+/// ISA NOTE — immediate shifts are deliberately absent from every fold
+/// table: the VEX immediate-shift encodings (66.0F 71/72/73 /digit ib)
+/// are REGISTER-ONLY. The r/m-as-memory form exists solely under EVEX
+/// (AVX-512), which the x86-64-v3 baseline does not provide; GNU as
+/// assembles `vpslld $3,(%rdi),%xmm3` to an EVEX encoding, and hand-
+/// rolling the VEX-looking bytes encodes an INVALID instruction (SIGILL,
+/// verified on the v5 battery). The S49-era analysis admitted shift
+/// consumers whose emitters then emitted the invalid form — a latent
+/// compile-error (assembler rejection) for any 8×i32 `<<` shape with an
+/// adjacent single-use load; both the analysis entries and the emitters'
+/// fold branches are removed here for good.
+pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<bool> {
     use crate::ir::intrinsics::IntrinsicOp as O;
-    matches!(
-        op,
-        O::VecShlI16x16
-            | O::VecLShrI16x16
-            | O::VecAShrI16x16
-            | O::VecShlI32x8
-            | O::VecLShrI32x8
-            | O::VecAShrI32x8
-            | O::VecShlI64x4
-            | O::VecLShrI64x4
-    )
+    match op {
+        // Commutative: add/mul/bitwise/integer-min/max.
+        O::VecAddF64x2
+        | O::VecAddF32x4
+        | O::VecMulF64x2
+        | O::VecMulF32x4
+        | O::VecXorF64x2
+        | O::VecXorF32x4
+        | O::VecAddI64x2
+        | O::VecAddI32x4
+        | O::VecMulI32x4
+        | O::VecMulI16x8
+        | O::VecAddI16x8
+        | O::VecAddI8x16
+        | O::VecAndI64x2
+        | O::VecOrI64x2
+        | O::VecXorI64x2
+        | O::VecAndI32x4
+        | O::VecOrI32x4
+        | O::VecXorI32x4
+        | O::VecAndI16x8
+        | O::VecOrI16x8
+        | O::VecXorI16x8
+        | O::VecAndI8x16
+        | O::VecOrI8x16
+        | O::VecXorI8x16
+        // Integer min/max has none of the FP unordered/signed-zero
+        // asymmetry — commutative.
+        | O::VecMinU8x16
+        | O::VecMaxU8x16
+        | O::VecMinI16x8
+        | O::VecMaxI16x8
+        | O::VecSminI32x4
+        | O::VecSmaxI32x4 => Some(true),
+        // Non-commutative: FP sub/div return different results under
+        // operand exchange; packed FP min/max return SRC2 on unordered and
+        // equal lanes; integer sub is src1 − src2. A fold is order-safe in
+        // the args[1] (src2) position only.
+        O::VecSubF64x2
+        | O::VecSubF32x4
+        | O::VecDivF64x2
+        | O::VecDivF32x4
+        | O::VecMinF32x4
+        | O::VecMaxF32x4
+        | O::VecMinF64x2
+        | O::VecMaxF64x2
+        | O::VecSubI64x2
+        | O::VecSubI32x4
+        | O::VecSubI16x8
+        | O::VecSubI8x16 => Some(false),
+        _ => None,
+    }
 }
 
 /// Two-operand 256-bit VEX arithmetic intrinsics that go through
@@ -2159,9 +2271,11 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
     use crate::ir::intrinsics::IntrinsicOp as O;
     match op {
         O::VecAddF64x4
-        | O::VecMulF64x4
         | O::VecAddF32x8
+        | O::VecMulF64x4
         | O::VecMulF32x8
+        | O::VecXorF64x4
+        | O::VecXorF32x8
         | O::VecAddI32x8
         | O::VecMulI32x8
         | O::VecMaxI32x8
@@ -2231,12 +2345,15 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
 ///   intervening load — it falls back to the ordinary load otherwise;
 /// * VEX arithmetic imposes no alignment on memory operands, so unaligned
 ///   streams are legal; legacy-SSE 128-bit forms (`paddd m128`) would fault,
-///   hence only the 256-bit family is eligible;
+///   hence the 128-bit families are eligible only under AVX2 (the VEX.128
+///   encodings) — gated at the emitter (`try_elide_vec_load`), which is the
+///   single point that actually elides;
 /// * a non-commutative consumer may only fold its second operand (AT&T
 ///   `op mem, %src1, %dst` computes `src1 op mem`);
 /// * every consumer path either uses the memory operand or materialises the
-///   load (`avx_load_arg_to`), and a safety net in `emit_intrinsic_impl`
-///   materialises a pending fold before any unexpected intrinsic.
+///   load (`avx_load_arg_to`/`sse_load_arg` re-issue paths), and a safety net
+///   in `emit_intrinsic_impl` materialises a pending fold before any
+///   unexpected intrinsic — including a width-mismatched consumer.
 ///
 /// When both operands of a consumer are adjacent loads, the farther one is
 /// folded: the nearer load then streams through `%ymm0` under the existing
@@ -2276,14 +2393,11 @@ pub(super) fn compute_vector_memfold_homed_ok(func: &IrFunction) -> FxHashSet<u3
             else {
                 continue;
             };
-            // Only the plain binary family; the madd/FMA variants are
-            // excluded on purpose (see the doc comment). The BB-SLP
-            // unary+immediate shift family is admitted too:
-            // emit_avx_shift_imm_256 consults pending_vec_memfold as its
-            // FIRST action, the same audited contract.
-            if (memfold_consumer_256(op).is_none() && !memfold_consumer_unary_imm_256(op))
-                || memfold_consumer_madd_256(op)
-            {
+            // Only the audited memfold-first emitters; the madd/FMA variants
+            // are excluded on purpose (see the doc comment). The immediate
+            // SHIFT families are NOT admitted: their VEX encodings are
+            // register-only (see memfold_consumer_unary_imm_NEVER).
+            if memfold_consumer_256(op).is_none() && memfold_consumer_128(op).is_none() {
                 continue;
             }
             for a in args {
@@ -2344,11 +2458,21 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
     let debug = env_flag("CCC_DEBUG_VLFOLD");
     for (bi, block) in func.blocks.iter().enumerate() {
         let insts = &block.instructions;
-        let load_at = |k: usize| -> Option<u32> {
+        // The elided load's width must match its consumer's family: a
+        // 128-bit consumer folds a 16-byte memory operand, a 256-bit
+        // consumer a 32-byte one. `wide` selects the matching load set.
+        let load_at = |k: usize, wide: bool| -> Option<u32> {
             match insts.get(k) {
                 Some(Instruction::Intrinsic {
                     dest: Some(d), op, ..
-                }) if is_memfold_vec_load(op) => Some(d.0),
+                }) if if wide {
+                    is_memfold_vec_load(op)
+                } else {
+                    is_memfold_vec_load_128(op)
+                } =>
+                {
+                    Some(d.0)
+                }
                 _ => None,
             }
         };
@@ -2367,47 +2491,15 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
             };
             // Madd `a*b + c`: every position may fold (the multiplicands
             // commute; the emitter picks the 213/231 form and keeps the
-            // XMM-homed broadcast as the register source).
+            // XMM-homed broadcast as the register source). 256-bit only.
+            // (Immediate-shift consumers are NOT foldable — the VEX forms
+            // are register-only; see memfold_consumer_unary_imm_NEVER.)
             let madd = memfold_consumer_madd_256(cop);
-            // Unary + immediate consumers (BB-SLP packed shifts): the
-            // single vector operand (args[0]) folds — `v<inst> $imm, MEM,
-            // %dst`. Same adjacency/purity/use-count contract as the
-            // binary form; the emitter consumes the pending fold first.
-            if !madd && cargs.len() == 2 {
-                if let (Operand::Value(a0), Operand::Const(_)) = (&cargs[0], &cargs[1]) {
-                    if memfold_consumer_unary_imm_256(cop) {
-                        let d0 = a0.0;
-                        if !poisoned.contains(&d0) && use_count.get(&d0).copied() == Some(1) {
-                            let mut pick = None;
-                            if j >= 2 && pure_load_at(j - 1) {
-                                if let Some(d) = load_at(j - 2) {
-                                    if d == d0 {
-                                        pick = Some(d);
-                                    }
-                                }
-                            }
-                            if pick.is_none() && j >= 1 {
-                                if let Some(d) = load_at(j - 1) {
-                                    if d == d0 {
-                                        pick = Some(d);
-                                    }
-                                }
-                            }
-                            if let Some(d) = pick {
-                                if debug {
-                                    eprintln!(
-                                        "[VLFOLD-IR] {} b{} i{} fold load %{} into {:?} (unary+imm)",
-                                        func.name, bi, j, d, cop
-                                    );
-                                }
-                                result.insert(d);
-                            }
-                        }
-                        continue;
-                    }
-                }
-            }
-            let (commutative, a0, a1) = if madd {
+            // Binary consumers: the 256-bit table (emit_avx_binary_256) or
+            // the 128-bit table (emit_sse_binary_128's VEX path). A given
+            // opcode belongs to exactly one family, so the lookups cannot
+            // disagree. `wide` carries the width to the load matcher.
+            let (commutative, wide, a0, a1) = if madd {
                 if cargs.len() != 3 {
                     continue;
                 }
@@ -2416,9 +2508,12 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
                 else {
                     continue;
                 };
-                (true, a0, a2)
+                (true, true, a0, a2)
             } else {
-                let Some(commutative) = memfold_consumer_256(cop) else {
+                let Some((commutative, wide)) = memfold_consumer_256(cop)
+                    .map(|c| (c, true))
+                    .or_else(|| memfold_consumer_128(cop).map(|c| (c, false)))
+                else {
                     continue;
                 };
                 if cargs.len() != 2 {
@@ -2427,7 +2522,7 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
                 let (Operand::Value(a0), Operand::Value(a1)) = (&cargs[0], &cargs[1]) else {
                     continue;
                 };
-                (commutative, a0, a1)
+                (commutative, wide, a0, a1)
             };
             if a0.0 == a1.0 {
                 continue;
@@ -2452,12 +2547,12 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
             };
             let mut pick = None;
             if j >= 2 && pure_load_at(j - 1) {
-                if let Some(d) = load_at(j - 2) {
+                if let Some(d) = load_at(j - 2, wide) {
                     pick = pick_from(d);
                 }
             }
             if pick.is_none() && j >= 1 {
-                if let Some(d) = load_at(j - 1) {
+                if let Some(d) = load_at(j - 1, wide) {
                     pick = pick_from(d);
                 }
             }

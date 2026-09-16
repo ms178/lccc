@@ -130,6 +130,21 @@ impl RegCache {
 pub(crate) static EXPLORATORY_EMISSION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// A VLFOLD-elided vector load awaiting its consumer.
+/// See `CodegenState::pending_vec_memfold` for the width contract.
+#[derive(Clone, Debug)]
+pub struct PendingVecMemfold {
+    /// Value id of the elided load's result.
+    pub val: u32,
+    /// The load's source memory operand (already rendered as AT&T text).
+    pub mem: String,
+    /// The load mnemonic (`vmovdqu`, `vmovups`, `vmovupd`) for
+    /// materialisation / re-issue.
+    pub mnemonic: &'static str,
+    /// Access width in bytes: 16 (VEX.128 fold) or 32 (VEX.256 fold).
+    pub width: u32,
+}
+
 pub struct CodegenState {
     pub out: AsmOutput,
     /// Set from CodegenOptions for -O0 non-SSA correctness.
@@ -212,12 +227,19 @@ pub struct CodegenState {
     /// elided when the load's destination carries a register home; see
     /// `compute_vector_memfold_homed_ok`.
     pub vector_memfold_homed_ok: FxHashSet<u32>,
-    /// The elided load awaiting its consumer: (value id, memory operand,
-    /// load mnemonic for materialisation). Consumed by `emit_avx_binary_256`
-    /// as a memory operand, or by `avx_load_arg_to` as a real load; the
-    /// safety net in `emit_intrinsic_impl` materialises it before any other
-    /// intrinsic.
-    pub pending_vec_memfold: Option<(u32, String, &'static str)>,
+    /// The elided load awaiting its consumer. Consumed as a memory operand
+    /// by the audited memfold-first emitters, or re-issued as a real load by
+    /// the memfold-aware loaders; the safety net in `emit_intrinsic_impl`
+    /// materialises it before any other intrinsic.
+    ///
+    /// `width` is the access width in BYTES (16 for a VEX.128 fold, 32 for a
+    /// VEX.256 fold). A materialisation or re-issue must read EXACTLY that
+    /// many bytes: a 32-byte read of a 16-byte object can cross a page the
+    /// program never touched (the source object is only guaranteed to span
+    /// `width` bytes), and a 16-byte read of a 32-bit object would load
+    /// garbage lanes. Every consumer site checks the width matches its own
+    /// vector family before consuming.
+    pub pending_vec_memfold: Option<PendingVecMemfold>,
     /// Lazy-flush half of the deferred-store mechanism: a skipped vector
     /// result store is kept PENDING here (value id, holding register, 256-bit
     /// flag) instead of being dropped. If the consumer really receives the
@@ -515,6 +537,9 @@ pub struct CodegenState {
     /// FP constants are emitted as .rodata entries and loaded via
     /// `movsd .LCFPxx(%rip), %xmm` instead of `movabsq + movq`.
     pub fp_const_pool: FxHashMap<u64, String>,
+    /// Full-width VECTOR constant pool (16/32 bytes, little-endian) for
+    /// emitters that fold a constant vector as a VEX memory operand.
+    pub vec_const_pool: FxHashMap<Vec<u8>, String>,
     /// Label emitted immediately after the current block, if any. Used to
     /// elide unconditional jumps on the hot fall-through path.
     pub next_block_label: Option<BlockId>,
@@ -624,6 +649,7 @@ impl CodegenState {
             emit_cfi: true,
 
             fp_const_pool: FxHashMap::default(),
+            vec_const_pool: FxHashMap::default(),
             next_block_label: None,
         }
     }
@@ -690,6 +716,22 @@ impl CodegenState {
         label
     }
 
+    /// Label for a full-width VECTOR constant (16 or 32 bytes, little-
+    /// endian). Keyed by the exact byte pattern so equal masks share one
+    /// .rodata slot. Used by emitters that fold a constant vector as a VEX
+    /// memory operand (`vxorps .LCVEC_3(%rip), %src, %dst`) — the one-
+    /// instruction spelling of the FP-Neg sign-mask composite, exactly the
+    /// form GCC emits for `-x` lanes.
+    pub fn get_vec_const_label(&mut self, bytes: &[u8]) -> String {
+        if let Some(label) = self.vec_const_pool.get(bytes) {
+            return label.clone();
+        }
+        let label = format!(".LCVEC_{}", self.label_counter);
+        self.label_counter += 1;
+        self.vec_const_pool.insert(bytes.to_vec(), label.clone());
+        label
+    }
+
     /// Emit all accumulated FP constants as a .rodata section.
     /// Called once at the end of module codegen.
     ///
@@ -703,7 +745,7 @@ impl CodegenState {
     /// the upper lane of the andpd mask zero, which is the correct identity
     /// for scalar-typed lanes.
     pub fn emit_fp_const_pool(&mut self) {
-        if self.fp_const_pool.is_empty() {
+        if self.fp_const_pool.is_empty() && self.vec_const_pool.is_empty() {
             return;
         }
         self.out.emit(".section .rodata");
@@ -722,6 +764,21 @@ impl CodegenState {
             self.out
                 .emit_fmt(format_args!("    .quad {}", *bits as i64));
             self.out.emit("    .quad 0");
+        }
+        // Full-width vector constants: 16 or 32 little-endian bytes each,
+        // .p2align 4 (VEX memory operands carry no alignment requirement;
+        // the alignment keeps the pool tidy and legacy-safe).
+        let mut ventries: Vec<_> = self.vec_const_pool.iter().collect();
+        ventries.sort_by_key(|(_, label)| (*label).clone());
+        for (bytes, label) in ventries {
+            self.out.emit(".p2align 4");
+            self.out.emit_fmt(format_args!("{}:", label));
+            for chunk in bytes.chunks(8) {
+                let mut q = [0u8; 8];
+                q[..chunk.len()].copy_from_slice(chunk);
+                self.out
+                    .emit_fmt(format_args!("    .quad {}", u64::from_le_bytes(q) as i64));
+            }
         }
     }
 
@@ -876,6 +933,46 @@ impl CodegenState {
         // physical machine state that persists until an explicit vzeroupper
         // (or the epilogue's); invalidating the cache mid-function must not
         // lose the pending epilogue emission.
+    }
+
+    /// Record that vector value `v` is currently held in the physical
+    /// vector register named `reg` ("xmm5"/"ymm3"/"zmm0"). One physical
+    /// register bank holds exactly one vector value: every OTHER value's
+    /// claim on the same bank is evicted — the write that produced `v`
+    /// destroyed whatever the bank held before (a VEX.128 write also
+    /// zeroes the bank's upper half, and a 256/512-bit write overwrites
+    /// the low view, so the eviction is alias-conservative across the
+    /// xmm/ymm/zmm spellings of the same bank in both directions: at
+    /// worst it costs a redundant reload, never a wrong read).
+    ///
+    /// The eviction is the soundness fix for the stale-claim hazard: a
+    /// scratch bank claimed by two values — the add's accumulator claim
+    /// on xmm0 outlived the shift that redefined xmm0, and the xor's
+    /// operand resolver then read the shift's result as the accumulator
+    /// (`vpxor (v>>1), (v>>1)` — the simd_vecreg loopcarry miscompile).
+    /// Claims are only ever recorded after a real write of `v` into
+    /// `reg`, so eviction at the claim is exactly the point where the
+    /// previous content provably died.
+    pub fn vec_claim_live_reg(&mut self, v: u32, reg: &'static str) {
+        let bank = vector_reg_bank(reg);
+        self.vec_live_regs
+            .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == v);
+        self.vec_live_regs.insert(v, reg);
+    }
+
+    /// Every value's `vec_live_regs` claim on `reg`'s bank EXCEPT `keep`
+    /// dies here: the bank is being overwritten with data that is (or
+    /// will be) `keep`'s — a real load into the scratch view, or a
+    /// move-aside `movdqa held -> reg`. Without this eviction a claim
+    /// survived the very clobber that invalidated it, and a later
+    /// operand resolver read the WRONG value out of the register (the
+    /// simd_vecreg loopcarry shape: the accumulator's claim on xmm0
+    /// outlived both the streamed reload and the shift that redefined
+    /// xmm0; the xor then consumed `(v>>1) ^ (v>>1)`).
+    pub fn vec_evict_bank_except(&mut self, reg: &str, keep: u32) {
+        let bank = vector_reg_bank(reg);
+        self.vec_live_regs
+            .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == keep);
     }
 
     /// Get the over-alignment requirement for an alloca (> 16 bytes), or None.
@@ -1100,6 +1197,16 @@ impl CodegenState {
             None
         }
     }
+}
+
+/// The bank number of a physical vector register name ("xmm5" → 5,
+/// "ymm3" → 3, "zmm0" → 0). The xmm/ymm/zmm spellings of one bank name
+/// the SAME physical storage viewed at different widths, so alias
+/// decisions in `vec_claim_live_reg` compare bank numbers, not strings.
+fn vector_reg_bank(reg: &str) -> u32 {
+    reg.trim_start_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]

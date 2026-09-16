@@ -24,6 +24,17 @@
 # open-policy one produces output byte-identical to gate-off.
 set -eu
 
+# Visible skip when the i386 multilib is absent: CI installs gcc-multilib
+# + libc6-dev-i386 and runs the m32 legs for real; a headerless host
+# (container sandboxes without root) cannot run them at all, and a hard
+# failure there reports the ENVIRONMENT, not the code.
+i386_headers_ok() {
+    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
+        echo "SKIP: i686 leg ($1) - no i386 libc headers on this host (CI installs gcc-multilib)"
+        return 1
+    fi
+}
+
 CCC=${CCC:-./target/fastbuild/lccc}
 [ -x "$CCC" ] || { >&2 echo "SKIP: $CCC not built"; exit 1; }
 # Canonicalize the compiler path while the caller's cwd is still ours; CI
@@ -91,7 +102,7 @@ must_not_grep '\[GLA\] main applied:' "$tmp/os.log" "-Os edited nbody"
 #     from an induction counter (measured loop_patterns 1.05x regression
 #     at the old band 6). The i686 driver is the argv0-selected bin. --------
 CCC686="$dir/../../target/fastbuild/lccc-i686"
-if [ -x "$CCC686" ]; then
+if [ -x "$CCC686" ] && i386_headers_ok "$CCC686"; then
   CCC_RA_GLOBAL_LOCATION=1 CCC_DEBUG_SPLIT=1 CCC_GLA_TRACE=1 \
     "$CCC686" -O2 -S -o "$tmp/m32.s" "$src" 2>"$tmp/m32.log"
   must_not_grep '\[GLA\] main applied:' "$tmp/m32.log" "i686 policy edited nbody"

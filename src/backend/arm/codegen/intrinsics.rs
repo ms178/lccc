@@ -818,6 +818,7 @@ impl ArmCodegen {
             | IntrinsicOp::VecMulF32x4
             | IntrinsicOp::VecAddI32x4
             | IntrinsicOp::VecSmaxI32x4
+            | IntrinsicOp::VecSminI32x4
             | IntrinsicOp::VecSubF64x2
             | IntrinsicOp::VecDivF64x2
             | IntrinsicOp::VecSubF32x4
@@ -837,6 +838,7 @@ impl ArmCodegen {
                         IntrinsicOp::VecDivF32x4 => ("fdiv", "4s"),
                         IntrinsicOp::VecAddI32x4 => ("add", "4s"),
                         IntrinsicOp::VecSmaxI32x4 => ("smax", "4s"),
+                        IntrinsicOp::VecSminI32x4 => ("smin", "4s"),
                         _ => ("mul", "4s"),
                     };
                     if let Some(name) = self.assigned_vector_reg(d.0) {
