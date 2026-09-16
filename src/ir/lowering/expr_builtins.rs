@@ -477,6 +477,45 @@ impl Lowerer {
                 let is_long_double_variant = name == "__builtin_infl"
                     || name == "__builtin_huge_vall"
                     || name == "__builtin_nanl";
+                // NaN builtins with a payload string: GCC/glibc semantics.
+                // The argument is an n-char-sequence parsed with
+                // strtoull-style base-0 rules (0x hex, leading-0 octal,
+                // decimal); the value becomes the quiet-NaN significand
+                // (glibc: `0x7fc00000 | (payload & 0x7fffff)` for f32,
+                // analogously f64/f128 — the exponent is all-ones and the
+                // quiet bit forced, the payload fills the remaining
+                // mantissa bits). Empty/absent string → canonical qNaN
+                // (the ConstantF64(f64::NAN) fallback below).
+                if matches!(name, "__builtin_nan" | "__builtin_nanf" | "__builtin_nanl") {
+                    let payload: Option<u64> = match args.first() {
+                        Some(Expr::StringLiteral(s, _)) if !s.is_empty() => {
+                            parse_n_char_sequence(s)
+                        }
+                        _ => None,
+                    };
+                    if let Some(p) = payload {
+                        if name == "__builtin_nanf" {
+                            let bits = 0x7fc0_0000u32 | (p as u32 & 0x007f_ffff);
+                            return Some(Operand::Const(IrConst::F32(f32::from_bits(bits))));
+                        } else if name == "__builtin_nan" {
+                            let bits = 0x7ff8_0000_0000_0000u64 | (p & 0x000f_ffff_ffff_ffff);
+                            return Some(Operand::Const(IrConst::F64(f64::from_bits(bits))));
+                        } else {
+                            // nanl: binary128 qNaN (the LongDouble const
+                            // carries explicit big-endian f128 bytes);
+                            // the u64 payload fills mantissa bits 63..0.
+                            let mut bytes = [0u8; 16];
+                            bytes[0] = 0x7F;
+                            bytes[1] = 0xFF;
+                            bytes[2] = 0x80;
+                            bytes[8..16].copy_from_slice(&p.to_be_bytes());
+                            return Some(Operand::Const(IrConst::long_double_with_bytes(
+                                f64::NAN,
+                                bytes,
+                            )));
+                        }
+                    }
+                }
                 if is_float_variant {
                     Some(Operand::Const(IrConst::F32(*val as f32)))
                 } else if is_long_double_variant {
@@ -2738,4 +2777,48 @@ fn classify_ctype(ty: &CType) -> i64 {
         CType::Union(_) => 13,     // union_type_class
         CType::Vector(_, _) => 14, // array_type_class (GCC classifies vectors here)
     }
+}
+
+/// Parse a C99 `n-char-sequence` (the payload string of
+/// `nan("...")`/`__builtin_nan*`) with `strtoull` base-0 semantics:
+/// `0x`/`0X` prefix → hexadecimal, a leading `0` → octal, otherwise
+/// decimal. Parsing stops at the first character that cannot belong to
+/// the chosen base (exactly like strtoull); an empty parse yields 0 —
+/// glibc's own `nan()` behaviour, and the canonical-qNaN result for
+/// garbage strings. Values saturate at u64::MAX (strtoull's ERANGE
+/// behaviour). Some(_) is only returned for a non-empty, at least
+/// partially valid sequence.
+fn parse_n_char_sequence(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return None;
+    }
+    let (digits_start, radix) = if b.len() >= 2 && b[0] == b'0' && (b[1] | 0x20) == b'x' {
+        (2, 16u32)
+    } else if b[0] == b'0' {
+        (1, 8u32)
+    } else {
+        (0, 10u32)
+    };
+    if digits_start >= b.len() {
+        // "0x" alone: strtoull parses the "0" and leaves "x" unconsumed.
+        return Some(0);
+    }
+    let mut acc: u64 = 0;
+    let mut any = false;
+    for &c in &b[digits_start..] {
+        let d = match (c as char).to_digit(radix) {
+            Some(d) => d as u64,
+            None => break,
+        };
+        any = true;
+        acc = acc.saturating_mul(radix as u64).saturating_add(d);
+    }
+    if !any {
+        // No valid digit in the chosen base (e.g. "0xzz" after the 0x
+        // prefix, or a "9" in an octal prefix "09..."): strtoull still
+        // consumed the "0" prefix — value 0.
+        return Some(0);
+    }
+    Some(acc)
 }

@@ -26,6 +26,15 @@ ccc=${LCCC_BIN:-target/fastbuild/lccc}
 td=$(mktemp -d)
 trap 'rm -rf "$td"' EXIT
 
+# The i386 multilib probe: CI installs gcc-multilib + libc6-dev-i386 and
+# runs this gate for real; a headerless host (container sandboxes without
+# root) cannot compile even `#include <stdio.h>` at -m32, and a hard
+# failure there reports the ENVIRONMENT, not the code. Skip loudly.
+if ! printf '#include <stdio.h>\n' | "$ccc" -m32 -x c - -fsyntax-only >/dev/null 2>&1; then
+    echo "SKIP: i686-tls-ie-relax - no i386 libc headers on this host (CI installs gcc-multilib)"
+    exit 0
+fi
+
 cat >"$td/tls.c" <<'CEOF'
 #include <stdio.h>
 static __thread int le_var = 5;   /* local, offset 0 in the block */

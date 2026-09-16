@@ -371,6 +371,21 @@ pub enum IntrinsicOp {
     VecSqrtF32x8,
     /// Vector square root: %dest_vec = sqrt(%src_vec) - SSE2 4×F32.
     VecSqrtF32x4,
+    /// Packed FP bitwise XOR: %dest_vec = args[0] ^ args[1] per lane BIT
+    /// (`vxorps`). Commutative, pure, and — crucially — NOT an FP compare
+    /// or arithmetic op: it does not signal, canonicalise NaNs, or merge
+    /// signed zeros, so it is the exact packed spelling of every
+    /// bit-manipulation idiom whose scalar form is an integer-domain XOR
+    /// on the FP bit pattern (the FP Negation family: `-x` lowers to a
+    /// sign-bit flip, identical to `x ^ -0.0` for EVERY value including
+    /// NaN payloads and ±0). AVX2 8×F32.
+    VecXorF32x8,
+    /// Packed FP bitwise XOR (see `VecXorF32x8`) - SSE 4×F32 (`xorps`).
+    VecXorF32x4,
+    /// Packed FP bitwise XOR (see `VecXorF32x8`) - AVX2 4×F64 (`vxorpd`).
+    VecXorF64x4,
+    /// Packed FP bitwise XOR (see `VecXorF32x8`) - SSE2 2×F64 (`xorpd`).
+    VecXorF64x2,
     /// Packed IEEE minimum with x86 `MINPS/MINPD` operand semantics:
     /// `dest[i] = args[0][i] < args[1][i] ? args[0][i] : args[1][i]`.
     /// The SECOND operand is returned whenever a lane is unordered (NaN)
@@ -492,6 +507,10 @@ pub enum IntrinsicOp {
     /// Integer max is associative, commutative, and idempotent, so lane-order
     /// reduction matches sequential scalar max bit-for-bit (levkropp 8b139820).
     VecSmaxI32x4,
+    /// Lane-wise signed minimum of two 4×I32 vectors. The SSE4.1
+    /// `pminsd` twin of `VecSmaxI32x4`; the SSE2-only baseline lowers it
+    /// to the exact 4-op pcmpgtd+and/andn/or select in the emitter.
+    VecSminI32x4,
     /// NEON smaxv: horizontal signed max of 4xI32 lanes; dest = scalar I32.
     VecHorizontalMaxI32x4,
     /// Broadcast a scalar I32 to all 4 lanes: %dest_vec = {x, x, x, x}
@@ -1565,8 +1584,8 @@ impl IntrinsicOp {
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
             | VecSubI32x8 | VecAndI32x8 | VecOrI32x8 | VecXorI32x8
-            | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4
-            | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8
+            | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4 | VecXorF64x4
+            | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8 | VecXorF32x8
             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
             | VecMulF32x8 | VecFmaF32x8 | VecMaddF32x8
             | VecBroadcastF32x8 | VecZeroF32x8
@@ -1661,9 +1680,9 @@ impl IntrinsicOp {
             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
-            | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2
+            | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2 | VecXorF64x2
             | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
-            | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4
+            | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4 | VecXorF32x4
             | VecMinF32x4 | VecMaxF32x4 | VecCmpF32x4 | VecBlendvF32x4
             | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
             | VecCmpI32x4 | VecBlendvI32x4
@@ -1691,7 +1710,7 @@ impl IntrinsicOp {
             | VecWidenMaskedAddI32x4ToI64x2
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
             | VecSubI32x4 | VecSubI64x2 | VecAndI32x4 | VecOrI32x4 | VecXorI32x4
-            | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
+            | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4 | VecSminI32x4
             // BB-SLP 128-bit families: I64x2 bitwise, I16x8/I8x16
             // load/store/bitwise, and the 2-lane gather/extract pairs.
             | VecAndI64x2 | VecOrI64x2 | VecXorI64x2
@@ -1986,6 +2005,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecDivF64x2
                 | IntrinsicOp::VecSqrtF64x4
                 | IntrinsicOp::VecSqrtF64x2
+                | IntrinsicOp::VecXorF64x4
+                | IntrinsicOp::VecXorF64x2
                 | IntrinsicOp::VecBroadcastF64x4
                 | IntrinsicOp::VecBroadcastF64x2
                 | IntrinsicOp::VecMulF32x8
@@ -1996,6 +2017,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecDivF32x4
                 | IntrinsicOp::VecSqrtF32x8
                 | IntrinsicOp::VecSqrtF32x4
+                | IntrinsicOp::VecXorF32x8
+                | IntrinsicOp::VecXorF32x4
                 | IntrinsicOp::VecWidenAddI32x4ToI64x2
                 | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
                 | IntrinsicOp::VecMaskedAddI32x8
@@ -2032,6 +2055,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecSmlalLoI32x4
                 | IntrinsicOp::VecSmlalHiI32x4
                 | IntrinsicOp::VecSmaxI32x4
+                | IntrinsicOp::VecSminI32x4
                 | IntrinsicOp::VecMinF32x8
                 | IntrinsicOp::VecMinF32x4
                 | IntrinsicOp::VecMinF64x4
@@ -2317,12 +2341,17 @@ mod vector_result_width_tests {
             "VecOrI32x8" => IntrinsicOp::VecOrI32x8,
             "VecSadalpI32x4" => IntrinsicOp::VecSadalpI32x4,
             "VecSmaxI32x4" => IntrinsicOp::VecSmaxI32x4,
+            "VecSminI32x4" => IntrinsicOp::VecSminI32x4,
             "VecSmlalHiI32x4" => IntrinsicOp::VecSmlalHiI32x4,
             "VecSmlalLoI32x4" => IntrinsicOp::VecSmlalLoI32x4,
             "VecSqrtF32x4" => IntrinsicOp::VecSqrtF32x4,
             "VecSqrtF32x8" => IntrinsicOp::VecSqrtF32x8,
             "VecSqrtF64x2" => IntrinsicOp::VecSqrtF64x2,
             "VecSqrtF64x4" => IntrinsicOp::VecSqrtF64x4,
+            "VecXorF32x4" => IntrinsicOp::VecXorF32x4,
+            "VecXorF32x8" => IntrinsicOp::VecXorF32x8,
+            "VecXorF64x2" => IntrinsicOp::VecXorF64x2,
+            "VecXorF64x4" => IntrinsicOp::VecXorF64x4,
             "VecStoreF32x4" => IntrinsicOp::VecStoreF32x4,
             "VecStoreF32x8" => IntrinsicOp::VecStoreF32x8,
             "VecStoreF64x2" => IntrinsicOp::VecStoreF64x2,
@@ -2498,6 +2527,10 @@ mod memory_classification_tests {
             O::VecAndI8x16,
             O::VecOrI16x8,
             O::VecXorI32x4,
+            O::VecXorF32x4,
+            O::VecXorF32x8,
+            O::VecXorF64x2,
+            O::VecXorF64x4,
             O::VecBroadcastI64x4,
             O::VecZeroF32x4,
             O::VecPackI64x2,

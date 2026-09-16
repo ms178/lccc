@@ -100,13 +100,41 @@ gate "rust-toolchain-selector" fast \
 # run was green. Repeating the suite is the only way to see it, and it is
 # cheap once the test binaries are built. Set LCCC_TEST_REPEATS to raise the
 # count (CI itself runs it once).
+#
+# Memory-constrained hosts: the monolithic lib-test compile with the
+# fastbuild profile's line-tables debuginfo needs ~3 GB of resident rustc;
+# on a 4 GB sandbox the OOM killer SIGKILLs it and the gate reports a
+# compile failure that has nothing to do with the code under test. The
+# test binary's debuginfo contributes nothing the assertions read --
+# panic messages carry their own source spans -- and cargo's -j only
+# serialises the COMPILE (the test harness's own parallelism is
+# --test-threads, untouched), so on hosts with less than 6 GB of RAM
+# the test compile drops the debuginfo AND builds one rustc at a time
+# (CARGO_PROFILE_FASTBUILD_DEBUG=0, -j 1; set the env var explicitly to
+# override the heuristic, including back to the profile default with
+# CARGO_PROFILE_FASTBUILD_DEBUG=line-tables-only).
 cargo_test_repeated() {
-    local flags="" n i
+    local flags="" n i dbg jobs
     # Reuse the flags the build gate resolved, or cargo rebuilds everything.
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
+    dbg="${CARGO_PROFILE_FASTBUILD_DEBUG:-}"
+    jobs=2
+    if [ -z "$dbg" ]; then
+        local total_mb
+        total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+        if [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ]; then
+            dbg=0
+            jobs=1
+        fi
+    fi
     n="${LCCC_TEST_REPEATS:-1}"
     for ((i = 1; i <= n; i++)); do
-        if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j 2; then
+        if [ -n "$dbg" ]; then
+            export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg"
+        else
+            unset CARGO_PROFILE_FASTBUILD_DEBUG
+        fi
+        if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
             printf 'cargo-test: FAILED on repeat %d/%d\n' "$i" "$n" >&2
             return 1
         fi
@@ -227,6 +255,14 @@ gate "bb-slp-v4" fast \
 # strict min/max folds, adversarial rejections.
 gate "bb-slp-v5" fast \
     bash tests/regression/check_bb_slp_v5_codegen.sh
+
+# BB-SLP v6: the 128-bit VEX memory fold, FP negation (one-instruction
+# sign-mask composite), integer min/max folds, the general cmp+blendv
+# composite, and the rule-(b) cross-block relaxation; plus the W5
+# register-homing contracts (dead-frame-free rotate diamonds, homed
+# min/max, GCC-parity shapes) and the stale-claim regression shapes.
+gate "bb-slp-v6" fast \
+    bash tests/regression/check_bb_slp_v6_codegen.sh
 
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh

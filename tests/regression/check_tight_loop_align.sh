@@ -26,6 +26,17 @@
 #   8. i686  — the cross compiler runs the same two-layer decision.
 set -euo pipefail
 
+# Visible skip when the i386 multilib is absent: CI installs gcc-multilib
+# + libc6-dev-i386 and runs the m32 legs for real; a headerless host
+# (container sandboxes without root) cannot run them at all, and a hard
+# failure there reports the ENVIRONMENT, not the code.
+i386_headers_ok() {
+    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
+        echo "SKIP: i686 leg ($1) — no i386 libc headers on this host (CI installs gcc-multilib)"
+        return 1
+    fi
+}
+
 CCC=${CCC:-./target/fastbuild/lccc}
 CCC32=${CCC32:-./target/fastbuild/lccc-i686}
 td=$(mktemp -d)
@@ -188,7 +199,7 @@ printf '.text\n.globl fg\nfg:\n.lccc_tight_loop .Lx\n.Lx:\nret\n' >"$td/ok.s"
 "$CCC" -c "$td/ok.s" -o "$td/ok.o" || bad "well-formed .lccc_tight_loop failed to assemble"
 
 # ── 8. i686 cross compiler: same two-layer decision ──
-if [ -x "$CCC32" ]; then
+if [ -x "$CCC32" ] && i386_headers_ok "$CCC32"; then
     dump=$({ CCC_DUMP_ALIGN=1 CCC_DEBUG_TIGHT=1 "$CCC32" -O2 -c "$td/good.c" -o "$td/good32.o"; } 2>&1)
     echo "$dump" | grep -q "func=good .*tight=yes" || bad "i686: structural audit did not accept"
     echo "$dump" | grep -q "\[TIGHT\].*align=" || bad "i686: assembler did not resolve a bucket"

@@ -1197,7 +1197,16 @@ impl X86Codegen {
         } else {
             super::isel::ShlxMode::Never
         });
-        self.avx2_enabled = opts.avx2 && opts.isa.ymm;
+        // VEX.256 / VEX.128 permission follows the NORMALIZED ISA, not the
+        // raw request bit — the `fma_enabled` discipline two lines below.
+        // The project's default -march is x86-64-v3, which grants AVX2 in
+        // `opts.isa.ymm` while the raw CLI flag stays false; keying on the
+        // request bit split the pass world (set_x86_simd_isa, which forms
+        // 256-bit packs from the same isa.ymm) from the emitter world
+        // (legacy 128-bit fallbacks) — the FP-Neg wide family then staged
+        // its 256-bit source through movdqa/xorps and silently dropped the
+        // upper lanes under VEX.256 loads/stores.
+        self.avx2_enabled = opts.isa.ymm;
         self.avx512_enabled = opts.avx512 && opts.isa.ymm;
         self.isa = opts.isa;
         // Publish for the emitters without `&self` (MachInst, peepholes).
@@ -7708,7 +7717,7 @@ impl ArchCodegen for X86Codegen {
                         self.state
                             .emit_fmt(format_args!("    {} %{}, %{}", mov, held, target));
                     }
-                    self.state.vec_live_regs.insert(dest.0, target);
+                    self.state.vec_claim_live_reg(dest.0, target);
                     self.state.vector_values.insert(dest.0);
                     if is_128 {
                         self.state.vector128_values.insert(dest.0);

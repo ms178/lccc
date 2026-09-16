@@ -15,6 +15,17 @@
 # trampoline shape is unreachable (phi-feeding weight >= 10 > weight cap,
 # plus the one-live-segment cap); see engineering/DECISIONS.md RA-GLA-03.
 set -euo pipefail
+
+# Visible skip when the i386 multilib is absent: CI installs gcc-multilib
+# + libc6-dev-i386 and runs the m32 legs for real; a headerless host
+# (container sandboxes without root) cannot run them at all, and a hard
+# failure there reports the ENVIRONMENT, not the code.
+i386_headers_ok() {
+    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
+        echo "SKIP: i686 leg ($1) - no i386 libc headers on this host (CI installs gcc-multilib)"
+        return 1
+    fi
+}
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 dir=$repo/tests/regression
 src=$dir/gla_backedge_no_trampoline.c
@@ -62,7 +73,7 @@ if [ -x "$rv" ] && command -v riscv64-linux-gnu-gcc >/dev/null 2>&1; then
   assert_zero_trampolines "riscv64" "$rv" \
     "$(riscv64-linux-gnu-gcc -print-file-name=include)" -O1
 fi
-if [ -x "$m32" ]; then
+if [ -x "$m32" ] && i386_headers_ok "$m32"; then
   assert_zero_trampolines "i686" "$m32" "" -O1
 fi
 

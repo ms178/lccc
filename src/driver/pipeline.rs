@@ -2265,7 +2265,6 @@ impl Driver {
             tune,
             lzcnt: self.enable_lzcnt,
             popcnt: self.enable_popcnt,
-            avx2: self.enable_avx2,
             avx512: self.enable_avx512f,
             isa: self.x86_isa(),
             no_relax: self.riscv_no_relax,

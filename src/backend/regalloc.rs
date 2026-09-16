@@ -6550,12 +6550,14 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecSubF32x4
             | O::VecMulF32x4
             | O::VecDivF32x4
+            | O::VecXorF32x4
             | O::VecMinF32x4
             | O::VecMaxF32x4
             | O::VecAddF64x2
             | O::VecSubF64x2
             | O::VecMulF64x2
             | O::VecDivF64x2
+            | O::VecXorF64x2
             | O::VecMinF64x2
             | O::VecMaxF64x2
             | O::VecRotlI32x4
@@ -7548,6 +7550,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecHorizontalMaxI32x8
                                 | O::VecHorizontalMaxI32x4
                                 | O::VecSmaxI32x4
+                                | O::VecSminI32x4
                                 | O::VecLoadWidenI32ToI64x2
                                 // Byte-predicate counting loops carry the
                                 // map-family byte ops (compare masks, the
@@ -7772,6 +7775,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAddF32x8
                     | O::VecSubF32x8
                     | O::VecDivF32x8
+                    | O::VecXorF32x8
                     | O::VecSqrtF32x8
                     | O::VecMaddF32x8
                     | O::VecCmpF32x8
@@ -7785,6 +7789,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAddF64x4
                     | O::VecSubF64x4
                     | O::VecDivF64x4
+                    | O::VecXorF64x4
                     | O::VecSqrtF64x4
                     | O::VecMaddF64x4
                     | O::VecCmpF64x4
@@ -7977,37 +7982,53 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             O::VecLoadF32x8
             | O::VecSubF32x8
             | O::VecDivF32x8
+            | O::VecXorF32x8
             | O::VecSqrtF32x8
             | O::VecMaddF32x8
             | O::VecCmpF32x8
             | O::VecBlendvF32x8
             | O::VecMinF32x8
-            | O::VecMaxF32x8 => Some(1),
+            | O::VecMaxF32x8
+            // Add/Mul ride `emit_avx_binary_256`, the same audited emitter
+            // as Sub/Div (W5: a streamed load feeding an add/mul chain was
+            // rejected here and paid a 32-byte dead slot + spill round
+            // trips).
+            | O::VecAddF32x8
+            | O::VecMulF32x8 => Some(1),
             O::VecLoadF64x4
             | O::VecSubF64x4
             | O::VecDivF64x4
+            | O::VecXorF64x4
             | O::VecSqrtF64x4
             | O::VecMaddF64x4
             | O::VecCmpF64x4
             | O::VecBlendvF64x4
             | O::VecMinF64x4
-            | O::VecMaxF64x4 => Some(2),
+            | O::VecMaxF64x4
+            | O::VecAddF64x4
+            | O::VecMulF64x4 => Some(2),
             O::VecLoadF32x4
             | O::VecSubF32x4
             | O::VecDivF32x4
+            | O::VecXorF32x4
             | O::VecSqrtF32x4
             | O::VecCmpF32x4
             | O::VecBlendvF32x4
             | O::VecMinF32x4
-            | O::VecMaxF32x4 => Some(4),
+            | O::VecMaxF32x4
+            | O::VecAddF32x4
+            | O::VecMulF32x4 => Some(4),
             O::VecLoadF64x2
             | O::VecSubF64x2
             | O::VecDivF64x2
+            | O::VecXorF64x2
             | O::VecSqrtF64x2
             | O::VecCmpF64x2
             | O::VecBlendvF64x2
             | O::VecMinF64x2
-            | O::VecMaxF64x2 => Some(5),
+            | O::VecMaxF64x2
+            | O::VecAddF64x2
+            | O::VecMulF64x2 => Some(5),
             // Integer map intermediates (class numbering mirrors the
             // broadcast collector): dword lanes, AVX2 8-wide and SSE2
             // 4-wide. Conditional-map results (compare masks, blends)
@@ -8065,6 +8086,20 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecAShrI32x8
             | O::VecShlI64x4
             | O::VecLShrI64x4 => Some(3),
+            // W5: the I64x4 family rides the SAME audited emitters as the
+            // I32x8 twins above (emit_avx_binary_256 / vec_store_source_
+            // 256). Without these producer entries a rotate diamond
+            // (load → {shl, shr} → or) left every value slot-homed: 7
+            // memory ops where 2 suffice, plus a dead frame. Deferral
+            // cannot cover the shift results: the second shift is an
+            // intervening Intrinsic, rejected by the window analysis —
+            // homing is the only sound cover.
+            | O::VecLoadI64x4
+            | O::VecAddI64x4
+            | O::VecSubI64x4
+            | O::VecAndI64x4
+            | O::VecOrI64x4
+            | O::VecXorI64x4 => Some(3),
             O::VecLoadI32x4
             | O::VecSubI32x4
             | O::VecAddI32x4
@@ -8100,7 +8135,19 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecLShrI32x4
             | O::VecAShrI32x4
             | O::VecShlI64x2
-            | O::VecLShrI64x2 => Some(6),
+            | O::VecLShrI64x2
+            // W5: I64x2 family (emit_sse_binary_128 / vec_store_source_
+            // 128, the I32x4 twins) and the SSE4.1 signed dword min/max
+            // (emit_sse_binary_128 via emit_sminmax_i32x4) — same rotate-
+            // diamond and dead-slot reasoning as the 256-bit arms above.
+            | O::VecLoadI64x2
+            | O::VecAddI64x2
+            | O::VecSubI64x2
+            | O::VecAndI64x2
+            | O::VecOrI64x2
+            | O::VecXorI64x2
+            | O::VecSminI32x4
+            | O::VecSmaxI32x4 => Some(6),
             _ => None,
         }
     };
@@ -8119,6 +8166,13 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinF32x8
                     | O::VecMaxF32x8
                     | O::VecStoreF32x8
+                    // W5: Add/Mul/Xor ride emit_avx_binary_256 / the
+                    // FP-Neg sign-mask path (vec_home_256 first) — a
+                    // streamed load feeding the FP-Neg xor kept a dead
+                    // 32-byte slot + frame otherwise.
+                    | O::VecAddF32x8
+                    | O::VecMulF32x8
+                    | O::VecXorF32x8
             ),
             2 => matches!(
                 op,
@@ -8131,6 +8185,11 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinF64x4
                     | O::VecMaxF64x4
                     | O::VecStoreF64x4
+                    // W5: Add/Mul/Xor — emit_avx_binary_256 / sign-mask
+                    // path, same audit as class 1.
+                    | O::VecAddF64x4
+                    | O::VecMulF64x4
+                    | O::VecXorF64x4
             ),
             4 => matches!(
                 op,
@@ -8142,6 +8201,11 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinF32x4
                     | O::VecMaxF32x4
                     | O::VecStoreF32x4
+                    // W5: Add/Mul/Xor — emit_sse_binary_128 / sign-mask
+                    // path (vec_home_128 first).
+                    | O::VecAddF32x4
+                    | O::VecMulF32x4
+                    | O::VecXorF32x4
             ),
             5 => matches!(
                 op,
@@ -8153,6 +8217,10 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinF64x2
                     | O::VecMaxF64x2
                     | O::VecStoreF64x2
+                    // W5: Add/Mul/Xor — same audit as class 4.
+                    | O::VecAddF64x2
+                    | O::VecMulF64x2
+                    | O::VecXorF64x2
             ),
             3 => matches!(
                 op,
@@ -8211,6 +8279,14 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAShrI32x8
                     | O::VecShlI64x4
                     | O::VecLShrI64x4
+                    // W5: the I64x4 binary family + store — the exact
+                    // emitters of the I32x8 twins above.
+                    | O::VecAddI64x4
+                    | O::VecSubI64x4
+                    | O::VecAndI64x4
+                    | O::VecOrI64x4
+                    | O::VecXorI64x4
+                    | O::VecStoreI64x4
             ),
             6 => matches!(
                 op,
@@ -8253,6 +8329,17 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAShrI32x4
                     | O::VecShlI64x2
                     | O::VecLShrI64x2
+                    // W5: I64x2 binaries + store (emit_sse_binary_128 /
+                    // vec_store_source_128 — the I32x4 twins) and the
+                    // SSE4.1 signed dword min/max (emit_sse_binary_128).
+                    | O::VecAddI64x2
+                    | O::VecSubI64x2
+                    | O::VecAndI64x2
+                    | O::VecOrI64x2
+                    | O::VecXorI64x2
+                    | O::VecSminI32x4
+                    | O::VecSmaxI32x4
+                    | O::VecStoreI64x2
             ),
             _ => false,
         }
