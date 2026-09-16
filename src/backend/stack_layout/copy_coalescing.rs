@@ -2131,6 +2131,27 @@ pub(crate) fn is_cache_aware_3op(op: &crate::ir::intrinsics::IntrinsicOp) -> boo
     )
 }
 
+/// BB-SLP unary+immediate 256-bit consumers (packed lane shifts): the
+/// single vector operand is `args[0]` and the VEX immediate form reads it
+/// from memory (`vpslld $imm, MEM, %dst`). `emit_avx_shift_imm_256`
+/// consults `pending_vec_memfold` as its FIRST action and either emits the
+/// folded form or routes the operand through the memfold-aware loaders —
+/// the same audited contract as `emit_avx_binary_256_inner`.
+pub(crate) fn memfold_consumer_unary_imm_256(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecShlI16x16
+            | O::VecLShrI16x16
+            | O::VecAShrI16x16
+            | O::VecShlI32x8
+            | O::VecLShrI32x8
+            | O::VecAShrI32x8
+            | O::VecShlI64x4
+            | O::VecLShrI64x4
+    )
+}
+
 /// Two-operand 256-bit VEX arithmetic intrinsics that go through
 /// `emit_avx_binary_256` and therefore can take a memory operand.
 /// Returns `Some(commutative)`.
@@ -2256,8 +2277,13 @@ pub(super) fn compute_vector_memfold_homed_ok(func: &IrFunction) -> FxHashSet<u3
                 continue;
             };
             // Only the plain binary family; the madd/FMA variants are
-            // excluded on purpose (see the doc comment).
-            if memfold_consumer_256(op).is_none() || memfold_consumer_madd_256(op) {
+            // excluded on purpose (see the doc comment). The BB-SLP
+            // unary+immediate shift family is admitted too:
+            // emit_avx_shift_imm_256 consults pending_vec_memfold as its
+            // FIRST action, the same audited contract.
+            if (memfold_consumer_256(op).is_none() && !memfold_consumer_unary_imm_256(op))
+                || memfold_consumer_madd_256(op)
+            {
                 continue;
             }
             for a in args {
@@ -2343,6 +2369,44 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
             // commute; the emitter picks the 213/231 form and keeps the
             // XMM-homed broadcast as the register source).
             let madd = memfold_consumer_madd_256(cop);
+            // Unary + immediate consumers (BB-SLP packed shifts): the
+            // single vector operand (args[0]) folds — `v<inst> $imm, MEM,
+            // %dst`. Same adjacency/purity/use-count contract as the
+            // binary form; the emitter consumes the pending fold first.
+            if !madd && cargs.len() == 2 {
+                if let (Operand::Value(a0), Operand::Const(_)) = (&cargs[0], &cargs[1]) {
+                    if memfold_consumer_unary_imm_256(cop) {
+                        let d0 = a0.0;
+                        if !poisoned.contains(&d0) && use_count.get(&d0).copied() == Some(1) {
+                            let mut pick = None;
+                            if j >= 2 && pure_load_at(j - 1) {
+                                if let Some(d) = load_at(j - 2) {
+                                    if d == d0 {
+                                        pick = Some(d);
+                                    }
+                                }
+                            }
+                            if pick.is_none() && j >= 1 {
+                                if let Some(d) = load_at(j - 1) {
+                                    if d == d0 {
+                                        pick = Some(d);
+                                    }
+                                }
+                            }
+                            if let Some(d) = pick {
+                                if debug {
+                                    eprintln!(
+                                        "[VLFOLD-IR] {} b{} i{} fold load %{} into {:?} (unary+imm)",
+                                        func.name, bi, j, d, cop
+                                    );
+                                }
+                                result.insert(d);
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
             let (commutative, a0, a1) = if madd {
                 if cargs.len() != 3 {
                     continue;

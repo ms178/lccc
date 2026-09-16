@@ -45,7 +45,7 @@ use crate::common::types::{AddressSpace, IrType};
 use crate::ir::constants::IrConst;
 use crate::ir::instruction::{BasicBlock, Instruction, Operand, Terminator, Value};
 use crate::ir::intrinsics::IntrinsicOp;
-use crate::ir::ops::IrBinOp;
+use crate::ir::ops::{IrBinOp, IrCmpOp, IrUnaryOp};
 use crate::ir::reexports::IrFunction;
 use crate::passes::vectorize::{x86_avx2_available_pub, x86_simd_available_pub};
 
@@ -694,6 +694,210 @@ fn is_commutative(op: IrBinOp) -> bool {
     )
 }
 
+/// Map a shift lane op to its packed intrinsic — the uniform CONSTANT
+/// amount forms only (`psllw/psrlw/psraw/pslld/psrld/psrad/psllq/psrlq`
+/// and their VEX counterparts). None where the ISA has no packed form:
+/// byte lanes (no packed byte shift before AVX-512) and I64 arithmetic
+/// right shift (no packed qword `psraq` before AVX-512). Those lanes
+/// degrade to gathers where a family has one, else reject the seed.
+fn packed_shift(op: IrBinOp, ty: IrType, width: usize) -> Option<IntrinsicOp> {
+    match (ty, width) {
+        (IrType::I16 | IrType::U16, 16) => match op {
+            IrBinOp::Shl => Some(IntrinsicOp::VecShlI16x16),
+            IrBinOp::LShr => Some(IntrinsicOp::VecLShrI16x16),
+            IrBinOp::AShr => Some(IntrinsicOp::VecAShrI16x16),
+            _ => None,
+        },
+        (IrType::I16 | IrType::U16, 8) => match op {
+            IrBinOp::Shl => Some(IntrinsicOp::VecShlI16x8),
+            IrBinOp::LShr => Some(IntrinsicOp::VecLShrI16x8),
+            IrBinOp::AShr => Some(IntrinsicOp::VecAShrI16x8),
+            _ => None,
+        },
+        (IrType::I32 | IrType::U32, 8) => match op {
+            IrBinOp::Shl => Some(IntrinsicOp::VecShlI32x8),
+            IrBinOp::LShr => Some(IntrinsicOp::VecLShrI32x8),
+            IrBinOp::AShr => Some(IntrinsicOp::VecAShrI32x8),
+            _ => None,
+        },
+        (IrType::I32 | IrType::U32, 4) => match op {
+            IrBinOp::Shl => Some(IntrinsicOp::VecShlI32x4),
+            IrBinOp::LShr => Some(IntrinsicOp::VecLShrI32x4),
+            IrBinOp::AShr => Some(IntrinsicOp::VecAShrI32x4),
+            _ => None,
+        },
+        (IrType::I64 | IrType::U64, 4) => match op {
+            IrBinOp::Shl => Some(IntrinsicOp::VecShlI64x4),
+            IrBinOp::LShr => Some(IntrinsicOp::VecLShrI64x4),
+            _ => None,
+        },
+        (IrType::I64 | IrType::U64, 2) => match op {
+            IrBinOp::Shl => Some(IntrinsicOp::VecShlI64x2),
+            IrBinOp::LShr => Some(IntrinsicOp::VecLShrI64x2),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The all-ones constant of a lane type (`-1` in every width — the bit
+/// pattern `try_all_ones_splat` lowers to one `pcmpeqd`/`vpcmpeqd`).
+fn all_ones_const(ty: IrType) -> Option<IrConst> {
+    match ty {
+        IrType::I8 | IrType::U8 => Some(IrConst::I8(-1)),
+        IrType::I16 | IrType::U16 => Some(IrConst::I16(-1)),
+        IrType::I32 | IrType::U32 => Some(IrConst::I32(-1)),
+        IrType::I64 | IrType::U64 => Some(IrConst::I64(-1)),
+        _ => None,
+    }
+}
+
+/// Map an FP lane type/width to its packed strict min/max intrinsic.
+/// FP-only: integer min/max needs no such fold (cmp+blendv is the exact
+/// integer lowering, and the SSE2 baseline lacks dword pminsd/pmaxsd).
+fn packed_minmax(is_max: bool, ty: IrType, width: usize) -> Option<IntrinsicOp> {
+    match (ty, width) {
+        (IrType::F32, 8) => Some(if is_max {
+            IntrinsicOp::VecMaxF32x8
+        } else {
+            IntrinsicOp::VecMinF32x8
+        }),
+        (IrType::F32, 4) => Some(if is_max {
+            IntrinsicOp::VecMaxF32x4
+        } else {
+            IntrinsicOp::VecMinF32x4
+        }),
+        (IrType::F64, 4) => Some(if is_max {
+            IntrinsicOp::VecMaxF64x4
+        } else {
+            IntrinsicOp::VecMinF64x4
+        }),
+        (IrType::F64, 2) => Some(if is_max {
+            IntrinsicOp::VecMaxF64x2
+        } else {
+            IntrinsicOp::VecMinF64x2
+        }),
+        _ => None,
+    }
+}
+
+/// Strip identity casts (`Cast{ty→ty}` — the frontend's re-spelling
+/// wrappers; from_ty == to_ty is the identity function by definition).
+fn strip_identity_casts(ctx: &BlockCtx, o: &Operand) -> Operand {
+    let block = ctx.block;
+    let mut cur = o.clone();
+    for _ in 0..8 {
+        let Operand::Value(v) = &cur else { break };
+        let Some(&i) = ctx.def_pos.get(&v.0) else {
+            break;
+        };
+        match &block.instructions[i] {
+            Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty == to_ty => {
+                cur = src.clone();
+            }
+            _ => break,
+        }
+    }
+    cur
+}
+
+/// Two operands name the same SOURCE when (after identity-cast stripping)
+/// they are the same value, or two loads of the same symbolic address
+/// with NO memory write between them — the pre-CSE frontend emits one
+/// load per spelling side, and the interval check is the whole
+/// same-value proof (any write between the two loads could change the
+/// observed bytes; rule (c) covers the pack's own lane range only).
+fn same_source(ctx: &BlockCtx, a: &Operand, b: &Operand) -> bool {
+    let a = strip_identity_casts(ctx, a);
+    let b = strip_identity_casts(ctx, b);
+    if a == b {
+        return true;
+    }
+    let block = ctx.block;
+    let addr_of = |o: &Operand| -> Option<(SymAddr, usize)> {
+        let Operand::Value(v) = o else { return None };
+        let &i = ctx.def_pos.get(&v.0)?;
+        match &block.instructions[i] {
+            Instruction::Load {
+                ptr,
+                seg_override,
+                volatile,
+                ..
+            } if *seg_override == AddressSpace::Default && !*volatile => {
+                eval_sym_addr(block, &ctx.def_pos, *ptr).map(|a| (a, i))
+            }
+            _ => None,
+        }
+    };
+    match (addr_of(&a), addr_of(&b)) {
+        (Some((aa, pa)), Some((ab, pb))) => {
+            if aa != ab {
+                return false;
+            }
+            let (plo, phi) = if pa < pb { (pa, pb) } else { (pb, pa) };
+            (plo + 1..phi).all(|q| !is_memory_write(&block.instructions[q]))
+        }
+        _ => false,
+    }
+}
+
+/// Resolve an operand to a compile-time i64, looking through the
+/// `Copy`/`Cast` constant materializations the frontend emits before
+/// `simplify` folds them into inline constants (the early SLP sweep runs
+/// first: `x << 7` arrives as `Shl(x, Copy(Cast(Const(7))))`).
+///
+/// Exactness: a `Copy` forwards its value; an integer `Cast` is followed
+/// only when the constant fits the cast's OUTPUT width — the machine
+/// value at the use site is then the same number (a narrowing cast of an
+/// out-of-range constant would truncate and is refused). Callers bound
+/// the result to the lane's defined shift domain on top.
+fn const_amount(ctx: &BlockCtx, op: &Operand) -> Option<i64> {
+    let mut cur = op.clone();
+    for _ in 0..8 {
+        match &cur {
+            Operand::Const(c) => return c.to_i64(),
+            Operand::Value(v) => {
+                let Some(&i) = ctx.def_pos.get(&v.0) else {
+                    return None;
+                };
+                match &ctx.block.instructions[i] {
+                    Instruction::Copy { src, .. } => {
+                        cur = src.clone();
+                    }
+                    Instruction::Cast { src, to_ty, .. } => {
+                        let Operand::Const(c) = src else {
+                            match src {
+                                Operand::Value(nv) => {
+                                    cur = Operand::Value(*nv);
+                                    continue;
+                                }
+                                _ => return None,
+                            }
+                        };
+                        let val = c.to_i64()?;
+                        let bits = to_ty.size() as i64 * 8;
+                        if !ty_is_integer(*to_ty) || bits >= 64 {
+                            return Some(val);
+                        }
+                        let lim = 1i64 << (bits - 1);
+                        if (-lim..lim).contains(&val) {
+                            return Some(val);
+                        }
+                        return None;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Lane types the store-seed collector accepts.
 fn supported_store_ty(ty: IrType) -> bool {
     matches!(
@@ -741,6 +945,37 @@ enum PackKind {
     },
     /// 4-lane gather (VecPackI32x4).
     Gather4 { ops: Vec<Operand> },
+    /// Packed lane shift by a uniform CONSTANT amount:
+    /// `dest = vec_op(val, amount)`. Two shapes share the kind:
+    /// plain scalar shift lanes (lane_vals = the shift defs, removed by
+    /// the rewrite) and the synthetic halves of a rotate decomposition
+    /// (lane_vals empty — scheduled by the leaf fixpoint like a splat,
+    /// cost 1 each).
+    ShiftImm {
+        vec_op: IntrinsicOp,
+        val: usize,
+        amount: i64,
+    },
+    /// FP strict min/max fold: `dest = MINPS/MAXPS(src1, src2)` with the
+    /// x86 operand contract (the SECOND source is returned on unordered
+    /// and both-zero lanes). `lane_vals` are the folded Select defs;
+    /// `cond_lanes` the Cmp defs that die with them (removed, and
+    /// external-use-checked, but never extracted — a scalar bool cannot
+    /// be reconstructed from the packed mask cheaply).
+    ///
+    /// Lane-exactness (the same proof the loop vectorizer's
+    /// `MapExpr::MinMax` carries): a strict-ordered C ternary
+    /// `l < r ? l : r` returns the false arm exactly when MINPS returns
+    /// src2 — every special case (NaN, ±0 of either sign, equal values)
+    /// agrees — so the four strict spellings fold with the false arm in
+    /// the src2 position. Non-strict `<=`/`>=` forms differ on ±0 and
+    /// keep the scalar lowering.
+    FpMinMax {
+        vec_op: IntrinsicOp,
+        lhs: usize,
+        rhs: usize,
+        cond_lanes: Vec<Value>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1304,6 +1539,9 @@ fn build_pack(
                                     | IrBinOp::And
                                     | IrBinOp::Or
                                     | IrBinOp::Xor
+                                    | IrBinOp::Shl
+                                    | IrBinOp::LShr
+                                    | IrBinOp::AShr
                             )
                 )
             };
@@ -1412,6 +1650,97 @@ fn build_pack(
                     }
                     if ops_ok && uniform_op.is_some() {
                         let op = uniform_op.unwrap();
+                        // Shift lanes: the sub-word semantics depend on the
+                        // PROMOTION kind, which the IR encodes in the
+                        // widening cast's from_ty — the lane type itself:
+                        //   - Shl: the low n bits of a left shift depend
+                        //     only on the low n input bits — sound under
+                        //     both zext and sext;
+                        //   - AShr: sext → psraw; zext (unsigned lanes) →
+                        //     the promoted value is non-negative, so the
+                        //     arithmetic shift IS logical → psrlw;
+                        //   - LShr: zext → psrlw; sext REJECTS (the sign
+                        //     bits enter the truncated window:
+                        //     trunc(sext(x) >>u k) is no sub-word shift).
+                        // The amount must be a compile-time constant,
+                        // uniform across lanes, and in [1, lane_bits):
+                        // at or above the lane width the hardware masks
+                        // the packed count while the promoted shift's low
+                        // bits are all zero — never equal.
+                        if matches!(op, IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr) {
+                            let lane_bits = ty.size() as i64 * 8;
+                            let effective: Option<IrBinOp> = match op {
+                                IrBinOp::Shl => Some(IrBinOp::Shl),
+                                IrBinOp::AShr => {
+                                    if ty.is_signed() {
+                                        Some(IrBinOp::AShr)
+                                    } else {
+                                        Some(IrBinOp::LShr)
+                                    }
+                                }
+                                _ => {
+                                    if ty.is_signed() {
+                                        None
+                                    } else {
+                                        Some(IrBinOp::LShr)
+                                    }
+                                }
+                            };
+                            let mut amount: Option<i64> = None;
+                            let mut amounts_ok = true;
+                            for b in &op_b {
+                                let Operand::Const(c) = b else {
+                                    amounts_ok = false;
+                                    break;
+                                };
+                                let Some(k) = c.to_i64() else {
+                                    amounts_ok = false;
+                                    break;
+                                };
+                                if !(1..lane_bits).contains(&k) {
+                                    amounts_ok = false;
+                                    break;
+                                }
+                                match amount {
+                                    None => amount = Some(k),
+                                    Some(a) if a == k => {}
+                                    _ => {
+                                        amounts_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if let (Some(eff), Some(k)) = (effective, amount) {
+                                if amounts_ok {
+                                    if let Some(vec_op) = packed_shift(eff, ty, width) {
+                                        if let Some(val) = build_pack(
+                                            ctx,
+                                            &op_a,
+                                            ty,
+                                            width,
+                                            fam,
+                                            packs,
+                                            dedup,
+                                            depth + 1,
+                                        ) {
+                                            let idx = packs.len();
+                                            packs.push(Pack {
+                                                kind: PackKind::ShiftImm {
+                                                    vec_op,
+                                                    val,
+                                                    amount: k,
+                                                },
+                                                lane_vals: vals.clone(),
+                                                sched: usize::MAX,
+                                                order: 0,
+                                            });
+                                            dedup.insert(key, idx);
+                                            return Some(idx);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(vec_op) = packed_binop(op, ty, width) {
                             // Recurse at the sub-word width; operand packs
                             // see the raw sub-word loads/values.
@@ -1498,6 +1827,269 @@ fn build_pack(
             }
         }
 
+        // 2b. Unary Not / Neg lanes (integer, at the store's lane width):
+        //     composites over the existing pack kinds, both bit-exact in
+        //     two's-complement lane arithmetic for EVERY value including
+        //     the wrap edges:
+        //       Not(x) == Xor(x, -1)            (definitional)
+        //       Neg(x) == Sub(0, x)             (two's complement)
+        //     The all-ones splat materializes as ONE pcmpeqd/vpcmpeqd
+        //     (`try_all_ones_splat`), the zero splat as one vpxor/pxor —
+        //     so a 4-lane Not costs 2 vector ops and a 4-lane Neg 2
+        //     where the scalar code paid 4 (GCC emits the same shapes).
+        //     A unary op at a DIFFERENT type than the seed's lane type
+        //     (the sub-word promotion spelling) is left to v2.
+        if matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+        ) {
+            let unary_lanes_ok = |uop: IrUnaryOp| {
+                vals.iter().all(|v| {
+                    matches!(
+                        ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]),
+                        Some(Instruction::UnaryOp {
+                            op: lop,
+                            ty: uty,
+                            ..
+                        }) if *lop == uop && *uty == ty
+                    )
+                })
+            };
+            if unary_lanes_ok(IrUnaryOp::Not) {
+                if packed_binop(IrBinOp::Xor, ty, width).is_some() {
+                    let srcs: Vec<Operand> = vals
+                        .iter()
+                        .map(|v| {
+                            let i = ctx.def_pos[&v.0];
+                            match &block.instructions[i] {
+                                Instruction::UnaryOp { src, .. } => src.clone(),
+                                _ => unreachable!(),
+                            }
+                        })
+                        .collect();
+                    let ones = all_ones_const(ty).unwrap();
+                    if let Some(lhs) =
+                        build_pack(ctx, &srcs, ty, width, fam, packs, dedup, depth + 1)
+                    {
+                        let ones_idx = packs.len();
+                        packs.push(Pack {
+                            kind: PackKind::Splat {
+                                src: Operand::Const(ones),
+                                is_zero: false,
+                            },
+                            lane_vals: Vec::new(),
+                            sched: usize::MAX,
+                            order: 0,
+                        });
+                        let idx = packs.len();
+                        packs.push(Pack {
+                            kind: PackKind::BinOp {
+                                op: IrBinOp::Xor,
+                                ty,
+                                vec_op: packed_binop(IrBinOp::Xor, ty, width).unwrap(),
+                                lhs,
+                                rhs: ones_idx,
+                            },
+                            lane_vals: vals.clone(),
+                            sched: usize::MAX,
+                            order: 0,
+                        });
+                        dedup.insert(key, idx);
+                        return Some(idx);
+                    }
+                }
+            } else if unary_lanes_ok(IrUnaryOp::Neg) {
+                if packed_binop(IrBinOp::Sub, ty, width).is_some() {
+                    let srcs: Vec<Operand> = vals
+                        .iter()
+                        .map(|v| {
+                            let i = ctx.def_pos[&v.0];
+                            match &block.instructions[i] {
+                                Instruction::UnaryOp { src, .. } => src.clone(),
+                                _ => unreachable!(),
+                            }
+                        })
+                        .collect();
+                    if let Some(rhs) =
+                        build_pack(ctx, &srcs, ty, width, fam, packs, dedup, depth + 1)
+                    {
+                        let zero_idx = packs.len();
+                        packs.push(Pack {
+                            kind: PackKind::Splat {
+                                src: Operand::Const(IrConst::Zero),
+                                is_zero: true,
+                            },
+                            lane_vals: Vec::new(),
+                            sched: usize::MAX,
+                            order: 0,
+                        });
+                        let idx = packs.len();
+                        packs.push(Pack {
+                            kind: PackKind::BinOp {
+                                op: IrBinOp::Sub,
+                                ty,
+                                vec_op: packed_binop(IrBinOp::Sub, ty, width).unwrap(),
+                                lhs: zero_idx,
+                                rhs,
+                            },
+                            lane_vals: vals.clone(),
+                            sched: usize::MAX,
+                            order: 0,
+                        });
+                        dedup.insert(key, idx);
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+
+        // 2c. FP strict min/max Select lanes: every lane is
+        //     `Select(cond = Cmp(op, l, r), t, f)` in one of the four
+        //     STRICT-ORDERED foldable spellings (see PackKind::FpMinMax).
+        //     Operand identity is compared BIT-EXACTLY (`lane_key`), never
+        //     by `Operand`'s derived float equality — a {-0.0, +0.0}
+        //     mismatch under `==` would fold a ternary whose ±0 lanes the
+        //     packed op answers differently. Non-strict (<=, >=) compares
+        //     and mixed per-lane shapes reject the lanes (v2: per-lane
+        //     routing).
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            let sel_shape =
+                |v: &Value| -> Option<(IrCmpOp, Operand, Operand, Operand, Operand, Value)> {
+                    let i = ctx.def_pos.get(&v.0)?;
+                    let Instruction::Select {
+                        cond,
+                        true_val,
+                        false_val,
+                        ..
+                    } = &block.instructions[*i]
+                    else {
+                        return None;
+                    };
+                    let Operand::Value(cv) = cond else {
+                        return None;
+                    };
+                    let ci = ctx.def_pos.get(&cv.0)?;
+                    let Instruction::Cmp {
+                        op,
+                        lhs,
+                        rhs,
+                        ty: cty,
+                        ..
+                    } = &block.instructions[*ci]
+                    else {
+                        return None;
+                    };
+                    if *cty != ty {
+                        return None;
+                    }
+                    Some((
+                        *op,
+                        lhs.clone(),
+                        rhs.clone(),
+                        true_val.clone(),
+                        false_val.clone(),
+                        *cv,
+                    ))
+                };
+            if vals.iter().all(|v| sel_shape(v).is_some()) {
+                // Uniform fold decision across lanes.
+                #[derive(Clone, Copy, PartialEq)]
+                enum Fold {
+                    Min,
+                    Max,
+                }
+                let mut fold: Option<(Fold, bool)> = None; // (kind, arms_swapped)
+                let mut shapes_ok = true;
+                for v in &vals {
+                    let Some((op, l, r, t, f, _)) = sel_shape(v) else {
+                        unreachable!()
+                    };
+                    let this = match op {
+                        IrCmpOp::Slt => {
+                            if same_source(ctx, &t, &l) && same_source(ctx, &f, &r) {
+                                Some((Fold::Min, false))
+                            } else if same_source(ctx, &t, &r) && same_source(ctx, &f, &l) {
+                                Some((Fold::Max, true))
+                            } else {
+                                None
+                            }
+                        }
+                        IrCmpOp::Sgt => {
+                            if same_source(ctx, &t, &l) && same_source(ctx, &f, &r) {
+                                Some((Fold::Max, false))
+                            } else if same_source(ctx, &t, &r) && same_source(ctx, &f, &l) {
+                                Some((Fold::Min, true))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    match (this, fold) {
+                        (Some(x), None) => fold = Some(x),
+                        (Some(x), Some(y)) if x == y => {}
+                        _ => {
+                            shapes_ok = false;
+                            break;
+                        }
+                    }
+                }
+                let _dbg_trace = std::env::var("LCCC_DEBUG_SLP_TRACE").is_ok();
+                if _dbg_trace {
+                    eprintln!("[SLP-TRACE] 2c: sel_shapes ok, fold={}", fold.is_some());
+                }
+                if shapes_ok && fold.is_some() {
+                    let (kind, arms_swapped) = fold.unwrap();
+                    let vec_op = packed_minmax(kind == Fold::Max, ty, width);
+                    if let Some(vec_op) = vec_op {
+                        // src1/src2 lanes per the fold's operand order:
+                        // arms_swapped selects (r, l) for the mirrored
+                        // spellings — the FALSE arm must be src2.
+                        let mut src1: Vec<Operand> = Vec::with_capacity(width);
+                        let mut src2: Vec<Operand> = Vec::with_capacity(width);
+                        let mut conds: Vec<Value> = Vec::with_capacity(width);
+                        for v in &vals {
+                            let (_, l, r, _, _, cv) = sel_shape(v).unwrap();
+                            if arms_swapped {
+                                src1.push(strip_identity_casts(ctx, &r));
+                                src2.push(strip_identity_casts(ctx, &l));
+                            } else {
+                                src1.push(strip_identity_casts(ctx, &l));
+                                src2.push(strip_identity_casts(ctx, &r));
+                            }
+                            conds.push(cv);
+                        }
+                        if let (Some(lhs), Some(rhs)) = (
+                            build_pack(ctx, &src1, ty, width, fam, packs, dedup, depth + 1),
+                            build_pack(ctx, &src2, ty, width, fam, packs, dedup, depth + 1),
+                        ) {
+                            let idx = packs.len();
+                            packs.push(Pack {
+                                kind: PackKind::FpMinMax {
+                                    vec_op,
+                                    lhs,
+                                    rhs,
+                                    cond_lanes: conds,
+                                },
+                                lane_vals: vals.clone(),
+                                sched: usize::MAX,
+                                order: 0,
+                            });
+                            dedup.insert(key, idx);
+                            return Some(idx);
+                        }
+                    }
+                }
+            }
+        }
+
         // 3. Same-op, same-type binop lanes. Operand sides flow into the
         // recursion as Operands — an all-same-const side becomes a splat
         // (`a[i] * 2`), anything unbuildable degrades to a gather.
@@ -1522,6 +2114,166 @@ fn build_pack(
         if uniform && first.is_some() {
             let (op, bty) = first.unwrap();
             if bty == ty {
+                // 3a. Rotate decomposition (RotateLeft/RotateRight lanes
+                //     with a UNIFORM constant amount): the IR's own
+                //     documented definition
+                //         rotl(x, k)  = (x << k) | (x >> (W - k))
+                //         rotr(x, k)  = rotl(x, W - k)
+                //     holds per-lane BITWISE, so it holds on the packed
+                //     value: the composite is one shl pack + one lshr pack
+                //     + one or pack over the shared operand pack. x86 has
+                //     no packed rotate before AVX-512, and this is exactly
+                //     the triple GCC/Clang emit for vectorized ARX code.
+                //     Amounts are normalized into [1, W-1] (the IR takes
+                //     them modulo W; 0 is the identity and folds away);
+                //     anything outside — including a non-constant or
+                //     per-lane-varying amount — rejects these lanes.
+                if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
+                    let bits = (ty.size() as i64) * 8;
+                    let shl_op = packed_shift(IrBinOp::Shl, ty, width);
+                    let shr_op = packed_shift(IrBinOp::LShr, ty, width);
+                    let or_op = packed_binop(IrBinOp::Or, ty, width);
+                    if let (Some(shl_op), Some(shr_op), Some(or_op)) = (shl_op, shr_op, or_op) {
+                        let mut amount: Option<i64> = None;
+                        let mut amounts_ok = true;
+                        let mut lhs_lanes: Vec<Operand> = Vec::with_capacity(width);
+                        for v in &vals {
+                            let i = ctx.def_pos[&v.0];
+                            let Instruction::BinOp { lhs, rhs, .. } = &block.instructions[i] else {
+                                unreachable!()
+                            };
+                            let Some(k) = const_amount(ctx, rhs) else {
+                                amounts_ok = false;
+                                break;
+                            };
+                            // Normalize modulo the lane width (the IR's own
+                            // rotate contract); a normalized 0 is the
+                            // identity — not representable as the composite
+                            // (W - 0 = W is outside the shift domain).
+                            let kn = k.rem_euclid(bits);
+                            if kn == 0 {
+                                amounts_ok = false;
+                                break;
+                            }
+                            match amount {
+                                None => amount = Some(kn),
+                                Some(a) if a == kn => {}
+                                _ => {
+                                    amounts_ok = false;
+                                    break;
+                                }
+                            }
+                            lhs_lanes.push(lhs.clone());
+                        }
+                        if amounts_ok {
+                            let kn = amount.unwrap();
+                            let rotl_k = if op == IrBinOp::RotateLeft {
+                                kn
+                            } else {
+                                bits - kn
+                            };
+                            if let Some(val) =
+                                build_pack(ctx, &lhs_lanes, ty, width, fam, packs, dedup, depth + 1)
+                            {
+                                let shl_idx = packs.len();
+                                packs.push(Pack {
+                                    kind: PackKind::ShiftImm {
+                                        vec_op: shl_op,
+                                        val,
+                                        amount: rotl_k,
+                                    },
+                                    lane_vals: Vec::new(),
+                                    sched: usize::MAX,
+                                    order: 0,
+                                });
+                                let shr_idx = packs.len();
+                                packs.push(Pack {
+                                    kind: PackKind::ShiftImm {
+                                        vec_op: shr_op,
+                                        val,
+                                        amount: bits - rotl_k,
+                                    },
+                                    lane_vals: Vec::new(),
+                                    sched: usize::MAX,
+                                    order: 0,
+                                });
+                                let idx = packs.len();
+                                packs.push(Pack {
+                                    kind: PackKind::BinOp {
+                                        op: IrBinOp::Or,
+                                        ty,
+                                        vec_op: or_op,
+                                        lhs: shl_idx,
+                                        rhs: shr_idx,
+                                    },
+                                    lane_vals: vals.clone(),
+                                    sched: usize::MAX,
+                                    order: 0,
+                                });
+                                dedup.insert(key, idx);
+                                return Some(idx);
+                            }
+                        }
+                    }
+                }
+                // 3b. Uniform-constant shift lanes: one ShiftImm pack.
+                //     The amount must be a compile-time constant, equal in
+                //     every lane, and inside [1, W-1] — the defined C
+                //     domain, where the packed immediate form is lane-exact
+                //     against the scalar lowering by construction. Anything
+                //     else (variable amount, per-lane amounts, 0, >= W)
+                //     rejects these lanes.
+                if matches!(op, IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr) {
+                    if let Some(vec_op) = packed_shift(op, ty, width) {
+                        let bits = (ty.size() as i64) * 8;
+                        let mut amount: Option<i64> = None;
+                        let mut amounts_ok = true;
+                        let mut lhs_lanes: Vec<Operand> = Vec::with_capacity(width);
+                        for v in &vals {
+                            let i = ctx.def_pos[&v.0];
+                            let Instruction::BinOp { lhs, rhs, .. } = &block.instructions[i] else {
+                                unreachable!()
+                            };
+                            let Some(k) = const_amount(ctx, rhs) else {
+                                amounts_ok = false;
+                                break;
+                            };
+                            if !(1..bits).contains(&k) {
+                                amounts_ok = false;
+                                break;
+                            }
+                            match amount {
+                                None => amount = Some(k),
+                                Some(a) if a == k => {}
+                                _ => {
+                                    amounts_ok = false;
+                                    break;
+                                }
+                            }
+                            lhs_lanes.push(lhs.clone());
+                        }
+                        if amounts_ok {
+                            let k = amount.unwrap();
+                            if let Some(val) =
+                                build_pack(ctx, &lhs_lanes, ty, width, fam, packs, dedup, depth + 1)
+                            {
+                                let idx = packs.len();
+                                packs.push(Pack {
+                                    kind: PackKind::ShiftImm {
+                                        vec_op,
+                                        val,
+                                        amount: k,
+                                    },
+                                    lane_vals: vals.clone(),
+                                    sched: usize::MAX,
+                                    order: 0,
+                                });
+                                dedup.insert(key, idx);
+                                return Some(idx);
+                            }
+                        }
+                    }
+                }
                 if let Some(vec_op) = packed_binop(op, ty, width) {
                     let mut lhs_lanes: Vec<Operand> = Vec::with_capacity(width);
                     let mut rhs_lanes: Vec<Operand> = Vec::with_capacity(width);
@@ -1532,6 +2284,168 @@ fn build_pack(
                         };
                         lhs_lanes.push(lhs.clone());
                         rhs_lanes.push(rhs.clone());
+                    }
+                    // Rotate-pattern look-through (the raw C spelling):
+                    // every lane is Or(Shl(x_i, k), LShr(x_i, W-k)) in
+                    // either operand order, with the SAME x_i on both
+                    // sides and a uniform k. The early SLP sweep runs
+                    // BEFORE simplify canonicalizes the funnel-shift
+                    // idiom into RotateLeft, so the raw spelling is the
+                    // one that actually arrives here; recognizing it in
+                    // the pack graph (instead of relying on phase order)
+                    // builds ONE shared operand pack — the naive
+                    // whole-side recursion builds two identical MemLoad
+                    // packs, one per shift half, and the emitted code
+                    // loads the vector twice.
+                    //
+                    // Soundness: identical to the RotateLeft composite —
+                    // the pattern IS the IR's documented rotate
+                    // definition, spelled out lane by lane, with the two
+                    // sides reading the same SSA value.
+                    if op == IrBinOp::Or {
+                        let bits = (ty.size() as i64) * 8;
+                        let shl_op = packed_shift(IrBinOp::Shl, ty, width);
+                        let shr_op = packed_shift(IrBinOp::LShr, ty, width);
+                        if let (Some(shl_op), Some(shr_op)) = (shl_op, shr_op) {
+                            // (Shl(x,k), LShr(x,W-k)) in either order; the
+                            // shared `same_source` (identity-cast strip +
+                            // same-address-load proof) establishes the two
+                            // halves read the same value.
+                            let lane_rotate =
+                                |lo: &Operand, hi: &Operand| -> Option<(i64, Operand)> {
+                                    let lo = strip_identity_casts(ctx, lo);
+                                    let hi = strip_identity_casts(ctx, hi);
+                                    let side =
+                                        |o: &Operand, want: IrBinOp| -> Option<(i64, Operand)> {
+                                            let Operand::Value(v) = o else { return None };
+                                            let i = ctx.def_pos.get(&v.0)?;
+                                            let Instruction::BinOp {
+                                                op: sop,
+                                                lhs,
+                                                rhs,
+                                                ty: sty,
+                                                ..
+                                            } = &block.instructions[*i]
+                                            else {
+                                                return None;
+                                            };
+                                            if *sop != want || *sty != ty {
+                                                return None;
+                                            }
+                                            let k = const_amount(ctx, rhs)?;
+                                            Some((k, strip_identity_casts(ctx, lhs)))
+                                        };
+                                    let (lk, lx) = side(&lo, IrBinOp::Shl)?;
+                                    let (rk, rx) = side(&hi, IrBinOp::LShr)?;
+                                    // Same source, complementary amounts, both
+                                    // in the defined shift domain.
+                                    if !same_source(ctx, &lx, &rx)
+                                        || lk + rk != bits
+                                        || !(1..bits).contains(&lk)
+                                    {
+                                        return None;
+                                    }
+                                    Some((lk, lx))
+                                };
+                            let mut rot_amount: Option<i64> = None;
+                            let mut rot_ok = true;
+                            let mut rot_operands: Vec<Operand> = Vec::with_capacity(width);
+                            for (l, r) in lhs_lanes.iter().zip(rhs_lanes.iter()) {
+                                match lane_rotate(l, r).or_else(|| lane_rotate(r, l)) {
+                                    Some((k, x)) => {
+                                        match rot_amount {
+                                            None => rot_amount = Some(k),
+                                            Some(a) if a == k => {}
+                                            _ => {
+                                                rot_ok = false;
+                                                break;
+                                            }
+                                        }
+                                        rot_operands.push(x);
+                                    }
+                                    None => {
+                                        rot_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if rot_ok && rot_amount.is_some() {
+                                let k = rot_amount.unwrap();
+                                if let Some(val) = build_pack(
+                                    ctx,
+                                    &rot_operands,
+                                    ty,
+                                    width,
+                                    fam,
+                                    packs,
+                                    dedup,
+                                    depth + 1,
+                                ) {
+                                    let shl_idx = packs.len();
+                                    packs.push(Pack {
+                                        kind: PackKind::ShiftImm {
+                                            vec_op: shl_op,
+                                            val,
+                                            amount: k,
+                                        },
+                                        lane_vals: Vec::new(),
+                                        sched: usize::MAX,
+                                        order: 0,
+                                    });
+                                    let shr_idx = packs.len();
+                                    packs.push(Pack {
+                                        kind: PackKind::ShiftImm {
+                                            vec_op: shr_op,
+                                            val,
+                                            amount: bits - k,
+                                        },
+                                        lane_vals: Vec::new(),
+                                        sched: usize::MAX,
+                                        order: 0,
+                                    });
+                                    let idx = packs.len();
+                                    packs.push(Pack {
+                                        kind: PackKind::BinOp {
+                                            op: IrBinOp::Or,
+                                            ty,
+                                            vec_op,
+                                            lhs: shl_idx,
+                                            rhs: shr_idx,
+                                        },
+                                        lane_vals: vals.clone(),
+                                        sched: usize::MAX,
+                                        order: 0,
+                                    });
+                                    dedup.insert(key, idx);
+                                    return Some(idx);
+                                }
+                            }
+                        }
+                    }
+                    // Idiom rewrite: Sub(x, 1) → Add(x, -1). Bit-exact in
+                    // two's complement for every lane value (x - 1 and
+                    // x + (-1) wrap identically), and the -1 splat
+                    // materializes as ONE pcmpeqd/vpcmpeqd where the 1
+                    // splat pays the staged mov/movd/pshufd chain — the
+                    // GCC/Clang `vpcmpeqd + vpaddd` idiom for `x - 1`.
+                    // Only the rhs-constant-1 form: `1 - x` is a different
+                    // (negation-shaped) beast and stays scalar.
+                    let mut op = op;
+                    let mut vec_op = vec_op;
+                    if op == IrBinOp::Sub
+                        && rhs_lanes
+                            .iter()
+                            .all(|o| matches!(o, Operand::Const(c) if c.to_i64() == Some(1)))
+                    {
+                        if let Some(add_op) = packed_binop(IrBinOp::Add, ty, width) {
+                            if let Some(ones) = all_ones_const(ty) {
+                                op = IrBinOp::Add;
+                                vec_op = add_op;
+                                for r in rhs_lanes.iter_mut() {
+                                    *r = Operand::Const(ones.clone());
+                                }
+                            }
+                        }
                     }
                     // Whole-side attempt, then (commutative) the swapped
                     // spelling. GATHER-AWARE: a side that degenerated to a
@@ -1720,9 +2634,19 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 continue;
             }
             keep[i] = true;
-            if let PackKind::BinOp { lhs, rhs, .. } = packs[i].kind {
-                stack.push(lhs);
-                stack.push(rhs);
+            match packs[i].kind {
+                PackKind::BinOp { lhs, rhs, .. } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                PackKind::ShiftImm { val, .. } => {
+                    stack.push(val);
+                }
+                PackKind::FpMinMax { lhs, rhs, .. } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                _ => {}
             }
         }
         if keep.iter().any(|k| !k) {
@@ -1736,9 +2660,19 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 new_packs.push(p);
             }
             for p in &mut new_packs {
-                if let PackKind::BinOp { lhs, rhs, .. } = &mut p.kind {
-                    *lhs = remap[*lhs];
-                    *rhs = remap[*rhs];
+                match &mut p.kind {
+                    PackKind::BinOp { lhs, rhs, .. } => {
+                        *lhs = remap[*lhs];
+                        *rhs = remap[*rhs];
+                    }
+                    PackKind::ShiftImm { val, .. } => {
+                        *val = remap[*val];
+                    }
+                    PackKind::FpMinMax { lhs, rhs, .. } => {
+                        *lhs = remap[*lhs];
+                        *rhs = remap[*rhs];
+                    }
+                    _ => {}
                 }
             }
             packs = new_packs;
@@ -1773,11 +2707,15 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                     continue;
                 }
                 let inputs = match &other.kind {
-                    PackKind::BinOp { lhs, rhs, .. } => Some((*lhs, *rhs)),
+                    PackKind::BinOp { lhs, rhs, .. } => Some(vec![*lhs, *rhs]),
+                    // A ShiftImm consumes its operand pack the same way a
+                    // BinOp consumes its sides.
+                    PackKind::ShiftImm { val, .. } => Some(vec![*val]),
+                    PackKind::FpMinMax { lhs, rhs, .. } => Some(vec![*lhs, *rhs]),
                     _ => None,
                 };
-                if let Some((l, r)) = inputs {
-                    if l == i || r == i {
+                if let Some(ins) = inputs {
+                    if ins.contains(&i) {
                         has_consumer = true;
                         if other.sched != usize::MAX {
                             min_sched = min_sched.min(other.sched);
@@ -1820,6 +2758,15 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     for p in &packs {
         for v in &p.lane_vals {
             removed.insert(ctx.def_pos[&v.0]);
+        }
+        // The FP min/max fold also removes the Cmp defs that fed the
+        // folded Selects — their only remaining uses die with the select
+        // lanes (an external use rejects the seed in the legality walk
+        // below).
+        if let PackKind::FpMinMax { cond_lanes, .. } = &p.kind {
+            for c in cond_lanes {
+                removed.insert(ctx.def_pos[&c.0]);
+            }
         }
     }
     for &i in &cand.store_idx {
@@ -1908,6 +2855,25 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             // after — extracts are pure.
             for &u in ctx.uses.get(&v.0).unwrap_or(&Vec::new()) {
                 if u != usize::MAX && !removed.contains(&u) && u <= p.sched {
+                    return None;
+                }
+            }
+        }
+        // The FP min/max fold's Cmp lanes: NO extract exists for them (a
+        // scalar bool cannot be reconstructed from the packed mask), so
+        // EVERY use outside the removed set — early OR late, terminator
+        // included — rejects the seed. (The early-only variant left the
+        // cmp's later consumers reading a deleted def: backend ICE.)
+        if let PackKind::FpMinMax { cond_lanes, .. } = &p.kind {
+            for c in cond_lanes {
+                if ctx.external_uses.contains(&c.0) {
+                    return None;
+                }
+                let uses = ctx.uses.get(&c.0).map(|us| us.as_slice()).unwrap_or(&[]);
+                if !uses
+                    .iter()
+                    .all(|&u| u != usize::MAX && removed.contains(&u))
+                {
                     return None;
                 }
             }
@@ -2091,11 +3057,32 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             PackKind::MemLoad { .. } | PackKind::BinOp { .. } => {
                 benefit += width as i64 - 1;
             }
-            PackKind::Splat { is_zero, .. } => {
-                benefit -= if *is_zero { 1 } else { 2 };
+            PackKind::Splat { src, is_zero } => {
+                // An integer all-ones splat is ONE instruction
+                // (`try_all_ones_splat`'s self-compare) — the same cost
+                // class as the zero splat, not the staged broadcast's 2.
+                let is_ones = matches!(src,
+                    Operand::Const(c) if c.to_i64() == Some(-1));
+                benefit -= if *is_zero || is_ones { 1 } else { 2 };
             }
             PackKind::Gather2 { .. } => benefit -= 3,
             PackKind::Gather4 { .. } => benefit -= 7,
+            // The FP min/max fold replaces W Selects AND their W Cmps with
+            // one packed op; counted conservatively as one BinOp-level
+            // replacement (the cmp removal is uncounted headroom).
+            PackKind::FpMinMax { .. } => {
+                benefit += width as i64 - 1;
+            }
+            // Plain scalar shift lanes replace W ops with one vector op
+            // (+W-1); the synthetic halves of a rotate decomposition
+            // replace nothing (cost 1 each, like a splat leaf).
+            PackKind::ShiftImm { .. } => {
+                if p.lane_vals.is_empty() {
+                    benefit -= 1;
+                } else {
+                    benefit += width as i64 - 1;
+                }
+            }
         }
     }
     // Extract costs: 1 move for a low-half lane; a 256-bit HIGH-half
@@ -2121,6 +3108,10 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
 fn topo_depth(packs: &[Pack], idx: usize) -> usize {
     match &packs[idx].kind {
         PackKind::BinOp { lhs, rhs, .. } => {
+            1 + topo_depth(packs, *lhs).max(topo_depth(packs, *rhs))
+        }
+        PackKind::ShiftImm { val, .. } => 1 + topo_depth(packs, *val),
+        PackKind::FpMinMax { lhs, rhs, .. } => {
             1 + topo_depth(packs, *lhs).max(topo_depth(packs, *rhs))
         }
         _ => 0,
@@ -2199,6 +3190,30 @@ fn apply_plan(
                 op: IntrinsicOp::VecPackI32x4,
                 dest_ptr: None,
                 args: ops.clone(),
+            },
+            PackKind::ShiftImm {
+                vec_op,
+                val,
+                amount,
+            } => Instruction::Intrinsic {
+                dest: Some(dest),
+                op: *vec_op,
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(vec_dest[*val]),
+                    Operand::Const(IrConst::I64(*amount)),
+                ],
+            },
+            PackKind::FpMinMax {
+                vec_op, lhs, rhs, ..
+            } => Instruction::Intrinsic {
+                dest: Some(dest),
+                op: *vec_op,
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(vec_dest[*lhs]),
+                    Operand::Value(vec_dest[*rhs]),
+                ],
             },
         };
         inserts.push((p.sched, p.order, inst));
@@ -2293,14 +3308,32 @@ fn apply_plan(
     func.blocks[block_idx].terminator = rewrite_term_uses(term, &extract_dest);
 
     if debug {
+        let kinds: Vec<String> = plan
+            .packs
+            .iter()
+            .map(|p| match &p.kind {
+                PackKind::MemLoad { .. } => "MemLoad".into(),
+                PackKind::BinOp { op, lhs, rhs, .. } => {
+                    format!("BinOp({:?} l{} r{})", op, lhs, rhs)
+                }
+                PackKind::Splat { .. } => "Splat".into(),
+                PackKind::Gather2 { .. } => "Gather2".into(),
+                PackKind::Gather4 { .. } => "Gather4".into(),
+                PackKind::ShiftImm { val, amount, .. } => {
+                    format!("ShiftImm(v{} ${})", val, amount)
+                }
+                PackKind::FpMinMax { .. } => "FpMinMax".into(),
+            })
+            .collect();
         eprintln!(
-            "[BB-SLP] fn={} block B{}: packed {}x{:?} ({} packs, benefit {})",
+            "[BB-SLP] fn={} block B{}: packed {}x{:?} ({} packs, benefit {}): [{}]",
             func.name,
             block_idx,
             width,
             cand.ty,
             plan.packs.len(),
-            plan.benefit
+            plan.benefit,
+            kinds.join(", ")
         );
     }
     true

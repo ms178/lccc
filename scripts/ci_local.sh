@@ -222,6 +222,12 @@ gate "bb-slp-v3" fast \
 gate "bb-slp-v4" fast \
     bash tests/regression/check_bb_slp_v4_codegen.sh
 
+# BB-SLP v5: packed shifts, rotate decomposition (both spellings,
+# shared operand), Not/Neg composites, Sub(x,1) all-ones idiom, FP
+# strict min/max folds, adversarial rejections.
+gate "bb-slp-v5" fast \
+    bash tests/regression/check_bb_slp_v5_codegen.sh
+
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
 
