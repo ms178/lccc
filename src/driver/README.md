@@ -485,7 +485,7 @@ tokenization enabled) before passing the result to the builtin assembler. For
 
 The builtin assembler path also handles the `-Wa,--version` probe: when
 detected, it prints `GNU assembler (Claude's C Compiler built-in) 2.42` to satisfy the Linux
-kernel's `scripts/as-version.sh`.
+kernel's as-version.sh probe script (out of tree).
 
 ### Linker Selection
 

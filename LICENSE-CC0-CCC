@@ -1,0 +1,12 @@
+This file mirrors the upstream CCC licensing statement.
+
+The upstream "Claude's C Compiler" code this project derives from was
+released under the CC0 1.0 Universal public domain dedication
+(Creative Commons Zero v1.0 Universal):
+<https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt>
+
+"No rights reserved." To the extent possible under law, the authors have
+waived all copyright and related or neighboring rights. See LICENSING.md
+for the layered structure: CCC-derived parts stay CC0; LCCC contributions
+are MIT OR Apache-2.0 OR BSD-2-Clause; benchmark kernels keep their
+upstream licenses (see tests/benchmark/WORKLOAD_PROVENANCE.md).

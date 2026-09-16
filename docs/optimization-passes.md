@@ -221,7 +221,7 @@ no longer a predecessor still "works" whenever that block happens to dominate. A
 `loop_rotate` defect hid behind exactly that accident until SCCP — which trusts the
 predecessor list and prunes operands on edges it proves dead — deleted an induction
 variable's initialisation. See
-`engineering/FOLLOWUP-2026-08-31-sccp-loop-rotate-ir-verifier.md`.
+`../engineering/journal/2026-08.md`.
 
 Verification is off by default and costs one atomic load per pass when disabled.
 

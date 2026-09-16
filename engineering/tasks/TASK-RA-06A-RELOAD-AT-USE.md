@@ -96,7 +96,7 @@ while gcc runs the same loop in 47 instructions with **zero** stack references.
 Evidence:
 [`../evidence/ra-web-inloop-use-2026-09-11/`](../evidence/ra-web-inloop-use-2026-09-11/)
 (raw factorial JSON, isolation matrices, reproduction commands) and
-[`../FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md`](../FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md)
+[`../journal/2026-09-W2.md`](../journal/2026-09-W2.md)
 (falsified alternatives: store-to-load width mismatch, `CCC_EVICT_MODE`,
 `CCC_NO_TIER2_GRAPH`, `CCC_NO_LEAF_CALLER_HOME`, forcing `MachInst` onto the loop).
 
@@ -165,7 +165,7 @@ amplified benchmark, not by instruction count alone (see "Do not" below).
   programs; sha256 gained exactly 1. Each epilogue group contains a genuine indirect
   write through the reloaded pointer (`movl %eax, (%r8)`), which must invalidate every
   mapping, so dedup cannot reach the pattern. Reverted.
-  Full record: `engineering/FOLLOWUP-2026-09-11-x86-slot-load-dedup.md`.
+  Full record: `../journal/2026-09-W2.md`.
 - **Do not relax `has_indirect_mem → invalidate_all_mappings` for read-only indirect
   operands** (`addl (%rcx), %eax`) to unlock the above: it widens the risk surface of
   every slot-tracking pass for a measured payoff of nil.

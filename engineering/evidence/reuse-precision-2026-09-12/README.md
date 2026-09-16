@@ -130,9 +130,9 @@ honestly reported as such: the asymmetry was real in the code and unreachable in
 > both wrong. They are preserved here struck through rather than quietly
 > rewritten, because the second one was acted on as a follow-up instruction.
 > The replacement analysis is
-> [`FOLLOWUP-2026-09-12-i686-x87-gp-pair-staging.md`](../../../FOLLOWUP-2026-09-12-i686-x87-gp-pair-staging.md)
+> [`../../journal/2026-09-W2.md`](../../journal/2026-09-W2.md)
 > and the audit trail is
-> [`engineering/AUDIT-2026-09-12-S17-redteam.md`](../../AUDIT-2026-09-12-S17-redteam.md).
+> [`../../journal/2026-09-W2.md`](../../journal/2026-09-W2.md).
 
 **False claim 1 — "this sandbox has no 32-bit glibc dev headers, so i686
 binaries cannot be executed."** Passwordless `sudo` was available and had never
@@ -201,3 +201,46 @@ each group still ends in an indirect store (`movl %eax, 4(%rax)`), which the pre
 deliberately refuses to reason about. Closing the reloads needs either a points-to fact about
 the spilled parameter or register residency for the base, i.e. the P0-A/P0-C work. That is the next increment, recorded
 against `TASK-RA-06A` with the oracle-derived target (slot refs 52 → 20, insns 194 → 126).
+
+
+---
+
+<!-- folded from `reuse-precision-2026-09-12/paired-sha256.md` (consolidation 2026-09-16) -->
+
+# Benchmark Screen: A: lccc_S15_base vs B: lccc_v4
+- **Flags**: `-O2 -DPASSES=8 -DBLOCK_COUNT=131072`
+- **Rounds**: `11`
+- **Aggregate B/A Geomean**: `1.0026`
+
+| Benchmark | A min (ms) | B min (ms) | B/A Ratio | B/A low3 | Note |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| `sha256_transform` | 404.95 | 406.01 | 1.003 | 1.002 |  |
+
+
+---
+
+<!-- folded from `reuse-precision-2026-09-12/matrix-ra-on-vs-off.md` (consolidation 2026-09-16) -->
+
+# Benchmark Screen: A: w_ON_ON.sh vs B: w_OFF_ON.sh
+- **Flags**: `-O2 -DPASSES=8 -DBLOCK_COUNT=131072`
+- **Rounds**: `15`
+- **Aggregate B/A Geomean**: `1.0606`
+
+| Benchmark | A min (ms) | B min (ms) | B/A Ratio | B/A low3 | Note |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| `sha256_transform` | 405.13 | 429.69 | 1.061 | 1.062 |  |
+
+
+---
+
+<!-- folded from `reuse-precision-2026-09-12/paired-fannkuch-rbtree.md` (consolidation 2026-09-16) -->
+
+# Benchmark Screen: A: lccc_S15_base vs B: lccc_v4
+- **Flags**: `-O2`
+- **Rounds**: `11`
+- **Aggregate B/A Geomean**: `0.9973`
+
+| Benchmark | A min (ms) | B min (ms) | B/A Ratio | B/A low3 | Note |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| `fannkuch` | 2796.13 | 2804.89 | 1.003 | 1.003 |  |
+| `linux_rbtree` | 15.90 | 15.77 | 0.991 | 0.992 |  |

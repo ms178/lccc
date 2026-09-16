@@ -2,14 +2,30 @@
 
 **Purpose.** Every load-bearing lesson from the point-in-time session journals
 that used to live in `docs/history/` (121 files, 2026-03…2026-08),
-`updates/` (10 files), `engineering/agent/SESSION_FOLLOWUP_KERNEL_BOOT.md`,
-`engineering/agent/RA23_COMPLETION.md`,
-`engineering/SESSION-20260825-torture-followup.md`,
+`updates/` (10 files), `engineering/agent/SESSION_FOLLOWUP_KERNEL_BOOT.md` (deleted),
+`engineering/agent/RA23_COMPLETION.md` (deleted),
 `docs/linker/FOLLOWUP_2026-08-17{,_SESSION2}.md`, `hotspots/`, and
-`docs/simd-audit.md` — all deleted; full text remains in git history. Nothing
+`docs/simd-audit.md` — all deleted; session-day history lives in
+[`journal/`](journal/README.md), full text in git. Nothing
 here is a status snapshot. Each entry is a constraint, a measured negative, or
 a root cause a future agent must not relearn the hard way. Entries cite the
 source file they were distilled from.
+
+**Read order / navigation** (this file is long — search or jump):
+
+- §Register allocation · `## RA-*` / `## Session *` (RA-PRESSURE, valve,
+  split, coalesce, GLA-01/02/03) — biggest section.
+- §Optimizer (IR passes) · `## Session 10–15` — expression sinking, OP-42,
+  PF-15, phi-acyclic, in-loop-use supply.
+- §Codegen x86 · epilogue cross-jumping, MS-09, ROT-16, the peephole
+  audits. §Vectorizer · §Frontend/sema · §Linker (lccc-ld) · §Multi-arch.
+- §Process & environment — harness/toolchain rules.
+- Appendix: §Status corrections (superseded public claims).
+- Session-day narratives and per-day edit history:
+  [`journal/2026-08.md`](journal/2026-08.md),
+  [`journal/2026-09-W1.md`](journal/2026-09-W1.md),
+  [`journal/2026-09-W2.md`](journal/2026-09-W2.md),
+  [`journal/2026-09-W3.md`](journal/2026-09-W3.md).
 
 This file is append-only in spirit: when a new session produces a measured
 negative or a reverted experiment, add one bullet. When a lesson is fully
@@ -491,12 +507,12 @@ anyway (the bullet carries the *why*).
 
 ## Linker & assembler (lccc-ld)
 
-- **[linker/FOLLOWUP_SESSION2 §0]** Stale **release** oracles produced two
+- **[linker/sessions-2026-08 (doc folded) §0]** Stale **release** oracles produced two
   false failures (wild 0.7.0 blamed lccc; wild-git agreed lccc was right).
   Always build mold/wild from git before drawing conclusions. mold CMake
   pins: `-DMOLD_TARGETS='X86_64;I386'`, `-DMOLD_USE_MIMALLOC=OFF`,
   `-DMOLD_LTO=OFF`. Never compare Callgrind Ir across build profiles.
-- **[linker/FOLLOWUP_SESSION2 §2]** Measured negatives: symtab **index
+- **[linker/sessions-2026-08 (doc folded) §2]** Measured negatives: symtab **index
   sort** worse (57.8M vs 53.7M Ir); pre-sizing the FDE Vec with
   `count_eh_frame_fdes` 1.7 % slower; `push_strtab_name` as a tidy
   `extend(...)` iterator 5.8 % worse (defeats the vectorised copy — the
@@ -505,20 +521,20 @@ anyway (the bullet carries the *why*).
   zero-copy `SectionData` was 1.4M Ir *slower* because Deref re-derives
   bounds-checked subslices — bind `as_slice()` once. Removing a copy is not
   automatically a win.
-- **[linker/FOLLOWUP_SESSION2 §2.2]** `parallel_reloc.rs` shipped real UB
+- **[linker/sessions-2026-08 (doc folded) §2.2]** `parallel_reloc.rs` shipped real UB
   once: its doc claimed sorted-by-offset disjointness nothing established,
   and the bounds check was a `debug_assert!` (out-of-bounds **write** in
   release). Rewritten with high-water-mark partitions + checked writes; a
   randomised differential test caught an ordering bug **in the fix itself**
   (a stable sort only protects equal offsets).
-- **[linker/FOLLOWUP_SESSION2 §2.3/§4.6]** Congruent segment packing
+- **[linker/sessions-2026-08 (doc folded) §2.3/§4.6]** Congruent segment packing
   (−59.5 % binaries): `p_offset ≡ p_vaddr (mod p_align)` is all the gABI
   requires. RELRO's boundary is an **address** boundary. `emit_shared.rs`
   had the identical defect (separate layout implementations drift
   silently). CORRECTION on record: the session-1 claim that
   `emit_script.rs` had the page-padding defect was **wrong** — an
   unverified claim in a follow-up doc is worse than no claim.
-- **[linker/FOLLOWUP_SESSION2 §2.10+]** Linker correctness rules with named
+- **[linker/sessions-2026-08 (doc folded) §2.10+]** Linker correctness rules with named
   traps: `--exclude-libs` must suppress the PLT too (else `r_info` index 0
   → "undefined symbol: <empty>"); "the first matching arm wins — a
   duplicate arm added later is silently dead"; "a comment asserting
@@ -540,13 +556,13 @@ anyway (the bullet carries the *why*).
   GROUP-script handler (`libm.so` is exactly such a script); validate a
   fuzzer against a planted bug; "a clean `git apply --check` is not
   integration proof — build it."
-- **[linker/FOLLOWUP_SESSION2 §13]** The mmap work shipped a
+- **[linker/sessions-2026-08 (doc folded) §13]** The mmap work shipped a
   `private_interfaces` warning for four sessions because the gate was
   `cargo build 2>&1 | grep -E "^error"` — blind to warnings by construction.
   Fix the gate, not the instance: `build_lccc_fast.sh` now exports
   `RUSTFLAGS=-D warnings` (`LCCC_ALLOW_WARNINGS=1` to opt out).
   Mutation-verify the gate.
-- **[linker/FOLLOWUP_SESSION2 §14]** DSE deleted the stack-top write of an
+- **[linker/sessions-2026-08 (doc folded) §14]** DSE deleted the stack-top write of an
   inline **retpoline** (`movq %target,(%rsp); ret`) → infinite
   `pause; lfence; jmp` spin. DSE must recognize a stack-top store
   immediately consumed by `ret` or `pop`. `movsbl`/`movswl` must not be
@@ -656,7 +672,7 @@ anyway (the bullet carries the *why*).
   (the LK-26 reproducers `/tmp/tlsinit.i` + `/tmp/offprobe.c` are gone — regen
   via the recorded `/tmp/tlspp.sh` recipe or reconstruct from `git show
   afa22485`).
-- **[history/session84 / agent/SESSION_FOLLOWUP_KERNEL_BOOT]** Build recipe
+- **[history/session84 + kernel-boot P0s, §below]** Build recipe
   for mold-less sandboxes: `.cargo/config.toml` pins
   `clang -fuse-ld=mold`; when absent pass
   `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc` **and** `RUSTFLAGS` in
@@ -702,7 +718,7 @@ anyway (the bullet carries the *why*).
   before touching the workload**. Callgrind is the deterministic
   PMU-independent metric (bit-identical across runs; single-threaded
   algorithmic work only; always reported next to best-of-N wall).
-- **[linker/FOLLOWUP_SESSION2 §6]** Testing rules that paid off: fuzz
+- **[linker/sessions-2026-08 (doc folded) §6]** Testing rules that paid off: fuzz
   before claiming robustness; write the randomised differential test
   before trusting a concurrency fix; **mutation-verify new tests** ("a
   test that passes under the bug it was written for is worse than no
@@ -750,7 +766,7 @@ stale sections of live ones:
   stmt_expr_asm_typeof, vectorize_iv_dependent_base. Root-cause these
   before flipping the default (queued as TASK-PF-17).
 - **Kernel-boot P0 dispositions** (from the deleted
-  agent/SESSION_FOLLOWUP_KERNEL_BOOT.md + session 85): the
+  the kernel-boot P0 list in [`journal/2026-08.md`](journal/2026-08.md) + session 85): the
   `emit_int_binop` Add with slot-spilled GlobalAddr base
   (workqueue_prepare_cpu ICE class) is **FIXED** — session 85 integrated
   the per_cpu_ptr-style `Add(Cast(GlobalAddr), reg)` → SIB
@@ -789,7 +805,7 @@ branch of ~230 is byte-identical to upstream `6f1b99ac`.
   ~60 differential-testing reproducers + fixes + `yarpgen_diff.py`/`csmith_diff.py`
   harnesses. Ported 28 reproducers into `tests/regression/`; they exposed 17 real
   LCCC miscompiles, 8 now fixed (see
-  `FOLLOWUP-2026-08-31-regehr-yarpgen-corpus.md`).
+  `journal/2026-08.md`).
 - **DEFER (valuable):** `CrazyTodd-one` SCCP/use_def optimizer passes; `thanhtoantnt`
   property-based tests (needs a dev-dep).
 - **REJECT FOREVER:** `wadsaek/claudes-c-compiler` is **malicious** — its only
@@ -1356,7 +1372,7 @@ full live-range-length, call-crossing, and live-point accounting and commits a
 chain only as a complete transaction after a strict Pareto check.  The targeted
 unit cases and verifier-enabled corpus gate pass; the exact implementation and
 negative controls are recorded in
-`engineering/FOLLOWUP-2026-09-05e-op42-cg09-inline-policy.md`.
+`journal/2026-09-W1.md`.
 
 ## Session 13 — normal `-O2` inline pressure is measurable, not a size-only choice
 
@@ -1384,7 +1400,7 @@ samples, not cross-run comparison.  The normal inline policy should evolve to
 profile-aware benefit versus post-allocation pressure feedback; direct-call
 count is a deliberately conservative interim proxy.  Full rationale,
 exceptions, and validation are in
-`engineering/FOLLOWUP-2026-09-05e-op42-cg09-inline-policy.md`.
+`journal/2026-09-W1.md`.
 
 ## Session 13 — TLS GlobalAddr CSE class unification
 
@@ -1426,7 +1442,7 @@ push increase.  Exhaustive signed-byte equality/termination and all-six-relop
 C regressions, focused IR tests, the structural lowering checks, and the full
 suite (`638 pass, 0 fail`) all pass.  The complete evidence, compiler-oracle
 gap, and follow-up guardrails are in
-`engineering/FOLLOWUP-2026-09-06-pf15-widened-byte-carriers.md`.
+`journal/2026-09-W2.md`.
 
 ## Session 15 — cycle-accurate phi copy ordering landed opt-in; the removed copy was a live-range splitter
 
@@ -1496,7 +1512,7 @@ both arms, the flag is wired, and the opt-in does not leak (unset/`0`/empty/
 `true` all reproduce the default byte for byte) — and is mutation-verified in
 both directions.  Full evidence, the census tables, and the two independent
 allocator leads found while diagnosing are in
-`engineering/FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md`.  One of those leads
+`journal/2026-09-W2.md`.  One of those leads
 is recorded there as **corrected and closed**: `MACHINST_ALLOCATABLE_GPRS` has
 `15` entries and *does* include `rax`/`rcx` (an earlier reading of this session
 said `13` with the two reserved — wrong; only the *main* RA never homes them).
@@ -1633,7 +1649,7 @@ really would become hot reloads.  The defect is that `worth_capping` is a veto w
 no cost-aware replacement, so a more accurate input produced a worse global
 decision.  Base gets the right answer here by accident — it under-counts the web,
 which keeps the cheap span demotable.  Recorded in
-`FOLLOWUP-2026-09-11-valve-cost-blindness.md` with the required sequencing: make
+`journal/2026-09-W2.md` with the required sequencing: make
 the valve cost-ordered **first**, then re-feed web-wide counts.  It is deliberately
 not bundled here, because the valve is core victim selection whose measured history
 (chacha20's ARX webs, adler32's inlined NMAX loop, glibc_memcmp's address span)
@@ -1685,9 +1701,9 @@ cap-counts pin), `ci_local.sh --fast` 24/0/3, clippy clean, rustfmt clean.
 `mod.rs` gate/run, `policy.rs`, `pressure.rs`, `planner.rs`,
 `materializer.rs`, `verifier.rs`), gate in `src/driver/pipeline.rs`,
 shared helpers in `src/backend/split_ranges.rs`. Full design and
-calibration record:
-`FOLLOWUP-2026-09-11-global-location-allocation-phase1.md`,
-`AUDIT-2026-09-12-S16-redteam.md`.
+calibration record in the phase-1 report and the S16 audit, both
+digested in [`journal/2026-09-W2.md`](journal/2026-09-W2.md)
+(GLA entry).
 
 The feature originally shipped **off**; **source-less rematerialization
 graduated to default ON under RA-GLA-02 below** (2026-09-12) — the env var
@@ -2186,7 +2202,7 @@ callee-saved GPR sets.
 **Method.** Static screening of every TU in benchmark/{programs,
 kernel_corpus,patterns} + regression at -O0..-O3,-Os with gate off vs
 gate on for reach bands 6, 7, 8, 9, 10, 11, 12, 14, 22
-(`work/band_sweep.py`, `work/band_detail.py`, `work/band_knee.py`;
+(`work/band_sweep.py`, `work/band_detail.py`, `work/band_knee.py` — uncommitted scratch scripts, wiped; <!-- dl-skip -->
 `.flags` sidecars honored as the real harness and census do), Godbolt
 per-function oracle comparisons for every TU whose deltas move with the
 band, and per-function assembly attribution of each marginal change.

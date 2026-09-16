@@ -196,6 +196,9 @@ gate "segfs-declarator-codegen" fast \
 gate "phi-acyclic-copy-order" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_phi_acyclic_order.sh
 
+gate "doc-link-integrity" fast \
+    python3 scripts/check_doc_links.py
+
 gate "ra-web-inloop-use" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ra_web_inloop_use.sh
 

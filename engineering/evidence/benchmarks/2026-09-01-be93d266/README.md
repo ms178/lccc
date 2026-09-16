@@ -16,6 +16,6 @@ microarchitectural claims.
 only stable when both arms were measured in the same window; VM drift that
 hits the two compilers unequally moves it. Attribution of any change must come
 from a paired same-window A/B with kill switches — see
-`engineering/FOLLOWUP-2026-09-01j-block-layout-order-preserving.md`, where
+`../../../journal/2026-09-W1.md`, where
 that method showed two of three previously "reported" regressions did not
 exist.

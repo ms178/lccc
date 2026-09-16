@@ -12,5 +12,5 @@ induction-variable widening through the element-scaling chain.
 A ratio is only stable when both arms were measured in one window, and GCC's
 own times moved between runs on this shared VM. Attribution of the widening
 change comes from a paired same-window A/B with `CCC_NO_IV_WIDEN`, reported in
-`engineering/FOLLOWUP-2026-09-01k-iv-widen-scaling.md`: `sieve` **−21.6%**,
+`../../../journal/2026-09-W1.md`: `sieve` **−21.6%**,
 `nbody` −3.0%, `arith_loop` −1.3%, `sqlite_varint` −1.3%, nothing regressed.

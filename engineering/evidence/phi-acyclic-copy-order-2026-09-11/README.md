@@ -3,7 +3,7 @@
 Frozen measurement record for the decision to land the cycle-accurate phi copy
 resolver **opt-in** (`CCC_PHI_ACYCLIC_ORDER=1`) rather than as the default.
 Full root-cause write-up:
-[`../../FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md`](../../FOLLOWUP-2026-09-11-phi-acyclic-copy-order.md).
+[`../../journal/2026-09-W2.md`](../../journal/2026-09-W2.md).
 
 All timings are shared-VM wall-clock screens from `scripts/paired_ab.py`:
 25 counted rounds after 2 discarded warm-ups, both arms interleaved *within*

@@ -240,7 +240,7 @@ The web-wide count is not wrong — members share one register, so those three
 reads really would become hot reloads. The wrongness is that `worth_capping` is a
 veto with no cost-aware replacement, so a more accurate input produced a worse
 global decision. That is recorded as
-`engineering/FOLLOWUP-2026-09-11-valve-cost-blindness.md`, including the required
+`../../journal/2026-09-W2.md`, including the required
 sequencing (make the valve cost-ordered *first*, then re-feed the counts).
 
 ### What ships: the decoupled design

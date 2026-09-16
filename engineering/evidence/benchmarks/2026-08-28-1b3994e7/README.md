@@ -1,6 +1,6 @@
 # Canonical screening run — 2026-08-28 — main @ `1b3994e7`
 
-Frozen point-in-time evidence (see `../README.md` retention rule). The root
+Frozen point-in-time evidence (see `../../README.md` retention rule). The root
 `README.md` performance table is derived from exactly these files; nothing in
 the table is hand-entered.
 
@@ -26,15 +26,15 @@ by at most ~2 %.
 
 | File | Kernels | UTC |
 |---|---|---|
-| `chunkA.json` / `chunkA.md` | binary_trees, fannkuch, mandelbrot, nbody, spectral_norm | 18:37 |
-| `chunkB.json` / `chunkB.md` | remaining 27 kernels (canonical rounds) | 18:42 |
-| `chunkC.json` / `chunkC.md` | hash_table (8 rounds) | 18:43 |
+| `chunkA.json` (report in `RESULTS.md`) | binary_trees, fannkuch, mandelbrot, nbody, spectral_norm | 18:37 |
+| `chunkB.json` (report in `RESULTS.md`) | remaining 27 kernels (canonical rounds) | 18:42 |
+| `chunkC.json` (report in `RESULTS.md`) | hash_table (8 rounds) | 18:43 |
 
 ## Result integrity
 
 - 33/33 pairs: LCCC output byte-identical to the GCC baseline (checksum
   gating; a mismatch disqualifies the number).
-- Aggregate recomputed independently from the raw JSON (`merged-verified.md`):
+- Aggregate recomputed independently from the raw JSON (in `RESULTS.md`):
   geomean 0.7381 (all 33), 1.0963 (30 conventional-code pairs), cross-checked
   against the runner's own aggregate where emitted.
 - Sub-2 ms medians (fib, ackermann, constant_recursion, binary_search,
