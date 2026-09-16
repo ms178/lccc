@@ -67,10 +67,13 @@ if [ "$n_vec_nr" -gt 0 ]; then
 fi
 
 if [ -n "$march" ]; then
-    # 256-bit seed: one vmovdqu pair for the 4×i64 copy+add.
-    n_vec_precise=$(scoped rt_precise | grep -c "vmovdqu" || true)
+    # 256-bit seed: the 4×i64 copy+add packs. The VEX memfold may fold the
+    # stream load into the packed add (`vpaddq (%rdi), %ymm0, %ymm0`), so
+    # the vectorized signature is the packed op itself plus the store —
+    # counting only vmovdqu would reject the FOLDED (better) code.
+    n_vec_precise=$(scoped rt_precise | grep -cE "vpaddq|vmovdqu" || true)
     if [ "$n_vec_precise" -lt 2 ]; then
-        echo "FAIL: rt_precise did not vectorize (rule (e) over-rejects: $n_vec_precise vmovdqu)"
+        echo "FAIL: rt_precise did not vectorize (rule (e) over-rejects: $n_vec_precise vector ops)"
         exit 1
     fi
     n_w16=$(scoped rt_w16 | grep -cE "paddw|vpaddw" || true)

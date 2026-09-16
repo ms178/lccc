@@ -2507,7 +2507,15 @@ impl super::InstructionEncoder {
         let pp = if has_66 { 1 } else { 0 };
         if ops.len() == 3 {
             match (&ops[0], &ops[1], &ops[2]) {
-                // $imm, %xmm_src, %xmm_dst  (immediate shift, dst = vvvv)
+                // $imm, %xmm_src, %xmm_dst  (immediate shift, dst = vvvv).
+                // NOTE: the VEX immediate-shift forms (0F 71/72/73) are
+                // REGISTER-ONLY — the r/m-as-memory form exists solely
+                // under EVEX (AVX-512), which this target does not assume.
+                // GNU as confirms: `vpslld $3,(%rdi),%xmm3` assembles to an
+                // EVEX encoding. The VEX-looking memory encoding is INVALID
+                // and faults (SIGILL) — the VLFOLD analysis therefore never
+                // admits immediate-shift consumers (see
+                // memfold_consumer_unary_imm_* removal notes).
                 (
                     Operand::Immediate(ImmediateValue::Integer(imm)),
                     Operand::Register(src),

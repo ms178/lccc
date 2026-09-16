@@ -130,6 +130,21 @@ impl RegCache {
 pub(crate) static EXPLORATORY_EMISSION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// A VLFOLD-elided vector load awaiting its consumer.
+/// See `CodegenState::pending_vec_memfold` for the width contract.
+#[derive(Clone, Debug)]
+pub struct PendingVecMemfold {
+    /// Value id of the elided load's result.
+    pub val: u32,
+    /// The load's source memory operand (already rendered as AT&T text).
+    pub mem: String,
+    /// The load mnemonic (`vmovdqu`, `vmovups`, `vmovupd`) for
+    /// materialisation / re-issue.
+    pub mnemonic: &'static str,
+    /// Access width in bytes: 16 (VEX.128 fold) or 32 (VEX.256 fold).
+    pub width: u32,
+}
+
 pub struct CodegenState {
     pub out: AsmOutput,
     /// Set from CodegenOptions for -O0 non-SSA correctness.
@@ -212,12 +227,19 @@ pub struct CodegenState {
     /// elided when the load's destination carries a register home; see
     /// `compute_vector_memfold_homed_ok`.
     pub vector_memfold_homed_ok: FxHashSet<u32>,
-    /// The elided load awaiting its consumer: (value id, memory operand,
-    /// load mnemonic for materialisation). Consumed by `emit_avx_binary_256`
-    /// as a memory operand, or by `avx_load_arg_to` as a real load; the
-    /// safety net in `emit_intrinsic_impl` materialises it before any other
-    /// intrinsic.
-    pub pending_vec_memfold: Option<(u32, String, &'static str)>,
+    /// The elided load awaiting its consumer. Consumed as a memory operand
+    /// by the audited memfold-first emitters, or re-issued as a real load by
+    /// the memfold-aware loaders; the safety net in `emit_intrinsic_impl`
+    /// materialises it before any other intrinsic.
+    ///
+    /// `width` is the access width in BYTES (16 for a VEX.128 fold, 32 for a
+    /// VEX.256 fold). A materialisation or re-issue must read EXACTLY that
+    /// many bytes: a 32-byte read of a 16-byte object can cross a page the
+    /// program never touched (the source object is only guaranteed to span
+    /// `width` bytes), and a 16-byte read of a 32-bit object would load
+    /// garbage lanes. Every consumer site checks the width matches its own
+    /// vector family before consuming.
+    pub pending_vec_memfold: Option<PendingVecMemfold>,
     /// Lazy-flush half of the deferred-store mechanism: a skipped vector
     /// result store is kept PENDING here (value id, holding register, 256-bit
     /// flag) instead of being dropped. If the consumer really receives the

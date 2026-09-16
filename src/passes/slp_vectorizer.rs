@@ -2683,7 +2683,8 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
     // ── Schedules ──────────────────────────────────────────────────────
     // Op/MemLoad packs: max lane def position (strictly before every
     // consumer — SSA within the block). Splat/gather leaves: min over
-    // consumers, resolved by fixpoint.
+    // consumers, resolved by fixpoint — EXCEPT splats, which take their
+    // EARLIEST valid position instead (see the splat block below).
     for p in packs.iter_mut() {
         if !p.lane_vals.is_empty() {
             p.sched = p
@@ -2692,6 +2693,61 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 .map(|v| ctx.def_pos[&v.0])
                 .max()
                 .unwrap_or(0);
+        }
+    }
+    // Splats: EARLIEST-valid scheduling. A splat is pure, so the only
+    // ordering constraints are (1) its scalar source's def and (2) the
+    // block's phi prefix (a non-phi must never be inserted before a phi).
+    // Placing splats at the earliest valid point — instead of the
+    // latest (min over consumers) — puts every MemLoad pack ADJACENT to
+    // the op pack that consumes it: the emitted IR reads
+    //   [splat, ..., load, op]
+    // instead of [load, splat, op], and the VLFOLD memory-fold analysis
+    // (which requires the load next to — or next-but-one across another
+    // pure load from — its consumer) fires for the streamed-load shapes
+    // (`q[i] = a[i] - 1`, `~a[i]`, ARX quarter-rounds) exactly like
+    // GCC/Clang schedule them: constant materialisation first, then
+    // `vop (%rdi), %xmmK, %xmmD`. A value splat's source is defined
+    // before the scalar lanes that consumed it (SSA), so
+    // src_def+1 ≤ every consumer's schedule — never a violation.
+    {
+        // The prologue-like prefix: phis, ParamRefs and Allocas. A non-
+        // prologue instruction inserted before a ParamRef breaks the
+        // `x86_param_caller_homes_safe` prefix walk — the params then lose
+        // their ABI-register homes and pay an entry copy + callee-save
+        // push/pop pair each (measured on the ksub showdown shape: +6
+        // instructions). Nothing but these three forms may precede the
+        // first real instruction.
+        let phi_prefix = block
+            .instructions
+            .iter()
+            .position(|i| {
+                !matches!(
+                    i,
+                    Instruction::Phi { .. }
+                        | Instruction::ParamRef { .. }
+                        | Instruction::Alloca { .. }
+                )
+            })
+            .unwrap_or(block.instructions.len());
+        for (pi, p) in packs.iter_mut().enumerate() {
+            // The ROOT splat (an all-constant seed like `q[0..3] = 0`)
+            // feeds only the seed STORE; early placement would needlessly
+            // extend its live range across the whole block, so it keeps
+            // the fixpoint/store-slot discipline.
+            if pi == root {
+                continue;
+            }
+            if let PackKind::Splat { src, .. } = &p.kind {
+                let earliest = match src {
+                    Operand::Value(v) => match ctx.def_pos.get(&v.0) {
+                        Some(&d) => (d + 1).max(phi_prefix),
+                        None => phi_prefix, // foreign value: dominates
+                    },
+                    Operand::Const(_) => phi_prefix,
+                };
+                p.sched = earliest;
+            }
         }
     }
     loop {
