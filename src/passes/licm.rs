@@ -39,6 +39,15 @@ use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
 /// Run LICM using pre-computed CFG analysis (avoids redundant analysis when
 /// called from a pipeline that shares analysis across GVN, LICM, IVSR).
 pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnalysis) -> usize {
+    // FIX: -funsigned-char miscompile in number() (kernel lib/vsprintf.c)
+    // LICM hoists invariant GlobalAddr/Cast from base 8/16 loop but corrupts
+    // small-path i for base10, producing leading null + digit (e.g. "\0"+"0"
+    // for irq 0). Root cause is char signedness handling in LICM invariance
+    // with U8 vs I8. Disable LICM when plain char is unsigned until properly fixed.
+    // This unblocks linux-cachymod-6.18.52 QEMU boot (kobject empty name).
+    if crate::common::types::char_is_unsigned() {
+        return 0;
+    }
     if cfg.num_blocks < 2 {
         return 0;
     }

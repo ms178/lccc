@@ -2071,11 +2071,23 @@ fn link_with_script_machine(
                         .is_some_and(|s| s.name == ".note.gnu.property")
             })
     });
-    let note_phdr_actual = out_secs
-        .iter()
-        .filter(|o| o.is_alloc && o.size > 0 && o.name.starts_with(".note"))
-        .count()
-        + usize::from(has_note_property_out);
+    // When the script explicitly declares PHDRS including PT_NOTE (as the
+    // Linux vDSO does), the declared PT_NOTE already covers the note
+    // sections and we must NOT synthesize additional PT_NOTE headers.
+    // The SIZEOF_HEADERS prediction above (note_phdr_pred) already does
+    // this check; the final layout must agree exactly, otherwise
+    // SIZEOF_HEADERS under-reserves and the first alloc section overlaps
+    // the program-header table, producing filesz > memsz and breaking
+    // objcopy/vdso2c. See the VDSO failure in the kernel VM build.
+    let note_phdr_actual = if script.phdrs.iter().any(|d| d.ptype == PT_NOTE_) {
+        0
+    } else {
+        out_secs
+            .iter()
+            .filter(|o| o.is_alloc && o.size > 0 && o.name.starts_with(".note"))
+            .count()
+            + usize::from(has_note_property_out)
+    };
     let n_phdrs = declared_phdrs.len().max(1) + usize::from(needs_tls_phdr) + note_phdr_actual;
     let mut file_off = script_header_size_with(
         &script,

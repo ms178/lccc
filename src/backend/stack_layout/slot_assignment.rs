@@ -765,15 +765,22 @@ fn classify_value(
     if state.never_materialized_values.contains(&dest.0) {
         return;
     }
-    // Skip register-assigned values (no stack slot needed).
+    // SOUNDNESS FIX (kernel 6.18.52): do NOT skip register-assigned values.
+    // The previous register-only strategy left values with no stack slot
+    // fallback when their home register was clobbered (staging, in-place
+    // derived compute, call) — triggering the `operand_to_rax: stale home
+    // with no slot/remat` ICE in intel_gmch_probe / conntrack_mt /
+    // intel-gtt.  Always allocate a spill slot as a sound fallback; the
+    // register remains the primary home (store_rax_to now spills to both).
+    // Protected values already have their own path; this keeps them too.
     if reg_assigned.contains_key(&dest.0) {
         if debug_protect && state.protected_slot_values.contains(&dest.0) {
             eprintln!(
-                "[CLASSIFY] SSA {} is protected but register-assigned, skipping slot",
+                "[CLASSIFY] SSA {} is protected but register-assigned, allocating slot anyway (soundness fix)",
                 dest.0
             );
         }
-        return;
+        // fall through — allocate a spill slot as fallback
     }
 
     // Skip dead values (defined but never used).

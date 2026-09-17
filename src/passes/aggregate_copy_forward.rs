@@ -607,12 +607,45 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
                     func.name, bi, gep_idx, insert_at
                 );
             }
+            // FIX: guard against stale indices (mm/execmem.o ICE: removal index 8 len 1).
+            // def_site is built from current blocks, but concurrent mutations or
+            // multi-def handling can leave gep_idx out of bounds. Fail closed.
+            if bi >= func.blocks.len() {
+                return 0;
+            }
+            let block_len = func.blocks[bi].instructions.len();
+            if gep_idx >= block_len || insert_at > block_len {
+                return 0;
+            }
             let block = &mut func.blocks[bi];
             let inst = block.instructions.remove(gep_idx);
-            block.instructions.insert(insert_at, inst);
+            // After removal len = old_len-1. If insert_at was after gep_idx,
+            // its logical position shifts left by one.
+            let adjusted_insert = if insert_at > gep_idx {
+                insert_at - 1
+            } else {
+                insert_at
+            };
+            if adjusted_insert > block.instructions.len() {
+                // Restore and bail (should not happen after bounds check).
+                block.instructions.insert(gep_idx, inst);
+                return 0;
+            }
+            block.instructions.insert(adjusted_insert, inst);
             if !block.source_spans.is_empty() {
-                let span = block.source_spans.remove(gep_idx);
-                block.source_spans.insert(insert_at, span);
+                if gep_idx < block.source_spans.len() {
+                    let span = block.source_spans.remove(gep_idx);
+                    let span_insert = if insert_at > gep_idx {
+                        insert_at - 1
+                    } else {
+                        insert_at
+                    };
+                    if span_insert <= block.source_spans.len() {
+                        block.source_spans.insert(span_insert, span);
+                    } else {
+                        block.source_spans.insert(gep_idx, span);
+                    }
+                }
             }
             // Indices recorded in `copies`/`def_site` for this block are
             // now stale; count the hoist as a change and let the caller's

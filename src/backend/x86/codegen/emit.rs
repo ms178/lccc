@@ -2631,6 +2631,21 @@ impl X86Codegen {
                     .out
                     .emit_instr_reg_reg("    movq", "rax", reg_name);
             }
+            // SOUNDNESS FIX (kernel 6.18.52): always spill to the stack slot
+            // as well, if one exists. The previous register-only strategy
+            // left values with no slot recovery when their home register
+            // was clobbered (staging, in-place derived compute, call) —
+            // triggering the `operand_to_rax: stale home with no slot/remat`
+            // ICE in intel_gmch_probe / conntrack_mt / intel-gtt. Spilling
+            // both ways keeps the slot as a sound fallback and lets
+            // fresh_home_of() fall back to a reload instead of ICEing.
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                if use_small {
+                    self.state.out.emit_instr_reg_rbp("    movl", "eax", slot.0);
+                } else {
+                    self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+                }
+            }
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             if use_small {
                 self.state.out.emit_instr_reg_rbp("    movl", "eax", slot.0);

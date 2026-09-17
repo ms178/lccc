@@ -779,9 +779,15 @@ fn run(args: &[String]) -> Result<(), String> {
                     // the shared parser: it carries the positional state with
                     // the input and force-loads every member.  The plain
                     // `object_files` path always loads archives selectively.
+                    // For relocatable (-r) links we use the `inputs` vector
+                    // directly, so we must also record the archive there;
+                    // otherwise `inputs` stays empty and the link fails with
+                    // \"no input files\" (observed on the kernel's vmlinux.o
+                    // thin-archive link).
                     passthrough.push("--whole-archive".to_string());
                     passthrough.push(a.to_string());
                     passthrough.push("--no-whole-archive".to_string());
+                    inputs.push((a.to_string(), true));
                 } else {
                     inputs.push((a.to_string(), whole_archive));
                 }
