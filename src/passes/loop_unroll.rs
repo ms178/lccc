@@ -584,6 +584,38 @@ fn analyze_loop(
         exit_cond_positive,
     ) = find_exit_condition(func, header, &lp.body, iv_phi)?;
 
+    // 8b. The IV phi may only be referenced by a phi OUTSIDE the loop when
+    //     that phi lives in the DIRECT exit block — Step 5 threads exactly
+    //     those with per-exit-check edge values.  A phi in any LATER block
+    //     (an exit block that an intermediate pass SPLIT, a downstream
+    //     join) keeps its stale header-edge incoming while the new
+    //     exit-check edges bypass it entirely: the reader sees the
+    //     once-per-k IV (⌊n/k⌋·k instead of n — found on the counting
+    //     epic's remainder, whose exit merge sat past a split).  Fail
+    //     closed on the shape; the loop keeps its rolled form.
+    {
+        let exit_bi = func.blocks.iter().position(|b| b.label == exit_target);
+        for (bi, block) in func.blocks.iter().enumerate() {
+            if lp.body.contains(&bi) {
+                continue;
+            }
+            if Some(bi) == exit_bi {
+                continue; // the direct exit block: Step 5 threads it
+            }
+            for inst in &block.instructions {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (op, _) in incoming {
+                        if let Operand::Value(v) = op {
+                            if v.0 == iv_phi.0 {
+                                return None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 9. Count body instructions and select the unroll factor.
     let body_inst_count: usize = body_work
         .iter()

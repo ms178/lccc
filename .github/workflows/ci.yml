@@ -274,6 +274,18 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_bb_slp_v7_codegen.sh
 
+      # Adler-32 loop epic: the rolling-checksum reassociation
+      # (vpsadbw + vpmaddubsw weights + vpmaddwd, exact mod 2^32) that
+      # GCC/Clang/ICX all leave scalar, plus the counting-epic
+      # miscompile fixes (multi-accumulator decline, IV live-out
+      # materialisation, narrow-compare constant wrap) and the asm
+      # homing contracts. Tri-config differential (epic on /
+      # -mno-avx2 / gcc) included.
+      - name: Verify Adler-32 epic contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_vec_adler_epic.sh
+
       # BB-SLP v6 (the gate ci.yml was missing — ci_local.sh had it): the
       # 128-bit VEX memory fold, FP negation sign-mask, integer min/max
       # folds, the general cmp+blendv composite, and the rule-(b)

@@ -5980,6 +5980,12 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             // (`vpsadbw a, b`, `vpaddq a, b`).
             | O::VecSadbwU8x32
             | O::VecAddI64x4 => Some(2),
+            // Adler-32 epic binaries: `vpmaddubsw`/`vpmaddwd` each read two
+            // vector operands.  The const-table producer reads none (its
+            // 32 args are all constants).
+            | O::VecMaddubsU8x32
+            | O::VecMaddwdI16x16 => Some(2),
+            O::VecConstI8x32 => Some(0),
 
             // Three genuine vector inputs (no scalar operand in the prefix).
             O::Pblendvb128
@@ -7283,6 +7289,13 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // the u64x4 accumulator, and the zero seeds it.  Class 8 so
             // the Copy-web can home the loop-carried accumulator.
             O::VecSadbwU8x32 | O::VecAddI64x4 | O::VecZeroI64x4 => Some(8),
+            // Adler-32 epic: the maddubs result and the .rodata constant
+            // tables (weights, ones, seed mask) are 256-bit YMM values kept
+            // register-resident across the vector loop — class 8 (the
+            // I64x4 physical family) so the Copy-web can home them.  The
+            // maddwd result feeds the class-5 dword accumulator add.
+            O::VecMaddubsU8x32 | O::VecConstI8x32 => Some(8),
+            O::VecMaddwdI16x16 => Some(5),
             // BB-SLP I64x4 copy/ALU chains: loads, sub/bitwise, splat.
             O::VecLoadI64x4
             | O::VecSubI64x4
@@ -7373,6 +7386,18 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // BB-SLP 256-bit lane extract: reads the YMM home
                     // (half staging), scratch confined to xmm1.
                     | O::VecExtractLaneI32x8
+                    // Integer map lane bitwise (And/Or/Xor): the counting
+                    // reduction's `& 1` mask step goes through
+                    // `emit_avx_binary_256` exactly like the add/mul arms
+                    // above, so a register-homed I32x8 value (the 0x01
+                    // byte splat, a compare mask) is safe to keep live
+                    // across it.  Without this entry the splat's home was
+                    // illegal, forcing the `movdqa %ymm5, %ymm0` +
+                    // `movdqa %ymm3, %ymm1` staging pair before every
+                    // `vpand` — two dead copies per counting iteration.
+                    | O::VecAndI32x8
+                    | O::VecOrI32x8
+                    | O::VecXorI32x8
             ),
             6 => matches!(
                 op,
@@ -7431,6 +7456,14 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             8 => matches!(
                 op,
                 O::VecAddI64x4 | O::VecHorizontalAddI64x4 | O::VecSadbwU8x32
+                    // Adler-32 epic multiply-adds: both consume their
+                    // 256-bit sources through `emit_avx_binary_256`'s
+                    // home-aware paths (all-homed register form, slot r/m
+                    // source, or staged scratch — never a home write), so a
+                    // register-homed weights/ones/maddubs value stays live
+                    // across them exactly like the counting binaries.
+                    | O::VecMaddubsU8x32
+                    | O::VecMaddwdI16x16
                     // BB-SLP 4×u64 copy chain: store reads the homed YMM
                     // directly (vec_store_source_256); sub/bitwise go
                     // through emit_avx_binary_256's home-aware paths.
@@ -7497,6 +7530,18 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecHorizontalAddI32x8
                                 | O::VecHorizontalAddI32x4
                                 | O::VecHorizontalAddI64x2
+                                // Byte-count/Adler-32 epic exits: the
+                                // 4×I64 horizontal reduce (vextracti128 +
+                                // vpaddq + vpshufd chain) confines scratch
+                                // to the reserved ymm0/ymm1 pair and only
+                                // READS the accumulator's home — the same
+                                // discipline as the I32x8 twin above.
+                                // Without this entry the epic's exit
+                                // poisoned EVERY vector web in the
+                                // function (the counting accumulator
+                                // round-tripped 32 bytes through the
+                                // stack every iteration).
+                                | O::VecHorizontalAddI64x4
                                 // v12 Fix C: widening reductions consume an
                                 // I64x2 accumulator (whitelisted above). Their
                                 // lowerings confine scratch to xmm0/xmm1 so an
@@ -7610,6 +7655,9 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecExtractLaneI16x16
                         ) =>
                 {
+                    if std::env::var("CCC_DEBUG_VECWEB").is_ok() {
+                        eprintln!("[VECWEB-POISON] fn={} op={:?}", func.name, op);
+                    }
                     return FxHashSet::default();
                 }
                 _ => {}
@@ -7658,6 +7706,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
     }
     for value in &conflicts {
         classes.remove(value);
+    }
+    if std::env::var("CCC_DEBUG_VECWEB").is_ok() {
+        let mut v: Vec<u32> = classes.keys().copied().collect();
+        v.sort_unstable();
+        eprintln!("[VECWEB-1] fn={} classes_after_prop={:?}", func.name, v);
     }
 
     loop {
@@ -7715,6 +7768,14 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             break;
         }
         let old_len = classes.len();
+        if std::env::var("CCC_DEBUG_VECWEB").is_ok() {
+            let mut v: Vec<u32> = classes.keys().copied().collect();
+            v.sort_unstable();
+            eprintln!(
+                "[VECWEB-2] fn={} evict={:?} remaining={:?}",
+                func.name, bad, v
+            );
+        }
         for value in bad {
             classes.remove(&value);
         }
@@ -7742,6 +7803,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
         }
     }
     classes.retain(|value, _| copy_web.contains(value));
+    if std::env::var("CCC_DEBUG_VECWEB").is_ok() {
+        let mut v: Vec<u32> = classes.keys().copied().collect();
+        v.sort_unstable();
+        eprintln!("[VECWEB] fn={} web={:?}", func.name, v);
+    }
     classes.into_keys().collect()
 }
 
@@ -7759,6 +7825,9 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
             O::VecBroadcastF32x4 => Some(4),
             O::VecBroadcastF64x2 => Some(5),
             O::VecBroadcastI32x4 | O::VecBroadcastI8x16 | O::VecBroadcastI16x8 => Some(6),
+            // Adler-32 epic invariants (see the consumer class 8 below):
+            // the SAD zero and the .rodata weight/ones tables.
+            O::VecZeroI64x4 | O::VecConstI8x32 => Some(8),
             _ => None,
         }
     };
@@ -7906,6 +7975,25 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMinI16x8
                     | O::VecMaxI16x8
                     | O::VecBlendvI16x8
+            ),
+            // Adler-32 epic invariants: the SAD zero operand
+            // (`VecZeroI64x4`) and the .rodata weight/ones tables
+            // (`VecConstI8x32`) are loop-invariant 256-bit values whose
+            // ONLY uses are the epic's packed consumers — the same
+            // charter as the broadcasts above (live across every
+            // iteration, never an accumulator).  Without this class they
+            // took no register home and every maddubs/maddwd/sadbw
+            // re-read them from the stack.
+            8 => matches!(
+                op,
+                O::VecSadbwU8x32
+                    | O::VecMaddubsU8x32
+                    | O::VecMaddwdI16x16
+                    | O::VecAddI64x4
+                    | O::VecSubI64x4
+                    | O::VecAndI64x4
+                    | O::VecOrI64x4
+                    | O::VecXorI64x4
             ),
             _ => false,
         }

@@ -294,6 +294,15 @@ gate "bb-slp-v6" fast \
 gate "bb-slp-v7" fast \
     bash tests/regression/check_bb_slp_v7_codegen.sh
 
+# Adler-32 loop epic: the rolling-checksum reassociation (vpsadbw +
+# vpmaddubsw weights + vpmaddwd, exact mod 2^32) that GCC/Clang/ICX all
+# leave scalar — tri-config differential (epic on / -mno-avx2 / gcc) plus
+# the counting-epic miscompile fixes (multi-accumulator decline, IV
+# live-out materialisation, narrow-compare constant wrap) and the asm
+# homing contracts.
+gate "vec-adler-epic" fast \
+    bash tests/regression/check_vec_adler_epic.sh
+
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
 
