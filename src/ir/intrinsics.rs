@@ -646,8 +646,39 @@ pub enum IntrinsicOp {
     /// differences).  The byte-predicate COUNTING reduction uses it against
     /// an all-zero vector: with lanes in {0, 1} the u64 lanes hold the exact
     /// per-group counts — the classic strlen/memchr/ctype-classifier
-    /// vectorization (`vpcmpeqb` + `vpand` + `vpsadbw`).
+    /// vectorization (`vpcmpeqb` + `vpand` + `vpsadbw`).  The Adler-32
+    /// loop epic uses it against the zero as the `vs1` partial-sum
+    /// generator (bytes are non-negative, so `|b − 0| = b`).
     VecSadbwU8x32,
+    /// Packed byte×byte pair multiply-add (`vpmaddubsw`, SSSE3/AVX2):
+    /// `dest = Maddubs(args[0], args[1])` — for each byte pair, the
+    /// i16 sum `args[0][2i] * args[1][2i] + args[0][2i+1] * args[1][2i+1]`
+    /// (16×i16 per YMM).  NON-COMMUTATIVE: args[0] is UNSIGNED bytes,
+    /// args[1] is SIGNED bytes (the ISA's operand contract), and the two
+    /// roles are not interchangeable.  The Adler-32 loop epic pairs
+    /// args[0] = the byte stream with args[1] = the .rodata weight table
+    /// `[32, 31, ..., 1]` (folded rip-relative in the src2 slot), which
+    /// computes the exact `(32-l)·b_l` weighted contribution of s2.
+    VecMaddubsU8x32,
+    /// Packed word pair multiply-add (`vpmaddwd`, SSE2/AVX2):
+    /// `dest = Maddwd(args[0], args[1])` — for each adjacent word pair,
+    /// the i32 sum `args[0][2i] * args[1][2i] + args[0][2i+1] * args[1][2i+1]`
+    /// (8×i32 per YMM).  Marked NON-commutative for operand-order
+    /// discipline (the ISA result is symmetric, but keeping the explicit
+    /// order matches the maddubs contract and the fold gate below).  The
+    /// Adler-32 loop epic pairs args[0] = the maddubs word products with
+    /// args[1] = an all-ones vector, horizontal-summing the weighted byte
+    /// pairs into dword lanes.
+    VecMaddwdI16x16,
+    /// 32-byte constant vector from 32 const byte args (Adler-32 weights
+    /// `[32..1]`, the i16 ones table, the lane-0 mask `[~0, 0, 0, 0]`):
+    /// `dest = ConstBytes(args[0..32])`.  Emitted exclusively in preheaders
+    /// by loop epics; the codegen materialises the byte pattern once in
+    /// `.rodata` (`.LCVEC_n`, the v6 FP-neg const pool) and loads or
+    /// register-homes it, so every consumer downstream sees an ordinary
+    /// 256-bit value.  args MUST be 32 `Operand::Const` values — a
+    /// non-constant operand is an invariant violation and fails loudly.
+    VecConstI8x32,
 
     /// NEON sadalp: sign-extend 4×I32 lanes and accumulate adjacent pairs into
     /// a 2×I64 accumulator: dest = args[0] + pairwise_sums(args[1]).
@@ -1654,6 +1685,9 @@ impl IntrinsicOp {
             // protected slot and makes every copy a legacy `movdqa %xmm`
             // that silently freezes the upper lanes. Classify by shape.
             | VecLoadI64x4 | VecAddI64x4 | VecZeroI64x4 | VecSadbwU8x32
+            // Adler-32 loop epic: the two packed multiply-add producers and
+            // the .rodata constant-table producer are 256-bit results.
+            | VecMaddubsU8x32 | VecMaddwdI16x16 | VecConstI8x32
             // BB-SLP I64x4 family completion: sub/bitwise/broadcast and
             // the 256-bit store round out the 4×u64 copy chains.
             | VecSubI64x4 | VecAndI64x4 | VecOrI64x4 | VecXorI64x4
@@ -2040,6 +2074,9 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecHorizontalAddI64x4
                 | IntrinsicOp::VecZeroI64x4
                 | IntrinsicOp::VecSadbwU8x32
+                | IntrinsicOp::VecMaddubsU8x32
+                | IntrinsicOp::VecMaddwdI16x16
+                | IntrinsicOp::VecConstI8x32
                 | IntrinsicOp::VecSubI64x4
                 | IntrinsicOp::VecAndI64x4
                 | IntrinsicOp::VecOrI64x4
@@ -2253,6 +2290,9 @@ mod vector_result_width_tests {
             "VecAddI64x2" => IntrinsicOp::VecAddI64x2,
             "VecAddI64x4" => IntrinsicOp::VecAddI64x4,
             "VecSadbwU8x32" => IntrinsicOp::VecSadbwU8x32,
+            "VecMaddubsU8x32" => IntrinsicOp::VecMaddubsU8x32,
+            "VecMaddwdI16x16" => IntrinsicOp::VecMaddwdI16x16,
+            "VecConstI8x32" => IntrinsicOp::VecConstI8x32,
             "VecAndI32x4" => IntrinsicOp::VecAndI32x4,
             "VecAndI32x8" => IntrinsicOp::VecAndI32x8,
             "VecBlendvF32x4" => IntrinsicOp::VecBlendvF32x4,

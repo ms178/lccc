@@ -392,6 +392,28 @@ fn vectorize_with_analysis_mode(
                 total_changes += n;
                 continue;
             }
+        } else if !neon
+            && !force_two_wide
+            && std::env::var("LCCC_FORCE_SSE2").is_err()
+            && x86_avx2_available()
+            && let Some(adler_pattern) = analyze_adler_loop(func, loop_info, cfg)
+        {
+            // Adler-32 rolling-checksum epic (`s1 += b; s2 += s1`): the
+            // reassociative two-accumulator recurrence that GCC, Clang and
+            // ICX all leave scalar (verified on the DO8 kernel: pure scalar
+            // unroll in all three).  AVX2-only by construction (the
+            // 32-byte `vpmaddubsw` weight table); exact mod 2^32 for every
+            // input and length by the ring-homomorphism proof in the epic's
+            // section comment.  The analysis fails closed on every shape it
+            // cannot prove — the loop keeps its scalar form on those paths.
+            let n = transform_adler_loop(func, &adler_pattern);
+            if n > 0 {
+                if debug {
+                    eprintln!("[VEC] Adler-32 epic matched! {} changes (loop {})", n, idx);
+                }
+                total_changes += n;
+                continue;
+            }
         } else if let Some(red_pattern) = analyze_reduction_pattern(
             func,
             loop_info,
@@ -3458,6 +3480,129 @@ fn rewrite_reduction_body(
     }
 
     (init_zero_value, vec_sum_value, changes)
+}
+
+/// Rewrite uses of the value `id` outside the given loop blocks AND
+/// outside the blocks whose labels are in `skip_labels`.  Unlike
+/// [`rewrite_accumulator_uses_outside_loop`] this covers EVERY
+/// instruction kind including `Intrinsic` consumers (a later packed op
+/// reading the value) — it exists for the counting epic's IV
+/// materialisation, where the new transform-owned blocks (which the
+/// label set excludes) deliberately keep reading the original phi.
+fn rewrite_value_uses_outside(
+    func: &mut IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    skip_labels: &FxHashSet<u32>,
+    id: u32,
+    replacement: Value,
+) -> usize {
+    let mut updates = 0usize;
+    let mut replace_in_operand = |op: &mut Operand| -> bool {
+        if let Operand::Value(v) = op {
+            if v.0 == id {
+                *v = replacement;
+                return true;
+            }
+        }
+        false
+    };
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        if loop_blocks.contains(&bi) || skip_labels.contains(&block.label.0) {
+            continue;
+        }
+        for inst in &mut block.instructions {
+            match inst {
+                Instruction::Copy { src, .. } => {
+                    if replace_in_operand(src) {
+                        updates += 1;
+                    }
+                }
+                Instruction::Store { val, .. } => {
+                    if replace_in_operand(val) {
+                        updates += 1;
+                    }
+                }
+                Instruction::BinOp { lhs, rhs, .. } => {
+                    if replace_in_operand(lhs) {
+                        updates += 1;
+                    }
+                    if replace_in_operand(rhs) {
+                        updates += 1;
+                    }
+                }
+                Instruction::Cmp { lhs, rhs, .. } => {
+                    if replace_in_operand(lhs) {
+                        updates += 1;
+                    }
+                    if replace_in_operand(rhs) {
+                        updates += 1;
+                    }
+                }
+                Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
+                    if replace_in_operand(src) {
+                        updates += 1;
+                    }
+                }
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    for a in &mut info.args {
+                        if replace_in_operand(a) {
+                            updates += 1;
+                        }
+                    }
+                }
+                Instruction::Intrinsic { args, .. } => {
+                    for a in args.iter_mut() {
+                        if replace_in_operand(a) {
+                            updates += 1;
+                        }
+                    }
+                }
+                Instruction::Phi { incoming, .. } => {
+                    for (op, _) in incoming {
+                        if replace_in_operand(op) {
+                            updates += 1;
+                        }
+                    }
+                }
+                Instruction::Select {
+                    cond,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    if replace_in_operand(cond) {
+                        updates += 1;
+                    }
+                    if replace_in_operand(true_val) {
+                        updates += 1;
+                    }
+                    if replace_in_operand(false_val) {
+                        updates += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match &mut block.terminator {
+            Terminator::Return(Some(op)) => {
+                if replace_in_operand(op) {
+                    updates += 1;
+                }
+            }
+            Terminator::CondBranch { cond, .. } => {
+                if replace_in_operand(cond) {
+                    updates += 1;
+                }
+            }
+            Terminator::Switch { val, .. } => {
+                if replace_in_operand(val) {
+                    updates += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    updates
 }
 
 /// Rewrite every use of `acc_id` OUTSIDE the reduction's loop blocks to
@@ -7275,6 +7420,92 @@ fn analyze_byte_count_loop(
         }
     };
 
+    // ── Single-chain discipline (fail-closed) ─────────────────────────
+    // The transform REPLACES the loop's trip structure wholesale (the
+    // original loop becomes the vector loop with a divided limit, and the
+    // remainder is a freshly built scalar mirror).  Three shapes it cannot
+    // honor must decline here — each was a live miscompile found by the
+    // red-team battery:
+    //
+    //   * a SECOND loop-carried accumulator (`a += pred1(s[i]);
+    //     b += pred2(s[i])` — the b chain has no surviving definition and
+    //     b stayed 0): the header must carry EXACTLY the two phis this
+    //     transform models, the IV and the accumulator;
+    //   * side effects (stores, calls, volatile accesses): the packed
+    //     loop runs ⌊n/32⌋ iterations — a volatile read or a call would
+    //     fire 32× fewer times, an observable behavior change;
+    //   * body values live-out of the loop (like `last = s[i]` consumed
+    //     after it): the body now executes the packed chain, not the
+    //     scalar tree, and the stray value has no producer on the
+    //     vector path.
+    for inst in &func.blocks[header_idx].instructions {
+        if let Instruction::Phi { dest, .. } = inst {
+            if *dest != iv && *dest != acc_phi {
+                if debug {
+                    eprintln!(
+                        "[VEC-CNT] extra header phi v{} (not the IV or the accumulator); declining",
+                        dest.0
+                    );
+                }
+                return None;
+            }
+        }
+    }
+    for &b in &loop_blocks {
+        for inst in &func.blocks[b].instructions {
+            if inst.may_write_memory() {
+                if debug {
+                    eprintln!("[VEC-CNT] loop writes memory; declining");
+                }
+                return None;
+            }
+            if matches!(
+                inst,
+                Instruction::Call { .. } | Instruction::CallIndirect { .. }
+            ) {
+                if debug {
+                    eprintln!("[VEC-CNT] loop contains a call; declining");
+                }
+                return None;
+            }
+            if let Instruction::Load { volatile: true, .. } = inst {
+                if debug {
+                    eprintln!("[VEC-CNT] loop contains a volatile load; declining");
+                }
+                return None;
+            }
+        }
+    }
+    // Live-out discipline for BODY values (the two header phis are the
+    // loop-carried values the transform preserves or materialises; their
+    // out-of-loop uses are served by the exit machinery).
+    for &b in &loop_blocks {
+        for inst in &func.blocks[b].instructions {
+            if matches!(inst, Instruction::Phi { .. }) {
+                continue;
+            }
+            let Some(d) = count_inst_dest(inst) else {
+                continue;
+            };
+            for (ob, other) in func.blocks.iter().enumerate() {
+                if loop_blocks.contains(&ob) {
+                    continue;
+                }
+                let used = other
+                    .instructions
+                    .iter()
+                    .any(|i| adler_inst_uses_value(i, d))
+                    || terminator_uses_value(&other.terminator, d);
+                if used {
+                    if debug {
+                        eprintln!("[VEC-CNT] body value v{} is live-out; declining", d.0);
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+
     // Byte-load stream discovery: contiguous IV-indexed I8/U8 loads.
     let mut leaf_tys: Vec<(Value, IrType)> = Vec::new();
     let mut src_geps: Vec<Value> = Vec::new();
@@ -7681,12 +7912,23 @@ fn transform_byte_count_reduction_inner(
     // The zero vector for `vpsadbw`'s second operand lives in the preheader
     // (register-allocated once); the `& 1` constant rides the tree's own
     // `Invariant` broadcast, so no separate ones vector is needed.
+    //
+    // The zero is the I64x4 family (`VecZeroI64x4`), NOT `VecZeroI32x8`:
+    // this value is ALSO the accumulator phi's entry incoming, and the
+    // accumulator adds are `VecAddI64x4` (web class 8).  A class-5 zero
+    // mixed a class-5 and a class-8 producer onto one phi, which broke the
+    // Copy-web unification — the accumulator then had NO class, no register
+    // home, and every iteration paid a slot load + slot store round trip
+    // (`vpaddq 176(%rsp), %ymm0, %ymm0; vmovdqu %ymm0, 176(%rsp)`), plus
+    // the zero itself was re-read from its slot per iteration.  With both
+    // producers in class 8 the whole web — zero → phi → vpaddq → backedge
+    // → horizontal exit — unifies and stays register-homed.
     let zero_vec = count_fresh(&mut *next_val_id);
     func.blocks[preheader_idx]
         .instructions
         .push(Instruction::Intrinsic {
             dest: Some(zero_vec),
-            op: IntrinsicOp::VecZeroI32x8,
+            op: IntrinsicOp::VecZeroI64x4,
             dest_ptr: None,
             args: vec![],
         });
@@ -7839,6 +8081,7 @@ fn transform_byte_count_reduction_inner(
         source_spans: vec![],
     };
     func.blocks.push(vec_exit_block);
+    let vec_exit_idx = func.blocks.len() - 1;
     changes += 1;
 
     // Remainder header: r_acc phi (entry: h) + iv phi + compare.
@@ -8025,6 +8268,96 @@ fn transform_byte_count_reduction_inner(
     // Rewrite outside uses of the accumulator phi to `total`.
     let updates = rewrite_accumulator_uses_outside_loop(func, &p.loop_blocks, p.acc_phi.0, total);
     changes += updates;
+
+    // ── IV exit materialisation ─────────────────────────────────────
+    // The source's final `i` is a PURE FUNCTION OF THE LIMIT, not of the
+    // loop's execution: the counting loop steps the IV by exactly +1 from
+    // a proven-zero entry, so it exits with i == limit whenever it runs
+    // and i == 0 (= the entry value) whenever it does not.  For unsigned
+    // IVs the final value is therefore the limit itself (a zero limit
+    // keeps i = 0 = limit); for signed IVs a non-positive limit keeps
+    // i = 0, so the final value is max(limit, 0).
+    //
+    // Computing it FROM THE LIMIT (in the vec-exit block, where it
+    // dominates the remainder header) instead of reading the remainder's
+    // IV makes the materialisation IMMUNE to every downstream loop
+    // transformation: the post-vectorize unroller partially unrolls the
+    // remainder with per-element early exits, and a live-out IV read
+    // through an exit phi is exactly the shape its threading misses when
+    // an intermediate pass splits the exit block (observed: the final i
+    // came back k-granular — ⌊n/4⌋·4 instead of n).  The limit-based
+    // value is loop-invariant; no restructuring can desynchronize it.
+    let iv_final_edge: Operand = if matches!(p.iv_ty, IrType::I32 | IrType::I64) {
+        // signed: max(limit, 0) via compare+select, built in the vec-exit.
+        let c = count_fresh(&mut *next_val_id);
+        let s = count_fresh(&mut *next_val_id);
+        let zero = match p.iv_ty {
+            IrType::I32 => Operand::Const(IrConst::I32(0)),
+            _ => Operand::Const(IrConst::I64(0)),
+        };
+        func.blocks[vec_exit_idx]
+            .instructions
+            .push(Instruction::Cmp {
+                dest: c,
+                op: IrCmpOp::Sgt,
+                lhs: p.limit.clone(),
+                rhs: zero.clone(),
+                ty: p.iv_ty,
+            });
+        func.blocks[vec_exit_idx]
+            .instructions
+            .push(Instruction::Select {
+                dest: s,
+                cond: Operand::Value(c),
+                true_val: p.limit.clone(),
+                false_val: zero,
+                ty: p.iv_ty,
+            });
+        Operand::Value(s)
+    } else {
+        // unsigned: the limit itself (defined outside the loop, so it
+        // dominates the remainder header and every reader).
+        p.limit.clone()
+    };
+    let iv_entry_const = match p.iv_ty {
+        IrType::I32 | IrType::U32 => Operand::Const(IrConst::I32(0)),
+        _ => Operand::Const(IrConst::I64(0)),
+    };
+    let iv_on_exit: Operand = if other_preds.is_empty() {
+        // Single-predecessor exit (unguarded loop): the limit-based value
+        // is the final IV on every path (the loop either ran to the limit
+        // or never entered, and both spell the same value).
+        iv_final_edge
+    } else {
+        // Merge: the ENTRY value (proven zero) on every bypass edge, the
+        // limit-based final value on the remainder edge.
+        let iv_exit_phi = count_fresh(&mut *next_val_id);
+        let mut incoming = Vec::with_capacity(other_preds.len() + 1);
+        for lbl in &other_preds {
+            incoming.push((iv_entry_const.clone(), *lbl));
+        }
+        incoming.push((iv_final_edge, rem_header_label));
+        func.blocks[p.exit_idx].instructions.insert(
+            exit_block_phis,
+            Instruction::Phi {
+                dest: iv_exit_phi,
+                ty: p.iv_ty,
+                incoming,
+            },
+        );
+        changes += 1;
+        Operand::Value(iv_exit_phi)
+    };
+    // Rewrite every outside use of the IV phi — INCLUDING Intrinsic
+    // consumers (a later packed op reading `i`), but EXCLUDING the new
+    // blocks: the vec-exit's `rem_start = iv << 5` deliberately reads
+    // the VECTOR IV (that is the resume computation), and the remainder
+    // blocks never reference the original phi.
+    if let Operand::Value(iv_repl) = &iv_on_exit {
+        let iv_updates =
+            rewrite_value_uses_outside(func, &p.loop_blocks, &new_block_labels, p.iv.0, *iv_repl);
+        changes += iv_updates;
+    }
 
     if debug {
         eprintln!(
@@ -8213,6 +8546,1367 @@ fn emit_scalar_count_tree(
         }
         MapExpr::Sqrt(_) | MapExpr::MinMax { .. } => None,
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Adler-32 rolling-checksum loop epic
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The marquee loop reassociation: the serial two-accumulator checksum
+//
+//     while (n >= K) {           // K = 1, 2, 4, 8, 16 or 32 (K | 32)
+//         s1 += *p++;            // N = K per-byte steps in the body
+//         s2 += s1;              // (source-unrolled DO8 = K=8, DO4 = K=4)
+//         ... K times ...
+//         n -= K;
+//     }
+//
+// which GCC 16.2, Clang 23.1 and ICX (2026-09 CE pins, verified on the
+// DO8 kernel: pure scalar unroll in all three) leave entirely scalar,
+// vectorized 32 bytes per iteration with SEVEN vector instructions:
+//
+//     vbuf   = loadu 32 bytes
+//     vsad   = vpsadbw(vbuf, 0)             # 4 qword partial sums
+//     vs3   += vs1                          # cross-term snapshot (BEFORE vs1)
+//     vshort = vpmaddubsw(vbuf, [32..1])    # (32-l)·b_l pair weights
+//     vsum2  = vpmaddwd(vshort, ones)       # dword lane sums
+//     vs2   += vsum2
+//     vs1   += vsad
+//
+// plus the exit materialisation `s2 += (u32)hsum(vs3) << 5` (the deferred
+// 32·Σ S_k cross term) and `s1 = (u32)hsum(vs1)`, `s2 = hsum(vs2) + init`.
+//
+// EXACTNESS PROOF (mod 2^32, for EVERY input and length — the ring
+// homomorphism argument):
+//
+// The scalar recurrence per byte t (global): s1_{t+1} = s1_t + b_t,
+// s2_{t+1} = s2_t + s1_{t+1}, all arithmetic wrapping mod 2^32.  Over one
+// 32-byte chunk starting with s1 = S:
+//
+//     Δs2 = Σ_{l=0..31} (S + Σ_{j≤l} b_j) = 32·S + Σ_l (32−l)·b_l
+//
+// as integers; because every subsequent step only adds/multiplies values
+// that are CONGRUENT mod 2^32 to the scalar ones, the vector result is
+// congruent to the scalar result mod 2^32 for every input.  Concretely:
+//
+//   * vs1 (4×u64 lanes) accumulates the vpsadbw per-8-byte partials; lane
+//     0 is seeded with s1_init (broadcastq + lane-0 mask).  Lane values
+//     wrap mod 2^64, and 2^32 | 2^64, so hsum(vs1) ≡ s1_final (mod 2^32)
+//     for ANY buffer length (the u64 "overflow" preserves the congruence
+//     — it is not an error state).  Truncating to u32 is exact.
+//   * vs3 (4×u64) accumulates the per-iteration START value of vs1 (the
+//     update `vs3 += vs1` is emitted BEFORE `vs1 += vsad`).  hsum(vs3)
+//     ≡ Σ_k S_k (mod 2^32) by the same double-congruence: each lane's u64
+//     wrapping preserves mod-2^32 congruence, and the UNWRAPPED hsum
+//     equals Σ_k (adler0 + Σ_{i<k} B_i) = Σ_k s1_k + 2^32·(wrap count),
+//     whose difference from Σ_k s1_k is a multiple of 2^32.
+//   * The cross term 32·Σ_k S_k mod 2^32 = ((u32)hsum(vs3) << 5) mod 2^32
+//     (multiplication by 32 preserves mod-2^32 congruence).
+//   * vs2 (8×i32 lanes) accumulates vpmaddwd(vpmaddubsw(vbuf, W), ones)
+//     where the 32-byte weight table W = [32, 31, ..., 1] puts weight
+//     (32−l) on byte l of each chunk (lane 0 of the table covers bytes
+//     0..15 with weights 32..17, lane 1 covers bytes 16..31 with 16..1 —
+//     the concatenation is exactly the position-dependent weight).  No
+//     intermediate saturation: the maddubs word ≤ 63·255 = 16065 < 2^15,
+//     the maddwd dword ≤ 2·16065 = 32130 < 2^31.  Each dword lane wraps
+//     mod 2^32 = the scalar accumulator width, so hsum(vs2) ≡ Σ_l (32−l)·b_l
+//     summed over all chunks (mod 2^32).
+//   * Zero vector iterations (n_init < 32): the init vectors are
+//     hsum-exact identities ([s1_init,0,0,0], 0, 0), so the exit
+//     materialisation returns s1_init/s2_init unchanged — no separate
+//     guard, no merge phi.
+//
+// REMAINDER HANDLING — the original loop IS the remainder.  The transform
+// prepends the vector loop and rewires the original header phis to accept
+// the vector results; the original body still executes for the 0..(32/K − 1)
+// leftover source iterations (n < 32 on entry to the original header) and
+// the source's own tail loop handles n mod K.  No scalar mirror is built,
+// no resume index is computed, and the exit block is untouched.  Because
+// K | 32, the vector loop's consumption ⌊n_init/32⌋·32 never exceeds the
+// original loop's total K·⌊n_init/K⌋: n mod K ≤ n mod 32 when K divides
+// 32, so the original loop always sees a non-negative byte count it can
+// finish exactly.
+//
+// RECOGNITION GRAMMAR (strict, fail-closed).  A natural loop with:
+//   * straight-line discipline (only the header branches conditionally),
+//   * two U32 header phis s1, s2 whose backedge values close the chains
+//     s1_{i+1} = Add(s1_i, zext(b_i)) and s2_{i+1} = Add(s2_i, s1_{i+1})
+//     (N = K ≥ 1 steps, all in one body block; every b_i a U8 load),
+//   * a byte-counter phi n (I32/I64/U32/U64) stepping by −K with the
+//     header compare `n >= K` (Uge/Sge → body, or the branch-flipped
+//     Ult/Slt → exit),
+//   * a byte-cursor phi p advancing by +K (Add chains or GEPs), every
+//     load reading p+k for its chain position k,
+//   * no stores, no calls, no volatile accesses, and NOTHING else in the
+//     body besides the chain, the cursor arithmetic, and the counter step;
+//   * every body-defined value consumed only inside the loop or as a
+//     header-phi backedge (no live-outs besides the phis).
+//
+// Anything else declines and the loop keeps its scalar form.
+
+/// A recognized Adler-32 checksum loop (see the section proof above).
+struct AdlerPattern {
+    header_idx: usize,
+    loop_blocks: FxHashSet<usize>,
+    /// The two U32 accumulator phis, in chain order.
+    s1_phi: Value,
+    s2_phi: Value,
+    /// Their preheader (non-backedge) incomings.
+    s1_init: Operand,
+    s2_init: Operand,
+    /// The byte-counter phi, its type, its preheader incoming, its
+    /// backedge value (the step's dest — the transform mirrors the exact
+    /// Sub/Add spelling it found), and whether the compare family is
+    /// signed (Sge) or unsigned (Uge).
+    n_phi: Value,
+    n_ty: IrType,
+    n_init: Operand,
+    n_back: Value,
+    /// The compare is signed (Sge) rather than unsigned (Uge).
+    n_signed: bool,
+    /// The byte-cursor phi and its preheader incoming.
+    p_phi: Value,
+    p_init: Operand,
+    /// The cursor phi's IR type (I64 for the `*p++` arithmetic spelling,
+    /// Ptr for the `buf[k]` GEP spelling) — the vector loop mirrors it.
+    p_ty: IrType,
+    /// The chain length (= bytes per source iteration = the counter step).
+    /// Must divide 32.
+    chain_len: usize,
+    /// The body block (chain + cursor + counter step live here).
+    body_block: usize,
+}
+
+/// Resolve a load's pointer to `(cursor, const_offset)` when it reads
+/// `cursor + off` via a GEP with a constant offset, a direct Add with a
+/// constant, or the cursor itself (offset 0).  Returns None for anything
+/// else (variable offsets, foreign bases).
+fn adler_load_base_offset(func: &IrFunction, ptr: Value) -> Option<(Value, i64)> {
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } if *dest == ptr => {
+                    let Operand::Const(c) = offset else {
+                        return None;
+                    };
+                    let off = c.to_i64()?;
+                    return Some((*base, off));
+                }
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                } if *dest == ptr => {
+                    // `p + k` (constant k on the rhs).
+                    let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) else {
+                        return None;
+                    };
+                    let off = c.to_i64()?;
+                    return Some((*v, off));
+                }
+                _ => {}
+            }
+        }
+    }
+    // The pointer is used directly (offset 0): caller decides whether it
+    // is the cursor phi.
+    Some((ptr, 0))
+}
+
+/// Walk one step of the s1 chain: find `dest = Add(cur, zext(load))` in the
+/// body block (either operand order for the add, but the zext side must be
+/// the byte).  Returns (add_dest, load_dest, load_ptr).
+fn adler_chain_step(
+    func: &IrFunction,
+    body_idx: usize,
+    cur: Value,
+    consumed: &FxHashSet<u32>,
+) -> Option<(Value, Value, Value)> {
+    for inst in &func.blocks[body_idx].instructions {
+        let Instruction::BinOp {
+            dest,
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: IrType::U32,
+        } = inst
+        else {
+            continue;
+        };
+        if consumed.contains(&dest.0) {
+            continue;
+        }
+        // Probe both operand orders; the byte side must be a U8→U32 cast of
+        // a load, the other side the running s1.
+        for (run, byte) in [(lhs, rhs), (rhs, lhs)] {
+            let Operand::Value(rv) = run else { continue };
+            if *rv != cur {
+                continue;
+            }
+            let Operand::Value(bv) = byte else { continue };
+            // bv must be a non-volatile U8 load zero-extended to U32 (an
+            // I8 source would sign-extend — the packed form is only exact
+            // for the unsigned spelling, so it fails closed here).
+            let mut resolved: Option<Value> = None;
+            for block in &func.blocks {
+                for ci in &block.instructions {
+                    match ci {
+                        Instruction::Cast {
+                            dest,
+                            src,
+                            from_ty,
+                            to_ty,
+                        } if *dest == *bv && *from_ty == IrType::U8 && *to_ty == IrType::U32 => {
+                            let Operand::Value(lv) = src else { continue };
+                            resolved = Some(*lv);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let Some(lv) = resolved else { continue };
+            // lv must be a non-volatile U8 load.
+            let mut load_ptr = None;
+            for block in &func.blocks {
+                for ci in &block.instructions {
+                    if let Instruction::Load {
+                        dest,
+                        ptr,
+                        ty,
+                        volatile: false,
+                        ..
+                    } = ci
+                    {
+                        if *dest == lv && *ty == IrType::U8 {
+                            load_ptr = Some(*ptr);
+                        }
+                    }
+                }
+            }
+            let Some(load_ptr) = load_ptr else { continue };
+            return Some((*dest, lv, load_ptr));
+        }
+    }
+    None
+}
+
+fn analyze_adler_loop(
+    func: &IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+    _cfg: &CfgAnalysis,
+) -> Option<AdlerPattern> {
+    let debug = std::env::var("LCCC_DEBUG_VEC_ADLER").is_ok();
+    let header_idx = loop_info.header;
+    let loop_blocks: FxHashSet<usize> = loop_info.body.iter().copied().collect();
+
+    // Straight-line discipline: only the header may branch conditionally.
+    if loop_blocks.iter().copied().any(|b| {
+        b != header_idx && matches!(func.blocks[b].terminator, Terminator::CondBranch { .. })
+    }) {
+        return None;
+    }
+    let Some(exit_idx) = find_exit(func, loop_info) else {
+        return None;
+    };
+    let _ = exit_idx;
+    let Some(latch_idx) = find_latch(func, loop_info) else {
+        return None;
+    };
+    let latch_label = func.blocks[latch_idx].label;
+    // No memory writes anywhere in the loop (the byte stream must be pure
+    // input; a store could alias the cursor target).
+    for &b in &loop_blocks {
+        for inst in &func.blocks[b].instructions {
+            if inst.may_write_memory() {
+                return None;
+            }
+        }
+    }
+
+    // The body block: the unique loop block that is neither header nor
+    // latch (or the latch itself when body == latch).
+    let body_candidates: Vec<usize> = loop_blocks
+        .iter()
+        .copied()
+        .filter(|&b| b != header_idx)
+        .collect();
+    if body_candidates.len() != 1 {
+        if debug {
+            eprintln!("[VEC-ADLER] not a single body block; declining");
+        }
+        return None;
+    }
+    let body_idx = body_candidates[0];
+
+    // ── Chain walk: find the s1/s2 pair ────────────────────────────────
+    // Every 2-incoming U32 header phi is a candidate s1.  For each, walk
+    // the chain forward; the walk must end at the phi's backedge value and
+    // the parallel s2 walk at the s2 phi's backedge.
+    let header_phis: Vec<(Value, IrType, Vec<(Operand, BlockId)>)> = func.blocks[header_idx]
+        .instructions
+        .iter()
+        .filter_map(|i| {
+            if let Instruction::Phi { dest, ty, incoming } = i {
+                Some((*dest, *ty, incoming.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut matched: Option<AdlerPattern> = None;
+    's1search: for (s1_phi, s1_ty, s1_incoming) in &header_phis {
+        if *s1_ty != IrType::U32 || s1_incoming.len() != 2 {
+            continue;
+        }
+        // Split the phi's incomings into (init, backedge).
+        let (s1_init, s1_back) = {
+            let mut init = None;
+            let mut back = None;
+            for (v, lbl) in s1_incoming {
+                if *lbl == latch_label {
+                    back = Some(v.clone());
+                } else {
+                    init = Some(v.clone());
+                }
+            }
+            (init?, back?)
+        };
+        let Operand::Value(s1_back_v) = s1_back else {
+            continue;
+        };
+
+        // Walk the chain from s1_phi.
+        let mut consumed: FxHashSet<u32> = FxHashSet::default();
+        let mut chain_adds: Vec<Value> = Vec::new();
+        let mut s2_adds: Vec<Value> = Vec::new();
+        let mut loads: Vec<Value> = Vec::new();
+        let mut load_ptrs: Vec<Value> = Vec::new();
+        let mut cur = *s1_phi;
+        let mut s2_cur: Option<Value> = None;
+        let mut s2_phi_v: Option<Value> = None;
+        loop {
+            let Some((add_dest, load_dest, load_ptr)) =
+                adler_chain_step(func, body_idx, cur, &consumed)
+            else {
+                break;
+            };
+            // The s2 consumer: Add(s2cur, add_dest) with the running s1
+            // value on EITHER side (both `s2 += s1` and `s2 = s1 + s2`
+            // spell the same wrapping accumulation — Add is commutative
+            // mod 2^32, so accepting the mirror is exact, not heuristic).
+            let s2_add = func.blocks[body_idx].instructions.iter().find_map(|i| {
+                if let Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ty: IrType::U32,
+                } = i
+                {
+                    if consumed.contains(&dest.0) {
+                        return None;
+                    }
+                    for (acc_side, s1_side) in [(lhs, rhs), (rhs, lhs)] {
+                        if *s1_side != Operand::Value(add_dest) {
+                            continue;
+                        }
+                        if let Operand::Value(l) = acc_side {
+                            if Some(*l) == s2_cur || s2_cur.is_none() {
+                                return Some((*dest, *l));
+                            }
+                        }
+                    }
+                }
+                None
+            });
+            let Some((s2_dest, s2_lhs)) = s2_add else {
+                break;
+            };
+            if s2_cur.is_none() {
+                // The first s2 operand must be a U32 header phi —
+                // DISTINCT from s1 (a shared phi means the chains are
+                // entangled: `s2 += s1` folding back onto s1 itself, which
+                // the algebra does not model) — with a backedge that will
+                // close at the end of the chain.
+                let is_phi = header_phis
+                    .iter()
+                    .any(|(d, t, _)| *d == s2_lhs && *t == IrType::U32 && *d != *s1_phi);
+                if !is_phi {
+                    break;
+                }
+                s2_phi_v = Some(s2_lhs);
+            } else if s2_cur != Some(s2_lhs) {
+                break;
+            }
+            s2_cur = Some(s2_dest);
+            consumed.insert(add_dest.0);
+            consumed.insert(s2_dest.0);
+            chain_adds.push(add_dest);
+            s2_adds.push(s2_dest);
+            loads.push(load_dest);
+            load_ptrs.push(load_ptr);
+            cur = add_dest;
+            if chain_adds.len() > 64 {
+                break;
+            }
+        }
+        let chain_len = chain_adds.len();
+        if chain_len == 0 || !matches!(chain_len, 1 | 2 | 4 | 8 | 16 | 32) {
+            continue;
+        }
+        // The chain must close BOTH phis.
+        if cur != s1_back_v {
+            continue;
+        }
+        let Some(s2_phi) = s2_phi_v else { continue };
+        let Some((_, s2_ty, s2_incoming)) = header_phis.iter().find(|(d, _, _)| *d == s2_phi)
+        else {
+            continue;
+        };
+        if *s2_ty != IrType::U32 || s2_incoming.len() != 2 {
+            continue;
+        }
+        let (s2_init, s2_back) = {
+            let mut init = None;
+            let mut back = None;
+            for (v, lbl) in s2_incoming {
+                if *lbl == latch_label {
+                    back = Some(v.clone());
+                } else {
+                    init = Some(v.clone());
+                }
+            }
+            (init?, back?)
+        };
+        let Operand::Value(s2_back_v) = s2_back else {
+            continue;
+        };
+        if s2_cur != Some(s2_back_v) {
+            continue;
+        }
+
+        // ── Cursor: the loads must read p+k in chain order ────────────
+        // Accept either the Add-chain spelling (`*p++`: p_{k+1} = Add(p_k,1),
+        // load k reads p_k) or the GEP spelling (`buf[k]`: load k reads
+        // GEP(p, k)); the backedge must be p+K in either family.
+        // Try: all loads resolve to (X, k) with the same base X and k =
+        // 0..K-1 in order.
+        let mut cursor_ok = true;
+        let mut base: Option<Value> = None;
+        for (k, &lp) in load_ptrs.iter().enumerate() {
+            let Some((b, off)) = adler_load_base_offset(func, lp) else {
+                cursor_ok = false;
+                break;
+            };
+            match base {
+                None => base = Some(b),
+                Some(prev) if prev == b => {}
+                _ => {
+                    cursor_ok = false;
+                    break;
+                }
+            }
+            if off != k as i64 {
+                cursor_ok = false;
+                break;
+            }
+        }
+        let Some(cursor_base) = base else {
+            continue;
+        };
+        if !cursor_ok {
+            if debug {
+                eprintln!("[VEC-ADLER] loads are not p+0..p+K; declining");
+            }
+            continue;
+        }
+        // The base must be a 2-incoming header phi (the cursor), and the
+        // backedge must be base + K (GEP or Add) or the last +1 chain link.
+        let mut p_phi: Option<Value> = None;
+        let mut p_init: Option<Operand> = None;
+        let mut p_back: Option<Value> = None;
+        let mut p_ty_found: Option<IrType> = None;
+        for (d, t, inc) in &header_phis {
+            if *d != cursor_base || inc.len() != 2 {
+                continue;
+            }
+            let is_ptrish = matches!(t, IrType::I64 | IrType::U64 | IrType::Ptr);
+            if !is_ptrish {
+                continue;
+            }
+            let mut init = None;
+            let mut back = None;
+            for (v, lbl) in inc {
+                if *lbl == latch_label {
+                    back = Some(v.clone());
+                } else {
+                    init = Some(v.clone());
+                }
+            }
+            let (Some(init), Some(back_v)) = (init, back) else {
+                continue;
+            };
+            let Operand::Value(bv) = back_v else { continue };
+            // backedge = base + K?
+            let back_ok = 'back: {
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        match inst {
+                            Instruction::GetElementPtr {
+                                dest, base, offset, ..
+                            } if *dest == bv => {
+                                if *base != cursor_base {
+                                    continue;
+                                }
+                                if let Operand::Const(c) = offset {
+                                    if c.to_i64() == Some(chain_len as i64) {
+                                        break 'back true;
+                                    }
+                                }
+                            }
+                            Instruction::BinOp {
+                                dest,
+                                op: IrBinOp::Add,
+                                lhs,
+                                rhs,
+                                ..
+                            } if *dest == bv => {
+                                let lhs_b = matches!(lhs, Operand::Value(v) if *v == cursor_base);
+                                let rhs_b = matches!(rhs, Operand::Value(v) if *v == cursor_base);
+                                let lhs_k = matches!(lhs, Operand::Const(c) if c.to_i64() == Some(chain_len as i64));
+                                let rhs_k = matches!(rhs, Operand::Const(c) if c.to_i64() == Some(chain_len as i64));
+                                if (lhs_b && rhs_k) || (lhs_k && rhs_b) {
+                                    break 'back true;
+                                }
+                                // The `*p++` spelling: the backedge is the
+                                // LAST +1 link of an Add chain rooted at
+                                // the phi (p_K).  The chain positions were
+                                // already validated by the load offsets
+                                // (p+0..p+K-1); walk forward from the phi
+                                // counting +1 steps to confirm the link.
+                                if lhs_b || rhs_b {
+                                    let mut cur_p = cursor_base;
+                                    let mut steps = 0usize;
+                                    'walk: loop {
+                                        let mut next = None;
+                                        'find: for blk in &func.blocks {
+                                            for inst2 in &blk.instructions {
+                                                if let Instruction::BinOp {
+                                                    dest: d2,
+                                                    op: IrBinOp::Add,
+                                                    lhs: l2,
+                                                    rhs: r2,
+                                                    ..
+                                                } = inst2
+                                                {
+                                                    let lb = matches!(l2, Operand::Value(v) if *v == cur_p);
+                                                    let rb = matches!(r2, Operand::Value(v) if *v == cur_p);
+                                                    let l1 = matches!(
+                                                        l2,
+                                                        Operand::Const(c) if c.to_i64() == Some(1)
+                                                    );
+                                                    let r1 = matches!(
+                                                        r2,
+                                                        Operand::Const(c) if c.to_i64() == Some(1)
+                                                    );
+                                                    if (lb && r1) || (l1 && rb) {
+                                                        next = Some(*d2);
+                                                        break 'find;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        match next {
+                                            Some(np) => {
+                                                steps += 1;
+                                                if np == bv {
+                                                    break 'walk;
+                                                }
+                                                if steps > 64 {
+                                                    break 'walk;
+                                                }
+                                                cur_p = np;
+                                            }
+                                            None => break 'walk,
+                                        }
+                                    }
+                                    if steps == chain_len {
+                                        break 'back true;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                false
+            };
+            if !back_ok {
+                continue;
+            }
+            p_phi = Some(cursor_base);
+            p_init = Some(init);
+            p_back = Some(bv);
+            p_ty_found = Some(*t);
+            break;
+        }
+        let (Some(p_phi), Some(p_init), Some(p_back), Some(p_ty)) =
+            (p_phi, p_init, p_back, p_ty_found)
+        else {
+            if debug {
+                eprintln!("[VEC-ADLER] cursor phi/backedge not recognized; declining");
+            }
+            continue;
+        };
+
+        // ── Counter: n phi stepping by −K with the header compare ─────
+        // Accept (Uge|Sge)(n, K) true→body, or (Ult|Slt)(n, K) with the
+        // body on the FALSE edge (branch-flipped spelling).
+        let mut counter: Option<(Value, IrType, Operand, Value, bool)> = None;
+        for (d, t, _) in &header_phis {
+            if *d == p_phi || *d == *s1_phi || *d == s2_phi {
+                continue;
+            }
+            if !matches!(t, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
+                continue;
+            }
+            // Backedge: Sub(n, K) or Add(n, −K).
+            let inc = header_phis
+                .iter()
+                .find(|(d2, _, inc2)| *d2 == *d && inc2.len() == 2)
+                .map(|(_, _, inc2)| inc2.clone());
+            let Some(inc) = inc else { continue };
+            let mut back = None;
+            for (v, lbl) in &inc {
+                if *lbl == latch_label {
+                    back = Some(v.clone());
+                }
+            }
+            let Some(Operand::Value(bv)) = back else {
+                continue;
+            };
+            let step_ok = func.blocks[body_idx].instructions.iter().any(|i| match i {
+                Instruction::BinOp {
+                    dest, op, lhs, rhs, ..
+                } if *dest == bv => {
+                    let n_side = matches!(lhs, Operand::Value(v) if *v == *d)
+                        || matches!(rhs, Operand::Value(v) if *v == *d);
+                    let k_sub = match op {
+                        IrBinOp::Sub => {
+                            matches!(rhs, Operand::Const(c) if c.to_i64() == Some(chain_len as i64))
+                                && matches!(lhs, Operand::Value(v) if *v == *d)
+                        }
+                        IrBinOp::Add => {
+                            let neg_k = -(chain_len as i64);
+                            matches!(rhs, Operand::Const(c) if c.to_i64() == Some(neg_k))
+                                && matches!(lhs, Operand::Value(v) if *v == *d)
+                        }
+                        _ => false,
+                    };
+                    n_side && k_sub
+                }
+                _ => false,
+            });
+            if !step_ok {
+                continue;
+            }
+            // Header compare on this phi against K.
+            let cmp_ok = func.blocks[header_idx].instructions.iter().any(|i| {
+                if let Instruction::Cmp { op, lhs, rhs, .. } = i {
+                    let l_is_n = matches!(lhs, Operand::Value(v) if *v == *d);
+                    let r_is_n = matches!(rhs, Operand::Value(v) if *v == *d);
+                    if !l_is_n && !r_is_n {
+                        return false;
+                    }
+                    let k = match rhs {
+                        Operand::Const(c) => c.to_i64(),
+                        _ => None,
+                    };
+                    if k != Some(chain_len as i64) {
+                        return false;
+                    }
+                    matches!(
+                        op,
+                        IrCmpOp::Uge | IrCmpOp::Sge | IrCmpOp::Ult | IrCmpOp::Slt
+                    )
+                } else {
+                    false
+                }
+            });
+            if !cmp_ok {
+                continue;
+            }
+            let init = inc
+                .iter()
+                .find(|(_, lbl)| *lbl != latch_label)
+                .map(|(v, _)| v.clone())?;
+            let signed = matches!(t, IrType::I32 | IrType::I64);
+            counter = Some((*d, *t, init, bv, signed));
+            break;
+        }
+        let Some((n_phi, n_ty, n_init, n_back, n_signed)) = counter else {
+            if debug {
+                eprintln!("[VEC-ADLER] no byte-counter phi; declining");
+            }
+            continue;
+        };
+
+        // ── Strict body grammar ────────────────────────────────────────
+        // The body may contain ONLY: the chain (K s1 adds + K s2 adds + K
+        // loads + K casts), the cursor arithmetic (pointer-family Adds or
+        // GEPs), and the counter step.  Anything else (extra loads, calls,
+        // selects, unrelated computes) declines.  Every member is tracked
+        // EXPLICITLY — no type-based catch-alls (a U32 Add that is not one
+        // of the walked chain/s2 adds rejects the loop).
+        let mut allowed: FxHashSet<u32> = FxHashSet::default();
+        for &a in &chain_adds {
+            allowed.insert(a.0);
+        }
+        for &a in &s2_adds {
+            allowed.insert(a.0);
+        }
+        for &l in &loads {
+            allowed.insert(l.0);
+        }
+        // The zext casts: U8→U32 casts whose source is a walked load.
+        for inst in &func.blocks[body_idx].instructions {
+            if let Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+            } = inst
+            {
+                if *from_ty == IrType::U8 && *to_ty == IrType::U32 {
+                    if let Operand::Value(sv) = src {
+                        if loads.contains(sv) {
+                            allowed.insert(dest.0);
+                        }
+                    }
+                }
+            }
+        }
+        // The cursor arithmetic: pointer-family Adds (I64/U64 — the
+        // `*p++` spelling) and GEPs (the `buf[k]` spelling), plus the
+        // counter step (dest == n's backedge).  Both families only ever
+        // produce addresses/counts — a stray I64 Add of unrelated values
+        // is dead by the live-out discipline and harmless, but the
+        // counter step is exact.
+        for inst in &func.blocks[body_idx].instructions {
+            match inst {
+                Instruction::BinOp { dest, op, ty, .. } => {
+                    // Pointer-family Adds (I64/U64 — the `*p++` spelling)
+                    // and the counter step in either spelling (Sub(n, K)
+                    // or Add(n, −K), any counter width).  A stray I64 Add
+                    // of unrelated values is dead by the live-out
+                    // discipline and harmless.
+                    let cursor_add = *op == IrBinOp::Add && matches!(ty, IrType::I64 | IrType::U64);
+                    let counter_step = *dest == n_back && matches!(op, IrBinOp::Sub | IrBinOp::Add);
+                    if cursor_add || counter_step {
+                        allowed.insert(dest.0);
+                    }
+                }
+                Instruction::GetElementPtr { dest, .. } => {
+                    allowed.insert(dest.0);
+                }
+                _ => {}
+            }
+        }
+        let mut grammar_ok = true;
+        for (ii, inst) in func.blocks[body_idx].instructions.iter().enumerate() {
+            let Some(d) = count_inst_dest(inst) else {
+                grammar_ok = false;
+                break;
+            };
+            if !allowed.contains(&d.0) {
+                if debug {
+                    eprintln!(
+                        "[VEC-ADLER] body instruction #{} ({:?}) outside the grammar; declining",
+                        ii, inst
+                    );
+                }
+                grammar_ok = false;
+                break;
+            }
+        }
+        if !grammar_ok {
+            continue;
+        }
+
+        // ── Live-out discipline ────────────────────────────────────────
+        // Every value defined in the loop BODY must be used ONLY inside
+        // the loop.  A body value live-out (like `last_b = b7` consumed
+        // after the loop) cannot be reproduced by the vector loop — the
+        // body executes only in the remainder, so a direct out-of-loop use
+        // would read a stale/undefined value when the remainder runs zero
+        // iterations: a silent miscompile class this must refuse.
+        //
+        // The header PHIS are exempt: they are the loop-carried values the
+        // transform preserves by construction (the phi itself survives;
+        // only its entry incoming is rewired to the vector results), so
+        // their out-of-loop uses are exactly the results the rewiring
+        // serves.  The backedge values' phi uses sit IN the header, which
+        // is in the loop, so they need no exemption; an out-of-loop use of
+        // a backedge value itself is just as fatal as any other.
+        for &b in &loop_blocks {
+            for inst in &func.blocks[b].instructions {
+                if matches!(inst, Instruction::Phi { .. }) {
+                    continue;
+                }
+                let Some(d) = count_inst_dest(inst) else {
+                    continue;
+                };
+                // Uses of d outside the loop blocks?
+                for (ob, other) in func.blocks.iter().enumerate() {
+                    if loop_blocks.contains(&ob) {
+                        continue;
+                    }
+                    let used = other
+                        .instructions
+                        .iter()
+                        .any(|i| adler_inst_uses_value(i, d))
+                        || terminator_uses_value(&other.terminator, d);
+                    if used {
+                        if debug {
+                            eprintln!("[VEC-ADLER] body value v{} is live-out; declining", d.0);
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+
+        // ── Exact header-phi census ───────────────────────────────────
+        // The rewiring relabels every preheader-labeled phi incoming to
+        // the vec-exit edge.  A FIFTH phi (one the transform does not
+        // track) would keep its preheader-labeled incoming while that
+        // edge goes dead — its incoming list would no longer cover the
+        // header's predecessors, leaving the value UNDEFINED on the
+        // vec-exit path (a silent miscompile class).  The header must
+        // contain EXACTLY the four phis this transform rewires.
+        if header_phis
+            .iter()
+            .any(|(d, _, _)| ![*s1_phi, s2_phi, n_phi, p_phi].contains(d))
+        {
+            if debug {
+                eprintln!("[VEC-ADLER] extra header phi; declining");
+            }
+            continue;
+        }
+
+        matched = Some(AdlerPattern {
+            header_idx,
+            loop_blocks,
+            s1_phi: *s1_phi,
+            s2_phi,
+            s1_init,
+            s2_init,
+            n_phi,
+            n_ty,
+            n_back,
+            n_init,
+            n_signed,
+            p_phi,
+            p_init,
+            p_ty,
+            chain_len,
+            body_block: body_idx,
+        });
+        break 's1search;
+    }
+    matched
+}
+
+/// Whether an instruction reads the value `v` in any operand position
+/// (the canonical liveness visitors — covers every `Operand::Value` slot
+/// plus the non-operand use positions like GEP bases and phi sources).
+fn adler_inst_uses_value(inst: &Instruction, v: Value) -> bool {
+    let mut hit = false;
+    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+        if matches!(op, Operand::Value(x) if *x == v) {
+            hit = true;
+        }
+    });
+    if hit {
+        return true;
+    }
+    crate::backend::liveness::for_each_value_use_in_instruction(inst, |x| {
+        if *x == v {
+            hit = true;
+        }
+    });
+    hit
+}
+
+/// Transform a recognized Adler-32 loop: prepend the 32-byte vector loop
+/// and rewire the original header phis to its results (the original loop
+/// becomes the remainder).  Returns the change count.
+fn transform_adler_loop(func: &mut IrFunction, p: &AdlerPattern) -> usize {
+    let mut next_val_id = func.next_value_id;
+    let changes = transform_adler_loop_inner(func, p, &mut next_val_id);
+    func.next_value_id = next_val_id;
+    changes
+}
+
+fn transform_adler_loop_inner(
+    func: &mut IrFunction,
+    p: &AdlerPattern,
+    next_val_id: &mut u32,
+) -> usize {
+    let debug = std::env::var("LCCC_DEBUG_VEC_ADLER").is_ok();
+    let mut changes = 0usize;
+
+    // Preheader: the unique non-loop predecessor branching to the header.
+    let header_label = func.blocks[p.header_idx].label;
+    let mut preheader_idx = None;
+    for (i, b) in func.blocks.iter().enumerate() {
+        if p.loop_blocks.contains(&i) {
+            continue;
+        }
+        if matches!(&b.terminator, Terminator::Branch(l) if *l == header_label) {
+            preheader_idx = Some(i);
+            break;
+        }
+    }
+    let Some(preheader_idx) = preheader_idx else {
+        return 0;
+    };
+    let preheader_label = func.blocks[preheader_idx].label;
+
+    // ── Fresh ids and labels (allocated up front; no bail-outs below) ──
+    let vs1_phi = count_fresh(next_val_id);
+    let vs2_phi = count_fresh(next_val_id);
+    let vs3_phi = count_fresh(next_val_id);
+    let vn_phi = count_fresh(next_val_id);
+    let vp_phi = count_fresh(next_val_id);
+    let vs1_next = count_fresh(next_val_id);
+    let vs2_next = count_fresh(next_val_id);
+    let vs3_next = count_fresh(next_val_id);
+    let vn_next = count_fresh(next_val_id);
+    let vp_next = count_fresh(next_val_id);
+    let vcmp = count_fresh(next_val_id);
+    let vbuf = count_fresh(next_val_id);
+    let vsad = count_fresh(next_val_id);
+    let vshort = count_fresh(next_val_id);
+    let vsum2 = count_fresh(next_val_id);
+    let zext_s1 = count_fresh(next_val_id);
+    let bcast_s1 = count_fresh(next_val_id);
+    let mask_c = count_fresh(next_val_id);
+    let vs1_init = count_fresh(next_val_id);
+    let vs2_init = count_fresh(next_val_id);
+    let vs3_init = count_fresh(next_val_id);
+    let zero64 = count_fresh(next_val_id);
+    let weights = count_fresh(next_val_id);
+    let ones = count_fresh(next_val_id);
+    let hs1 = count_fresh(next_val_id);
+    let hs3 = count_fresh(next_val_id);
+    let hs2 = count_fresh(next_val_id);
+    let t3 = count_fresh(next_val_id);
+    let t3s = count_fresh(next_val_id);
+    let s1_res = count_fresh(next_val_id);
+    let hs2_u = count_fresh(next_val_id);
+    let s2_res = count_fresh(next_val_id);
+    let s2_final = count_fresh(next_val_id);
+    let vec_header_label = BlockId(func.next_label);
+    func.next_label += 1;
+    let vec_body_label = BlockId(func.next_label);
+    func.next_label += 1;
+    let vec_exit_label = BlockId(func.next_label);
+    func.next_label += 1;
+
+    let int_const = |n: i64| -> IrConst {
+        match p.n_ty {
+            IrType::I32 | IrType::U32 => IrConst::I32(n as i32),
+            _ => IrConst::I64(n),
+        }
+    };
+
+    // ── Preheader: the invariant vectors ──────────────────────────────
+    // vs1_init = [s1_init, 0, 0, 0] (broadcastq + lane-0 mask): the seed
+    // that makes hsum(vs1) and the vs3 snapshots exact including the
+    // initial value.  vs2/vs3 start at zero; zero64 is the SAD operand.
+    func.blocks[preheader_idx]
+        .instructions
+        .push(Instruction::Cast {
+            dest: zext_s1,
+            src: p.s1_init.clone(),
+            from_ty: IrType::U32,
+            to_ty: IrType::U64,
+        });
+    func.blocks[preheader_idx]
+        .instructions
+        .push(Instruction::Intrinsic {
+            dest: Some(bcast_s1),
+            op: IntrinsicOp::VecBroadcastI64x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(zext_s1)],
+        });
+    let mut mask_bytes: [i64; 32] = [0; 32];
+    for b in mask_bytes.iter_mut().take(8) {
+        *b = -1; // 0xFF in every byte of qword lane 0
+    }
+    func.blocks[preheader_idx]
+        .instructions
+        .push(Instruction::Intrinsic {
+            dest: Some(mask_c),
+            op: IntrinsicOp::VecConstI8x32,
+            dest_ptr: None,
+            args: mask_bytes
+                .map(|b| Operand::Const(IrConst::I8(b as i8)))
+                .to_vec(),
+        });
+    func.blocks[preheader_idx]
+        .instructions
+        .push(Instruction::Intrinsic {
+            dest: Some(vs1_init),
+            op: IntrinsicOp::VecAndI64x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(bcast_s1), Operand::Value(mask_c)],
+        });
+    for (dest, op) in [
+        (vs2_init, IntrinsicOp::VecZeroI32x8),
+        (vs3_init, IntrinsicOp::VecZeroI64x4),
+        (zero64, IntrinsicOp::VecZeroI64x4),
+    ] {
+        func.blocks[preheader_idx]
+            .instructions
+            .push(Instruction::Intrinsic {
+                dest: Some(dest),
+                op,
+                dest_ptr: None,
+                args: vec![],
+            });
+    }
+    // The Adler weight table [32, 31, ..., 1] (i8) and the i16 ones table
+    // (byte pattern 01 00 repeated — the little-endian encoding of 16
+    // word lanes of 1).
+    let weight_bytes: [i64; 32] = std::array::from_fn(|i| (32 - i) as i64);
+    let ones_bytes: [i64; 32] = std::array::from_fn(|i| if i % 2 == 0 { 1 } else { 0 });
+    func.blocks[preheader_idx]
+        .instructions
+        .push(Instruction::Intrinsic {
+            dest: Some(weights),
+            op: IntrinsicOp::VecConstI8x32,
+            dest_ptr: None,
+            args: weight_bytes
+                .map(|b| Operand::Const(IrConst::I8(b as i8)))
+                .to_vec(),
+        });
+    func.blocks[preheader_idx]
+        .instructions
+        .push(Instruction::Intrinsic {
+            dest: Some(ones),
+            op: IntrinsicOp::VecConstI8x32,
+            dest_ptr: None,
+            args: ones_bytes
+                .map(|b| Operand::Const(IrConst::I8(b as i8)))
+                .to_vec(),
+        });
+    changes += 10;
+
+    // ── Vector header: phis + `n >= 32` compare ────────────────────────
+    // The polarity mirrors the source's compare family: unsigned counters
+    // use Uge, signed use Sge.  TRUE → body (continue), FALSE → exit.
+    let vec_cmp_op = if p.n_signed {
+        IrCmpOp::Sge
+    } else {
+        IrCmpOp::Uge
+    };
+    let vec_header = BasicBlock {
+        label: vec_header_label,
+        instructions: vec![
+            Instruction::Phi {
+                dest: vs1_phi,
+                ty: IrType::I64,
+                incoming: vec![
+                    (Operand::Value(vs1_init), preheader_label),
+                    (Operand::Value(vs1_next), vec_body_label),
+                ],
+            },
+            Instruction::Phi {
+                dest: vs2_phi,
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(vs2_init), preheader_label),
+                    (Operand::Value(vs2_next), vec_body_label),
+                ],
+            },
+            Instruction::Phi {
+                dest: vs3_phi,
+                ty: IrType::I64,
+                incoming: vec![
+                    (Operand::Value(vs3_init), preheader_label),
+                    (Operand::Value(vs3_next), vec_body_label),
+                ],
+            },
+            Instruction::Phi {
+                dest: vn_phi,
+                ty: p.n_ty,
+                incoming: vec![
+                    (p.n_init.clone(), preheader_label),
+                    (Operand::Value(vn_next), vec_body_label),
+                ],
+            },
+            Instruction::Phi {
+                dest: vp_phi,
+                // The cursor phi mirrors the SOURCE's family — I64 for the
+                // `*p++` arithmetic spelling, Ptr for the `buf[k]` GEP
+                // spelling — so the preheader incoming (the source's own
+                // pointer value) and the exit rewire stay type-exact.
+                ty: p.p_ty,
+                incoming: vec![
+                    (p.p_init.clone(), preheader_label),
+                    (Operand::Value(vp_next), vec_body_label),
+                ],
+            },
+            Instruction::Cmp {
+                dest: vcmp,
+                op: vec_cmp_op,
+                lhs: Operand::Value(vn_phi),
+                rhs: Operand::Const(int_const(32)),
+                ty: p.n_ty,
+            },
+        ],
+        terminator: Terminator::CondBranch {
+            cond: Operand::Value(vcmp),
+            true_label: vec_body_label,
+            false_label: vec_exit_label,
+        },
+        source_spans: vec![],
+    };
+    func.blocks.push(vec_header);
+    changes += 1;
+
+    // ── Vector body: the seven-instruction checksum step ──────────────
+    // Emission order is SCHEDULER-DELIBERATE for the deferred-register
+    // chain (one hot %ymm0): the snapshot (vs3 += the OLD vs1 — homed,
+    // in-place, never touching %ymm0) runs first so the load's hot value
+    // survives into the madd chain; the madd chain runs to completion
+    // into the homed vs2; the sad folds vbuf from its slot (the load's
+    // own store) immediately before the vs1 update consumes its result
+    // hot — the exact adjacency the counting epic's sad→vpaddq pair
+    // proved.  The vs3 update MUST precede vs1's own update: the
+    // cross-term snapshot must see the START-of-iteration s1 (the
+    // algebra's S_k).
+    let mut body_insts = vec![
+        // vs3 += vs1 BEFORE vs1's own update: the cross-term snapshot must
+        // see the START-of-iteration s1 (the algebra's S_k).
+        Instruction::Intrinsic {
+            dest: Some(vs3_next),
+            op: IntrinsicOp::VecAddI64x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(vs3_phi), Operand::Value(vs1_phi)],
+        },
+        Instruction::Intrinsic {
+            dest: Some(vbuf),
+            op: IntrinsicOp::VecLoadI8x32,
+            dest_ptr: None,
+            args: vec![Operand::Value(vp_phi), Operand::Const(IrConst::I64(0))],
+        },
+        Instruction::Intrinsic {
+            dest: Some(vshort),
+            op: IntrinsicOp::VecMaddubsU8x32,
+            dest_ptr: None,
+            args: vec![Operand::Value(vbuf), Operand::Value(weights)],
+        },
+        Instruction::Intrinsic {
+            dest: Some(vsum2),
+            op: IntrinsicOp::VecMaddwdI16x16,
+            dest_ptr: None,
+            args: vec![Operand::Value(vshort), Operand::Value(ones)],
+        },
+        Instruction::Intrinsic {
+            dest: Some(vs2_next),
+            op: IntrinsicOp::VecAddI32x8,
+            dest_ptr: None,
+            args: vec![Operand::Value(vs2_phi), Operand::Value(vsum2)],
+        },
+        Instruction::Intrinsic {
+            dest: Some(vsad),
+            op: IntrinsicOp::VecSadbwU8x32,
+            dest_ptr: None,
+            args: vec![Operand::Value(vbuf), Operand::Value(zero64)],
+        },
+        Instruction::Intrinsic {
+            dest: Some(vs1_next),
+            op: IntrinsicOp::VecAddI64x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(vs1_phi), Operand::Value(vsad)],
+        },
+    ];
+    // Cursor advance: mirror the source's family (Add for the `*p++`
+    // I64-cursor spelling, GEP for the `buf[k]` pointer spelling).
+    let cursor_advance = if p.p_ty == IrType::Ptr {
+        Instruction::GetElementPtr {
+            dest: vp_next,
+            base: vp_phi,
+            offset: Operand::Const(IrConst::I64(32)),
+            ty: IrType::U8,
+        }
+    } else {
+        Instruction::BinOp {
+            dest: vp_next,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(vp_phi),
+            rhs: Operand::Const(IrConst::I64(32)),
+            ty: p.p_ty,
+        }
+    };
+    body_insts.push(cursor_advance);
+    // Counter: n −= 32 (the vector loop consumes 32 bytes per iteration).
+    // Mirror the SOURCE's exact step spelling found by the analyzer: the
+    // Sub(n, K) form keeps the positive constant; the Add(n, −K) form
+    // keeps the negated one.  Both wrap identically mod 2^bits; matching
+    // the source spelling keeps the IR canonical for later passes.
+    let counter_step_op = func.blocks[p.body_block]
+        .instructions
+        .iter()
+        .find_map(|i| {
+            if let Instruction::BinOp { dest, op, .. } = i {
+                if *dest == p.n_back {
+                    return Some(*op);
+                }
+            }
+            None
+        })
+        .unwrap_or(IrBinOp::Sub);
+    body_insts.push(Instruction::BinOp {
+        dest: vn_next,
+        op: counter_step_op,
+        lhs: Operand::Value(vn_phi),
+        rhs: Operand::Const(int_const(if counter_step_op == IrBinOp::Add {
+            -32
+        } else {
+            32
+        })),
+        ty: p.n_ty,
+    });
+    let vec_body = BasicBlock {
+        label: vec_body_label,
+        instructions: body_insts,
+        terminator: Terminator::Branch(vec_header_label),
+        source_spans: vec![],
+    };
+    func.blocks.push(vec_body);
+    changes += 1;
+
+    // ── Vector exit: the scalar materialisation ───────────────────────
+    // s1 = (u32)hsum(vs1);  s2 = (u32)hsum(vs2) + ((u32)hsum(vs3) << 5) + s2_init.
+    // Zero vector iterations are the identity (proven above), so no merge
+    // phi and no guard: the ORIGINAL loop takes over with n < 32.
+    let vec_exit = BasicBlock {
+        label: vec_exit_label,
+        instructions: vec![
+            Instruction::Intrinsic {
+                dest: Some(hs1),
+                op: IntrinsicOp::VecHorizontalAddI64x4,
+                dest_ptr: None,
+                args: vec![Operand::Value(vs1_phi)],
+            },
+            Instruction::Intrinsic {
+                dest: Some(hs3),
+                op: IntrinsicOp::VecHorizontalAddI64x4,
+                dest_ptr: None,
+                args: vec![Operand::Value(vs3_phi)],
+            },
+            Instruction::Intrinsic {
+                dest: Some(hs2),
+                op: IntrinsicOp::VecHorizontalAddI32x8,
+                dest_ptr: None,
+                args: vec![Operand::Value(vs2_phi)],
+            },
+            Instruction::Cast {
+                dest: t3,
+                src: Operand::Value(hs3),
+                from_ty: IrType::I64,
+                to_ty: IrType::U32,
+            },
+            Instruction::BinOp {
+                dest: t3s,
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(t3),
+                rhs: Operand::Const(IrConst::I32(5)),
+                ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: hs2_u,
+                src: Operand::Value(hs2),
+                from_ty: IrType::I32,
+                to_ty: IrType::U32,
+            },
+            Instruction::BinOp {
+                dest: s2_res,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(hs2_u),
+                rhs: Operand::Value(t3s),
+                ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: s1_res,
+                src: Operand::Value(hs1),
+                from_ty: IrType::I64,
+                to_ty: IrType::U32,
+            },
+            Instruction::BinOp {
+                dest: s2_final,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(s2_res),
+                rhs: p.s2_init.clone(),
+                ty: IrType::U32,
+            },
+        ],
+        terminator: Terminator::Branch(header_label),
+        source_spans: vec![],
+    };
+    func.blocks.push(vec_exit);
+    changes += 1;
+
+    // ── Rewire: preheader → vec_header; original phis take vec results ─
+    if let Terminator::Branch(l) = &mut func.blocks[preheader_idx].terminator {
+        if *l == header_label {
+            *l = vec_header_label;
+            changes += 1;
+        }
+    }
+    // The original header phis: their preheader incoming becomes the
+    // vec-exit incoming with the vector results (the latch backedge keeps
+    // the original scalar chain — that IS the remainder loop).
+    let rewire = |phi: Value, new_val: Operand, blocks: &mut [BasicBlock]| -> usize {
+        let mut n = 0;
+        for b in blocks.iter_mut() {
+            for inst in b.instructions.iter_mut() {
+                if let Instruction::Phi { dest, incoming, .. } = inst {
+                    if *dest == phi {
+                        for (v, lbl) in incoming.iter_mut() {
+                            if *lbl == preheader_label {
+                                *v = new_val.clone();
+                                *lbl = vec_exit_label;
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        n
+    };
+    changes += rewire(p.s1_phi, Operand::Value(s1_res), &mut func.blocks);
+    changes += rewire(p.s2_phi, Operand::Value(s2_final), &mut func.blocks);
+    changes += rewire(p.n_phi, Operand::Value(vn_phi), &mut func.blocks);
+    changes += rewire(p.p_phi, Operand::Value(vp_phi), &mut func.blocks);
+
+    if debug {
+        eprintln!(
+            "[VEC-ADLER] fn={} loop H{}: adler32 vectorized (K={}), {} changes",
+            func.name, p.header_idx, p.chain_len, changes
+        );
+    }
+    changes
 }
 
 /// Every BinOp/Sqrt/Cmp/Select/MinMax node in the tree must have a lowering
@@ -9194,6 +10888,41 @@ fn range_within(r: WideRange, bound: (i64, i64)) -> bool {
     matches!(r, Some((lo, hi)) if lo >= bound.0 && hi <= bound.1)
 }
 
+/// Narrow-compare constant wrapping (see the `Cmp` arm of
+/// `parse_byte_map_expr`): if `e` is a single-point CONSTANT whose range
+/// misses the domain but the OTHER side's range lies inside `dom`, rewrite
+/// the constant to its value modulo the domain.  Returns whether the
+/// rewrite happened; on success the caller treats the compare in `dom`'s
+/// signedness.  Only constants wrap — a runtime invariant's value is
+/// unknowable, and a non-single-point range is not a folded spelling.
+fn try_wrap_lane_cmp_constant(
+    e: &mut MapExpr,
+    er: WideRange,
+    other_r: WideRange,
+    dom: (i64, i64),
+) -> bool {
+    let MapExpr::Invariant(Operand::Const(c)) = e else {
+        return false;
+    };
+    let Some(v) = c.to_i64() else {
+        return false;
+    };
+    let Some((lo, hi)) = er else {
+        return false;
+    };
+    if lo != hi || lo != v {
+        // Not the folded single-point spelling of this constant.
+        return false;
+    }
+    if !range_within(other_r, dom) {
+        return false;
+    }
+    let width = dom.1 - dom.0 + 1;
+    let wrapped = (v - dom.0).rem_euclid(width) + dom.0;
+    *e = MapExpr::Invariant(Operand::Const(IrConst::I32(wrapped as i32)));
+    true
+}
+
 /// A byte constant replicated across all four bytes of an `I32` broadcast
 /// lane.  `VecBroadcastI32x{4,8}` splats a dword; splatting `b*0x01010101`
 /// fills every BYTE lane with `b`, so the byte path needs no `vpbroadcastb`
@@ -9457,7 +11186,7 @@ fn parse_byte_map_expr(
             ))
         }
         Instruction::Cmp { op, lhs, rhs, .. } => {
-            let (l, lr) = parse_byte_map_operand(
+            let (mut l, lr) = parse_byte_map_operand(
                 func,
                 loop_blocks,
                 leaf_tys,
@@ -9466,7 +11195,7 @@ fn parse_byte_map_expr(
                 depth + 1,
                 elem_bytes,
             )?;
-            let (r, rr) = parse_byte_map_operand(
+            let (mut r, rr) = parse_byte_map_operand(
                 func,
                 loop_blocks,
                 leaf_tys,
@@ -9475,9 +11204,31 @@ fn parse_byte_map_expr(
                 depth + 1,
                 elem_bytes,
             )?;
+            // The frontend's narrow-compare fold wraps compare constants
+            // to the lane width: C's `zext(x) == 0xAA` (an int compare
+            // against 170) arrives as a U8-lane compare against the I8
+            // spelling of 0xAA, i.e. −86.  The wrapped spelling is exact
+            // at the lane width, but the constant's range (−86, −86)
+            // fails the unsigned-domain side-condition below and the
+            // whole loop would stay scalar — precisely the shape memchr
+            // and table-lookup classifiers write.  Reinterpret a
+            // single-point CONSTANT modulo the other side's byte domain,
+            // rewriting the invariant so the packed splat, the range
+            // analysis, and the scalar remainder mirror all see the
+            // domain value (170 for the example).  Runtime invariants
+            // never wrap (their value is unknowable); only the folded
+            // constant spelling does.
             let byte_op = if range_within(lr, u_dom) && range_within(rr, u_dom) {
                 byte_predicate_unsigned(*op)
             } else if range_within(lr, s_dom) && range_within(rr, s_dom) {
+                *op
+            } else if try_wrap_lane_cmp_constant(&mut l, lr, rr, u_dom)
+                || try_wrap_lane_cmp_constant(&mut r, rr, lr, u_dom)
+            {
+                byte_predicate_unsigned(*op)
+            } else if try_wrap_lane_cmp_constant(&mut l, lr, rr, s_dom)
+                || try_wrap_lane_cmp_constant(&mut r, rr, lr, s_dom)
+            {
                 *op
             } else {
                 return None;

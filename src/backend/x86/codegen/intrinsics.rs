@@ -5204,6 +5204,87 @@ impl X86Codegen {
                     self.emit_avx_binary_256(d, args, "vpsadbw", true);
                 }
             }
+            IntrinsicOp::VecMaddubsU8x32 => {
+                // Unsigned×signed byte pair multiply-add (`vpmaddubsw`):
+                // NON-commutative 3-operand VEX binary.  AT&T
+                // `vpmaddubsw r/m, reg, dst` takes the SIGNED weights in
+                // the r/m (first textual) slot = IR args[1], the unsigned
+                // byte stream in the register slot = IR args[0]; operand
+                // order is preserved by `commutative = false` so the two
+                // roles can never swap (a swap would feed the byte stream
+                // to the signed multiplier and the weights to the unsigned
+                // one — a silent miscompile class).
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpmaddubsw", false);
+                }
+            }
+            IntrinsicOp::VecMaddwdI16x16 => {
+                // Word pair multiply-add (`vpmaddwd`): the Adler-32 epic
+                // sums the maddubs word products with an all-ones table
+                // into dword lanes.  Order-preserving (commutative=false)
+                // for the same discipline as maddubs.
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpmaddwd", false);
+                }
+            }
+            IntrinsicOp::VecConstI8x32 => {
+                // 32-byte .rodata constant vector (Adler-32 epic: the
+                // `[32, 31, ..., 1]` weight table, the i16 ones table, the
+                // lane-0 seed mask).  The byte pattern is deduplicated
+                // through the shared `.LCVEC` const pool (the v6 FP-neg
+                // infrastructure), then materialised like VecZeroI64x4:
+                // straight into a register home when the web allocated one,
+                // otherwise through the %ymm0 scratch + slot store.
+                // Args MUST be exactly 32 const bytes — anything else is an
+                // IR-construction bug, never a silent default.
+                assert!(
+                    args.len() == 32,
+                    "VecConstI8x32: expected 32 const byte args, got {}",
+                    args.len()
+                );
+                let mut bytes = [0u8; 32];
+                for (i, slot) in bytes.iter_mut().enumerate() {
+                    let byte = match &args[i] {
+                        Operand::Const(c) => c.to_i64(),
+                        _ => None,
+                    };
+                    let Some(byte) = byte else {
+                        panic!(
+                            "VecConstI8x32: arg {} is not a constant (IR construction bug)",
+                            i
+                        );
+                    };
+                    assert!(
+                        (-128..=127).contains(&byte),
+                        "VecConstI8x32: arg {} = {} out of byte range",
+                        i,
+                        byte
+                    );
+                    *slot = byte as u8;
+                }
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let label = self.state.get_vec_const_label(&bytes);
+                let mem = format!("{}(%rip)", label);
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if let Some(&reg) = self.reg_assignments.get(&d.0).filter(|r| is_xmm_reg(**r)) {
+                        let name = phys_reg_name_256(reg);
+                        self.state
+                            .emit_fmt(format_args!("    vmovdqu {}, %{}", mem, name));
+                        self.state.dirty_upper_ymm = true;
+                        self.state.vec_claim_live_reg(d.0, name);
+                        self.state.vec_last_store_val = Some(d.0);
+                        self.state.vec_last_store_reg = true;
+                        self.state.vec_last_store_reg_name = Some(name);
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    vmovdqu {}, %ymm0", mem));
+                        self.state.dirty_upper_ymm = true;
+                        self.avx_store_dest(d);
+                    }
+                }
+            }
             IntrinsicOp::VecHorizontalAddI64x4 => {
                 // 4×I64 YMM → one I64 scalar: extract the high 128 bits,
                 // fold the four lanes down pairwise, land the result in
@@ -9308,6 +9389,28 @@ impl X86Codegen {
                 self.state.vec_last_store_reg = false;
             }
             (Some(m0), None) if commutative => {
+                // A REGISTER-HOMED args[1] (the Adler epic's zero/weight
+                // tables, map kernels' clamp bounds) is the VEX.vvvv
+                // source DIRECTLY — the home is read-only here, so no
+                // `%ymm1` staging copy is needed (`vpsadbw m, %ymm6, %ymm0`
+                // instead of `vmovdqa %ymm6, %ymm1` + `vpsadbw m, %ymm1,
+                // %ymm0`: one instruction off every iteration).
+                if let Operand::Value(v1) = &args[1] {
+                    if let Some(r1) = self
+                        .reg_assignments
+                        .get(&v1.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r))
+                    {
+                        let n1 = phys_reg_name_256(r1);
+                        self.state.dirty_upper_ymm = true;
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %{}, %ymm0", avx_inst, m0, n1));
+                        self.state.vec_last_store_reg = false;
+                        self.avx_store_dest(dest_ptr);
+                        return;
+                    }
+                }
                 self.avx_load_arg_to(&args[1], "ymm1");
                 self.state
                     .emit_fmt(format_args!("    {} {}, %ymm1, %ymm0", avx_inst, m0));

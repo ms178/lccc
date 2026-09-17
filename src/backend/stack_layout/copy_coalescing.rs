@@ -1740,6 +1740,11 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // same `emit_avx_binary_256` 3-operand VEX discipline.
             | O::VecSadbwU8x32
             | O::VecAddI64x4
+            // Adler-32 epic multiply-add binaries: `vpmaddubsw`/`vpmaddwd`
+            // are the same `emit_avx_binary_256` consumers (the byte-stream
+            // register source plus a folded src2).
+            | O::VecMaddubsU8x32
+            | O::VecMaddwdI16x16
             | O::VecAddI16x16
             | O::VecSubI16x16
             | O::VecMulI16x16
@@ -1826,6 +1831,11 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // horizontal exit's scalar is not a vector value).
             | O::VecSadbwU8x32
             | O::VecAddI64x4
+            // Adler-32 epic producers: the two multiply-add results and the
+            // .rodata constant table all define vector SSA values.
+            | O::VecMaddubsU8x32
+            | O::VecMaddwdI16x16
+            | O::VecConstI8x32
             | O::VecLoadF64x2
             | O::VecLoadF64x4
             | O::VecLoadI32x4
@@ -2310,6 +2320,14 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         O::VecSadbwU8x32 | O::VecAddI64x4 => Some(true),
         O::VecAndI64x4 | O::VecOrI64x4 | O::VecXorI64x4 => Some(true),
         O::VecSubI64x4 => Some(false),
+        // Adler-32 epic multiply-adds: `vpmaddubsw`/`vpmaddwd` are
+        // strictly order-sensitive in the ISA encoding (the signed and
+        // unsigned operand roles differ for maddubs), so a fold is only
+        // order-safe in the args[1] (src2/r/m) position — the weights
+        // slot.  The byte-stream load sits in args[0] (the register
+        // source) and is never foldable, which the Some(false) gate
+        // enforces exactly.
+        O::VecMaddubsU8x32 | O::VecMaddwdI16x16 => Some(false),
         O::VecAddI16x16
         | O::VecMulI16x16
         | O::VecMinI16x16
