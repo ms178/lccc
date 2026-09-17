@@ -4956,12 +4956,100 @@ impl X86Codegen {
                 };
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                self.sse_load_arg(&args[0], "xmm1");
-                if lane & 1 != 0 {
-                    self.state.emit("    pshufd $0x0E, %xmm1, %xmm1");
+                let mut handled_fast = false;
+                // REGISTER-SOURCED fast path (the nbody d² chain): a
+                // homed or live XMM source extracts with ZERO staging —
+                // lane 0 IS the register's low double (a direct
+                // `movsd %src, DST` stores it), lane 1 is one pshufd.
+                // The generic path below pays movdqa+movapd copies and a
+                // slot round trip that sit directly on the d² dependency
+                // chain of every vectorized pair loop.
+                if let Operand::Value(v) = &args[0] {
+                    let src_reg = self
+                        .reg_assignments
+                        .get(&v.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r))
+                        .map(phys_reg_name)
+                        .or_else(|| {
+                            self.state
+                                .vec_live_regs
+                                .get(&v.0)
+                                .copied()
+                                .filter(|n| n.starts_with("xmm"))
+                        });
+                    if let Some(src_name) = src_reg {
+                        if let Some(d) = dest {
+                            let dst_home = self.dest_xmm_home_name(d);
+                            if lane & 1 == 0 {
+                                match dst_home {
+                                    Some(h) if h != src_name => {
+                                        self.state.emit_fmt(format_args!(
+                                            "    movapd %{}, %{}",
+                                            src_name, h
+                                        ));
+                                        self.note_inplace_compute(
+                                            self.reg_assignments.get(&d.0).copied().unwrap(),
+                                            d.0,
+                                        );
+                                        self.state.reg_cache.invalidate_acc();
+                                    }
+                                    Some(_) => {
+                                        self.state.reg_cache.invalidate_acc();
+                                    }
+                                    None => {
+                                        if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                                            self.state.resolve_slot_addr(d.0)
+                                        {
+                                            self.state.emit_fmt(format_args!(
+                                                "    movsd %{}, {}",
+                                                src_name,
+                                                self.slot_ref(slot.0)
+                                            ));
+                                            self.state.sse_last_store_slot = Some(slot.0);
+                                        } else {
+                                            self.state.emit_fmt(format_args!(
+                                                "    movapd %{}, %xmm0",
+                                                src_name
+                                            ));
+                                            self.store_xmm0_fp_dest(d, IrType::F64);
+                                        }
+                                    }
+                                }
+                            } else {
+                                match dst_home {
+                                    Some(h) => {
+                                        self.state.emit_fmt(format_args!(
+                                            "    pshufd $0x0E, %{}, %{}",
+                                            src_name, h
+                                        ));
+                                        self.note_inplace_compute(
+                                            self.reg_assignments.get(&d.0).copied().unwrap(),
+                                            d.0,
+                                        );
+                                        self.state.reg_cache.invalidate_acc();
+                                    }
+                                    None => {
+                                        self.state.emit_fmt(format_args!(
+                                            "    pshufd $0x0E, %{}, %xmm0",
+                                            src_name
+                                        ));
+                                        self.store_xmm0_fp_dest(d, IrType::F64);
+                                    }
+                                }
+                            }
+                            handled_fast = true;
+                        }
+                    }
                 }
-                if let Some(d) = dest {
-                    self.store_f64_lane_dest(d);
+                if !handled_fast {
+                    self.sse_load_arg(&args[0], "xmm1");
+                    if lane & 1 != 0 {
+                        self.state.emit("    pshufd $0x0E, %xmm1, %xmm1");
+                    }
+                    if let Some(d) = dest {
+                        self.store_f64_lane_dest(d);
+                    }
                 }
             }
             IntrinsicOp::VecExtractLaneI64x4 => {
@@ -5922,6 +6010,21 @@ impl X86Codegen {
                     self.emit_avx_map_fma(d, args, "vfmadd132pd");
                 }
             }
+            IntrinsicOp::VecFmaF64x2
+            | IntrinsicOp::VecFnmaF64x2
+            | IntrinsicOp::VecFmaF32x4
+            | IntrinsicOp::VecFnmaF32x4 => {
+                if let Some(d) = dest {
+                    // args = [a, b, acc] → acc ± a·b, 128-bit lanes.
+                    let (mn, ps) = match op {
+                        IntrinsicOp::VecFmaF64x2 => ("vfmadd", "pd"),
+                        IntrinsicOp::VecFnmaF64x2 => ("vfnmadd", "pd"),
+                        IntrinsicOp::VecFmaF32x4 => ("vfmadd", "ps"),
+                        _ => ("vfnmadd", "ps"),
+                    };
+                    self.emit_vec_fma_128(d, args, mn, ps);
+                }
+            }
             IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 => {
                 // defer-aware emitters (vpaddd is 3-op VEX, paddd is 2-op).
                 if let Some(d) = dest {
@@ -6338,11 +6441,86 @@ impl X86Codegen {
             IntrinsicOp::VecBroadcastF64x2 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                self.emit_fp_operand_to_xmm(&args[0], IrType::F64, "xmm0");
-                self.state.emit("    unpcklpd %xmm0, %xmm0");
-                if let Some(d) = dest {
-                    self.state.vector_values.insert(d.0);
-                    self.sse_store_dest(d, "xmm0");
+                // AVX fast paths (the nbody mass/mag broadcasts): a
+                // register-homed source broadcasts in place
+                // (`vmovddup %xmmN, %xmmD`), a slot-homed one straight
+                // from memory (`vmovddup SLOT, %xmmD`) — ONE instruction
+                // where the SSE staging paid movsd+unpcklpd+movdqa (and
+                // the staging copy `vmovsd %xmmN, %xmmN` was pure waste).
+                if self.avx2_enabled {
+                    if let Some(d) = dest {
+                        let dst_home = self.dest_xmm_home_name(d);
+                        let mut done = false;
+                        if let Operand::Value(v) = &args[0] {
+                            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                                if is_xmm_reg(reg) {
+                                    let name = phys_reg_name(reg);
+                                    match dst_home {
+                                        Some(h) if h == name => {
+                                            // dest reuses the dying source's
+                                            // home: broadcast in place.
+                                            self.state.emit_fmt(format_args!(
+                                                "    vmovddup %{}, %{}",
+                                                name, name
+                                            ));
+                                        }
+                                        Some(h) => {
+                                            self.state.emit_fmt(format_args!(
+                                                "    vmovddup %{}, %{}",
+                                                name, h
+                                            ));
+                                        }
+                                        None => {
+                                            self.state.emit_fmt(format_args!(
+                                                "    vmovddup %{}, %xmm0",
+                                                name
+                                            ));
+                                        }
+                                    }
+                                    done = true;
+                                }
+                            }
+                            if !done {
+                                if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                                    self.state.resolve_slot_addr(v.0)
+                                {
+                                    match dst_home {
+                                        Some(h) => {
+                                            self.state.emit_fmt(format_args!(
+                                                "    vmovddup {}, %{}",
+                                                self.slot_ref(slot.0),
+                                                h
+                                            ));
+                                        }
+                                        None => {
+                                            self.state.emit_fmt(format_args!(
+                                                "    vmovddup {}, %xmm0",
+                                                self.slot_ref(slot.0)
+                                            ));
+                                        }
+                                    }
+                                    done = true;
+                                }
+                            }
+                        }
+                        if !done {
+                            self.emit_fp_operand_to_xmm(&args[0], IrType::F64, "xmm0");
+                            self.state.emit("    unpcklpd %xmm0, %xmm0");
+                            self.sse_store_dest(d, "xmm0");
+                        } else if let Some(h) = dst_home {
+                            self.sse_commit_dest_direct(d, h);
+                        } else {
+                            self.sse_store_dest(d, "xmm0");
+                        }
+                        self.state.vector_values.insert(d.0);
+                    }
+                } else {
+                    self.emit_fp_operand_to_xmm(&args[0], IrType::F64, "xmm0");
+                    self.state.emit("    unpcklpd %xmm0, %xmm0");
+                    if let Some(d) = dest {
+                        self.state.vector_values.insert(d.0);
+                        self.sse_store_dest(d, "xmm0");
+                    }
                 }
             }
             IntrinsicOp::VecBroadcastF32x8 => {
@@ -7562,6 +7740,158 @@ impl X86Codegen {
             .copied()
             .filter(|r| is_xmm_reg(*r))
             .map(phys_reg_name)
+    }
+
+    /// Packed 128-bit FMA/FMS contraction (BB-SLP): `dest = args[2] ±
+    /// args[0]·args[1]` under the FP-contract discipline. Two shapes:
+    ///
+    /// * VLFOLD fast path — the accumulator is an elided single-use
+    ///   128-bit load (the SLP MemLoad pack's deferred tuple): the 132
+    ///   form folds it as the memory operand, `v{f,n}madd132{ps,pd} %b,
+    ///   MEM_acc, %a_dst` (dst preloaded with a) — ONE instruction, the
+    ///   GCC nbody shape.
+    /// * register path — the accumulator loads into the destination
+    ///   register first (a no-op copy when the allocator coalesced dest
+    ///   with the dying accumulator), then `v{f,n}madd231{ps,pd} %b, %a,
+    ///   %dst`.
+    ///
+    /// FMA3-only: the caller gates on the ISA (the SLP pass refuses to
+    /// build FMA packs without it), and the mnemonic is unconditional
+    /// here exactly like the scalar vfmadd231 emitter.
+    fn emit_vec_fma_128(&mut self, dest: &Value, args: &[Operand], mn: &str, ps: &str) {
+        assert!(
+            args.len() == 3,
+            "emit_vec_fma_128: {} expects [a, b, acc]",
+            mn
+        );
+        self.state.invalidate_vec_peephole();
+        // A pending deferred store may name the accumulator or a
+        // multiplicand; the FMA reads all three — flush first (the
+        // pending discipline only survives one consumer).
+        self.flush_pending_vec_store_impl();
+
+        let pf = self.state.pending_vec_memfold.clone();
+        let acc_fold: Option<String> = pf
+            .as_ref()
+            .filter(|pf| pf.width == 16 && matches!(&args[2], Operand::Value(v) if v.0 == pf.val))
+            .map(|pf| pf.mem.clone());
+
+        let dst_home = self.dest_xmm_home_name(dest);
+        let (dst, dst_static): (String, &'static str) = match dst_home {
+            Some(name) => (format!("%{}", name), name),
+            None => ("%xmm0".to_string(), "xmm0"),
+        };
+
+        // ── Register-alias discipline ────────────────────────────────
+        // Three operands (a, b, acc) are live at the FMA and any of them
+        // may be the register the allocator REUSED for the dest (each
+        // dies at the instruction). The two Intel forms:
+        //   231: D = ±(S1·S2) + D   — D must hold the ACCUMULATOR.
+        //   132: D = ±(D·S2) + S1   — D must hold one MULTIPLICAND.
+        // The alias of dst with a/b/acc selects the form; the product
+        // commutes, so 132's S2 is whichever multiplicand dst does NOT
+        // hold. Multiple aliases are impossible (a, b, acc are mutually
+        // distinct live values).
+        //
+        // Resolve the multiplicands first (homed: their register; unhomed:
+        // staged into %xmm1/%xmm2). The resolution NAMES let the alias
+        // checks below see live-reg claims too, not just RA homes.
+        let b_src = self.vex128_source(&args[1], "xmm1");
+        let a_src = self.vex128_source(&args[0], "xmm2");
+
+        if let Some(mem) = acc_fold {
+            // 132 with the accumulator folded as the memory operand:
+            // `v{f,n}madd132{ps,pd} %S2, MEM_acc, %dst`, dst holding a
+            // multiplicand (loaded into dst when it holds neither).
+            if a_src == dst && b_src == dst {
+                // Impossible (distinct live values share no register);
+                // fail loudly rather than guess.
+                unreachable!("FMA dest aliases both multiplicands");
+            }
+            if a_src != dst && b_src != dst {
+                // dst holds neither: load `a` into it (b is already
+                // resolved to its own register/scratch).
+                self.sse_load_arg(&args[0], dst_static);
+                self.state.emit_fmt(format_args!(
+                    "    {}132{} {}, {}, {}",
+                    mn, ps, b_src, mem, dst
+                ));
+            } else {
+                let s2 = if a_src == dst {
+                    b_src.clone()
+                } else {
+                    a_src.clone()
+                };
+                self.state
+                    .emit_fmt(format_args!("    {}132{} {}, {}, {}", mn, ps, s2, mem, dst));
+            }
+            self.state.pending_vec_memfold = None;
+        } else {
+            if let Some(pf) = pf {
+                // A pending fold of a DIFFERENT value cannot survive the
+                // register reads below (the staging may clobber the
+                // never-materialised register).
+                let _ = pf;
+                self.materialize_pending_memfold();
+            }
+            if a_src == dst || b_src == dst {
+                // dst holds a multiplicand: the 132 form with the
+                // accumulator as the register src1. Resolving the acc
+                // after the multiplicands cannot claim dst (it is
+                // neither's scratch) — unless the allocator coalesced
+                // dest with the ACC, which contradicts this branch
+                // holding a multiplicand; the defensive move-aside
+                // keeps that impossible case correct anyway.
+                let s2 = if a_src == dst {
+                    b_src.clone()
+                } else {
+                    a_src.clone()
+                };
+                let acc_src = self.vex128_source(&args[2], "xmm3");
+                if acc_src == dst {
+                    self.state
+                        .emit_fmt(format_args!("    movdqa {}, %xmm3", dst));
+                    self.state
+                        .emit_fmt(format_args!("    {}132{} {}, %xmm3, {}", mn, ps, s2, dst));
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    {}132{} {}, {}, {}",
+                        mn, ps, s2, acc_src, dst
+                    ));
+                }
+            } else {
+                // 231: dst holds the accumulator (copied in when the
+                // allocator did not coalesce dest with the dying acc).
+                let acc_src = self.vex128_source(&args[2], dst_static);
+                if acc_src != dst {
+                    self.state
+                        .emit_fmt(format_args!("    movdqa {}, {}", acc_src, dst));
+                }
+                self.state.emit_fmt(format_args!(
+                    "    {}231{} {}, {}, {}",
+                    mn, ps, b_src, a_src, dst
+                ));
+            }
+        }
+        // Commit: homed dests claim their register (the FMA wrote it in
+        // place); unhomed dests store %xmm0 to their slot — or defer the
+        // store when the value is in the defer set (the VecRotlI32x4
+        // commit discipline).
+        self.sse_commit_dest_direct(dest, dst_static);
+        if dst_home.is_none() {
+            let deferred = self.state.vector_defer_values.contains(&dest.0);
+            if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                self.state.resolve_slot_addr(dest.0)
+            {
+                if !deferred {
+                    self.state
+                        .emit_fmt(format_args!("    movdqu %xmm0, {}", self.slot_ref(slot.0)));
+                } else {
+                    self.state.pending_vec_store = Some((dest.0, "xmm0", false));
+                }
+                self.state.sse_last_store_slot = Some(slot.0);
+            }
+        }
     }
 
     /// VEX.128 three-operand binary: `inst src2, src1, dst` with

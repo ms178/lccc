@@ -381,40 +381,83 @@ fn eval_sym_addr_d(
     };
     match inst {
         Instruction::GetElementPtr { base, offset, .. } => {
-            // Base of a GEP may itself be a const-offset GEP — fold
-            // recursively; a base that carries its own index variable
-            // degrades to the inner GEP's value as an opaque base (two
-            // accesses through the SAME base-GEP value still stream
-            // together — the `p = &a[i]; p[0..3]` shape).
-            let mut addr = match eval_sym_addr_d(block, def_pos, *base, depth.saturating_sub(1)) {
-                Some(a) if a.var.is_none() => a,
-                _ => SymAddr {
+            // Base of a GEP may itself be a GEP — fold recursively. A
+            // base that carries its own index variable now COMPOSES:
+            //
+            //   * const offset over a var-carrying base — the struct-
+            //     field pattern `a[i].f2` is GEP(GEP(a, i*stride),
+            //     field_off). Degradation (the previous behavior) put
+            //     `a[i].f1` in stream (a, i, stride, 0) but `a[i].f2`
+            //     in stream (GEP(a,i*stride), -, 1, field_off) — two
+            //     DIFFERENT stream keys for accesses of the SAME
+            //     object and index, so the field pair never grouped
+            //     and struct-array kernels (nbody bodies[i].vx/vy,
+            //     rbtree node fields, Particle x/y/z) never seeded.
+            //     Composition keeps the ROOT symbol as the base —
+            //     strictly more canonical, and strictly better for
+            //     `RestrictBases::disjoint` (a root GlobalAddr/alloca/
+            //     param classifies; an intermediate GEP value never
+            //     did).
+            //   * var offset indexing the SAME variable — the byte
+            //     offsets compose scale-wise (base + m1·v + m2·v);
+            //     both scales are positive by `affine_term`'s
+            //     canonicality, and the sum is u64-checked (fail-closed
+            //     to None on overflow).
+            //   * var offset with a DIFFERENT variable — two index
+            //     variables in one address (`a[i][j]`): no single-
+            //     stream model. The base degrades to the inner GEP's
+            //     value as an opaque anchor and THIS GEP's index
+            //     becomes the stream variable (two accesses through
+            //     the SAME base-GEP value still stream together — the
+            //     `p = &a[i]; p[0..3]` shape; the historical behavior,
+            //     byte-for-byte).
+            let mut addr = eval_sym_addr_d(block, def_pos, *base, depth.saturating_sub(1))
+                .unwrap_or(SymAddr {
                     base: *base,
                     var: None,
                     mult: 1,
                     off: 0,
-                },
-            };
+                });
             // The offset term: a constant folds into `off`; a variable
             // term (with its scale and constant part from `affine_term`)
-            // becomes the stream's index. `addr` never carries a var at
-            // this point (var-carrying bases degraded above), so at most
-            // one index variable composes here.
+            // becomes the stream's index. `addr` may carry at most one
+            // index variable at this point; the same variable composes,
+            // a different one degrades the base (below).
             let t = affine_term(block, def_pos, offset, AFFINE_DEPTH)?;
             match t.var {
                 None => {
                     addr.off = addr.off.checked_add(t.off)?;
                 }
-                Some(v) => {
-                    if addr.var.is_some() {
-                        // Two different index variables in one address
-                        // (`a[i][j]`): no single-stream model — skip.
-                        return None;
+                Some(v) => match addr.var {
+                    None => {
+                        addr.var = Some(v);
+                        addr.mult = t.mult as u64;
+                        addr.off = addr.off.checked_add(t.off)?;
                     }
-                    addr.var = Some(v);
-                    addr.mult = t.mult as u64;
-                    addr.off = addr.off.checked_add(t.off)?;
-                }
+                    Some(bv) if bv == v => {
+                        // Same index variable at both levels: the address
+                        // is base + (m1 + m2)·v + (o1 + o2). Both mults
+                        // are positive (canonical affine terms); a sum
+                        // that overflows u64 was never a real stride.
+                        let m = i64::try_from(addr.mult).ok()?.checked_add(t.mult)?;
+                        if m <= 0 {
+                            return None;
+                        }
+                        addr.mult = m as u64;
+                        addr.off = addr.off.checked_add(t.off)?;
+                    }
+                    Some(_) => {
+                        // Two different index variables (`a[i][j]`): the
+                        // base becomes the opaque anchor and this GEP's
+                        // index is the stream variable.
+                        addr = SymAddr {
+                            base: *base,
+                            var: Some(v),
+                            mult: t.mult as u64,
+                            off: t.off,
+                        };
+                    }
+                },
             }
             Some(addr)
         }
@@ -1070,6 +1113,96 @@ fn same_source(ctx: &BlockCtx, a: &Operand, b: &Operand) -> bool {
     }
 }
 
+/// The SAME-SOURCE proof for the same-source SPLAT (pack 1a): two
+/// operands (already bit-identity-stripped by the caller) name the same
+/// loadable value when they are the same SSA value, or non-volatile
+/// Default-segment loads of the SAME symbolic address — same base, same
+/// index variable, same stride, same offset — with no write between them
+/// that touches those bytes.
+///
+/// This is `same_source`'s proof with the conservative "any write
+/// between the loads rejects" interval upgraded to the full symbolic
+/// disjointness battery: a write to the SAME stream is checked by exact
+/// byte ranges, a write to the same base with the same stride but a
+/// different index variable by the FIELD-DISJOINTNESS THEOREM, and
+/// everything else still rejects. That upgrade is what the pre-CSE
+/// struct-field spelling needs: `bodies[j].mass` is loaded once per
+/// component with velocity stores to `bodies[i].vx/vy/vz` in between —
+/// stores that provably never touch the mass field for ANY i, j.
+fn same_source_loads_symbolic(ctx: &BlockCtx, a: &Operand, b: &Operand) -> bool {
+    if a == b {
+        return true;
+    }
+    let block = ctx.block;
+    let addr_of = |o: &Operand| -> Option<(SymAddr, usize, i64)> {
+        let Operand::Value(v) = o else { return None };
+        let &i = ctx.def_pos.get(&v.0)?;
+        match &block.instructions[i] {
+            Instruction::Load {
+                ptr,
+                seg_override,
+                volatile,
+                ty,
+                ..
+            } if *seg_override == AddressSpace::Default && !*volatile => {
+                eval_sym_addr(block, &ctx.def_pos, *ptr).map(|ad| (ad, i, ty.size() as i64))
+            }
+            _ => None,
+        }
+    };
+    let Some((aa, pa, sa)) = addr_of(a) else {
+        return false;
+    };
+    let Some((ab, pb, sb)) = addr_of(b) else {
+        return false;
+    };
+    if aa.base != ab.base || aa.var != ab.var || aa.mult != ab.mult || aa.off != ab.off {
+        return false;
+    }
+    let size = sa.max(sb);
+    let (plo, phi) = if pa < pb { (pa, pb) } else { (pb, pa) };
+    (plo + 1..phi).all(|q| {
+        let inst = &block.instructions[q];
+        if !is_memory_write(inst) {
+            return true;
+        }
+        let Instruction::Store {
+            ptr,
+            ty: wty,
+            seg_override,
+            volatile,
+            ..
+        } = inst
+        else {
+            return false;
+        };
+        if *seg_override != AddressSpace::Default || *volatile {
+            return false;
+        }
+        let Some(wa) = eval_sym_addr(block, &ctx.def_pos, *ptr) else {
+            return false;
+        };
+        let ws = wty.size() as i64;
+        if wa.base == aa.base && wa.var == aa.var && wa.mult == aa.mult {
+            // Same stream: exact byte ranges.
+            !byte_ranges_overlap(aa.off, size, wa.off, ws)
+        } else if wa.base == aa.base && wa.mult == aa.mult {
+            // Same base and stride, different (or absent) index variable:
+            // the field-disjointness theorem. `aa.mult` is the shared
+            // stride; a mult of 1 with distinct constant windows is the
+            // degenerate "no stride" case the byte-range arm already
+            // covers when the vars match, and the theorem handles the
+            // rest.
+            field_disjoint(aa.mult, aa.off, size, wa.off, ws)
+        } else {
+            // Different base or stride: no symbolic proof available
+            // here (this helper has no RestrictBases access — the pack
+            // rules (c)/(d)/(e) apply those classes separately).
+            false
+        }
+    })
+}
+
 /// Resolve an operand to a compile-time i64, looking through the
 /// `Copy`/`Cast` constant materializations the frontend emits before
 /// `simplify` folds them into inline constants (the early SLP sweep runs
@@ -1139,6 +1272,66 @@ fn supported_store_ty(ty: IrType) -> bool {
     )
 }
 
+/// THE FIELD-DISJOINTNESS THEOREM (same base, same stride, different
+/// index variables).
+///
+/// Two accesses `base + m·i + off1` (width `s1`) and `base + m·j + off2`
+/// (width `s2`) — with the SAME base object and the SAME positive byte
+/// stride `m`, but INDEPENDENT index variables `i`, `j` — never overlap
+/// when both accesses are confined to single elements and their
+/// element-relative windows are disjoint:
+///
+/// * normalize `o1 = off1 mod m`, `o2 = off2 mod m` (both in `[0, m)`),
+/// * require `o1 + s1 ≤ m` and `o2 + s2 ≤ m` (no access spans an
+///   element boundary), and `o1 + s1 ≤ o2 || o2 + s2 ≤ o1`.
+///
+/// PROOF: the address difference is `(o1 − o2) + m·d` with
+/// `d = i − j ∈ ℤ` and `v0 = o1 − o2 ∈ (−m, m)`. Overlap of
+/// `[A, A+s1)` and `[B, B+s2)` needs `−s1 < A − B < s2`, i.e.
+/// `−s1 < v0 + m·d < s2`.
+/// * `d = 0`: in-element disjointness gives `v0 ≤ −s1` or `v0 ≥ s2` —
+///   excluded.
+/// * `d ≥ 1`: `v0 + m·d ≥ v0 + m > −m + m = 0`, and `v0 + m·d < s2 ≤ m`
+///   needs `v0 < s2 − m·d ≤ s2 − m`. But `v0 ≥ −o2 ≥ −(m − s2) = s2 − m`
+///   (single-element confinement of access 2) — excluded. For `d ≥ 2`,
+///   `v0 + m·d ≥ v0 + 2m > m ≥ s2` outright.
+/// * `d ≤ −1`: symmetric — `v0 + m·d ≤ v0 − m < m − m = 0`, and
+///   `> −s1` needs `v0 > m − s1`; but `v0 ≤ o1 ≤ m − s1` (single-element
+///   confinement of access 1) — excluded. For `d ≤ −2`,
+///   `v0 + m·d ≤ v0 − 2m < −m ≤ −s1` outright.
+///
+/// This is the proof that makes struct-field streams independent of the
+/// index relation: `bodies[i].mass` (element window [48,56) of a 56-byte
+/// element) and `bodies[j].vx` (window [24,32)) can never alias for ANY
+/// `i`, `j` — including `i == j` — which no amount of same-stream
+/// offset comparison could establish (the streams carry different index
+/// variables). Without it, every intervening field access of a struct
+/// array rejected rules (c)/(d) and the same-source splat below.
+fn field_disjoint(mult: u64, off1: i64, size1: i64, off2: i64, size2: i64) -> bool {
+    let m = mult as i128;
+    if m <= 0 {
+        return false;
+    }
+    let s1 = size1 as i128;
+    let s2 = size2 as i128;
+    if s1 <= 0 || s2 <= 0 || s1 > m || s2 > m {
+        return false;
+    }
+    let o1 = ((off1 as i128) % m + m) % m;
+    let o2 = ((off2 as i128) % m + m) % m;
+    if o1 + s1 > m || o2 + s2 > m {
+        return false;
+    }
+    o1 + s1 <= o2 || o2 + s2 <= o1
+}
+
+/// Byte-range overlap of two same-stream windows at constant offsets.
+fn byte_ranges_overlap(off1: i64, size1: i64, off2: i64, size2: i64) -> bool {
+    let a = off1 as i128;
+    let b = off2 as i128;
+    a < b + size2 as i128 && b < a + size1 as i128
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Pack graph
 // ─────────────────────────────────────────────────────────────────────────
@@ -1150,6 +1343,18 @@ enum PackKind {
     /// its stream byte offset (offs[i] = offs[0] + i*size — re-asserted
     /// by the run builder).
     MemLoad { ptrs: Vec<Value>, offs: Vec<i64> },
+    /// The lanes are lane-extracts of ONE existing vector value at
+    /// consecutive indices 0..width-1 — the pack IS that vector. This is
+    /// the CHAINED-SEED forward: a second seed whose operand tree reads
+    /// a first seed's vector through its extracts (the nbody pair body:
+    /// the i-velocity seed packs (dx,dy) into one vsubpd; the
+    /// j-velocity seed's mul tree consumes the SAME (dx,dy) through the
+    /// extracts the rewrite left behind) reuses the vector with ZERO
+    /// new instructions instead of re-gathering the scalars. Without
+    /// the forward, the second seed's operand recursion meets extract
+    /// values (not loads, not binops) and falls to the low-benefit
+    /// gather — or declines outright.
+    Forward { val: Value },
     /// Same-op binop lanes. `ty` is the lane type (== the binop type).
     BinOp {
         op: IrBinOp,
@@ -1157,6 +1362,25 @@ enum PackKind {
         vec_op: IntrinsicOp,
         lhs: usize,
         rhs: usize,
+    },
+    /// Packed FMA/FMS contraction: every lane is `acc_lane ± Mul(x_lane,
+    /// s_lane)` with the `s` side UNIFORM across lanes (bit-identical or
+    /// same-source — a Splat pack) — emitted as ONE vfmadd/vfnmadd
+    /// reading the accumulator pack, the varying multiplicand pack and
+    /// the splat. ROUNDING PARITY: the scalar path contracts the same
+    /// shape (the gap-fused mul+add/sub detector), so the vector form
+    /// MUST fuse the outer multiply too — a packed mulpd+subpd pair pays
+    /// a THIRD rounding the scalar code never takes and the tri-config
+    /// differential (SLP on / SLP off / gcc) drifts. FMA3-gated at pack
+    /// build; the FP contract is threaded from the driver (Fast for C,
+    /// exactly the scalar contraction's policy).
+    Fma {
+        /// false: dest = acc + a·b (vfmadd); true: dest = acc − a·b
+        /// (vfnmadd).
+        negate: bool,
+        acc: usize,
+        a: usize,
+        b: usize,
     },
     /// One scalar operand broadcast to all lanes (`is_zero` selects the
     /// cheaper VecZero lowering at emit time).
@@ -1261,6 +1485,20 @@ struct SeedCandidate {
 /// Entry point: run basic-block SLP on one function. Returns the number of
 /// seeds vectorized.
 pub(crate) fn run_bb_slp(func: &mut IrFunction) -> usize {
+    run_bb_slp_with_contract(
+        func,
+        crate::common::fp_contract::FpContract::c_language_default(),
+    )
+}
+
+/// The FP-contraction-aware entry: the packed FMA contraction must honor
+/// exactly the contract the scalar gap-fused detector sees (threaded from
+/// the driver's -ffp-contract flag). The bare `run_bb_slp` above keeps the
+/// `run_on_visited` closure shape with the C default.
+pub(crate) fn run_bb_slp_with_contract(
+    func: &mut IrFunction,
+    fp_contract: crate::common::fp_contract::FpContract,
+) -> usize {
     if !x86_simd_available_pub() {
         return 0;
     }
@@ -1277,7 +1515,7 @@ pub(crate) fn run_bb_slp(func: &mut IrFunction) -> usize {
     for _round in 0..24 {
         let mut fired = 0usize;
         for b in 0..func.blocks.len() {
-            while slp_block_once(func, b, &cross, debug) == 1 {
+            while slp_block_once(func, b, &cross, fp_contract, debug) == 1 {
                 fired += 1;
             }
         }
@@ -1347,12 +1585,16 @@ struct BlockCtx<'a> {
     /// packed lane in the set cannot be replaced by a block-local
     /// extract — reject its seed.
     external_uses: &'a FxHashSet<u32>,
+    /// The FP contraction contract (threaded from the driver): gates the
+    /// packed FMA contraction exactly like the scalar gap-fused detector.
+    fp_contract: crate::common::fp_contract::FpContract,
 }
 
 fn build_ctx<'a>(
     func: &'a IrFunction,
     block_idx: usize,
     cross: &'a FxHashSet<u32>,
+    fp_contract: crate::common::fp_contract::FpContract,
 ) -> BlockCtx<'a> {
     let block = &func.blocks[block_idx];
     let mut def_pos: FxHashMap<u32, usize> = FxHashMap::default();
@@ -1383,6 +1625,7 @@ fn build_ctx<'a>(
         def_pos,
         uses,
         external_uses: cross,
+        fp_contract,
     }
 }
 
@@ -1670,13 +1913,14 @@ fn slp_block_once(
     func: &mut IrFunction,
     block_idx: usize,
     cross: &FxHashSet<u32>,
+    fp_contract: crate::common::fp_contract::FpContract,
     debug: bool,
 ) -> usize {
     // All analysis under one immutable borrow; the plans are fully owned
     // (no lifetimes into the block), so the mutable rewrite afterwards
     // is borrow-clean.
     let (candidates, plans): (Vec<SeedCandidate>, Vec<Option<Plan>>) = {
-        let ctx = build_ctx(func, block_idx, cross);
+        let ctx = build_ctx(func, block_idx, cross, fp_contract);
         let bases = RestrictBases::build(func);
         let candidates = collect_seed_candidates(&ctx);
         let plans = candidates
@@ -1716,6 +1960,38 @@ struct Plan {
 /// Returns the pack index, or None when the lanes cannot be represented.
 /// SSA def-before-use within a block makes cycles impossible; the depth
 /// guard covers pathological shapes only.
+/// Cross-seed splat CSE lookup: does this block already contain a
+/// `fam.broadcast` (or the zero form for all-zero constants) of exactly
+/// this source operand (bit-identity)? Returns the broadcast's dest —
+/// the vector a new Splat pack would reproduce. Only same-block hits
+/// are useful (the Forward pack schedules at the dest's position and
+/// consumers are later in this block by construction).
+fn find_existing_broadcast(ctx: &BlockCtx, fam: &VecFamily, src: &Operand) -> Option<Value> {
+    let block = ctx.block;
+    let zero_src = matches!(src, Operand::Const(c) if c.is_all_zero_bits());
+    for inst in &block.instructions {
+        let Instruction::Intrinsic {
+            dest: Some(d),
+            op,
+            args,
+            dest_ptr: None,
+        } = inst
+        else {
+            continue;
+        };
+        let is_bcast = if zero_src {
+            // The zero splat's emitted form is fam.zero with no args.
+            *op == fam.zero && args.is_empty()
+        } else {
+            *op == fam.broadcast && args.len() == 1 && lane_key(&args[0]) == lane_key(src)
+        };
+        if is_bcast {
+            return Some(*d);
+        }
+    }
+    None
+}
+
 fn build_pack(
     ctx: &BlockCtx,
     lanes: &[Operand],
@@ -1734,6 +2010,30 @@ fn build_pack(
         return Some(idx);
     }
     let block = ctx.block;
+
+    // 0. CROSS-SEED SPLAT CSE: a previous seed's applied plan may have
+    //    emitted this exact broadcast already (the nbody pair body: the
+    //    i-velocity and j-velocity seeds each splat `mag`; the fixpoint
+    //    applies them one block-scan apart, so the second plan's dedup
+    //    map — fresh per plan — cannot see the first). If the block
+    //    already carries `broadcast(src)` (or the zero form for an
+    //    all-zero constant), FORWARD its dest: zero new instructions,
+    //    exactly the PackKind::Forward chaining the extract case uses.
+    //    Bit-identity of the source operand is the LaneKey predicate.
+    if lanes.windows(2).all(|w| lane_key(&w[0]) == lane_key(&w[1])) {
+        let src0 = strip_bitidentity_casts(ctx, &lanes[0]);
+        if let Some(prev) = find_existing_broadcast(ctx, fam, &src0) {
+            let idx = packs.len();
+            packs.push(Pack {
+                kind: PackKind::Forward { val: prev },
+                lane_vals: Vec::new(),
+                sched: usize::MAX,
+                order: 0,
+            });
+            dedup.insert(key, idx);
+            return Some(idx);
+        }
+    }
 
     // 1. Splat: all lanes the same operand — BIT-EXACTLY. `Operand`'s
     // derived equality compares `IrConst::F32/F64` as IEEE floats, under
@@ -1771,6 +2071,91 @@ fn build_pack(
         return Some(idx);
     }
 
+    // 1a. SAME-SOURCE splat: lanes are VALUES that all name the same
+    //     source — the same SSA value through bit-identity casts, or
+    //     non-volatile loads of the same symbolic address with no
+    //     intervening write that touches those bytes. The pre-CSE
+    //     frontend emits one load per C spelling (`bodies[j].mass` per
+    //     component of the nbody pair update), and the aliasing
+    //     discipline cannot merge them across may-alias stores, so the
+    //     mul trees carry N loads of ONE address — a shape the bit-exact
+    //     splat can never see and the MemLoad pack rejects (the lanes
+    //     are at the SAME offset, not consecutive). Broadcast lane 0's
+    //     value; every other lane's def is recorded in `lane_vals` so
+    //     the legality rules treat it as removed (the redundant load
+    //     dies with its only consumer) while the broadcast's SOURCE is
+    //     kept alive by `keep_operands`.
+    //
+    //     Soundness: the no-intervening-write proof is per WRITE with
+    //     the full symbolic disjointness battery — same stream
+    //     (base, var, mult): byte ranges; same base and mult with a
+    //     different var: the FIELD-DISJOINTNESS THEOREM (the write's
+    //     element window vs the loaded window — the nbody mass/vx case,
+    //     where the velocity stores between the mass loads provably
+    //     never touch the mass field for ANY i, j); anything else: the
+    //     write rejects (conservative, exactly like rule (c)). All
+    //     lanes therefore observed bit-identical bytes, and the
+    //     broadcast of lane 0's read reproduces each lane's value.
+    if lanes.len() >= 2 {
+        let all_values: Option<Vec<&Operand>> = lanes
+            .iter()
+            .map(|l| match l {
+                Operand::Value(_) => Some(l),
+                _ => None,
+            })
+            .collect();
+        if let Some(vals) = all_values {
+            let lane0 = strip_bitidentity_casts(ctx, vals[0]);
+            let lanes_same_source = vals[1..]
+                .iter()
+                .all(|l| same_source_loads_symbolic(ctx, &lane0, &strip_bitidentity_casts(ctx, l)));
+            if lanes_same_source {
+                // Cross-seed CSE for the same-source class too: an
+                // earlier plan may have broadcast this exact source.
+                if let Some(prev) = find_existing_broadcast(ctx, fam, &lane0) {
+                    let idx = packs.len();
+                    packs.push(Pack {
+                        kind: PackKind::Forward { val: prev },
+                        lane_vals: Vec::new(),
+                        sched: usize::MAX,
+                        order: 0,
+                    });
+                    dedup.insert(key, idx);
+                    return Some(idx);
+                }
+                let src = lane0;
+                // Remove every lane EXCEPT the broadcast source: the
+                // source's def must survive (the broadcast reads it);
+                // the others are dead once their consumers are packed.
+                // If a lane IS the source (spelled differently), set
+                // semantics make the double removal idempotent.
+                let mut lane_vals: Vec<Value> = Vec::with_capacity(width);
+                let mut src_id: Option<u32> = None;
+                if let Operand::Value(sv) = &src {
+                    src_id = Some(sv.0);
+                }
+                for l in vals {
+                    let Operand::Value(v) = l else { continue };
+                    if Some(v.0) != src_id {
+                        lane_vals.push(*v);
+                    }
+                }
+                let idx = packs.len();
+                packs.push(Pack {
+                    kind: PackKind::Splat {
+                        src,
+                        is_zero: false,
+                    },
+                    lane_vals,
+                    sched: usize::MAX,
+                    order: 0,
+                });
+                dedup.insert(key, idx);
+                return Some(idx);
+            }
+        }
+    }
+
     // All-value path from here down (loads / binops need defs).
     let as_values: Option<Vec<Value>> = lanes
         .iter()
@@ -1781,6 +2166,65 @@ fn build_pack(
         .collect();
 
     if let Some(vals) = as_values {
+        // 1a-F. FORWARD: every lane is a lane-extract of ONE existing
+        // vector at consecutive indices 0..width-1 — the pack IS that
+        // vector (see `PackKind::Forward`). The extract must be THIS
+        // family's own lane-extract intrinsic (an F64x2 extract
+        // forwards into an F64×2 pack; an F64x4 extract has a different
+        // vector width and cannot).
+        if let Some(extract_op) = fam.extract {
+            let extract_shape = |v: &Value| -> Option<(Value, i64)> {
+                let i = ctx.def_pos.get(&v.0)?;
+                match &block.instructions[*i] {
+                    Instruction::Intrinsic {
+                        op,
+                        args,
+                        dest: Some(_),
+                        dest_ptr: None,
+                    } if *op == extract_op && args.len() == 2 => {
+                        let Operand::Value(vec) = &args[0] else {
+                            return None;
+                        };
+                        let Operand::Const(c) = &args[1] else {
+                            return None;
+                        };
+                        Some((*vec, c.to_i64()?))
+                    }
+                    _ => None,
+                }
+            };
+            let mut forward_vec: Option<Value> = None;
+            let mut forward_ok = true;
+            for (li, v) in vals.iter().enumerate() {
+                match extract_shape(v) {
+                    Some((vec, lane)) if lane == li as i64 => match forward_vec {
+                        None => forward_vec = Some(vec),
+                        Some(prev) if prev == vec => {}
+                        _ => {
+                            forward_ok = false;
+                            break;
+                        }
+                    },
+                    _ => {
+                        forward_ok = false;
+                        break;
+                    }
+                }
+            }
+            if forward_ok && forward_vec.is_some() {
+                let idx = packs.len();
+                packs.push(Pack {
+                    kind: PackKind::Forward {
+                        val: forward_vec.unwrap(),
+                    },
+                    lane_vals: Vec::new(),
+                    sched: usize::MAX,
+                    order: 0,
+                });
+                dedup.insert(key, idx);
+                return Some(idx);
+            }
+        }
         // 1b. Sub-word promotion rewrite: C integer promotion leaves sub-word
         // lane math as `trunc(zext(a) OP zext(b))` in I32. For two's-
         // complement Add/Sub/Mul/And/Or/Xor the low lane bits of the
@@ -2980,6 +3424,156 @@ fn build_pack(
         if uniform && first.is_some() {
             let (op, bty) = first.unwrap();
             if bty == ty {
+                // 3f. PACKED FMA CONTRACTION — tried FIRST among the
+                //     Add/Sub shapes (strictly better when it applies:
+                //     one instruction where the generic path builds a
+                //     Mul pack + an Add/Sub pack, AND the rounding
+                //     parity the scalar gap-fused contraction already
+                //     guarantees — the tri-config differential would
+                //     otherwise drift by the extra multiply rounding).
+                //     Lanes: `acc ± Mul(x, s)` with the s side UNIFORM
+                //     across lanes (bit-identical lane_keys or
+                //     same-source loads — exactly the Splat pack's
+                //     domain), the acc side any packable operand run
+                //     (the MemLoad accumulator of a load-modify-store,
+                //     a forwarded vector, ...). FMA3 + the FP contract
+                //     gate the whole shape; the emitted intrinsic
+                //     (VecFma/VecFnma {F64x2,F32x4}) mirrors the scalar
+                //     emit_fused_mul_{add,sub} rounding discipline.
+                if matches!(op, IrBinOp::Add | IrBinOp::Sub)
+                    && matches!(ty, IrType::F64 | IrType::F32)
+                    && crate::passes::vectorize::x86_fma_available_pub()
+                    && ctx.fp_contract != crate::common::fp_contract::FpContract::Off
+                {
+                    // Decompose each lane: which side is the Mul, which
+                    // the accumulator. The orientation must be uniform
+                    // across lanes.
+                    let mul_side = |o: &Operand| -> Option<(Operand, Operand)> {
+                        let Operand::Value(mv) = o else {
+                            return None;
+                        };
+                        let mi = ctx.def_pos.get(&mv.0)?;
+                        match &block.instructions[*mi] {
+                            Instruction::BinOp {
+                                op: IrBinOp::Mul,
+                                lhs,
+                                rhs,
+                                ty: mty,
+                                ..
+                            } if *mty == ty => Some((lhs.clone(), rhs.clone())),
+                            _ => None,
+                        }
+                    };
+                    let mut acc_lanes: Vec<Operand> = Vec::with_capacity(width);
+                    let mut mul_lhs_lanes: Vec<Operand> = Vec::with_capacity(width);
+                    let mut mul_rhs_lanes: Vec<Operand> = Vec::with_capacity(width);
+                    let mut orientation: Option<bool> = None; // true: mul on lhs
+                    let mut fma_ok = true;
+                    for v in &vals {
+                        let i = ctx.def_pos[&v.0];
+                        let Instruction::BinOp { lhs, rhs, .. } = &block.instructions[i] else {
+                            unreachable!()
+                        };
+                        let (mul_on_lhs, mul_ops, acc) = match (mul_side(lhs), mul_side(rhs)) {
+                            (Some(m), None) => (true, m, rhs.clone()),
+                            (None, Some(m)) => (false, m, lhs.clone()),
+                            _ => {
+                                fma_ok = false;
+                                break;
+                            }
+                        };
+                        match orientation {
+                            None => orientation = Some(mul_on_lhs),
+                            Some(o) if o == mul_on_lhs => {}
+                            _ => {
+                                fma_ok = false;
+                                break;
+                            }
+                        }
+                        acc_lanes.push(acc);
+                        mul_lhs_lanes.push(mul_ops.0);
+                        mul_rhs_lanes.push(mul_ops.1);
+                    }
+                    if fma_ok && orientation.is_some() {
+                        // Which mul side is uniform (the splat b)?
+                        // Bit-identical lane_keys first, then the
+                        // same-source proof (the mass-load class).
+                        let uniform_side = |lanes: &[Operand]| -> bool {
+                            if lanes.is_empty() {
+                                return false;
+                            }
+                            let l0 = strip_bitidentity_casts(ctx, &lanes[0]);
+                            lanes[1..].iter().all(|l| {
+                                let ls = strip_bitidentity_casts(ctx, l);
+                                lane_key(&l0) == lane_key(&ls)
+                                    || same_source_loads_symbolic(ctx, &l0, &ls)
+                            })
+                        };
+                        let (x_lanes, s_lanes) = if uniform_side(&mul_lhs_lanes) {
+                            (mul_rhs_lanes.clone(), mul_lhs_lanes.clone())
+                        } else if uniform_side(&mul_rhs_lanes) {
+                            (mul_lhs_lanes.clone(), mul_rhs_lanes.clone())
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+                        if !x_lanes.is_empty() {
+                            if let (Some(acc_p), Some(a_p), Some(b_p)) = (
+                                build_pack(
+                                    ctx,
+                                    &acc_lanes,
+                                    ty,
+                                    width,
+                                    fam,
+                                    packs,
+                                    dedup,
+                                    depth + 1,
+                                ),
+                                build_pack(ctx, &x_lanes, ty, width, fam, packs, dedup, depth + 1),
+                                build_pack(ctx, &s_lanes, ty, width, fam, packs, dedup, depth + 1),
+                            ) {
+                                // The splat side must actually BE a splat
+                                // (a gather would re-materialise the
+                                // uniform value per lane — the generic
+                                // path is then no worse).
+                                // The uniform side must actually BE a
+                                // broadcast-shaped leaf: a Splat, or a
+                                // FORWARD of an existing broadcast of
+                                // exactly this uniform source (the
+                                // cross-seed CSE). A gather re-materialises
+                                // the uniform value per lane (the generic
+                                // path is then no worse); a Forward of a
+                                // NON-broadcast vector (the (dx,dy)
+                                // difference) is not uniform and must
+                                // reject.
+                                let b_is_splat = match &packs[b_p].kind {
+                                    PackKind::Splat { .. } => true,
+                                    PackKind::Forward { val } => {
+                                        let s0 = strip_bitidentity_casts(ctx, &s_lanes[0]);
+                                        find_existing_broadcast(ctx, fam, &s0)
+                                            .is_some_and(|prev| prev == *val)
+                                    }
+                                    _ => false,
+                                };
+                                if b_is_splat {
+                                    let idx = packs.len();
+                                    packs.push(Pack {
+                                        kind: PackKind::Fma {
+                                            negate: op == IrBinOp::Sub,
+                                            acc: acc_p,
+                                            a: a_p,
+                                            b: b_p,
+                                        },
+                                        lane_vals: vals.clone(),
+                                        sched: usize::MAX,
+                                        order: 0,
+                                    });
+                                    dedup.insert(key, idx);
+                                    return Some(idx);
+                                }
+                            }
+                        }
+                    }
+                }
                 // 3a. Rotate decomposition (RotateLeft/RotateRight lanes
                 //     with a UNIFORM constant amount): the IR's own
                 //     documented definition
@@ -3505,6 +4099,11 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                     stack.push(lhs);
                     stack.push(rhs);
                 }
+                PackKind::Fma { acc, a, b, .. } => {
+                    stack.push(acc);
+                    stack.push(a);
+                    stack.push(b);
+                }
                 PackKind::ShiftImm { val, .. } => {
                     stack.push(val);
                 }
@@ -3541,6 +4140,11 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                     PackKind::BinOp { lhs, rhs, .. } => {
                         *lhs = remap[*lhs];
                         *rhs = remap[*rhs];
+                    }
+                    PackKind::Fma { acc, a, b, .. } => {
+                        *acc = remap[*acc];
+                        *a = remap[*a];
+                        *b = remap[*b];
                     }
                     PackKind::ShiftImm { val, .. } => {
                         *val = remap[*val];
@@ -3652,6 +4256,9 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 }
                 let inputs = match &other.kind {
                     PackKind::BinOp { lhs, rhs, .. } => Some(vec![*lhs, *rhs]),
+                    // An Fma consumes its accumulator and both
+                    // multiplicand packs.
+                    PackKind::Fma { acc, a, b, .. } => Some(vec![*acc, *a, *b]),
                     // A ShiftImm consumes its operand pack the same way a
                     // BinOp consumes its sides.
                     PackKind::ShiftImm { val, .. } => Some(vec![*val]),
@@ -3858,70 +4465,88 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                 }
             }
         }
-        // (c) No memory write strictly between the lane loads of a
-        // MemLoad pack: an interleaved write could change which lanes see
-        // old vs. new values. ESCAPE (rule (e)'s disjointness classes): a
-        // write whose bytes are PROVABLY disjoint from the loaded window
-        // [off0, off0 + width*size) cannot change any lane's observed
-        // value — the restrict contract / global / alloca object
-        // identity. Interleaved accumulations into other objects
-        // (`q[i] = a[i]; acc += other[i];`) are the unblocked shape.
-        // Same-stream writes get the exact byte-range test; anything not
-        // a plain Store (calls, atomics, asm, vector intrinsics) keeps
-        // the conservative rejection.
-        if let PackKind::MemLoad { ptrs, .. } = &p.kind {
+        // (c) No memory write strictly between a lane's load and the
+        // pack's vector load position that touches THAT LANE's bytes:
+        // the vector load re-reads every lane at M = max lane def, so a
+        // write in (P_k, M) overlapping lane k's byte range would change
+        // what lane k observes. PER-LANE precision (the v8 refinement):
+        // the original whole-window test [off0, off0+width·size)
+        // rejected a write touching ANY lane — even one whose load sits
+        // after the write (nothing observed changes for it) or whose
+        // own bytes the write misses. The per-lane byte ranges make
+        // interleaved SAME-OBJECT field traffic legal exactly when it
+        // is observationally inert.
+        // ESCAPES (the disjointness battery): same stream
+        // (base, var, mult) → exact byte ranges; same base and stride
+        // with a different index variable → the FIELD-DISJOINTNESS
+        // THEOREM (struct-field traffic across i/j indices); otherwise
+        // the restrict contract / global / alloca object identity.
+        // Anything not a plain Store (calls, atomics, asm, vector
+        // intrinsics) keeps the conservative rejection.
+        if let PackKind::MemLoad { ptrs, offs, .. } = &p.kind {
             let positions: Vec<usize> = p.lane_vals.iter().map(|v| ctx.def_pos[&v.0]).collect();
-            let lo = *positions.iter().min().unwrap();
             let hi = *positions.iter().max().unwrap();
             let lane_addr = eval_sym_addr(block, &ctx.def_pos, ptrs[0]);
-            let lane_hi = lane_addr
-                .as_ref()
-                .map(|la| la.off as i128 + width as i128 * fam.size as i128)
-                .unwrap_or(0);
-            for q in lo + 1..hi {
-                if !is_memory_write(&block.instructions[q]) || removed.contains(&q) {
-                    continue;
-                }
-                let (ptr, acc_size) = match &block.instructions[q] {
-                    Instruction::Store { ptr, ty, .. } => (*ptr, ty.size() as i128),
-                    _ => return None,
-                };
-                let disjoint_from_lanes =
-                    match (&lane_addr, eval_sym_addr(block, &ctx.def_pos, ptr)) {
+            for (li, &v) in p.lane_vals.iter().enumerate() {
+                let pk = positions[li];
+                let lane_off = offs[li];
+                for q in pk + 1..hi {
+                    if !is_memory_write(&block.instructions[q]) || removed.contains(&q) {
+                        continue;
+                    }
+                    let (ptr, acc_size) = match &block.instructions[q] {
+                        Instruction::Store { ptr, ty, .. } => (*ptr, ty.size() as i128),
+                        _ => return None,
+                    };
+                    let touches_lane = match (&lane_addr, eval_sym_addr(block, &ctx.def_pos, ptr)) {
                         (Some(la), Some(wa))
                             if la.base == wa.base && la.var == wa.var && la.mult == wa.mult =>
                         {
-                            wa.off as i128 >= lane_hi || la.off as i128 >= wa.off as i128 + acc_size
+                            byte_ranges_overlap(lane_off, fam.size as i64, wa.off, acc_size as i64)
                         }
-                        (Some(la), Some(wa)) => bases.disjoint(la.base.0, wa.base.0),
-                        _ => false,
+                        (Some(la), Some(wa)) if la.base == wa.base && la.mult == wa.mult => {
+                            !field_disjoint(
+                                la.mult,
+                                lane_off,
+                                fam.size as i64,
+                                wa.off,
+                                acc_size as i64,
+                            )
+                        }
+                        (Some(la), Some(wa)) => !bases.disjoint(la.base.0, wa.base.0),
+                        _ => true,
                     };
-                if !disjoint_from_lanes {
-                    return None;
+                    if touches_lane {
+                        return None;
+                    }
                 }
             }
         }
     }
-    // (d) No memory access strictly between the seed stores other than
-    // the removed lanes themselves: the vector store commits all lanes at
-    // m_max, so an interleaved reader could observe a different
-    // half-stored state. ESCAPE (rule (e)'s disjointness classes): a
-    // scalar load/store whose bytes are PROVABLY disjoint from the seed
-    // window [off0, off0 + width*size) cannot observe or modify the seed
-    // bytes, so the batched commit is unobservable to it — the common
-    // `pos[i] = x; total += other[i]; pos[i+1] = y;` shapes stay
-    // vectorizable (GCC and Clang apply the same restrict/object-identity
-    // reasoning). Same-stream accesses get the exact byte-range test;
-    // foreign streams need the restrict/global/alloca disjointness proof;
-    // everything unanalyzable (calls, atomics, asm, vector intrinsics,
-    // opaque pointers) keeps the conservative rejection.
+    // (d) No memory access between a lane's OWN seed store and the batched
+    // vector-store commit that touches THAT LANE's bytes. The vector store
+    // commits every lane at m_max, so for lane k (scalar store at s_k):
+    //   * a READ at q with s_k < q < m_max originally observed lane k's
+    //     POST-store value but reads the PRE-commit value after the
+    //     rewrite — miscompile;
+    //   * a WRITE at q with s_k < q < m_max originally had its effect
+    //     overwritten by nothing (s_k already committed) — the scalar
+    //     final state is the write's value — but the rewrite's commit at
+    //     m_max clobbers it — miscompile;
+    //   * any access at q ≤ s_k is inert for lane k (reads see the same
+    //     pre-store bytes; writes are overwritten by s_k's own commit
+    //     either way).
+    // PER-LANE precision (the v8 refinement of the original whole-window
+    // test): only accesses after that lane's own store, overlapping that
+    // lane's byte range, reject. ESCAPES (the disjointness battery):
+    // same stream → exact byte ranges; same base and stride with a
+    // different index variable → the FIELD-DISJOINTNESS THEOREM;
+    // otherwise restrict/global/alloca object identity. Everything
+    // unanalyzable (calls, atomics, asm, vector intrinsics, opaque
+    // pointers) keeps the conservative rejection.
     let m_min = *cand.store_idx.iter().min().unwrap();
     let m_max = *cand.store_idx.iter().max().unwrap();
     let seed_addr = eval_sym_addr(block, &ctx.def_pos, cand.anchor_ptr);
-    let seed_hi = seed_addr
-        .as_ref()
-        .map(|sa| sa.off as i128 + width as i128 * fam.size as i128)
-        .unwrap_or(0);
     for q in m_min + 1..m_max {
         if removed.contains(&q) {
             continue;
@@ -3936,18 +4561,30 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             }
             _ => return None,
         };
-        let disjoint_from_seed = match (&seed_addr, eval_sym_addr(block, &ctx.def_pos, ptr)) {
-            (Some(sa), Some(aa))
-                if sa.base == aa.base && sa.var == aa.var && sa.mult == aa.mult =>
-            {
-                // Same stream: exact byte-range overlap.
-                aa.off as i128 >= seed_hi || sa.off as i128 >= aa.off as i128 + acc_size
+        let access_addr = eval_sym_addr(block, &ctx.def_pos, ptr);
+        for (li, &s_k) in cand.store_idx.iter().enumerate() {
+            if s_k >= q {
+                continue; // lane k's store has not committed yet at q
             }
-            (Some(sa), Some(aa)) => bases.disjoint(sa.base.0, aa.base.0),
-            _ => false,
-        };
-        if !disjoint_from_seed {
-            return None;
+            let lane_off = seed_addr
+                .as_ref()
+                .map(|sa| sa.off + li as i64 * fam.size as i64)
+                .unwrap_or(0);
+            let touches_lane = match (&seed_addr, &access_addr) {
+                (Some(sa), Some(aa))
+                    if sa.base == aa.base && sa.var == aa.var && sa.mult == aa.mult =>
+                {
+                    byte_ranges_overlap(lane_off, fam.size as i64, aa.off, acc_size as i64)
+                }
+                (Some(sa), Some(aa)) if sa.base == aa.base && sa.mult == aa.mult => {
+                    !field_disjoint(sa.mult, lane_off, fam.size as i64, aa.off, acc_size as i64)
+                }
+                (Some(sa), Some(aa)) => !bases.disjoint(sa.base.0, aa.base.0),
+                _ => true,
+            };
+            if touches_lane {
+                return None;
+            }
         }
     }
 
@@ -3989,6 +4626,25 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
                             let store_off = sa.off as i128 + si as i128 * fam.size as i128;
                             let lane_off = offs[li] as i128;
                             (store_off - lane_off).abs() < fam.size as i128
+                        }
+                        // FIELD-DISJOINTNESS THEOREM: same base and byte
+                        // stride with a DIFFERENT index variable — the
+                        // store's element window vs the lane's window can
+                        // never overlap for ANY index values (the struct-
+                        // field traffic the whole-window test had to
+                        // reject because the streams carry different
+                        // vars).
+                        (Some(sa), Some((lb_base, _, lb_mult)))
+                            if sa.base == *lb_base && sa.mult == *lb_mult =>
+                        {
+                            let store_off = sa.off + si as i64 * fam.size as i64;
+                            !field_disjoint(
+                                sa.mult,
+                                store_off,
+                                fam.size as i64,
+                                offs[li],
+                                fam.size as i64,
+                            )
                         }
                         // Restrict escape (C11 6.7.3.1): distinct bases
                         // where one carries `restrict` and the other is
@@ -4040,6 +4696,18 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
         match &p.kind {
             PackKind::MemLoad { .. } | PackKind::BinOp { .. } => {
                 benefit += width as i64 - 1;
+            }
+            // A forwarded vector replaces W scalar operand lanes with
+            // ZERO new instructions — the full scalar-op saving with no
+            // vector-op cost (the vector already exists).
+            PackKind::Forward { .. } => {
+                benefit += width as i64;
+            }
+            // The FMA contraction replaces W muls AND W adds/subs with ONE
+            // packed op — the same 2(W−1) the Mul+Add pair would count —
+            // and removes the rounding drift besides.
+            PackKind::Fma { .. } => {
+                benefit += 2 * (width as i64 - 1);
             }
             PackKind::Splat { src, is_zero } => {
                 // An integer all-ones splat is ONE instruction
@@ -4104,6 +4772,11 @@ fn topo_depth(packs: &[Pack], idx: usize) -> usize {
         PackKind::BinOp { lhs, rhs, .. } => {
             1 + topo_depth(packs, *lhs).max(topo_depth(packs, *rhs))
         }
+        PackKind::Fma { acc, a, b, .. } => {
+            1 + topo_depth(packs, *acc)
+                .max(topo_depth(packs, *a))
+                .max(topo_depth(packs, *b))
+        }
         PackKind::ShiftImm { val, .. } => 1 + topo_depth(packs, *val),
         PackKind::FpNeg { val, .. } => 1 + topo_depth(packs, *val),
         PackKind::CmpBlendv {
@@ -4158,6 +4831,15 @@ fn apply_plan(
         extract_dest.insert(vid, Value(func.next_value_id));
         func.next_value_id += 1;
     }
+    // FORWARD packs emit no instruction: their vector result IS the
+    // forwarded value (the pre-wasted fresh id above is simply unused).
+    // Overriding `vec_dest` here makes every consumer's
+    // `Operand::Value(vec_dest[idx])` reference the existing vector.
+    for (pi, p) in plan.packs.iter().enumerate() {
+        if let PackKind::Forward { val } = &p.kind {
+            vec_dest[pi] = *val;
+        }
+    }
 
     // Insertion batches: (position, order, instruction). Sorted by
     // (position, order); dependencies land first within a slot.
@@ -4165,6 +4847,27 @@ fn apply_plan(
     for (pi, p) in plan.packs.iter().enumerate() {
         let dest = vec_dest[pi];
         let inst = match &p.kind {
+            // No instruction: the pack's vector IS the forwarded value.
+            // (No extracts ride with it either — `lane_vals` is empty.)
+            PackKind::Forward { .. } => continue,
+            PackKind::Fma { negate, acc, a, b } => Instruction::Intrinsic {
+                dest: Some(dest),
+                op: match (negate, cand.ty) {
+                    (false, IrType::F64) => IntrinsicOp::VecFmaF64x2,
+                    (true, IrType::F64) => IntrinsicOp::VecFnmaF64x2,
+                    (false, IrType::F32) => IntrinsicOp::VecFmaF32x4,
+                    (true, IrType::F32) => IntrinsicOp::VecFnmaF32x4,
+                    // The pack builder only creates Fma packs for F64/F32
+                    // lanes (the contraction's type gate).
+                    _ => unreachable!("Fma pack with non-FP lane type"),
+                },
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(vec_dest[*a]),
+                    Operand::Value(vec_dest[*b]),
+                    Operand::Value(vec_dest[*acc]),
+                ],
+            },
             PackKind::MemLoad { ptrs, .. } => Instruction::Intrinsic {
                 dest: Some(dest),
                 op: fam.load,
@@ -4395,6 +5098,16 @@ fn apply_plan(
             .iter()
             .map(|p| match &p.kind {
                 PackKind::MemLoad { .. } => "MemLoad".into(),
+                PackKind::Forward { val } => format!("Forward(v{})", val.0),
+                PackKind::Fma { negate, acc, a, b } => {
+                    format!(
+                        "Fma({} acc{} a{} b{})",
+                        if *negate { "-" } else { "+" },
+                        acc,
+                        a,
+                        b
+                    )
+                }
                 PackKind::BinOp { op, lhs, rhs, .. } => {
                     format!("BinOp({:?} l{} r{})", op, lhs, rhs)
                 }

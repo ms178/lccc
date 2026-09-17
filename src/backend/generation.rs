@@ -2922,7 +2922,8 @@ fn detect_gap_fma_fusions(
     accumulator_dests: &FxHashSet<u32>,
     fp_contract: crate::common::fp_contract::FpContract,
     fp_tags: &crate::common::fp_contract::FpExprTags,
-) -> Vec<(usize, usize)> {
+    fuse_float_sub: bool,
+) -> Vec<(usize, usize, IrBinOp)> {
     let mut out = Vec::new();
     if !fuse_float || env_flag_set("CCC_NO_GAP_FMA") {
         return out;
@@ -2957,23 +2958,69 @@ fn detect_gap_fma_fusions(
         let mut found = None;
         for j in (idx + 1)..block.instructions.len() {
             match &block.instructions[j] {
-                Instruction::Load { .. } | Instruction::GetElementPtr { .. } if gap_len < 2 => {
+                // The gap may carry the full ADDRESS COMPUTATION chain —
+                // Cast/Shl/Add integer math for the index, GEP, the
+                // accumulator Load (the `p[i].vx -= t * mag` shapes where
+                // expr_sink lifted the multiply above the address chain).
+                // Every gap instruction must be SIDE-EFFECT-FREE for the
+                // registers its dest may claim; the call-site clash
+                // analysis rejects any gap dest whose physical register
+                // or stack slot aliases a mul operand's (the deferred
+                // emission re-reads the operands after the gap ran).
+                // Bound the window so pathological blocks stay fast.
+                Instruction::Load { .. }
+                | Instruction::GetElementPtr { .. }
+                | Instruction::Cast { .. }
+                | Instruction::Copy { .. }
+                | Instruction::GlobalAddr { .. }
+                    if gap_len < 8 =>
+                {
+                    gap_len += 1;
+                }
+                Instruction::BinOp {
+                    op:
+                        IrBinOp::Shl
+                        | IrBinOp::LShr
+                        | IrBinOp::AShr
+                        | IrBinOp::Add
+                        | IrBinOp::Sub
+                        | IrBinOp::Mul
+                        | IrBinOp::And
+                        | IrBinOp::Or
+                        | IrBinOp::Xor,
+                    ty: gty,
+                    ..
+                } if gap_len < 8 && !gty.is_float() => {
+                    // Integer-only: an FP Add/Sub is the PARTNER, never a
+                    // gap filler (match arms are ordered — this arm would
+                    // otherwise swallow the fusion partner itself).
                     gap_len += 1;
                 }
                 Instruction::BinOp {
                     dest: add_dest,
-                    op: IrBinOp::Add,
+                    op: partner_op @ (IrBinOp::Add | IrBinOp::Sub),
                     lhs,
                     rhs,
                     ty: add_ty,
                 } if gap_len > 0 => {
                     let mul_used = matches!(lhs, Operand::Value(v) if v.0 == mul_dest.0)
                         || matches!(rhs, Operand::Value(v) if v.0 == mul_dest.0);
+                    // Float Sub fusion mirrors the adjacent detector's
+                    // policy: only under the fmsub contract, never into a
+                    // loop-carried accumulator (the serial-chain latency
+                    // discipline). The `acc - product` spelling (mul on the
+                    // rhs) and `product - acc` (mul on the lhs) both fuse —
+                    // vfnmadd/vfmsub respectively, matching GCC
+                    // -ffp-contract=fast on the load-gap shapes
+                    // (`p[i].vx -= t * mag` with the accumulator loaded
+                    // between the multiply and the subtract).
+                    let sub_ok = *partner_op == IrBinOp::Add || fuse_float_sub;
                     // Accumulator gate mirrors the fmsub/fmadd policy: fusing
                     // into a loop-carried accumulator lengthens the serial
                     // dependency chain.
                     if mul_used
                         && add_ty == mul_ty
+                        && sub_ok
                         && !accumulator_dests.contains(&add_dest.0)
                         && (fp_int.like(mul_ty)
                             || fp_contract.fuse_pair(
@@ -2981,15 +3028,15 @@ fn detect_gap_fma_fusions(
                                 fp_tags.get(&add_dest.0).copied(),
                             ))
                     {
-                        found = Some(j);
+                        found = Some((j, *partner_op));
                     }
                     break;
                 }
                 _ => break,
             }
         }
-        if let Some(add_idx) = found {
-            out.push((idx, add_idx));
+        if let Some((add_idx, partner_op)) = found {
+            out.push((idx, add_idx, partner_op));
         }
     }
     out
@@ -4403,14 +4450,15 @@ fn generate_function(
         // the gap into the slot of a value whose IR liveness ended at the
         // Mul (his check missed this class entirely).
         let mut gap_mul_skips: FxHashSet<usize> = FxHashSet::default();
-        let mut gap_add_fusions: FxHashMap<usize, usize> = FxHashMap::default();
-        for &(mul_idx, add_idx) in &detect_gap_fma_fusions(
+        let mut gap_add_fusions: FxHashMap<usize, (usize, IrBinOp)> = FxHashMap::default();
+        for &(mul_idx, add_idx, partner_op) in &detect_gap_fma_fusions(
             block,
             &value_use_counts,
             cg.supports_fused_float_mul_add(),
             &accumulator_dests,
             cg.fp_contract(),
             &func.fp_expr_tags,
+            cg.supports_fused_float_mul_sub() && !env_flag_set("CCC_NO_FMSUB"),
         ) {
             let Instruction::BinOp {
                 lhs: mul_lhs,
@@ -4425,6 +4473,10 @@ fn generate_function(
                 let gap_dest = match &block.instructions[g] {
                     Instruction::Load { dest, .. } => Some(*dest),
                     Instruction::GetElementPtr { dest, .. } => Some(*dest),
+                    Instruction::Cast { dest, .. } => Some(*dest),
+                    Instruction::Copy { dest, .. } => Some(*dest),
+                    Instruction::GlobalAddr { dest, .. } => Some(*dest),
+                    Instruction::BinOp { dest, .. } => Some(*dest),
                     _ => None,
                 };
                 let Some(gd) = gap_dest else { continue };
@@ -4450,7 +4502,7 @@ fn generate_function(
             }
             if !clash {
                 gap_mul_skips.insert(mul_idx);
-                gap_add_fusions.insert(add_idx, mul_idx);
+                gap_add_fusions.insert(add_idx, (mul_idx, partner_op));
             }
         }
         let cmp_select_fusions =
@@ -4553,7 +4605,7 @@ fn generate_function(
                 cg.state().current_program_point += 1;
                 continue;
             }
-            if let Some(&mul_idx) = gap_add_fusions.get(&idx) {
+            if let Some(&(mul_idx, partner_op)) = gap_add_fusions.get(&idx) {
                 if let (
                     Instruction::BinOp {
                         dest: mul_dest,
@@ -4573,7 +4625,25 @@ fn generate_function(
                     let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
                     let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
                     cg.flush_machinst();
-                    cg.emit_fused_mul_add(mul_dest, mul_lhs, mul_rhs, acc_op, add_dest, *mul_ty);
+                    match partner_op {
+                        IrBinOp::Add => {
+                            cg.emit_fused_mul_add(
+                                mul_dest, mul_lhs, mul_rhs, acc_op, add_dest, *mul_ty,
+                            );
+                        }
+                        IrBinOp::Sub => {
+                            // The gap detector only records float Subs
+                            // when the backend advertised
+                            // supports_fused_float_mul_sub and the
+                            // accumulator gate passed. mul_is_lhs selects
+                            // fmsub (product - acc) vs fnmadd
+                            // (acc - product).
+                            cg.emit_fused_mul_sub(
+                                mul_dest, mul_lhs, mul_rhs, acc_op, add_dest, *mul_ty, mul_is_lhs,
+                            );
+                        }
+                        _ => unreachable!("gap fusion partner must be Add or Sub"),
+                    }
                     cg.state().current_program_point += 1;
                     continue;
                 }

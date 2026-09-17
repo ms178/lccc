@@ -294,6 +294,17 @@ gate "bb-slp-v6" fast \
 gate "bb-slp-v7" fast \
     bash tests/regression/check_bb_slp_v7_codegen.sh
 
+# BB-SLP v8: struct-field stream composition (the a[i].f1/f2 unlock),
+# the field-disjointness theorem (same-base/same-stride different-index
+# streams), per-lane rules (c)/(d), the same-source splat (per-component
+# field re-loads), Forward packs (chained seeds reusing one vector), the
+# packed FMA contraction (rounding parity with the scalar gap-fused
+# detector), and the scalar gap-FMA Sub extension — tri-config
+# differential (SLP on / CCC_NO_BB_SLP=1 / gcc) plus the SSE2-baseline
+# fail-closed run are part of the gate.
+gate "bb-slp-v8" fast \
+    bash tests/regression/check_bb_slp_v8_codegen.sh
+
 # Adler-32 loop epic: the rolling-checksum reassociation (vpsadbw +
 # vpmaddubsw weights + vpmaddwd, exact mod 2^32) that GCC/Clang/ICX all
 # leave scalar — tri-config differential (epic on / -mno-avx2 / gcc) plus

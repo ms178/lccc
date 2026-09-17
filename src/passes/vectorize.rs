@@ -196,6 +196,12 @@ fn x86_fma_enabled() -> bool {
     X86_FMA_AVAILABLE.with(|f| f.get())
 }
 
+/// Read-only access for sibling passes (BB-SLP's packed FMA contraction
+/// gates on the same FMA3 ISA permission the loop vectorizer uses).
+pub(crate) fn x86_fma_available_pub() -> bool {
+    x86_fma_enabled()
+}
+
 /// Record whether the exact AVX2 + SSE4.1 profile required by the strict
 /// computed-reciprocal lowering is active.  Called once per translation unit
 /// alongside set_x86_fma_enabled so a previous compile on the same worker
