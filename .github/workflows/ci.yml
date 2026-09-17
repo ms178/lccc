@@ -274,6 +274,15 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_bb_slp_v7_codegen.sh
 
+      # BB-SLP v8: struct-field stream composition, field-disjointness
+      # theorem, same-source splats, Forward packs, packed FMA
+      # contraction (rounding parity), gap-FMA Sub extension — tri-config
+      # differential plus the SSE2-baseline fail-closed run.
+      - name: Verify basic-block SLP v8 contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_bb_slp_v8_codegen.sh
+
       # Adler-32 loop epic: the rolling-checksum reassociation
       # (vpsadbw + vpmaddubsw weights + vpmaddwd, exact mod 2^32) that
       # GCC/Clang/ICX all leave scalar, plus the counting-epic

@@ -6040,6 +6040,10 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecBlendvF32x4
             | O::VecBlendvF64x4
             | O::VecBlendvF64x2
+            | O::VecFmaF64x2
+            | O::VecFnmaF64x2
+            | O::VecFmaF32x4
+            | O::VecFnmaF32x4
             | O::VecBlendvI32x8
             | O::VecBlendvI32x4
             | O::VecBlendvI8x32
@@ -6183,6 +6187,10 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecLoadF32x8
                 | O::VecAddF64x2
                 | O::VecAddF64x4
+                | O::VecFmaF64x2
+                | O::VecFnmaF64x2
+                | O::VecFmaF32x4
+                | O::VecFnmaF32x4
                 | O::VecAddI32x4
                 | O::VecAddI32x8
                 | O::VecAddI8x32
@@ -6563,6 +6571,10 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecSubF64x2
             | O::VecMulF64x2
             | O::VecDivF64x2
+            | O::VecFmaF64x2
+            | O::VecFnmaF64x2
+            | O::VecFmaF32x4
+            | O::VecFnmaF32x4
             | O::VecXorF64x2
             | O::VecMinF64x2
             | O::VecMaxF64x2
@@ -7249,8 +7261,18 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecAddF64x4
             | O::VecMulF64x4
             | O::VecFmaF64x4 => Some(2),
-            O::VecZeroF32x4 | O::VecLoadF32x4 | O::VecAddF32x4 | O::VecMulF32x4 => Some(3),
-            O::VecZeroF64x2 | O::VecLoadF64x2 | O::VecAddF64x2 | O::VecMulF64x2 => Some(4),
+            O::VecZeroF32x4
+            | O::VecLoadF32x4
+            | O::VecAddF32x4
+            | O::VecMulF32x4
+            | O::VecFmaF32x4
+            | O::VecFnmaF32x4 => Some(3),
+            O::VecZeroF64x2
+            | O::VecLoadF64x2
+            | O::VecAddF64x2
+            | O::VecMulF64x2
+            | O::VecFmaF64x2
+            | O::VecFnmaF64x2 => Some(4),
             O::VecZeroI32x8 | O::VecLoadI32x8 | O::VecAddI32x8 | O::VecMulI32x8 => Some(5),
             // BB-SLP 256-bit dword shifts: class 5 (I32x8 family; the
             // home-aware immediate-shift emitter reads/writes the YMM
@@ -7353,6 +7375,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             3 => matches!(
                 op,
                 O::VecAddF32x4 | O::VecMulF32x4 | O::VecHorizontalAddF32x4
+                    | O::VecFmaF32x4
+                    | O::VecFnmaF32x4
                     // BB-SLP lane extract (128-bit F32): reads the XMM
                     // home; scratch confined to xmm1.
                     | O::VecExtractLaneF32x4
@@ -7360,6 +7384,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             4 => matches!(
                 op,
                 O::VecAddF64x2 | O::VecMulF64x2 | O::VecHorizontalAddF64x2
+                    | O::VecFmaF64x2
+                    | O::VecFnmaF64x2
                     // BB-SLP sinks: the 128-bit store reads a homed source
                     // directly (vec_store_source_128); the lane extract
                     // stages through xmm1 only (sse_load_arg discipline).
@@ -7944,6 +7970,8 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecBlendvF64x2
                     | O::VecMinF64x2
                     | O::VecMaxF64x2
+                    | O::VecFmaF64x2
+                    | O::VecFnmaF64x2
             ),
             6 => matches!(
                 op,
@@ -8116,7 +8144,9 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecMinF64x2
             | O::VecMaxF64x2
             | O::VecAddF64x2
-            | O::VecMulF64x2 => Some(5),
+            | O::VecMulF64x2
+            | O::VecFmaF64x2
+            | O::VecFnmaF64x2 => Some(5),
             // Integer map intermediates (class numbering mirrors the
             // broadcast collector): dword lanes, AVX2 8-wide and SSE2
             // 4-wide. Conditional-map results (compare masks, blends)
@@ -8309,6 +8339,8 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAddF64x2
                     | O::VecMulF64x2
                     | O::VecXorF64x2
+                    | O::VecFmaF64x2
+                    | O::VecFnmaF64x2
             ),
             3 => matches!(
                 op,

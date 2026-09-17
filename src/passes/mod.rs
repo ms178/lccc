@@ -1658,7 +1658,9 @@ pub(crate) fn run_passes(
             {
                 let n = timed_pass!(
                     "slp",
-                    run_on_visited(module, &dirty, &mut changed, slp_vectorizer::run_bb_slp)
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        slp_vectorizer::run_bb_slp_with_contract(f, fp_contract)
+                    })
                 );
                 total_changes += n;
                 total_changes_excl_dce += n;
@@ -1773,7 +1775,9 @@ pub(crate) fn run_passes(
             {
                 let n = timed_pass!(
                     "slp_late",
-                    run_on_visited(module, &dirty, &mut changed, slp_vectorizer::run_bb_slp)
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        slp_vectorizer::run_bb_slp_with_contract(f, fp_contract)
+                    })
                 );
                 total_changes += n;
                 total_changes_excl_dce += n;

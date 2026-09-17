@@ -287,6 +287,19 @@ pub enum IntrinsicOp {
     VecFmaF64x4,
     /// Contract-legal affine map: input * scale + bias, AVX 4×F64.
     VecMaddF64x4,
+    /// Packed FMA contraction (BB-SLP): args = [a, b, acc] → acc + a·b,
+    /// SSE2-register-width 2×F64 (vfmadd231pd under FMA3). Rounding parity
+    /// with the scalar fused-mul-add path (single rounding of a·b + acc).
+    VecFmaF64x2,
+    /// Packed FMS contraction (BB-SLP): args = [a, b, acc] → acc − a·b,
+    /// 2×F64 (vfnmadd231pd). Same single-rounding contract.
+    VecFnmaF64x2,
+    /// Packed FMA contraction (BB-SLP): args = [a, b, acc] → acc + a·b,
+    /// 4×F32 (vfmadd231ps).
+    VecFmaF32x4,
+    /// Packed FMS contraction (BB-SLP): args = [a, b, acc] → acc − a·b,
+    /// 4×F32 (vfnmadd231ps).
+    VecFnmaF32x4,
     /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 8×I32
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecAddI32x8,
@@ -1719,6 +1732,7 @@ impl IntrinsicOp {
             | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4 | VecXorF32x4
             | VecMinF32x4 | VecMaxF32x4 | VecCmpF32x4 | VecBlendvF32x4
             | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
+            | VecFmaF64x2 | VecFnmaF64x2 | VecFmaF32x4 | VecFnmaF32x4
             | VecCmpI32x4 | VecBlendvI32x4
             | VecAddI8x16 | VecSubI8x16 | VecCmpI8x16
             | VecMinU8x16 | VecMaxU8x16 | VecBlendvI8x16
@@ -1953,6 +1967,10 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadF32x4
                 | IntrinsicOp::VecAddF64x4
                 | IntrinsicOp::VecAddF64x2
+                | IntrinsicOp::VecFmaF64x2
+                | IntrinsicOp::VecFnmaF64x2
+                | IntrinsicOp::VecFmaF32x4
+                | IntrinsicOp::VecFnmaF32x4
                 | IntrinsicOp::VecAddI32x8
                 | IntrinsicOp::VecMaxI32x8
                 | IntrinsicOp::VecMinI32x8
@@ -2359,6 +2377,10 @@ mod vector_result_width_tests {
             "VecLoadWidenI32ToI64x2" => IntrinsicOp::VecLoadWidenI32ToI64x2,
             "VecMaddF32x8" => IntrinsicOp::VecMaddF32x8,
             "VecMaddF64x4" => IntrinsicOp::VecMaddF64x4,
+            "VecFmaF64x2" => IntrinsicOp::VecFmaF64x2,
+            "VecFnmaF64x2" => IntrinsicOp::VecFnmaF64x2,
+            "VecFmaF32x4" => IntrinsicOp::VecFmaF32x4,
+            "VecFnmaF32x4" => IntrinsicOp::VecFnmaF32x4,
             "VecMaskedAddI32x8" => IntrinsicOp::VecMaskedAddI32x8,
             "VecMaxF32x4" => IntrinsicOp::VecMaxF32x4,
             "VecMaxF32x8" => IntrinsicOp::VecMaxF32x8,

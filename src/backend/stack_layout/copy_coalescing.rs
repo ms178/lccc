@@ -1763,6 +1763,10 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecFmaF32x8
             | O::VecAddF64x2
             | O::VecMulF64x2
+            | O::VecFmaF64x2
+            | O::VecFnmaF64x2
+            | O::VecFmaF32x4
+            | O::VecFnmaF32x4
             | O::VecAddI32x4
             | O::VecAddF32x4
             | O::VecMulF32x4
@@ -2394,6 +2398,19 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
 /// operand resolver in the backend must be memfold-aware" -- an unbounded
 /// proof obligation that has now failed twice -- into "these consumers are
 /// audited", which is checkable and stays checkable as emitters are added.
+/// The 128-bit packed FMA/FMS consumers (BB-SLP contraction): the
+/// ACCUMULATOR position (args[2]) folds as the 132-form memory operand
+/// (`v{f,n}madd132{ps,pd} %b, MEM_acc, %a_dst`). The multiplicand
+/// positions never fold — the emitter's 132 form puts memory in the
+/// addend slot only.
+pub(crate) fn memfold_consumer_fma_128(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecFmaF64x2 | O::VecFnmaF64x2 | O::VecFmaF32x4 | O::VecFnmaF32x4
+    )
+}
+
 pub(super) fn compute_vector_memfold_homed_ok(func: &IrFunction) -> FxHashSet<u32> {
     let mut ok = FxHashSet::default();
     if env_flag("CCC_NO_VLFOLD") {
@@ -2415,7 +2432,10 @@ pub(super) fn compute_vector_memfold_homed_ok(func: &IrFunction) -> FxHashSet<u3
             // are excluded on purpose (see the doc comment). The immediate
             // SHIFT families are NOT admitted: their VEX encodings are
             // register-only (see memfold_consumer_unary_imm_NEVER).
-            if memfold_consumer_256(op).is_none() && memfold_consumer_128(op).is_none() {
+            if memfold_consumer_256(op).is_none()
+                && memfold_consumer_128(op).is_none()
+                && !memfold_consumer_fma_128(op)
+            {
                 continue;
             }
             for a in args {
@@ -2513,11 +2533,27 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
             // (Immediate-shift consumers are NOT foldable — the VEX forms
             // are register-only; see memfold_consumer_unary_imm_NEVER.)
             let madd = memfold_consumer_madd_256(cop);
+            // The 128-bit packed FMA/FMS consumers: [a, b, acc] — only the
+            // ACC folds (the 132 form's addend slot). Modelled as the
+            // non-commutative second position: a1 = acc (folds), a0 = b
+            // (the `eligible(d, false)` commutativity gate keeps it
+            // unfoldable). The multiplicand `a` is not offered at all.
+            let fma128 = memfold_consumer_fma_128(cop);
             // Binary consumers: the 256-bit table (emit_avx_binary_256) or
             // the 128-bit table (emit_sse_binary_128's VEX path). A given
             // opcode belongs to exactly one family, so the lookups cannot
             // disagree. `wide` carries the width to the load matcher.
-            let (commutative, wide, a0, a1) = if madd {
+            let (commutative, wide, a0, a1) = if fma128 {
+                if cargs.len() != 3 {
+                    continue;
+                }
+                let (Operand::Value(_a), Operand::Value(b), Operand::Value(acc)) =
+                    (&cargs[0], &cargs[1], &cargs[2])
+                else {
+                    continue;
+                };
+                (false, false, b, acc)
+            } else if madd {
                 if cargs.len() != 3 {
                     continue;
                 }
