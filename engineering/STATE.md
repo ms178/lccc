@@ -94,3 +94,30 @@ the range fusion; it used to be a scalar loop.
 2. **LZ4 Match Loop & Store Forwarding:** LZ4 compression loop needs better unaligned word load forwarding and fast hash table index registers.
 3. **Loop Rotation Default-Enable (PF-17):** Hardening remaining 15 edge-case loop shapes to enable loop rotation by default (eliminating the extra entry jump in hot loops).
 4. **MachInst Instruction Selection Coverage Expansion:** Expand MachInst window allocator to 95%+ of instruction forms.
+
+## Kernel-mode status (linux-cachymod-6.18.52, lccc + lccc-ld only)
+
+- **M1 vmlinux link PASS** — 21.5 MB vmlinux, pure lccc-ld, 0 dynamic
+  relocations, vdso phdr parity with GNU (regression
+  `script_vdso_declared_note_phdrs`).
+- **M2 bzImage PASS** — `m16` boot pipeline, i386 real-mode setup,
+  zstd compressed image (5.0 MB), reproducible sha256.
+- **M3 boot** — kernel boots to `run_init_process` with zero phantom
+  NULs in the serial log (MachInst sub-word arriving-reload fix,
+  `arriving_reload()` in `machinst_alloc.rs`, regression
+  `machinst_subword_reload_sign.c`).
+- **Defect (d) ROOT-CAUSED + FIXED (2026-09-17)** — every execve failed
+  with -E2BIG because `pte_mkwrite` (by-value pte_t + inlined helper
+  chain) returned leftover stack as the PTE: aggregate_sroa's
+  copy-buffer collapse deleted the initializing Memcpy of a buffer a
+  forwarded load had just been re-pointed at (`forward_target_roots`
+  guard; regression `sroa_fwd_load_vs_buffer_collapse.c`). Kernel
+  rebuild/boot validation of the fix still pending.
+- **Defect (e) OPEN** — lccc integrated assembler rejects a valid
+  `vaesenc` operand form in `aes-ctr-avx-x86_64.S` (module-only;
+  bzImage unaffected).
+- **Defect (b) OPEN** — CPU1 hotplug bring-up times out (`maxcpus=1`
+  boots fine).
+- Kernel harness scripts (`build_kernel_vm.sh`, `prepare_kernel_tree.sh`
+  with whole-tree extraction audit, `qemu_boot_test.sh`) are unreviewed
+  deltas in the session patch, not upstream.

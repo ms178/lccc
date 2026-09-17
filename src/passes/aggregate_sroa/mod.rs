@@ -432,6 +432,18 @@ fn run_function(func: &mut IrFunction) -> usize {
         }
     }
     let mut forwarded_from: FxHashMap<u32, u32> = FxHashMap::default();
+    // Roots that Transform 1's plan will make a forwarded LOAD read. The
+    // plan inserts a new GEP rooted at the writer's `src`; after the rewrite
+    // that root is load-reachable, so its own initializing memcpy must
+    // survive. Both the dead-writer removal below and the copy-buffer
+    // collapse after it key on the PRE-plan instruction stream and would
+    // otherwise see the root as memcpy-only and delete its writer, leaving
+    // the forwarded load reading an uninitialized slot (observed:
+    // linux-6.18 pte_mkwrite returned leftover stack as the PTE because
+    // `Memcpy V67 <- V0` (an inlined by-value pte_t argument bridge) was
+    // collapsed away after another load had just been forwarded onto V67).
+    let mut forward_target_roots: crate::common::fx_hash::FxHashSet<u32> =
+        crate::common::fx_hash::FxHashSet::default();
     {
         for (bi, block) in func.blocks.iter().enumerate() {
             for (ii, inst) in block.instructions.iter().enumerate() {
@@ -519,6 +531,8 @@ fn run_function(func: &mut IrFunction) -> usize {
                         let d = next;
                         next += 1;
                         plan.load_ptr.push((bi, ii, d));
+                        let (fwd_root, _) = resolve(&s.gep, src);
+                        forward_target_roots.insert(fwd_root);
                         plan.insert.push(Insert {
                             block: bi,
                             at: ii,
@@ -544,6 +558,12 @@ fn run_function(func: &mut IrFunction) -> usize {
                 continue;
             }
             if store_target.contains(&r) || any_escape(&s.escapes, &s.gep, r) {
+                continue;
+            }
+            // A forwarded load from another buffer was just re-pointed at
+            // this buffer's content (its writer's src): removing THIS writer
+            // would strand that load on an uninitialized slot.
+            if forward_target_roots.contains(&r) {
                 continue;
             }
             let n_loads = loads_from.get(&r).copied().unwrap_or(0);
@@ -572,6 +592,14 @@ fn run_function(func: &mut IrFunction) -> usize {
                 continue;
             }
             if store_target.contains(&r) || any_escape(&s.escapes, &s.gep, r) {
+                continue;
+            }
+            // pointer_uses() sees the PRE-plan stream: uses Transform 1 is
+            // about to create (forwarded loads re-pointed at this buffer)
+            // are invisible here, so "all uses are memcpy uses" can be
+            // false by the time the plan applies. Never collapse a buffer
+            // that a forwarded load will read.
+            if forward_target_roots.contains(&r) {
                 continue;
             }
             let u = uses.get(&r).cloned().unwrap_or_default();

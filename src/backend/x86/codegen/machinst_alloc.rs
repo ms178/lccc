@@ -556,6 +556,59 @@ fn transfer_size(ty: Option<&IrType>, small_slot: bool) -> OpSize {
     }
 }
 
+/// Reload of an arriving vreg from its slot into its window register.
+///
+/// Sub-word (S8/S16) reloads must DEFINE THE FULL REGISTER: a plain
+/// `movb slot, %r11b` writes only the low byte and leaves bits [8..64)
+/// stale, yet the rest of the pipeline — home moves (`movq %r11, %rdi`),
+/// full-width store-backs (`movq %rdi, slot`), S64 `Test`/`Cmp` operands —
+/// reads the vreg as a full 64-bit register image (the same
+/// zero-/sign-extended-image invariant `value_to_reg` upholds classically:
+/// U8 loads are `movzbl`, I8 are `movsbq`). A partial reload made
+/// vsnprintf's `number()` emit a phantom NUL byte before every `%d` under
+/// `-funsigned-char`: the sign char was reloaded with `movb` into a
+/// register whose upper bits still held `(unsigned)(field_width - 1)`
+/// (0xFFFFFF00 for the default width 0), the 64-bit `if (sign)` test then
+/// saw a nonzero image and stored sign byte 0x00 ahead of the digits.
+///
+/// S32 needs no help: `movl` writes zero-extend into all of bits [32..64).
+/// The store-back side keeps the narrow transfer: it writes exactly the
+/// value's own bytes, and the register image is defined at this point.
+fn arriving_reload(slot: i64, reg: MachReg, size: OpSize, ty: Option<&IrType>) -> MachInst {
+    let signed = ty.is_some_and(|t| t.is_signed());
+    match (size, signed) {
+        (OpSize::S8, false) => MachInst::Movzx {
+            src: MachOperand::StackSlot(slot),
+            dst: reg,
+            from_size: OpSize::S8,
+            to_size: OpSize::S32,
+        },
+        (OpSize::S8, true) => MachInst::Movsx {
+            src: MachOperand::StackSlot(slot),
+            dst: reg,
+            from_size: OpSize::S8,
+            to_size: OpSize::S64,
+        },
+        (OpSize::S16, false) => MachInst::Movzx {
+            src: MachOperand::StackSlot(slot),
+            dst: reg,
+            from_size: OpSize::S16,
+            to_size: OpSize::S32,
+        },
+        (OpSize::S16, true) => MachInst::Movsx {
+            src: MachOperand::StackSlot(slot),
+            dst: reg,
+            from_size: OpSize::S16,
+            to_size: OpSize::S64,
+        },
+        (size, _) => MachInst::Mov {
+            src: MachOperand::StackSlot(slot),
+            dst: MachOperand::Reg(reg),
+            size,
+        },
+    }
+}
+
 /// True when a type lives outside the integer GPR domain (or is wider than
 /// one register), where the window allocator must not substitute a GPR.
 fn non_gpr_type(ty: Option<&IrType>) -> bool {
@@ -745,14 +798,7 @@ pub(crate) fn allocate_window(
         // above) references before it — the slot holds the value.
         let arriving = e.def.is_none();
         if arriving {
-            inserts.push((
-                e.first,
-                MachInst::Mov {
-                    src: MachOperand::StackSlot(slot),
-                    dst: MachOperand::Reg(reg),
-                    size,
-                },
-            ));
+            inserts.push((e.first, arriving_reload(slot, reg, size, ctx.types.get(id))));
         }
 
         // Live-out AND window-written: the window's reads alone never
@@ -1726,6 +1772,94 @@ mod tests {
             reload,
             Some(OpSize::S32),
             "small-slot transfers must be 32-bit"
+        );
+    }
+
+    /// A sub-word arriving vreg must reload with an instruction that
+    /// DEFINES THE FULL REGISTER (movzx/movsx), never a partial `movb`/
+    /// `movw`: home moves and full-width consumers read the vreg as a
+    /// 64-bit register image, and a partial reload leaks whatever the
+    /// register held before into that image (the vsnprintf `number()`
+    /// phantom-NUL miscompile).
+    #[test]
+    fn subword_arriving_reload_defines_full_register() {
+        // U8: zero-extending reload.
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(91, StackSlot(-16));
+        types.insert(91, IrType::U8);
+        uses.insert(91, 2);
+        let empty = FxHashSet::default();
+        let c = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let insts = vec![MachInst::Mov {
+            src: MachOperand::Mem {
+                base: vreg(91),
+                offset: 0,
+            },
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let matches = out.iter().any(|i| {
+            matches!(
+                i,
+                MachInst::Movzx {
+                    src: MachOperand::StackSlot(_),
+                    dst: MachReg::Phys(_),
+                    from_size: OpSize::S8,
+                    to_size: OpSize::S32,
+                }
+            )
+        });
+        assert!(
+            matches,
+            "U8 arriving reload must be movzbl (full-register def), got: {out:?}"
+        );
+
+        // I8: sign-extending reload.
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(92, StackSlot(-24));
+        types.insert(92, IrType::I8);
+        uses.insert(92, 2);
+        let c = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let insts = vec![MachInst::Mov {
+            src: MachOperand::Mem {
+                base: vreg(92),
+                offset: 0,
+            },
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        let out = allocate_window(insts, &c).expect("allocation must succeed");
+        let matches = out.iter().any(|i| {
+            matches!(
+                i,
+                MachInst::Movsx {
+                    src: MachOperand::StackSlot(_),
+                    dst: MachReg::Phys(_),
+                    from_size: OpSize::S8,
+                    to_size: OpSize::S64,
+                }
+            )
+        });
+        assert!(
+            matches,
+            "I8 arriving reload must be movsbq (full-register def), got: {out:?}"
         );
     }
 }
