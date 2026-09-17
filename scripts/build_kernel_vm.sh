@@ -21,7 +21,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.50}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
 LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
 LOG=${BUILD_LOG:-/tmp/kernel-build-lccc.log}
@@ -142,6 +142,28 @@ preflight_host_tools() {
   echo "preflight: host tools OK"
 }
 preflight_host_tools || exit 1
+
+# ---- linker-change guard -----------------------------------------------------
+# Kbuild's if_changed tracks the recorded COMMAND LINE and prerequisite
+# timestamps, not the tool binaries' identity.  After an lccc/lccc-ld rebuild
+# (fix + `cargo build`) the recorded command line is byte-identical, so make
+# happily reuses link-only artifacts produced by the OLD linker.  Observed:
+# a fixed lccc-ld still produced `vdso2c: cannot handle memsz != filesz`
+# because the stale vdso64.so.dbg from the previous run was never re-linked.
+# Stamp the tool identity and remove exactly the link-only products when it
+# changes; compiled .o files stay valid (their producer is the compiler, and
+# a compiler rebuild goes through this same stamp).
+tools_stamp=".lccc-tools-stamp"
+tools_hash="$(sha256sum "$LCCC" "$LCCC_LD" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+if [[ -f $tools_stamp && $(cat "$tools_stamp") != "$tools_hash" ]]; then
+  echo "build_kernel_vm: lccc/lccc-ld changed since last build; purging link-only artifacts"
+  rm -f arch/x86/entry/vdso/vdso*.so* \
+        arch/x86/entry/vdso/vdso-image-*.c \
+        arch/x86/boot/setup.elf arch/x86/boot/setup.bin \
+        arch/x86/boot/compressed/vmlinux* \
+        arch/x86/boot/bzImage vmlinux .tmp_vmlinux* vmlinux.symvers vmlinux.map
+fi
+printf '%s\n' "$tools_hash" > "$tools_stamp"
 
 start=$(date +%s)
 # Refresh include/config/auto.conf SERIALLY before the parallel build.  A

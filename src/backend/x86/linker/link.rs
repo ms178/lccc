@@ -342,6 +342,14 @@ pub fn link_builtin(
     // archive members are extracted so they can resolve symbols introduced by
     // those members (e.g., QEMU's libqemuutil.a members reference libglib-2.0.so).
     let mut deferred_libs: Vec<String> = Vec::new();
+    // A --whole-archive member is force-loaded in full exactly ONCE. The set
+    // must be declared before the deferred_libs loop below: the group
+    // resolution loop re-scans every deferred library, and an archive that
+    // was already force-loaded here must not be force-loaded again there —
+    // the double load duplicated every member and failed the link with a
+    // spurious `multiple definition` (reproduced with a two-member archive
+    // and one referencing object: `--whole-archive reg.a --no-whole-archive m.o`).
+    let mut whole_archive_loaded: FxHashSet<String> = FxHashSet::default();
     for path in &extra_object_files {
         if path.ends_with(".a") || path.ends_with(".so") || path.contains(".so.") {
             deferred_libs.push(path.clone());
@@ -359,6 +367,7 @@ pub fn link_builtin(
                     true,
                     as_needed_for(path),
                 )?;
+                whole_archive_loaded.insert(path.clone());
             }
         } else {
             load_file(
@@ -425,9 +434,9 @@ pub fn link_builtin(
         // (from shared library resolution) since either can introduce work for
         // the other on the next iteration.
         let mut changed = true;
-        // A --whole-archive member is force-loaded in full on the first pass;
-        // re-loading it on every group iteration would duplicate every symbol.
-        let mut whole_archive_loaded: FxHashSet<String> = FxHashSet::default();
+        // whole_archive_loaded was initialised before the deferred_libs loop
+        // above and carries the paths already force-loaded there, so a
+        // whole-archive archive is never loaded twice.
         while changed {
             changed = false;
             let prev_obj_count = objects.len();

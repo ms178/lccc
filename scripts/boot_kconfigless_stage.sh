@@ -22,9 +22,9 @@
 #     compiler-{types,gcc}.h for __GNUC__ with sane function alignment)
 #
 # Usage:
-#   ./boot_kconfigless_stage.sh /path/to/linux-6.18.50.tar.xz /path/to/workdir
+#   ./boot_kconfigless_stage.sh /path/to/linux-6.18.52.tar.xz /path/to/workdir
 #   eval "$(./boot_kconfigless_stage.sh ... | grep ^export)"  # sets LCCC_BOOT_EXTRA
-#   KERNEL_DIR=/path/to/workdir/linux-6.18.50 LCCC=... OUT=... ./build_kernel_boot.sh
+#   KERNEL_DIR=/path/to/workdir/linux-6.18.52 LCCC=... OUT=... ./build_kernel_boot.sh
 # ============================================================================
 set -euo pipefail
 
@@ -33,16 +33,16 @@ WORK=${2:?usage: $0 <kernel.tar.xz> <workdir>}
 mkdir -p "$WORK"
 cd "$WORK"
 tar -xJf "$TARBALL" \
-    linux-6.18.50/arch/x86/boot \
-    linux-6.18.50/arch/x86/include \
-    linux-6.18.50/include \
-    linux-6.18.50/scripts \
-    linux-6.18.50/arch/x86/kernel/cpu \
-    linux-6.18.50/arch/x86/tools \
-    linux-6.18.50/arch/x86/lib \
-    linux-6.18.50/arch/x86/Makefile \
-    linux-6.18.50/Makefile
-K="$WORK/linux-6.18.50"
+    linux-6.18.52/arch/x86/boot \
+    linux-6.18.52/arch/x86/include \
+    linux-6.18.52/include \
+    linux-6.18.52/scripts \
+    linux-6.18.52/arch/x86/kernel/cpu \
+    linux-6.18.52/arch/x86/tools \
+    linux-6.18.52/arch/x86/lib \
+    linux-6.18.52/arch/x86/Makefile \
+    linux-6.18.52/Makefile
+K="$WORK/linux-6.18.52"
 
 # ---- capflags.c (in-tree generator) ----------------------------------------
 sh "$K/arch/x86/kernel/cpu/mkcapflags.sh" \
@@ -63,7 +63,7 @@ for h in ioctl.h errno.h; do
     printf '#include <uapi/asm-generic/%s>\n' "$h" \
         > "$K/arch/x86/include/generated/uapi/asm/$h"
 done
-printf '#define UTS_RELEASE "6.18.50"\n' > "$K/include/generated/utsrelease.h"
+printf '#define UTS_RELEASE "6.18.52"\n' > "$K/include/generated/utsrelease.h"
 
 # ---- cpufeaturemasks.h (in-tree awk generator + stub .config) ---------------
 {

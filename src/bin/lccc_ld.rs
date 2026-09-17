@@ -774,15 +774,20 @@ fn run(args: &[String]) -> Result<(), String> {
                     // Unknown flag: warn (parity with ld's permissiveness would
                     // be an error, but warn keeps us usable during bring-up).
                     eprintln!("lccc-ld: warning: ignoring unknown option '{}'", a);
-                } else if whole_archive && a.ends_with(".a") {
-                    // Positional archives under --whole-archive must go through
-                    // the shared parser: it carries the positional state with
-                    // the input and force-loads every member.  The plain
-                    // `object_files` path always loads archives selectively.
-                    passthrough.push("--whole-archive".to_string());
-                    passthrough.push(a.to_string());
-                    passthrough.push("--no-whole-archive".to_string());
                 } else {
+                    // Every positional input lands in `inputs` WITH its
+                    // --whole-archive state, in command-line order.  The
+                    // relocatable (-r) and script (-T) modes consume `inputs`
+                    // directly through `load_inputs_for_ld`, which force-loads
+                    // whole-archive members; routing a positional archive into
+                    // `passthrough` at parse time (the old behaviour) removed
+                    // it from those modes entirely — the kernel's
+                    //   lccc-ld -r -o vmlinux.o --whole-archive vmlinux.a \
+                    //     --no-whole-archive --start-group --end-group
+                    // failed with `no input files` and a lone archive under
+                    // -r silently produced an EMPTY relocatable object.
+                    // The userspace mode re-derives its passthrough sandwich
+                    // from this flag below.
                     inputs.push((a.to_string(), whole_archive));
                 }
             }
@@ -918,11 +923,22 @@ fn run(args: &[String]) -> Result<(), String> {
     // positional inputs from the caller (gcc-style invocation), so no CRT
     // injection happens here; whole-archive members are force-loaded.
     // ------------------------------------------------------------------
-    // Whole-archive archives were routed to `passthrough` during argument
-    // parsing, so everything left here is an ordinary object or archive.
+    // The builtin userspace pipeline resolves archives itself through the
+    // shared argument parser, which needs the --whole-archive state spelled
+    // positionally around the archive (it does not read the `(path, wa)`
+    // pairs). Re-derive that sandwich HERE instead of at argument-parsing
+    // time, so the relocatable and script modes keep seeing the archive in
+    // `inputs`. The archive is deliberately NOT also added to object_files:
+    // that would load it twice (duplicate symbols).
     let mut object_files: Vec<String> = Vec::new();
-    for (path, _wa) in &inputs {
-        object_files.push(path.clone());
+    for (path, wa) in &inputs {
+        if *wa && path.ends_with(".a") {
+            passthrough.push("--whole-archive".to_string());
+            passthrough.push(path.clone());
+            passthrough.push("--no-whole-archive".to_string());
+        } else {
+            object_files.push(path.clone());
+        }
     }
     let object_refs: Vec<&str> = object_files.iter().map(|s| s.as_str()).collect();
 

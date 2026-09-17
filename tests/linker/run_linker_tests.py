@@ -2226,6 +2226,36 @@ VERSION {
 }
 """
 
+# The real linux-6.18 vDSO shape: a PHDRS clause that DECLARES `note PT_NOTE`
+# while the SECTIONS clause places a real allocated `.note` output section.
+# GNU ld emits exactly the four declared headers; lccc-ld once counted an
+# extra auto PT_NOTE, skewing e_phnum, SIZEOF_HEADERS-based file offsets and
+# the PT_LOAD filesz/memsz (see _vdso_note_phdr_test).
+VDSO_NOTE_SCRIPT = r"""
+PHDRS {
+ text PT_LOAD FILEHDR PHDRS FLAGS(5);
+ dynamic PT_DYNAMIC FLAGS(4);
+ note PT_NOTE FLAGS(4);
+ eh_frame_hdr 0x6474e550 FLAGS(4);
+}
+SECTIONS {
+ . = SIZEOF_HEADERS;
+ .hash : { *(.hash) } :text
+ .gnu.hash : { *(.gnu.hash) } :text
+ .dynsym : { *(.dynsym) } :text
+ .dynstr : { *(.dynstr) } :text
+ .gnu.version : { *(.gnu.version) } :text
+ .gnu.version_d : { *(.gnu.version_d) } :text
+ .dynamic : { *(.dynamic) } :text :dynamic
+ .note : { *(.note.*) } :text :note
+ .text : { *(.text .text.*) } :text
+ /DISCARD/ : { *(.comment) *(.eh_frame) }
+}
+VERSION {
+ LCCC_VDSO_1 { global: vdso_answer; local: *; };
+}
+"""
+
 
 def _as_needed_positional_test(args, oracles):
     """--as-needed / --no-as-needed are positional, and default is no-as-needed.
@@ -3001,6 +3031,107 @@ def _vdso_script_test(args, oracles):
         return Result(name, "FAIL", f"harness exception: {e!r}")
     finally:
         shutil.rmtree(td, ignore_errors=True)
+
+def _vdso_note_phdr_test(args, oracles):
+    """Declared-PHDRS scripts emit exactly the declared headers (GNU parity).
+
+    Regression test for the linux-6.18.52 vDSO blocker: the vDSO script
+    declares `note PT_NOTE` in its PHDRS clause while also placing a real
+    allocated `.note` section.  lccc-ld used to count an auto PT_NOTE for the
+    section on top of the declared one, so e_phnum/file-offset seeding
+    disagreed with the headers actually written.  The vDSO then got a phantom
+    trailing NULL phdr and -- because SIZEOF_HEADERS seeded 4 headers while
+    the file offsets seeded 5 -- the first section's file offset jumped a page
+    (0x120 -> 0x1120), leaving the sole PT_LOAD with p_filesz > p_memsz.
+    vdso2c rejects such an image ("cannot handle memsz != filesz") and the
+    kernel build died at arch/x86/entry/vdso/vdso-image-64.c.
+
+    GNU ld (measured on binutils 2.44) never auto-adds PT_NOTE, PT_GNU_PROPERTY
+    or PT_TLS to a script that declares a PHDRS clause; auto-headers exist only
+    on the implicit-segment path.  This test pins all of that: exact phdr
+    count, filesz == memsz, and an alloc-section address/offset table identical
+    to GNU ld's for the same link.
+    """
+    name = "script_vdso_declared_note_phdrs"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "t.c"), "w") as f:
+            f.write("int vdso_answer(void){return 42;}\n"
+                    "/* A real allocated note input section, like vdso-note.o. */\n"
+                    "__attribute__((used, section(\".note.test\")))\n"
+                    "static const struct { unsigned long namesz, descsz, type;\n"
+                    "                      char name[8]; } my_note = {\n"
+                    "    4, 0, 0x100, { 'T','E','S','T' } };\n")
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write(VDSO_NOTE_SCRIPT)
+        r = sh([CC, "-c", "-O1", "-fPIC", "-fno-asynchronous-unwind-tables",
+                "t.c", "-o", "t.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        common = ["-shared", "--hash-style=both", "-Bsymbolic", "-soname",
+                  "linux-vdso-test.so.1", "-z", "max-page-size=4096",
+                  "-T", "t.lds", "t.o"]
+        r = sh([lccc_ld] + common + ["-o", "out.lccc.so"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:300]}")
+
+        phdrs = sh(["readelf", "-lW", "out.lccc.so"], cwd=td).stdout.decode()
+        # exactly the four declared headers, no phantom NULL, no auto PT_NOTE
+        types = [ln.split()[0] for ln in phdrs.splitlines()
+                 if re.match(r"^\s*(LOAD|DYNAMIC|NOTE|TLS|GNU_EH_FRAME|GNU_STACK|"
+                             r"GNU_RELRO|GNU_PROPERTY|NULL)\s", ln)]
+        if types != ["LOAD", "DYNAMIC", "NOTE", "GNU_EH_FRAME"]:
+            return Result(name, "FAIL", f"phdr set is {types}, expected the 4 declared")
+        # vdso2c invariant: p_filesz must equal p_memsz on the single LOAD and
+        # the segment must begin at offset 0 / vaddr 0 (FILEHDR PHDRS).
+        load = [ln.split() for ln in phdrs.splitlines()
+                if re.match(r"^\s*LOAD\s", ln)][0]
+        if load[1] != "0x000000" or load[2] != "0x0000000000000000":
+            return Result(name, "FAIL", f"LOAD does not start at 0: {load[:5]}")
+        if load[4] != load[5]:
+            return Result(name, "FAIL",
+                          f"p_filesz {load[4]} != p_memsz {load[5]} (vdso2c rejects this)")
+        # readelf itself flags filesz > memsz; assert it stayed silent.
+        if "larger than its memory size" in phdrs:
+            return Result(name, "FAIL", "readelf reports filesz > memsz")
+
+        # Strongest check that is independent of synthetic dynamic-section
+        # sizes (hash bucket counts and dynstr legitimately differ): every
+        # allocated section must satisfy offset == vaddr in BOTH outputs.
+        # This is exactly the invariant the bug broke -- the first section's
+        # offset jumped a page ahead of its vaddr, which no self-consistency
+        # check on phdrs alone would catch.
+        r2 = sh(["ld"] + common + ["-o", "out.gnu.so"], cwd=td)
+        if r2.returncode != 0:
+            return Result(name, "SKIP", f"GNU ld oracle failed: {r2.stderr.decode()[:150]}")
+
+        def alloc_table(path):
+            out = sh(["readelf", "-SW", path], cwd=td).stdout.decode()
+            rows = []
+            for ln in out.splitlines():
+                m = re.match(r"^\s*\[\s*\d+\]\s+(\S+)\s+(\S+)\s+([0-9a-f]+)\s+"
+                             r"([0-9a-f]+)\s+([0-9a-f]+)", ln)
+                if m and m.group(1) not in (".symtab", ".strtab", ".shstrtab"):
+                    rows.append(m.groups())
+            return rows
+
+        for label, path in (("lccc", "out.lccc.so"), ("gnu", "out.gnu.so")):
+            for row in alloc_table(path):
+                if int(row[2], 16) != int(row[3], 16):
+                    return Result(name, "FAIL",
+                                  f"{label}: section {row[0]} vaddr {row[2]} "
+                                  f"!= offset {row[3]} (page-skewed layout)")
+        # and the .note section itself must be allocated and present
+        note_row = [r for r in alloc_table("out.lccc.so") if r[0] == ".note"]
+        if not note_row:
+            return Result(name, "FAIL", "no allocated .note output section")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
 
 def _elf32_script_test(args, oracles):
     """Linux setup.elf-shaped ELF32 link, including every narrow i386 REL.
@@ -4299,6 +4430,99 @@ def _rel_test(name, sources, expect_stdout, asm=None, compile_flags=None):
         finally:
             shutil.rmtree(td, ignore_errors=True)
     return runner
+
+
+def _whole_archive_r_test(args, oracles):
+    """Standalone `lccc-ld -r --whole-archive` — the kernel's vmlinux.o link.
+
+    linux 6.18 links vmlinux.o with
+      $(LD) -r -o vmlinux.o --whole-archive vmlinux.a --no-whole-archive \
+          --start-group --end-group
+    where vmlinux.a is a THIN archive (Makefile.vmlinux_a).  lccc-ld once
+    rerouted positional archives under --whole-archive into a passthrough list
+    that only the userspace mode reads, so the relocatable mode lost the
+    archive entirely: the kernel build died with `lccc-ld: error: no input
+    files`, and a lone `-r --whole-archive x.a -o y.o` silently produced an
+    EMPTY relocatable object.  Both archive flavours (regular and thin) are
+    exercised here, and the merged object must keep the unreferenced members
+    (that is the entire point of --whole-archive) and final-link + run with
+    identical output to GNU ld's merge.
+    """
+    name = "reloc_whole_archive_thin_and_regular"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "u.c"), "w") as f:
+            f.write("int used(void){return 7;}\n")
+        with open(os.path.join(td, "u2.c"), "w") as f:
+            f.write("int used2(void){return 35;}\n")
+        # keepme() is referenced by NOBODY: lazy archive scanning can never
+        # pull it in, so its presence in the merged object proves the
+        # --whole-archive force-load (the same discipline as
+        # whole_archive_exec, applied to the relocatable mode).
+        with open(os.path.join(td, "k.c"), "w") as f:
+            f.write("int keepme(void){return 1;}\n")
+        with open(os.path.join(td, "m2.c"), "w") as f:
+            f.write("#include <stdio.h>\n"
+                    "extern int used(void);\n"
+                    "extern int used2(void);\n"
+                    "int main(void){ printf(\"%d\\n\", used() + used2()); return 0; }\n")
+        for c in ("u.c", "u2.c", "k.c", "m2.c"):
+            r = sh([CC, "-c", "-O1", c, "-o", c[:-2] + ".o"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "SKIP", r.stderr.decode()[:200])
+        sh(["ar", "crD", "--thin", "thin.a", "u.o", "u2.o", "k.o"], cwd=td)
+        sh(["ar", "crD", "reg.a", "u.o", "u2.o", "k.o"], cwd=td)
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+
+        def defined_syms(path):
+            out = sh(["readelf", "-sW", path], cwd=td).stdout.decode()
+            names = set()
+            for ln in out.splitlines():
+                parts = ln.split()
+                if len(parts) >= 8 and parts[3] == "FUNC" and parts[4] != "UND":
+                    names.add(parts[7])
+            return names
+
+        for arch in ("thin.a", "reg.a"):
+            # exact kernel flag shape
+            r = sh([lccc_ld, "-r", "-o", f"m.{arch}.lccc.o", "--whole-archive",
+                    arch, "--no-whole-archive", "--start-group", "--end-group"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL",
+                              f"lccc-ld -r --whole-archive {arch} failed: {r.stderr.decode()[:300]}")
+            mine = defined_syms(f"m.{arch}.lccc.o")
+            for required in ("used", "used2", "keepme"):
+                if required not in mine:
+                    return Result(name, "FAIL",
+                                  f"{arch}: whole-archive member lost ({required} missing)")
+            # GNU ld parity on the identical link: same defined symbol set
+            r = sh(["ld", "-r", "-o", f"m.{arch}.ld.o", "--whole-archive",
+                    arch, "--no-whole-archive"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "SKIP", f"GNU ld -r {arch} failed")
+            gnu = defined_syms(f"m.{arch}.ld.o")
+            if mine != gnu:
+                return Result(name, "FAIL",
+                              f"{arch}: defined symbol set differs from GNU ld: "
+                              f"lccc-only={sorted(mine-gnu)} gnu-only={sorted(gnu-mine)}")
+        # End-to-end: merge the thin archive via -r --whole-archive (kernel
+        # shape), final-link the merged object with gcc, run it.
+        r = sh([lccc_ld, "-r", "-o", "e2e.lccc.o", "--whole-archive", "thin.a",
+                "--no-whole-archive"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"e2e -r failed: {r.stderr.decode()[:300]}")
+        rr = sh([CC, "e2e.lccc.o", "m2.o", "-o", "fin.e2e"], cwd=td)
+        if rr.returncode != 0:
+            return Result(name, "FAIL", f"e2e final link failed: {rr.stderr.decode()[:300]}")
+        code, out = run_bin(os.path.join(td, "fin.e2e"), [], td)
+        if code != 0 or out != "42\n":
+            return Result(name, "FAIL", f"e2e run got {(code, out)!r}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
 
 # ============================================================================
 # 12. C++ EXCEPTIONS — unwinding through lccc-linked binaries
@@ -6936,6 +7160,7 @@ def main():
                 continue
         results.append(_rel_test(name, sources, expect,
                                  compile_flags=cflags)(args, oracles))
+    results.append(_whole_archive_r_test(args, oracles))
 
     if (not args.filter or "cxx" in args.filter) and (not args.tag or args.tag == "ehframe"):
         results.append(_cxx_eh_test(args, oracles))
@@ -6949,6 +7174,7 @@ def main():
         results.append(_script_undefined_archive_test_i386(args, oracles))
     if (not args.filter or "vdso" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_vdso_script_test(args, oracles))
+        results.append(_vdso_note_phdr_test(args, oracles))
     if (not args.filter or "elf32" in args.filter or "kernel" in args.filter) \
             and (not args.tag or args.tag in ("script", "kernel")):
         results.append(_elf32_script_test(args, oracles))

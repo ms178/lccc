@@ -1169,26 +1169,35 @@ fn link_with_script_machine(
     // A synthesised PT_TLS adds a program header, so it must be counted here
     // too or SIZEOF_HEADERS under-reserves and the first section overlaps the
     // header table. Predict it from the inputs, since output sections do not
-    // exist yet: any allocated SHF_TLS input section will produce one unless
-    // the script already declares PT_TLS.
-    let will_add_tls_phdr = objects.iter().any(|o| {
-        o.sections
-            .iter()
-            .any(|sec| (sec.flags & SHF_TLS_) != 0 && (sec.flags & SHF_ALLOC_) != 0 && sec.size > 0)
-    }) && !script.phdrs.iter().any(|d| d.ptype == PT_TLS_);
+    // exist yet: any allocated SHF_TLS input section will produce one when the
+    // linker synthesises segments.  GNU ld NEVER auto-adds a PT_TLS (or any
+    // other header) to a script that declares a PHDRS clause -- measured on
+    // binutils 2.44: `PHDRS { text PT_LOAD FILEHDR PHDRS; }` + .tdata emits
+    // exactly one program header and SIZEOF_HEADERS reflects only the declared
+    // ones.  An unconditional synthesis would inflate SIZEOF_HEADERS, shifting
+    // every section address away from GNU's for the same script.
+    let will_add_tls_phdr = script.phdrs.is_empty()
+        && objects.iter().any(|o| {
+            o.sections.iter().any(|sec| {
+                (sec.flags & SHF_TLS_) != 0 && (sec.flags & SHF_ALLOC_) != 0 && sec.size > 0
+            })
+        });
     // GNU ld also writes one PT_NOTE program header per allocated note
-    // section, plus a PT_GNU_PROPERTY alias for `.note.gnu.property`.
-    // Predict the count from the (already merged) inputs, exactly as the
-    // PT_TLS prediction above does.  The prediction counts one header per
-    // input note section, which is always >= the number of output sections
-    // that end up holding note data (outputs may merge inputs), so
-    // SIZEOF_HEADERS can only over-reserve -- never under-reserve -- the
-    // header table.  The exact final count is recomputed after layout for
-    // `n_phdrs` and the section file offsets.
+    // section, plus a PT_GNU_PROPERTY alias for `.note.gnu.property` --
+    // but, like PT_TLS, only for scripts with no PHDRS clause: with a
+    // declared PHDRS block, GNU ld emits exactly the declared headers and
+    // attaches note sections to whatever segment the script assigns them
+    // (measured on binutils 2.44).  The prediction is needed only for the
+    // auto-segment path.  It counts one header per input note section, which
+    // is always >= the number of output sections that end up holding note
+    // data (outputs may merge inputs), so SIZEOF_HEADERS can only
+    // over-reserve -- never under-reserve -- the header table.  The exact
+    // final count is recomputed after layout for `n_phdrs` and the section
+    // file offsets.
     let has_note_property = objects.iter().flat_map(|o| o.sections.iter()).any(|sec| {
         sec.name == ".note.gnu.property" && (sec.flags & SHF_ALLOC_) != 0 && sec.size > 0
     });
-    let note_phdr_pred = if !script.phdrs.iter().any(|d| d.ptype == PT_NOTE_) {
+    let note_phdr_pred = if script.phdrs.is_empty() {
         objects
             .iter()
             .flat_map(|o| o.sections.iter())
@@ -2042,15 +2051,20 @@ fn link_with_script_machine(
     // ELF header + phdrs at file start.
     let declared_phdrs: Vec<&linker_script::PhdrDecl> = script.phdrs.iter().collect();
     // A script that places SHF_TLS sections but declares no PT_TLS gets one
-    // synthesised. Without it the loader never allocates the thread block, so
-    // every %fs-relative access reads whatever happens to precede the TCB --
-    // the relocations are correct and the program still misbehaves.
+    // synthesised -- but only on the auto-segment path (no PHDRS clause).
+    // Without the header the loader never allocates the thread block, so every
+    // %fs-relative access reads whatever happens to precede the TCB -- the
+    // relocations are correct and the program still misbehaves.  A script that
+    // declares a PHDRS block gets exactly the declared headers, matching GNU
+    // ld (binutils 2.44): a `.tdata` under `PHDRS { text PT_LOAD FILEHDR
+    // PHDRS; }` emits no PT_TLS, and SIZEOF_HEADERS counts the declared
+    // headers only.
     //
     // This must agree with `will_add_tls_phdr` above, which fed SIZEOF_HEADERS.
-    let needs_tls_phdr = out_secs
-        .iter()
-        .any(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc)
-        && !script.phdrs.iter().any(|d| d.ptype == PT_TLS_);
+    let needs_tls_phdr = script.phdrs.is_empty()
+        && out_secs
+            .iter()
+            .any(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc);
     debug_assert_eq!(
         needs_tls_phdr, will_add_tls_phdr,
         "PT_TLS prediction disagreed with the final layout; SIZEOF_HEADERS would be wrong"
@@ -2059,7 +2073,14 @@ fn link_with_script_machine(
     // plus the PT_GNU_PROPERTY alias) count toward the header table exactly
     // like the synthesised PT_TLS does, or the first section's file offset
     // would land inside the program header table.  Counted from the final
-    // layout so it is exact by construction.
+    // layout so it is exact by construction.  Like PT_TLS, they exist only on
+    // the auto-segment path: a declared PHDRS block suppresses them in GNU ld,
+    // and counting them anyway desynchronised e_phnum/file-offset seeding from
+    // the headers actually written -- the vDSO (PHDRS declaring `note
+    // PT_NOTE`) got a phantom fifth NULL phdr, a 0x1000-skewed first-section
+    // file offset (headers seeded for 5 phdrs while SIZEOF_HEADERS seeded 4)
+    // and a PT_LOAD with p_filesz > p_memsz, which vdso2c rejects.
+    let auto_note_phdrs = script.phdrs.is_empty();
     let has_note_property_out = out_secs.iter().any(|o| {
         o.is_alloc
             && o.size > 0
@@ -2071,11 +2092,15 @@ fn link_with_script_machine(
                         .is_some_and(|s| s.name == ".note.gnu.property")
             })
     });
-    let note_phdr_actual = out_secs
-        .iter()
-        .filter(|o| o.is_alloc && o.size > 0 && o.name.starts_with(".note"))
-        .count()
-        + usize::from(has_note_property_out);
+    let note_phdr_actual = if auto_note_phdrs {
+        out_secs
+            .iter()
+            .filter(|o| o.is_alloc && o.size > 0 && o.name.starts_with(".note"))
+            .count()
+            + usize::from(has_note_property_out)
+    } else {
+        0
+    };
     let n_phdrs = declared_phdrs.len().max(1) + usize::from(needs_tls_phdr) + note_phdr_actual;
     let mut file_off = script_header_size_with(
         &script,
@@ -3235,10 +3260,12 @@ fn link_with_script_machine(
     // One PT_NOTE segment per allocated note output section (each spanning
     // exactly its own section, aligned to at least 4 as in GNU ld), plus
     // the PT_GNU_PROPERTY alias over the output section holding the merged
-    // `.note.gnu.property` data (alignment 8).  Skipped entirely when the
-    // script itself declares PT_NOTE segments.  The count matches
-    // `note_phdr_actual` above by construction.
-    if !script.phdrs.iter().any(|d| d.ptype == PT_NOTE_) {
+    // `.note.gnu.property` data (alignment 8).  Auto-segment path only:
+    // a declared PHDRS block means GNU ld emits exactly the declared
+    // headers (measured on binutils 2.44), so no note or property headers
+    // are synthesised.  The count matches `note_phdr_actual` above by
+    // construction.
+    if script.phdrs.is_empty() {
         for os in out_secs.iter() {
             if os.is_alloc && os.size > 0 && os.name.starts_with(".note") {
                 write_script_phdr(
