@@ -118,6 +118,7 @@ cargo_test_repeated() {
     # Reuse the flags the build gate resolved, or cargo rebuilds everything.
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
     dbg="${CARGO_PROFILE_FASTBUILD_DEBUG:-}"
+    incr="${CARGO_INCREMENTAL:-}"
     jobs=2
     if [ -z "$dbg" ]; then
         local total_mb
@@ -127,12 +128,29 @@ cargo_test_repeated() {
             jobs=1
         fi
     fi
+    # The debuginfo drop alone is not always enough: rustc's incremental
+    # session state for the monolithic lib-test compile adds roughly a
+    # gigabyte of resident memory on this crate, and on a 4 GB host with
+    # a cold page cache the OOM killer still SIGKILLs a compile that
+    # succeeds with incremental off (verified both ways, 2026-09-16 v7
+    # session: same rustc invocation, SIGKILL with -C incremental, clean
+    # pass with CARGO_INCREMENTAL=0). Incremental only speeds up
+    # REBUILDS of the test binary; set CARGO_INCREMENTAL explicitly to
+    # override.
+    if [ -z "$incr" ] && [ "${dbg:-}" = "0" ]; then
+        incr=0
+    fi
     n="${LCCC_TEST_REPEATS:-1}"
     for ((i = 1; i <= n; i++)); do
         if [ -n "$dbg" ]; then
             export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg"
         else
             unset CARGO_PROFILE_FASTBUILD_DEBUG
+        fi
+        if [ -n "$incr" ]; then
+            export CARGO_INCREMENTAL="$incr"
+        else
+            unset CARGO_INCREMENTAL
         fi
         if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
             printf 'cargo-test: FAILED on repeat %d/%d\n' "$i" "$n" >&2
@@ -266,6 +284,15 @@ gate "bb-slp-v5" fast \
 # min/max, GCC-parity shapes) and the stale-claim regression shapes.
 gate "bb-slp-v6" fast \
     bash tests/regression/check_bb_slp_v6_codegen.sh
+
+# BB-SLP v7: the red-team adversarial edges of the v6 feature set
+# (cross-block corners, cmp+blendv corner predicates, FP-Neg chains,
+# memfold width/order corners) plus the sub-word SELECT demotion
+# (C integer promotion: i8/i16/u8/u16 selects and min/max pack at the
+# lane width with predicate remapping) — tri-config differential
+# (SLP on / CCC_NO_BB_SLP=1 / gcc) is part of the gate.
+gate "bb-slp-v7" fast \
+    bash tests/regression/check_bb_slp_v7_codegen.sh
 
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
