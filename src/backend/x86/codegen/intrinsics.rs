@@ -5411,7 +5411,13 @@ impl X86Codegen {
             }
             IntrinsicOp::VecBlendvI32x4 => {
                 if let Some(d) = dest {
-                    self.emit_sse_blendv_128_int(d, args);
+                    // Dword lanes: the vblendvps sign-bit select is exact
+                    // at the lane granularity under SSE4.1+AVX2.
+                    if self.isa.sse41 && self.avx2_enabled {
+                        self.emit_blendv_128_vex(d, args, "vblendvps");
+                    } else {
+                        self.emit_sse_blendv_128_int(d, args);
+                    }
                 }
             }
             IntrinsicOp::VecCmpI32x8 | IntrinsicOp::VecCmpI32x4 => {
@@ -5669,7 +5675,18 @@ impl X86Codegen {
             }
             IntrinsicOp::VecBlendvI16x8 => {
                 if let Some(d) = dest {
-                    self.emit_sse_blendv_128_int(d, args);
+                    // Word lanes: `vpblendvb` consults the sign bit of
+                    // EVERY BYTE, and a word-compare mask sets all 16 bits
+                    // of its lane — both bytes carry the same value, so
+                    // the per-byte select is word-atomic and exact. The
+                    // DWORD `vblendvps` would read only the HIGH word's
+                    // mask into bits 31 of each dword — wrong whenever a
+                    // dword's two word lanes disagree.
+                    if self.isa.sse41 && self.avx2_enabled {
+                        self.emit_blendv_128_vex(d, args, "vpblendvb");
+                    } else {
+                        self.emit_sse_blendv_128_int(d, args);
+                    }
                 }
             }
             IntrinsicOp::VecBroadcastI16x16 => {
@@ -5758,7 +5775,14 @@ impl X86Codegen {
             // SSE2 lowering serves the byte width with no SSE4.1 dependency.
             IntrinsicOp::VecBlendvI8x16 => {
                 if let Some(d) = dest {
-                    self.emit_sse_blendv_128_int(d, args);
+                    // Byte lanes: `vpblendvb` (per-BYTE sign select) is
+                    // the exact one-instruction form; the dword blend
+                    // would smear one mask bit across four bytes.
+                    if self.isa.sse41 && self.avx2_enabled {
+                        self.emit_blendv_128_vex(d, args, "vpblendvb");
+                    } else {
+                        self.emit_sse_blendv_128_int(d, args);
+                    }
                 }
             }
             // ---- SSE2 byte-lane twins (baseline path) ----------------------
@@ -7755,6 +7779,14 @@ impl X86Codegen {
 
     /// Packed FP compare (SSE2 baseline): `cmpps $imm, src, dst` computes
     /// `dst PRED src` in place; args[0] streams through %xmm0.
+    ///
+    /// Under AVX2 the THREE-OPERAND VEX form fires first — the same
+    /// discipline `emit_int_cmp` got in v6: `vcmpps $imm, %src2, %src1,
+    /// %dst` with every operand register-homed and ZERO staging (the
+    /// legacy 2-operand form had to copy src1 into the destination
+    /// first). The predicate immediates 0/1/2/4 coincide between the
+    /// legacy and VEX vocabularies (EQ/LT/LE/NEQ), which are exactly the
+    /// C spellings the producers admit.
     pub(super) fn emit_sse_cmp_128(&mut self, dest: &Value, args: &[Operand], inst: &str) {
         assert!(args.len() == 3, "{}: expects lhs, rhs, predicate", inst);
         let imm = match &args[2] {
@@ -7765,6 +7797,39 @@ impl X86Codegen {
         // cache hit (the load below moves it aside).  Both operands are read
         // through registers only, so no slot can be observed stale.
         self.state.invalidate_vec_peephole();
+        if self.avx2_enabled {
+            // All-homed fast path: one instruction, no staging. A homed
+            // destination may ALIAS a source home — the VEX form reads
+            // every source before writing the destination. The homes are
+            // the 128-BIT xmm views (this is the SSE-family compare).
+            let a = self.vec_home_128(&args[0]);
+            let b = self.vec_home_128(&args[1]);
+            if let (Some(a), Some(b)) = (&a, &b) {
+                if let Some(d) = self.dest_xmm_home_name(dest) {
+                    self.state
+                        .emit_fmt(format_args!("    v{} ${}, {}, {}, %{}", inst, imm, b, a, d));
+                    self.sse_commit_dest_direct(dest, d);
+                    return;
+                }
+            }
+            // Staged VEX: rhs (src2) in the reserved second scratch,
+            // lhs (src1) through %xmm0 — `vcmpps $imm, %xmm1, %xmm0,
+            // %xmm0` computes lhs PRED rhs, overwriting the staged lhs.
+            let rhs = match self.vec_home_128(&args[1]) {
+                Some(reg) => reg,
+                None => {
+                    self.sse_load_arg(&args[1], "xmm1");
+                    "%xmm1".to_string()
+                }
+            };
+            self.sse_load_arg(&args[0], "xmm0");
+            self.state.emit_fmt(format_args!(
+                "    v{} ${}, {}, %xmm0, %xmm0",
+                inst, imm, rhs
+            ));
+            self.sse_store_dest(dest, "xmm0");
+            return;
+        }
         let rhs = match self.vec_home_128(&args[1]) {
             Some(reg) => reg,
             None => {
@@ -8758,6 +8823,22 @@ impl X86Codegen {
         domain: BlendvDomain,
     ) {
         assert!(args.len() == 3, "blendv128: expects false, true, mask");
+        // SSE4.1+AVX2 takes the ONE-instruction VEX lane select first.
+        // The FP compares produce per-DWORD masks (cmpps) or per-QWORD
+        // masks (cmppd, whose two dwords agree), so the dword-granular
+        // vblendvps/vblendvpd sign select is exact for both FP widths.
+        // Legacy SSE4.1-only targets keep the 3-op andps/andnps/orps
+        // select: blendvps carries its mask IMPLICITLY in %xmm0 there
+        // (a different, destructive encoding) and vblendvps without VEX
+        // is a guaranteed SIGILL.
+        if self.isa.sse41 && self.avx2_enabled {
+            let inst = match domain {
+                BlendvDomain::Pd => "vblendvpd",
+                _ => "vblendvps",
+            };
+            self.emit_blendv_128_vex(dest, args, inst);
+            return;
+        }
         let (and, andn, or) = match domain {
             BlendvDomain::Ps => ("andps", "andnps", "orps"),
             BlendvDomain::Pd => ("andpd", "andnpd", "orpd"),
@@ -8767,28 +8848,23 @@ impl X86Codegen {
     }
 
     /// Integer-domain lane-mask select (SSE2): pand/pandn/por — see
-    /// `emit_sse_blendv_128`. SSE4.1+ takes the ONE-instruction
-    /// `vblendvps` form first (dword-lane bitwise select keyed on the
-    /// mask lane's sign bit — exact on integer payloads, the same
-    /// mnemonic the 256-bit path uses).
+    /// `emit_sse_blendv_128`. The callers pick the width-aware VEX form
+    /// first when the target and the LANE GRANULARITY admit it (dword
+    /// lanes: vblendvps; word/byte lanes: vpblendvb — see the dispatch
+    /// comments); this baseline stays the always-exact per-BIT select.
     pub(super) fn emit_sse_blendv_128_int(&mut self, dest: &Value, args: &[Operand]) {
-        // VEX form only under AVX2: the legacy SSE4.1 `blendvps` carries
-        // its mask IMPLICITLY in %xmm0 (a different, destructive encoding)
-        // — emitting `vblendvps` on an SSE4.1-only target (x86-64-v2!) is
-        // a guaranteed SIGILL. Those targets keep the correct 3-op
-        // bitwise select below.
-        if self.isa.sse41 && self.avx2_enabled {
-            self.emit_blendv_128_vexps(dest, args);
-            return;
-        }
         self.emit_sse_blendv_128_mnemonics(dest, args, "pand", "pandn", "por");
     }
 
-    /// `vblendvps %mask, %true, %false, %dst` (128-bit, VEX — AVX2 gated):
-    /// all-homed fast path with zero staging; otherwise the mask and true
-    /// arms stream through the scratch pair with the false arm recovered
-    /// from its home or slot (the audited blendv discipline).
-    fn emit_blendv_128_vexps(&mut self, dest: &Value, args: &[Operand]) {
+    /// `vblendvX %mask, %true, %false, %dst` (128-bit, VEX — SSE4.1+AVX2
+    /// gated, mnemonic picked by the CALLER for lane granularity):
+    /// all-homed fast path with zero staging; otherwise the mask and
+    /// false arm stream through the scratch pair with the true arm
+    /// recovered from its home or slot (the audited blendv discipline,
+    /// and the VEX /is4 slot constraints: the r/m operand is the AT&T
+    /// SECOND source — the true arm — and VEX.vvvv the third — the false
+    /// arm, register-only).
+    fn emit_blendv_128_vex(&mut self, dest: &Value, args: &[Operand], inst: &str) {
         debug_assert!(args.len() == 3, "blendv128: expects false, true, mask");
         self.state.invalidate_vec_peephole();
         if matches!((&args[0], &args[1]), (Operand::Value(a), Operand::Value(b)) if a == b) {
@@ -8803,23 +8879,29 @@ impl X86Codegen {
         if let (Some(f), Some(t), Some(m)) = (&f, &t, &m) {
             if let Some(d) = self.dest_xmm_home_name(dest) {
                 self.state
-                    .emit_fmt(format_args!("    vblendvps {}, {}, {}, %{}", m, t, f, d));
+                    .emit_fmt(format_args!("    {} {}, {}, {}, %{}", inst, m, t, f, d));
                 self.sse_commit_dest_direct(dest, d);
                 return;
             }
         }
-        // Generic: mask and true into the scratch pair, false recovered
-        // from home/slot — mirror emit_sse_blendv_128_mnemonics' proven
-        // resolution order (mask first so a deferred cmp result keeps its
-        // cache hit).
+        // Generic: mask and FALSE arm through the scratch pair, true arm
+        // recovered from home/slot — the VEX /is4 encoding constrains the
+        // operand slots: AT&T `vblendvps %mask, %src2, %src1, %dst` puts
+        // src2 in the ModRM.r/m (memory allowed) and src1 in VEX.vvvv
+        // (REGISTER ONLY). lccc's blendv arg order is [false, true,
+        // mask], so the FALSE arm is src1 (vvvv — must stream through a
+        // register) and the TRUE arm is src2 (may take its slot as a
+        // memory operand), exactly like `emit_avx_blendv_256`'s (None,
+        // None) arm. The mask resolves first so a deferred cmp result
+        // keeps its cache hit.
         self.sse_load_arg(&args[2], "xmm1");
-        self.sse_load_arg(&args[1], "xmm0");
-        let fsrc = match self.vec_home_128(&args[0]) {
+        self.sse_load_arg(&args[0], "xmm0");
+        let tsrc = match self.vec_home_128(&args[1]) {
             Some(reg) => reg,
-            None => self.vec_mem_source_after_flush(&args[0], "vblendvps128"),
+            None => self.vec_mem_source_after_flush(&args[1], "blendv128"),
         };
         self.state
-            .emit_fmt(format_args!("    vblendvps %xmm1, %xmm0, {}, %xmm0", fsrc));
+            .emit_fmt(format_args!("    {} %xmm1, {}, %xmm0, %xmm0", inst, tsrc));
         self.sse_store_dest(dest, "xmm0");
     }
 

@@ -927,15 +927,118 @@ fn strip_identity_casts(ctx: &BlockCtx, o: &Operand) -> Operand {
     cur
 }
 
-/// Two operands name the same SOURCE when (after identity-cast stripping)
-/// they are the same value, or two loads of the same symbolic address
-/// with NO memory write between them — the pre-CSE frontend emits one
-/// load per spelling side, and the interval check is the whole
-/// same-value proof (any write between the two loads could change the
-/// observed bytes; rule (c) covers the pack's own lane range only).
+/// Strip casts that preserve the BIT PATTERN exactly: same-width integer
+/// reinterprets (`(int32_t)uint32_t` — U32→I32 and every sibling
+/// spelling) plus the `from == to` identity casts `strip_identity_casts`
+/// covers. Legal wherever the consumer reasons about RAW BITS and takes
+/// its signedness from the predicate, not the cast types: the packed
+/// compares read the identical lanes, and the min/max arm identity is a
+/// bit-level question. A widening or narrowing cast is NEVER stripped
+/// here (the bits differ).
+fn strip_bitidentity_casts(ctx: &BlockCtx, o: &Operand) -> Operand {
+    let block = ctx.block;
+    let mut cur = o.clone();
+    for _ in 0..8 {
+        let Operand::Value(v) = &cur else { break };
+        let Some(&i) = ctx.def_pos.get(&v.0) else {
+            break;
+        };
+        match &block.instructions[i] {
+            Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty == to_ty
+                || (ty_is_integer(*from_ty)
+                    && ty_is_integer(*to_ty)
+                    && from_ty.size() == to_ty.size()) =>
+            {
+                cur = src.clone();
+            }
+            _ => break,
+        }
+    }
+    cur
+}
+
+/// Remap a promoted-width compare predicate onto the narrow lane type it
+/// was widened from, given the widening cast's source and destination
+/// signedness. Exactness:
+///   * Eq/Ne are width-free.
+///   * A zext widening (unsigned source) makes the promoted values
+///     non-negative: a SIGNED promoted compare then agrees with the
+///     UNSIGNED narrow compare (this is exactly C's promotion of
+///     unsigned char/short lanes to `int`), and an unsigned one with
+///     itself.
+///   * A sext widening (signed source into a SIGNED wider type) is
+///     strictly monotone for the signed order: signed predicates keep.
+///     A sext into an UNSIGNED wider type reorders (the sign extension
+///     enters the unsigned domain as a huge value): reject. An unsigned
+///     predicate over sext values reorders the same way: reject.
+fn demote_cmp_pred(op: IrCmpOp, from_unsigned: bool, to_unsigned: bool) -> Option<IrCmpOp> {
+    match op {
+        IrCmpOp::Eq | IrCmpOp::Ne => Some(op),
+        IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => {
+            if from_unsigned {
+                Some(match op {
+                    IrCmpOp::Slt => IrCmpOp::Ult,
+                    IrCmpOp::Sle => IrCmpOp::Ule,
+                    IrCmpOp::Sgt => IrCmpOp::Ugt,
+                    _ => IrCmpOp::Uge,
+                })
+            } else if !to_unsigned {
+                Some(op)
+            } else {
+                None
+            }
+        }
+        IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => {
+            if from_unsigned {
+                Some(op)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The narrow-lane constant for a promoted integer constant: the demoted
+/// select's arm/compare operand. ARM constants truncate exactly (the
+/// stored value is `trunc(promoted select)` for every arm value); COMPARE
+/// operands additionally require the value to lie in the narrow range of
+/// the final predicate's signedness (checked by the caller — an
+/// out-of-range compare operand changes the predicate's truth value).
+fn narrow_const(cv: i64, ty: IrType) -> IrConst {
+    match ty {
+        IrType::I8 | IrType::U8 => IrConst::I8(cv as i8),
+        _ => IrConst::I16(cv as i16),
+    }
+}
+
+/// Does `cv` lie in the narrow lane's range for a predicate of
+/// signedness `unsigned`? Outside it, the promoted compare is
+/// constant-foldable and the demotion must not guess its answer.
+fn fits_narrow(cv: i64, ty: IrType, unsigned: bool) -> bool {
+    let bits = 8 * ty.size() as i64;
+    if unsigned {
+        (0..1i64 << bits).contains(&cv)
+    } else {
+        (-(1i64 << (bits - 1))..1i64 << (bits - 1)).contains(&cv)
+    }
+}
+
+/// Two operands name the same SOURCE when (after bit-identity cast
+/// stripping — same-width integer reinterprets preserve every bit, so
+/// they name the same loadable value) they are the same value, or two
+/// loads of the same symbolic address with NO memory write between them
+/// — the pre-CSE frontend emits one load per spelling side, and the
+/// interval check is the whole same-value proof (any write between the
+/// two loads could change the observed bytes; rule (c) covers the
+/// pack's own lane range only).
 fn same_source(ctx: &BlockCtx, a: &Operand, b: &Operand) -> bool {
-    let a = strip_identity_casts(ctx, a);
-    let b = strip_identity_casts(ctx, b);
+    let a = strip_bitidentity_casts(ctx, a);
+    let b = strip_bitidentity_casts(ctx, b);
     if a == b {
         return true;
     }
@@ -1376,6 +1479,42 @@ fn collect_seed_candidates(ctx: &BlockCtx) -> Vec<SeedCandidate> {
                             anchor_ptr: run[0].3,
                             width,
                         });
+                        // Fallback sub-window candidates: the full-width
+                        // seed takes the first `width` stores of the run,
+                        // and when ITS lanes are not uniform (v7_pressure:
+                        // three independent 4-lane groups — add, sub, xor
+                        // — fused into one 12-store run) the pack build
+                        // fails and, without fallbacks, the WHOLE run
+                        // stays scalar. Every aligned 128-bit window is
+                        // offered as its own seed so the uniform groups
+                        // still pack (GCC's behavior on the same shape).
+                        // Overlap with the primary seed is safe: plans are
+                        // attempted longest-first, one applied per scan,
+                        // and the rewrite turns the packed stores into
+                        // vector stores before the rescan re-collects.
+                        let w128 = (16 / size) as usize;
+                        if width > w128 {
+                            for chunk in run.chunks(w128) {
+                                if chunk.len() < 2 {
+                                    continue;
+                                }
+                                let cw = match preferred_width(chunk.len(), size as u64, ty, avx2) {
+                                    Some(cw) if cw == chunk.len() => cw,
+                                    _ => continue,
+                                };
+                                let store_idx: Vec<usize> =
+                                    chunk.iter().map(|(_, i, _, _)| *i).collect();
+                                let lane_ops: Vec<Operand> =
+                                    chunk.iter().map(|(_, _, v, _)| v.clone()).collect();
+                                candidates.push(SeedCandidate {
+                                    store_idx,
+                                    lane_ops,
+                                    ty,
+                                    anchor_ptr: chunk[0].3,
+                                    width: cw,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -1922,6 +2061,402 @@ fn build_pack(
                     }
                 }
             }
+            // 1b. Sub-word SELECT demotion: lanes are truncating casts of
+            //     PROMOTED selects — `q[i] = a[i] < b[i] ? a[i] : b[i]` (the
+            //     min/max spelling) or `? 7 : 3` (mixed arms) on i8/i16/u8/
+            //     u16 arrays. C promotes the compare and BOTH arms to int;
+            //     the store truncates back, so the packed replacement needs
+            //     only be bit-identical to `trunc(promoted select)` — which a
+            //     select at the LANE width over the raw narrow values is, by
+            //     construction, for every arm constant (arms truncate
+            //     exactly) and every predicate the remap table below admits.
+            //     The promoted Select/Cmp chain STAYS in the IR for any wider
+            //     uses (its lanes here are only the truncs), so the pack's
+            //     cond_lanes are EMPTY — nothing is removed that is still
+            //     used, and DCE retires the promoted chain when the truncs
+            //     were its only consumers.
+            {
+                let sel_demotable = vals.iter().all(|v| {
+                    match ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]) {
+                        Some(Instruction::Cast {
+                            src: Operand::Value(sv),
+                            from_ty,
+                            to_ty,
+                            ..
+                        }) if *to_ty == ty
+                            && ty_is_integer(*from_ty)
+                            && from_ty.size() > ty.size() =>
+                        {
+                            matches!(
+                                ctx.def_pos.get(&sv.0).map(|&j| &block.instructions[j]),
+                                Some(Instruction::Select { .. })
+                            )
+                        }
+                        _ => false,
+                    }
+                });
+                if sel_demotable {
+                    // Per lane: (remapped compare op, stripped lhs, stripped
+                    // rhs, stripped true arm, stripped false arm).
+                    let mut shapes: Vec<(IrCmpOp, Operand, Operand, Operand, Operand)> =
+                        Vec::with_capacity(width);
+                    let mut demote_ok = true;
+                    for v in &vals {
+                        let i = ctx.def_pos[&v.0];
+                        let Instruction::Cast {
+                            src: Operand::Value(sv),
+                            ..
+                        } = &block.instructions[i]
+                        else {
+                            unreachable!()
+                        };
+                        let j = ctx.def_pos[&sv.0];
+                        let Instruction::Select {
+                            cond,
+                            true_val,
+                            false_val,
+                            ..
+                        } = &block.instructions[j]
+                        else {
+                            unreachable!()
+                        };
+                        let Operand::Value(cv) = cond else {
+                            demote_ok = false;
+                            break;
+                        };
+                        let Some(&ci) = ctx.def_pos.get(&cv.0) else {
+                            demote_ok = false;
+                            break;
+                        };
+                        let Instruction::Cmp {
+                            op,
+                            lhs,
+                            rhs,
+                            ty: cty,
+                            ..
+                        } = &block.instructions[ci]
+                        else {
+                            demote_ok = false;
+                            break;
+                        };
+                        // The compare is either already at the lane width
+                        // (an earlier pass narrowed it — the arms still carry
+                        // the widening casts) or at the promoted width over
+                        // widening casts/consts of the lane values.
+                        let (remap, l, r) = if *cty == ty {
+                            (
+                                Some(*op),
+                                strip_bitidentity_casts(ctx, lhs),
+                                strip_bitidentity_casts(ctx, rhs),
+                            )
+                        } else if ty_is_integer(*cty) && cty.size() > ty.size() {
+                            // Widen-cast / fitting-const operands only.
+                            let strip_wide = |o: &Operand| -> Option<(bool, bool, Operand)> {
+                                match o {
+                                    Operand::Value(w) => {
+                                        match ctx.def_pos.get(&w.0).map(|&k| &block.instructions[k])
+                                        {
+                                            Some(Instruction::Cast {
+                                                src,
+                                                from_ty,
+                                                to_ty,
+                                                ..
+                                            }) if *from_ty == ty && *to_ty == *cty => Some((
+                                                !from_ty.is_signed(),
+                                                !to_ty.is_signed(),
+                                                src.clone(),
+                                            )),
+                                            _ => None,
+                                        }
+                                    }
+                                    Operand::Const(c) => {
+                                        let cv = c.to_i64()?;
+                                        // The const must compare identically after
+                                        // the demotion: it has to fit the FINAL
+                                        // (remapped) predicate's narrow range.
+                                        // The remap here uses the SAME unsigned
+                                        // flags the tuple reports (and the cast
+                                        // side uses) — a signed lane promotes by
+                                        // sext, so its compare stays SIGNED and
+                                        // an out-of-range constant (40000 vs
+                                        // int16) must reject, never truncate.
+                                        // (Both-const compares fold before SLP.)
+                                        let rem = demote_cmp_pred(
+                                            *op,
+                                            !ty.is_signed(),
+                                            !cty.is_signed(),
+                                        )?;
+                                        let unsigned_final = matches!(
+                                            rem,
+                                            IrCmpOp::Ult
+                                                | IrCmpOp::Ule
+                                                | IrCmpOp::Ugt
+                                                | IrCmpOp::Uge
+                                        );
+                                        if fits_narrow(cv, ty, unsigned_final) {
+                                            Some((
+                                                !ty.is_signed(),
+                                                !cty.is_signed(),
+                                                Operand::Const(narrow_const(cv, ty)),
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                }
+                            };
+                            match (strip_wide(lhs), strip_wide(rhs)) {
+                                (Some((fu0, tu0, l)), Some((fu1, tu1, r)))
+                                    if fu0 == fu1 && tu0 == tu1 =>
+                                {
+                                    (demote_cmp_pred(*op, fu0, tu0), l, r)
+                                }
+                                _ => (None, lhs.clone(), rhs.clone()),
+                            }
+                        } else {
+                            (None, lhs.clone(), rhs.clone())
+                        };
+                        let Some(remapped) = remap else {
+                            demote_ok = false;
+                            break;
+                        };
+                        // The arms: widening casts of the lane values, or
+                        // constants (truncation-exact for every value).
+                        // The arms widen to the SELECT's type, which is the
+                        // compare's type only when the compare itself is at
+                        // the promoted width — an already-narrow compare
+                        // (an earlier pass narrowed it) still carries
+                        // full-width arms. Accept ANY wider target.
+                        let strip_arm = |o: &Operand| -> Option<Operand> {
+                            match o {
+                                Operand::Value(w) => {
+                                    match ctx.def_pos.get(&w.0).map(|&k| &block.instructions[k]) {
+                                        Some(Instruction::Cast {
+                                            src,
+                                            from_ty,
+                                            to_ty,
+                                            ..
+                                        }) if *from_ty == ty
+                                            && ty_is_integer(*to_ty)
+                                            && to_ty.size() > ty.size() =>
+                                        {
+                                            Some(src.clone())
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                                Operand::Const(c) => {
+                                    c.to_i64().map(|cv| Operand::Const(narrow_const(cv, ty)))
+                                }
+                            }
+                        };
+                        let Some(t) = strip_arm(true_val) else {
+                            demote_ok = false;
+                            break;
+                        };
+                        let Some(f) = strip_arm(false_val) else {
+                            demote_ok = false;
+                            break;
+                        };
+                        shapes.push((remapped, l, r, t, f));
+                    }
+                    if demote_ok && shapes.len() == width {
+                        let op0 = shapes[0].0;
+                        let uniform = shapes.iter().all(|s| s.0 == op0);
+                        if uniform {
+                            // (a) the min/max spelling on the stripped
+                            //     operands — same fold table as the at-width
+                            //     2c path.
+                            let spell = match op0 {
+                                IrCmpOp::Slt | IrCmpOp::Sle => Some(0),
+                                IrCmpOp::Sgt | IrCmpOp::Sge => Some(1),
+                                _ => None,
+                            };
+                            if let Some(s) = spell {
+                                #[derive(Clone, Copy, PartialEq)]
+                                enum Fold {
+                                    Min,
+                                    Max,
+                                }
+                                let mut fold: Option<(Fold, bool)> = None;
+                                let mut shapes_ok = true;
+                                for (op, l, r, t, f) in &shapes {
+                                    let _ = op;
+                                    let this = if same_source(ctx, t, l) && same_source(ctx, f, r) {
+                                        Some(if s == 0 {
+                                            (Fold::Min, false)
+                                        } else {
+                                            (Fold::Max, false)
+                                        })
+                                    } else if same_source(ctx, t, r) && same_source(ctx, f, l) {
+                                        Some(if s == 0 {
+                                            (Fold::Max, true)
+                                        } else {
+                                            (Fold::Min, true)
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    match (this, fold) {
+                                        (Some(x), None) => fold = Some(x),
+                                        (Some(x), Some(y)) if x == y => {}
+                                        _ => {
+                                            shapes_ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if shapes_ok {
+                                    if let Some((kind, arms_swapped)) = fold {
+                                        if let Some(vec_op) =
+                                            packed_int_minmax(kind == Fold::Max, ty, width)
+                                        {
+                                            let mut src1: Vec<Operand> = Vec::with_capacity(width);
+                                            let mut src2: Vec<Operand> = Vec::with_capacity(width);
+                                            for (_, l, r, _, _) in &shapes {
+                                                if arms_swapped {
+                                                    src1.push(strip_bitidentity_casts(ctx, r));
+                                                    src2.push(strip_bitidentity_casts(ctx, l));
+                                                } else {
+                                                    src1.push(strip_bitidentity_casts(ctx, l));
+                                                    src2.push(strip_bitidentity_casts(ctx, r));
+                                                }
+                                            }
+                                            if let (Some(lhs), Some(rhs)) = (
+                                                build_pack(
+                                                    ctx,
+                                                    &src1,
+                                                    ty,
+                                                    width,
+                                                    fam,
+                                                    packs,
+                                                    dedup,
+                                                    depth + 1,
+                                                ),
+                                                build_pack(
+                                                    ctx,
+                                                    &src2,
+                                                    ty,
+                                                    width,
+                                                    fam,
+                                                    packs,
+                                                    dedup,
+                                                    depth + 1,
+                                                ),
+                                            ) {
+                                                let idx = packs.len();
+                                                packs.push(Pack {
+                                                    kind: PackKind::FpMinMax {
+                                                        vec_op,
+                                                        lhs,
+                                                        rhs,
+                                                        // The promoted Cmp stays
+                                                        // (the promoted Select still
+                                                        // reads it); nothing is
+                                                        // removed on its behalf.
+                                                        cond_lanes: Vec::new(),
+                                                    },
+                                                    lane_vals: vals.clone(),
+                                                    sched: usize::MAX,
+                                                    order: 0,
+                                                });
+                                                dedup.insert(key, idx);
+                                                return Some(idx);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // (b) the general cmp+blendv composite with the
+                            //     remapped predicate.
+                            if let Some((pred, swap)) = cmp_predicate_imm(op0, false) {
+                                if let Some((cmp_op, blend_op)) = packed_cmp_blendv(ty, width) {
+                                    let mut a_lanes: Vec<Operand> = Vec::with_capacity(width);
+                                    let mut b_lanes: Vec<Operand> = Vec::with_capacity(width);
+                                    let mut t_lanes: Vec<Operand> = Vec::with_capacity(width);
+                                    let mut f_lanes: Vec<Operand> = Vec::with_capacity(width);
+                                    for (_, l, r, t, f) in &shapes {
+                                        // The mirrored relations compare (r, l).
+                                        if swap {
+                                            a_lanes.push(r.clone());
+                                            b_lanes.push(l.clone());
+                                        } else {
+                                            a_lanes.push(l.clone());
+                                            b_lanes.push(r.clone());
+                                        }
+                                        t_lanes.push(t.clone());
+                                        f_lanes.push(f.clone());
+                                    }
+                                    if let (Some(lhs), Some(rhs), Some(tv), Some(fv)) = (
+                                        build_pack(
+                                            ctx,
+                                            &a_lanes,
+                                            ty,
+                                            width,
+                                            fam,
+                                            packs,
+                                            dedup,
+                                            depth + 1,
+                                        ),
+                                        build_pack(
+                                            ctx,
+                                            &b_lanes,
+                                            ty,
+                                            width,
+                                            fam,
+                                            packs,
+                                            dedup,
+                                            depth + 1,
+                                        ),
+                                        build_pack(
+                                            ctx,
+                                            &t_lanes,
+                                            ty,
+                                            width,
+                                            fam,
+                                            packs,
+                                            dedup,
+                                            depth + 1,
+                                        ),
+                                        build_pack(
+                                            ctx,
+                                            &f_lanes,
+                                            ty,
+                                            width,
+                                            fam,
+                                            packs,
+                                            dedup,
+                                            depth + 1,
+                                        ),
+                                    ) {
+                                        let idx = packs.len();
+                                        packs.push(Pack {
+                                            kind: PackKind::CmpBlendv {
+                                                cmp_op,
+                                                blend_op,
+                                                pred,
+                                                lhs,
+                                                rhs,
+                                                tv,
+                                                fv,
+                                                // Empty: the promoted Cmp is
+                                                // not removed (the surviving
+                                                // promoted Select reads it).
+                                                cond_lanes: Vec::new(),
+                                            },
+                                            lane_vals: vals.clone(),
+                                            sched: usize::MAX,
+                                            order: 0,
+                                        });
+                                        dedup.insert(key, idx);
+                                        return Some(idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // 2. Consecutive-address loads of the exact lane type.
@@ -2199,7 +2734,14 @@ fn build_pack(
                     else {
                         return None;
                     };
-                    if *cty != ty {
+                    if *cty != ty
+                        && !(ty_is_integer(*cty) && ty_is_integer(ty) && cty.size() == ty.size())
+                    {
+                        // The compare must sit at the pack's lane type,
+                        // or at a SAME-WIDTH integer sibling — a
+                        // `(int32_t)uint32_t` reinterpret whose bits the
+                        // predicate (which carries the signedness itself)
+                        // reads identically. FP lanes never reinterpret.
                         return None;
                     }
                     Some((
@@ -2281,11 +2823,11 @@ fn build_pack(
                         for v in &vals {
                             let (_, l, r, _, _, cv) = sel_shape(v).unwrap();
                             if arms_swapped {
-                                src1.push(strip_identity_casts(ctx, &r));
-                                src2.push(strip_identity_casts(ctx, &l));
+                                src1.push(strip_bitidentity_casts(ctx, &r));
+                                src2.push(strip_bitidentity_casts(ctx, &l));
                             } else {
-                                src1.push(strip_identity_casts(ctx, &l));
-                                src2.push(strip_identity_casts(ctx, &r));
+                                src1.push(strip_bitidentity_casts(ctx, &l));
+                                src2.push(strip_bitidentity_casts(ctx, &r));
                             }
                             conds.push(cv);
                         }
@@ -2333,8 +2875,8 @@ fn build_pack(
                                     uniform = false;
                                     break;
                                 }
-                                l_lanes.push(strip_identity_casts(ctx, &l));
-                                r_lanes.push(strip_identity_casts(ctx, &r));
+                                l_lanes.push(strip_bitidentity_casts(ctx, &l));
+                                r_lanes.push(strip_bitidentity_casts(ctx, &r));
                                 t_lanes.push(t.clone());
                                 f_lanes.push(f.clone());
                                 conds.push(cv);
@@ -3226,7 +3768,19 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             if removed.contains(&i) {
                 continue;
             }
-            if !matches!(inst, Instruction::Cast { .. } | Instruction::BinOp { .. }) {
+            // Select and Cmp join the feeder kinds for the sub-word
+            // SELECT demotion: the promoted chain (Select reading a Cmp
+            // and widening Casts, feeding only the removed truncating
+            // lanes) is exactly the scaffolding that must retire here —
+            // rule (a) would otherwise see its reads of the load lanes
+            // as live in-block uses at or before the pack slot.
+            if !matches!(
+                inst,
+                Instruction::Cast { .. }
+                    | Instruction::BinOp { .. }
+                    | Instruction::Select { .. }
+                    | Instruction::Cmp { .. }
+            ) {
                 continue;
             }
             let Some(d) = inst.dest() else { continue };

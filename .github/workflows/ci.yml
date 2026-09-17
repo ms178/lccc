@@ -263,6 +263,26 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_bb_slp_v5_codegen.sh
 
+      # BB-SLP v7: red-team adversarial edges of the v6 feature set
+      # (cross-block corners, cmp+blendv corner predicates, FP-Neg
+      # chains, memfold width/order corners) plus the sub-word SELECT
+      # demotion (C integer promotion: i8/i16/u8/u16 selects and min/max
+      # pack at the lane width with predicate remapping) — tri-config
+      # differential (SLP on / CCC_NO_BB_SLP=1 / gcc) included.
+      - name: Verify basic-block SLP v7 contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_bb_slp_v7_codegen.sh
+
+      # BB-SLP v6 (the gate ci.yml was missing — ci_local.sh had it): the
+      # 128-bit VEX memory fold, FP negation sign-mask, integer min/max
+      # folds, the general cmp+blendv composite, and the rule-(b)
+      # cross-block relaxation, plus the W5 register-homing contracts.
+      - name: Verify basic-block SLP v6 contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_bb_slp_v6_codegen.sh
+
       # Compare-replay home-rewrite contract: a multi-select compare-replay
       # must never trust a register-homed operand across an emission gap
       # that rewrites its home (the RA's latch/phi-web coalescing shares one
