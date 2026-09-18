@@ -495,11 +495,29 @@ impl InstructionEncoder {
             "vpsraw" => r(self.encode_evex_shift_imm(ops, 0, 0x71, 4)),
             "vpsrad" => r(self.encode_evex_shift_imm(ops, 0, 0x72, 4)),
             "vpsraq" => r(self.encode_evex_shift_imm(ops, 1, 0x72, 4)),
+            // Whole-vector byte shifts share the 0F.73 shift group:
+            // VPSLLDQ is /7, VPSRLDQ is /3 (W0; no opmask/broadcast).
+            "vpslldq" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_shift_imm(ops, 0, 0x73, 7))),
+            "vpsrldq" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_shift_imm(ops, 0, 0x73, 3))),
             // 3-source + imm8 (AT&T: $imm, src2, src1, dst)
             "vpternlogd" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x25)),
             "vpternlogq" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x25)),
             "vpalignr" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x0F)),
             "vpclmulqdq" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x44)),
+            // VAES rounds: EVEX.128/256/512.66.0F38.W0 DC..DF. xmm/ymm0-15
+            // without masking take the shorter VEX encoding in the table
+            // below; zmm, ymm16-31, and masked forms land here. The ISA has
+            // no opmask/broadcast forms for VAES (GNU as rejects them).
+            "vaesenc" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_binary(ops, 2, 1, 0, 0xDC))),
+            "vaesenclast" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_binary(ops, 2, 1, 0, 0xDD))),
+            "vaesdec" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_binary(ops, 2, 1, 0, 0xDE))),
+            "vaesdeclast" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_binary(ops, 2, 1, 0, 0xDF))),
             "vinserti32x4" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x38)),
             "vinserti64x2" => r(self.encode_evex_3src_imm(ops, 3, 1, 1, 0x38)),
             "vinserti32x8" => r(self.encode_evex_3src_imm(ops, 3, 1, 0, 0x3A)),

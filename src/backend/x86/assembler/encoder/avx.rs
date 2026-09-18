@@ -109,6 +109,28 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// VAES rounds and VPS{LL,RL}DQ whole-vector byte shifts have EVEX forms
+    /// for the wider registers, but the ISA gives them no opmask (k1/z) and
+    /// no embedded broadcast ({1toN}). GNU as rejects those operands with
+    /// "unsupported masking/broadcast for `<mnemonic>'"; match that instead
+    /// of silently encoding EVEX mask/bcst bits into an invalid instruction.
+    pub(crate) fn evex_forbid_mask_bcst(mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+        for op in ops {
+            let (masked, zeroing, bcst) = match op {
+                Operand::Register(reg) => (reg.mask.is_some(), reg.zeroing, false),
+                Operand::Memory(mem) => (mem.mask.is_some(), mem.zeroing, mem.broadcast.is_some()),
+                _ => continue,
+            };
+            if masked || zeroing {
+                return Err(format!("unsupported masking for `{mnemonic}'"));
+            }
+            if bcst {
+                return Err(format!("unsupported broadcast for `{mnemonic}'"));
+            }
+        }
+        Ok(())
+    }
+
     /// Encode an EVEX memory operand with scale-aware disp8 (EVEX disp8 is
     /// multiplied by N = element-size × vector-length; using it for
     /// displacements not divisible by N silently computes the WRONG address).

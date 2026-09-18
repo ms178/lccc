@@ -800,6 +800,40 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             let vals = parse_data_values(args)?;
             Ok(AsmItem::Quad(vals))
         }
+        // `.octa` — 16-byte (128-bit) constants, emitted little-endian.
+        // Previously this directive fell through to the "ignore unknown
+        // directive" arm, silently emitting NOTHING: the kernel's
+        // `.Lbswap_mask`-style `.octa` constant pools lost whole entries
+        // (shifting everything after them) with no diagnostic, and AES-CTR
+        // assembled with a zeroed byte-swap mask.
+        ".octa" => {
+            let mut data: Vec<DataValue> = Vec::new();
+            for part in args.split(',') {
+                let t = strip_outer_parens(part.trim());
+                if t.is_empty() {
+                    continue;
+                }
+                // 128-bit literals first (they can exceed u64); fall back to
+                // the ordinary 64-bit expression parser for smaller values.
+                let wide =
+                    parse_u128_literal(t).or_else(|| parse_integer_expr(t).ok().map(|v| v as u128));
+                match wide {
+                    Some(v) => {
+                        // AsmItem::Byte is a byte-per-DataValue stream
+                        // (the .float/.double path uses the same shape).
+                        data.extend(
+                            v.to_le_bytes()
+                                .iter()
+                                .map(|b| DataValue::Integer(*b as i64)),
+                        );
+                    }
+                    None => {
+                        return Err(format!(".octa: unsupported value: {t}"));
+                    }
+                }
+            }
+            Ok(AsmItem::Byte(data))
+        }
         // Floating-point data. These were previously UNRECOGNIZED and fell
         // through to the "ignore unknown directive" arm, silently emitting
         // NOTHING — every `.float`/`.double` constant pool assembled from
@@ -2264,6 +2298,40 @@ fn parse_float_values(s: &str, double: bool) -> Result<Vec<DataValue>, String> {
     Ok(out)
 }
 
+/// Parse a standalone 128-bit integer literal (decimal, 0x hex, 0b binary,
+/// 0o/leading-0 octal), with an optional leading `-` (two's complement).
+/// Returns None for anything that is not a pure literal.
+fn parse_u128_literal(s: &str) -> Option<u128> {
+    let s = s.trim();
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest.trim()),
+        None => (false, s),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let (radix, digits) =
+        if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            (16, h)
+        } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+            (2, b)
+        } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+            (8, o)
+        } else if body.len() > 1
+            && body.starts_with('0')
+            && body[1..].bytes().all(|c| c.is_ascii_digit())
+        {
+            (8, &body[1..])
+        } else {
+            (10, body)
+        };
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let v = u128::from_str_radix(digits, radix).ok()?;
+    Some(if neg { v.wrapping_neg() } else { v })
+}
+
 fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
     let mut vals = Vec::new();
     for part in s.split(',') {
@@ -2779,6 +2847,9 @@ fn parse_integer_expr(s: &str) -> Result<i64, String> {
 #[derive(Clone, Debug)]
 struct GasMacro {
     params: Vec<(String, Option<String>)>, // (name, default_value)
+    /// Index of the `name:vararg` parameter: it swallows ALL remaining
+    /// positional arguments (comma-joined) instead of binding to one.
+    vararg_index: Option<usize>,
     body: Vec<String>,
 }
 
@@ -2942,7 +3013,7 @@ fn expand_gas_macros_with_state(
 
         // .macro name param1:req param2:req ...
         if let Some(rest) = directive_arg(&trimmed, ".macro") {
-            let (name, params) = parse_macro_def(rest)?;
+            let (name, params, vararg_index) = parse_macro_def(rest)?;
             let mut body = Vec::new();
             let mut depth = 1;
             i += 1;
@@ -2962,7 +3033,14 @@ fn expand_gas_macros_with_state(
             if depth != 0 {
                 return Err(".macro without matching .endm".to_string());
             }
-            macros.insert(name, GasMacro { params, body });
+            macros.insert(
+                name,
+                GasMacro {
+                    params,
+                    vararg_index,
+                    body,
+                },
+            );
             i += 1;
             continue;
         }
@@ -3390,7 +3468,7 @@ fn expand_gas_macros_with_state(
             } else {
                 first_part[macro_name.len()..].trim()
             };
-            let args = parse_macro_args(args_str, &mac.params)?;
+            let args = parse_macro_args(args_str, &mac.params, mac.vararg_index)?;
             // Sort parameters by name length (longest first) to avoid partial
             // substitution: e.g., \orig must not match before \orig_len.
             let mut sorted_args: Vec<(String, String)> = args.clone();
@@ -3479,7 +3557,9 @@ fn expand_gas_macros_with_state(
 }
 
 /// Parse a .macro definition header: "name param1:req param2:req ..."
-fn parse_macro_def(rest: &str) -> Result<(String, Vec<(String, Option<String>)>), String> {
+fn parse_macro_def(
+    rest: &str,
+) -> Result<(String, Vec<(String, Option<String>)>, Option<usize>), String> {
     // Tokenize the parameter list at PAREN DEPTH 0 only.
     //
     // Splitting on raw whitespace shreds a default value that contains spaces:
@@ -3538,6 +3618,7 @@ fn parse_macro_def(rest: &str) -> Result<(String, Vec<(String, Option<String>)>)
     }
     let name = parts[0].clone();
     let mut params = Vec::new();
+    let mut vararg_index = None;
     for part in &parts[1..] {
         // `param=default` wins over `param:req`: a default may itself contain
         // a colon, and the qualifier is not part of the parameter NAME.
@@ -3547,18 +3628,23 @@ fn parse_macro_def(rest: &str) -> Result<(String, Vec<(String, Option<String>)>)
             let default = part[eq + 1..].to_string();
             params.push((pname, Some(default)));
         } else if let Some(colon) = part.find(':') {
+            let qual = part[colon + 1..].trim();
+            if qual == "vararg" && vararg_index.is_none() {
+                vararg_index = Some(params.len());
+            }
             params.push((part[..colon].to_string(), None));
         } else {
             params.push((part.clone(), None));
         }
     }
-    Ok((name, params))
+    Ok((name, params, vararg_index))
 }
 
 /// Parse macro invocation arguments: "param1=val1, param2=val2" or positional
 fn parse_macro_args(
     args_str: &str,
     params: &[(String, Option<String>)],
+    vararg_index: Option<usize>,
 ) -> Result<Vec<(String, String)>, String> {
     let mut result = Vec::new();
     if args_str.is_empty() {
@@ -3607,9 +3693,27 @@ fn parse_macro_args(
         positional_idx += 1;
     }
 
-    // Build result: start with positional, then override with named
+    // Build result: start with positional, then override with named.
+    //
+    // A `:vararg` parameter (must be the last one) swallows ALL remaining
+    // positional arguments, comma-joined — the kernel's
+    //     .macro _xor_data vecs:vararg
+    //         .irp i, \vecs ...
+    // invoked as `_xor_data 0,1,2,3,4,5,6,7` needs `\vecs` to expand to the
+    // full seven-element list, not just `0`. An empty remainder expands to
+    // the empty string.
     let mut pos_iter = positional_vals.into_iter();
-    for (name, default) in params {
+    for (pi, (name, default)) in params.iter().enumerate() {
+        if vararg_index == Some(pi) {
+            let joined = pos_iter
+                .by_ref()
+                .map(|(_, v)| v)
+                .collect::<Vec<String>>()
+                .join(", ");
+            let val = arg_map.get(name).cloned().unwrap_or(joined);
+            result.push((name.clone(), val));
+            continue;
+        }
         if let Some(val) = arg_map.get(name) {
             result.push((name.clone(), val.clone()));
         } else if let Some((_, val)) = pos_iter.next() {
