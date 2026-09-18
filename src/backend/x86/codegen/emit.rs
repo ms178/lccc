@@ -3619,6 +3619,19 @@ impl X86Codegen {
                         self.emit_global_addr_into_reg(&name, reg);
                         return;
                     }
+                    // Last resort: the accumulator cache (rax holds this
+                    // value). This mirrors operand_to_callee_reg's fallback —
+                    // a value can be acc-resident with no slot, home, or Copy
+                    // definition (e.g. inline-asm inputs consumed straight
+                    // after a computation staged through rax). Without this,
+                    // materialising such a value for an asm operand panicked
+                    // even though the data was live in rax.
+                    if self.state.reg_cache.acc_has(val.0, false)
+                        || self.state.reg_cache.acc_has(val.0, true)
+                    {
+                        self.state.out.emit_instr_reg_reg("    movq", "rax", reg);
+                        return;
+                    }
                     panic!(
                         "x86 codegen: value {} has no register, stack slot, Copy, or \
                          GlobalAddr definition",

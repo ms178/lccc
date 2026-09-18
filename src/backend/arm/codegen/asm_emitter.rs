@@ -271,6 +271,42 @@ impl InlineAsmEmitter for ArmCodegen {
                         // Non-alloca: load the value from the stack slot.
                         self.emit_load_from_sp(reg, slot.0, "ldr");
                     }
+                } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    // No stack slot, but register-allocated (authoritative
+                    // allocation — the register holds the value throughout
+                    // its range): materialise the asm input with a direct
+                    // mov, mirroring the RISC-V backend's register-home
+                    // path. This matters for asm that must not touch the
+                    // stack (page-table switches) and for tied operands
+                    // (`asm("" : "=r"(out) : "0"(in))`) where silently
+                    // skipping the load feeds the asm stale register
+                    // contents (the x86-64 OPTIMIZER_HIDE_VAR bug class).
+                    if is_fp {
+                        panic!(
+                            "arm codegen: inline-asm FP input value {} has no stack \
+                             slot — register home cannot feed an FP asm register",
+                            v.0
+                        );
+                    }
+                    if is_sp {
+                        // sp cannot be an ldr/mov destination from an
+                        // arbitrary home in all states; stage via x9.
+                        let src = super::emit::callee_saved_name(phys);
+                        self.state.emit_fmt(format_args!("    mov x9, {}", src));
+                        self.state.emit("    mov sp, x9");
+                    } else {
+                        let src = super::emit::callee_saved_name(phys);
+                        self.state
+                            .emit_fmt(format_args!("    mov {}, {}", reg, src));
+                    }
+                } else {
+                    // Neither slot nor register: fail loudly instead of
+                    // silently feeding the asm stale register contents.
+                    panic!(
+                        "arm codegen: inline-asm input value {} has no stack slot or \
+                         register assignment",
+                        v.0
+                    );
                 }
             }
         }
