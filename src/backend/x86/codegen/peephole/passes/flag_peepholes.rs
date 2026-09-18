@@ -27,7 +27,7 @@ use super::helpers::{get_dest_reg, writes_family_full};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
-    split_two_operands,
+    provably_dead, split_two_operands,
 };
 
 /// What a line does to EFLAGS.
@@ -583,6 +583,142 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
         // The LEA is emitted at the ARITHMETIC width; its base register is
         // always named 64-bit so the address computation stays in 64-bit mode
         // (`leal 1(%r9), %eax` — 32-bit result, 64-bit base).
+        let mnemonic = if add_wide { "leaq" } else { "leal" };
+        let base = REG_NAMES[0][src_fam as usize];
+        let dst_name = if add_wide {
+            REG_NAMES[0][dst_fam as usize]
+        } else {
+            REG_NAMES[1][dst_fam as usize]
+        };
+        let new_line = format!("    {} {}({}), {}", mnemonic, imm, base, dst_name);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+// ── 1b. in-place add-immediate + copy → lea (the mirrored order) ─────────────
+
+/// `addq $imm, %S` + `movq %S, %D` → `leaq imm(%S), %D` (same for `l`, and
+/// for `sub` with the displacement negated).
+///
+/// The mirror of [`fold_copy_add_into_lea`] for the order the loop backend
+/// actually emits: the in-place ALU computes the induction step in the phi's
+/// home and then repairs the result into the temp's home — every indexed
+/// load pair in a loop-carried scan pays `addq $1, %r10; movq %r10, %r9`
+/// (linux_find_bit's bitmap scan measured 9 insns/word vs GCC's 7).
+///
+/// Soundness: the LEA computes the same value in `%D` and — the one semantic
+/// difference — PRESERVES `%S` where the add destroyed it, so the transform
+/// additionally requires `%S` to be dead after the copy. Flags the add wrote
+/// must be dead after the pair, as in the copy-first mirror.
+pub(super) fn fold_inplace_add_copy_into_lea(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let add = infos[i].trimmed(store.get(i));
+        let (add_wide, neg, arest) = if let Some(r) = add.strip_prefix("addq ") {
+            (true, false, r)
+        } else if let Some(r) = add.strip_prefix("addl ") {
+            (false, false, r)
+        } else if let Some(r) = add.strip_prefix("subq ") {
+            (true, true, r)
+        } else if let Some(r) = add.strip_prefix("subl ") {
+            (false, true, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        // Only the IMMEDIATE form folds (the register form would need a
+        // two-source LEA; `leaq (%S,%R), %D` — a different pattern).
+        let Some((imm_text, add_dst)) = split_two_operands(arest) else {
+            i += 1;
+            continue;
+        };
+        let Some(src_fam) = plain_gp_operand(add_dst) else {
+            i += 1;
+            continue;
+        };
+        if src_fam == 4 || src_fam == 5 {
+            i += 1;
+            continue;
+        }
+        let Some(mut imm) = imm_value(imm_text) else {
+            i += 1;
+            continue;
+        };
+        if neg {
+            imm = -imm;
+        }
+        if imm < i32::MIN as i64 || imm > i32::MAX as i64 {
+            i += 1;
+            continue;
+        }
+        // The consumer: an adjacent full-width copy of %S to a different
+        // register. The copy may be WIDER than the arithmetic (movq after
+        // addl), never narrower (a movl copy would truncate the 64-bit
+        // result the LEA must produce).
+        let Some(j) = next_real(infos, i, len) else {
+            i += 1;
+            continue;
+        };
+        if infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let mov = infos[j].trimmed(store.get(j));
+        let (copy_wide, mrest) = if let Some(r) = mov.strip_prefix("movq ") {
+            (true, r)
+        } else if let Some(r) = mov.strip_prefix("movl ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        if !copy_wide && add_wide {
+            i += 1;
+            continue;
+        }
+        let Some((m_src, m_dst)) = split_two_operands(mrest) else {
+            i += 1;
+            continue;
+        };
+        let (Some(m_src_fam), Some(dst_fam)) = (plain_gp_operand(m_src), plain_gp_operand(m_dst))
+        else {
+            i += 1;
+            continue;
+        };
+        if m_src_fam != src_fam || dst_fam == src_fam || dst_fam == 4 || dst_fam == 5 {
+            i += 1;
+            continue;
+        }
+        // The copy must read the arithmetic's destination at its exact
+        // width spelling (width mismatch = different value semantics).
+        if !names_family_at_width(m_src, src_fam, add_wide) {
+            i += 1;
+            continue;
+        }
+        // %S's incremented value must be dead after the copy: the LEA
+        // preserves %S's ORIGINAL value, the add did not.
+        if !provably_dead(store, infos, j, src_fam, &[i, j]) {
+            i += 1;
+            continue;
+        }
+        // Flags the add wrote must be dead after the pair.
+        if !flags_dead_after(store, infos, j + 1) {
+            i += 1;
+            continue;
+        }
         let mnemonic = if add_wide { "leaq" } else { "leal" };
         let base = REG_NAMES[0][src_fam as usize];
         let dst_name = if add_wide {

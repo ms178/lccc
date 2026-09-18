@@ -76,6 +76,7 @@
 use super::super::types::*;
 use super::helpers::{get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate, writes_family};
 use super::liveness::FileLiveness;
+use super::relay_and_lea::is_full_write;
 
 /// High-byte names have no equivalent in the `%rsi`/`%rdi`/`%r8`+ families.
 const HIGH_BYTE: &[&str] = &["%ah", "%bh", "%ch", "%dh"];
@@ -438,8 +439,20 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
             }
             // Rule 4: the use must not also write %D (explicitly — `addl
             // %eax, %edx` — or implicitly, e.g. `idivq` overwriting a %rax
-            // copy).
+            // copy).  A PURE full-width redefinition (`movq %rax, %r9`,
+            // `movzbl %al, %r9d` — a mov-class destination whose source
+            // half does not read %D) is NOT a violation: it ends the copy's
+            // live range exactly like Rule 3's write-without-mention, and
+            // the fold stays sound because the redefinition is not renamed
+            // (only the uses before it are).  This is the loop-induction
+            // shape: `movq %r10, %r9; load (%base,%r9,8); load
+            // (%base2,%r9,8); movq %rax, %r9` — the staging copy feeds the
+            // two loads and dies at the redefinition (linux_find_bit's
+            // bitmap scan: 9 insns/word vs GCC's 7).
             if writes_family(&infos[j], line, dfam) {
+                if is_full_write(&infos[j], line, dfam) {
+                    break;
+                }
                 ok = false;
                 break;
             }
