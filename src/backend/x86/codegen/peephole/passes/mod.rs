@@ -1261,6 +1261,15 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         if !sk("copy_fold") {
             global_changed |= narrow_copy_fold::fold_register_copies(&mut store, &mut infos);
         }
+        // Producer→copy-back staging (the loop-induction update shapes):
+        // `movq 8(%rdx), %rax; movq %rax, %rdx` and
+        // `leaq 8(%rsi), %rax; movq %rax, %rsi` redirect the producer's
+        // destination into the copy target, delete the copy and rewrite
+        // the staging register's remaining uses — GCC's single-register
+        // induction update (hash chains, match loops, rotate counters).
+        if !sk("copyback_fold") {
+            global_changed |= narrow_copy_fold::fold_induction_copyback(&mut store, &mut infos);
+        }
         // Global passes can re-expose dead `cltq` shapes (store-forwarding
         // substitutions, spill-deref folds); Phase 1's copy before the LEA
         // window fold is the primary site, this is the mop-up. Idempotent.
@@ -1510,6 +1519,10 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
     // Phase 7: Compact stack frames.
     if !skip_phase7 {
         frame_compact::compact_frame(&mut store, &mut infos);
+        // Never-referenced leaf frames (`subq $N, %rsp` with no body
+        // reference to %rsp): slots the allocator reserved and later
+        // passes retired. GCC's leaf functions carry no such frame.
+        frame_compact::remove_dead_leaf_frame(&mut store, &mut infos);
     }
 
     // Phase 7b: Narrow `movabsq/movq $imm` to `movl` where zero-extension

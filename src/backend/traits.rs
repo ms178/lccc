@@ -913,6 +913,15 @@ pub trait ArchCodegen {
         // Phase 2b: save caller-saved registers with live values before the call.
         self.emit_pre_call_save_caller_regs();
 
+        // ABI-marker hygiene (defense-in-depth for `# LCCC_CALL_ARGS`): the
+        // argument-count state is armed by the register-argument phase below
+        // and discharged by the call emission. Resetting here guarantees a
+        // call site that never reaches the arming phase (early bail-out,
+        // arch-specific path) publishes the conservative all-six instead of
+        // the PREVIOUS call's count — a stale low count would drop a real
+        // argument read from the liveness oracle's model.
+        self.state().call_gp_arg_count = 6;
+
         use super::call_abi::*;
         let config = self.call_abi_config();
         let mut arg_classes = classify_call_args(

@@ -353,3 +353,197 @@ fn reg_id_to_name_q(reg: RegId) -> &'static str {
         _ => "%rax",
     }
 }
+
+/// Remove a never-referenced constant leaf frame outright, or shrink it to
+/// the alignment minimum when the function makes calls.
+///
+/// Shape: a function whose prologue is exactly `subq $N, %rsp` (no
+/// `pushq %rbp`, no callee-saved pushes) whose body never names `%rsp`,
+/// and whose every `ret` is immediately preceded by the matching
+/// `addq $N, %rsp`. The frame exists because slots the register allocator
+/// reserved were retired by later peephole passes; nothing observes it.
+///
+/// * **Leaf** (no `call`): delete the `subq` and every matched `addq`. At
+///   entry `%rsp ≡ 8 (mod 16)`; a leaf that never addresses through
+///   `%rsp` and never calls has no alignment or address observation of
+///   the adjustment at all, and every return site executes the matching
+///   `addq` on the way out, so deleting the pair keeps `%rsp` exact on
+///   every path.
+/// * **Calls present**: the ABI requires `%rsp ≡ 0 (mod 16)` at every
+///   call site — the entry value is ≡ 8, so the frame is (at least
+///   partly) an alignment frame. When `N ≡ 8 (mod 16)` and `N > 8`,
+///   shrink to `subq $8, %rsp` (the smallest alignment-preserving
+///   adjustment); any other residue means the frame also carries an
+///   outbound-argument or spill area that would have referenced `%rsp`
+///   and cannot appear here.
+///
+/// The `.cfi_def_cfa_offset` that follows the `subq` is rewritten to the
+/// new offset so unwind info stays truthful.
+pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    if len == 0 {
+        return false;
+    }
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        // Prologue: subq $N, %rsp as the FIRST real instruction of the
+        // function (the preceding lines are the label/CFI directives, so
+        // no pushq %rbp and no callee-save pushes precede it).
+        let line = infos[i].trimmed(store.get(i));
+        let Some(n) = parse_subq_rsp(&line) else {
+            i += 1;
+            continue;
+        };
+        if !prologue_precedes_label(store, infos, i) {
+            i += 1;
+            continue;
+        }
+
+        // Audit the whole function body: collect the epilogue `addq`s,
+        // require every ret to be paired with one, reject any other
+        // reference to the stack pointer or opaque/stack-shaping line.
+        let mut epilogues: Vec<usize> = Vec::new();
+        let mut has_call = false;
+        let mut rsp_named = false;
+        let mut unpaired_ret = false;
+        let mut func_end = len;
+        let mut j = i + 1;
+        while j < len {
+            if infos[j].is_nop() || matches!(infos[j].kind, LineKind::Directive) {
+                let dj = infos[j].trimmed(store.get(j));
+                if dj.starts_with(".size ") {
+                    func_end = j + 1;
+                    break;
+                }
+                j += 1;
+                continue;
+            }
+            let body = infos[j].trimmed(store.get(j));
+            if body == format!("addq ${}, %rsp", n) {
+                epilogues.push(j);
+                j += 1;
+                continue;
+            }
+            match infos[j].kind {
+                LineKind::Call => {
+                    has_call = true;
+                    j += 1;
+                    continue;
+                }
+                LineKind::Ret => {
+                    // A ret must be preceded (modulo directives/NOPs) by a
+                    // collected epilogue addq, or this path would return
+                    // with an unbalanced stack under the fold.
+                    let mut p = j;
+                    let mut paired = false;
+                    while p > i {
+                        p -= 1;
+                        if infos[p].is_nop() || matches!(infos[p].kind, LineKind::Directive) {
+                            continue;
+                        }
+                        paired = epilogues.contains(&p);
+                        break;
+                    }
+                    if !paired {
+                        unpaired_ret = true;
+                    }
+                    j += 1;
+                    continue;
+                }
+                LineKind::Push { .. } | LineKind::Pop { .. } | LineKind::InlineAsm => {
+                    // push/pop shift the frame offsets; inline asm is
+                    // opaque to the %rsp audit.
+                    rsp_named = true;
+                    j += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if body.contains("%rsp") || body.contains("%esp") {
+                // Any other explicit reference to the stack pointer — a
+                // memory operand, register read, or address computation.
+                rsp_named = true;
+            }
+            j += 1;
+        }
+        if epilogues.is_empty() || rsp_named || unpaired_ret {
+            i = func_end.min(len - 1) + 1;
+            continue;
+        }
+
+        if !has_call {
+            // Leaf: delete the subq and every matched addq. Rewrite the
+            // CFA-offset directive that follows the subq (if present) to
+            // the entry offset 8.
+            mark_nop(&mut infos[i]);
+            for &ep in &epilogues {
+                mark_nop(&mut infos[ep]);
+            }
+            rewrite_cfa_after(store, infos, i, 8);
+            changed = true;
+        } else if n % 16 == 8 && n > 8 {
+            // Alignment frame with calls: shrink to the minimum.
+            replace_line(store, &mut infos[i], i, "    subq $8, %rsp".to_string());
+            for &ep in &epilogues {
+                replace_line(store, &mut infos[ep], ep, "    addq $8, %rsp".to_string());
+            }
+            rewrite_cfa_after(store, infos, i, 16);
+            changed = true;
+        }
+        i = func_end.min(len - 1) + 1;
+    }
+    changed
+}
+
+/// Rewrite the first `.cfi_def_cfa_offset` directive at or after `at` to
+/// `new_offset` (the CFA distance from %rsp after the adjustment).
+fn rewrite_cfa_after(store: &mut LineStore, infos: &mut [LineInfo], at: usize, new_offset: i64) {
+    let len = store.len();
+    let mut d = at + 1;
+    while d < len && matches!(infos[d].kind, LineKind::Directive) {
+        let dl = infos[d].trimmed(store.get(d));
+        if dl.starts_with(".cfi_def_cfa_offset ") {
+            replace_line(
+                store,
+                &mut infos[d],
+                d,
+                format!(".cfi_def_cfa_offset {}", new_offset),
+            );
+            return;
+        }
+        if dl.starts_with(".cfi_startproc") || dl.starts_with(".size ") {
+            return;
+        }
+        d += 1;
+    }
+}
+
+/// True when the nearest non-directive line before `at` is a function
+/// label or `.cfi_startproc` — i.e. `at` is the first real instruction of
+/// a function.
+fn prologue_precedes_label(store: &LineStore, infos: &[LineInfo], at: usize) -> bool {
+    let mut p = at;
+    while p > 0 {
+        p -= 1;
+        if infos[p].is_nop() || matches!(infos[p].kind, LineKind::Directive) {
+            if infos[p].trimmed(store.get(p)).starts_with(".cfi_startproc") {
+                return true;
+            }
+            continue;
+        }
+        return infos[p].trimmed(store.get(p)).ends_with(':');
+    }
+    false
+}
+
+/// Parse `subq $N, %rsp` (constant adjustment only).
+fn parse_subq_rsp(line: &str) -> Option<i64> {
+    let rest = line.strip_prefix("subq $")?;
+    let val = rest.strip_suffix(", %rsp")?;
+    val.parse::<i64>().ok()
+}

@@ -230,6 +230,21 @@ fn can_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
     if cg.state_ref().is_alloca(info.base.0) {
         return true;
     }
+    // CCC_NO_FOLDED_INDEX_LIVENESS removes the RA-side interval extension
+    // that every register-dependent fold's soundness contract rests on:
+    // the access re-reads the base (here) or the SIB index (the indexed
+    // form below) at its own point with NO IR operand, and the extension
+    // is what keeps that register live past the offset chain's last IR
+    // use. With the extension off but the fold still firing, an
+    // in-place-coalesced chain instruction (the peeled `shl`) lands on
+    // the register between its materialisation and the access — measured:
+    // the bool-pair control kernel's store read `i*4` as the SIB index
+    // with scale 4 still applied (base + 16*i) and SIGSEGV'd. The kill
+    // switch must disable the WHOLE mechanism, never half of it.
+    // Alloca bases are exempt (no register contract — see above).
+    if env_flag_set("CCC_NO_FOLDED_INDEX_LIVENESS") {
+        return false;
+    }
     // REGISTER-RESIDENT bases fold only on backends that (a) extend the
     // base's live interval to the consuming Load/Store — the backend passes
     // collect_gep_fold_base_links(func) into register allocation — and
@@ -247,6 +262,14 @@ fn can_indexed_addr_fold(
     global_addr_map: &FxHashMap<u32, String>,
     gep_dest: u32,
 ) -> bool {
+    // CCC_NO_FOLDED_INDEX_LIVENESS: same contract as the register-base arm
+    // of can_const_addr_fold above — the SIB re-reads the index register
+    // (and a register base) at the access with no IR operand, and the
+    // removed interval extension is what keeps it live there. Disable the
+    // indexed fold with the extension, never half of the mechanism.
+    if env_flag_set("CCC_NO_FOLDED_INDEX_LIVENESS") {
+        return false;
+    }
     // Backend agreement on the ACCESS profile first: types (and store
     // staging) the backend's indexed emitter refuses must also refuse the
     // fold here, or the skip/rematerialise path would read expired offset

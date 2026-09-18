@@ -21,7 +21,19 @@ set -euo pipefail
 # (container sandboxes without root) cannot run them at all, and a hard
 # failure there reports the ENVIRONMENT, not the code.
 i386_headers_ok() {
-    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
+    # Rootless hosts can point LCCC_I686_SYSROOT at an unpacked multilib
+    # sysroot (the regression suite's convention): exporting it as
+    # LCCC_SYSROOT makes both this probe and the i686 legs below run for
+    # real instead of skipping. CI installs gcc-multilib and never sets
+    # the variable, so its path is unchanged.
+    if [ -n "${LCCC_I686_SYSROOT:-}" ] && [ -d "$LCCC_I686_SYSROOT" ]; then
+        export LCCC_SYSROOT="$LCCC_I686_SYSROOT"
+    fi
+    # -E (preprocess-only): the header-visible outcome without linking.
+    # (-fsyntax-only is dropped on the stdin input path — the driver links
+    # and fails on the empty translation unit's missing main; filed as a
+    # follow-up. -E sees exactly the same headers.)
+    if ! printf '#include <stdio.h>\n' | "$1" -x c -E - >/dev/null 2>&1; then
         echo "SKIP: i686 leg ($1) - no i386 libc headers on this host (CI installs gcc-multilib)"
         return 1
     fi

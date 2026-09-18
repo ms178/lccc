@@ -50,6 +50,13 @@ const RSP: u16 = 1 << 4;
 /// invisibly). Modeling every call as reading %r10 pinned each %r10
 /// scratch value across every call — the RA's most common scratch pick
 /// after rax/rcx/rdx — and blocked the LEA→memory window fold.
+///
+/// The six-argument-register read is itself now refined per call site by
+/// the `# LCCC_CALL_ARGS <n>` marker (see the `LineKind::Call` arm): a
+/// call reads exactly the FIRST n GP argument registers its classification
+/// consumed. This constant survives as the fail-closed default for absent
+/// markers (hand-written fragments, raw `call` emissions).
+#[expect(dead_code)]
 const CALL_READS: u16 = RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9);
 /// Registers a call may destroy.
 const CALLER_SAVED: u16 =
@@ -762,10 +769,51 @@ impl FileLiveness {
                 // The inline-thunk and `call *%r10` forms mention %r10 in
                 // their own text (`mentioned` covers them).
                 let retpoline_r10 = t.starts_with("call __x86_indirect_thunk_");
+                // `# LCCC_CALL_ARGS <n>`: the codegen's authoritative count
+                // of leading SysV GP argument registers THIS call reads
+                // (armed by the register-argument phase from the
+                // `CallArgClass` classification, published right after the
+                // call text — the same authority contract as the VA marker).
+                // The conservative model reads all six at every call, which
+                // pins any argument-register value across every call and
+                // blocks folds whenever the RA homes a scratch in %rdx/
+                // %rcx/... (measured: the hash-chain chase lost its
+                // load→compare fold when the two-block unroller's
+                // profitability gate shifted the register allocation).
+                // Absent/illegible marker (hand-written fragments, raw
+                // `call` emissions like the i128 helpers) keeps all six:
+                // fail-closed.
+                let mut gp_args: usize = 6;
+                for k in n + 1..(n + 5).min(infos.len()) {
+                    if infos[k].is_nop() {
+                        continue;
+                    }
+                    let mk = infos[k].trimmed(store.get(k));
+                    if let Some(rest) = mk.strip_prefix("# LCCC_CALL_ARGS ") {
+                        if let Ok(v) = rest.trim().parse::<usize>() {
+                            gp_args = v.min(6);
+                        }
+                        break;
+                    }
+                    if mk.starts_with('#') || mk.starts_with('.') {
+                        continue; // a sibling marker or directive
+                    }
+                    break; // a real instruction ends the marker window
+                }
+                // The first n GP argument registers, in SysV order.
+                let arg_reads: u16 = match gp_args {
+                    0 => 0,
+                    1 => 1 << 7,                                                // rdi
+                    2 => (1 << 7) | (1 << 6),                                   // +rsi
+                    3 => (1 << 7) | (1 << 6) | RDX,                             // +rdx
+                    4 => (1 << 7) | (1 << 6) | RDX | RCX,                       // +rcx
+                    5 => (1 << 7) | (1 << 6) | RDX | RCX | (1 << 8),            // +r8
+                    _ => (1 << 7) | (1 << 6) | RDX | RCX | (1 << 8) | (1 << 9), // +r9
+                };
                 let mut reads = if variadic {
-                    CALL_READS | mentioned
+                    arg_reads | RAX | mentioned
                 } else {
-                    (CALL_READS & !RAX) | mentioned
+                    arg_reads | mentioned
                 };
                 if chain || retpoline_r10 {
                     reads |= 1 << 10;

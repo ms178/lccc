@@ -283,6 +283,18 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_bb_slp_v8_codegen.sh
 
+      # Two-block partial unroller + half-wide dword-pair SLP family:
+      # guard-free xk unroll of two-block counted loops (phi threading
+      # incl. the IV-reference carried-phi miscompile class), I32/U32
+      # pair load/store/pack, MemLoad stream CSE, SIB addressing, VEX
+      # in-place forms, the immediate-source load fold, and the loop-vec
+      # Max/conditional-sum gates — tri-config + kill-switch + SSE2
+      # differentials and the asm contracts.
+      - name: Verify two-block unroll red-team contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_two_block_unroll_redteam.sh
+
       # Adler-32 loop epic: the rolling-checksum reassociation
       # (vpsadbw + vpmaddubsw weights + vpmaddwd, exact mod 2^32) that
       # GCC/Clang/ICX all leave scalar, plus the counting-epic

@@ -500,6 +500,7 @@ fn vectorize_with_analysis_mode(
                 let latch_label = func.blocks[red_pattern.latch_idx].label;
                 let mut narrow_iv = false;
                 let mut const_zero_init = false;
+                let mut const_nonzero_init = false;
                 for inst in &hdr.instructions {
                     if let Instruction::Phi {
                         dest, ty, incoming, ..
@@ -510,10 +511,18 @@ fn vectorize_with_analysis_mode(
                         }
                         narrow_iv =
                             matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
-                        const_zero_init = incoming.iter().any(|(op, lbl)| {
-                            *lbl != latch_label
-                                && matches!(op, Operand::Const(c) if c.to_i64() == Some(0))
-                        });
+                        for (op, lbl) in incoming {
+                            if *lbl == latch_label {
+                                continue;
+                            }
+                            if let Operand::Const(c) = op {
+                                if c.to_i64() == Some(0) {
+                                    const_zero_init = true;
+                                } else if c.to_i64().is_some() {
+                                    const_nonzero_init = true;
+                                }
+                            }
+                        }
                     }
                 }
                 if narrow_iv {
@@ -524,7 +533,20 @@ fn vectorize_with_analysis_mode(
                     }
                     continue;
                 }
-                if !const_zero_init {
+                // The Max reduction's addressing is the MARCHING POINTER
+                // (the detector requires the ptr-phi form and matches the
+                // pointer's preheader init to element c), so the c-shifted
+                // IV only counts trips: the vector loop runs
+                // max(0, n/w − c) iterations and the remainder's
+                // c-relative start (max_shift) resumes EXACTLY where the
+                // vector coverage stopped — every element in [c, n) is
+                // covered exactly once (suboptimal by at most (w−1)·c
+                // scalar remainder iterations, never wrong). The Sum/Dot
+                // byte-offset and element-index schemes have no such
+                // discipline and stay zero-init-only.
+                if !const_zero_init
+                    && !(red_pattern.kind == ReductionKind::Max && const_nonzero_init)
+                {
                     if debug {
                         eprintln!(
                             "[VEC] Skip reduction: induction variable does not start at a constant 0 (limit rescale + remainder math assume an element-0 start)"
@@ -1809,20 +1831,20 @@ fn analyze_reduction_pattern(
     let mut is_max_reduction = false;
     let mut max_select_val = None;
     let mut max_accumulator_phi = None;
-    // v12 Fix F: the Max reduction DETECTOR is target-independent (the
-    // Select-shaped max pattern is the same on AArch64 and x86). The
-    // AVX2 transform body + lowerings + whitelist (VecMaxI32x8 class 5,
+    // v13 (2026-09-18): the gate is LIFTED on x86. The AVX2 transform
+    // body + lowerings + whitelist (VecMaxI32x8 class 5,
     // VecHorizontalMaxI32x8 legal consumer, is_two_operand_binary
-    // deferral) are all wired and CORRECT (output matches GCC for
-    // 10M-element find_max). However, the vectorized find_max is currently
-    // ~1.4× SLOWER than scalar on the loop_patterns benchmark — the init
-    // broadcast, horizontal reduce, and YMM7 occupancy add overhead that
-    // exceeds the 8× lane speedup for this small (10M) working set. The
-    // detection is therefore still gated on `neon` (AArch64, where it's a
-    // proven win) until the AVX2 cost model is tuned. All infrastructure
-    // landed; removing the gate is a one-line v13 change once the cost
-    // model accounts for the init+reduce overhead.
-    if neon {
+    // deferral) are all wired; the v12-era "~1.4× slower" claim is being
+    // re-measured this session against the loop_patterns driver on the
+    // find_max loop (10M elements over a 40 MB array — memory-bound at
+    // DRAM bandwidth for both forms; the 8-wide lane max removes ~3/4 of
+    // the compare/select uops, while the init broadcast and the
+    // once-per-call horizontal reduce are noise at 1.25M iterations). If
+    // the measurement still regresses, the gate goes back on with the
+    // profile attached. The SSE2 path still declines on x86 (pmaxsd is
+    // SSE4.1 and the tuned epilogue is the 256-bit form), so a non-AVX2
+    // TU keeps the scalar loop.
+    if neon || x86_avx2_available() {
         let latch_label = func.blocks[latch_idx].label;
         'max_search: for inst in &header.instructions {
             let Instruction::Phi {
@@ -2461,7 +2483,29 @@ fn analyze_reduction_pattern(
         // summed every element).  Keep such loops scalar — correct code
         // beats wrong vectors, and the scalar guarded sum is what GCC emits
         // for the innermost remainder anyway.
-        if element_type != IrType::I32 {
+        //
+        // EXCEPTION (the widening form): `long s; if (a[i] > k) s += a[i]`
+        // lowers the added value as `Cast(I32→I64)(load)` with the guard
+        // comparing the I32 LOADED element — the accumulator's ADD type is
+        // I64 but the lanes are I32, and the masked WIDENING composite
+        // (`VecWidenMaskedAddI32x4ToI64x2`, the AVX2 transform's
+        // `widening_i64 && guard_cond.is_some()` arm) covers exactly that
+        // shape.  The exception is gated on the AVX2 transform actually
+        // being selected — the SSE2 path fail-closes on guarded patterns
+        // (it has no masked composite; the generic emitter would drop the
+        // guard), so at -mno-avx / CCC_FORCE_SSE2 the loop must stay
+        // scalar here rather than reach a transform that miscompiles it.
+        let guard_widening_i32 = matches!(
+            added_inst,
+            Instruction::Cast {
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+                ..
+            }
+        ) && element_type == IrType::I64
+            && x86_avx2_available()
+            && std::env::var("CCC_FORCE_SSE2").is_err();
+        if element_type != IrType::I32 && !guard_widening_i32 {
             set_reject("conditional-sum guard needs an I32 element type (masked equal-width form)");
             return None;
         }
@@ -19622,6 +19666,23 @@ fn transform_reduction_sse2(
     if !reduction_remainder_references_sound(func, pattern) {
         if debug {
             eprintln!("[VEC-RED] remainder references not dominance-safe; skipping loop");
+        }
+        return 0;
+    }
+
+    // GUARDED REDUCTIONS FAIL CLOSED here: this 128-bit path has no masked
+    // composite (the AVX2 transform's `VecWidenMaskedAddI32x4ToI64x2` /
+    // masked equal-width arms are the only guarded forms), and the generic
+    // Sum emitter would silently DROP the guard — the loop would sum every
+    // element instead of the guarded subset. Measured at -mno-avx on the
+    // widen_i32_i64_sse2_reduction battery's int-accumulator spelling:
+    // `if (p[i] > 0) s += p[i]` printed the UNGUARDED total (pre-existing;
+    // the long-accumulator spelling joined it when the analyzer's widening
+    // exception opened, now gated on AVX2). NEON keeps its own audited
+    // paths.
+    if !neon && pattern.guard_cond.is_some() {
+        if debug {
+            eprintln!("[VEC-RED] SSE2 path cannot express a guarded reduction; staying scalar");
         }
         return 0;
     }

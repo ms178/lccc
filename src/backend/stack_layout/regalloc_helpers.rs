@@ -215,6 +215,8 @@ pub fn run_regalloc_and_merge_clobbers_ex(
                     | IntrinsicOp::VecMulI32x4
                     | IntrinsicOp::VecZeroI64x2
                     | IntrinsicOp::VecLoadI64x2
+                    | IntrinsicOp::VecLoadI32x4Pair
+                    | IntrinsicOp::VecPackI32x4Pair
                     | IntrinsicOp::VecAddI64x2
                     | IntrinsicOp::VecMulI64x2
                     | IntrinsicOp::VecAddF32x8

@@ -712,10 +712,25 @@ impl X86Codegen {
                                 if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(a1.0) {
                                     self.state.pending_vec_store = None;
                                 }
-                                self.state.emit_fmt(format_args!(
-                                    "    {} %{}, %{}",
-                                    sse_inst, src, target
-                                ));
+                                // VEX form under AVX2: the legacy 2-operand
+                                // `op %src, %target` is SSE-encoded, and
+                                // mixing it with the VEX shift/load forms
+                                // in one loop pays a SSE→VEX transition
+                                // penalty on every execution (the known
+                                // mixing follow-up). The non-destructive
+                                // encoding with dst == src1 is
+                                // semantically identical.
+                                if self.avx2_enabled {
+                                    self.state.emit_fmt(format_args!(
+                                        "    v{} %{}, %{}, %{}",
+                                        sse_inst, src, target, target
+                                    ));
+                                } else {
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} %{}, %{}",
+                                        sse_inst, src, target
+                                    ));
+                                }
                                 self.sse_mark_in_place(dest_ptr, target);
                                 return;
                             }
@@ -741,8 +756,18 @@ impl X86Codegen {
                     if acc_same && fresh_held {
                         let held = self.state.sse_last_store_reg_name.unwrap_or("xmm0");
                         let target = phys_reg_name(dest_reg);
-                        self.state
-                            .emit_fmt(format_args!("    {} %{}, %{}", sse_inst, held, target));
+                        // VEX form under AVX2 (same reasoning as the
+                        // in-place path above: no legacy/VEX mixing in
+                        // one loop body).
+                        if self.avx2_enabled {
+                            self.state.emit_fmt(format_args!(
+                                "    v{} %{}, %{}, %{}",
+                                sse_inst, held, target, target
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    {} %{}, %{}", sse_inst, held, target));
+                        }
                         if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(fresh.0) {
                             self.state.pending_vec_store = None;
                         }
@@ -4924,6 +4949,125 @@ impl X86Codegen {
                 }
                 self.state.emit("    movq %rax, %xmm1");
                 self.state.emit("    punpcklqdq %xmm1, %xmm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
+            IntrinsicOp::VecLoadI32x4Pair => {
+                // HALF-WIDE dword-pair load: two consecutive dwords into
+                // lanes 0/1, upper 64 bits ZEROED (MOVQ xmm, m64 clears
+                // the high half in both the legacy and VEX encodings).
+                // Home-direct discipline identical to VecLoadI64x2. The
+                // load is NEVER elided into a consumer's r/m slot (the
+                // VLFOLD match table deliberately does not list it — an
+                // 8-byte fold would need width-8 pending machinery, and
+                // the half-wide shapes want the explicit pair load).
+                let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
+                let mnemonic = if self.avx2_enabled { "vmovq" } else { "movq" };
+                let mut loaded_home = false;
+                if let Some(d) = dest {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let name = phys_reg_name(reg);
+                            self.state
+                                .emit_fmt(format_args!("    {} {}, %{}", mnemonic, mem, name));
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_claim_live_reg(d.0, name);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(name);
+                            loaded_home = true;
+                        }
+                    }
+                }
+                if !loaded_home {
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %xmm0", mnemonic, mem));
+                }
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    if !loaded_home {
+                        self.sse_store_dest(d, "xmm0");
+                    }
+                }
+            }
+            IntrinsicOp::VecStoreI32x4Pair => {
+                // HALF-WIDE dword-pair store: lanes 0/1 of the XMM source
+                // as 8 bytes (MOVQ xmm, m64). Mirrors VecStoreI64x2's
+                // register-home discipline exactly — the source is the
+                // I32x4-family web's value, read through the shared
+                // vec_store_source_128 path.
+                let src = self.vec_store_source_128(&args[0]);
+                let mnemonic = if self.avx2_enabled { "vmovq" } else { "movq" };
+                if src != "xmm0" {
+                    if let Operand::Value(v) = &args[0] {
+                        if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                            self.state.pending_vec_store = None;
+                        }
+                    }
+                    self.state.invalidate_vec_peephole();
+                    self.emit_vec_store_addr(args, dest_ptr, mnemonic, src);
+                    return;
+                }
+                let in_reg = matches!(&args[0], Operand::Value(v)
+                    if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
+                if !in_reg {
+                    self.flush_pending_vec_store_impl();
+                    if let Operand::Value(v) = &args[0] {
+                        if let Some(addr) = self.state.resolve_slot_addr(v.0) {
+                            if let crate::backend::state::SlotAddr::Direct(slot) = addr {
+                                self.state.emit_fmt(format_args!(
+                                    "    {} {}, %xmm0",
+                                    mnemonic,
+                                    self.slot_ref(slot.0)
+                                ));
+                            }
+                        }
+                    }
+                } else if let Operand::Value(v) = &args[0] {
+                    if self.state.pending_vec_store.map(|(p, _, _)| p) == Some(v.0) {
+                        self.state.pending_vec_store = None;
+                    }
+                }
+                self.state.invalidate_vec_peephole();
+                self.emit_vec_store_addr(args, dest_ptr, mnemonic, "xmm0");
+            }
+            IntrinsicOp::VecPackI32x4Pair => {
+                // HALF-WIDE dword-pair gather: two scalar dwords into
+                // lanes 0/1 with lanes 2/3 ZERO (movd clears bits 32..127,
+                // punpckldq interleaves the low dwords of two
+                // zero-uppered registers — [a,0,0,0] ⊕ [b,0,0,0] →
+                // [a,b,0,0]). SSE2-exact: no pinsrd dependency.
+                //   movd lo, %xmm0
+                //   movd hi, %xmm1 ; punpckldq %xmm1, %xmm0
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let load_lane = |this: &mut Self, arg: &Operand, xmm: &'static str| {
+                    if let Operand::Value(v) = arg {
+                        if let Some(&reg) = this.reg_assignments.get(&v.0) {
+                            if !is_xmm_reg(reg) {
+                                this.state.emit_fmt(format_args!(
+                                    "    movd %{}, %{}",
+                                    phys_reg_name(reg),
+                                    xmm
+                                ));
+                                return;
+                            }
+                        }
+                        if let Some(slot) = this.state.get_slot(v.0) {
+                            this.state
+                                .out
+                                .emit_instr_rbp_reg("    movd", slot.0 as i64, xmm);
+                            return;
+                        }
+                    }
+                    this.operand_to_reg(arg, "rax");
+                    this.state.emit_fmt(format_args!("    movd %rax, %{}", xmm));
+                };
+                load_lane(self, &args[0], "xmm0");
+                load_lane(self, &args[1], "xmm1");
+                self.state.emit("    punpckldq %xmm1, %xmm0");
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
                     self.sse_store_dest(d, "xmm0");

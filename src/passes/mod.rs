@@ -1453,7 +1453,9 @@ pub(crate) fn run_passes(
         if iter == 0 && opt_level >= 2 && !optimize_for_size && !dis.unroll {
             let n = timed_pass!(
                 "loop_unroll",
-                run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops)
+                run_on_visited(module, &dirty, &mut changed, |f| {
+                    loop_unroll::unroll_loops(f, loop_unroll::UnrollPhase::Early)
+                })
             );
             total_changes += n;
             total_changes_excl_dce += n;
@@ -1620,10 +1622,16 @@ pub(crate) fn run_passes(
             // Post-vectorize unroll: the matmul/map vector body is often a
             // single intrinsic — unrolling it 2–4× exposes independent FMA
             // chains (GCC's multi-accum style) without growing scalar code.
+            // The PostVec phase also unlocks the guard-free two-block partial
+            // unroll (see `UnrollPhase`): loops the vectorizer declined are
+            // exactly its feedstock, and the k concatenated bodies in one
+            // block feed the BB-SLP packer right below.
             if !dis.unroll {
                 let n = timed_pass!(
                     "loop_unroll_post_vec",
-                    run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_loops)
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        loop_unroll::unroll_loops(f, loop_unroll::UnrollPhase::PostVec)
+                    })
                 );
                 total_changes += n;
                 total_changes_excl_dce += n;

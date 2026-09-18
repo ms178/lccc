@@ -405,6 +405,19 @@ pub struct CodegenState {
     /// value across calls and blocked the LEA→memory window fold on the
     /// RA's favorite scratch register).
     pub chain_call: bool,
+    /// Number of leading x86-64 SysV GP argument registers the call being
+    /// emitted actually reads (0..=6).  Set by the x86-64 argument emitter
+    /// from the authoritative `CallArgClass` classification and published
+    /// as `# LCCC_CALL_ARGS <n>` after the call text (the same authority
+    /// contract as `call_is_variadic` / `chain_call`): the late text
+    /// peephole's GP liveness oracle conservatively modeled EVERY call as
+    /// reading all six argument registers, which pinned any value the RA
+    /// homed in %rdx/%rcx/... across calls and blocked the load→compare
+    /// fold whenever the chase scratch landed in an argument register
+    /// (the hash-chain kernel after the two-block unroller's profitability
+    /// gate shifted its register allocation).  6 = the conservative
+    /// default (i686, hand-written fragments, non-argument call paths).
+    pub call_gp_arg_count: usize,
     /// Patchable function entry: (total_nops, nops_before_entry).
     /// When set, emits NOP padding around function entry points and records
     /// them in __patchable_function_entries for runtime patching (ftrace).
@@ -617,6 +630,7 @@ impl CodegenState {
             indirect_branch_thunk_inline: false,
             call_is_variadic: false,
             chain_call: false,
+            call_gp_arg_count: 6,
             patchable_function_entry: None,
             mcount: None,
             pending_classic_mcount_label: None,
@@ -836,6 +850,7 @@ impl CodegenState {
         // Reset both per function; value ids are already function-local.
         self.chain_call = false;
         self.call_is_variadic = false;
+        self.call_gp_arg_count = 6;
         self.value_locations.clear();
         self.alloca_values.clear();
         self.volatile_alloca_values.clear();
