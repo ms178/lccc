@@ -503,6 +503,20 @@ impl InlineAsmEmitter for X86Codegen {
                             ));
                         }
                     }
+                } else {
+                    // No stack slot: the value is register-homed, accumulator-
+                    // resident, or defined by a Copy/Cast chain. Materialise it
+                    // explicitly — silently skipping the load feeds the asm
+                    // operand whatever the scratch register happened to hold
+                    // (kernel OPTIMIZER_HIDE_VAR, `asm("" : "=r"(out) : "0"(in))`:
+                    // the tie input stayed in its home while the tied scratch
+                    // still carried a boolean chain, so get_file_rcu compared
+                    // bool-vs-pointer and hung userspace boot). value_to_reg
+                    // resolves fresh/stale homes, width-consistent typed loads,
+                    // Copy/bit-identical Cast chains, GlobalAddr remats and the
+                    // accumulator, and panics loudly when none applies.
+                    let reg64 = Self::reg_to_64(reg);
+                    self.value_to_reg(v, &reg64);
                 }
             }
         }
@@ -1067,5 +1081,92 @@ mod duplicate_modifier_tests {
         assert_eq!(strip_duplicate_modifier("# %d[x] %d12"), "# %[x] %12");
         assert_eq!(strip_duplicate_modifier("movb %dl, %%dl"), "movb %dl, %%dl");
         assert_eq!(strip_duplicate_modifier("%%d0 %dx"), "%%d0 %dx");
+    }
+}
+
+/// Regression tests for the no-stack-slot inline-asm input path (the kernel
+/// 6.18.52 OPTIMIZER_HIDE_VAR bug class). An asm input value that is
+/// register-homed (or accumulator-resident) WITHOUT a stack slot used to be
+/// silently skipped by load_input_to_reg, feeding the asm operand whatever
+/// the scratch register happened to hold: in `__get_file_rcu` (fs/file.c),
+/// `asm("" : "=r"(out) : "0"(in))` compared a leftover "=@ccns" boolean chain
+/// in rcx against the file pointer in r12 and hung userspace boot. The
+/// emitter must materialise such values explicitly.
+#[cfg(test)]
+mod tied_operand_no_slot_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+    use crate::ir::reexports::{Operand, Value};
+
+    fn tied_rcx_operand() -> AsmOperand {
+        let mut op = AsmOperand::new(AsmOperandKind::Tied(0), None);
+        op.reg = "rcx".to_string();
+        op.operand_type = IrType::I64;
+        op.constraint = "0".to_string();
+        op
+    }
+
+    fn emitted(cg: &X86Codegen) -> String {
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Value homed in a register, no slot: the tie load must move from the
+    /// home register (r13) into the tied scratch (rcx).
+    #[test]
+    fn asm_input_without_slot_moves_from_register_home() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(43, PhysReg(3)); // r13, fresh home
+        let op = tied_rcx_operand();
+        cg.load_input_to_reg(&op, &Operand::Value(Value(43)), "0");
+        let text = emitted(&cg);
+        assert_eq!(text, "movq %r13, %rcx");
+    }
+
+    /// Value in the accumulator (rax), no slot and no home: materialise from
+    /// the accumulator instead of panicking (mirrors operand_to_callee_reg).
+    #[test]
+    fn asm_input_without_slot_moves_from_accumulator() {
+        let mut cg = X86Codegen::new();
+        cg.state.reg_cache.set_acc(43, false);
+        let op = tied_rcx_operand();
+        cg.load_input_to_reg(&op, &Operand::Value(Value(43)), "0");
+        let text = emitted(&cg);
+        assert_eq!(text, "movq %rax, %rcx");
+    }
+
+    /// The mov is the ONLY instruction: a fresh home equal to the target
+    /// scratch emits nothing (the register already holds the value).
+    #[test]
+    fn asm_input_home_equal_to_scratch_emits_nothing() {
+        let mut cg = X86Codegen::new();
+        // rcx is not a valid PhysReg home; use r11 (PhysReg(10)) as both the
+        // home and the tied scratch instead.
+        cg.reg_assignments.insert(43, PhysReg(10)); // r11
+        let mut op = tied_rcx_operand();
+        op.reg = "r11".to_string();
+        cg.load_input_to_reg(&op, &Operand::Value(Value(43)), "0");
+        let text = emitted(&cg);
+        assert_eq!(text, "");
+    }
+
+    /// A narrow (U8) homed value materialises width-consistently through
+    /// value_to_reg's typed path when only a slot exists — and the no-slot
+    /// home path must not truncate to 8 bits either.
+    #[test]
+    fn asm_input_without_slot_preserves_width_via_home() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(7, PhysReg(3)); // r13
+        let mut op = tied_rcx_operand();
+        op.operand_type = IrType::U8;
+        cg.load_input_to_reg(&op, &Operand::Value(Value(7)), "0");
+        let text = emitted(&cg);
+        assert_eq!(text, "movq %r13, %rcx");
     }
 }

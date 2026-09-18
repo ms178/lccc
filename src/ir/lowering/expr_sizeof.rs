@@ -74,13 +74,23 @@ impl Lowerer {
                     if matches!(pointee.as_ref(), CType::Void | CType::Function(_)) {
                         return 1;
                     }
-                    let sz = self.resolve_ctype_size(pointee);
-                    if sz == 0 {
-                        return 1;
-                    }
-                    return sz;
+                    // Everything else reports the TRUE pointee size — including 0.
+                    // GNU C allows zero-length arrays, and GCC keeps their size:
+                    //   char (*p)[0];  sizeof(*p) == 0
+                    // That value is load-bearing: the kernel's kfifo encodes
+                    // "record fifo or plain fifo" as sizeof of a pointer to
+                    // char[N] (include/linux/kfifo.h __STRUCT_KFIFO_COMMON's
+                    // rectype member). Clamping 0 to 1 here silently turned
+                    // every plain kfifo into a record fifo (__kfifo_in_r /
+                    // __kfifo_out_r with recsize=1), corrupting the 8250 xmit
+                    // stream byte by byte (userspace serial output mangled to
+                    // one character per line).
+                    return self.resolve_ctype_size(pointee);
                 }
-                CType::Array(elem, _) => return self.resolve_ctype_size(elem).max(1),
+                // Dereferencing an array expression yields its element type
+                // (possibly itself a zero-length array: `*x` for
+                // `char x[0][0]` is char[0], sizeof 0 per GCC).
+                CType::Array(elem, _) => return self.resolve_ctype_size(elem),
                 // GCC extension: sizeof(*func) == 1 where func is a function
                 CType::Function(_) => return 1,
                 _ => {}
@@ -113,21 +123,23 @@ impl Lowerer {
 
     /// Get the sizeof for an array subscript expression.
     fn sizeof_subscript(&self, base: &Expr, index: &Expr) -> usize {
-        // Use CType-based resolution first (handles string literals, typed pointers, vectors)
+        // Use CType-based resolution first (handles string literals, typed pointers, vectors).
+        // No lower clamp: `p[0]` for `char (*p)[0]` is a zero-length array and
+        // GCC gives sizeof == 0 (the kfifo rectype idiom; see sizeof_deref).
         if let Some(base_ctype) = self.get_expr_ctype(base) {
             match &base_ctype {
-                CType::Array(elem, _) => return self.resolve_ctype_size(elem).max(1),
-                CType::Pointer(pointee, _) => return self.resolve_ctype_size(pointee).max(1),
-                CType::Vector(elem, _) => return self.resolve_ctype_size(elem).max(1),
+                CType::Array(elem, _) => return self.resolve_ctype_size(elem),
+                CType::Pointer(pointee, _) => return self.resolve_ctype_size(pointee),
+                CType::Vector(elem, _) => return self.resolve_ctype_size(elem),
                 _ => {}
             }
         }
         // Also check reverse subscript (index[base])
         if let Some(idx_ctype) = self.get_expr_ctype(index) {
             match &idx_ctype {
-                CType::Array(elem, _) => return self.resolve_ctype_size(elem).max(1),
-                CType::Pointer(pointee, _) => return self.resolve_ctype_size(pointee).max(1),
-                CType::Vector(elem, _) => return self.resolve_ctype_size(elem).max(1),
+                CType::Array(elem, _) => return self.resolve_ctype_size(elem),
+                CType::Pointer(pointee, _) => return self.resolve_ctype_size(pointee),
+                CType::Vector(elem, _) => return self.resolve_ctype_size(elem),
                 _ => {}
             }
         }
@@ -145,9 +157,9 @@ impl Lowerer {
                 let is_ptr = matches!(base, Expr::PointerMemberAccess(..));
                 if let Some(ctype) = self.resolve_field_ctype(base_expr, field_name, is_ptr) {
                     match &ctype {
-                        CType::Array(elem_ty, _) => return self.resolve_ctype_size(elem_ty).max(1),
+                        CType::Array(elem_ty, _) => return self.resolve_ctype_size(elem_ty),
                         CType::Pointer(pointee, _) => {
-                            return self.resolve_ctype_size(pointee).max(1);
+                            return self.resolve_ctype_size(pointee);
                         }
                         _ => {}
                     }

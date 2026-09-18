@@ -57,6 +57,17 @@ echo "--- congestion control ---"; cat /proc/sys/net/ipv4/tcp_available_congesti
 echo "--- cache-aware sched features ---"; grep -i cache_hot_buddy /sys/kernel/debug/sched/features
 echo "--- sched_debug (BORE) ---"; grep -m3 -i bore /proc/sched_debug
 echo "--- cpus ---"; grep -c '^processor' /proc/cpuinfo
+echo "--- serial integrity ---"
+# Sentinel that exercises the 8250 UART xmit path end to end. Every ttyS0
+# write above flows through kernel/printk + the initramfs write()s, but a
+# data-corrupting console driver bug can pass all other checks while
+# mangling the stream (lccc defect (h): sizeof through char(*)[0] was
+# clamped to 1, so plain kfifo fifos took the record path and the 8250
+# xmit kfifo handed userspace one character per write — the line below
+# arrived letter-per-line). One long line with spaces and punctuation,
+# then one with a hex address, must arrive verbatim on a healthy console.
+echo "serial-ok the quick brown fox jumps over the lazy dog 0123456789 !?%&/(){}[]"
+echo "serial-ok addr=0xdeadbeef count=31415926 end"
 echo "--- dmesg ---"; dmesg | head -30
 echo "==== LCCC KERNEL BOOT VALIDATION END ===="
 poweroff -f
@@ -153,6 +164,11 @@ expect "SMP compiled in"                   "CONFIG_SMP=y"
 expect "bbr listed in congestion algos"    "(^| )bbr( |$)"
 expect "BORE stats in sched_debug"         "bore|BORE"
 expect "2 CPUs online"                     "^2$"
+# Serial-integrity sentinels: must arrive verbatim. A console/xmit bug that
+# drops bytes or splits writes (defect (h), kfifo record-path corruption)
+# breaks the multi-word line or the trailing word of the hex line.
+expect "serial sentinel line verbatim"     "serial-ok the quick brown fox jumps over the lazy dog 0123456789 !\?%&/\(\)\{\}\[\]$"
+expect "serial sentinel hex line verbatim" "serial-ok addr=0xdeadbeef count=31415926 end$"
 expect "validation ran to completion"      "LCCC KERNEL BOOT VALIDATION END"
 
 if [[ $fail -eq 0 ]]; then

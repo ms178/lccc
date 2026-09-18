@@ -374,6 +374,32 @@ impl InlineAsmEmitter for I686Codegen {
                         self.state
                             .emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, dest));
                     }
+                } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    // No stack slot, but register-allocated: the i686 linear
+                    // scan is authoritative (the register holds the value
+                    // throughout its range — see direct_reg_src_ref), so a
+                    // direct mov materialises the asm input. Register pairs
+                    // have no single home; refuse loudly rather than load
+                    // half the value.
+                    if is_pair {
+                        panic!(
+                            "i686 codegen: inline-asm input value {} (64-bit pair) has \
+                             no stack slot — cannot materialise from a single home",
+                            v.0
+                        );
+                    }
+                    let src = super::emit::phys_reg_name(phys);
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, %{}", src, reg));
+                } else {
+                    // Neither slot nor register: silently skipping the load
+                    // feeds the asm whatever the scratch register held (the
+                    // x86-64 OPTIMIZER_HIDE_VAR bug class). Fail loudly.
+                    panic!(
+                        "i686 codegen: inline-asm input value {} has no stack slot or \
+                         register assignment",
+                        v.0
+                    );
                 }
             }
         }

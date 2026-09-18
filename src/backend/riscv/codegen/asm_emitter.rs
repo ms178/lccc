@@ -347,6 +347,16 @@ impl InlineAsmEmitter for RiscvCodegen {
                     } else {
                         self.emit_load_from_s0(reg, slot.0, "ld");
                     }
+                } else {
+                    // Neither a register home nor a stack slot: fail loudly
+                    // instead of silently skipping the load — a skipped load
+                    // feeds the asm whatever the operand register happened to
+                    // hold (the x86-64 OPTIMIZER_HIDE_VAR bug class).
+                    panic!(
+                        "riscv codegen: inline-asm input value {} has no register \
+                         assignment or stack slot",
+                        v.0
+                    );
                 }
             }
         }
