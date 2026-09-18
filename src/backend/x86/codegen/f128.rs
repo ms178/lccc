@@ -482,14 +482,14 @@ impl X86Codegen {
 
             CastKind::SignedToFloat { to_f64, from_ty } => {
                 self.emit_sign_extend_to_rax(from_ty);
-                self.emit_int_to_float_conv(to_f64);
+                self.emit_int_to_float_conv(from_ty, to_f64);
             }
 
             CastKind::UnsignedToFloat { to_f64, from_ty } => {
                 if from_ty == IrType::U64 {
                     self.emit_u64_to_float(to_f64);
                 } else {
-                    self.emit_int_to_float_conv(to_f64);
+                    self.emit_int_to_float_conv(from_ty, to_f64);
                 }
             }
 
@@ -571,12 +571,11 @@ impl X86Codegen {
     }
 
     /// Convert i64 in rax to float (f32 or f64), result back in rax.
-    fn emit_int_to_float_conv(&mut self, to_f64: bool) {
+    fn emit_int_to_float_conv(&mut self, from_ty: IrType, to_f64: bool) {
+        self.emit_cvt_si2fp_from_rax(from_ty, to_f64, "xmm0");
         if to_f64 {
-            self.state.emit("    cvtsi2sdq %rax, %xmm0");
             self.state.emit("    movq %xmm0, %rax");
         } else {
-            self.state.emit("    cvtsi2ssq %rax, %xmm0");
             self.state.emit("    movd %xmm0, %eax");
         }
     }
@@ -587,22 +586,17 @@ impl X86Codegen {
         let done_label = self.state.fresh_label("u2f_done");
         self.state.emit("    testq %rax, %rax");
         self.state.out.emit_jcc_label("    js", &big_label);
-        if to_f64 {
-            self.state.emit("    cvtsi2sdq %rax, %xmm0");
-        } else {
-            self.state.emit("    cvtsi2ssq %rax, %xmm0");
-        }
+        self.emit_cvt_si2fp_from_rax(IrType::I64, to_f64, "xmm0");
         self.state.out.emit_jmp_label(&done_label);
         self.state.out.emit_named_label(&big_label);
         self.state.emit("    movq %rax, %rcx");
         self.state.emit("    shrq $1, %rax");
         self.state.emit("    andq $1, %rcx");
         self.state.emit("    orq %rcx, %rax");
+        self.emit_cvt_si2fp_from_rax(IrType::I64, to_f64, "xmm0");
         if to_f64 {
-            self.state.emit("    cvtsi2sdq %rax, %xmm0");
             self.state.emit("    addsd %xmm0, %xmm0");
         } else {
-            self.state.emit("    cvtsi2ssq %rax, %xmm0");
             self.state.emit("    addss %xmm0, %xmm0");
         }
         self.state.out.emit_named_label(&done_label);

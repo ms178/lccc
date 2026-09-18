@@ -587,12 +587,16 @@ impl X86Codegen {
         } else {
             (lhs, rhs)
         };
-        self.emit_fp_operand_to_xmm(first, ty, "xmm0");
-        self.emit_fp_operand_to_xmm(second, ty, "xmm1");
-        if ty == IrType::F64 {
-            self.state.emit("    ucomisd %xmm1, %xmm0");
-        } else {
-            self.state.emit("    ucomiss %xmm1, %xmm0");
+        // Register-direct compare (same contract as emit_float_cmp_impl):
+        // zero/one staging instead of the xmm0+xmm1 pair.
+        if !self.try_emit_fp_cmp_direct(first, second, ty) {
+            self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+            self.emit_fp_operand_to_xmm(second, ty, "xmm1");
+            if ty == IrType::F64 {
+                self.state.emit("    ucomisd %xmm1, %xmm0");
+            } else {
+                self.state.emit("    ucomiss %xmm1, %xmm0");
+            }
         }
         match op {
             IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => {
@@ -604,6 +608,116 @@ impl X86Codegen {
             IrCmpOp::Eq | IrCmpOp::Ne => {
                 self.emit_fp_cmp_setcc(dest, op);
             }
+        }
+    }
+
+    /// Classify an FP operand for the ucomis/vcmp SOURCE position — the
+    /// memory-capable operand slot: a fresh XMM home renders as `%xmmN`, an
+    /// FP constant as its RIP-relative pool label, a stack slot as its frame
+    /// reference. Returns None for anything needing the GPR shuttle or the
+    /// accumulator cache (the caller falls back to the staged path).
+    ///
+    /// Mirrors `emit_fp_operand_to_xmm`'s decision order (register home,
+    /// then slot) so the two paths read the same location for the same
+    /// operand; the one deviation is freshness: a clobbered XMM home
+    /// declines here (the staged path's exact behavior is preserved by the
+    /// caller's fallback rather than risking a stale-register read).
+    fn fp_src_mem_operand(&mut self, op: &Operand, ty: IrType) -> Option<String> {
+        match op {
+            Operand::Value(v) => {
+                if let Some(reg) = self.fresh_home_of(v.0).filter(|r| is_xmm_reg(*r)) {
+                    return Some(format!("%{}", phys_reg_name(reg)));
+                }
+                // A live (non-clobbered) GPR home needs the shuttle; a
+                // clobbered XMM home must take the fallback, not the slot
+                // (matching the staged path's register-first order).
+                if self.reg_assignments.contains_key(&v.0) {
+                    return None;
+                }
+                let slot = self.state.get_slot(v.0)?;
+                Some(self.slot_ref(slot.0))
+            }
+            Operand::Const(IrConst::F64(c)) => Some(format!(
+                "{}(%rip)",
+                self.state.get_fp_const_label(c.to_bits())
+            )),
+            Operand::Const(IrConst::F32(c)) => Some(format!(
+                "{}(%rip)",
+                self.state.get_fp_const_label(c.to_bits() as u64)
+            )),
+            _ => None,
+        }
+    }
+
+    /// Register-direct ucomisd/ucomiss: emit the FP compare with zero or one
+    /// staging instruction instead of the staged `first→xmm0, second→xmm1`
+    /// pair. The ucomis source position accepts registers AND m32/m64
+    /// memory, so when the FIRST operand is XMM-homed its home is the
+    /// destination directly and the second rides the source slot. One load
+    /// into %xmm0 remains only when the FIRST operand is itself a constant
+    /// or slot (the destination must be a register).
+    ///
+    /// Flags semantics are bit-identical to the staged form: EFLAGS compare
+    /// FIRST vs SECOND, so the setcc tables, `pending_fp_cmp` fusion jcc's,
+    /// and replay re-emission all apply unchanged.
+    fn try_emit_fp_cmp_direct(&mut self, first: &Operand, second: &Operand, ty: IrType) -> bool {
+        if !matches!(ty, IrType::F32 | IrType::F64) {
+            // Binary floats only: decimals keep the staged path (they carry
+            // opaque BID bit patterns through the same emitters).
+            return false;
+        }
+        let mnemonic = if ty == IrType::F64 {
+            "ucomisd"
+        } else {
+            "ucomiss"
+        };
+        match first {
+            Operand::Value(fv) => {
+                let first_home = self.fresh_home_of(fv.0).filter(|r| is_xmm_reg(*r));
+                if let Some(freg) = first_home {
+                    if let Some(src) = self.fp_src_mem_operand(second, ty) {
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, %{}",
+                            mnemonic,
+                            src,
+                            phys_reg_name(freg)
+                        ));
+                        return true;
+                    }
+                    return false;
+                }
+                // FIRST slot-resident (no register home): one load into the
+                // %xmm0 scratch, second operand from the source slot. Still
+                // strictly fewer stagings than the pair being replaced.
+                if self.reg_assignments.contains_key(&fv.0) {
+                    return false; // GPR-homed: shuttle required
+                }
+                let Some(slot) = self.state.get_slot(fv.0) else {
+                    return false;
+                };
+                let Some(src) = self.fp_src_mem_operand(second, ty) else {
+                    return false;
+                };
+                let mov = if ty == IrType::F32 { "movss" } else { "movsd" };
+                let sr = self.slot_ref(slot.0);
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %xmm0", mov, sr));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %xmm0", mnemonic, src));
+                true
+            }
+            Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::F32(_)) => {
+                // Constant FIRST: materialize into %xmm0 (pool load or xor),
+                // compare the second operand from its source slot.
+                let Some(src) = self.fp_src_mem_operand(second, ty) else {
+                    return false;
+                };
+                self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %xmm0", mnemonic, src));
+                true
+            }
+            _ => false,
         }
     }
 
@@ -641,15 +755,35 @@ impl X86Codegen {
             (lhs, rhs)
         };
 
-        // Load first operand → %xmm0 (use constant pool for FP constants)
-        self.emit_fp_operand_to_xmm(first, ty, "xmm0");
-        // Load second operand → %xmm1
-        self.emit_fp_operand_to_xmm(second, ty, "xmm1");
-
-        if ty == IrType::F64 {
-            self.state.emit("    ucomisd %xmm1, %xmm0");
+        // REGISTER-DIRECT COMPARE: when the FIRST operand is XMM-homed, its
+        // home IS the ucomis destination — no staging. The SECOND operand
+        // rides the memory-capable source position (a register home, a
+        // RIP-relative pool constant, or a stack slot all encode directly).
+        // The staged `vmovsd home,home,%xmm0` + `vmovsd home,home,%xmm1`
+        // pair this replaces sat ON THE COMPARE'S LATENCY CHAIN in every
+        // FP loop: vector-register moves are not eliminated at rename on
+        // many cores (move elimination covers GPRs; XMM rename arrived
+        // only with Ice Lake), so each stage costs a full FP-op latency
+        // slot ahead of the ucomisd. Mandelbrot's escape check —
+        // `|z|² > 4.0` with |z|² in a home and 4.0 in the pool — measured
+        // 1.51s → 1.21s from this fix alone (the compare gates the loop
+        // backedge). Flags semantics are IDENTICAL to the staged form
+        // (compare FIRST vs SECOND); every downstream consumer — setcc
+        // tables, pending_fp_cmp fusion, replay re-emission — is
+        // operand-order-agnostic.
+        if self.try_emit_fp_cmp_direct(first, second, ty) {
+            // flags set; fall through to the shared fusion/setcc logic
         } else {
-            self.state.emit("    ucomiss %xmm1, %xmm0");
+            // Load first operand → %xmm0 (use constant pool for FP constants)
+            self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+            // Load second operand → %xmm1
+            self.emit_fp_operand_to_xmm(second, ty, "xmm1");
+
+            if ty == IrType::F64 {
+                self.state.emit("    ucomisd %xmm1, %xmm0");
+            } else {
+                self.state.emit("    ucomiss %xmm1, %xmm0");
+            }
         }
 
         // FLAG FUSION: when this FP Cmp's boolean result is consumed ONLY by
@@ -1755,14 +1889,37 @@ impl X86Codegen {
             if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
                 eprintln!("[FP-SELECT] blend into {}", d_name);
             }
-            // 1. mask: lhs → xmm0, rhs → xmm1, mask → xmm0. (The operands'
-            //    homes can only be xmm2-xmm15, so no aliasing with scratch.)
-            self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
-            self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
-            self.state.emit_fmt(format_args!(
-                "    {} ${}, %xmm1, %xmm0, %xmm0",
-                cmp_insn, imm
-            ));
+            // 1. mask: the vcmpsd source position takes the RHS directly
+            //    (fresh XMM home / pool constant / stack slot — the same
+            //    classification as the register-direct compare), with the
+            //    LHS compared straight from its own home. Falls back to the
+            //    staged lhs→xmm0/rhs→xmm1 pair when the LHS has no fresh
+            //    home. The mask lands in %xmm0 either way (scratch, never
+            //    a home), and the compare still runs BEFORE the false-arm
+            //    copy can touch a shared home — order preserved.
+            let lhs_home = match lhs {
+                Operand::Value(v) => self
+                    .fresh_home_of(v.0)
+                    .filter(|r| is_xmm_reg(*r))
+                    .map(phys_reg_name),
+                _ => None,
+            };
+            match (lhs_home, self.fp_src_mem_operand(rhs, ty)) {
+                (Some(l_name), Some(r_src)) => {
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, {}, %{}, %xmm0",
+                        cmp_insn, imm, r_src, l_name
+                    ));
+                }
+                _ => {
+                    self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
+                    self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, %xmm1, %xmm0, %xmm0",
+                        cmp_insn, imm
+                    ));
+                }
+            }
             // 2. true → xmm1 BEFORE false can clobber a shared home.
             self.emit_fp_operand_to_xmm(true_val, ty, "xmm1");
             // 3. false → dest home (no-op when the false arm already lives
@@ -1798,13 +1955,32 @@ impl X86Codegen {
         if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
             eprintln!("[FP-SELECT] blend into xmm0 (false in {})", f_name);
         }
-        // 1. mask → xmm1: lhs → xmm0, rhs → xmm1, vcmpsd into xmm1.
-        self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
-        self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
-        self.state.emit_fmt(format_args!(
-            "    {} ${}, %xmm1, %xmm0, %xmm1",
-            cmp_insn, imm
-        ));
+        // 1. mask → xmm1: register-direct when the LHS has a fresh home
+        //    (RHS from the memory-capable source slot), else the staged
+        //    lhs→xmm0 / rhs→xmm1 pair. Mask in %xmm1 either way.
+        let lhs_home = match lhs {
+            Operand::Value(v) => self
+                .fresh_home_of(v.0)
+                .filter(|r| is_xmm_reg(*r))
+                .map(phys_reg_name),
+            _ => None,
+        };
+        match (lhs_home, self.fp_src_mem_operand(rhs, ty)) {
+            (Some(l_name), Some(r_src)) => {
+                self.state.emit_fmt(format_args!(
+                    "    {} ${}, {}, %{}, %xmm1",
+                    cmp_insn, imm, r_src, l_name
+                ));
+            }
+            _ => {
+                self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
+                self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
+                self.state.emit_fmt(format_args!(
+                    "    {} ${}, %xmm1, %xmm0, %xmm1",
+                    cmp_insn, imm
+                ));
+            }
+        }
         // 2. true → xmm0 (any operand kind; the false arm stays in its home).
         self.emit_fp_operand_to_xmm(true_val, ty, "xmm0");
         // 3. blend into the accumulator: mask ? xmm0 : %f.

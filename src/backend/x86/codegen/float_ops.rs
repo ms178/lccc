@@ -1517,6 +1517,124 @@ impl X86Codegen {
             }
         }
 
+        // Path 2b — 132-form: the destination shares its home with one of
+        // the MULTIPLY operands (regalloc coalesced the fused result onto a
+        // dying multiplicand) while the accumulator does NOT share it. The
+        // accumulator then rides the AT&T-second (addend) position of
+        // `vfmadd132sd mul_other, addend, dest`, which computes
+        // `dest = dest * mul_other + acc` — zero staging when the acc is
+        // itself XMM-homed (one pool/slot load through xmm0 otherwise, with
+        // no store-back in either case). This is the recurrence shape every
+        // FP loop produces (`x = x * k + c`, `zi = zi * 2zr + ci`):
+        // mandelbrot's inner loop previously staged `movsd ci,xmm0; fma;
+        // movsd xmm0,zi` per iteration and measured 1.51s; the 132-form
+        // reaches 1.02s.
+        //
+        // Aliasing proof: dest holds mul_operand's bits because the
+        // allocator coalesced the fma's destination onto that operand's
+        // register — the operand's live range ends at this fma, exactly the
+        // invariant the 231-coalescing path above relies on for acc. The
+        // OTHER multiply operand must be readable from a home or slot
+        // distinct from dest_name; the accumulator must be a fresh home
+        // distinct from dest_name (it cannot equal dest_name here — that
+        // is path 1's shape, which already returned), a pool/slot load
+        // through xmm0, or a GPR-shuttle case we decline.
+        {
+            let dest_xmm = self.dest_reg(add_dest).filter(|r| is_xmm_reg(*r));
+            if let Some(dest_reg) = dest_xmm {
+                let dest_name = phys_reg_name(dest_reg);
+                // The multiply operand homed AT the destination (lhs first,
+                // then rhs); `other` is the m64-capable first position.
+                let lhs_at_dest = match mul_lhs {
+                    Operand::Value(v) => {
+                        self.fresh_home_of(v.0).map(phys_reg_name) == Some(dest_name)
+                    }
+                    _ => false,
+                };
+                let rhs_at_dest = match mul_rhs {
+                    Operand::Value(v) => {
+                        self.fresh_home_of(v.0).map(phys_reg_name) == Some(dest_name)
+                    }
+                    _ => false,
+                };
+                let other: Option<&Operand> = if lhs_at_dest {
+                    Some(mul_rhs)
+                } else if rhs_at_dest {
+                    Some(mul_lhs)
+                } else {
+                    None
+                };
+                if let Some(other_op) = other {
+                    // First (AT&T) position: register home, slot, or
+                    // RIP-relative constant — all legal m64 sources.
+                    let other_src: Option<String> = match other_op {
+                        Operand::Value(v) => match self.fresh_home_of(v.0) {
+                            Some(reg) if is_xmm_reg(reg) => {
+                                let name = phys_reg_name(reg);
+                                if name != dest_name {
+                                    Some(format!("%{}", name))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => self
+                                .state
+                                .get_slot(v.0)
+                                .filter(|_| !self.reg_assignments.contains_key(&v.0))
+                                .map(|slot| self.slot_ref(slot.0)),
+                        },
+                        Operand::Const(IrConst::F64(c)) => Some(format!(
+                            "{}(%rip)",
+                            self.state.get_fp_const_label(c.to_bits())
+                        )),
+                        Operand::Const(IrConst::F32(c)) => Some(format!(
+                            "{}(%rip)",
+                            self.state.get_fp_const_label(c.to_bits() as u64)
+                        )),
+                        _ => None,
+                    };
+                    // Second (AT&T) position: the addend must be a register.
+                    // acc homed in a distinct XMM → direct; acc const → one
+                    // load into xmm0 (never a home — guarded by other_src
+                    // being usable so the load is never orphaned); anything
+                    // else declines to the scratch path below.
+                    if let Some(o_src) = other_src {
+                        let addend: Option<String> = match acc {
+                            Operand::Value(v) => match self.fresh_home_of(v.0) {
+                                Some(reg) if is_xmm_reg(reg) => {
+                                    let name = phys_reg_name(reg);
+                                    if name != dest_name {
+                                        Some(format!("%{}", name))
+                                    } else {
+                                        None // acc at dest: path 1's shape
+                                    }
+                                }
+                                _ => None,
+                            },
+                            Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::F32(_)) => {
+                                self.load_fp_to_xmm0(acc, ty);
+                                Some("%xmm0".to_string())
+                            }
+                            _ => None,
+                        };
+                        if let Some(a_src) = addend {
+                            let fma132 = fma.replace("231", "132");
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}, {}, %{}",
+                                fma132, o_src, a_src, dest_name
+                            ));
+                            self.state.reg_cache.invalidate_acc();
+                            // Definition-writes-home accounting: the 132-form
+                            // derived the fused dest in place over the dying
+                            // multiplicand occupying that home.
+                            self.note_inplace_compute(dest_reg, add_dest.0);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // Path 3 — constant accumulator, lhs and destination share an XMM
         // home (the shape path 2 must refuse: its accumulator preload would
         // clobber the lhs sitting in that home).  Use the 213 form instead:

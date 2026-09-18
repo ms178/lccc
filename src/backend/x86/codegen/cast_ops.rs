@@ -1,6 +1,6 @@
 //! X86Codegen: cast operations.
 
-use super::emit::X86Codegen;
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32};
 use crate::backend::generation::is_i128_type;
 use crate::backend::regalloc::PhysReg;
 use crate::common::types::IrType;
@@ -22,6 +22,129 @@ pub(super) struct PendingWiden {
 }
 
 impl X86Codegen {
+    /// Emit an int→float conversion of `src` into `dst`, with the cvtsi2sd
+    /// family's FALSE DEPENDENCY ON THE DESTINATION broken and the
+    /// narrowest legal source form selected.
+    ///
+    /// The legacy 2-operand `cvtsi2sdq %rax, %dst` merges the converted
+    /// value into dst's upper 64 bits — i.e. it READS dst's previous full
+    /// content, so back-to-back conversions into the same register
+    /// serialize at cvtsi2sd latency (~5-6 cycles on Skylake-derived
+    /// cores) even though the conversions are data-independent. In a loop
+    /// like spectral_norm's `A(i,j)` divisor recurrence this alone costs
+    /// ~6 cycles per iteration.
+    ///
+    ///   AVX:    `vcvtsi2sd{q,l} %src, %other, %dst` — the VEX form takes
+    ///           the upper-half bits from an explicit source register;
+    ///           picking one that never aliases dst removes the read of
+    ///           dst's old content entirely (register renaming then
+    ///           overlaps consecutive conversions). %xmm0/%xmm1 are pure
+    ///           scratch under the XMM-homes-are-xmm2..15 contract, so one
+    ///           of them always differs from dst.
+    ///   legacy: `pxor %dst, %dst` first (exactly GCC's spelling): one
+    ///           extra uop, rename-elided on modern cores, and it
+    ///           substitutes a known-zero upper half for the merge.
+    ///
+    /// Source form: when the value is GPR-homed AND its type provably
+    /// fills the register — I32 defs write the full 32-bit register and
+    /// 32-bit writes zero-extend to 64 (x86), so U32 and I64 defs fill
+    /// their whole home — the conversion reads the HOME directly: no
+    /// `movq home,%rax` staging, no extension (GCC's one-instruction
+    /// `cvtsi2sdl %eax` form). I8/I16/U8/U16 may have partial-register
+    /// defs, so they keep the staged-and-extended form.
+    ///
+    /// The upper-half CONTENT is a scalar don't-care: every scalar
+    /// consumer (movsd/movss stores, scalar FP arithmetic, ucomis, ABI
+    /// argument/return lanes) reads only the low lane, and the legacy
+    /// merge left the same class of unspecified bits there anyway.
+    pub(super) fn emit_cvt_si2fp(
+        &mut self,
+        src: &Operand,
+        from_ty: IrType,
+        to_f64: bool,
+        dst: &str,
+    ) {
+        // Direct-from-home: the value's full width is in its GPR home.
+        if let Operand::Value(v) = src {
+            if let Some(reg) = self.fresh_home_of(v.0).filter(|r| !is_xmm_reg(*r)) {
+                let n64 = phys_reg_name(reg);
+                let n32 = phys_reg_name_32(reg);
+                let home_form: Option<(&str, String)> = match (to_f64, from_ty) {
+                    (true, IrType::I32) => Some(("cvtsi2sdl", format!("%{}", n32))),
+                    (true, IrType::U32) | (true, IrType::I64) => {
+                        Some(("cvtsi2sdq", format!("%{}", n64)))
+                    }
+                    (false, IrType::I32) => Some(("cvtsi2ssl", format!("%{}", n32))),
+                    (false, IrType::U32) | (false, IrType::I64) => {
+                        Some(("cvtsi2ssq", format!("%{}", n64)))
+                    }
+                    _ => None,
+                };
+                if let Some((insn, sreg)) = home_form {
+                    if self.isa.avx {
+                        let other = if dst == "xmm0" { "xmm1" } else { "xmm0" };
+                        self.state
+                            .emit_fmt(format_args!("    v{} {}, %{}, %{}", insn, sreg, other, dst));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    pxor %{}, %{}", dst, dst));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %{}", insn, sreg, dst));
+                    }
+                    return;
+                }
+            }
+        }
+        // Staged form: value into %rax, extension per type, L/Q per width.
+        self.operand_to_rax(src);
+        if from_ty.is_unsigned() {
+            self.emit_zero_extend_to_rax(from_ty);
+        } else if from_ty != IrType::I32 {
+            // I32 needs no extension: the L-form conversion reads %eax
+            // directly (the cltq would be dead).
+            self.emit_sign_extend_to_rax(from_ty);
+        }
+        self.emit_cvt_si2fp_from_rax(from_ty, to_f64, dst);
+    }
+
+    /// The %rax-staged core of [`Self::emit_cvt_si2fp`]: the value (already
+    /// extended per its type) sits in %rax/%eax; convert into `dst` with
+    /// the destination false dependency broken.
+    ///
+    /// I8/I16/I32 and U8/U16 are exactly representable in the signed 32-bit
+    /// %eax after extension → the L form (one instruction for I32 where the
+    /// old path paid cltq + q-form). U32 keeps the Q form (values ≥ 2^31
+    /// are negative as i32; %rax holds the zero-extended value). I64 and
+    /// Ptr take the Q form.
+    pub(super) fn emit_cvt_si2fp_from_rax(&mut self, from_ty: IrType, to_f64: bool, dst: &str) {
+        let narrow = matches!(
+            from_ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32
+        );
+        if self.isa.avx {
+            let other = if dst == "xmm0" { "xmm1" } else { "xmm0" };
+            let (insn, src) = match (to_f64, narrow) {
+                (true, true) => ("vcvtsi2sdl", "%eax"),
+                (true, false) => ("vcvtsi2sdq", "%rax"),
+                (false, true) => ("vcvtsi2ssl", "%eax"),
+                (false, false) => ("vcvtsi2ssq", "%rax"),
+            };
+            self.state
+                .emit_fmt(format_args!("    {} {}, %{}, %{}", insn, src, other, dst));
+        } else {
+            let (insn, src) = match (to_f64, narrow) {
+                (true, true) => ("cvtsi2sdl", "%eax"),
+                (true, false) => ("cvtsi2sdq", "%rax"),
+                (false, true) => ("cvtsi2ssl", "%eax"),
+                (false, false) => ("cvtsi2ssq", "%rax"),
+            };
+            self.state
+                .emit_fmt(format_args!("    pxor %{}, %{}", dst, dst));
+            self.state
+                .emit_fmt(format_args!("    {} {}, %{}", insn, src, dst));
+        }
+    }
+
     fn pf15_trace(&self, msg: &str) {
         if std::env::var_os("CCC_DEBUG_PF15").is_some() {
             eprintln!("[pf15] {msg}");
@@ -302,19 +425,7 @@ impl X86Codegen {
                     // operand_to_rax handles the accumulator cache
                     // (immediately-consumed sources have no slot and no
                     // register — value_to_reg/operand_to_reg would panic).
-                    self.operand_to_rax(src);
-                    if from_ty.is_unsigned() {
-                        self.emit_zero_extend_to_rax(from_ty);
-                    } else {
-                        self.emit_sign_extend_to_rax(from_ty);
-                    }
-                    if to_ty == IrType::F64 {
-                        self.state
-                            .emit_fmt(format_args!("    cvtsi2sdq %rax, %{}", dname));
-                    } else {
-                        self.state
-                            .emit_fmt(format_args!("    cvtsi2ssq %rax, %{}", dname));
-                    }
+                    self.emit_cvt_si2fp(src, from_ty, to_ty == IrType::F64, dname);
                     self.state.reg_cache.invalidate_acc();
                     return;
                 }
@@ -374,11 +485,7 @@ impl X86Codegen {
                 self.operand_to_rax(src);
                 // Sign-extend sub-64-bit sources to 64 bits (Noop for I64).
                 self.emit_cast_instrs_x86(ft, IrType::I64);
-                if to_f64 {
-                    self.state.emit("    cvtsi2sdq %rax, %xmm0");
-                } else {
-                    self.state.emit("    cvtsi2ssq %rax, %xmm0");
-                }
+                self.emit_cvt_si2fp_from_rax(ft, to_f64, "xmm0");
                 self.store_xmm_to(dest, "xmm0", to_ty);
                 true
             }
@@ -394,22 +501,17 @@ impl X86Codegen {
                     let done_label = self.state.fresh_label("u2f_done");
                     self.state.emit("    testq %rax, %rax");
                     self.state.out.emit_jcc_label("    js", &big_label);
-                    if to_f64 {
-                        self.state.emit("    cvtsi2sdq %rax, %xmm0");
-                    } else {
-                        self.state.emit("    cvtsi2ssq %rax, %xmm0");
-                    }
+                    self.emit_cvt_si2fp_from_rax(ft, to_f64, "xmm0");
                     self.state.out.emit_jmp_label(&done_label);
                     self.state.out.emit_named_label(&big_label);
                     self.state.emit("    movq %rax, %rcx");
                     self.state.emit("    shrq $1, %rax");
                     self.state.emit("    andq $1, %rcx");
                     self.state.emit("    orq %rcx, %rax");
+                    self.emit_cvt_si2fp_from_rax(ft, to_f64, "xmm0");
                     if to_f64 {
-                        self.state.emit("    cvtsi2sdq %rax, %xmm0");
                         self.state.emit("    addsd %xmm0, %xmm0");
                     } else {
-                        self.state.emit("    cvtsi2ssq %rax, %xmm0");
                         self.state.emit("    addss %xmm0, %xmm0");
                     }
                     self.state.out.emit_named_label(&done_label);
@@ -417,11 +519,7 @@ impl X86Codegen {
                     self.store_xmm_to(dest, "xmm0", to_ty);
                 } else {
                     // U8/U16/U32: already zero-extended in %rax by the load.
-                    if to_f64 {
-                        self.state.emit("    cvtsi2sdq %rax, %xmm0");
-                    } else {
-                        self.state.emit("    cvtsi2ssq %rax, %xmm0");
-                    }
+                    self.emit_cvt_si2fp_from_rax(ft, to_f64, "xmm0");
                     self.store_xmm_to(dest, "xmm0", to_ty);
                 }
                 true

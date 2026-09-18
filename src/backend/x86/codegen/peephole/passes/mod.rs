@@ -967,6 +967,19 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed |= c;
             }
         }
+        if !sk("inplace_add_copy_lea") {
+            {
+                let c = flag_peepholes::fold_inplace_add_copy_into_lea(&mut store, &mut infos);
+                trace(
+                    "fold_inplace_add_copy_into_lea",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
         if !sk("copy_shift_lea") {
             {
                 let c = flag_peepholes::fold_copy_shift_into_lea(&mut store, &mut infos);
