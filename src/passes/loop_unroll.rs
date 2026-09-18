@@ -92,9 +92,34 @@ struct UnrollCandidate {
     unroll_factor: u32,
 }
 
-/// Run the loop-unrolling pass on one function. Returns the number of loops
-/// that were successfully unrolled.
-pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
+/// Which pipeline slot `unroll_loops` was invoked from.
+///
+/// The two invocation points have different safety envelopes around the
+/// SAME loop population:
+///
+/// * `Early` (Phase 2b, before the main loop vectorizer): a two-block
+///   partial unroll here would rewrite unit-stride elementwise store loops
+///   (`a[i] = f(a[i])` shapes) into step-`k` store pairs BEFORE the
+///   vectorizer ever sees them; its map detector then correctly declines
+///   the non-unit stride and the loop stays SCALAR ×k — a large regression
+///   versus the 4/8-wide packed form it would have produced. The complete
+///   unroller does not have this hazard (it removes the loop entirely and
+///   the SLP/unrolled pair machinery handles the flattened stores), and
+///   `do_unroll`'s guarded form only takes 3+-block chains, so only the
+///   NEW partial two-block path needs the gate.
+/// * `PostVec` (after `vectorize`, before BB-SLP): every loop that remains
+///   rolled here was DECLINED by the loop vectorizer — the two-block
+///   partial unroll's feedstock. The k concatenated bodies land in one
+///   basic block, exactly the shape `run_bb_slp` packs (adjacent stores
+///   seed, isomorphic trees pack, `PackKind::MemLoad` fuses consecutive
+///   loads).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnrollPhase {
+    Early,
+    PostVec,
+}
+
+pub(crate) fn unroll_loops(func: &mut IrFunction, phase: UnrollPhase) -> usize {
     if func.blocks.len() < 2 {
         return 0;
     }
@@ -212,6 +237,50 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
     }
     if count > 0 {
         return count;
+    }
+
+    // Pass B: partial GUARD-FREE unrolling of two-block counted loops
+    // (post-vectorize phase only — see `UnrollPhase`). Rebuild the CFG
+    // after each success: one new block is appended and the latch is
+    // disconnected, so block indices captured by earlier analyses go
+    // stale. The pass is idempotent-safe by construction: the unrolled
+    // loop is itself a two-block loop, so the fixpoint may take it again
+    // (trip/k, work×k) until either the divisibility, the code-size
+    // budget, or the `count` cap stops it — every step is a legal
+    // guard-free unroll of a smaller constant trip.
+    // CCC_NO_TWO_BLOCK_UNROLL is the standard per-transform kill switch
+    // (every A/B differential in the harness speaks it).
+    if phase == UnrollPhase::PostVec && std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err() {
+        loop {
+            let cfg = CfgAnalysis::build(func);
+            let raw = loop_analysis::find_natural_loops(
+                cfg.num_blocks,
+                &cfg.preds,
+                &cfg.succs,
+                &cfg.idom,
+            );
+            let loops_now = loop_analysis::merge_loops_by_header(raw);
+            let mut did = false;
+            let mut two_block: Vec<_> = loops_now
+                .iter()
+                .filter(|lp| lp.body.len() == 2 && !loop_is_arx(lp, func))
+                .cloned()
+                .collect();
+            two_block.sort_by_key(|lp| lp.header);
+            for lp in &two_block {
+                if try_partial_unroll_two_block(func, lp, &cfg) {
+                    count += 1;
+                    did = true;
+                    break;
+                }
+            }
+            if !did || count > 96 {
+                break;
+            }
+        }
+        if count > 0 {
+            return count;
+        }
     }
 
     // Collect and sort candidates by body size (smallest first = innermost first).
@@ -2495,6 +2564,597 @@ fn try_complete_unroll_two_block(
     true
 }
 
+// ── Pass B: partial guard-free two-block unrolling ───────────────────────────
+
+/// Partially unroll a two-block counted loop — header (phis + exit test)
+/// and a work-carrying latch — by a factor `k` that DIVIDES the known
+/// constant trip count, emitting all `k` iteration bodies concatenated in
+/// ONE straight-line block between the header and the back edge with NO
+/// inter-iteration guards.
+///
+/// This is the missing middle ground between the two existing unrollers:
+/// the complete unroller flattens trips ≤ 16 (≤ 512 expanded instructions)
+/// entirely, and `do_unroll` partially unrolls only 3+-block chains
+/// (`analyze_loop` requires non-empty `body_work`); the tight two-block
+/// counted loop — by far the most common profitable shape (SHA-256's
+/// message schedule and round loops, stream transforms, table walks) —
+/// was taken by NEITHER and always stayed rolled.
+///
+/// # Why guard-free is sound
+///
+/// `trip % k == 0` partitions the source iterations into `trip / k` exact
+/// groups. The header guard still runs once per group: control enters the
+/// body only while the IV is below the limit, and then the group executes
+/// exactly `k` source iterations — the (t)-th iteration is in-bounds for
+/// every `t < trip` by the definition of `trip`
+/// (`complete_unroll_trip`), and the group containing iterations
+/// `g·k .. g·k+k-1` starts at IV `init + g·k·step`, which is below the
+/// limit for every `g < trip/k` (the largest is `init + (trip-k)·step`,
+/// still the (trip-k)-th iteration's IV — in-bounds). The first group
+/// whose start IV reaches the limit exits at the header, exactly as the
+/// rolled loop would at iteration `trip`. No mid-group exit can exist.
+///
+/// # Why one straight-line block is sound (and precious)
+///
+/// Concatenating the `k` renamed copies of consecutive iterations in
+/// program order IS `k` consecutive iterations — every cross-iteration
+/// memory dependence (store of iteration `t` feeding load of iteration
+/// `t+2`, etc.) is preserved verbatim because the loads/stores keep their
+/// relative order. SSA is maintained by renaming: each clone defines
+/// fresh values; header-phi references are substituted with the previous
+/// clone's definitions (the threading below); the IV advances through
+/// explicit `Add` instructions.
+///
+/// The single-block form is what makes BB-SLP able to pack the group:
+/// `run_bb_slp` works per basic block, so the two adjacent stores
+/// `m[i]`, `m[i+1]` seed one pack, the isomorphic per-lane trees pack,
+/// and `PackKind::MemLoad` fuses the consecutive `m[i-2]/m[i-1]` loads
+/// into one vector load — GCC's 2-wide `vpsrld/vpxor` schedule form. The
+/// SLP side's own legality rules stay in charge: rule (e) rejects any
+/// seed whose lanes would read bytes a seed store writes (the
+/// store→load-forwarding shape `m[i] = f(m[i-1])`), so the transform is
+/// beneficial exactly where it is safe and falls back to scalar where it
+/// is not.
+///
+/// # Live-out exactness
+///
+/// The IV phi's back-edge value becomes `Add(iv_{k-1}, step)`, so after
+/// the final group the phi reads `init + trip·step` — the same value the
+/// rolled loop leaves (each group advances the IV by `k·step`, and
+/// `trip/k` groups run). Carried phis thread through the clones and end
+/// at the last clone's copy of their back value — the value iteration
+/// `trip` computed in the rolled form. Values defined in the latch can
+/// never be live out of the loop through the exit edge: the exit is
+/// reachable from the header WITHOUT executing the latch (the very first
+/// guard evaluation), so SSA dominance already forbids such uses.
+///
+/// # Fail-closed shape requirements
+///
+/// * exactly two blocks in the natural loop, single back-edge predecessor
+///   (the latch), `Branch(header)` latch terminator;
+/// * a basic IV (`find_iv_in_loop_ext`) whose latch increment is the LAST
+///   latch instruction (nothing may follow it — a trailing instruction
+///   would need clone-local placement semantics this pass does not model);
+/// * the exit comparison in the header against a loop-invariant operand
+///   (`find_exit_condition`), same type as the IV;
+/// * constant IV init (preheader edge) and constant limit → exact trip
+///   via `complete_unroll_trip`;
+/// * no header instructions beyond the phi + exit-test chain
+///   (`header_extra_indices`);
+/// * every header phi in the two-incoming preheader/latch form
+///   (`collect_header_phis`);
+/// * clone-safe latch work: no calls, indirect calls, inline asm, dynamic
+///   allocas, or atomics; intrinsics must be pure;
+/// * `trip ≥ 2k` (at least two groups — one group is complete-unroll
+///   territory), `k ≤ 4`, and `work × k ≤ 512` expanded instructions.
+///
+/// Returns `true` when the loop was rewritten.
+fn try_partial_unroll_two_block(
+    func: &mut IrFunction,
+    lp: &loop_analysis::NaturalLoop,
+    cfg: &CfgAnalysis,
+) -> bool {
+    if lp.body.len() != 2 {
+        return false;
+    }
+    let header = lp.header;
+    let back_preds: Vec<usize> = cfg
+        .preds
+        .row(header)
+        .iter()
+        .map(|&p| p as usize)
+        .filter(|p| lp.body.contains(p))
+        .collect();
+    if back_preds.len() != 1 {
+        return false;
+    }
+    let latch = back_preds[0];
+    if latch == header {
+        return false;
+    }
+    let header_label = func.blocks[header].label;
+    let latch_label = func.blocks[latch].label;
+    match &func.blocks[latch].terminator {
+        Terminator::Branch(lbl) if *lbl == header_label => {}
+        _ => return false,
+    }
+
+    let Some((iv_phi, iv_ty, iv_step, latch_iv_incr_idx)) =
+        find_iv_in_loop_ext(func, header, latch, latch_label)
+    else {
+        return false;
+    };
+    let Some((
+        exit_target,
+        body_entry,
+        raw_cmp_op,
+        cmp_ty,
+        exit_limit,
+        iv_is_lhs,
+        exit_cond_positive,
+    )) = find_exit_condition(func, header, &lp.body, iv_phi)
+    else {
+        return false;
+    };
+    if cmp_ty != iv_ty {
+        return false;
+    }
+    // 2-block form only: the work lives in the latch itself.
+    if body_entry != latch_label {
+        return false;
+    }
+    // The IV increment must be the final latch instruction.
+    if latch_iv_incr_idx + 1 != func.blocks[latch].instructions.len() {
+        return false;
+    }
+
+    // Constant IV init from the preheader edge (resolved through the same
+    // const-chain evaluator as the complete unrollers).
+    let mut iv_init_op: Option<Operand> = None;
+    for inst in &func.blocks[header].instructions {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            if dest.0 == iv_phi.0 {
+                for (op, lbl) in incoming {
+                    if *lbl != latch_label {
+                        iv_init_op = Some(op.clone());
+                    }
+                }
+            }
+        }
+    }
+    let Some(iv_init_op) = iv_init_op else {
+        return false;
+    };
+    let Some(iv_init) = resolve_const_operand(func, &iv_init_op, 0) else {
+        return false;
+    };
+    let Some(limit_n) = resolve_const_operand(func, &exit_limit, 0) else {
+        return false;
+    };
+    let cmp_op = canonical_continue_cmp(raw_cmp_op, iv_is_lhs, exit_cond_positive);
+    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step, iv_ty) else {
+        return false;
+    };
+
+    let work_len = latch_iv_incr_idx;
+    // An empty work latch (pure counting loop) has nothing to unroll.
+    if work_len == 0 {
+        return false;
+    }
+
+    // PROFITABILITY: the pass exists to make the k concatenated bodies
+    // BB-SLP feedstock — `run_bb_slp` is STORE-SEEDED and its lane inputs
+    // are LOAD packs, so a latch lacking either can never pack anything
+    // and the unroll is pure code-size bloat with zero runtime gain.
+    // Measured (2026-09-18, the codegen-quality gate's tolerance breach):
+    // gzip_crc32's table walk (loads + the crc rotation only, no store)
+    // +30% insns at neutral runtime; glibc_memcmp's compare loops +20.7%
+    // at neutral runtime; crc32's inlined fill_data LCG loop (store, no
+    // load — a serial dependence chain) +21 lines at neutral runtime.
+    // Both must be plain non-volatile accesses through any pointer (the
+    // seed rules vet the address shapes later); volatile accesses never
+    // participate in packs.
+    {
+        let work = &func.blocks[latch].instructions[..work_len];
+        let has_store = work.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Store {
+                    volatile: false,
+                    ..
+                }
+            )
+        });
+        let has_load = work.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Load {
+                    volatile: false,
+                    ..
+                }
+            )
+        });
+        if !has_store || !has_load {
+            return false;
+        }
+    }
+
+    // Clone-safety scan of the latch work.
+    for inst in &func.blocks[latch].instructions[..work_len] {
+        match inst {
+            Instruction::Call { .. }
+            | Instruction::CallIndirect { .. }
+            | Instruction::InlineAsm { .. }
+            | Instruction::DynAlloca { .. }
+            | Instruction::AtomicRmw { .. }
+            | Instruction::AtomicCmpxchg { .. }
+            | Instruction::AtomicLoad { .. }
+            | Instruction::AtomicStore { .. } => return false,
+            Instruction::Intrinsic { op, .. } => {
+                if !op.is_pure() {
+                    return false;
+                }
+                // VECTORIZED BODIES STAY ROLLED: the loop vectorizer's
+                // rolled body is the deliberate final shape (the ARX
+                // marker philosophy — `do_unroll`'s guarded form already
+                // serves the multi-accumulator FMA exposure case, and the
+                // RA's accumulator homing is tuned for the rolled phi
+                // web). Unrolling a Vec*-intrinsic chain here both
+                // fights that design and demonstrably breaks the
+                // accumulator web: the chained `VecWidenAdd`s of an
+                // unrolled widening reduction left the phi's register
+                // stale (arm_vec_load_offset summed to 0). This pass
+                // exists for the SCALAR two-block feedstock the
+                // vectorizer declined — the SLP pack takes it from here.
+                if op.produces_vector_value() || op.writes_memory_via_args() || op.may_read_memory()
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The header must be phis + exit-test chain only.
+    if !header_extra_indices(func, header).is_empty() {
+        return false;
+    }
+    let Some(phis) = collect_header_phis(func, header, latch_label) else {
+        return false;
+    };
+
+    // ROTATION-DOMINATED loops stay rolled: count carried phis whose
+    // back-edge value is ANOTHER header phi (a rotation edge — `h = g;
+    // g = f; f = e; ...`). A k-shift register of ≥ 3 values is a SERIAL
+    // dependence chain (each round consumes the previous round's outputs
+    // through t1/t2-class temporaries): unrolling cannot shorten the
+    // chain, it only duplicates the transient temporaries on top of the
+    // already-high carried-state pressure — the sha256 round loop
+    // unrolled ×2 spilled its whole working set through the stack (the
+    // measured 1.50× gap became 1.94×, every MAJ term store-forwarding
+    // through `%rsp`). The SCHEDULE loop (distance-2 memory recurrence,
+    // ZERO rotation edges) is the shape this unroll exists for.
+    {
+        let phi_ids: FxHashSet<u32> = phis.iter().map(|p| p.id).collect();
+        let rotation_edges = phis
+            .iter()
+            .filter(|p| {
+                p.id != iv_phi.0 && matches!(&p.back, Operand::Value(v) if phi_ids.contains(&v.0))
+            })
+            .count();
+        if rotation_edges >= 3 {
+            return false;
+        }
+    }
+
+    // Factor selection: the size-based preference, walked down through
+    // powers of two until one divides the trip. k is capped at 4 (a
+    // 2-4× two-block body is the SLP/code-size sweet spot; larger
+    // factors belong to `do_unroll`'s guarded form).
+    //
+    // NOTE (routing, verified empirically): the `trip >= 2k` guard below
+    // can only bind for trips < 8 — and every trip <= 16 loop whose
+    // budget the complete unroller accepts (work*trip <= 512, which any
+    // Pass-B-eligible work satisfies) is already complete-unrolled by
+    // Pass A before Pass B ever sees it. The guard is therefore a
+    // fail-closed INVARIANT for the states that reach this pass today,
+    // not a reachable decline — "exactly two groups" is complete-unroll
+    // territory by construction (pinned by
+    // `two_block_small_trips_are_complete_unrolled_not_partial`).
+    let k_pref = choose_unroll_factor(work_len).min(4) as usize;
+    let mut k: usize = 1;
+    let mut cand_k = k_pref;
+    while cand_k >= 2 {
+        if trip % (cand_k as i64) == 0 {
+            k = cand_k;
+            break;
+        }
+        cand_k /= 2;
+    }
+    if k < 2 {
+        return false;
+    }
+    if trip < 2 * k as i64 {
+        return false;
+    }
+    if work_len.saturating_mul(k) > 512 {
+        return false;
+    }
+
+    // ── Mint fresh values and the clone label ─────────────────────────────
+    let mut next_val = func.next_value_id;
+    let mut fresh = || {
+        let v = Value(next_val);
+        next_val += 1;
+        v
+    };
+    let body_label = {
+        let l = BlockId(func.next_label);
+        func.next_label += 1;
+        l
+    };
+
+    // Per-clone rename maps for the latch work definitions.
+    let mut vmaps: Vec<FxHashMap<u32, u32>> = Vec::with_capacity(k);
+    for _ in 0..k {
+        let mut vmap: FxHashMap<u32, u32> = FxHashMap::default();
+        for inst in &func.blocks[latch].instructions[..work_len] {
+            if let Some(d) = inst.dest() {
+                vmap.insert(d.0, fresh().0);
+            }
+        }
+        vmaps.push(vmap);
+    }
+
+    // The IV chain ids, minted BEFORE the phi threading: a carried phi's
+    // back edge may reference the IV itself ("x = i" — the phi) or the
+    // canonical increment (a GVN-merged "x = i + 1"), and both must thread
+    // through the per-clone IV values. iv_vals[j] is the IV clone j runs
+    // with (iv_vals[0] = the phi); iv_vals[k] is the post-group value that
+    // becomes the phi's new back-edge incoming.
+    let mut iv_vals: Vec<Value> = Vec::with_capacity(k + 1);
+    iv_vals.push(iv_phi);
+    for _ in 1..=k {
+        iv_vals.push(fresh());
+    }
+    // The canonical increment's dest: references to it evaluate to the
+    // NEXT clone's IV (iv_vals[c+1] in clone c's context).
+    let iv_incr_dest_id: Option<u32> = func.blocks[latch].instructions[latch_iv_incr_idx]
+        .dest()
+        .map(|d| d.0);
+
+    // Threaded phi operands: thread[j][P] is the operand clone j sees for
+    // header phi P. thread[0][P] = P itself; thread[j][P] (j ≥ 1) is P's
+    // back value evaluated in clone j-1:
+    //   * a latch-defined value → clone j-1's renamed copy;
+    //   * the IV phi → iv_vals[j-1] (the IV clone j-1 ran with);
+    //   * the canonical IV increment → iv_vals[j] (the post-increment IV
+    //     of clone j-1 — a GVN-merged "x = i + 1");
+    //   * another header phi Q → thread[j-1][Q] (cross-phi threading);
+    //   * anything else (constant, loop-invariant, dominating def) →
+    //     verbatim.
+    // The IV phi itself is NOT a thread-map key (clone j's references to
+    // it are substituted with iv_vals[j] by the combined map below); the
+    // subst_back IV arms exist precisely for OTHER phis' back edges that
+    // reference the IV — the "x = i" hole: left verbatim, clone j ≥ 2
+    // reads the GROUP-START IV and the loop's live-out x becomes the
+    // group start instead of the last iteration (measured: trip 64, k 4
+    // → x = 60 instead of 63).
+    let phi_ids: FxHashSet<u32> = phis.iter().map(|p| p.id).collect();
+    let subst_back = |op: &Operand,
+                      clone_ctx: usize,
+                      vmap: &FxHashMap<u32, u32>,
+                      thread_prev: &FxHashMap<u32, Operand>|
+     -> Operand {
+        match op {
+            Operand::Value(v) => {
+                if v.0 == iv_phi.0 {
+                    Operand::Value(iv_vals[clone_ctx])
+                } else if Some(v.0) == iv_incr_dest_id {
+                    Operand::Value(iv_vals[clone_ctx + 1])
+                } else if let Some(&nv) = vmap.get(&v.0) {
+                    Operand::Value(Value(nv))
+                } else if phi_ids.contains(&v.0) {
+                    thread_prev.get(&v.0).cloned().unwrap_or_else(|| op.clone())
+                } else {
+                    op.clone()
+                }
+            }
+            _ => op.clone(),
+        }
+    };
+    let mut thread: Vec<FxHashMap<u32, Operand>> = Vec::with_capacity(k);
+    {
+        let mut t0: FxHashMap<u32, Operand> = FxHashMap::default();
+        for p in &phis {
+            if p.id != iv_phi.0 {
+                t0.insert(p.id, Operand::Value(Value(p.id)));
+            }
+        }
+        thread.push(t0);
+    }
+    for j in 1..k {
+        let mut tj: FxHashMap<u32, Operand> = FxHashMap::default();
+        for p in &phis {
+            if p.id == iv_phi.0 {
+                continue;
+            }
+            let threaded = subst_back(&p.back, j - 1, &vmaps[j - 1], &thread[j - 1]);
+            tj.insert(p.id, threaded);
+        }
+        thread.push(tj);
+    }
+    // The phi's new back-edge incoming: the back value evaluated in the
+    // LAST clone (k-1).
+    let mut back_new: FxHashMap<u32, Operand> = FxHashMap::default();
+    for p in &phis {
+        if p.id == iv_phi.0 {
+            continue;
+        }
+        back_new.insert(
+            p.id,
+            subst_back(&p.back, k - 1, &vmaps[k - 1], &thread[k - 1]),
+        );
+    }
+
+    // ── Build the merged body block ───────────────────────────────────────
+    let mut body_insts: Vec<Instruction> = Vec::with_capacity(work_len * k + k);
+    // iv chain: iv_vals[0] = the phi; iv_vals[j] = Add(iv_vals[j-1], step)
+    // for j in 1..=k (the ids were minted before the phi threading because
+    // the threading's IV arms reference them; iv_vals[k] doubles as the
+    // phi's new back-edge value).
+    for j in 1..=k {
+        body_insts.push(Instruction::BinOp {
+            dest: iv_vals[j],
+            op: IrBinOp::Add,
+            lhs: Operand::Value(iv_vals[j - 1]),
+            rhs: Operand::Const(IrConst::from_i64(iv_step, iv_ty)),
+            ty: iv_ty,
+        });
+    }
+    // Const-backed carried phis (back value a Const — `x = 0` at the end
+    // of the body): clones j ≥ 1 read the constant. Materialized ONCE as
+    // a Copy at the body top (the const is j-independent), then mapped
+    // like every other phi. Without this the u32→u32 rename below could
+    // not express the substitution.
+    let mut const_temp: FxHashMap<u32, Value> = FxHashMap::default();
+    for p in &phis {
+        if p.id == iv_phi.0 {
+            continue;
+        }
+        if thread[1..].iter().all(|tj| {
+            tj.get(&p.id)
+                .is_some_and(|op| matches!(op, Operand::Const(_)))
+        }) && thread
+            .get(1)
+            .and_then(|t1| t1.get(&p.id))
+            .is_some_and(|op| matches!(op, Operand::Const(_)))
+        {
+            let cv = fresh();
+            if let Some(Operand::Const(c)) = thread[1].get(&p.id).cloned() {
+                body_insts.push(Instruction::Copy {
+                    dest: cv,
+                    src: Operand::Const(c),
+                });
+                const_temp.insert(p.id, cv);
+            }
+        }
+    }
+
+    for j in 0..k {
+        for inst in &func.blocks[latch].instructions[..work_len] {
+            let mut cloned = inst.clone();
+            // Every clone — including the first — is renamed to FRESH
+            // value ids: the original latch block still physically exists
+            // (unreachable, deleted by the next DCE sweep), so keeping any
+            // original definition id would double-define it and hand every
+            // pass between here and DCE malformed SSA.
+            //
+            // The phi/IV substitution and the definition rename share ONE
+            // combined u32→u32 map applied by `replace_values_in_inst` —
+            // a SINGLE-PASS walker over every operand position INCLUDING
+            // the bare-Value positions (`Store.ptr`, `GEP.base`, `Load.
+            // ptr`, ...) that `for_each_operand_mut` skips. Two hard-won
+            // properties:
+            //
+            // * COMPLETENESS: the fill-loop regression
+            //   (`memset_loop_iv_escape`) catches exactly the bare-position
+            //   class — a `Store { ptr: phi }` left unsubstituted made
+            //   every unrolled clone store through the SAME phi pointer
+            //   (buf[0] four times instead of buf[0..3]).
+            // * ATOMICITY: the threading maps phi→phi (clone 1's h-slot
+            //   is phi g, its g-slot is phi f, ...); applying each phi's
+            //   substitution in its own pass would rewrite the values a
+            //   previous pass just inserted (the sha256 round loop read
+            //   phi f one rotation step too far). One pass over the
+            //   combined map looks each position up exactly once.
+            if j > 0 {
+                let mut combined: FxHashMap<u32, u32> = FxHashMap::default();
+                for p in &phis {
+                    if p.id == iv_phi.0 {
+                        continue;
+                    }
+                    match thread[j].get(&p.id) {
+                        Some(Operand::Value(tv)) => {
+                            combined.insert(p.id, tv.0);
+                        }
+                        Some(Operand::Const(_)) => {
+                            if let Some(&cv) = const_temp.get(&p.id) {
+                                combined.insert(p.id, cv.0);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                combined.insert(iv_phi.0, iv_vals[j].0);
+                for (&old, &new) in &vmaps[j] {
+                    combined.insert(old, new);
+                }
+                replace_values_in_inst(&mut cloned, &combined);
+            } else {
+                replace_values_in_inst(&mut cloned, &vmaps[j]);
+            }
+            rename_inst_dest(&mut cloned, &vmaps[j]);
+            body_insts.push(cloned);
+        }
+    }
+    func.next_value_id = next_val;
+
+    // ── Rewire the CFG ────────────────────────────────────────────────────
+    // Header: the continue target becomes the merged body.
+    {
+        let term = &mut func.blocks[header].terminator;
+        match term {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                if *true_label == latch_label {
+                    *true_label = body_label;
+                } else if *false_label == latch_label {
+                    *false_label = body_label;
+                }
+            }
+            _ => return false, // find_exit_condition guaranteed this shape
+        }
+    }
+    // Header phis: relabel the back edge to the body block and substitute
+    // the threaded back values.
+    for inst in func.blocks[header].instructions.iter_mut() {
+        let Instruction::Phi { dest, incoming, .. } = inst else {
+            continue;
+        };
+        let is_iv = dest.0 == iv_phi.0;
+        for (op, lbl) in incoming.iter_mut() {
+            if *lbl == latch_label {
+                *lbl = body_label;
+                if is_iv {
+                    *op = Operand::Value(iv_vals[k]);
+                } else if let Some(new_op) = back_new.get(&dest.0) {
+                    *op = new_op.clone();
+                }
+                // A phi whose back operand is neither latch-defined nor a
+                // cross-phi (constant / loop-invariant) keeps it verbatim —
+                // exactly the rolled semantics.
+            }
+        }
+    }
+    // The latch is unreachable: the header now enters the body and the
+    // body branches straight back to the header.
+    func.blocks[latch].terminator = Terminator::Unreachable;
+
+    func.blocks.push(BasicBlock {
+        label: body_label,
+        instructions: body_insts,
+        terminator: Terminator::Branch(header_label),
+        source_spans: Vec::new(),
+    });
+
+    let _ = exit_target;
+    true
+}
+
 pub(crate) fn subst_value_with_operand(inst: &mut Instruction, old_id: u32, new_op: &Operand) {
     inst.for_each_operand_mut(|operand| {
         if matches!(operand, Operand::Value(value) if value.0 == old_id) {
@@ -2702,7 +3362,14 @@ fn find_iv_in_loop(
                     None
                 }
             });
-        let back_val = back_val?;
+        // Same contract as `find_iv_in_loop_ext`: a non-Value back edge
+        // (constant reset, malformed incoming) disqualifies THIS phi as
+        // the IV but must not abort the search — header phi order is
+        // arbitrary and the real IV can be minted after a const-backed
+        // phi.
+        let Some(back_val) = back_val else {
+            continue;
+        };
 
         // Look for `Add(phi_dest, const_step)` or `Add(const_step, phi_dest)`
         // in the latch that produces `back_val`.
@@ -2756,7 +3423,18 @@ fn find_iv_in_loop_ext(
                     None
                 }
             });
-        let back_val = back_val?;
+        // A phi whose back edge is not a Value (a CONSTANT back edge — the
+        // `c = 3;` reset idiom, or a missing latch incoming on a malformed
+        // phi) cannot be this loop's IV — but it must not abort the SEARCH
+        // either. Header phi order is arbitrary (mem2reg mints phis in
+        // discovery order, not IV-first), so a const-backed phi emitted
+        // before the real IV used to `?`-bail the whole finder and silently
+        // decline the loop (measured: the `s += c*(i+1); c = 3;` battery
+        // shape never unrolled while the identical loop with `c = i & 3`
+        // did). Skip the phi and keep looking.
+        let Some(back_val) = back_val else {
+            continue;
+        };
 
         // Look for `Add(phi_dest, const_step)` / `Add(const_step, phi_dest)`
         // or `Sub(phi_dest, const_step)` in the latch that produces
@@ -3820,6 +4498,1069 @@ mod tests {
         func
     }
 
+    /// Two-block counted loop (header + work-carrying latch) with a
+    /// carried phi X whose back edge references `back` — used to pin the
+    /// Pass B phi-threading contract for the two IV-reference shapes:
+    /// `back == iv_phi` (the C `x = i;`) and `back == the latch's Add
+    /// dest` (the GVN-merged `x = i + 1`).
+    ///
+    /// The latch carries REAL SLP feedstock (`arr[iv] = X + src[iv]` — a
+    /// non-volatile load AND store): the profitability gate declines
+    /// latch work without both, and these fixtures exist to exercise the
+    /// threading of the transform WHEN IT FIRES, so they must model the
+    /// shapes it fires on.
+    ///
+    /// Shape: B0 preheader (iv init, X init, arr/src bases) → B1 header
+    /// (iv phi %1, X phi %2, exit cmp %3 < trip) → B2 latch (GEP+GEP+
+    /// load src[iv], Add X+loaded, store arr[iv], iv Add %5 LAST) → B1;
+    /// B4 exit uses X (live-out).
+    fn make_two_block_iv_back_loop(trip: i32, x_back_is_iv_phi: bool) -> IrFunction {
+        let mut func = IrFunction::new("two_block_test".to_string(), IrType::Void, vec![], false);
+        let x_back = if x_back_is_iv_phi {
+            Operand::Value(Value(1)) // the IV phi itself
+        } else {
+            Operand::Value(Value(5)) // the latch's canonical increment
+        };
+        // B0: preheader
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::Copy {
+                    dest: Value(11),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(10),
+                    name: "arr".to_string(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(12),
+                    name: "src".to_string(),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B1: header — iv phi, X phi (back edge = the chosen IV shape), cmp
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(2)),
+                    ],
+                },
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(11)), BlockId(0)),
+                        (x_back, BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(3),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(trip)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(2),
+                false_label: BlockId(4),
+            },
+            source_spans: Vec::new(),
+        });
+        // B2: latch — load src[iv], store arr[iv] = X + loaded, iv Add LAST
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::GetElementPtr {
+                    dest: Value(4),
+                    base: Value(10),
+                    offset: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(13),
+                    base: Value(12),
+                    offset: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    dest: Value(14),
+                    ptr: Value(13),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::BinOp {
+                    dest: Value(15),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Value(Value(14)),
+                    ty: IrType::I32,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(15)),
+                    ptr: Value(4),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B4: exit — X is live out (its exactness is the contract)
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![
+                Instruction::GetElementPtr {
+                    dest: Value(6),
+                    base: Value(10),
+                    offset: Operand::Value(Value(2)),
+                    ty: IrType::I32,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(2)),
+                    ptr: Value(6),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 16; // 0–15 used (10/12 = arr/src placeholders)
+        func.next_label = 5;
+        func
+    }
+
+    /// Shared Pass B contract check: after the PostVec unroll of the
+    /// two-block loop, the carried phi X (Value(2)) must NOT keep an
+    /// IV-shaped verbatim back edge — its back incoming must be a value
+    /// defined by an Add inside the merged body block (the threaded
+    /// per-clone IV chain), and the live body must not reference the
+    /// dead original latch's definitions.
+    fn assert_two_block_iv_threading(func: &IrFunction, unrolled: usize) {
+        assert_eq!(unrolled, 1, "the two-block loop must unroll");
+        // The merged body block: the header's non-exit CondBranch
+        // successor (the preheader also branches to the header, and the
+        // original latch is now Unreachable — neither is the body).
+        let body_label = {
+            let header = func
+                .blocks
+                .iter()
+                .find(|b| b.label == BlockId(1))
+                .expect("header survives");
+            match &header.terminator {
+                Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } => {
+                    if *true_label != BlockId(4) {
+                        *true_label
+                    } else {
+                        *false_label
+                    }
+                }
+                other => panic!("header lost its exit branch: {other:?}"),
+            }
+        };
+        let body = func
+            .blocks
+            .iter()
+            .find(|b| b.label == body_label)
+            .expect("merged body block exists");
+        // The adds defined in the body (the iv chain) — legal threading
+        // targets for X's back edge.
+        let body_adds: Vec<u32> = body
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    ..
+                } => Some(dest.0),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            body_adds.len() >= 2,
+            "the iv chain must materialize (found {} adds)",
+            body_adds.len()
+        );
+        // X's phi: the back-edge incoming (from the body label) must be one
+        // of the body's Adds — NOT the iv phi (Value(1), the group-start
+        // miscompile) and NOT the dead latch's Value(5).
+        let x_phi = func
+            .blocks
+            .iter()
+            .find(|b| b.label == BlockId(1))
+            .unwrap()
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::Phi { dest, incoming, .. } if dest.0 == 2 => Some(incoming.clone()),
+                _ => None,
+            })
+            .expect("X phi survives");
+        let back = x_phi
+            .iter()
+            .find(|(_, lbl)| *lbl == body.label)
+            .map(|(op, _)| op.clone())
+            .expect("X has a back-edge incoming from the body");
+        match back {
+            Operand::Value(v) => {
+                assert!(
+                    body_adds.contains(&v.0),
+                    "X's back edge must thread to the body's iv chain (got Value({}), adds {:?})",
+                    v.0,
+                    body_adds
+                );
+                assert_ne!(
+                    v.0, 1,
+                    "X's back edge must not be the iv phi (group-start IV)"
+                );
+                assert_ne!(v.0, 5, "X's back edge must not be the dead latch increment");
+            }
+            other => panic!("X's back edge must be a value, got {other:?}"),
+        }
+        // The live body must not reference the dead latch's definitions
+        // (Value(5)) anywhere.
+        for inst in &body.instructions {
+            let mut probe = inst.clone();
+            let mut bad = false;
+            probe.for_each_operand_mut(|op| {
+                if matches!(op, Operand::Value(v) if v.0 == 5) {
+                    bad = true;
+                }
+            });
+            assert!(!bad, "live body references the dead latch increment");
+        }
+    }
+
+    #[test]
+    fn two_block_unroll_threads_iv_referencing_phi() {
+        // The C `x = i;` — the carried phi's back edge IS the iv phi.
+        // Before the threading fix this left the group-start IV in every
+        // clone >= 2 and in the live-out (measured: x = 60, not 63).
+        let mut func = make_two_block_iv_back_loop(64, true);
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        assert_two_block_iv_threading(&func, n);
+    }
+
+    #[test]
+    fn two_block_unroll_threads_increment_referencing_phi() {
+        // The GVN-merged `x = i + 1;` — the carried phi's back edge is the
+        // latch's canonical Add. Verbatim threading would dangle on the
+        // dead latch; the fix threads to the per-clone post-increment IVs.
+        let mut func = make_two_block_iv_back_loop(64, false);
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        assert_two_block_iv_threading(&func, n);
+    }
+
+    #[test]
+    fn two_block_unroll_declines_when_killed() {
+        // CCC_NO_TWO_BLOCK_UNROLL must leave the loop rolled.
+        unsafe { std::env::set_var("CCC_NO_TWO_BLOCK_UNROLL", "1") };
+        let mut func = make_two_block_iv_back_loop(64, true);
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        unsafe { std::env::remove_var("CCC_NO_TWO_BLOCK_UNROLL") };
+        assert_eq!(n, 0, "kill switch must disable Pass B");
+        // The loop is intact: latch still branches to the header.
+        assert!(matches!(
+            func.blocks.iter().find(|b| b.label == BlockId(2)).unwrap().terminator,
+            Terminator::Branch(l) if l == BlockId(1)
+        ));
+    }
+
+    /// Latch memory profile for the profitability-gate fixtures: the pass
+    /// exists to manufacture BB-SLP feedstock (store-seeded packs with
+    /// load-pack lane inputs), so the latch's non-volatile access census
+    /// decides profitability.
+    #[derive(Clone, Copy, PartialEq)]
+    enum LatchFeed {
+        /// Plain load + store — the packable feedstock: FIRES.
+        LoadStore,
+        /// Store only (fill loop): pure code-size bloat at neutral runtime
+        /// (measured: crc32's fill_data LCG +21 lines) — DECLINES.
+        StoreOnly,
+        /// Load only (table walk / compare loop): bloat (measured:
+        /// gzip_crc32 +30% insns, glibc_memcmp +20.7%) — DECLINES.
+        LoadOnly,
+        /// Volatile load + store only: volatile accesses never join packs,
+        /// so there is no feedstock either — DECLINES.
+        VolatileOnly,
+        /// Plain load + store PLUS a volatile store: fires, and the
+        /// volatile side effect must be cloned per iteration exactly.
+        MixedVolatile,
+    }
+
+    /// Two-block counted loop with an accumulator phi and a configurable
+    /// latch memory profile — the profitability-gate fixture family.
+    ///
+    /// Shape: B0 preheader → B1 header (iv phi %1, acc phi %2, cmp %3) →
+    /// B2 latch (profile-dependent work, iv Add %5 LAST) → B1; B4 exit
+    /// stores acc (live-out exactness).
+    fn make_two_block_feed_loop(trip: i32, feed: LatchFeed) -> IrFunction {
+        let mut func = IrFunction::new("feed_loop_test".to_string(), IrType::Void, vec![], false);
+        let has_load = matches!(
+            feed,
+            LatchFeed::LoadStore
+                | LatchFeed::LoadOnly
+                | LatchFeed::VolatileOnly
+                | LatchFeed::MixedVolatile
+        );
+        let has_store = !matches!(feed, LatchFeed::LoadOnly);
+        let vol = matches!(feed, LatchFeed::VolatileOnly);
+        // B0: preheader
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::Copy {
+                    dest: Value(11),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(10),
+                    name: "arr".to_string(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(12),
+                    name: "src".to_string(),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B1: header — iv phi, acc phi (back edge = the latch's work Add),
+        // exit cmp
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(2)),
+                    ],
+                },
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(11)), BlockId(0)),
+                        (Operand::Value(Value(15)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(3),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(trip)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(2),
+                false_label: BlockId(4),
+            },
+            source_spans: Vec::new(),
+        });
+        // B2: latch — the profile-dependent work, iv Add LAST
+        let mut work: Vec<Instruction> = Vec::new();
+        work.push(Instruction::GetElementPtr {
+            dest: Value(4),
+            base: Value(10),
+            offset: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        });
+        if has_load {
+            work.push(Instruction::GetElementPtr {
+                dest: Value(13),
+                base: Value(12),
+                offset: Operand::Value(Value(1)),
+                ty: IrType::I32,
+            });
+            work.push(Instruction::Load {
+                dest: Value(14),
+                ptr: Value(13),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: vol,
+            });
+            work.push(Instruction::BinOp {
+                dest: Value(15),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Value(Value(14)),
+                ty: IrType::I32,
+            });
+        } else {
+            work.push(Instruction::BinOp {
+                dest: Value(15),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            });
+        }
+        if has_store {
+            work.push(Instruction::Store {
+                volatile: vol,
+                val: Operand::Value(Value(15)),
+                ptr: Value(4),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        if feed == LatchFeed::MixedVolatile {
+            // The observable side effect riding along the packable work:
+            // cloned per iteration, never packed.
+            work.push(Instruction::Store {
+                volatile: true,
+                val: Operand::Value(Value(2)),
+                ptr: Value(4),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        work.push(Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: work,
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B4: exit — acc is live out
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![
+                Instruction::GetElementPtr {
+                    dest: Value(6),
+                    base: Value(10),
+                    offset: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(2)),
+                    ptr: Value(6),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 16; // 0–15 used
+        func.next_label = 5;
+        func
+    }
+
+    /// The merged body block of an unrolled two-block loop: the header's
+    /// non-exit CondBranch successor (the preheader also branches to the
+    /// header and the original latch is now Unreachable — neither is the
+    /// body).
+    fn merged_body_of(func: &IrFunction) -> &BasicBlock {
+        let header = func
+            .blocks
+            .iter()
+            .find(|b| b.label == BlockId(1))
+            .expect("header survives");
+        let body_label = match &header.terminator {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                if *true_label != BlockId(4) {
+                    *true_label
+                } else {
+                    *false_label
+                }
+            }
+            other => panic!("header lost its exit branch: {other:?}"),
+        };
+        func.blocks
+            .iter()
+            .find(|b| b.label == body_label)
+            .expect("merged body block exists")
+    }
+
+    #[test]
+    fn two_block_unroll_profitability_positive_control() {
+        // Plain load + store feedstock: the unroll must FIRE.
+        let mut func = make_two_block_feed_loop(64, LatchFeed::LoadStore);
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        assert_eq!(n, 1, "load+store latch must unroll");
+    }
+
+    #[test]
+    fn two_block_unroll_declines_store_only_latch() {
+        // A store-only latch (fill loop) has no load packs to feed the
+        // store seeds: the unroll is pure bloat and must decline.
+        let mut func = make_two_block_feed_loop(64, LatchFeed::StoreOnly);
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        assert_eq!(n, 0, "store-only latch must decline (fill-loop bloat)");
+        assert!(matches!(
+            func.blocks.iter().find(|b| b.label == BlockId(2)).unwrap().terminator,
+            Terminator::Branch(l) if l == BlockId(1)
+        ));
+    }
+
+    #[test]
+    fn two_block_unroll_declines_load_only_latch() {
+        // A load-only latch (table walk / compare loop) has no store seeds
+        // at all: must decline.
+        let mut func = make_two_block_feed_loop(64, LatchFeed::LoadOnly);
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        assert_eq!(n, 0, "load-only latch must decline (no store seeds)");
+        assert!(matches!(
+            func.blocks.iter().find(|b| b.label == BlockId(2)).unwrap().terminator,
+            Terminator::Branch(l) if l == BlockId(1)
+        ));
+    }
+
+    #[test]
+    fn two_block_unroll_declines_volatile_only_latch() {
+        // Volatile accesses never join packs: a volatile-only latch has no
+        // feedstock and must decline (the same bloat class, plus volatile
+        // loops are I/O-shaped where branch overhead is noise).
+        let mut func = make_two_block_feed_loop(64, LatchFeed::VolatileOnly);
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        assert_eq!(n, 0, "volatile-only latch must decline");
+        assert!(matches!(
+            func.blocks.iter().find(|b| b.label == BlockId(2)).unwrap().terminator,
+            Terminator::Branch(l) if l == BlockId(1)
+        ));
+    }
+
+    #[test]
+    fn two_block_unroll_clones_volatile_riding_packable_work() {
+        // Mixed latch: plain load + store (feedstock) PLUS a volatile
+        // store. The unroll fires, and the volatile side effect must be
+        // cloned into EVERY iteration of the merged body — k plain loads,
+        // k plain stores, k volatile stores, no more, no fewer.
+        let mut func = make_two_block_feed_loop(64, LatchFeed::MixedVolatile);
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        assert_eq!(
+            n, 1,
+            "mixed latch (plain load+store + volatile) must unroll"
+        );
+        let body = merged_body_of(&func);
+        let plain_loads = body
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Load {
+                        volatile: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let plain_stores = body
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Store {
+                        volatile: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let vol_stores = body
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Store { volatile: true, .. }))
+            .count();
+        assert!(
+            plain_loads >= 2 && plain_stores >= 2,
+            "the body must be a k-fold clone (loads={plain_loads}, stores={plain_stores})"
+        );
+        assert_eq!(
+            plain_loads, plain_stores,
+            "each clone carries one plain load and one plain store"
+        );
+        assert_eq!(
+            vol_stores, plain_stores,
+            "the volatile store must be cloned exactly once per clone"
+        );
+    }
+
+    /// Two-block counted loop whose header mints a CONST-BACKED carried
+    /// phi (%2, back edge `Const(3)`) BEFORE the IV phi (%1) — the phi
+    /// order that used to make `find_iv_in_loop_ext`'s `?`-bail abort the
+    /// IV search and silently decline the whole loop.
+    fn make_two_block_const_phi_before_iv(trip: i32) -> IrFunction {
+        let mut func = IrFunction::new("const_phi_test".to_string(), IrType::Void, vec![], false);
+        // B0: preheader
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::Copy {
+                    dest: Value(11),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(10),
+                    name: "arr".to_string(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(12),
+                    name: "src".to_string(),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B1: header — the CONST-BACKED phi comes FIRST (the discovery
+        // order mem2reg would mint for `int c = 7; ... c = 3;` declared
+        // before the loop's IV), then the iv phi, then the exit cmp.
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(11)), BlockId(0)),
+                        (Operand::Const(IrConst::I32(3)), BlockId(2)),
+                    ],
+                },
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(3),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(trip)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(2),
+                false_label: BlockId(4),
+            },
+            source_spans: Vec::new(),
+        });
+        // B2: latch — load src[iv], store arr[iv] = C + loaded, iv Add LAST
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::GetElementPtr {
+                    dest: Value(4),
+                    base: Value(10),
+                    offset: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(13),
+                    base: Value(12),
+                    offset: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    dest: Value(14),
+                    ptr: Value(13),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::BinOp {
+                    dest: Value(15),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Value(Value(14)),
+                    ty: IrType::I32,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(15)),
+                    ptr: Value(4),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B4: exit — C is live out (its post-loop value must be the const)
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![
+                Instruction::GetElementPtr {
+                    dest: Value(6),
+                    base: Value(10),
+                    offset: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(2)),
+                    ptr: Value(6),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 16;
+        func.next_label = 5;
+        func
+    }
+
+    #[test]
+    fn two_block_unroll_threads_const_phi_minted_before_iv() {
+        // THE IV-FINDER ORDER BUG: a const-backed phi minted before the IV
+        // used to `?`-bail the whole IV search (the loop silently stayed
+        // rolled while the identical loop with the phis swapped unrolled).
+        // The finder must SKIP unqualified phis and keep searching.
+        let mut func = make_two_block_const_phi_before_iv(64);
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        assert_eq!(n, 1, "const-back phi before the IV must not hide the IV");
+        let body = merged_body_of(&func);
+        // The const_temp materialization: one Copy of Const(3) at the body
+        // top feeding clones >= 1.
+        let const_temps: Vec<u32> = body
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::I32(3)),
+                } => Some(dest.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            const_temps.len(),
+            1,
+            "exactly one const_temp Copy of the reset constant"
+        );
+        // Clone 0 reads the C phi itself; every later clone reads the
+        // const_temp — never the phi again.
+        let phi_reads = body
+            .instructions
+            .iter()
+            .filter(|i| {
+                let mut probe = (*i).clone();
+                let mut reads = false;
+                probe.for_each_operand_mut(|op| {
+                    if matches!(op, Operand::Value(v) if v.0 == 2) {
+                        reads = true;
+                    }
+                });
+                reads
+            })
+            .count();
+        assert_eq!(
+            phi_reads, 1,
+            "only clone 0 may read the const-backed phi (got {phi_reads})"
+        );
+        let temp_reads = body
+            .instructions
+            .iter()
+            .filter(|i| {
+                let mut probe = (*i).clone();
+                let mut reads = 0;
+                probe.for_each_operand_mut(|op| {
+                    if matches!(op, Operand::Value(v) if v.0 == const_temps[0]) {
+                        reads += 1;
+                    }
+                });
+                reads > 0
+            })
+            .count();
+        assert!(temp_reads >= 1, "clones >= 1 must read the const_temp copy");
+        // The phi's back edge stays the constant, relabelled to the body.
+        let c_phi = func
+            .blocks
+            .iter()
+            .find(|b| b.label == BlockId(1))
+            .unwrap()
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::Phi { dest, incoming, .. } if dest.0 == 2 => Some(incoming.clone()),
+                _ => None,
+            })
+            .expect("C phi survives");
+        let (back, lbl) = c_phi
+            .iter()
+            .find(|(_, l)| *l != BlockId(0))
+            .expect("back edge exists");
+        assert!(
+            matches!(back, Operand::Const(IrConst::I32(3))),
+            "the reset constant stays the back edge"
+        );
+        assert_eq!(*lbl, merged_body_of(&func).label, "relabelled to the body");
+    }
+
+    /// Two-block counted loop with STEP-2 IV and trip 4 (i = 0, 2, 4, 6;
+    /// limit 8) with load+store feedstock — the SMALL-TRIP routing
+    /// fixture: trips <= 16 whose budget the complete unroller accepts
+    /// are Pass A territory by construction, so this loop must be
+    /// FLATTENED, never partially unrolled.
+    fn make_small_trip_feed_loop() -> IrFunction {
+        let mut func = IrFunction::new("small_trip_test".to_string(), IrType::Void, vec![], false);
+        // B0: preheader
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::Copy {
+                    dest: Value(11),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(10),
+                    name: "arr".to_string(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(12),
+                    name: "src".to_string(),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B1: header — iv phi (STEP 2), acc phi (back edge = the work
+        // Add below), exit cmp against the limit 8 (trip 4: 0,2,4,6)
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(2)),
+                    ],
+                },
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(11)), BlockId(0)),
+                        (Operand::Value(Value(15)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(3),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(8)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(2),
+                false_label: BlockId(4),
+            },
+            source_spans: Vec::new(),
+        });
+        // B2: latch — load src[iv], store arr[iv] = acc + loaded, iv
+        // Add (STEP 2) LAST
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::GetElementPtr {
+                    dest: Value(4),
+                    base: Value(10),
+                    offset: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(13),
+                    base: Value(12),
+                    offset: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    dest: Value(14),
+                    ptr: Value(13),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::BinOp {
+                    dest: Value(15),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Value(Value(14)),
+                    ty: IrType::I32,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(15)),
+                    ptr: Value(4),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(2)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B4: exit — acc is live out
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![
+                Instruction::GetElementPtr {
+                    dest: Value(6),
+                    base: Value(10),
+                    offset: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(2)),
+                    ptr: Value(6),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 16; // 0–15 used
+        func.next_label = 5;
+        func
+    }
+
+    #[test]
+    fn two_block_small_trips_are_complete_unrolled_not_partial() {
+        // Step-2 IV, trip 4, feedstock: the complete unroller owns every
+        // trip <= 16 whose budget it accepts (work*trip <= 512 holds for
+        // any Pass-B-eligible work), so "exactly two groups" (trip == 2k,
+        // k <= 4) is complete-unroll territory BY CONSTRUCTION. Pin the
+        // routing: the loop must be flattened, not partially unrolled —
+        // and the flattened body must carry all four iterations' traffic.
+        let mut func = make_small_trip_feed_loop();
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        assert!(n >= 1, "the small-trip loop must be unrolled by SOMETHING");
+        // No rolled two-block loop remains: no block both ends in a
+        // conditional and is the target of an unconditional back-branch.
+        let has_rolled_two_block = func.blocks.iter().any(|b| {
+            matches!(&b.terminator, Terminator::CondBranch { .. })
+                && func
+                    .blocks
+                    .iter()
+                    .any(|l| matches!(&l.terminator, Terminator::Branch(t) if *t == b.label))
+        });
+        assert!(
+            !has_rolled_two_block,
+            "trip-4 loops are flattened by the complete unroller, not partially unrolled"
+        );
+        // The feedstock survives the flatten: 4 flattened loads and
+        // stores (offsets 0, 2, 4, 6), the exit block's live-out store,
+        // and the ORIGINAL latch's copy — the unreachable block still
+        // physically exists until the next DCE sweep (same contract as
+        // Pass B's dead latch).
+        let stores = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Store {
+                        volatile: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let loads = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::Load {
+                        volatile: false,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            (loads, stores),
+            (5, 6),
+            "all four iterations' traffic in the flattened body"
+        );
+    }
+
     /// `make_counting_loop`, but the loop is entered CONDITIONALLY and the
     /// exit block is a join carrying a phi.
     ///
@@ -3960,7 +5701,7 @@ mod tests {
         // condition above is ever relaxed.
         for trip in [40i32, 100, 257] {
             let mut func = make_conditional_counting_loop_with_exit_phi_impl(trip, false);
-            unroll_loops(&mut func);
+            unroll_loops(&mut func, UnrollPhase::Early);
 
             let mut violations = Vec::new();
             crate::passes::verify::verify_function(&func, "unroll_loops", &mut violations);
@@ -3998,7 +5739,7 @@ mod tests {
         // normal partial-unroll candidate.
         let mut plain = make_counting_loop(40);
         let blocks_before = plain.blocks.len();
-        unroll_loops(&mut plain);
+        unroll_loops(&mut plain, UnrollPhase::Early);
         assert!(
             plain.blocks.len() > blocks_before,
             "plain counting loop (store in body) should partially unroll"
@@ -4017,7 +5758,7 @@ mod tests {
         let blocks_before = func.blocks.len();
         let header_term_before = format!("{:?}", func.blocks[1].terminator);
         let latch_before = format!("{:?}", func.blocks[3].instructions);
-        unroll_loops(&mut func);
+        unroll_loops(&mut func, UnrollPhase::Early);
 
         assert_eq!(
             func.blocks.len(),
@@ -4084,7 +5825,7 @@ mod tests {
             "latch def reaching the header phi must count as escaping"
         );
         let blocks_before = func.blocks.len();
-        unroll_loops(&mut func);
+        unroll_loops(&mut func, UnrollPhase::Early);
         assert_eq!(
             func.blocks.len(),
             blocks_before,
@@ -4113,7 +5854,7 @@ mod tests {
     fn complete_unroll_repairs_exit_block_phi_labels() {
         for trip in [2i32, 3, 4, 6, 8] {
             let mut func = make_conditional_counting_loop_with_exit_phi(trip);
-            unroll_loops(&mut func);
+            unroll_loops(&mut func, UnrollPhase::Early);
 
             let mut violations = Vec::new();
             crate::passes::verify::verify_function(&func, "unroll_loops", &mut violations);
@@ -4173,7 +5914,7 @@ mod tests {
     #[test]
     fn test_basic_unroll_8x() {
         let mut func = make_counting_loop(100);
-        let n = unroll_loops(&mut func);
+        let n = unroll_loops(&mut func, UnrollPhase::Early);
         assert_eq!(n, 1, "should unroll exactly one loop");
 
         // Original 5 blocks + 7 exit_check blocks + 7 body_work clones = 19.
@@ -4220,7 +5961,7 @@ mod tests {
                 *offset = Operand::Value(Value(1)); // index by the IV
             }
         }
-        let n = unroll_loops(&mut func);
+        let n = unroll_loops(&mut func, UnrollPhase::Early);
         assert_eq!(
             n, 1,
             "IV-indexed GEP loop should be unrolled (per-clone remap)"
@@ -4243,7 +5984,7 @@ mod tests {
                 to_ty: IrType::I64,
             },
         );
-        let n = unroll_loops(&mut func);
+        let n = unroll_loops(&mut func, UnrollPhase::Early);
         if crate::common::types::target_is_32bit() {
             assert_eq!(n, 1, "32-bit targets have no widening hazard");
         } else {
@@ -4278,7 +6019,7 @@ mod tests {
                 ret_is_f128_sse: false,
             },
         });
-        let n = unroll_loops(&mut func);
+        let n = unroll_loops(&mut func, UnrollPhase::Early);
         assert_eq!(n, 0, "loop with call should not be unrolled");
         assert_eq!(func.blocks.len(), 5, "block count should be unchanged");
     }
@@ -4294,7 +6035,7 @@ mod tests {
                 src: Operand::Value(Value(0)),
             });
         }
-        let n = unroll_loops(&mut func);
+        let n = unroll_loops(&mut func, UnrollPhase::Early);
         assert_eq!(
             n, 0,
             "loop with > 60 body instructions should not be unrolled"
@@ -4311,7 +6052,7 @@ mod tests {
         if let Instruction::Phi { incoming, .. } = &mut func.blocks[1].instructions[0] {
             incoming.push((Operand::Value(Value(0)), BlockId(4)));
         }
-        let n = unroll_loops(&mut func);
+        let n = unroll_loops(&mut func, UnrollPhase::Early);
         assert_eq!(n, 0, "loop without unique preheader should not be unrolled");
     }
 
@@ -4450,7 +6191,7 @@ mod tests {
 
         func.next_value_id = 21;
 
-        let n = unroll_loops(&mut func);
+        let n = unroll_loops(&mut func, UnrollPhase::Early);
 
         // The GENERAL complete unroller may now also fully unroll this outer
         // loop (constant trip 10, tiny body, inner loop cloned wholesale —
@@ -4596,7 +6337,7 @@ mod tests {
         // After unrolling, all Value IDs must be distinct (no duplicates in all
         // block instructions). This catches the "reuse old val IDs" bug.
         let mut func = make_counting_loop(16);
-        unroll_loops(&mut func);
+        unroll_loops(&mut func, UnrollPhase::Early);
 
         let mut seen: FxHashSet<u32> = FxHashSet::default();
         for block in &func.blocks {
@@ -4629,7 +6370,7 @@ mod tests {
     fn complete_unroll_leaves_structurally_valid_ir() {
         for trip in [2i32, 4, 8, 16] {
             let mut func = make_counting_loop(trip);
-            unroll_loops(&mut func);
+            unroll_loops(&mut func, UnrollPhase::Early);
 
             let mut violations = Vec::new();
             crate::passes::verify::verify_function(&func, "unroll_loops", &mut violations);
@@ -4859,7 +6600,7 @@ mod tests {
 
         func.next_value_id = 7;
 
-        let n = unroll_loops(&mut func);
+        let n = unroll_loops(&mut func, UnrollPhase::Early);
 
         // trip = 2 passes the 2..=16 gate, so only the checked final-IV
         // computation stands between this loop and a clone: it must bail

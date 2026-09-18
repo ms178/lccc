@@ -1950,6 +1950,8 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecXorI8x16
             | O::VecPackI64x2
             | O::VecPackF64x2
+            | O::VecLoadI32x4Pair
+            | O::VecPackI32x4Pair
             | O::VecZeroI64x2
             | O::VecZeroI64x4
             | O::VecBroadcastI32x4
@@ -2108,6 +2110,7 @@ pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool 
             | O::VecLoadF32x4
             | O::VecLoadI32x4
             | O::VecLoadI64x2
+            | O::VecLoadI32x4Pair
             | O::VecLoadI64x4
             | O::VecLoadI16x8
             | O::VecLoadI8x16

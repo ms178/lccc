@@ -27,6 +27,16 @@
 #                     qemu-i386 on PATH. Without a working execution path,
 #                     ELF32 tests SKIP — they must never pass vacuously by
 #                     comparing two SIGSYS deaths (exit 159 == exit 159).
+#   LCCC_I686_SYSROOT  rootless 32-bit multilib sysroot (an unpacked
+#                     libc6-dev-i386 + libc6-i386 + lib32gcc-14-dev tree
+#                     under a private prefix) for hosts with neither root
+#                     nor the multilib packages installed.  When set, every
+#                     -m32 lccc build runs with LCCC_SYSROOT pointed at it
+#                     (crt/libc/libgcc discovery and the i386 include dir
+#                     resolve beneath the prefix), and the GCC -m32 oracle
+#                     gains the matching -isystem/-B flags.  Complements
+#                     LCCC_I686_RUNNER: the sysroot makes the BUILDS work,
+#                     the runner makes the RUNS work.
 # ============================================================================
 set -u
 
@@ -35,6 +45,7 @@ REG="$REPO/tests/regression"
 LCCC_BIN=${LCCC_BIN:-$REPO/target/fastbuild/lccc}
 GCC_BIN=${GCC_BIN:-gcc}
 GCC_INC="-I$(gcc -print-file-name=include)"
+I686_SYSROOT=${LCCC_I686_SYSROOT:-}
 FILTER=${1:-}
 WORK=$(mktemp -d /tmp/lccc-reg.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
@@ -69,6 +80,57 @@ if "$GCC_BIN" -m32 -O2 -fno-pic -nostdlib -static -Wl,-e,_start \
     probe_ec=$?
     if [[ $probe_ec -eq 42 ]]; then
         ELF32_MODE="native"
+        # Stage-2 DYNAMIC probe.  Static ia32 execution succeeding does NOT
+        # imply dynamic ia32 execution succeeds: this sandbox's seccomp
+        # allows the exit-only int $0x80 set (stage 1 passes, kernel runs
+        # static ELF32) while the dynamic loader's richer startup syscalls
+        # (set_thread_area et al.) die with SIGSYS, and a host can equally
+        # lack /lib/ld-linux.so.2 entirely.  Misclassifying that case as
+        # "native" turns every ELF32 test into exit-127 at run time.  Build
+        # the dynamic probe with lccc itself (the gcc side needs the very
+        # multilib this environment lacks; lccc + LCCC_I686_SYSROOT links
+        # dynamic ELF32 without it) and demand the real exit code.
+        dyn_src="$WORK/elf32dyn.c"
+        dyn_bin="$WORK/elf32dyn.bin"
+        printf 'int main(void){return 7;}\n' > "$dyn_src"
+        dyn_built=0
+        if [[ -n "$I686_SYSROOT" ]]; then
+            if LCCC_SYSROOT="$I686_SYSROOT" "$LCCC_BIN" -m32 -O2 \
+                    "$dyn_src" -o "$dyn_bin" 2>/dev/null; then
+                dyn_built=1
+            fi
+        else
+            if "$LCCC_BIN" -m32 -O2 "$dyn_src" -o "$dyn_bin" 2>/dev/null; then
+                dyn_built=1
+            fi
+        fi
+        if [[ $dyn_built -eq 1 ]]; then
+            { "$dyn_bin" >/dev/null 2>&1; } 2>/dev/null
+            dyn_ec=$?
+            if [[ $dyn_ec -ne 7 ]]; then
+                # Dynamic native execution is broken: fall back to the same
+                # runner candidates as the static case, but validated
+                # against the DYNAMIC binary (a runner that can only execute
+                # static ELF32 is worthless for this suite).
+                for cand in "${LCCC_I686_RUNNER:-}" qemu-i386 qemu-i386-static; do
+                    [[ -n "$cand" ]] || continue
+                    command -v "$cand" >/dev/null 2>&1 || [[ -x "$cand" ]] || continue
+                    { "$cand" "$dyn_bin" >/dev/null 2>&1; } 2>/dev/null
+                    if [[ $? -eq 7 ]]; then
+                        RUNNER32="$cand"
+                        ELF32_MODE="runner"
+                        break
+                    fi
+                done
+                if [[ -z "$ELF32_MODE" || "$ELF32_MODE" == "native" ]]; then
+                    ELF32_MODE="none"
+                fi
+            fi
+            # dyn_ec == 7: genuinely native-capable, ELF32_MODE stays "native"
+        fi
+        # dyn_built == 0 (no way to build a dynamic ELF32 probe without the
+        # multilib): keep the stage-1 verdict — best effort, as before.
+        rm -f "$dyn_src" "$dyn_bin"
     else
         for cand in "${LCCC_I686_RUNNER:-}" qemu-i386 qemu-i386-static; do
             [[ -n "$cand" ]] || continue
@@ -99,6 +161,16 @@ run_one() {  # run_one <src> ; env may override CCC_NO_SMALL_SLOTS etc.
     local flags=()
     [[ -f "$base.flags" ]] && read -r -a flags < "$base.flags"
     local obj="$WORK/$(basename "$base").bin"
+    # Rootless multilib sysroot: -m32 builds only.  LCCC_SYSROOT remaps the
+    # i386 include dir and the crt/libc/libgcc discovery beneath the private
+    # prefix; it must NOT leak into -m64 builds (the prefixed generic
+    # /usr/include would shadow the host's and break every 64-bit compile
+    # that reaches a system header the sparse sysroot lacks).
+    if [[ -n "${I686_SYSROOT:-}" ]] && [[ " ${flags[*]} " == *" -m32 "* ]]; then
+        export LCCC_SYSROOT="$I686_SYSROOT"
+    else
+        unset LCCC_SYSROOT
+    fi
     # IR STRUCTURAL GATE: compile with the inter-pass verifier armed. A pass
     # that emits malformed IR (a phi naming a block that is not a predecessor,
     # a phi stranded after a non-phi, a branch to a nonexistent block) is a
@@ -147,7 +219,7 @@ for src in "$REG"/*.c; do
     done
 
     # 1. lccc run (default configuration)
-    res=$(env ${env_vars[@]:-} bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32'; run_one '$src'")
+    res=$(env ${env_vars[@]:-} bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
 
     if [[ $res == "BUILDFAIL" ]]; then
         echo "FAIL  $name (lccc build failed: $(head -3 "$WORK/cc.err" | tr '\n' ' '))"
@@ -175,6 +247,27 @@ for src in "$REG"/*.c; do
     if [[ $no_compare -eq 0 ]]; then
         gflags=()
         [[ -f "$REG/$name.flags" ]] && read -r -a gflags < "$REG/$name.flags"
+        # Rootless multilib sysroot for the oracle side: -m32 only.  The
+        # sysroot's include dir answers <bits/*.h> ahead of the host's
+        # (empty) i386 multiarch dir, and the -B prefixes make cc1/collect2
+        # resolve crt1.o/crti.o/crtn.o/libc and gcc's own 32-bit
+        # crtbegin.o/crtend.o/libgcc beneath the prefix.
+        if [[ -n "$I686_SYSROOT" ]] && [[ " ${gflags[*]} " == *" -m32 "* ]]; then
+            gccver=$("$GCC_BIN" -dumpversion 2>/dev/null) || gccver=""
+            gcc32dir=""
+            for d in "$I686_SYSROOT/usr/lib/gcc/x86_64-linux-gnu/${gccver:-__none__}/32" \
+                     "$I686_SYSROOT"/usr/lib/gcc/x86_64-linux-gnu/*/32; do
+                if [[ -f "$d/crtbegin.o" ]]; then gcc32dir=$d; break; fi
+            done
+            if [[ -n "$gcc32dir" ]]; then
+                gflags=(-isystem "$I686_SYSROOT/usr/include/i386-linux-gnu" \
+                        -B"$I686_SYSROOT/usr/lib32/" \
+                        -B"$gcc32dir/" "${gflags[@]}")
+            else
+                gflags=(-isystem "$I686_SYSROOT/usr/include/i386-linux-gnu" \
+                        -B"$I686_SYSROOT/usr/lib32/" "${gflags[@]}")
+            fi
+        fi
         gbin="$WORK/$(basename "$name").gcc.bin"
         if ! "$GCC_BIN" -O2 "${gflags[@]}" "$src" -o "$gbin" -lm 2>/dev/null; then
             skip=$((skip+1))   # GCC can't build it (lccc-specific asm) — lccc-only test
@@ -199,7 +292,7 @@ for src in "$REG"/*.c; do
 
     # 3. A/B differential: small slots on (default) vs off
     if [[ $no_ab -eq 0 ]]; then
-        res_ab=$(env ${env_vars[@]:-} CCC_NO_SMALL_SLOTS=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32'; run_one '$src'")
+        res_ab=$(env ${env_vars[@]:-} CCC_NO_SMALL_SLOTS=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_ab != "$res" ]]; then
             echo "FAIL  $name (A/B small-slot differential)"
             echo "      default : $(echo "$res" | head -2)"
@@ -212,7 +305,7 @@ for src in "$REG"/*.c; do
         # to reuse must never hold a live value at the moment of reuse, so the
         # two layouts must produce byte-identical program output. Divergence
         # here is a coloring soundness bug (2026-09-02 preboot-ZSTD class).
-        res_t2=$(env ${env_vars[@]:-} CCC_NO_TIER2_GRAPH=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32'; run_one '$src'")
+        res_t2=$(env ${env_vars[@]:-} CCC_NO_TIER2_GRAPH=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_t2 != "$res" ]]; then
             echo "FAIL  $name (A/B Tier-2 sharing differential)"
             echo "      default  : $(echo "$res" | head -2)"
@@ -225,7 +318,7 @@ for src in "$REG"/*.c; do
         # source-less values must produce identical program output. The full
         # opt/target matrix is covered by scripts/gla_equiv_check.sh; this arm
         # guards the default-on policy at the suite's -O2.
-        res_gla=$(env ${env_vars[@]:-} CCC_RA_GLOBAL_LOCATION=0 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32'; run_one '$src'")
+        res_gla=$(env ${env_vars[@]:-} CCC_RA_GLOBAL_LOCATION=0 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32' I686_SYSROOT='$I686_SYSROOT'; run_one '$src'")
         if [[ $res_gla != "$res" ]]; then
             echo "FAIL  $name (A/B GLA gate differential)"
             echo "      default(on) : $(echo "$res" | head -2)"

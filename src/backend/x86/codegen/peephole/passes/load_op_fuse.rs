@@ -281,10 +281,19 @@ fn is_window_kind(kind: LineKind) -> bool {
 
 /// Parse `mov{l,q} MEM, %reg` into `(is_q, mem, family)`.
 fn parse_memory_load(t: &str) -> Option<(bool, &str, RegId)> {
-    let (is_q, rest) = if let Some(r) = t.strip_prefix("movl ") {
-        (false, r)
+    // (load_q, rest): load_q is the FOLDABLE width — the memory operand's
+    // width a flag/alu consumer may re-read in place of the register.
+    // `movslq mem, %r64` loads a 32-bit memory sign-extended into a 64-bit
+    // register: only the LOW DWORD is the loaded value, so load_q stays
+    // false (an l-suffixed consumer) and a q-suffixed consumer mismatches
+    // and declines — reading 8 bytes of memory would not reproduce the
+    // sign-extended 64-bit compare.
+    let (is_q, dest_is_64, rest) = if let Some(r) = t.strip_prefix("movl ") {
+        (false, false, r)
     } else if let Some(r) = t.strip_prefix("movq ") {
-        (true, r)
+        (true, true, r)
+    } else if let Some(r) = t.strip_prefix("movslq ") {
+        (false, true, r)
     } else {
         return None;
     };
@@ -293,9 +302,10 @@ fn parse_memory_load(t: &str) -> Option<(bool, &str, RegId)> {
         return None;
     }
     let fam = plain_gp_operand(dst)?;
-    // The destination must be the exact width of the load (movq→%r64,
-    // movl→%r32); anything else is not the shape the allocator emits.
-    let expect = if is_q {
+    // The destination must be the exact register spelling of its bank
+    // (movq/movslq → %r64, movl → %r32); anything else is not the shape
+    // the allocator emits.
+    let expect = if dest_is_64 {
         REG_NAMES[0][fam as usize]
     } else {
         REG_NAMES[1][fam as usize]
@@ -333,6 +343,48 @@ fn parse_reg_reg_alu(t: &str) -> Option<(&'static str, bool, RegId, RegId)> {
     Some((op, is_q, src, dst))
 }
 
+/// Parse `cmp{l,q} $imm, %dst` — the immediate-source flag consumer whose
+/// DESTINATION slot holds the loaded scratch (the constant-key pointer
+/// walk: `movl 8(%rdx), %r10d; cmpl $25, %r10d`). The immediate is kept
+/// verbatim (decimal, hex and negative spellings all re-emit as written).
+/// Only the two non-writing flag producers are accepted — same discipline
+/// as the register mirror form.
+fn parse_imm_reg_flag(t: &str) -> Option<(&'static str, bool, &str, RegId)> {
+    let mnemonic = t.split_whitespace().next()?;
+    let (op, suffix) = mnemonic.split_at(mnemonic.len().checked_sub(1)?);
+    let is_q = match suffix {
+        "q" => true,
+        "l" => false,
+        _ => return None,
+    };
+    if op != "cmp" && op != "test" {
+        return None;
+    }
+    // Reborrow from the static spelling (the split borrows `t`).
+    let op: &'static str = if op == "cmp" { "cmp" } else { "test" };
+    let rest = t[mnemonic.len()..].trim();
+    let (a, b) = split_two_operands(rest)?;
+    if !a.starts_with('$') {
+        return None;
+    }
+    // Backend-emitted immediates: optional minus, then digits/hex; no
+    // spaces or expression syntax (those never fold).
+    let digits = &a[1..];
+    if digits.is_empty()
+        || !digits
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() || c == b'-' || c == b'x')
+    {
+        return None;
+    }
+    let dst = plain_gp_operand(b)?;
+    let width = if is_q { 0 } else { 1 };
+    if b != REG_NAMES[width][dst as usize] {
+        return None;
+    }
+    Some((op, is_q, a, dst))
+}
+
 /// Parse `mov{l,q} %src, %dst` (plain GP register copy).  Returns
 /// `(is_q, src_fam, dst_fam)`.
 fn parse_reg_copy(t: &str) -> Option<(bool, RegId, RegId)> {
@@ -351,6 +403,54 @@ fn parse_reg_copy(t: &str) -> Option<(bool, RegId, RegId)> {
         return None;
     }
     Some((is_q, src, dst))
+}
+
+/// Parse `andn{q,l} %src2, %src1, %dst` (all plain GP registers of the
+/// suffix width) and, when the FIRST source is the loaded scratch `t_fam`,
+/// produce the folded `andn{q,l} MEM, %src1, %dst` line.
+///
+/// AT&T operand order for the three-operand BMI form is
+/// `andn src2, src1, dst` = Intel `andn dst, src1, src2` (`dst = ~src2 &
+/// src1`), and Intel's `src2` is the r/m-encodable slot — so exactly the
+/// AT&T-first operand may become the folded memory operand.  The loaded
+/// scratch must be dead after the `andn` (caller-proved) and every other
+/// slot stays a register.
+fn try_fold_bmi_andn(
+    cons: &str,
+    load_q: bool,
+    t_fam: RegId,
+    mem: &str,
+    scratch_dead: bool,
+) -> Option<String> {
+    if !scratch_dead {
+        return None;
+    }
+    let suffix = if load_q { "q" } else { "l" };
+    let rest = cons
+        .strip_prefix("andn")
+        .and_then(|r| r.strip_prefix(suffix))?;
+    let rest = rest.trim_start();
+    // Three operands: src2, src1, dst — split on the first two commas.
+    let (a, tail) = rest.split_once(',')?;
+    let (b, c) = tail.split_once(',')?;
+    let a = a.trim();
+    let b = b.trim();
+    let c = c.trim().trim_end();
+    let width = if load_q { 0 } else { 1 };
+    let s2 = plain_gp_operand(a)?;
+    let s1 = plain_gp_operand(b)?;
+    let dst = plain_gp_operand(c)?;
+    // Exact-width spellings only (the shape the backend emits).
+    if a != REG_NAMES[width][s2 as usize]
+        || b != REG_NAMES[width][s1 as usize]
+        || c != REG_NAMES[width][dst as usize]
+    {
+        return None;
+    }
+    if s2 != t_fam || s1 == t_fam || dst == t_fam {
+        return None;
+    }
+    Some(format!("    andn{suffix} {mem}, {}, {}", b, c))
 }
 
 /// Outcome of scanning the lines strictly between two indices.
@@ -475,7 +575,75 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
                 i = j + 1;
                 continue;
             }
+            // ── mirror form: OP %C, %T ────────────────────────────────────
+            // The loaded scratch sits in the DESTINATION operand slot
+            // (`movl (%rsi), %edx; cmpl %edi, %edx` — the hash-chain walk
+            // every pointer-chasing kernel emits).  Only flag-producing,
+            // non-writing consumers may take a memory operand in that
+            // slot: `cmp` writes nothing, and folding `cmpl %edi, %edx` to
+            // `cmpl %edi, (%rsi)` computes the identical MEM−%edi flags
+            // difference.  `test`'s operands are symmetric (the left-slot
+            // rule already covers it), and every other FUSIBLE op writes
+            // its destination — folding the dst slot would turn the
+            // instruction into an unintended memory RMW.
+            if op_q == load_q
+                && dst == t_fam
+                && src != t_fam
+                && (op == "cmp" || op == "test")
+                && lv.live_after(j, t_fam) == Some(false)
+            {
+                let new_line =
+                    format!("    {op}{suffix} {}, {mem}", REG_NAMES[width][src as usize]);
+                mark_nop(&mut infos[i]);
+                replace_line(store, &mut infos[j], j, new_line);
+                lv.refresh_at(store, infos, j);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
             i += 1;
+            continue;
+        }
+
+        // ── mirror form, immediate source: cmp $I, %T ─────────────────────
+        // `movl 8(%rdx), %r10d; cmpl $25, %r10d` — the constant-key walk —
+        // folds to `cmpl $25, 8(%rdx)` (cmp r/m32, imm8/imm32 is the
+        // classic 83 /7 or 81 /7 encoding). Same flag-producing, non-
+        // writing discipline as the register mirror: cmp/test only, the
+        // immediate stays the AT&T source, the loaded scratch's slot takes
+        // the memory operand, and the scratch must be dead after.
+        if let Some((op, op_q, imm, dst)) = parse_imm_reg_flag(&cons) {
+            if op_q == load_q && dst == t_fam && lv.live_after(j, t_fam) == Some(false) {
+                let new_line = format!("    {op}{suffix} {imm}, {mem}");
+                mark_nop(&mut infos[i]);
+                replace_line(store, &mut infos[j], j, new_line);
+                lv.refresh_at(store, infos, j);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        // ── BMI three-operand form: andn %T, %S, %D ────────────────────────
+        // `andn` (Intel `andn dst, src1, src2` = ~src2 & src1) takes its
+        // AT&T-first operand (Intel src2) as r/m — the bitmap-word shape
+        // `mov (%rdi,%r10,8), %rbp; ...; andn %rbp, %rax, %rcx` folds the
+        // load away exactly like the two-operand left-slot rule.  The
+        // other two slots stay registers (architectural).
+        if let Some(new_line) = try_fold_bmi_andn(
+            &cons,
+            load_q,
+            t_fam,
+            mem,
+            lv.live_after(j, t_fam) == Some(false),
+        ) {
+            mark_nop(&mut infos[i]);
+            replace_line(store, &mut infos[j], j, new_line);
+            lv.refresh_at(store, infos, j);
+            changed = true;
+            i = j + 1;
             continue;
         }
 

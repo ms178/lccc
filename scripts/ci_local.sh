@@ -305,6 +305,17 @@ gate "bb-slp-v7" fast \
 gate "bb-slp-v8" fast \
     bash tests/regression/check_bb_slp_v8_codegen.sh
 
+# Two-block partial unroller + half-wide dword-pair SLP family: the
+# guard-free xk unroll of two-block counted loops (phi threading incl.
+# the IV-reference carried-phi class), the I32/U32 pair load/store/pack
+# family, MemLoad stream CSE (byte-precise no-write windows), SIB
+# index-var addressing, VEX in-place forms, the immediate-source load
+# fold (constant-key pointer walks), and the loop-vec Max/conditional-sum
+# gates — tri-config + kill-switch + SSE2-baseline differentials and the
+# asm contracts (vmovq pair loads, no legacy/VEX mixing, folded cmp).
+gate "two-block-unroll-redteam" fast \
+    bash tests/regression/check_two_block_unroll_redteam.sh
+
 # Adler-32 loop epic: the rolling-checksum reassociation (vpsadbw +
 # vpmaddubsw weights + vpmaddwd, exact mod 2^32) that GCC/Clang/ICX all
 # leave scalar — tri-config differential (epic on / -mno-avx2 / gcc) plus

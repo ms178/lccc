@@ -621,6 +621,30 @@ pub enum IntrinsicOp {
     /// Gather two scalar F64 values into one 2-lane vector (bit-identical
     /// register choreography to VecPackI64x2). args = [lo, hi].
     VecPackF64x2,
+    /// HALF-WIDE BB-SLP dword-pair family. The register shape is the full
+    /// I32x4 XMM register (16 bytes — every lane-independent op between
+    /// the endpoints is the ordinary `Vec*I32x4` intrinsic, so the value
+    /// web stays one family); only the MEMORY endpoints are 64-bit:
+    /// `VecLoadI32x4Pair` loads two consecutive dwords into lanes 0/1
+    /// with the upper 64 bits ZEROED (VEX/SSE `movq` xmm, m64 — both
+    /// encodings clear the high half, so the upper lanes hold
+    /// deterministic zeros, never stale register content). Emitted by
+    /// the BB-SLP `PackKind::MemLoad` for 2-lane dword runs — GCC's
+    /// SHA-256 message-schedule form (`vmovq` pair loads feeding
+    /// `vpsrld/vpxor/vpaddd`). args = [base, offset-const] like every
+    /// `VecLoad*`.
+    VecLoadI32x4Pair,
+    /// HALF-WIDE store: writes lanes 0/1 of the I32x4-shaped source
+    /// register to memory as 8 bytes (`movq` xmm, m64; the upper lanes
+    /// are never observable). The BB-SLP seed-store sink for 2-lane
+    /// dword runs. args = [vector, base, offset-const] (SIB form) or
+    /// dest_ptr + args = [vector].
+    VecStoreI32x4Pair,
+    /// HALF-WIDE gather: two scalar dwords into lanes 0/1 with the upper
+    /// 64 bits zeroed (`movd` clears bits 32..127, then `pinsrd $1`).
+    /// args = [lo, hi]. The 2-lane fallback for dword seeds whose lanes
+    /// are not consecutive-address loads (constants, register values).
+    VecPackI32x4Pair,
     /// Extract one I64/U64 lane as a GPR scalar (movq / pshufd+movq).
     /// args = [vector, Const(lane)].
     VecExtractLaneI64x2,
@@ -1765,6 +1789,7 @@ impl IntrinsicOp {
             | VecLoadI16x8 | VecAndI16x8 | VecOrI16x8 | VecXorI16x8
             | VecLoadI8x16 | VecAndI8x16 | VecOrI8x16 | VecXorI8x16
             | VecPackI64x2 | VecPackF64x2
+            | VecLoadI32x4Pair | VecStoreI32x4Pair | VecPackI32x4Pair
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
             | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
@@ -1906,6 +1931,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecStoreF64x2
                 | IntrinsicOp::VecStoreI64x2
                 | IntrinsicOp::VecStoreI64x4
+                | IntrinsicOp::VecStoreI32x4Pair
                 | IntrinsicOp::VecStoreI16x8
                 | IntrinsicOp::VecStoreI8x16
                 | IntrinsicOp::VecStoreI8x32
@@ -1935,6 +1961,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadI8x32
                 | IntrinsicOp::VecLoadWidenI32ToI64x2
                 | IntrinsicOp::VecLoadI64x2
+                | IntrinsicOp::VecLoadI32x4Pair
                 | IntrinsicOp::VecLoadI64x4
                 | IntrinsicOp::VecLoadI16x8
                 | IntrinsicOp::VecLoadI8x16
@@ -2082,9 +2109,11 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecMaddF32x8
                 | IntrinsicOp::VecLoadWidenI32ToI64x2
                 | IntrinsicOp::VecLoadI64x2
+                | IntrinsicOp::VecLoadI32x4Pair
                 | IntrinsicOp::VecAddI64x2
                 | IntrinsicOp::VecMulI64x2
                 | IntrinsicOp::VecStoreI64x2
+                | IntrinsicOp::VecStoreI32x4Pair
                 | IntrinsicOp::VecBroadcastI64x2
                 | IntrinsicOp::VecZeroI64x2
                 | IntrinsicOp::VecLoadI64x4
@@ -2102,6 +2131,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecBroadcastI64x4
                 | IntrinsicOp::VecPackI64x2
                 | IntrinsicOp::VecPackF64x2
+                | IntrinsicOp::VecPackI32x4Pair
                 | IntrinsicOp::VecMulI32x4
                 | IntrinsicOp::VecMulI32x8
                 | IntrinsicOp::VecBroadcastI32x4
@@ -2259,7 +2289,13 @@ mod vector_result_width_tests {
         for name in names {
             // Divergence classes: name sounds shaped but the result is not.
             let exempt_none = name.contains("Horizontal")
-                || (name.starts_with("VecStore") && name != "VecStoreI64x2")
+                || (name.starts_with("VecStore")
+                    && name != "VecStoreI64x2"
+                    // The half-wide Pair store declares the FULL register
+                    // width its vector operand lives in (the I32x4 shape,
+                    // 16 bytes) — the homing web keys on it, exactly the
+                    // VecStoreI64x2 precedent (register-shaped stores).
+                    && name != "VecStoreI32x4Pair")
                 || name.starts_with("VecSadalp")
                 || name.starts_with("VecSmlal")
              // Reads a 128-bit vector, extracts ONE lane into a GPR:
@@ -2502,6 +2538,9 @@ mod vector_result_width_tests {
             "VecOrI8x16" => IntrinsicOp::VecOrI8x16,
             "VecXorI8x16" => IntrinsicOp::VecXorI8x16,
             "VecPackI64x2" => IntrinsicOp::VecPackI64x2,
+            "VecLoadI32x4Pair" => IntrinsicOp::VecLoadI32x4Pair,
+            "VecStoreI32x4Pair" => IntrinsicOp::VecStoreI32x4Pair,
+            "VecPackI32x4Pair" => IntrinsicOp::VecPackI32x4Pair,
             "VecPackF64x2" => IntrinsicOp::VecPackF64x2,
             "VecExtractLaneI64x4" => IntrinsicOp::VecExtractLaneI64x4,
             "VecExtractLaneF64x4" => IntrinsicOp::VecExtractLaneF64x4,
@@ -2541,6 +2580,7 @@ mod memory_classification_tests {
             O::VecStoreI8x16,
             O::VecStoreI8x32,
             O::VecStoreI16x16,
+            O::VecStoreI32x4Pair,
         ] {
             assert!(
                 op.writes_memory_via_args(),
@@ -2568,6 +2608,7 @@ mod memory_classification_tests {
             O::VecLoadI8x16,
             O::VecLoadI8x32,
             O::VecLoadI16x16,
+            O::VecLoadI32x4Pair,
             O::VecLoadWidenI32ToI64x2,
             O::Loadu256,
             O::Load256,
@@ -2596,6 +2637,7 @@ mod memory_classification_tests {
             O::VecBroadcastI64x4,
             O::VecZeroF32x4,
             O::VecPackI64x2,
+            O::VecPackI32x4Pair,
             O::VecExtractLaneI64x2,
             O::VecAndI16x16,
             O::VecOrI16x16,

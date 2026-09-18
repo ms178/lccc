@@ -575,6 +575,399 @@ pub(super) fn eliminate_dead_inplace_ext(store: &mut LineStore, infos: &mut [Lin
     changed
 }
 
+// ── D. induction copy-back folds ────────────────────────────────────────────
+
+/// The producer whose destination feeds a copy straight back into one of
+/// its own inputs (or into an unrelated base register).
+enum CopybackProducer<'a> {
+    /// `mov{q,l} MEM, %T` — `MEM` may mention `%D` (the classic
+    /// `movq 8(%rsi), %rax; movq %rax, %rsi` chain-walk update).
+    Load { is_q: bool, mem: &'a str },
+    /// `leaq $N(%B), %T` with the copy target `%D` — when `%B == %D` the
+    /// redirected form becomes `addq $N, %D`; otherwise it is a plain
+    /// destination redirect `leaq $N(%B), %D`.
+    Lea { disp: &'a str, base: RegId },
+}
+
+/// Parse the producer line for a copy-back fold.
+///
+/// Accepted shapes (the destination must be a plain GP register `%T`):
+/// * `movq MEM, %T` / `movl MEM, %T` — a full or zero-extending load
+///   (a `movl` producer is only sound with a `movq` copy, which the
+///   caller enforces: the copy then transfers exactly the bits the load
+///   defined, zeros above 32 included).
+/// * `leaq $N(%B), %T` — the induction bump whose result is copied back
+///   into (usually) its own base.
+fn parse_copyback_producer(trimmed: &str) -> Option<(CopybackProducer<'_>, RegId)> {
+    if let Some(rest) = trimmed
+        .strip_prefix("movq ")
+        .or(trimmed.strip_prefix("movl "))
+    {
+        let is_q = trimmed.starts_with("movq ");
+        let (src, dst) = rest.split_once(',')?;
+        let src = src.trim();
+        let dst = dst.trim();
+        // Memory source only (register copies are fold_register_copies'
+        // job) and a plain GP destination of the load's own width.
+        if !src.contains('(') || !src.ends_with(')') || src.starts_with('%') {
+            return None;
+        }
+        let fam = plain_reg_family(dst)?;
+        let expect = if is_q {
+            REG_NAMES[W64][fam as usize]
+        } else {
+            REG_NAMES[W32][fam as usize]
+        };
+        if dst != expect {
+            return None;
+        }
+        return Some((CopybackProducer::Load { is_q, mem: src }, fam));
+    }
+    if let Some(rest) = trimmed.strip_prefix("leaq ") {
+        let (src, dst) = rest.split_once(',')?;
+        let dst = dst.trim();
+        let fam = plain_reg_family(dst)?;
+        if dst != REG_NAMES[W64][fam as usize] {
+            return None;
+        }
+        // `disp(%base)` — plain base, no index/scale (the induction bump).
+        let src = src.trim();
+        let Some(open) = src.find('(') else {
+            return None;
+        };
+        if !src.ends_with(')') {
+            return None;
+        }
+        let disp = src[..open].trim();
+        let base_str = &src[open + 1..src.len() - 1];
+        let base_str = base_str.split(',').next().unwrap_or(base_str).trim();
+        let base = plain_reg_family(base_str)?;
+        return Some((CopybackProducer::Lea { disp, base }, fam));
+    }
+    None
+}
+
+/// Resolve a plain GP register name (`%rsi`, `%r10d`, …) to its family.
+fn plain_reg_family(op: &str) -> Option<RegId> {
+    let name = op.strip_prefix('%')?;
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    family_of_reg_name(name)
+}
+
+/// Fold producer→copy-back shapes where the copy's destination is one of
+/// the producer's own inputs (or an unrelated base) and the copy is the
+/// producer result's only bridge into that register.
+///
+/// ```text
+///     movq 8(%rdx), %rax        movq 8(%rdx), %rdx
+///     movq %rax, %rdx      ->   testq %rdx, %rdx        (uses rewritten)
+///     testq %rax, %rax
+/// ```
+///
+/// ```text
+///     leaq 8(%rsi), %rax        addq $8, %rsi
+///     movq %rax, %rsi      ->   cmpq %r8, %rsi
+///     cmpq %r8, %rax
+/// ```
+///
+/// SOUNDNESS (both forms share one argument): with the producer at `i`,
+/// the copy at `c` and the last rewritten use at `k`,
+///
+/// 1. No mention of `%T` OR `%D` in `(i, c)`. The redirected producer
+///    writes `%D` EARLY, so a read of the old `%D` there would see the
+///    loaded/bumped value instead (`%D`'s original value is destroyed
+///    before the copy that used to preserve it); a read of `%T` there
+///    would see a value the redirected producer never wrote; any write
+///    diverges both directions at once.
+/// 2. In `(c, k]`: no write of `%D` (it must still hold the producer's
+///    value when the rewritten uses read it), no write of `%T` (a write
+///    starts a fresh live range the copy no longer feeds), no barriers,
+///    no implicit-register instructions, no shifts/rotates, and no
+///    inline asm — identical to [`fold_register_copies`] rules 2/4/6 with
+///    the roles of source and destination both played by live registers.
+/// 3. Every use of `%T` in `[c, k]` is rewritten to `%D`; uses of `%D`
+///    there already read the right value in both semantics.
+/// 4. `%T` is dead after `k` ([`FileLiveness`]).
+/// 5. The copy is `movq` (full width): every bit `%D` receives from `%T`
+///    is reproduced by the redirected producer — a `movq` load defines
+///    all 64, a `movl` load zero-extends to 64, a `leaq` defines all 64.
+///    `movl` producers are therefore only paired with `movq` copies; a
+///    `movl` copy would leave `%D`'s upper 32 bits stale in the original
+///    and zero in the fold (or vice versa), so the shape is declined.
+/// 6. Never `%rsp`/`%rbp`, and `xchg`-class or implicit-destination
+///    producers are excluded by the parser (only `mov`/`lea` are read).
+pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    if len < 3 {
+        return false;
+    }
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+
+    for i in 0..len.saturating_sub(1) {
+        if infos[i].is_nop() || infos[i].is_barrier() || infos[i].pinned {
+            continue;
+        }
+        let producer_line = infos[i].trimmed(store.get(i)).to_string();
+        let Some((producer, t_fam)) = parse_copyback_producer(&producer_line) else {
+            continue;
+        };
+
+        // Find the copy: scan forward through the pre-window (lines that
+        // are transparent or pure reads of %T; any mention of the copy
+        // target family or a barrier ends the search — the copy-back
+        // staging shape keeps them close). The first plain `movq %T, %D`
+        // whose destination differs from %T is the candidate; its
+        // destination becomes the fold target %D.
+        let mut c = None;
+        let mut d_fam_opt: Option<RegId> = None;
+        {
+            let mut j = i + 1;
+            let mut steps = 0;
+            while j < len && steps < 8 {
+                if infos[j].is_nop() || matches!(infos[j].kind, LineKind::Directive) {
+                    j += 1;
+                    continue;
+                }
+                steps += 1;
+                if infos[j].is_barrier() || infos[j].kind == LineKind::InlineAsm || infos[j].pinned
+                {
+                    break;
+                }
+                let line = infos[j].trimmed(store.get(j));
+                if let Some((copy_w, cs, cd)) = parse_reg_to_reg_mov(line) {
+                    if copy_w == W64
+                        && cs == t_fam
+                        && cd != t_fam
+                        && !is_frame_family(cd)
+                        && get_dest_reg(&infos[j]) == cd
+                    {
+                        // Candidate copy — but only accept it if no line
+                        // between the producer and here mentioned %D (the
+                        // old %D must not be observed; checked inline below
+                        // via the mentions scan in this loop).
+                        c = Some(j);
+                        d_fam_opt = Some(cd);
+                        break;
+                    }
+                    // A different copy shape: it mentions %T as a pure read
+                    // only if it is not a write of %T; treat like any
+                    // other pre-window line below.
+                }
+                // Any mention of a register that could be the target is
+                // handled by the main rule-1 scan after the copy is found;
+                // here we only need to know that the region is scannable.
+                // (The copy target is unknown until the copy is found, so
+                // track candidates conservatively: a line mentioning %T
+                // must be a pure read.)
+                if infos[j].reg_refs & (1u16 << t_fam) != 0 {
+                    if writes_family(&infos[j], line, t_fam) {
+                        break;
+                    }
+                }
+                j += 1;
+            }
+        }
+        let (Some(c), Some(d_fam)) = (c, d_fam_opt) else {
+            continue;
+        };
+        let copy_line = infos[c].trimmed(store.get(c)).to_string();
+        let Some((_, cs, cd)) = parse_reg_to_reg_mov(&copy_line) else {
+            continue;
+        };
+        if cs != t_fam || cd != d_fam || is_frame_family(cs) {
+            continue;
+        }
+        let t_bit = 1u16 << t_fam;
+        let d_bit = 1u16 << d_fam;
+
+        // Rule 1 window (producer, copy): instructions mentioning `%T`
+        // must be PURE READS — they are rewritten to `%D` (with the
+        // redirect, `%D` holds the producer's value from the producer
+        // onward, so the read observes the same bits). Any WRITE of `%T`
+        // starts a range the copy no longer feeds; any mention of `%D`
+        // other than the copy itself reads the OLD `%D` (destroyed by the
+        // redirect) or writes it — both diverge, so the fold declines.
+        // Barrier/CFC lines also end the window (the copy must stay in
+        // the same straight-line region as its producer).
+        let mut pre_uses: Vec<usize> = Vec::new();
+        let mut j = i + 1;
+        let mut clean = true;
+        while j < c {
+            if infos[j].is_nop() || matches!(infos[j].kind, LineKind::Directive) {
+                j += 1;
+                continue;
+            }
+            if infos[j].is_barrier() || infos[j].kind == LineKind::InlineAsm || infos[j].pinned {
+                clean = false;
+                break;
+            }
+            let line = infos[j].trimmed(store.get(j));
+            let mentions_t = infos[j].reg_refs & t_bit != 0;
+            let mentions_d = infos[j].reg_refs & d_bit != 0;
+            if mentions_d {
+                clean = false;
+                break;
+            }
+            if mentions_t {
+                if writes_family(&infos[j], line, t_fam)
+                    || writes_family(&infos[j], line, d_fam)
+                    || has_implicit_reg_usage(line)
+                    || is_shift_or_rotate(line)
+                {
+                    clean = false;
+                    break;
+                }
+                pre_uses.push(j);
+            }
+            j += 1;
+        }
+        if !clean {
+            continue;
+        }
+
+        // Collect the uses of %T after the copy (rules 2/3), tracking the
+        // last one. The scan ends at the first line that breaks the
+        // equivalence window between %T and %D:
+        //   * ANY write of `%T` — full (`movq %rcx, %rax`), read-write
+        //     (`addq %rcx, %rax`), or implicit (`cqto`-class) — starts a
+        //     NEW live range of `%T`. Post-write mentions of `%T` read the
+        //     new value, not the copy's, so rewriting them to `%D` would
+        //     feed them the stale copied value (miscompile: the
+        //     cmp_replay_acc_nohome `leaq 8(%rax),%rax; movq %rax,%r8;
+        //     movq (%rax),%rax` chain — the load's destination write made
+        //     every later `%rax` read the loaded pointer, and the fold
+        //     pointed them at the pre-bump value). The line itself is NOT
+        //     collected either: it reads the never-written `%T` under the
+        //     fold, and the `live_after` check at the end then sees `%T`
+        //     still live at that point and rejects the whole fold —
+        //     exactly the fail-closed behaviour the shape demands.
+        //   * a write of `%D` without a `%T` read — `%D` starts a new
+        //     value, so later `%T` uses are beyond the fold (break);
+        //   * a line that READS `%T` while also writing `%D` (`addq %rax,
+        //     %rdx`) — rewriting gives `%rdx += %rdx` and not rewriting
+        //     reads the stale, never-written `%T`: both directions
+        //     miscompile, so the whole fold is rejected (ok = false);
+        // Uses of `%D` in this window need no rewrite — `%D` already holds
+        // the producer's value under the fold.
+        let mut uses: Vec<usize> = Vec::new();
+        let mut last = c;
+        let mut ok = true;
+        for j in (c + 1)..len {
+            if infos[j].is_nop() {
+                continue;
+            }
+            if infos[j].is_barrier() || infos[j].kind == LineKind::InlineAsm {
+                break;
+            }
+            let line = infos[j].trimmed(store.get(j));
+            let mentions_t = infos[j].reg_refs & t_bit != 0;
+            let writes_d = writes_family(&infos[j], line, d_fam);
+            let writes_t = writes_family(&infos[j], line, t_fam);
+            if mentions_t {
+                if writes_d {
+                    ok = false;
+                    break;
+                }
+                if writes_t {
+                    break;
+                }
+                if has_implicit_reg_usage(line) || is_shift_or_rotate(line) {
+                    ok = false;
+                    break;
+                }
+                uses.push(j);
+                last = j;
+            } else {
+                if writes_d || writes_t {
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // Rule 4: T dead after the last collected mention (either window;
+        // with no uses at all, dead right after the copy).
+        let mut all_uses: Vec<usize> = pre_uses;
+        all_uses.extend_from_slice(&uses);
+        let dead_at = if all_uses.is_empty() {
+            c
+        } else {
+            *all_uses.last().unwrap()
+        };
+        if lv.live_after(dead_at, t_fam) != Some(false) {
+            continue;
+        }
+
+        // Apply: redirect the producer destination to %D (preserving the
+        // load's own width — a `movl` producer stays a 4-byte read into
+        // %D's 32-bit name, whose zero-extension is exactly the bits the
+        // `movq` copy used to transfer), delete the copy, rewrite every
+        // collected mention of %T to %D at the mention's own width.
+        let new_producer = match &producer {
+            CopybackProducer::Load { is_q: true, mem } => {
+                format!("    movq {}, {}", mem, REG_NAMES[W64][d_fam as usize])
+            }
+            CopybackProducer::Load { is_q: false, mem } => {
+                format!("    movl {}, {}", mem, REG_NAMES[W32][d_fam as usize])
+            }
+            CopybackProducer::Lea { disp, base } => {
+                if *base == d_fam {
+                    // `leaq N(%D), %D` == `addq $N, %D` (shorter encoding,
+                    // GCC's exact spelling for the induction bump). The LEA
+                    // displacement text carries no `$` — the immediate form
+                    // needs one, or the assembler reads it as an absolute
+                    // memory operand.
+                    format!("    addq ${}, {}", disp, REG_NAMES[W64][d_fam as usize])
+                } else {
+                    format!(
+                        "    leaq {}({}), {}",
+                        disp, REG_NAMES[W64][*base as usize], REG_NAMES[W64][d_fam as usize]
+                    )
+                }
+            }
+        };
+        // Pre-compute every use's rewritten form first: a use that mentions
+        // %T in a spelling the width renaming cannot express (or that the
+        // rewrite leaves still mentioning %T) aborts the whole fold — the
+        // copy is those uses' only definition bridge.
+        let t_names: Vec<(String, String)> = (0..4)
+            .map(|w| {
+                (
+                    REG_NAMES[w][t_fam as usize].to_string(),
+                    REG_NAMES[w][d_fam as usize].to_string(),
+                )
+            })
+            .collect();
+        let mut rewritten_uses: Vec<(usize, String)> = Vec::with_capacity(all_uses.len());
+        let mut all_rewritable = true;
+        for &j in &all_uses {
+            let line = infos[j].trimmed(store.get(j)).to_string();
+            let mut rw = line.clone();
+            for (from, to) in &t_names {
+                rw = replace_reg(&rw, from, to);
+            }
+            if rw == line || t_names.iter().any(|(from, _)| contains_reg(&rw, from)) {
+                all_rewritable = false;
+                break;
+            }
+            rewritten_uses.push((j, rw));
+        }
+        replace_line(store, &mut infos[i], i, new_producer);
+        mark_nop(&mut infos[c]);
+        for (j, rw) in rewritten_uses {
+            replace_line(store, &mut infos[j], j, format!("    {}", rw.trim_start()));
+        }
+        lv.refresh_at(store, infos, dead_at);
+        changed = true;
+    }
+
+    changed
+}
+
 #[cfg(test)]
 #[path = "narrow_copy_fold_tests.rs"]
 mod tests;

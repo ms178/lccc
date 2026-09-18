@@ -84,6 +84,19 @@ printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
 if [ "${LCCC_ALLOW_WARNINGS:-0}" != "1" ]; then
     rustflags="${rustflags:+$rustflags }-D warnings"
 fi
+# Small hosts (< 6 GB): link with `--no-keep-memory`. GNU ld's default keeps
+# symbol/string tables resident for the whole link; on the monolithic lib-test
+# binary that spikes past what a 4 GB cgroup leaves free and the OOM killer
+# SIGKILLs rustc at the link step (verified: same invocation, SIGKILL without
+# the flag, clean link with it). The flag makes ld trade link SPEED for
+# bounded memory (re-reading sections instead of caching) — the right default
+# exactly where RAM is the constraint. CI-sized hosts keep the fast path.
+# Published through target/lccc-rustflags so `scripts/ci_local.sh`'s
+# cargo-test leg reuses the SAME flag set (one cargo cache, no rebuild).
+total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+if [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ]; then
+    rustflags="$rustflags -C link-arg=-Wl,--no-keep-memory"
+fi
 # Publish the resolved flags. RUSTFLAGS is part of cargo's fingerprint, so a
 # later `cargo test` that passed a different value would rebuild the entire
 # tree; `scripts/ci_local.sh` reads this file to reuse the build's cache.

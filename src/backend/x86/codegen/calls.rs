@@ -548,6 +548,37 @@ impl X86Codegen {
         ];
         let mut float_count = 0usize;
 
+        // Publish the count of leading SysV GP argument registers this call
+        // actually reads — the `# LCCC_CALL_ARGS` marker's data. The liveness
+        // oracle's conservative all-six model pins any value homed in an
+        // argument register across EVERY call (the hash-chain chase lost its
+        // load→compare fold exactly this way when the unroller's profitability
+        // gate moved the scratch into %rdx). Computed from the authoritative
+        // classification: the highest GP slot index consumed, +1. LP64 only —
+        // the i686 regparm/fastcall layouts keep the conservative default.
+        if crate::common::types::target_ptr_size() == 8 {
+            let mut gp_high = 0usize;
+            for cls in arg_classes {
+                let span: Option<usize> = match cls {
+                    CallArgClass::IntReg { reg_idx } => Some(reg_idx + 1),
+                    CallArgClass::I128RegPair { base_reg_idx }
+                    | CallArgClass::I64RegPair { base_reg_idx } => Some(base_reg_idx + 2),
+                    CallArgClass::StructByValReg { base_reg_idx, size } => {
+                        Some(base_reg_idx + size.div_ceil(8))
+                    }
+                    CallArgClass::StructMixedIntSseReg { int_reg_idx, .. }
+                    | CallArgClass::StructMixedSseIntReg { int_reg_idx, .. } => {
+                        Some(int_reg_idx + 1)
+                    }
+                    _ => None,
+                };
+                if let Some(hi) = span {
+                    gp_high = gp_high.max(hi);
+                }
+            }
+            self.state.call_gp_arg_count = gp_high.min(6);
+        }
+
         // ---- Staging-hazard pre-spill (session 25) ----
         // Die-at-birth register coalescing can home a still-needed value in
         // an argument register that an EARLIER argument's staging overwrites:
@@ -1157,6 +1188,17 @@ impl X86Codegen {
         if self.state.call_is_variadic {
             self.state.emit("    # LCCC_VA_CALL");
         }
+        // Call-argument count marker (the same authority contract as the
+        // VA marker above): the GP liveness oracle reads this to model
+        // exactly the LEADING SysV GP argument registers the callee
+        // consumes, instead of conservatively pinning all six across every
+        // call. 6 (or an absent marker — hand-written fragments, raw `call`
+        // emissions like the i128 helpers) keeps the old conservative read
+        // set: fail-closed.
+        self.state.emit_fmt(format_args!(
+            "    # LCCC_CALL_ARGS {}",
+            self.state.call_gp_arg_count.min(6)
+        ));
         // Static-chain call marker (same authority contract): a chain call
         // reads %r10 (the nested-callee's static chain, staged by the
         // immediately preceding SetStaticChain emission). Absent marker ⇒

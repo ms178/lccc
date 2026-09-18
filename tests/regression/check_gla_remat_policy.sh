@@ -3,20 +3,27 @@
 # real nbody program, plus the default-ON master-gate contract (RA-GLA-02).
 #
 # nbody's printf format-string global address (v94) spans TWO hole-aware
-# live segments around the nested depth-3 simulation loops, and every block
-# it covers peaks at 38-45 GPR color classes against a 12-register budget.
-# Rematerializing it reorders the colorer's global FP-loop assignment for
-# +28 instructions and +88 stack references (A/B census 2026-09-11). The
-# shipped conservative policy rejects it through TWO independent
-# fail-closed gates, and this script pins both plus their conjunction:
+# live segments around the nested depth-3 simulation loops. Rematerializing
+# it reorders the colorer's global FP-loop assignment for +28 instructions
+# and +88 stack references (A/B census 2026-09-11), so the shipped
+# conservative policy keeps it homed. The rejection used to ride on TWO
+# independent fail-closed gates; the pressure profile has since shifted
+# (the covered blocks now peak at 15-22 GPR color classes against the
+# 12-register budget — measured 2026-09-18 — down from the 38-45 that
+# originally pushed every over-budget point outside the default reach
+# band), so the reach-band gate now ADMITS the candidate and the ONE-
+# SEGMENT CAP is the binding rejector under the default policy. This
+# script pins the current facts:
 #
-#   default (reach=6, cap=1): v94 covers no *reachable* over-budget point
-#     (block-level reach-band gate) and nothing is applied;
-#   reach=999, cap=1:        the candidate becomes reachable but the
-#     one-segment cap rejects it ("2 segments > 1");
-#   reach=6, cap=2:         the segment cap is open but the reach-band gate
-#     keeps covers_reachable=false and nothing is applied;
-#   reach=999, cap=2:       BOTH gates open -> exactly one remat applies.
+#   default (reach=6, cap=1):   v94 is band-admitted (covers_reachable=
+#     true) but the one-segment cap rejects it ("2 segments > 1") — nothing
+#     is applied;
+#   reach=999, cap=1:           same rejection (the cap is reach-
+#     independent);
+#   reach=6, cap=2:             BOTH gates open -> exactly one remat
+#     applies (the band admits it at the default reach — the independent
+#     band rejection is gone with the old pressure profile);
+#   reach=999, cap=2:           same application.
 #
 # Master gate contract (RA-GLA-02): unset == ON; every documented off token
 # (0/off/no/false, case-insensitive, empty) silences the pass; an unset
@@ -29,7 +36,19 @@ set -eu
 # (container sandboxes without root) cannot run them at all, and a hard
 # failure there reports the ENVIRONMENT, not the code.
 i386_headers_ok() {
-    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
+    # Rootless hosts can point LCCC_I686_SYSROOT at an unpacked multilib
+    # sysroot (the regression suite's convention): exporting it as
+    # LCCC_SYSROOT makes both this probe and the i686 legs below run for
+    # real instead of skipping. CI installs gcc-multilib and never sets
+    # the variable, so its path is unchanged.
+    if [ -n "${LCCC_I686_SYSROOT:-}" ] && [ -d "$LCCC_I686_SYSROOT" ]; then
+        export LCCC_SYSROOT="$LCCC_I686_SYSROOT"
+    fi
+    # -E (preprocess-only): the header-visible outcome without linking.
+    # (-fsyntax-only is dropped on the stdin input path — the driver links
+    # and fails on the empty translation unit's missing main; filed as a
+    # follow-up. -E sees exactly the same headers.)
+    if ! printf '#include <stdio.h>\n' | "$1" -x c -E - >/dev/null 2>&1; then
         echo "SKIP: i686 leg ($1) - no i386 libc headers on this host (CI installs gcc-multilib)"
         return 1
     fi
@@ -67,25 +86,25 @@ must_not_grep() { # must_not_grep PAT FILE [description]
   fi
 }
 
-# --- default policy: reach-band gate rejects the hopeless blocks --------
+# --- default policy: the one-segment cap rejects the two-segment candidate
 run_trace default
 must_grep 'v94' "$tmp/default.log"
-must_grep 'v94 .*segments=2 covers_reachable=false' "$tmp/default.log"
+must_grep 'v94 .*segments=2 covers_reachable=true' "$tmp/default.log"
+must_grep 'rejected: 2 segments > 1' "$tmp/default.log"
 must_not_grep '\[GLA\] main applied:' "$tmp/default.log" \
   "default policy edited nbody"
 
-# --- reach wide, segment cap shut: cap rejects --------------------------
+# --- reach wide, segment cap shut: the cap rejects (reach-independent) --
 run_trace capshut CCC_GLA_REACH=999
 must_grep 'v94 .*segments=2 covers_reachable=true' "$tmp/capshut.log"
 must_grep 'rejected: 2 segments > 1' "$tmp/capshut.log"
 must_not_grep '\[GLA\] main applied:' "$tmp/capshut.log" \
   "segment cap did not reject nbody"
 
-# --- segment cap open, reach shut: reach gate rejects -------------------
-run_trace reachshut CCC_GLA_REMAT_MAX_SEGMENTS=2
-must_grep 'v94 .*segments=2 covers_reachable=false' "$tmp/reachshut.log"
-must_not_grep '\[GLA\] main applied:' "$tmp/reachshut.log" \
-  "reach gate did not reject nbody"
+# --- segment cap open, default reach: the band ADMITS (profile shifted) --
+run_trace bandadmits CCC_GLA_REMAT_MAX_SEGMENTS=2
+must_grep 'v94 .*segments=2 covers_reachable=true' "$tmp/bandadmits.log"
+must_grep '\[GLA\] main applied: 1 values \(1 remat' "$tmp/bandadmits.log"
 
 # --- both gates open: the candidate applies -----------------------------
 run_trace open CCC_GLA_REACH=999 CCC_GLA_REMAT_MAX_SEGMENTS=2

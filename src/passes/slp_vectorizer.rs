@@ -496,6 +496,25 @@ struct VecFamily {
 fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
     let avx2 = x86_avx2_available_pub();
     match (ty, width) {
+        // HALF-WIDE dword pairs: 2 lanes of 4 bytes in the low 64 bits of
+        // an XMM register. The register SHAPE is I32x4 — every
+        // lane-independent op between the endpoints resolves (via
+        // `reg_width_for`) to the ordinary I32x4 intrinsics, so the value
+        // web, homing classes and pack graph stay the familiar full-width
+        // ones; only the MEMORY endpoints (load/store/gather) are the
+        // 64-bit Pair forms with the upper lanes deterministically zero.
+        // This is GCC's SHA-256 message-schedule shape: `vmovq` pair
+        // loads feeding `vpsrld/vpxor/vpaddd`.
+        (IrType::I32 | IrType::U32, 2) => Some(VecFamily {
+            load: IntrinsicOp::VecLoadI32x4Pair,
+            store: IntrinsicOp::VecStoreI32x4Pair,
+            broadcast: IntrinsicOp::VecBroadcastI32x4,
+            zero: IntrinsicOp::VecZeroI32x4,
+            pack2: Some(IntrinsicOp::VecPackI32x4Pair),
+            pack4: None,
+            extract: Some(IntrinsicOp::VecExtractLaneI32x4),
+            size: 4,
+        }),
         (IrType::F64, 2) => Some(VecFamily {
             load: IntrinsicOp::VecLoadF64x2,
             store: IntrinsicOp::VecStoreF64x2,
@@ -629,6 +648,7 @@ fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
 /// no exact packed form (div/rem/shifts/bit-test/rotates, i64 Muls —
 /// there is no SSE2/AVX2 pmulq).
 fn packed_binop(op: IrBinOp, ty: IrType, width: usize) -> Option<IntrinsicOp> {
+    let width = reg_width_for(ty, width);
     match (ty, width) {
         (IrType::F64, 2) => match op {
             IrBinOp::Add => Some(IntrinsicOp::VecAddF64x2),
@@ -767,6 +787,7 @@ fn minus_zero_const(ty: IrType) -> Option<IrConst> {
 /// simply keep the cmp+blendv two-op form, which is itself exact).
 /// Halfword (pminsw/pmaxsw) and byte (pminub/pmaxub) are SSE2.
 fn packed_int_minmax(is_max: bool, ty: IrType, width: usize) -> Option<IntrinsicOp> {
+    let width = reg_width_for(ty, width);
     let avx2 = x86_avx2_available_pub();
     match (ty, width) {
         (IrType::I32 | IrType::U32, 8) => Some(if is_max {
@@ -809,6 +830,7 @@ fn packed_int_minmax(is_max: bool, ty: IrType, width: usize) -> Option<Intrinsic
 /// width) family. `None` where no family exists (I64 lanes) — the lanes
 /// then degrade to the gather/binop paths.
 fn packed_cmp_blendv(ty: IrType, width: usize) -> Option<(IntrinsicOp, IntrinsicOp)> {
+    let width = reg_width_for(ty, width);
     let avx2 = x86_avx2_available_pub();
     match (ty, width) {
         (IrType::F32, 8) if avx2 => Some((IntrinsicOp::VecCmpF32x8, IntrinsicOp::VecBlendvF32x8)),
@@ -865,6 +887,7 @@ fn cmp_predicate_imm(op: IrCmpOp, is_fp: bool) -> Option<(i64, bool)> {
 /// right shift (no packed qword `psraq` before AVX-512). Those lanes
 /// degrade to gathers where a family has one, else reject the seed.
 fn packed_shift(op: IrBinOp, ty: IrType, width: usize) -> Option<IntrinsicOp> {
+    let width = reg_width_for(ty, width);
     match (ty, width) {
         (IrType::I16 | IrType::U16, 16) => match op {
             IrBinOp::Shl => Some(IntrinsicOp::VecShlI16x16),
@@ -920,6 +943,7 @@ fn all_ones_const(ty: IrType) -> Option<IrConst> {
 /// FP-only: integer min/max needs no such fold (cmp+blendv is the exact
 /// integer lowering, and the SSE2 baseline lacks dword pminsd/pmaxsd).
 fn packed_minmax(is_max: bool, ty: IrType, width: usize) -> Option<IntrinsicOp> {
+    let width = reg_width_for(ty, width);
     match (ty, width) {
         (IrType::F32, 8) => Some(if is_max {
             IntrinsicOp::VecMaxF32x8
@@ -1801,8 +1825,31 @@ fn preferred_width(len: usize, size: u64, ty: IrType, avx2: bool) -> Option<usiz
         Some(w256)
     } else if len >= w128 && family_for(ty, w128).is_some() {
         Some(w128)
+    } else if size == 4 && len == 2 && family_for(ty, 2).is_some() {
+        // HALF-WIDE dword pairs: two consecutive dword stores are one
+        // 64-bit store of the low half of an XMM register (GCC's 2-wide
+        // message-schedule / stream-transform shape). Reaches here only
+        // when the full-width families did not take the run (len < 4).
+        Some(2)
     } else {
         None
+    }
+}
+
+/// Normalize an SLP pack width to the REGISTER width its ops use.
+///
+/// HALF-WIDE packs (2 lanes of 4-byte integers) live in the low 64 bits
+/// of an XMM register whose full shape is 4 lanes: every lane-independent
+/// op between the 64-bit memory endpoints is the ordinary full-register
+/// intrinsic, so the op resolvers must look up (ty, REGISTER width), not
+/// (ty, pack width). The upper lanes hold `op(0, 0)` (the Pair load and
+/// gather zero them; VEX/SSE `movq`/`movd` both clear the high bits) —
+/// deterministic, and never observable because the Pair store writes
+/// only lanes 0/1.
+fn reg_width_for(ty: IrType, width: usize) -> usize {
+    match (ty, width) {
+        (IrType::I32 | IrType::U32, 2) => 4,
+        _ => width,
     }
 }
 
@@ -2939,6 +2986,113 @@ fn build_pack(
                         && w[1].off.checked_sub(w[0].off) == Some(fam.size as i64)
                 })
             {
+                // 2a. STREAM CSE: the scalar IR materializes ONE Load per
+                // use site, so the same address window arrives here once
+                // per consumer (the rotate composite's five separate
+                // m[i-2] loads — its same-source proof accepts
+                // same-address loads by symbolic evaluation). A prior
+                // MemLoad pack of this plan with the SAME stream
+                // (base, var, mult), the SAME first offset and the SAME
+                // lane count reads exactly the same bytes — PROVIDED no
+                // memory write intervenes between the two scalar load
+                // groups (a write there would mean the scalar code
+                // itself read two different values, and forwarding would
+                // silently pick one). Fail-closed: any Store in the
+                // position window between the two groups blocks the CSE.
+                // This is GCC's schedule form: each pair loads ONCE.
+                let a0 = &addrs[0];
+                if let Some(prior) = packs.iter().position(|p| {
+                    let PackKind::MemLoad {
+                        ptrs: pp, offs: po, ..
+                    } = &p.kind
+                    else {
+                        return false;
+                    };
+                    if po.len() != width || po.first() != Some(&a0.off) {
+                        return false;
+                    }
+                    match eval_sym_addr(block, &ctx.def_pos, pp[0]) {
+                        Some(pa)
+                            if pa.base == a0.base && pa.var == a0.var && pa.mult == a0.mult =>
+                        {
+                            // Same stream and window: now the no-write
+                            // interval spanning BOTH groups' reads —
+                            // the earliest to the latest position of
+                            // either group's lanes.
+                            let prior_pos: Vec<usize> = p
+                                .lane_vals
+                                .iter()
+                                .filter_map(|v| ctx.def_pos.get(&v.0).copied())
+                                .collect();
+                            let this_pos: Vec<usize> = vals
+                                .iter()
+                                .filter_map(|v| ctx.def_pos.get(&v.0).copied())
+                                .collect();
+                            let lo = prior_pos
+                                .iter()
+                                .chain(this_pos.iter())
+                                .copied()
+                                .min()
+                                .unwrap_or(usize::MAX);
+                            let hi = prior_pos
+                                .iter()
+                                .chain(this_pos.iter())
+                                .copied()
+                                .max()
+                                .unwrap_or(usize::MAX);
+                            // A memory write in the window blocks the CSE
+                            // UNLESS it is provably disjoint from the
+                            // loaded bytes: same symbolic stream with
+                            // non-overlapping byte ranges (the schedule's
+                            // seed stores at +0/+4 vs the rotate windows
+                            // at −8/−4 — disjoint by the exact affine
+                            // offsets), exactly the byte-precision
+                            // discipline of rules (c)/(d)/(e). Different
+                            // or opaque streams block conservatively.
+                            let window_lo = a0.off as i128;
+                            let window_hi = window_lo + width as i128 * fam.size as i128;
+                            !(lo..=hi).any(|q| {
+                                let inst = &block.instructions[q];
+                                let is_write = matches!(
+                                    inst,
+                                    Instruction::Store { .. }
+                                        | Instruction::AtomicStore { .. }
+                                        | Instruction::AtomicRmw { .. }
+                                        | Instruction::AtomicCmpxchg { .. }
+                                        | Instruction::Call { .. }
+                                        | Instruction::CallIndirect { .. }
+                                        | Instruction::InlineAsm { .. }
+                                        | Instruction::DynAlloca { .. }
+                                        | Instruction::Memcpy { .. }
+                                );
+                                if !is_write {
+                                    return false;
+                                }
+                                if let Instruction::Store { ptr, ty: sty, .. } = inst {
+                                    if let Some(sa) = eval_sym_addr(block, &ctx.def_pos, *ptr) {
+                                        if sa.base == a0.base
+                                            && sa.var == a0.var
+                                            && sa.mult == a0.mult
+                                        {
+                                            let s_lo = sa.off as i128;
+                                            let s_hi = s_lo + sty.size() as i128;
+                                            return s_lo < window_hi && window_lo < s_hi;
+                                        }
+                                        // Different stream: provably
+                                        // disjoint only via base identity
+                                        // (the RestrictBases machinery is
+                                        // not threaded here) — block.
+                                        return true;
+                                    }
+                                }
+                                true
+                            })
+                        }
+                        _ => false,
+                    }
+                }) {
+                    return Some(prior);
+                }
                 let idx = packs.len();
                 packs.push(Pack {
                     kind: PackKind::MemLoad {
@@ -4798,6 +4952,35 @@ fn topo_depth(packs: &[Pack], idx: usize) -> usize {
 // Rewrite
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Look up an index variable's integer type from its defining instruction
+/// anywhere in the function (the SIB decomposition's `var` is typically a
+/// LOOP-HEADER phi — the body block under SLP only uses it). SSA
+/// guarantees the def dominates every use, so materializing arithmetic
+/// over it at position 0 of the using block is well-formed. `None` for
+/// values with no integer def in this function (opaque foreign vars) —
+/// the caller keeps the materialized pointer, fail-closed.
+fn lookup_var_ty(func: &IrFunction, v: Value) -> Option<IrType> {
+    func.blocks
+        .iter()
+        .find_map(|blk| {
+            blk.instructions.iter().find_map(|inst| {
+                let d = inst.dest()?;
+                if d.0 != v.0 {
+                    return None;
+                }
+                match inst {
+                    Instruction::Phi { ty, .. } => Some(*ty),
+                    Instruction::ParamRef { ty, .. } => Some(*ty),
+                    Instruction::Cast { to_ty, .. } => Some(*to_ty),
+                    Instruction::BinOp { ty, .. } => Some(*ty),
+                    Instruction::Load { ty, .. } => Some(*ty),
+                    _ => None,
+                }
+            })
+        })
+        .filter(|t| t.is_integer() && t.size() <= 8)
+}
+
 fn apply_plan(
     func: &mut IrFunction,
     block_idx: usize,
@@ -4841,9 +5024,172 @@ fn apply_plan(
         }
     }
 
+    // ── SIB-form addressing for index-variable streams ───────────────────
+    //
+    // A MemLoad stream whose symbolic address carries an index variable
+    // (base + var·mult + off) currently names the MATERIALIZED pointer
+    // (the scalar GEP chain): the unrolled sha256 schedule paid FOUR
+    // leal+shlq+leaq chains per group — 12 instructions to restate
+    // `m + (i−c)·4` four times. The x86 back end's `vec_mem_operand`
+    // folds `(base, index, disp)` into one SIB operand
+    // `disp(%base,%index)`, so ONE shared `idx = cast(var) << k` per
+    // (var, mult) plus constant displacements replaces every chain
+    // (GCC's exact schedule-loop form: one advancing index, folded
+    // taps). The displaced GEP chains lose their only consumers and die
+    // in the next DCE sweep.
+    //
+    // PLACEMENT: the materialization must respect INTRA-BLOCK SSA order
+    // — a var defined in THIS block (a computed index in a straight-line
+    // seed) places its arithmetic after that def; a var defined elsewhere
+    // (the loop-header phi of a loop body) places it at position 0. A
+    // pack whose schedule position does not strictly follow the
+    // materialization keeps its materialized pointer — fail-closed.
+    let mut sib_materialize: Vec<(usize, usize, Instruction)> = Vec::new();
+    // Per pack: (base, idx value, disp) when the stream decomposes.
+    let mut sib_streams: Vec<Option<(Value, Value, i64)>> = vec![None; plan.packs.len()];
+    // The seed store's decomposed anchor, when available.
+    let mut anchor_out: Option<(Value, Value, i64)> = None;
+    {
+        // Phase 1 (read-only): per-pack stream decompositions and the
+        // distinct (var, mult, var_ty) materialization needs.
+        let block_snapshot = &func.blocks[block_idx];
+        let mut def_pos_local: FxHashMap<u32, usize> = FxHashMap::default();
+        for (i, inst) in block_snapshot.instructions.iter().enumerate() {
+            if let Some(d) = inst.dest() {
+                def_pos_local.insert(d.0, i);
+            }
+        }
+        let mut need: Vec<(Value, u64, IrType)> = Vec::new();
+        // streams_stage: (base, var, mult, disp)
+        let mut streams_stage: Vec<Option<(Value, Value, u64, i64)>> = vec![None; plan.packs.len()];
+        let mut anchor_stage: Option<(Value, Value, u64, i64)> = None;
+        for (pi, p) in plan.packs.iter().enumerate() {
+            let PackKind::MemLoad { ptrs, .. } = &p.kind else {
+                continue;
+            };
+            let Some(a) = eval_sym_addr(block_snapshot, &def_pos_local, ptrs[0]) else {
+                continue;
+            };
+            let Some(v) = a.var else { continue };
+            if a.mult == 0 {
+                continue;
+            }
+            // The var's TYPE comes from its defining instruction ANYWHERE
+            // in the function (the loop IV is a HEADER phi — the body
+            // block under SLP only USES it). SSA dominance is automatic
+            // for used values; only the INTRA-BLOCK position needs care
+            // (handled at materialization below). Values without an
+            // integer def in this function (opaque foreign vars) keep
+            // the materialized pointer — fail-closed.
+            let Some(var_ty) = lookup_var_ty(func, v) else {
+                continue;
+            };
+            need.push((v, a.mult, var_ty));
+            streams_stage[pi] = Some((a.base, v, a.mult, a.off));
+        }
+        // The seed store's anchor stream decomposes the same way (the
+        // sha256 schedule's store `m[i]` shares the loads' (i, 4) index).
+        if let Some(a) = eval_sym_addr(block_snapshot, &def_pos_local, cand.anchor_ptr) {
+            if let Some(v) = a.var {
+                if a.mult != 0 {
+                    if let Some(var_ty) = lookup_var_ty(func, v) {
+                        need.push((v, a.mult, var_ty));
+                        anchor_stage = Some((a.base, v, a.mult, a.off));
+                    }
+                }
+            }
+        }
+        // Phase 2 (minting): one Cast(+Shl/Mul) chain per distinct
+        // (var, mult), shared by every pack of the plan. The widening
+        // cast is shared per VAR (mult=1 uses it directly).
+        let mut sib_index: FxHashMap<(u32, u64), (Value, usize)> = FxHashMap::default();
+        let mut cast_of: FxHashMap<u32, (Value, usize)> = FxHashMap::default();
+        for (v, mult, var_ty) in need {
+            if sib_index.contains_key(&(v.0, mult)) {
+                continue;
+            }
+            // Placement: after the var's def when it is defined in THIS
+            // block, else at the top (a dominating def — the loop phi).
+            let mat_pos = match def_pos_local.get(&v.0) {
+                Some(&d) => d + 1,
+                None => 0,
+            };
+            let (cast_dest, cast_pos) = if var_ty == IrType::I64 {
+                (v, mat_pos)
+            } else if let Some(&(cv, cp)) = cast_of.get(&v.0) {
+                (cv, cp)
+            } else {
+                let cv = Value(func.next_value_id);
+                func.next_value_id += 1;
+                sib_materialize.push((
+                    mat_pos,
+                    sib_materialize.len(),
+                    Instruction::Cast {
+                        dest: cv,
+                        src: Operand::Value(v),
+                        from_ty: var_ty,
+                        to_ty: IrType::I64,
+                    },
+                ));
+                cast_of.insert(v.0, (cv, mat_pos));
+                (cv, mat_pos)
+            };
+            if mult == 1 {
+                sib_index.insert((v.0, mult), (cast_dest, cast_pos));
+            } else {
+                let idx = Value(func.next_value_id);
+                func.next_value_id += 1;
+                let op = if mult.is_power_of_two() {
+                    Instruction::BinOp {
+                        dest: idx,
+                        op: IrBinOp::Shl,
+                        lhs: Operand::Value(cast_dest),
+                        rhs: Operand::Const(IrConst::I64(mult.trailing_zeros() as i64)),
+                        ty: IrType::I64,
+                    }
+                } else {
+                    Instruction::BinOp {
+                        dest: idx,
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(cast_dest),
+                        rhs: Operand::Const(IrConst::I64(mult as i64)),
+                        ty: IrType::I64,
+                    }
+                };
+                let idx_pos = cast_pos.max(mat_pos).max(mat_pos);
+                sib_materialize.push((idx_pos, sib_materialize.len(), op));
+                sib_index.insert((v.0, mult), (idx, idx_pos));
+            }
+        }
+        // Phase 3: resolve each pack's (base, idx, disp) triple — the
+        // pack's schedule position must STRICTLY follow the idx's
+        // materialization position (same-position ordering is the
+        // (position, order) sort; the materializations carry their own
+        // increasing orders, so strictly-later positions are the only
+        // unambiguous form).
+        for (pi, s) in streams_stage.into_iter().enumerate() {
+            if let Some((base, v, mult, disp)) = s {
+                if let Some(&(idx, idx_pos)) = sib_index.get(&(v.0, mult)) {
+                    if plan.packs[pi].sched > idx_pos {
+                        sib_streams[pi] = Some((base, idx, disp));
+                    }
+                }
+            }
+        }
+        if let Some((base, v, mult, disp)) = anchor_stage {
+            if let Some(&(idx, idx_pos)) = sib_index.get(&(v.0, mult)) {
+                let store_pos = *cand.store_idx.iter().max().unwrap();
+                if store_pos > idx_pos {
+                    anchor_out = Some((base, idx, disp));
+                }
+            }
+        }
+    }
+
     // Insertion batches: (position, order, instruction). Sorted by
     // (position, order); dependencies land first within a slot.
     let mut inserts: Vec<(usize, usize, Instruction)> = Vec::new();
+    inserts.extend(sib_materialize);
     for (pi, p) in plan.packs.iter().enumerate() {
         let dest = vec_dest[pi];
         let inst = match &p.kind {
@@ -4868,15 +5214,27 @@ fn apply_plan(
                     Operand::Value(vec_dest[*acc]),
                 ],
             },
-            PackKind::MemLoad { ptrs, .. } => Instruction::Intrinsic {
-                dest: Some(dest),
-                op: fam.load,
-                dest_ptr: None,
-                // Lane 0's pointer anchors the access; the vector reads
-                // exactly [off0, off0 + width*size) — the union of the
-                // scalar lane reads, never more.
-                args: vec![Operand::Value(ptrs[0]), Operand::Const(IrConst::I64(0))],
-            },
+            PackKind::MemLoad { ptrs, .. } => {
+                // SIB form when the stream decomposed: (base, idx, disp)
+                // folds into `disp(%base,%idx)` in the back end; otherwise
+                // lane 0's materialized pointer anchors the access. Either
+                // way the vector reads exactly [off0, off0 + width*size) —
+                // the union of the scalar lane reads, never more.
+                let args = match sib_streams.get(pi).and_then(|s| *s) {
+                    Some((base, idx, disp)) => vec![
+                        Operand::Value(base),
+                        Operand::Value(idx),
+                        Operand::Const(IrConst::I64(disp)),
+                    ],
+                    None => vec![Operand::Value(ptrs[0]), Operand::Const(IrConst::I64(0))],
+                };
+                Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: fam.load,
+                    dest_ptr: None,
+                    args,
+                }
+            }
             PackKind::BinOp {
                 vec_op, lhs, rhs, ..
             } => Instruction::Intrinsic {
@@ -5009,7 +5367,23 @@ fn apply_plan(
     // canonical `Instruction::may_write_memory` classifies the store as a
     // write (its contract keys on `dest_ptr`, with the `VecStore*`
     // args-form supplement); the backend's `emit_vec_store_addr` prefers
-    // the 3-arg form and ignores the redundant `dest_ptr`.
+    // the 3-arg form and ignores the redundant `dest_ptr`. With a
+    // decomposed anchor the args become the SIB 4-arg form
+    // [vector, base, index, disp] — `emit_vec_store_addr`'s ≥3-arg path
+    // folds it to `disp(%base,%index)`, and the anchor GEP chain dies.
+    let store_args = match anchor_out {
+        Some((base, idx, disp)) => vec![
+            Operand::Value(vec_dest[plan.root]),
+            Operand::Value(base),
+            Operand::Value(idx),
+            Operand::Const(IrConst::I64(disp)),
+        ],
+        None => vec![
+            Operand::Value(vec_dest[plan.root]),
+            Operand::Value(cand.anchor_ptr),
+            Operand::Const(IrConst::I64(0)),
+        ],
+    };
     inserts.push((
         *cand.store_idx.iter().max().unwrap(),
         10_000,
@@ -5017,11 +5391,7 @@ fn apply_plan(
             dest: None,
             op: fam.store,
             dest_ptr: Some(cand.anchor_ptr),
-            args: vec![
-                Operand::Value(vec_dest[plan.root]),
-                Operand::Value(cand.anchor_ptr),
-                Operand::Const(IrConst::I64(0)),
-            ],
+            args: store_args,
         },
     ));
 

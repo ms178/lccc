@@ -61,7 +61,16 @@ for fn in v4_affine_window_i32 v4_affine_window_f64 v4_affine_window_f32 \
         echo "FAIL: $fn must emit the vector load+store pair (got $n_vec vector ops)"
         exit 1
     fi
-    n_scalar=$(scoped "$fn" | grep -cE "movslq|movswq|movsxd|[a-z]+ -?[0-9]+\(%rdi" || true)
+    # Scalar element accesses = scalar movs WITH a memory operand (loads:
+    # `movl -4(%rdi,%r8), %eax`; stores: `movl %eax, (%rsi)`; sign/zero
+    # extensions from memory: `movslq 12(%rdi), %r11`). The register-to-
+    # register index extension (`movslq %edx, %r8` — no memory operand)
+    # and the VECTOR loads (`movdqu -4(%rdi,%r8), %xmm2` — the displaced
+    # affine-window form) are NOT scalar accesses; the old pattern
+    # (`movslq|...|[a-z]+ -?[0-9]+\(%rdi`) matched both and false-failed
+    # every affine kernel once the induction work moved the index into a
+    # sign-extended register.
+    n_scalar=$(scoped "$fn" | grep -cE "mov(s|z)[a-z]* [^,]*\(|mov[bwl] ([^,]*\(|%[a-z0-9]+, *[^,]*\()" || true)
     if [ "$n_scalar" -gt 1 ]; then
         echo "FAIL: $fn has scalar element accesses left ($n_scalar)"
         exit 1
