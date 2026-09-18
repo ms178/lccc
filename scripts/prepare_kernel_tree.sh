@@ -143,12 +143,12 @@ done
 # Compare the file count against the archive listing instead; a short
 # tree is re-extracted once before giving up.
 n_tar=$(tar -tf "linux-$KVER.tar.xz" | grep -v '/$' | wc -l)
-n_tree=$(cd "$KDIR" && find . -type f -not -path './.git/*' | wc -l)
+n_tree=$(cd "$KDIR" && find . \( -type f -o -type l \) -not -path './.git/*' | wc -l)
 if (( n_tree < n_tar )); then
   echo "prepare_kernel_tree: short tree ($n_tree of $n_tar files); re-extracting" >&2
   rm -rf "$KDIR"
   tar -xf "linux-$KVER.tar.xz" || { echo "prepare_kernel_tree: tar failed on re-extract" >&2; exit 1; }
-  n_tree=$(cd "$KDIR" && find . -type f | wc -l)
+  n_tree=$(cd "$KDIR" && find . \( -type f -o -type l \) | wc -l)
   (( n_tree >= n_tar )) || { echo "prepare_kernel_tree: still short after re-extract ($n_tree of $n_tar)" >&2; exit 1; }
 fi
 cd "$KDIR"

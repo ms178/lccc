@@ -499,7 +499,39 @@ pub(crate) fn expand_rept_blocks_with_insn_size(
 pub(crate) struct MacroDef {
     params: Vec<String>,
     defaults: Vec<Option<String>>,
+    /// Index of the `name:vararg` parameter, if any: it swallows all
+    /// remaining invocation arguments (comma-joined) rather than binding
+    /// to a single one. GAS requires it to be the last parameter.
+    vararg_index: Option<usize>,
     body: Vec<String>,
+}
+
+impl MacroDef {
+    /// The replacement text for parameter `pi` given invocation args.
+    ///
+    /// GAS `:vararg` semantics: the vararg parameter expands to ALL
+    /// remaining arguments joined with ", " (an empty list expands to the
+    /// empty string). Without this, `.macro _xor_data vecs:vararg` invoked
+    /// as `_xor_data 0,1,2,3,4,5,6,7` bound `\vecs` to just `0`, so the
+    /// `.irp i, \vecs` round loop silently emitted one iteration instead of
+    /// eight — the assembled AES-CTR code was missing 7/8 of its rounds.
+    /// Every other parameter binds positionally, falling back to its
+    /// declared default and then to "0" when the caller omits it.
+    fn replacement_for(&self, args: &[String], pi: usize) -> String {
+        if self.vararg_index == Some(pi) {
+            return if pi < args.len() {
+                args[pi..].join(", ")
+            } else {
+                String::new()
+            };
+        }
+        args.get(pi).cloned().unwrap_or_else(|| {
+            self.defaults
+                .get(pi)
+                .and_then(|d| d.clone())
+                .unwrap_or_else(|| "0".to_string())
+        })
+    }
 }
 
 /// Index of the first `=` that separates a parameter name from its default.
@@ -529,7 +561,7 @@ fn find_toplevel_eq(s: &str) -> Option<usize> {
     None
 }
 
-/// Strip GAS parameter qualifiers from a `.macro` parameter name.
+/// Split a GAS parameter qualifier off a `.macro` parameter token.
 ///
 /// GAS allows `name:req` (argument is mandatory) and `name:vararg` (argument
 /// swallows the rest of the line). The qualifier is not part of the parameter
@@ -537,12 +569,14 @@ fn find_toplevel_eq(s: &str) -> Option<usize> {
 /// the name meant substitution never fired, and the kernel's
 /// `.macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=...` left every
 /// `\ftr` unexpanded in the macro body.
-fn strip_param_qualifiers(name: &str) -> String {
-    match name.split_once(':') {
+///
+/// Returns the bare name and whether the token declared `:vararg`.
+fn split_param_qualifier(tok: &str) -> (String, bool) {
+    match tok.split_once(':') {
         Some((base, qual)) if matches!(qual, "req" | "vararg") && !base.is_empty() => {
-            base.to_string()
+            (base.to_string(), qual == "vararg")
         }
-        _ => name.to_string(),
+        _ => (tok.to_string(), false),
     }
 }
 
@@ -550,13 +584,22 @@ fn strip_param_qualifiers(name: &str) -> String {
 ///
 /// GAS allows parameters like `enable = 1` where `1` is the default value
 /// used when the caller omits that argument. Parameters are separated by
-/// commas or whitespace.
-fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>) {
+/// commas or whitespace. Returns the names, their defaults, and the index
+/// of the `:vararg` parameter (if any).
+fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>, Option<usize>) {
     if params_str.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), None);
     }
     let mut params = Vec::new();
     let mut defaults = Vec::new();
+    let mut vararg_index = None;
+    let mut push_param = |name: String, is_vararg: bool, default: Option<String>| {
+        if is_vararg && vararg_index.is_none() {
+            vararg_index = Some(params.len());
+        }
+        params.push(name);
+        defaults.push(default);
+    };
 
     // Split on TOP-LEVEL commas only: a parameter default may itself contain
     // commas inside parentheses. The kernel's
@@ -591,27 +634,27 @@ fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>) {
             if tokens.len() > 1 {
                 // Everything before the last token are separate params with no default
                 for t in &tokens[..tokens.len() - 1] {
-                    params.push(strip_param_qualifiers(t));
-                    defaults.push(None);
+                    let (name, is_vararg) = split_param_qualifier(t);
+                    push_param(name, is_vararg, None);
                 }
             }
             if let Some(last) = tokens.last() {
                 if !last.is_empty() {
-                    params.push(strip_param_qualifiers(last));
-                    defaults.push(Some(default_val.to_string()));
+                    let (name, is_vararg) = split_param_qualifier(last);
+                    push_param(name, is_vararg, Some(default_val.to_string()));
                 }
             }
         } else {
             // No default value - may contain space-separated params
             for token in part.split_whitespace() {
                 if !token.is_empty() {
-                    params.push(strip_param_qualifiers(token));
-                    defaults.push(None);
+                    let (name, is_vararg) = split_param_qualifier(token);
+                    push_param(name, is_vararg, None);
                 }
             }
         }
     }
-    (params, defaults)
+    (params, defaults, vararg_index)
 }
 
 /// Split macro invocation arguments, matching GNU as behavior.
@@ -931,7 +974,7 @@ pub fn expand_macros(lines: &[&str], comment_style: &CommentStyle) -> Result<Vec
                 ),
                 None => (rest, ""),
             };
-            let (params, defaults) = parse_macro_params(params_str);
+            let (params, defaults, vararg_index) = parse_macro_params(params_str);
             let mut body = Vec::new();
             let mut depth = 1;
             i += 1;
@@ -956,6 +999,7 @@ pub fn expand_macros(lines: &[&str], comment_style: &CommentStyle) -> Result<Vec
                 MacroDef {
                     params,
                     defaults,
+                    vararg_index,
                     body,
                 },
             );
@@ -987,13 +1031,8 @@ pub fn expand_macros(lines: &[&str], comment_style: &CommentStyle) -> Result<Vec
                     for &pi in &sorted_indices {
                         let param = &mac.params[pi];
                         let pattern = format!("\\{}", param);
-                        let replacement = args.get(pi).map(|s| s.as_str()).unwrap_or_else(|| {
-                            mac.defaults
-                                .get(pi)
-                                .and_then(|d| d.as_deref())
-                                .unwrap_or("0")
-                        });
-                        expanded = replace_macro_param(&expanded, &pattern, replacement);
+                        let replacement = mac.replacement_for(&args, pi);
+                        expanded = replace_macro_param(&expanded, &pattern, &replacement);
                     }
                     // Strip GAS macro argument delimiters: \() resolves to empty string.
                     // Used to separate parameter names from adjacent text,
@@ -1082,13 +1121,8 @@ fn expand_macros_with(
                 for &pi in &sorted_indices {
                     let param = &mac.params[pi];
                     let pattern = format!("\\{}", param);
-                    let replacement = args.get(pi).map(|s| s.as_str()).unwrap_or_else(|| {
-                        mac.defaults
-                            .get(pi)
-                            .and_then(|d| d.as_deref())
-                            .unwrap_or("0")
-                    });
-                    expanded = replace_macro_param(&expanded, &pattern, replacement);
+                    let replacement = mac.replacement_for(&args, pi);
+                    expanded = replace_macro_param(&expanded, &pattern, &replacement);
                 }
                 // Strip GAS macro argument delimiters: \() resolves to empty string
                 expanded = expanded.replace("\\()", "");
@@ -1540,21 +1574,21 @@ mod tests {
 
     #[test]
     fn test_parse_macro_params_simple() {
-        let (params, defaults) = parse_macro_params("a, b, c");
+        let (params, defaults, _va) = parse_macro_params("a, b, c");
         assert_eq!(params, vec!["a", "b", "c"]);
         assert_eq!(defaults, vec![None, None, None]);
     }
 
     #[test]
     fn test_parse_macro_params_with_defaults() {
-        let (params, defaults) = parse_macro_params("a, b = 5, c");
+        let (params, defaults, _va) = parse_macro_params("a, b = 5, c");
         assert_eq!(params, vec!["a", "b", "c"]);
         assert_eq!(defaults, vec![None, Some("5".to_string()), None]);
     }
 
     #[test]
     fn test_parse_macro_params_space_separated() {
-        let (params, defaults) = parse_macro_params("a b c");
+        let (params, defaults, _va) = parse_macro_params("a b c");
         assert_eq!(params, vec!["a", "b", "c"]);
         assert_eq!(defaults, vec![None, None, None]);
     }
@@ -1562,16 +1596,77 @@ mod tests {
     #[test]
     fn test_parse_macro_params_mixed() {
         // GAS-style: `.macro ALT_NEW_CONTENT vendor_id, patch_id, enable = 1, new_c`
-        let (params, defaults) = parse_macro_params("vendor_id, patch_id, enable = 1, new_c");
+        let (params, defaults, _va) = parse_macro_params("vendor_id, patch_id, enable = 1, new_c");
         assert_eq!(params, vec!["vendor_id", "patch_id", "enable", "new_c"]);
         assert_eq!(defaults, vec![None, None, Some("1".to_string()), None]);
     }
 
     #[test]
     fn test_parse_macro_params_empty() {
-        let (params, defaults) = parse_macro_params("");
+        let (params, defaults, _va) = parse_macro_params("");
         assert!(params.is_empty());
         assert!(defaults.is_empty());
+    }
+
+    #[test]
+    fn test_parse_macro_params_vararg() {
+        let (params, defaults, va) = parse_macro_params("vecs:vararg");
+        assert_eq!(params, vec!["vecs"]);
+        assert_eq!(defaults, vec![None]);
+        assert_eq!(va, Some(0));
+
+        let (params, defaults, va) = parse_macro_params("a, rest:vararg");
+        assert_eq!(params, vec!["a", "rest"]);
+        assert_eq!(defaults, vec![None, None]);
+        assert_eq!(va, Some(1));
+
+        // :req stays a plain mandatory parameter (no vararg semantics)
+        let (params, _defaults, va) = parse_macro_params("reg:req, nr:req");
+        assert_eq!(params, vec!["reg", "nr"]);
+        assert_eq!(va, None);
+    }
+
+    #[test]
+    fn test_vararg_param_swallows_all_args() {
+        // The kernel's aes-ctr-avx-x86_64.S pattern: `.irp i, \vecs` inside a
+        // :vararg macro must see the FULL comma list. Before the fix, \vecs
+        // bound to the first argument only and 7 of 8 AES round-loop
+        // iterations were silently dropped from the object.
+        let lines = vec![
+            ".macro _emit vecs:vararg",
+            ".irp i, \\vecs",
+            "\t.long \\i",
+            ".endr",
+            ".endm",
+            "_emit 10, 20, 30",
+        ];
+        let result = expand_macros(&lines, &CommentStyle::Hash).unwrap();
+        assert!(
+            result
+                .iter()
+                .any(|l| l.replace('\t', " ").contains(".irp i, 10, 20, 30")),
+            "vararg substitution incomplete: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_vararg_param_empty_invocation() {
+        let lines = vec![
+            ".macro _emit vecs:vararg",
+            ".irp i, \\vecs",
+            "\t.long \\i",
+            ".endr",
+            ".endm",
+            "_emit",
+        ];
+        let result = expand_macros(&lines, &CommentStyle::Hash).unwrap();
+        // No arguments: the vararg expands to the empty string, not "0".
+        assert!(
+            result
+                .iter()
+                .any(|l| l.replace('\t', " ").contains(".irp i, ")),
+            "empty vararg should substitute to empty: {result:?}"
+        );
     }
 
     #[test]

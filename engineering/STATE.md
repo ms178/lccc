@@ -113,9 +113,25 @@ the range fusion; it used to be a scalar loop.
   forwarded load had just been re-pointed at (`forward_target_roots`
   guard; regression `sroa_fwd_load_vs_buffer_collapse.c`). Kernel
   rebuild/boot validation of the fix still pending.
-- **Defect (e) OPEN** — lccc integrated assembler rejects a valid
-  `vaesenc` operand form in `aes-ctr-avx-x86_64.S` (module-only;
-  bzImage unaffected).
+- **Defect (e) FIXED (2026-09-18, commit c256c917)** — the
+  `aes-ctr-avx-x86_64.S` failure was the tip of FOUR assembler
+  defects, three of them silent object corruption: (1) VAES
+  (vaesenc/vaesenclast/vaesdec/vaesdeclast) had no EVEX forms
+  (0F38.W0 DC..DF) for zmm/ymm16-31 operands; (2) same gap for
+  vpsrldq/vpslldq (0F.73 /3, /7); (3) `:vararg` macro parameters
+  bound a single argument instead of the whole remainder — `.irp i,
+  \vecs` inside `.macro _xor_data vecs:vararg` emitted 1 of 8
+  iterations, so the assembled AES-CTR object was missing 7/8 of its
+  rounds with no diagnostic (both macro engines: asm_preprocess +
+  x86 parser); (4) `.octa` silently emitted nothing (unknown-directive
+  fallthrough), zeroing `.Lbswap_mask`. Post-fix, lccc's kernel object
+  matches GNU as byte-for-byte in .rodata and instruction stream
+  (264/264 AES rounds), modulo the intentional commutative-vpxor
+  VEX.2 shortening and NOP padding style. Regression coverage:
+  `tests/asm-diff/vaes.casefile` (6 groups incl. reject parity:
+  VAES has no opmask/broadcast forms) and
+  `tests/asm-diff/macro_vararg.casefile` (4 groups: kernel pattern,
+  forwarding, empty/single invocation).
 - **Defect (b) OPEN** — CPU1 hotplug bring-up times out (`maxcpus=1`
   boots fine).
 - Kernel harness scripts (`build_kernel_vm.sh`, `prepare_kernel_tree.sh`
