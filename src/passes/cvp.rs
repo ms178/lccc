@@ -138,6 +138,15 @@ fn intersect(x: &Set, y: &Set) -> Set {
     out
 }
 
+/// Whether any active predicate excludes zero for `value`. Zero/nonzero is
+/// representation-invariant across integer widths, so this deliberately also
+/// consumes the BOOL_BITS fact attached to a direct `CondBranch(value)`.
+fn proves_nonzero(facts: &[Fact], value: Value) -> bool {
+    facts
+        .iter()
+        .any(|f| f.value == value && f.set.iter().all(|&(lo, hi)| !(lo <= 0 && 0 <= hi)))
+}
+
 fn is_subset(sub: &Set, sup: &Set) -> bool {
     // Both normalised: every `sub` interval must sit inside one `sup` interval.
     let mut j = 0;
@@ -551,6 +560,24 @@ pub fn run_function(func: &mut IrFunction) -> usize {
                         dest: *dest,
                         src: if t { *true_val } else { *false_val },
                     }),
+                    Instruction::UnaryOp {
+                        dest,
+                        op:
+                            op @ (crate::ir::reexports::IrUnaryOp::Clz
+                            | crate::ir::reexports::IrUnaryOp::Ctz),
+                        src: Operand::Value(src),
+                        ty,
+                    } if proves_nonzero(&stack, *src) => Some(Instruction::UnaryOp {
+                        dest: *dest,
+                        op: match op {
+                            crate::ir::reexports::IrUnaryOp::Clz => {
+                                crate::ir::reexports::IrUnaryOp::ClzNonZero
+                            }
+                            _ => crate::ir::reexports::IrUnaryOp::CtzNonZero,
+                        },
+                        src: Operand::Value(*src),
+                        ty: *ty,
+                    }),
                     _ => None,
                 };
                 if let Some(r) = repl {
@@ -648,6 +675,79 @@ mod tests {
         assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ne, 0)), Some(true));
         assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ugt, 0)), Some(true));
         assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ult, 5)), None);
+    }
+
+    #[test]
+    fn nonzero_edge_specializes_defined_bitcounts_only_in_dominated_region() {
+        // b0: br v, b1, b2
+        // b1 is dominated by the nonzero edge, so defined-zero Clz/Ctz can use
+        // their branchless nonzero forms. b2 deliberately retains Ctz: the
+        // false edge proves zero and changing its semantics would be invalid.
+        let v = Value(0);
+        let mut f = IrFunction::new("bitcounts".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![],
+                Terminator::CondBranch {
+                    cond: Operand::Value(v),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![
+                    Instruction::UnaryOp {
+                        dest: Value(1),
+                        op: crate::ir::reexports::IrUnaryOp::Clz,
+                        src: Operand::Value(v),
+                        ty: IrType::U64,
+                    },
+                    Instruction::UnaryOp {
+                        dest: Value(2),
+                        op: crate::ir::reexports::IrUnaryOp::Ctz,
+                        src: Operand::Value(v),
+                        ty: IrType::U64,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ),
+            mk(
+                2,
+                vec![Instruction::UnaryOp {
+                    dest: Value(3),
+                    op: crate::ir::reexports::IrUnaryOp::Ctz,
+                    src: Operand::Value(v),
+                    ty: IrType::U64,
+                }],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+        ];
+        f.next_value_id = 4;
+        assert_eq!(run_function(&mut f), 2);
+        assert!(matches!(
+            f.blocks[1].instructions[0],
+            Instruction::UnaryOp {
+                op: crate::ir::reexports::IrUnaryOp::ClzNonZero,
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.blocks[1].instructions[1],
+            Instruction::UnaryOp {
+                op: crate::ir::reexports::IrUnaryOp::CtzNonZero,
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.blocks[2].instructions[0],
+            Instruction::UnaryOp {
+                op: crate::ir::reexports::IrUnaryOp::Ctz,
+                ..
+            }
+        ));
+        assert_eq!(run_function(&mut f), 0, "specialization is idempotent");
     }
 
     #[test]

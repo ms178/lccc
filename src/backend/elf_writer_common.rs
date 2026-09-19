@@ -220,13 +220,26 @@ struct JumpInfo {
     /// it is essential: an optimistically shortened branch may later need to
     /// grow after alignment reaches its fixed point.
     long_len: usize,
+    /// Base label and constant source addend are kept separately.  Short-only
+    /// branches are patched by the relaxation engine rather than an ELF
+    /// relocation, so retaining a spelling such as `.Lloop+1` as the literal
+    /// label would leave its displacement at zero (the label does not exist).
     target: String,
+    target_addend: i64,
     is_conditional: bool,
     /// Whether the jump currently uses its short form.
     relaxed: bool,
     /// Whether this writer shortened the jump and can restore its long form.
     /// Short-only instructions remain false.
     can_grow: bool,
+}
+
+/// Apply a source-level branch addend without wrapping an invalid target into
+/// the section.  Returning `None` leaves the ordinary unresolved-target path
+/// in control; it must never manufacture an address on overflow.
+fn jump_target_with_addend(offset: Option<usize>, addend: i64) -> Option<usize> {
+    let offset = i64::try_from(offset?).ok()?;
+    usize::try_from(offset.checked_add(addend)?).ok()
 }
 
 /// Tracks an alignment or .org marker within a section.
@@ -1848,14 +1861,15 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
         // Register jump for relaxation if detected
         if let Some(jump_det) = result.jump {
-            if let Some(ref label) = self.get_jump_target_label(instr) {
+            if let Some((label, target_addend)) = self.get_jump_target_label(instr) {
                 if jump_det.already_short {
                     // Short-only jumps (jecxz/jcxz/loop) - already short, just need displacement patched
                     self.sections[sec_idx].jumps.push(JumpInfo {
                         offset: base_offset as usize,
                         len: instr_len,
                         long_len: instr_len,
-                        target: label.clone(),
+                        target: label,
+                        target_addend,
                         is_conditional: jump_det.is_conditional,
                         relaxed: true,
                         can_grow: false,
@@ -1868,7 +1882,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         offset: base_offset as usize,
                         len: instr_len,
                         long_len: instr_len,
-                        target: label.clone(),
+                        target: label,
+                        target_addend,
                         is_conditional: jump_det.is_conditional,
                         relaxed: false,
                         can_grow: false,
@@ -1892,19 +1907,28 @@ impl<A: X86Arch> ElfWriterCore<A> {
         Ok(())
     }
 
-    fn get_jump_target_label(&self, instr: &Instruction) -> Option<String> {
+    fn get_jump_target_label(&self, instr: &Instruction) -> Option<(String, i64)> {
         let mnem = &instr.mnemonic;
         let is_jump = mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
-        if !is_jump {
+        if !is_jump || instr.operands.len() != 1 {
             return None;
         }
-        if instr.operands.len() != 1 {
+        let Operand::Label(label) = &instr.operands[0] else {
             return None;
-        }
-        if let Operand::Label(label) = &instr.operands[0] {
-            Some(label.clone())
+        };
+
+        // The parser deliberately leaves bare control-flow operands
+        // context-neutral.  Split the same symbol-plus-constant grammar used
+        // by relocation emission here because short-only loop/jecxz branches
+        // never emit a relocation: the relaxation engine patches their disp8
+        // directly.  Applying the addend there exactly once avoids looking up
+        // a non-existent literal label named `.Ltarget+1`.
+        if let Some((base, addend)) =
+            crate::backend::x86::assembler::parser::split_relocation_symbol_addend(label)
+        {
+            Some((base.to_string(), addend))
         } else {
-            None
+            Some((label.clone(), 0))
         }
     }
 
@@ -2980,10 +3004,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let mut actions: Vec<(usize, Action)> = Vec::new();
                 let dbg = std::env::var("CCC_DEBUG_RELAX").is_ok();
                 for (j_idx, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
-                    let target_off_opt = local_labels.get(&jump.target).copied().or_else(|| {
-                        self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
-                            .map(|(_, off)| off as usize)
-                    });
+                    let target_off_opt = jump_target_with_addend(
+                        local_labels.get(&jump.target).copied().or_else(|| {
+                            self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
+                                .map(|(_, off)| off as usize)
+                        }),
+                        jump.target_addend,
+                    );
                     if dbg {
                         eprintln!(
                             "[RELAX] sec{} j{} off={} len={} cond={} target={:?} target_off={:?} relaxed={} growable={}",
@@ -3218,13 +3245,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 .iter()
                 .filter(|j| j.relaxed)
                 .filter_map(|jump| {
-                    let target = local_labels
-                        .get(&jump.target)
-                        .copied()
-                        .or_else(|| {
-                            self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
-                                .map(|(_, off)| off as usize)
-                        });
+                    let target = jump_target_with_addend(
+                        local_labels
+                            .get(&jump.target)
+                            .copied()
+                            .or_else(|| {
+                                self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
+                                    .map(|(_, off)| off as usize)
+                            }),
+                        jump.target_addend,
+                    );
                     target.map(|target_off| {
                         let end_of_instr = jump.offset + 2;
                         let disp = target_off as i64 - end_of_instr as i64;

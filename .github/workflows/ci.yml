@@ -367,6 +367,12 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_prefix_full_matrix.sh
 
+      # Kbuild tracks command lines but not the contents of CC/LD executables.
+      # A rebuilt compiler at the same path must invalidate every target
+      # product; a linker-only rebuild should retain expensive object files.
+      - name: Verify kernel tool-identity invalidation
+        run: bash tests/regression/check_kernel_tool_identity.sh
+
       - name: Upload regression results
         if: always()
         uses: actions/upload-artifact@v7

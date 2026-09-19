@@ -1,0 +1,11 @@
+;;; bare_memory_and_internal_pc8_addends
+.text
+.extern ext
+movl ext+9, %edx
+movl %edx, ext-7
+movw ext+5, %ax
+movw %ax, ext-3
+btl $7, ext+11
+.Lagain:
+loop .Lagain+1
+jecxz .Lagain+1

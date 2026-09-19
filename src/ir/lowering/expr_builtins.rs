@@ -545,8 +545,12 @@ impl Lowerer {
             BuiltinIntrinsic::AddOverflowP => self.lower_overflow_p_builtin(args, IrBinOp::Add),
             BuiltinIntrinsic::SubOverflowP => self.lower_overflow_p_builtin(args, IrBinOp::Sub),
             BuiltinIntrinsic::MulOverflowP => self.lower_overflow_p_builtin(args, IrBinOp::Mul),
-            BuiltinIntrinsic::Clz => self.lower_unary_intrinsic(name, args, IrUnaryOp::Clz),
-            BuiltinIntrinsic::Ctz => self.lower_unary_intrinsic(name, args, IrUnaryOp::Ctz),
+            // ISO C leaves clz/ctz undefined for zero. Preserve that precondition
+            // explicitly: baseline x86 can then use BSR/BSF without a cold
+            // zero-fixup branch. Internal transforms that require defined-zero
+            // semantics continue to use Clz/Ctz.
+            BuiltinIntrinsic::Clz => self.lower_unary_intrinsic(name, args, IrUnaryOp::ClzNonZero),
+            BuiltinIntrinsic::Ctz => self.lower_unary_intrinsic(name, args, IrUnaryOp::CtzNonZero),
             BuiltinIntrinsic::Ffs => self.lower_ffs_intrinsic(name, args),
             BuiltinIntrinsic::Clrsb => self.lower_clrsb_intrinsic(name, args),
             BuiltinIntrinsic::Bswap => self.lower_bswap_intrinsic(name, args),

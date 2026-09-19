@@ -208,6 +208,37 @@ impl X86Codegen {
         }
     }
 
+    /// CLZ for a value proven nonzero by the frontend or CVP. Unlike the
+    /// defined-zero IR operation, baseline x86 needs only BSR+XOR.
+    pub(super) fn emit_int_clz_nonzero_impl(&mut self, ty: IrType) {
+        if self.lzcnt_enabled {
+            self.emit_int_clz_impl(ty);
+            return;
+        }
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    bsrl %eax, %eax");
+                self.state.emit("    xorl $31, %eax");
+                self.state.emit("    subl $24, %eax");
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.emit("    bsrl %eax, %eax");
+                self.state.emit("    xorl $31, %eax");
+                self.state.emit("    subl $16, %eax");
+            }
+            IrType::I32 | IrType::U32 => {
+                self.state.emit("    bsrl %eax, %eax");
+                self.state.emit("    xorl $31, %eax");
+            }
+            _ => {
+                self.state.emit("    bsrq %rax, %rax");
+                self.state.emit("    xorq $63, %rax");
+            }
+        }
+    }
+
     pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
         if self.lzcnt_enabled {
             match ty {
@@ -249,6 +280,27 @@ impl X86Codegen {
                 self.state.emit("    bsfq %rax, %rax");
                 self.state.out.emit_named_label(&done);
             }
+        }
+    }
+
+    /// CTZ for a value proven nonzero by the frontend or CVP. BSF has exactly
+    /// the desired semantics on that domain and needs no test/branch/fallback.
+    pub(super) fn emit_int_ctz_nonzero_impl(&mut self, ty: IrType) {
+        if self.lzcnt_enabled {
+            self.emit_int_ctz_impl(ty);
+            return;
+        }
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    bsfl %eax, %eax");
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.emit("    bsfl %eax, %eax");
+            }
+            IrType::I32 | IrType::U32 => self.state.emit("    bsfl %eax, %eax"),
+            _ => self.state.emit("    bsfq %rax, %rax"),
         }
     }
 

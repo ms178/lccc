@@ -16,6 +16,13 @@
 # The canary set below must all exist; the ~10k-file snapshot cap truncates
 # large trees, so a damaged tree regenerates instead of half-working.
 LCCC_PREPARED_CANARIES=(
+  # Alphabetically and structurally distributed source/build sentinels.  The
+  # snapshot file cap once retained every generated header below but dropped
+  # the central Kbuild include, yielding a misleading late "No rule" failure.
+  Makefile
+  scripts/Kbuild.include
+  init/main.c
+  kernel/workqueue.c
   arch/x86/boot/setup.ld
   include/generated/autoconf.h
   include/generated/utsversion.h
