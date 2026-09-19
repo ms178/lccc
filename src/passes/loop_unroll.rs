@@ -37,6 +37,42 @@ use crate::ir::reexports::{
     Value,
 };
 
+thread_local! {
+    /// Whether Pass B (two-block guard-free unrolling) runs at all — the
+    /// documented `CCC_NO_TWO_BLOCK_UNROLL` kill switch that every A/B
+    /// differential in the harness speaks.
+    ///
+    /// Resolved ONCE by the driver and then read from per-thread state, the
+    /// same contract the vectorizer's ISA gates use (`set_x86_simd_isa`).  It
+    /// used to be read out of the process environment inside `unroll_loops`;
+    /// because `std::env::set_var` is process-global, the kill-switch test
+    /// toggled it underneath every test running in parallel on the other
+    /// threads of the same test binary, and those tests observed the wrong
+    /// value.  Measured on the `two_block_unroll` group: 11 failing runs in
+    /// 150 (~7%), the symptom being
+    /// `two_block_unroll_profitability_positive_control` seeing the switch ON
+    /// and the unroller declining a loop it must unroll.  This is the same
+    /// defect `LoopInvertConfig` was introduced to remove from `loop_invert`;
+    /// configuration a caller can supply belongs in a parameter or in
+    /// per-thread state, never in ambient global state.
+    ///
+    /// Defaults to enabled, which is exactly the environment-unset default, so
+    /// an entry point that never went through `run_passes` (unit tests) behaves
+    /// as it did before the switch existed.
+    static TWO_BLOCK_UNROLL_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Record whether Pass B may run.  Called by `run_passes` before any unroll
+/// entry point runs on this thread.
+pub(crate) fn set_two_block_unroll_enabled(enabled: bool) {
+    TWO_BLOCK_UNROLL_ENABLED.with(|cell| cell.set(enabled));
+}
+
+#[inline]
+fn two_block_unroll_enabled() -> bool {
+    TWO_BLOCK_UNROLL_ENABLED.with(|cell| cell.get())
+}
+
 /// Maximum number of body-work blocks (body excluding header and latch) for
 /// a loop to be eligible. Prevents excessive code size growth.
 const MAX_UNROLL_BODY_BLOCKS: usize = 12; // increased for hot loops via PGO
@@ -249,8 +285,10 @@ pub(crate) fn unroll_loops(func: &mut IrFunction, phase: UnrollPhase) -> usize {
     // budget, or the `count` cap stops it — every step is a legal
     // guard-free unroll of a smaller constant trip.
     // CCC_NO_TWO_BLOCK_UNROLL is the standard per-transform kill switch
-    // (every A/B differential in the harness speaks it).
-    if phase == UnrollPhase::PostVec && std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err() {
+    // (every A/B differential in the harness speaks it).  It is resolved once
+    // by the driver into per-thread state — see `TWO_BLOCK_UNROLL_ENABLED` —
+    // so this hot path never reads the process environment.
+    if phase == UnrollPhase::PostVec && two_block_unroll_enabled() {
         loop {
             let cfg = CfgAnalysis::build(func);
             let raw = loop_analysis::find_natural_loops(
@@ -4811,11 +4849,14 @@ mod tests {
 
     #[test]
     fn two_block_unroll_declines_when_killed() {
-        // CCC_NO_TWO_BLOCK_UNROLL must leave the loop rolled.
-        unsafe { std::env::set_var("CCC_NO_TWO_BLOCK_UNROLL", "1") };
+        // CCC_NO_TWO_BLOCK_UNROLL must leave the loop rolled.  The switch is
+        // per-thread state rather than the process environment, so this test
+        // cannot race the sibling `two_block_unroll_*` tests that run on the
+        // other threads of the same test binary and expect Pass B enabled.
+        set_two_block_unroll_enabled(false);
         let mut func = make_two_block_iv_back_loop(64, true);
         let n = unroll_loops(&mut func, UnrollPhase::PostVec);
-        unsafe { std::env::remove_var("CCC_NO_TWO_BLOCK_UNROLL") };
+        set_two_block_unroll_enabled(true);
         assert_eq!(n, 0, "kill switch must disable Pass B");
         // The loop is intact: latch still branches to the header.
         assert!(matches!(

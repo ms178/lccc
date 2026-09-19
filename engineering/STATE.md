@@ -108,13 +108,14 @@ the range fusion; it used to be a scalar loop.
   NULs in the serial log (MachInst sub-word arriving-reload fix,
   `arriving_reload()` in `machinst_alloc.rs`, regression
   `machinst_subword_reload_sign.c`).
-- **Defect (d) ROOT-CAUSED + FIXED (2026-09-17)** — every execve failed
-  with -E2BIG because `pte_mkwrite` (by-value pte_t + inlined helper
-  chain) returned leftover stack as the PTE: aggregate_sroa's
-  copy-buffer collapse deleted the initializing Memcpy of a buffer a
-  forwarded load had just been re-pointed at (`forward_target_roots`
-  guard; regression `sroa_fwd_load_vs_buffer_collapse.c`). Kernel
-  rebuild/boot validation of the fix still pending.
+- **Defect (d) ROOT-CAUSED + FIXED + BOOT-VALIDATED (2026-09-19)** — every
+  execve failed with -E2BIG because `pte_mkwrite` (by-value pte_t + inlined
+  helper chain) returned leftover stack as the PTE: aggregate_sroa's
+  copy-buffer collapse deleted the initializing Memcpy of a buffer a forwarded
+  load had just been re-pointed at (`forward_target_roots` guard; regression
+  `sroa_fwd_load_vs_buffer_collapse.c`). A clean full minimal CachyMod rebuild
+  now reaches init, executes the complete busybox validation suite, and powers
+  off cleanly under QEMU.
 - **Defect (e) FIXED (2026-09-18, commit c256c917)** — the
   `aes-ctr-avx-x86_64.S` failure was the tip of FOUR assembler
   defects, three of them silent object corruption: (1) VAES
@@ -134,8 +135,9 @@ the range fusion; it used to be a scalar loop.
   VAES has no opmask/broadcast forms) and
   `tests/asm-diff/macro_vararg.casefile` (4 groups: kernel pattern,
   forwarding, empty/single invocation).
-- **Defect (b) OPEN** — CPU1 hotplug bring-up times out (`maxcpus=1`
-  boots fine).
+- **Defect (b) FIXED / CURRENT GATE PASS (2026-09-19)** — the clean QEMU
+  build brings CPU1 online and the guest reports exactly 2 CPUs. Continue
+  dedicated offline/online hotplug cycling as a stronger follow-up stress gate.
 - Kernel harness scripts (`build_kernel_vm.sh`, `prepare_kernel_tree.sh`
   with whole-tree extraction audit, `qemu_boot_test.sh`) are unreviewed
   deltas in the session patch, not upstream.

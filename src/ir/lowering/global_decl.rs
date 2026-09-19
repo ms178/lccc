@@ -398,6 +398,21 @@ impl Lowerer {
             } else {
                 da.base_ty
             };
+            // `struct_layout` may describe the pointee of a pointer declaration.
+            // It must not shape the pointer object's own brace initializer:
+            //
+            //     static const struct big *p = { &object };
+            //
+            // The object is one pointer wide, not `sizeof(struct big)`.  Passing
+            // the pointee layout here made compound lowering append trailing
+            // struct padding after the relocation while IrGlobal::size remained
+            // 8, bloating custom pointer-table sections and making their consumers
+            // iterate across zero-filled phantom entries.
+            let object_struct_layout = if da.is_pointer {
+                None
+            } else {
+                da.struct_layout.clone()
+            };
             self.lower_global_init(
                 initializer,
                 &decl.type_spec,
@@ -405,7 +420,7 @@ impl Lowerer {
                 da.is_array,
                 da.elem_size,
                 da.actual_alloc_size,
-                &da.struct_layout,
+                &object_struct_layout,
                 &da.array_dim_strides,
             )
         } else {

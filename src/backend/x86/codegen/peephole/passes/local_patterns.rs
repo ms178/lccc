@@ -3341,37 +3341,47 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
                     if j < len {
                         let line_j = infos[j].trimmed(store.get(j));
 
-                        // Sub-pattern G1: movq (%rcx), %rax → movq (%<src>), %rax
-                        if line_j == "movq (%rcx), %rax" {
+                        // All three sub-patterns fold a `mov`-family use of
+                        // (%rcx), and each used to rebuild the same successor
+                        // index and re-run the same liveness walk — up to
+                        // three scans of one region per candidate.  That walk
+                        // is the dominant cost of this pass: every line it
+                        // visits can pay a full-width-write test, an implicit
+                        // operand classification and a read-modify-write test.
+                        // The guard below is exactly the union of the
+                        // three sub-pattern guards (both `movq (%rcx), %rax`
+                        // and `movsd (%rcx), %xmmN` start with "mov"), so the
+                        // answer is computed at most once per candidate and
+                        // never for a line no fold could use.
+                        let rcx_dead_after_deref = if line_j.starts_with("mov") {
                             let mut k = j + 1;
                             while k < len && infos[k].is_nop() {
                                 k += 1;
                             }
-                            if !rcx_is_live_at(store, infos, k, len) {
-                                let new = format!("    movq (%{}), %rax", src_reg);
-                                mark_nop(&mut infos[i]);
-                                replace_line(store, &mut infos[j], j, new);
-                                changed = true;
-                                i = j + 1;
-                                continue;
-                            }
+                            !rcx_is_live_at(store, infos, k, len)
+                        } else {
+                            false
+                        };
+
+                        // Sub-pattern G1: movq (%rcx), %rax → movq (%<src>), %rax
+                        if rcx_dead_after_deref && line_j == "movq (%rcx), %rax" {
+                            let new = format!("    movq (%{}), %rax", src_reg);
+                            mark_nop(&mut infos[i]);
+                            replace_line(store, &mut infos[j], j, new);
+                            changed = true;
+                            i = j + 1;
+                            continue;
                         }
 
                         // Sub-pattern G2: movsd (%rcx), %xmmN → movsd (%<src>), %xmmN
-                        if line_j.starts_with("movsd (%rcx), %xmm") {
+                        if rcx_dead_after_deref && line_j.starts_with("movsd (%rcx), %xmm") {
                             let xmm_dest = &line_j[14..]; // after "movsd (%rcx), " → "%xmmN"
-                            let mut k = j + 1;
-                            while k < len && infos[k].is_nop() {
-                                k += 1;
-                            }
-                            if !rcx_is_live_at(store, infos, k, len) {
-                                let new = format!("    movsd (%{}), {}", src_reg, xmm_dest);
-                                mark_nop(&mut infos[i]);
-                                replace_line(store, &mut infos[j], j, new);
-                                changed = true;
-                                i = j + 1;
-                                continue;
-                            }
+                            let new = format!("    movsd (%{}), {}", src_reg, xmm_dest);
+                            mark_nop(&mut infos[i]);
+                            replace_line(store, &mut infos[j], j, new);
+                            changed = true;
+                            i = j + 1;
+                            continue;
                         }
 
                         // Sub-pattern G3: a pointer copy feeding a store:
@@ -3388,31 +3398,25 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
                         // deliberately excluded: replacing only the base
                         // register there would need a different parser and
                         // could change the effective address.
-                        if line_j.starts_with("mov") {
+                        if rcx_dead_after_deref {
                             let Some((source, destination)) = line_j.rsplit_once(',') else {
                                 i += 1;
                                 continue;
                             };
                             if destination.trim() == "(%rcx)" && !source.contains("%rcx") {
-                                let mut k = j + 1;
-                                while k < len && infos[k].is_nop() {
-                                    k += 1;
-                                }
-                                if !rcx_is_live_at(store, infos, k, len) {
-                                    let replacement =
-                                        line_j.replacen("(%rcx)", &format!("(%{})", src_reg), 1);
-                                    if replacement != line_j && !replacement.contains("%rcx") {
-                                        mark_nop(&mut infos[i]);
-                                        replace_line(
-                                            store,
-                                            &mut infos[j],
-                                            j,
-                                            format!("    {}", replacement),
-                                        );
-                                        changed = true;
-                                        i = j + 1;
-                                        continue;
-                                    }
+                                let replacement =
+                                    line_j.replacen("(%rcx)", &format!("(%{})", src_reg), 1);
+                                if replacement != line_j && !replacement.contains("%rcx") {
+                                    mark_nop(&mut infos[i]);
+                                    replace_line(
+                                        store,
+                                        &mut infos[j],
+                                        j,
+                                        format!("    {}", replacement),
+                                    );
+                                    changed = true;
+                                    i = j + 1;
+                                    continue;
                                 }
                             }
                         }
@@ -3425,6 +3429,9 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
     }
     changed
 }
+
+/// Family bitmask for `%rcx` (see `scan_register_refs`: family 1).
+const RCX_FAMILY_MASK: u16 = 1 << 1;
 
 fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) -> bool {
     // This is a liveness query for the value copied into %rcx, not merely a
@@ -3439,15 +3446,22 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) 
     // conservative barrier because another predecessor may observe the old
     // value.  A plain write to %rcx kills the old value; every other mention is
     // a use (including %ecx/%cx/%cl, as represented by reg_refs).
-    let rcx_mask = 1u16 << 1;
+    //
+    // The walk is ordered cheapest-and-most-selective first.  The nop flag, the
+    // barrier kind and the pre-scanned `reg_refs` bitmask are all cached in
+    // `LineInfo`, so most lines are rejected without reading any text; and of
+    // the lines that do mention the family, the common case is a USE, which the
+    // single-pass source-operand scan settles before the full-width-write,
+    // implicit-operand and read-modify-write tests are paid for at all.
     let mut i = at;
     while i < len {
-        if infos[i].is_nop() {
+        let info = &infos[i];
+        if info.is_nop() {
             i += 1;
             continue;
         }
         if matches!(
-            infos[i].kind,
+            info.kind,
             LineKind::Label
                 | LineKind::Jmp
                 | LineKind::JmpIndirect
@@ -3456,9 +3470,7 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) 
         ) {
             return true;
         }
-
-        let t = infos[i].trimmed(store.get(i));
-        if infos[i].reg_refs & rcx_mask == 0 {
+        if info.reg_refs & RCX_FAMILY_MASK == 0 {
             i += 1;
             continue;
         }
@@ -3476,21 +3488,104 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) 
         //     value through the address even though the destination is the
         //     full-width family.
         // Every other family mention is a use.
-        let dest_token = t.rsplit(',').next().unwrap_or(t).trim();
-        let head = &t[..t.len() - dest_token.len()];
-        let killed = writes_family_full(&infos[i], &t, 1)
-            && implicit_read_refs(t.as_bytes()) & rcx_mask == 0
-            && !is_read_modify_write(&t)
-            && !(head.contains("%rcx")
-                || head.contains("%ecx")
-                || head.contains("%cx")
-                || head.contains("%cl"));
+        //
+        // The source operand is split once, on the last comma.  Deriving it as
+        // "everything but the last `dest_token.len()` bytes" instead — where
+        // `dest_token` is the *trimmed* tail — silently shifts the boundary
+        // whenever the line carries trailing whitespace or a stray `\r`,
+        // because `LineStore::get` returns the raw slice: with four or more
+        // trailing blanks the window reaches back into the destination itself
+        // and a genuine kill is reported as a use.
+        let t = info.trimmed(store.get(i));
+        let source = match t.rsplit_once(',') {
+            Some((source, _dest)) => source,
+            None => "",
+        };
+        let killed = !mentions_rcx_family(source)
+            && !is_read_modify_write(t)
+            && writes_family_full(info, t, 1)
+            && implicit_read_refs(t.as_bytes()) & RCX_FAMILY_MASK == 0;
         if killed {
             return false;
         }
         return true;
     }
     false
+}
+
+/// True when `operand` mentions any register of the `%rcx` family
+/// (`%rcx`, `%ecx`, `%cx`, `%cl`).
+///
+/// One left-to-right scan anchored on `%` instead of four independent substring
+/// searches.  This runs per candidate line of the liveness walk above, where
+/// the operands are short and the four searches re-walked the same bytes; it is
+/// also the walk's first and most selective test, so it must be the cheapest.
+fn mentions_rcx_family(operand: &str) -> bool {
+    let bytes = operand.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        // %rcx / %ecx spell the family with a width prefix, %cx / %cl without.
+        if matches!(
+            &bytes[i + 1..],
+            [b'r' | b'e', b'c', b'x', ..] | [b'c', b'x' | b'l', ..]
+        ) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[cfg(test)]
+mod mentions_rcx_family_tests {
+    use super::mentions_rcx_family;
+
+    #[test]
+    fn matches_exactly_the_rcx_family_spellings() {
+        for hit in [
+            "%rcx",
+            "%ecx",
+            "%cx",
+            "%cl",
+            "movq %rcx",
+            "-8(%rcx)",
+            "%eax,%rcx",
+            "(%ecx,%rdx,4)",
+            "%cl,",
+            "%%rcx",
+        ] {
+            assert!(mentions_rcx_family(hit), "{hit} mentions the %rcx family");
+        }
+        // Neighbours a coarser `%c` search would over-match, and look-alikes
+        // that do not name the family at all.
+        for miss in [
+            "",
+            "%rax",
+            "%eax",
+            "%ax",
+            "%ah",
+            "%al",
+            "%ch",
+            "%rdx",
+            "%rbx",
+            "%rsi",
+            "%rdi",
+            "%r8",
+            "%xmm1",
+            "movq %rax, %rdx",
+            "%rc",
+            "%r",
+            "%c",
+            "rcx",
+            "%rrcx",
+        ] {
+            assert!(!mentions_rcx_family(miss), "{miss} does not mention %rcx");
+        }
+    }
 }
 
 // ── Movq + extension/truncation fusion ───────────────────────────────────────
