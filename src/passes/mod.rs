@@ -938,6 +938,12 @@ pub(crate) fn run_passes(
     // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
     // 128-bit SSE2 instead of disabling vectorization outright.
     vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41);
+    // Pass B (two-block guard-free unroll) kill switch, resolved once here for
+    // the same reason as the ISA gates above: the unroller is a hot path and
+    // must not read the process environment per call, and per-thread state
+    // keeps the kill-switch unit test from racing its siblings (see
+    // `TWO_BLOCK_UNROLL_ENABLED` in loop_unroll.rs).
+    loop_unroll::set_two_block_unroll_enabled(std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err());
     // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
     // ignores this.

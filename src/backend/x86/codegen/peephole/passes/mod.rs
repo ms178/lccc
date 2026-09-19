@@ -2149,6 +2149,33 @@ mod tests {
     }
 
     #[test]
+    fn test_rcx_address_copy_full_kill_ignores_trailing_whitespace() {
+        // `LineStore::get` hands back the RAW line slice, so trailing blanks
+        // from an externally supplied .s survive into the trimmed view.  The
+        // kill test must therefore split the source operand on the last comma
+        // rather than by cutting `dest_token.len()` bytes off the end of a
+        // *trimmed* tail: with four or more trailing blanks that arithmetic
+        // walks the boundary back into the destination itself, the source side
+        // then appears to mention %rcx, and a genuine full-width kill is
+        // reported as a use.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rbx, %rcx    \n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq (%rdi), %rax"),
+            "trailing whitespace on the kill suppressed the fold: {result}"
+        );
+    }
+
+    #[test]
     fn test_stack_top_store_consumed_by_ret_survives_dse() {
         let asm = concat!(
             "f:\n",
