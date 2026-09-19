@@ -23,7 +23,10 @@
 # ============================================================================
 set -euo pipefail
 
-REPO=${LCCC_REPO:-/home/user/lccc}
+# The checkout this script lives in.  LCCC_REPO still overrides, but the default
+# must work from any clone: the deliverable is produced by running this script
+# from the tree it describes.
+REPO=${LCCC_REPO:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 ART=${LCCC_ARTIFACTS:-/home/user/artifacts}
 BASE_REF_FILE="$ART/.base_ref"
 DELIVERABLE=${LCCC_DELIVERABLE:-/home/user/ms178-1.patch}

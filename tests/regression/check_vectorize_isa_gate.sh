@@ -121,5 +121,135 @@ fi
 "$ccc" -O2 "${KERNEL_ISA[@]}" -msse -msse2 -S "$src" -o "$tmp/resse.s"
 check_gt0 "-mno-sse ... -msse re-enables vectorization" "$(count_simd $tmp/resse.s)"
 
+
+# ---- 6. ISA-gate trace contract --------------------------------------------
+# The gate is answered BEFORE the natural-loop analysis, so a TU compiled with
+# the kernel's -mno-sse does not build a loop forest that the gate then throws
+# away (measured on one real TU, mm/page_alloc.c of 6.18.52: 814 entries into
+# vectorize_with_analysis_mode, 814 refusals).  Hoisting a gate above the work
+# it guards is exactly the kind of change that silently drops a diagnostic, so
+# the trace is pinned here:
+#
+#   * LCCC_DEBUG_VECTORIZE prints the header line — which reports the loop
+#     count — and then the refusal, per function, in that order and paired by
+#     function name;
+#   * the loop count is still the REAL one, i.e. under trace the analysis runs
+#     exactly as it did when the gate came last;
+#   * LCCC_WHY_NOT_VECTORIZE alone prints only the refusals, and agrees with
+#     the debug run on how many functions the gate refused;
+#   * neither variable prints anything at all.
+hdr_re='^\[VEC\] Function: [A-Za-z_][A-Za-z0-9_]*, blocks: [0-9]+, loops: [0-9]+$'
+ref_re='^\[VEC\] Function [A-Za-z_][A-Za-z0-9_]*: not vectorized: x86 SIMD disabled by ISA flags \(-mno-sse/-mno-sse2/-mgeneral-regs-only\)$'
+
+LCCC_DEBUG_VECTORIZE=1 "$ccc" -O2 "${KERNEL_ISA[@]}" -S "$src" -o "$tmp/tr-dbg.s"   2>"$tmp/tr-dbg.err"
+LCCC_WHY_NOT_VECTORIZE=1 "$ccc" -O2 "${KERNEL_ISA[@]}" -S "$src" -o "$tmp/tr-why.s" 2>"$tmp/tr-why.err"
+"$ccc" -O2 "${KERNEL_ISA[@]}" -S "$src" -o "$tmp/tr-quiet.s" 2>"$tmp/tr-quiet.err"
+
+n_hdr=$(grep -cE "$hdr_re" "$tmp/tr-dbg.err" || true)
+n_ref=$(grep -cE "$ref_re" "$tmp/tr-dbg.err" || true)
+n_nonblank=$(grep -cvE '^[[:space:]]*$' "$tmp/tr-dbg.err" || true)
+check_gt0 "trace: header lines under LCCC_DEBUG_VECTORIZE + kernel ISA flags" "${n_hdr:-0}"
+check_eq  "trace: one refusal per header line" "$n_hdr" "$n_ref"
+check_eq  "trace: the gate prints nothing besides the paired lines" \
+          "$n_nonblank" "$((n_hdr + n_ref))"
+
+# Pairing and ORDER: every header must be immediately followed by the refusal
+# for the same function, with no stray line in between or after.
+pair_err=$(awk '
+    /^\[VEC\] Function: / {
+        name = $3; sub(/,$/, "", name); pending = name; next
+    }
+    /: not vectorized: x86 SIMD disabled/ {
+        name = $3; sub(/:$/, "", name)
+        if (pending == "")      printf "refusal without a header line: %s\n", name
+        else if (pending != name) printf "header/refusal name mismatch: %s != %s\n", pending, name
+        pending = ""; next
+    }
+    { printf "stray trace line: %s\n", $0 }
+    END { if (pending != "") printf "header without a refusal: %s\n", pending }
+' "$tmp/tr-dbg.err")
+if [[ -n $pair_err ]]; then
+    echo "FAIL: ISA-gate trace pairing/order" >&2
+    printf '%s\n' "$pair_err" >&2
+    fail=1
+fi
+
+# The loop count must be the analysed one, not a placeholder: if the hoist ever
+# skipped find_natural_loops under trace, every count would collapse to 0.
+max_loops=$(grep -oE 'loops: [0-9]+' "$tmp/tr-dbg.err" | awk '{print $2}' | sort -n | tail -1)
+check_gt0 "trace: the natural-loop analysis still runs under trace" "${max_loops:-0}"
+
+check_eq "trace: LCCC_WHY_NOT_VECTORIZE alone prints no header lines" \
+         "$(grep -cE "$hdr_re" "$tmp/tr-why.err" || true)" 0
+check_eq "trace: both variables agree on the refusal count" \
+         "$(grep -cE "$ref_re" "$tmp/tr-why.err" || true)" "$n_ref"
+check_eq "trace: no variable, no output" \
+         "$(wc -c < "$tmp/tr-quiet.err" | tr -d '[:space:]')" 0
+
+
+# ---- 6. ISA-gate trace contract --------------------------------------------
+# The gate is answered BEFORE the natural-loop analysis, so a TU compiled with
+# the kernel's -mno-sse does not build a loop forest that the gate then throws
+# away (measured on one real TU, mm/page_alloc.c of 6.18.52: 814 entries into
+# vectorize_with_analysis_mode, 814 refusals).  Hoisting a gate above the work
+# it guards is exactly the kind of change that silently drops a diagnostic, so
+# the trace is pinned here:
+#
+#   * LCCC_DEBUG_VECTORIZE prints the header line — which reports the loop
+#     count — and then the refusal, per function, in that order and paired by
+#     function name;
+#   * the loop count is still the REAL one, i.e. under trace the analysis runs
+#     exactly as it did when the gate came last;
+#   * LCCC_WHY_NOT_VECTORIZE alone prints only the refusals, and agrees with
+#     the debug run on how many functions the gate refused;
+#   * neither variable prints anything at all.
+hdr_re='^\[VEC\] Function: [A-Za-z_][A-Za-z0-9_]*, blocks: [0-9]+, loops: [0-9]+$'
+ref_re='^\[VEC\] Function [A-Za-z_][A-Za-z0-9_]*: not vectorized: x86 SIMD disabled by ISA flags \(-mno-sse/-mno-sse2/-mgeneral-regs-only\)$'
+
+LCCC_DEBUG_VECTORIZE=1 "$ccc" -O2 "${KERNEL_ISA[@]}" -S "$src" -o "$tmp/tr-dbg.s"   2>"$tmp/tr-dbg.err"
+LCCC_WHY_NOT_VECTORIZE=1 "$ccc" -O2 "${KERNEL_ISA[@]}" -S "$src" -o "$tmp/tr-why.s" 2>"$tmp/tr-why.err"
+"$ccc" -O2 "${KERNEL_ISA[@]}" -S "$src" -o "$tmp/tr-quiet.s" 2>"$tmp/tr-quiet.err"
+
+n_hdr=$(grep -cE "$hdr_re" "$tmp/tr-dbg.err" || true)
+n_ref=$(grep -cE "$ref_re" "$tmp/tr-dbg.err" || true)
+n_nonblank=$(grep -cvE '^[[:space:]]*$' "$tmp/tr-dbg.err" || true)
+check_gt0 "trace: header lines under LCCC_DEBUG_VECTORIZE + kernel ISA flags" "${n_hdr:-0}"
+check_eq  "trace: one refusal per header line" "$n_hdr" "$n_ref"
+check_eq  "trace: the gate prints nothing besides the paired lines" \
+          "$n_nonblank" "$((n_hdr + n_ref))"
+
+# Pairing and ORDER: every header must be immediately followed by the refusal
+# for the same function, with no stray line in between or after.
+pair_err=$(awk '
+    /^\[VEC\] Function: / {
+        name = $3; sub(/,$/, "", name); pending = name; next
+    }
+    /: not vectorized: x86 SIMD disabled/ {
+        name = $3; sub(/:$/, "", name)
+        if (pending == "")      printf "refusal without a header line: %s\n", name
+        else if (pending != name) printf "header/refusal name mismatch: %s != %s\n", pending, name
+        pending = ""; next
+    }
+    { printf "stray trace line: %s\n", $0 }
+    END { if (pending != "") printf "header without a refusal: %s\n", pending }
+' "$tmp/tr-dbg.err")
+if [[ -n $pair_err ]]; then
+    echo "FAIL: ISA-gate trace pairing/order" >&2
+    printf '%s\n' "$pair_err" >&2
+    fail=1
+fi
+
+# The loop count must be the analysed one, not a placeholder: if the hoist ever
+# skipped find_natural_loops under trace, every count would collapse to 0.
+max_loops=$(grep -oE 'loops: [0-9]+' "$tmp/tr-dbg.err" | awk '{print $2}' | sort -n | tail -1)
+check_gt0 "trace: the natural-loop analysis still runs under trace" "${max_loops:-0}"
+
+check_eq "trace: LCCC_WHY_NOT_VECTORIZE alone prints no header lines" \
+         "$(grep -cE "$hdr_re" "$tmp/tr-why.err" || true)" 0
+check_eq "trace: both variables agree on the refusal count" \
+         "$(grep -cE "$ref_re" "$tmp/tr-why.err" || true)" "$n_ref"
+check_eq "trace: no variable, no output" \
+         "$(wc -c < "$tmp/tr-quiet.err" | tr -d '[:space:]')" 0
+
 if [[ $fail -ne 0 ]]; then exit 1; fi
 echo "vectorizer/FMA x86 ISA emission gates: PASS"

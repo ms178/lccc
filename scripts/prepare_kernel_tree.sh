@@ -41,7 +41,31 @@ KVER=${KVER:-6.18.52}
 WORK=$(dirname "$KDIR")
 TARBALL="$WORK/linux-$KVER.tar.xz"
 
-[[ -d $PKGDIR ]] || { echo "prepare_kernel_tree: PKGDIR not found: $PKGDIR" >&2; exit 1; }
+# The 28 CachyMod patches and the package config live in a sibling repository,
+# and the Arena snapshot does not persist it: a fresh sandbox has the tarball URL
+# but nothing to patch with, so this script used to die before downloading
+# anything.  Fetch it bloblessly (one directory of one repo) instead, which makes
+# the script the only prerequisite of every kernel gate.
+PKG_REPO=${PKG_REPO:-https://github.com/ms178/archpkgbuilds.git}
+PKG_ROOT=${PKG_ROOT:-/home/user/archpkgbuilds}
+ensure_pkgdir() {
+  [[ -d $PKGDIR ]] && return 0
+  command -v git >/dev/null 2>&1 || return 1
+  echo "prepare_kernel_tree: fetching package sources from $PKG_REPO"
+  local rel=${PKGDIR#"$PKG_ROOT"/} branch
+  rm -rf "$PKG_ROOT"
+  git clone --quiet --filter=blob:none --no-checkout --depth 1 "$PKG_REPO" "$PKG_ROOT" || return 1
+  branch=$(git -C "$PKG_ROOT" symbolic-ref --short HEAD 2>/dev/null || echo main)
+  git -C "$PKG_ROOT" sparse-checkout init --cone || return 1
+  git -C "$PKG_ROOT" sparse-checkout set "$rel" || return 1
+  git -C "$PKG_ROOT" checkout --quiet --force "$branch" || return 1
+  [[ -d $PKGDIR ]]
+}
+ensure_pkgdir || {
+  echo "prepare_kernel_tree: PKGDIR not found and could not be fetched: $PKGDIR" >&2
+  echo "  clone $PKG_REPO yourself, or point PKGDIR at an existing checkout" >&2
+  exit 1
+}
 
 # `make olddefconfig`/`make prepare` need host tools that are not part of the
 # LCCC build and therefore easy to have absent on a fresh machine; failing

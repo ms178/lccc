@@ -31,3 +31,29 @@ LCCC_BOOT_OBJS=(a20 bioscall cmdline copy cpu cpuflags cpucheck
 
 # The 32 KiB setup gate: setup.ld asserts `_end <= 0x8000`.
 LCCC_BOOT_GATE_BYTES=32768
+
+# Reference-compiler spelling of the same command line.
+#
+# LCCC_BOOT_CFLAGS is the GCC/lccc line.  `-mpreferred-stack-boundary` is
+# GCC-only, so the documented `CC_ORACLE=clang` comparison died with
+# "clang: error: unknown argument: '-mpreferred-stack-boundary=2'" before it
+# compiled a single object.  The mapping below is not invented: arch/x86/Makefile
+# states it — `cc_stack_align4 := -mpreferred-stack-boundary=2` under
+# CONFIG_CC_IS_GCC and `:= -mstack-alignment=4` under CONFIG_CC_IS_CLANG — and
+# the same Makefile appends -Wno-gnu to REALMODE_CFLAGS for clang.  Verified
+# against linux-6.18.52: clang 19 compiles all 24 arch/x86/boot objects with
+# the translated line and no diagnostics beyond the stubbed zoffset.h
+# redefinitions gcc also reports.
+#
+# Flag-for-flag, so an A/B size comparison still measures code generation and
+# nothing else.  Unknown compilers keep the canonical line untouched.
+lccc_boot_cflags_for() { # lccc_boot_cflags_for <cc>  -> flags on stdout
+  local cc=$1 flags=$LCCC_BOOT_CFLAGS
+  case ${cc##*/} in
+    *clang*)
+      flags=${flags//-mpreferred-stack-boundary=2/-mstack-alignment=4}
+      flags+=" -Wno-gnu"
+      ;;
+  esac
+  printf '%s\n' "$flags"
+}

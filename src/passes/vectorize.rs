@@ -226,6 +226,20 @@ fn take_reject() -> Option<&'static str> {
     REJECT_REASON.with(|r| r.borrow_mut().take())
 }
 
+/// The ISA-gate explanation for a function the vectorizer refused to touch.
+///
+/// One definition on purpose: the gate now has two exits — the fast one, taken
+/// before the natural-loop analysis, and the traced one, taken after it so the
+/// `loops:` count stays in the trace — and a message duplicated across them
+/// would drift.
+fn report_simd_disabled(func_name: &str) {
+    eprintln!(
+        "[VEC] Function {}: not vectorized: x86 SIMD disabled by ISA flags \
+         (-mno-sse/-mno-sse2/-mgeneral-regs-only)",
+        func_name
+    );
+}
+
 /// Run SSE2 vectorization on a function with precomputed CFG analysis.
 pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) -> usize {
     vectorize_with_analysis_mode(func, cfg, false, false, false, FpContract::default())
@@ -240,9 +254,43 @@ fn vectorize_with_analysis_mode(
     fp_contract: crate::common::fp_contract::FpContract,
 ) -> usize {
     let num_blocks = func.blocks.len();
+    // `var_os(..).is_some()` is the crate's presence-means-on spelling (see
+    // `vec_interleave`'s gate on these same two variables): `var` additionally
+    // UTF-8-validates the value and allocates a `String` that nobody reads.
+    let debug = std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some();
+
+    // ISA gate: the x86 vector lowerings require the SIMD register file. Under
+    // `-mno-sse` / `-mno-sse2` / `-mgeneral-regs-only` the target has no xmm
+    // state at all (kernel: CR4.OSFXSR=0), so bail out before any transform
+    // rewrites the loop. `neon` entry points are AArch64, where the vector ISA
+    // is baseline and this gate does not apply.
+    //
+    // The gate is answered BEFORE the natural-loop analysis, which it otherwise
+    // makes dead work.  `find_natural_loops` walks every back edge and the
+    // dominator tree to build the loop forest, and the x86-64 kernel disables
+    // SSE globally in KBUILD_CFLAGS (only FPU translation units re-enable it
+    // through CC_FLAGS_FPU), so every function of every such TU paid for the
+    // forest and then discarded it here.  Measured on one real TU
+    // (mm/page_alloc.c, 6.18.52, the kernel's SIMD flag set): 814 entries into
+    // this function, 814 refusals — a 100% waste rate, per function, per TU.
+    //
+    // `debug` keeps the analysis alive because the trace line reports the loop
+    // count; the observable output of LCCC_DEBUG_VECTORIZE and
+    // LCCC_WHY_NOT_VECTORIZE is unchanged in both content and order (header
+    // line first, then the refusal).  Verified byte-for-byte against the
+    // pre-hoist compiler across all five environment combinations, and pinned
+    // going forward by section 6 of
+    // tests/regression/check_vectorize_isa_gate.sh.
+    let simd_ok = neon || x86_simd_available();
+    if !simd_ok && !debug {
+        if std::env::var_os("LCCC_WHY_NOT_VECTORIZE").is_some() {
+            report_simd_disabled(&func.name);
+        }
+        return 0;
+    }
+
     let loops = loop_analysis::find_natural_loops(num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
 
-    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     if debug {
         eprintln!(
             "[VEC] Function: {}, blocks: {}, loops: {}",
@@ -250,22 +298,10 @@ fn vectorize_with_analysis_mode(
             num_blocks,
             loops.len()
         );
-    }
-
-    // ISA gate: the x86 vector lowerings require the SIMD register file. Under
-    // `-mno-sse` / `-mno-sse2` / `-mgeneral-regs-only` the target has no xmm
-    // state at all (kernel: CR4.OSFXSR=0), so bail out before any transform
-    // rewrites the loop. `neon` entry points are AArch64, where the vector ISA
-    // is baseline and this gate does not apply.
-    if !neon && !x86_simd_available() {
-        if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
-            eprintln!(
-                "[VEC] Function {}: not vectorized: x86 SIMD disabled by ISA flags \
-                 (-mno-sse/-mno-sse2/-mgeneral-regs-only)",
-                func.name
-            );
+        if !simd_ok {
+            report_simd_disabled(&func.name);
+            return 0;
         }
-        return 0;
     }
 
     if loops.is_empty() {

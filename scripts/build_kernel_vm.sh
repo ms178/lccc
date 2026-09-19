@@ -22,13 +22,15 @@
 set -euo pipefail
 
 K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
-LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
-LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
 LOG=${BUILD_LOG:-/tmp/kernel-build-lccc.log}
-# Resolve the script directory before `cd "$K"`: the fragment must be found
-# relative to THIS script, not to an absolute repo path baked in at write
-# time (/home/user/lccc only exists on the original Arena host).
+# Resolve the script directory before `cd "$K"`: the fragment and the compiler
+# defaults must be found relative to THIS script, not to an absolute repo path
+# baked in at write time (/home/user/lccc only exists on the original Arena
+# host).
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
+LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
 FRAGMENT=${FRAGMENT:-$SCRIPT_DIR/kernel-vm.fragment}
 JOBS=${JOBS:-2}
 
