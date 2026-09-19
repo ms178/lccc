@@ -1,0 +1,223 @@
+main:
+..B1.1: # Preds ..B1.0
+  pushq %rbp #53.16
+  movq %rsp, %rbp #53.16
+  andq $-128, %rsp #53.16
+  subq $384, %rsp #53.16
+  movl $3, %edi #53.16
+  xorl %esi, %esi #53.16
+  call __intel_new_feature_proc_init #53.16
+..B1.7: # Preds ..B1.1
+  stmxcsr (%rsp) #53.16
+  xorl %r8d, %r8d #55.5
+  xorl %r10d, %r10d #54.18
+  orl $32832, (%rsp) #53.16
+  xorl %r9d, %r9d #55.5
+  ldmxcsr (%rsp) #53.16
+  movups 240(%rsp), %xmm12 #45.47
+  pxor %xmm0, %xmm0 #54.18
+  movsd .L_2il0floatpacket.34(%rip), %xmm13 #25.23
+  movb $80, %dil #27.5
+..B1.2: # Preds ..B1.2 ..B1.7
+  movl $1717986919, %eax #28.28
+  lea 1(%r8), %esi #45.47
+  imull %r8d #28.28
+  movl $1717986919, %eax #28.28
+  pxor %xmm7, %xmm7 #23.19
+  sarl $2, %edx #28.28
+  cvtsi2sd %r8d, %xmm1 #23.19
+  cvtsi2sd %esi, %xmm9 #23.19
+  movsd .L_2il0floatpacket.32(%rip), %xmm10 #23.23
+  lea (%rdx,%rdx,4), %r11d #28.28
+  imull %esi #28.28
+  movsd .L_2il0floatpacket.33(%rip), %xmm14 #24.23
+  addl %r11d, %r11d #28.28
+  sarl $2, %edx #28.28
+  negl %r11d #28.28
+  mulsd %xmm1, %xmm10 #23.23
+  addl %r8d, %r11d #28.28
+  mulsd %xmm1, %xmm14 #24.23
+  mulsd %xmm13, %xmm1 #25.23
+  addl $48, %r11d #28.28
+  lea (%rdx,%rdx,4), %ecx #28.28
+  addl %ecx, %ecx #28.28
+  movl $1717986919, %eax #28.28
+  negl %ecx #28.28
+  movl %r8d, 232(%rsp) #26.5
+  addl %esi, %ecx #28.28
+  movb %dil, 236(%rsp) #27.5
+  addl $48, %ecx #28.28
+  movb %r11b, 237(%rsp) #28.5
+  movb %r9b, 238(%rsp) #29.5
+  movhpd 232(%rsp), %xmm1 #45.47
+  movb %cl, 237(%rsp) #28.5
+  lea 2(%r8), %ecx #55.5
+  cvtsi2sd %ecx, %xmm7 #23.19
+  imull %ecx #28.28
+  addl $3, %r8d #55.5
+  movsd .L_2il0floatpacket.32(%rip), %xmm8 #23.23
+  movsd .L_2il0floatpacket.33(%rip), %xmm6 #24.23
+  cvtsi2sd %r8d, %xmm5 #23.19
+  mulsd %xmm7, %xmm8 #23.23
+  mulsd %xmm7, %xmm6 #24.23
+  mulsd %xmm13, %xmm7 #25.23
+  movsd .L_2il0floatpacket.33(%rip), %xmm15 #24.23
+  movsd .L_2il0floatpacket.32(%rip), %xmm11 #23.23
+  mulsd %xmm9, %xmm11 #23.23
+  mulsd %xmm9, %xmm15 #24.23
+  mulsd %xmm13, %xmm9 #25.23
+  unpcklpd %xmm14, %xmm10 #45.47
+  unpcklpd %xmm6, %xmm8 #45.47
+  movsd .L_2il0floatpacket.32(%rip), %xmm6 #23.23
+  movsd .L_2il0floatpacket.33(%rip), %xmm2 #24.23
+  movups %xmm10, 256(%rsp) #49.31
+  mulsd %xmm5, %xmm6 #23.23
+  mulsd %xmm5, %xmm2 #24.23
+  mulsd %xmm13, %xmm5 #25.23
+  movsd 256(%rsp), %xmm4 #34.17
+  movsd 264(%rsp), %xmm3 #35.17
+  unpcklpd %xmm15, %xmm11 #45.47
+  movups %xmm10, (%rsp) #45.47
+  movaps %xmm3, %xmm10 #35.23
+  movups %xmm1, 16(%rsp) #45.47
+  movups %xmm1, 272(%rsp) #49.31
+  movaps %xmm4, %xmm1 #34.23
+  movups %xmm11, 304(%rsp) #49.31
+  sarl $2, %edx #28.28
+  subsd 304(%rsp), %xmm1 #34.23
+  subsd 312(%rsp), %xmm10 #35.23
+  mulsd %xmm1, %xmm1 #37.15
+  mulsd %xmm10, %xmm10 #37.23
+  movl %esi, 232(%rsp) #26.5
+  lea (%rdx,%rdx,4), %eax #28.28
+  movsd %xmm6, 208(%rsp) #23.5
+  addl %eax, %eax #28.28
+  movsd %xmm2, 216(%rsp) #24.5
+  addsd %xmm10, %xmm1 #37.23
+  movhpd 232(%rsp), %xmm9 #45.47
+  movaps %xmm3, %xmm10 #35.23
+  unpcklpd %xmm2, %xmm6 #45.47
+  movsd 272(%rsp), %xmm2 #36.17
+  movups %xmm9, 320(%rsp) #49.31
+  movaps %xmm2, %xmm14 #36.23
+  movl %ecx, 232(%rsp) #26.5
+  subl %eax, %ecx #28.28
+  movl $1717986919, %eax #28.28
+  addl $48, %ecx #28.28
+  imull %r8d #28.28
+  movups %xmm8, 304(%rsp) #49.31
+  movaps %xmm2, %xmm15 #36.23
+  sarl $2, %edx #28.28
+  subsd 320(%rsp), %xmm14 #36.23
+  subsd 312(%rsp), %xmm10 #35.23
+  mulsd %xmm14, %xmm14 #37.31
+  mulsd %xmm10, %xmm10 #37.23
+  addsd %xmm14, %xmm1 #37.31
+  movaps %xmm4, %xmm14 #34.23
+  movb %cl, 237(%rsp) #28.5
+  lea (%rdx,%rdx,4), %ecx #28.28
+  movhpd 232(%rsp), %xmm7 #45.47
+  addl %ecx, %ecx #28.28
+  movl %r8d, 232(%rsp) #26.5
+  subl %ecx, %r8d #28.28
+  movups %xmm7, 320(%rsp) #49.31
+  addl $48, %r8d #28.28
+  movb %r8b, 237(%rsp) #28.5
+  movl %esi, %r8d #55.5
+  movsd %xmm5, 224(%rsp) #25.5
+  movhpd 232(%rsp), %xmm5 #45.47
+  movq %r10, 200(%rsp) #43.5
+  movups %xmm11, 256(%rsp) #49.31
+  movups %xmm11, 48(%rsp) #45.47
+  movups %xmm9, 272(%rsp) #49.31
+  movups %xmm9, 64(%rsp) #45.47
+  movsd 272(%rsp), %xmm9 #36.17
+  movups %xmm5, 160(%rsp) #45.47
+  movups %xmm7, 272(%rsp) #49.31
+  movups %xmm12, 32(%rsp) #45.47
+  movups %xmm12, 80(%rsp) #45.47
+  movups %xmm8, 96(%rsp) #45.47
+  movups %xmm7, 112(%rsp) #45.47
+  movups %xmm12, 128(%rsp) #45.47
+  movups %xmm6, 144(%rsp) #45.47
+  movups %xmm12, 176(%rsp) #45.47
+  movups %xmm12, 288(%rsp) #49.31
+  movups %xmm12, 336(%rsp) #49.31
+  subsd 304(%rsp), %xmm14 #34.23
+  subsd 320(%rsp), %xmm15 #36.23
+  addsd 200(%rsp), %xmm1 #49.13
+  mulsd %xmm14, %xmm14 #37.15
+  mulsd %xmm15, %xmm15 #37.31
+  addsd %xmm10, %xmm14 #37.23
+  movups %xmm6, 304(%rsp) #49.31
+  addsd %xmm15, %xmm14 #37.31
+  subsd 304(%rsp), %xmm4 #34.23
+  subsd 312(%rsp), %xmm3 #35.23
+  addsd %xmm14, %xmm1 #49.13
+  mulsd %xmm4, %xmm4 #37.15
+  mulsd %xmm3, %xmm3 #37.23
+  movups %xmm5, 320(%rsp) #49.31
+  addsd %xmm3, %xmm4 #37.23
+  subsd 320(%rsp), %xmm2 #36.23
+  mulsd %xmm2, %xmm2 #37.31
+  movsd 256(%rsp), %xmm10 #34.17
+  addsd %xmm2, %xmm4 #37.31
+  movsd 264(%rsp), %xmm2 #35.17
+  movaps %xmm10, %xmm11 #34.23
+  movups %xmm8, 304(%rsp) #49.31
+  movaps %xmm2, %xmm3 #35.23
+  movups %xmm7, 320(%rsp) #49.31
+  addsd %xmm4, %xmm1 #49.13
+  subsd 304(%rsp), %xmm11 #34.23
+  subsd 312(%rsp), %xmm3 #35.23
+  mulsd %xmm11, %xmm11 #37.15
+  mulsd %xmm3, %xmm3 #37.23
+  movaps %xmm9, %xmm4 #36.23
+  addsd %xmm3, %xmm11 #37.23
+  subsd 320(%rsp), %xmm4 #36.23
+  movups %xmm6, 304(%rsp) #49.31
+  movups %xmm8, 256(%rsp) #49.31
+  movups %xmm5, 320(%rsp) #49.31
+  mulsd %xmm4, %xmm4 #37.31
+  subsd 304(%rsp), %xmm10 #34.23
+  subsd 312(%rsp), %xmm2 #35.23
+  subsd 320(%rsp), %xmm9 #36.23
+  mulsd %xmm10, %xmm10 #37.15
+  addsd %xmm4, %xmm11 #37.31
+  mulsd %xmm2, %xmm2 #37.23
+  mulsd %xmm9, %xmm9 #37.31
+  addsd %xmm11, %xmm1 #49.13
+  addsd %xmm2, %xmm10 #37.23
+  movsd 256(%rsp), %xmm5 #34.17
+  addsd %xmm9, %xmm10 #37.31
+  subsd 304(%rsp), %xmm5 #34.23
+  addsd %xmm10, %xmm1 #49.13
+  mulsd %xmm5, %xmm5 #37.15
+  movsd 264(%rsp), %xmm3 #35.17
+  movsd 272(%rsp), %xmm4 #36.17
+  movsd %xmm1, 200(%rsp) #49.13
+  subsd 312(%rsp), %xmm3 #35.23
+  subsd 320(%rsp), %xmm4 #36.23
+  mulsd %xmm3, %xmm3 #37.23
+  mulsd %xmm4, %xmm4 #37.31
+  addsd %xmm3, %xmm5 #37.23
+  addsd %xmm4, %xmm5 #37.31
+  addsd %xmm5, %xmm1 #49.13
+  addsd %xmm1, %xmm0 #57.9
+  cmpl $2000000, %esi #55.5
+  jb ..B1.2 # Prob 99% #55.5
+..B1.3: # Preds ..B1.2
+  movl $.L_2__STRING.0, %edi #59.5
+  movl $1, %eax #59.5
+  movsd %xmm1, 200(%rsp) #43.5
+  movl $4, 192(%rsp) #42.5
+  call printf #59.5
+..B1.4: # Preds ..B1.3
+  xorl %eax, %eax #60.12
+  movq %rbp, %rsp #60.12
+  popq %rbp #60.12
+  ret #60.12
+.L_2il0floatpacket.32:
+.L_2il0floatpacket.33:
+.L_2il0floatpacket.34:
+.L_2__STRING.0:
