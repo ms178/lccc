@@ -7195,15 +7195,29 @@ impl ArchCodegen for X86Codegen {
             // fused mul-add consumed the ZONE POINTER as the index).
             for inst in &ir_shadow {
                 let Some(dest) = inst.dest() else { continue };
-                if self.reg_assignments.contains_key(&dest.0)
-                    && !self.home_clobbered.contains(&dest.0)
-                {
-                    // Pre-colored dest: the window wrote it into its home
-                    // (fresh_ra_for_isel passes exactly the not-clobbered
-                    // homed values) — a normal definition. Mark fresh so
+                if !self.reg_assignments.contains_key(&dest.0) {
+                    continue;
+                }
+                // Typed calls are emitted with their return move explicitly
+                // targeted at the allocator's home register (try_lower_call_
+                // typed builds CallRetMove from reg_assignments).  That home
+                // may already be marked clobbered by an earlier instruction
+                // in the same function; using home_clobbered as the sole
+                // "was this pre-colored?" test would then leave the freshly
+                // returned value falsely stale.  A call result is a new
+                // definition, so it re-establishes its home unconditionally.
+                let typed_call_home_def = matches!(
+                    inst,
+                    crate::ir::reexports::Instruction::Call { info, .. }
+                        | crate::ir::reexports::Instruction::CallIndirect { info, .. }
+                        if info.dest.as_ref().is_some_and(|d| d.0 == dest.0)
+                );
+                if typed_call_home_def || !self.home_clobbered.contains(&dest.0) {
+                    // Pre-colored destination (or a typed call return): the
+                    // window wrote the value into its home. Mark it fresh so
                     // later consumers may read the home.
                     self.note_home_written(dest.0);
-                } else if self.reg_assignments.contains_key(&dest.0) {
+                } else {
                     // Not pre-colored: the window's result went to scratch
                     // and/or a slot; the home holds whatever preceded it.
                     self.home_fresh.remove(&dest.0);

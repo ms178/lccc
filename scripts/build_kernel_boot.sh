@@ -36,6 +36,12 @@ cd "$K"
 # comparison must never be confounded by a flag difference).
 # shellcheck source=boot_flags.sh
 . "$SCRIPT_DIR/boot_flags.sh"
+# shellcheck source=boot_offsets.sh
+. "$SCRIPT_DIR/boot_offsets.sh"
+# A preceding full Kbuild may have replaced the setup-only zoffset.h with a
+# generated file that lacks the mixed-mode EFI symbols.  The setup harness is
+# deliberately stubbed, so restore deterministic immediates before header.S.
+ensure_boot_offset_stubs
 RMF="$LCCC_BOOT_CFLAGS"
 INC="$LCCC_BOOT_CPPFLAGS"
 # Extra flags for kconfigless staging (see boot_kconfigless_stage.sh): ways to

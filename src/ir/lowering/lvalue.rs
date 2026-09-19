@@ -965,7 +965,35 @@ impl Lowerer {
     /// Check if the result of an array subscript is still a sub-array (not a scalar).
     /// For int a[2][3]: a[i] results in a sub-array (int[3]), a[i][j] is a scalar.
     pub(super) fn subscript_result_is_array(&self, expr: &Expr) -> bool {
-        if let Expr::ArraySubscript(base, _, _) = expr {
+        if let Expr::ArraySubscript(base, _index, _) = expr {
+            // A pointer-to-array subscript keeps the array type.  This is
+            // distinct from an ordinary pointer subscript: for
+            // `cpumask_var_t *p` where `cpumask_var_t` is `struct cpumask[1]`,
+            // `p[i]` is an array lvalue whose address is `p + i`, not a
+            // loaded pointer stored in its first word.  The old fallback
+            // consulted the expression's already-decayed type and missed
+            // this case, emitting a 32-bit load followed by `->bits`.
+            let result_is_array = |ctype: Option<CType>| {
+                ctype.is_some_and(|ctype| match ctype {
+                    CType::Array(element, _) | CType::Pointer(element, _) => {
+                        matches!(*element, CType::Array(_, _))
+                    }
+                    _ => false,
+                })
+            };
+            let member_base_is_array = match base.as_ref() {
+                Expr::MemberAccess(owner, field, _) => {
+                    result_is_array(self.resolve_field_ctype(owner, field, false))
+                }
+                Expr::PointerMemberAccess(owner, field, _) => {
+                    result_is_array(self.resolve_field_ctype(owner, field, true))
+                }
+                _ => false,
+            };
+            if result_is_array(self.get_expr_ctype(base)) || member_base_is_array {
+                return true;
+            }
+
             let root_name = self.get_array_root_name_from_base(base);
             let depth = self.count_subscript_depth(base) + 1; // +1 for this subscript
 

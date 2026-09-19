@@ -639,6 +639,15 @@ impl Emitter {
 /// Public entry: transform one function. Returns the number of scalar ARX
 /// ops vectorized (0 = no change).
 pub fn vec_arx_function(func: &mut IrFunction) -> usize {
+    // ISA gate: this entry runs in Phase 2b, before the main vectorizer's
+    // `vectorize_with_analysis` gate, yet it emits the same XMM-shaped Vec*
+    // intrinsics (VecLoadI32x4, VecShufdI32x4, ...).  A `-mno-sse` /
+    // `-mgeneral-regs-only` TU (kernel: CR4.OSFXSR=0) must keep every loop
+    // scalar — the x86 backend rightly rejects an XMM instruction there.
+    // Mirrors the gate the const-trip map entry gained for the same reason.
+    if !crate::passes::vectorize::x86_simd_available_pub() {
+        return 0;
+    }
     let cfg = CfgAnalysis::build(func);
     let dom = DominanceChecker::new(cfg.num_blocks, &cfg.idom);
     let loops =

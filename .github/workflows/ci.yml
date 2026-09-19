@@ -307,6 +307,18 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_vec_adler_epic.sh
 
+      # x86 SIMD ISA contract of the middle end: every vectorization
+      # entry that runs BEFORE the main vectorizer's gate must carry
+      # its own -mno-sse refusal (the const-trip map path and the
+      # memory-form ARX vectorizer both left XMM intrinsics in kernel
+      # TUs otherwise), -mno-avx downgrades to 128-bit instead of
+      # disabling, and the FMA3 fold only fires when the backend can
+      # emit vfmadd. Emission AND executed semantics are pinned.
+      - name: Verify vectorizer ISA gate contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_vectorize_isa_gate.sh
+
       # BB-SLP v6 (the gate ci.yml was missing — ci_local.sh had it): the
       # 128-bit VEX memory fold, FP negation sign-mask, integer min/max
       # folds, the general cmp+blendv composite, and the rule-(b)

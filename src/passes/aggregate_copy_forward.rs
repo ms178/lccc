@@ -608,9 +608,15 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
                 );
             }
             let block = &mut func.blocks[bi];
+            // Source spans are optional metadata and must be parallel to the
+            // instruction list before they can be reordered.  Kernel builds
+            // can reach this hoist with a partially populated span vector;
+            // moving the IR is still valid, but indexing that vector would
+            // turn a recoverable metadata mismatch into a compiler ICE.
+            let spans_parallel = block.source_spans.len() == block.instructions.len();
             let inst = block.instructions.remove(gep_idx);
             block.instructions.insert(insert_at, inst);
-            if !block.source_spans.is_empty() {
+            if spans_parallel {
                 let span = block.source_spans.remove(gep_idx);
                 block.source_spans.insert(insert_at, span);
             }
@@ -831,9 +837,11 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
     let mut removals: Vec<(usize, usize)> = copies.values().map(|(b, i, _)| (*b, *i)).collect();
     removals.sort_unstable_by(|a, b| b.cmp(a));
     for (bi, ii) in removals {
-        func.blocks[bi].instructions.remove(ii);
-        if !func.blocks[bi].source_spans.is_empty() {
-            func.blocks[bi].source_spans.remove(ii);
+        let block = &mut func.blocks[bi];
+        let spans_parallel = block.source_spans.len() == block.instructions.len();
+        block.instructions.remove(ii);
+        if spans_parallel {
+            block.source_spans.remove(ii);
         }
         changes += 1;
     }
@@ -1266,6 +1274,66 @@ mod tests {
                 .iter()
                 .any(|instruction| matches!(instruction, Instruction::Memcpy { .. }))
         );
+    }
+
+    #[test]
+    fn hoist_with_partial_source_spans_does_not_panic() {
+        // Some lowering paths attach only a subset of source spans.  The
+        // aggregate-copy hoist must still be able to move the pure address
+        // computation without indexing that non-parallel metadata vector.
+        let mut func = IrFunction::new("partial_spans".into(), IrType::I32, vec![], false);
+        func.next_value_id = 3;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::Memcpy {
+                    dest: Value(2),
+                    src: Value(0),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            // Deliberately not one-to-one with instructions: this is the
+            // shape observed in the kernel's execmem_init_missing function.
+            source_spans: vec![crate::common::source::Span::dummy()],
+        });
+
+        assert_eq!(forward_store_only_temporaries(&mut func), 1);
+        assert_eq!(func.blocks[0].instructions.len(), 5);
+        assert_eq!(func.blocks[0].source_spans.len(), 1);
+        assert!(matches!(
+            func.blocks[0].instructions[2],
+            Instruction::GetElementPtr { dest: Value(2), .. }
+        ));
     }
 
     #[test]

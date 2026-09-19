@@ -3427,24 +3427,70 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
 }
 
 fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) -> bool {
-    if at >= len {
-        return false;
-    }
-    match infos[at].kind {
-        // LoadRbp loads into a GP reg — doesn't use %rcx as address
-        LineKind::LoadRbp { .. } => false,
-        LineKind::Other { dest_reg: 1 } => {
-            // rcx is the destination. "movq <src>, %rcx" is a pure write if src ≠ %rcx.
-            let t = infos[at].trimmed(store.get(at));
-            if t.starts_with("movq ") && t.ends_with(", %rcx") {
-                let src = &t[5..t.len() - 6];
-                src.contains("%rcx")
-            } else {
-                t.contains("%rcx")
-            }
+    // This is a liveness query for the value copied into %rcx, not merely a
+    // query about the first instruction after the dereference.  The old
+    // one-line lookahead was unsound when another peephole pass folded a later
+    // reload into `movq %rcx, %rax`: the address-copy pass removed the defining
+    // `movq %src, %rcx`, but left that later use reading the incoming (and
+    // unrelated) %rcx value.  That interaction corrupted stack-constructed
+    // structs in the kernel scheduler.
+    //
+    // Scan the remainder of the straight-line region.  A branch/label is a
+    // conservative barrier because another predecessor may observe the old
+    // value.  A plain write to %rcx kills the old value; every other mention is
+    // a use (including %ecx/%cx/%cl, as represented by reg_refs).
+    let rcx_mask = 1u16 << 1;
+    let mut i = at;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
         }
-        _ => infos[at].trimmed(store.get(at)).contains("%rcx"),
+        if matches!(
+            infos[i].kind,
+            LineKind::Label
+                | LineKind::Jmp
+                | LineKind::JmpIndirect
+                | LineKind::CondJmp
+                | LineKind::Call
+        ) {
+            return true;
+        }
+
+        let t = infos[i].trimmed(store.get(i));
+        if infos[i].reg_refs & rcx_mask == 0 {
+            i += 1;
+            continue;
+        }
+
+        // A kill must be an EXACT full-width, unconditional redefinition of
+        // the family — the shared acceptance-grade predicates, not a
+        // mnemonic-prefix heuristic:
+        //   * sub-width destinations (`movw %ax, %cx`, `sete %cl`) leave the
+        //     surviving bits of the copied 64-bit value observable;
+        //   * `cmovcc` keeps the old destination when the condition is
+        //     false, i.e. reads it (`is_read_modify_write`);
+        //   * implicit readers (`rep movsq`'s count, `cpuid`'s subleaf)
+        //     observe it (`implicit_read_refs`);
+        //   * a source-side mention (`movq 8(%rcx), %rcx`) reads the old
+        //     value through the address even though the destination is the
+        //     full-width family.
+        // Every other family mention is a use.
+        let dest_token = t.rsplit(',').next().unwrap_or(t).trim();
+        let head = &t[..t.len() - dest_token.len()];
+        let killed = writes_family_full(&infos[i], &t, 1)
+            && implicit_read_refs(t.as_bytes()) & rcx_mask == 0
+            && !is_read_modify_write(&t)
+            && !(head.contains("%rcx")
+                || head.contains("%ecx")
+                || head.contains("%cx")
+                || head.contains("%cl"));
+        if killed {
+            return false;
+        }
+        return true;
     }
+    false
 }
 
 // ── Movq + extension/truncation fusion ───────────────────────────────────────

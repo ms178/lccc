@@ -584,6 +584,26 @@ impl super::InstructionEncoder {
         self.sized_op = true;
         match &ops[0] {
             Operand::Register(reg) => {
+                // Segment registers keep their own one-byte opcodes and take
+                // no operand-size variant: `push %ds` is 1e in .code32 and
+                // 66 1e in .code16gcc (binutils 2.44 emits the inert 0x66
+                // there because the unsuffixed default is 32-bit; GAS .code16
+                // `pushl %ds` assembles to the same 66 1e).  The .code16
+                // unsuffixed form is routed to `encode_push16` by the match
+                // guard above; without these arms the .code32/.code16gcc
+                // spelling died with "bad register" where GAS succeeds.
+                if is_segment_reg(&reg.name) {
+                    match reg.name.as_str() {
+                        "es" => self.bytes.push(0x06),
+                        "cs" => self.bytes.push(0x0E),
+                        "ss" => self.bytes.push(0x16),
+                        "ds" => self.bytes.push(0x1E),
+                        "fs" => self.bytes.extend_from_slice(&[0x0F, 0xA0]),
+                        "gs" => self.bytes.extend_from_slice(&[0x0F, 0xA8]),
+                        _ => return Err(format!("cannot push {}", reg.name)),
+                    }
+                    return Ok(());
+                }
                 let num = reg_num(&reg.name).ok_or("bad register")?;
                 self.bytes.push(0x50 + num);
                 Ok(())

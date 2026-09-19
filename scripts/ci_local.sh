@@ -325,6 +325,15 @@ gate "two-block-unroll-redteam" fast \
 gate "vec-adler-epic" fast \
     bash tests/regression/check_vec_adler_epic.sh
 
+# x86 SIMD ISA contract of the middle end: every vectorization entry that
+# runs BEFORE the main vectorizer's gate must carry its own -mno-sse
+# refusal (the const-trip map path and the memory-form ARX vectorizer
+# both left XMM intrinsics in kernel TUs otherwise), -mno-avx downgrades
+# to 128-bit instead of disabling, and the FMA3 fold only fires when the
+# backend can emit vfmadd.  Emission AND executed semantics are pinned.
+gate "vectorize-isa-gate" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_vectorize_isa_gate.sh
+
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
 
