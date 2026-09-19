@@ -3011,6 +3011,18 @@ fn build_pack(
                     if po.len() != width || po.first() != Some(&a0.off) {
                         return false;
                     }
+                    // WO-7 (red-team audit, 2026-09-18): pin the
+                    // construction-time invariant AT THE POINT OF USE. The
+                    // CSE's "same stream + same first offset + same width ⇒
+                    // identical bytes" reasoning additionally needs `po` to
+                    // be a strict arithmetic progression at the family
+                    // stride; MemLoad construction guarantees it (the
+                    // `addrs.windows(2)` exact-delta check above), and this
+                    // assert makes a future construction change fail loudly
+                    // here instead of silently breaking the equivalence.
+                    debug_assert!(po.iter().enumerate().all(|(i, &o)| {
+                        o == po.first().copied().unwrap() + i as i64 * fam.size as i64
+                    }));
                     match eval_sym_addr(block, &ctx.def_pos, pp[0]) {
                         Some(pa)
                             if pa.base == a0.base && pa.var == a0.var && pa.mult == a0.mult =>

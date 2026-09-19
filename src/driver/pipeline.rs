@@ -31,6 +31,15 @@ pub enum CompileMode {
     ObjectOnly,
     /// -E: Stop after preprocessing, output preprocessed source to stdout
     PreprocessOnly,
+    /// -fsyntax-only: run the translation unit through preprocess + parse +
+    /// semantic analysis, report diagnostics, and stop. No code is
+    /// generated, no output file is produced (`-o` is ignored), and the
+    /// link stage never runs — for ANY input kind. This is the driver bug
+    /// the i686 header gate worked around with `-E` (WO-4, red-team audit
+    /// 2026-09-18): the flag used to be silently dropped by the unknown-
+    /// argument handler, so `-x c - -fsyntax-only` linked the (empty) TU
+    /// and failed on the missing `main`.
+    SyntaxOnly,
 }
 
 /// A command-line define: -Dname or -Dname=value
@@ -595,6 +604,7 @@ impl Driver {
             CompileMode::AssemblyOnly => self.run_assembly_only(),
             CompileMode::ObjectOnly => self.run_object_only(),
             CompileMode::Full => self.run_full(),
+            CompileMode::SyntaxOnly => self.run_syntax_only(),
         }
     }
 
@@ -721,6 +731,119 @@ impl Driver {
                         filename
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// `-fsyntax-only`: run each C translation unit through preprocess +
+    /// lex + parse + semantic analysis and stop. Diagnostics are reported
+    /// exactly as in a real compilation (including `-Werror` promotion),
+    /// but no IR is built, no assembly is generated, no object is
+    /// assembled, and the link stage never runs — for any input kind.
+    ///
+    /// Assembly inputs have no C syntax to check; their `#include`/`#error`
+    /// directives still gate through a preprocess-only pass (GCC's
+    /// `-fsyntax-only` on `.S` is likewise a preprocess pass-through).
+    /// Objects/archives are skipped: there is nothing left to check.
+    ///
+    /// This closes the WO-4 driver bug (red-team audit 2026-09-18): the
+    /// flag used to be silently dropped by the unknown-argument handler,
+    /// so `printf '#include <stdio.h>\n' | lccc -x c - -fsyntax-only`
+    /// compiled AND LINKED the stdin TU and failed on the missing `main`.
+    fn run_syntax_only(&self) -> Result<(), String> {
+        for input_file in &self.input_files {
+            if Self::is_object_or_archive(input_file) {
+                continue;
+            }
+            let filename = if input_file == "-" {
+                "<stdin>"
+            } else {
+                input_file
+            };
+
+            let source = Self::read_source(input_file)?;
+            let mut preprocessor = Preprocessor::new();
+            self.configure_preprocessor(&mut preprocessor);
+            preprocessor.set_filename(filename);
+            self.process_force_includes(&mut preprocessor)?;
+            let preprocessed = preprocessor.preprocess(&source);
+
+            let pp_errors = preprocessor.errors();
+            if !pp_errors.is_empty() {
+                for err in pp_errors {
+                    eprintln!(
+                        "{}:{}:{}: error: {}",
+                        err.file, err.line, err.col, err.message
+                    );
+                }
+                return Err(format!(
+                    "{} preprocessor error(s) in {}",
+                    pp_errors.len(),
+                    filename
+                ));
+            }
+
+            if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
+                // Nothing past the preprocessor to check for assembly.
+                if self.verbose {
+                    eprintln!("syntax check passed (assembly): {}", filename);
+                }
+                continue;
+            }
+
+            // Lex. The source manager owns the preprocessed text; the line
+            // map and macro-expansion metadata give spans their
+            // file:line:col resolution (same wiring as compile_to_assembly).
+            let mut source_manager = SourceManager::new();
+            let file_id = source_manager.add_file(input_file.to_string(), preprocessed);
+            source_manager.build_line_map();
+            let macro_expansions = preprocessor.take_macro_expansion_info();
+            source_manager.set_macro_expansions(macro_expansions);
+            let mut lexer = Lexer::new(source_manager.get_content(file_id), file_id);
+            lexer.set_gnu_extensions(self.gnu_extensions);
+            let tokens = lexer.tokenize();
+            let lexer_diags = std::mem::take(&mut lexer.diagnostics);
+
+            // Parse.
+            let mut diagnostics = DiagnosticEngine::new();
+            diagnostics.set_warning_config(self.warning_config.clone());
+            diagnostics.set_color_mode(self.color_mode);
+            diagnostics.set_source_manager(source_manager);
+            for (msg, span) in lexer_diags {
+                diagnostics.error(msg, span);
+            }
+            let mut parser = Parser::new(tokens);
+            parser.set_diagnostics(diagnostics);
+            let ast = parser.parse();
+            if parser.error_count > 0 {
+                return Err(format!(
+                    "{}: {} parse error(s)",
+                    input_file, parser.error_count
+                ));
+            }
+
+            // Semantic analysis.
+            let diagnostics = parser.take_diagnostics();
+            let mut sema = SemanticAnalyzer::new();
+            sema.set_diagnostics(diagnostics);
+            if let Err(error_count) = sema.analyze(&ast) {
+                return Err(format!("{} error(s) during semantic analysis", error_count));
+            }
+            let mut diagnostics = sema.take_diagnostics();
+            // -Werror promotion applies to the syntax check too: a TU whose
+            // warnings are promoted to errors must fail -fsyntax-only.
+            if diagnostics.has_errors() {
+                return Err(format!(
+                    "{} error(s) (warnings promoted by -Werror)",
+                    diagnostics.error_count()
+                ));
+            }
+            if self.verbose && diagnostics.warning_count() > 0 {
+                eprintln!("{} warning(s) generated", diagnostics.warning_count());
+            }
+            if self.verbose {
+                eprintln!("syntax check passed: {}", filename);
             }
         }
         Ok(())
@@ -1046,6 +1169,8 @@ impl Driver {
             CompileMode::AssemblyOnly => format!("{}.s", stem),
             CompileMode::ObjectOnly => format!("{}.o", stem),
             CompileMode::PreprocessOnly => String::new(),
+            // -fsyntax-only writes nothing; `-o` is ignored (GCC behaviour).
+            CompileMode::SyntaxOnly => String::new(),
             CompileMode::Full => self.output_path.clone(),
         }
     }
