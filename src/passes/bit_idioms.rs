@@ -83,6 +83,399 @@ fn same_value(a: Operand, b: Operand, defs: &[Option<Instruction>]) -> bool {
     }
 }
 
+/// If `opnd` names a value defined by `And`, its operands and type.
+/// Copy-only peeling: an `And` reached through an integer cast is a
+/// DIFFERENT width's and — repurposing it would change semantics.
+fn and_parts(opnd: Operand, defs: &[Option<Instruction>]) -> Option<(Operand, Operand, IrType)> {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
+        return None;
+    };
+    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::BinOp {
+            op: IrBinOp::And,
+            lhs,
+            rhs,
+            ty,
+            ..
+        }) => Some((*lhs, *rhs, *ty)),
+        _ => None,
+    }
+}
+
+/// If `opnd` names a value defined by `Xor` or `Or`, its op, operands and
+/// type (copy-only peeling, same discipline as [`and_parts`]).
+fn xor_or_or_parts(
+    opnd: Operand,
+    defs: &[Option<Instruction>],
+) -> Option<(IrBinOp, Operand, Operand, IrType)> {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
+        return None;
+    };
+    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::BinOp {
+            op: op @ (IrBinOp::Xor | IrBinOp::Or),
+            lhs,
+            rhs,
+            ty,
+            ..
+        }) => Some((*op, *lhs, *rhs, *ty)),
+        _ => None,
+    }
+}
+
+/// If `opnd` names a value defined by `Not(x)`, the source `x`
+/// (copy-only peeling).
+fn not_source(opnd: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
+        return None;
+    };
+    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::UnaryOp {
+            op: IrUnaryOp::Not,
+            src,
+            ..
+        }) => Some(*src),
+        _ => None,
+    }
+}
+
+/// The value `opnd` names, after copy peeling — for single-use proofs the
+/// proof must cover every alias that reads the producer.
+fn peeled_value(
+    opnd: Operand,
+    defs: &[Option<Instruction>],
+) -> Option<crate::ir::reexports::Value> {
+    match peel_copies(opnd, defs) {
+        Operand::Value(v) => Some(v),
+        _ => None,
+    }
+}
+
+// ── Boolean mux / majority algebra (the CH/MAJ family) ────────────────────
+//
+// Three bit-exact boolean identities, each strictly reducing the op count:
+//
+//   (distributive)   (x&y) ^ (x&z)   →  x & (y^z)          3 ops → 2
+//   (mux / CH)       (x&y) ^ (~x&z)  →  z ^ (x & (y^z))    4 ops → 3
+//   (majority / MAJ) (x&y) ^ (x&z) ^ (y&z) → (x&y) ^ (z&(x^y))   5 → 4
+//
+// Per-bit proofs (exhaustive over the shared-variable cases):
+//   mux: x=1 → y ^ 0... (x&y)^(~x&z) at x=1 is y|0 = y; the target is
+//   z ^ (1&(y^z)) = z^y^z = y. At x=0: 0^z = z; target z^(0&·) = z. ✓
+//   maj: (x&y)^(x&z)^(y&z) — the three terms are pairwise disjoint unless
+//   all three are set (T1&T2=1 ⇒ x=y=z=1 ⇒ T3=1), so the xor equals the
+//   majority; (x&y) ^ (z&(x^y)): at z=1 this is (x&y)^(x^y) = x|y = maj
+//   at z=1; at z=0 it is x&y = maj at z=0. ✓
+//
+// The mux form is exactly SHA-256's CH and the majority form its MAJ (the
+// same shapes appear in Keccak/SHA-3 chi, in bitplane codecs, and in every
+// `(a & m) | (b & ~m)` select spell). GCC -O2 also reduces MAJ to the
+// 4-op form but leaves CH at 4 ops with a NOT; this canonicalization takes
+// CH to 3.
+//
+// Repurposing discipline (the soundness core): producers are rewritten
+// IN PLACE (an `And` becomes the `Xor`, etc.), so (a) every repurposed
+// producer needs a single-use proof — a second reader would see the new
+// value; (b) every operand NEWLY introduced into a repurposed producer
+// must still dominate that producer's position. Within one block that is
+// the index check below; a cross-block def of an operand already read by
+// another instruction of the same block dominates the whole block by SSA
+// (its use there is dominated, and a foreign dominator of a position in B
+// dominates B). To keep that argument airtight without a dominator tree,
+// v1 additionally restricts every REPURPOSED producer to the consumer's
+// own block. Producers that are only KEPT (read, not rewritten) may live
+// anywhere.
+
+/// Result of [`match_bool_mux_algebra`]: the consumer's replacement plus
+/// deferred producer rewrites `(block, index, instruction)` for the
+/// pass-end application (dest-verified, like `pending_masks`).
+pub(super) fn match_bool_mux_algebra(
+    c_lhs: Operand,
+    c_rhs: Operand,
+    c_op: IrBinOp,
+    c_dest: crate::ir::reexports::Value,
+    c_ty: IrType,
+    block_bi: usize,
+    index: usize,
+    defs: &[Option<Instruction>],
+    use_counts: &[u32],
+    def_loc: &[Option<(usize, usize)>],
+) -> Option<(Instruction, Vec<(usize, usize, Instruction)>)> {
+    // Structural resolution is COPY-FREE: the consumer must name its
+    // producers directly. A producer reached through a `Copy` chain would
+    // forward the repurposed value through the copy to any other reader,
+    // and the single-use proof on the underlying value would not see them.
+    let direct_def = |op: &Operand| -> Option<&Instruction> {
+        let Operand::Value(v) = op else {
+            return None;
+        };
+        defs.get(v.0 as usize).and_then(Option::as_ref)
+    };
+    let and_strict = |op: &Operand| -> Option<(Operand, Operand)> {
+        match direct_def(op) {
+            Some(Instruction::BinOp {
+                op: IrBinOp::And,
+                lhs,
+                rhs,
+                ty,
+                ..
+            }) if *ty == c_ty => Some((*lhs, *rhs)),
+            _ => None,
+        }
+    };
+    let single_use = |op: &Operand| -> bool {
+        match op {
+            Operand::Value(v) => use_counts.get(v.0 as usize).copied() == Some(1),
+            _ => false,
+        }
+    };
+    let same_block_before = |op: &Operand, before: usize| -> bool {
+        // May `op` be read at position `before` of this block? Constants and
+        // def-less values (function parameters — every instruction-carried
+        // def, phis included, has a `def_loc` entry): yes, they dominate the
+        // whole function. Same-block defs: index order. Other cross-block
+        // defs: `op` is already an operand of one of the matched
+        // instructions in this block, so its def dominates that use; a
+        // foreign-block dominator of a position in B dominates all of B.
+        match op {
+            Operand::Const(_) => true,
+            Operand::Value(v) => match def_loc.get(v.0 as usize).copied().flatten() {
+                None => true,
+                Some((b, i)) => b != block_bi || i < before,
+            },
+        }
+    };
+    let loc_of = |op: &Operand| -> Option<(usize, usize)> {
+        match op {
+            Operand::Value(v) => def_loc.get(v.0 as usize).copied().flatten(),
+            _ => None,
+        }
+    };
+
+    // ── Pattern C: majority ────────────────────────────────────────────
+    // consumer {Xor|Or}( inner{Xor|Or}(And(x,y), And(x,z)), And(y,z) )
+    //   (inner Or with consumer Xor is a DIFFERENT function — rejected)
+    // →  a2 := Xor(x, y);  and3 := And(z, a2);  consumer := Xor(a1, and3)
+    for (inner_opnd, and3_opnd) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
+        let Some(Instruction::BinOp {
+            op: inner_op,
+            lhs: i_lhs,
+            rhs: i_rhs,
+            ty: inner_ty,
+            ..
+        }) = direct_def(&inner_opnd).cloned()
+        else {
+            continue;
+        };
+        if !matches!(inner_op, IrBinOp::Xor | IrBinOp::Or) || inner_ty != c_ty {
+            continue;
+        }
+        if inner_op == IrBinOp::Or && c_op == IrBinOp::Xor {
+            continue; // mixed spelling is not the majority function
+        }
+        let Some((a1_lhs, a1_rhs)) = and_strict(&i_lhs) else {
+            continue;
+        };
+        let Some((a2_lhs, a2_rhs)) = and_strict(&i_rhs) else {
+            continue;
+        };
+        let Some((a3_lhs, a3_rhs)) = and_strict(&and3_opnd) else {
+            continue;
+        };
+        let Operand::Value(a1v) = i_lhs else { continue };
+        let Operand::Value(a2v) = i_rhs else { continue };
+        let Operand::Value(a3v) = and3_opnd else {
+            continue;
+        };
+        // a2 and and3 are repurposed: same block as the consumer, and the
+        // single-use proofs (a2, and3, and the inner xor which must die —
+        // its value changes because a2 changes).
+        let (Some((a2b, a2i)), Some((a3b, a3i))) = (loc_of(&i_rhs), loc_of(&and3_opnd)) else {
+            continue;
+        };
+        if a2b != block_bi || a3b != block_bi || !(a2i < a3i) {
+            continue; // and3 reads a2 after the rewrite
+        }
+        if !single_use(&i_rhs) || !single_use(&and3_opnd) || !single_use(&inner_opnd) {
+            continue;
+        }
+        for (x, y) in [(a1_lhs, a1_rhs), (a1_rhs, a1_lhs)] {
+            for (x2, z) in [(a2_lhs, a2_rhs), (a2_rhs, a2_lhs)] {
+                if !same_value(x, x2, defs) || same_value(y, z, defs) {
+                    continue;
+                }
+                let yz = (same_value(a3_lhs, y, defs) && same_value(a3_rhs, z, defs))
+                    || (same_value(a3_lhs, z, defs) && same_value(a3_rhs, y, defs));
+                if !yz {
+                    continue;
+                }
+                // New operand of the repurposed a2: y (an a1 operand). It
+                // must dominate a2's position.
+                if !same_block_before(&y, a2i) {
+                    continue;
+                }
+                let new_a2 = Instruction::BinOp {
+                    dest: a2v,
+                    op: IrBinOp::Xor,
+                    lhs: x,
+                    rhs: y,
+                    ty: c_ty,
+                };
+                let new_a3 = Instruction::BinOp {
+                    dest: a3v,
+                    op: IrBinOp::And,
+                    lhs: z,
+                    rhs: Operand::Value(a2v),
+                    ty: c_ty,
+                };
+                let new_consumer = Instruction::BinOp {
+                    dest: c_dest,
+                    op: IrBinOp::Xor,
+                    lhs: Operand::Value(a1v),
+                    rhs: Operand::Value(a3v),
+                    ty: c_ty,
+                };
+                let pending = vec![(a2b, a2i, new_a2), (a3b, a3i, new_a3)];
+                return Some((new_consumer, pending));
+            }
+        }
+    }
+
+    // ── Pattern B: mux (CH) ────────────────────────────────────────────
+    // consumer {Xor|Or}( And(x,y), And(~x,z) )  (either arm order)
+    // →  early := Xor(y, z);  late := And(x, early);  consumer := Xor(z, late)
+    // The EARLIER-defined And always becomes the inner xor; the roles
+    // ((x,y)-side vs (~x,z)-side) are found either way round, and BOTH of
+    // the xor's operands (y and z) must dominate the early position — in
+    // each role assignment exactly one of them is new to it.
+    for (first, second) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
+        let Some((f_lhs, f_rhs)) = and_strict(&first) else {
+            continue;
+        };
+        let Some((s_lhs, s_rhs)) = and_strict(&second) else {
+            continue;
+        };
+        let (Some((fb, fi)), Some((sb, si))) = (loc_of(&first), loc_of(&second)) else {
+            continue;
+        };
+        if fb != block_bi || sb != block_bi || !(fi < si) {
+            continue;
+        }
+        if !single_use(&first) || !single_use(&second) {
+            continue;
+        }
+        let Operand::Value(fv) = first else { continue };
+        let Operand::Value(sv) = second else { continue };
+        for swap_roles in [false, true] {
+            let (xy_lhs, xy_rhs) = if swap_roles {
+                (s_lhs, s_rhs)
+            } else {
+                (f_lhs, f_rhs)
+            };
+            let (nz_lhs, nz_rhs) = if swap_roles {
+                (f_lhs, f_rhs)
+            } else {
+                (s_lhs, s_rhs)
+            };
+            for (x, y) in [(xy_lhs, xy_rhs), (xy_rhs, xy_lhs)] {
+                for (maybe_not, z) in [(nz_lhs, nz_rhs), (nz_rhs, nz_lhs)] {
+                    if let Some(nx) = not_source(maybe_not, defs) {
+                        if !same_value(nx, x, defs) {
+                            continue;
+                        }
+                        // The repurposed early And becomes Xor(y, z); both
+                        // must dominate its position (whichever of the two
+                        // is an operand of the LATE arm is new here).
+                        if !same_block_before(&y, fi) || !same_block_before(&z, fi) {
+                            continue;
+                        }
+                        let new_first = Instruction::BinOp {
+                            dest: fv,
+                            op: IrBinOp::Xor,
+                            lhs: y,
+                            rhs: z,
+                            ty: c_ty,
+                        };
+                        let new_second = Instruction::BinOp {
+                            dest: sv,
+                            op: IrBinOp::And,
+                            lhs: x,
+                            rhs: Operand::Value(fv),
+                            ty: c_ty,
+                        };
+                        let new_consumer = Instruction::BinOp {
+                            dest: c_dest,
+                            op: IrBinOp::Xor,
+                            lhs: z,
+                            rhs: Operand::Value(sv),
+                            ty: c_ty,
+                        };
+                        let pending = vec![(fb, fi, new_first), (sb, si, new_second)];
+                        return Some((new_consumer, pending));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Pattern A: distributive ────────────────────────────────────────
+    // consumer {Xor|Or}( And(x,y), And(x,z) )  →  repurposed := Xor/Or(y,z);
+    // consumer := And(x, repurposed). Creates no new dominance edges beyond
+    // the repurposed operand's def, checked below.
+    for (a, b) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
+        let Some((a_lhs, a_rhs)) = and_strict(&a) else {
+            continue;
+        };
+        let Some((b_lhs, b_rhs)) = and_strict(&b) else {
+            continue;
+        };
+        if !single_use(&a) {
+            continue;
+        }
+        let Some((ab, ai)) = loc_of(&a) else {
+            continue;
+        };
+        if ab != block_bi {
+            continue;
+        }
+        for (x, y) in [(a_lhs, a_rhs), (a_rhs, a_lhs)] {
+            for (x2, z) in [(b_lhs, b_rhs), (b_rhs, b_lhs)] {
+                if !same_value(x, x2, defs) || same_value(y, z, defs) {
+                    continue;
+                }
+                // z is new to the repurposed `a`.
+                if !same_block_before(&z, ai) {
+                    continue;
+                }
+                let Operand::Value(av) = a else { continue };
+                let inner_op = if c_op == IrBinOp::Or {
+                    IrBinOp::Or
+                } else {
+                    IrBinOp::Xor
+                };
+                let new_a = Instruction::BinOp {
+                    dest: av,
+                    op: inner_op,
+                    lhs: y,
+                    rhs: z,
+                    ty: c_ty,
+                };
+                let new_consumer = Instruction::BinOp {
+                    dest: c_dest,
+                    op: IrBinOp::And,
+                    lhs: x,
+                    rhs: Operand::Value(av),
+                    ty: c_ty,
+                };
+                let pending = vec![(ab, ai, new_a)];
+                return Some((new_consumer, pending));
+            }
+        }
+    }
+
+    None
+}
+
 fn binop(
     opnd: Operand,
     wanted: IrBinOp,
@@ -817,6 +1210,9 @@ pub(crate) fn recognize_function(
 
     let mut changes = 0;
     let mut next_value_id = func.max_value_id().saturating_add(1);
+    // Boolean mux/majority algebra kill switch (same authority contract as
+    // the vectorizer's CCC_NO_* gates; A/B for the differential batteries).
+    let bool_algebra_disabled = std::env::var("CCC_NO_BOOL_ALGEBRA").is_ok();
     // Deferred cross-block rewrites (mask distribution): the producer and
     // consumer may live in different blocks; both mutations are applied
     // after the scan ends so no &mut borrow of `func.blocks` overlaps the
@@ -974,6 +1370,94 @@ pub(crate) fn recognize_function(
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // ── Boolean mux/majority algebra (CH/MAJ family) ────────────
+            //
+            // COHERENCE CONTRACT (the soundness core, learned the hard
+            // way): every rewrite — the in-place consumer AND the producer
+            // repurposes — is applied IMMEDIATELY, and `defs`/`use_counts`
+            // are updated in the same step. All repurposed producers sit at
+            // earlier indices of THIS block (the matcher requires it), so
+            // mutating them mid-scan only touches already-visited slots,
+            // and every later matcher in the same run resolves structure
+            // against the POST-rewrite truth. The first version deferred
+            // the producer rewrites to pass end and left `defs` stale:
+            // Pattern A rewrote the inner xor of a MAJ tree, then Pattern
+            // C matched the outer consumer on the PRE-rewrite snapshot and
+            // emitted a consumer reading a value whose definition had
+            // already changed — sha256_transform returned the wrong digest
+            // (exit 2). Deferred application is only sound for rewrites
+            // whose result cannot re-enter matching (the mask
+            // distribution's And-with-mask); these can.
+            if !bool_algebra_disabled {
+                if let Instruction::BinOp {
+                    dest,
+                    op: c_op @ (IrBinOp::Xor | IrBinOp::Or),
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
+                } = &block.instructions[index]
+                {
+                    let (c_dest, c_ty) = (*dest, *ty);
+                    let (c_lhs, c_rhs, c_op) = (*lhs, *rhs, *c_op);
+                    if let Some((new_consumer, rewrites)) = match_bool_mux_algebra(
+                        c_lhs,
+                        c_rhs,
+                        c_op,
+                        c_dest,
+                        c_ty,
+                        block_bi,
+                        index,
+                        &defs,
+                        &use_counts,
+                        &def_loc,
+                    ) {
+                        // Apply producer repurposes (same block, earlier
+                        // indices), then the consumer, keeping defs and
+                        // use_counts coherent for the rest of the scan.
+                        // For BinOps the operand iterator is the complete
+                        // use set (the value-use iterator covers only
+                        // address operands), so the accounting is exact.
+                        let mut adjust_counts = |old: &Instruction, new: &Instruction| {
+                            crate::backend::liveness::for_each_operand_in_instruction(old, |op| {
+                                if let Operand::Value(v) = op {
+                                    if let Some(c) = use_counts.get_mut(v.0 as usize) {
+                                        *c = c.saturating_sub(1);
+                                    }
+                                }
+                            });
+                            crate::backend::liveness::for_each_operand_in_instruction(new, |op| {
+                                if let Operand::Value(v) = op {
+                                    if let Some(c) = use_counts.get_mut(v.0 as usize) {
+                                        *c = c.saturating_add(1);
+                                    }
+                                }
+                            });
+                        };
+                        for (rbi, rii, rinst) in rewrites {
+                            debug_assert_eq!(rbi, block_bi, "v1 repurposes are same-block");
+                            let old = block.instructions[rii].clone();
+                            adjust_counts(&old, &rinst);
+                            block.instructions[rii] = rinst.clone();
+                            if let Some(d) = rinst.dest() {
+                                if let Some(slot) = defs.get_mut(d.0 as usize) {
+                                    *slot = Some(rinst);
+                                }
+                            }
+                        }
+                        let old_consumer = block.instructions[index].clone();
+                        adjust_counts(&old_consumer, &new_consumer);
+                        block.instructions[index] = new_consumer.clone();
+                        if let Some(d) = new_consumer.dest() {
+                            if let Some(slot) = defs.get_mut(d.0 as usize) {
+                                *slot = Some(new_consumer);
+                            }
+                        }
+                        changes += 1;
                     }
                 }
             }
@@ -1716,5 +2200,435 @@ mod tests {
             &defs
         ));
         assert!(high_bits_zero(Operand::Const(IrConst::I64(0)), 0, &defs));
+    }
+
+    // ── Boolean mux/majority algebra ────────────────────────────────────
+
+    /// A one-block fixture: instructions in order, defs/def_loc/use_counts
+    /// derived exactly the way `recognize_function` derives them, plus the
+    /// operand-use counting it performs.
+    struct BoolFixture {
+        defs: Vec<Option<Instruction>>,
+        def_loc: Vec<Option<(usize, usize)>>,
+        use_counts: Vec<u32>,
+        insts: Vec<Instruction>,
+    }
+
+    fn fixture(insts: Vec<Instruction>) -> BoolFixture {
+        let mut n = 4usize;
+        for inst in &insts {
+            if let Some(dest) = inst.dest() {
+                n = n.max(dest.0 as usize + 1);
+            }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    n = n.max(v.0 as usize + 1);
+                }
+            });
+        }
+        let mut defs = vec![None; n];
+        let mut def_loc = vec![None; n];
+        let mut use_counts = vec![0u32; n];
+        for (ii, inst) in insts.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                defs[dest.0 as usize] = Some(inst.clone());
+                def_loc[dest.0 as usize] = Some((0, ii));
+            }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    use_counts[v.0 as usize] += 1;
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                use_counts[v.0 as usize] += 1;
+            });
+        }
+        BoolFixture {
+            defs,
+            def_loc,
+            use_counts,
+            insts,
+        }
+    }
+
+    fn and3(d: u32, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::And,
+            lhs: a,
+            rhs: b,
+            ty: IrType::U32,
+        }
+    }
+    fn xor3(d: u32, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Xor,
+            lhs: a,
+            rhs: b,
+            ty: IrType::U32,
+        }
+    }
+    fn or3(d: u32, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Or,
+            lhs: a,
+            rhs: b,
+            ty: IrType::U32,
+        }
+    }
+    fn not3(d: u32, a: Operand) -> Instruction {
+        Instruction::UnaryOp {
+            dest: Value(d),
+            op: IrUnaryOp::Not,
+            src: a,
+            ty: IrType::U32,
+        }
+    }
+
+    /// Evaluate a value under an environment for the def-less inputs
+    /// (ids 0,1,2 = x,y,z) — the exhaustive truth-table oracle.
+    fn eval_val(op: &Operand, fx: &BoolFixture, env: &[u32; 3]) -> u32 {
+        match op {
+            Operand::Value(v) => {
+                let id = v.0 as usize;
+                if id < 3 {
+                    env[id]
+                } else {
+                    eval_inst(fx.defs[id].as_ref().unwrap(), fx, env)
+                }
+            }
+            Operand::Const(c) => c.to_i64().unwrap_or(0) as u32,
+        }
+    }
+
+    fn eval_inst(inst: &Instruction, fx: &BoolFixture, env: &[u32; 3]) -> u32 {
+        match inst {
+            Instruction::BinOp { op, lhs, rhs, .. } => {
+                let a = eval_val(lhs, fx, env);
+                let b = eval_val(rhs, fx, env);
+                match op {
+                    IrBinOp::And => a & b,
+                    IrBinOp::Or => a | b,
+                    IrBinOp::Xor => a ^ b,
+                    _ => unreachable!("fixture uses only And/Or/Xor"),
+                }
+            }
+            Instruction::UnaryOp { op, src, .. } => {
+                let a = eval_val(src, fx, env);
+                match op {
+                    IrUnaryOp::Not => !a,
+                    _ => unreachable!("fixture uses only Not"),
+                }
+            }
+            _ => unreachable!("fixture uses only binops/unops"),
+        }
+    }
+
+    /// Run the matcher on the fixture's last instruction (the consumer) and
+    /// verify the rewrite is EXHAUSTIVELY bit-exact: for every assignment of
+    /// multi-bit values to x/y/z (all 2^3 sign patterns plus mixed-width
+    /// patterns), the rewritten program computes what the original did.
+    fn assert_rewrite_bit_exact(fx: &BoolFixture, consumer_idx: usize) {
+        let consumer = fx.insts[consumer_idx].clone();
+        let Instruction::BinOp {
+            dest, lhs, rhs, op, ..
+        } = &consumer
+        else {
+            panic!("fixture consumer must be a BinOp");
+        };
+        let (new_consumer, pending) = match_bool_mux_algebra(
+            *lhs,
+            *rhs,
+            *op,
+            *dest,
+            IrType::U32,
+            0,
+            consumer_idx,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+        )
+        .expect("the shape must match");
+        // Apply the rewrite to a copy of the program.
+        let mut rewritten = fx.insts.clone();
+        rewritten[consumer_idx] = new_consumer;
+        for (bi, ii, inst) in pending {
+            assert_eq!(bi, 0, "v1 repurposes stay in the consumer's block");
+            rewritten[ii] = inst;
+        }
+        // A second fixture over the REWRITTEN program (same env) must
+        // evaluate the consumer's dest identically on every pattern.
+        let rfx = fixture(rewritten.clone());
+        let old_dest = dest.0;
+        let new_dest = rewritten[consumer_idx].dest().unwrap().0;
+        assert_eq!(old_dest, new_dest, "the consumer keeps its dest");
+        let mut patterns = Vec::new();
+        for x in [0u32, 1, 0x8000_0000, 0x7fff_ffff, 0xffff_ffff, 0x1234_5678] {
+            for y in [0u32, 1, 0x8000_0000, 0x7fff_ffff, 0xffff_ffff, 0xdead_beef] {
+                for z in [0u32, 1, 0x8000_0000, 0x7fff_ffff, 0xffff_ffff, 0x0f0f_0f0f] {
+                    patterns.push([x, y, z]);
+                }
+            }
+        }
+        for env in patterns {
+            let before = eval_inst(&consumer, fx, &env);
+            let after = eval_inst(&rfx.insts[consumer_idx], &rfx, &env);
+            assert_eq!(
+                before, after,
+                "rewrite changed semantics at x={:#x} y={:#x} z={:#x}",
+                env[0], env[1], env[2]
+            );
+        }
+    }
+
+    #[test]
+    fn mux_ch_shape_rewrites_and_stays_bit_exact() {
+        // (x&y) ^ (~x&z)   →   z ^ (x & (y^z))   [4 ops → 3]
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(0), v(1)), // early: And(x, y)
+            and3(5, v(3), v(2)), // late:  And(~x, z)
+            xor3(6, v(4), v(5)), // consumer
+        ]);
+        assert_rewrite_bit_exact(&fx, 3);
+    }
+
+    #[test]
+    fn mux_ch_shape_with_swapped_arms_rewrites() {
+        // (~x&z) first, (x&y) second — the orientation loop must find it.
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(3), v(2)), // early: And(~x, z)
+            and3(5, v(0), v(1)), // late:  And(x, y)
+            xor3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 3);
+    }
+
+    #[test]
+    fn mux_ch_shape_with_swapped_and_operands_rewrites() {
+        // And(y, x) and And(z, ~x) — operand order inside the Ands.
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(1), v(0)),
+            and3(5, v(2), v(3)),
+            xor3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 3);
+    }
+
+    #[test]
+    fn mux_ch_or_spelling_rewrites() {
+        // (x&y) | (~x&z) — arms disjoint, the Or spelling is the same mux.
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(0), v(1)),
+            and3(5, v(3), v(2)),
+            or3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 3);
+    }
+
+    #[test]
+    fn maj_shape_rewrites_and_stays_bit_exact() {
+        // (x&y) ^ (x&z) ^ (y&z)   →   (x&y) ^ (z & (x^y))   [5 → 4]
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)), // a1 = And(x, y)   [KEPT]
+            and3(5, v(0), v(2)), // a2 = And(x, z)   [repurposed: Xor(x,y)]
+            and3(6, v(1), v(2)), // a3 = And(y, z)   [repurposed: And(z, a2)]
+            xor3(7, v(4), v(5)), // inner
+            xor3(8, v(7), v(6)), // consumer
+        ]);
+        assert_rewrite_bit_exact(&fx, 4);
+    }
+
+    #[test]
+    fn maj_shape_with_reordered_inner_arms_rewrites() {
+        // inner = Xor(a2, a1); consumer arms swapped.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            and3(6, v(1), v(2)),
+            xor3(7, v(5), v(4)),
+            xor3(8, v(6), v(7)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 4);
+    }
+
+    #[test]
+    fn maj_all_or_spelling_rewrites() {
+        // (x&y) | (x&z) | (y&z) — the all-Or spelling is the same majority.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            and3(6, v(1), v(2)),
+            or3(7, v(4), v(5)),
+            or3(8, v(7), v(6)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 4);
+    }
+
+    #[test]
+    fn maj_mixed_or_inner_xor_outer_is_rejected() {
+        // (x&y)|(x&z) ^ (y&z) is a DIFFERENT function — must NOT match.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            and3(6, v(1), v(2)),
+            or3(7, v(4), v(5)),
+            xor3(8, v(7), v(6)),
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(7),
+                v(6),
+                IrBinOp::Xor,
+                Value(8),
+                IrType::U32,
+                0,
+                4,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn distributive_xor_shape_rewrites_and_stays_bit_exact() {
+        // (x&y) ^ (x&z)   →   x & (y^z)   [3 → 2]
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            xor3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 2);
+    }
+
+    #[test]
+    fn distributive_or_shape_rewrites() {
+        // (x&y) | (x&z)   →   x & (y|z)
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            or3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 2);
+    }
+
+    #[test]
+    fn mux_with_a_multi_use_producer_declines() {
+        // The early And feeds another consumer: repurposing it would change
+        // what that reader sees. Must decline (fail-closed).
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(0), v(1)),
+            and3(5, v(3), v(2)),
+            xor3(6, v(4), v(5)),
+            xor3(7, v(4), v(2)), // second reader of v4
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn mux_without_a_shared_selector_declines() {
+        // (x&y) ^ (~w&z): the Not's source is not the And's operand — no
+        // selector, no mux.
+        let fx = fixture(vec![
+            not3(3, v(0)), // ~x where the And uses w = Value(9)
+            and3(4, Operand::Value(Value(9)), v(1)),
+            and3(5, v(3), v(2)),
+            xor3(6, v(4), v(5)),
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cross_block_producer_declines() {
+        // The repurposed And lives in another block (block 1 here): v1
+        // repurposes only same-block producers.
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(0), v(1)),
+            and3(5, v(3), v(2)),
+            xor3(6, v(4), v(5)),
+        ]);
+        let mut def_loc = fx.def_loc.clone();
+        def_loc[4] = Some((1, 0)); // v4 "defined" in block 1
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &def_loc,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn maj_with_a_new_operand_defined_too_late_declines() {
+        // The repurposed a2 would read y, but y is defined AFTER a2 in the
+        // block (between a2 and a1) — the dominance check must reject.
+        let fx = fixture(vec![
+            and3(4, v(0), v(2)),                     // a2 = And(x, z) at idx 0  [→ Xor(x,y)]
+            xor3(5, v(1), v(2)),                     // y  = Xor(y_in, z) at idx 1  [AFTER a2]
+            and3(6, v(0), Operand::Value(Value(5))), // a1 = And(x, y) at idx 2
+            and3(7, Operand::Value(Value(5)), v(2)), // a3 = And(y, z) at idx 3
+            xor3(8, v(6), v(4)),                     // inner at idx 4
+            xor3(9, v(8), v(7)),                     // consumer at idx 5
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(8),
+                v(7),
+                IrBinOp::Xor,
+                Value(9),
+                IrType::U32,
+                0,
+                5,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+            )
+            .is_none()
+        );
     }
 }

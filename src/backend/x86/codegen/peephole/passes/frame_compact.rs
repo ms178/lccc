@@ -359,9 +359,14 @@ fn reg_id_to_name_q(reg: RegId) -> &'static str {
 ///
 /// Shape: a function whose prologue is exactly `subq $N, %rsp` (no
 /// `pushq %rbp`, no callee-saved pushes) whose body never names `%rsp`,
-/// and whose every `ret` is immediately preceded by the matching
-/// `addq $N, %rsp`. The frame exists because slots the register allocator
-/// reserved were retired by later peephole passes; nothing observes it.
+/// and whose every `ret` is immediately preceded (modulo directives/NOPs)
+/// by the matching `addq $N, %rsp` — and, symmetrically, every collected
+/// `addq $N, %rsp` is immediately FOLLOWED (modulo directives/NOPs) by a
+/// `ret`. Epilogues are classified by this bidirectional ret-pairing, not
+/// by string identity: a mid-body stack readjustment that happens to
+/// spell `addq $N, %rsp` sets the decline flag instead of being NOP'd.
+/// The frame exists because slots the register allocator reserved were
+/// retired by later peephole passes; nothing observes it.
 ///
 /// * **Leaf** (no `call`): delete the `subq` and every matched `addq`. At
 ///   entry `%rsp ≡ 8 (mod 16)`; a leaf that never addresses through
@@ -425,7 +430,42 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
             }
             let body = infos[j].trimmed(store.get(j));
             if body == format!("addq ${}, %rsp", n) {
-                epilogues.push(j);
+                // WO-1 (red-team audit, 2026-09-18): string identity alone
+                // does not make an epilogue. Classify by what FOLLOWS: the
+                // addq is an epilogue only when the next real line (skipping
+                // exactly the line classes the ret-pairing backward scan
+                // skips — NOPs and directives) is a `ret`. A mid-body stack
+                // readjustment that merely SPELLS the same `addq $N, %rsp`
+                // (e.g. a future emitter's alloca cleanup or manual stack
+                // ping-pong) would otherwise be NOP'd without a matching
+                // prologue deletion on its path — an unbalanced stack.
+                // Anything else that names %rsp declines the fold
+                // (fail-closed), which is the pass's contract for shapes it
+                // cannot classify.
+                //
+                // Soundness of the ret-paired rule: deleting the prologue
+                // subq and every ret-paired addq preserves %rsp on every
+                // entry→ret path because (a) every ret is preceded by a
+                // collected addq (checked below), (b) every collected addq
+                // is immediately followed by a ret, so a path crossing it
+                // terminates there — no path crosses two collected addqs,
+                // and each path's single prologue subq is matched by its
+                // single terminal addq.
+                let mut q = j + 1;
+                let mut ret_paired = false;
+                while q < len {
+                    if infos[q].is_nop() || matches!(infos[q].kind, LineKind::Directive) {
+                        q += 1;
+                        continue;
+                    }
+                    ret_paired = matches!(infos[q].kind, LineKind::Ret);
+                    break;
+                }
+                if ret_paired {
+                    epilogues.push(j);
+                } else {
+                    rsp_named = true;
+                }
                 j += 1;
                 continue;
             }
@@ -547,3 +587,7 @@ fn parse_subq_rsp(line: &str) -> Option<i64> {
     let val = rest.strip_suffix(", %rsp")?;
     val.parse::<i64>().ok()
 }
+
+#[cfg(test)]
+#[path = "frame_compact_tests.rs"]
+mod tests;

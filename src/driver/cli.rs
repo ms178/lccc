@@ -692,6 +692,15 @@ impl Driver {
                 "-S" => self.mode = CompileMode::AssemblyOnly,
                 "-c" => self.mode = CompileMode::ObjectOnly,
                 "-E" => self.mode = CompileMode::PreprocessOnly,
+                // -fsyntax-only: check the translation unit (preprocess +
+                // parse + sema) and stop — no codegen, no assembly, no
+                // link, no output file, for ANY input kind (including
+                // stdin). Previously this flag fell through to the unknown
+                // argument handler and was silently dropped, so the driver
+                // ran the Full pipeline and failed linking the empty TU's
+                // missing `main` (WO-4, red-team audit 2026-09-18; the
+                // i686 header gate had to probe with `-E` instead).
+                "-fsyntax-only" => self.mode = CompileMode::SyntaxOnly,
                 "-P" => self.suppress_line_markers = true,
                 "-dM" => self.dump_defines = true,
 

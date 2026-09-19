@@ -94,6 +94,18 @@ fi
 # Published through target/lccc-rustflags so `scripts/ci_local.sh`'s
 # cargo-test leg reuses the SAME flag set (one cargo cache, no rebuild).
 total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+# BSD/macOS have no `free`; sysctl reports total bytes there (hw.memsize on
+# Darwin, hw.physmem on some BSDs). WO-8 (red-team audit, 2026-09-18): the
+# old code silently skipped the small-host flag on those hosts — graceful,
+# but recoverable. If neither probe answers, the flag stays unapplied
+# (unchanged legacy behavior).
+if [ -z "$total_mb" ] && command -v sysctl >/dev/null 2>&1; then
+    bytes=$(sysctl -n hw.memsize 2>/dev/null || sysctl -n hw.physmem 2>/dev/null || true)
+    case "$bytes" in
+        '' | *[!0-9]*) ;; # absent or non-numeric: leave unset
+        *) total_mb=$((bytes / 1048576)) ;;
+    esac
+fi
 if [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ]; then
     rustflags="$rustflags -C link-arg=-Wl,--no-keep-memory"
 fi

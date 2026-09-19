@@ -1834,17 +1834,31 @@ fn analyze_reduction_pattern(
     // v13 (2026-09-18): the gate is LIFTED on x86. The AVX2 transform
     // body + lowerings + whitelist (VecMaxI32x8 class 5,
     // VecHorizontalMaxI32x8 legal consumer, is_two_operand_binary
-    // deferral) are all wired; the v12-era "~1.4× slower" claim is being
-    // re-measured this session against the loop_patterns driver on the
-    // find_max loop (10M elements over a 40 MB array — memory-bound at
-    // DRAM bandwidth for both forms; the 8-wide lane max removes ~3/4 of
-    // the compare/select uops, while the init broadcast and the
-    // once-per-call horizontal reduce are noise at 1.25M iterations). If
-    // the measurement still regresses, the gate goes back on with the
-    // profile attached. The SSE2 path still declines on x86 (pmaxsd is
-    // SSE4.1 and the tuned epilogue is the 256-bit form), so a non-AVX2
-    // TU keeps the scalar loop.
-    if neon || x86_avx2_available() {
+    // deferral) are all wired; the v12-era "~1.4× slower" claim was
+    // re-measured and the record is inline below (WO-3). The SSE2 path
+    // still declines on x86 (pmaxsd is SSE4.1 and the tuned epilogue is
+    // the 256-bit form), so a non-AVX2 TU keeps the scalar loop. Kill
+    // switch: CCC_NO_LOOP_VEC_MAX=1 restores the scalar loop on every
+    // target (same authority contract as CCC_NO_MAP_VEC /
+    // CCC_NO_STENCIL_VEC; exercised by the two-block red-team gate's 6th
+    // differential leg).
+    //
+    // WO-3 measurement record (2026-09-18, this session): find_max over
+    // 10M i32 (40 MB working set), 15 sweeps per run, paired medians of 9
+    // interleaved runs, AVX2 transform on vs CCC_NO_LOOP_VEC_MAX=1 vs
+    // gcc -O2 -march=x86-64-v3, same source:
+    //   vec 53 ms / scalar 134 ms / gcc 84 ms
+    //   → vec/scalar = 0.396, vec/gcc = 0.631 (HIGHER is worse; the
+    //   transform is 2.53× faster than the declined loop and 1.59×
+    //   faster than GCC). The v12-era "~1.4× slower" claim is decisively
+    //   falsified: the scalar cmp+cmov dependency chain (~1 elem/cycle)
+    //   is the binding constraint, not DRAM bandwidth — the 8-wide lane
+    //   max breaks it. Hardware: 2-core Xeon sandbox (Raptor-Lake-class
+    //   uop throughput); the CI's EPYC 9V74 is same-or-better for the
+    //   vector form (wider back-end). Decision per the pre-registered
+    //   rule: the lift STANDS on this number. The kill switch stays for
+    //   differential coverage (red-team gate leg 6).
+    if neon || (x86_avx2_available() && std::env::var("CCC_NO_LOOP_VEC_MAX").is_err()) {
         let latch_label = func.blocks[latch_idx].label;
         'max_search: for inst in &header.instructions {
             let Instruction::Phi {

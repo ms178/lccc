@@ -15,13 +15,21 @@
 #   5. Codegen contracts (scoped asm checks on the -S output):
 #      - d4_schedule_pairs (the sha256 message-schedule shape): at least
 #        3 vmovq pair loads and at least 6 VEX dword ops, and ZERO legacy
-#        SSE packed ops inside the function (the no-mixing contract);
+#        SSE packed-ARITHMETIC ops inside the function (the seed-path
+#        gather deliberately uses the SSE2-exact movd/punpckldq pair: it
+#        must pack on every x86-64 baseline — no SSE4.1 dependency — and
+#        it executes once per group where any transition consideration is
+#        amortized to zero; the contract grep scopes to the per-iteration
+#        packed arithmetic, which is all-VEX by design);
 #      - f1_hash_chain: the folded constant-key compare (cmp{l,q} $imm,
 #        off(%reg)) is present — the immediate-source load fold;
 #      - the A1 miscompile-class kernel: at least one pair of adjacent
 #        dword stores folded into a 64-bit vmovq/movq store somewhere in
 #        the battery's unrolled loops is NOT required (profitability
 #        declines are legitimate); the contract is the d4 shape above.
+#   6. Loop-vec Max-reduction kill-switch differential: CCC_NO_LOOP_VEC_MAX=1
+#      (the scalar loop reference of the same transform) must match — the
+#      e1_find_max kernel pins the gate's correctness both ways (WO-3).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ccc=${LCCC_BIN:-${CCC:-target/fastbuild/lccc}}
@@ -84,10 +92,37 @@ if [ "$out_sse2" != "$out_on" ]; then
     exit 1
 fi
 
-# ── 5. codegen contracts ─────────────────────────────────────────────────
+# ── 5. loop-vec Max-reduction kill-switch differential (WO-3) ────────────
+CCC_NO_LOOP_VEC_MAX=1 "$ccc" -O2 $march "$src" -o "$td/rt_nomax"
+out_nomax=$("$td/rt_nomax")
+if [ "$out_nomax" != "$out_on" ]; then
+    echo "FAIL: two_block_unroll_redteam Max-reduction kill-switch differential"
+    echo "  on   : $out_on"
+    echo "  nomax: $out_nomax"
+    exit 1
+fi
+
+# ── 6. codegen contracts ─────────────────────────────────────────────────
 "$ccc" -O2 $march -S "$src" -o "$td/rt.s"
 
-d4=$(awk '/^d4_schedule_pairs:/,/\.size[[:space:]]+d4_schedule_pairs/' "$td/rt.s")
+# WO-6: the asm ranges are BOUNDED on both ends — the `.size` directive OR
+# the next function label, whichever comes first. A bare
+# `/^d4_schedule_pairs:/,/\.size/` range degrades to EOF when the `.size`
+# line is ever absent (a different emitter, a stripped dump), inflating the
+# counts with the REST of the file's instructions — a false PASS. Ending on
+# the next global label too can only ever SHRINK the range (lccc's internal
+# labels are .L-prefixed), so the failure direction stays fail-closed.
+scoped_fn_asm() {
+    awk -v fn="$1" '
+        BEGIN { inrange = 0 }
+        $0 ~ "^" fn ":" { inrange = 1 }
+        inrange && /^[A-Za-z_][A-Za-z0-9_]*:$/ && $0 !~ ("^" fn ":") { inrange = 0 }
+        inrange { print }
+        inrange && $0 ~ ("\\.size[[:space:]]+" fn) { inrange = 0 }
+    ' "$2"
+}
+
+d4=$(scoped_fn_asm d4_schedule_pairs "$td/rt.s")
 # grep -c exits 1 on zero matches; the contract checks below own the verdict.
 vmovq=$(printf '%s\n' "$d4" | grep -c 'vmovq' || true)
 vexops=$(printf '%s\n' "$d4" | grep -cE '^ +v(padd|psrl|psll|pxor|por)' || true)
@@ -101,10 +136,10 @@ if [ "$legacy" -ne 0 ]; then
     exit 1
 fi
 
-f1=$(awk '/^f1_hash_chain:/,/\.size[[:space:]]+f1_hash_chain/' "$td/rt.s")
+f1=$(scoped_fn_asm f1_hash_chain "$td/rt.s")
 if ! printf '%s\n' "$f1" | grep -qE ' +cmp(l|q) \$[0-9-]+, [0-9-]*\(%r'; then
     echo "FAIL: f1_hash_chain constant-key compare did not fold (no cmp \$imm, off(%reg))"
     exit 1
 fi
 
-echo "ok: two_block_unroll_redteam (runtime, tri-config, kill-switch, SSE2 baseline, asm contracts)"
+echo "ok: two_block_unroll_redteam (runtime, tri-config, kill-switch, SSE2 baseline, Max kill-switch, asm contracts)"

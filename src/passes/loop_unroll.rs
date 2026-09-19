@@ -2703,6 +2703,22 @@ fn try_partial_unroll_two_block(
     if body_entry != latch_label {
         return false;
     }
+    // WO-2 (red-team audit, 2026-09-18): `body_entry` is, by construction
+    // in `find_exit_condition`, one of the header CondBranch's two arm
+    // labels — so the check above is exactly the invariant the CFG rewire
+    // at the bottom of this function relies on (one arm of the header's
+    // terminator IS `latch_label`). Pin it: nothing between here and the
+    // rewire may change the header terminator, and the rewire declines
+    // (rather than silently corrupting the CFG) if the invariant ever
+    // breaks.
+    debug_assert!(
+        matches!(
+            &func.blocks[header].terminator,
+            Terminator::CondBranch { true_label, false_label, .. }
+                if *true_label == latch_label || *false_label == latch_label
+        ),
+        "two-block unroller: body_entry == latch_label implies a CondBranch arm is the latch"
+    );
     // The IV increment must be the final latch instruction.
     if latch_iv_incr_idx + 1 != func.blocks[latch].instructions.len() {
         return false;
@@ -3114,6 +3130,19 @@ fn try_partial_unroll_two_block(
                     *true_label = body_label;
                 } else if *false_label == latch_label {
                     *false_label = body_label;
+                } else {
+                    // WO-2 (red-team audit, 2026-09-18): unreachable under
+                    // the checked invariant (`body_entry == latch_label` is
+                    // verified before any cloning), but this is the one
+                    // place in the pass where an invariant violation would
+                    // yield silent IR corruption instead of a decline:
+                    // relabelling nothing, marking the latch Unreachable,
+                    // and appending an unreachable body would strand the
+                    // loop with no exit. Decline instead. The only mutation
+                    // that precedes this point is the monotonic
+                    // `next_value_id` bump — the orphaned clone ids are
+                    // simply never issued again.
+                    return false;
                 }
             }
             _ => return false, // find_exit_condition guaranteed this shape
