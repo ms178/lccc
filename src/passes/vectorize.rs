@@ -23166,6 +23166,15 @@ pub(crate) fn vectorize_const_trip_map_loops(
     if std::env::var("CCC_NO_MAP_VEC").is_ok() {
         return 0;
     }
+    // This entry runs before the main vectorizer and therefore needs its own
+    // ISA gate.  It emits the same Vec* intrinsics, but the caller's generic
+    // `vectorize_with_analysis` gate is not reached here.  In particular,
+    // `-mno-sse` kernel TUs must keep fixed-trip aggregate-copy loops scalar;
+    // otherwise this early map path can leave a VecLoadI32x4 that the x86
+    // backend quite correctly rejects as an XMM instruction.
+    if !x86_simd_available() {
+        return 0;
+    }
     // Same diamond pre-conversion as the main vectorizer (see there).
     crate::passes::if_convert::if_convert_function(func);
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();

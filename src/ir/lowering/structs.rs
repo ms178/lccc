@@ -1262,6 +1262,40 @@ impl Lowerer {
                 // Try inner expression
                 self.get_pointed_struct_layout(inner)
             }
+            Expr::ArraySubscript(base, _index, _) => {
+                // A pointer-to-array subscript yields an array lvalue.  When
+                // that lvalue is immediately used with `->`, its element
+                // struct layout must be recovered without loading the first
+                // word of the array as though it were a pointer.
+                if let Some(ctype) = self.get_expr_ctype(expr) {
+                    match ctype {
+                        CType::Array(element, _) => {
+                            if let Some(layout) = self.struct_layout_from_ctype(&element) {
+                                return Some(layout);
+                            }
+                        }
+                        CType::Struct(_) | CType::Union(_) => {
+                            if let Some(layout) = self.struct_layout_from_ctype(&ctype) {
+                                return Some(layout);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Preserve the array-of-pointers case (pp[i]->field), then
+                // use the value-layout resolver for other array expressions.
+                if let Some(CType::Array(element, _) | CType::Pointer(element, _)) =
+                    self.get_expr_ctype(base).as_ref()
+                {
+                    if let CType::Pointer(pointee, _) = element.as_ref() {
+                        if let Some(layout) = self.struct_layout_from_ctype(pointee) {
+                            return Some(layout);
+                        }
+                    }
+                }
+                self.get_layout_for_expr(expr)
+                    .or_else(|| self.get_pointed_struct_layout(base))
+            }
             Expr::AddressOf(inner, _) => {
                 // &expr - result is a pointer to expr's type
                 self.get_layout_for_expr(inner)
@@ -1283,18 +1317,6 @@ impl Lowerer {
                 }
                 // Fallback: propagate through inner
                 self.get_pointed_struct_layout(inner)
-            }
-            Expr::ArraySubscript(base, _, _) => {
-                // pp[i] where pp is an array of struct pointers
-                if let Some(CType::Array(elem, _) | CType::Pointer(elem, _)) =
-                    self.get_expr_ctype(base).as_ref()
-                {
-                    if let CType::Pointer(pointee, _) = elem.as_ref() {
-                        return self.struct_layout_from_ctype(pointee);
-                    }
-                }
-                // Fallback: try base directly
-                self.get_pointed_struct_layout(base)
             }
             Expr::FunctionCall(func, _, _) => {
                 self.resolve_func_call_struct_layout(func, expr, true)

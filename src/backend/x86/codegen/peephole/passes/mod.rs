@@ -2006,6 +2006,33 @@ mod tests {
         assert!(result.contains("(%rcx)"), "{result}");
     }
 
+
+    #[test]
+    fn test_rcx_address_copy_preserves_later_reused_source() {
+        // The first load uses %rcx as a temporary address register.  The
+        // later identical stack load can be folded to `movq %rcx, %rax` by
+        // reuse_redundant_loads, so the defining copy must not be removed just
+        // because the immediate dereference does not read %rcx afterwards.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq -8(%rbp), %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rax, -16(%rbp)\n",
+            "    movq -8(%rbp), %rax\n",
+            "    movq %rax, -24(%rbp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq -8(%rbp), %rcx"),
+            "the address-copy definition was removed before its later use: {result}"
+        );
+    }
+
     #[test]
     fn test_stack_top_store_consumed_by_ret_survives_dse() {
         let asm = concat!(

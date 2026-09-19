@@ -84,8 +84,18 @@ for flag in -mno-fma -mno-avx; do
     "$ccc" -O2 "$flag" -S "$fmasrc" -o "$tmp/fma.s"
     check_eq "$flag: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
 done
-"$ccc" -O2 "${KERNEL_ISA[@]}" -S "$fmasrc" -o "$tmp/fma.s"
-check_eq "kernel ISA flags: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
+# The kernel's no-SSE contract also rejects live scalar FP: x86-64 LCCC has
+# no x87 lowering, and silently accepting this TU would be worse than a clear
+# diagnostic.  Keep the FMA gate assertion separate from that diagnostic.
+if "$ccc" -O2 "${KERNEL_ISA[@]}" -S "$fmasrc" -o "$tmp/fma.s" \
+    >"$tmp/kernel-fma.out" 2>"$tmp/kernel-fma.err"; then
+    echo "FAIL: kernel ISA flags accepted a live scalar-FP FMA TU" >&2
+    fail=1
+elif ! grep -q "floating-point operation requires SSE" "$tmp/kernel-fma.err"; then
+    echo "FAIL: kernel ISA FMA diagnostic changed or disappeared" >&2
+    cat "$tmp/kernel-fma.err" >&2
+    fail=1
+fi
 
 # ---- 5. `-msse` after `-mno-sse` re-enables (kernel CC_FLAGS_FPU) ----------
 # arch/x86/Makefile appends -msse to CC_FLAGS_FPU for FPU-using TUs, after the

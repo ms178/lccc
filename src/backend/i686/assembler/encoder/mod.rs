@@ -481,10 +481,19 @@ impl InstructionEncoder {
                 }
             }
 
-            // Stack ops (32-bit default)
+            // Stack ops.  An unsuffixed push/pop follows the current
+            // operand-size default: 16 bits in `.code16`, 32 bits in
+            // `.code16gcc`/`.code32`.  The explicit `l` spelling always
+            // selects the 32-bit form; `w` always selects the 16-bit form.
+            // This distinction is architectural, not cosmetic: `push $0`
+            // in the real-mode trampoline must decrement SP by two, while a
+            // mistaken 32-bit encoding leaves the return address stranded
+            // and sends the AP back into the BIOS reset vector.
+            "push" if self.code16 && !self.code16gcc => self.encode_push16(ops),
+            "pop" if self.code16 && !self.code16gcc => self.encode_pop16(ops),
             "pushl" | "push" => self.encode_push(ops),
             "popl" | "pop" => self.encode_pop(ops),
-            // Also handle pushw/popw for 16-bit variants
+            // Also handle explicit 16-bit variants.
             "pushw" => self.encode_push16(ops),
             "popw" => self.encode_pop16(ops),
 
@@ -1905,5 +1914,60 @@ impl InstructionEncoder {
                 mnemonic, ops
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_width_tests {
+    use super::*;
+
+    fn instruction(mnemonic: &str, operand: Operand) -> Instruction {
+        Instruction {
+            prefix: None,
+            mnemonic: mnemonic.to_owned(),
+            operands: vec![operand],
+            nf: false,
+            force_evex: false,
+            force_rex2: false,
+            dfv: 0,
+        }
+    }
+
+    fn immediate(value: i64) -> Operand {
+        Operand::Immediate(ImmediateValue::Integer(value))
+    }
+
+    #[test]
+    fn unsuffixed_stack_immediates_follow_code16_default() {
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        encoder
+            .encode(&instruction("push", immediate(0)))
+            .unwrap();
+        assert_eq!(encoder.bytes, [0x6a, 0x00]);
+
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        encoder
+            .encode(&instruction("pop", Operand::Register(Register {
+                name: "ax".to_owned(),
+                mask: None,
+                zeroing: false,
+                sae: false,
+                rounding: None,
+            })))
+            .unwrap();
+        assert_eq!(encoder.bytes, [0x58]);
+    }
+
+    #[test]
+    fn code16gcc_unsuffixed_stack_ops_remain_32_bit() {
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        encoder.code16gcc = true;
+        encoder
+            .encode(&instruction("push", immediate(0)))
+            .unwrap();
+        assert_eq!(encoder.bytes, [0x66, 0x6a, 0x00]);
     }
 }
