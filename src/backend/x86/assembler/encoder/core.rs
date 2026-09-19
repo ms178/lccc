@@ -929,8 +929,30 @@ impl super::InstructionEncoder {
         Ok(())
     }
 
-    /// Add a relocation relative to current position.
+    /// Add a relocation relative to the current instruction stream.
+    ///
+    /// `Operand::Label` is shared by control-flow targets and bare absolute
+    /// memory operands, so the parser cannot eagerly turn `symbol+constant`
+    /// into a `Displacement::SymbolPlusOffset`.  Normalize it here, at the
+    /// single relocation choke point.  Without this, `movq ext+9,%rax` and
+    /// `loop .Ltarget+1` emitted undefined symbols literally named `ext+9`
+    /// and `.Ltarget+1`; the internal PC8 type could then escape into ELF.
     pub(crate) fn add_relocation(&mut self, symbol: &str, reloc_type: u32, addend: i64) {
+        let (symbol, addend) = if let Some((base, extra)) =
+            super::super::parser::split_relocation_symbol_addend(symbol)
+        {
+            // Parsed source constants and architecture-supplied addends
+            // are both i64. Overflow is not a legal ELF addend; retaining
+            // the unsplit spelling lets the normal undefined-symbol path
+            // diagnose it rather than wrapping to a different address.
+            match addend.checked_add(extra) {
+                Some(sum) => (base, sum),
+                None => (symbol, addend),
+            }
+        } else {
+            (symbol, addend)
+        };
+
         // Strip @PLT suffix from symbol names - the suffix only affects relocation type,
         // not the symbol name in the ELF symbol table. Use PLT32 reloc when @PLT is present.
         let (sym, rtype) = if let Some(base) = symbol.strip_suffix("@PLT") {
@@ -944,7 +966,7 @@ impl super::InstructionEncoder {
             (symbol, reloc_type)
         };
         self.relocations.push(Relocation {
-            offset: self.offset + self.bytes.len() as u64 - (self.offset), // adjusted in caller
+            offset: self.bytes.len() as u64,
             symbol: sym.to_string(),
             reloc_type: rtype,
             addend,

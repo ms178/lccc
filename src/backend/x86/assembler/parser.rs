@@ -2006,6 +2006,27 @@ fn parse_displacement(s: &str) -> Result<Displacement, String> {
     Ok(Displacement::Symbol(s.to_string()))
 }
 
+/// Split a relocation target spelled `symbol+constant` / `symbol-constant`.
+///
+/// Bare operands are deliberately parsed as `Operand::Label` because the
+/// parser cannot know whether `foo+4` is a branch target or an absolute memory
+/// operand.  Every such path ultimately records a relocation, so the encoder's
+/// relocation choke point uses this helper to recover the addend.  Keeping the
+/// grammar here prevents the label and memory-displacement paths from drifting
+/// (the latter already calls `try_parse_symbol_plus_offset` directly).
+pub(crate) fn split_relocation_symbol_addend(s: &str) -> Option<(&str, i64)> {
+    match try_parse_symbol_plus_offset(s)? {
+        Displacement::SymbolPlusOffset(ref symbol, addend) => {
+            // `try_parse_symbol_plus_offset` trims the symbol. Return the
+            // corresponding slice of the caller's string so relocation
+            // recording does not need to allocate just to normalise a name.
+            let start = s.find(symbol.as_str())?;
+            Some((&s[start..start + symbol.len()], addend))
+        }
+        _ => None,
+    }
+}
+
 /// Try to parse a `symbol+offset` or `symbol-offset` expression.
 /// Returns None if the string doesn't match this pattern.
 fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
@@ -2192,24 +2213,112 @@ fn is_segment_name(s: &str) -> bool {
 }
 
 /// Check if a string looks like a label (alphanumeric, underscore, dot).
+///
+/// A bare numeric literal is never label-like.  Hex constants are spelled
+/// with alphabetic digits (`0xffffffff80000000`), so they satisfy the charset
+/// test below and would be mistaken for a symbol by the symbol-difference
+/// probe: the kernel's `init_top_pgt - __START_KERNEL_map` must be parsed as
+/// SymbolPlusOffset so it receives an absolute R_X86_64_32S relocation, not a
+/// PC-relative R_X86_64_PC32 relocation.
+///
+/// The literal test is a single allocation-free byte scan rather than a call
+/// into the shared evaluator.  `is_label_like` runs for every candidate
+/// symbol on every operand of every assembly line, and `parse_integer_expr`
+/// allocates an error `String` on *each* miss — twice, in fact, because
+/// `parse_single_integer` fails first and `tokenize_expr` then fails on the
+/// identifier's leading character.  That turned the hottest predicate in the
+/// assembler into two heap allocations per symbol.
+///
+/// Skipping the evaluator is exactly equivalent here, not an approximation:
+/// a string that reaches the literal test and survives the charset test
+/// contains no operator, parenthesis, sign, quote or whitespace, so the
+/// evaluator can only accept it through its single-literal path — and that
+/// path necessarily begins with an ASCII digit.  Identifiers, which are the
+/// overwhelming majority of call sites, therefore never enter the scan.
 fn is_label_like(s: &str) -> bool {
-    if s.is_empty() {
+    let bytes = s.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return false;
+    };
+    if first.is_ascii_digit() && is_bare_integer_literal(bytes) {
         return false;
     }
-    // Hex constants contain alphabetic digits (`0xffffffff...`) and would
-    // otherwise be mistaken for a label by the symbol-difference probe.  In
-    // particular, the kernel's `init_top_pgt - __START_KERNEL_map` must be
-    // parsed as SymbolPlusOffset so it receives an absolute R_X86_64_32S
-    // relocation, not a PC-relative R_X86_64_PC32 relocation.
-    if parse_integer_expr(s).is_ok() {
-        return false;
-    }
-    let first = s.as_bytes()[0];
     if !(first.is_ascii_alphabetic() || first == b'_' || first == b'.' || first.is_ascii_digit()) {
         return false;
     }
-    s.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+}
+
+/// Recognize a bare integer literal — `42`, `0644`, `0x1f`, `0b1010`, and the
+/// same with C integer suffixes — in one allocation-free pass over `bytes`.
+///
+/// Mirrors the accept/reject decision of `asm_expr::parse_single_integer` for
+/// the charset-restricted inputs [`is_label_like`] can observe; see there for
+/// why the evaluator itself must not be called on this path.
+fn is_bare_integer_literal(bytes: &[u8]) -> bool {
+    // C integer suffixes (u/U/l/L/z/Z, incl. LL/ULL combos) are stripped
+    // before the radix is read, exactly as the evaluator strips them.
+    let mut end = bytes.len();
+    while end > 0 && matches!(bytes[end - 1], b'u' | b'U' | b'l' | b'L' | b'z' | b'Z') {
+        end -= 1;
+    }
+    let lit = &bytes[..end];
+    let radixed = lit.len() > 1 && lit[0] == b'0';
+    if radixed && matches!(lit[1], b'x' | b'X') {
+        // u64: every 16-digit hexadecimal value fits, so width alone decides.
+        return fits_radix(&lit[2..], |b| b.is_ascii_hexdigit(), 16, None);
+    }
+    if radixed && matches!(lit[1], b'b' | b'B') {
+        // i64: 63 bits is the widest positive value that still fits.
+        return fits_radix(&lit[2..], |b| matches!(b, b'0' | b'1'), 63, None);
+    }
+    if radixed && lit.iter().all(|b| b.is_ascii_digit()) {
+        // A leading zero selects octal and never falls back to decimal, so
+        // `09` is not a literal — the evaluator rejects it identically.
+        return fits_radix(
+            lit,
+            |b| matches!(b, b'0'..=b'7'),
+            21,
+            Some(b"777777777777777777777"),
+        );
+    }
+    // Decimal, widened to u64 like the evaluator's i64-then-u64 retry.
+    fits_radix(
+        lit,
+        |b| b.is_ascii_digit(),
+        20,
+        Some(b"18446744073709551615"),
+    )
+}
+
+/// True when every byte of `body` is a digit of the radix under test and the
+/// value they spell fits the evaluator's target type.
+///
+/// Leading zeros never contribute to the value, so only the significant tail
+/// is measured.  Below `max_significant` digits every value fits; at exactly
+/// that width `limit` — the type's maximum spelled in this radix — is compared
+/// byte-wise, which is a numeric comparison because both operands have the
+/// same length and radix.  `limit` is `None` for the power-of-two radices,
+/// where a full-width value fits by construction.
+fn fits_radix(
+    body: &[u8],
+    is_digit: fn(u8) -> bool,
+    max_significant: usize,
+    limit: Option<&[u8]>,
+) -> bool {
+    if body.is_empty() || !body.iter().copied().all(is_digit) {
+        return false;
+    }
+    let Some(first) = body.iter().position(|&b| b != b'0') else {
+        return true; // the all-zero value fits in every radix
+    };
+    let significant = &body[first..];
+    if significant.len() != max_significant {
+        return significant.len() < max_significant;
+    }
+    limit.is_none_or(|limit| significant <= limit)
 }
 
 /// Strip balanced outer parentheses from an expression.
@@ -4035,6 +4144,25 @@ mod tests {
         assert!(parse_memory_operand("sym+4(%esp)").is_ok());
     }
 
+    /// Bare label operands stay context-neutral until instruction dispatch,
+    /// but their relocation addends must use the exact same grammar as a
+    /// parenthesized memory displacement.
+    #[test]
+    fn test_split_relocation_symbol_addend() {
+        assert_eq!(split_relocation_symbol_addend("ext+9"), Some(("ext", 9)));
+        assert_eq!(
+            split_relocation_symbol_addend(" ext - 7 "),
+            Some(("ext", -7))
+        );
+        assert_eq!(split_relocation_symbol_addend("4+ext"), Some(("ext", 4)));
+        assert_eq!(
+            split_relocation_symbol_addend(".Ltarget+1"),
+            Some((".Ltarget", 1))
+        );
+        assert_eq!(split_relocation_symbol_addend("plain"), None);
+        assert_eq!(split_relocation_symbol_addend("sym-other"), None);
+    }
+
     /// GAS `\@` must be substituted with a DISTINCT value per macro
     /// expansion (kernel ANNOTATE emits `.Lhere_\@:` once per use; a shared
     /// value collapses every annotation onto one label).
@@ -4315,6 +4443,144 @@ mod tests {
                 assert_eq!(addend, 0x8000_0000);
             }
             other => panic!("hex constant was misparsed as a symbol difference: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_is_label_like_numeric_literal_boundaries() {
+        // Literals: rejected as labels, in every radix the evaluator accepts
+        // and with the C integer suffixes it strips.
+        for literal in [
+            "0",
+            "1",
+            "42",
+            "0644",
+            "00",
+            "0x1f",
+            "0X1F",
+            "0b1010",
+            "0xffffffff80000000",
+            "0xffffffffffffffff",
+            "9223372036854775807",
+            "18446744073709551615",
+            "0777777777777777777777",
+            "0x10u",
+            "12ul",
+            "0xffULL",
+            "0000000000000000000000005",
+        ] {
+            assert!(
+                !is_label_like(literal),
+                "{literal} is a numeric literal and must not be label-like"
+            );
+        }
+
+        // Charset-valid non-literals: still label-like.  GAS local-label
+        // references (`1f`/`2b`) and overflowing constants are the cases that
+        // a coarser "starts with a digit" rejection would break.
+        for symbol in [
+            "1f",
+            "1b",
+            "2f",
+            "09",                      // octal selection, then '9' is not an octal digit
+            "0x1g",                    // not a hex digit
+            "0x",                      // empty mantissa
+            "0b",                      // empty mantissa
+            "0abc",                    // leading zero but not octal digits
+            "1.5",                     // no floating point in integer expressions
+            "0xfffffffffffffffff",     // 17 hex digits: overflows u64
+            "18446744073709551616",    // u64::MAX + 1
+            "777777777777777777778",   // 21 digits, above the decimal width
+            "07777777777777777777777", // 22 significant octal digits
+            // 21 DECIMAL digits, so above u64::MAX: only the leading-zero
+            // spelling `0777777777777777777777` selects octal and fits i64.
+            "777777777777777777777",
+            "init_top_pgt",
+            "__START_KERNEL_map",
+            ".Lfoo",
+            "_bar9",
+        ] {
+            assert!(
+                is_label_like(symbol),
+                "{symbol} is not a numeric literal and must stay label-like"
+            );
+        }
+
+        // Anything outside the label charset is never label-like, whether or
+        // not the evaluator could parse it.
+        for rejected in ["", "-5", "1+2", "(8)", " 5", "5 ", "1 << 5", "'A'"] {
+            assert!(
+                !is_label_like(rejected),
+                "{rejected:?} is outside the label charset"
+            );
+        }
+    }
+
+    /// The allocation-free literal recognizer must agree with the shared
+    /// evaluator on every input `is_label_like` can actually reach.  Exhaustive
+    /// over a charset that covers each decision the recognizer makes: radix
+    /// prefixes (case-insensitive), valid and invalid digits per radix, the
+    /// octal-vs-decimal selection on a leading zero, suffix stripping, and the
+    /// charset-only separators.
+    #[test]
+    fn test_bare_integer_literal_matches_shared_evaluator() {
+        const ALPHABET: &[u8] = b"01789xXbBfeulz._";
+        const MAX_LEN: usize = 4;
+        let mut buf = [0u8; MAX_LEN];
+        let mut checked = 0usize;
+        for len in 1..=MAX_LEN {
+            let radix = ALPHABET.len();
+            for n in 0..radix.pow(len as u32) {
+                let mut v = n;
+                for slot in buf[..len].iter_mut() {
+                    *slot = ALPHABET[v % radix];
+                    v /= radix;
+                }
+                let candidate = std::str::from_utf8(&buf[..len]).unwrap();
+                assert_eq!(
+                    is_bare_integer_literal(candidate.as_bytes()),
+                    parse_integer_expr(candidate).is_ok(),
+                    "literal recognizer disagrees with the shared evaluator on {candidate:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 60_000, "corpus too small: {checked}");
+    }
+
+    /// Width boundaries the exhaustive corpus above cannot reach: the widest
+    /// value each radix accepts and the first one it rejects.
+    #[test]
+    fn test_bare_integer_literal_width_boundaries() {
+        let cases: &[(&str, bool)] = &[
+            ("0xffffffffffffffff", true),    // 16 hex digits = u64::MAX
+            ("0x10000000000000000", false),  // 17 hex digits
+            ("0x0000000000000000001", true), // leading zeros do not count
+            (
+                "0b111111111111111111111111111111111111111111111111111111111111111",
+                true,
+            ), // 63 bits
+            (
+                "0b1000000000000000000000000000000000000000000000000000000000000000",
+                false,
+            ), // 64 bits
+            ("0777777777777777777777", true), // i64::MAX in octal
+            ("01000000000000000000000", false), // 2^63 in octal
+            ("18446744073709551615", true),  // u64::MAX in decimal
+            ("18446744073709551616", false), // u64::MAX + 1
+            ("9223372036854775807", true),   // i64::MAX, via the u64 retry
+        ];
+        for (candidate, expected) in cases {
+            assert_eq!(
+                is_bare_integer_literal(candidate.as_bytes()),
+                *expected,
+                "width boundary {candidate:?}"
+            );
+            assert_eq!(
+                is_bare_integer_literal(candidate.as_bytes()),
+                parse_integer_expr(candidate).is_ok(),
+                "evaluator parity on {candidate:?}"
+            );
         }
     }
 

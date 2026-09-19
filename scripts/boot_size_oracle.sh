@@ -50,6 +50,14 @@ CC_ORACLE=${CC_ORACLE:-gcc}
 [[ -d $K ]] || { echo "boot_size_oracle: kernel tree missing: $K" >&2; exit 1; }
 [[ -x $LCCC ]] || { echo "boot_size_oracle: lccc missing: $LCCC" >&2; exit 1; }
 cd "$K"
+# `LCCC_BOOT_OBJS` includes `header`, and header.S includes zoffset.h/voffset.h
+# for ZO_efi*_stub_entry / VO__text.  A setup-only link never regenerates them,
+# so this harness was sourcing boot_offsets.sh without ever calling it and then
+# dying on the missing header instead of reporting a size delta.  Restore the
+# same deterministic immediates build_kernel_boot.sh uses; both toolchains
+# compile the identical stubbed header, so the lccc-vs-oracle delta stays
+# codegen-only.
+ensure_boot_offset_stubs
 
 # The KEEP-annotated copy of setup.ld used by build_kernel_boot.sh; regenerate
 # identically so both links see the same script.

@@ -23163,6 +23163,23 @@ pub(crate) fn vectorize_const_trip_map_loops(
     func: &mut IrFunction,
     fp_contract: FpContract,
 ) -> usize {
+    // ISA gate FIRST.  This entry runs before the main vectorizer and
+    // therefore needs its own gate: it emits the same Vec* intrinsics, but the
+    // caller's generic `vectorize_with_analysis` gate is not reached here.  In
+    // particular, `-mno-sse` kernel TUs must keep fixed-trip aggregate-copy
+    // loops scalar; otherwise this early map path can leave a VecLoadI32x4
+    // that the x86 backend quite correctly rejects as an XMM instruction.
+    //
+    // It is also the cheapest guard in this function — a thread-local read —
+    // so it must not sit behind the two whole-function IR walks and the
+    // environment lookup below.  A gated TU (the kernel's `-mno-sse
+    // -mgeneral-regs-only` contract) otherwise pays a DynAlloca scan, a
+    // volatile-access scan and an `env::var` allocation for every function in
+    // the module to reach a test that was already decided before the pass ran.
+    // All four guards are pure `return 0`, so the ordering is semantic-free.
+    if !x86_simd_available() {
+        return 0;
+    }
     // Same scoped legality gates as the main vectorizer: a DynAlloca breaks
     // the transform's fixed-address assumptions, volatile accesses are
     // observable and must keep their scalar width/order.
@@ -23178,15 +23195,6 @@ pub(crate) fn vectorize_const_trip_map_loops(
         return 0;
     }
     if std::env::var("CCC_NO_MAP_VEC").is_ok() {
-        return 0;
-    }
-    // This entry runs before the main vectorizer and therefore needs its own
-    // ISA gate.  It emits the same Vec* intrinsics, but the caller's generic
-    // `vectorize_with_analysis` gate is not reached here.  In particular,
-    // `-mno-sse` kernel TUs must keep fixed-trip aggregate-copy loops scalar;
-    // otherwise this early map path can leave a VecLoadI32x4 that the x86
-    // backend quite correctly rejects as an XMM instruction.
-    if !x86_simd_available() {
         return 0;
     }
     // Same diamond pre-conversion as the main vectorizer (see there).

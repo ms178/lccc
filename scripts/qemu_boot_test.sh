@@ -111,19 +111,36 @@ else
             break
         fi
     done
-    # Debian's split layout is the normal system install.  Symlinks are
-    # sufficient and avoid copying firmware into the persistent workspace.
-    if [[ -z "$firmware_dir" && -f "$bios_dir/bios-256k.bin" \
-          && -f "$rom_dir/linuxboot_dma.bin" && -f "$rom_dir/kvmvapic.bin" \
-          && -f "$rom_dir/efi-e1000.rom" ]]; then
-        firmware_dir="$WORK/qemu-firmware"
-        rm -rf "$firmware_dir"
-        mkdir -p "$firmware_dir"
-        for f in bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom; do
-            src="$rom_dir/$f"
-            [[ -f "$src" ]] || src="$bios_dir/$f"
-            ln -s "$src" "$firmware_dir/$f"
+    # Debian's split layout is the normal system install: SeaBIOS ships
+    # bios-256k.bin while qemu-system-data / ipxe-qemu ship the option ROMs.
+    # WHICH directory holds WHICH file is a packaging detail, so resolve every
+    # required file independently and accept any split.  (Requiring one fixed
+    # assignment — bios in $bios_dir, all three ROMs in $rom_dir — rejected
+    # complete unions that merely came from a different package layout, and
+    # resolving per file also makes a dangling symlink impossible.)  Symlinks
+    # are sufficient and avoid copying firmware into the persistent workspace.
+    if [[ -z "$firmware_dir" ]]; then
+        firmware_required=(bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom)
+        firmware_resolved=()
+        firmware_complete=1
+        for f in "${firmware_required[@]}"; do
+            if [[ -f "$rom_dir/$f" ]]; then
+                firmware_resolved+=("$rom_dir/$f")
+            elif [[ -f "$bios_dir/$f" ]]; then
+                firmware_resolved+=("$bios_dir/$f")
+            else
+                firmware_complete=0
+                break
+            fi
         done
+        if ((firmware_complete)); then
+            firmware_dir="$WORK/qemu-firmware"
+            rm -rf "$firmware_dir"
+            mkdir -p "$firmware_dir"
+            for i in "${!firmware_required[@]}"; do
+                ln -s "${firmware_resolved[$i]}" "$firmware_dir/${firmware_required[$i]}"
+            done
+        fi
     fi
     if [[ -z "$firmware_dir" ]]; then
         echo "qemu_boot_test: could not find a complete QEMU firmware set" >&2
