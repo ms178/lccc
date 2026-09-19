@@ -77,6 +77,24 @@ check_eq "kernel ISA flags: SIMD register refs" "$(count_simd $tmp/kernel-isa.s)
 check_eq "kernel ISA flags at -O3: SIMD register refs" \
     "$(count_simd $tmp/kernel-isa-o3.s)" 0
 
+# The Phase-2b memory-form ARX vectorizer (`vec_arx`) runs BEFORE the main
+# vectorizer's ISA gate yet emits XMM-shaped intrinsics on the u32[16]
+# ChaCha slot domain.  Before its own gate it turned a kernel TU into a
+# hard backend rejection ("offending instruction: `movdqu (%rax), %xmm2'").
+# Both the array spelling (benchmark chacha20_block.c) and the phi spelling
+# (regression vec_arx_scalar_spelling.c) must stay scalar and compile.
+for arx in "$repo/tests/regression/vec_arx_scalar_spelling.c" \
+           "$repo/tests/benchmark/programs/chacha20_block.c"; do
+    name=$(basename "$arx" .c)
+    "$ccc" -O2 "${KERNEL_ISA[@]}" -S "$arx" -o "$tmp/arx-$name.s"
+    check_eq "kernel ISA flags: ARX $name xmm refs" \
+        "$(count_simd "$tmp/arx-$name.s")" 0
+done
+"$ccc" -O3 "${KERNEL_ISA[@]}" -S "$repo/tests/benchmark/programs/chacha20_block.c" \
+    -o "$tmp/arx-chacha-o3.s"
+check_eq "kernel ISA flags at -O3: ARX chacha20_block xmm refs" \
+    "$(count_simd "$tmp/arx-chacha-o3.s")" 0
+
 # ---- 4. FMA3 gate ----------------------------------------------------------
 "$ccc" -O2 -S "$fmasrc" -o "$tmp/fma-default.s"
 check_gt0 "default fmaf folds to vfmadd" "$(count_vfmadd $tmp/fma-default.s)"
@@ -84,8 +102,18 @@ for flag in -mno-fma -mno-avx; do
     "$ccc" -O2 "$flag" -S "$fmasrc" -o "$tmp/fma.s"
     check_eq "$flag: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
 done
-"$ccc" -O2 "${KERNEL_ISA[@]}" -S "$fmasrc" -o "$tmp/fma.s"
-check_eq "kernel ISA flags: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
+# The kernel's no-SSE contract also rejects live scalar FP: x86-64 LCCC has
+# no x87 lowering, and silently accepting this TU would be worse than a clear
+# diagnostic.  Keep the FMA gate assertion separate from that diagnostic.
+if "$ccc" -O2 "${KERNEL_ISA[@]}" -S "$fmasrc" -o "$tmp/fma.s" \
+    >"$tmp/kernel-fma.out" 2>"$tmp/kernel-fma.err"; then
+    echo "FAIL: kernel ISA flags accepted a live scalar-FP FMA TU" >&2
+    fail=1
+elif ! grep -q "floating-point operation requires SSE" "$tmp/kernel-fma.err"; then
+    echo "FAIL: kernel ISA FMA diagnostic changed or disappeared" >&2
+    cat "$tmp/kernel-fma.err" >&2
+    fail=1
+fi
 
 # ---- 5. `-msse` after `-mno-sse` re-enables (kernel CC_FLAGS_FPU) ----------
 # arch/x86/Makefile appends -msse to CC_FLAGS_FPU for FPU-using TUs, after the

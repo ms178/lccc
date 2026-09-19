@@ -2196,6 +2196,14 @@ fn is_label_like(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
+    // Hex constants contain alphabetic digits (`0xffffffff...`) and would
+    // otherwise be mistaken for a label by the symbol-difference probe.  In
+    // particular, the kernel's `init_top_pgt - __START_KERNEL_map` must be
+    // parsed as SymbolPlusOffset so it receives an absolute R_X86_64_32S
+    // relocation, not a PC-relative R_X86_64_PC32 relocation.
+    if parse_integer_expr(s).is_ok() {
+        return false;
+    }
     let first = s.as_bytes()[0];
     if !(first.is_ascii_alphabetic() || first == b'_' || first == b'.' || first.is_ascii_digit()) {
         return false;
@@ -4294,6 +4302,19 @@ mod tests {
                 assert_eq!(n, 1);
             }
             other => panic!("a-b+N misparsed: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hex_constant_is_not_symbol_difference_rhs() {
+        let operand = parse_immediate_operand("init_top_pgt - 0xffffffff80000000")
+            .expect("immediate expression should parse");
+        match operand {
+            Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, addend)) => {
+                assert_eq!(sym, "init_top_pgt");
+                assert_eq!(addend, 0x8000_0000);
+            }
+            other => panic!("hex constant was misparsed as a symbol difference: {other:?}"),
         }
     }
 

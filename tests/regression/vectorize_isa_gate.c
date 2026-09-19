@@ -49,6 +49,20 @@ __attribute__((noinline)) long dot_ll(const long *a, const long *b, int n)
     return acc;
 }
 
+/* Fixed-trip aggregate copies take the early constant-map vectorizer path,
+ * before the ordinary loop vectorizer.  Keep this kernel-shaped case here so
+ * -mno-sse gates both entry points, not just the later general loop path. */
+static const unsigned int fixed_src[12] = {
+    0x10203040u, 0x50607080u, 0x90a0b0c0u, 0xd0e0f000u,
+    11u, 22u, 33u, 44u, 55u, 66u, 77u, 88u,
+};
+
+__attribute__((noinline)) void fixed_copy(unsigned int *d)
+{
+    for (int i = 0; i < 12; i++)
+        d[i] = fixed_src[i];
+}
+
 int main(void)
 {
     static int d[N], m[N], s[N];
@@ -81,6 +95,13 @@ int main(void)
     }
     if (dot_ll(va, vb, N) != want_dot)
         fail++;
+
+    unsigned int fixed_dst[12] = {0};
+    fixed_copy(fixed_dst);
+    for (int i = 0; i < 12; i++) {
+        if (fixed_dst[i] != fixed_src[i])
+            fail++;
+    }
 
     /* A second pass with a different length exercises the scalar remainder /
      * peel path that the vector transforms add. */

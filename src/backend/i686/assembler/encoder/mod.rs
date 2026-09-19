@@ -481,10 +481,19 @@ impl InstructionEncoder {
                 }
             }
 
-            // Stack ops (32-bit default)
+            // Stack ops.  An unsuffixed push/pop follows the current
+            // operand-size default: 16 bits in `.code16`, 32 bits in
+            // `.code16gcc`/`.code32`.  The explicit `l` spelling always
+            // selects the 32-bit form; `w` always selects the 16-bit form.
+            // This distinction is architectural, not cosmetic: `push $0`
+            // in the real-mode trampoline must decrement SP by two, while a
+            // mistaken 32-bit encoding leaves the return address stranded
+            // and sends the AP back into the BIOS reset vector.
+            "push" if self.code16 && !self.code16gcc => self.encode_push16(ops),
+            "pop" if self.code16 && !self.code16gcc => self.encode_pop16(ops),
             "pushl" | "push" => self.encode_push(ops),
             "popl" | "pop" => self.encode_pop(ops),
-            // Also handle pushw/popw for 16-bit variants
+            // Also handle explicit 16-bit variants.
             "pushw" => self.encode_push16(ops),
             "popw" => self.encode_pop16(ops),
 
@@ -1905,5 +1914,95 @@ impl InstructionEncoder {
                 mnemonic, ops
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_width_tests {
+    use super::*;
+
+    fn instruction(mnemonic: &str, operand: Operand) -> Instruction {
+        Instruction {
+            prefix: None,
+            mnemonic: mnemonic.to_owned(),
+            operands: vec![operand],
+            nf: false,
+            force_evex: false,
+            force_rex2: false,
+            dfv: 0,
+        }
+    }
+
+    fn immediate(value: i64) -> Operand {
+        Operand::Immediate(ImmediateValue::Integer(value))
+    }
+
+    fn reg(name: &str) -> Operand {
+        Operand::Register(Register {
+            name: name.to_owned(),
+            mask: None,
+            zeroing: false,
+            sae: false,
+            rounding: None,
+        })
+    }
+
+    #[test]
+    fn unsuffixed_stack_immediates_follow_code16_default() {
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        encoder.encode(&instruction("push", immediate(0))).unwrap();
+        assert_eq!(encoder.bytes, [0x6a, 0x00]);
+
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        encoder.encode(&instruction("pop", reg("ax"))).unwrap();
+        assert_eq!(encoder.bytes, [0x58]);
+    }
+
+    #[test]
+    fn code16gcc_unsuffixed_stack_ops_remain_32_bit() {
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        encoder.code16gcc = true;
+        encoder.encode(&instruction("push", immediate(0))).unwrap();
+        assert_eq!(encoder.bytes, [0x66, 0x6a, 0x00]);
+    }
+
+    #[test]
+    fn segment_register_stack_ops_match_gas() {
+        // .code32: `push %ds` = 1e, `pop %es` = 07 (binutils: no prefix).
+        let mut encoder = InstructionEncoder::new();
+        encoder.encode(&instruction("push", reg("ds"))).unwrap();
+        assert_eq!(encoder.bytes, [0x1e]);
+        let mut encoder = InstructionEncoder::new();
+        encoder.encode(&instruction("pop", reg("es"))).unwrap();
+        assert_eq!(encoder.bytes, [0x07]);
+        // .code32: the two-byte fs/gs forms.
+        let mut encoder = InstructionEncoder::new();
+        encoder.encode(&instruction("push", reg("fs"))).unwrap();
+        assert_eq!(encoder.bytes, [0x0f, 0xa0]);
+        let mut encoder = InstructionEncoder::new();
+        encoder.encode(&instruction("pop", reg("gs"))).unwrap();
+        assert_eq!(encoder.bytes, [0x0f, 0xa9]);
+
+        // .code16gcc: the unsuffixed 32-bit default adds the inert 0x66
+        // that binutils 2.44 emits for `push %ds` (66 1e) in this mode.
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        encoder.code16gcc = true;
+        encoder.encode(&instruction("push", reg("ds"))).unwrap();
+        assert_eq!(encoder.bytes, [0x66, 0x1e]);
+
+        // .code16 unsuffixed: no prefix (encode_push16's own segment arms).
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        encoder.encode(&instruction("push", reg("ds"))).unwrap();
+        assert_eq!(encoder.bytes, [0x1e]);
+        // .code16 explicit `pushl %ds`: GAS assembles 66 1e here too.
+        let mut encoder = InstructionEncoder::new();
+        encoder.code16 = true;
+        encoder.encode(&instruction("pushl", reg("ds"))).unwrap();
+        assert_eq!(encoder.bytes, [0x66, 0x1e]);
     }
 }

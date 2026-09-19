@@ -2007,6 +2007,148 @@ mod tests {
     }
 
     #[test]
+    fn test_rcx_address_copy_preserves_later_reused_source() {
+        // The first load uses %rcx as a temporary address register.  The
+        // later identical stack load can be folded to `movq %rcx, %rax` by
+        // reuse_redundant_loads, so the defining copy must not be removed just
+        // because the immediate dereference does not read %rcx afterwards.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq -8(%rbp), %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rax, -16(%rbp)\n",
+            "    movq -8(%rbp), %rax\n",
+            "    movq %rax, -24(%rbp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq -8(%rbp), %rcx"),
+            "the address-copy definition was removed before its later use: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_register_source_with_later_use() {
+        // The register-source spelling of the same contract — and the exact
+        // shape the matcher fires on (`movq %<gpr>, %rcx`): a later reload
+        // use of %rcx after the dereference must keep the defining copy.
+        // The one-instruction lookahead this pass used to have answered
+        // "dead" here by only inspecting the first following line.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rax, -16(%rbp)\n",
+            "    movq %rcx, %rax\n",
+            "    movq %rax, -24(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "the address copy was removed before its later %rcx use: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_cmov_is_not_a_kill() {
+        // cmovCC conditionally PRESERVES the old destination (it is a
+        // read-modify-write of %rcx), so the copied value stays observable
+        // through it even though the destination token is the full family.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    cmovz %rbx, %rcx\n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "cmov was treated as a full kill of %rcx: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_setcc_is_not_a_kill() {
+        // `sete %cl` redefines only the low byte: the surviving upper bits
+        // of the copied 64-bit value stay observable for the later shift.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    sete %cl\n",
+            "    shrq $8, %rcx\n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "setCC %cl was treated as a full kill of the %rcx family: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_movw_is_not_a_kill() {
+        // A word-granular destination redefines only the low 16 bits; the
+        // upper 48 bits of the copied value survive to the later store.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movw %ax, %cx\n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "movw to %cx was treated as a full kill of the %rcx family: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_full_kill_still_eliminates() {
+        // Positive control: a genuine full-width unconditional redefinition
+        // (`movq %rbx, %rcx`) kills the value, so the copy is eliminated
+        // and the dereference reads through the original source register.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rbx, %rcx\n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq (%rdi), %rax"),
+            "the dereference was not folded through the source register: {result}"
+        );
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "the dead address copy was not eliminated: {result}"
+        );
+    }
+
+    #[test]
     fn test_stack_top_store_consumed_by_ret_survives_dse() {
         let asm = concat!(
             "f:\n",

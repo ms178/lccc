@@ -44,6 +44,8 @@ CC_ORACLE=${CC_ORACLE:-gcc}
 
 # shellcheck source=boot_flags.sh
 . "$here/boot_flags.sh"
+# shellcheck source=boot_offsets.sh
+. "$here/boot_offsets.sh"
 
 [[ -d $K ]] || { echo "boot_size_oracle: kernel tree missing: $K" >&2; exit 1; }
 [[ -x $LCCC ]] || { echo "boot_size_oracle: lccc missing: $LCCC" >&2; exit 1; }
