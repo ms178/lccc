@@ -56,83 +56,93 @@ LCCC is self-contained with zero external compiler or LLVM dependencies and is c
 
 ## Generated-Code Performance Benchmark Corpus
 
-Generated-code performance is evaluated using paired, deterministic execution benchmarks across 39 workloads and algorithms comparing **LCCC**, **GCC 14.2**, and **Clang 19.1** under identical flags (`-O2`) and CPU pinning.
+Generated-code performance is evaluated using paired, deterministic execution benchmarks across 39 workloads and algorithms comparing **LCCC**, **GCC 14.2**, and **Clang 19.1.7** under identical flags (`-O2`) and CPU pinning.
 
 All 39 benchmark outputs are verified for **100% byte-for-byte correctness and algorithmic equivalence** against reference compilers.
 
-> **Provenance & interpretation.** The medians below come from a bare-metal
-> run of `tests/benchmark/run_benchmarks.py` (paired rounds, excluded warm-ups,
-> CPU pinning, raw-sample retention) on the project's reference host; the
-> checked-in runner reproduces the protocol anywhere and writes the JSON /
-> Markdown evidence. Read the table as a *screening matrix*: the large
-> `constant_recursion` / `ackermann` / `fib` ratios reflect LCCC's aggressive
-> recursive-specialization (rec2iter) that GCC deliberately does not perform,
-> while codec and parser kernels (`lz4_compress`, `chacha20_block`,
-> `sha256_transform`) are honest losses with root-cause analyses and fix
-> backlogs in
-> [`engineering/journal/2026-09-W2.md`](engineering/journal/2026-09-W2.md).
+> **Provenance & interpretation.** The medians below are a fresh re-measure
+> from 2026-09-19 (base `56858cbc`, after the worst-15 campaign waves landed:
+> two-block unrolling, half-wide SLP, packed FMA contraction, struct-field
+> streams, Adler-32 loop epic, and the WO-1..8 red-team audit) of
+> `tests/benchmark/run_benchmarks.py` — paired randomized rounds (9 timed reps
+> after 2 excluded warm-ups, seed 20260810), CPU pinning, raw-sample
+> retention, GCC 14.2 + Clang 19.1.7 as references; JSON evidence:
+> `engineering/evidence/godbolt/s59-rank/runtime-main.json`. Read the table as
+> a *screening matrix*: the large `constant_recursion` / `ackermann` / `fib`
+> ratios reflect LCCC's aggressive recursive-specialization (rec2iter) that
+> GCC deliberately does not perform, while the remaining honest losses
+> (`expat_xml_scan`, `sha256_transform`, `zstd_count`, `linux_find_bit`)
+> carry root-cause analyses and fix backlogs in
+> [`engineering/journal/`](engineering/journal/) and
+> [`backlog.md`](backlog.md). Against the identical protocol's previous
+> checkpoint (2026-09-17, pre-campaign), same-host paired medians improved:
+> `mandelbrot` −33% (ratio 1.69 → 1.14), `sha256_transform` −20% (1.50 →
+> 1.20), `loop_patterns` −34% (now 0.84× — faster than GCC), `matmul` −27%
+> (0.93 → 0.69), `spectral_norm` −11%, `hash_table` −28%.
 
 ### Benchmark Results (39 Workloads & Kernels)
 
 | Benchmark | Category / Stress Focus | LCCC Median | GCC Median | Clang Median | LCCC / Best Ref | Verdict |
 |---|---|---:|---:|---:|---:|:---:|
-| `constant_recursion` | Constant recursive specialization | **2.21 ms** | 155.69 ms | 819.35 ms | **0.014× (70.52× faster)** | PASS |
-| `ackermann` | Deep recursive stack folding | **2.27 ms** | 154.70 ms | 828.17 ms | **0.015× (67.72× faster)** | PASS |
-| `fib` | Fibonacci recurrence recognition | **8.93 ms** | 271.13 ms | 535.52 ms | **0.031× (32.00× faster)** | PASS |
-| `libm_round_family` | glibc libm scalar rounding (`vroundsd`) | **203.64 ms** | 544.05 ms | 645.00 ms | **0.370× (2.70× faster)** | PASS |
-| `bitops` | Integer bit manipulation & selection | **216.91 ms** | 335.02 ms | 267.64 ms | **0.810× (1.23× faster)** | PASS |
-| `gzip_crc32` | GNU gzip 1.14 CRC-32 scalar table loop | **137.37 ms** | 159.90 ms | 155.91 ms | **0.880× (1.14× faster)** | PASS |
-| `arith_loop` | 32-variable arithmetic loop / RA pressure | **196.20 ms** | 203.05 ms | 199.59 ms | **0.983× (1.02× faster)** | PASS |
-| `switch_dispatch` | Jump table switch lowering | **526.70 ms** | 516.93 ms | 531.60 ms | **0.997× (1.00× faster)** | PASS |
-| `glibc_memcmp` | glibc aligned-word memcmp path | 7.31 ms | 7.26 ms | 7.26 ms | **1.006×** | PASS |
-| `binary_search` | Sorted-table binary search lookup | 2.05 ms | 2.09 ms | 2.00 ms | **1.001×** | PASS |
-| `double_reduction` | Two independent accumulators per loop | 99.29 ms | 102.14 ms | 97.46 ms | **1.010×** | PASS |
-| `qsort` | Quicksort partitioning & branches | 247.22 ms | 245.82 ms | 246.71 ms | **1.016×** | PASS |
-| `loop_patterns` | Scalar induction variable transforms | 75.60 ms | 73.74 ms | 67.12 ms | **1.126×** | PASS |
-| `ring_fifo` | SPSC bounded queue with mask wrapping | 2.00 ms | 2.01 ms | 1.91 ms | **1.045×** | PASS |
-| `ascii_case_fold` | Byte parser case-folding loop | 2.37 ms | 2.39 ms | 2.24 ms | **1.049×** | PASS |
-| `glibc_strstr` | glibc Two-Way substring search (Crochemore-Perrin) | 4.356 s | 4.108 s | 4.073 s | **1.069×** | PASS |
-| `histogram` | 256-bin reduction & scattered memory increments | 2.52 ms | 2.52 ms | 2.33 ms | **1.078×** | PASS |
-| `strlen_bench` | String byte operations | 221.35 ms | 216.19 ms | 205.36 ms | **1.075×** | PASS |
-| `linux_rbtree` | Linux kernel intrusive Red-Black tree ops | 16.61 ms | 15.34 ms | 16.79 ms | **1.083×** | PASS |
-| `zlib_ng_adler32` | zlib-ng Adler-32 NMAX accumulator | 37.14 ms | 37.51 ms | 34.82 ms | **1.067×** | PASS |
-| `binary_trees` | Binary trees allocation and traversal | 2.380 s | 2.042 s | 2.238 s | **1.082×** | PASS |
-| `hash_table` | Hash table pointer-chasing | 11.360 s | 10.790 s | 10.733 s | **1.119×** | PASS |
-| `struct_copy` | Struct copy / ABI memory transfer | 27.02 ms | 24.02 ms | 19.66 ms | **1.376×** | PASS |
-| `aarch64_select_patterns` | Conditional select & compare chains | 119.94 ms | 120.11 ms | 102.56 ms | **1.163×** | PASS |
-| `fannkuch` | Fannkuch-Redux permutation generation | 3.196 s | 2.545 s | 2.718 s | **1.174×** | PASS |
-| `mandelbrot` | Mandelbrot FP branch-heavy loop | 2.539 s | 2.012 s | 2.136 s | **1.208×** | PASS |
-| `sqlite_varint` | SQLite 1–9 byte variable-length int decoder | 28.38 ms | 23.71 ms | 28.13 ms | **1.217×** | PASS |
-| `nbody` | N-body floating-point simulation | 566.88 ms | 454.93 ms | 487.57 ms | **1.163×** | PASS |
-| `sieve` | Sieve of Eratosthenes memory stores | 87.31 ms | 70.69 ms | 69.18 ms | **1.262×** | PASS |
-| `spectral_norm` | Dense floating-point matrix approximation | 505.85 ms | 388.60 ms | 388.27 ms | **1.311×** | PASS |
-| `zstd_count` | Zstandard unaligned match length counting (`ctz`) | 12.00 ms | 9.07 ms | 9.52 ms | **1.279×** | PASS |
-| `tls_seg_access` | glibc thread-local `%fs` segment access | 10.25 ms | 9.72 ms | 7.89 ms | **1.304×** | PASS |
-| `matmul` | Dense matrix multiply floating point | 10.10 ms | 9.91 ms | 11.56 ms | **1.463×** | PASS |
-| `linux_find_bit` | Linux kernel sparse `find_next_andnot_bit` | 14.43 ms | 9.44 ms | 11.17 ms | **1.529×** | PASS |
-| `expat_xml_scan` | Expat UTF-8 XML name-token scan | 71.98 ms | 40.57 ms | 49.21 ms | **1.772×** | PASS |
-| `sha256_transform` | SHA-256 64-step block transformation | 480.36 ms | 251.70 ms | 251.31 ms | **1.952×** | PASS |
-| `tce_sum` | Tail-call elimination accumulator | 7.98 ms | 3.98 ms | 3.99 ms | **1.997×** | PASS |
-| `lz4_compress` | LZ4 hash-table sliding window compression | 10.96 ms | 3.46 ms | 3.52 ms | **3.131×** | PASS |
-| `chacha20_block` | ChaCha20 20-round ARX block cipher | 1.159 s | 242.45 ms | 211.81 ms | **5.502×** | PASS |
+| `expat_xml_scan` | Expat UTF-8 XML name-token scan | 45.45 ms | 34.43 ms | 31.27 ms | **1.453×** | PASS |
+| `aarch64_select_patterns` | conditional increment, narrow compare, and select pressure | 104.52 ms | 106.01 ms | 76.33 ms | **1.369×** | PASS |
+| `linux_find_bit` | Linux sparse find_next_andnot_bit | 13.45 ms | 9.91 ms | 10.79 ms | **1.358×** | PASS |
+| `zstd_count` | Zstandard fast unaligned match counting | 9.67 ms | 7.58 ms | 7.94 ms | **1.275×** | PASS |
+| `sha256_transform` | SHA-256 64-step block transform / rotate and schedule | 287.61 ms | 239.56 ms | 243.91 ms | **1.201×** | PASS |
+| `loop_patterns` | scalar loop transforms | 31.57 ms | 37.59 ms | 27.08 ms | **1.166×** | PASS |
+| `chacha20_block` | ChaCha20 20-round ARX block cipher / register pressure | 235.01 ms | 224.67 ms | 202.50 ms | **1.161×** | PASS |
+| `linux_rbtree` | Linux kernel intrusive Red-Black tree insertion and search | 15.46 ms | 13.36 ms | 14.39 ms | **1.157×** | PASS |
+| `nbody` | N-body simulation / FP structs | 246.22 ms | 213.73 ms | 229.58 ms | **1.152×** | PASS |
+| `hash_table` | hash table / pointer chasing | 13.016 s | 12.052 s | 11.371 s | **1.145×** | PASS |
+| `mandelbrot` | Mandelbrot / FP branch-heavy inner loop | 1.016 s | 892.59 ms | 955.04 ms | **1.138×** | PASS |
+| `ascii_case_fold` | ASCII parser case-fold byte loop / branch selection | 0.81 ms | 0.79 ms | 0.71 ms | **1.136×** | PASS |
+| `sieve` | sieve of Eratosthenes / stores | 54.27 ms | 49.02 ms | 48.13 ms | **1.128×** | PASS |
+| `histogram` | 256-bin histogram / indexed increment and reduction | 1.45 ms | 1.38 ms | 1.29 ms | **1.126×** | PASS |
+| `tls_seg_access` | glibc TLS access shapes | 8.52 ms | 8.94 ms | 7.58 ms | **1.124×** | PASS |
+| `sqlite_varint` | SQLite 1–9 byte varint decoder | 22.62 ms | 20.15 ms | 21.75 ms | **1.123×** | PASS |
+| `switch_dispatch` | switch lowering / dispatch | 527.28 ms | 476.56 ms | 486.07 ms | **1.106×** | PASS |
+| `glibc_strstr` | glibc two-way string search / needle shift table | 4.172 s | 3.887 s | 3.956 s | **1.073×** | PASS |
+| `spectral_norm` | spectral norm / dense floating point | 193.39 ms | 180.92 ms | 180.98 ms | **1.069×** | PASS |
+| `binary_trees` | binary trees / allocation and recursion | 2.113 s | 1.983 s | 2.002 s | **1.066×** | PASS |
+| `strlen_bench` | string operations / byte loops | 217.76 ms | 211.65 ms | 205.29 ms | **1.061×** | PASS |
+| `lz4_compress` | LZ4 fast block compression / 4-byte hash matching | 2.24 ms | 2.12 ms | 2.29 ms | **1.057×** | PASS |
+| `fannkuch` | Fannkuch-Redux / permutations | 2.383 s | 2.256 s | 2.419 s | **1.056×** | PASS |
+| `zlib_ng_adler32` | zlib-ng Adler-32 NMAX accumulator | 38.24 ms | 38.74 ms | 36.22 ms | **1.056×** | PASS |
+| `struct_copy` | struct copy / ABI and memory | 17.96 ms | 21.34 ms | 17.09 ms | **1.051×** | PASS |
+| `arith_loop` | 32-variable arithmetic loop / register pressure | 94.93 ms | 91.97 ms | 93.60 ms | **1.032×** | PASS |
+| `ring_fifo` | masked ring FIFO enqueue/dequeue / dependent loads | 0.62 ms | 0.61 ms | 0.60 ms | **1.025×** | PASS |
+| `qsort` | quicksort via libc / branches | 111.71 ms | 110.92 ms | 110.69 ms | **1.009×** | PASS |
+| `glibc_memcmp` | glibc aligned-word memcmp path | 5.59 ms | 5.60 ms | 5.55 ms | **1.007×** | PASS |
+| `tce_sum` | tail-recursive accumulator / TCE | 0.63 ms | 0.64 ms | 0.63 ms | **1.003×** | PASS |
+| `double_reduction` | two independent accumulators per loop | 105.43 ms | 115.50 ms | 111.55 ms | **0.945× (1.06× faster)** | PASS |
+| `binary_search` | sorted-table binary search / branch-heavy lookup | 0.65 ms | 0.70 ms | 0.69 ms | **0.931× (1.07× faster)** | PASS |
+| `gzip_crc32` | GNU gzip CRC-32 scalar table loop | 134.90 ms | 154.15 ms | 153.29 ms | **0.880× (1.14× faster)** | PASS |
+| `bitops` | bit manipulation / integer selection | 197.51 ms | 300.43 ms | 250.80 ms | **0.788× (1.27× faster)** | PASS |
+| `matmul` | dense matrix multiply / FP and cache | 3.66 ms | 5.32 ms | 5.09 ms | **0.719× (1.39× faster)** | PASS |
+| `libm_round_family` | glibc libm scalar rounding entry points | 201.02 ms | 486.65 ms | 619.05 ms | **0.413× (2.42× faster)** | PASS |
+| `ackermann` | Ackermann / deep recursion | 0.84 ms | 60.96 ms | 118.46 ms | **0.014× (72.92× faster)** | PASS |
+| `constant_recursion` | constant recursive specialization | 0.84 ms | 61.18 ms | 118.48 ms | **0.014× (72.92× faster)** | PASS |
+| `fib` | recursive Fibonacci / recurrence recognition | 0.88 ms | 129.03 ms | 211.25 ms | **0.007× (146.13× faster)** | PASS |
 
 ### Summary Statistics
 
-- **LCCC / GCC Geometric Mean Ratio:** **`0.8598`** *(LCCC outperforms GCC in overall geometric mean across the 39-benchmark suite)*
-- **LCCC / Fastest Available Reference Geometric Mean Ratio:** **`0.8936`**
+- **LCCC / GCC Geometric Mean Ratio:** **`0.7047`** *(LCCC outperforms GCC in overall geometric mean across the 39-benchmark suite)*
+- **LCCC / Fastest Available Reference Geometric Mean Ratio:** **`0.7399`**
 - **Correctness Rate:** **39 / 39 (100.0%)** exact matching test verifications.
 
-> **Session 2026-09-11 (screening VM, same-window A/B, not comparable to the
-> table above across hosts).** Base `417951a4` + patch series S04–S07:
-> full-corpus geomean (LCCC/fastest-ref) 0.7777 → 0.7857 with the S05 inline
-> fix (neutral within noise; zstd_count runtime 1.1597 → 1.1371); S07
-> ifcombine-profitability-guard gives **lz4 +4.7%** with 38/39 corpus files
-> byte-identical. Worst-10 re-triage found lz4's *true* gap is ~10x (A/B
-> startup-overhead artifact; root cause: byte-at-a-time match/copy loops —
-> loop-idiom project), mandelbrot is a vectorizer gap, expat's ifcombine
-> loss was already guarded. Full analysis, evidence and follow-ups:
-> [`engineering/journal/2026-09-W2.md`](engineering/journal/2026-09-W2.md)
-> (worst-12 triage) and the live queue in [`backlog.md`](backlog.md).
+> **Worst-15 codegen campaign (2026-09-17 → 2026-09-19).** The companion
+> static-codegen survey (`scripts/codegen_oracle.py --rank`, `-O2
+> -march=x86-64-v3` vs GCC 16.2 / Clang 23.1 / ICX latest / ICC 2021.10 on
+> Compiler Explorer) re-ranked all 102 functions: the total instruction gap
+> to the best oracle is 2,874 (2,864 at the 2026-09-17 checkpoint —
+> structurally flat: the campaign's wins are runtime wins like `mandelbrot`
+> −33% and `sha256_transform` −20%, which static screening does not capture);
+> the remaining worst-15 kernels (`linux_rbtree`, `csv_field_sum`,
+> `zlib_ng_adler32`, `nbody`, `chacha20_block`, `sha256_transform`,
+> `moving_stats`, `loop_patterns`, `i686_alu_chains`, `glibc_strstr`,
+> `strlen_bench`, `struct_copy`, `matmul`, `expat_xml_scan`,
+> `vecreg_new_ops`) are tracked with per-kernel root causes in
+> `engineering/evidence/godbolt/s59-rank/before.md`.
 
 ---
 
@@ -178,21 +188,22 @@ LCCC includes an automated Godbolt/Compiler Explorer comparison oracle
 (`scripts/codegen_oracle.py`, built on `scripts/godbolt.py`) against GCC 16.2,
 Clang 23.1, Intel ICC 2021.10, and Intel ICX (latest). Instruction counts are
 static size metrics (`-O3 -march=x86-64-v3`), not latency/throughput evidence —
-use `tests/benchmark/run_benchmarks.py` for timing. Verified 2026-09-06:
+use `tests/benchmark/run_benchmarks.py` for timing. Verified 2026-09-19
+(base `56858cbc`):
 
 | Target (unit measured) | LCCC | GCC 16.2 | Clang 23.1 | ICC | ICX | Best | LCCC vs Best |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `glibc_strstr` `two_way_short_needle` (function) | **75** | 144 | *(inlined)* | *(inlined)* | *(inlined)* | **LCCC** | **1.92× smaller than GCC** |
-| `sha256_transform` (whole TU) | 444 | 275 | **267** | 438 | 1145 | Clang | 0.60× (0 vector insns vs Clang's 44) |
+| `glibc_strstr` (whole TU; `two_way_short_needle` now inlined by LCCC, Clang, ICC and ICX — GCC still outlines it at 144 insns) | **197** | 351 | 319 | 211 | 265 | **LCCC** | **1.78× smaller than GCC** |
+| `sha256_transform` (whole TU) | 358 | 275 | **267** | 438 | 1145 | Clang | 0.75× (68 spills vs Clang's 35; 70 vector insns vs Clang's 44) |
 
 The oracle's purpose is to *find and rank codegen gaps*, kernel by kernel, not
 to declare overall victory: every cell above is reproducible via
-`scripts/codegen_oracle.py <source> --function <fn> --local ./target/fastbuild/lccc`
-(clang/icc/icx inline the named statics in some kernels, hence the whole-TU
-row). Flag sensitivity matters: at `-O2` GCC emits 58 instructions for
-`two_way_short_needle` and beats LCCC's 75 — the LCCC win above is an `-O3`
-result. The measured sha256 gap (zero vector instructions, 194 spills vs
-Clang's 35) is the top codegen backlog item in the follow-up document.
+`scripts/codegen_oracle.py <source> --all-functions --local ./target/fastbuild/lccc`
+(the named-static form inlines under LCCC/Clang/ICC/ICX in these kernels,
+hence the whole-TU rows). The sha256 gap halved over the 2026-09-06
+checkpoint (444 → 358) via the two-block unroller + half-wide SLP waves; the
+remaining gap is spill discipline in the schedule loop and is tracked as a
+worst-15 item in `engineering/evidence/godbolt/s59-rank/before.md`.
 
 ---
 
