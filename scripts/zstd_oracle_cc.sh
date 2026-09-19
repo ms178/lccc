@@ -40,7 +40,9 @@
 set -uo pipefail
 
 K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
-LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
 OUT=${OUT:-/tmp/zo}
 ZFILE=${ZFILE:-$K/arch/x86/boot/compressed/vmlinux.bin.zst}
 PFILE=${PFILE:-$K/arch/x86/boot/compressed/vmlinux.bin}

@@ -19,8 +19,8 @@ use super::flag_peepholes::flags_dead_after;
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
     extract_jump_target, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
-    is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family, writes_family,
-    writes_family_full,
+    is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family,
+    self_zeroing_full_write, writes_family, writes_family_full,
 };
 use super::liveness::FileLiveness;
 use super::relay_and_lea::function_range;
@@ -3430,8 +3430,15 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
     changed
 }
 
-/// Family bitmask for `%rcx` (see `scan_register_refs`: family 1).
-const RCX_FAMILY_MASK: u16 = 1 << 1;
+/// The `%rcx` family, and its bitmask (see `register_family_at`: family 1).
+///
+/// Named because the kill test below hands the family to four family-generic
+/// predicates.  A bare `1` in each of those call positions reads as an
+/// instruction count, an operand index or a shift amount until you already
+/// know which family the fold is about — and the day a second family gets the
+/// same treatment, the literals are what has to change.
+const RCX_FAMILY: RegId = 1;
+const RCX_FAMILY_MASK: u16 = 1 << RCX_FAMILY;
 
 fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) -> bool {
     // This is a liveness query for the value copied into %rcx, not merely a
@@ -3444,7 +3451,8 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) 
     //
     // Scan the remainder of the straight-line region.  A branch/label is a
     // conservative barrier because another predecessor may observe the old
-    // value.  A plain write to %rcx kills the old value; every other mention is
+    // value; a `ret` is the opposite — it ends the region, so the value is
+    // dead.  A plain write to %rcx kills the old value; every other mention is
     // a use (including %ecx/%cx/%cl, as represented by reg_refs).
     //
     // The walk is ordered cheapest-and-most-selective first.  The nop flag, the
@@ -3459,6 +3467,22 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) 
         if info.is_nop() {
             i += 1;
             continue;
+        }
+        // A `ret` ENDS the region: no later line executes on this path, so the
+        // copied value is dead here even though the walk has not reached the
+        // end of the text.  A path that does reach the following code entered
+        // it through a branch, and such a path cannot have executed the copy
+        // being folded away — reaching post-`ret` code from the copy would
+        // require a label or a jump between them, and both are the
+        // conservative barrier below.  This is the same reasoning
+        // `dead_code.rs`'s dead-move scan already applies to this family ("a
+        // return cannot observe non-result caller-saved registers"), and
+        // `LineInfo::is_barrier` classifies `Ret` as a block terminator.
+        //
+        // Checked before the `reg_refs` filter: a bare `ret` names no register
+        // at all, so the family bitmask would otherwise walk straight past it.
+        if info.kind == LineKind::Ret {
+            return false;
         }
         if matches!(
             info.kind,
@@ -3476,17 +3500,38 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) 
         }
 
         // A kill must be an EXACT full-width, unconditional redefinition of
-        // the family — the shared acceptance-grade predicates, not a
-        // mnemonic-prefix heuristic:
-        //   * sub-width destinations (`movw %ax, %cx`, `sete %cl`) leave the
-        //     surviving bits of the copied 64-bit value observable;
-        //   * `cmovcc` keeps the old destination when the condition is
-        //     false, i.e. reads it (`is_read_modify_write`);
-        //   * implicit readers (`rep movsq`'s count, `cpuid`'s subleaf)
-        //     observe it (`implicit_read_refs`);
-        //   * a source-side mention (`movq 8(%rcx), %rcx`) reads the old
-        //     value through the address even though the destination is the
+        // the family.  Four predicates answer that, and they are NOT equally
+        // exact — saying so matters, because a reader who believes all four
+        // are exact will lean on the conjunction further than it reaches:
+        //   * `writes_family_full`: the WIDTH half is exact spelling (the
+        //     destination token must equal `%rcx` or `%ecx`, so `movw %ax, %cx`
+        //     and `sete %cl` are refused — they leave bits of the copied
+        //     64-bit value observable).  The destination IDENTITY half is
+        //     `parse_dest_reg_fast`, a mnemonic-PREFIX union (`div*`/`inc*`/
+        //     `shr*`/... plus a last-top-level-comma scan) that over-claims
+        //     writers.  It is only safe because the next veto is conservative
+        //     in the opposite direction.
+        //   * `is_read_modify_write`: a prefix heuristic whose DEFAULT IS TRUE
+        //     — every mnemonic outside its write-only whitelist (`mov*`,
+        //     `lea*`, `set*`, the dest-only BMI forms) counts as reading its
+        //     destination.  That default is what stops `testq %rax, %rcx`,
+        //     whose destination the prefix union happily reports as family 1,
+        //     from scoring as a kill.  `cmovcc` is refused for the same reason
+        //     it deserves: it keeps the old destination when the condition is
+        //     false.
+        //   * `implicit_read_refs`: an exact table of architectural implicit
+        //     readers (`rep movsq`'s count, `cpuid`'s subleaf), which the
+        //     textual scan cannot see.
+        //   * the source-side mention veto: exact spelling through the shared
+        //     `register_family_at` oracle, INCLUDING the high-byte aliases, so
+        //     `movq 8(%rcx), %rcx` and `movzbl %ch, %ecx` are both refused —
+        //     each reads the old value even though the destination is the
         //     full-width family.
+        // The self-zeroing idioms are the one exception to the last two
+        // vetoes: `xorl %ecx, %ecx` names the family on its source side and
+        // classifies as read-modify-write, yet it writes a CONSTANT — the
+        // result is independent of the old value, so the family is retired
+        // (`self_zeroing_full_write`).
         // Every other family mention is a use.
         //
         // The source operand is split once, on the last comma.  Deriving it as
@@ -3501,10 +3546,30 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) 
             Some((source, _dest)) => source,
             None => "",
         };
-        let killed = !mentions_rcx_family(source)
-            && !is_read_modify_write(t)
-            && writes_family_full(info, t, 1)
-            && implicit_read_refs(t.as_bytes()) & RCX_FAMILY_MASK == 0;
+        // Three shapes retire the copied value, cheapest test first:
+        //
+        //   * `popq %rcx` redefines the family from the stack and names no
+        //     register source.  Only the family itself can reach this arm:
+        //     `Pop { reg }` carries `reg_refs = 1 << reg`, so the bitmask
+        //     filter above already skipped every other family, and
+        //     `popfq`/`popfl` classify with REG_NONE and no register refs at
+        //     all.  `is_read_modify_write` answers conservatively for every
+        //     mnemonic it does not know — pop included — so the general
+        //     conjunction below would veto a kill that `writes_family_full`
+        //     proves.  That conservative default is load-bearing elsewhere
+        //     (pop shifts %rsp, and the slot-offset passes must stop there),
+        //     so it is bypassed here rather than changed globally.
+        //   * the self-zeroing idioms (`xorl %ecx, %ecx`, `subl %ecx, %ecx`)
+        //     write a CONSTANT: their source-side mention of the family and
+        //     their read-modify-write classification are both true, and both
+        //     irrelevant to a result that does not depend on the old value.
+        //   * everything else: the exact conjunction, unchanged.
+        let killed = matches!(info.kind, LineKind::Pop { reg: RCX_FAMILY })
+            || self_zeroing_full_write(t, RCX_FAMILY)
+            || (!mentions_rcx_family(source)
+                && !is_read_modify_write(t)
+                && writes_family_full(info, t, RCX_FAMILY)
+                && implicit_read_refs(t.as_bytes()) & RCX_FAMILY_MASK == 0);
         if killed {
             return false;
         }
@@ -3513,31 +3578,18 @@ fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) 
     false
 }
 
-/// True when `operand` mentions any register of the `%rcx` family
-/// (`%rcx`, `%ecx`, `%cx`, `%cl`).
+/// True when `operand` mentions any register of the `%rcx` family — `%rcx`,
+/// `%ecx`, `%cx`, `%cl` AND the high-byte alias `%ch`.
 ///
-/// One left-to-right scan anchored on `%` instead of four independent substring
-/// searches.  This runs per candidate line of the liveness walk above, where
-/// the operands are short and the four searches re-walked the same bytes; it is
-/// also the walk's first and most selective test, so it must be the cheapest.
+/// `%ch` is bits 8..15 of the same architectural register the copy defined, so
+/// a line reading it reads the copied value: `movzbl %ch, %ecx` must veto the
+/// kill even though its destination is an exact full-width spelling.  This used
+/// to be a private four-spelling scan that disagreed with `scan_register_refs`
+/// (which has always mapped `%ch` to family 1), with `compare_branch`'s
+/// `%ah`-aliasing rule and with `relay_and_lea`'s `%dh` rule; it is now the
+/// shared oracle, so the disagreement cannot come back.
 fn mentions_rcx_family(operand: &str) -> bool {
-    let bytes = operand.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            i += 1;
-            continue;
-        }
-        // %rcx / %ecx spell the family with a width prefix, %cx / %cl without.
-        if matches!(
-            &bytes[i + 1..],
-            [b'r' | b'e', b'c', b'x', ..] | [b'c', b'x' | b'l', ..]
-        ) {
-            return true;
-        }
-        i += 1;
-    }
-    false
+    mentions_family(operand.as_bytes(), RCX_FAMILY)
 }
 
 #[cfg(test)]
@@ -3557,6 +3609,12 @@ mod mentions_rcx_family_tests {
             "(%ecx,%rdx,4)",
             "%cl,",
             "%%rcx",
+            // The high-byte alias: bits 8..15 of the same register.  Asserting
+            // this was a MISS is what let the address-copy kill test delete a
+            // defining copy that a later `movzbl %ch, %ecx` still read.
+            "%ch",
+            "movzbl %ch",
+            "%ch,%ecx",
         ] {
             assert!(mentions_rcx_family(hit), "{hit} mentions the %rcx family");
         }
@@ -3569,7 +3627,6 @@ mod mentions_rcx_family_tests {
             "%ax",
             "%ah",
             "%al",
-            "%ch",
             "%rdx",
             "%rbx",
             "%rsi",
@@ -6208,10 +6265,22 @@ pub(super) fn fold_staged_imm_into_alu(store: &mut LineStore, infos: &mut [LineI
             continue;
         }
         let fam = get_dest_reg(&infos[i]);
+        // Validity FIRST: `fam` is REG_NONE (255) for a destination the
+        // classifier does not know and an XMM/MM family id (>= 16) for a
+        // non-GP one, and REG_NAMES rows hold 16 entries.  Indexing before the
+        // check made `movq $3, %xmm0` and `movq $1, %st` panic the compiler
+        // outright — no trailing whitespace required, and the assembler accepts
+        // both lines far enough to reach here.  The old order also read as
+        // though `||` guarded the index; short-circuiting cannot help when the
+        // index is evaluated on the line above.
+        if !is_valid_gp_reg(fam) {
+            i += 1;
+            continue;
+        }
         // The mov's destination must be the plain family register at the
         // mov's own width — no partial rewrites for exotic addressing.
         let expected = REG_NAMES[width_row][fam as usize];
-        if dst != &expected[1..] || !is_valid_gp_reg(fam) {
+        if dst != &expected[1..] {
             i += 1;
             continue;
         }

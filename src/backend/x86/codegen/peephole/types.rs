@@ -236,13 +236,30 @@ impl LineInfo {
     /// Get the trimmed content of a line using the cached trim offset.
     /// This avoids re-scanning leading whitespace on every access.
     #[inline]
+    /// The instruction text of `line`: leading indentation removed via the
+    /// cached offset, trailing blanks removed here.
+    ///
+    /// The trailing trim is load-bearing, not cosmetic.  Passes derive operands
+    /// by slicing this text (`&t[dest_token.len()..]`, `split_once(", ")`,
+    /// `ends_with(reg_name)`), and a line that carries trailing blanks shifts
+    /// every one of those boundaries: with four blanks after `movq (%rcx), %rax`
+    /// the address-copy fold stopped firing, and a label spelled `f: ` stopped
+    /// classifying as a label because the classifier reads the LAST byte to find
+    /// the colon.  Trailing whitespace is semantically neutral in every assembly
+    /// syntax GAS accepts, so no pass may observe it; trimming once here is what
+    /// makes that true for all ~500 call sites instead of at each of them.
+    /// `passes/whitespace_invariance.rs` asserts the property over the
+    /// repository's real assembly under seven paddings, CRLF included.
+    ///
+    /// Cost: one byte comparison for the lines a compiler actually emits (which
+    /// have no trailing blanks), and a scan of the blanks for the ones that do.
     pub(super) fn trimmed<'a>(&self, line: &'a str) -> &'a str {
         let start = self.trim_start as usize;
         if start >= line.len() {
             // Line was replaced with shorter/empty text after classification
             line.trim()
         } else {
-            &line[start..]
+            line[start..].trim_end()
         }
     }
 }
@@ -363,7 +380,12 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
         trim_start <= u16::MAX as usize,
         "assembly line with >65535 leading spaces"
     );
-    let s = &raw[trim_start..];
+    // Parse the trailing-trimmed text: every recognizer below reads the END of
+    // the line (the label colon, the destination operand, the instruction
+    // suffix), so a trailing blank or a CRLF file's `\r` would otherwise decide
+    // the classification.  `trimmed` trims the same way, so a pass sees exactly
+    // the text that was classified.
+    let s = raw[trim_start..].trim_end();
     let sb = s.as_bytes();
 
     if sb.is_empty() {
@@ -1697,91 +1719,26 @@ pub(super) const REG_NAMES: [[&str; 16]; 4] = [
 /// `eliminate_unused_callee_saves`.
 #[inline]
 pub(super) fn scan_register_refs(b: &[u8]) -> u16 {
+    // Architectural implicit operands (`cqto`, `idivq %r11`, `cpuid`, string
+    // primitives, ...) are invisible to the textual scan; every consumer of
+    // `reg_refs` must see the same instruction as the CPU executes it.
+    scan_register_refs_explicit(b) | implicit_reg_refs(b)
+}
+
+/// The SPELLING half of [`scan_register_refs`]: the families named by `%`-prefixed
+/// register tokens in `b`, and nothing else.
+///
+/// Split out so the agreement with [`mentions_family`] is a statable property
+/// rather than an argument — the implicit half is architectural knowledge, not
+/// spelling, and mixing the two would make every comparison against
+/// `mentions_family` need a caveat about `cqto`.
+pub(super) fn scan_register_refs_explicit(b: &[u8]) -> u16 {
     let mut refs: u16 = 0;
     let len = b.len();
     let mut i = 0;
     while i < len {
         if b[i] == b'%' && i + 2 < len {
-            // Try to identify the register family from the bytes after '%'
-            let fam = match b[i + 1] {
-                b'r' => {
-                    if i + 3 < len {
-                        match (b[i + 2], b[i + 3]) {
-                            (b'a', b'x') => Some(0u8),
-                            (b'c', b'x') => Some(1),
-                            (b'd', b'x') => Some(2),
-                            (b'b', b'x') => Some(3),
-                            (b's', b'p') => Some(4),
-                            (b'b', b'p') => Some(5),
-                            (b's', b'i') => Some(6),
-                            (b'd', b'i') => Some(7),
-                            (b'8', _) => Some(8),
-                            (b'9', _) => Some(9),
-                            (b'1', b'0') => Some(10),
-                            (b'1', b'1') => Some(11),
-                            (b'1', b'2') => Some(12),
-                            (b'1', b'3') => Some(13),
-                            (b'1', b'4') => Some(14),
-                            (b'1', b'5') => Some(15),
-                            _ => None,
-                        }
-                    } else {
-                        // Short: %r8, %r9 (only i + 2 < len is guaranteed here)
-                        match b[i + 2] {
-                            b'8' => Some(8),
-                            b'9' => Some(9),
-                            _ => None,
-                        }
-                    }
-                }
-                b'e' => {
-                    if i + 3 < len {
-                        match (b[i + 2], b[i + 3]) {
-                            (b'a', b'x') => Some(0),
-                            (b'c', b'x') => Some(1),
-                            (b'd', b'x') => Some(2),
-                            (b'b', b'x') => Some(3),
-                            (b's', b'p') => Some(4),
-                            (b'b', b'p') => Some(5),
-                            (b's', b'i') => Some(6),
-                            (b'd', b'i') => Some(7),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                }
-                // 16-bit / 8-bit: %ax, %al, %ah, %cx, %cl, etc.
-                b'a' => Some(0),
-                b'c' => Some(1),
-                b'd' => {
-                    if i + 2 < len && b[i + 2] == b'i' {
-                        Some(7)
-                    } else {
-                        Some(2)
-                    }
-                }
-                b'b' => {
-                    if i + 2 < len && b[i + 2] == b'p' {
-                        Some(5)
-                    } else {
-                        Some(3)
-                    }
-                }
-                b's' => {
-                    if i + 2 < len {
-                        match b[i + 2] {
-                            b'p' => Some(4),
-                            b'i' => Some(6),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            if let Some(id) = fam {
+            if let Some(id) = register_family_at(b, i + 1) {
                 refs |= 1u16 << id;
             }
             i += 2; // skip past '%X'
@@ -1789,10 +1746,138 @@ pub(super) fn scan_register_refs(b: &[u8]) -> u16 {
             i += 1;
         }
     }
-    // Architectural implicit operands (`cqto`, `idivq %r11`, `cpuid`, string
-    // primitives, ...) are invisible to the textual scan above; every consumer
-    // of `reg_refs` must see the same instruction as the CPU executes it.
-    refs | implicit_reg_refs(b)
+    refs
+}
+
+/// The GP family named by the register identifier starting at `b[j]` — the byte
+/// AFTER a `%`.  `None` when it names no GP family: a segment (`%cs`), a
+/// control register (`%cr0`), a vector register (`%xmm1`), or a truncated tail.
+///
+/// ONE spelling oracle for the whole text pipeline.  `scan_register_refs`
+/// accumulates it into the per-line bitmask and `mentions_family` answers the
+/// single-family question with it, so the two cannot disagree about what a
+/// spelling means.  That disagreement is not hypothetical: the address-copy
+/// kill test kept a private exact-spelling scan beside the bitmask, the two
+/// differed on the high-byte forms, and the difference deleted a defining copy
+/// that a later `movzbl %ch, %ecx` still read.
+///
+/// The spellings are AT&T's.  The 64/32-bit names carry a width prefix
+/// (`%rcx`, `%ecx`, `%r8d`); the 16/8-bit names do not (`%cx`, `%cl`); and the
+/// high-byte forms (`%ah`/`%bh`/`%ch`/`%dh`) exist only for families 0-3 but
+/// alias their family exactly as the low byte does — they are bits 8..15 of the
+/// SAME architectural register, so a line naming one mentions the family.
+#[inline]
+fn register_family_at(b: &[u8], j: usize) -> Option<RegId> {
+    let len = b.len();
+    if j + 1 >= len {
+        // A lone trailing `%` names nothing.  The byte-wise caller
+        // (`mentions_family`) can land here; the bitmask scan cannot, because
+        // it only enters on `i + 2 < len`.
+        return None;
+    }
+    match b[j] {
+        b'r' => {
+            if j + 2 < len {
+                match (b[j + 1], b[j + 2]) {
+                    (b'a', b'x') => Some(0u8),
+                    (b'c', b'x') => Some(1),
+                    (b'd', b'x') => Some(2),
+                    (b'b', b'x') => Some(3),
+                    (b's', b'p') => Some(4),
+                    (b'b', b'p') => Some(5),
+                    (b's', b'i') => Some(6),
+                    (b'd', b'i') => Some(7),
+                    (b'8', _) => Some(8),
+                    (b'9', _) => Some(9),
+                    (b'1', b'0') => Some(10),
+                    (b'1', b'1') => Some(11),
+                    (b'1', b'2') => Some(12),
+                    (b'1', b'3') => Some(13),
+                    (b'1', b'4') => Some(14),
+                    (b'1', b'5') => Some(15),
+                    _ => None,
+                }
+            } else {
+                // Short: %r8, %r9
+                match b[j + 1] {
+                    b'8' => Some(8),
+                    b'9' => Some(9),
+                    _ => None,
+                }
+            }
+        }
+        b'e' => {
+            if j + 2 < len {
+                match (b[j + 1], b[j + 2]) {
+                    (b'a', b'x') => Some(0),
+                    (b'c', b'x') => Some(1),
+                    (b'd', b'x') => Some(2),
+                    (b'b', b'x') => Some(3),
+                    (b's', b'p') => Some(4),
+                    (b'b', b'p') => Some(5),
+                    (b's', b'i') => Some(6),
+                    (b'd', b'i') => Some(7),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        // 16-bit / 8-bit, including the high-byte aliases: %ax, %al, %ah, %cx,
+        // %cl, %ch, ...  `%cs` also lands here and over-reports family 1; for a
+        // mention oracle that is the conservative direction, and a segment
+        // register never appears in an operand the codegen emits.
+        b'a' => Some(0),
+        b'c' => Some(1),
+        b'd' => {
+            if b[j + 1] == b'i' {
+                Some(7)
+            } else {
+                Some(2)
+            }
+        }
+        b'b' => {
+            if b[j + 1] == b'p' {
+                Some(5)
+            } else {
+                Some(3)
+            }
+        }
+        b's' => match b[j + 1] {
+            b'p' => Some(4),
+            b'i' => Some(6),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// True when `b` mentions GP family `fam` anywhere in its text.
+///
+/// The single-family question behind the liveness kill vetoes: a line whose
+/// SOURCE operand names the family reads the value being retired — through an
+/// address (`movq 8(%rcx), %rcx`) or through an alias (`movzbl %ch, %ecx`) —
+/// and so cannot be the redefinition that retires it.
+///
+/// One left-to-right scan with an early exit over the shared spelling oracle.
+/// This is the walk's first and most selective test, so it must also be its
+/// cheapest: no allocation, no second pass, and it stops at the first hit.
+///
+/// Deliberately MORE inclusive than the per-line bitmask: it steps one byte
+/// past a `%` where `scan_register_refs` steps two, so the escaped `%%rcx` of
+/// inline-asm template text is a hit here and a miss there.  For a veto,
+/// over-approximation is the safe direction; `mentions_family_never_misses_
+/// what_the_bitmask_sees` pins the agreement on every unescaped spelling.
+#[inline]
+pub(super) fn mentions_family(b: &[u8], fam: RegId) -> bool {
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b'%' && register_family_at(b, i + 1) == Some(fam) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 // ── Implicit register operands ───────────────────────────────────────────────
@@ -2340,5 +2425,227 @@ mod implicit_oracle_tests {
         // The Cmp kind funnels through the same scan (cmpxchg lives there).
         let info = classify_line("    cmpxchgq %rbx, (%rdi)");
         assert_eq!(info.reg_refs & RAX, RAX);
+    }
+}
+
+// ── tests: the register-spelling oracle ──────────────────────────────────────
+
+#[cfg(test)]
+mod register_spelling_oracle_tests {
+    use super::{REG_NAMES, mentions_family, scan_register_refs, scan_register_refs_explicit};
+
+    /// Every spelling the codegen can emit, the high-byte aliases it cannot,
+    /// and the look-alikes that must not be mistaken for either.  The oracle's
+    /// answer is a property of the TEXT, so the text is what gets enumerated.
+    const NAMES: [&str; 26] = [
+        // 64-bit, 32-bit, 16-bit, 8-bit — a sample of every row, including the
+        // two-digit extended registers whose spelling rules differ.
+        "%rax", "%ecx", "%rdx", "%bl", "%rsp", "%bpl", "%rsi", "%dil", "%r8", "%r9d", "%r10w",
+        "%r15b", "%cx", "%cl", "%al", "%dx",
+        // High-byte aliases: families 0-3 only, and invisible to REG_NAMES.
+        "%ah", "%bh", "%ch", "%dh",
+        // Look-alikes: a segment, a control register, a vector register, the
+        // PC-relative base, and truncated or doubled spellings.
+        "%cs", "%cr0", "%xmm1", "%rip", "%r", "%c",
+    ];
+
+    /// Operand shapes the passes actually hand the oracle: a bare name, a
+    /// destination, a source, a SIB base/index, a displacement, an escaped
+    /// inline-asm template token.
+    const SHAPES: [&str; 8] = [
+        "{n}",
+        "movq {n}, %rax",
+        "movq %rdi, {n}",
+        "-8({n})",
+        "(%rbp,{n},4)",
+        "{n},",
+        "movzbl {n}, %ecx",
+        "%%{n:#}",
+    ];
+
+    fn corpus() -> Vec<String> {
+        let mut out = Vec::with_capacity(NAMES.len() * SHAPES.len() + 8);
+        for name in NAMES {
+            for shape in SHAPES {
+                // `{n:#}` is the escaped spelling's marker: `%%%rcx` would be
+                // nonsense, so the escaped shape drops the name's own `%`.
+                let text = if shape.contains("{n:#}") {
+                    shape.replace("{n:#}", &name[1..])
+                } else {
+                    shape.replace("{n}", name)
+                };
+                out.push(text);
+            }
+        }
+        // Whole-line shapes: several mentions, no mention, and the empty text.
+        out.extend([
+            "".to_string(),
+            " ".to_string(),
+            "%".to_string(),
+            "%%".to_string(),
+            "movq (%rcx,%rdx,4), %rax".to_string(),
+            "movq %rdi, %rcx".to_string(),
+            "rep movsq".to_string(),
+            "cqto".to_string(),
+            ".LBB12:".to_string(),
+            "ret".to_string(),
+        ]);
+        out
+    }
+
+    #[test]
+    fn every_emittable_spelling_maps_to_its_own_family() {
+        // REG_NAMES is the emitter's table: whatever it can print, the oracle
+        // must map back to the family it came from, in every operand shape.
+        for (row, width) in ["64-bit", "32-bit", "16-bit", "8-bit"]
+            .into_iter()
+            .enumerate()
+        {
+            for fam in 0..16u8 {
+                let name = REG_NAMES[row][fam as usize];
+                for shape in SHAPES
+                    .iter()
+                    .filter(|s| !s.contains('{') || s.contains("{n}"))
+                {
+                    let text = shape.replace("{n}", name);
+                    let bit = 1u16 << fam;
+                    assert_eq!(
+                        scan_register_refs_explicit(text.as_bytes()) & bit,
+                        bit,
+                        "{width} {name} in {text:?} must mention family {fam}"
+                    );
+                    assert!(
+                        mentions_family(text.as_bytes(), fam),
+                        "{width} {name} in {text:?} must mention family {fam}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn high_byte_aliases_mention_their_family() {
+        // The hole this oracle exists to close: `%ch` is bits 8..15 of `%rcx`,
+        // so a line reading it reads the copied value.
+        for (name, fam) in [("%ah", 0u8), ("%ch", 1), ("%dh", 2), ("%bh", 3)] {
+            let bit = 1u16 << fam;
+            assert_ne!(
+                scan_register_refs_explicit(name.as_bytes()) & bit,
+                0,
+                "{name} is an alias of family {fam}"
+            );
+            assert!(
+                mentions_family(name.as_bytes(), fam),
+                "{name} is an alias of family {fam}"
+            );
+            // And it must not be mistaken for a NEIGHBOUR family.
+            for other in 0..16u8 {
+                if other != fam {
+                    assert!(
+                        !mentions_family(name.as_bytes(), other),
+                        "{name} does not mention family {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mentions_family_never_misses_what_the_bitmask_sees() {
+        // The direction that matters for soundness: a kill veto may be too
+        // eager (it only blocks a fold), never too lax.  So every family the
+        // spelling scan reports must also be reported by the single-family
+        // query, on every text in the corpus.
+        for text in corpus() {
+            let bits = scan_register_refs_explicit(text.as_bytes());
+            for fam in 0..16u8 {
+                if bits & (1u16 << fam) != 0 {
+                    assert!(
+                        mentions_family(text.as_bytes(), fam),
+                        "bitmask sees family {fam} in {text:?} but mentions_family does not"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_scans_agree_except_on_escaped_spellings() {
+        // The converse, and the ONE documented divergence: `mentions_family`
+        // steps a byte past `%` where the bitmask steps two, so the escaped
+        // `%%rcx` of inline-asm template text is a hit for the veto and a miss
+        // for the bitmask.  Over-approximation is the safe side for a veto;
+        // anything else that disagrees is a bug in one of the two scans.
+        for text in corpus() {
+            let escaped = text.contains("%%");
+            for fam in 0..16u8 {
+                let by_query = mentions_family(text.as_bytes(), fam);
+                let by_mask = scan_register_refs_explicit(text.as_bytes()) & (1u16 << fam) != 0;
+                if by_query && !by_mask {
+                    assert!(
+                        escaped,
+                        "mentions_family sees family {fam} in {text:?} but the bitmask does not,                          and the text carries no escaped `%%` spelling"
+                    );
+                }
+                if by_mask {
+                    assert!(
+                        by_query,
+                        "bitmask sees family {fam} in {text:?}, the query does not"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn golden_bitmasks_pin_the_helper_extraction() {
+        // The refactor that produced `register_family_at` must not have moved a
+        // bit.  These are the values the inlined match produced, spelled out so
+        // a future edit to the table fails here rather than in a miscompile.
+        for (text, want) in [
+            ("movq %rdi, %rcx", (1u16 << 7) | (1 << 1)),
+            ("movq (%rcx), %rax", (1u16 << 1) | (1 << 0)),
+            ("movzbl %ch, %ecx", 1u16 << 1),
+            ("movzbl %ah, %eax", 1u16 << 0),
+            (
+                "movq (%rbp,%rdx,4), %rax",
+                (1u16 << 5) | (1 << 2) | (1 << 0),
+            ),
+            ("movl %r10d, %r11d", (1u16 << 10) | (1 << 11)),
+            ("movw %r8w, %cx", (1u16 << 8) | (1 << 1)),
+            ("movb %r15b, %cl", (1u16 << 15) | (1 << 1)),
+            ("leaq 8(%rsp), %rbp", (1u16 << 4) | (1 << 5)),
+            ("movq %xmm1, %rax", 1u16 << 0),
+            ("movq -4(%rip), %rax", 1u16 << 0),
+            ("movq %cs, %rax", (1u16 << 1) | (1 << 0)),
+            ("", 0u16),
+            ("ret", 0u16),
+            ("movq %r, %rax", 1u16 << 0),
+            ("movq %r8, %rax", (1u16 << 8) | (1 << 0)),
+            ("movq %r9, %rax", (1u16 << 9) | (1 << 0)),
+        ] {
+            assert_eq!(
+                scan_register_refs_explicit(text.as_bytes()),
+                want,
+                "explicit spelling bitmask for {text:?}"
+            );
+        }
+        // The implicit half is what `scan_register_refs` adds on top: `cqto`
+        // writes %rdx without naming it, `rep movsq` reads the %rcx count.
+        assert_ne!(
+            scan_register_refs(b"cqto") & (1u16 << 2),
+            0,
+            "cqto writes %rdx"
+        );
+        assert_eq!(
+            scan_register_refs_explicit(b"cqto"),
+            0,
+            "cqto names nothing"
+        );
+        assert_ne!(
+            scan_register_refs(b"rep movsq") & (1u16 << 1),
+            0,
+            "rep movsq reads the %rcx count"
+        );
     }
 }

@@ -113,6 +113,8 @@ pub(crate) mod ir;
 pub mod linker_entry;
 pub(crate) mod passes;
 pub(crate) mod pgo;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// Shared entry point for all compiler binaries. Spawns the real work on a
 /// thread with a large stack so deeply recursive C files don't overflow.

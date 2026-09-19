@@ -278,6 +278,33 @@ pub(crate) struct LineStore {
     replacements: Vec<String>,
 }
 
+/// Length of `line` excluding its trailing blanks — the same set
+/// `str::trim_end` removes, minus `\n`, which cannot appear inside a line.
+///
+/// Trailing whitespace is semantically neutral in every assembly syntax GAS
+/// accepts, so no pass may be able to observe it.  Enforcing that here, once,
+/// is what makes it true for all of them: passes reach line text both through
+/// `LineInfo::trimmed` and through raw `store.get(i)` slices (the store-forwarding
+/// and relay passes slice operands out of the raw text), and only the store sees
+/// both.  It is also free in the common case — a compiler-emitted line has no
+/// trailing blanks, so this is one predictable comparison per line, paid while
+/// the line is already being scanned for its `\n`.
+///
+/// Without it, a single trailing space after `movq 152(%rsp), %rax` was enough
+/// to stop the store-to-load forward of the `movq $0, 152(%rsp)` above it in
+/// lccc's own sha256 output: the load's operand slice carried the blank, the
+/// slot comparison missed, and the constant stayed in memory.
+/// `passes/whitespace_invariance.rs` asserts the property over the repository's
+/// real assembly under seven paddings, CRLF included.
+#[inline]
+fn line_len_without_trailing_blanks(line: &[u8]) -> usize {
+    let mut end = line.len();
+    while end > 0 && matches!(line[end - 1], b' ' | b'\t' | b'\r' | 0x0b | 0x0c) {
+        end -= 1;
+    }
+    end
+}
+
 #[inline]
 fn pack_span(start: usize, len: usize) -> LineEntry {
     debug_assert!(
@@ -294,6 +321,11 @@ impl LineStore {
     /// Split `asm` on `\n`. A trailing newline does not produce an extra
     /// empty line. An empty input is one empty line so `len() == 1` and
     /// `get(0) == ""` (same as the previous implementation).
+    ///
+    /// Every span excludes the line's trailing blanks (see
+    /// [`line_len_without_trailing_blanks`]), so `get` never hands a pass text
+    /// that differs from the same line without padding.  The bytes stay in
+    /// `original`; only the span is shorter — no copy, no allocation.
     pub(crate) fn new(asm: String) -> Self {
         let bytes = asm.as_bytes();
         let total = bytes.len();
@@ -301,12 +333,18 @@ impl LineStore {
         let mut start = 0usize;
         for (i, &b) in bytes.iter().enumerate() {
             if b == b'\n' {
-                entries.push(pack_span(start, i - start));
+                entries.push(pack_span(
+                    start,
+                    line_len_without_trailing_blanks(&bytes[start..i]),
+                ));
                 start = i + 1;
             }
         }
         if start < total || entries.is_empty() {
-            entries.push(pack_span(start, total - start));
+            entries.push(pack_span(
+                start,
+                line_len_without_trailing_blanks(&bytes[start..total]),
+            ));
         }
         LineStore {
             original: asm,
@@ -340,7 +378,16 @@ impl LineStore {
     /// Replace line `idx`. A second replace of the same index overwrites
     /// the existing slot (the old path pushed a new `String` every time
     /// and left the previous one unreachable).
-    pub(crate) fn replace(&mut self, idx: usize, new_text: String) {
+    ///
+    /// The replacement obeys the same no-trailing-blanks invariant as the
+    /// original spans: a pass that formats its own text with a trailing space
+    /// (they do — several build `format!("{indent}{mnem} {src}, {dst} ")` style
+    /// strings) would otherwise reintroduce, for later passes, exactly the
+    /// byte the store removed on the way in.  `truncate` is O(1) here: the tail
+    /// is ASCII, so the cut is always a char boundary.
+    pub(crate) fn replace(&mut self, idx: usize, mut new_text: String) {
+        let end = line_len_without_trailing_blanks(new_text.as_bytes());
+        new_text.truncate(end);
         let e = &mut self.entries[idx];
         if e.len == REPLACED {
             self.replacements[e.start as usize] = new_text;
@@ -371,6 +418,52 @@ impl LineStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The store is the single place where the peephole's whitespace invariance
+    /// is enforced: passes read line text both through `LineInfo::trimmed` and
+    /// through raw `get()` slices (store forwarding and the relay passes slice
+    /// operands out of the raw text), and only the store sees both paths.
+    #[test]
+    fn the_store_never_hands_a_pass_trailing_whitespace() {
+        for padding in [" ", "    ", "\t", "        ", "\r", " \r", "  \t "] {
+            let text = format!("f:\n    movq %rax, %rbx{padding}\n    ret{padding}\n");
+            let store = LineStore::new(text);
+            assert_eq!(store.len(), 3, "padding {padding:?} changed the line count");
+            for i in 0..store.len() {
+                let line = store.get(i);
+                assert_eq!(
+                    line,
+                    line.trim_end(),
+                    "padding {padding:?} survived into line {i}: {line:?}"
+                );
+            }
+            let built = store.build_result(|_| false);
+            assert!(
+                built.split('\n').all(|line| line.trim_end() == line),
+                "build_result re-emitted trailing whitespace for {padding:?}: {built:?}"
+            );
+        }
+
+        // A line that is only whitespace is an empty line, not a padded one.
+        let store = LineStore::new("f:\n   \n\t\nret\n".to_string());
+        assert_eq!(store.get(1), "");
+        assert_eq!(store.get(2), "");
+
+        // Pass-generated replacements obey the same rule, so a later pass cannot
+        // see blanks an earlier one formatted into its own text.
+        let mut store = LineStore::new("f:\n    ret\n".to_string());
+        store.replace(1, "    movq %rax, %rbx \t".to_string());
+        assert_eq!(store.get(1), "    movq %rax, %rbx");
+        store.replace(1, "    movq %rax, %rbx   ".to_string());
+        assert_eq!(store.get(1), "    movq %rax, %rbx");
+
+        // The documented edge contracts are unchanged by the trim.
+        let store = LineStore::new(String::new());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(0), "");
+        let store = LineStore::new("a\nb\n".to_string());
+        assert_eq!(store.len(), 2, "a trailing newline must not add a line");
+    }
 
     #[test]
     fn ident_chars() {

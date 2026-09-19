@@ -334,6 +334,39 @@ gate "vec-adler-epic" fast \
 gate "vectorize-isa-gate" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_vectorize_isa_gate.sh
 
+# The boot-size harnesses only run against a prepared kernel tree, so a silent
+# measurement error in them is invisible to every other gate.  These two do not
+# need a kernel tree: executable bytes must be summed by section FLAG (the boot
+# stage keeps code in .bstext/.entrytext/.inittext, which a /^\.text/ sum
+# reported as 0) and the per-object table must actually be ranked by delta
+# (`sort -n` reads a %+8d column as 0 and ordered the table by object name).
+gate "boot-size-measurement" fast \
+    bash tests/regression/check_boot_size_measurement.sh
+
+# Process-global state hygiene.  Four invariants, each grep-checkable, each one
+# a defect this tree actually had: tests mutated the environment behind five
+# deferred-audit markers whose premise (single-threaded access) cargo's test
+# pool falsifies, two modules held separate locks that serialized nothing across
+# modules, and four passes read the environment per call -- eight `environ` scans
+# and eight allocations per function, one of them inside a candidate loop.  The
+# guard and the per-thread configs are the fix; the ratchet keeps the remaining
+# 157 sites from growing while they are migrated.
+gate "env-test-hygiene" fast \
+    bash tests/regression/check_env_test_hygiene.sh
+
+# The peephole used to change its mind about a line because of a trailing blank:
+# a padded load stopped forwarding the constant store above it (lccc's own
+# sha256 output), the %rcx address-copy fold was lost when the CONSUMER line was
+# padded, and `movq $3, %xmm0` / `movq $1, %st` panicked the compiler outright --
+# an index into the 16-entry GP register-name table taken before the family id
+# was validated, which needs no whitespace at all.  All three are now impossible
+# at the LineStore boundary; this gate re-derives the property from real
+# assembly: the committed corpus, ~150k operand spellings, freshly generated
+# output at four -O levels, and the assembler path, where a padded .s must
+# produce byte-identical object code.
+gate "peephole-whitespace-invariance" slow \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_peephole_whitespace.sh
+
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
 

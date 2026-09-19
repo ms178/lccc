@@ -9,9 +9,10 @@ Developer and research tooling. None of these are needed to build LCCC.
 | `build_lccc_o1_j2.sh` | Ship-quality release: Rust opt-level 1, two Cargo jobs, thin LTO, swap active, manifest-selected current Rust/Cargo release, and warnings denied by default. |
 | `ensure_swap.sh` | Idempotently verify swap or recreate/activate the disposable 8 GiB `/swapfile` after a constrained-harness root reset; both compiler build scripts invoke it. |
 | `arena_session_restore.sh` | Rehydrates swap, the manifest-selected current Rust/Cargo toolchain, host multilib/kernel packages, git metadata and fastbuild after an Arena reset. |
-| `prepare_kernel_tree.sh` | Recreate Linux 6.18.44 with the linux-cachymod patch series and generated boot headers after a harness wipe. |
+| `prepare_kernel_tree.sh` | Recreate Linux 6.18.52 with the linux-cachymod patch series and generated boot headers after a harness wipe. |
 | `build_kernel_boot.sh` | Build all x86 real-mode setup objects with LCCC (`-ffunction-sections`), link with `lccc-ld --gc-sections`, preserve non-relocation boot payloads through a build-local `KEEP` script, enforce the authentic 32 KiB ASSERTs, and require flat-image byte identity with available BFD/LLD oracles. |
-| `realmode_corpus.sh` | Compare LCCC/GCC executable text per `arch/x86/boot` C file under the real `-m16 -Os` flags. |
+| `elf_sections.sh` | Shared ELF section helper: `lccc_elf_code_bytes` sums every `SHF_EXECINSTR` section of an object. Sourced by the size harnesses, because summing sections named `.text*` reports `header.o` and `bioscall.o` as 0 bytes (their code is in `.bstext`/`.entrytext`/`.inittext`) and understates `tty.o`'s gap against GCC from +184 to +57. |
+| `realmode_corpus.sh` | Compare LCCC/GCC executable (`SHF_EXECINSTR`) bytes per `arch/x86/boot` C file under the real `-m16 -Os` flags. |
 | `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. |
 | `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. A shorter-than-GAS encoding is reported as `BETTER` only after the tool disassembles both forms and confirms they decode identically. |
 | `encdiff.py` | Multi-assembler encoding differential: LCCC against GNU as **and** the Clang, GCC, ICC and ICX integrated assemblers over the Compiler Explorer API. Judges LCCC against the *shortest legal encoding any oracle produced*, not against GAS alone. |

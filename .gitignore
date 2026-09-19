@@ -39,6 +39,10 @@ Thumbs.db
 *.exe
 a.out
 test_*
+# ...except the crate's own test-support module: `test_*` above would
+# silently drop src/test_support.rs from every `git add -A`, and a patch
+# emitted without it does not build.
+!src/test_support.rs
 bench_*
 # ...but the benchmark HARNESS is source, not a build artifact. Without this
 # negation `bench_*` silently swallows it: tests/bench/ (the kernels and the

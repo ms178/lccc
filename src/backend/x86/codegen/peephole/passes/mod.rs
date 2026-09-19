@@ -597,6 +597,12 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         .collect();
     let sk = |name: &str| -> bool { skip_set.contains(name) };
 
+    // CCC_PEEPHOLE_RELAY is read ONCE, here, rather than at its two use sites:
+    // both are inside the phase-1 fixed-point loop, so the knob cost an
+    // `environ` scan per pass per iteration (up to `MAX_LOCAL_PASS_ITERATIONS`
+    // of them) for a decision that cannot change while the function compiles.
+    let relay_opt_in = std::env::var("CCC_PEEPHOLE_RELAY").is_ok();
+
     // CCC_PEEPHOLE_TRACE=<dir>: write the assembly text after every phase-1
     // sub-pass that reported a change, as <dir>/<seq>-p<iter>-<pass>.s.  The
     // skip-set bisection (`CCC_PEEPHOLE_SKIP`) gives MISLEADING culprits when
@@ -788,7 +794,7 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         // Opt-in (CCC_PEEPHOLE_RELAY=1): fuses load+dead-copy relays; known
         // masked interaction with expat test_multichar_cdata_utf16 under the
         // full pass mix — root cause still open, so keep it off by default.
-        if std::env::var("CCC_PEEPHOLE_RELAY").is_ok() && !sk("load_copy_relay") {
+        if relay_opt_in && !sk("load_copy_relay") {
             {
                 let c = memory_fold::fold_load_copy_relay(&mut store, &mut infos);
                 trace("fold_load_copy_relay", pass_count, c, &store, &infos);
@@ -1364,7 +1370,7 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             if !sk("fp_const_hoist") {
                 changed2 |= memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos);
             }
-            if std::env::var("CCC_PEEPHOLE_RELAY").is_ok() && !sk("load_copy_relay") {
+            if relay_opt_in && !sk("load_copy_relay") {
                 changed2 |= memory_fold::fold_load_copy_relay(&mut store, &mut infos);
             }
             changed2 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
@@ -1571,6 +1577,9 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod whitespace_invariance;
 
 #[cfg(test)]
 mod tests {
@@ -2172,6 +2181,288 @@ mod tests {
         assert!(
             result.contains("movq (%rdi), %rax"),
             "trailing whitespace on the kill suppressed the fold: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_high_byte_use_is_not_a_kill() {
+        // `movzbl %ch, %ecx` READS bits 8..15 of the copied value and only
+        // then redefines the family, so the copy is live across it.  The
+        // high-byte spellings alias their family exactly like the low byte:
+        // `scan_register_refs` has always mapped `%ch` to family 1 (its own
+        // comment names `%ah`), `compare_branch` refuses to fuse across `%ah`
+        // for that reason, `relay_and_lea` refuses to relay across `%dh`, and
+        // the i686 backend's alias table lists `%ch` under REG_ECX.  When the
+        // source-side veto did not see the alias, the rest of the conjunction
+        // scored the line a genuine kill -- `%ecx` is an exact full-width
+        // spelling, `movzbl` is write-only per `is_read_modify_write`, and the
+        // line names no implicit operand -- the address copy was deleted, and
+        // the `movzbl` then read the CALLER's %rcx high byte instead of the
+        // copied address.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movzbl %ch, %ecx\n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "a high-byte READ of the copied value was treated as a kill and the \
+             address copy was eliminated: {result}"
+        );
+        assert!(
+            !result.contains("movq (%rdi), %rax"),
+            "the dereference was folded through a source register whose high \
+             byte is still read below: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_ret_ends_the_region() {
+        // A `ret` terminates the region: nothing after it runs on this path,
+        // and the only way to reach the following code is a branch, which the
+        // barrier refuses to fold across.  The walk used to step over the
+        // terminator (a bare `ret` names no register, so the family bitmask
+        // skipped it) and then answer "live" at the NEXT function's label or at
+        // its unrelated use of the incoming %rcx — losing the fold in every
+        // leaf-shaped return.  `dead_code.rs` already relies on exactly this
+        // reasoning for the same family.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    ret\n",
+            ".size f, .-f\n",
+            "g:\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size g, .-g\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq (%rdi), %rax"),
+            "the dereference was not folded at a leaf return: {result}"
+        );
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "the address copy that a `ret` retires was not eliminated: {result}"
+        );
+        // Soundness half: the following function reads the INCOMING %rcx, which
+        // the fold must not touch — its value never came from f's copy.
+        assert!(
+            result.contains("movq %rcx, %rdx"),
+            "the fold leaked across the return into the next function: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_use_before_ret_still_blocks() {
+        // The terminator only retires what comes AFTER it.  A use between the
+        // dereference and the `ret` observes the copied value, so the copy must
+        // survive — otherwise the `ret` arm would be a fold-across-a-use bug
+        // dressed up as a liveness improvement.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "a use before the return lost its definition: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_self_zeroing_xor_is_a_kill() {
+        // `xorl %ecx, %ecx` writes a CONSTANT.  It mentions the family on its
+        // source side and classifies as read-modify-write, so both vetoes in
+        // the general conjunction fired and the canonical zeroing idiom kept a
+        // dead address copy alive.  Neither veto is about the RESULT, which is
+        // 0 regardless of the old value.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    xorl %ecx, %ecx\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq (%rdi), %rax"),
+            "the dereference was not folded across the zeroing idiom: {result}"
+        );
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "the address copy a self-xor retires was not eliminated: {result}"
+        );
+        // The zeroing itself, and the consumer that reads the zero, must both
+        // survive: the fold removes the COPY, never the redefinition.
+        assert!(result.contains("xorl %ecx, %ecx"), "{result}");
+        assert!(result.contains("movq %rcx, %rdx"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_self_zeroing_sub_is_a_kill() {
+        // `sub r, r` is the second idiom whose result is independent of the old
+        // value; the 64-bit spelling is included so the width rule is exercised
+        // on both accepted suffixes.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    subq %rcx, %rcx\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "the address copy a self-subtract retires was not eliminated: {result}"
+        );
+        assert!(result.contains("subq %rcx, %rcx"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_partial_self_zeroing_is_not_a_kill() {
+        // `xorw %cx, %cx` clears 16 bits and LEAVES the upper 48 bits of the
+        // copied value observable to the following 64-bit read.  A width rule
+        // that accepted it would ship the pointer's high half as garbage.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    xorw %cx, %cx\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "a 16-bit self-xor was accepted as a full kill: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_mixed_operand_self_zeroing_is_not_a_kill() {
+        // `xorl %eax, %ecx` is a genuine read-modify-write of %rcx: its result
+        // DEPENDS on the copied value, so deleting the copy would xor into the
+        // incoming register.  Identical-operand identity is what makes the
+        // idiom a constant write, and this is the case that proves the test is
+        // not a mnemonic-prefix heuristic.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    xorl %eax, %ecx\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "a two-register xor was accepted as a constant write: {result}"
+        );
+        assert!(result.contains("xorl %eax, %ecx"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_value_preserving_self_op_is_not_a_kill() {
+        // `andl %ecx, %ecx` / `orq %rcx, %rcx` name the same register twice but
+        // PRESERVE the old value, so they are uses, not kills.  The predicate
+        // accepts `xor`/`sub` only, and this pins the exclusion.
+        for op in ["andl %ecx, %ecx", "orq %rcx, %rcx"] {
+            let asm = format!(
+                "f:\n    movq %rdi, %rcx\n    movq (%rcx), %rax\n    {op}\n    movq %rcx, %rdx\n    ret\n.size f, .-f\n"
+            );
+            let result = peephole_optimize(asm);
+            assert!(
+                result.contains("movq %rdi, %rcx"),
+                "`{op}` was accepted as a constant write: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rcx_address_copy_popq_is_a_kill() {
+        // `popq %rcx` has ONE operand and it is the destination: the value is
+        // redefined from the stack and no register source is read, so the copy
+        // is dead.  The walk used to answer "live" here twice over — the comma
+        // split handed `"popq %rcx"` to the width test, and
+        // `is_read_modify_write` answers conservatively for every mnemonic it
+        // does not know.  The arm is exact because `Pop { reg }` carries
+        // `reg_refs = 1 << reg`, so only the family itself reaches it.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    popq %rcx\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq (%rdi), %rax"),
+            "the dereference was not folded across the pop: {result}"
+        );
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "the address copy a `popq %rcx` retires was not eliminated: {result}"
+        );
+        assert!(result.contains("popq %rcx"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_popq_of_another_family_is_not_a_kill() {
+        // The mirror image: a pop of a DIFFERENT family says nothing about
+        // %rcx, so the copy must survive.  (It never reaches the kill arm at
+        // all — the family bitmask filters it — but the contract is worth
+        // pinning because the arm matches on the classified register.)
+        //
+        // The later consumer returns %rcx in %rax: a result register stays live
+        // across the `ret` (`dead_code.rs` keeps RAX/RDX there on purpose), so
+        // the copied value is genuinely observable and the whole chain must
+        // survive.  An unobserved consumer would be removed legitimately by the
+        // dead-move scan and the test would stop testing the pop arm.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rdx\n",
+            "    popq %rsi\n",
+            "    movq %rcx, %rax\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "a pop of another family was treated as a kill of %rcx: {result}"
+        );
+        assert!(
+            result.contains("movq %rcx, %rax"),
+            "the live consumer of the copied value disappeared: {result}"
         );
     }
 

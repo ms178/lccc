@@ -873,6 +873,23 @@ pub(super) struct IvsrPointerInfo {
     pub backedge_block: BlockId, // Block with pointer increment
 }
 
+/// `CCC_TRACE_NOTES` gates the home-register note trace
+/// (`[INS]`/`[CLOB]`) emitted by [`X86Codegen::note_home_written`] and
+/// [`X86Codegen::note_reg_clobbered`].
+///
+/// Read once and cached.  `note_home_written` runs per homed definition —
+/// effectively per emitted instruction — and an uncached lookup there is a
+/// `getenv` plus an `OsString` clone of the value on the codegen hot path,
+/// i.e. a compile-time regression paid by every build that never sets the
+/// variable.  Same convention as `i686::codegen::emit::const_stack_arg_disabled`
+/// and `split_ranges::split_debug_enabled`; the environment cannot change
+/// mid-process in the driver, so caching is exact, not an approximation.
+fn trace_notes_enabled() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_TRACE_NOTES").is_some());
+    *FLAG
+}
+
 impl X86Codegen {
     /// Compare the low 64-bit half of a 128-bit switch value (already in
     /// %rax) against `case_val` and branch to `label` on equality.  The sign
@@ -1406,7 +1423,7 @@ impl X86Codegen {
     /// `note_reg_clobbered`.
     pub(super) fn note_home_written(&mut self, dest_id: u32) {
         if self.reg_assignments.contains_key(&dest_id) {
-            if std::env::var_os("CCC_TRACE_NOTES").is_some() {
+            if trace_notes_enabled() {
                 eprintln!("[INS] fn={} v={}", self.state.current_func_name, dest_id);
             }
             self.home_fresh.insert(dest_id);
@@ -1439,7 +1456,9 @@ impl X86Codegen {
                         .is_some_and(|segs| segs.iter().any(|&(s, e)| s <= point && point <= e))
                 })
                 .collect();
-            if std::env::var_os("CCC_TRACE_NOTES").is_some() && !stale.is_empty() {
+            // Cheap test first: the eviction list is empty for the vast
+            // majority of clobbers, and only a non-empty one can trace.
+            if !stale.is_empty() && trace_notes_enabled() {
                 eprintln!(
                     "[CLOB] fn={} phys={} pp={} evicts={:?}",
                     self.state.current_func_name, phys, point, stale

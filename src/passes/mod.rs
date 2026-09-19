@@ -944,6 +944,33 @@ pub(crate) fn run_passes(
     // keeps the kill-switch unit test from racing its siblings (see
     // `TWO_BLOCK_UNROLL_ENABLED` in loop_unroll.rs).
     loop_unroll::set_two_block_unroll_enabled(std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err());
+    // Every remaining pass switch, resolved here for the same reason.  No pass
+    // reads the process environment any more: each of these was an `environ`
+    // scan (and an `OsString` or `String` allocation) PER FUNCTION — eight of
+    // them across the interleave, load-sink, backedge-PRE and loop-alignment
+    // passes — and because the environment is process-global, each pass's
+    // kill-switch test had to mutate it underneath every sibling test on cargo's
+    // thread pool.  `tests/regression/check_env_test_hygiene.sh` fails the build
+    // if a pass grows an env read again or a test mutates the environment
+    // without `test_support::EnvGuard`.
+    vec_interleave::set_vec_interleave_env(vec_interleave::InterleaveEnv {
+        enabled: std::env::var_os("CCC_NO_VEC_INTERLEAVE").is_none(),
+        trace: std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some()
+            || std::env::var_os("LCCC_WHY_NOT_VECTORIZE").is_some(),
+        // 2, 4 and 8 are the only forces the knob documents; anything else
+        // leaves the CPU model in charge.
+        forced_factor: std::env::var("CCC_VEC_INTERLEAVE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|f| matches!(f, 2 | 4 | 8))
+            .unwrap_or(0),
+    });
+    vec_load_sink::set_vec_load_sink_env(vec_load_sink::SinkEnv {
+        enabled: std::env::var_os("CCC_NO_VEC_LOAD_SINK").is_none(),
+        trace: std::env::var_os("CCC_DEBUG_VEC_LOAD_SINK").is_some(),
+    });
+    backedge_pre::set_backedge_pre_env(backedge_pre::EnvConfig::from_env());
+    loop_align::set_tight_loop_mode(loop_align::TightLoopMode::from_env());
     // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
     // ignores this.

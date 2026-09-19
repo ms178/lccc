@@ -2229,18 +2229,23 @@ fn is_segment_name(s: &str) -> bool {
 /// identifier's leading character.  That turned the hottest predicate in the
 /// assembler into two heap allocations per symbol.
 ///
-/// Skipping the evaluator is exactly equivalent here, not an approximation:
-/// a string that reaches the literal test and survives the charset test
-/// contains no operator, parenthesis, sign, quote or whitespace, so the
-/// evaluator can only accept it through its single-literal path — and that
-/// path necessarily begins with an ASCII digit.  Identifiers, which are the
-/// overwhelming majority of call sites, therefore never enter the scan.
+/// The scan is the evaluator's OWN grammar, not a copy of it: both call
+/// `asm_expr::bare_integer_literal`, so there is no second recognizer to drift
+/// and no allocation on either side.  Skipping the rest of the evaluator is
+/// exactly equivalent here, not an approximation: a string that survives the
+/// charset test below contains no operator, parenthesis, sign, quote or
+/// whitespace, so the evaluator can only accept it through its single-literal
+/// path (its tokenizer fallback values numbers through the same function) —
+/// and that path necessarily begins with an ASCII digit.  Identifiers, the
+/// overwhelming majority of call sites, never enter the scan at all.
+/// `is_label_like_agrees_with_the_library_parsers_exhaustively` pins the
+/// equivalence against an independent restatement built on `str::parse`.
 fn is_label_like(s: &str) -> bool {
     let bytes = s.as_bytes();
     let Some(&first) = bytes.first() else {
         return false;
     };
-    if first.is_ascii_digit() && is_bare_integer_literal(bytes) {
+    if first.is_ascii_digit() && asm_expr::bare_integer_literal(bytes).is_some() {
         return false;
     }
     if !(first.is_ascii_alphabetic() || first == b'_' || first == b'.' || first.is_ascii_digit()) {
@@ -2249,76 +2254,6 @@ fn is_label_like(s: &str) -> bool {
     bytes
         .iter()
         .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
-}
-
-/// Recognize a bare integer literal — `42`, `0644`, `0x1f`, `0b1010`, and the
-/// same with C integer suffixes — in one allocation-free pass over `bytes`.
-///
-/// Mirrors the accept/reject decision of `asm_expr::parse_single_integer` for
-/// the charset-restricted inputs [`is_label_like`] can observe; see there for
-/// why the evaluator itself must not be called on this path.
-fn is_bare_integer_literal(bytes: &[u8]) -> bool {
-    // C integer suffixes (u/U/l/L/z/Z, incl. LL/ULL combos) are stripped
-    // before the radix is read, exactly as the evaluator strips them.
-    let mut end = bytes.len();
-    while end > 0 && matches!(bytes[end - 1], b'u' | b'U' | b'l' | b'L' | b'z' | b'Z') {
-        end -= 1;
-    }
-    let lit = &bytes[..end];
-    let radixed = lit.len() > 1 && lit[0] == b'0';
-    if radixed && matches!(lit[1], b'x' | b'X') {
-        // u64: every 16-digit hexadecimal value fits, so width alone decides.
-        return fits_radix(&lit[2..], |b| b.is_ascii_hexdigit(), 16, None);
-    }
-    if radixed && matches!(lit[1], b'b' | b'B') {
-        // i64: 63 bits is the widest positive value that still fits.
-        return fits_radix(&lit[2..], |b| matches!(b, b'0' | b'1'), 63, None);
-    }
-    if radixed && lit.iter().all(|b| b.is_ascii_digit()) {
-        // A leading zero selects octal and never falls back to decimal, so
-        // `09` is not a literal — the evaluator rejects it identically.
-        return fits_radix(
-            lit,
-            |b| matches!(b, b'0'..=b'7'),
-            21,
-            Some(b"777777777777777777777"),
-        );
-    }
-    // Decimal, widened to u64 like the evaluator's i64-then-u64 retry.
-    fits_radix(
-        lit,
-        |b| b.is_ascii_digit(),
-        20,
-        Some(b"18446744073709551615"),
-    )
-}
-
-/// True when every byte of `body` is a digit of the radix under test and the
-/// value they spell fits the evaluator's target type.
-///
-/// Leading zeros never contribute to the value, so only the significant tail
-/// is measured.  Below `max_significant` digits every value fits; at exactly
-/// that width `limit` — the type's maximum spelled in this radix — is compared
-/// byte-wise, which is a numeric comparison because both operands have the
-/// same length and radix.  `limit` is `None` for the power-of-two radices,
-/// where a full-width value fits by construction.
-fn fits_radix(
-    body: &[u8],
-    is_digit: fn(u8) -> bool,
-    max_significant: usize,
-    limit: Option<&[u8]>,
-) -> bool {
-    if body.is_empty() || !body.iter().copied().all(is_digit) {
-        return false;
-    }
-    let Some(first) = body.iter().position(|&b| b != b'0') else {
-        return true; // the all-zero value fits in every radix
-    };
-    let significant = &body[first..];
-    if significant.len() != max_significant {
-        return significant.len() < max_significant;
-    }
-    limit.is_none_or(|limit| significant <= limit)
 }
 
 /// Strip balanced outer parentheses from an expression.
@@ -4538,7 +4473,7 @@ mod tests {
                 }
                 let candidate = std::str::from_utf8(&buf[..len]).unwrap();
                 assert_eq!(
-                    is_bare_integer_literal(candidate.as_bytes()),
+                    asm_expr::bare_integer_literal(candidate.as_bytes()).is_some(),
                     parse_integer_expr(candidate).is_ok(),
                     "literal recognizer disagrees with the shared evaluator on {candidate:?}"
                 );
@@ -4548,10 +4483,12 @@ mod tests {
         assert!(checked > 60_000, "corpus too small: {checked}");
     }
 
-    /// Width boundaries the exhaustive corpus above cannot reach: the widest
-    /// value each radix accepts and the first one it rejects.
+    /// Width boundaries, as a readable table: the widest value each radix
+    /// accepts and the first one it rejects.  The exhaustive equivalence corpus
+    /// below covers these too, but a table a human can read is what tells the
+    /// next person which boundary a change moved.
     #[test]
-    fn test_bare_integer_literal_width_boundaries() {
+    fn test_width_boundaries_through_the_shared_grammar() {
         let cases: &[(&str, bool)] = &[
             ("0xffffffffffffffff", true),    // 16 hex digits = u64::MAX
             ("0x10000000000000000", false),  // 17 hex digits
@@ -4571,15 +4508,18 @@ mod tests {
             ("9223372036854775807", true),   // i64::MAX, via the u64 retry
         ];
         for (candidate, expected) in cases {
+            let recognized = asm_expr::bare_integer_literal(candidate.as_bytes()).is_some();
+            assert_eq!(recognized, *expected, "width boundary {candidate:?}");
             assert_eq!(
-                is_bare_integer_literal(candidate.as_bytes()),
-                *expected,
-                "width boundary {candidate:?}"
-            );
-            assert_eq!(
-                is_bare_integer_literal(candidate.as_bytes()),
+                recognized,
                 parse_integer_expr(candidate).is_ok(),
                 "evaluator parity on {candidate:?}"
+            );
+            // And the predicate that consumes it: a literal is never a label.
+            assert_eq!(
+                is_label_like(candidate),
+                !*expected,
+                "is_label_like on width boundary {candidate:?}"
             );
         }
     }
@@ -4650,5 +4590,392 @@ main:
         assert!(parse_asm("\t.lccc_tight_loop .LBB3,\n").is_err());
         assert!(parse_asm("\t.lccc_tight_loop LBB3\n").is_err());
         assert!(parse_asm("\t.lccc_tight_loop .LBB3\nnop\n").is_ok());
+    }
+}
+
+// ── tests: the integer grammar has exactly one implementation ────────────────
+
+#[cfg(test)]
+mod integer_grammar_equivalence_tests {
+    use super::is_label_like;
+    use crate::backend::asm_expr::{bare_integer_literal, parse_integer_expr};
+
+    /// `is_label_like` as it was defined BEFORE the literal test became a byte
+    /// scan: ask the full evaluator, then apply the charset test.  Slow and
+    /// obvious on purpose — it is the oracle, and it exercises the evaluator's
+    /// tokenizer fallback, char literals and sign handling as well.
+    fn original_is_label_like(s: &str) -> bool {
+        if s.is_empty() {
+            return false;
+        }
+        if parse_integer_expr(s).is_ok() {
+            return false;
+        }
+        let first = s.as_bytes()[0];
+        if !(first.is_ascii_alphabetic()
+            || first == b'_'
+            || first == b'.'
+            || first.is_ascii_digit())
+        {
+            return false;
+        }
+        s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+    }
+
+    /// The evaluator's numeric branches as they were before the grammar was
+    /// shared, restated on the STANDARD LIBRARY's parsers: `from_str_radix` for
+    /// the prefixed radices, `parse` for decimal with its i64-then-u64 retry,
+    /// suffix stripping first and the sign handled by wrapping negation.  std is
+    /// the independent implementation here — nothing in this function calls the
+    /// code under test.
+    fn library_single_integer(s: &str) -> Option<i64> {
+        let bytes = s.as_bytes();
+        let mut end = bytes.len();
+        while end > 0 && matches!(bytes[end - 1], b'u' | b'U' | b'l' | b'L' | b'z' | b'Z') {
+            end -= 1;
+        }
+        let s = &s[..end];
+        if s.is_empty() {
+            return None;
+        }
+        let (negative, s) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            let uval = u64::from_str_radix(hex, 16).ok()?;
+            return Some(if negative {
+                (uval as i64).wrapping_neg()
+            } else {
+                uval as i64
+            });
+        }
+        if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+            let val = i64::from_str_radix(bin, 2).ok()?;
+            return Some(if negative { val.wrapping_neg() } else { val });
+        }
+        if s.starts_with('0') && s.len() > 1 && s.chars().all(|c| c.is_ascii_digit()) {
+            let val = i64::from_str_radix(s, 8).ok()?;
+            return Some(if negative { val.wrapping_neg() } else { val });
+        }
+        if let Ok(val) = s.parse::<i64>() {
+            return Some(if negative { -val } else { val });
+        }
+        let uval = s.parse::<u64>().ok()?;
+        Some(if negative {
+            (uval as i64).wrapping_neg()
+        } else {
+            uval as i64
+        })
+    }
+
+    /// The same question through the shared recognizer, structured exactly as
+    /// `parse_single_integer` structures it: sign first, then the grammar.
+    fn shared_single_integer(s: &str) -> Option<i64> {
+        let bytes = s.as_bytes();
+        let (body, negative) = match bytes.first() {
+            Some(b'-') => (&bytes[1..], true),
+            _ => (bytes, false),
+        };
+        let value = bare_integer_literal(body)?;
+        Some(if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        })
+    }
+
+    /// Every string up to `max_len` over `alphabet`, shortest first.
+    fn exhaustive(alphabet: &[u8], max_len: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut frontier: Vec<String> = vec![String::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::with_capacity(frontier.len() * alphabet.len());
+            for prefix in &frontier {
+                for &b in alphabet {
+                    let mut s = prefix.clone();
+                    s.push(b as char);
+                    next.push(s);
+                }
+            }
+            out.extend(next.iter().cloned());
+            frontier = next;
+        }
+        out
+    }
+
+    /// The bytes that decide the grammar: decimal digits incl. the two that are
+    /// invalid octal, both radix prefixes in both cases, every suffix letter,
+    /// the sign, the dot that the charset allows and the tokenizer does not,
+    /// hex letters that are not suffix letters, and the identifier underscore.
+    const ALPHABET: &[u8] = b"0189xXbBuUlLzZ+-.aAfF_";
+    /// A subset, for one more byte of length at a tolerable case count.
+    const ALPHABET_SMALL: &[u8] = b"0189xXuL+-.a";
+    /// The alphabet the recognizer's own decisions need at full length four:
+    /// both radix prefixes in both cases, every valid and invalid digit per
+    /// radix, the octal-vs-decimal selection on a leading zero, every suffix
+    /// letter, and the two charset-only separators.  16^4 = 65536 cases.
+    const ALPHABET_GRAMMAR: &[u8] = b"01789xXbBfeulz._";
+
+    fn boundary_literals() -> Vec<String> {
+        let mut out = Vec::new();
+        // Width boundaries of all four radices, as decimal/hex/octal/binary
+        // digit strings: bound-1, bound, bound+1.
+        let bounds: [(&str, [u128; 3]); 4] = [
+            (
+                "dec",
+                [u64::MAX as u128 - 1, u64::MAX as u128, u64::MAX as u128 + 1],
+            ),
+            (
+                "hex",
+                [u64::MAX as u128 - 1, u64::MAX as u128, u64::MAX as u128 + 1],
+            ),
+            (
+                "oct",
+                [i64::MAX as u128 - 1, i64::MAX as u128, i64::MAX as u128 + 1],
+            ),
+            (
+                "bin",
+                [i64::MAX as u128 - 1, i64::MAX as u128, i64::MAX as u128 + 1],
+            ),
+        ];
+        let suffixes = [
+            "", "u", "U", "l", "L", "z", "Z", "ul", "UL", "ull", "ULL", "llu", "zzzz",
+        ];
+        let signs = ["", "+", "-"];
+        for (radix, values) in bounds {
+            for value in values {
+                // i64::MAX + 1 as a signed decimal is out of i64 range but in
+                // u64 range: both spellings matter, so emit each value in every
+                // radix that can represent it.
+                let spellings: Vec<String> = match radix {
+                    "dec" => vec![format!("{value}")],
+                    "hex" => vec![format!("0x{value:x}"), format!("0X{value:X}")],
+                    "oct" => vec![format!("0{value:o}")],
+                    "bin" => vec![format!("0b{value:b}")],
+                    _ => unreachable!(),
+                };
+                for spelling in spellings {
+                    for suffix in suffixes {
+                        for sign in signs {
+                            // A sign in front of a radix prefix is not a
+                            // literal (the prefix match happens on the string
+                            // as given), but it IS a valid thing to feed the
+                            // predicate, so the corpus keeps it.
+                            out.push(format!("{sign}{spelling}{suffix}"));
+                        }
+                    }
+                }
+            }
+        }
+        // Shapes from real assembly: the kernel's symbol arithmetic, GAS local
+        // labels, and the glibc constant-expression suffix idiom.
+        out.extend([
+            "0xffffffff80000000".to_string(),
+            "0xffffffffffffffff".to_string(),
+            "9223372036854775807".to_string(),
+            "18446744073709551615".to_string(),
+            "0777777777777777777777".to_string(),
+            "0b111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            "__START_KERNEL_map".to_string(),
+            "init_top_pgt".to_string(),
+            ".LBB12".to_string(),
+            ".Ltmp0".to_string(),
+            "1U".to_string(),
+            "0x1fU".to_string(),
+            "09".to_string(),
+            "08".to_string(),
+            "00".to_string(),
+            "0".to_string(),
+            "+42".to_string(),
+            "-42".to_string(),
+            "+0x1f".to_string(),
+            "-0x1f".to_string(),
+            "1.2".to_string(),
+            "1_000".to_string(),
+            "1e5".to_string(),
+            "'A'".to_string(),
+            "'\\n'".to_string(),
+            "1<<4".to_string(),
+            "(1+2)".to_string(),
+        ]);
+        out
+    }
+
+    fn corpus() -> Vec<String> {
+        let mut out = exhaustive(ALPHABET, 3);
+        out.extend(exhaustive(ALPHABET_SMALL, 4));
+        out.extend(exhaustive(ALPHABET_GRAMMAR, 4));
+        out.extend(boundary_literals());
+        out
+    }
+
+    #[test]
+    fn shared_grammar_matches_the_library_parsers_exhaustively() {
+        // Accept/reject AND value, over the whole corpus.  `bare_integer_literal`
+        // is one allocation-free pass with hand-rolled digit arithmetic and
+        // hand-rolled width bounds; the library is neither.  Agreement is what
+        // makes sharing the grammar safe instead of merely tidy.
+        let mut literals = 0usize;
+        for text in corpus() {
+            // A repeated sign is the ONE documented divergence, and it is a
+            // divergence of the private single-integer path only: the public
+            // evaluator recovers the same value through its tokenizer, which
+            // `the_public_evaluator_is_unchanged_by_the_shared_grammar` pins.
+            let bytes = text.as_bytes();
+            let repeated_sign = bytes
+                .windows(2)
+                .any(|w| matches!(w[0], b'+' | b'-') && matches!(w[1], b'+' | b'-'));
+            if repeated_sign {
+                continue;
+            }
+            let shared = shared_single_integer(&text);
+            let library = library_single_integer(&text);
+            assert_eq!(
+                shared, library,
+                "the shared grammar and the library parsers disagree on {text:?}"
+            );
+            literals += usize::from(shared.is_some());
+        }
+        // What that counter is really for: a differential test over inputs that
+        // all reject proves nothing.  So assert the shapes that decide the
+        // grammar by VALUE -- the widest literal each radix accepts and the
+        // first it rejects -- instead of trusting a count that could stay high
+        // while the boundaries fell out of the corpus.  (3327 of the ~90k
+        // strings are literals; the floor below only catches a corpus that
+        // stopped generating them at all.)
+        let bin63 = "0b111111111111111111111111111111111111111111111111111111111111111";
+        let bin64 = "0b1000000000000000000000000000000000000000000000000000000000000000";
+        for (widest, first_rejected) in [
+            ("18446744073709551615", "18446744073709551616"), // u64::MAX, decimal
+            ("0xffffffffffffffff", "0x10000000000000000"),    // u64::MAX, hex
+            ("0777777777777777777777", "01000000000000000000000"), // i64::MAX, octal
+            (bin63, bin64),                                   // i64::MAX, binary
+        ] {
+            assert!(
+                shared_single_integer(widest).is_some(),
+                "the corpus lost the widest {widest:?}"
+            );
+            assert!(
+                shared_single_integer(first_rejected).is_none(),
+                "the corpus lost the first rejected {first_rejected:?}"
+            );
+        }
+        assert!(
+            literals > 3_000,
+            "corpus accepted only {literals} literals; it is no longer generating them"
+        );
+    }
+
+    #[test]
+    fn is_label_like_matches_the_original_definition_exhaustively() {
+        // The predicate's ANSWER must not have moved when its literal test
+        // became a byte scan: the original definition asked the full evaluator.
+        let mut labels = 0usize;
+        for text in corpus() {
+            let fast = is_label_like(&text);
+            let slow = original_is_label_like(&text);
+            assert_eq!(
+                fast, slow,
+                "is_label_like disagrees with the evaluator-based definition on {text:?}"
+            );
+            labels += usize::from(fast);
+        }
+        assert!(
+            labels > 5_000,
+            "corpus produced only {labels} label-like texts; identifiers are not being exercised"
+        );
+        // And the two answers the predicate exists to tell apart, on the shapes
+        // that motivated the byte scan: the kernel's symbol arithmetic must stay
+        // a symbol, and its absolute addresses must stay literals.
+        assert!(is_label_like("__START_KERNEL_map"));
+        assert!(is_label_like("init_top_pgt"));
+        assert!(!is_label_like("0xffffffff80000000"));
+        assert!(!is_label_like("0x1f"));
+    }
+
+    #[test]
+    fn the_public_evaluator_is_unchanged_by_the_shared_grammar() {
+        // The repeated-sign shapes the recognizer now declines, with the values
+        // the OLD single-integer path produced.  `parse_integer_expr` must still
+        // produce them -- through the tokenizer's unary handling -- because that
+        // function is the public contract and assembly files are written against
+        // it, not against a private helper.
+        for (text, want) in [
+            ("--42", 42i64),
+            ("+-42", -42),
+            ("-+42", -42),
+            ("++42", 42),
+            ("---42", -42),
+            ("- -42", 42),
+            ("--0x1f", 31),
+            ("-1u", -1),
+            // A '+' in front of a radix prefix is not a bare literal (the prefix
+            // match never fires behind a sign), but it IS a valid expression:
+            // the tokenizer reads `+` applied to `0x1f`.  Both implementations
+            // answer 31 -- the original through `str::parse` declining and the
+            // tokenizer taking over, this one the same way.
+            ("+0x1f", 31),
+            ("+0b101", 5),
+        ] {
+            assert_eq!(
+                parse_integer_expr(text).ok(),
+                Some(want),
+                "{text:?}: the evaluator's answer moved when the grammar was shared"
+            );
+        }
+    }
+
+    #[test]
+    fn the_evaluator_and_the_recognizer_agree_on_bare_literals() {
+        // End to end through the public evaluator: for a bare numeric token the
+        // value it returns is the value the recognizer produced, sign included.
+        for text in [
+            "0",
+            "42",
+            "-42",
+            "+42",
+            "0x1f",
+            "0X1F",
+            "0b1010",
+            "0644",
+            "0777777777777777777777",
+            "9223372036854775807",
+            "18446744073709551615",
+            "0xffffffffffffffff",
+            "1U",
+            "0x1full",
+            "-0x1f",
+            "+42",
+        ] {
+            let evaluated = parse_integer_expr(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            let recognized = shared_single_integer(text).expect(text);
+            assert_eq!(evaluated, recognized, "{text:?}");
+        }
+        // And the rejects stay rejects, with the message naming the radix that
+        // was actually attempted (the four messages are observable in assembler
+        // diagnostics, so they are part of the contract).
+        for (text, want) in [
+            ("09", "bad octal: 09"),
+            ("0x", "bad hex: 0x"),
+            // The tokenizer's binary branch stops at the first non-binary
+            // digit, so the token it fails on is `0b`, not `0b2`.
+            ("0b2", "bad binary: 0b"),
+            ("0x10000000000000000", "bad hex: 0x10000000000000000"),
+            ("18446744073709551616", "bad integer: 18446744073709551616"),
+            ("abc", "bad integer: abc"),
+            ("0z9", "bad integer: 0z9"),
+        ] {
+            // `parse_integer_expr` falls back to its tokenizer, which reports a
+            // different error for some of these; the message contract belongs to
+            // `parse_single_integer`, so ask it through a shape that cannot be
+            // tokenized any other way.
+            let err = parse_integer_expr(text).expect_err(text);
+            assert!(
+                err.contains(want) || err.contains("unexpected") || err.contains("expression"),
+                "{text:?}: got {err:?}, want it to mention {want:?}"
+            );
+        }
     }
 }

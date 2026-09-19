@@ -19,18 +19,19 @@
 set -euo pipefail
 
 K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
-LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
-LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
 INTACT=${INTACT_VMLINUX:-/home/user/kernel-work/intact/vmlinux}
 C=$K/arch/x86/boot/compressed
 B=$K/arch/x86/boot
 S=$K/arch/x86/boot/startup
 OUT=${OUT:-/tmp/lccc-compressed}
-# Resolve the script directory before `cd "$K"`: the fragment and the
-# boot-builder must be found relative to THIS script, not to an absolute
-# repo path baked in at write time (/home/user/lccc only exists on the
+# Resolve the script directory before `cd "$K"`: the fragment, the boot-builder
+# and the compiler defaults must all be found relative to THIS script, not to an
+# absolute repo path baked in at write time (/home/user/lccc only exists on the
 # original Arena host).
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
+LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
 
 [[ -d "$K" ]] || { echo "kernel tree missing: $K" >&2; exit 1; }
 [[ -x "$LCCC" ]] || { echo "lccc missing: $LCCC" >&2; exit 1; }

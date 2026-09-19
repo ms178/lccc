@@ -14,6 +14,11 @@ set -euo pipefail
 LCCC=$(realpath "${1:?usage: realmode_corpus.sh <lccc-binary> [outdir]}")
 OUT=${2:-/tmp/realmode}
 K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
+# Resolve the script directory before `cd "$K"`: the shared ELF section helper
+# has to be found relative to THIS script, not inside the kernel tree.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=elf_sections.sh
+. "$SCRIPT_DIR/elf_sections.sh"
 
 cd "$K"
 
@@ -75,23 +80,22 @@ mkdir -p "$OUT/lccc" "$OUT/gcc"
 
 sum_lccc=0
 sum_gcc=0
-# Sum EVERY executable section (.text, .text.startup, .text.unlikely, ...).
-# GCC's -freorder-functions partitions cold/startup code into .text.* input
-# sections which setup.ld merges via `*(.text .text.*)`; counting only .text
-# silently underreported GCC (main.c read as 12 bytes instead of 493).
-# `size -A` prints all sections in decimal (portable across awk variants).
-exec_text_bytes() {  # exec_text_bytes <object>
-  size -A "$1" | awk '$1 ~ /^\.text/ { total += $2 } END { print total + 0 }'
-}
-printf '%-24s %10s %10s %8s\n' "file" "lccc.text" "gcc.text" "ratio"
+# Sum EVERY executable section, from elf_sections.sh.  GCC's -freorder-functions
+# partitions cold/startup code into .text.* input sections which setup.ld merges
+# via `*(.text .text.*)`, and the `.text`-only sum this replaced once silently
+# underreported GCC (main.c read as 12 bytes instead of 493).  Widening the
+# pattern to `.text.*` fixed that case but not the class: header.o keeps its code
+# in .bstext/.entrytext and bioscall.o/tty.o in .inittext, which no `.text*`
+# pattern matches, so the helper reads SHF_EXECINSTR instead of a name list.
+printf '%-24s %10s %10s %8s\n' "file" "lccc.code" "gcc.code" "ratio"
 printf '%-24s %10s %10s %8s\n' "----" "--------" "--------" "-----"
 for f in "${CFILES[@]}"; do
   src="arch/x86/boot/$f.c"
   [[ -f "$src" ]] || continue
   "$LCCC" "${INC[@]}" "${DEFS[@]}" "${RMF[@]}" -c "$src" -o "$OUT/lccc/$f.o" 2>"$OUT/lccc/$f.err" \
-    && l=$(exec_text_bytes "$OUT/lccc/$f.o") || l="ERR"
+    && l=$(lccc_elf_code_bytes "$OUT/lccc/$f.o") || l="ERR"
   gcc    "${INC[@]}" "${DEFS[@]}" "${RMF[@]}" -c "$src" -o "$OUT/gcc/$f.o" 2>"$OUT/gcc/$f.err" \
-    && g=$(exec_text_bytes "$OUT/gcc/$f.o") || g="ERR"
+    && g=$(lccc_elf_code_bytes "$OUT/gcc/$f.o") || g="ERR"
   [[ "$l" == "ERR" ]] || sum_lccc=$((sum_lccc+l))
   [[ "$g" == "ERR" ]] || sum_gcc=$((sum_gcc+g))
   ratio=""

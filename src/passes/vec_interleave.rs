@@ -285,8 +285,7 @@ fn int_const(ty: IrType, v: i64) -> Option<IrConst> {
 }
 
 fn why_not() -> bool {
-    std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some()
-        || std::env::var_os("LCCC_WHY_NOT_VECTORIZE").is_some()
+    interleave_env().trace
 }
 
 /// One accumulator phi of a candidate loop.
@@ -615,11 +614,10 @@ fn operand_mentions_any(insts: &[Instruction], id: u32) -> bool {
 /// allocator spilled the 2 × 4 YMM accumulators plus load temporaries when
 /// this pass was first measured — see `docs/FOLLOWUP_CPU_MODEL.md`).
 fn choose_factor(func: &IrFunction, c: &Candidate) -> u32 {
-    if let Some(forced) = std::env::var("CCC_VEC_INTERLEAVE")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|f| matches!(f, 2 | 4 | 8))
-    {
+    // Resolved once per compile: this used to allocate a `String` and parse it
+    // for every candidate loop of every function.
+    let forced = interleave_env().forced_factor;
+    if forced != 0 {
         return forced;
     }
     let shape = body_shape(func, c);
@@ -1093,10 +1091,86 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
     true
 }
 
+/// The interleave pass's switches, resolved ONCE per compile by `run_passes`.
+///
+/// Every one of these used to be read out of the process environment at the point
+/// of use: the kill switch and the two trace variables per function, and the
+/// forced factor per CANDIDATE LOOP — `std::env::var` allocates a `String` and
+/// UTF-8 validates it, so the innermost of those was a heap allocation inside the
+/// candidate loop of every vectorizable function.  None of them can change
+/// mid-compile.
+#[derive(Clone, Copy)]
+pub(crate) struct InterleaveEnv {
+    /// Whether the pass runs at all: `CCC_NO_VEC_INTERLEAVE` unset.
+    pub(crate) enabled: bool,
+    /// Whether refusals are explained: `LCCC_DEBUG_VECTORIZE` or
+    /// `LCCC_WHY_NOT_VECTORIZE`.
+    pub(crate) trace: bool,
+    /// The factor forced by `CCC_VEC_INTERLEAVE`, or 0 for "the CPU model
+    /// decides".  2, 4 and 8 are the only forces the knob accepts; anything else
+    /// resolves to 0 here rather than being re-parsed per candidate.
+    pub(crate) forced_factor: u32,
+}
+
+/// The environment-unset configuration, which is also the default for an entry
+/// point that never went through `run_passes` (unit tests).
+const INTERLEAVE_ENV_DEFAULT: InterleaveEnv = InterleaveEnv {
+    enabled: true,
+    trace: false,
+    forced_factor: 0,
+};
+
+thread_local! {
+    /// This thread's switches.  See [`InterleaveEnv`] for what moved here and
+    /// why; the documented kill switch is `CCC_NO_VEC_INTERLEAVE`.
+    ///
+    /// Resolved ONCE by `run_passes` and read from per-thread state: the
+    /// contract `loop_unroll`'s `TWO_BLOCK_UNROLL_ENABLED`, `loop_invert`'s
+    /// `LoopInvertConfig` and the vectorizer's ISA gates already follow.  This
+    /// used to be read out of the process environment here, per call — an
+    /// `environ` scan and an `OsString` allocation for every function — and
+    /// because that state is process-global, the kill-switch test had to mutate
+    /// the environment to reach it, underneath every sibling test on cargo's
+    /// thread pool (`loop_unroll` measured the same defect at 11 failures in 150
+    /// runs, ~7%).  It also removes the reason a deferred-audit marker was
+    /// sitting on that mutation.
+    ///
+    /// Defaults to enabled, which is exactly the environment-unset default, so an
+    /// entry point that never went through `run_passes` (unit tests) behaves as
+    /// it did before the switch existed.
+    static INTERLEAVE_ENV: std::cell::Cell<InterleaveEnv> =
+        const { std::cell::Cell::new(INTERLEAVE_ENV_DEFAULT) };
+}
+
+/// Record the interleave pass's switches for this thread.  Called by
+/// `run_passes` before any interleave entry point runs.
+pub(crate) fn set_vec_interleave_env(env: InterleaveEnv) {
+    INTERLEAVE_ENV.with(|cell| cell.set(env));
+}
+
+#[inline]
+fn interleave_env() -> InterleaveEnv {
+    INTERLEAVE_ENV.with(std::cell::Cell::get)
+}
+
+#[inline]
+fn vec_interleave_enabled() -> bool {
+    interleave_env().enabled
+}
+
+#[inline]
+fn set_interleave_enabled(enabled: bool) {
+    INTERLEAVE_ENV.with(|cell| {
+        let mut env = cell.get();
+        env.enabled = enabled;
+        cell.set(env);
+    });
+}
+
 /// Interleave every canonical vector reduction loop in `func`.  Returns the
 /// number of loops transformed.
 pub(crate) fn run(func: &mut IrFunction, fp_reassoc: bool) -> usize {
-    if func.blocks.is_empty() || std::env::var_os("CCC_NO_VEC_INTERLEAVE").is_some() {
+    if func.blocks.is_empty() || !vec_interleave_enabled() {
         return 0;
     }
     let has_vec_acc = func.blocks.iter().any(|b| {
@@ -1133,18 +1207,11 @@ pub(crate) fn run(func: &mut IrFunction, fp_reassoc: bool) -> usize {
 mod tests {
     use super::*;
 
-    /// Serializes every test that reaches the pass entry: `run` reads
-    /// CCC_NO_VEC_INTERLEAVE and environment variables are PROCESS-GLOBAL,
-    /// so the kill-switch test's set/remove window otherwise races with the
-    /// other tests' env reads under cargo's default test parallelism and
-    /// randomly disables the pass mid-test (observed as interleave_dot
-    /// returning 0).  Every run() call below goes through run_locked.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn run_locked(f: &mut IrFunction, fp_reassoc: bool) -> usize {
-        let _g = ENV_LOCK.lock().unwrap();
-        run(f, fp_reassoc)
-    }
+    // The switch is per-thread state now, so there is nothing to serialize:
+    // this module used to hold its own `ENV_LOCK` and route every `run` call
+    // through a `run_locked` wrapper, which protected the module against itself
+    // and nothing else (tests from every module share cargo's thread pool, so
+    // the lock never covered another module's `environ` read).
 
     /// Build the canonical post-vectorizer dot-product loop (4×F64 FMA,
     /// byte IV step 32) as a synthetic IrFunction: 4 blocks (entry, header,
@@ -1321,7 +1388,7 @@ mod tests {
     #[test]
     fn interleave_dot_f64_transforms_and_verifies() {
         let (mut f, _base) = build_dot_func();
-        let n = run_locked(&mut f, true);
+        let n = run(&mut f, true);
         assert_eq!(n, 1, "the canonical dot loop must interleave");
         // 4 new blocks: NP, MH, MB, C.
         assert_eq!(f.blocks.len(), 8);
@@ -1381,22 +1448,22 @@ mod tests {
     #[test]
     fn fp_interleave_requires_reassoc() {
         let (mut f, _base) = build_dot_func();
-        let n = run_locked(&mut f, false);
+        let n = run(&mut f, false);
         assert_eq!(n, 0, "FP interleave without -fassociative-math must bail");
     }
 
     #[test]
     fn kill_switch_disables_the_pass() {
         let (mut f, _base) = build_dot_func();
-        // Hold ENV_LOCK across the whole set/run/remove window: the env var
-        // is process-global and every other run_locked() caller reads it.
-        let _g = ENV_LOCK.lock().unwrap();
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("CCC_NO_VEC_INTERLEAVE", "1") };
-        // Direct call: the guard above already serializes us.
-        let n = run(&mut f, true);
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("CCC_NO_VEC_INTERLEAVE") };
-        assert_eq!(n, 0);
+        // Per-thread switch, restored by the guard: no process-global state, so
+        // no lock and no `unsafe` environment mutation — and a failing assertion
+        // cannot leave the pass disabled for the tests that follow on this
+        // thread, which is what the bare set/remove pair did.
+        let _g = crate::test_support::ScopedFlag::new(
+            vec_interleave_enabled,
+            set_interleave_enabled,
+            false,
+        );
+        assert_eq!(run(&mut f, true), 0);
     }
 }

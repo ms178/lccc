@@ -294,7 +294,7 @@ impl LoopAlignConfig {
 /// passing loop — resolved at IR level, works under `-S` too), or
 /// `5skip` (bounded 32 with a 16 fallback).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TightLoopMode {
+pub(crate) enum TightLoopMode {
     /// Disable the tight-loop pass; every scalar loop gets 16/8.
     Off,
     /// GCC-faithful size bucket rule (default).
@@ -307,8 +307,36 @@ enum TightLoopMode {
     Bounded32,
 }
 
+thread_local! {
+    /// The tight-loop tier for this thread, resolved ONCE per compile by
+    /// `run_passes` through [`TightLoopMode::from_env`].
+    ///
+    /// The pass used to call `from_env` itself, per function: a `String`
+    /// allocation plus UTF-8 validation for an A/B knob that cannot change
+    /// mid-compile, and process-global state the tier test then had to mutate.
+    /// The default is the environment-unset tier, so an entry point that never
+    /// went through `run_passes` behaves as before.
+    static TIGHT_LOOP_MODE: std::cell::Cell<TightLoopMode> =
+        const { std::cell::Cell::new(TightLoopMode::Gcc) };
+}
+
+/// Record the tight-loop tier for this thread.  Called by `run_passes`.
+pub(crate) fn set_tight_loop_mode(mode: TightLoopMode) {
+    TIGHT_LOOP_MODE.with(|cell| cell.set(mode));
+}
+
+#[inline]
+fn tight_loop_mode() -> TightLoopMode {
+    TIGHT_LOOP_MODE.with(std::cell::Cell::get)
+}
+
 impl TightLoopMode {
-    fn from_env() -> Self {
+    /// Resolve the A/B knob from the process environment.  Called once per
+    /// compile by `run_passes`; reading the environment IS this function's
+    /// contract, so its test mutates the environment — behind
+    /// `test_support::EnvGuard`, which serializes the window process-wide and
+    /// restores it even when an assertion fails.
+    pub(crate) fn from_env() -> Self {
         match std::env::var("CCC_LOOP_ALIGN_HOT")
             .unwrap_or_else(|_| "gcc".to_string())
             .trim()
@@ -469,7 +497,7 @@ fn align_function(
     // Natural-loop nesting: the tight-loop tier is reserved for
     // INNERMOST contiguous loops (see `audit_tight_loop`).
     let nest = loop_analysis::LoopNest::analyze(cfg_analysis.num_blocks, &loops);
-    let tight_mode = TightLoopMode::from_env();
+    let tight_mode = tight_loop_mode();
 
     // Backedge targets in FINAL BLOCK ORDER. The natural-loop header and
     // the backward-branch target coincide for any sane layout (the header
@@ -1274,16 +1302,25 @@ mod tests {
 
     #[test]
     fn unknown_tight_mode_knob_fails_closed_to_gcc_policy() {
-        // SAFETY: single-threaded env mutation within this test; the knob
-        // is read nowhere else in the unit-test process.
-        unsafe {
-            std::env::set_var("CCC_LOOP_ALIGN_HOT", "garbage");
+        // `from_env` reads the environment by contract, so this test mutates it —
+        // behind the guard, one assertion per window.  The bare `unsafe` block
+        // this replaces claimed "single-threaded env mutation within this test",
+        // which cargo's test pool does not provide, and restored nothing when an
+        // assertion failed: `CCC_LOOP_ALIGN_HOT=garbage` then leaked into every
+        // later test on the thread.
+        use crate::test_support::EnvGuard;
+        const KEY: &str = "CCC_LOOP_ALIGN_HOT";
+        {
+            let _g = EnvGuard::set(KEY, "garbage");
             assert_eq!(TightLoopMode::from_env(), TightLoopMode::Gcc);
-            std::env::remove_var("CCC_LOOP_ALIGN_HOT");
+        }
+        {
+            let _g = EnvGuard::unset(KEY);
             assert_eq!(TightLoopMode::from_env(), TightLoopMode::Gcc);
-            std::env::set_var("CCC_LOOP_ALIGN_HOT", "off");
+        }
+        {
+            let _g = EnvGuard::set(KEY, "off");
             assert_eq!(TightLoopMode::from_env(), TightLoopMode::Off);
-            std::env::remove_var("CCC_LOOP_ALIGN_HOT");
         }
     }
 }

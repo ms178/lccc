@@ -90,17 +90,48 @@ const AVAILABLE_EXPR_SCAN_BUDGET: usize = 512;
 // ── Environment / target configuration ──────────────────────────────────────
 
 #[derive(Clone, Copy)]
-struct EnvConfig {
+pub(crate) struct EnvConfig {
     disabled: bool,
     /// `CCC_BEPRE_FP=1`: enable FP PRE for singly-used top expressions too.
     fp_broad: bool,
     debug: bool,
 }
 
+/// The unset-environment configuration, which is also the default for an entry
+/// point that never went through `run_passes` (unit tests).
+const ENV_CONFIG_DEFAULT: EnvConfig = EnvConfig {
+    disabled: false,
+    fp_broad: false,
+    debug: false,
+};
+
+thread_local! {
+    /// This thread's switches, resolved ONCE per compile by `run_passes`.
+    ///
+    /// `read` used to do three `environ` scans and allocate three `OsString`s
+    /// per function — the comment it carried already knew the cost ("env access
+    /// takes the process env lock") and had moved the reads from per-candidate to
+    /// per-function, which is where the pass is still hottest.  Per-thread state
+    /// removes the cost entirely and, because the environment is process-global,
+    /// also removes the reason the tests had to mutate it.
+    static ENV_CONFIG: std::cell::Cell<EnvConfig> = const { std::cell::Cell::new(ENV_CONFIG_DEFAULT) };
+}
+
+/// Record the pass's switches for this thread.  Called by `run_passes`.
+pub(crate) fn set_backedge_pre_env(config: EnvConfig) {
+    ENV_CONFIG.with(|cell| cell.set(config));
+}
+
 impl EnvConfig {
-    /// Read once per function (not per candidate as before): env access takes
-    /// the process env lock, and this is called from the innermost scan loop.
+    /// This thread's switches.  Allocation-free and lock-free: the driver
+    /// resolved them once.
     fn read() -> Self {
+        ENV_CONFIG.with(std::cell::Cell::get)
+    }
+
+    /// Resolve the documented switches from the process environment.  Called
+    /// once per compile by `run_passes`, never from the pass itself.
+    pub(crate) fn from_env() -> Self {
         Self {
             disabled: std::env::var_os("CCC_NO_BEPRE").is_some(),
             fp_broad: std::env::var_os("CCC_BEPRE_FP").is_some(),
@@ -1634,8 +1665,12 @@ mod tests {
                 }
             }
         }
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("CCC_BEPRE_FP") };
+        // The FP-broad switch is per-thread state resolved by the driver, and
+        // its default is off, which is what this test asserts against.  The
+        // `remove_var` this replaces was defending against a process-global
+        // variable that no test in this module sets — and defending badly, since
+        // a sibling test on another thread could set it back mid-assertion.
+        assert_eq!(EnvConfig::read().fp_broad, false, "the default moved");
         assert_eq!(run(&mut f), 0);
     }
 
