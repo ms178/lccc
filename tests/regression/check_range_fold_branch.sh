@@ -13,8 +13,10 @@
 #                 two compares live in different domains; BOTH must remain
 #                 (a fold here would misclassify negative x).
 #   span-shape    a span that does not fit the compare width
-#                 (x >= INT_MIN && x <= INT_MAX) — unfolded, both compares
-#                 remain.
+#                 (x >= INT_MIN && x <= INT_MAX) — since the full-domain
+#                 fold this folds to a CONSTANT (value forms carry no
+#                 compare at all); what must never appear is the
+#                 unsigned-bias shape with a wrapped span.
 #
 # Every configuration is also EXECUTED and diffed against -O0: a gate
 # that only checked emission would pass while silently breaking the
@@ -151,21 +153,36 @@ check_present "mixed-sign: upper compare remains" "$tmp/mix.s" 'cmp[a-z]*\s+\$57
 "$ccc" -O2 "$tmp/mix.c" -o "$tmp/mix.bin" && "$tmp/mix.bin"
 check_eq "mixed-sign: execution" "$?" "0"
 
-# --- 4. no-fire: unrepresentable span ----------------------------------------
+# --- 4. full-domain span: constant fold, never a wrapped-span bias ----------
 cat > "$tmp/span.c" <<'EOF'
 #include <limits.h>
 int span(int x) {
     if (x >= INT_MIN && x <= INT_MAX) return 1;
     return 0;
 }
-int main(void) { return (span(0) == 1 && span(-1) == 1) ? 0 : 1; }
+int span_val(int x) { int in = (x >= INT_MIN && x <= INT_MAX); return in * 5 + 2; }
+int span_u8(int x) { int in = ((unsigned char)x >= 0 && (unsigned char)x <= 255); return in * 3 + 1; }
+int span_or(int x) { if (x < INT_MIN || x > INT_MAX) return 1; return 0; }
+int main(void) {
+    return (span(0) == 1 && span(-1) == 1 && span_val(5) == 7 &&
+            span_u8(200) == 4 && span_or(0) == 0) ? 0 : 1;
+}
 EOF
 "$ccc" -O2 -S "$tmp/span.c" -o "$tmp/span.s"
-# The span 0xFFFFFFFF is not representable in the I32 compare domain, so
-# the fold must leave the predicate alone (SCCP may legitimately fold the
-# tautological compares to constants — what must NEVER appear is the
-# unsigned-bias shape with a wrapped span).
+# A range covering the compare domain's every value folds to a CONSTANT:
+# the value-context forms must carry no compare at all (the constant
+# propagated through the arithmetic), and what must NEVER appear anywhere
+# is the unsigned-bias shape with a wrapped span. (The branch form's
+# tautological halves may legitimately dissolve one compare at a time via
+# the type-domain facts — the contract here is the wrapped-span absence
+# plus the fully-constant value forms.)
 check_absent "span-overflow: no wrapped-span fold" "$tmp/span.s" 'sub[a-z]*\s+\$-214748364|cmp[a-z]*\s+\$-1,|cmp[a-z]*\s+\$4294967295,'
+sed -n '/^span_val:/,/^\.cfi_endproc/p' "$tmp/span.s" > "$tmp/span_val-body.s"
+check_absent "full-domain value form: fully constant (no compare)" "$tmp/span_val-body.s" 'cmp'
+check_present "full-domain value form: the folded constant" "$tmp/span_val-body.s" 'mov[a-z]*\s+\$7,'
+sed -n '/^span_u8:/,/^\.cfi_endproc/p' "$tmp/span.s" > "$tmp/span_u8-body.s"
+check_absent "narrowed full-domain: fully constant (no compare)" "$tmp/span_u8-body.s" 'cmp'
+check_present "narrowed full-domain: the folded constant" "$tmp/span_u8-body.s" 'mov[a-z]*\s+\$4,'
 "$ccc" -O2 "$tmp/span.c" -o "$tmp/span.bin" && "$tmp/span.bin"
 check_eq "span-overflow: execution" "$?" "0"
 

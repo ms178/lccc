@@ -34,9 +34,14 @@ LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
 FRAGMENT=${FRAGMENT:-$SCRIPT_DIR/kernel-vm.fragment}
 JOBS=${JOBS:-2}
 
-[[ -d "$K" ]] || { echo "build_kernel_vm: kernel tree missing: $K" >&2; exit 1; }
 [[ -x "$LCCC" ]] || { echo "build_kernel_vm: lccc missing: $LCCC" >&2; exit 1; }
 [[ -x "$LCCC_LD" ]] || { echo "build_kernel_vm: lccc-ld missing: $LCCC_LD" >&2; exit 1; }
+# A harness snapshot can preserve the prepared stamp and generated headers yet
+# truncate the ~55k-file source tree.  The preparation helper validates a
+# distributed canary set and regenerates only when necessary; invoking it here
+# makes this entry point self-contained and prevents a partial tree from being
+# misdiagnosed as an LCCC/Kbuild failure.
+"$SCRIPT_DIR/prepare_kernel_tree.sh" "$K"
 cd "$K"
 
 if [[ ! -f .lccc-vm-config ]]; then
@@ -145,27 +150,10 @@ preflight_host_tools() {
 }
 preflight_host_tools || exit 1
 
-# ---- linker-change guard -----------------------------------------------------
-# Kbuild's if_changed tracks the recorded COMMAND LINE and prerequisite
-# timestamps, not the tool binaries' identity.  After an lccc/lccc-ld rebuild
-# (fix + `cargo build`) the recorded command line is byte-identical, so make
-# happily reuses link-only artifacts produced by the OLD linker.  Observed:
-# a fixed lccc-ld still produced `vdso2c: cannot handle memsz != filesz`
-# because the stale vdso64.so.dbg from the previous run was never re-linked.
-# Stamp the tool identity and remove exactly the link-only products when it
-# changes; compiled .o files stay valid (their producer is the compiler, and
-# a compiler rebuild goes through this same stamp).
-tools_stamp=".lccc-tools-stamp"
-tools_hash="$(sha256sum "$LCCC" "$LCCC_LD" 2>/dev/null | sha256sum | cut -d' ' -f1)"
-if [[ -f $tools_stamp && $(cat "$tools_stamp") != "$tools_hash" ]]; then
-  echo "build_kernel_vm: lccc/lccc-ld changed since last build; purging link-only artifacts"
-  rm -f arch/x86/entry/vdso/vdso*.so* \
-        arch/x86/entry/vdso/vdso-image-*.c \
-        arch/x86/boot/setup.elf arch/x86/boot/setup.bin \
-        arch/x86/boot/compressed/vmlinux* \
-        arch/x86/boot/bzImage vmlinux .tmp_vmlinux* vmlinux.symvers vmlinux.map
-fi
-printf '%s\n' "$tools_hash" > "$tools_stamp"
+# ---- compiler/linker identity guard -----------------------------------------
+# Kbuild fingerprints command lines, not executable content.  Invalidate every
+# target product on compiler changes, but only link products on linker changes.
+"$SCRIPT_DIR/kernel_tool_identity.sh" "$K" "$LCCC" "$LCCC_LD"
 
 start=$(date +%s)
 # Refresh include/config/auto.conf SERIALLY before the parallel build.  A

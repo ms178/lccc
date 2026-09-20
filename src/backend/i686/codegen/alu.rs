@@ -106,6 +106,32 @@ impl I686Codegen {
         }
     }
 
+    /// CLZ for a value whose nonzero precondition is explicit in IR.
+    pub(super) fn emit_int_clz_nonzero_impl(&mut self, ty: IrType) {
+        if self.lzcnt_enabled {
+            self.emit_int_clz_impl(ty);
+            return;
+        }
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                self.state.emit("    andl $0xff, %eax");
+                self.state.emit("    bsrl %eax, %eax");
+                self.state.emit("    xorl $31, %eax");
+                self.state.emit("    subl $24, %eax");
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.emit("    bsrl %eax, %eax");
+                self.state.emit("    xorl $31, %eax");
+                self.state.emit("    subl $16, %eax");
+            }
+            _ => {
+                self.state.emit("    bsrl %eax, %eax");
+                self.state.emit("    xorl $31, %eax");
+            }
+        }
+    }
+
     pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
         if self.lzcnt_enabled {
             match ty {
@@ -140,6 +166,25 @@ impl I686Codegen {
             _ => {
                 self.emit_ctz32_baseline("eax", "eax");
             }
+        }
+    }
+
+    /// CTZ for a value whose nonzero precondition is explicit in IR.
+    pub(super) fn emit_int_ctz_nonzero_impl(&mut self, ty: IrType) {
+        if self.lzcnt_enabled {
+            self.emit_int_ctz_impl(ty);
+            return;
+        }
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                self.state.emit("    andl $0xff, %eax");
+                self.state.emit("    bsfl %eax, %eax");
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.emit("    bsfl %eax, %eax");
+            }
+            _ => self.state.emit("    bsfl %eax, %eax"),
         }
     }
 

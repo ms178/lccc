@@ -138,6 +138,42 @@ fn intersect(x: &Set, y: &Set) -> Set {
     out
 }
 
+/// Peel conversions that preserve the zero/nonzero partition exactly.
+fn zero_equivalent_root(
+    mut value: Value,
+    casts: &FxHashMap<Value, (Operand, IrType, IrType)>,
+) -> Value {
+    // Same-width integer reinterpretations and widenings preserve zero in both
+    // directions. Truncations do not: e.g. 0x100 -> u8 is zero. Bound the walk
+    // defensively even though valid SSA cast chains are acyclic.
+    for _ in 0..32 {
+        let Some(&(Operand::Value(src), from_ty, to_ty)) = casts.get(&value) else {
+            break;
+        };
+        if !from_ty.is_integer() || !to_ty.is_integer() || to_ty.size() < from_ty.size() {
+            break;
+        }
+        value = src;
+    }
+    value
+}
+
+/// Whether any active predicate excludes zero for `value`. Zero/nonzero is
+/// representation-invariant across zero-preserving integer casts, so this also
+/// consumes BOOL_BITS facts attached to direct `CondBranch(value)`.
+fn proves_nonzero(
+    facts: &[Fact],
+    value: Value,
+    casts: &FxHashMap<Value, (Operand, IrType, IrType)>,
+) -> bool {
+    let root = zero_equivalent_root(value, casts);
+    facts.iter().any(|f| {
+        zero_equivalent_root(f.value, casts) == root
+            && !f.set.is_empty()
+            && f.set.iter().all(|&(lo, hi)| !(lo <= 0 && 0 <= hi))
+    })
+}
+
 fn is_subset(sub: &Set, sup: &Set) -> bool {
     // Both normalised: every `sub` interval must sit inside one `sup` interval.
     let mut j = 0;
@@ -502,12 +538,24 @@ pub fn run_function(func: &mut IrFunction) -> usize {
     let idom = compute_dominators(n, &preds, &succs);
     let children = build_dom_tree_children(n, &idom);
 
-    // Value → (block, instruction) for Cmp definitions.
+    // Value → definition maps used by predicate and zero-equivalence queries.
     let mut defs: FxHashMap<Value, (usize, usize)> = FxHashMap::default();
+    let mut casts: FxHashMap<Value, (Operand, IrType, IrType)> = FxHashMap::default();
     for (bi, b) in func.blocks.iter().enumerate() {
         for (ii, inst) in b.instructions.iter().enumerate() {
-            if let Instruction::Cmp { dest, .. } = inst {
-                defs.insert(*dest, (bi, ii));
+            match inst {
+                Instruction::Cmp { dest, .. } => {
+                    defs.insert(*dest, (bi, ii));
+                }
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } => {
+                    casts.insert(*dest, (*src, *from_ty, *to_ty));
+                }
+                _ => {}
             }
         }
     }
@@ -550,6 +598,24 @@ pub fn run_function(func: &mut IrFunction) -> usize {
                     } => decide_bool(&stack, func, &defs, cond).map(|t| Instruction::Copy {
                         dest: *dest,
                         src: if t { *true_val } else { *false_val },
+                    }),
+                    Instruction::UnaryOp {
+                        dest,
+                        op:
+                            op @ (crate::ir::reexports::IrUnaryOp::Clz
+                            | crate::ir::reexports::IrUnaryOp::Ctz),
+                        src: Operand::Value(src),
+                        ty,
+                    } if proves_nonzero(&stack, *src, &casts) => Some(Instruction::UnaryOp {
+                        dest: *dest,
+                        op: match op {
+                            crate::ir::reexports::IrUnaryOp::Clz => {
+                                crate::ir::reexports::IrUnaryOp::ClzNonZero
+                            }
+                            _ => crate::ir::reexports::IrUnaryOp::CtzNonZero,
+                        },
+                        src: Operand::Value(*src),
+                        ty: *ty,
                     }),
                     _ => None,
                 };
@@ -648,6 +714,112 @@ mod tests {
         assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ne, 0)), Some(true));
         assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ugt, 0)), Some(true));
         assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ult, 5)), None);
+    }
+
+    #[test]
+    fn nonzero_edge_specializes_defined_bitcounts_only_in_dominated_region() {
+        // b0: br v, b1, b2
+        // b1 is dominated by the nonzero edge, so defined-zero Clz/Ctz can use
+        // their branchless nonzero forms. b2 deliberately retains Ctz: the
+        // false edge proves zero and changing its semantics would be invalid.
+        let v = Value(0);
+        let mut f = IrFunction::new("bitcounts".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![],
+                Terminator::CondBranch {
+                    cond: Operand::Value(v),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![
+                    Instruction::UnaryOp {
+                        dest: Value(1),
+                        op: crate::ir::reexports::IrUnaryOp::Clz,
+                        src: Operand::Value(v),
+                        ty: IrType::U64,
+                    },
+                    // Builtin lowering commonly inserts a signedness-only
+                    // cast between the guarded value and bitcount operand.
+                    Instruction::Cast {
+                        dest: Value(4),
+                        src: Operand::Value(v),
+                        from_ty: IrType::U64,
+                        to_ty: IrType::I64,
+                    },
+                    Instruction::UnaryOp {
+                        dest: Value(2),
+                        op: crate::ir::reexports::IrUnaryOp::Ctz,
+                        src: Operand::Value(Value(4)),
+                        ty: IrType::I64,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ),
+            mk(
+                2,
+                vec![Instruction::UnaryOp {
+                    dest: Value(3),
+                    op: crate::ir::reexports::IrUnaryOp::Ctz,
+                    src: Operand::Value(v),
+                    ty: IrType::U64,
+                }],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+        ];
+        f.next_value_id = 5;
+        assert_eq!(run_function(&mut f), 2);
+        assert!(matches!(
+            f.blocks[1].instructions[0],
+            Instruction::UnaryOp {
+                op: crate::ir::reexports::IrUnaryOp::ClzNonZero,
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.blocks[1].instructions[2],
+            Instruction::UnaryOp {
+                op: crate::ir::reexports::IrUnaryOp::CtzNonZero,
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.blocks[2].instructions[0],
+            Instruction::UnaryOp {
+                op: crate::ir::reexports::IrUnaryOp::Ctz,
+                ..
+            }
+        ));
+        assert_eq!(run_function(&mut f), 0, "specialization is idempotent");
+    }
+
+    #[test]
+    fn empty_fact_set_does_not_prove_nonzero() {
+        let facts = vec![Fact {
+            value: Value(1),
+            bits: 8,
+            set: Vec::new(),
+        }];
+        assert!(!proves_nonzero(&facts, Value(1), &FxHashMap::default()));
+    }
+
+    #[test]
+    fn zero_equivalent_cast_roots_accept_widenings_and_reject_truncations() {
+        let mut casts = FxHashMap::default();
+        casts.insert(
+            Value(2),
+            (Operand::Value(Value(1)), IrType::U32, IrType::I64),
+        );
+        casts.insert(
+            Value(3),
+            (Operand::Value(Value(2)), IrType::I64, IrType::U8),
+        );
+        assert_eq!(zero_equivalent_root(Value(2), &casts), Value(1));
+        assert_eq!(zero_equivalent_root(Value(3), &casts), Value(3));
     }
 
     #[test]

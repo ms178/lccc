@@ -275,7 +275,10 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     IrUnaryOp::Neg => {
                         set_def(&mut neg_defs, dest.0, NegDef { src: *src });
                     }
-                    IrUnaryOp::Clz | IrUnaryOp::Ctz => {
+                    IrUnaryOp::Clz
+                    | IrUnaryOp::ClzNonZero
+                    | IrUnaryOp::Ctz
+                    | IrUnaryOp::CtzNonZero => {
                         set_def(
                             &mut unary_defs,
                             dest.0,
@@ -583,7 +586,13 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                     }
                 }
                 Instruction::UnaryOp { dest, op, src, ty }
-                    if matches!(op, IrUnaryOp::Clz | IrUnaryOp::Ctz) =>
+                    if matches!(
+                        op,
+                        IrUnaryOp::Clz
+                            | IrUnaryOp::ClzNonZero
+                            | IrUnaryOp::Ctz
+                            | IrUnaryOp::CtzNonZero
+                    ) =>
                 {
                     if (dest.0 as usize) < unary_defs.len() {
                         unary_defs[dest.0 as usize] = Some(UnaryDef {
@@ -648,7 +657,10 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                                 Operand::Value(rv) => matches!(
                                     unary_defs.get(rv.0 as usize).and_then(|d| d.as_ref()),
                                     Some(UnaryDef {
-                                        op: IrUnaryOp::Clz | IrUnaryOp::Ctz,
+                                        op: IrUnaryOp::Clz
+                                            | IrUnaryOp::ClzNonZero
+                                            | IrUnaryOp::Ctz
+                                            | IrUnaryOp::CtzNonZero,
                                         ..
                                     })
                                 ),
@@ -688,7 +700,7 @@ fn clz_ctz_zero_guard_replacement(
     let found = loop {
         let Operand::Value(v) = cur else { break None };
         if let Some(Some(UnaryDef {
-            op: IrUnaryOp::Clz | IrUnaryOp::Ctz,
+            op: IrUnaryOp::Clz | IrUnaryOp::ClzNonZero | IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero,
             ..
         })) = unary_defs.get(v.0 as usize)
         {

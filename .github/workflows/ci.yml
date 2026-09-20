@@ -391,6 +391,46 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_prefix_full_matrix.sh
 
+      # Whole-object ELF32 differential corpus, including relocation/addend
+      # ownership for bare memory operands and relaxation-patched loop/jecxz.
+      - name: Verify i686 assembly differential vs GNU as
+        run: python3 scripts/asmdiff.py --32 --lccc target/fastbuild/lccc-i686
+
+      # Keep every standalone gate from ci_local.sh represented in hosted CI.
+      # Group the compact contracts to avoid YAML drift and setup overhead;
+      # the expensive codegen-quality gate remains in bench.yml.
+      - name: Verify remaining fast local contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: |
+          set -euo pipefail
+          python3 scripts/check_ci_gate_parity.py
+          bash tests/regression/check_loop_memset.sh
+          bash tests/regression/check_bool_pair_tail_jmp.sh
+          bash tests/regression/check_bool_pair_prune.sh
+          bash tests/regression/check_demorgan_branch_split.sh
+          bash tests/regression/check_gvn_xsign_load_cse.sh
+          bash tests/regression/check_phi_acyclic_order.sh
+          python3 scripts/check_doc_links.py
+          bash tests/regression/check_ra_web_inloop_use.sh
+          bash tests/regression/check_store_alu_cross_join.sh
+          bash tests/regression/check_gla_remat_policy.sh
+          bash tests/regression/check_gla_cross_reach_band.sh
+          bash tests/regression/check_gla_backedge_no_trampoline.sh
+          bash tests/regression/check_tight_loop_align.sh
+          bash tests/regression/check_i686_atomics.sh
+          bash tests/regression/check_i686_tls_ie_relax.sh
+          bash tests/regression/check_boot_size_measurement.sh
+          bash tests/regression/check_env_test_hygiene.sh
+          bash tests/regression/check_peephole_whitespace.sh
+          bash tests/regression/check_atomic_backends.sh
+
+      # Kbuild tracks command lines but not the contents of CC/LD executables.
+      # A rebuilt compiler at the same path must invalidate every target
+      # product; a linker-only rebuild should retain expensive object files.
+      - name: Verify kernel tool-identity invalidation
+        run: bash tests/regression/check_kernel_tool_identity.sh
+
       - name: Upload regression results
         if: always()
         uses: actions/upload-artifact@v7

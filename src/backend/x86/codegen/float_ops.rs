@@ -1079,6 +1079,60 @@ impl X86Codegen {
         true
     }
 
+    /// Baseline BSR/BSF direct form for a source that is explicit nonzero IR.
+    /// Both instructions are two-operand and do not require staging through
+    /// `%rax`; keeping the allocator's source and destination registers saves
+    /// a move in hot bit-walking loops.
+    fn emit_nonzero_bitcount_direct(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        ty: IrType,
+        leading: bool,
+    ) -> bool {
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+        if !use_32bit && !matches!(ty, IrType::I64 | IrType::U64) {
+            return false;
+        }
+        let Some(s_reg) = self.operand_reg(src).filter(|r| !is_xmm_reg(*r)) else {
+            return false;
+        };
+        let dest_gpr = self.dest_reg(dest).filter(|r| !is_xmm_reg(*r));
+        let (s_name, d_name, suffix) = if use_32bit {
+            (
+                phys_reg_name_32(s_reg),
+                dest_gpr.map(phys_reg_name_32).unwrap_or("eax"),
+                "l",
+            )
+        } else {
+            (
+                phys_reg_name(s_reg),
+                dest_gpr.map(phys_reg_name).unwrap_or("rax"),
+                "q",
+            )
+        };
+        self.state.emit_fmt(format_args!(
+            "    {}{} %{}, %{}",
+            if leading { "bsr" } else { "bsf" },
+            suffix,
+            s_name,
+            d_name
+        ));
+        if leading {
+            self.state.emit_fmt(format_args!(
+                "    xor{} ${}, %{}",
+                suffix,
+                if use_32bit { 31 } else { 63 },
+                d_name
+            ));
+        }
+        self.state.reg_cache.invalidate_acc();
+        if dest_gpr.is_none() {
+            self.store_rax_to(dest);
+        }
+        true
+    }
+
     pub(super) fn emit_unaryop_impl(
         &mut self,
         dest: &Value,
@@ -1106,6 +1160,19 @@ impl X86Codegen {
             }
             return;
         }
+        if !self.lzcnt_enabled {
+            let leading = match op {
+                IrUnaryOp::ClzNonZero => Some(true),
+                IrUnaryOp::CtzNonZero => Some(false),
+                _ => None,
+            };
+            if let Some(leading) = leading
+                && self.emit_nonzero_bitcount_direct(dest, src, ty, leading)
+            {
+                return;
+            }
+        }
+
         // Integer dest-only two-operand ABM/BMI: popcnt/lzcnt/tzcnt write dest
         // without reading it. Emit `mnem %src, %dest` (or `%src, %eax` when dest
         // is the accumulator / return) so we never stage through `movq %src, %rax`
@@ -1115,8 +1182,8 @@ impl X86Codegen {
             if matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
                 let bitcount = match op {
                     IrUnaryOp::Popcount if self.popcnt_enabled => Some("popcnt"),
-                    IrUnaryOp::Clz if self.lzcnt_enabled => Some("lzcnt"),
-                    IrUnaryOp::Ctz if self.lzcnt_enabled => Some("tzcnt"),
+                    IrUnaryOp::Clz | IrUnaryOp::ClzNonZero if self.lzcnt_enabled => Some("lzcnt"),
+                    IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero if self.lzcnt_enabled => Some("tzcnt"),
                     _ => None,
                 };
                 if let Some(mnem) = bitcount {

@@ -2503,8 +2503,8 @@ impl ArchCodegen for I686Codegen {
             match op {
                 IrUnaryOp::Neg => self.emit_i128_neg(),
                 IrUnaryOp::Not => self.emit_i128_not(),
-                IrUnaryOp::Clz => self.emit_i64_clz(),
-                IrUnaryOp::Ctz => self.emit_i64_ctz(),
+                IrUnaryOp::Clz | IrUnaryOp::ClzNonZero => self.emit_i64_clz(),
+                IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero => self.emit_i64_ctz(),
                 IrUnaryOp::Popcount => self.emit_i64_popcount(),
                 IrUnaryOp::Bswap => self.emit_i64_bswap(),
                 IrUnaryOp::BitReverse => unreachable!("bit-reverse idiom is not enabled for i686"),
@@ -2525,7 +2525,9 @@ impl ArchCodegen for I686Codegen {
             }
             IrUnaryOp::Not => self.emit_int_not(ty),
             IrUnaryOp::Clz => self.emit_int_clz(ty),
+            IrUnaryOp::ClzNonZero => self.emit_int_clz_nonzero(ty),
             IrUnaryOp::Ctz => self.emit_int_ctz(ty),
+            IrUnaryOp::CtzNonZero => self.emit_int_ctz_nonzero(ty),
             IrUnaryOp::Popcount => self.emit_int_popcount(ty),
             IrUnaryOp::Bswap => self.emit_int_bswap(ty),
             IrUnaryOp::BitReverse => unreachable!("bit-reverse idiom is not enabled for i686"),
@@ -3315,7 +3317,9 @@ impl ArchCodegen for I686Codegen {
         fn emit_int_neg(&mut self, ty: IrType) => emit_int_neg_impl;
         fn emit_int_not(&mut self, ty: IrType) => emit_int_not_impl;
         fn emit_int_clz(&mut self, ty: IrType) => emit_int_clz_impl;
+        fn emit_int_clz_nonzero(&mut self, ty: IrType) => emit_int_clz_nonzero_impl;
         fn emit_int_ctz(&mut self, ty: IrType) => emit_int_ctz_impl;
+        fn emit_int_ctz_nonzero(&mut self, ty: IrType) => emit_int_ctz_nonzero_impl;
         fn emit_int_bswap(&mut self, ty: IrType) => emit_int_bswap_impl;
         fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
         fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;
