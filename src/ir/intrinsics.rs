@@ -1913,6 +1913,26 @@ impl IntrinsicOp {
             || self.writes_memory_via_args()
     }
 
+    /// True when an `args` position of this intrinsic may carry a READ-ONLY
+    /// memory pointer: the load families (the pointer is the load address)
+    /// and the vector compute families whose vector operands may be
+    /// memory-folded (the backend's VLFOLD / explicit-SIMD conventions —
+    /// an operand that is a pointer is only ever READ).
+    ///
+    /// This is the read-side counterpart of the write classification and
+    /// the ONLY allowlist through which a pointer may reach an intrinsic
+    /// argument in a callee-read-only proof: anything not listed here
+    /// defaults to rejection, so a future opcode cannot silently widen the
+    /// pointer positions a promoted array's address may observe. (Scalar
+    /// pure intrinsics — Crc32*, shifts, math — have no legitimate pointer
+    /// argument; a pointer there is address observation, not a memory
+    /// operand.)
+    pub fn reads_pointer_arg(&self) -> bool {
+        self.may_read_memory()
+            || self.produces_vector_value()
+            || self.vector_result_width().is_some()
+    }
+
     /// True when this intrinsic writes memory through its `args` rather
     /// than `dest_ptr`: the `VecStore*` family, which carries the
     /// destination pointer in `args[1]` (the loop vectorizers add
