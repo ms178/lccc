@@ -308,13 +308,60 @@ NOINLINE static int a11_wrap_u32(unsigned x) {
 static int a11_wrap_u32_ref(unsigned x) { (void)x; return 0; }
 
 /* A12: signed 64-bit full-range bounds — the span 2^64-1 is not
- * representable, the fold must reject, and the arithmetic must not
- * overflow (a checked build would panic on the i64 span subtraction). */
+ * representable as a bias compare, and since the full-domain fold the
+ * shape is a CONSTANT (inside form: true). The arithmetic must not
+ * overflow either way (a checked build would panic on the i64 span
+ * subtraction). */
 NOINLINE static int a12_span_i64(long long x) {
     if (x >= LLONG_MIN && x <= LLONG_MAX) return 1;
     return 0;
 }
 static int a12_ref(long long x) { (void)x; return 1; }
+
+/* ------------------------------------------------------------------ *
+ * Full-domain shapes: a range covering the compare domain's every
+ * value folds to a CONSTANT — inside form TRUE, outside form FALSE —
+ * in every emission form (Select, bitwise And/Or, phi diamond, branch
+ * chain). The oracles state the constants directly.
+ * ------------------------------------------------------------------ */
+
+/* F1: value context (Select/And form), signed full domain. */
+NOINLINE static int f1_val(int x) {
+    int in = (x >= INT_MIN && x <= INT_MAX);
+    return in * 5 + 2;
+}
+static int f1_ref(int x) { (void)x; return 7; }
+
+/* F2: branch form, outside (||) full domain — constant false. */
+NOINLINE static int f2_out(int x) {
+    if (x < INT_MIN || x > INT_MAX) return 1;
+    return 0;
+}
+static int f2_ref(int x) { (void)x; return 0; }
+
+/* F3: narrowed byte domain covering its source completely — the u8
+ * compare is the tautology, folded at the narrowed domain. */
+NOINLINE static int f3_u8(int x) {
+    int in = ((unsigned char)x >= 0 && (unsigned char)x <= 255);
+    return in * 3 + 1;
+}
+static int f3_ref(int x) { (void)x; return 4; }
+
+/* F4: unsigned full domain, value context. */
+NOINLINE static int f4_u32(unsigned x) {
+    int in = (x >= 0u && x <= 4294967295u);
+    return in + 10;
+}
+static int f4_ref(unsigned x) { (void)x; return 11; }
+
+/* F5: the phi-merge spelling — a value assigned in both arms of the
+ * diamond. */
+NOINLINE static int f5_phi(int x) {
+    int p = 0;
+    if (x >= INT_MIN && x <= INT_MAX) p = 1;
+    return p + 6;
+}
+static int f5_ref(int x) { (void)x; return 7; }
 
 /* ------------------------------------------------------------------ */
 
@@ -348,6 +395,7 @@ int main(void) {
         CHECK(a10_domain(u), a10_ref(u), i);
         CHECK(a10v_domain(u), a10v_ref(u), i);
         CHECK(a11_wrap_u32((unsigned)i), a11_wrap_u32_ref((unsigned)i), i);
+        CHECK(f3_u8(i - 128), f3_ref(i - 128), i);
         h = h * 31 + (unsigned)p_digit(c) + (unsigned)p_or(c) * 7
             + (unsigned)a10_domain(u) * 3;
     }
@@ -387,6 +435,9 @@ int main(void) {
             CHECK(a6_phi_merge(x), a6_ref(x), x);
             CHECK(a7_outer_norangefold(x), a7_ref(x), x);
             CHECK(a8_or_span(x), a8_ref(x), x);
+            CHECK(f1_val(x), f1_ref(x), x);
+            CHECK(f2_out(x), f2_ref(x), x);
+            CHECK(f5_phi(x), f5_ref(x), x);
             {
                 int acc = 0, acc_ref = 0;
                 CHECK(p_bigbody(x, &acc), r_bigbody(x, &acc_ref), x);
@@ -422,8 +473,10 @@ int main(void) {
                                       4294967286u,
                                       4294967294u,
                                       4294967295u};
-        for (i = 0; i < (int)(sizeof(ue) / sizeof(ue[0])); i++)
+        for (i = 0; i < (int)(sizeof(ue) / sizeof(ue[0])); i++) {
             CHECK(p_u32(ue[i]), r_u32(ue[i]), (int)i);
+            CHECK(f4_u32(ue[i]), f4_ref(ue[i]), (int)i);
+        }
     }
     {
         static const long long le[] = {-1000000000001LL, -1000000000000LL, -1,
@@ -433,6 +486,7 @@ int main(void) {
         for (i = 0; i < (int)(sizeof(le) / sizeof(le[0])); i++) {
             CHECK(p_i64(le[i]), r_i64(le[i]), (int)i);
             CHECK(a12_span_i64(le[i]), a12_ref(le[i]), (int)i);
+            CHECK(f2_out((int)le[i]), f2_ref((int)le[i]), (int)i);
         }
         /* The wrapped-u64 sweep: both ends of the phantom window. */
         {

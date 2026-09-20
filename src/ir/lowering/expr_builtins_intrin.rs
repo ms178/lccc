@@ -34,7 +34,15 @@ impl Lowerer {
         if args.is_empty() {
             return Some(Operand::Const(IrConst::I64(0)));
         }
-        let ty = Self::intrinsic_type_from_suffix(name);
+        // CLZ/CTZ/Popcount consume the unsigned type of the suffix width even
+        // though their C result is `int`. Keeping the operand unsigned avoids
+        // a semantically empty U32->I32 sign-extension on RISC-V and AArch64;
+        // all three operations inspect only the width-exact bit pattern.
+        let ty = match Self::intrinsic_type_from_suffix(name) {
+            IrType::I32 => IrType::U32,
+            IrType::I64 => IrType::U64,
+            other => other,
+        };
         // Cast the argument to the intrinsic's operand width (e.g. zero-extend
         // a 32-bit size_t to 64-bit for __builtin_clzll on i686).
         let arg = self.lower_expr_with_type(&args[0], ty);

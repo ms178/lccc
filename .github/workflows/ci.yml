@@ -319,6 +319,32 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_vectorize_isa_gate.sh
 
+      # Vector copy elimination (peephole passes/vector_copy.rs): the GP copy
+      # machinery declines every vector family by construction, so the
+      # codegen's fresh-temporary bracketing reached the assembler as
+      # copy-in/copy-out pairs nothing removed. Three pinned contracts:
+      # the oracle instruction shapes (floor/fma/round wins vs ICX/GCC),
+      # runtime equality with the reference compiler on kernels built to hit
+      # every legality rule (live-in temporaries, packed reads, calls and
+      # branches inside brackets, xmm/ymm aliasing, FMA families, AVX-512
+      # where the host has it), and a corpus instruction ratchet so the
+      # copies cannot come back unmeasured.
+      - name: Verify vector copy elimination contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_vector_copy_elimination.sh
+
+      # Peephole phi-diamond preinitialisation safety: the hoisted incoming
+      # may only be a register, immediate, or plain stack slot — a user-memory
+      # source made `c ? *p : *q` dereference a NULL p on the path that never
+      # reads it. Runtime battery over every branch polarity and arm-width
+      # mix, plus the register-init positive control (the optimisation must
+      # survive its own safety fix).
+      - name: Verify peephole phi-hoist safety contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_peephole_phi_hoist_safety.sh
+
       # Constant-array promotion: fully-constant local arrays become
       # .rodata globals. Emission contracts (the .LCA_ global, store
       # elimination, rip-relative references, alignment preservation)
@@ -390,6 +416,46 @@ jobs:
         env:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_prefix_full_matrix.sh
+
+      # Whole-object ELF32 differential corpus, including relocation/addend
+      # ownership for bare memory operands and relaxation-patched loop/jecxz.
+      - name: Verify i686 assembly differential vs GNU as
+        run: python3 scripts/asmdiff.py --32 --lccc target/fastbuild/lccc-i686
+
+      # Keep every standalone gate from ci_local.sh represented in hosted CI.
+      # Group the compact contracts to avoid YAML drift and setup overhead;
+      # the expensive codegen-quality gate remains in bench.yml.
+      - name: Verify remaining fast local contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: |
+          set -euo pipefail
+          python3 scripts/check_ci_gate_parity.py
+          bash tests/regression/check_loop_memset.sh
+          bash tests/regression/check_bool_pair_tail_jmp.sh
+          bash tests/regression/check_bool_pair_prune.sh
+          bash tests/regression/check_demorgan_branch_split.sh
+          bash tests/regression/check_gvn_xsign_load_cse.sh
+          bash tests/regression/check_phi_acyclic_order.sh
+          python3 scripts/check_doc_links.py
+          bash tests/regression/check_ra_web_inloop_use.sh
+          bash tests/regression/check_store_alu_cross_join.sh
+          bash tests/regression/check_gla_remat_policy.sh
+          bash tests/regression/check_gla_cross_reach_band.sh
+          bash tests/regression/check_gla_backedge_no_trampoline.sh
+          bash tests/regression/check_tight_loop_align.sh
+          bash tests/regression/check_i686_atomics.sh
+          bash tests/regression/check_i686_tls_ie_relax.sh
+          bash tests/regression/check_boot_size_measurement.sh
+          bash tests/regression/check_env_test_hygiene.sh
+          bash tests/regression/check_peephole_whitespace.sh
+          bash tests/regression/check_atomic_backends.sh
+
+      # Kbuild tracks command lines but not the contents of CC/LD executables.
+      # A rebuilt compiler at the same path must invalidate every target
+      # product; a linker-only rebuild should retain expensive object files.
+      - name: Verify kernel tool-identity invalidation
+        run: bash tests/regression/check_kernel_tool_identity.sh
 
       - name: Upload regression results
         if: always()

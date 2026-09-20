@@ -1828,6 +1828,28 @@ impl X86Codegen {
                 .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, acc_reg));
             return;
         }
+        // Slot-direct fold (the discipline of emit_int_cmp_insn_typed arms
+        // 1/4): a slotted non-alloca RHS compares straight from its slot —
+        // `cmpq N(%rsp), %rax` — with zero staging instructions. The replay
+        // path used to stage it through %rcx unconditionally, which made a
+        // spilled compare RHS MORE expensive than the inline path for the
+        // same value; the allocator's slot-operand economics (the
+        // cost-ratio escape refuses steals on behalf of values whose every
+        // use is such a fold) require both paths to agree. The width is
+        // the compare's own (cmp_width_info gives the matching mnemonic
+        // and accumulator sub-register); the alloca guard matches the
+        // inline arms — an alloca's home slot holds the object's bytes,
+        // not the address value.
+        if let Operand::Value(rv) = rhs {
+            if self.dest_reg(rv).is_none() && !self.state.is_alloca(rv.0) {
+                if let Some(slot) = self.state.get_slot(rv.0) {
+                    let sref = self.slot_ref(slot.0);
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %{}", cmp_instr, sref, acc_reg));
+                    return;
+                }
+            }
+        }
         match rhs {
             Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
                 self.value_to_reg(v, "rcx");
@@ -8083,7 +8105,9 @@ impl ArchCodegen for X86Codegen {
         fn emit_int_neg(&mut self, ty: IrType) => emit_int_neg_impl;
         fn emit_int_not(&mut self, ty: IrType) => emit_int_not_impl;
         fn emit_int_clz(&mut self, ty: IrType) => emit_int_clz_impl;
+        fn emit_int_clz_nonzero(&mut self, ty: IrType) => emit_int_clz_nonzero_impl;
         fn emit_int_ctz(&mut self, ty: IrType) => emit_int_ctz_impl;
+        fn emit_int_ctz_nonzero(&mut self, ty: IrType) => emit_int_ctz_nonzero_impl;
         fn emit_int_bswap(&mut self, ty: IrType) => emit_int_bswap_impl;
         fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
         fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;

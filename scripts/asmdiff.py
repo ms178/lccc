@@ -520,6 +520,18 @@ def main() -> int:
         files = sorted((DEFAULT_CORPUS / "i686").glob("*.casefile"))
     else:
         files = sorted(DEFAULT_CORPUS.glob("*.casefile"))
+    # An explicitly named i686 casefile without --32 compares ELF32 lccc
+    # objects against ELF64 `as` output — every case then "fails" on
+    # encoding and relocation-type mismatches that say nothing about the
+    # compiler. Refuse the foot-gun instead of reporting bogus failures.
+    if not args.bits32 and any(
+        "asm-diff" in str(f) and f.parent.name == "i686" for f in files
+    ):
+        print("error: i686 casefiles given without --32; the GNU as oracle "
+              "would assemble them as ELF64 and every difference would be "
+              "spurious. Re-run with --32 (or drop the explicit case path "
+              "to use the default x86-64 corpus).", file=sys.stderr)
+        return 2
     cases = [c for f in files for c in load_cases(f)]
     if not cases:
         print("error: no cases found", file=sys.stderr)

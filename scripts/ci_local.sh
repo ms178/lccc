@@ -217,6 +217,9 @@ gate "phi-acyclic-copy-order" fast \
 gate "doc-link-integrity" fast \
     python3 scripts/check_doc_links.py
 
+gate "ci-gate-parity" fast \
+    python3 scripts/check_ci_gate_parity.py
+
 gate "ra-web-inloop-use" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ra_web_inloop_use.sh
 
@@ -257,6 +260,12 @@ gate "i686-asm-diff" fast \
     python3 scripts/asmdiff.py --32 --lccc target/fastbuild/lccc-i686
 gate "i686-tls-ie-relax" fast \
     bash tests/regression/check_i686_tls_ie_relax.sh
+
+# Kbuild does not fingerprint compiler/linker executable contents.  Preserve
+# the contract that compiler changes clean all products while linker-only
+# changes retain target objects and purge only link outputs.
+gate "kernel-tool-identity" fast \
+    bash tests/regression/check_kernel_tool_identity.sh
 
 gate "bb-slp-redteam" fast \
     bash tests/regression/check_bb_slp_codegen.sh
@@ -395,6 +404,14 @@ gate "env-test-hygiene" fast \
 # produce byte-identical object code.
 gate "peephole-whitespace-invariance" slow \
     env CCC=target/fastbuild/lccc bash tests/regression/check_peephole_whitespace.sh
+
+# The one-move phi-diamond preinitialisation hoists the cheap incoming
+# above the branch. A memory-source init may fault on the path it lands
+# on: `c ? *p : *q` must never touch a NULL p when c selects q. The
+# hoistable-source guard (register / immediate / plain stack slot) plus
+# the runtime battery and the register-init positive control live here.
+gate "peephole-phi-hoist-safety" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_peephole_phi_hoist_safety.sh
 
 gate "cross-backend-atomics" fast \
     bash tests/regression/check_atomic_backends.sh
