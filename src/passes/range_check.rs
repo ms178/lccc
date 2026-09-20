@@ -379,6 +379,138 @@ fn try_fold_select(
     Some(out)
 }
 
+/// Fold the BITWISE form of a two-sided range predicate:
+/// `And(Cmp(lo-bound, x), Cmp(hi-bound, x))` (and the `Or` complement).
+///
+/// When if-conversion HAS collapsed the short-circuit control flow — the
+/// normal `-O2` path for small guarded bodies like `if (in_range) r++;` —
+/// the frontend/if-convert pair lowers `x >= lo && x <= hi` to
+///
+///   %c1 = Cmp(Sge, x, lo)
+///   %c2 = Cmp(Sle, x, hi)
+///   %a  = And %c1, %c2          (ty I32; operands are the 0/1 compares)
+///   Select %a ? r+1 : r
+///
+/// The Select/Phi/branch folds never see a range: the And is not a
+/// one-constant-armed Select, and the compares are branchless. GCC folds
+/// exactly this shape in match.pd (`(X >= A) & (X <= B)`), because both
+/// operands are provably 0/1 — bitwise AND *is* logical AND there.
+///
+/// Replace the And/Or with the unsigned-bias test; keep the compares for
+/// any other uses (DCE retires them when this was the last one):
+///
+///   %d = Sub(x, lo); %t = Cmp(Ule, %d, hi - lo); [Cast %t -> and_ty]
+///
+/// Soundness: only Cmp-defined (or boolean-widening-cast-of-Cmp) operands
+/// match, so both sides are exactly 0/1 and the bitwise/logical equivalence
+/// holds. The same `extract_range` algebra and representable-span check as
+/// the other forms apply. The result keeps the And/Or's own type via the
+/// widening cast when it is wider than the boolean.
+fn try_fold_bool_op(
+    inst: &Instruction,
+    cmp_defs: &[Option<(IrCmpOp, Operand, Operand, IrType)>],
+    cast_defs: &[Option<(Operand, IrType, IrType)>],
+    next_id: &mut u32,
+) -> Option<Vec<Instruction>> {
+    let Instruction::BinOp {
+        dest,
+        op,
+        lhs,
+        rhs,
+        ty,
+    } = inst
+    else {
+        return None;
+    };
+    let and_form = match op {
+        IrBinOp::And => true,
+        IrBinOp::Or => false,
+        _ => return None,
+    };
+    if !ty.is_integer() {
+        return None;
+    }
+    let lhs_id = match lhs {
+        Operand::Value(v) => v.0,
+        _ => return None,
+    };
+    let rhs_id = match rhs {
+        Operand::Value(v) => v.0,
+        _ => return None,
+    };
+    let lhs_cmp_id = resolve_bool_cmp(lhs_id, cmp_defs, cast_defs)?;
+    let rhs_cmp_id = resolve_bool_cmp(rhs_id, cmp_defs, cast_defs)?;
+    // Tautology guard: And(x, x) / Or(x, x) of one compare is not a range.
+    if lhs_cmp_id == rhs_cmp_id {
+        return None;
+    }
+    let (Some(&Some((op1, l1, r1, ty1))), Some(&Some((op2, l2, r2, ty2)))) = (
+        cmp_defs.get(lhs_cmp_id as usize),
+        cmp_defs.get(rhs_cmp_id as usize),
+    ) else {
+        return None;
+    };
+    let bound1 = canonicalize(op1, &l1, &r1, ty1)?;
+    let bound2 = canonicalize(op2, &l2, &r2, ty2)?;
+    let range = extract_range(&bound1, &bound2, and_form, cast_defs)?;
+    let span = range.hi - range.lo;
+    int_const(range.ty, span)?;
+    let lo_const = int_const(range.ty, range.lo)?;
+
+    // Narrow the compare to the operand's source width when the operand is
+    // a widening cast of a byte/short (the Select path's
+    // `add edx,62; cmp dl,29` shape).
+    let mut cmp_ty = range.ty;
+    if let Some(Some((_, from_ty, to_ty))) = cast_defs.get(range.value.0 as usize) {
+        if *to_ty == range.ty
+            && from_ty.is_integer()
+            && from_ty.size() < range.ty.size()
+            && int_const(*from_ty, span).is_some()
+        {
+            cmp_ty = *from_ty;
+        }
+    }
+    let span_narrow_const = int_const(cmp_ty, span)?;
+
+    let sub_dest = Value(*next_id);
+    *next_id += 1;
+    let mut out = Vec::with_capacity(3);
+    out.push(Instruction::BinOp {
+        dest: sub_dest,
+        op: IrBinOp::Sub,
+        lhs: Operand::Value(range.value),
+        rhs: Operand::Const(lo_const),
+        ty: range.ty,
+    });
+    let cmp_op = if and_form { IrCmpOp::Ule } else { IrCmpOp::Ugt };
+    if *ty == IrType::I8 || *ty == IrType::U8 {
+        out.push(Instruction::Cmp {
+            dest: *dest,
+            op: cmp_op,
+            lhs: Operand::Value(sub_dest),
+            rhs: Operand::Const(span_narrow_const),
+            ty: cmp_ty,
+        });
+    } else {
+        let cmp_dest = Value(*next_id);
+        *next_id += 1;
+        out.push(Instruction::Cmp {
+            dest: cmp_dest,
+            op: cmp_op,
+            lhs: Operand::Value(sub_dest),
+            rhs: Operand::Const(span_narrow_const),
+            ty: cmp_ty,
+        });
+        out.push(Instruction::Cast {
+            dest: *dest,
+            src: Operand::Value(cmp_dest),
+            from_ty: IrType::I8,
+            to_ty: *ty,
+        });
+    }
+    Some(out)
+}
+
 /// Fold the PHI form of a short-circuit `&&`/`||` range predicate.
 ///
 /// if_convert is disabled on the m16 size profile (measured: it grows the
@@ -774,6 +906,459 @@ fn fold_phi_diamonds(
     changes
 }
 
+/// Branch-condition range fusion — the short-circuit `&&`/`||` CFG form the
+/// Select and Phi-diamond folds never see.
+///
+/// When the guarded body is too large for if-conversion (or the target is a
+/// control-flow merge if-conversion declines to touch), C's
+/// `if (x >= lo && x <= hi) {body} else {exit}` lowers to a two-block branch
+/// chain that survives the whole pipeline:
+///
+///   Bcond:  ... c1 = Cmp(op1, x, K1) ...
+///           CondBranch(c1, Bcheck, Bexit)        // `&&`: first half true → check second
+///   Bcheck: [casts of x,] c2 = Cmp(op2, x, K2)
+///           CondBranch(c2, Bbody, Bexit)         // both "no" edges → Bexit
+///
+/// The backend emits two compare-and-branch pairs per character where GCC's
+/// jump threader fuses the pair into the unsigned-bias form on the FIRST
+/// branch (csv_field_sum's digit test, Expat's classifiers, every
+/// `c >= 'a' && c <= 'z'` loop guard). Fold:
+///
+///   Bcond:  ... %d = Sub(x, lo); %t = Cmp(Ule, %d, hi - lo)
+///           CondBranch(%t, Bbody, Bexit)
+///
+/// The `||` form (`if (x < lo || x > hi) {exit} else {body}`) has the roles
+/// swapped on both branches — Bcond's TRUE edge is the shared exit, Bcheck's
+/// TRUE edge is the exit and its FALSE edge the body — and fuses to
+/// `Cmp(Ugt, %d, hi - lo)` with the same target structure:
+///
+///   Bcond:  CondBranch(c1, Bexit, Bcheck)
+///   Bcheck: CondBranch(c2, Bexit, Bbody)
+///     →     CondBranch(%t, Bexit, Bbody)   // %t = Ule(...) — in-range true
+///
+/// Soundness contract (fail-closed; a candidate failing any check keeps its
+/// shape):
+///
+/// 1. `Bcheck` has exactly one predecessor, `Bcond`, and is a pure check
+///    block: its instructions are one `Cmp` plus casts whose results are
+///    used only inside that same block. Nothing else.
+/// 2. `c1` (the Bcond compare) is used ONLY by Bcond's terminator, and `c2`
+///    only by Bcheck's. A value-context use (`int ok = a && b;`) belongs to
+///    the Select/Phi forms and must not be stolen by this fold.
+/// 3. The two compares canonicalize to the same root value (full cast-chain
+///    identity, reusing `extract_range`) with `lo <= hi` and `hi - lo`
+///    representable — the same algebra as the Select form.
+/// 4. Phi-edge rewrite discipline for the two retargeted successors:
+///    - `Bbody` loses the Bcheck→Bbody edge and gains Bcond→Bbody. Every
+///      phi arm keyed to Bcheck is retargeted to Bcond. This is sound
+///      because any value arriving on that arm is either defined before
+///      Bcond (it dominated Bcheck, whose only predecessor is Bcond, hence
+///      it dominates Bcond's end too) or is `c2`/a Bcheck-local cast —
+///      both excluded from having uses outside Bcheck by check 2. After
+///      retargeting, a phi must not carry two arms keyed Bcond: if the
+///      old Bcond arm and the retargeted arm differ, the fold is rejected
+///      (the values would need a merge that no longer exists).
+///    - `Bexit` keeps its Bcond arm and simply drops the Bcheck arm: every
+///      path through Bcheck is gone, so the edge is dead. Its remaining
+///      arm set must still cover exactly its live predecessors.
+/// 5. `Bbody != Bexit` (a same-target chain is cfg_simplify's job, not a
+///    range), and neither equals `Bcheck`.
+/// 6. Bcheck's terminator is a `CondBranch` (not Switch/Return): the
+///    second comparison must actually branch.
+fn fold_branch_chains(
+    func: &mut IrFunction,
+    cmp_defs: &[Option<(IrCmpOp, Operand, Operand, IrType)>],
+    cast_defs: &[Option<(Operand, IrType, IrType)>],
+    next_id: &mut u32,
+) -> usize {
+    use crate::common::fx_hash::{FxHashMap, FxHashSet};
+
+    if func.blocks.is_empty() {
+        return 0;
+    }
+    let idx_of: FxHashMap<u32, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.0, i))
+        .collect();
+
+    fn succs(t: &Terminator) -> Vec<u32> {
+        match t {
+            Terminator::Branch(l) => vec![l.0],
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => vec![true_label.0, false_label.0],
+            Terminator::Switch { cases, default, .. } => {
+                let mut v: Vec<u32> = cases.iter().map(|(_, l)| l.0).collect();
+                v.push(default.0);
+                v
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
+    for (i, b) in func.blocks.iter().enumerate() {
+        for s in succs(&b.terminator) {
+            if let Some(&j) = idx_of.get(&s) {
+                preds[j].push(i);
+            }
+        }
+    }
+
+    // Total use count of every value id across instructions, terminators and
+    // phi arms — the "only use" checks need the whole function, not a block.
+    let max_id = func.max_value_id() as usize;
+    let mut uses: Vec<u32> = vec![0; max_id + 2];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|id| {
+                if (id as usize) < uses.len() {
+                    uses[id as usize] += 1;
+                }
+            });
+        }
+        block.terminator.for_each_used_value(|id| {
+            if (id as usize) < uses.len() {
+                uses[id as usize] += 1;
+            }
+        });
+    }
+
+    // A pure check block: exactly one Cmp (the terminator's condition) plus
+    // Casts whose results are used only inside this block. Returns the
+    // compare's value id. The single `uses` count per def is split into
+    // local instruction uses and terminator uses; any remainder means the
+    // value escapes the block.
+    fn check_block_cmp(block: &crate::ir::reexports::BasicBlock, uses: &[u32]) -> Option<u32> {
+        let mut cmp_id = None;
+        let mut local_defs: Vec<u32> = Vec::new();
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Cmp { dest, .. } => {
+                    if cmp_id.is_some() {
+                        return None; // more than one compare
+                    }
+                    cmp_id = Some(dest.0);
+                    local_defs.push(dest.0);
+                }
+                Instruction::Cast { dest, .. } => local_defs.push(dest.0),
+                _ => return None,
+            }
+        }
+        let cmp_id = cmp_id?;
+        let mut local_use_count: FxHashMap<u32, u32> = FxHashMap::default();
+        for inst in &block.instructions {
+            inst.for_each_used_value(|id| {
+                if local_defs.contains(&id) {
+                    *local_use_count.entry(id).or_insert(0) += 1;
+                }
+            });
+        }
+        let mut terminator_uses: Vec<u32> = Vec::new();
+        block
+            .terminator
+            .for_each_used_value(|id| terminator_uses.push(id));
+        for &d in &local_defs {
+            let total = uses.get(d as usize).copied().unwrap_or(0);
+            let local = local_use_count.get(&d).copied().unwrap_or(0);
+            let term = u32::try_from(terminator_uses.iter().filter(|&&u| u == d).count())
+                .unwrap_or(u32::MAX);
+            if total != local + term {
+                return None; // escapes the block
+            }
+            if d != cmp_id && term != 0 {
+                return None; // only the compare may reach the terminator
+            }
+        }
+        match &block.terminator {
+            Terminator::CondBranch {
+                cond: Operand::Value(v),
+                ..
+            } if v.0 == cmp_id => Some(cmp_id),
+            _ => None,
+        }
+    }
+
+    // Candidate: (bcond index, check-block index, shared-exit label, and_form).
+    struct Cand {
+        bcond_idx: usize,
+        bcheck_idx: usize,
+        bexit_label: u32,
+        and_form: bool,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    for (bcond_idx, bcond) in func.blocks.iter().enumerate() {
+        let Terminator::CondBranch {
+            cond: Operand::Value(c1),
+            true_label,
+            false_label,
+        } = &bcond.terminator
+        else {
+            continue;
+        };
+        let c1 = c1.0;
+        // c1 must be a compare used ONLY by this terminator.
+        if uses.get(c1 as usize).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        // `&&`: CondBranch(c1, Bcheck, Bexit); `||`: CondBranch(c1, Bexit, Bcheck).
+        for (check_label, exit_label, and_form) in [
+            (true_label.0, false_label.0, true),
+            (false_label.0, true_label.0, false),
+        ] {
+            let Some(&bi) = idx_of.get(&check_label) else {
+                continue;
+            };
+            if preds[bi].as_slice() != [bcond_idx] {
+                continue; // not a dedicated single-pred check block
+            }
+            if check_block_cmp(&func.blocks[bi], &uses).is_none() {
+                continue;
+            }
+            cands.push(Cand {
+                bcond_idx,
+                bcheck_idx: bi,
+                bexit_label: exit_label,
+                and_form,
+            });
+        }
+    }
+
+    let mut changes = 0usize;
+    let mut removed: FxHashSet<u32> = FxHashSet::default();
+
+    for cand in cands {
+        if removed.contains(&func.blocks[cand.bcond_idx].label.0)
+            || removed.contains(&func.blocks[cand.bcheck_idx].label.0)
+        {
+            continue;
+        }
+        let bcond_label = func.blocks[cand.bcond_idx].label.0;
+        let bcheck_label = func.blocks[cand.bcheck_idx].label.0;
+
+        // --- structural read-out of the pair ---------------------------------
+        let (c1_id, c2_id, bbody_label) = {
+            let bcond = &func.blocks[cand.bcond_idx];
+            let bcheck = &func.blocks[cand.bcheck_idx];
+            let (
+                Terminator::CondBranch {
+                    cond: Operand::Value(c1),
+                    true_label: t1,
+                    false_label: f1,
+                },
+                Terminator::CondBranch {
+                    cond: Operand::Value(c2),
+                    true_label: t2,
+                    false_label: f2,
+                },
+            ) = (&bcond.terminator, &bcheck.terminator)
+            else {
+                continue;
+            };
+            let (c1, c2) = (c1.0, c2.0);
+            // Recompute the orientation from the actual targets (the cand
+            // scan proved one of these; re-derive to stay local).
+            let (check_of_bcond, exit_of_bcond) = if cand.and_form {
+                (t1.0, f1.0)
+            } else {
+                (f1.0, t1.0)
+            };
+            if check_of_bcond != bcheck_label || exit_of_bcond != cand.bexit_label {
+                continue;
+            }
+            let (body_of_check, exit_of_check) = if cand.and_form {
+                (t2.0, f2.0)
+            } else {
+                (f2.0, t2.0)
+            };
+            if exit_of_check != cand.bexit_label {
+                continue; // the "no" edges must share one exit
+            }
+            if body_of_check == cand.bexit_label
+                || body_of_check == bcheck_label
+                || cand.bexit_label == bcheck_label
+            {
+                continue;
+            }
+            (c1, c2, body_of_check)
+        };
+
+        // --- the two bounds ---------------------------------------------------
+        let (Some(&Some((op1, l1, r1, ty1))), Some(&Some((op2, l2, r2, ty2)))) =
+            (cmp_defs.get(c1_id as usize), cmp_defs.get(c2_id as usize))
+        else {
+            continue;
+        };
+        let (Some(bound1), Some(bound2)) = (
+            canonicalize(op1, &l1, &r1, ty1),
+            canonicalize(op2, &l2, &r2, ty2),
+        ) else {
+            continue;
+        };
+        let Some(range) = extract_range(&bound1, &bound2, cand.and_form, cast_defs) else {
+            continue;
+        };
+        let span = range.hi - range.lo;
+        let Some(lo_const) = int_const(range.ty, range.lo) else {
+            continue;
+        };
+        let Some(span_const) = int_const(range.ty, span) else {
+            continue;
+        };
+
+        // --- phi-edge discipline on Bbody and Bexit ---------------------------
+        // Bbody: retarget Bcheck arms to Bcond; reject on a conflicting
+        // existing Bcond arm (two arms with the same key and different
+        // values cannot be merged).
+        // Bexit: drop the Bcheck arm (dead edge); a Bcond arm must exist.
+        {
+            let bbody_idx = match idx_of.get(&bbody_label) {
+                Some(&i) => i,
+                None => continue,
+            };
+            let bexit_idx = match idx_of.get(&cand.bexit_label) {
+                Some(&i) => i,
+                None => continue,
+            };
+            let mut bbody_ok = true;
+            let mut bexit_ok = true;
+            for (bi, ok) in [(bbody_idx, &mut bbody_ok), (bexit_idx, &mut bexit_ok)] {
+                for inst in &func.blocks[bi].instructions {
+                    let Instruction::Phi { incoming, .. } = inst else {
+                        break; // phis lead the block
+                    };
+                    for (arm_val, from) in incoming {
+                        if from.0 == bcheck_label {
+                            if bi == bbody_idx {
+                                if incoming
+                                    .iter()
+                                    .any(|(v2, f2)| f2.0 == bcond_label && *v2 != *arm_val)
+                                {
+                                    *ok = false;
+                                }
+                            } else if bi == bexit_idx {
+                                // Removing a dead edge: nothing can conflict,
+                                // but the remaining arm set must keep a Bcond
+                                // arm (it always does — that edge stays).
+                            }
+                        }
+                    }
+                    if !*ok {
+                        break;
+                    }
+                }
+            }
+            if !bbody_ok || !bexit_ok {
+                continue;
+            }
+        }
+
+        // --- build the fused test ---------------------------------------------
+        let sub_dest = Value(*next_id);
+        *next_id += 1;
+        let cmp_dest = Value(*next_id);
+        *next_id += 1;
+        let cmp_op = if cand.and_form {
+            IrCmpOp::Ule
+        } else {
+            IrCmpOp::Ugt
+        };
+        let new_insts = vec![
+            Instruction::BinOp {
+                dest: sub_dest,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(range.value),
+                rhs: Operand::Const(lo_const),
+                ty: range.ty,
+            },
+            Instruction::Cmp {
+                dest: cmp_dest,
+                op: cmp_op,
+                lhs: Operand::Value(sub_dest),
+                rhs: Operand::Const(span_const),
+                ty: range.ty,
+            },
+        ];
+        let (new_true, new_false) = if cand.and_form {
+            (
+                crate::ir::reexports::BlockId(bbody_label),
+                crate::ir::reexports::BlockId(cand.bexit_label),
+            )
+        } else {
+            (
+                crate::ir::reexports::BlockId(cand.bexit_label),
+                crate::ir::reexports::BlockId(bbody_label),
+            )
+        };
+
+        // --- apply --------------------------------------------------------------
+        {
+            let bcond = &mut func.blocks[cand.bcond_idx];
+            bcond.instructions.extend(new_insts);
+            bcond.terminator = Terminator::CondBranch {
+                cond: Operand::Value(cmp_dest),
+                true_label: new_true,
+                false_label: new_false,
+            };
+        }
+        // Bbody phis: retarget Bcheck arms to Bcond; drop a duplicate arm
+        // with an identical value.
+        if let Some(&bbody_idx) = idx_of.get(&bbody_label) {
+            let bbody = &mut func.blocks[bbody_idx];
+            let mut arm_rewrite: Vec<(usize, Option<usize>)> = Vec::new();
+            for (pi, inst) in bbody.instructions.iter().enumerate() {
+                let Instruction::Phi { incoming, .. } = inst else {
+                    break;
+                };
+                for (ai, (_, from)) in incoming.iter().enumerate() {
+                    if from.0 == bcheck_label {
+                        let dup = incoming
+                            .iter()
+                            .position(|(v2, f2)| f2.0 == bcond_label && *v2 == incoming[ai].0);
+                        arm_rewrite.push((pi, dup));
+                    }
+                }
+            }
+            for (pi, dup) in arm_rewrite.into_iter().rev() {
+                if let Instruction::Phi { incoming, .. } = &mut bbody.instructions[pi] {
+                    let pos = incoming
+                        .iter()
+                        .position(|(_, f)| f.0 == bcheck_label)
+                        .expect("arm existed in the scan");
+                    if let Some(_dup_with_same_value) = dup {
+                        // Duplicate with identical value: drop the Bcheck arm,
+                        // keeping the existing Bcond arm.
+                        incoming.remove(pos);
+                    } else {
+                        incoming[pos].1 = crate::ir::reexports::BlockId(bcond_label);
+                    }
+                }
+            }
+        }
+        // Bexit phis: drop the Bcheck arm (dead edge).
+        if let Some(&bexit_idx) = idx_of.get(&cand.bexit_label) {
+            let bexit = &mut func.blocks[bexit_idx];
+            for inst in &mut bexit.instructions {
+                let Instruction::Phi { incoming, .. } = inst else {
+                    break;
+                };
+                incoming.retain(|(_, f)| f.0 != bcheck_label);
+            }
+        }
+        removed.insert(bcheck_label);
+        changes += 1;
+    }
+
+    if !removed.is_empty() {
+        func.blocks.retain(|b| !removed.contains(&b.label.0));
+    }
+    changes
+}
+
 /// Run the range-check fold over one function. Returns the number of folds.
 pub(crate) fn run_function(func: &mut IrFunction) -> usize {
     let mut next_id = func.next_value_id;
@@ -906,6 +1491,12 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
     // Phi-diamond form (if-convert off, e.g. the m16 size profile): fold
     // first, while the def maps still describe the pre-fold structure.
     let mut changes = fold_phi_diamonds(func, &cmp_defs, &cast_defs, &mut next_id);
+    // Branch-chain form (the short-circuit `&&`/`||` whose guarded body
+    // if-conversion declined to touch — csv_field_sum's digit test and every
+    // loop guard of that shape). Also consumes the pre-fold def maps: the
+    // fused `Cmp`/`Sub` it inserts are not range candidates themselves, and
+    // the removed check block's compare leaves no dangling lookups.
+    changes += fold_branch_chains(func, &cmp_defs, &cast_defs, &mut next_id);
     for (block_idx, block) in func.blocks.iter_mut().enumerate() {
         let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
         let known_pos = block_known_pos_i32[block_idx];
@@ -963,6 +1554,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
                 new_insts.push(replacement);
             } else if let Some(replacements) =
                 try_fold_select(&inst, &cmp_defs, &cast_defs, &mut next_id)
+                    .or_else(|| try_fold_bool_op(&inst, &cmp_defs, &cast_defs, &mut next_id))
             {
                 changes += 1;
                 new_insts.extend(replacements);

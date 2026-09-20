@@ -20,6 +20,7 @@ pub(crate) mod bit_idioms;
 pub(crate) mod block_layout;
 pub(crate) mod bool_thread;
 pub(crate) mod cfg_simplify;
+pub(crate) mod const_array_promote;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod cvp;
@@ -2611,6 +2612,20 @@ pub(crate) fn run_passes(
     // unaudited intrinsic positions retain their required alignment.
     if !pass_disabled(&disabled, "vecpromote") {
         vector_temp_promotion::downgrade_nonescaping_vector_align(module);
+    }
+
+    // Phase 11e: Constant-array promotion. Local arrays whose surviving
+    // stores are all constants tiling the object exactly, and whose address
+    // only feeds loads and provably read-only direct callees, become
+    // `.rodata` globals (`.LCA_n`) — the 48 scalar `movb`s of a
+    // constant-initialized 16-byte array collapse to zero instructions and
+    // rip-relative references, exactly what GCC and Clang emit for the
+    // shape. Runs last: it needs the post-unroll, post-SCCP store image,
+    // and it removes stores no earlier pass could classify.
+    // Pass name for CCC_DISABLE_PASSES: "constarr".
+    if !pass_disabled(&disabled, "constarr") {
+        const_array_promote::run(module);
+        module.for_each_function(dce::eliminate_dead_code);
     }
 
     if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {

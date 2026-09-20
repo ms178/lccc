@@ -334,6 +334,17 @@ gate "vec-adler-epic" fast \
 gate "vectorize-isa-gate" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_vectorize_isa_gate.sh
 
+# Constant-array promotion: fully-constant local arrays become .rodata
+# globals. Emission contracts (the .LCA_ global, store elimination,
+# rip-relative references, alignment preservation) AND the fail-closed
+# rejections the red-team battery drove: the variable-index runtime store
+# (invisible to the original const-offset classifier — promoted straight
+# into .rodata), the pointer-induction callee reader (must PROMOTE, not
+# reject), and the `return a;` terminator escape (must compile without an
+# ICE). Every config is executed, not just checked.
+gate "const-array-promote" fast \
+    bash tests/regression/check_const_array_promote.sh
+
 # The boot-size harnesses only run against a prepared kernel tree, so a silent
 # measurement error in them is invisible to every other gate.  These two do not
 # need a kernel tree: executable bytes must be summed by section FLAG (the boot
