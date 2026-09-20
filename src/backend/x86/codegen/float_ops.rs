@@ -1160,6 +1160,20 @@ impl X86Codegen {
             }
             return;
         }
+        // Scalar FP negate: one sign-bit flip in the SSE domain.  The default
+        // path moves the value to %rax, materialises the sign mask in %rcx,
+        // xors, and moves back -- five instructions and two domain crossings
+        // for what GCC, Clang and ICX all emit as a single `vxorpd` against a
+        // rodata mask, which is what `fabs` already does here with `andpd`.
+        // Computing into the value's XMM home keeps it out of the GPR
+        // shuttle that the FMA emitters then cannot see through: `-(a*b) - c`
+        // stayed a multiply, a five-instruction negate and a subtract while
+        // the oracles fused it into one `vfnmsub`.
+        if matches!(ty, IrType::F32 | IrType::F64) && op == IrUnaryOp::Neg {
+            if self.emit_fp_neg_direct(dest, src, ty) {
+                return;
+            }
+        }
         if !self.lzcnt_enabled {
             let leading = match op {
                 IrUnaryOp::ClzNonZero => Some(true),
@@ -1246,6 +1260,68 @@ impl X86Codegen {
         }
 
         crate::backend::traits::emit_unaryop_default(self, dest, op, src, ty);
+    }
+
+    /// `dest = -src` for F32/F64 as a sign-bit xor in the SSE domain, into the
+    /// destination's XMM home or, failing one, through the `%xmm0` scratch and
+    /// [`Self::store_xmm0_fp_dest`].  Always emits; the `bool` is the
+    /// caller's "handled" convention.
+    ///
+    /// The mask is the same 16-byte-aligned rodata slot the `fabs` emitter uses
+    /// for its `andpd`, with the sign bit set instead of cleared; the pad
+    /// qword is zero, so the xor leaves the upper lane of a scalar-typed
+    /// register as it was, exactly as `andpd`'s pad does for `fabs`.  With AVX
+    /// the three-operand `vxorpd mask(%rip), %src, %dst` reads the source in
+    /// place and writes the destination without a copy; without it, the
+    /// destructive legacy form needs the value in the destination first.
+    fn emit_fp_neg_direct(&mut self, dest: &Value, src: &Operand, ty: IrType) -> bool {
+        let (mask, xor) = if ty == IrType::F32 {
+            (0x8000_0000u64, "xorps")
+        } else {
+            (0x8000_0000_0000_0000u64, "xorpd")
+        };
+        let src_home = match src {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r))
+                .map(phys_reg_name),
+            _ => None,
+        };
+        // The destination's home, or the `%xmm0` scratch when it has none
+        // (a slot-homed value, typically because it lives across a call):
+        // the xor still runs in the SSE domain and the scalar store to the
+        // slot is one instruction, where the accumulator path is a GPR round
+        // trip plus the same store.
+        let (dname, d_reg) = match self.dest_reg(dest).filter(|r| is_xmm_reg(*r)) {
+            Some(r) => (phys_reg_name(r), Some(r)),
+            None => ("xmm0", None),
+        };
+        let label = self.state.get_fp_const_label(mask);
+        if self.isa.avx {
+            let sname = match src_home {
+                Some(name) => name,
+                None => {
+                    self.load_fp_to_reg(src, ty, dname);
+                    dname
+                }
+            };
+            self.state.emit_fmt(format_args!(
+                "    v{} {}(%rip), %{}, %{}",
+                xor, label, sname, dname
+            ));
+        } else {
+            self.load_fp_to_reg(src, ty, dname);
+            self.state
+                .emit_fmt(format_args!("    {} {}(%rip), %{}", xor, label, dname));
+        }
+        self.state.reg_cache.invalidate_acc();
+        match d_reg {
+            Some(r) => self.note_inplace_compute(r, dest.0),
+            None => self.store_xmm0_fp_dest(dest, ty),
+        }
+        true
     }
 
     /// Load an FP operand directly into an XMM register, using the constant pool
@@ -1477,13 +1553,68 @@ impl X86Codegen {
         ty: IrType,
         mul_is_lhs: bool,
     ) {
-        let fma = match (mul_is_lhs, matches!(ty, IrType::F64)) {
-            (true, true) => "vfmsub231sd",
-            (true, false) => "vfmsub231ss",
-            (false, true) => "vfnmadd231sd",
-            (false, false) => "vfnmadd231ss",
+        // `acc - product` negates the product; `product - acc` negates the
+        // addend.  Both flags false is the plain fmadd.
+        self.emit_scalar_fma_signed(mul_lhs, mul_rhs, acc, sub_dest, ty, !mul_is_lhs, mul_is_lhs);
+    }
+
+    /// Any of the four signed FMA3 families in one rounding:
+    /// `dest = ±(lhs*rhs) ± acc`, the signs chosen by the two flags.  The
+    /// x86 naming composes exactly: `n` negates the PRODUCT and `sub`
+    /// subtracts the ADDEND, so
+    /// `(false,false) vfmadd · (false,true) vfmsub · (true,false) vfnmadd ·
+    /// (true,true) vfnmsub` — the complete sign algebra behind the source
+    /// shapes `-(a*b) - c`, `-(a*b) + c`, `-(a*b + c)` and `-(c - a*b)`,
+    /// which GCC contracts to one instruction each under
+    /// `-ffp-contract=fast` (oracle-verified; the same algebra covers
+    /// AArch64 with the `sub`/`n` roles swapped — there `sub` negates the
+    /// product and `n` the addend: fmadd·fnmsub·fmsub·fnmadd).
+    pub(super) fn emit_scalar_fma_signed(
+        &mut self,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        dest: &Value,
+        ty: IrType,
+        negate_product: bool,
+        negate_addend: bool,
+    ) {
+        let fma = match (negate_product, negate_addend, matches!(ty, IrType::F64)) {
+            (false, false, true) => "vfmadd231sd",
+            (false, false, false) => "vfmadd231ss",
+            (false, true, true) => "vfmsub231sd",
+            (false, true, false) => "vfmsub231ss",
+            (true, false, true) => "vfnmadd231sd",
+            (true, false, false) => "vfnmadd231ss",
+            (true, true, true) => "vfnmsub231sd",
+            (true, true, false) => "vfnmsub231ss",
         };
-        self.emit_scalar_fma231_with(fma, mul_lhs, mul_rhs, acc, sub_dest, ty);
+        self.emit_scalar_fma231_with(fma, mul_lhs, mul_rhs, acc, dest, ty);
+    }
+
+    /// The four-way signed FMA hook (`emit_fused_fma` on the trait): any
+    /// negated family routes here; the plain family keeps its own path.
+    pub(super) fn emit_fused_fma_impl(
+        &mut self,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        dest: &Value,
+        ty: IrType,
+        negate_product: bool,
+        negate_addend: bool,
+    ) {
+        debug_assert!(matches!(ty, IrType::F32 | IrType::F64));
+        debug_assert!(negate_product || negate_addend);
+        self.emit_scalar_fma_signed(
+            mul_lhs,
+            mul_rhs,
+            acc,
+            dest,
+            ty,
+            negate_product,
+            negate_addend,
+        );
     }
 
     fn emit_scalar_fma231_with(

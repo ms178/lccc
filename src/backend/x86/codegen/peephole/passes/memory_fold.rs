@@ -17,6 +17,7 @@
 
 use super::super::types::*;
 use super::dead_writes::label_is_fallthrough_only;
+use super::fma_forms::{FmaWidth, parse_scalar_fma};
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
     implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, writes_family,
@@ -2009,19 +2010,30 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
 /// Soundness: the copy must be the load's ONLY consumer — the loaded register
 /// is proven dead before any read/redispatch; the rewrite never changes the
 /// load's width or extension semantics (width-narrowing copies are refused).
-/// Fold a single-use scalar FP load into the memory-src2 slot of an adjacent
-/// FMA3 231-form instruction:
+/// Fold a single-use scalar FP load into the memory slot of an adjacent scalar
+/// FMA3 instruction, whichever role the loaded value plays:
 ///
 /// ```text
 ///   movsd 32(%rsi), %xmm11                vfmadd231sd 32(%rsi), %xmm10, %xmm2
 ///   vfmadd231sd %xmm11, %xmm10, %xmm2  =>
+///
+///   movsd bodies+96(%rip), %xmm5          vfmadd231sd bodies+96(%rip), %xmm4, %xmm3
+///   vfmadd231sd %xmm4, %xmm5, %xmm3    =>
+///
+///   movsd (%rdi), %xmm4                   vfmadd132sd (%rdi), %xmm2, %xmm0
+///   vfmadd213sd %xmm2, %xmm4, %xmm0    =>
 /// ```
 ///
-/// The first AT&T operand (Intel src2) is the only FMA3 slot that may read
-/// memory.  When the loaded register is never read or written again, the
-/// staging `movsd` is pure overhead — the dominant shape in the second and
-/// later iterations of unrolled dot products, where each `b` element is
-/// loaded exactly once.
+/// Only AT&T operand 0 (Intel `src3`) has a memory encoding, in every form.
+/// A load feeding operand 1 is therefore not foldable *in the form the line
+/// arrived in*, but the three forms are the same computation with the roles
+/// permuted ([`super::fma_forms`]), so the instruction is re-encoded with the
+/// loaded role at operand 0 and the destination unchanged.  The one role that
+/// can never be memory is whichever one is the destination; that case declines.
+/// When the loaded register is never read or written again, the staging
+/// `movsd` is pure overhead — the dominant shape in the second and later
+/// iterations of unrolled dot products, and in nbody's `bodies[i].mass`
+/// reads, where the multiplicand rather than the addend was staged.
 ///
 /// Liveness proof, deliberately stronger than the block-local scan used by
 /// `fold_scalar_fp_memory_into_vex_op`: from the load line to the end of the
@@ -2032,11 +2044,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
 /// (the load redefines the register), so a home reused across loop iterations
 /// stays foldable for the later load.  Being function-wide, the proof is
 /// immune to cross-block reads that a block-local scan cannot see.
-pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-    /// FMA3 231 forms: dest = dest OP (src2 * src1); src2 is the rm slot and
-    /// therefore the only memory-legal operand position.
-    const FMA231: &[&str] = &["vfmadd231", "vfmsub231", "vfnmadd231", "vfnmsub231"];
-
+pub(super) fn fold_fma_memory_operand(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     /// Parse an exact `%xmmN` operand token into N.
     fn xmm_num(op: &str) -> Option<u32> {
         let d = op.strip_prefix("%xmm")?;
@@ -2094,21 +2102,47 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
             continue;
         }
         let lj = infos[j].trimmed(store.get(j));
-        let Some((fop, body)) = FMA231.iter().find_map(|m| {
-            lj.strip_prefix(&format!("{}{} ", m, width))
-                .map(|b| (*m, b))
-        }) else {
+        let Some(fma) = parse_scalar_fma(lj) else {
             i += 1;
             continue;
         };
-        // The pre-fold line has three plain register operands; anything with
-        // a memory operand already (or an immediate) is not our shape.
-        let ops: Vec<&str> = body.split(',').map(|s| s.trim()).collect();
-        if ops.len() != 3 || ops.iter().any(|o| xmm_num(o).is_none()) {
+        // The load's width has to be the instruction's element width: an
+        // `ss` load defines 32 bits and an `sd` FMA reads 64.
+        let elem = match fma.width {
+            FmaWidth::Sd => "sd",
+            FmaWidth::Ss => "ss",
+        };
+        if elem != width {
             i += 1;
             continue;
         }
-        if xmm_num(ops[0]) != Some(n) {
+        // The pre-fold line has three plain register operands; a memory
+        // operand already present means either a different load feeds it or
+        // this is not the shape.
+        if fma.ops.iter().any(|o| !o.starts_with('%')) {
+            i += 1;
+            continue;
+        }
+        // The VEX-encoded scalar FMA this pass folds addresses at most
+        // %xmm15: %xmm16 and above need EVEX, which parse_scalar_fma
+        // refuses.  Refuse the fold at the register-number level as well,
+        // so that a future parser extension cannot silently produce a
+        // fold whose re-encoding has no VEX form -- the rejection must not
+        // live only in mentions()==0 as a side effect of the parser's
+        // current reach.
+        if n >= 16 {
+            i += 1;
+            continue;
+        }
+        let Ok(n8) = u8::try_from(n) else {
+            i += 1;
+            continue;
+        };
+        // The loaded register must play exactly one role, and not the
+        // destination: folding one of two reads leaves the other undefined,
+        // and the destination has no memory encoding in any form.
+        let roles = fma.roles();
+        if roles.mentions(n8) != 1 || fma.dst() == n8 {
             i += 1;
             continue;
         }
@@ -2116,26 +2150,24 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
         // ── liveness: the loaded register must be dead after the FMA on
         //    every path (CFG-aware; a loop-top reader through the back edge,
         //    a call reading it as an FP argument, or a merge-form
-        //    redefinition all keep it live).  The FMA must not read the
-        //    register through another operand slot either (`ops[1]`/`ops[2]`
-        //    naming it means the load feeds two inputs — folding one leaves
-        //    the other undefined). ───────────────────────────────────────
-        if xmm_num(ops[1]) == Some(n) || xmm_num(ops[2]) == Some(n) {
-            i += 1;
-            continue;
-        }
+        //    redefinition all keep it live). ─────────────────────────────
         if !lv.xmm_dead_after(store, infos, j, n, &[i, j]) {
             i += 1;
             continue;
         }
 
+        // Re-encode with the loaded role as a memory operand.  The encoder
+        // puts the memory role at operand 0 in whichever form allows it and
+        // keeps the destination; with the original form as the tie-break, a
+        // line that was already foldable in place keeps its mnemonic.
+        let Some(enc) = roles.substitute(n8, addr).encode(fma.dst(), fma.form) else {
+            i += 1;
+            continue;
+        };
+        let rewritten = format!("    {}", enc.render());
+
         mark_nop(&mut infos[i]);
-        replace_line(
-            store,
-            &mut infos[j],
-            j,
-            format!("    {}{} {}, {}, {}", fop, width, addr, ops[1], ops[2]),
-        );
+        replace_line(store, &mut infos[j], j, rewritten);
         lv.refresh_at(store, infos, i);
         changed = true;
         i = j + 1;
@@ -2482,7 +2514,7 @@ fn is_pure_xmm_overwrite(t: &str, reg: &str) -> bool {
 ///
 /// Soundness: the loaded register must be mentioned exactly twice between
 /// the load and the end of the function (the load itself and the FMA), the
-/// same last-mention proof as [`fold_fma_memory_src2`]; the three lines
+/// same last-mention proof as [`fold_fma_memory_operand`]; the three lines
 /// must be adjacent (NOPs aside) so no label makes the FMA reachable
 /// without the zeroing; and neither the zero nor the destination may be
 /// the loaded register.  The zeroing itself is preserved — %xmm0 is
@@ -2567,7 +2599,7 @@ pub(super) fn fold_zero_addend_fma213_to_132(
 
         // ── liveness: the FMA must be the LAST reader of the loaded value
         //    (%xmmB) on every path — CFG-aware dataflow, same contract as
-        //    fold_fma_memory_src2. ─────────────────────────────────────────
+        //    fold_fma_memory_operand. ─────────────────────────────────────────
         if !lv.xmm_dead_after(store, infos, k, b, &[i, k]) {
             i += 1;
             continue;
@@ -2971,14 +3003,14 @@ mod fold_load_copy_relay_tests {
 #[cfg(test)]
 mod fma_mem_fold_tests {
     use super::super::super::types::classify_line;
-    use super::fold_fma_memory_src2;
+    use super::fold_fma_memory_operand;
     use crate::backend::peephole_common::LineStore;
 
     fn run(asm: &str) -> (bool, Vec<String>) {
         let mut store = LineStore::new(asm.to_string());
         let n = store.len();
         let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
-        let changed = fold_fma_memory_src2(&mut store, &mut infos);
+        let changed = fold_fma_memory_operand(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len())
             .filter(|i| !infos[*i].is_nop())
             .map(|i| store.get(i).trim().to_string())
@@ -3005,6 +3037,24 @@ mod fma_mem_fold_tests {
              \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
              \x20   vaddsd %xmm11, %xmm0, %xmm0\n");
         assert!(!changed, "later reader must veto the fold");
+    }
+
+    /// %xmm16 and above have no VEX encoding, so a load into them must
+    /// never fold — even if every other precondition holds.  The rejection
+    /// is deliberate (audit F4): leaving it to `mentions() == 0` as a side
+    /// effect of the parser's reach would let a future EVEX-aware parser
+    /// silently emit an unencodable re-write.
+    #[test]
+    fn refuses_xmm16_and_above() {
+        let (changed, out) = run("    movsd 32(%rsi), %xmm16\n\
+             \x20   vfmadd231sd %xmm16, %xmm10, %xmm2\n");
+        assert!(
+            !changed,
+            "xmm16 has no VEX encoding; the fold must be refused"
+        );
+        assert_eq!(out.len(), 2, "both lines must survive verbatim: {out:?}");
+        assert_eq!(out[0], "movsd 32(%rsi), %xmm16");
+        assert_eq!(out[1], "vfmadd231sd %xmm16, %xmm10, %xmm2");
     }
 
     /// A later FULL overwrite of the loaded register kills the loaded
@@ -3091,7 +3141,11 @@ mod fma_mem_fold_tests {
     }
 
     /// Mentions BEFORE the load are irrelevant (the load redefines the
-    /// register), so a home reused across iterations stays foldable.
+    /// register), so a home reused across iterations stays foldable — and
+    /// both pairs fold: the first feeds a 213 form's multiplicand, which
+    /// re-encodes as 132 with the load at operand 0 (`xmm2 = xmm2 * mem +
+    /// xmm0`, the same roles as `xmm2 = xmm5 * xmm2 + xmm0` with `xmm5` the
+    /// loaded value), and the second is the plain 231 case.
     #[test]
     fn folds_reused_home_when_later_use_is_last() {
         let (changed, out) = run("    movsd (%rsi), %xmm5\n\
@@ -3099,15 +3153,15 @@ mod fma_mem_fold_tests {
              \x20   movsd 56(%rsi), %xmm5\n\
              \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
              \x20   ret\n");
-        assert!(changed, "second (last-def) load should fold");
-        assert!(
-            out.iter()
-                .any(|l| l == "vfmadd231sd 56(%rsi), %xmm3, %xmm8"),
-            "expected folded second pair: {out:?}"
-        );
-        assert!(
-            out.iter().any(|l| l == "movsd (%rsi), %xmm5"),
-            "first pair must stay untouched: {out:?}"
+        assert!(changed, "both loads should fold");
+        assert_eq!(
+            out,
+            vec![
+                "vfmadd132sd (%rsi), %xmm0, %xmm2",
+                "vfmadd231sd 56(%rsi), %xmm3, %xmm8",
+                "ret",
+            ],
+            "{out:?}"
         );
     }
 
@@ -3165,13 +3219,55 @@ mod fma_mem_fold_tests {
         assert!(!changed, "ss load must not fold into sd fma");
     }
 
-    /// Only 231 forms have a memory-legal src2; a 213 form's first operand
-    /// is the addend register, not the rm slot — must not fold.
+    /// Every form has exactly one memory-legal slot, operand 0, and the
+    /// forms are the same computation with the roles permuted: a load that
+    /// feeds operand 0 of a 213 form (the addend) folds in place, a load that
+    /// feeds operand 1 (a multiplicand) folds after re-encoding as 132, and a
+    /// 132 form's operand 1 (the addend) folds after re-encoding as 213.  The
+    /// destination is the one role that never has a memory encoding.
     #[test]
-    fn refuses_non_231_form() {
-        let (changed, _) = run("    movsd (%rsi), %xmm11\n\
+    fn folds_every_form_by_re_encoding_around_the_memory_slot() {
+        let (changed, out) = run("    movsd (%rsi), %xmm11\n\
              \x20   vfmadd213sd %xmm11, %xmm3, %xmm8\n");
-        assert!(!changed, "213 form has no memory src2 slot");
+        assert!(changed);
+        assert_eq!(out, vec!["vfmadd213sd (%rsi), %xmm3, %xmm8"]);
+
+        let (changed, out) = run("    movsd (%rsi), %xmm11\n\
+             \x20   vfmadd213sd %xmm3, %xmm11, %xmm8\n");
+        assert!(changed);
+        assert_eq!(out, vec!["vfmadd132sd (%rsi), %xmm3, %xmm8"]);
+
+        let (changed, out) = run("    movsd (%rsi), %xmm11\n\
+             \x20   vfnmsub132ss %xmm3, %xmm11, %xmm8\n");
+        assert!(!changed, "an ss FMA must not take an sd load");
+        assert_eq!(out.len(), 2);
+        let (changed, out) = run("    movss (%rsi), %xmm11\n\
+             \x20   vfnmsub132ss %xmm3, %xmm11, %xmm8\n");
+        assert!(changed);
+        assert_eq!(out, vec!["vfnmsub213ss (%rsi), %xmm3, %xmm8"]);
+
+        // nbody's shape: the staged multiplicand sits at operand 1 of a 231.
+        let (changed, out) = run("    movsd bodies+96(%rip), %xmm5\n\
+             \x20   vfmadd231sd %xmm4, %xmm5, %xmm3\n");
+        assert!(changed);
+        assert_eq!(out, vec!["vfmadd231sd bodies+96(%rip), %xmm4, %xmm3"]);
+
+        // The destination role: no form can read it from memory.
+        let (changed, _) = run("    movsd (%rsi), %xmm8\n\
+             \x20   vfmadd132sd %xmm3, %xmm11, %xmm8\n");
+        assert!(!changed, "the destination has no memory encoding");
+    }
+
+    /// A register that plays two roles cannot be folded once: the second
+    /// read would be left reading a register nothing defines.
+    #[test]
+    fn refuses_a_load_that_feeds_two_roles() {
+        let (changed, _) = run("    movsd (%rsi), %xmm5\n\
+             \x20   vfmadd231sd %xmm5, %xmm5, %xmm8\n");
+        assert!(!changed, "x*x needs the register twice");
+        let (changed, _) = run("    movsd (%rsi), %xmm5\n\
+             \x20   vfmadd132sd %xmm5, %xmm5, %xmm8\n");
+        assert!(!changed);
     }
 
     /// A label between the load and the FMA means the FMA is reachable

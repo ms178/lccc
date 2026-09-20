@@ -5,7 +5,7 @@
 //!
 //! [`super::liveness::FileLiveness`] answers "is GP register F read on any
 //! path from here?" with a real backward dataflow over the function's CFG.
-//! The scalar-FP folds (`fold_fp_register_loads`, `fold_fma_memory_src2`,
+//! The scalar-FP folds (`fold_fp_register_loads`, `fold_fma_memory_operand`,
 //! `fold_scalar_fp_memory_into_vex_op`, `eliminate_fp_spill_around_load`,
 //! `fold_ptr_deref_through_stack`, `promote_loop_invariant_fp_load`, the
 //! `eliminate_fp_xmm_roundtrips` patterns …) had no such oracle: every one of

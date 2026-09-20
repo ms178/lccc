@@ -6460,8 +6460,42 @@ pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -
 }
 
 /// Remove vector register self-moves (`vmovdqu %ymm0, %ymm0`, `movaps %xmm1,
-/// %xmm1`, ...). Moving a register to itself is a no-op that costs a decoded
-/// instruction and a dependency without changing any observable state.
+/// %xmm1`, `movsd %xmm0, %xmm0`, ...). Moving a register to itself is a no-op
+/// that costs a decoded instruction and a dependency without changing any
+/// observable state.
+///
+/// Which spellings qualify is a statement about upper bits, and each family
+/// is here for a reason:
+///
+/// * the full-width moves (`movap*`, `movup*`, `movdq*`, VEX or legacy) copy
+///   every bit of the register onto itself;
+/// * the legacy scalar `movsd`/`movss` register form MERGES: it writes the
+///   low lane from the source and keeps the destination's upper bits — with
+///   source and destination the same register, both halves are unchanged;
+/// * the VEX three-operand `vmovsd %a, %a, %a` takes the low lane from one
+///   `%a` and the upper lane of the 128-bit register from the other, and
+///   zeroes bits 128 and up — exactly what every `%xmm`-spelled VEX
+///   self-move this pass already deleted (`vmovaps %xmm0, %xmm0`) does, so it
+///   is a no-op under the same assumption those rely on: the codegen never
+///   spells a self-move of a register whose `%ymm` half is live in `%xmm`
+///   (its scalar and 256-bit domains are separated by `vzeroupper`).
+///
+/// Not here: `vmovsd %a, %a` two-operand (that is a load/store spelling in
+/// AT&T and never register-to-register), `vmovq`/`vmovd` in ANY spelling, and
+/// any line with a memory operand — the `split_once` on the comma would
+/// otherwise pair an address with a register.
+///
+/// `vmovq`/`vmovd` register-to-register are not no-ops and do not belong in a
+/// text-level deletion list at all (measured on hardware, see
+/// `self_moves_that_zero_upper_bits_must_survive`): `vmovq %xmm1, %xmm1`
+/// (VEX.128.F3.0F 7E) and its legacy twin ZERO bits 127:64 — a later `movapd`
+/// read of the register observes the difference, and the `vzeroupper`
+/// invariant only covers the half ABOVE the register, not the upper half of
+/// the `%xmm` itself.  `vmovd %xmm1, %xmm1` has no VEX encoding at all (GAS
+/// silently picks an EVEX one that faults without AVX-512) and its
+/// zero-extends-into-127:32 semantics would be wrong to delete anyway.  A
+/// deliberate zeroing self-move is code, not noise; if a producer of such a
+/// line ever shows up, it needs a liveness-gated cleanup, not this pass.
 pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
@@ -6474,21 +6508,39 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
             .strip_prefix("vmovdqu ")
             .or_else(|| t.strip_prefix("vmovdqa "))
             .or_else(|| t.strip_prefix("vmovupd "))
+            .or_else(|| t.strip_prefix("vmovups "))
+            .or_else(|| t.strip_prefix("vmovapd "))
             .or_else(|| t.strip_prefix("vmovaps "))
-            .or_else(|| t.strip_prefix("vmovd "))
-            .or_else(|| t.strip_prefix("vmovq "))
+            .or_else(|| t.strip_prefix("vmovsd "))
+            .or_else(|| t.strip_prefix("vmovss "))
             .or_else(|| t.strip_prefix("movdqu "))
             .or_else(|| t.strip_prefix("movdqa "))
+            .or_else(|| t.strip_prefix("movupd "))
             .or_else(|| t.strip_prefix("movups "))
+            .or_else(|| t.strip_prefix("movapd "))
             .or_else(|| t.strip_prefix("movaps "))
+            .or_else(|| t.strip_prefix("movsd "))
+            .or_else(|| t.strip_prefix("movss "))
         else {
             continue;
         };
-        if let Some((src, dst)) = rest.split_once(',') {
-            if src.trim() == dst.trim() {
-                mark_nop(&mut infos[i]);
-                changed = true;
-            }
+        // Every operand must be the same vector register: two for the
+        // ordinary forms, three for the VEX scalar merge.  A memory operand
+        // (or a GPR) is not a vector register and fails the test.
+        let mut ops = rest.split(',').map(str::trim);
+        let Some(first) = ops.next() else { continue };
+        let is_vec =
+            first.starts_with("%xmm") || first.starts_with("%ymm") || first.starts_with("%zmm");
+        let n_ops = 1 + ops.clone().count();
+        let all_same = ops.all(|o| o == first);
+        let arity_ok = match n_ops {
+            2 => true,
+            3 => t.starts_with("vmovsd ") || t.starts_with("vmovss "),
+            _ => false,
+        };
+        if is_vec && all_same && arity_ok {
+            mark_nop(&mut infos[i]);
+            changed = true;
         }
     }
     changed
@@ -8421,5 +8473,99 @@ mod broadcast_fold_tests {
             "register staging must survive:\n{}",
             out.join("\n")
         );
+    }
+    #[test]
+    fn vector_self_moves_of_every_spelling_are_deleted_and_nothing_else_is() {
+        use super::super::super::types::classify_line;
+        use crate::backend::peephole_common::LineStore;
+        let run = |asm: &str| -> Vec<String> {
+            let mut store = LineStore::new(asm.to_string());
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            super::eliminate_vector_self_moves(&mut store, &mut infos);
+            (0..store.len())
+                .filter(|&i| !infos[i].is_nop())
+                .map(|i| store.get(i).trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        // Deleted: every register-to-register spelling with all operands equal.
+        for line in [
+            "movsd %xmm0, %xmm0",
+            "movss %xmm7, %xmm7",
+            "movapd %xmm1, %xmm1",
+            "movaps %xmm15, %xmm15",
+            "movupd %xmm2, %xmm2",
+            "vmovsd %xmm3, %xmm3, %xmm3",
+            "vmovss %xmm4, %xmm4, %xmm4",
+            "vmovapd %ymm5, %ymm5",
+            "vmovdqu %ymm6, %ymm6",
+            "vmovdqa %zmm6, %zmm6",
+        ] {
+            assert!(
+                run(&format!("    {line}\n")).is_empty(),
+                "{line} should be deleted"
+            );
+        }
+        // Kept: anything that moves data or names memory.
+        for line in [
+            "movsd %xmm0, %xmm1",
+            "movsd %xmm0, (%rax)",
+            "movsd (%rax), %xmm0",
+            "vmovsd %xmm3, %xmm3, %xmm4",
+            "vmovsd %xmm3, %xmm4, %xmm3",
+            "vmovsd 8(%rsp), %xmm3",
+            "vmovsd %xmm3, 8(%rsp)",
+            "movq %xmm0, %rax",
+            "movq %rax, %xmm0",
+            "movq %xmm1, %xmm1",
+            "movd %xmm1, %xmm1",
+            "movsd %xmm10, %xmm1",
+        ] {
+            assert_eq!(
+                run(&format!("    {line}\n")),
+                vec![line.to_string()],
+                "{line} must stay"
+            );
+        }
+    }
+
+    /// `vmovq`/`vmovd` register self-moves are NOT no-ops and must survive.
+    ///
+    /// Measured on hardware (Zen 4, AVX2): `vmovq %xmm1, %xmm1` encodes as
+    /// VEX.128.F3.0F 7E and ZEROES bits 127:64 of the register (same for the
+    /// legacy `movq` twin); `vmovd %xmm1, %xmm1` has no VEX encoding (GAS
+    /// picks an EVEX one that faults without AVX-512) and would zero bits
+    /// 127:32.  A later full-width read of the register — exactly the
+    /// `movapd` in the fixture below — observes the difference, and the
+    /// vzeroupper invariant this pass's other deletions rely on covers only
+    /// the half ABOVE the register, never the upper half of the `%xmm`
+    /// itself.  Deleting the line would silently un-zero live bits.
+    #[test]
+    fn self_moves_that_zero_upper_bits_must_survive() {
+        use super::super::super::types::classify_line;
+        use crate::backend::peephole_common::LineStore;
+        let run = |asm: &str| -> Vec<String> {
+            let mut store = LineStore::new(asm.to_string());
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            super::eliminate_vector_self_moves(&mut store, &mut infos);
+            (0..store.len())
+                .filter(|&i| !infos[i].is_nop())
+                .map(|i| store.get(i).trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        for zeroing in ["vmovq %xmm1, %xmm1", "vmovd %xmm1, %xmm1"] {
+            let out = run(&format!("    {zeroing}\n    movapd %xmm1, %xmm5\n"));
+            assert_eq!(
+                out,
+                vec![zeroing.to_string(), "movapd %xmm1, %xmm5".to_string()],
+                "a zeroing self-move is code, not noise:\n{}",
+                out.join("\n")
+            );
+        }
     }
 }

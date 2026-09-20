@@ -2859,6 +2859,28 @@ impl ArchCodegen for ArmCodegen {
             self.emit_int_fused_mul_sub_impl(mul_lhs, mul_rhs, acc, sub_dest, ty);
         }
     }
+    fn emit_fused_fma(
+        &mut self,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        dest: &Value,
+        ty: IrType,
+        negate_product: bool,
+        negate_addend: bool,
+    ) {
+        debug_assert!(matches!(ty, IrType::F32 | IrType::F64));
+        debug_assert!(negate_product || negate_addend);
+        self.emit_fused_fma_signed_impl(
+            mul_lhs,
+            mul_rhs,
+            acc,
+            dest,
+            ty,
+            negate_product,
+            negate_addend,
+        );
+    }
     fn state(&mut self) -> &mut CodegenState {
         &mut self.state
     }

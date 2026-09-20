@@ -727,8 +727,8 @@ pub trait ArchCodegen {
     }
 
     /// Emit a fused multiply-subtract.
-    /// `mul_is_lhs == false`: sub_dest = acc - (mul_lhs * mul_rhs)  [fmsub]
-    /// `mul_is_lhs == true` : sub_dest = (mul_lhs * mul_rhs) - acc  [fnmsub]
+    /// `mul_is_lhs == false`: sub_dest = acc - (mul_lhs * mul_rhs)  [x86 vfnmadd / a64 fmsub]
+    /// `mul_is_lhs == true` : sub_dest = (mul_lhs * mul_rhs) - acc  [x86 vfmsub / a64 fnmsub]
     ///
     /// Only called when supports_fused_float_mul_sub() returned true and the
     /// type is F32/F64; there is deliberately NO default mul+sub fallback —
@@ -746,6 +746,36 @@ pub trait ArchCodegen {
         _mul_is_lhs: bool,
     ) {
         unreachable!("emit_fused_mul_sub called on a backend that does not support it");
+    }
+
+    /// Emit any of the four signed fused multiply-add families with a single
+    /// rounding: `dest = ±(mul_lhs * mul_rhs) ± acc`, the two signs chosen by
+    /// `negate_product` and `negate_addend`.
+    ///
+    /// This is the complete sign algebra behind the negation contraction
+    /// shapes — `-(a*b) - c`, `-(a*b) + c`, `-(a*b + c)`, `-(c - a*b)` — all
+    /// of which GCC contracts to one instruction under `-ffp-contract=fast`:
+    /// * x86:   `vfmadd` (+,+) · `vfmsub` (+,-) · `vfnmadd` (-,+) · `vfnmsub` (-,-)
+    ///   (`n` negates the product, `sub` subtracts the addend);
+    /// * aarch64: `fmadd` (+,+) · `fnmsub` (+,-) · `fmsub` (-,+) · `fnmadd` (-,-)
+    ///   (the roles swap: `sub` negates the product, `n` the addend).
+    ///
+    /// The plain (+,+) family keeps going through [`Self::emit_fused_mul_add`];
+    /// this hook is only invoked with a negated flag set, and has NO default
+    /// (same policy as [`Self::emit_fused_mul_sub`]): the detector records
+    /// negated shapes only after `supports_fused_float_mul_sub()`, and a
+    /// backend advertising the sub families carries all four spellings.
+    fn emit_fused_fma(
+        &mut self,
+        _mul_lhs: &Operand,
+        _mul_rhs: &Operand,
+        _acc: &Operand,
+        _dest: &Value,
+        _ty: IrType,
+        _negate_product: bool,
+        _negate_addend: bool,
+    ) {
+        unreachable!("emit_fused_fma called on a backend that does not support it");
     }
 
     /// Whether the target can encode `other & ~value` directly.
