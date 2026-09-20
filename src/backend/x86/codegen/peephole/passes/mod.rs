@@ -48,6 +48,7 @@ mod self_zext;
 mod spill_deref;
 mod store_forwarding;
 mod tail_call;
+mod vector_copy;
 mod vex_promote;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -1009,6 +1010,65 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             {
                 let c = copy_coalesce::coalesce_register_copies(&mut store, &mut infos);
                 trace("coalesce_register_copies", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // The vector counterpart of the two GP copy passes above.  The codegen
+        // routes every scalar FP value through a fresh temporary, so the text
+        // carries copy-in/copy-out brackets that `copy_propagation` (parses
+        // movq/movl), `coalesce_register_copies` (requires a literal "movq ")
+        // and `eliminate_dead_pure_writes` (GP pure-write prefixes) all decline
+        // by construction.  Bracket first: it deletes both copies of the
+        // pattern, and what it leaves behind is a single-use copy that
+        // propagation then feeds to the dead-copy sweep.
+        // A narrow copy into a private temporary cannot serve the packed reads
+        // that follow it, which is what keeps copysign's copies alive; widening
+        // it first lets the two passes below do their work.
+        if !sk("vector_copy_widen") {
+            {
+                let c = vector_copy::widen_private_vector_copies(&mut store, &mut infos);
+                trace("widen_private_vector_copies", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // The FMA accumulator bracket.  Every FMA form reads its destination as
+        // the accumulator, so this is the one bracket the pass below cannot
+        // retarget: `return __builtin_fma(a, b, c);` reaches the assembler as
+        // copy-in / vfmadd231 / copy-out, three instructions where GCC emits one
+        // vfmadd132sd and Clang and ICX one vfmadd213sd.  Rotating the encoding
+        // puts the result register in a role it can legally play.  Runs after
+        // widening so the copy spellings it matches are already normalised.
+        if !sk("vector_copy_fma") {
+            {
+                let c = vector_copy::reassociate_fma_accumulator(&mut store, &mut infos);
+                trace("reassociate_fma_accumulator", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("vector_copy_bracket") {
+            {
+                let c = vector_copy::coalesce_vector_brackets(&mut store, &mut infos);
+                trace("coalesce_vector_brackets", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("vector_copy_prop") {
+            {
+                let c = vector_copy::propagate_vector_copies(&mut store, &mut infos);
+                trace("propagate_vector_copies", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("vector_copy_dead") {
+            {
+                let c = vector_copy::eliminate_dead_vector_copies(&store, &mut infos);
+                trace(
+                    "eliminate_dead_vector_copies",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
                 changed |= c;
             }
         }
@@ -4604,11 +4664,34 @@ mod regression_tests {
 
     #[test]
     fn test_vector_self_move_kept_for_different_regs() {
+        // The bug this pins: a self-move eliminator that matched the destination
+        // spelling twice read `vmovdqu %ymm1, %ymm0` as a move of %ymm0 onto
+        // itself, dropped it, and lost the value the store below needs.
+        //
+        // Vector copy propagation now folds the copy into its only consumer,
+        // which is a strictly better answer to the same bug — the value still
+        // reaches 240(%rsp), with one instruction fewer doing it.  So the
+        // property asserted is the one that was actually violated: either the
+        // copy survives, or the store is retargeted onto the copy's source.
+        // What must never happen is the copy disappearing and the store still
+        // naming a register nothing defined.
         let asm = ["    vmovdqu %ymm1, %ymm0", "    vmovdqu %ymm0, 240(%rsp)"].join("\n") + "\n";
         let out = peephole_optimize(asm.to_string());
+        let folded = out.contains("vmovdqu %ymm1, 240(%rsp)");
+        let kept = out.contains("vmovdqu %ymm1, %ymm0") && out.contains("vmovdqu %ymm0, 240(%rsp)");
         assert!(
-            out.contains("vmovdqu %ymm1, %ymm0"),
-            "reg-reg move with different regs must stay: {}",
+            folded || kept,
+            "the value must reach the slot, by copy or by fold: {}",
+            out
+        );
+        assert!(
+            out.contains("240(%rsp)"),
+            "the store itself must survive: {}",
+            out
+        );
+        assert!(
+            !out.contains("vmovdqu %ymm0, %ymm0"),
+            "a genuine self-move is still removed: {}",
             out
         );
     }
