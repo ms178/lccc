@@ -43,6 +43,9 @@ check_gt0() { # check_gt0 <desc> <actual>
 count_simd() { grep -cE '\b[xyz]mm[0-9]+\b' "$1" || true; }
 count_ymm() { grep -cE '\bymm[0-9]+\b' "$1" || true; }
 count_vfmadd() { grep -cE '\bvfmadd[0-9]*p?[sd]\b|\bvfmadd' "$1" || true; }
+count_bitcount_zero_guards() { grep -cE '^\.Lc[lt]z_nz_' "$1" || true; }
+count_bsf() { grep -cE '\bbsf[lq]\b' "$1" || true; }
+count_bsr() { grep -cE '\bbsr[lq]\b' "$1" || true; }
 
 run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
     local label=$1; shift
@@ -56,6 +59,15 @@ run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
 # ---- 1. default: AVX2 baseline must survive -------------------------------
 run_cfg default
 check_gt0 "default AVX2 vectorization (ymm)" "$(count_ymm $tmp/default.s)"
+# __builtin_clz/ctz have a nonzero source precondition. On baseline x86 the
+# optimal lowering is branchless BSR/BSF; a .Lclz_nz/.Lctz_nz label proves the
+# backend accidentally restored its internal defined-zero semantics.
+check_eq "baseline nonzero clz/ctz zero-fixup guards" \
+    "$(count_bitcount_zero_guards $tmp/default.s)" 0
+check_gt0 "baseline nonzero ctz uses BSF" "$(count_bsf $tmp/default.s)"
+check_gt0 "baseline nonzero clz uses BSR" "$(count_bsr $tmp/default.s)"
+check_eq "baseline direct CTZ has no dead rdi-to-rax preload" \
+    "$(grep -c 'movq %rdi, %rax' "$tmp/default.s" || true)" 0
 
 run_cfg march-v3 -march=x86-64-v3
 check_gt0 "-march=x86-64-v3 AVX2 vectorization (ymm)" "$(count_ymm $tmp/march-v3.s)"

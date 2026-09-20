@@ -545,6 +545,10 @@ impl Lowerer {
             BuiltinIntrinsic::AddOverflowP => self.lower_overflow_p_builtin(args, IrBinOp::Add),
             BuiltinIntrinsic::SubOverflowP => self.lower_overflow_p_builtin(args, IrBinOp::Sub),
             BuiltinIntrinsic::MulOverflowP => self.lower_overflow_p_builtin(args, IrBinOp::Mul),
+            // Preserve LCCC's deterministic zero extension for direct builtins:
+            // Clz(0)/Ctz(0) == operand width. CVP specializes these to the
+            // branchless NonZero forms only where control flow proves the
+            // source nonzero, retaining compatibility and optimal guarded loops.
             BuiltinIntrinsic::Clz => self.lower_unary_intrinsic(name, args, IrUnaryOp::Clz),
             BuiltinIntrinsic::Ctz => self.lower_unary_intrinsic(name, args, IrUnaryOp::Ctz),
             BuiltinIntrinsic::Ffs => self.lower_ffs_intrinsic(name, args),

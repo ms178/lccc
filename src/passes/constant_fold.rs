@@ -1088,15 +1088,21 @@ fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
     Some(match op {
         IrUnaryOp::Neg => src.wrapping_neg(),
         IrUnaryOp::Not => !src,
-        IrUnaryOp::Clz => {
+        IrUnaryOp::Clz | IrUnaryOp::ClzNonZero => {
+            if src == 0 && op == IrUnaryOp::ClzNonZero {
+                return None;
+            }
             if is_32bit {
                 (src as u32).leading_zeros() as i64
             } else {
                 (src as u64).leading_zeros() as i64
             }
         }
-        IrUnaryOp::Ctz => {
+        IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero => {
             if src == 0 {
+                if op == IrUnaryOp::CtzNonZero {
+                    return None;
+                }
                 if is_32bit { 32 } else { 64 }
             } else if is_32bit {
                 (src as u32).trailing_zeros() as i64
@@ -1238,6 +1244,18 @@ mod tests {
         assert_eq!(fold_unaryop(IrUnaryOp::Clz, 1, IrType::I32), Some(31));
         // 64-bit CLZ of 1 = 63
         assert_eq!(fold_unaryop(IrUnaryOp::Clz, 1, IrType::I64), Some(63));
+        assert_eq!(
+            fold_unaryop(IrUnaryOp::ClzNonZero, 1, IrType::I64),
+            Some(63)
+        );
+        assert_eq!(
+            fold_unaryop(IrUnaryOp::CtzNonZero, 16, IrType::I32),
+            Some(4)
+        );
+        // A nonzero-precondition operation on zero is undefined and must not
+        // be assigned the internal defined-zero extension by constant folding.
+        assert_eq!(fold_unaryop(IrUnaryOp::ClzNonZero, 0, IrType::I32), None);
+        assert_eq!(fold_unaryop(IrUnaryOp::CtzNonZero, 0, IrType::I64), None);
         assert_eq!(
             fold_unaryop(IrUnaryOp::BitReverse, 0x0000_0001, IrType::U32),
             Some(0x8000_0000)

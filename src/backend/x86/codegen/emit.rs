@@ -8083,7 +8083,9 @@ impl ArchCodegen for X86Codegen {
         fn emit_int_neg(&mut self, ty: IrType) => emit_int_neg_impl;
         fn emit_int_not(&mut self, ty: IrType) => emit_int_not_impl;
         fn emit_int_clz(&mut self, ty: IrType) => emit_int_clz_impl;
+        fn emit_int_clz_nonzero(&mut self, ty: IrType) => emit_int_clz_nonzero_impl;
         fn emit_int_ctz(&mut self, ty: IrType) => emit_int_ctz_impl;
+        fn emit_int_ctz_nonzero(&mut self, ty: IrType) => emit_int_ctz_nonzero_impl;
         fn emit_int_bswap(&mut self, ty: IrType) => emit_int_bswap_impl;
         fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
         fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;

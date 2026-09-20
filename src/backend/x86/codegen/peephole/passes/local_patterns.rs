@@ -25,6 +25,96 @@ use super::helpers::{
 use super::liveness::FileLiveness;
 use super::relay_and_lea::function_range;
 
+#[cfg(test)]
+mod nonzero_bitcount_staging_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        combined_local_pass(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn removes_exact_bsf_and_bsr_preloads_at_both_widths() {
+        let out = run(concat!(
+            "    movq %rdi, %rax\n",
+            "    bsfq %rdi, %rax\n",
+            "    movl %ecx, %r9d\n",
+            "    bsrl %ecx, %r9d\n",
+            "    ret\n",
+        ));
+        assert_eq!(out, vec!["bsfq %rdi, %rax", "bsrl %ecx, %r9d", "ret"]);
+    }
+
+    #[test]
+    fn refuses_different_source_destination_or_width() {
+        let out = run(concat!(
+            "    movq %rdi, %rax\n",
+            "    bsfq %rsi, %rax\n",
+            "    movq %rcx, %r9\n",
+            "    bsfl %ecx, %r9d\n",
+            "    ret\n",
+        ));
+        assert!(out.iter().any(|x| x == "movq %rdi, %rax"));
+        assert!(out.iter().any(|x| x == "movq %rcx, %r9"));
+    }
+
+    #[test]
+    fn preinitialises_single_move_phi_diamond() {
+        let out = run(concat!(
+            "    cmpl %edx, %eax\n",
+            "    jne .Lalt\n",
+            ".Lfall:\n",
+            "    movq %rdx, %r9\n",
+            "    jmp .Lmerge\n",
+            ".Lalt:\n",
+            "    movl (%rsi,%r8,4), %r9d\n",
+            ".Lmerge:\n",
+            "    ret\n",
+        ));
+        assert!(
+            out.windows(2)
+                .any(|w| { w == ["movq %rdx, %r9".to_string(), ".Lfall:".to_string()] })
+        );
+        assert!(out.iter().any(|x| x == "je .Lmerge"));
+        assert!(!out.iter().any(|x| x == "jmp .Lmerge"));
+    }
+
+    #[test]
+    fn refuses_targeted_fallthrough_or_alt_reading_destination() {
+        let targeted = run(concat!(
+            "    jmp .Lfall\n",
+            "    jne .Lalt\n",
+            ".Lfall:\n",
+            "    movq %rdx, %r9\n",
+            "    jmp .Lmerge\n",
+            ".Lalt:\n",
+            "    movl (%rsi), %r9d\n",
+            ".Lmerge:\n",
+            "    ret\n",
+        ));
+        assert!(targeted.iter().any(|x| x == "jmp .Lmerge"));
+
+        let reads_dst = run(concat!(
+            "    jne .Lalt\n",
+            "    movq %rdx, %r9\n",
+            "    jmp .Lmerge\n",
+            ".Lalt:\n",
+            "    movl (%r9), %r9d\n",
+            ".Lmerge:\n",
+            "    ret\n",
+        ));
+        assert!(reads_dst.iter().any(|x| x == "jmp .Lmerge"));
+    }
+}
+
 /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
 /// Used to ensure an adjacent store and load refer to the SAME slot (same base),
 /// so a numeric offset equality is meaningful.
@@ -128,6 +218,49 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                     changed = true;
                     i += 1;
                     continue;
+                }
+            }
+        }
+
+        // --- Pattern: dead staging move before two-operand BSR/BSF ---
+        // Direct nonzero bitcount lowering can meet a conservative allocator
+        // preload at the textual boundary:
+        //
+        //   movq %rdi, %rax
+        //   bsfq %rdi, %rax
+        //
+        // BSR/BSF fully define the destination on their nonzero domain, so the
+        // identical-source preload is dead. Defined-zero IR reaches this shape
+        // only inside its already-taken nonzero arm; ClzNonZero/CtzNonZero make
+        // the same precondition explicit. Exact source+destination equality
+        // keeps this independent of register aliases and memory effects.
+        {
+            let cur = infos[i].trimmed(store.get(i));
+            let move_ops = cur
+                .strip_prefix("movq ")
+                .map(|x| (x, 'q'))
+                .or_else(|| cur.strip_prefix("movl ").map(|x| (x, 'l')));
+            if let Some((ops, width)) = move_ops {
+                let mut j = i + 1;
+                while j < len && infos[j].is_nop() {
+                    j += 1;
+                }
+                if j < len {
+                    let next = infos[j].trimmed(store.get(j));
+                    let bit_ops = match width {
+                        'q' => next
+                            .strip_prefix("bsfq ")
+                            .or_else(|| next.strip_prefix("bsrq ")),
+                        _ => next
+                            .strip_prefix("bsfl ")
+                            .or_else(|| next.strip_prefix("bsrl ")),
+                    };
+                    if bit_ops == Some(ops) {
+                        mark_nop(&mut infos[i]);
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
                 }
             }
         }
@@ -465,6 +598,97 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                         continue;
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Pattern: preinitialise a one-move phi diamond ---
+        //
+        //   jCC ALT                 mov SRC, DST
+        //   mov SRC, DST     =>     j!CC MERGE
+        //   jmp MERGE               ALT:
+        // ALT:                       mov OTHER, DST
+        //   mov OTHER, DST          MERGE:
+        // MERGE:
+        //
+        // MOV preserves compare flags. Preinitialising the cheap incoming lets
+        // the alternate arm overwrite it and removes the unconditional join
+        // branch. Require exact one-instruction arms, the same full GP
+        // destination, and an alternate source/address independent of DST.
+        if infos[i].kind == LineKind::CondJmp {
+            let cond = infos[i].trimmed(store.get(i));
+            if let Some(sp) = cond.find(' ') {
+                let cc = &cond[1..sp];
+                let alt_target = cond[sp + 1..].trim();
+                let next_live = |mut p: usize| {
+                    while p < len && (infos[p].is_nop() || infos[p].kind == LineKind::Empty) {
+                        p += 1;
+                    }
+                    p
+                };
+                let mut j = next_live(i + 1);
+                // Block emission may name the otherwise-unreferenced
+                // fall-through arm. Hoisting across that label is safe only
+                // when no control-flow edge targets it.
+                let mut fallthrough_label_ok = true;
+                if j < len && infos[j].kind == LineKind::Label {
+                    let name = infos[j].trimmed(store.get(j)).trim_end_matches(':');
+                    fallthrough_label_ok = !(0..len).any(|q| {
+                        q != j && extract_jump_target(infos[q].trimmed(store.get(q))) == Some(name)
+                    });
+                    j = next_live(j + 1);
+                }
+                let k = next_live(j + 1);
+                let l = next_live(k + 1);
+                let m = next_live(l + 1);
+                let n = next_live(m + 1);
+                if n < len
+                    && fallthrough_label_ok
+                    && infos[k].kind == LineKind::Jmp
+                    && infos[l].kind == LineKind::Label
+                    && infos[n].kind == LineKind::Label
+                {
+                    let init = infos[j].trimmed(store.get(j));
+                    let alt = infos[m].trimmed(store.get(m));
+                    let init_mov = ["movq ", "movl "].iter().find_map(|p| init.strip_prefix(p));
+                    let alt_mov = ["movq ", "movl "].iter().find_map(|p| alt.strip_prefix(p));
+                    if let (Some(init_ops), Some(alt_ops)) = (init_mov, alt_mov)
+                        && let (Some((_, init_dst)), Some((alt_src, alt_dst))) =
+                            (init_ops.rsplit_once(','), alt_ops.rsplit_once(','))
+                    {
+                        let dst = init_dst.trim();
+                        let dst_fam = register_family_fast(dst);
+                        let alt_label = infos[l].trimmed(store.get(l)).trim_end_matches(':');
+                        let merge = infos[n].trimmed(store.get(n)).trim_end_matches(':');
+                        let jump_merge = infos[k]
+                            .trimmed(store.get(k))
+                            .strip_prefix("jmp ")
+                            .map(str::trim);
+                        if is_valid_gp_reg(dst_fam)
+                            && register_family_fast(alt_dst.trim()) == dst_fam
+                            && !line_refs_gp_family(alt_src, dst_fam)
+                            && alt_label == alt_target
+                            && jump_merge == Some(merge)
+                        {
+                            let inv = invert_cc(cc);
+                            if inv != cc {
+                                let init_owned = init.to_string();
+                                let inv_owned = inv.to_string();
+                                let merge_owned = merge.to_string();
+                                replace_line(store, &mut infos[i], i, format!("    {init_owned}"));
+                                replace_line(
+                                    store,
+                                    &mut infos[j],
+                                    j,
+                                    format!("    j{inv_owned} {merge_owned}"),
+                                );
+                                mark_nop(&mut infos[k]);
+                                changed = true;
+                                i += 1;
+                                continue;
                             }
                         }
                     }

@@ -138,6 +138,16 @@ the range fusion; it used to be a scalar loop.
 - **Defect (b) FIXED / CURRENT GATE PASS (2026-09-19)** — the clean QEMU
   build brings CPU1 online and the guest reports exactly 2 CPUs. Continue
   dedicated offline/online hotplug cycling as a stronger follow-up stress gate.
-- Kernel harness scripts (`build_kernel_vm.sh`, `prepare_kernel_tree.sh`
-  with whole-tree extraction audit, `qemu_boot_test.sh`) are unreviewed
-  deltas in the session patch, not upstream.
+- **Defect (f) FIXED + CLEAN-BOOT-VALIDATED (2026-09-19)** — conditional
+  store sinking recursively cloned `Cast(index) -> Shl(2) -> GEP` with one SSA
+  ID for every node. The simplifier composed that self-shift on each fixpoint
+  iteration (`2 -> 4 -> 8 -> 16`); `llc_populate_cpu_shard_id()` consequently
+  wrote `int[c]` 64 KiB away and corrupted the broad-config SCSI device table.
+  The cloner now reserves each fresh ID before recursive descent. Focused
+  runtime/codegen, unique-SSA unit, real-workqueue assembly, clean full kernel,
+  and 16-gate QEMU validations pass. See
+  `FOLLOWUP-2026-09-19C-kernel-ifconvert-boot.md`.
+- Kernel harness scripts (`build_kernel_vm.sh`, `prepare_kernel_tree.sh`,
+  `kernel_tool_identity.sh`, `qemu_boot_test.sh`) are production-validated:
+  compiler hash changes force a complete Kbuild clean, linker-only changes
+  preserve objects, and truncated post-wipe source trees self-regenerate.

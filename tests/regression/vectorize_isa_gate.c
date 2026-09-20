@@ -63,6 +63,42 @@ __attribute__((noinline)) void fixed_copy(unsigned int *d)
         d[i] = fixed_src[i];
 }
 
+/* Kernel workqueue shape: if-conversion sinks the two conditional stores into
+ * one phi-driven store and rebuilds Cast(index)->Shl(2)->GEP in the merge.
+ * Every cloned node needs a distinct SSA destination.  Reusing one destination
+ * made simplify compose the self-shift once per optimizer iteration
+ * (2 -> 4 -> 8 -> 16), so int[c] wrote 64 KiB away and corrupted the SCSI
+ * static-device table during boot. */
+static int branch_slots[64];
+__attribute__((noinline)) void branch_index_store(unsigned long mask)
+{
+    int c = 0;
+    while (mask) {
+        int n = __builtin_ctzl(mask);
+        if (n == c)
+            branch_slots[c] = c;
+        else
+            branch_slots[c] = branch_slots[n];
+        c++;
+        mask &= mask - 1;
+    }
+}
+
+/* LCCC deliberately keeps deterministic width results for direct zero-input
+ * clz/ctz calls, matching the established differential corpus. Once CFG facts
+ * prove nonzero, baseline x86 must use straight BSR/BSF without duplicating
+ * that compatibility fallback. Cover both operand widths and both ops. */
+__attribute__((noinline)) unsigned nonzero_bitcounts(unsigned x, unsigned long y)
+{
+    /* Keep the proof inside this function: callers alone cannot justify
+     * branchless BSR/BSF after noinline. CVP must carry both short-circuit
+     * nonzero facts into the dominated hot body. */
+    if (!x || !y)
+        return 0;
+    return __builtin_clz(x) + __builtin_ctz(x) +
+           __builtin_clzl(y) + __builtin_ctzl(y);
+}
+
 int main(void)
 {
     static int d[N], m[N], s[N];
@@ -100,6 +136,23 @@ int main(void)
     fixed_copy(fixed_dst);
     for (int i = 0; i < 12; i++) {
         if (fixed_dst[i] != fixed_src[i])
+            fail++;
+    }
+
+    for (int i = 0; i < 64; i++)
+        branch_slots[i] = 100 + i;
+    branch_index_store(6ul); /* set bits 1 and 2: two else-arm stores */
+    if (branch_slots[0] != 101 || branch_slots[1] != 102 ||
+        branch_slots[4] != 104)
+        fail++;
+
+    /* Every nonzero power of two has clz(x)+ctz(x)==width-1. Sweep all
+     * 32-bit positions and a coprime permutation of all 64-bit positions so
+     * narrow/wide BSR and BSF destinations are stressed across their domain. */
+    for (unsigned i = 0; i < 64; i++) {
+        unsigned x = 1u << (i & 31);
+        unsigned long y = 1ul << ((i * 37u) & 63);
+        if (nonzero_bitcounts(x, y) != 94u)
             fail++;
     }
 
