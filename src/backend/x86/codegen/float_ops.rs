@@ -1106,6 +1106,20 @@ impl X86Codegen {
             }
             return;
         }
+        // Scalar FP negate: one sign-bit flip in the SSE domain.  The default
+        // path moves the value to %rax, materialises the sign mask in %rcx,
+        // xors, and moves back -- five instructions and two domain crossings
+        // for what GCC, Clang and ICX all emit as a single `vxorpd` against a
+        // rodata mask, which is what `fabs` already does here with `andpd`.
+        // Computing into the value's XMM home keeps it out of the GPR
+        // shuttle that the FMA emitters then cannot see through: `-(a*b) - c`
+        // stayed a multiply, a five-instruction negate and a subtract while
+        // the oracles fused it into one `vfnmsub`.
+        if matches!(ty, IrType::F32 | IrType::F64) && op == IrUnaryOp::Neg {
+            if self.emit_fp_neg_direct(dest, src, ty) {
+                return;
+            }
+        }
         // Integer dest-only two-operand ABM/BMI: popcnt/lzcnt/tzcnt write dest
         // without reading it. Emit `mnem %src, %dest` (or `%src, %eax` when dest
         // is the accumulator / return) so we never stage through `movq %src, %rax`
@@ -1179,6 +1193,68 @@ impl X86Codegen {
         }
 
         crate::backend::traits::emit_unaryop_default(self, dest, op, src, ty);
+    }
+
+    /// `dest = -src` for F32/F64 as a sign-bit xor in the SSE domain, into the
+    /// destination's XMM home or, failing one, through the `%xmm0` scratch and
+    /// [`Self::store_xmm0_fp_dest`].  Always emits; the `bool` is the
+    /// caller's "handled" convention.
+    ///
+    /// The mask is the same 16-byte-aligned rodata slot the `fabs` emitter uses
+    /// for its `andpd`, with the sign bit set instead of cleared; the pad
+    /// qword is zero, so the xor leaves the upper lane of a scalar-typed
+    /// register as it was, exactly as `andpd`'s pad does for `fabs`.  With AVX
+    /// the three-operand `vxorpd mask(%rip), %src, %dst` reads the source in
+    /// place and writes the destination without a copy; without it, the
+    /// destructive legacy form needs the value in the destination first.
+    fn emit_fp_neg_direct(&mut self, dest: &Value, src: &Operand, ty: IrType) -> bool {
+        let (mask, xor) = if ty == IrType::F32 {
+            (0x8000_0000u64, "xorps")
+        } else {
+            (0x8000_0000_0000_0000u64, "xorpd")
+        };
+        let src_home = match src {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r))
+                .map(phys_reg_name),
+            _ => None,
+        };
+        // The destination's home, or the `%xmm0` scratch when it has none
+        // (a slot-homed value, typically because it lives across a call):
+        // the xor still runs in the SSE domain and the scalar store to the
+        // slot is one instruction, where the accumulator path is a GPR round
+        // trip plus the same store.
+        let (dname, d_reg) = match self.dest_reg(dest).filter(|r| is_xmm_reg(*r)) {
+            Some(r) => (phys_reg_name(r), Some(r)),
+            None => ("xmm0", None),
+        };
+        let label = self.state.get_fp_const_label(mask);
+        if self.isa.avx {
+            let sname = match src_home {
+                Some(name) => name,
+                None => {
+                    self.load_fp_to_reg(src, ty, dname);
+                    dname
+                }
+            };
+            self.state.emit_fmt(format_args!(
+                "    v{} {}(%rip), %{}, %{}",
+                xor, label, sname, dname
+            ));
+        } else {
+            self.load_fp_to_reg(src, ty, dname);
+            self.state
+                .emit_fmt(format_args!("    {} {}(%rip), %{}", xor, label, dname));
+        }
+        self.state.reg_cache.invalidate_acc();
+        match d_reg {
+            Some(r) => self.note_inplace_compute(r, dest.0),
+            None => self.store_xmm0_fp_dest(dest, ty),
+        }
+        true
     }
 
     /// Load an FP operand directly into an XMM register, using the constant pool

@@ -30,6 +30,7 @@ mod dead_code;
 mod dead_writes;
 mod epilogue_merge;
 mod flag_peepholes;
+mod fma_forms;
 mod fp_liveness;
 mod frame_compact;
 mod helpers;
@@ -1042,6 +1043,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             {
                 let c = vector_copy::reassociate_fma_accumulator(&mut store, &mut infos);
                 trace("reassociate_fma_accumulator", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("vector_copy_retarget") {
+            {
+                let c = vector_copy::retarget_vex_scalar_result(&mut store, &mut infos);
+                trace("retarget_vex_scalar_result", pass_count, c, &store, &infos);
                 changed |= c;
             }
         }

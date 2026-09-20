@@ -43,7 +43,7 @@
 //!
 //! # What this pass does
 //!
-//! Five transformations, in the order that converges fastest:
+//! Six transformations, in the order that converges fastest:
 //!
 //! * [`widen_private_vector_copies`] — a legacy narrow copy (`movsd`, `movss`)
 //!   into a temporary nothing has defined yet becomes the full-width move of the
@@ -52,10 +52,14 @@
 //!   copy cannot feed a 128-bit `vandpd`, and widening it is sound precisely
 //!   because the bits it does not define were nobody's.
 //! * [`reassociate_fma_accumulator`] — the one bracket no other rule can serve,
-//!   because every FMA form reads its own destination as the accumulator.
-//!   Rotating the 231 encoding into the 213 puts the result in the register the
-//!   copy-out wanted, which is what `__builtin_fma` needs to reach one
-//!   instruction.
+//!   because every FMA form reads its own destination as one of its roles.
+//!   Re-encoding the instruction (132, 213 or 231, whichever makes the wanted
+//!   register the destination — the algebra lives in [`super::fma_forms`])
+//!   puts the result where the copy-out wanted it, which is what
+//!   `__builtin_fma` and `a * b + c` need to reach one instruction.
+//! * [`retarget_vex_scalar_result`] — a VEX scalar producer whose result is
+//!   only copied elsewhere writes that register directly; unlike an FMA its
+//!   destination is a plain output.
 //! * [`coalesce_vector_brackets`] — the copy-in / ops / copy-out bracket above.
 //!   The temporary is private to the bracket, so the destination family is
 //!   renamed to the source family and both copies disappear.
@@ -751,43 +755,6 @@ pub(super) fn widen_private_vector_copies(store: &mut LineStore, infos: &mut [Li
     changed
 }
 
-/// The 231→213 sibling of a scalar FMA mnemonic, as an explicit table.
-///
-/// String surgery on mnemonics is how a pass ends up emitting `vfnadd213sd`,
-/// which is not an instruction. The mapping is uniform across the four families
-/// because their sign structure attaches to the same two roles in every form:
-/// the product and the addend. Rotating which register plays the destination
-/// rotates those roles with it, and the arithmetic does not change — for
-/// `vfmadd`, 231 is `dst = src1*src2 + dst` and 213 is `dst = src1*dst + src2`,
-/// so both compute (product of the two multiplicands) + addend; `vfmsub`,
-/// `vfnmadd` and `vfnmsub` differ only in the two signs, which travel with the
-/// same roles. Multiplication is commutative and bitwise exact in IEEE-754, and
-/// an FMA rounds once either way, so the result is identical.
-fn fma_213_sibling(mn: &str) -> Option<&'static str> {
-    Some(match mn {
-        "vfmadd231sd" => "vfmadd213sd",
-        "vfmadd231ss" => "vfmadd213ss",
-        "vfmsub231sd" => "vfmsub213sd",
-        "vfmsub231ss" => "vfmsub213ss",
-        "vfnmadd231sd" => "vfnmadd213sd",
-        "vfnmadd231ss" => "vfnmadd213ss",
-        "vfnmsub231sd" => "vfnmsub213sd",
-        "vfnmsub231ss" => "vfnmsub213ss",
-        _ => return None,
-    })
-}
-
-/// How this line spells register `n`, taken from the line rather than
-/// reconstructed from a width: the rewrite must not invent a spelling the
-/// surrounding code does not use.
-fn operand_spelling(t: &str, n: u8) -> Option<&str> {
-    let (_, operands) = split_mn(t);
-    operand_list(operands)
-        .into_iter()
-        .map(str::trim)
-        .find(|op| vec_operand(op).is_some_and(|(r, _)| r == n))
-}
-
 /// The next line that is neither a nop nor blank, or `None` if a barrier or the
 /// end of the function comes first. "Adjacent" in this pass means exactly that.
 fn next_real(store: &LineStore, infos: &[LineInfo], from: usize, fend: usize) -> Option<usize> {
@@ -804,213 +771,429 @@ fn next_real(store: &LineStore, infos: &[LineInfo], from: usize, fend: usize) ->
     None
 }
 
-/// Collapse the FMA accumulator bracket, which is what `__builtin_fma` reaches
-/// the assembler as:
+/// The previous line that is neither a nop nor blank, or `None` if a barrier
+/// or the start of the function comes first.
+fn prev_real(store: &LineStore, infos: &[LineInfo], before: usize, fstart: usize) -> Option<usize> {
+    let mut n = before;
+    while n > fstart {
+        n -= 1;
+        if infos[n].is_nop() || infos[n].kind == LineKind::Empty {
+            continue;
+        }
+        let t = infos[n].trimmed(store.get(n));
+        if is_barrier(&infos[n], t) {
+            return None;
+        }
+        return Some(n);
+    }
+    None
+}
+
+/// Both operands of a register copy are spelled `%xmm`.
+fn copy_spelled_xmm(t: &str) -> bool {
+    let (_, ops) = split_mn(t);
+    operand_list(ops)
+        .iter()
+        .all(|op| vec_operand(op.trim()).is_some_and(|(_, w)| w == W128))
+}
+
+/// Re-home a scalar FMA so that the copies around it disappear.
+///
+/// The codegen stages a scalar FMA's operands through copies whenever the
+/// register allocator's homes do not line up with the one form it picked:
+/// the accumulator is copied into the destination, a value that was sitting
+/// in the destination is copied out of the way first, and the result is
+/// copied to where it was wanted.  That is what `__builtin_fma` reaches the
+/// assembler as, what `a * b + c` reaches it as in the 132 form, and what
+/// `x * x + c` reaches it as with the swap:
 ///
 /// ```text
 /// vmovsd %xmm2, %xmm2, %xmm5          vfmadd213sd %xmm2, %xmm1, %xmm0
 /// vfmadd231sd %xmm1, %xmm0, %xmm5  →  ret
 /// movsd %xmm5, %xmm0
 /// ret
+///
+/// movsd %xmm2, %xmm4                  vfmadd132sd %xmm1, %xmm2, %xmm0
+/// movsd %xmm0, %xmm2               →  ret
+/// vfmadd132sd %xmm1, %xmm4, %xmm2
+/// movsd %xmm2, %xmm0
+/// ret
+///
+/// movsd %xmm0, %xmm2                  vfmadd132sd %xmm0, %xmm1, %xmm0
+/// movsd %xmm1, %xmm0               →  ret
+/// vfmadd231sd %xmm2, %xmm2, %xmm0
+/// ret
 /// ```
 ///
-/// GCC 16.2 emits one `vfmadd132sd` here, Clang 23.1 and ICX one
-/// `vfmadd213sd`; the left-hand side is three instructions.
+/// Each right-hand side is GCC 16.2's exact text; Clang 23.1 and ICX emit the
+/// 213 spelling of the same instruction.
 ///
-/// This is the one bracket [`coalesce_vector_brackets`] cannot handle, and the
-/// reason is the destination: every FMA form reads its own destination as the
-/// accumulator, so the destination is not a plain output that can be retargeted
-/// onto the value's home register — retargeting it would change which value is
-/// added. What CAN be done is to rotate the encoding so that the register which
-/// must hold the result plays a role it can legally play. The bracket's three
-/// values are two multiplicands and an addend, and the result register `D` is
-/// always one of the instruction's three operands in this shape, so exactly one
-/// rotation writes it directly:
+/// [`coalesce_vector_brackets`] cannot serve these because every FMA form
+/// reads its destination as one of its three roles: the destination is not a
+/// plain output that can be renamed onto the value's home.  What CAN be
+/// changed is the *encoding*.  The three forms differ only in which role the
+/// destination plays ([`super::fma_forms`] has the table), so whenever the
+/// register the result must end up in holds one of the three values, exactly
+/// one form — up to the 132/213 tie, broken towards the original — writes it
+/// directly, and the copies that shuffled values into the form's fixed
+/// positions are not needed.
 ///
-/// * `D` is the addend's register — keep 231, move the destination onto it.
-/// * `D` is either multiplicand — take 213, whose destination is a multiplicand
-///   and whose `src2` is the addend.
+/// # The rule
+///
+/// Take the run of register-to-register vector copies immediately before the
+/// FMA whose destinations feed it (directly, or through another copy of the
+/// run), and the scalar copy of the result immediately after it, if there is
+/// one.  Simulate the run to learn, for every role register, which register
+/// held that value BEFORE the run began — its origin.  Rewrite the roles to
+/// their origins, encode the result into the register the code wanted (the
+/// copy-out's destination, else the FMA's own), and delete the run and the
+/// copy-out.
 ///
 /// # Why it is legal
 ///
-/// The temporary is required to be named by exactly these three lines in the
-/// whole function, so deleting the two copies cannot orphan a reader, and it
-/// must be distinct from all four value registers: were it one of them, the
-/// copy-in would already have overwritten an operand the FMA reads, and the
-/// rotated form reads that operand *after* the overwrite. Both copies must be
-/// register-to-register and scalar — a scalar copy-out touches only `D`'s low
-/// lane, and a scalar FMA preserves its destination's upper bits, so `D`'s
-/// upper bits are its own in both the original and the rewritten form. The
-/// copy-in may be wider than the element (a `movapd` feeding `vfmadd231sd` is
-/// fine, the accumulator's low lane is what the form reads) but not narrower:
-/// an `ss` copy does not define the 64 bits an `sd` accumulator needs. Masked
-/// and broadcast EVEX forms are refused outright, as are the packed suffixes —
-/// there the whole register is the value and the copy widths have to match the
-/// vector length, which is a different proof.
+/// * **Origins are exact.**  The run is copies and nothing else, so the value
+///   a role register holds at the FMA is the value its origin held when the
+///   run began; with the run deleted, the origin still holds it at the FMA,
+///   because nothing between the run's start and the FMA writes anything.
+///   A copy narrower than the element (`movss` into an `sd` role) does not
+///   define the bits the role reads and ends the run; wider copies are fine,
+///   the role reads only its low lane.
+/// * **Deleted destinations are dead.**  Every register the run wrote, and
+///   the FMA's own destination when the result moves elsewhere, is no longer
+///   written by the rewrite; a later reader would see a stale value.  Each is
+///   asked of [`FpLiveness`] after the last deleted line, which sees readers
+///   below, readers reached through a back edge, and the implicit reads of
+///   `ret` and `call`, and answers "live" for a function it cannot analyse.
+///   Readers *before* the run need no rule: they ran before it.
+/// * **The result register's upper bits are its own.**  A scalar FMA writes
+///   only its destination's low lane.  Originally the destination's upper
+///   bits came from the last thing that wrote it: a legacy element-width
+///   copy preserves them, a `movapd` or a VEX copy replaces them.  Unless the
+///   last copy into the result register was preserving, the rewrite may
+///   change those bits, so it is allowed only when no line of the function
+///   outside the rewritten bracket reads that register wider than the
+///   element.  The copy-out itself must be a legacy element-width copy for
+///   the same reason, seen from the other side.
+/// * **Memory operands travel with their role.**  The encoder puts a memory
+///   role at operand 0 in whichever form allows it and reports that no form
+///   can when the role that must be memory is the destination, or when two
+///   roles are memory.
+/// * A writemask, a broadcast, a packed suffix or a wide spelling never
+///   parses as a scalar FMA here; a label, branch, call or `ret` between the
+///   lines ends the bracket; pinned lines are never touched.
 ///
-/// Measured over the archived oracle corpus this shape does not occur: the 52
-/// FMA sites in those 51 benchmarks are loop accumulators that instruction
-/// selection already placed correctly, and none carries a copy bracket. What it
-/// fixes is the straight-line intrinsic — three instructions to one, which is
-/// where a side-by-side comparison with GCC, Clang and ICX puts it. Choosing
-/// the accumulator form during selection, while the value is still in the
-/// selector, is what would cover the loop cases too; that is recorded in
-/// `engineering/FOLLOWUP-2026-09-19E-vector-copy-elimination.md`.
+/// Measured over the archived oracle corpus this collapses every
+/// straight-line FMA shape the codegen produces — the intrinsic, the
+/// contracted `a * b + c` in all its operand orders, and the squared norm —
+/// to the one instruction the oracles emit.
 pub(super) fn reassociate_fma_accumulator(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    use super::fma_forms::{parse_scalar_fma, xmm_reg};
+
+    /// Longest run of copies considered; an FMA has three roles, and a fourth
+    /// copy can only be a chain link.
+    const MAX_RUN: usize = 4;
+
     let len = store.len();
     let mut changed = false;
-    let mut i = 0;
-    while i < len {
-        if infos[i].is_nop() || infos[i].pinned {
-            i += 1;
-            continue;
-        }
-        let t_in = infos[i].trimmed(store.get(i)).to_string();
-        let Some(copy_in) = parse_vec_copy(&t_in) else {
-            i += 1;
-            continue;
-        };
-        let Some((fstart, fend)) = function_range(store, infos, i) else {
-            i += 1;
-            continue;
-        };
-        let Some(j) = next_real(store, infos, i + 1, fend) else {
-            i += 1;
-            continue;
-        };
-        let Some(k) = next_real(store, infos, j + 1, fend) else {
-            i += 1;
-            continue;
-        };
-        if infos[j].pinned || infos[k].pinned {
-            i += 1;
+    let mut fp: Option<FpLiveness> = None;
+    let mut j = 0;
+    while j < len {
+        if infos[j].is_nop() || infos[j].pinned {
+            j += 1;
             continue;
         }
         let t_fma = infos[j].trimmed(store.get(j)).to_string();
-        let (mn, operands) = split_mn(&t_fma);
-        let Some(mn213) = fma_213_sibling(mn) else {
-            i += 1;
+        let Some(fma) = parse_scalar_fma(&t_fma) else {
+            j += 1;
             continue;
         };
-        // A writemask makes the destination a partial write and a broadcast
-        // makes one source a memory operand with a different role; neither is
-        // reasoned about here.
-        if t_fma.contains('{') {
-            i += 1;
+        let Some((fstart, fend)) = function_range(store, infos, j) else {
+            j += 1;
+            continue;
+        };
+        let elem_bits = fma.width.bits();
+        let t = fma.dst();
+
+        // The copy-out, if any: a legacy element-width move of the result,
+        // adjacent, register to register in `%xmm` spelling.
+        let copy_out = next_real(store, infos, j + 1, fend).and_then(|k| {
+            if infos[k].pinned {
+                return None;
+            }
+            let text = infos[k].trimmed(store.get(k));
+            let c = parse_vec_copy(text)?;
+            (c.src == t && c.width == elem_bits && !c.zeroes_above && copy_spelled_xmm(text))
+                .then_some((k, c))
+        });
+        let (d, last) = match copy_out {
+            Some((k, c)) => (c.dst, k),
+            None => (t, j),
+        };
+
+        // The run of copies feeding the FMA, walked backwards: a copy joins
+        // when its destination is a role register or the source of a copy
+        // already in the run.
+        let roles = fma.roles();
+        let mut relevant: u16 = 0;
+        for r in [roles.mult[0], roles.mult[1], roles.addend] {
+            if let Some(n) = xmm_reg(r) {
+                relevant |= 1 << n;
+            }
+        }
+        let mut run: Vec<(usize, VecCopy)> = Vec::new();
+        let mut p = j;
+        while run.len() < MAX_RUN {
+            let Some(i) = prev_real(store, infos, p, fstart) else {
+                break;
+            };
+            if infos[i].pinned {
+                break;
+            }
+            let text = infos[i].trimmed(store.get(i));
+            let Some(c) = parse_vec_copy(text) else { break };
+            if relevant & (1 << c.dst) == 0 || c.width < elem_bits || !copy_spelled_xmm(text) {
+                break;
+            }
+            relevant |= 1 << c.src;
+            run.push((i, c));
+            p = i;
+        }
+        if run.is_empty() && copy_out.is_none() {
+            j += 1;
             continue;
         }
-        // Two widths are in play and conflating them is how this guard rejects
-        // every bracket it exists to fold.  The ELEMENT width is what the suffix
-        // names -- 64 for `sd`, 32 for `ss` -- and it is what the copies have to
-        // define.  The REGISTER width is what `vec_operand` reports: 128 for
-        // every `%xmm` spelling, 256 for `%ymm`, 512 for `%zmm`, whatever the
-        // instruction does with it.
-        let elem_width = if mn.ends_with("sd") { W64 } else { W32 };
+        run.reverse();
+
+        // Origins: simulate the run forwards from the identity.
+        let mut origin: [u8; 16] = std::array::from_fn(|n| n as u8);
+        for (_, c) in &run {
+            origin[usize::from(c.dst)] = origin[usize::from(c.src)];
+        }
+        let spelling: [String; 16] = std::array::from_fn(|n| format!("%xmm{n}"));
+        let mut rewritten = roles.clone();
+        for n in 0u8..16 {
+            if origin[usize::from(n)] != n {
+                rewritten =
+                    rewritten.substitute(n, spelling[usize::from(origin[usize::from(n)])].as_str());
+            }
+        }
+        let Some(enc) = rewritten.encode(d, fma.form) else {
+            j += 1;
+            continue;
+        };
+
+        // Every register the rewrite stops writing must be dead after the
+        // last deleted line.
+        let mut owned: Vec<usize> = run.iter().map(|(i, _)| *i).collect();
+        owned.push(j);
+        owned.push(last);
+        let mut must_be_dead: u16 = 0;
+        for (_, c) in &run {
+            if c.dst != d {
+                must_be_dead |= 1 << c.dst;
+            }
+        }
+        if copy_out.is_some() {
+            must_be_dead |= 1 << t;
+        }
+        let oracle = fp.get_or_insert_with(|| FpLiveness::new(store, infos));
+        let all_dead = (0u8..16)
+            .filter(|n| must_be_dead & (1 << n) != 0)
+            .all(|n| oracle.xmm_dead_after(store, infos, last, u32::from(n), &owned));
+        if !all_dead {
+            j += 1;
+            continue;
+        }
+
+        // The result register's upper bits: unchanged by the rewrite only if
+        // the last copy that wrote it was a legacy element-width merge.
+        // Otherwise no line of the function outside the bracket may read it
+        // wider than the element.
+        let last_write_into_d = run.iter().rev().find(|(_, c)| c.dst == d).map(|(_, c)| *c);
+        let upper_preserved =
+            last_write_into_d.is_none_or(|c| !c.zeroes_above && c.width == elem_bits);
+        if !upper_preserved {
+            let wide_reader = (fstart..fend).any(|n| {
+                !owned.contains(&n)
+                    && !infos[n].is_nop()
+                    && vec_mention_width(infos[n].trimmed(store.get(n)), d) > elem_bits
+            });
+            if wide_reader {
+                j += 1;
+                continue;
+            }
+        }
+
+        debug_assert_eq!(xmm_reg(enc.ops[2]), Some(d));
+        replace_line(store, &mut infos[j], j, format!("    {}", enc.render()));
+        for (i, _) in &run {
+            mark_nop(&mut infos[*i]);
+        }
+        if let Some((k, _)) = copy_out {
+            mark_nop(&mut infos[k]);
+        }
+        if let Some(oracle) = fp.as_mut() {
+            oracle.refresh_at(store, infos, j);
+        }
+        changed = true;
+        j = last + 1;
+    }
+    changed
+}
+
+/// Bases of the VEX arithmetic and logical instructions that write their
+/// destination from their sources alone, in `ss`/`sd`/`ps`/`pd` flavours.
+/// An explicit list: the FMA families read their destination as a role, the
+/// EVEX `vfixupimm*` merges a table into it, and the moves, converts, blends
+/// and inserts each have their own upper-lane story.  None of those is here.
+const VEX_PLAIN_OUTPUT_BASES: &[&str] = &[
+    "add", "sub", "mul", "div", "min", "max", "sqrt", "rsqrt", "rcp", "round", "xor", "and",
+    "andn", "or",
+];
+
+/// `Some(true)` when `mn` is a VEX (`v`-prefixed) instruction from
+/// [`VEX_PLAIN_OUTPUT_BASES`] with an `ss`/`sd`/`ps`/`pd` suffix.
+fn vex_plain_output(mn: &str) -> bool {
+    let Some(rest) = mn.strip_prefix('v') else {
+        return false;
+    };
+    let Some(base) = rest
+        .strip_suffix("ss")
+        .or_else(|| rest.strip_suffix("sd"))
+        .or_else(|| rest.strip_suffix("ps"))
+        .or_else(|| rest.strip_suffix("pd"))
+    else {
+        return false;
+    };
+    VEX_PLAIN_OUTPUT_BASES.contains(&base)
+}
+
+/// Re-home a VEX instruction whose result is only ever copied somewhere else:
+///
+/// ```text
+/// vxorpd .LC0(%rip), %xmm0, %xmm3        vxorpd .LC0(%rip), %xmm0, %xmm0
+/// movsd  %xmm3, %xmm0                 →  ret
+/// ret
+/// ```
+///
+/// A VEX arithmetic or logical instruction writes its destination from its
+/// sources alone, so unlike the FMA forms the destination is a plain output
+/// and can be retargeted wherever the copy-out wanted it — nothing about the
+/// computation changes.  [`coalesce_vector_brackets`] handles this when a
+/// copy-IN opens the bracket; this rule is the same idea for a producer that
+/// needed no copy-in because its sources were already in place, which is what
+/// every straight-line negate, round, sqrt and two-operand arithmetic reaches
+/// the assembler as when the allocator's home for the result is not the
+/// register the caller wants it in.
+///
+/// # Why it is legal
+///
+/// * The producer is from [`VEX_PLAIN_OUTPUT_BASES`]: it reads its sources,
+///   then writes its destination — the low lane(s) with the result, the rest
+///   of the 128-bit register from its first source for the scalar forms, and
+///   zero above.  Retargeting the destination changes none of that.
+/// * The copy-out is a legacy element-width move: it wrote only `D`'s low
+///   element and left the rest of `D` alone.  After the rewrite the rest of
+///   `D` is whatever the producer puts there, so a reader of `D` wider than
+///   the copy-out's element could see a difference: the rewrite is refused
+///   when any line of the function outside the two rewritten ones mentions
+///   `D` wider than that element.  This is the whole upper-bit argument and
+///   it does not depend on which source the producer merged from, or on
+///   whether `D` was itself a source.
+/// * The producer's old destination `T` is dead after the copy-out, asked of
+///   [`FpLiveness`]: the rewrite stops writing it.
+/// * The two lines are adjacent up to nops, in one basic block, neither is
+///   pinned, and every register operand is spelled `%xmm`.
+pub(super) fn retarget_vex_scalar_result(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut fp: Option<FpLiveness> = None;
+    let mut j = 0;
+    while j < len {
+        if infos[j].is_nop() || infos[j].pinned {
+            j += 1;
+            continue;
+        }
+        let t_op = infos[j].trimmed(store.get(j)).to_string();
+        let (mn, operands) = split_mn(&t_op);
+        if !vex_plain_output(mn) || operands.contains('{') {
+            j += 1;
+            continue;
+        }
         let ops: Vec<&str> = operand_list(operands).iter().map(|o| o.trim()).collect();
-        if ops.len() != 3 {
-            i += 1;
+        // Three operands, or four with a leading immediate (`vroundsd`).
+        let arity_ok = ops.len() == 3 || (ops.len() == 4 && ops[0].starts_with('$'));
+        if !arity_ok {
+            j += 1;
             continue;
         }
-        // AT&T reverses Intel's order, so the text reads (src2, src1, dst).
-        let (Some((s2, s2w)), Some((s1, s1w)), Some((acc, accw))) = (
-            vec_operand(ops[0]),
-            vec_operand(ops[1]),
-            vec_operand(ops[2]),
-        ) else {
-            i += 1;
+        let Some((t, W128)) = vec_operand(ops[ops.len() - 1]) else {
+            j += 1;
             continue;
         };
-        // One register width across all three operands: a scalar form uses %xmm
-        // throughout, and a mixed spelling would mean the operands name
-        // different amounts of their physical registers.
-        if acc != copy_in.dst || s2w != accw || s1w != accw {
-            i += 1;
+        let sources_ok = ops[..ops.len() - 1]
+            .iter()
+            .all(|op| !op.starts_with('%') || vec_operand(op).is_some_and(|(_, w)| w == W128));
+        if !sources_ok {
+            j += 1;
             continue;
         }
-        // The copy-in has to move the register the FMA actually accumulates
-        // into, spelling included: `%ymm5` and `%xmm5` are the same physical
-        // register but not the same amount of it, and only the spelling the FMA
-        // names is the accumulator being replaced.
-        let acc_spelling_ok = |text: &str, n: u8| -> bool {
-            operand_spelling(text, n)
-                .and_then(vec_operand)
-                .is_some_and(|(_, w)| w == accw)
+        let Some((fstart, fend)) = function_range(store, infos, j) else {
+            j += 1;
+            continue;
         };
-        if !acc_spelling_ok(&t_in, copy_in.dst) {
-            i += 1;
+        let Some(k) = next_real(store, infos, j + 1, fend) else {
+            j += 1;
+            continue;
+        };
+        if infos[k].pinned {
+            j += 1;
             continue;
         }
         let t_out = infos[k].trimmed(store.get(k)).to_string();
         let Some(copy_out) = parse_vec_copy(&t_out) else {
-            i += 1;
+            j += 1;
             continue;
         };
-        // The copy-out must be a scalar move of the element: it then touches only
-        // the destination's low lane, and a scalar FMA preserves its
-        // destination's upper bits, so the destination's upper bits are its own
-        // in both the original and the rotated form.  A 128-bit copy-out would
-        // take them from the temporary instead.
-        if copy_out.src != copy_in.dst || copy_out.width != elem_width {
-            i += 1;
+        if copy_out.src != t
+            || copy_out.width >= W128
+            || copy_out.zeroes_above
+            || !copy_spelled_xmm(&t_out)
+        {
+            j += 1;
             continue;
         }
-        // The copy-in may be wider than the element -- widening runs first, so a
-        // `movsd` that a packed read promoted arrives here as `movapd`, and the
-        // accumulator reads only its low lane either way -- but not narrower: an
-        // `ss` copy does not define the 64 bits an `sd` accumulator needs.
-        if copy_in.width < elem_width {
-            i += 1;
-            continue;
-        }
-        let (c, t, d) = (copy_in.src, copy_in.dst, copy_out.dst);
-        // The temporary is named by exactly these three lines, in the whole
-        // function: a reader anywhere else would be left reading a register
-        // nothing defines once the copies go.
-        let t_fam = VEC_FAMILY_BASE + t;
-        let private = (fstart..fend).all(|n| {
-            n == i
-                || n == j
-                || n == k
-                || infos[n].is_nop()
-                || !mentions_family(infos[n].trimmed(store.get(n)).as_bytes(), t_fam)
+        let d = copy_out.dst;
+        let wide_reader = (fstart..fend).any(|n| {
+            n != j
+                && n != k
+                && !infos[n].is_nop()
+                && vec_mention_width(infos[n].trimmed(store.get(n)), d) > copy_out.width
         });
-        // And it must not be one of the value registers: if it were, the copy-in
-        // would have overwritten an operand the FMA reads, and the rotated form
-        // reads that operand after the overwrite.
-        if !private || t == c || t == s1 || t == s2 || t == d {
-            i += 1;
+        if wide_reader {
+            j += 1;
             continue;
         }
-        let (Some(c_sp), Some(d_sp)) = (operand_spelling(&t_in, c), operand_spelling(&t_out, d))
-        else {
-            i += 1;
-            continue;
-        };
-        if !acc_spelling_ok(&t_out, d) {
-            i += 1;
+        let oracle = fp.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if !oracle.xmm_dead_after(store, infos, k, u32::from(t), &[j, k]) {
+            j += 1;
             continue;
         }
-        let rewritten = if d == c {
-            // The result lands in the addend, so the accumulator role moves onto
-            // it: the same 231 encoding with a different destination.
-            format!("{mn} {}, {}, {d_sp}", ops[0], ops[1])
-        } else if d == s1 {
-            format!("{mn213} {c_sp}, {}, {d_sp}", ops[0])
-        } else if d == s2 {
-            format!("{mn213} {c_sp}, {}, {d_sp}", ops[1])
-        } else {
-            // The result register is none of the three operands, so no single FMA
-            // encoding writes it.  Inventing one is not this layer's call: the
-            // form has to be chosen while the value is still in the selector,
-            // during instruction selection.
-            i += 1;
-            continue;
-        };
-        replace_line(store, &mut infos[j], j, format!("    {rewritten}"));
-        mark_nop(&mut infos[i]);
+        let mut new_ops: Vec<String> = ops.iter().map(|o| (*o).to_string()).collect();
+        let last = new_ops.len() - 1;
+        new_ops[last] = format!("%xmm{d}");
+        replace_line(
+            store,
+            &mut infos[j],
+            j,
+            format!("    {mn} {}", new_ops.join(", ")),
+        );
         mark_nop(&mut infos[k]);
+        if let Some(oracle) = fp.as_mut() {
+            oracle.refresh_at(store, infos, j);
+        }
         changed = true;
-        i = k + 1;
+        j = k + 1;
     }
     changed
 }
@@ -1289,14 +1472,26 @@ mod tests {
             "    movsd %xmm0, %xmm2\n    vaddsd %xmm0, %xmm2, %xmm2\n    movsd %xmm2, %xmm0\n    ret\n",
         );
         let out = insns(&run(&asm));
-        // Propagation may still rewrite the interior read (that is value-
-        // identical) and the copy-in may then die as a dead write.  What must
-        // NOT happen is the rename: the interior keeps writing the temporary,
-        // and the copy-out is still needed to put the result in %xmm0.
+        // Propagation rewrites the interior read (value-identical), the
+        // copy-in then dies, and the result retarget puts the sum straight
+        // into %xmm0: `a + a` computed in place.  What must NOT happen is the
+        // rename of %xmm2 onto %xmm0 WHILE the interior still reads %xmm0's
+        // old value -- that would compute `2a` from a register that already
+        // held... `a`, which is the same here, but the rule is what is under
+        // test, so the bracket coalescer alone is pinned separately below.
         assert_eq!(
             out,
-            vec!["vaddsd %xmm0, %xmm0, %xmm2", "movsd %xmm2, %xmm0", "ret"],
-            "the temporary must survive as the destination: {out:?}"
+            vec!["vaddsd %xmm0, %xmm0, %xmm0", "ret"],
+            "the whole pipeline reaches the one-instruction form: {out:?}"
+        );
+        // The bracket coalescer on its own must refuse (rule 2).
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(
+            !coalesce_vector_brackets(&mut store, &mut infos),
+            "rule 2: an interior read of the source blocks the rename"
         );
     }
 
@@ -1357,20 +1552,32 @@ mod tests {
             "the temporary still has a use outside the bracket: {out:?}"
         );
         // And a temporary read BEFORE the bracket is equally disqualifying for
-        // the rename — though propagation may still shorten the interior, and
-        // the copy-in may then die as a dead write.  The invariant is that the
-        // interior still writes %xmm2 and the earlier read still sees it.
-        let out = insns(&run(&body(
+        // the rename.  Propagation still shortens the interior, the copy-in
+        // dies, and the result retarget then computes the rounding straight
+        // into %xmm0 -- legal because the earlier read of %xmm2 ran before
+        // any of this and is untouched, and %xmm2 is dead afterwards.
+        let asm2 = body(
             "    vaddsd %xmm2, %xmm1, %xmm1\n    movsd %xmm0, %xmm2\n    vroundsd $9, %xmm2, %xmm2, %xmm2\n    movsd %xmm2, %xmm0\n    ret\n",
-        )));
-        assert!(
-            out.iter().any(|l| l == "vaddsd %xmm2, %xmm1, %xmm1"),
-            "the pre-bracket read of the temporary is untouchable: {out:?}"
         );
+        let out = insns(&run(&asm2));
+        assert_eq!(
+            out,
+            vec![
+                "vaddsd %xmm2, %xmm1, %xmm1",
+                "vroundsd $9, %xmm0, %xmm0, %xmm0",
+                "ret"
+            ],
+            "the pre-bracket read is untouched and the rounding lands in %xmm0: {out:?}"
+        );
+        // The bracket coalescer on its own must refuse (rule 4): renaming
+        // %xmm2 onto %xmm0 would make the earlier read see the wrong register.
+        let mut store = LineStore::new(asm2);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
         assert!(
-            out.iter()
-                .any(|l| l.ends_with("%xmm2") && l.starts_with("vroundsd")),
-            "a live-in temporary cannot be renamed onto the source: {out:?}"
+            !coalesce_vector_brackets(&mut store, &mut infos),
+            "rule 4: a temporary read outside the bracket blocks the rename"
         );
     }
 
@@ -1738,16 +1945,78 @@ mod tests {
     }
 
     #[test]
-    fn fma_reassociation_refuses_a_copy_in_narrower_than_the_element() {
-        // A 32-bit copy does not define the 64 bits an sd accumulator reads.
+    fn fma_reassociation_refuses_to_see_through_a_copy_in_narrower_than_the_element() {
+        // A 32-bit copy does not define the 64 bits an sd accumulator reads, so
+        // %xmm2 must NOT be substituted for %xmm5: the value the FMA adds is
+        // %xmm5's 64 bits, only 32 of which came from %xmm2.  What remains
+        // legal is the copy-out-only rule on the FMA itself -- read the same
+        // %xmm5, write the result straight into %xmm0 -- and the narrow copy
+        // stays, exactly as written, feeding it.
         let got = fma_only(
             "    movss %xmm2, %xmm5\n    vfmadd231sd %xmm1, %xmm0, %xmm5\n    movsd %xmm5, %xmm0\n    ret\n",
         );
         assert_eq!(
-            got.len(),
-            4,
-            "an ss copy cannot feed an sd accumulator: {got:?}"
+            got,
+            vec![
+                "movss %xmm2, %xmm5",
+                "vfmadd213sd %xmm5, %xmm1, %xmm0",
+                "ret"
+            ],
+            "the ss copy is kept and still read; only the copy-out folds: {got:?}"
         );
+    }
+
+    #[test]
+    fn fma_copy_out_only_re_homes_the_result_when_the_accumulator_is_dead() {
+        // No copy-in at all: the FMA accumulates in %xmm5, which is dead once
+        // its result has been copied to %xmm0.  Writing %xmm0 directly needs
+        // the form whose destination is a multiplicand.
+        let got =
+            fma_only("    vfmadd231sd %xmm1, %xmm0, %xmm5\n    movsd %xmm5, %xmm0\n    ret\n");
+        assert_eq!(got, vec!["vfmadd213sd %xmm5, %xmm1, %xmm0", "ret"]);
+        // ... and refuses when the accumulator is still read afterwards.
+        let got = fma_only(
+            "    vfmadd231sd %xmm1, %xmm0, %xmm5\n    movsd %xmm5, %xmm0\n    vaddsd %xmm5, %xmm0, %xmm0\n    ret\n",
+        );
+        assert_eq!(got.len(), 4, "%xmm5 is live: {got:?}");
+        // ... and when the result register is not one of the roles.
+        let got =
+            fma_only("    vfmadd231sd %xmm1, %xmm0, %xmm5\n    movsd %xmm5, %xmm7\n    ret\n");
+        assert_eq!(got.len(), 3, "no form writes %xmm7: {got:?}");
+    }
+
+    #[test]
+    fn fma_132_bracket_from_the_mul_add_shape_collapses_to_one_instruction() {
+        // `a * b + c` exactly as the codegen emits it: the addend staged out of
+        // the way, the multiplicand copied onto the accumulator home, a 132
+        // form, and the result copied to the return register.  Propagation
+        // and the dead sweep clear the first copy; this pass must clear the
+        // bracket, and the 132 form is kept as GCC's spelling.
+        let asm = body(
+            "    movsd %xmm2, %xmm4\n    movsd %xmm0, %xmm2\n    vfmadd132sd %xmm1, %xmm4, %xmm2\n    movsd %xmm2, %xmm0\n    ret\n",
+        );
+        assert_eq!(
+            insns(&run(&asm)),
+            vec!["vfmadd132sd %xmm1, %xmm2, %xmm0", "ret"],
+            "five instructions to one, GCC's exact text"
+        );
+    }
+
+    #[test]
+    fn fma_bracket_with_a_memory_multiplicand_keeps_it_at_operand_zero() {
+        // The memory role travels with the re-encoding: the result register is
+        // the register multiplicand, so the form flips to 132 and the memory
+        // operand stays where the ISA can encode it.
+        let got = fma_only(
+            "    vmovsd %xmm2, %xmm2, %xmm5\n    vfmadd231sd (%rdi), %xmm0, %xmm5\n    movsd %xmm5, %xmm0\n    ret\n",
+        );
+        assert_eq!(got, vec!["vfmadd132sd (%rdi), %xmm2, %xmm0", "ret"]);
+        // A second bracket where the result must be the ADDEND's register:
+        // 231 with the memory operand already in place.
+        let got = fma_only(
+            "    vmovsd %xmm2, %xmm2, %xmm5\n    vfmadd231sd (%rdi), %xmm0, %xmm5\n    movsd %xmm5, %xmm2\n    ret\n",
+        );
+        assert_eq!(got, vec!["vfmadd231sd (%rdi), %xmm0, %xmm2", "ret"]);
     }
 
     #[test]
@@ -1772,6 +2041,188 @@ mod tests {
             got.iter().any(|l| l == "vfmadd231sd %xmm1, %xmm0, %xmm5"),
             "a call splits the bracket: {got:?}"
         );
+    }
+
+    #[test]
+    fn fma_squared_norm_shape_with_a_swap_run_collapses_to_gcc_text() {
+        // `x * x + c`: the codegen saves x out of %xmm0, moves the addend in,
+        // and squares from the saved copy.  Both copies are one run whose
+        // origins are x -> %xmm0 and c -> %xmm1; the result is wanted in %xmm0,
+        // which is a multiplicand, so the 231 form cannot serve and the
+        // encoder picks 213: `%xmm0 = %xmm0 * %xmm0 + %xmm1`.  GCC spells the
+        // same instruction as `vfmadd132sd %xmm0, %xmm1, %xmm0`; the two are
+        // the same computation and the same length.
+        let got = fma_only(
+            "    movsd %xmm0, %xmm2\n    movsd %xmm1, %xmm0\n    vfmadd231sd %xmm2, %xmm2, %xmm0\n    ret\n",
+        );
+        assert_eq!(got, vec!["vfmadd213sd %xmm1, %xmm0, %xmm0", "ret"]);
+    }
+
+    #[test]
+    fn fma_run_refuses_when_any_deleted_destination_is_still_read() {
+        // Same run, but the saved copy of x in %xmm2 is read after the FMA:
+        // deleting the run would leave that read with a stale %xmm2.
+        let got = fma_only(
+            "    movsd %xmm0, %xmm2\n    movsd %xmm1, %xmm0\n    vfmadd231sd %xmm2, %xmm2, %xmm0\n    vaddsd %xmm2, %xmm0, %xmm0\n    ret\n",
+        );
+        assert_eq!(got.len(), 5, "%xmm2 is live after the FMA: {got:?}");
+        // And through a back edge: the loop top reads %xmm2 before the run
+        // redefines it, so it is live out of the FMA on the loop path.
+        let got = fma_only(
+            ".L1:\n    vaddsd %xmm2, %xmm3, %xmm3\n    movsd %xmm0, %xmm2\n    movsd %xmm1, %xmm0\n    vfmadd231sd %xmm2, %xmm2, %xmm0\n    jmp .L1\n",
+        );
+        assert!(
+            got.iter().any(|l| l == "movsd %xmm0, %xmm2"),
+            "the run must stay when the loop reads %xmm2: {got:?}"
+        );
+    }
+
+    #[test]
+    fn fma_run_follows_a_chain_of_copies_to_the_true_origin() {
+        // c travels %xmm2 -> %xmm4 -> %xmm5 before the FMA accumulates into
+        // %xmm5; the origin of the accumulator role is %xmm2.
+        let got = fma_only(
+            "    movsd %xmm2, %xmm4\n    movsd %xmm4, %xmm5\n    vfmadd231sd %xmm1, %xmm0, %xmm5\n    movsd %xmm5, %xmm0\n    ret\n",
+        );
+        assert_eq!(got, vec!["vfmadd213sd %xmm2, %xmm1, %xmm0", "ret"]);
+    }
+
+    #[test]
+    fn fma_run_stops_at_a_copy_that_does_not_feed_the_fma() {
+        // The first copy writes %xmm9, which is neither a role nor the source
+        // of a copy in the run: it is not part of the bracket and must stay.
+        let got = fma_only(
+            "    movsd %xmm7, %xmm9\n    vmovsd %xmm2, %xmm2, %xmm5\n    vfmadd231sd %xmm1, %xmm0, %xmm5\n    movsd %xmm5, %xmm0\n    ret\n",
+        );
+        assert_eq!(
+            got,
+            vec![
+                "movsd %xmm7, %xmm9",
+                "vfmadd213sd %xmm2, %xmm1, %xmm0",
+                "ret"
+            ]
+        );
+    }
+
+    #[test]
+    fn fma_result_register_upper_bits_are_protected() {
+        // The last copy into the result register %xmm0 is a VEX (zeroing)
+        // copy, so originally %xmm0's upper lane was zero after the bracket;
+        // after the rewrite it is whatever it was before.  A packed read of
+        // %xmm0 later in the function would see the difference: refuse.
+        let got = fma_only(
+            "    vmovsd %xmm1, %xmm1, %xmm0\n    vfmadd231sd %xmm2, %xmm2, %xmm0\n    vaddpd %xmm0, %xmm3, %xmm3\n    ret\n",
+        );
+        assert!(
+            got.iter().any(|l| l == "vmovsd %xmm1, %xmm1, %xmm0"),
+            "a wide reader of the result register keeps the zeroing copy: {got:?}"
+        );
+        // With only scalar readers the same bracket folds.  The result stays
+        // in %xmm0 (there is no copy-out), the accumulator's origin is %xmm1,
+        // and %xmm0 is the addend role, so 231 with the addend read from
+        // %xmm1 and the destination %xmm0 -- which is legal because the
+        // destination need not be a source in the 231 form only when it IS
+        // the addend; here the addend's value comes from %xmm1, so the
+        // encoder must put the result where the addend lives... which is not
+        // %xmm0.  No single instruction reads the addend from %xmm1 and
+        // writes %xmm0 while %xmm0 plays no role, so the bracket is refused.
+        // That is the correct answer: the copy is the cheapest way to move
+        // the addend, and the case belongs to register allocation.
+        let got = fma_only(
+            "    vmovsd %xmm1, %xmm1, %xmm0\n    vfmadd231sd %xmm2, %xmm2, %xmm0\n    vaddsd %xmm0, %xmm3, %xmm3\n    ret\n",
+        );
+        assert_eq!(
+            got.len(),
+            4,
+            "no form writes a register that holds no role: {got:?}"
+        );
+    }
+
+    /// Run just the result retarget and report the surviving lines.
+    fn retarget_only(text: &str) -> Vec<String> {
+        let mut store = LineStore::new(body(text));
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        retarget_vex_scalar_result(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|t| !t.is_empty() && !t.starts_with('.') && !t.ends_with(':'))
+            .collect()
+    }
+
+    #[test]
+    fn a_vex_producer_whose_result_is_only_copied_writes_the_target_directly() {
+        // `-a`: the sign flip lands in a fresh home and is copied to the
+        // return register.  One instruction, GCC's text.
+        assert_eq!(
+            retarget_only(
+                "    vxorpd .LCFP_0(%rip), %xmm0, %xmm3\n    movsd %xmm3, %xmm0\n    ret\n"
+            ),
+            vec!["vxorpd .LCFP_0(%rip), %xmm0, %xmm0", "ret"]
+        );
+        // Four-operand form with an immediate; float width; `D` a source.
+        assert_eq!(
+            retarget_only(
+                "    vroundss $9, %xmm1, %xmm1, %xmm3\n    movss %xmm3, %xmm1\n    ret\n"
+            ),
+            vec!["vroundss $9, %xmm1, %xmm1, %xmm1", "ret"]
+        );
+        // A packed producer with a scalar copy-out: the copy took the low
+        // element only, so the retarget is legal exactly when nothing reads
+        // the target wider than that element -- here nothing does.
+        assert_eq!(
+            retarget_only(
+                "    vandpd .LCFP_1(%rip), %xmm2, %xmm4\n    movsd %xmm4, %xmm0\n    ret\n"
+            ),
+            vec!["vandpd .LCFP_1(%rip), %xmm2, %xmm0", "ret"]
+        );
+    }
+
+    #[test]
+    fn the_result_retarget_refuses_every_case_it_must() {
+        // `T` still read afterwards.
+        let got = retarget_only(
+            "    vxorpd .LCFP_0(%rip), %xmm0, %xmm3\n    movsd %xmm3, %xmm0\n    vaddsd %xmm3, %xmm0, %xmm0\n    ret\n",
+        );
+        assert_eq!(got.len(), 4, "%xmm3 is live: {got:?}");
+        // `D` read wider than the element later: the copy-out preserved D's
+        // upper lane, the retargeted producer would not.
+        let got = retarget_only(
+            "    vsqrtsd %xmm1, %xmm1, %xmm3\n    movsd %xmm3, %xmm0\n    vaddpd %xmm0, %xmm2, %xmm2\n    ret\n",
+        );
+        assert_eq!(
+            got.len(),
+            4,
+            "a wide reader of %xmm0 keeps the copy-out: {got:?}"
+        );
+        // FMA producers belong to the accumulator rule, not this one.
+        let got =
+            retarget_only("    vfmadd231sd %xmm1, %xmm2, %xmm3\n    movsd %xmm3, %xmm0\n    ret\n");
+        assert_eq!(got.len(), 3, "an FMA reads its destination: {got:?}");
+        // A VEX (zeroing) copy-out is not the legacy merge this rule models.
+        let got = retarget_only(
+            "    vaddsd %xmm1, %xmm2, %xmm3\n    vmovsd %xmm3, %xmm3, %xmm0\n    ret\n",
+        );
+        assert_eq!(got.len(), 3, "{got:?}");
+        // A full-width copy-out reads all of T, which the retarget would
+        // leave undefined in D's upper lane.
+        let got =
+            retarget_only("    vaddsd %xmm1, %xmm2, %xmm3\n    movapd %xmm3, %xmm0\n    ret\n");
+        assert_eq!(got.len(), 3, "{got:?}");
+        // Not adjacent: a barrier between.
+        let got = retarget_only(
+            "    vaddsd %xmm1, %xmm2, %xmm3\n    call f\n    movsd %xmm3, %xmm0\n    ret\n",
+        );
+        assert_eq!(got.len(), 4, "{got:?}");
+        // Masked EVEX and %ymm spellings are out of scope.
+        let got =
+            retarget_only("    vaddsd %xmm1, %xmm2, %xmm3{%k1}\n    movsd %xmm3, %xmm0\n    ret\n");
+        assert_eq!(got.len(), 3, "{got:?}");
+        let got =
+            retarget_only("    vaddpd %ymm1, %ymm2, %ymm3\n    movsd %xmm3, %xmm0\n    ret\n");
+        assert_eq!(got.len(), 3, "{got:?}");
     }
 
     #[test]

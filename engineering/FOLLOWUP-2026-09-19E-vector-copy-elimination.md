@@ -1,17 +1,18 @@
-# Vector copy elimination: what landed, what it is worth, and the one thing left
+# Vector copy elimination: what landed, what it is worth, and what is left
 
-Status: landed. Follow-up: one item, instruction-selection level, sized below.
+Status: landed in two increments (PR #566/#567 and the follow-up below).
 
 ## What landed
 
-`src/backend/x86/codegen/peephole/passes/vector_copy.rs` — five passes, gated
-individually (`vector_copy_widen|fma|bracket|prop|dead`) and running in the
+`src/backend/x86/codegen/peephole/passes/vector_copy.rs` — six passes, gated
+individually (`vector_copy_widen|fma|retarget|bracket|prop|dead`) and running in the
 phase-1 fixed-point loop ahead of `dead_pure_writes`:
 
 | pass | what it removes |
 | --- | --- |
 | `widen_private_vector_copies` | legacy `movsd`/`movss` into a temporary nothing has defined yet becomes the full-width move of the same flavour, so the packed reads that follow can be served from the source |
-| `reassociate_fma_accumulator` | the FMA copy bracket, by rotating the 231 encoding into the 213 (or keeping 231 with a different destination) |
+| `reassociate_fma_accumulator` | the copies around a scalar FMA — a run of copy-ins, a copy-out, or both — by re-encoding the instruction (132/213/231) so the register the code wanted is its destination; `fma_forms.rs` holds the role algebra |
+| `retarget_vex_scalar_result` | a VEX arithmetic/logical producer whose result is only ever copied elsewhere writes that register directly (its destination is a plain output, unlike an FMA's) |
 | `coalesce_vector_brackets` | `copy-in / ops / copy-out` around a private temporary: the destination family is renamed to the source family and both copies go |
 | `propagate_vector_copies` | forward substitution of a copy's source into the reads of its destination, width-checked at every step |
 | `eliminate_dead_vector_copies` | a copy whose destination cannot be observed again, asked of `FpLiveness` rather than a textual scan |
@@ -70,56 +71,85 @@ Validation, all of it run, none of it assumed:
 * `cargo clippy --all-targets --profile fastbuild --locked -- -D warnings`: clean.
 * `cargo fmt --all -- --check`: clean.
 
-## The one thing left: FMA form selection belongs in instruction selection
+## Second increment: FMA form algebra, negation, self-moves
 
-The rotation that landed handles a *bracket*: copy-in, `vfmadd231`, copy-out, all
-registers. The general shape is wider, and the remaining cases are visible in the
-residual copy inventory of the gate's runtime kernel (48 vector register copies
-in a 60-function FP stress file):
+The first increment left "general FMA form selection" as an
+instruction-selection item.  Measured again, it is not one: every case in the
+inventory is a peephole re-encoding once the three forms are treated as what
+they are — one computation with the roles permuted.  `fma_forms.rs` is that
+table, with an exhaustive test (4 families × 3 forms × 2 widths × 2 memory
+placements × every choice of result register = 120 re-encodings, each checked
+for role preservation, destination, memory-operand position and round-trip).
 
-| count | shape | why it survives | correct? |
+What changed, `-O2 -march=x86-64-v3 -ffp-contract=fast`, GCC 16.2 on the same
+host:
+
+| source | before | after | gcc |
 | --- | --- | --- | --- |
-| 14 | `vmovsd %xmm15,%xmm15,%xmm2` then `andpd …,%xmm2` | the VEX merge form **defines** the upper bits as zero, so widening is refused and a 128-bit read cannot be served from a 64-bit copy | yes — folding it would change observable bits |
-| 11 | `movsd %xmm0,%xmm2` then `vfmsub132sd …,%xmm2` (and the copy-out-only variant `vfmsub132sd …,%xmm2` / `movsd %xmm2,%xmm0`) | the input form is 132, not 231, and in the copy-out-only variant the accumulator was placed by selection, not by a copy | no — this is real remaining waste |
-| 7 | `movapd %xmm2,%xmm4` in `fma_chain` | widened copy whose consumer's width does not match | needs case-by-case review |
-| 4 | `movsd %xmm2,%xmm0` then `ret` | the producer wrote a temporary; only selection can make the producer write `%xmm0` | no — same root cause as the 11 |
+| `a * b + c` | 5 | **1** `vfmadd132sd %xmm1, %xmm2, %xmm0` | 1 (identical text) |
+| `x * x + c` | 4 | **1** | 1 |
+| `__builtin_fma(a, *p, c)` | 3 | **1** `vfmadd132sd (%rdi), …` | 1 (identical text) |
+| `-x` (double / float) | 5 | **1** `vxorpd mask(%rip), %xmm0, %xmm0` | 1 (identical) |
+| `double t = -a; return sin(t) + t;` | 10 | **6** | 8 |
+| `chain` (the gate's residual) | 4 | **3** | 3 |
+| nbody `bodies[i].mass` FMA staging | `movsd` + FMA | FMA with memory operand | same |
 
-In the corpus the same shape occurs 4 times (68 FMA sites total: 52 in the 231
-form, 16 in the 132 form, none carrying a copy-in bracket), worth 4 instructions
-out of 8712 — 0.05%, which is why it is a follow-up and not a blocker.
+Three defects fixed on the way, each found by the census rather than by
+inspection:
 
-The general rule is: given any scalar FMA with destination `T` and a scalar
-copy-out `T -> D` where `T` is dead after the copy-out, rotate the encoding so
-`D` is the destination — 231 when `D` holds the addend, 213 when `D` holds a
-multiplicand and the addend is the memory operand (or there is none), 132 when
-`D` holds a multiplicand and the *other* multiplicand is the memory operand.
-The constraint that makes this fragile as a peephole is the memory operand: only
-Intel `src2` may be memory, which is AT&T operand 0 in all three forms, so the
-choice between 213 and 132 is dictated by which role the memory operand plays —
-and `chain` shows the deeper problem, where the constant `3.0` was allocated to
-`%xmm0` and so the accumulator could not be the return register at all:
+* `fold_fma_memory_src2` only folded a load feeding AT&T operand 0 of a 231
+  form.  A load feeding operand 1 (nbody, four sites) or any operand of a
+  132/213 form was left as a `movsd`; now the instruction is re-encoded so the
+  loaded role sits at operand 0, in whichever form allows it.
+* scalar FP negation went through the GPR accumulator: `movq %xmm, %rax;
+  movabsq $sign, %rcx; xorq; movq %rax, %xmm; movsd` — five instructions and
+  two domain crossings where every oracle emits one `vxorpd`.  Fixed at the
+  emitter (`emit_fp_neg_direct`), which also unblocks the contraction of
+  `-(a*b) - c` shapes that the GPR detour had hidden from the FMA fuser.
+* `eliminate_vector_self_moves` did not know the legacy scalar spellings
+  (`movsd %xmm0, %xmm0`) or the VEX three-operand one; five survived in the
+  corpus.
 
-```text
-vaddsd .LCFP_2(%rip), %xmm0, %xmm2      gcc:  vaddsd .LC2(%rip), %xmm0, %xmm0
-movsd  .LCFP_4(%rip), %xmm0                   vmovsd .LC3(%rip), %xmm1
-vfmsub132sd .LCFP_3(%rip), %xmm0, %xmm2        vfmsub132sd .LC4(%rip), %xmm1, %xmm0
-movsd  %xmm2, %xmm0                     (4)                                    (3)
-```
+Corpus (51 archived benchmarks): **8646 → 8627 instructions**, ratio to
+best-of-oracles **1.4619 → 1.4591**, vector register copies **40 → 31**, GPR
+sign-flip negates **4 → 0**, no regressions (`libm_round_family` 217 → 207,
+`nbody` 319 → 312, `struct_copy` 138 → 136).  Gate budgets are pinned to the
+new numbers; the runtime kernel's copy budget is 42 (was 48).
 
-Selecting the accumulator form while the value is still in the selector — and
-preferring the return register as the accumulator for a tail FMA — removes both
-the 11 and the 4, and is where GCC and Clang get their answer. That is an
-instruction-selection change with a register-allocation interaction, not a text
-rewrite, and it should not be attempted inside a peephole that has already been
-proved sound on a narrower contract.
+Validation: `cargo test` 3036 passed / 0 failed; the gate 35 checks including a
+new FMA-algebra kernel (builtins bit-exact against GCC; contracted kernels
+checked against their builtin twins inside the same binary, since
+`-ffp-contract=fast` output is not comparable across compilers; per-encoding
+anti-vacuity), and a negation kernel bit-exact against GCC at seven flag sets
+(`-O0`…`-O3`, v2/v3, with and without contraction) that also asserts zero GPR
+sign-mask round trips; `check_benchmark_outputs.sh` 204/204; clippy `-D
+warnings` clean; rustfmt clean.
+
+## What is left
+
+Two items, both now register allocation rather than encoding:
+
+* **Copy-in with no copy-out** (`movsd %S, %T; vfmadd… %T`, result staying in
+  `T`): a loop accumulator the allocator did not coalesce.  The result's home is
+  right; the staging is the waste.  4 corpus sites.
+* **`fma(-a, b, -c)` builtin sign variants**: the negations are separate
+  `vxorpd`s feeding a `vfmadd`; GCC folds them into `vfnmsub`.  That is a
+  simplify-level rewrite of `Neg` into the FMA's sign family, not an encoding
+  question.  Zero corpus sites; the gate's algebra kernel excludes these from
+  its one-instruction list and says so.
+
+The residual 31 corpus copies and the runtime kernel's 42 are inventoried by
+the census scripts in this document's history; 14 of the kernel's are VEX
+merge-form copies whose zeroed upper bits a 128-bit `andpd` genuinely reads,
+and they are correct to keep.
 
 ## Reproducing every number above
 
 ```sh
 scripts/arena_session_restore.sh                       # toolchain, swap, git, kernel tree
 cargo build --profile fastbuild --locked -j 2
-tests/regression/check_vector_copy_elimination.sh      # shapes, runtime differential, ratchet
+tests/regression/check_vector_copy_elimination.sh      # shapes, runtime differentials, ratchet
 scripts/check_benchmark_outputs.sh                     # 204 differential runs vs GCC
-scripts/ci_local.sh --fast                             # 48 gates
+scripts/ci_local.sh                                    # every gate
 cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
 ```
