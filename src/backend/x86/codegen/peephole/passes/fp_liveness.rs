@@ -33,7 +33,10 @@
 //!
 //! One backward dataflow per function over a combined fact vector:
 //!
-//! * bits `0..16`  — `%xmm0`..`%xmm15` (a `%ymmN` mention aliases `%xmmN`);
+//! * bits `0..16`  — `%xmm0`..`%xmm15` (a `%ymmN` or `%zmmN` mention aliases
+//!   `%xmmN`: all three spellings name the same physical register's low 128
+//!   bits, and an EVEX writemask makes the destination a partial write, so it
+//!   stays a read);
 //! * bits `16..`   — frame slots, interned per function as `(base, offset,
 //!   byte-size)` triples.  A slot is *read* by any instruction whose text
 //!   contains a memory operand overlapping it, unless that instruction is a
@@ -325,11 +328,24 @@ impl FpLiveness {
     }
 }
 
-/// Parse `%xmmN` / `%ymmN` (N < 16) at the START of `op`; returns N.
+/// Parse `%xmmN` / `%ymmN` / `%zmmN` (N < 16) at the START of `op`; returns N.
+///
+/// All three spellings name the same physical register's low 128 bits, so all
+/// three must report the same N: an AVX-512 `vaddpd %zmm3, %zmm4, %zmm5` reads
+/// `%xmm3` and `%xmm4` and writes `%xmm5` exactly as the `%ymm` spelling does.
+/// Missing the `%zmm` spelling made this oracle answer "dead" for a register a
+/// later EVEX instruction still read, and every consumer of that answer
+/// (`eliminate_fp_xmm_roundtrips`, the dead-write and store-forwarding folds)
+/// deletes code on the strength of it.
+///
+/// N >= 16 returns `None` on purpose: `%xmm16`..`%xmm31` exist only under
+/// AVX-512, this model tracks 16 registers, and an untracked register is a
+/// distinct physical one — ignoring it cannot make a tracked register look dead.
 fn xmm_index(op: &str) -> Option<u32> {
     let rest = op
         .strip_prefix("%xmm")
-        .or_else(|| op.strip_prefix("%ymm"))?;
+        .or_else(|| op.strip_prefix("%ymm"))
+        .or_else(|| op.strip_prefix("%zmm"))?;
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
     if digits == 0 || digits > 2 || rest.len() != digits {
         return None;
@@ -338,14 +354,18 @@ fn xmm_index(op: &str) -> Option<u32> {
     (n < 16).then_some(n)
 }
 
-/// Bitmask of every `%xmmN`/`%ymmN` mentioned anywhere in `t`.
+/// Bitmask of every `%xmmN`/`%ymmN`/`%zmmN` (N < 16) mentioned anywhere in `t`.
+///
+/// The `%zmm` spelling is included for the aliasing reason given on
+/// [`xmm_index`].  A mention inside an EVEX writemask suffix (`%zmm3{%k1}`)
+/// counts as a mention too, which is what keeps masked writes conservative.
 fn xmm_mentions(t: &str) -> u64 {
     let b = t.as_bytes();
     let mut mask = 0u64;
     let mut i = 0;
     while i + 4 < b.len() {
         if b[i] == b'%'
-            && (b[i + 1] == b'x' || b[i + 1] == b'y')
+            && (b[i + 1] == b'x' || b[i + 1] == b'y' || b[i + 1] == b'z')
             && b[i + 2] == b'm'
             && b[i + 3] == b'm'
         {
@@ -1048,7 +1068,15 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                 let mut reads = mentioned;
                 let mut writes = 0u64;
                 let dest = dest_operand(operands);
-                if let Some(d) = dest {
+                // An EVEX writemask (`%zmm3{%k1}`, with or without `{z}`) makes
+                // the destination write PARTIAL: merge-masking leaves the
+                // inactive lanes at their old value and zero-masking zeroes only
+                // the active ones.  Neither is a full definition, so the
+                // destination must stay a read.  `xmm_index` already declines
+                // the masked spelling; this guard states the reason and keeps
+                // the answer correct if that parser ever learns to strip masks.
+                let masked_dest = dest.is_some_and(|d| d.contains("{%k"));
+                if let Some(d) = dest.filter(|_| !masked_dest) {
                     if let Some(dn) = xmm_index(d) {
                         let bit = 1u64 << dn;
                         let srcs = match last_top_level_comma(operands.as_bytes()) {
@@ -1287,6 +1315,81 @@ mod tests {
         assert_eq!(xmm_index("%xmm16"), None);
         assert_eq!(xmm_index("%ymm0"), Some(0));
         assert_eq!(xmm_index("(%rax)"), None);
+    }
+
+    #[test]
+    fn zmm_mentions_alias_the_same_xmm() {
+        // The aliasing hole this pins: an EVEX instruction reads and writes the
+        // low 128 bits of the same physical registers the SSE spelling does.
+        assert_eq!(
+            xmm_mentions("vaddpd %zmm3, %zmm4, %zmm5"),
+            (1 << 3) | (1 << 4) | (1 << 5)
+        );
+        assert_eq!(xmm_index("%zmm7"), Some(7));
+        assert_eq!(xmm_index("%zmm0"), Some(0));
+        // Untracked registers are distinct physical ones: reporting None keeps
+        // them out of the model without making a tracked register look dead.
+        assert_eq!(xmm_index("%zmm16"), None);
+        assert_eq!(xmm_index("%zmm20"), None);
+        assert_eq!(xmm_mentions("vaddpd %zmm20, %zmm21, %zmm22"), 0);
+        // A masked destination still counts as a mention of its register.
+        assert_eq!(xmm_mentions("vaddpd %zmm1, %zmm2, %zmm3{%k1}"), 0b1110);
+        assert_eq!(xmm_index("%zmm3{%k1}"), None);
+    }
+
+    #[test]
+    fn a_zmm_read_keeps_the_aliased_xmm_live() {
+        // Before the aliasing fix this answered "dead": the scan saw no `%xmm1`
+        // spelling, so a fold was free to delete the value `%zmm1` still reads.
+        let (store, infos, lv) =
+            build("    vmovsd %xmm0, %xmm1\n    vaddpd %zmm1, %zmm2, %zmm3\n    vzeroupper\n");
+        let i = line_of(&store, "vmovsd %xmm0, %xmm1");
+        assert_eq!(
+            lv.xmm_live_after(i, 1),
+            Some(true),
+            "the %zmm1 read must keep %xmm1 live"
+        );
+        assert!(!lv.xmm_dead_after(&store, &infos, i, 1, &[i]));
+    }
+
+    #[test]
+    fn a_masked_evex_write_is_not_a_full_definition() {
+        // The discriminating question is what the instruction does to the value
+        // ALREADY in the destination.  Merge-masking reads the inactive lanes
+        // from it and zero-masking zeroes only the active ones, so under either
+        // mask the predecessor's definition stays live into the instruction.
+        // Unmasked, the same mnemonic is a full definition and kills it.
+        let masked = [
+            "vaddpd %zmm1, %zmm1, %zmm2{%k1}",
+            "vaddpd %zmm1, %zmm1, %zmm2{%k1}{z}",
+        ];
+        for op in masked {
+            let (store, _infos, lv) = build(&format!(
+                "    vmovapd %xmm4, %xmm2\n    {op}\n    vmovsd %xmm2, %xmm0\n"
+            ));
+            let def = line_of(&store, "vmovapd %xmm4, %xmm2");
+            assert_eq!(
+                lv.xmm_live_after(def, 2),
+                Some(true),
+                "a masked destination still reads its incoming value: {op}"
+            );
+        }
+        let (store, _infos, lv) = build(
+            "    vmovapd %xmm4, %xmm2\n    vaddpd %zmm1, %zmm1, %zmm2\n    vmovsd %xmm2, %xmm0\n",
+        );
+        let def = line_of(&store, "vmovapd %xmm4, %xmm2");
+        assert_eq!(
+            lv.xmm_live_after(def, 2),
+            Some(false),
+            "unmasked, the EVEX write is a full definition and kills the old value"
+        );
+        // And the unmasked full-width %zmm spelling still defines %xmm2, so the
+        // aliasing fix must not make the oracle conservative to the point of
+        // losing that answer: nothing after this line reads it.
+        let (store, infos, lv) = build("    vmovapd %zmm4, %zmm2\n    vzeroupper\n");
+        let i = line_of(&store, "vmovapd");
+        assert_eq!(lv.xmm_live_after(i, 2), Some(false));
+        assert!(lv.xmm_dead_after(&store, &infos, i, 2, &[i]));
     }
 
     #[test]

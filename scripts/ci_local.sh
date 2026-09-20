@@ -359,6 +359,19 @@ gate "range-fold-branch" fast \
 gate "boot-size-measurement" fast \
     bash tests/regression/check_boot_size_measurement.sh
 
+# Vector copy elimination.  The GP copy machinery declines every vector family
+# by construction (`is_xmm_family` keeps families 24..39 out of the GP reg_refs
+# bitmask, and copy_propagation / coalesce_register_copies /
+# eliminate_dead_pure_writes all bail out on a register they cannot represent),
+# so the copy-in/copy-out brackets the FP codegen emits around every temporary
+# survived to the assembler: `__builtin_floor` as three instructions where ICX
+# emits one vroundsd, `double t = a; t += b; return t;` as four where GCC, Clang
+# and ICX all emit one vaddsd.  This gate pins the instruction shapes, the
+# runtime equality with GCC on kernels built to hit every legality rule of the
+# new pass, and a corpus ratchet so the copies cannot come back unmeasured.
+gate "vector-copy-elimination" fast \
+    bash tests/regression/check_vector_copy_elimination.sh
+
 # Process-global state hygiene.  Four invariants, each grep-checkable, each one
 # a defect this tree actually had: tests mutated the environment behind five
 # deferred-audit markers whose premise (single-threaded access) cargo's test

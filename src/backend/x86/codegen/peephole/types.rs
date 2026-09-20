@@ -16,6 +16,14 @@ pub(super) const REG_NONE: RegId = 255;
 /// register-to-register moves via reg_id_to_name).
 pub(super) const REG_GP_MAX: RegId = 15;
 
+/// Family id of `%xmm0`/`%ymm0`/`%zmm0`.  Vector register N of any width is
+/// family `VEC_FAMILY_BASE + N`, so the sixteen tracked vector registers occupy
+/// 24..39.  They are families rather than a separate namespace because the
+/// question every pass asks is the same one — "does this line touch this
+/// physical register" — and `%ymm2` touching `%xmm2`'s bits is exactly the
+/// `%ah`/`%rax` aliasing the GP families already model.
+pub(super) const VEC_FAMILY_BASE: RegId = 24;
+
 /// Sentinel value for `rbp_offset` meaning "no %rbp reference" or "multiple/complex references".
 pub(super) const RBP_OFFSET_NONE: i32 = i32::MIN;
 
@@ -1030,7 +1038,7 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
 /// represented in the GP reg_refs bitmask and must not be handled by the
 /// GP-oriented StoreRbp/LoadRbp consumers.
 pub(super) fn is_xmm_family(reg_id: RegId) -> bool {
-    (24..=39).contains(&reg_id)
+    (VEC_FAMILY_BASE..VEC_FAMILY_BASE + 16).contains(&reg_id)
 }
 
 /// Parse `movX %reg, offset(%rbp)` (store to rbp-relative slot).
@@ -1695,12 +1703,18 @@ pub(super) fn register_family_fast(reg: &str) -> RegId {
         },
         // MMX registers: %mm0..%mm7 → families 16..23
         b'm' if len == 4 && b[2] == b'm' && b[3] >= b'0' && b[3] <= b'7' => 16 + (b[3] - b'0'),
-        // XMM registers: %xmm0..%xmm15 → families 24..39
-        b'x' if len >= 5 && b[2] == b'm' && b[3] == b'm' => {
-            if len == 5 && b[4] >= b'0' && b[4] <= b'9' {
-                24 + (b[4] - b'0')
+        // Vector registers: %xmm0..%xmm15 → families 24..39, and the %ymm/%zmm
+        // spellings of the same number join them.  All three name one physical
+        // register at three widths, so a pass asking whether a line touches
+        // family 26 gets the same answer for `%xmm2`, `%ymm2` and `%zmm2` — the
+        // vector counterpart of %rax/%eax/%ax/%ah sharing family 0.  Numbers
+        // above 15 exist only under AVX-512 and are untracked: they are distinct
+        // physical registers, so declining them cannot hide a tracked one.
+        b'x' | b'y' | b'z' if len >= 5 && b[2] == b'm' && b[3] == b'm' => {
+            if len == 5 && b[4].is_ascii_digit() {
+                VEC_FAMILY_BASE + (b[4] - b'0')
             } else if len == 6 && b[4] == b'1' && b[5] >= b'0' && b[5] <= b'5' {
-                34 + (b[5] - b'0') // xmm10..xmm15
+                VEC_FAMILY_BASE + 10 + (b[5] - b'0') // 10..15
             } else {
                 REG_NONE
             }
@@ -1783,7 +1797,9 @@ pub(super) fn scan_register_refs_explicit(b: &[u8]) -> u16 {
 
 /// The GP family named by the register identifier starting at `b[j]` — the byte
 /// AFTER a `%`.  `None` when it names no GP family: a segment (`%cs`), a
-/// control register (`%cr0`), a vector register (`%xmm1`), or a truncated tail.
+/// control register (`%cr0`), a vector register (`%xmm1` — see
+/// [`vector_family_at`], the other half of [`mentions_family`]), or a truncated
+/// tail.
 ///
 /// ONE spelling oracle for the whole text pipeline.  `scan_register_refs`
 /// accumulates it into the per-line bitmask and `mentions_family` answers the
@@ -1904,12 +1920,53 @@ fn register_family_at(b: &[u8], j: usize) -> Option<RegId> {
 pub(super) fn mentions_family(b: &[u8], fam: RegId) -> bool {
     let mut i = 0;
     while i + 1 < b.len() {
-        if b[i] == b'%' && register_family_at(b, i + 1) == Some(fam) {
+        if b[i] == b'%'
+            && (register_family_at(b, i + 1) == Some(fam)
+                || vector_family_at(b, i + 1) == Some(fam))
+        {
             return true;
         }
         i += 1;
     }
     false
+}
+
+/// The VECTOR family named by the register identifier starting at `b[j]` — the
+/// byte AFTER a `%`.  `None` when it names no tracked vector register.
+///
+/// [`register_family_at`] is the GP half of this query and stays GP-only on
+/// purpose: it feeds `scan_register_refs_explicit`, whose `u16` bitmask has no
+/// room for families above 15 (`1u16 << 24` is a shift overflow, not a bit).
+/// Splitting the two spellings behind one `mentions_family` keeps the property
+/// that made the shared oracle worth having — no pass can hold a private
+/// register scanner that disagrees with the veto everyone else consults — while
+/// the bitmask keeps exactly the GP meaning its consumers assume.
+///
+/// `%xmmN`, `%ymmN` and `%zmmN` all report `VEC_FAMILY_BASE + N` for N <= 15;
+/// N >= 16 reports `None` for the reason given on [`register_family_fast`].
+fn vector_family_at(b: &[u8], j: usize) -> Option<RegId> {
+    // Shortest tracked spelling is "%xmm0" → four bytes from j.
+    if j + 4 > b.len()
+        || !matches!(b[j], b'x' | b'y' | b'z')
+        || b[j + 1] != b'm'
+        || b[j + 2] != b'm'
+    {
+        return None;
+    }
+    let mut k = j + 3;
+    let mut n = 0u16;
+    let mut digits = 0;
+    while k < b.len() && b[k].is_ascii_digit() && digits < 2 {
+        n = n * 10 + u16::from(b[k] - b'0');
+        k += 1;
+        digits += 1;
+    }
+    // No digits, or a number the model does not track, or a third digit that
+    // makes this an identifier rather than a register name.
+    if digits == 0 || n > 15 || (k < b.len() && b[k].is_ascii_digit()) {
+        return None;
+    }
+    Some(VEC_FAMILY_BASE + n as RegId)
 }
 
 // ── Implicit register operands ───────────────────────────────────────────────
@@ -2464,21 +2521,34 @@ mod implicit_oracle_tests {
 
 #[cfg(test)]
 mod register_spelling_oracle_tests {
-    use super::{REG_NAMES, mentions_family, scan_register_refs, scan_register_refs_explicit};
+    use super::{
+        REG_NAMES, REG_NONE, VEC_FAMILY_BASE, is_xmm_family, mentions_family, register_family_fast,
+        scan_register_refs, scan_register_refs_explicit,
+    };
+
+    /// GP families are 0..=15; `RegId` is private to the parent, so the bound is
+    /// restated here rather than imported.
+    const REG_GP_MAX_LOCAL: u16 = 15;
 
     /// Every spelling the codegen can emit, the high-byte aliases it cannot,
     /// and the look-alikes that must not be mistaken for either.  The oracle's
     /// answer is a property of the TEXT, so the text is what gets enumerated.
-    const NAMES: [&str; 26] = [
+    const NAMES: [&str; 33] = [
         // 64-bit, 32-bit, 16-bit, 8-bit — a sample of every row, including the
         // two-digit extended registers whose spelling rules differ.
         "%rax", "%ecx", "%rdx", "%bl", "%rsp", "%bpl", "%rsi", "%dil", "%r8", "%r9d", "%r10w",
         "%r15b", "%cx", "%cl", "%al", "%dx",
         // High-byte aliases: families 0-3 only, and invisible to REG_NAMES.
         "%ah", "%bh", "%ch", "%dh",
-        // Look-alikes: a segment, a control register, a vector register, the
-        // PC-relative base, and truncated or doubled spellings.
-        "%cs", "%cr0", "%xmm1", "%rip", "%r", "%c",
+        // Vector spellings: all three widths of one tracked number, the
+        // two-digit boundary, and the AVX-512 numbers this model does not track.
+        // Without these the corpus is GP-only and every vector property below
+        // passes over text containing no vector register — the vacuous-pass
+        // failure mode the crate's other gates explicitly guard against.
+        "%xmm1", "%xmm0", "%xmm15", "%ymm2", "%ymm15", "%zmm7", "%ymm16", "%zmm20",
+        // Look-alikes: a segment, a control register, the PC-relative base, and
+        // truncated or doubled spellings.
+        "%cs", "%cr0", "%rip", "%r", "%c",
     ];
 
     /// Operand shapes the passes actually hand the oracle: a bare name, a
@@ -2578,6 +2648,138 @@ mod register_spelling_oracle_tests {
                         "{name} does not mention family {other}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn vector_spellings_share_one_family() {
+        // One physical register, three widths, one family — the vector
+        // counterpart of %rax/%eax/%ax/%ah all reporting family 0.
+        for n in 0u8..16 {
+            let fam = VEC_FAMILY_BASE + n;
+            assert_eq!(register_family_fast(&format!("%xmm{n}")), fam);
+            assert_eq!(register_family_fast(&format!("%ymm{n}")), fam);
+            assert_eq!(register_family_fast(&format!("%zmm{n}")), fam);
+            assert!(is_xmm_family(fam));
+            let line = format!("vaddpd %ymm{n}, %ymm1, %ymm2");
+            assert!(
+                mentions_family(line.as_bytes(), fam),
+                "mentions_family must see %ymm{n} as family {fam}"
+            );
+        }
+        // Untracked numbers are distinct physical registers, so declining them
+        // is correct rather than conservative-by-accident.
+        for spelling in ["%xmm16", "%ymm16", "%zmm20", "%zmm31"] {
+            assert_eq!(register_family_fast(spelling), REG_NONE, "{spelling}");
+        }
+        assert!(!mentions_family(
+            b"vaddpd %zmm20, %zmm21, %zmm4",
+            VEC_FAMILY_BASE + 5
+        ));
+        // A vector spelling is not a GP family and vice versa.
+        assert!(!mentions_family(b"vaddpd %ymm2, %ymm3, %ymm4", 2));
+        assert!(!mentions_family(b"movq %rdx, %rax", VEC_FAMILY_BASE + 2));
+        // Identifiers that merely START like a register name are over-reported,
+        // exactly as the GP half over-reports `%raxfoo`: a mention oracle feeds
+        // vetoes, and a veto that fires too often only blocks a fold, while one
+        // that misses deletes live code.
+        assert!(mentions_family(
+            b"vaddpd %ymm2foo, %ymm3",
+            VEC_FAMILY_BASE + 2
+        ));
+        // The digit boundary, by contrast, must be strict: reading `%xmm1` out
+        // of `%xmm15` would aim a rewrite at the wrong register.
+        assert!(!mentions_family(
+            b"vaddpd %xmm15, %ymm3",
+            VEC_FAMILY_BASE + 1
+        ));
+        assert!(!mentions_family(
+            b"vaddpd %xmm155, %ymm3",
+            VEC_FAMILY_BASE + 15
+        ));
+        assert_eq!(register_family_fast("%ymm"), REG_NONE);
+        assert_eq!(register_family_fast("%xmm155"), REG_NONE);
+    }
+
+    #[test]
+    fn the_gp_bitmask_stays_gp_only() {
+        // `reg_refs` is a u16 GP bitmask: vector families have no bit in it, and
+        // accumulating one would be `1u16 << 24` — a shift overflow in debug
+        // builds and a corrupted veto in release.  The two halves of
+        // `mentions_family` exist so this stays true while the query is complete.
+        assert_eq!(
+            scan_register_refs_explicit(b"vaddpd %ymm2, %ymm3, %ymm4"),
+            0
+        );
+        assert_eq!(
+            scan_register_refs_explicit(b"vfmadd231sd %xmm1, %rax, %xmm0"),
+            1 << 0,
+            "the GP operand still contributes its bit"
+        );
+        assert_eq!(
+            scan_register_refs_explicit(b"vmovdqu %zmm7, (%rdi,%rcx,4)"),
+            (1 << 7) | (1 << 1)
+        );
+        // Systematically, rather than over the corpus: the leak this test is
+        // named for is a vector mention setting a GP bit, so enumerate the vector
+        // spellings against every register number and both operand shapes.  A
+        // corpus loop asserting `x & 0xF000 == 0 | (x & 0xF000)` lived here once;
+        // it was a tautology and caught nothing, and 0xF000 is inside the u16
+        // anyway, so it was not even testing overflow.  The corpus differential
+        // that IS worth running -- does the mention oracle agree with an
+        // independent scan, in both directions -- is the next test, where the
+        // vector side is the thing being decided.
+        for prefix in ["xmm", "ymm", "zmm"] {
+            for n in 0..16u8 {
+                let only_vector = format!("vaddpd %{prefix}{n}, %{prefix}{n}, %{prefix}{n}");
+                assert_eq!(
+                    scan_register_refs_explicit(only_vector.as_bytes()),
+                    0,
+                    "{only_vector} must contribute no GP bit"
+                );
+                let with_gp_index = format!("vmovdqu %{prefix}{n}, (%rdi,%rcx,4)");
+                assert_eq!(
+                    scan_register_refs_explicit(with_gp_index.as_bytes()),
+                    (1 << 7) | (1 << 1),
+                    "{with_gp_index} must set exactly the two GP index bits"
+                );
+                // The digit-boundary case: %xmm15 must not be read as %xmm1 plus
+                // a stray 5, and neither reading may reach the GP mask.
+                let fifteen = format!("vaddpd %{prefix}15, %{prefix}1{n}, %{prefix}{n}");
+                assert_eq!(
+                    scan_register_refs_explicit(fifteen.as_bytes()),
+                    0,
+                    "{fifteen} must contribute no GP bit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vector_mentions_agree_with_an_independent_scan() {
+        // The oracle against a deliberately naive scanner over the committed
+        // assembly corpus, in BOTH directions.  Under-reporting a mention is the
+        // unsound one — it is a veto that fails to fire — but a false positive
+        // here would mean the digit parser stopped early and read `%xmm1` out of
+        // `%xmm15`, which would silently aim a rewrite at the wrong register.
+        for text in corpus() {
+            for n in 0u8..16 {
+                let fam = VEC_FAMILY_BASE + n;
+                let spelled = ["xmm", "ymm", "zmm"].iter().any(|prefix| {
+                    let needle = format!("%{prefix}{n}");
+                    text.match_indices(&needle).any(|(i, _)| {
+                        text[i + needle.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+                    })
+                });
+                let got = mentions_family(text.as_bytes(), fam);
+                assert_eq!(
+                    got, spelled,
+                    "family {fam} (%xmm/%ymm/%zmm{n}): oracle={got} spelled={spelled} in {text:?}"
+                );
             }
         }
     }
