@@ -122,17 +122,74 @@ fn collect_use_sites(func: &IrFunction) -> FxHashMap<u32, Vec<UseSite>> {
     uses
 }
 
+/// The load-sink pass's switches, resolved ONCE per compile by `run_passes`.
+///
+/// Both used to be read out of the process environment per function — an
+/// `environ` scan and an `OsString` allocation each — for values that cannot
+/// change mid-compile.
+#[derive(Clone, Copy)]
+pub(crate) struct SinkEnv {
+    /// Whether the pass runs at all: `CCC_NO_VEC_LOAD_SINK` unset.
+    pub(crate) enabled: bool,
+    /// Whether moves are traced: `CCC_DEBUG_VEC_LOAD_SINK`.
+    pub(crate) trace: bool,
+}
+
+/// The environment-unset configuration, which is also the default for an entry
+/// point that never went through `run_passes` (unit tests).
+const SINK_ENV_DEFAULT: SinkEnv = SinkEnv {
+    enabled: true,
+    trace: false,
+};
+
+thread_local! {
+    /// This thread's switches.  The documented kill switch is
+    /// `CCC_NO_VEC_LOAD_SINK`; see [`SinkEnv`] for what moved here and why.
+    ///
+    /// Resolved ONCE by `run_passes`; see `INTERLEAVE_ENABLED` in
+    /// `vec_interleave.rs` for why a pass must not read the process environment
+    /// per call (an `environ` scan and an `OsString` allocation per function, and
+    /// process-global state that the kill-switch test then had to mutate under
+    /// every sibling test).  Defaults are the environment-unset defaults, so an
+    /// entry point that never went through `run_passes` behaves as before.
+    static SINK_ENV: std::cell::Cell<SinkEnv> = const { std::cell::Cell::new(SINK_ENV_DEFAULT) };
+}
+
+/// Record the sink pass's switches for this thread.  Called by `run_passes`.
+pub(crate) fn set_vec_load_sink_env(env: SinkEnv) {
+    SINK_ENV.with(|cell| cell.set(env));
+}
+
+#[inline]
+fn sink_env() -> SinkEnv {
+    SINK_ENV.with(std::cell::Cell::get)
+}
+
+#[inline]
+fn vec_load_sink_enabled() -> bool {
+    sink_env().enabled
+}
+
+#[inline]
+fn set_sink_enabled(enabled: bool) {
+    SINK_ENV.with(|cell| {
+        let mut env = cell.get();
+        env.enabled = enabled;
+        cell.set(env);
+    });
+}
+
 /// Sink single-use pure vector loads next to their consumer.  Returns the
 /// number of loads moved.
 pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
-    if std::env::var_os("CCC_NO_VEC_LOAD_SINK").is_some() {
+    if !vec_load_sink_enabled() {
         return 0;
     }
     if func.is_declaration || func.blocks.is_empty() {
         return 0;
     }
     let mut uses = collect_use_sites(func);
-    let debug = std::env::var_os("CCC_DEBUG_VEC_LOAD_SINK").is_some();
+    let debug = sink_env().trace;
     let mut moved = 0usize;
 
     for (bi, block) in func.blocks.iter_mut().enumerate() {
@@ -239,17 +296,11 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
 mod tests {
     use super::*;
 
-    /// Serializes every test that reaches the pass entry: `sink_vector_loads`
-    /// reads CCC_NO_VEC_LOAD_SINK and environment variables are
-    /// PROCESS-GLOBAL, so the kill-switch test's set/remove window otherwise
-    /// races with the other tests' env reads under cargo's default test
-    /// parallelism.  Every call below goes through sink_locked.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn sink_locked(f: &mut IrFunction) -> usize {
-        let _g = ENV_LOCK.lock().unwrap();
-        sink_vector_loads(f)
-    }
+    // The switch is per-thread state now, so there is nothing to serialize:
+    // this module used to hold its own `ENV_LOCK` and route every call through
+    // a `sink_locked` wrapper.  A per-module lock never covered another
+    // module's `environ` read, and cargo runs every module's tests on one
+    // shared pool.
     use crate::common::source::Span;
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::intrinsics::IntrinsicOp as O;
@@ -340,7 +391,7 @@ mod tests {
                 vstore(41, 4, 35),
             ],
         ));
-        assert_eq!(sink_locked(&mut f), 1);
+        assert_eq!(sink_vector_loads(&mut f), 1);
         assert_eq!(
             ops(&f, 0),
             vec![
@@ -352,7 +403,7 @@ mod tests {
             ]
         );
         // Idempotent: nothing left to move.
-        assert_eq!(sink_locked(&mut f), 0);
+        assert_eq!(sink_vector_loads(&mut f), 0);
     }
 
     /// `add(load_a, load_b)`: `load_b` is adjacent already; `load_a` sits at
@@ -370,7 +421,7 @@ mod tests {
                 vstore(42, 4, 38),
             ],
         ));
-        assert_eq!(sink_locked(&mut f), 1);
+        assert_eq!(sink_vector_loads(&mut f), 1);
         assert_eq!(
             ops(&f, 0),
             vec![
@@ -402,7 +453,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        assert_eq!(sink_locked(&mut f), 0);
+        assert_eq!(sink_vector_loads(&mut f), 0);
         assert_eq!(ops(&f, 0)[0], "VecLoadF32x8:37");
     }
 
@@ -419,7 +470,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        assert_eq!(sink_locked(&mut f), 0);
+        assert_eq!(sink_vector_loads(&mut f), 0);
     }
 
     /// A call is opaque (may write the loaded memory): blocks.
@@ -439,7 +490,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        assert_eq!(sink_locked(&mut f), 0);
+        assert_eq!(sink_vector_loads(&mut f), 0);
     }
 
     /// A volatile scalar load is an observable side effect: blocks.
@@ -455,7 +506,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        assert_eq!(sink_locked(&mut f), 0);
+        assert_eq!(sink_vector_loads(&mut f), 0);
     }
 
     /// Non-volatile scalar loads and scalar arithmetic are transparent.
@@ -478,7 +529,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        assert_eq!(sink_locked(&mut f), 1);
+        assert_eq!(sink_vector_loads(&mut f), 1);
         assert_eq!(ops(&f, 0)[3], "VecLoadF32x8:37");
         assert_eq!(ops(&f, 0)[4], "VecAddF32x8:41");
     }
@@ -496,7 +547,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 42, 37, 41),
             ],
         ));
-        assert_eq!(sink_locked(&mut f), 0);
+        assert_eq!(sink_vector_loads(&mut f), 0);
     }
 
     /// A use in another block disqualifies the load (no cross-block motion).
@@ -509,7 +560,7 @@ mod tests {
         ));
         f.blocks
             .push(block(1, vec![vbin(O::VecAddF32x8, 41, 37, 40)]));
-        assert_eq!(sink_locked(&mut f), 0);
+        assert_eq!(sink_vector_loads(&mut f), 0);
     }
 
     /// A use by a non-intrinsic (e.g. a terminator operand) never sinks.
@@ -519,17 +570,17 @@ mod tests {
         let mut b = block(0, vec![vload(37, 4, 35), vbin(O::VecMulF32x8, 40, 38, 38)]);
         b.terminator = Terminator::Return(Some(Operand::Value(Value(37))));
         f.blocks.push(b);
-        assert_eq!(sink_locked(&mut f), 0);
+        assert_eq!(sink_vector_loads(&mut f), 0);
     }
 
     /// Kill switch honoured.
     #[test]
     fn kill_switch_disables_pass() {
-        // Hold ENV_LOCK across the whole set/run/remove window: the env var
-        // is process-global and every other sink_locked() caller reads it.
-        let _g = ENV_LOCK.lock().unwrap();
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("CCC_NO_VEC_LOAD_SINK", "1") };
+        // Per-thread switch behind the RAII guard: no lock, no `unsafe`
+        // environment mutation, and the switch is restored even if the
+        // assertion below fails.
+        let _g =
+            crate::test_support::ScopedFlag::new(vec_load_sink_enabled, set_sink_enabled, false);
         let mut f = mkfunc();
         f.blocks.push(block(
             0,
@@ -539,11 +590,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        // Direct call: the guard above already serializes us.
-        let n = sink_vector_loads(&mut f);
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("CCC_NO_VEC_LOAD_SINK") };
-        assert_eq!(n, 0);
+        assert_eq!(sink_vector_loads(&mut f), 0);
     }
 
     /// Two independent sinks in one block keep their consumers correct and
@@ -564,7 +611,7 @@ mod tests {
         );
         b.source_spans = (0..6u32).map(|k| Span::new(100 + k, 100 + k, 0)).collect();
         f.blocks.push(b);
-        assert_eq!(sink_locked(&mut f), 2);
+        assert_eq!(sink_vector_loads(&mut f), 2);
         assert_eq!(
             ops(&f, 0),
             vec![

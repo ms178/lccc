@@ -3,8 +3,10 @@
 # build_kernel_compressed.sh) with independent CC/LD choices.
 set -euo pipefail
 K=${KERNEL_DIR:-/home/user/kernel-work/linux-vm}
-LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
-LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
+LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
 OUT=${OUT:-/tmp/bz}
 C=$K/arch/x86/boot/compressed
 B=$K/arch/x86/boot
@@ -12,7 +14,7 @@ mkdir -p $OUT/setup
 sed_zoffset='s/^\([0-9a-fA-F]*\) [a-zA-Z] \(startup_32\|efi.._stub_entry\|efi\(32\)\?_pe_entry\|input_data\|kernel_info\|_end\|_ehead\|_text\|_e\?data\|_e\?sbat\|z_.*\)$/#define ZO_\2 0x\1/p'
 nm "$C/vmlinux" | sed -n "$sed_zoffset" > "$B/zoffset.h"
 echo "zoffset.h:"; cat "$B/zoffset.h"
-OUT=$OUT/setup KERNEL_DIR=$K LCCC=$LCCC LCCC_LD=$LCCC_LD bash /home/user/lccc/scripts/build_kernel_boot.sh > /tmp/setup_build.log 2>&1 || { echo "setup build failed"; tail -5 /tmp/setup_build.log; exit 1; }
+OUT=$OUT/setup KERNEL_DIR=$K LCCC=$LCCC LCCC_LD=$LCCC_LD bash "$SCRIPT_DIR/build_kernel_boot.sh" > /tmp/setup_build.log 2>&1 || { echo "setup build failed"; tail -5 /tmp/setup_build.log; exit 1; }
 grep -E "32 KiB gate|ORACLE" /tmp/setup_build.log
 RMF="-std=gnu11 -m16 -g -Os -march=i386 -mregparm=3 -fno-strict-aliasing -fomit-frame-pointer -fno-pic -mno-mmx -mno-sse -mpreferred-stack-boundary=2 -ffreestanding -ffunction-sections -fno-stack-protector -fno-asynchronous-unwind-tables -fcf-protection=none -fno-jump-tables -DSVGA_MODE=NORMAL_VGA"
 SINC="-nostdinc -I$B -I$K/arch/x86/include -I$K/arch/x86/include/generated -I$K/include -I$K/include/generated -I$K/include/uapi -I$K/arch/x86/include/uapi -I$K/arch/x86/include/generated/uapi -I$K/include/generated/uapi -include $K/include/linux/compiler-version.h -include $K/include/linux/kconfig.h -include $K/include/linux/compiler_types.h -D__KERNEL__ -D_SETUP -DDISABLE_BRANCH_PROFILING -D__DISABLE_EXPORTS"

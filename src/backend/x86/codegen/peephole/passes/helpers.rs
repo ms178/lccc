@@ -481,16 +481,91 @@ pub(super) fn writes_family_full(info: &LineInfo, trimmed: &str, fam: RegId) -> 
     // 2. The explicit destination: full only when the destination token
     //    names the family at 32 or 64 bits.  A memory destination redefines
     //    no register; `%ax`/`%al`/`%ah`-style tokens redefine only part.
-    get_dest_reg(info) == fam && dest_operand_is_full_width(trimmed, fam)
+    get_dest_reg(info) == fam && dest_operand_is_full_width(info, trimmed, fam)
 }
 
-/// The explicit destination token (text after the last comma) names `fam` at
-/// 32 or 64 bits.  `REG_NAMES[0]` is the 64-bit row, `REG_NAMES[1]` the
-/// 32-bit row; any other width (or a memory operand) is a partial/no write.
+/// Does the line's explicit destination name `fam` at 32 or 64 bits?
+/// `REG_NAMES[0]` is the 64-bit row, `REG_NAMES[1]` the 32-bit row; any other
+/// width (or a memory operand) is a partial/no write.
+///
+/// Two operand shapes reach a full-width destination, and the comma split only
+/// sees the first:
+///
+/// * two operands — the token after the last comma (`movl %ecx, %eax`);
+/// * `popq %r` — ONE operand, and that operand IS the destination.  Handing
+///   the whole `"popq %rcx"` string to the width test matched no register
+///   name, so every acceptance path above lost the kill: a `movq %rax, %rcx`
+///   whose only consumer was already gone survived a later `popq %rcx` that
+///   redefines the family unconditionally.  The classifier's answer is
+///   authoritative — `LineKind::Pop { reg }` is produced only for the `popq `
+///   spelling, which is always a full 64-bit write of the popped register,
+///   while `popfq`/`popfl` carry `REG_NONE` (no GP family) and `popl`/`popw`
+///   stay `Other` with an unparsed destination, i.e. conservatively partial.
 #[inline]
-fn dest_operand_is_full_width(trimmed: &str, fam: RegId) -> bool {
+fn dest_operand_is_full_width(info: &LineInfo, trimmed: &str, fam: RegId) -> bool {
+    if let LineKind::Pop { reg } = info.kind {
+        return reg == fam;
+    }
     let dest = trimmed.rsplit(',').next().unwrap_or(trimmed).trim();
     dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize]
+}
+
+/// Is `trimmed` a self-zeroing idiom that fully redefines GP family `fam`?
+///
+/// `xorl %ecx, %ecx` / `subl %ecx, %ecx` write a CONSTANT: the result does not
+/// depend on the operand's old value.  Both properties a liveness walk uses to
+/// veto a kill therefore misfire on them — the family appears on the source
+/// side, and `xor`/`sub` are classified read-modify-write — yet the old value
+/// is retired exactly as `movl $0, %ecx` retires it.  Callers must ask this
+/// predicate BEFORE those two vetoes, or the canonical zeroing idiom keeps a
+/// dead address copy alive.
+///
+/// Exactness (this is an ACCEPTANCE-grade predicate: a true answer deletes a
+/// definition, so it may not over-approximate):
+///
+/// * only `xor` and `sub`.  `and`/`or` preserve the old value, and `adc`/`sbb`
+///   additionally read CF — neither writes a constant;
+/// * both operand tokens must be IDENTICAL, so `xorl %eax, %ecx` (a real
+///   read-modify-write of %ecx) and `xorl $0, %ecx` are rejected;
+/// * the destination must name `fam` at 32 or 64 bits.  A 32-bit write
+///   zero-extends and so retires the whole family; `xorw`/`xorb` leave the
+///   surviving bits observable.  The four-byte mnemonic test also rejects the
+///   packed forms (`xorps`, `subss`) and the suffix-less `xor`.
+#[inline]
+pub(super) fn self_zeroing_full_write(trimmed: &str, fam: RegId) -> bool {
+    if fam > REG_GP_MAX {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    // One byte rejects every other mnemonic.  This predicate sits on the
+    // fall-through path of a liveness kill test — i.e. it is reached for every
+    // line that mentions the family and is NOT a kill, the common case — so it
+    // must be free before it is right.
+    if bytes.first() != Some(&b'x') && bytes.first() != Some(&b's') {
+        return false;
+    }
+    let (mnemonic, operands) = match trimmed.split_once(' ') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let m = mnemonic.as_bytes();
+    // `xor{l,q}` / `sub{l,q}`: exactly four bytes, last one the width suffix.
+    if m.len() != 4 || !matches!(m[3], b'l' | b'q') {
+        return false;
+    }
+    if !(m.starts_with(b"xor") || m.starts_with(b"sub")) {
+        return false;
+    }
+    // Exactly two operands.  A first-comma split is safe here: a SIB source
+    // such as `xorl (%rax,%rcx), %eax` yields a "destination" token that is
+    // not a bare register name and is rejected below, i.e. conservatively.
+    let (source, dest) = match operands.split_once(',') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let dest = dest.trim();
+    source.trim() == dest
+        && (dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize])
 }
 
 // ── Label/jump parsing ───────────────────────────────────────────────────────
@@ -855,5 +930,151 @@ mod writes_family_tests {
         ] {
             assert!(!has_implicit_reg_usage(t), "{t}");
         }
+    }
+
+    /// `popq %r` has ONE operand and it is the destination, so the comma split
+    /// that serves every two-operand form matched no register name and reported
+    /// a partial write.  Every acceptance path above then lost the kill.
+    #[test]
+    fn popq_names_its_single_operand_as_a_full_width_destination() {
+        let info = classify_line("    popq %rcx");
+        assert!(writes_family_full(&info, "popq %rcx", 1));
+        // …and of no other family: the answer must stay exact, not "pop
+        // redefines the register file".
+        for fam in [0, 2, 3, 4, 5, 6, 7, 8, 15] {
+            assert!(!writes_family_full(&info, "popq %rcx", fam), "fam={fam}");
+        }
+        // Every GP family, both spellings the width test accepts.
+        for fam in 0..=REG_GP_MAX {
+            let q = format!("    popq {}", REG_NAMES[0][fam as usize]);
+            let info = classify_line(&q);
+            let t = q.trim();
+            assert!(writes_family_full(&info, t, fam), "{t}");
+            for other in 0..=REG_GP_MAX {
+                if other != fam {
+                    assert!(!writes_family_full(&info, t, other), "{t} fam={other}");
+                }
+            }
+        }
+    }
+
+    /// The negative half of the same contract: nothing that merely LOOKS like
+    /// `popq %r` may be promoted to a full redefinition.
+    #[test]
+    fn pop_lookalikes_are_not_full_writes() {
+        // `popfq`/`popfl` write flags, not a GP DATA family — the classifier
+        // gives them REG_NONE, so the explicit-destination arm answers nothing.
+        // They do, however, pop the stack, and the architectural implicit write
+        // set says so (`b"popf" | b"popfq" | b"popfw" | b"popfl" => (RSP, RSP)`
+        // in types.rs), so %rsp IS fully redefined.  Asserting "no family at
+        // all" here would be a test that is wrong about the ISA.
+        for t in ["popfq", "popfl"] {
+            let info = classify_line(&format!("    {t}"));
+            for fam in 0..=REG_GP_MAX {
+                if fam == 4 {
+                    assert!(writes_family_full(&info, t, fam), "{t} must retire %rsp");
+                } else {
+                    assert!(!writes_family_full(&info, t, fam), "{t} fam={fam}");
+                }
+            }
+        }
+        // `pushq` reads its operand and writes no GP register.
+        let info = classify_line("    pushq %rcx");
+        assert!(!writes_family_full(&info, "pushq %rcx", 1));
+        // `popcnt` shares the prefix; its operand pair has a real destination
+        // and the source must not be mistaken for one.
+        let info = classify_line("    popcntl %ecx, %eax");
+        assert!(writes_family_full(&info, "popcntl %ecx, %eax", 0));
+        assert!(!writes_family_full(&info, "popcntl %ecx, %eax", 1));
+        // A pop into memory does not exist, but the width test must still
+        // refuse a non-register token rather than match by accident.
+        let info = classify_line("    popq (%rcx)");
+        assert!(!writes_family_full(&info, "popq (%rcx)", 1));
+    }
+
+    /// `xorl %ecx, %ecx` / `subl %ecx, %ecx` write a CONSTANT: the old value
+    /// is retired even though the family appears on the source side and the
+    /// mnemonic classifies as read-modify-write.
+    #[test]
+    fn self_zeroing_idiom_is_an_exact_full_kill() {
+        // Positive matrix: both idioms × both full widths × every GP family.
+        for mnemonic in ["xor", "sub"] {
+            for width in ["l", "q"] {
+                for fam in 0..=REG_GP_MAX {
+                    let row = if width == "q" { 0 } else { 1 };
+                    let name = REG_NAMES[row][fam as usize];
+                    let t = format!("{mnemonic}{width} {name}, {name}");
+                    assert!(self_zeroing_full_write(&t, fam), "{t}");
+                    for other in 0..=REG_GP_MAX {
+                        if other != fam {
+                            assert!(
+                                !self_zeroing_full_write(&t, other),
+                                "{t} must not kill fam={other}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Whitespace around the operands is insignificant in AT&T text.
+        assert!(self_zeroing_full_write("xorl %ecx,%ecx", 1));
+        assert!(self_zeroing_full_write("xorq  %rcx ,  %rcx", 1));
+    }
+
+    /// The negative half: everything that is NOT a constant write of the whole
+    /// family must be refused, because a true answer deletes a definition.
+    #[test]
+    fn self_zeroing_rejects_every_non_constant_or_partial_form() {
+        for t in [
+            // Partial widths leave the surviving bits of the 64-bit family
+            // observable.
+            "xorw %cx, %cx",
+            "xorb %cl, %cl",
+            "subw %cx, %cx",
+            "subb %cl, %cl",
+            // Different registers: a genuine read-modify-write of the dest.
+            "xorl %eax, %ecx",
+            "xorq %rcx, %rax",
+            "xorl %ecx, %eax",
+            // %rcx is the SOURCE here and %rax the destination: neither family
+            // is zeroed, and the reversed-operand spelling must not be mistaken
+            // for the idiom by a token-set comparison.
+            "subq %rcx, %rax",
+            // Value-preserving / flag-reading forms are not constant writes.
+            "andl %ecx, %ecx",
+            "orq %rcx, %rcx",
+            "adcl %ecx, %ecx",
+            "sbbl %ecx, %ecx",
+            // An immediate or a memory source is not the zeroing idiom (and
+            // the memory form genuinely reads through the address).
+            "xorl $0, %ecx",
+            "xorq $-1, %rcx",
+            "xorl (%rax), %eax",
+            "xorl (%rax,%rcx), %eax",
+            "subl 8(%rbp), %ebp",
+            // Packed / other mnemonics sharing the first three bytes.
+            "xorps %xmm0, %xmm0",
+            "xorpd %xmm1, %xmm1",
+            "subss %xmm0, %xmm0",
+            "subpd %xmm2, %xmm2",
+            // Suffix-less and malformed spellings.
+            "xor",
+            "xor %ecx, %ecx",
+            "xorl",
+            "xorl %ecx",
+            "",
+            "    ",
+            "xorl\t%ecx, %ecx",
+        ] {
+            for fam in 0..=REG_GP_MAX {
+                assert!(
+                    !self_zeroing_full_write(t, fam),
+                    "{t:?} must not be a self-zeroing kill of fam={fam}"
+                );
+            }
+        }
+        // Out-of-range families (XMM ids, REG_NONE) are never GP kills.
+        assert!(!self_zeroing_full_write("xorl %ecx, %ecx", REG_NONE));
+        assert!(!self_zeroing_full_write("xorl %ecx, %ecx", REG_GP_MAX + 1));
     }
 }

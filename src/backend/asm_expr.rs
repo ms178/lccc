@@ -287,6 +287,171 @@ fn eval_unary(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
     }
 }
 
+/// The radix a bare integer literal is spelled in.
+///
+/// The evaluator's width per radix is part of its observable behaviour, not an
+/// implementation detail: hex and decimal were widened to `u64` (so
+/// `0xffffffffffffffff` and `18446744073709551615` are literals) while binary
+/// and octal stayed `i64` (`0b1` plus 62 more ones is the widest binary
+/// literal, `0777777777777777777777` the widest octal).  Unifying the four
+/// would silently change what assembly the assembler accepts, so each radix
+/// carries its own bound — and now carries it in exactly one place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Radix {
+    Decimal,
+    Hex,
+    Binary,
+    Octal,
+}
+
+impl Radix {
+    #[inline]
+    fn base(self) -> u64 {
+        match self {
+            Radix::Decimal => 10,
+            Radix::Hex => 16,
+            Radix::Binary => 2,
+            Radix::Octal => 8,
+        }
+    }
+
+    /// The word the evaluator's error message has always used for this radix
+    /// (`bad hex: ...`), with `Decimal` spelling the generic `bad integer: ...`.
+    #[inline]
+    fn label(self) -> &'static str {
+        match self {
+            Radix::Hex => "hex",
+            Radix::Binary => "binary",
+            Radix::Octal => "octal",
+            Radix::Decimal => "integer",
+        }
+    }
+}
+
+/// Select the radix of a suffix-stripped literal body and return its digit span.
+///
+/// A leading zero selects hex, binary or octal and NEVER falls back to decimal:
+/// `09` is spelled octal, so it is not a literal (GAS agrees, and the
+/// evaluator's own `from_str_radix(.., 8)` rejected it the same way).
+#[inline]
+fn literal_shape(body: &[u8]) -> (Radix, &[u8]) {
+    if body.len() > 1 && body[0] == b'0' {
+        match body[1] {
+            b'x' | b'X' => return (Radix::Hex, &body[2..]),
+            b'b' | b'B' => return (Radix::Binary, &body[2..]),
+            // The octal test is the evaluator's own: every byte a DECIMAL digit
+            // (so `0z9` is not octal-shaped) and the value read in base 8.
+            _ if body.iter().all(|b| b.is_ascii_digit()) => return (Radix::Octal, body),
+            _ => {}
+        }
+    }
+    (Radix::Decimal, body)
+}
+
+/// The radix a bare literal is spelled in, for error messages.
+///
+/// Radix selection lives here once: [`bare_integer_literal`] uses the same
+/// function, so a message can never name a radix the recognizer did not try.
+pub fn bare_integer_radix(bytes: &[u8]) -> Radix {
+    // The recognizer's own selection, so a message can never name a radix that
+    // was not attempted: behind a sign `literal_shape` falls through to
+    // `Decimal`, which is why `+0x1f` has always been reported as `bad integer`
+    // rather than `bad hex`.
+    literal_shape(strip_integer_suffixes(bytes)).0
+}
+
+/// Strip the C integer suffixes (`u`/`U`/`l`/`L`/`z`/`Z`, incl. LL/ULL combos)
+/// that are valid in assembler constant expressions (`$(1U<<1)` from glibc).
+#[inline]
+fn strip_integer_suffixes(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && matches!(bytes[end - 1], b'u' | b'U' | b'l' | b'L' | b'z' | b'Z') {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+/// Recognize AND value a bare integer literal in one allocation-free pass.
+///
+/// ONE copy of the integer grammar, shared by the evaluator
+/// ([`parse_single_integer`], which values the literal) and by the x86
+/// assembler's `is_label_like`, which asks only the yes/no question.  That
+/// predicate runs for every candidate symbol of every operand of every assembly
+/// line, and the `Result<_, String>` it used to call allocates an error `String`
+/// on each miss — twice, because `tokenize_expr` then fails on the identifier's
+/// leading character as well.  Sharing the grammar keeps the hot path
+/// allocation-free WITHOUT keeping a second recognizer to drift.
+///
+/// The result is the evaluator's `i64`, so a hex literal above `i64::MAX` comes
+/// back as its two's-complement pattern exactly as `u64 as i64` did before.
+///
+/// Two shapes deserve a word, because both are behaviour rather than detail and
+/// a deduplication that moved either would be a silent semantic change:
+///
+///   * the WIDTH per radix: hex and decimal were widened to `u64` (so
+///     `0xffffffffffffffff` and `18446744073709551615` are literals) while
+///     binary and octal stayed `i64`.  A negative body may reach the type's
+///     most-negative value, whose magnitude is one GREATER than its maximum —
+///     `parse::<i64>` accepts `-9223372036854775808` and rejects
+///     `9223372036854775808` — and `u64` has no negative at all, so `0x-1`
+///     stays rejected;
+///   * a sign INSIDE the body: `from_str_radix` and `str::parse` each accept one
+///     (`0x+0`, `0b-1`), so the evaluator accepted them, and GAS assembles
+///     `.long 0x+0` as well — as `0x` followed by `+0`, a different mechanism
+///     with the same answer.  One sign is therefore honoured here.  A SECOND is
+///     not (`--42`): the evaluator's tokenizer values that as `-(-42)`, the same
+///     42 the single-literal path produced, so `parse_integer_expr` is
+///     unchanged.  `tokenize_expr` only ever hands this function a slice
+///     starting at a digit, so it cannot see a sign at all;
+///     `the_public_evaluator_is_unchanged_by_the_shared_grammar` pins both
+///     claims against the values the old paths produced.
+pub fn bare_integer_literal(bytes: &[u8]) -> Option<i64> {
+    let lit = strip_integer_suffixes(bytes);
+    if lit.is_empty() {
+        return None;
+    }
+    // Radix selection sees the text as given, which is why `+0x1f` is decimal
+    // (and therefore not a literal): the prefix match never fires behind a sign.
+    let (radix, digits) = literal_shape(lit);
+    let (negative, digits) = match digits.first() {
+        Some(b'+') => (false, &digits[1..]),
+        Some(b'-') => (true, &digits[1..]),
+        _ => (false, digits),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let bound = match (radix, negative) {
+        (Radix::Hex, true) => return None, // u64 has no negative values
+        (Radix::Hex, false) | (Radix::Decimal, false) => u64::MAX,
+        (Radix::Binary, false) | (Radix::Octal, false) => i64::MAX as u64,
+        (_, true) => 1u64 << 63, // |i64::MIN|
+    };
+    let base = radix.base();
+    let mut magnitude: u64 = 0;
+    for &b in digits {
+        let digit = match b {
+            b'0'..=b'9' => u64::from(b - b'0'),
+            b'a'..=b'f' => u64::from(b - b'a' + 10),
+            b'A'..=b'F' => u64::from(b - b'A' + 10),
+            _ => return None,
+        };
+        if digit >= base {
+            return None;
+        }
+        magnitude = magnitude.checked_mul(base)?.checked_add(digit)?;
+    }
+    if magnitude > bound {
+        return None;
+    }
+    let value = magnitude as i64;
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
+}
+
 /// Parse a single integer value (no arithmetic expressions).
 /// Supports decimal, hex (0x/0X), binary (0b/0B), octal (leading 0),
 /// and character literals ('c', '\n', etc.).
@@ -347,32 +512,16 @@ fn parse_single_integer(s: &str) -> Result<i64, String> {
         (false, s)
     };
 
-    let val = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        let uval = u64::from_str_radix(hex, 16).map_err(|_| format!("bad hex: {}", s))?;
-        if negative {
-            return Ok((uval as i64).wrapping_neg());
-        }
-        return Ok(uval as i64);
-    } else if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
-        i64::from_str_radix(bin, 2).map_err(|_| format!("bad binary: {}", s))?
-    } else if s.starts_with('0') && s.len() > 1 && s.chars().all(|c| c.is_ascii_digit()) {
-        // Octal (must be checked before decimal to handle leading-zero literals)
-        i64::from_str_radix(s, 8).map_err(|_| format!("bad octal: {}", s))?
-    } else {
-        // Try decimal, including u64 range for large unsigned values
-        if let Ok(val) = s.parse::<i64>() {
-            if negative {
-                return Ok(-val);
-            }
-            return Ok(val);
-        }
-        if let Ok(uval) = s.parse::<u64>() {
-            if negative {
-                return Ok((uval as i64).wrapping_neg());
-            }
-            return Ok(uval as i64);
-        }
-        return Err(format!("bad integer: {}", s));
+    // Radix selection, per-radix width, suffix stripping and the leading '+'
+    // rule are the shared grammar's business, not this function's: the x86
+    // assembler asks the same yes/no question through `bare_integer_literal` on
+    // a path that must not allocate, and two recognizers for one grammar drift.
+    let Some(val) = bare_integer_literal(s.as_bytes()) else {
+        return Err(format!(
+            "bad {}: {}",
+            bare_integer_radix(s.as_bytes()).label(),
+            s
+        ));
     };
 
     Ok(if negative { val.wrapping_neg() } else { val })

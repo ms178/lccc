@@ -22,12 +22,27 @@
 set -euo pipefail
 
 K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
-LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
-LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
 OUT=${OUT:-/tmp/bootbuild}
 # Resolve the script directory before `cd "$K"`: $0 is relative to the caller's
 # cwd, so sourcing boot_flags.sh after the cd would look inside the kernel tree.
+# The compiler defaults follow the same rule and point at THIS checkout: a repo
+# path baked in at write time only exists on the machine it was written on, and
+# every other harness script (boot_size_oracle.sh, boot_stage_bisect.sh) already
+# resolves relative to $0.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
+LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
+
+# Fail fast with an actionable message: without these, the first failure is a
+# bare "No such file or directory" from the assemble loop, dozens of lines in.
+[[ -d "$K" ]] || { echo "build_kernel_boot: kernel tree missing: $K" >&2; exit 1; }
+[[ -x "$LCCC" ]] || {
+  echo "build_kernel_boot: lccc missing: $LCCC" >&2
+  echo "  build it with scripts/build_lccc_fast.sh, or point LCCC= at one" >&2
+  exit 1
+}
+[[ -x "$LCCC_LD" ]] || { echo "build_kernel_boot: lccc-ld missing: $LCCC_LD" >&2; exit 1; }
 
 cd "$K"
 

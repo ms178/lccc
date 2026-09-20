@@ -24,8 +24,9 @@
 # Environment:
 #   KERNEL_DIR  patched tree  (default /home/user/kernel-work/linux-6.18.52)
 #   PKGDIR      archpkgbuilds pkg dir (default .../packages/linux-cachymod-6.18)
-#   LCCC        compiler (default /home/user/lccc/target/fastbuild/lccc)
-#   LCCC_LD     linker   (default /home/user/lccc/target/fastbuild/lccc-ld)
+#   LCCC        compiler (default <repo>/target/fastbuild/lccc, where <repo> is
+#               the checkout this script lives in)
+#   LCCC_LD     linker   (default <repo>/target/fastbuild/lccc-ld)
 #   LCCC_JOBS   build parallelism (default 2)
 #   LCCC_NOOBJTOOL  if 1, swap tools/objtool/objtool for a no-op shim so the
 #                  compile-only sweep can proceed (objtool interop is the
@@ -38,8 +39,9 @@ set -euo pipefail
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
 PKGDIR=${PKGDIR:-/home/user/archpkgbuilds/packages/linux-cachymod-6.18}
-LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
-LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
+REPO_ROOT=$(CDPATH= cd -- "$here/.." && pwd)
+LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
+LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
 JOBS=${LCCC_JOBS:-2}
 NOOBJTOOL=${LCCC_NOOBJTOOL:-1}
 RECONFIG=${LCCC_RECONFIG:-0}

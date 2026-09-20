@@ -67,11 +67,17 @@ log "rustc: $(rustc --version 2>/dev/null || echo MISSING)"
 log "cargo: $(cargo --version 2>/dev/null || echo MISSING)"
 
 # ---- 3. host packages (kernel tree + -m32 oracle) ----------------------------
-if ! gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/dev/null; then
+if ! gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/dev/null \
+    || ! command -v zstd >/dev/null 2>&1 || ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
     log 'installing apt deps (gcc-multilib, kernel tooling)'
     sudo apt-get update -qq >/dev/null 2>&1
+    # The list is what scripts/prepare_kernel_tree.sh preflights, plus the 32-bit
+    # oracle: installing only part of it lets --with-kernel fail after the
+    # tarball download, which is the expensive part (observed: zstd missing for
+    # CONFIG_KERNEL_ZSTD=y on a restored sandbox).
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         flex bison bc libelf-dev libssl-dev cpio gcc-multilib libc6-dev-i386 \
+        zstd xz-utils lz4 lzop bzip2 kmod dwarves rsync qemu-system-x86 \
         >/dev/null 2>&1
 fi
 log "m32 oracle: $(gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/dev/null && echo OK || echo FAIL)"

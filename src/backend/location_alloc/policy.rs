@@ -436,22 +436,33 @@ mod token_tests {
 
     #[test]
     fn opt_in_env_defaults_off_for_unset_and_honors_both_vocabularies() {
-        // Unique throwaway vars: no OnceLock caches these call sites, so
-        // mutation cannot race other tests (edition 2024 marks env
-        // mutation unsafe for that reason).
-        // SAFETY: test-only, uniquely named variables, no concurrent reader.
-        unsafe {
-            const NAME: &str = "CCC_GLA_TEST_OPT_IN_TOKEN_PARSER";
-            std::env::remove_var(NAME);
+        // `opt_in_env` reads the environment by contract, so this test mutates
+        // it — behind the guard: one process-wide window per assertion, restored
+        // even if one fails.  The bare `unsafe` block this replaces justified
+        // itself with "uniquely named variables, no concurrent reader", which is
+        // not the hazard edition 2024 is about: `setenv` may reallocate the
+        // `environ` array another thread's `getenv` is walking, whatever the key
+        // is called.  A unique name protects the VALUE, not the array.
+        use crate::test_support::EnvGuard;
+        const NAME: &str = "CCC_GLA_TEST_OPT_IN_TOKEN_PARSER";
+        {
+            let _g = EnvGuard::unset(NAME);
             assert!(!opt_in_env(NAME, false));
+            // The `<KEY>_ON` vocabulary is a second, independent opt-in and is
+            // never set by anything in this suite.
             assert!(opt_in_env("CCC_GLA_TEST_OPT_IN_TOKEN_PARSER_ON", true));
-            std::env::set_var(NAME, "1");
+        }
+        {
+            let _g = EnvGuard::set(NAME, "1");
             assert!(opt_in_env(NAME, false));
-            std::env::set_var(NAME, "No");
+        }
+        {
+            let _g = EnvGuard::set(NAME, "No");
             assert!(!opt_in_env(NAME, true));
-            std::env::set_var(NAME, "");
+        }
+        {
+            let _g = EnvGuard::set(NAME, "");
             assert!(!opt_in_env(NAME, true));
-            std::env::remove_var(NAME);
         }
     }
 }

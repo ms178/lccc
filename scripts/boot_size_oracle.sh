@@ -46,6 +46,8 @@ CC_ORACLE=${CC_ORACLE:-gcc}
 . "$here/boot_flags.sh"
 # shellcheck source=boot_offsets.sh
 . "$here/boot_offsets.sh"
+# shellcheck source=elf_sections.sh
+. "$here/elf_sections.sh"
 
 [[ -d $K ]] || { echo "boot_size_oracle: kernel tree missing: $K" >&2; exit 1; }
 [[ -x $LCCC ]] || { echo "boot_size_oracle: lccc missing: $LCCC" >&2; exit 1; }
@@ -84,22 +86,29 @@ PY
 compile_set() { # compile_set <cc> <outdir> <extra-args...>
   local cc=$1 dir=$2; shift 2
   mkdir -p "$dir"
+  # Per-compiler spelling of the shared flag set (see boot_flags.sh): the
+  # oracle may be clang, which rejects GCC's -mpreferred-stack-boundary.  Both
+  # sides still get the SAME flags for the same compiler, so a delta stays a
+  # code-generation delta.
+  local cflags
+  cflags=$(lccc_boot_cflags_for "$cc")
   local f
   for f in "${LCCC_BOOT_ASM_FILES[@]}"; do
-    "$cc" $LCCC_BOOT_CPPFLAGS $LCCC_BOOT_CFLAGS "$@" -D__ASSEMBLY__ \
+    "$cc" $LCCC_BOOT_CPPFLAGS $cflags "$@" -D__ASSEMBLY__ \
       -c "arch/x86/boot/$f.S" -o "$dir/$f.o"
   done
   for f in "${LCCC_BOOT_C_FILES[@]}"; do
-    "$cc" $LCCC_BOOT_CPPFLAGS $LCCC_BOOT_CFLAGS "$@" \
+    "$cc" $LCCC_BOOT_CPPFLAGS $cflags "$@" \
       -c "arch/x86/boot/$f.c" -o "$dir/$f.o"
   done
 }
 
-text_bytes() { # text_bytes <obj>  -> total size of all .text* sections
-  # `size -A` prints decimal sizes, so this works with mawk too (no strtonum).
-  size -A "$1" 2>/dev/null | awk '
-    $1 ~ /^\.text/ && $2 ~ /^[0-9]+$/ { s += $2 } END { printf "%d\n", s+0 }'
-}
+# Executable bytes per object come from elf_sections.sh.  The local sum this
+# replaced matched `/^\.text/` and so reported header.o and bioscall.o as 0
+# bytes -- the boot stage keeps their code in .bstext, .entrytext and .inittext
+# -- hiding 918 of lccc's 25299 executable bytes (791 of gcc's, 815 of clang's)
+# and shrinking tty.o's real +184-byte gap against gcc to +57 in the ranking
+# below, whose whole purpose is to surface the objects worth optimizing.
 
 gate_report() { # gate_report <elf> <label>
   local elf=$1 label=$2 end dec head
@@ -144,8 +153,8 @@ for cc in $CC_ORACLE; do
 
   rows=''; total_l=0; total_o=0
   for o in "${LCCC_BOOT_OBJS[@]}"; do
-    tl=$(text_bytes "$OUT/$o.o")
-    to=$(text_bytes "$odir/$o.o")
+    tl=$(lccc_elf_code_bytes "$OUT/$o.o")
+    to=$(lccc_elf_code_bytes "$odir/$o.o")
     total_l=$((total_l + tl)); total_o=$((total_o + to))
     d=$((tl - to))
     note=''
@@ -155,7 +164,10 @@ for cc in $CC_ORACLE; do
   done
   printf '%-10s %8s %8s %8s   %s\n' OBJECT LCCC "$cc" DELTA 'note'
   # Largest lccc excess first: the objects worth optimizing bubble to the top.
-  printf '%s' "$rows" | sort -k4 -n -r
+  # The ranking lives in elf_sections.sh: `sort -n` reads a `%+8d` delta as 0,
+  # so sorting the printed column here tied every row and emitted the table in
+  # reverse-lexicographic order by object name instead of by excess.
+  printf '%s' "$rows" | lccc_rank_size_rows
   echo
   printf '%-10s %8d %8d %+8d\n' TOTAL "$total_l" "$total_o" "$((total_l - total_o))"
   echo
