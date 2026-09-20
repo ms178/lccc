@@ -9103,7 +9103,9 @@ fn collect_i686_scratch_hazard_points_refined(
                             IrUnaryOp::Neg
                                 | IrUnaryOp::Not
                                 | IrUnaryOp::Clz
+                                | IrUnaryOp::ClzNonZero
                                 | IrUnaryOp::Ctz
+                                | IrUnaryOp::CtzNonZero
                                 | IrUnaryOp::Bswap
                                 | IrUnaryOp::Popcount
                         ) =>

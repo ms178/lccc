@@ -617,11 +617,21 @@ fn clone_addr_chain_into_merge(
             memo.insert(v, resolved);
             return Some(resolved);
         };
+        // Reserve this node's destination BEFORE recursively cloning its
+        // operands.  Reserving afterwards gives every node in a nested chain
+        // the same ID: Cast(iv)->Shl(2)->GEP became `vN=cast; vN=shl vN`, and
+        // each optimizer iteration then composed the self-shift (2→4→8→16).
+        // The Linux workqueue shard store consequently indexed int[c] as
+        // c<<16 and corrupted an unrelated SCSI pointer 64 KiB away.
+        //
+        // A failed clone may leave an unused ID, which is harmless; reusing an
+        // ID is not.  Children are still emitted before parents, preserving
+        // def-before-use order independently of numeric ID order.
         let nv = Value(*next_val);
+        *next_val += 1;
         match def {
             Instruction::Copy { src, .. } => {
                 let ns = clone_operand(src, defs, copy_of, memo, emitted, next_val)?;
-                *next_val += 1;
                 emitted.push(Instruction::Copy { dest: nv, src: ns });
             }
             Instruction::Cast {
@@ -631,7 +641,6 @@ fn clone_addr_chain_into_merge(
                 ..
             } => {
                 let ns = clone_operand(src, defs, copy_of, memo, emitted, next_val)?;
-                *next_val += 1;
                 emitted.push(Instruction::Cast {
                     dest: nv,
                     src: ns,
@@ -648,7 +657,6 @@ fn clone_addr_chain_into_merge(
             } => {
                 let nl = clone_operand(lhs, defs, copy_of, memo, emitted, next_val)?;
                 let nr = clone_operand(rhs, defs, copy_of, memo, emitted, next_val)?;
-                *next_val += 1;
                 emitted.push(Instruction::BinOp {
                     dest: nv,
                     op: *op,
@@ -3609,7 +3617,13 @@ mod tests {
         f.blocks.push(block(
             2,
             vec![
-                shl2(10, 1),
+                Instruction::Cast {
+                    dest: Value(9),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U64,
+                    to_ty: IrType::I64,
+                },
+                shl2(10, 9),
                 gep(11, 0, 10),
                 Instruction::Store {
                     val: Operand::Const(IrConst::F32(0.0)),
@@ -3625,11 +3639,17 @@ mod tests {
         f.blocks.push(block(
             3,
             vec![
-                shl2(12, 1),
-                gep(13, 0, 12),
+                Instruction::Cast {
+                    dest: Value(12),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U64,
+                    to_ty: IrType::I64,
+                },
+                shl2(13, 12),
+                gep(14, 0, 13),
                 Instruction::Store {
                     val: Operand::Const(IrConst::F32(1.0)),
-                    ptr: Value(13),
+                    ptr: Value(14),
                     ty: IrType::F32,
                     volatile: false,
                     seg_override: AddressSpace::Default,
@@ -3676,5 +3696,29 @@ mod tests {
             .position(|i| matches!(i, Instruction::Store { .. }))
             .unwrap();
         assert!(phi_pos < store_pos);
+
+        // The rebuilt Cast -> Shl -> GEP chain must be strict SSA: every
+        // destination is unique and the source scale remains exactly 2.
+        // Allocating a parent ID only after recursively cloning its child made
+        // all three definitions share one ID; simplify then doubled the shift
+        // on each pipeline iteration (2 -> 4 -> 8 -> 16).
+        let mut dests = FxHashSet::default();
+        for inst in &b4.instructions {
+            if let Some(dest) = inst.dest() {
+                assert!(
+                    dests.insert(dest),
+                    "duplicate cloned SSA destination v{}",
+                    dest.0
+                );
+            }
+        }
+        assert!(b4.instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::BinOp {
+                op: IrBinOp::Shl,
+                rhs: Operand::Const(IrConst::I32(2)),
+                ..
+            }
+        )));
     }
 }

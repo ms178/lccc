@@ -246,21 +246,37 @@ struct Range {
 ///   "always-true" span in release);
 /// * the span must be mathematically representable in `ty` (the status-quo
 ///   threshold: `int_const` rejects `I32`'s full-range span 2^32-1, keeping
-///   the too-wide-range shapes unfolded);
+///   the too-wide-range shapes unfolded) — EXCEPT for the one span that
+///   needs no compare at all: a range covering the compare type's ENTIRE
+///   domain makes the membership test a constant;
 /// * the compare may narrow to the operand's pre-promotion source type only
-///   when BOTH bounds fit that source's domain.
-struct RangePlan {
-    value: Value,
-    /// The `Sub`'s (and the compare's fallback) width — the compare type the
-    /// two source comparisons ran at.
-    ty: IrType,
-    /// The compare's width — `ty`, or the narrower source domain when the
-    /// bounds provably fit it.
-    cmp_ty: IrType,
-    /// The bias constant for the `Sub`, bit-exact for `ty`.
-    lo_const: IrConst,
-    /// The span constant for the compare, bit-exact for `cmp_ty`.
-    span_const: IrConst,
+///   when BOTH bounds fit that source's domain (and a range covering that
+///   narrowed domain entirely is likewise a constant).
+enum RangePlan {
+    /// The unsigned-bias test: `Sub(value, lo)` at `ty`, compared
+    /// `Ule|Ugt` against the span at `cmp_ty`.
+    Test {
+        value: Value,
+        /// The `Sub`'s (and the compare's fallback) width — the compare type the
+        /// two source comparisons ran at.
+        ty: IrType,
+        /// The compare's width — `ty`, or the narrower source domain when the
+        /// bounds provably fit it.
+        cmp_ty: IrType,
+        /// The bias constant for the `Sub`, bit-exact for `ty`.
+        lo_const: IrConst,
+        /// The span constant for the compare, bit-exact for `cmp_ty`.
+        span_const: IrConst,
+    },
+    /// The range covers the compare domain's every value: the INSIDE form
+    /// (`x >= lo && x <= hi`) is constant TRUE and the OUTSIDE form
+    /// (`x < lo || x > hi`) is constant FALSE. No `Sub`, no compare — the
+    /// emission paths materialize the constant directly. (GCC folds this
+    /// family too; the historical span-representability rejection kept the
+    /// SIGNED full domain `[INT_MIN, INT_MAX]` unfolded, and the unsigned
+    /// full domain paid a dead `Sub`+`Cmp` for a compare that always
+    /// answered the same.)
+    FullDomain,
 }
 
 fn plan_range(range: &Range, cast_defs: &[Option<(Operand, IrType, IrType)>]) -> Option<RangePlan> {
@@ -274,6 +290,22 @@ fn plan_range(range: &Range, cast_defs: &[Option<(Operand, IrType, IrType)>]) ->
     }
     // i128 span: cannot overflow for any <=64-bit domain.
     let span: i128 = hi - lo;
+    // Full domain at the COMPARE type: every value the operand can hold at
+    // this width lies inside the range, so the inside test is constant TRUE
+    // (and the outside form constant FALSE). Detected BEFORE the span-cap
+    // rejection — the signed full domain `[INT_MIN, INT_MAX]` spans 2^w-1,
+    // which exceeds the signed cap but needs no span constant at all.
+    // (No narrowing can apply here: the bounds of a full `ty` domain never
+    // fit a narrower source domain, so `cmp_ty` would be `ty` anyway.)
+    let ty_dom_min: i128 = if signed { -(1i128 << (w - 1)) } else { 0 };
+    let ty_dom_max: i128 = if signed {
+        (1i128 << (w - 1)) - 1
+    } else {
+        (1i128 << w) - 1
+    };
+    if lo == ty_dom_min && hi == ty_dom_max {
+        return Some(RangePlan::FullDomain);
+    }
     // Representability threshold, identical to the historical `int_const`
     // gate: signed types must fit their positive half, unsigned types their
     // full width.
@@ -306,6 +338,23 @@ fn plan_range(range: &Range, cast_defs: &[Option<(Operand, IrType, IrType)>]) ->
             cmp_ty = *from_ty;
         }
     }
+    // Full domain at the NARROWED compare type: both bounds fit the source
+    // domain and together they cover it — e.g. `(unsigned char)x >= 0 &&
+    // (unsigned char)x <= 255`, where the u8 compare is the tautology. The
+    // operand's domain at this compare is exactly `cmp_ty` (it is the
+    // promoted source value), so coverage of `cmp_ty` is coverage of every
+    // reachable value.
+    if let Some((cw, csigned)) = domain_of(cmp_ty) {
+        let cmin: i128 = if csigned { -(1i128 << (cw - 1)) } else { 0 };
+        let cmax: i128 = if csigned {
+            (1i128 << (cw - 1)) - 1
+        } else {
+            (1i128 << cw) - 1
+        };
+        if lo == cmin && hi == cmax {
+            return Some(RangePlan::FullDomain);
+        }
+    }
     // The span fits `cmp_ty` by construction: both bounds fit `cmp_ty`'s
     // domain (either it IS `ty` and the cap above held, or it is the source
     // domain both bounds fit), so their difference is < 2^width. Only the
@@ -318,7 +367,7 @@ fn plan_range(range: &Range, cast_defs: &[Option<(Operand, IrType, IrType)>]) ->
         span as i64
     };
     let span_const = int_const_bits(cmp_ty, span_bits)?;
-    Some(RangePlan {
+    Some(RangePlan::Test {
         value: range.value,
         ty: range.ty,
         cmp_ty,
@@ -336,6 +385,20 @@ fn range_test_core(
     and_form: bool,
     next_id: &mut u32,
 ) -> (Vec<Instruction>, Value) {
+    let RangePlan::Test {
+        value,
+        ty,
+        cmp_ty,
+        lo_const,
+        span_const,
+    } = plan
+    else {
+        // FullDomain plans carry no test: callers materialize the constant
+        // before ever reaching the core. Arriving here means a caller lost
+        // the distinction — an empty core would silently delete the test
+        // and miscompile, so fail loudly instead.
+        panic!("range_test_core: FullDomain plan has no test to build");
+    };
     let sub_dest = Value(*next_id);
     *next_id += 1;
     let cmp_dest = Value(*next_id);
@@ -346,16 +409,16 @@ fn range_test_core(
             Instruction::BinOp {
                 dest: sub_dest,
                 op: IrBinOp::Sub,
-                lhs: Operand::Value(plan.value),
-                rhs: Operand::Const(plan.lo_const.clone()),
-                ty: plan.ty,
+                lhs: Operand::Value(*value),
+                rhs: Operand::Const(lo_const.clone()),
+                ty: *ty,
             },
             Instruction::Cmp {
                 dest: cmp_dest,
                 op: cmp_op,
                 lhs: Operand::Value(sub_dest),
-                rhs: Operand::Const(plan.span_const.clone()),
-                ty: plan.cmp_ty,
+                rhs: Operand::Const(span_const.clone()),
+                ty: *cmp_ty,
             },
         ],
         cmp_dest,
@@ -553,6 +616,18 @@ fn try_fold_select(
 
     let range = extract_range(&cond_bound, &other_bound, and_form, cast_defs)?;
     let plan = plan_range(&range, cast_defs)?;
+    if matches!(plan, RangePlan::FullDomain) {
+        // The range covers the compare domain entirely: the inside form is
+        // constant TRUE and the outside form constant FALSE. The Select's
+        // arms (both comparison booleans, or the constant 0/1 partner) are
+        // left for DCE — this was their only consumer.
+        let v: i64 = if and_form { 1 } else { 0 };
+        let c = int_const(*ty, v)?;
+        return Some(vec![Instruction::Copy {
+            dest: *dest,
+            src: Operand::Const(c),
+        }]);
+    }
     let (core, cmp_dest) = range_test_core(&plan, and_form, next_id);
     let mut out = core;
     // The compare result is I8 (boolean). When the Select's result type is
@@ -649,6 +724,16 @@ fn try_fold_bool_op(
     let bound2 = canonicalize(op2, &l2, &r2, ty2)?;
     let range = extract_range(&bound1, &bound2, and_form, cast_defs)?;
     let plan = plan_range(&range, cast_defs)?;
+    if matches!(plan, RangePlan::FullDomain) {
+        // Constant TRUE for the And (inside) form, FALSE for the Or
+        // (outside) complement — the operand compares are left for DCE.
+        let v: i64 = if and_form { 1 } else { 0 };
+        let c = int_const(*ty, v)?;
+        return Some(vec![Instruction::Copy {
+            dest: *dest,
+            src: Operand::Const(c),
+        }]);
+    }
     let (core, cmp_dest) = range_test_core(&plan, and_form, next_id);
     let mut out = core;
     if *ty == IrType::I8 || *ty == IrType::U8 {
@@ -734,10 +819,18 @@ fn fold_phi_diamonds(
         jm: usize,
         pi: usize,
         new_insts: Vec<Instruction>,
-        replacement: Operand,
+        replacement: DiamondReplacement,
         phi_dest: Value,
         merge_label: u32,
         bcheck_label: u32,
+    }
+    /// What replaces the folded phi's value.
+    enum DiamondReplacement {
+        /// The range-test value (rewrites every use; the phi is deleted).
+        Value(Operand),
+        /// A full-domain constant: the phi itself becomes `Copy phi, const`
+        /// (uses keep their reference; no rewrite, no dangling position).
+        Const(IrConst),
     }
     let mut approved: Option<ApprovedDiamond> = None;
     'cands: for (jm, merge) in func.blocks.iter().enumerate() {
@@ -941,21 +1034,35 @@ fn fold_phi_diamonds(
             }
 
             // Build the replacement: sub + unsigned compare (+ widening cast
-            // to the phi's type when it is not the boolean type itself).
-            let (mut new_insts, cmp_dest) = range_test_core(&plan, and_form, next_id);
-            // Replacement value for the phi's uses.
-            let replacement: Operand = if *phi_ty == IrType::I8 || *phi_ty == IrType::U8 {
-                Operand::Value(cmp_dest)
+            // to the phi's type when it is not the boolean type itself) — or,
+            // for a full-domain range, the constant itself.
+            let (mut new_insts, replacement) = if matches!(plan, RangePlan::FullDomain) {
+                // The inside form is constant TRUE (outside: FALSE). The
+                // phi is rewritten IN PLACE into a Copy of the constant —
+                // every use keeps referencing phi_dest (Operand and
+                // bare-Value positions alike), so no use-rewrite is needed
+                // and no dangling reference is possible.
+                let Some(c) = int_const(*phi_ty, if and_form { 1 } else { 0 }) else {
+                    continue 'cands;
+                };
+                (Vec::new(), DiamondReplacement::Const(c))
             } else {
-                let cast_dest = Value(*next_id);
-                *next_id += 1;
-                new_insts.push(Instruction::Cast {
-                    dest: cast_dest,
-                    src: Operand::Value(cmp_dest),
-                    from_ty: IrType::I8,
-                    to_ty: *phi_ty,
-                });
-                Operand::Value(cast_dest)
+                let (mut new_insts, cmp_dest) = range_test_core(&plan, and_form, next_id);
+                // Replacement value for the phi's uses.
+                let replacement: Operand = if *phi_ty == IrType::I8 || *phi_ty == IrType::U8 {
+                    Operand::Value(cmp_dest)
+                } else {
+                    let cast_dest = Value(*next_id);
+                    *next_id += 1;
+                    new_insts.push(Instruction::Cast {
+                        dest: cast_dest,
+                        src: Operand::Value(cmp_dest),
+                        from_ty: IrType::I8,
+                        to_ty: *phi_ty,
+                    });
+                    Operand::Value(cast_dest)
+                };
+                (new_insts, DiamondReplacement::Value(replacement))
             };
 
             // Approved. Everything below mutates, so the descriptor is
@@ -976,8 +1083,9 @@ fn fold_phi_diamonds(
     let Some(a) = approved else { return changes };
 
     // Apply: splice into Bcond, unconditional branch to Bmerge,
-    // replace phi uses, delete the phi (and the now-dead Bcheck arm
-    // of every other merge phi), drop Bcheck.
+    // replace phi uses (or rewrite the phi to its full-domain constant),
+    // delete the phi (and the now-dead Bcheck arm of every other merge
+    // phi), drop Bcheck.
     {
         let ApprovedDiamond {
             bcond_idx,
@@ -995,46 +1103,81 @@ fn fold_phi_diamonds(
             bcond.instructions.extend(new_insts);
             bcond.terminator = Terminator::Branch(crate::ir::reexports::BlockId(merge_label));
         }
-        // Replace every use of phi_dest with the replacement.
-        for block in &mut func.blocks {
-            for inst in &mut block.instructions {
-                inst.for_each_operand_mut(|op: &mut Operand| {
-                    if let Operand::Value(v) = op {
-                        if v.0 == phi_dest.0 {
-                            *op = replacement;
+        match replacement {
+            DiamondReplacement::Value(replacement) => {
+                // Replace every use of phi_dest with the replacement.
+                for block in &mut func.blocks {
+                    for inst in &mut block.instructions {
+                        inst.for_each_operand_mut(|op: &mut Operand| {
+                            if let Operand::Value(v) = op {
+                                if v.0 == phi_dest.0 {
+                                    *op = replacement;
+                                }
+                            }
+                        });
+                        // Bare-Value positions (Store ptr, GEP base, ...) are
+                        // not Operands: the phi is deleted below, so any
+                        // naming it here must be rewritten too (same two-walk
+                        // contract as loop_memset; the replacement is always
+                        // a Value).
+                        if let Operand::Value(replacement_val) = replacement {
+                            inst.for_each_value_use_mut(|v: &mut Value| {
+                                if v.0 == phi_dest.0 {
+                                    *v = replacement_val;
+                                }
+                            });
                         }
                     }
-                });
-                // Bare-Value positions (Store ptr, GEP base, ...) are not
-                // Operands: the phi is deleted below, so any naming it here
-                // must be rewritten too (same two-walk contract as
-                // loop_memset; the replacement is always a Value).
-                if let Operand::Value(replacement_val) = replacement {
-                    inst.for_each_value_use_mut(|v: &mut Value| {
-                        if v.0 == phi_dest.0 {
-                            *v = replacement_val;
+                    block.terminator.for_each_operand_mut(|op: &mut Operand| {
+                        if let Operand::Value(v) = op {
+                            if v.0 == phi_dest.0 {
+                                *op = replacement;
+                            }
                         }
                     });
                 }
-            }
-            block.terminator.for_each_operand_mut(|op: &mut Operand| {
-                if let Operand::Value(v) = op {
-                    if v.0 == phi_dest.0 {
-                        *op = replacement;
+                // Drop the phi from Bmerge; collapse every other phi's
+                // duplicate Bcheck arm (proven equal above).
+                {
+                    let merge = &mut func.blocks[jm];
+                    merge.instructions.remove(pi);
+                    for inst in &mut merge.instructions {
+                        let Instruction::Phi { incoming, .. } = inst else {
+                            break;
+                        };
+                        incoming.retain(|(_, f)| f.0 != bcheck_label);
                     }
                 }
-            });
-        }
-        // Drop the phi from Bmerge; collapse every other phi's duplicate
-        // Bcheck arm (proven equal above).
-        {
-            let merge = &mut func.blocks[jm];
-            merge.instructions.remove(pi);
-            for inst in &mut merge.instructions {
-                let Instruction::Phi { incoming, .. } = inst else {
-                    break;
-                };
-                incoming.retain(|(_, f)| f.0 != bcheck_label);
+            }
+            DiamondReplacement::Const(c) => {
+                // Full domain: the phi IS the constant on every edge.
+                // Rewrite it in place (after the block's remaining leading
+                // phis, which must stay block-leading) so every use —
+                // Operand or bare-Value — keeps its reference; no rewrite
+                // walk, no dangling position.
+                let merge = &mut func.blocks[jm];
+                merge.instructions.remove(pi);
+                let mut insert_at = 0;
+                for (i, inst) in merge.instructions.iter().enumerate() {
+                    if matches!(inst, Instruction::Phi { .. }) {
+                        insert_at = i + 1;
+                    } else {
+                        break;
+                    }
+                }
+                merge.instructions.insert(
+                    insert_at,
+                    Instruction::Copy {
+                        dest: phi_dest,
+                        src: Operand::Const(c),
+                    },
+                );
+                for inst in &mut merge.instructions {
+                    let Instruction::Phi { incoming, .. } = inst else {
+                        break;
+                    };
+                    incoming.retain(|(_, f)| f.0 != bcheck_label);
+                }
             }
         }
         func.blocks.retain(|b| b.label.0 != bcheck_label);
@@ -1265,6 +1408,130 @@ fn fold_branch_chains(
     0
 }
 
+/// Every out-edge label of a block: terminator targets (including
+/// `IndirectBranch::possible_targets` and `Switch` cases) plus any
+/// `InlineAsm` goto labels in its instructions — the same edge census the
+/// canonical `build_cfg` performs.
+fn block_successor_labels(block: &crate::ir::reexports::BasicBlock) -> Vec<u32> {
+    let mut out = Vec::new();
+    match &block.terminator {
+        Terminator::Branch(b) => out.push(b.0),
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            out.push(true_label.0);
+            out.push(false_label.0);
+        }
+        Terminator::Switch { cases, default, .. } => {
+            out.extend(cases.iter().map(|(_, x)| x.0));
+            out.push(default.0);
+        }
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => out.extend(possible_targets.iter().map(|x| x.0)),
+        _ => {}
+    }
+    for inst in &block.instructions {
+        if let Instruction::InlineAsm { goto_labels, .. } = inst {
+            out.extend(goto_labels.iter().map(|(_, b)| b.0));
+        }
+    }
+    out
+}
+
+/// Audit a block for deletion after its last in-edges died: no value it
+/// defines may be used anywhere else (phi arms count as uses), and no
+/// successor may lose its last remaining predecessor besides blocks that
+/// die in the same fold. Fail-closed: any unknown returns false and the
+/// caller keeps the block (declining the fold when the block would
+/// otherwise be left predecessor-less).
+fn dead_block_is_droppable(
+    func: &IrFunction,
+    idx_of: &crate::common::fx_hash::FxHashMap<u32, usize>,
+    preds: &crate::ir::analysis::FlatAdj,
+    dead_label: u32,
+    dying: &[u32],
+) -> bool {
+    let Some(&di) = idx_of.get(&dead_label) else {
+        return false;
+    };
+    let dead = &func.blocks[di];
+    // (a) Every definition of the dead block must be dead outside it.
+    let defs: crate::common::fx_hash::FxHashSet<u32> = dead
+        .instructions
+        .iter()
+        .filter_map(|i| i.dest().map(|d| d.0))
+        .collect();
+    if !defs.is_empty() {
+        for (bi, block) in func.blocks.iter().enumerate() {
+            if bi == di {
+                continue;
+            }
+            let mut used = false;
+            for inst in &block.instructions {
+                inst.for_each_used_value(|id| {
+                    if defs.contains(&id) {
+                        used = true;
+                    }
+                });
+            }
+            block.terminator.for_each_used_value(|id| {
+                if defs.contains(&id) {
+                    used = true;
+                }
+            });
+            if used {
+                return false;
+            }
+        }
+    }
+    // (b) Every surviving successor keeps a predecessor outside the dying
+    // set (checked on the canonical CFG, so computed-goto and asm-goto
+    // edges count).
+    for succ in block_successor_labels(dead) {
+        if succ == dead_label || dying.contains(&succ) {
+            continue;
+        }
+        let Some(&si) = idx_of.get(&succ) else {
+            return false;
+        };
+        let keeps = preds.row(si).iter().any(|&p| {
+            let pl = func.blocks[p as usize].label.0;
+            pl != dead_label && !dying.contains(&pl)
+        });
+        if !keeps {
+            return false;
+        }
+    }
+    true
+}
+
+/// Delete a dead block: first drop its keyed arms from every surviving
+/// successor's leading phis (the block's terminator still names them),
+/// then remove the block.
+fn drop_dead_block(func: &mut IrFunction, dead_label: u32) {
+    let Some(di) = func.blocks.iter().position(|b| b.label.0 == dead_label) else {
+        return;
+    };
+    let targets = block_successor_labels(&func.blocks[di]);
+    for t in targets {
+        if t == dead_label {
+            continue;
+        }
+        if let Some(s) = func.blocks.iter_mut().find(|b| b.label.0 == t) {
+            for inst in &mut s.instructions {
+                let Instruction::Phi { incoming, .. } = inst else {
+                    break;
+                };
+                incoming.retain(|(_, f)| f.0 != dead_label);
+            }
+        }
+    }
+    func.blocks.retain(|b| b.label.0 != dead_label);
+}
+
 /// Validate and apply one branch-chain candidate. Every structural fact is
 /// re-derived from the CURRENT IR (never from the scan's snapshot), so a
 /// candidate whose blocks were touched by an earlier fold in the same pass
@@ -1337,16 +1604,51 @@ fn try_fold_one_branch_chain(
     };
     let range = extract_range(&bound1, &bound2, and_form, cast_defs)?;
     let plan = plan_range(&range, cast_defs)?;
+    let full = matches!(plan, RangePlan::FullDomain);
+
+    // --- full-domain structural guards -------------------------------------
+    // The dead side (Bexit, in both forms — the inside test is constant
+    // TRUE, so the outside continuation is never taken) is rewritten below;
+    // a dead side that IS the block being rewritten (a self-referential
+    // chain) needs surgery this fold does not model, and Bbody being
+    // Bcond itself would make the fold's live target a self-branch.
+    // Pathological, and not worth the audit surface.
+    if full && (bexit_label == bcond_label || bbody_label == bcond_label) {
+        return None;
+    }
 
     // --- phi-edge discipline on Bbody and Bexit ---------------------------
-    // Bbody: retarget Bcheck arms to Bcond; reject on a conflicting
-    // existing Bcond arm (two arms with the same key and different
-    // values cannot be merged).
-    // Bexit: the Bcheck edge dies as control flow but its paths live on
-    // through the fused branch — every leading phi must carry the SAME
-    // value on its Bcond and Bcheck arms, or the surviving Bcond arm
-    // would misselect for the old-Bcheck paths.
-    {
+    // Non-full: Bbody retargets its Bcheck arms to Bcond (reject on a
+    // conflicting existing Bcond arm); Bexit keeps the fused branch's false
+    // paths alive, so every leading phi must carry the SAME value on its
+    // Bcond and Bcheck arms.
+    // Full-domain (BOTH forms): the constant condition is TRUE in the
+    // "value flows to Bbody" sense — for `&&` the inside test is constant
+    // TRUE (Bcond branches to Bbody), and for `||` the outside test is
+    // constant FALSE (Bcond branches to Bbody, the outside test's FALSE
+    // continuation). Bexit loses BOTH chain edges in either form — its
+    // arms are simply dropped (no arm-equality needed), and when the chain
+    // was its only predecessor it is deleted outright (audited). Bbody is
+    // the fold's LIVE target in both forms; its Bcheck arms retarget to
+    // the new Bcond edge (value-safe: Bcheck's dedicated-block discipline
+    // forbids any use of its defs outside it, so a phi arm from Bcheck
+    // references a value defined outside Bcheck, which dominates Bcond).
+    let mut drop_bexit = false;
+    if full {
+        let Some(&bexit_idx) = idx_of.get(&bexit_label) else {
+            return None;
+        };
+        let chain_only = preds.row(bexit_idx).iter().all(|&p| {
+            let l = func.blocks[p as usize].label.0;
+            l == bcond_label || l == bcheck_label
+        });
+        if chain_only {
+            if !dead_block_is_droppable(func, idx_of, preds, bexit_label, &[bcheck_label]) {
+                return None;
+            }
+            drop_bexit = true;
+        }
+    } else {
         let bbody_idx = match idx_of.get(&bbody_label) {
             Some(&i) => i,
             None => return None,
@@ -1392,32 +1694,55 @@ fn try_fold_one_branch_chain(
         }
     }
 
-    // --- build the fused test ---------------------------------------------
-    let (new_insts, cmp_dest) = range_test_core(&plan, and_form, next_id);
-    let (new_true, new_false) = if and_form {
+    // --- build the replacement terminator -----------------------------------
+    let (new_insts, new_term) = if full {
+        // Constant condition: control flows one way, unconditionally. A
+        // full-domain range makes the INSIDE test true for every operand
+        // value — the `&&` form's conjunction holds and the `||` form's
+        // disjunction fails — so Bcond branches to Bbody in BOTH forms.
+        // (The outside test being constant FALSE selects its FALSE
+        // continuation, which for the `||` chain is Bbody: c1 false → Bcheck,
+        // c2 false → Bbody.)
         (
-            crate::ir::reexports::BlockId(bbody_label),
-            crate::ir::reexports::BlockId(bexit_label),
+            Vec::new(),
+            Terminator::Branch(crate::ir::reexports::BlockId(bbody_label)),
         )
     } else {
+        let (new_insts, cmp_dest) = range_test_core(&plan, and_form, next_id);
+        let (new_true, new_false) = if and_form {
+            (
+                crate::ir::reexports::BlockId(bbody_label),
+                crate::ir::reexports::BlockId(bexit_label),
+            )
+        } else {
+            (
+                crate::ir::reexports::BlockId(bexit_label),
+                crate::ir::reexports::BlockId(bbody_label),
+            )
+        };
         (
-            crate::ir::reexports::BlockId(bexit_label),
-            crate::ir::reexports::BlockId(bbody_label),
+            new_insts,
+            Terminator::CondBranch {
+                cond: Operand::Value(cmp_dest),
+                true_label: new_true,
+                false_label: new_false,
+            },
         )
     };
 
     // --- apply --------------------------------------------------------------
+    // Order matters: every `idx_of` lookup happens BEFORE any block is
+    // dropped (a drop shifts block indices and stales the map). The
+    // dead-block drops run last, by label.
     {
         let bcond = &mut func.blocks[bcond_idx];
         bcond.instructions.extend(new_insts);
-        bcond.terminator = Terminator::CondBranch {
-            cond: Operand::Value(cmp_dest),
-            true_label: new_true,
-            false_label: new_false,
-        };
+        bcond.terminator = new_term;
     }
-    // Bbody phis: retarget Bcheck arms to Bcond; drop a duplicate arm
-    // with an identical value.
+    // Bbody phis: EVERY form gains the bcond→bbody edge, so Bcheck arms
+    // retarget to Bcond (a duplicate Bcond arm with the same value
+    // collapses onto it). The full-domain `||` form is no exception: its
+    // target is Bbody exactly as the `&&` form's is.
     if let Some(&bbody_idx) = idx_of.get(&bbody_label) {
         let bbody = &mut func.blocks[bbody_idx];
         let mut arm_rewrite: Vec<(usize, Option<usize>)> = Vec::new();
@@ -1450,9 +1775,21 @@ fn try_fold_one_branch_chain(
             }
         }
     }
-    // Bexit phis: drop the Bcheck arm (proven value-equal to the surviving
-    // Bcond arm above).
-    if let Some(&bexit_idx) = idx_of.get(&bexit_label) {
+    // Bexit phis: full-domain forms lose BOTH chain arms (Bcond no longer
+    // branches there and Bcheck is deleted); every other case keeps the
+    // Bcond arm and drops Bcheck (proven value-equal above in the non-full
+    // form).
+    if full {
+        if let Some(&bexit_idx) = idx_of.get(&bexit_label) {
+            let bexit = &mut func.blocks[bexit_idx];
+            for inst in &mut bexit.instructions {
+                let Instruction::Phi { incoming, .. } = inst else {
+                    break;
+                };
+                incoming.retain(|(_, f)| f.0 != bcond_label && f.0 != bcheck_label);
+            }
+        }
+    } else if let Some(&bexit_idx) = idx_of.get(&bexit_label) {
         let bexit = &mut func.blocks[bexit_idx];
         for inst in &mut bexit.instructions {
             let Instruction::Phi { incoming, .. } = inst else {
@@ -1460,6 +1797,12 @@ fn try_fold_one_branch_chain(
             };
             incoming.retain(|(_, f)| f.0 != bcheck_label);
         }
+    }
+    // Dead-block drops, by label, after every index-based surgery. Bexit is
+    // the dead side in both full-domain forms; Bbody is the live target and
+    // is never dropped.
+    if drop_bexit {
+        drop_dead_block(func, bexit_label);
     }
     func.blocks.retain(|b| b.label.0 != bcheck_label);
     Some(())
@@ -1908,7 +2251,12 @@ mod tests {
         let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 4];
         cast_defs[1] = Some((Operand::Value(Value(0)), IrType::U8, IrType::I32));
         let plan = plan_range(&range, &cast_defs).expect("wide fold is legal");
-        assert_eq!(plan.cmp_ty, IrType::I32, "must not narrow to U8");
+        match plan {
+            RangePlan::Test { cmp_ty, .. } => {
+                assert_eq!(cmp_ty, IrType::I32, "must not narrow to U8");
+            }
+            RangePlan::FullDomain => panic!("[250, 260] is not the U8 domain"),
+        }
 
         // The in-domain range [250, 255] still narrows.
         let range = Range {
@@ -1918,7 +2266,12 @@ mod tests {
             ty: IrType::I32,
         };
         let plan = plan_range(&range, &cast_defs).expect("in-domain fold");
-        assert_eq!(plan.cmp_ty, IrType::U8, "in-domain bounds narrow");
+        match plan {
+            RangePlan::Test { cmp_ty, .. } => {
+                assert_eq!(cmp_ty, IrType::U8, "in-domain bounds narrow");
+            }
+            RangePlan::FullDomain => panic!("[250, 255] is not the U8 domain"),
+        }
     }
 
     /// A U64 range that wraps ([u64max-9, 10]) is EMPTY, not a 21-value
@@ -1937,20 +2290,107 @@ mod tests {
     #[test]
     fn u64_upper_half_range_folds() {
         let plan = plan_for(IrType::U64, -100, -91).expect("upper-half range folds");
-        // Bias keeps its bit pattern; span is the domain difference 9.
-        assert!(matches!(plan.lo_const, IrConst::I64(-100)));
-        assert!(matches!(plan.span_const, IrConst::I64(9)));
+        match plan {
+            RangePlan::Test {
+                lo_const,
+                span_const,
+                ..
+            } => {
+                // Bias keeps its bit pattern; span is the domain difference 9.
+                assert!(matches!(lo_const, IrConst::I64(-100)));
+                assert!(matches!(span_const, IrConst::I64(9)));
+            }
+            RangePlan::FullDomain => panic!("[u64max-99, u64max-90] is not the domain"),
+        }
     }
 
-    /// I64 full-range bounds cannot overflow the span computation (i128):
-    /// the span exceeds the representability cap and the fold rejects —
-    /// no panic in checked builds, no wrapped always-true span in release.
+    /// I64 full-range bounds cannot overflow the span computation (i128).
+    /// The FULL domain now folds to the constant form (it needs no span at
+    /// all); every other extreme range still rejects on the cap — no panic
+    /// in checked builds, no wrapped always-true span in release.
     #[test]
-    fn i64_extreme_bounds_reject_without_panic() {
-        assert!(plan_for(IrType::I64, i64::MIN, i64::MAX).is_none());
+    fn i64_extreme_bounds_fold_or_reject_without_panic() {
+        assert!(matches!(
+            plan_for(IrType::I64, i64::MIN, i64::MAX),
+            Some(RangePlan::FullDomain)
+        ));
         assert!(plan_for(IrType::I64, i64::MIN, i64::MAX - 1).is_none());
         // A representable-span I64 range still folds.
         assert!(plan_for(IrType::I64, i64::MIN, i64::MIN + 5).is_some());
+    }
+
+    /// Every full domain at every width classifies: signed [INT_MIN,
+    /// INT_MAX], unsigned [0, MAX], and a narrowed byte domain covering its
+    /// source completely. The inside form is constant TRUE; the OUTSIDE
+    /// form is the emission paths' constant FALSE.
+    #[test]
+    fn full_domain_ranges_classify() {
+        assert!(matches!(
+            plan_for(IrType::I32, i32::MIN as i64, i32::MAX as i64),
+            Some(RangePlan::FullDomain)
+        ));
+        assert!(matches!(
+            plan_for(IrType::U32, 0, u32::MAX as i64),
+            Some(RangePlan::FullDomain)
+        ));
+        assert!(matches!(
+            plan_for(IrType::U8, 0, 255),
+            Some(RangePlan::FullDomain)
+        ));
+        assert!(matches!(
+            plan_for(IrType::I8, -128, 127),
+            Some(RangePlan::FullDomain)
+        ));
+        // One-off bounds are NOT the domain.
+        assert!(!matches!(
+            plan_for(IrType::I32, i32::MIN as i64, i32::MAX as i64 - 1),
+            Some(RangePlan::FullDomain)
+        ));
+        assert!(!matches!(
+            plan_for(IrType::U32, 1, u32::MAX as i64),
+            Some(RangePlan::FullDomain)
+        ));
+        // The NARROWED domain: `(unsigned char)x >= 0 && (unsigned char)x
+        // <= 255` compares at I32 but the u8 operand covers its own domain.
+        let range = Range {
+            lo: 0,
+            hi: 255,
+            value: Value(1),
+            ty: IrType::I32,
+        };
+        let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 4];
+        cast_defs[1] = Some((Operand::Value(Value(0)), IrType::U8, IrType::I32));
+        assert!(matches!(
+            plan_range(&range, &cast_defs),
+            Some(RangePlan::FullDomain)
+        ));
+        // Same shape at the byte's signed spelling.
+        let range = Range {
+            lo: -128,
+            hi: 127,
+            value: Value(1),
+            ty: IrType::I32,
+        };
+        let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 4];
+        cast_defs[1] = Some((Operand::Value(Value(0)), IrType::I8, IrType::I32));
+        assert!(matches!(
+            plan_range(&range, &cast_defs),
+            Some(RangePlan::FullDomain)
+        ));
+        // A narrowing cast whose bounds do NOT cover the source domain
+        // stays a Test plan.
+        let range = Range {
+            lo: 0,
+            hi: 254,
+            value: Value(1),
+            ty: IrType::I32,
+        };
+        let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 4];
+        cast_defs[1] = Some((Operand::Value(Value(0)), IrType::U8, IrType::I32));
+        assert!(matches!(
+            plan_range(&range, &cast_defs),
+            Some(RangePlan::Test { .. })
+        ));
     }
 
     /// 128-bit comparisons are rejected explicitly — no silent guessing.
@@ -2776,5 +3216,517 @@ mod tests {
             Instruction::Cmp { op: IrCmpOp::Ule, ty, .. } if *ty == IrType::I32)
         });
         assert!(wide, "the unsigned-bias compare runs at I32");
+    }
+
+    /// Full-domain value forms fold to constants. The bitwise And of the
+    /// two boolean-widened compares over the SIGNED full domain becomes
+    /// `Copy 1`; the Or complement (exclusive bounds: `x < lo || x > hi`)
+    /// becomes `Copy 0`.
+    #[test]
+    fn full_domain_bool_op_folds_to_constant() {
+        let build = |op: IrBinOp| {
+            // Inside spelling for And, outside spelling for Or.
+            let (op1, op2) = if matches!(op, IrBinOp::And) {
+                (IrCmpOp::Sge, IrCmpOp::Sle)
+            } else {
+                (IrCmpOp::Slt, IrCmpOp::Sgt)
+            };
+            let mut f = IrFunction::new("fullbool".to_string(), IrType::I32, vec![], false);
+            f.blocks = vec![block(
+                0,
+                vec![
+                    Instruction::Cmp {
+                        dest: Value(1),
+                        op: op1,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Const(IrConst::I32(i32::MIN)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: op2,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Const(IrConst::I32(i32::MAX)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cast {
+                        dest: Value(3),
+                        src: Operand::Value(Value(1)),
+                        from_ty: IrType::I8,
+                        to_ty: IrType::I32,
+                    },
+                    Instruction::Cast {
+                        dest: Value(4),
+                        src: Operand::Value(Value(2)),
+                        from_ty: IrType::I8,
+                        to_ty: IrType::I32,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(5),
+                        op,
+                        lhs: Operand::Value(Value(3)),
+                        rhs: Operand::Value(Value(4)),
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(5)))),
+            )];
+            f.next_value_id = 6;
+            f
+        };
+        let mut f = build(IrBinOp::And);
+        assert_eq!(run_function(&mut f), 1, "the And folds");
+        assert_verified(&f, "range_fold:full-and");
+        match &f.blocks[0].instructions[4] {
+            Instruction::Copy {
+                dest: Value(5),
+                src: Operand::Const(IrConst::I32(1)),
+            } => {}
+            other => panic!("And must become Copy 1, got {other:?}"),
+        }
+        let mut g = build(IrBinOp::Or);
+        assert_eq!(run_function(&mut g), 1, "the Or folds");
+        assert_verified(&g, "range_fold:full-or");
+        match &g.blocks[0].instructions[4] {
+            Instruction::Copy {
+                dest: Value(5),
+                src: Operand::Const(IrConst::I32(0)),
+            } => {}
+            other => panic!("Or must become Copy 0, got {other:?}"),
+        }
+    }
+
+    /// Full-domain phi diamond: the boolean phi becomes a Copy of the
+    /// constant IN the merge block (uses keep their reference), the check
+    /// block dies, and Bcond branches unconditionally to the merge.
+    #[test]
+    fn full_domain_phi_diamond_folds_to_constant() {
+        let mut f = IrFunction::new("fulldiamond".to_string(), IrType::I32, vec![], false);
+        f.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Sge,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MIN)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: IrCmpOp::Sle,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Const(IrConst::I32(i32::MAX)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cast {
+                        dest: Value(3),
+                        src: Operand::Value(Value(2)),
+                        from_ty: IrType::I8,
+                        to_ty: IrType::I32,
+                    },
+                ],
+                Terminator::Branch(BlockId(2)),
+            ),
+            block(
+                2,
+                vec![Instruction::Phi {
+                    dest: Value(4),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                        (Operand::Value(Value(3)), BlockId(1)),
+                    ],
+                }],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+            ),
+        ];
+        f.next_value_id = 5;
+        assert_eq!(run_function(&mut f), 1, "the diamond folds");
+        assert_verified(&f, "range_fold:full-diamond");
+        assert_eq!(f.blocks.len(), 2, "Bcheck removed");
+        assert!(matches!(
+            &f.blocks[0].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+        // The phi's id survives as a Copy of the constant.
+        match &f.blocks[1].instructions[0] {
+            Instruction::Copy {
+                dest: Value(4),
+                src: Operand::Const(IrConst::I32(1)),
+            } => {}
+            other => panic!("phi must become Copy 1, got {other:?}"),
+        }
+    }
+
+    /// Full-domain branch chain, inside form: `x >= INT_MIN && x <=
+    /// INT_MAX` guarding a body — the guard is constant TRUE, so Bcond
+    /// branches to the body unconditionally and the never-taken Bexit is
+    /// deleted (its only predecessors were the chain, and nothing used its
+    /// definitions).
+    #[test]
+    fn full_domain_branch_chain_inside_folds_to_unconditional() {
+        let mut f = IrFunction::new("fullchain".to_string(), IrType::I32, vec![], false);
+        f.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Sge,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MIN)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Sle,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MAX)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+            ),
+            block(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            ),
+        ];
+        f.next_value_id = 3;
+        assert_eq!(run_function(&mut f), 1, "the chain folds");
+        assert_verified(&f, "range_fold:full-chain-and");
+        assert_eq!(f.blocks.len(), 2, "Bcheck and Bexit removed");
+        assert!(matches!(
+            &f.blocks[0].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+    }
+
+    /// Full-domain branch chain, outside form: `x < INT_MIN || x >
+    /// INT_MAX` guarding the exit — the OUTSIDE test is constant FALSE, so
+    /// control always takes the inside continuation: Bcond branches to
+    /// Bbody unconditionally and the never-reached Bexit is deleted.
+    /// (Bexit is the outside test's TRUE continuation: c1 true → Bexit,
+    /// c2 true → Bexit. A constant-FALSE test must select its FALSE
+    /// continuation — Bbody — NOT the exit.)
+    #[test]
+    fn full_domain_branch_chain_outside_folds_to_unconditional() {
+        let mut f = IrFunction::new("fullchainor".to_string(), IrType::I32, vec![], false);
+        f.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MIN)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(1),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Sgt,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MAX)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+            ),
+            block(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            ),
+        ];
+        f.next_value_id = 3;
+        assert_eq!(run_function(&mut f), 1, "the chain folds");
+        assert_verified(&f, "range_fold:full-chain-or");
+        assert_eq!(f.blocks.len(), 2, "Bcheck and Bexit removed");
+        assert!(matches!(
+            &f.blocks[0].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+    }
+
+    /// Full-domain `||` chain with a distinguishable phi on the LIVE target:
+    /// Bbody's Bcheck arm must be RETARGETED to the new Bcond edge (the
+    /// same value flows — Bcheck is no longer on the path), and Bbody must
+    /// keep its other predecessor's arm untouched.
+    #[test]
+    fn full_domain_or_retargets_bbody_phi_arms() {
+        let mut f = IrFunction::new("fullorphi".to_string(), IrType::I32, vec![], false);
+        // Block 2 (Bbody) merges a phi from Bcheck (77) and block 4 (13).
+        f.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MIN)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(1),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Sgt,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MAX)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Phi {
+                    dest: Value(5),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(77)), BlockId(1)),
+                        (Operand::Const(IrConst::I32(13)), BlockId(4)),
+                    ],
+                }],
+                Terminator::Return(Some(Operand::Value(Value(5)))),
+            ),
+            block(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            ),
+            block(4, vec![], Terminator::Branch(BlockId(2))),
+        ];
+        f.next_value_id = 6;
+        assert_eq!(run_function(&mut f), 1, "the chain folds");
+        assert_verified(&f, "range_fold:full-or-phi");
+        assert!(matches!(
+            &f.blocks[0].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+        let bbody = f.blocks.iter().find(|b| b.label.0 == 2).unwrap();
+        match &bbody.instructions[0] {
+            Instruction::Phi { incoming, .. } => {
+                // The Bcheck arm became the Bcond arm; block 4's arm is
+                // untouched. Exactly one arm per surviving predecessor.
+                assert_eq!(incoming.len(), 2, "both arms survive (retargeted + other)");
+                assert!(incoming.iter().any(
+                    |(v, from)| matches!(v, Operand::Const(c) if c.to_i64() == Some(77))
+                        && from.0 == 0
+                ));
+                assert!(incoming.iter().any(
+                    |(v, from)| matches!(v, Operand::Const(c) if c.to_i64() == Some(13))
+                        && from.0 == 4
+                ));
+            }
+            other => panic!("phi must survive in Bbody, got {other:?}"),
+        }
+    }
+
+    /// Full-domain `||` chain whose dead side (Bexit) has an EXTRA
+    /// predecessor: Bexit survives with that predecessor's arm only — both
+    /// chain arms are dropped, and the extra pred's control flow into it is
+    /// untouched.
+    #[test]
+    fn full_domain_or_keeps_bexit_extra_predecessor() {
+        let mut f = IrFunction::new("fullorxpred".to_string(), IrType::I32, vec![], false);
+        // Block 3 (Bexit) also receives an edge from block 4.
+        f.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MIN)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(1),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Sgt,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MAX)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+            ),
+            block(
+                3,
+                vec![Instruction::Phi {
+                    dest: Value(5),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(4)), BlockId(0)),
+                        (Operand::Const(IrConst::I32(13)), BlockId(1)),
+                        (Operand::Const(IrConst::I32(42)), BlockId(4)),
+                    ],
+                }],
+                Terminator::Return(Some(Operand::Value(Value(5)))),
+            ),
+            block(4, vec![], Terminator::Branch(BlockId(3))),
+        ];
+        f.next_value_id = 6;
+        assert_eq!(run_function(&mut f), 1, "the chain folds");
+        assert_verified(&f, "range_fold:full-or-xpred");
+        // Bcheck gone; Bexit kept (block 4 still enters it) with exactly
+        // the block-4 arm remaining.
+        assert_eq!(f.blocks.len(), 4, "Bcheck removed, Bexit kept");
+        let bexit = f.blocks.iter().find(|b| b.label.0 == 3).unwrap();
+        match &bexit.instructions[0] {
+            Instruction::Phi { incoming, .. } => {
+                assert_eq!(incoming.len(), 1, "both chain arms dropped");
+                assert!(matches!(
+                    (&incoming[0].0, incoming[0].1),
+                    (Operand::Const(c), BlockId(4)) if c.to_i64() == Some(42)
+                ));
+            }
+            other => panic!("phi must survive in Bexit, got {other:?}"),
+        }
+        assert!(matches!(
+            &f.blocks[0].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+    }
+
+    /// Full-domain chain whose dead side is NOT deletable (its definitions
+    /// are used elsewhere): the fold still applies — the block survives
+    /// with both chain arms dropped from its phis.
+    #[test]
+    fn full_domain_chain_keeps_used_dead_side_with_arms_dropped() {
+        let mut f = IrFunction::new("fullkeep".to_string(), IrType::I32, vec![], false);
+        // Bexit defines v5, which a LATER block consumes: not droppable.
+        f.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Sge,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MIN)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Sle,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(i32::MAX)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+            ),
+            block(
+                3,
+                vec![Instruction::Phi {
+                    dest: Value(5),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(4)), BlockId(0)),
+                        (Operand::Const(IrConst::I32(13)), BlockId(1)),
+                        (Operand::Const(IrConst::I32(42)), BlockId(4)),
+                    ],
+                }],
+                Terminator::Return(Some(Operand::Value(Value(5)))),
+            ),
+            block(4, vec![], Terminator::Branch(BlockId(3))),
+        ];
+        f.next_value_id = 6;
+        assert_eq!(run_function(&mut f), 1, "the chain folds");
+        assert_verified(&f, "range_fold:full-chain-keep");
+        // Bcheck gone; Bexit kept (block 4 still enters it) with exactly
+        // the block-4 arm remaining.
+        assert_eq!(f.blocks.len(), 4, "Bcheck removed, Bexit kept");
+        let bexit = f.blocks.iter().find(|b| b.label.0 == 3).unwrap();
+        match &bexit.instructions[0] {
+            Instruction::Phi { incoming, .. } => {
+                assert_eq!(incoming.len(), 1, "both chain arms dropped");
+                assert_eq!(incoming[0].1, BlockId(4));
+            }
+            other => panic!("expected the exit phi, got {other:?}"),
+        }
     }
 }

@@ -855,7 +855,9 @@ impl X86Codegen {
                         if matches!(
                             op,
                             crate::ir::reexports::IrUnaryOp::Clz
+                                | crate::ir::reexports::IrUnaryOp::ClzNonZero
                                 | crate::ir::reexports::IrUnaryOp::Ctz
+                                | crate::ir::reexports::IrUnaryOp::CtzNonZero
                                 | crate::ir::reexports::IrUnaryOp::Popcount
                         ) && !ty.is_float()
                             && ty.size() <= 4

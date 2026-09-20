@@ -151,6 +151,26 @@ pub struct LiveRange {
     /// foldable byte loads (18 "shorts" that never needed 18 registers)
     /// and demoted its marching pointer for nothing.
     pub fold_only_uses: bool,
+    /// True when EVERY use of this range — and of every coalesced web
+    /// member — is servable from its spill slot with ZERO extra
+    /// instructions: the RHS of an integer compare on x86-64, where both
+    /// emitter paths fold the slot directly into the compare
+    /// (`cmpq N(%rsp), %rax`; see `emit_int_cmp_insn_typed` arms 1/4 and
+    /// `emit_int_cmp_replay_insn`). Distinct from `fold_only_uses`
+    /// (addressing bases, whose slot service still pays a pipelined
+    /// reload): a slot-operand-only range's memory residency costs exactly
+    /// one store at its def. Set by [`mark_loop_spanning`].
+    ///
+    /// The cost-ratio escape must never fire on such an incoming: the
+    /// escape buys register residency for reloads that sit on latency
+    /// chains, and a slot-operand-only incoming has none — the steal only
+    /// displaces the victim and squeezes the pool for the incoming's whole
+    /// remaining life (the rot() shape: the sign-extended loop bound,
+    /// priority 20, stole a priority-1 entry web's register at the 16x
+    /// escape and cascaded the rotation's e-web through a per-iteration
+    /// stack round trip — +4 instructions vs the escape-off allocation,
+    /// while the bound itself is free in a slot as a `cmp` memory operand).
+    pub slot_operand_only: bool,
     /// In-loop use points per pass (web-wide, max over spanned loops) —
     /// the span's reload density inside the loop it spans. Feeds the
     /// admission ceiling: a span read many times per pass pays that many
@@ -239,6 +259,7 @@ impl LiveRange {
             span_has_in_loop_use: false,
             span_max_extent_len: 0,
             fold_only_uses: false,
+            slot_operand_only: false,
             span_in_loop_uses: 0,
             span_exposed_uses: 0,
             span_recurrence: false,
@@ -538,6 +559,96 @@ pub(crate) fn mark_loop_spanning(
     web_inloop_use: bool,
     phi_backedges: &[(u32, u32)],
 ) {
+    // Web leader -> members (built once, used by the unconditional
+    // slot-operand classification below and the extent pass after it).
+    let mut members_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (&member, &owner) in coalesce_member_of {
+        if member != owner {
+            members_of.entry(owner).or_default().push(member);
+        }
+    }
+    // SLOT-OPERAND CLASSIFICATION — unconditional, before the loop bail-out
+    // below: the cost-ratio escape in `select_evict_victim` runs in every
+    // function, loop-free ones included, and it must not fire on behalf of
+    // an incoming whose every remaining use is servable from its spill slot
+    // with ZERO instructions. Today exactly one such use context exists:
+    // the RHS of an integer compare on x86-64, where both emitter paths
+    // fold the slot directly into the compare (`cmpq N(%rsp), %rax` —
+    // `emit_int_cmp_insn_typed` arms 1/4 and `emit_int_cmp_replay_insn`).
+    //
+    // This is deliberately NOT conflated with `folded_at` (addressing
+    // bases, whose slot service still pays a pipelined reload that feeds
+    // pressure models): a slot-operand-only range's memory residency costs
+    // exactly one store at its def, so register residency buys it nothing
+    // and a steal on its behalf only displaces the victim and squeezes the
+    // pool for the incoming's whole remaining life. Alloca-derived
+    // operands are excluded — an alloca's home slot holds the OBJECT's
+    // bytes, not the address value, so the emitter's fold arms (is_alloca
+    // guard) reload them.
+    let slot_direct_enabled =
+        crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64;
+    if slot_direct_enabled {
+        let mut alloca_dests: FxHashSet<u32> = FxHashSet::default();
+        let mut slot_direct_at: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Alloca { dest, .. } = inst {
+                    alloca_dests.insert(dest.0);
+                }
+            }
+        }
+        {
+            // Dense point numbering of `collect_range_metadata` (one point
+            // per instruction, one for the block terminator) so the map
+            // aligns with `meta_uses` by construction.
+            let mut point = 0u32;
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Cmp {
+                        rhs: Operand::Value(rv),
+                        ty,
+                        ..
+                    } = inst
+                    {
+                        // Integer widths the emitter serves from a slot
+                        // with the width-matched mnemonic (cmpb..cmpq);
+                        // I128 compares take the multi-instruction
+                        // emit_i128_cmp path and must not be classified.
+                        if ty.is_integer() && ty.size() <= 8 && !alloca_dests.contains(&rv.0) {
+                            slot_direct_at.entry(point).or_default().insert(rv.0);
+                        }
+                    }
+                    point = point.saturating_add(1);
+                }
+                point = point.saturating_add(1);
+            }
+        }
+        let all_slot_direct = |vid: u32, uses: &[u32]| {
+            !uses.is_empty()
+                && uses
+                    .iter()
+                    .all(|u| slot_direct_at.get(u).is_some_and(|s| s.contains(&vid)))
+        };
+        for range in ranges.iter_mut() {
+            let mut slot_direct = all_slot_direct(range.value_id, &range.uses);
+            // Web-wide: a coalesced member with any latency-exposed (or
+            // unknown) use disqualifies the leader exactly as it does for
+            // the in-loop-use flag below — merged members own no range of
+            // their own, so their uses are read from `meta_uses`.
+            if slot_direct {
+                if let Some(members) = members_of.get(&range.value_id) {
+                    for &m in members {
+                        let m_ok = meta_uses.get(&m).is_some_and(|us| all_slot_direct(m, us));
+                        if !m_ok {
+                            slot_direct = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            range.slot_operand_only = slot_direct;
+        }
+    }
     // Nothing below is reachable without a loop, and the two IR walks that
     // follow are O(instructions): bail out before paying for them. (`folded_at`,
     // `def_uses` and the per-range pass all feed only the extent loop.)
@@ -690,12 +801,8 @@ pub(crate) fn mark_loop_spanning(
     // least the inner pressure — conservative in the right direction.
     // Web-wide use-point list per leader: a phi web's reads are recorded on
     // the members' ranges, so the leader's own `uses` under-count it.
-    let mut members_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for (&member, &owner) in coalesce_member_of {
-        if member != owner {
-            members_of.entry(owner).or_default().push(member);
-        }
-    }
+    // (`members_of` was built above the loop bail-out, alongside the
+    // unconditional slot-operand classification.)
     // Per value id: does its own range have a use inside ANY measured loop
     // extent, and how many of its uses fall inside the extents? Computed
     // once up front (read-only pass) so the mutation loop below can ask
@@ -1697,7 +1804,22 @@ impl LinearScanAllocator {
                 let escapes = k > 0
                     && nxt > pos
                     && (priority as u128) * (k as u128) < (bar as u128)
-                    && interval.range.remaining_cost(nxt) == 0;
+                    && interval.range.remaining_cost(nxt) == 0
+                    // A slot-operand-only incoming gains ~nothing from the
+                    // register: its remaining uses are served from the slot
+                    // with zero instructions (an integer compare's RHS
+                    // folds into `cmpq N(%rsp), %rax`), so residency saves
+                    // exactly the one def-side store. The escape buys
+                    // register residency for reloads that sit on latency
+                    // chains — vacuous here. The steal would only displace
+                    // the victim and squeeze the pool for the incoming's
+                    // whole remaining life: the rot() contract in
+                    // check_phi_acyclic_order — the sign-extended loop
+                    // bound (priority 20) stole a priority-1 entry web's
+                    // register at the default K=16 and cascaded the
+                    // rotation's e-web through a per-iteration stack round
+                    // trip, 59 insns/4 stkref vs the escape-off 55/2.
+                    && !incoming.slot_operand_only;
                 if !escapes {
                     continue;
                 }
@@ -3216,6 +3338,170 @@ mod tests {
         assert!(!x[0].spans_loop);
     }
 
+    /// The slot-operand classification: a value whose every use is the RHS
+    /// of an integer compare is `slot_operand_only` (its spill slot is
+    /// served with zero instructions — `cmpq N(%rsp), %rax`); any other use
+    /// context (compare LHS, ALU operand, float compare, alloca-derived
+    /// operand) disqualifies, and a coalesced web member with a
+    /// latency-exposed use disqualifies the leader. The classification runs
+    /// even without loops (the cost-ratio escape is loop-independent), and
+    /// is x86-64-only (the i686 emitter deliberately stages slotted compare
+    /// operands through %ecx for deferred-slot safety; ARM/RISC-V have no
+    /// memory-operand compares at all).
+    #[test]
+    fn slot_operand_classification_is_position_type_and_web_exact() {
+        if crate::common::types::target_elf_machine() != crate::backend::elf::EM_X86_64 {
+            return; // classification disabled off x86-64
+        }
+        use crate::ir::reexports::{IrCmpOp, Value};
+        let v = |id: u32| Operand::Value(Value(id));
+        let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        f.blocks.push(crate::ir::reexports::BasicBlock {
+            label: crate::ir::reexports::BlockId(0),
+            instructions: vec![
+                // point 0: v2 folds (rhs); v1 (lhs) does not.
+                Instruction::Cmp {
+                    dest: Value(10),
+                    op: IrCmpOp::Slt,
+                    lhs: v(1),
+                    rhs: v(2),
+                    ty: IrType::I64,
+                },
+                // point 1: v3 folds (rhs); v2 as LHS disqualifies v2.
+                Instruction::Cmp {
+                    dest: Value(11),
+                    op: IrCmpOp::Slt,
+                    lhs: v(2),
+                    rhs: v(3),
+                    ty: IrType::I64,
+                },
+                // point 2: v4 has an ALU use (v8 is the web-member probe).
+                Instruction::BinOp {
+                    dest: Value(12),
+                    op: IrBinOp::Add,
+                    lhs: v(4),
+                    rhs: v(8),
+                    ty: IrType::I32,
+                },
+                // point 3: v4 also folds here — but not everywhere.
+                Instruction::Cmp {
+                    dest: Value(13),
+                    op: IrCmpOp::Slt,
+                    lhs: v(1),
+                    rhs: v(4),
+                    ty: IrType::I64,
+                },
+                // point 4: an alloca whose address value is compared...
+                Instruction::Alloca {
+                    dest: Value(5),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                // point 5: ...as rhs (excluded: the slot holds the object).
+                Instruction::Cmp {
+                    dest: Value(14),
+                    op: IrCmpOp::Slt,
+                    lhs: v(1),
+                    rhs: v(5),
+                    ty: IrType::I64,
+                },
+                // point 6: v7 in a FLOAT compare (excluded).
+                Instruction::Cmp {
+                    dest: Value(15),
+                    op: IrCmpOp::Slt,
+                    lhs: v(6),
+                    rhs: v(7),
+                    ty: IrType::F64,
+                },
+            ],
+            terminator: Terminator::Return(Some(v(10))),
+            source_spans: Vec::new(),
+        });
+        // meta_uses on the same dense numbering the classification walk
+        // uses (one point per instruction, terminator after the block).
+        let mut meta_uses: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        meta_uses.insert(1, vec![0, 1, 5]);
+        meta_uses.insert(2, vec![0, 1]);
+        meta_uses.insert(3, vec![1]);
+        meta_uses.insert(4, vec![2, 3]);
+        meta_uses.insert(5, vec![5]);
+        meta_uses.insert(6, vec![6]);
+        meta_uses.insert(7, vec![6]);
+        meta_uses.insert(8, vec![2]);
+        // v3 (leader) carries the coalesced member v8 whose only use is the
+        // ALU operand at point 2 — the web is disqualified.
+        let mut coalesce_member_of: FxHashMap<u32, u32> = FxHashMap::default();
+        coalesce_member_of.insert(8, 3);
+        let mut ranges = vec![
+            lr(1, 0, 5, vec![0, 1, 5], 10),
+            lr(2, 0, 1, vec![0, 1], 10),
+            lr(3, 1, 2, vec![1], 10),
+            lr(4, 2, 3, vec![2, 3], 10),
+            lr(5, 4, 5, vec![5], 10),
+            lr(6, 6, 6, vec![6], 10),
+            lr(7, 6, 6, vec![6], 10),
+        ];
+        // EMPTY loop extents on purpose: the classification must not depend
+        // on the function having a loop (the escape does not).
+        mark_loop_spanning(
+            &mut ranges,
+            &[],
+            &coalesce_member_of,
+            &f,
+            &meta_uses,
+            true,
+            &[],
+        );
+        let flag = |rs: &[LiveRange], id: u32| {
+            rs.iter()
+                .find(|r| r.value_id == id)
+                .unwrap()
+                .slot_operand_only
+        };
+        // v3's own use folds, but web member v8's ALU use disqualifies.
+        assert!(
+            !flag(&ranges, 3),
+            "web member with a latency-exposed use must disqualify the leader"
+        );
+        // Positive control: the same v3 WITHOUT the coalesce web — its own
+        // single use (point 1, integer compare RHS) now classifies.
+        let mut ranges2 = vec![lr(3, 1, 2, vec![1], 10)];
+        mark_loop_spanning(
+            &mut ranges2,
+            &[],
+            &FxHashMap::default(),
+            &f,
+            &meta_uses,
+            true,
+            &[],
+        );
+        assert!(
+            ranges2[0].slot_operand_only,
+            "a value whose only use is an integer compare RHS must classify"
+        );
+        // Negative controls, all on the first call's ranges:
+        assert!(!flag(&ranges, 1), "compare LHS never folds");
+        assert!(
+            !flag(&ranges, 2),
+            "a value used as compare LHS anywhere is disqualified"
+        );
+        assert!(
+            !flag(&ranges, 4),
+            "an ALU use anywhere disqualifies (mixed fold/non-fold)"
+        );
+        assert!(
+            !flag(&ranges, 5),
+            "alloca-derived compare RHS is excluded (slot holds the object)"
+        );
+        assert!(
+            !flag(&ranges, 7),
+            "float compare RHS is excluded (ucomis needs registers)"
+        );
+    }
+
     #[test]
     fn loop_span_cap_spills_excess_spans_and_keeps_short_reserve() {
         // Pool of 4, reserve 1: at most 3 loop-spanning ranges may hold
@@ -3982,6 +4268,7 @@ mod tests {
             span_cost_bar: 0,
             span_has_in_loop_use: false,
             fold_only_uses: false,
+            slot_operand_only: false,
             span_max_extent_len: 0,
             span_in_loop_uses: 0,
             span_exposed_uses: 0,
@@ -4722,6 +5009,54 @@ mod tests {
         e.init_registers();
         e.allocate_range(victim);
         assert_eq!(e.select_evict_victim(&incoming, 3), None);
+    }
+
+    /// The escape never fires on behalf of a slot-operand-only incoming
+    /// (every remaining use servable from the spill slot with zero
+    /// instructions — an integer compare's RHS on x86-64). Register
+    /// residency buys such a value nothing but one saved def store; the
+    /// steal would only displace the victim and squeeze the pool for the
+    /// incoming's whole remaining life. The rot() regression: the
+    /// sign-extended loop bound (priority 20) stole a priority-1 entry
+    /// web's register at the default K=16 and cascaded the rotation's
+    /// e-web through a per-iteration stack round trip.
+    #[test]
+    fn slot_operand_only_incoming_never_escapes() {
+        let regs = vec![PhysReg(0)];
+        // Same 35x pair that escapes in (a) above — but the incoming is a
+        // compare-RHS-only value: the escape must refuse.
+        let victim = lr(1, 0, 200, vec![1, 80], 20);
+        let mut incoming = lr(2, 50, 120, vec![60, 119], 700);
+        incoming.slot_operand_only = true;
+        let mut a = LinearScanAllocator::new(vec![], regs.clone());
+        a.init_registers();
+        a.allocate_range(victim);
+        assert_eq!(
+            a.select_evict_victim(&incoming, 3),
+            None,
+            "a slot-operand-only incoming must not win the cost-ratio escape"
+        );
+        // Positive control: the identical pair without the flag still
+        // escapes (the flag is the only difference).
+        let incoming = lr(3, 50, 120, vec![60, 119], 700);
+        let mut b = LinearScanAllocator::new(vec![], regs);
+        b.init_registers();
+        b.allocate_range(lr(4, 0, 200, vec![1, 80], 20));
+        assert_eq!(b.select_evict_victim(&incoming, 3), Some(0));
+        // The flag does not suppress CLEAN evictions (victim's next use
+        // past the incoming's end): a slot-operand-only incoming may still
+        // take a register nobody else needs in the window.
+        let victim = lr(5, 0, 200, vec![1, 200], 20);
+        let mut incoming = lr(6, 50, 120, vec![60, 119], 700);
+        incoming.slot_operand_only = true;
+        let mut c = LinearScanAllocator::new(vec![], vec![PhysReg(0)]);
+        c.init_registers();
+        c.allocate_range(victim);
+        assert_eq!(
+            c.select_evict_victim(&incoming, 3),
+            Some(0),
+            "clean eviction (nxt > incoming.end) is unaffected by the flag"
+        );
     }
 
     /// Modes 1-3 must be untouched by the cost model: same victim, same

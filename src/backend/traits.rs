@@ -1941,7 +1941,17 @@ pub trait ArchCodegen {
     fn emit_int_neg(&mut self, ty: IrType);
     fn emit_int_not(&mut self, ty: IrType);
     fn emit_int_clz(&mut self, ty: IrType);
+    /// Emit CLZ when the operand is guaranteed nonzero. Backends whose native
+    /// operation already defines zero need no distinct lowering.
+    fn emit_int_clz_nonzero(&mut self, ty: IrType) {
+        self.emit_int_clz(ty);
+    }
     fn emit_int_ctz(&mut self, ty: IrType);
+    /// Emit CTZ when the operand is guaranteed nonzero. Baseline x86 overrides
+    /// this to avoid the defined-zero guard around BSR/BSF.
+    fn emit_int_ctz_nonzero(&mut self, ty: IrType) {
+        self.emit_int_ctz(ty);
+    }
     fn emit_int_bswap(&mut self, ty: IrType);
     fn emit_int_bitreverse(&mut self, _ty: IrType) {
         panic!("bit-reverse IR reached a backend without native lowering")
@@ -2944,7 +2954,9 @@ pub fn emit_unaryop_default(
             IrUnaryOp::Neg => cg.emit_int_neg(ty),
             IrUnaryOp::Not => cg.emit_int_not(ty),
             IrUnaryOp::Clz => cg.emit_int_clz(ty),
+            IrUnaryOp::ClzNonZero => cg.emit_int_clz_nonzero(ty),
             IrUnaryOp::Ctz => cg.emit_int_ctz(ty),
+            IrUnaryOp::CtzNonZero => cg.emit_int_ctz_nonzero(ty),
             IrUnaryOp::Bswap => cg.emit_int_bswap(ty),
             IrUnaryOp::BitReverse => cg.emit_int_bitreverse(ty),
             IrUnaryOp::Popcount => cg.emit_int_popcount(ty),

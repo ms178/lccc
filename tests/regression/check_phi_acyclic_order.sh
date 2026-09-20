@@ -237,6 +237,20 @@ if not d_i < g_i:
 if not (k_i <= 56 and k_s <= 4 and k_i < l_i - 10):
     bad.append(f"escape-off resolver shape regressed ({k_i} insns/{k_s} stkref; "
                f"legacy {l_i}/{l_s}): resolver contribution changed")
+# The escape must never make THIS shape worse than no-escape-at-all: the
+# rot() working set is 8 rotation webs + IV + bound, and the only value the
+# escape could rationally buy a register for (the sign-extended bound,
+# priority 20) is slot-operand-only — its two compare uses fold into
+# `cmpq N(%rsp), %r10` with zero instructions, so residency buys it one
+# def store while the steal cascades the e-web through a per-iteration
+# stack round trip. The allocator's slot-operand classification now refuses
+# that steal (2026-09-20: 59/4 -> 55/2); this pin holds the line so the
+# class cannot silently return. Drift tolerance: the default may be
+# SMALLER than escape-off (a smarter escape) but never larger.
+if not d_i <= k_i:
+    bad.append(f"default rot() is worse than escape-off ({d_i} vs {k_i} insns): "
+               "the cost-ratio escape fired on a shape it loses "
+               "(slot-operand-only incoming stole a register)")
 for b in bad:
     print(f"  FAIL: {b}", file=sys.stderr)
 sys.exit(1 if bad else 0)

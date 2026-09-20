@@ -258,8 +258,16 @@ impl IrBinOp {
 pub enum IrUnaryOp {
     Neg,
     Not,
+    /// Defined for zero: returns the operand bit width.
     Clz,
+    /// Operand is proven nonzero. This distinction lets baseline x86 use BSR
+    /// without a zero fixup while preserving `Clz(0) == width` for internal IR.
+    ClzNonZero,
+    /// Defined for zero: returns the operand bit width.
     Ctz,
+    /// Operand is proven nonzero. This distinction lets baseline x86 use BSF
+    /// without a zero fixup while preserving `Ctz(0) == width` for internal IR.
+    CtzNonZero,
     Bswap,
     BitReverse,
     Popcount,

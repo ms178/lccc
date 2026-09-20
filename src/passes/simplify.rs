@@ -275,7 +275,10 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     IrUnaryOp::Neg => {
                         set_def(&mut neg_defs, dest.0, NegDef { src: *src });
                     }
-                    IrUnaryOp::Clz | IrUnaryOp::Ctz => {
+                    IrUnaryOp::Clz
+                    | IrUnaryOp::ClzNonZero
+                    | IrUnaryOp::Ctz
+                    | IrUnaryOp::CtzNonZero => {
                         set_def(
                             &mut unary_defs,
                             dest.0,
@@ -583,7 +586,13 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                     }
                 }
                 Instruction::UnaryOp { dest, op, src, ty }
-                    if matches!(op, IrUnaryOp::Clz | IrUnaryOp::Ctz) =>
+                    if matches!(
+                        op,
+                        IrUnaryOp::Clz
+                            | IrUnaryOp::ClzNonZero
+                            | IrUnaryOp::Ctz
+                            | IrUnaryOp::CtzNonZero
+                    ) =>
                 {
                     if (dest.0 as usize) < unary_defs.len() {
                         unary_defs[dest.0 as usize] = Some(UnaryDef {
@@ -648,7 +657,10 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                                 Operand::Value(rv) => matches!(
                                     unary_defs.get(rv.0 as usize).and_then(|d| d.as_ref()),
                                     Some(UnaryDef {
-                                        op: IrUnaryOp::Clz | IrUnaryOp::Ctz,
+                                        op: IrUnaryOp::Clz
+                                            | IrUnaryOp::ClzNonZero
+                                            | IrUnaryOp::Ctz
+                                            | IrUnaryOp::CtzNonZero,
                                         ..
                                     })
                                 ),
@@ -723,7 +735,24 @@ fn clz_ctz_zero_guard_replacement(
     if peel_int_cast_chain(*cond, cast_defs, true) != peel_int_cast_chain(src, cast_defs, true) {
         return None;
     }
-    Some(*true_val)
+    // Defined-zero intrinsics only. `select(x, clz(x), W) == clz(x)` is an
+    // algebraic identity BECAUSE the IR defines Clz(0)/Ctz(0) == W. The
+    // NonZero spellings have no value at zero, so the identity does not
+    // apply to them: their guard-select is the only thing standing between
+    // a speculated BSR/BSF and a garbage return for x == 0. A NonZero arm
+    // reaches this shape when CVP specialized the intrinsic under a branch
+    // proof and if-conversion then speculated the arm ABOVE that proof
+    // (i686 has no pre-CVP diamond conversion; on x86-64 the vectorizer's
+    // pre-conversion merely hides the shape). Collapsing such a select
+    // returns BSR's undefined destination for x == 0 — measured
+    // `clz_if(0) == -846929913` before this rejection. When the nonzero
+    // fact DOES dominate the select, CVP's own fact-stack select folding
+    // performs the identical rewrite soundly (it runs both before and
+    // immediately after this pass), so nothing is lost here.
+    match op {
+        IrUnaryOp::Clz | IrUnaryOp::Ctz => Some(*true_val),
+        _ => None,
+    }
 }
 
 /// Cached information about a BinOp instruction for constant reassociation.
@@ -3164,6 +3193,43 @@ mod tests {
         assert_eq!(near(Operand::Value(Value(6))), None);
         // Truncated-condition value id 5 peels to nothing (same-size only).
         assert_eq!(near(Operand::Value(Value(5))), None);
+    }
+
+    #[test]
+    fn test_select_clz_guard_rejects_nonzero_variants() {
+        // The algebraic identity `select(x, clz(x), W) == clz(x)` rests on
+        // the IR's defined-zero extension. The NonZero spellings have NO
+        // value at zero, so a guard-select over a NonZero arm must survive:
+        // it is the only consumer discipline keeping a speculated BSR/BSF
+        // result out of the return value for x == 0. When the nonzero fact
+        // dominates the select, CVP's fact-stack select folding performs
+        // the same rewrite soundly instead.
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 7];
+        cast_defs[4] = Some(CastDef {
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; 7];
+        for op in [IrUnaryOp::ClzNonZero, IrUnaryOp::CtzNonZero] {
+            unary_defs[3] = Some(UnaryDef {
+                op,
+                src: Operand::Value(Value(1)),
+                ty: IrType::I32,
+            });
+            let arm = Operand::Value(Value(4));
+            assert_eq!(
+                clz_ctz_zero_guard_replacement(
+                    &Operand::Value(Value(1)),
+                    &arm,
+                    &Operand::Const(IrConst::I64(32)),
+                    &cast_defs,
+                    &unary_defs,
+                ),
+                None,
+                "{op:?} guard-select must not collapse without a dominating proof"
+            );
+        }
     }
 
     // === BinOp identity tests ===

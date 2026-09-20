@@ -1,0 +1,8 @@
+compiler       resolved id          instructions  name
+----------------------------------------------------------------------------------
+lccc           target/fastbuild/lccc           16  local LCCC
+gcc16.2        cg162                          14  x86-64 gcc 16.2
+clang          cclang2310                     19  x86-64 clang 23.1.0
+icc            cicc2021100                    20  x86-64 icc 2021.10.0
+icx            cicxlatest                     16  x86-64 icx (latest)
+wrote engineering/evidence/kernel/2026-09-20-bitcount-nonzero/x86-64-v3.json

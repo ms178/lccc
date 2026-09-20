@@ -14,7 +14,7 @@ The item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md); the active queue is 
   - Bounds-checked `slice::split_at_checked` in instruction decoders and encoders.
   - Clean unsigned integer `div_ceil` and `align_up` throughout stack layout and ELF writers.
 - **C frontend** → SSA IR → `-O0` skip / `-O1` light / `-O2` full / `-O3` +unroll / `-Os`/`-Oz` size (`src/passes/README.md` is the authoritative tier list).
-- **Linear-scan RA** in `src/backend/live_range.rs` (scan) + `src/backend/regalloc.rs` (policy). **Segment-aware interference is the scan's primary model** (RA-05a landed): `LiveRange::segs` + `segments_conflict`, coalesce-leader piece/use union, Phase-2f residual fill generalized to all targets and default-ON. Kill switches: `CCC_NO_SEGMENT_FILL`. Tier-2 hole-aware graph coloring is **production default** for eligible subsets (`CCC_NO_TIER2_GRAPH` restores scan-only).
+- **Linear-scan RA** in `src/backend/live_range.rs` (scan) + `src/backend/regalloc.rs` (policy). **Segment-aware interference is the scan's primary model** (RA-05a landed): `LiveRange::segs` + `segments_conflict`, coalesce-leader piece/use union, Phase-2f residual fill generalized to all targets and default-ON. Kill switches: `CCC_NO_SEGMENT_FILL`. Tier-2 hole-aware graph coloring is **production default** for eligible subsets (`CCC_NO_TIER2_GRAPH` restores scan-only). The eviction cost model is **slot-operand aware**: a range whose every use is an integer compare's RHS on x86-64 (`slot_operand_only`, web-wide, computed in `mark_loop_spanning` before the loop bail-out) is servable from its spill slot with zero instructions, so the cost-ratio escape (`CCC_EVICT_SHORT_K`) never fires on its behalf and both compare emitter paths (inline + replay) fold the slot directly (`cmpq N(%rsp), %rax`) — the rot() contract in `check_phi_acyclic_order` pins `default <= escape-off` so the class cannot return.
 - **MachInst Window Register Allocator:** SSA-driven MachInst window allocation with 85%+ instruction selection coverage.
 - **ABI physical hints** (RA-26) retain leading ParamRefs across safe call-free x86 CFG leaves; ordered caller homes; stack-arg/mixed/calling shapes fail closed (`CCC_NO_LEAF_PARAM_GPR`, `CCC_NO_EMPTY_LOCAL_FRAME_ELISION`).
 - **RA verifier**: `CCC_VERIFY_REGALLOC=1` hard-verifies segment interference, final assignments, and eviction occupancy history.
@@ -26,6 +26,7 @@ The item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md); the active queue is 
 - **`-fsyntax-only`** implemented (CompileMode::SyntaxOnly): preprocess+lex+parse+sema, diagnostics incl. -Werror promotion, no output/link for any input kind (previously silently dropped by the unknown-arg handler; the i686 header gate probed with -E).
 - **Loop rotation** `src/passes/loop_rotate.rs` is **opt-in** (`CCC_LOOP_ROTATE=1`): correctness-clean for canonical counted loops.
 - **DSE** `src/passes/dse.rs` (same-block, closed-alloca escape analysis, byte-range kills; `CCC_NO_DSE`); backedge PRE; GVN per-object epochs for disjoint non-escaping allocas + `restrict` params; GlobalAddr CSE with oracle-derived placement.
+- **Range-check fusion** `src/passes/range_check.rs` — one shared `RangePlan` domain argument (`i128`-normalized, spelling-independent) feeds four emission paths (Select, bitwise And/Or, phi diamond, branch chain): the unsigned-bias test `Sub(x, lo); Cmp(Ule, ·, hi-lo)` (narrowing to the pre-promotion source domain only when BOTH bounds fit it), or — since 2026-09-20 — the CONSTANT when the range covers the compare domain entirely (signed `[INT_MIN, INT_MAX]`, unsigned `[0, MAX]`, or the narrowed byte/short domain behind a widening cast; inside form TRUE, outside FALSE; the branch chain rewrites to an unconditional branch and deletes the dead side under a def-use + canonical-CFG audit). Value forms compile to one instruction. See `engineering/FOLLOWUP-2026-09-20D-pr565-ci-fix-fulldomain.md`.
 - **Aggregates**: AVX2 64-byte assignment = 2 YMM pairs + `vzeroupper`; 32/48-byte copies stay XMM. SysV all-SSE 16-byte struct returns use xmm0/xmm1.
 - **Multi-arch**: x86-64, i686 (natural 4-byte slots, m16 boot pipeline, 32 KiB boot gate PASS), AArch64 (CASP, MOVW `:abs_g*:`, `.org`, PREL64, G1/G2/SABS reloc repair), RISC-V (va_arg struct{long double} end-to-end padding). Assembler + ELF linker in-tree for all four.
 
@@ -138,6 +139,16 @@ the range fusion; it used to be a scalar loop.
 - **Defect (b) FIXED / CURRENT GATE PASS (2026-09-19)** — the clean QEMU
   build brings CPU1 online and the guest reports exactly 2 CPUs. Continue
   dedicated offline/online hotplug cycling as a stronger follow-up stress gate.
-- Kernel harness scripts (`build_kernel_vm.sh`, `prepare_kernel_tree.sh`
-  with whole-tree extraction audit, `qemu_boot_test.sh`) are unreviewed
-  deltas in the session patch, not upstream.
+- **Defect (f) FIXED + CLEAN-BOOT-VALIDATED (2026-09-19)** — conditional
+  store sinking recursively cloned `Cast(index) -> Shl(2) -> GEP` with one SSA
+  ID for every node. The simplifier composed that self-shift on each fixpoint
+  iteration (`2 -> 4 -> 8 -> 16`); `llc_populate_cpu_shard_id()` consequently
+  wrote `int[c]` 64 KiB away and corrupted the broad-config SCSI device table.
+  The cloner now reserves each fresh ID before recursive descent. Focused
+  runtime/codegen, unique-SSA unit, real-workqueue assembly, clean full kernel,
+  and 16-gate QEMU validations pass. See
+  `FOLLOWUP-2026-09-19C-kernel-ifconvert-boot.md`.
+- Kernel harness scripts (`build_kernel_vm.sh`, `prepare_kernel_tree.sh`,
+  `kernel_tool_identity.sh`, `qemu_boot_test.sh`) are production-validated:
+  compiler hash changes force a complete Kbuild clean, linker-only changes
+  preserve objects, and truncated post-wipe source trees self-regenerate.
