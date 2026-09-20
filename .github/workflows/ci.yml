@@ -319,6 +319,30 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_vectorize_isa_gate.sh
 
+      # Constant-array promotion: fully-constant local arrays become
+      # .rodata globals. Emission contracts (the .LCA_ global, store
+      # elimination, rip-relative references, alignment preservation)
+      # AND the fail-closed rejections the red-team battery drove:
+      # the variable-index runtime store (invisible to the original
+      # const-offset classifier — promoted straight into .rodata),
+      # the pointer-induction callee reader (must PROMOTE, not
+      # reject), and the `return a;` terminator escape (must compile
+      # without an ICE). Every config is executed, not just checked.
+      - name: Verify constant-array promotion contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_const_array_promote.sh
+
+      # Branch-condition range fusion (range_fold): the fused sub+unsigned
+      # compare must appear for the foldable shapes and stay absent for the
+      # adversarial ones (different values, mixed signedness, value-context
+      # uses, side effects between the tests, two-predecessor check blocks,
+      # wrapped/empty unsigned domains, unrepresentable spans).
+      - name: Verify range-fold branch contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_range_fold_branch.sh
+
       # BB-SLP v6 (the gate ci.yml was missing — ci_local.sh had it): the
       # 128-bit VEX memory fold, FP negation sign-mask, integer min/max
       # folds, the general cmp+blendv composite, and the rule-(b)
