@@ -786,26 +786,40 @@ fn minus_zero_const(ty: IrType) -> Option<IrConst> {
 /// pass's only feature accessor — which implies it (x86-64-v2-only builds
 /// simply keep the cmp+blendv two-op form, which is itself exact).
 /// Halfword (pminsw/pmaxsw) and byte (pminub/pmaxub) are SSE2.
+/// SIGNED lane types ONLY — see the note on the 16/32-bit arms below.
+///
+/// Every intrinsic returned here for a 16- or 32-bit lane lowers to a
+/// SIGNED instruction (`vpmaxsd`/`vpminsd`, `vpmaxsw`/`vpminsw`, and the
+/// 128-bit `pmaxsw`/`pminsw`).  Mapping an unsigned lane onto one is a
+/// miscompile, not a pessimization: for any lane with the top bit set the
+/// signed compare reads it as negative and selects the wrong operand
+/// (`max(0x80000000u32, 5u32)` would return 5).  There is no unsigned word
+/// or dword packed min/max in the intrinsic vocabulary — SSE4.1's
+/// `pmaxud`/`pminud` are encodable but have no `IntrinsicOp` — so the
+/// unsigned cases fail closed and the caller falls through to the
+/// cmp+blendv composite, which handles unsigned predicates correctly by
+/// emulating them with a sign-bit flip.  Only `U8` has a genuine unsigned
+/// form (`pminub`/`pmaxub`, SSE2) and is listed explicitly.
 fn packed_int_minmax(is_max: bool, ty: IrType, width: usize) -> Option<IntrinsicOp> {
     let width = reg_width_for(ty, width);
     let avx2 = x86_avx2_available_pub();
     match (ty, width) {
-        (IrType::I32 | IrType::U32, 8) => Some(if is_max {
+        (IrType::I32, 8) => Some(if is_max {
             IntrinsicOp::VecMaxI32x8
         } else {
             IntrinsicOp::VecMinI32x8
         }),
-        (IrType::I32 | IrType::U32, 4) if avx2 => Some(if is_max {
+        (IrType::I32, 4) if avx2 => Some(if is_max {
             IntrinsicOp::VecSmaxI32x4
         } else {
             IntrinsicOp::VecSminI32x4
         }),
-        (IrType::I16 | IrType::U16, 16) => Some(if is_max {
+        (IrType::I16, 16) => Some(if is_max {
             IntrinsicOp::VecMaxI16x16
         } else {
             IntrinsicOp::VecMinI16x16
         }),
-        (IrType::I16 | IrType::U16, 8) => Some(if is_max {
+        (IrType::I16, 8) => Some(if is_max {
             IntrinsicOp::VecMaxI16x8
         } else {
             IntrinsicOp::VecMinI16x8
@@ -1002,6 +1016,99 @@ fn strip_identity_casts(ctx: &BlockCtx, o: &Operand) -> Operand {
 /// compares read the identical lanes, and the min/max arm identity is a
 /// bit-level question. A widening or narrowing cast is NEVER stripped
 /// here (the bits differ).
+/// The operand of a lane-width unary operation, seeing through the
+/// promotion/truncation sandwich that C integer promotion builds.
+///
+/// `-t` on an `int16_t` does not arrive as `Neg_i16(t)`.  It arrives as
+///
+/// ```text
+/// Cast_{I32->I16}( UnaryOp{Neg, I32}( Cast_{I16->I32}(t) ) )
+/// ```
+///
+/// because the negation happens at the promoted width and only the store
+/// truncates.  Both spellings denote the same lane value: two's-complement
+/// negation and bitwise complement are per-bit / modulo-2^bits operations,
+/// so negating wide and then truncating agrees bit-for-bit with truncating
+/// and then negating — every surviving bit is the same.  Normalizing the
+/// sandwich to the narrow unary lets the existing packed `Sub(zero, x)` and
+/// `Xor(ones, x)` lowerings apply unchanged, which is what turns an
+/// `abs_i16` loop from 63 scalar instructions into the 7-instruction
+/// `vpsubw`/`vpcmpgtw`/`vpblendvb` sequence gcc emits.
+///
+/// Fail-closed: the widened operand must be a widening of exactly this lane
+/// type, so what gets negated is bit-identical to the lane.  Anything else
+/// returns `None` and the seed is rejected.
+fn unary_lane_src(ctx: &BlockCtx, v: &Value, ty: IrType, uop: IrUnaryOp) -> Option<Operand> {
+    let at = |id: u32| -> Option<&Instruction> {
+        ctx.def_pos.get(&id).map(|&i| &ctx.block.instructions[i])
+    };
+    // Direct spelling: the unary is already at the lane width.
+    if let Some(Instruction::UnaryOp {
+        op, src, ty: uty, ..
+    }) = at(v.0)
+    {
+        return (*op == uop && *uty == ty).then(|| src.clone());
+    }
+    // Promoted spelling: trunc_ty( unary_wide( widen_ty(x) ) ).
+    let Instruction::Cast {
+        src: Operand::Value(u),
+        from_ty: nfrom,
+        to_ty: nto,
+        ..
+    } = at(v.0)?
+    else {
+        return None;
+    };
+    if *nto != ty || !ty_is_integer(*nfrom) || nfrom.size() <= ty.size() {
+        return None;
+    }
+    let Instruction::UnaryOp {
+        op, src, ty: wty, ..
+    } = at(u.0)?
+    else {
+        return None;
+    };
+    if *op != uop || *wty != *nfrom {
+        return None;
+    }
+    match src {
+        // The unary's operand must be the lane value widened back up, so
+        // that the value being negated is bit-identical to the lane.
+        Operand::Value(w) => match at(w.0)? {
+            Instruction::Cast {
+                src: inner,
+                from_ty,
+                to_ty,
+                ..
+            } if *to_ty == *wty && *from_ty == ty => Some(inner.clone()),
+            _ => None,
+        },
+        // A constant operand needs no widening: trunc(-c) == -trunc(c).
+        Operand::Const(_) => Some(src.clone()),
+    }
+}
+
+/// Follow `Copy` instructions to the value they move.
+///
+/// A `Copy` is a pure SSA value move: same type, same bits, no side
+/// effects.  Following one is therefore a value-identity substitution and
+/// can never change what a lane denotes.  Bounded like
+/// `strip_bitidentity_casts` so a malformed copy cycle cannot spin.
+fn strip_copies(ctx: &BlockCtx, o: &Operand) -> Operand {
+    let mut cur = o.clone();
+    for _ in 0..8 {
+        let Operand::Value(v) = &cur else { break };
+        let Some(&i) = ctx.def_pos.get(&v.0) else {
+            break;
+        };
+        match &ctx.block.instructions[i] {
+            Instruction::Copy { src, .. } => cur = src.clone(),
+            _ => break,
+        }
+    }
+    cur
+}
+
 fn strip_bitidentity_casts(ctx: &BlockCtx, o: &Operand) -> Operand {
     let block = ctx.block;
     let mut cur = o.clone();
@@ -2039,6 +2146,361 @@ fn find_existing_broadcast(ctx: &BlockCtx, fam: &VecFamily, src: &Operand) -> Op
     None
 }
 
+/// Build the pack for one ARM of a demoted sub-word select when the arm's
+/// lanes are themselves PROMOTED-WIDTH selects.
+///
+/// This is the missing half of the 1b demotion in `build_pack`.  C's integer
+/// promotion lifts a whole conditional TREE to `int`, and the store truncates
+/// only at the root, so a two-sided clamp over a byte array arrives as
+///
+/// ```text
+///     Cast_{I32->U8}( Select(Cmp(Sgt,zx,200), 200,
+///                              Select(Cmp(Slt,zx,16), 16, zx)) )
+/// ```
+///
+/// The demotion packs the OUTER select at the lane width and then needs a pack
+/// for its false arm — whose lanes are `int` Select values.  `build_pack` has
+/// nothing to match there (they are neither lane-width ops, loads, casts of
+/// selects, nor constants), so the arm degraded to a gather and the whole seed
+/// was rejected: a 16-byte clamp stayed 161 scalar instructions where GCC and
+/// Clang emit 5.
+///
+/// The arm therefore gets the SAME demotion rule, one level down.  This is a
+/// structural split, not a second opinion about legality: every soundness
+/// primitive is shared with the at-width path — `demote_cmp_pred` (predicate
+/// remap), `fits_narrow` (fail-closed constant range check), `narrow_const`,
+/// `strip_bitidentity_casts`, `packed_int_minmax`, `packed_cmp_blendv`,
+/// `cmp_predicate_imm`, `same_source`.
+///
+/// EXACTNESS, per level (the same argument the at-width 2c path carries):
+/// the stored sub-word value is `trunc_W(select tree at the promoted width)`.
+/// A select is a per-lane CHOICE — no carry, no reassociation, no rounding —
+/// so it suffices that (i) each remapped predicate has the same truth value as
+/// the promoted one for every lane value, which `demote_cmp_pred` guarantees
+/// and `fits_narrow` bounds (an out-of-range constant rejects the whole pack,
+/// it is never truncated), and (ii) each arm truncates exactly, which
+/// `narrow_const` and the widening-cast strip both give by construction.
+/// Composition over levels is then trivially exact: each level chooses the same
+/// lane, so the tree picks the same lane at every depth.
+///
+/// Termination: `depth` (capped with `build_pack`'s own bound) and the fact
+/// that recursion happens only on lanes that ARE wider-integer selects.
+fn build_demoted_select_arm(
+    ctx: &BlockCtx,
+    lanes: &[Operand],
+    ty: IrType,
+    width: usize,
+    fam: &VecFamily,
+    packs: &mut Vec<Pack>,
+    dedup: &mut FxHashMap<Vec<LaneKey>, usize>,
+    depth: usize,
+) -> Option<usize> {
+    if packs.len() >= MAX_PACKS || depth > 16 || lanes.len() != width {
+        return None;
+    }
+    let key: Vec<LaneKey> = lanes.iter().map(lane_key).collect();
+    if let Some(&idx) = dedup.get(&key) {
+        return Some(idx);
+    }
+    let block = ctx.block;
+
+    // Per lane: (remapped predicate, stripped lhs, stripped rhs, stripped
+    // true arm, stripped false arm) — exactly the 1b demotion's shape tuple.
+    let mut shapes: Vec<(IrCmpOp, Operand, Operand, Operand, Operand)> = Vec::with_capacity(width);
+    for lane in lanes {
+        let Operand::Value(sv) = lane else {
+            return None;
+        };
+        let j = *ctx.def_pos.get(&sv.0)?;
+        let Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } = &block.instructions[j]
+        else {
+            return None;
+        };
+        let Operand::Value(cv) = cond else {
+            return None;
+        };
+        let ci = *ctx.def_pos.get(&cv.0)?;
+        let Instruction::Cmp {
+            op,
+            lhs,
+            rhs,
+            ty: cty,
+            ..
+        } = &block.instructions[ci]
+        else {
+            return None;
+        };
+        // The compare is either already at the lane width (an earlier pass
+        // narrowed it — the arms still carry the widening casts) or at the
+        // promoted width over widening casts/consts of the lane values.
+        // BOTH spellings occur: the two-statement temporary form
+        // (`uint16_t t = ...; d[i] = t < 4 ? 4 : t;`) keeps the compare
+        // promoted, while the single-expression form
+        // (`d[i] = a[i] > hi ? hi : (a[i] < lo ? lo : a[i])`) has it
+        // narrowed at the lane width.  This mirrors the 1b demotion's
+        // operand handling exactly; anything else fails closed.
+        let (remapped, l, r) = if *cty == ty {
+            (
+                *op,
+                strip_copies(ctx, &strip_bitidentity_casts(ctx, lhs)),
+                strip_copies(ctx, &strip_bitidentity_casts(ctx, rhs)),
+            )
+        } else if ty_is_integer(*cty) && cty.size() > ty.size() {
+            // Widen-cast / fitting-const operands only.
+            let strip_wide = |o: &Operand| -> Option<(bool, bool, Operand)> {
+                match o {
+                    Operand::Value(w) => {
+                        match ctx.def_pos.get(&w.0).map(|&k| &block.instructions[k]) {
+                            Some(Instruction::Cast {
+                                src,
+                                from_ty,
+                                to_ty,
+                                ..
+                            }) if *from_ty == ty && *to_ty == *cty => {
+                                Some((!from_ty.is_signed(), !to_ty.is_signed(), src.clone()))
+                            }
+                            _ => None,
+                        }
+                    }
+                    Operand::Const(c) => {
+                        let cv = c.to_i64()?;
+                        let rem = demote_cmp_pred(*op, !ty.is_signed(), !cty.is_signed())?;
+                        let unsigned_final = matches!(
+                            rem,
+                            IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge
+                        );
+                        if fits_narrow(cv, ty, unsigned_final) {
+                            Some((
+                                !ty.is_signed(),
+                                !cty.is_signed(),
+                                Operand::Const(narrow_const(cv, ty)),
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
+            let (fu0, tu0, l) = strip_wide(lhs)?;
+            let (fu1, tu1, r) = strip_wide(rhs)?;
+            if fu0 != fu1 || tu0 != tu1 {
+                return None;
+            }
+            (demote_cmp_pred(*op, fu0, tu0)?, l, r)
+        } else {
+            return None;
+        };
+        // The arms widen to the SELECT's type (any wider integer), or are
+        // constants — both truncate exactly to the lane width.
+        let strip_arm = |o: &Operand| -> Option<Operand> {
+            match o {
+                Operand::Value(w) => {
+                    match ctx.def_pos.get(&w.0).map(|&k| &block.instructions[k]) {
+                        Some(Instruction::Cast {
+                            src,
+                            from_ty,
+                            to_ty,
+                            ..
+                        }) if *from_ty == ty
+                            && ty_is_integer(*to_ty)
+                            && to_ty.size() > ty.size() =>
+                        {
+                            Some(src.clone())
+                        }
+                        // Deeper nesting (3+ levels): pass the inner select
+                        // through for the next recursion level, fail-closed
+                        // if that level cannot demote it.
+                        // ARM RE-NARROWED THEN RE-PROMOTED. With 16-bit lanes
+                        // the front end emits `trunc(select_i32)` for the arm and
+                        // then re-promotes it for the next level, so strip_arm sees
+                        // a Cast whose SOURCE is the inner Select.  Unwrap to the
+                        // bare Select so the recursive demotion recognizes it; the
+                        // recursion re-derives the same lane-width value, exactly as
+                        // this demotion re-derives `trunc(promoted select)` one
+                        // level up.  Fail-closed if the recursion cannot demote it.
+                        Some(Instruction::Cast {
+                            src: Operand::Value(inner),
+                            from_ty,
+                            to_ty,
+                            ..
+                        }) if *to_ty == ty
+                            && ty_is_integer(*from_ty)
+                            && from_ty.size() > ty.size()
+                            && matches!(
+                                ctx.def_pos.get(&inner.0).map(|&k| &block.instructions[k]),
+                                Some(Instruction::Select { .. })
+                            ) =>
+                        {
+                            Some(Operand::Value(*inner))
+                        }
+                        Some(Instruction::Select { .. }) => Some(o.clone()),
+                        _ => None,
+                    }
+                }
+                Operand::Const(c) => c.to_i64().map(|cv| Operand::Const(narrow_const(cv, ty))),
+            }
+        };
+        let t = strip_arm(true_val)?;
+        let f = strip_arm(false_val)?;
+        shapes.push((remapped, l, r, t, f));
+    }
+    if shapes.len() != width {
+        return None;
+    }
+    let op0 = shapes[0].0;
+    if !shapes.iter().all(|s| s.0 == op0) {
+        return None;
+    }
+
+    // An arm is built by whichever rule fits: a further promoted select
+    // recurses here, anything else goes to the ordinary pack builder.
+    let mut arm = |side: &[Operand],
+                   packs: &mut Vec<Pack>,
+                   dedup: &mut FxHashMap<Vec<LaneKey>, usize>|
+     -> Option<usize> {
+        let all_selects = side.iter().all(|o| {
+            matches!(o, Operand::Value(v)
+            if matches!(
+                ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]),
+                Some(Instruction::Select { .. })
+            ))
+        });
+        if all_selects {
+            if let Some(i) =
+                build_demoted_select_arm(ctx, side, ty, width, fam, packs, dedup, depth + 1)
+            {
+                return Some(i);
+            }
+        }
+        build_pack(ctx, side, ty, width, fam, packs, dedup, depth + 1)
+    };
+
+    // (a) the min/max spelling — the same fold table as the at-width path.
+    let spell = match op0 {
+        IrCmpOp::Slt | IrCmpOp::Sle => Some(false),
+        IrCmpOp::Sgt | IrCmpOp::Sge => Some(true),
+        _ => None,
+    };
+    if let Some(is_gt) = spell {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Fold {
+            Min,
+            Max,
+        }
+        let mut fold: Option<(Fold, bool)> = None;
+        let mut shapes_ok = true;
+        for (_, l, r, t, f) in &shapes {
+            let this = if same_source(ctx, t, l) && same_source(ctx, f, r) {
+                Some(if is_gt {
+                    (Fold::Max, false)
+                } else {
+                    (Fold::Min, false)
+                })
+            } else if same_source(ctx, t, r) && same_source(ctx, f, l) {
+                Some(if is_gt {
+                    (Fold::Min, true)
+                } else {
+                    (Fold::Max, true)
+                })
+            } else {
+                None
+            };
+            match (this, fold) {
+                (Some(x), None) => fold = Some(x),
+                (Some(x), Some(y)) if x == y => {}
+                _ => {
+                    shapes_ok = false;
+                    break;
+                }
+            }
+        }
+        if shapes_ok {
+            if let Some((kind, arms_swapped)) = fold {
+                if let Some(vec_op) = packed_int_minmax(kind == Fold::Max, ty, width) {
+                    let mut src1: Vec<Operand> = Vec::with_capacity(width);
+                    let mut src2: Vec<Operand> = Vec::with_capacity(width);
+                    for (_, l, r, _, _) in &shapes {
+                        if arms_swapped {
+                            src1.push(strip_bitidentity_casts(ctx, r));
+                            src2.push(strip_bitidentity_casts(ctx, l));
+                        } else {
+                            src1.push(strip_bitidentity_casts(ctx, l));
+                            src2.push(strip_bitidentity_casts(ctx, r));
+                        }
+                    }
+                    if let (Some(lhs), Some(rhs)) =
+                        (arm(&src1, packs, dedup), arm(&src2, packs, dedup))
+                    {
+                        let idx = packs.len();
+                        packs.push(Pack {
+                            kind: PackKind::FpMinMax {
+                                vec_op,
+                                lhs,
+                                rhs,
+                                // The promoted Cmp/Select stay for any wider
+                                // uses; DCE retires them when the truncs were
+                                // their only consumers.
+                                cond_lanes: Vec::new(),
+                            },
+                            lane_vals: Vec::new(),
+                            sched: usize::MAX,
+                            order: 0,
+                        });
+                        dedup.insert(key.clone(), idx);
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // (b) the general cmp+blendv composite with the remapped predicate.
+    let (pred, swap) = cmp_predicate_imm(op0, false)?;
+    let (cmp_op, blend_op) = packed_cmp_blendv(ty, width)?;
+    let mut a_lanes: Vec<Operand> = Vec::with_capacity(width);
+    let mut b_lanes: Vec<Operand> = Vec::with_capacity(width);
+    let mut t_lanes: Vec<Operand> = Vec::with_capacity(width);
+    let mut f_lanes: Vec<Operand> = Vec::with_capacity(width);
+    for (_, l, r, t, f) in &shapes {
+        if swap {
+            a_lanes.push(r.clone());
+            b_lanes.push(l.clone());
+        } else {
+            a_lanes.push(l.clone());
+            b_lanes.push(r.clone());
+        }
+        t_lanes.push(t.clone());
+        f_lanes.push(f.clone());
+    }
+    let lhs = arm(&a_lanes, packs, dedup)?;
+    let rhs = arm(&b_lanes, packs, dedup)?;
+    let tv = arm(&t_lanes, packs, dedup)?;
+    let fv = arm(&f_lanes, packs, dedup)?;
+    let idx = packs.len();
+    packs.push(Pack {
+        kind: PackKind::CmpBlendv {
+            cmp_op,
+            blend_op,
+            pred,
+            lhs,
+            rhs,
+            tv,
+            fv,
+            cond_lanes: Vec::new(),
+        },
+        lane_vals: Vec::new(),
+        sched: usize::MAX,
+        order: 0,
+    });
+    dedup.insert(key, idx);
+    Some(idx)
+}
+
 fn build_pack(
     ctx: &BlockCtx,
     lanes: &[Operand],
@@ -2052,6 +2514,37 @@ fn build_pack(
     if packs.len() >= MAX_PACKS || depth > 16 {
         return None;
     }
+
+    // COPY TRANSPARENCY.  A `Copy` is a pure value move — same type, same
+    // bits, no side effects — so a lane naming a copy names exactly the
+    // value that copy moves.  The front end emits them for C temporaries
+    // read more than once: `uint16_t t = a[i] > hi ? hi : a[i];` promotes
+    // `a[i]` twice, and the second read is a copy of the first load.  Copy
+    // propagation runs before the vectorizer, so these reach SLP, and with
+    // no recognizer for `Copy` the lane shape matches nothing — the whole
+    // seed is silently lost (a nested 16-bit clamp never vectorized).
+    //
+    // Normalizing is a value-identity substitution: the vector operation
+    // reads the copy's source, which is the value the copy denotes, and the
+    // scalar copy is left to DCE.  Done before the `LaneKey` is computed so
+    // the dedup map and the splat test see the same normalized shapes.
+    let normalized;
+    let lanes: &[Operand] = if lanes.iter().any(|l| {
+        matches!(l, Operand::Value(v)
+        if matches!(
+            ctx.def_pos.get(&v.0).map(|&i| &ctx.block.instructions[i]),
+            Some(Instruction::Copy { .. })
+        ))
+    }) {
+        normalized = lanes
+            .iter()
+            .map(|l| strip_copies(ctx, l))
+            .collect::<Vec<_>>();
+        &normalized
+    } else {
+        lanes
+    };
+
     let key: Vec<LaneKey> = lanes.iter().map(lane_key).collect();
     if let Some(&idx) = dedup.get(&key) {
         return Some(idx);
@@ -2637,8 +3130,8 @@ fn build_pack(
                         let (remap, l, r) = if *cty == ty {
                             (
                                 Some(*op),
-                                strip_bitidentity_casts(ctx, lhs),
-                                strip_bitidentity_casts(ctx, rhs),
+                                strip_copies(ctx, &strip_bitidentity_casts(ctx, lhs)),
+                                strip_copies(ctx, &strip_bitidentity_casts(ctx, rhs)),
                             )
                         } else if ty_is_integer(*cty) && cty.size() > ty.size() {
                             // Widen-cast / fitting-const operands only.
@@ -2733,6 +3226,50 @@ fn build_pack(
                                         {
                                             Some(src.clone())
                                         }
+                                        // ARM RE-NARROWED THEN RE-PROMOTED. With 16-bit lanes
+                                        // the front end emits `trunc(select_i32)` for the arm and
+                                        // then re-promotes it for the next level, so strip_arm sees
+                                        // a Cast whose SOURCE is the inner Select.  Unwrap to the
+                                        // bare Select so the recursive demotion recognizes it; the
+                                        // recursion re-derives the same lane-width value, exactly as
+                                        // this demotion re-derives `trunc(promoted select)` one
+                                        // level up.  Fail-closed if the recursion cannot demote it.
+                                        Some(Instruction::Cast {
+                                            src: Operand::Value(inner),
+                                            from_ty,
+                                            to_ty,
+                                            ..
+                                        }) if *to_ty == ty
+                                            && ty_is_integer(*from_ty)
+                                            && from_ty.size() > ty.size()
+                                            && matches!(
+                                                ctx.def_pos
+                                                    .get(&inner.0)
+                                                    .map(|&k| &block.instructions[k]),
+                                                Some(Instruction::Select { .. })
+                                            ) =>
+                                        {
+                                            Some(Operand::Value(*inner))
+                                        }
+                                        // NESTED promoted select: a two-sided
+                                        // clamp `x > hi ? hi : (x < lo ? lo : x)`
+                                        // promotes the WHOLE tree, so the outer
+                                        // arm is itself a wider-integer Select
+                                        // with no cast to strip.  Pass it
+                                        // through UNCHANGED — the arm-pack
+                                        // builder recognizes that shape and
+                                        // demotes it recursively (see
+                                        // `build_demoted_select_arm`).  If the
+                                        // recursion cannot handle it, the arm
+                                        // pack fails and the seed is rejected:
+                                        // fail-closed, never a partial demotion.
+                                        // No guard is needed: this arm is
+                                        // reached only by looking `w` up in
+                                        // `def_pos`, so its defining instruction
+                                        // is by construction the `Select`
+                                        // matched here, and a `Select` always
+                                        // has a destination.
+                                        Some(Instruction::Select { .. }) => Some(o.clone()),
                                         _ => None,
                                     }
                                 }
@@ -2861,6 +3398,38 @@ fn build_pack(
                             // (b) the general cmp+blendv composite with the
                             //     remapped predicate.
                             if let Some((pred, swap)) = cmp_predicate_imm(op0, false) {
+                                // A demoted arm may itself be a promoted
+                                // SELECT (the nested clamp): try the recursive
+                                // demotion first, fall back to the ordinary
+                                // pack builder for every other shape.
+                                let demote_arm = |side: &Vec<Operand>,
+                                                  packs: &mut Vec<Pack>,
+                                                  dedup: &mut FxHashMap<Vec<LaneKey>, usize>|
+                                 -> Option<usize> {
+                                    let all_sel = side.iter().all(|o| {
+                                        matches!(o, Operand::Value(v)
+                                        if matches!(
+                                            ctx.def_pos.get(&v.0)
+                                                .map(|&i| &block.instructions[i]),
+                                            Some(Instruction::Select { .. })
+                                        ))
+                                    });
+                                    if all_sel {
+                                        if let Some(i) = build_demoted_select_arm(
+                                            ctx,
+                                            side,
+                                            ty,
+                                            width,
+                                            fam,
+                                            packs,
+                                            dedup,
+                                            depth + 2,
+                                        ) {
+                                            return Some(i);
+                                        }
+                                    }
+                                    build_pack(ctx, side, ty, width, fam, packs, dedup, depth + 1)
+                                };
                                 if let Some((cmp_op, blend_op)) = packed_cmp_blendv(ty, width) {
                                     let mut a_lanes: Vec<Operand> = Vec::with_capacity(width);
                                     let mut b_lanes: Vec<Operand> = Vec::with_capacity(width);
@@ -2879,46 +3448,10 @@ fn build_pack(
                                         f_lanes.push(f.clone());
                                     }
                                     if let (Some(lhs), Some(rhs), Some(tv), Some(fv)) = (
-                                        build_pack(
-                                            ctx,
-                                            &a_lanes,
-                                            ty,
-                                            width,
-                                            fam,
-                                            packs,
-                                            dedup,
-                                            depth + 1,
-                                        ),
-                                        build_pack(
-                                            ctx,
-                                            &b_lanes,
-                                            ty,
-                                            width,
-                                            fam,
-                                            packs,
-                                            dedup,
-                                            depth + 1,
-                                        ),
-                                        build_pack(
-                                            ctx,
-                                            &t_lanes,
-                                            ty,
-                                            width,
-                                            fam,
-                                            packs,
-                                            dedup,
-                                            depth + 1,
-                                        ),
-                                        build_pack(
-                                            ctx,
-                                            &f_lanes,
-                                            ty,
-                                            width,
-                                            fam,
-                                            packs,
-                                            dedup,
-                                            depth + 1,
-                                        ),
+                                        demote_arm(&a_lanes, packs, dedup),
+                                        demote_arm(&b_lanes, packs, dedup),
+                                        demote_arm(&t_lanes, packs, dedup),
+                                        demote_arm(&f_lanes, packs, dedup),
                                     ) {
                                         let idx = packs.len();
                                         packs.push(Pack {
@@ -3143,30 +3676,17 @@ fn build_pack(
                 | IrType::I64
                 | IrType::U64
         ) {
-            let unary_lanes_ok = |uop: IrUnaryOp| {
-                vals.iter().all(|v| {
-                    matches!(
-                        ctx.def_pos.get(&v.0).map(|&i| &block.instructions[i]),
-                        Some(Instruction::UnaryOp {
-                            op: lop,
-                            ty: uty,
-                            ..
-                        }) if *lop == uop && *uty == ty
-                    )
-                })
+            // Every lane must denote the same unary AT LANE WIDTH, either
+            // spelled directly or through the promotion sandwich that
+            // `unary_lane_src` normalizes.  `collect` into `Option` makes
+            // one non-matching lane reject the whole seed.
+            let unary_srcs = |uop: IrUnaryOp| -> Option<Vec<Operand>> {
+                vals.iter()
+                    .map(|v| unary_lane_src(ctx, v, ty, uop))
+                    .collect()
             };
-            if unary_lanes_ok(IrUnaryOp::Not) {
+            if let Some(srcs) = unary_srcs(IrUnaryOp::Not) {
                 if packed_binop(IrBinOp::Xor, ty, width).is_some() {
-                    let srcs: Vec<Operand> = vals
-                        .iter()
-                        .map(|v| {
-                            let i = ctx.def_pos[&v.0];
-                            match &block.instructions[i] {
-                                Instruction::UnaryOp { src, .. } => src.clone(),
-                                _ => unreachable!(),
-                            }
-                        })
-                        .collect();
                     let ones = all_ones_const(ty).unwrap();
                     if let Some(lhs) =
                         build_pack(ctx, &srcs, ty, width, fam, packs, dedup, depth + 1)
@@ -3198,18 +3718,8 @@ fn build_pack(
                         return Some(idx);
                     }
                 }
-            } else if unary_lanes_ok(IrUnaryOp::Neg) {
+            } else if let Some(srcs) = unary_srcs(IrUnaryOp::Neg) {
                 if packed_binop(IrBinOp::Sub, ty, width).is_some() {
-                    let srcs: Vec<Operand> = vals
-                        .iter()
-                        .map(|v| {
-                            let i = ctx.def_pos[&v.0];
-                            match &block.instructions[i] {
-                                Instruction::UnaryOp { src, .. } => src.clone(),
-                                _ => unreachable!(),
-                            }
-                        })
-                        .collect();
                     if let Some(rhs) =
                         build_pack(ctx, &srcs, ty, width, fam, packs, dedup, depth + 1)
                     {
@@ -4541,18 +5051,39 @@ fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Op
             if removed.contains(&i) {
                 continue;
             }
-            // Select and Cmp join the feeder kinds for the sub-word
+            // Select, Cmp and Copy join the feeder kinds for the sub-word
             // SELECT demotion: the promoted chain (Select reading a Cmp
             // and widening Casts, feeding only the removed truncating
             // lanes) is exactly the scaffolding that must retire here —
             // rule (a) would otherwise see its reads of the load lanes
             // as live in-block uses at or before the pack slot.
+            //
+            // UnaryOp belongs here for the packed-negate fold: `-a[i]` on a
+            // sub-word lane is `trunc(Neg_wide(zext(a[i])))`, so the negate
+            // and the widening cast around it are scaffolding for a value the
+            // vector op now produces directly.  The negate is pure, so it
+            // retires on the same argument; leaving it live keeps the widening
+            // cast live, which keeps the LOAD's only use live at a position
+            // before the pack slot and costs the whole seed (abs_i16 stayed 63
+            // scalar instructions against gcc's 7).
+            //
+            // Copy matters for the same reason and is the purest case of
+            // it: the front end materializes a C temporary read twice as
+            // `Copy` of the load (`uint16_t t = a[i] > hi ? hi : a[i];`
+            // promotes `a[i]` for the compare and copies it for the arm),
+            // so the copy is the FIRST reader of the load lane and sits
+            // before the pack slot.  Once every use of the copy is
+            // removed it is dead by the identical argument — no side
+            // effects, no external uses, not a kept operand — and leaving
+            // it in place costs the whole seed.
             if !matches!(
                 inst,
                 Instruction::Cast { .. }
                     | Instruction::BinOp { .. }
                     | Instruction::Select { .. }
                     | Instruction::Cmp { .. }
+                    | Instruction::Copy { .. }
+                    | Instruction::UnaryOp { .. }
             ) {
                 continue;
             }

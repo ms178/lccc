@@ -1313,23 +1313,29 @@ fn if_convert_diamonds(func: &mut IrFunction) -> usize {
 
     // Apply conversions. Track modified blocks to avoid applying overlapping diamonds
     // (e.g., nested ternaries where converting one invalidates another).
+    //
+    // The touched set is the WHOLE footprint: the pred, the merge, and every
+    // block of both arm regions — an arm chain reaches into blocks a
+    // single-block view never named, and two planned diamonds can share one.
+    let footprint = |d: &DiamondInfo| -> Vec<usize> {
+        let mut v = Vec::with_capacity(4 + d.true_arm_blocks.len() + d.false_arm_blocks.len());
+        v.push(d.pred_idx);
+        v.push(d.merge_idx);
+        v.extend(d.true_arm_blocks.iter().copied());
+        v.extend(d.false_arm_blocks.iter().copied());
+        v
+    };
     let mut converted = 0;
     let mut modified_blocks: crate::common::fx_hash::FxHashSet<usize> =
         crate::common::fx_hash::FxHashSet::default();
     for diamond in &diamonds {
         // Skip if any of the diamond's blocks were already modified
-        if modified_blocks.contains(&diamond.pred_idx)
-            || modified_blocks.contains(&diamond.true_idx)
-            || modified_blocks.contains(&diamond.false_idx)
-            || modified_blocks.contains(&diamond.merge_idx)
-        {
+        let touched = footprint(diamond);
+        if touched.iter().any(|b| modified_blocks.contains(b)) {
             continue;
         }
         if apply_diamond(func, diamond) {
-            modified_blocks.insert(diamond.pred_idx);
-            modified_blocks.insert(diamond.true_idx);
-            modified_blocks.insert(diamond.false_idx);
-            modified_blocks.insert(diamond.merge_idx);
+            modified_blocks.extend(touched);
             converted += 1;
         }
     }
@@ -1735,9 +1741,12 @@ fn set_instruction_dest(inst: &mut Instruction, fresh: Value) {
 struct DiamondInfo {
     /// The block containing the CondBranch
     pred_idx: usize,
-    /// The true-branch block index
+    /// The block the TRUE arm's edge into the merge leaves from — the last
+    /// block of its region (the arm head when the arm is one block).  The
+    /// merge's phi incomings name THIS block, so it is the one the phi
+    /// matching and the merge-predecessor test must use.
     true_idx: usize,
-    /// The false-branch block index
+    /// The FALSE arm's exit block (see `true_idx`).
     false_idx: usize,
     /// The merge block index (with the Phi)
     merge_idx: usize,
@@ -1747,6 +1756,13 @@ struct DiamondInfo {
     true_arm_insts: Vec<Instruction>,
     /// Instructions to hoist from the false arm (before the Select)
     false_arm_insts: Vec<Instruction>,
+    /// Every block an arm's hoisted instructions came from: the arm head
+    /// first, then the single-predecessor chain behind it in execution
+    /// order.  `apply_diamond` clears all of them — nothing branches into
+    /// them any more, and the CFG simplification that runs after this pass
+    /// deletes them.
+    true_arm_blocks: Vec<usize>,
+    false_arm_blocks: Vec<usize>,
     /// Phi nodes in the merge block that can be converted to Select.
     /// Each entry is (phi_dest, phi_ty, true_val, false_val).
     phi_selects: Vec<(Value, IrType, Operand, Operand)>,
@@ -1894,7 +1910,22 @@ fn arm_load_speculation_ok(
     let need = load_width;
     // derefs(P): every memory operation in the pred executes before the
     // branch, on both paths.
-    if block_deref_keys(ctx, pred_idx)
+    //
+    // The pred is only the NEAREST such block.  A nested conditional's inner
+    // diamond has a pred that is itself an arm of the outer one and holds
+    // nothing but the compare — the covering access sits further up, in the
+    // outer head that loaded the value both levels test:
+    //
+    //     v = *p;                       <- covers *p, on every path
+    //     if (v > hi) ...               <- outer head
+    //     else if (v < lo) y = *p;      <- inner arm: the speculated load
+    //
+    // Walking the UNIQUE-PREDEDESSOR chain above the pred collects exactly
+    // the blocks that dominate it (a block with one predecessor is dominated
+    // by it), i.e. the blocks that have already executed on every path
+    // reaching the branch.  Their dereferences are therefore valid coverage
+    // evidence for both arms — the same argument, one dominator step up.
+    if dominating_deref_keys(ctx, pred_idx)
         .get(&key)
         .is_some_and(|&w| w >= need)
     {
@@ -1944,6 +1975,50 @@ fn block_deref_keys(ctx: &IfConvCtx<'_>, block_idx: usize) -> FxHashMap<String, 
                 .and_modify(|cur| *cur = (*cur).max(w))
                 .or_insert(w);
         }
+    }
+    keys
+}
+
+/// Deepest unique-predecessor chain walked for dominance evidence.
+///
+/// A bound, not a correctness requirement: the walk is monotone (each step
+/// moves to a distinct strict predecessor) so it already terminates on any
+/// finite CFG, and the chain length in practice is the nesting depth of the
+/// conditional being converted.  The cap keeps a pathological hand-built CFG
+/// from turning a per-arm query into a per-block CFG walk.
+const MAX_DOM_DEREF_CHAIN: usize = 64;
+
+/// Widest dereference of every address key proven reachable on EVERY path
+/// that reaches `block_idx`: the block's own dereferences unioned with those
+/// of its transitive UNIQUE-predecessor ancestors.
+///
+/// Soundness: if `p` is the only predecessor of `b`, every path to `b`
+/// contains `p`, so `p` dominates `b`.  Chaining that argument up from
+/// `block_idx` yields blocks that have all executed — in order, before
+/// `block_idx`'s terminator — on any execution that reaches `block_idx`, and
+/// hence on both arms of a diamond or triangle hanging off it.  A
+/// non-volatile, default-address-space access of `w` bytes there proves those
+/// `w` bytes are dereferenceable on both arms, which is precisely the
+/// evidence [`arm_load_speculation_ok`] requires.  Blocks with more than one
+/// predecessor end the walk (they are not dominated), so the result is a
+/// conservative subset of the true dominator set — never an over-estimate.
+fn dominating_deref_keys(ctx: &IfConvCtx<'_>, block_idx: usize) -> FxHashMap<String, usize> {
+    let mut keys = block_deref_keys(ctx, block_idx);
+    let mut cur = block_idx;
+    for _ in 0..MAX_DOM_DEREF_CHAIN {
+        if ctx.preds.len(cur) != 1 {
+            break;
+        }
+        let parent = ctx.preds.row(cur)[0] as usize;
+        if parent == cur {
+            break; // self-loop: no new dominance evidence, and it would spin
+        }
+        for (k, w) in block_deref_keys(ctx, parent) {
+            keys.entry(k)
+                .and_modify(|cur_w| *cur_w = (*cur_w).max(w))
+                .or_insert(w);
+        }
+        cur = parent;
     }
     keys
 }
@@ -2237,6 +2312,104 @@ fn effective_arm_len(block: &BasicBlock) -> usize {
 }
 
 /// Detect a diamond pattern starting from a block with a CondBranch terminator.
+/// Deepest single-predecessor chain followed through one diamond arm.
+/// Same bound rationale as `MAX_DOM_DEREF_CHAIN`: the walk is monotone, the
+/// cap only fences off a pathological CFG.
+const MAX_ARM_CHAIN: usize = 64;
+
+/// One diamond arm walked as a single-entry single-exit straight-line region.
+struct ArmRegion {
+    /// The arm's first block (the one the CondBranch targets).
+    head: usize,
+    /// The block the arm's edge into the merge leaves from.
+    exit: usize,
+    /// The merge candidate: the target of `exit`'s unconditional branch, or
+    /// `None` when the chain does not end in one (no diamond here).
+    target: Option<usize>,
+    /// Every block in the region, in execution order (`head` first).
+    blocks: Vec<usize>,
+    /// Concatenated instructions of every block, in execution order.
+    insts: Vec<Instruction>,
+    /// Summed EFFECTIVE arm length (see `effective_arm_len`).
+    effective_len: usize,
+}
+
+/// Walk one arm of a diamond as far as the CFG keeps it a straight line.
+///
+/// The classic detector stops at the arm's first block, which leaves a NESTED
+/// conditional permanently branchy: after the inner level converts, the outer
+/// false arm is `head -> merge_of_inner`, two blocks, and the outer detector
+/// sees a false arm that does not branch to the outer merge:
+///
+/// ```text
+///     H : CondBranch c1 -> T / H2
+///     T : ...; Branch M
+///     H2: Select ...; Branch N        <- inner diamond already converted
+///     N : (empty);  Branch M          <- single-pred tail of the false arm
+///     M : phi [(vT, T), (vN, N)]
+/// ```
+///
+/// Following the chain recovers the region `H2 -> N`, whose exit does branch
+/// to `M` — and whose phi incoming names `N`, which is why the region carries
+/// its exit separately from its head.
+///
+/// Soundness of following a block `n` after `cur`: `n` must have EXACTLY ONE
+/// predecessor, and it must be `cur`.  Then every path that reaches `n`
+/// reaches it only through `cur`, so the region executes exactly when the arm
+/// head executes — hoisting its instructions into the pred speculates
+/// precisely the same operations the single-block rule already admits, and
+/// the side-effect and budget gates are applied to every block in it.  The
+/// walk stops at the pred, at the sibling arm, at a block with any other
+/// predecessor count, and on any revisit, so it can neither swallow the
+/// merge nor loop.
+fn walk_arm(
+    ctx: &IfConvCtx<'_>,
+    arm_idx: usize,
+    pred_idx: usize,
+    sibling_idx: usize,
+) -> Option<ArmRegion> {
+    let func = ctx.func;
+    let mut region = ArmRegion {
+        head: arm_idx,
+        exit: arm_idx,
+        target: None,
+        blocks: vec![arm_idx],
+        insts: func.blocks[arm_idx].instructions.clone(),
+        effective_len: effective_arm_len(&func.blocks[arm_idx]),
+    };
+    let mut cur = arm_idx;
+    for _ in 0..MAX_ARM_CHAIN {
+        let Terminator::Branch(label) = &func.blocks[cur].terminator else {
+            break;
+        };
+        let next = *ctx.label_to_idx.get(label)?;
+        // The pred, the sibling arm and the arm head are never part of this
+        // region: the first two belong to the diamond's other edges, the
+        // third would close a cycle.
+        if next == pred_idx || next == sibling_idx || next == arm_idx || next == cur {
+            break;
+        }
+        // Only a block whose SOLE predecessor is `cur` is reached exactly
+        // when `cur` is — anything else is a join point (possibly the merge
+        // another edge also reaches) and ends the region.
+        if ctx.preds.len(next) != 1 || ctx.preds.row(next)[0] as usize != cur {
+            break;
+        }
+        region.blocks.push(next);
+        region
+            .insts
+            .extend(func.blocks[next].instructions.iter().cloned());
+        region.effective_len += effective_arm_len(&func.blocks[next]);
+        region.exit = next;
+        cur = next;
+    }
+    // The region's exit must branch somewhere for a merge to exist.
+    if let Terminator::Branch(label) = &func.blocks[region.exit].terminator {
+        region.target = ctx.label_to_idx.get(label).copied();
+    }
+    Some(region)
+}
+
 fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
     let func = &ctx.func;
     let label_to_idx = &ctx.label_to_idx;
@@ -2267,32 +2440,33 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
         return None;
     }
 
-    let true_block = &func.blocks[true_idx];
-    let false_block = &func.blocks[false_idx];
+    // Each arm is walked as a single-entry single-exit straight-line region
+    // (see `walk_arm`): one block in the classic case, a chain when a nested
+    // conditional has already been converted inside-out.
+    let true_arm = walk_arm(ctx, true_idx, pred_idx, false_idx)?;
+    let false_arm = walk_arm(ctx, false_idx, pred_idx, true_idx)?;
 
     // Both arms must end with unconditional branches to the same merge block
-    let true_target = match &true_block.terminator {
-        Terminator::Branch(label) => *label_to_idx.get(label)?,
-        _ => return None,
+    let (Some(true_target), Some(false_target)) = (true_arm.target, false_arm.target) else {
+        return None;
     };
-    let false_target = match &false_block.terminator {
-        Terminator::Branch(label) => *label_to_idx.get(label)?,
-        _ => return None,
-    };
-
     if true_target != false_target {
         return None; // Different merge blocks
     }
     let merge_idx = true_target;
 
-    // The merge block must not be one of the arms
-    if merge_idx == true_idx || merge_idx == false_idx || merge_idx == pred_idx {
+    // The merge block must not be inside either arm region, nor the pred.
+    if merge_idx == pred_idx
+        || true_arm.blocks.contains(&merge_idx)
+        || false_arm.blocks.contains(&merge_idx)
+    {
         return None;
     }
 
-    // The arm blocks should have exactly one predecessor each (the pred block).
-    // If they have other predecessors, other code flows into them and we can't
-    // eliminate the blocks.
+    // The arm HEAD blocks should have exactly one predecessor each (the pred
+    // block).  If they have other predecessors, other code flows into them
+    // and we can't eliminate the blocks.  (The rest of each region is
+    // single-predecessor by `walk_arm`'s construction.)
     if preds.len(true_idx) != 1 || preds.len(false_idx) != 1 {
         return None;
     }
@@ -2300,10 +2474,17 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
         return None;
     }
 
-    // Both arms must be side-effect-free.  Loads qualify only through the
-    // path-coverage speculation gate (see arm_load_speculation_ok).
-    if !arm_is_speculatable(ctx, true_block, pred_idx, Some(false_idx))
-        || !arm_is_speculatable(ctx, false_block, pred_idx, Some(true_idx))
+    // Every block of both arms must be side-effect-free.  Loads qualify only
+    // through the path-coverage speculation gate (see
+    // `arm_load_speculation_ok`).
+    if !true_arm
+        .blocks
+        .iter()
+        .all(|&b| arm_is_speculatable(ctx, &func.blocks[b], pred_idx, Some(false_idx)))
+        || !false_arm
+            .blocks
+            .iter()
+            .all(|&b| arm_is_speculatable(ctx, &func.blocks[b], pred_idx, Some(true_idx)))
     {
         return None;
     }
@@ -2324,12 +2505,16 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
     // Count only what actually executes speculatively. The conditional
     // reduction diamond (`if (arr[i] > 0) s += arr[i]`) is exactly this
     // shape: each arm = {Cast,Shl,Copy,Shl,GEP,Load,Cast,Add} — 8 raw,
-    // 3 effective (Load, Cast, Add).
-    if effective_arm_len(true_block) > max_arm_insts
-        || effective_arm_len(false_block) > max_arm_insts
-    {
+    // 3 effective (Load, Cast, Add).  For a multi-block region the budget
+    // covers the WHOLE region — the speculation cost is the sum.
+    if true_arm.effective_len > max_arm_insts || false_arm.effective_len > max_arm_insts {
         return None;
     }
+
+    // The phi incomings name each arm's EXIT block (the one whose edge
+    // reaches the merge), not its head.
+    let true_idx = true_arm.exit;
+    let false_idx = false_arm.exit;
 
     // The merge block must have Phi nodes that reference both arms.
     // Collect phi nodes we can convert.
@@ -2410,8 +2595,10 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
         false_idx,
         merge_idx,
         cond: *cond,
-        true_arm_insts: true_block.instructions.clone(),
-        false_arm_insts: false_block.instructions.clone(),
+        true_arm_insts: true_arm.insts.clone(),
+        false_arm_insts: false_arm.insts.clone(),
+        true_arm_blocks: true_arm.blocks.clone(),
+        false_arm_blocks: false_arm.blocks.clone(),
         phi_selects,
         full_merge,
     })
@@ -2587,6 +2774,16 @@ fn detect_triangle(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> 
         )
     };
 
+    // A triangle arm is a single block, so each region is just its head and
+    // the exit coincides with it.  The pseudo-arm (the merge block itself,
+    // carrying no instructions) contributes NO blocks to clear — emptying the
+    // merge would delete the code the whole conversion exists to feed.
+    let (true_blocks, false_blocks) = if arm_is_true {
+        (vec![arm_idx], Vec::new())
+    } else {
+        (Vec::new(), vec![arm_idx])
+    };
+
     Some(DiamondInfo {
         pred_idx,
         true_idx: true_idx_out,
@@ -2595,6 +2792,8 @@ fn detect_triangle(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> 
         cond: *cond,
         true_arm_insts: true_insts,
         false_arm_insts: false_insts,
+        true_arm_blocks: true_blocks,
+        false_arm_blocks: false_blocks,
         phi_selects,
         full_merge: preds.len(merge_idx) == 2,
     })
@@ -2761,13 +2960,22 @@ fn apply_diamond(func: &mut IrFunction, diamond: &DiamondInfo) -> bool {
     // Keep them as empty blocks with unconditional branches - CFG simplify
     // will remove them as dead blocks since they'll have no predecessors.
     // For triangle patterns, one arm IS the merge block - don't clear it.
-    if diamond.true_idx != diamond.merge_idx {
-        func.blocks[diamond.true_idx].instructions.clear();
-        func.blocks[diamond.true_idx].source_spans.clear();
-    }
-    if diamond.false_idx != diamond.merge_idx {
-        func.blocks[diamond.false_idx].instructions.clear();
-        func.blocks[diamond.false_idx].source_spans.clear();
+    //
+    // Every block of an arm REGION is emptied, not just its head: the whole
+    // region's instructions were hoisted into the pred, and every block of it
+    // is unreachable once the pred branches straight to the merge.  Leaving
+    // the tail blocks populated would leave a SECOND definition of each
+    // hoisted destination in the function — an SSA violation the verifier
+    // rightly rejects.
+    for &b in diamond
+        .true_arm_blocks
+        .iter()
+        .chain(diamond.false_arm_blocks.iter())
+    {
+        if b != diamond.merge_idx && b < func.blocks.len() {
+            func.blocks[b].instructions.clear();
+            func.blocks[b].source_spans.clear();
+        }
     }
 
     true
