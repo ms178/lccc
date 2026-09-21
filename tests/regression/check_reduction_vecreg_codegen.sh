@@ -35,8 +35,13 @@ for name, mnemonic in {
 }.items():
     current = body(new, name)
     disabled = body(old, name)
+    # In-place accumulator update: the accumulator register appears as
+    # BOTH the last source and the destination. The streamed input is
+    # memory-folded into the first operand since the VLFOLD work
+    # (`vaddps (%rdi,%r9), %ymm2, %ymm2` — one instruction where the
+    # pre-fold spelling loaded the stream into %ymm0 first).
     direct = re.search(
-        rf"{mnemonic} %ymm0, %(ymm(?:[2-9]|1[0-5])), %\1", current
+        rf"{mnemonic} .*, %(ymm(?:[2-9]|1[0-5])), %\1", current
     )
     if not direct:
         raise SystemExit(f"{name}: vector accumulator is not updated in place")

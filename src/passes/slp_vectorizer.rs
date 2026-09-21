@@ -5210,14 +5210,37 @@ fn apply_plan(
             PackKind::Forward { .. } => continue,
             PackKind::Fma { negate, acc, a, b } => Instruction::Intrinsic {
                 dest: Some(dest),
-                op: match (negate, cand.ty) {
-                    (false, IrType::F64) => IntrinsicOp::VecFmaF64x2,
-                    (true, IrType::F64) => IntrinsicOp::VecFnmaF64x2,
-                    (false, IrType::F32) => IntrinsicOp::VecFmaF32x4,
-                    (true, IrType::F32) => IntrinsicOp::VecFnmaF32x4,
+                // WIDTH-EXACT op selection. The pack's lane count must
+                // match the intrinsic's register width: a width-4 F64
+                // (or width-8 F32) pack lowered through the 128-bit
+                // VecFma/VecFnma family computes only HALF the lanes and
+                // leaves the store's upper half reading the multiplier
+                // pack raw — a silent miscompile (caught by the 4×F64
+                // slp_fma4 kernel: r[2], r[3] came out as raw x[2], x[3]
+                // that no differential had ever exercised, because every
+                // existing packed-FMA test shape was 128-bit). The 256-bit
+                // families are the affine-map madds: args
+                // [a, b, acc] = [input, scale, bias] exactly matches
+                // `emit_avx_map_fma`'s [input, scale, bias] contract (b
+                // is the builder's UNIFORM splat side), and the negated
+                // spelling `acc − a·b` is the Signed(np, na) algebra the
+                // negation peel already defined — VecMaddF64x4Signed(
+                // true, false) = −(a·b) + acc. Rounding parity holds for
+                // both widths: one fused mul-add per lane, the same
+                // single rounding the scalar gap-fused contraction takes.
+                op: match (*negate, cand.ty, cand.width) {
+                    (false, IrType::F64, 2) => IntrinsicOp::VecFmaF64x2,
+                    (true, IrType::F64, 2) => IntrinsicOp::VecFnmaF64x2,
+                    (false, IrType::F64, 4) => IntrinsicOp::VecMaddF64x4,
+                    (true, IrType::F64, 4) => IntrinsicOp::VecMaddF64x4Signed(true, false),
+                    (false, IrType::F32, 4) => IntrinsicOp::VecFmaF32x4,
+                    (true, IrType::F32, 4) => IntrinsicOp::VecFnmaF32x4,
+                    (false, IrType::F32, 8) => IntrinsicOp::VecMaddF32x8,
+                    (true, IrType::F32, 8) => IntrinsicOp::VecMaddF32x8Signed(true, false),
                     // The pack builder only creates Fma packs for F64/F32
-                    // lanes (the contraction's type gate).
-                    _ => unreachable!("Fma pack with non-FP lane type"),
+                    // lanes at the family widths `family_for` admits
+                    // (F64: 2 and 4-under-AVX2; F32: 4 and 8-under-AVX2).
+                    _ => unreachable!("Fma pack with unsupported lane type/width"),
                 },
                 dest_ptr: None,
                 args: vec![

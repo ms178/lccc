@@ -1276,6 +1276,18 @@ impl X86Codegen {
     }
 
     pub(super) fn avx_store_dest(&mut self, dest_ptr: &Value) {
+        self.avx_store_dest_from(dest_ptr, "ymm0");
+    }
+
+    /// `avx_store_dest` with an explicit source register: the 256-bit
+    /// result-homing discipline (RA home copy / slot store / deferred
+    /// pending store) applied to a value that lives in `src` rather than
+    /// `%ymm0` — e.g. the madd VLFOLD arm's 2XX form, which computes the
+    /// result into the streamed operand's own (dying) register. Every
+    /// downstream consumer of the pending/last-store machinery is
+    /// register-name-generic, so the deferral and register-cache
+    /// behaviour is identical to the %ymm0 spelling.
+    fn avx_store_dest_from(&mut self, dest_ptr: &Value, src: &'static str) {
         // 256-bit store paths read the full YMM register; the earlier load
         // already dirtied it, but mark defensively (a broadcast-only body
         // could reach here through a register-copy path).
@@ -1283,9 +1295,9 @@ impl X86Codegen {
         if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
             if is_xmm_reg(reg) {
                 let name = phys_reg_name_256(reg);
-                if name != "ymm0" {
+                if name != src {
                     self.state
-                        .emit_fmt(format_args!("    vmovdqa %ymm0, %{}", name));
+                        .emit_fmt(format_args!("    vmovdqa %{}, %{}", src, name));
                 }
                 self.state.vec_claim_live_reg(dest_ptr.0, name);
                 self.state.vec_last_store_val = Some(dest_ptr.0);
@@ -1305,27 +1317,31 @@ impl X86Codegen {
         if let Some(addr) = self.state.resolve_slot_addr(dest_ptr.0) {
             if let SlotAddr::Direct(slot) = addr {
                 if !deferred {
-                    self.state
-                        .emit_fmt(format_args!("    vmovdqu %ymm0, {}", self.slot_ref(slot.0)));
+                    self.state.emit_fmt(format_args!(
+                        "    vmovdqu %{}, {}",
+                        src,
+                        self.slot_ref(slot.0)
+                    ));
                 } else {
-                    self.state.pending_vec_store = Some((dest_ptr.0, "ymm0", true));
+                    self.state.pending_vec_store = Some((dest_ptr.0, src, true));
                 }
                 self.state.vec_last_store_slot = Some(slot.0);
                 self.state.vec_last_store_val = Some(dest_ptr.0);
                 self.state.vec_last_store_reg = true;
-                self.state.vec_last_store_reg_name = Some("ymm0");
+                self.state.vec_last_store_reg_name = Some(src);
                 return;
             }
         }
         if !deferred {
             self.value_to_reg(dest_ptr, "rax");
-            self.state.emit("    vmovdqu %ymm0, (%rax)");
+            self.state
+                .emit_fmt(format_args!("    vmovdqu %{}, (%rax)", src));
         } else {
-            self.state.pending_vec_store = Some((dest_ptr.0, "ymm0", true));
+            self.state.pending_vec_store = Some((dest_ptr.0, src, true));
         }
         self.state.vec_last_store_val = Some(dest_ptr.0);
         self.state.vec_last_store_reg = true;
-        self.state.vec_last_store_reg_name = Some("ymm0");
+        self.state.vec_last_store_reg_name = Some(src);
     }
 
     /// Memory operand for a vector arg, unless the value is still provably in a
@@ -1671,9 +1687,9 @@ impl X86Codegen {
             // memfold_consumer_128), so a pending fold before one is always
             // materialised.
             let width_matches = if pf.width == 16 {
-                cc::memfold_consumer_128(op).is_some()
+                cc::memfold_consumer_128(op).is_some() || cc::memfold_consumer_fma_128(op)
             } else {
-                cc::memfold_consumer_256(op).is_some()
+                cc::memfold_consumer_256(op).is_some() || cc::memfold_consumer_madd_256(op)
             };
             let consumes = args
                 .iter()
@@ -7557,56 +7573,289 @@ impl X86Codegen {
         }
     }
 
+    /// Re-encode a 132-family FMA mnemonic to its 213/231 sibling.
+    ///
+    /// The three FMA3 forms differ only in operand POSITION — the sign
+    /// structure (±product ±addend) attaches to the algebraic terms, not
+    /// the operand slots — so every family mnemonic has exact siblings
+    /// that compute the same value with the memory operand in a different
+    /// role (213: the addend; 231: a multiplicand). This is the complete,
+    /// CLOSED mapping over the eight family mnemonics the map-FMA emitter
+    /// accepts: an unknown string fails loudly instead of silently
+    /// passing through. (The `str::replace("132", …)` this replaces was
+    /// correct for all eight spellings but a silent no-op for any future
+    /// mnemonic lacking a "132" infix — the wrong answer for a
+    /// correctness-critical re-encoding.)
+    fn fma_form_reencode(mnemonic: &str, to_231: bool) -> &'static str {
+        match mnemonic {
+            "vfmadd132pd" => {
+                if to_231 {
+                    "vfmadd231pd"
+                } else {
+                    "vfmadd213pd"
+                }
+            }
+            "vfmadd132ps" => {
+                if to_231 {
+                    "vfmadd231ps"
+                } else {
+                    "vfmadd213ps"
+                }
+            }
+            "vfmsub132pd" => {
+                if to_231 {
+                    "vfmsub231pd"
+                } else {
+                    "vfmsub213pd"
+                }
+            }
+            "vfmsub132ps" => {
+                if to_231 {
+                    "vfmsub231ps"
+                } else {
+                    "vfmsub213ps"
+                }
+            }
+            "vfnmadd132pd" => {
+                if to_231 {
+                    "vfnmadd231pd"
+                } else {
+                    "vfnmadd213pd"
+                }
+            }
+            "vfnmadd132ps" => {
+                if to_231 {
+                    "vfnmadd231ps"
+                } else {
+                    "vfnmadd213ps"
+                }
+            }
+            "vfnmsub132pd" => {
+                if to_231 {
+                    "vfnmsub231pd"
+                } else {
+                    "vfnmsub213pd"
+                }
+            }
+            "vfnmsub132ps" => {
+                if to_231 {
+                    "vfnmsub231ps"
+                } else {
+                    "vfnmsub213ps"
+                }
+            }
+            other => unreachable!("not a 132-family FMA mnemonic: {other}"),
+        }
+    }
+
     fn emit_avx_map_fma_inner(&mut self, dest: &Value, args: &[Operand], mnemonic: &str) {
         assert!(args.len() == 3, "{} expects input, scale, bias", mnemonic);
-        // VLFOLD forms (ICX saxpy shape). With the scale in an XMM home:
-        //   bias elided : input streams in %ymm0 → `vfmadd213 mem, %s, %ymm0`
-        //                 (= s*input + mem)
-        //   input elided: bias  streams in %ymm0 → `vfmadd231 mem, %s, %ymm0`
-        //                 (= s*mem + bias)
+        // VLFOLD forms (ICX saxpy shape): one of the three operands is an
+        // elided single-use load and the FMA takes its SOURCE memory
+        // operand directly, exactly like the audited binary emitter
+        // (`emit_avx_binary_256_inner`). The Intel form algebra, with the
+        // sign structure attached to the algebraic TERMS (invariant under
+        // the operand permutation, re-derived against the SDM for all
+        // four families — the 132-family mnemonic re-encodes exactly):
+        //   fold = addend      (213): `<fam213> MEM, %src2, %dst` where
+        //                         dst holds a MULTIPLICAND (the streamed
+        //                         input), src2 the other multiplicand
+        //                         (typically the homed broadcast), MEM
+        //                         the folded bias.
+        //   fold = multiplicand (231): `<fam231> MEM, %src2, %dst` where
+        //                         dst holds the ADDEND (the streamed
+        //                         bias), src2 the other multiplicand,
+        //                         MEM the folded input.
+        // Operand resolution mirrors the binary arm: a register source is
+        // the operand's RA home or the scratch register holding its
+        // DEFERRED store (consumed in place — the pending store never
+        // fires; 256-bit pendings only, a 128-bit-named register would
+        // splice a mixed-width operand into a YMM instruction). The
+        // destination takes the dst-operand's OWN home (free: the
+        // single-use operand dies at this instruction — the classic
+        // destructive-form register reuse), its deferred scratch, or a
+        // load into a free scratch register.
+        //
+        // RESOLUTION IS MANDATORY (the binary arm's rule): when a fold
+        // names one of this op's operands — guaranteed by the
+        // emit_intrinsic_impl safety net — this arm either CONSUMES the
+        // fold or falls through, and every ordinary path below re-issues
+        // or materialises it. A pending fold is never left dangling past
+        // this intrinsic, so no later fast path can read the phantom
+        // register the allocator reserved for the elided value.
         if let (Some(pf), Operand::Value(m0), Operand::Value(m1), Operand::Value(bias)) = (
             self.state.pending_vec_memfold.clone(),
             &args[0],
             &args[1],
             &args[2],
         ) {
-            let (pv, mem) = (pf.val, pf.mem);
-            // The multiplicands commute: whichever of args[0]/args[1] has an
-            // XMM home (the loop-invariant broadcast) is the register source,
-            // the other one is the streamed element vector.
-            let home = |this: &Self, v: &Value| {
+            let (pv, mem) = (pf.val, pf.mem.clone());
+            // Memfold-aware home: the live fold's value has no
+            // materialised register — the RA reserved one but the elided
+            // load never wrote it. Reporting that register here is how a
+            // consumer silently reads garbage (the v6 clamp class).
+            let home = |this: &Self, v: &Value| -> Option<PhysReg> {
+                if v.0 == pv {
+                    return None;
+                }
                 this.reg_assignments
                     .get(&v.0)
                     .copied()
                     .filter(|r| is_xmm_reg(*r))
             };
-            let (scale_reg, streamed_mul) = match (home(self, m0), home(self, m1)) {
-                (Some(r), None) => (Some(r), Some((m1, &args[1]))),
-                (None, Some(r)) => (Some(r), Some((m0, &args[0]))),
-                _ => (None, None),
+            // The scratch register holding an operand's DEFERRED store,
+            // if that single-use store is still pending.
+            let held = |this: &Self, v: &Value| -> Option<&'static str> {
+                this.state
+                    .pending_vec_store
+                    .filter(|(p, _, wide)| *p == v.0 && *wide)
+                    .map(|(_, r, _)| r)
             };
-            if let (Some(scale_reg), Some((streamed, streamed_arg))) = (scale_reg, streamed_mul) {
-                let form = if bias.0 == pv {
-                    Some((mnemonic.replace("132", "213"), streamed_arg))
-                } else if streamed.0 == pv {
-                    Some((mnemonic.replace("132", "231"), &args[2]))
-                } else {
-                    None
-                };
-                if let Some((form, streamed)) = form {
-                    self.avx_load_arg(streamed);
-                    self.state.emit_fmt(format_args!(
-                        "    {} {}, %{}, %ymm0",
-                        form,
-                        mem,
-                        phys_reg_name_256(scale_reg)
-                    ));
-                    self.state.pending_vec_memfold = None;
-                    self.state.vec_last_store_reg = false;
-                    self.avx_store_dest(dest);
+            // Shared tail: emit `<fam> MEM, %src2, %dst` with the full
+            // result bookkeeping. `dst` must already hold the dst-operand
+            // (dying home / deferred scratch / staged load).
+            //
+            // DST-HOMING SOUNDNESS: an operand's register home may serve as
+            // dst ONLY when the operand provably dies at this instruction —
+            // `vector_dying_values` (single use, same block as the def)
+            // plus a live-regs claim on that home in THIS block (the
+            // claim map is reset at block boundaries, which is what
+            // excludes the loop-invariant broadcast: one static use site,
+            // read by every iteration, claimed only in the preheader).
+            // Any other home is read-only (src2) or stays untouched.
+            let dying_home = |this: &Self, v: &Value, home: PhysReg| -> bool {
+                let name = phys_reg_name_256(home);
+                this.state.vector_dying_values.contains(&v.0)
+                    && this.state.vec_live_regs.get(&v.0).copied() == Some(name)
+            };
+            let mut emit_2xx = |this: &mut Self,
+                                form: &'static str,
+                                src2: String,
+                                dst: &'static str,
+                                consumed_pending: bool| {
+                if consumed_pending {
+                    // The held operand's store never fires: its only use
+                    // is this instruction (the VDEFER single-use window).
+                    this.state.pending_vec_store = None;
+                }
+                this.state.dirty_upper_ymm = true;
+                this.state
+                    .emit_fmt(format_args!("    {} {}, {}, %{}", form, mem, src2, dst));
+                this.state.pending_vec_memfold = None;
+                // The result now owns dst's bank: every OTHER value's
+                // claim on it (the dying dst-operand's, in particular)
+                // just ended.
+                this.state.vec_evict_bank_except(dst, dest.0);
+                this.state.vec_last_store_reg = false;
+                this.avx_store_dest_from(dest, dst);
+            };
+            // 213: the fold is the addend. Both multiplicands must be
+            // free of the fold (an aliased multiplicand would have to be
+            // the memory operand AND a register source at once; the
+            // matcher's alias-free gate makes this unreachable, the check
+            // stays defensive).
+            if bias.0 == pv && m0.0 != pv && m1.0 != pv {
+                // Two orders (the multiplicands commute). PREFERENCE: an
+                // order whose dst-operand dies in its home (zero staging,
+                // the GCC/ICX saxpy shape) beats one that merely resolves
+                // src2 and stages the dst-operand through a scratch — so
+                // every order is checked for a dying-home dst BEFORE any
+                // staging fallback is taken.
+                let mut staged: Option<(String, bool, &Operand)> = None;
+                for (d_op, s_op, d_arg) in [(m0, m1, &args[0]), (m1, m0, &args[1])] {
+                    let src2 = home(self, s_op)
+                        .map(|r| format!("%{}", phys_reg_name_256(r)))
+                        .or_else(|| held(self, s_op).map(|h| format!("%{h}")));
+                    let Some(src2) = src2 else {
+                        continue;
+                    };
+                    let consumed = held(self, s_op).is_some();
+                    if let Some(dr) = home(self, d_op).filter(|&r| dying_home(self, d_op, r)) {
+                        let dst = phys_reg_name_256(dr);
+                        emit_2xx(
+                            self,
+                            Self::fma_form_reencode(mnemonic, false),
+                            src2,
+                            dst,
+                            consumed,
+                        );
+                        return;
+                    }
+                    if let Some(h) = held(self, d_op) {
+                        emit_2xx(
+                            self,
+                            Self::fma_form_reencode(mnemonic, false),
+                            src2,
+                            h,
+                            consumed,
+                        );
+                        return;
+                    }
+                    staged = staged.or(Some((src2, consumed, d_arg)));
+                }
+                if let Some((src2, consumed, d_arg)) = staged {
+                    // Stage the dst-operand into the scratch the src2 is
+                    // NOT using (avx_load_arg_to flushes any unrelated
+                    // pending store itself and evicts stale bank claims).
+                    let scratch: &'static str = if src2 == "%ymm0" { "ymm1" } else { "ymm0" };
+                    self.avx_load_arg_to(d_arg, scratch);
+                    emit_2xx(
+                        self,
+                        Self::fma_form_reencode(mnemonic, false),
+                        src2,
+                        scratch,
+                        consumed,
+                    );
                     return;
                 }
             }
+            // 231: the fold is a multiplicand. The addend streams in dst;
+            // src2 is the OTHER multiplicand (which must not itself be
+            // the fold — see above).
+            if (m0.0 == pv || m1.0 == pv) && bias.0 != pv {
+                let other = if m0.0 == pv { m1 } else { m0 };
+                let src2 = home(self, other)
+                    .map(|r| format!("%{}", phys_reg_name_256(r)))
+                    .or_else(|| held(self, other).map(|h| format!("%{h}")));
+                if let Some(src2) = src2 {
+                    let consumed = held(self, other).is_some();
+                    if let Some(dr) = home(self, bias).filter(|&r| dying_home(self, bias, r)) {
+                        let dst = phys_reg_name_256(dr);
+                        emit_2xx(
+                            self,
+                            Self::fma_form_reencode(mnemonic, true),
+                            src2,
+                            dst,
+                            consumed,
+                        );
+                        return;
+                    }
+                    if let Some(h) = held(self, bias) {
+                        emit_2xx(
+                            self,
+                            Self::fma_form_reencode(mnemonic, true),
+                            src2,
+                            h,
+                            consumed,
+                        );
+                        return;
+                    }
+                    let scratch: &'static str = if src2 == "%ymm0" { "ymm1" } else { "ymm0" };
+                    self.avx_load_arg_to(&args[2], scratch);
+                    emit_2xx(
+                        self,
+                        Self::fma_form_reencode(mnemonic, true),
+                        src2,
+                        scratch,
+                        consumed,
+                    );
+                    return;
+                }
+            }
+            // No 2XX form applied (the fold aliases operands across
+            // roles, or no register source resolved): fall through to the
+            // hardened ordinary paths, which re-issue or materialise the
+            // fold — the RESOLUTION IS MANDATORY rule above.
         }
         if let (Operand::Value(input), Operand::Value(scale), Operand::Value(bias)) =
             (&args[0], &args[1], &args[2])
@@ -7614,16 +7863,29 @@ impl X86Codegen {
             let input_held = self.state.vec_last_store_reg
                 && self.state.vec_last_store_val == Some(input.0)
                 && self.state.vec_last_store_reg_name == Some("ymm0");
+            // Memfold-aware sources (see the VLFOLD arm's `home`): an
+            // elided scale/bias has no materialised register, and the
+            // fast path must not read the phantom home. An elided input
+            // is excluded by `input_held` itself (an elided load never
+            // stores, so no last-store entry can name it).
+            let live_fold = |this: &Self, v: &Value| -> bool {
+                this.state
+                    .pending_vec_memfold
+                    .as_ref()
+                    .is_some_and(|pf| pf.val == v.0)
+            };
             let scale_reg = self
                 .reg_assignments
                 .get(&scale.0)
                 .copied()
-                .filter(|r| is_xmm_reg(*r));
+                .filter(|r| is_xmm_reg(*r))
+                .filter(|_| !live_fold(self, scale));
             let bias_reg = self
                 .reg_assignments
                 .get(&bias.0)
                 .copied()
-                .filter(|r| is_xmm_reg(*r));
+                .filter(|r| is_xmm_reg(*r))
+                .filter(|_| !live_fold(self, bias));
             if let (true, Some(scale_reg), Some(bias_reg)) = (input_held, scale_reg, bias_reg) {
                 self.state.emit_fmt(format_args!(
                     "    {} %{}, %{}, %ymm0",
@@ -7652,6 +7914,17 @@ impl X86Codegen {
             let Operand::Value(v) = arg else {
                 return None;
             };
+            // Memfold-aware (LOAD-BEARING, mirrors `vec_home_256`): a value
+            // whose load was elided into `pending_vec_memfold` has no
+            // materialised contents — the register the allocator reserved
+            // for it was never written. Reporting that register as a
+            // source is how a consumer silently reads garbage; returning
+            // None routes the operand through `avx_load_arg_to` (which
+            // re-issues the load) or the `memfold_operand` memory source
+            // in the (None, None) arm below.
+            if this.memfold_operand(arg).is_some() {
+                return None;
+            }
             if let Some(&reg) = this.reg_assignments.get(&v.0) {
                 if is_xmm_reg(reg) {
                     return Some(format!("%{}", phys_reg_name_256(reg)));
@@ -7985,13 +8258,18 @@ impl X86Codegen {
         // ── Register-alias discipline ────────────────────────────────
         // Three operands (a, b, acc) are live at the FMA and any of them
         // may be the register the allocator REUSED for the dest (each
-        // dies at the instruction). The two Intel forms:
-        //   231: D = ±(S1·S2) + D   — D must hold the ACCUMULATOR.
-        //   132: D = ±(D·S2) + S1   — D must hold one MULTIPLICAND.
+        // dies at the instruction). The Intel forms — canonical AT&T
+        // spelling (src3/r/m, src2/vvvv, dst), semantics CPU-verified:
+        //   132: D = D × src3 + src2 — r/m is the SECOND MULTIPLICAND,
+        //        VVVV the ADDEND. D must hold one MULTIPLICAND.
+        //   213: D = src2 × D + src3 — r/m is the ADDEND, VVVV the first
+        //        multiplier. D must hold one MULTIPLICAND.
+        //   231: D = src2 × src3 + D — r/m is the second multiplier, D
+        //        the ADDEND (the accumulator).
         // The alias of dst with a/b/acc selects the form; the product
-        // commutes, so 132's S2 is whichever multiplicand dst does NOT
-        // hold. Multiple aliases are impossible (a, b, acc are mutually
-        // distinct live values).
+        // commutes, so the multiplier register is whichever multiplicand
+        // dst does NOT hold. Multiple aliases are impossible (a, b, acc
+        // are mutually distinct live values).
         //
         // Resolve the multiplicands first (homed: their register; unhomed:
         // staged into %xmm1/%xmm2). The resolution NAMES let the alias
@@ -8000,8 +8278,15 @@ impl X86Codegen {
         let a_src = self.vex128_source(&args[0], "xmm2");
 
         if let Some(mem) = acc_fold {
-            // 132 with the accumulator folded as the memory operand:
-            // `v{f,n}madd132{ps,pd} %S2, MEM_acc, %dst`, dst holding a
+            // 213 with the accumulator folded as the memory operand — the
+            // ONE form whose r/m slot is the ADDEND (132/231 put a
+            // MULTIPLICAND in r/m). Spelling this as a 132 with the
+            // memory in the middle operand slot computed a·acc + b — the
+            // multiplier/addend roles inverted — and had never been
+            // assembled before: the v6 safety-net tightening dead-pathed
+            // this arm for its whole life, so no test ever executed it.
+            // Canonical AT&T: `v{f,n}madd213{ps,pd} MEM_acc, %S2, %dst`
+            // computes S2 × dst + MEM_acc = a·b + acc, dst holding a
             // multiplicand (loaded into dst when it holds neither).
             if a_src == dst && b_src == dst {
                 // Impossible (distinct live values share no register);
@@ -8013,8 +8298,8 @@ impl X86Codegen {
                 // resolved to its own register/scratch).
                 self.sse_load_arg(&args[0], dst_static);
                 self.state.emit_fmt(format_args!(
-                    "    {}132{} {}, {}, {}",
-                    mn, ps, b_src, mem, dst
+                    "    {}213{} {}, {}, {}",
+                    mn, ps, mem, b_src, dst
                 ));
             } else {
                 let s2 = if a_src == dst {
@@ -8023,7 +8308,7 @@ impl X86Codegen {
                     a_src.clone()
                 };
                 self.state
-                    .emit_fmt(format_args!("    {}132{} {}, {}, {}", mn, ps, s2, mem, dst));
+                    .emit_fmt(format_args!("    {}213{} {}, {}, {}", mn, ps, mem, s2, dst));
             }
             self.state.pending_vec_memfold = None;
         } else {
@@ -9967,5 +10252,61 @@ impl X86Codegen {
     /// value was produced by a GEP(base, offset) instruction with a variable offset.
     fn find_gep_base_offset(&self, val_id: u32) -> Option<(u32, u32)> {
         self.state.gep_base_offset.get(&val_id).copied()
+    }
+}
+
+/// The closed 132→{213,231} family table (`fma_form_reencode`): every
+/// mnemonic the map-FMA emitter can be dispatched with has both siblings,
+/// and the re-encode preserves lane width and sign family exactly. A
+/// mnemonic added to the dispatch tables without extending this match
+/// fails the exhaustive test below (and the emitter's `unreachable!`).
+#[cfg(test)]
+mod fma_form_reencode_tests {
+    use super::X86Codegen;
+
+    #[test]
+    fn every_family_mnemonic_has_both_siblings() {
+        // (132, 213, 231) × {pd, ps} × {vfmadd, vfmsub, vfnmadd, vfnmsub}
+        let families = ["vfmadd", "vfmsub", "vfnmadd", "vfnmsub"];
+        let widths = ["pd", "ps"];
+        for f in families {
+            for w in widths {
+                let m132 = format!("{f}132{w}");
+                let m213 = format!("{f}213{w}");
+                let m231 = format!("{f}231{w}");
+                assert_eq!(
+                    X86Codegen::fma_form_reencode(&m132, false),
+                    m213,
+                    "213 sibling of {m132}"
+                );
+                assert_eq!(
+                    X86Codegen::fma_form_reencode(&m132, true),
+                    m231,
+                    "231 sibling of {m132}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_132_inputs_are_rejected_not_passthrough() {
+        // The whole point of the closed table: a mnemonic that is not a
+        // 132-family spelling must fail loudly (in tests) rather than
+        // silently round-trip (the `str::replace` behaviour). Both the
+        // already-re-encoded forms and foreign mnemonics are rejected.
+        let bad = [
+            "vfmadd213pd",
+            "vfmadd231ps",
+            "vpaddd",
+            "vmovupd",
+            "vfmadd132sd",
+            "",
+        ];
+        for m in bad {
+            let r213 = std::panic::catch_unwind(|| X86Codegen::fma_form_reencode(m, false));
+            let r231 = std::panic::catch_unwind(|| X86Codegen::fma_form_reencode(m, true));
+            assert!(r213.is_err(), "{m} must not re-encode to 213");
+            assert!(r231.is_err(), "{m} must not re-encode to 231");
+        }
     }
 }
