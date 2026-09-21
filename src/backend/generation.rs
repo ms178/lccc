@@ -2775,6 +2775,22 @@ fn detect_conditional_increment_selects(
 }
 
 /// Mul whose single use is a nearby Add. Map: mul_idx → add_idx.
+/// One recorded mul→(add/sub) fusion.
+///
+/// The negation fields carry the sign algebra: a `Neg` wrapping the product
+/// (`-(a*b) ± c`, shape 1) and/or a `Neg` wrapping the partner's result
+/// (`-(a*b ± c)`, shape 2) flips the fused family, which the driver
+/// materialises through `emit_fused_fma`.  Both Neg instructions are consumed
+/// by the fusion and skipped at emission time, exactly like the partner.
+#[derive(Clone, Copy)]
+struct MulAddFusion {
+    partner_idx: usize,
+    neg_product_idx: Option<usize>,
+    neg_result_idx: Option<usize>,
+    negate_product: bool,
+    negate_addend: bool,
+}
+
 fn detect_mul_add_fusions(
     block: &BasicBlock,
     use_counts: &[u32],
@@ -2789,10 +2805,12 @@ fn detect_mul_add_fusions(
     // in `accs`: fusing `acc -= a*b` puts the multiply on the loop-carried
     // serial dependency chain (fmsub latency > fsub latency), a measured
     // 13% regression on nbody. Such Subs stay split so the multiply issues
-    // independently of the chain.
+    // independently of the chain.  Every NEGATED family is gated the same
+    // way: `acc += -(a*b)` lowers to Add(Neg(mul), acc) and is the same
+    // program as `acc -= a*b`, so it must not slip past the calibration.
     fuse_float_sub: Option<&FxHashSet<u32>>,
-) -> FxHashMap<usize, usize> {
-    let mut fusion_map: FxHashMap<usize, usize> = FxHashMap::default();
+) -> FxHashMap<usize, MulAddFusion> {
+    let mut fusion_map: FxHashMap<usize, MulAddFusion> = FxHashMap::default();
     // `a*b + c*d` must not fuse the first mul with an add whose other
     // operand is a not-yet-executed mul.
     let mut claimed_adds: FxHashSet<usize> = FxHashSet::default();
@@ -2826,6 +2844,11 @@ fn detect_mul_add_fusions(
         let mut add_ty_r = None;
         let mut skipped_defs: [u32; 6] = [u32::MAX; 6];
         let mut skipped_count = 0usize;
+        // Shape 1: `-(a*b) ± c`.  The product-side value the partner must
+        // consume starts as the mul's own dest and becomes the Neg's dest
+        // once a single-use Neg wrapped it.
+        let mut neg_product_idx = None;
+        let mut product_val = mul_dest.0;
         let max_scan = (idx + 6).min(block.instructions.len());
         for scan in (idx + 1)..max_scan {
             match &block.instructions[scan] {
@@ -2834,6 +2857,22 @@ fn detect_mul_add_fusions(
                         skipped_defs[skipped_count] = dest.0;
                         skipped_count += 1;
                     }
+                }
+                // `-(a*b) ± c`: a single-use Neg on the product flips the
+                // product's sign; the fused instruction reads the mul's
+                // ORIGINAL operands, so the Neg itself becomes dead.
+                Instruction::UnaryOp {
+                    dest,
+                    op: crate::ir::reexports::IrUnaryOp::Neg,
+                    src,
+                    ..
+                } if mul_ty.is_float()
+                    && neg_product_idx.is_none()
+                    && matches!(src, Operand::Value(v) if v.0 == mul_dest.0)
+                    && use_counts.get(dest.0 as usize).copied().unwrap_or(0) == 1 =>
+                {
+                    neg_product_idx = Some(scan);
+                    product_val = dest.0;
                 }
                 Instruction::BinOp {
                     op: IrBinOp::Add,
@@ -2901,14 +2940,67 @@ fn detect_mul_add_fusions(
         if claimed_adds.contains(&next_idx) {
             continue;
         }
-        let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == mul_dest.0);
-        let mul_is_rhs = matches!(add_rhs, Operand::Value(v) if v.0 == mul_dest.0);
+        let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == product_val);
+        let mul_is_rhs = matches!(add_rhs, Operand::Value(v) if v.0 == product_val);
         if !mul_is_lhs && !mul_is_rhs {
             continue;
         }
         let defined_between = |op: &Operand| matches!(op, Operand::Value(v) if skipped_defs[..skipped_count].contains(&v.0));
         if defined_between(add_lhs) || defined_between(add_rhs) || mul_ty != add_ty {
             continue;
+        }
+        // The partner op decides the base family: Add -> +(product) + acc;
+        // Sub with the product on the left -> +(product) - acc; Sub with it
+        // on the right -> acc - product = -(product) + acc.
+        let partner_op = match &block.instructions[next_idx] {
+            Instruction::BinOp { op, .. } => *op,
+            _ => continue,
+        };
+        let mut negate_product = neg_product_idx.is_some();
+        let mut negate_addend = false;
+        match partner_op {
+            IrBinOp::Add => {}
+            IrBinOp::Sub => {
+                if mul_is_lhs {
+                    negate_addend = true;
+                } else {
+                    negate_product = !negate_product;
+                }
+            }
+            _ => continue,
+        }
+        // Shape 2: `-(a*b ± c)` — a single-use Neg directly on the partner's
+        // result.  Folding it is exactly value-preserving GIVEN the fusion
+        // (IEEE negation is a sign flip and every supported rounding mode
+        // satisfies round(-x) = -round(x) for the fused vs split question
+        // the contract governs), so it adds no contraction of its own; the
+        // pair gate below therefore stays (mul_tag, partner_tag), the same
+        // one the plain fusion answers to.  The fused instruction writes
+        // the NEG's destination; the partner's dest dies with it.
+        let mut neg_result_idx = None;
+        if mul_ty.is_float() {
+            // The trailing Neg must directly follow the partner: allowing
+            // instructions between it and the partner would need the same
+            // deferred-read clash analysis the gap fusion carries.
+            if let Some(Instruction::UnaryOp {
+                op: crate::ir::reexports::IrUnaryOp::Neg,
+                src: neg_src,
+                ..
+            }) = block.instructions.get(next_idx + 1)
+            {
+                let partner_dest = match &block.instructions[next_idx] {
+                    Instruction::BinOp { dest, .. } => dest.0,
+                    _ => u32::MAX,
+                };
+                if matches!(neg_src, Operand::Value(v) if v.0 == partner_dest)
+                    && use_counts.get(partner_dest as usize).copied().unwrap_or(0) == 1
+                {
+                    // Flip both signs: -(p ± a) = (-p) ∓ a.
+                    negate_product = !negate_product;
+                    negate_addend = !negate_addend;
+                    neg_result_idx = Some(next_idx + 1);
+                }
+            }
         }
         // OP-36: FP contraction is pair-gated. `fast` fuses freely; `on`
         // requires the mul and the add to share one statement-root tag
@@ -2922,8 +3014,37 @@ fn detect_mul_add_fusions(
                 continue;
             }
         }
+        // Negated families carry the Sub-fusion discipline: the kill switch
+        // applies, and neither the partner's nor the folded Neg's
+        // destination may be a loop-carried accumulator (`acc += -(a*b)`
+        // is `acc -= a*b` in source terms; the nbody calibration rules it).
+        let negated = neg_product_idx.is_some() || neg_result_idx.is_some();
+        if negated {
+            let Some(accs) = fuse_float_sub else {
+                continue;
+            };
+            let partner_dest = block.instructions[next_idx].dest().map(|d| d.0);
+            let final_dest = match neg_result_idx {
+                Some(n) => block.instructions[n].dest().map(|d| d.0),
+                None => None,
+            };
+            if partner_dest.is_some_and(|d| accs.contains(&d))
+                || final_dest.is_some_and(|d| accs.contains(&d))
+            {
+                continue;
+            }
+        }
         claimed_adds.insert(next_idx);
-        fusion_map.insert(idx, next_idx);
+        fusion_map.insert(
+            idx,
+            MulAddFusion {
+                partner_idx: next_idx,
+                neg_product_idx,
+                neg_result_idx,
+                negate_product,
+                negate_addend,
+            },
+        );
     }
     fusion_map
 }
@@ -4844,7 +4965,7 @@ fn generate_function(
                 ty,
             } = inst
             {
-                if let Some(&add_i) = mul_add_fusions.get(&idx) {
+                if let Some(fusion) = mul_add_fusions.get(&idx) {
                     // Float always fuses (native fmadd/fmsub). Integer fuses
                     // when the temp is slot-homed, or unconditionally on
                     // targets where madd/msub cost the same as the mul
@@ -4859,29 +4980,93 @@ fn generate_function(
                             lhs: add_lhs,
                             rhs: add_rhs,
                             ty: add_ty,
-                        }) = block.instructions.get(add_i)
+                        }) = block.instructions.get(fusion.partner_idx)
                         {
-                            let mul_is_lhs = matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
-                            let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
-                            cg.flush_machinst();
-                            match partner_op {
-                                IrBinOp::Add => {
+                            let has_neg_shape =
+                                fusion.neg_product_idx.is_some() || fusion.neg_result_idx.is_some();
+                            if !has_neg_shape {
+                                let mul_is_lhs =
+                                    matches!(add_lhs, Operand::Value(v) if v.0 == dest.0);
+                                let acc_op = if mul_is_lhs { add_rhs } else { add_lhs };
+                                cg.flush_machinst();
+                                match partner_op {
+                                    IrBinOp::Add => {
+                                        cg.emit_fused_mul_add(
+                                            dest, lhs, rhs, acc_op, add_dest, *add_ty,
+                                        );
+                                    }
+                                    IrBinOp::Sub => {
+                                        // Detector only records float Subs when the
+                                        // backend advertised supports_fused_float_mul_sub.
+                                        // mul_is_lhs selects fnmsub (product - acc)
+                                        // vs fmsub (acc - product).
+                                        cg.emit_fused_mul_sub(
+                                            dest, lhs, rhs, acc_op, add_dest, *add_ty, mul_is_lhs,
+                                        );
+                                    }
+                                    _ => unreachable!("mul fusion partner must be Add or Sub"),
+                                }
+                                fused_add_skip.insert(fusion.partner_idx);
+                            } else {
+                                // A negated shape rides this fusion: the
+                                // product the partner consumed is the
+                                // shape-1 Neg's dest, and the FINAL
+                                // destination is the trailing shape-2 Neg's
+                                // dest when one was folded (the partner's
+                                // dest dies with it).
+                                let product_val = match fusion.neg_product_idx {
+                                    Some(n) => match block.instructions[n].dest() {
+                                        Some(d) => d.0,
+                                        None => u32::MAX,
+                                    },
+                                    None => dest.0,
+                                };
+                                let prod_is_lhs =
+                                    matches!(add_lhs, Operand::Value(v) if v.0 == product_val);
+                                let acc_op = if prod_is_lhs { add_rhs } else { add_lhs };
+                                let final_dest: Value = match fusion.neg_result_idx {
+                                    Some(n) => block.instructions[n]
+                                        .dest()
+                                        .expect("shape-2 Neg carries a dest"),
+                                    None => *add_dest,
+                                };
+                                cg.flush_machinst();
+                                if fusion.negate_product || fusion.negate_addend {
+                                    // A signed family (`-(a*b) ± c`, `c - a*b`
+                                    // via shape 1, `-(a*b ± c)`): one FMA,
+                                    // signs chosen by the two flags.
+                                    cg.emit_fused_fma(
+                                        lhs,
+                                        rhs,
+                                        acc_op,
+                                        &final_dest,
+                                        *add_ty,
+                                        fusion.negate_product,
+                                        fusion.negate_addend,
+                                    );
+                                } else {
+                                    // Double negation folded back to the plain
+                                    // family (`c - -(a*b)`, `-( -(a*b) - c)`):
+                                    // exactly `a*b + acc`, so the plain fmadd
+                                    // hook serves it -- emit_fused_fma's
+                                    // contract reserves it for negated flags.
                                     cg.emit_fused_mul_add(
-                                        dest, lhs, rhs, acc_op, add_dest, *add_ty,
+                                        dest,
+                                        lhs,
+                                        rhs,
+                                        acc_op,
+                                        &final_dest,
+                                        *add_ty,
                                     );
                                 }
-                                IrBinOp::Sub => {
-                                    // Detector only records float Subs when the
-                                    // backend advertised supports_fused_float_mul_sub.
-                                    // mul_is_lhs selects fnmsub (product - acc)
-                                    // vs fmsub (acc - product).
-                                    cg.emit_fused_mul_sub(
-                                        dest, lhs, rhs, acc_op, add_dest, *add_ty, mul_is_lhs,
-                                    );
+                                fused_add_skip.insert(fusion.partner_idx);
+                                if let Some(n) = fusion.neg_product_idx {
+                                    fused_add_skip.insert(n);
                                 }
-                                _ => unreachable!("mul fusion partner must be Add or Sub"),
+                                if let Some(n) = fusion.neg_result_idx {
+                                    fused_add_skip.insert(n);
+                                }
                             }
-                            fused_add_skip.insert(add_i);
                             cg.state().current_program_point += 1;
                             continue;
                         }

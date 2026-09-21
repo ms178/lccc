@@ -174,6 +174,51 @@ impl ArmCodegen {
         self.store_float_reg(sub_dest, ty, &output);
     }
 
+    /// The four-way signed FMA hook.  AArch64's spelling inverts the x86
+    /// roles: `sub` negates the PRODUCT (Rd = Ra - Rn*Rm) and the `n` prefix
+    /// negates the ADDEND, so — with (negate_product, negate_addend) flags —
+    ///   (+,+) fmadd · (+,-) fnmsub (Rd = Rn*Rm - Ra) ·
+    ///   (-,+) fmsub  (Rd = Ra - Rn*Rm) · (-,-) fnmadd (Rd = -(Rn*Rm) - Ra)
+    /// each mapping verified against GCC's aarch64 contraction of the six
+    /// negation source shapes under -ffp-contract=fast.
+    pub(super) fn emit_fused_fma_signed_impl(
+        &mut self,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        dest: &Value,
+        ty: IrType,
+        negate_product: bool,
+        negate_addend: bool,
+    ) {
+        let (r0, r1, r2) = if ty == IrType::F32 {
+            ("s0", "s1", "s2")
+        } else {
+            ("d0", "d1", "d2")
+        };
+        let acc_reg = self.float_operand_reg(acc, ty, r2);
+        let lhs_reg = self.float_operand_reg(mul_lhs, ty, r0);
+        let rhs_reg = self.float_operand_reg(mul_rhs, ty, r1);
+        let output = self
+            .reg_assignments
+            .get(&dest.0)
+            .copied()
+            .filter(|r| is_arm_fp_phys(*r))
+            .map(|r| arm_fp_name(r, ty))
+            .unwrap_or_else(|| r0.to_string());
+        let mnemonic = match (negate_product, negate_addend) {
+            (false, false) => "fmadd",
+            (false, true) => "fnmsub",
+            (true, false) => "fmsub",
+            (true, true) => "fnmadd",
+        };
+        self.state.emit_fmt(format_args!(
+            "    {} {}, {}, {}, {}",
+            mnemonic, output, lhs_reg, rhs_reg, acc_reg
+        ));
+        self.store_float_reg(dest, ty, &output);
+    }
+
     pub(super) fn emit_float_binop_impl(
         &mut self,
         dest: &Value,

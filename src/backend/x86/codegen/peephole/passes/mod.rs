@@ -30,6 +30,7 @@ mod dead_code;
 mod dead_writes;
 mod epilogue_merge;
 mod flag_peepholes;
+mod fma_forms;
 mod fp_liveness;
 mod frame_compact;
 mod helpers;
@@ -740,12 +741,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed |= c;
             }
         }
-        // Fold a single-use scalar FP load into an adjacent FMA3-231 memory
-        // src2 slot (dot-product inner shape; function-wide liveness proof).
+        // Fold a single-use scalar FP load into an adjacent scalar FMA's
+        // memory operand — any role the form algebra can put there (the
+        // dot-product src2 shape is just the most common one).
         if !sk("fma_mem_fold") {
             {
-                let c = memory_fold::fold_fma_memory_src2(&mut store, &mut infos);
-                trace("fold_fma_memory_src2", pass_count, c, &store, &infos);
+                let c = memory_fold::fold_fma_memory_operand(&mut store, &mut infos);
+                trace("fold_fma_memory_operand", pass_count, c, &store, &infos);
                 changed |= c;
             }
         }
@@ -1042,6 +1044,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             {
                 let c = vector_copy::reassociate_fma_accumulator(&mut store, &mut infos);
                 trace("reassociate_fma_accumulator", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("vector_copy_retarget") {
+            {
+                let c = vector_copy::retarget_vex_result(&mut store, &mut infos);
+                trace("retarget_vex_result", pass_count, c, &store, &infos);
                 changed |= c;
             }
         }
