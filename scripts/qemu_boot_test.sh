@@ -12,7 +12,8 @@
 #     PREEMPT, SMP
 #   * BBRv3 is loadable (tcp_available_congestion_control lists bbr)
 #   * sched-ext sysfs ABI exists (/sys/kernel/sched_ext)
-#   * BORE stats appear in /proc/sched_debug (SCHED_DEBUG=y)
+#   * BORE stats appear in sched_debug (/sys/kernel/debug/sched/debug on
+#     6.18, /proc/sched_debug on older trees)
 #   * both SMP CPUs are online
 #   * the guest reaches poweroff cleanly (VM exits by itself)
 #
@@ -55,7 +56,27 @@ echo "--- version ---"; cat /proc/version
 echo "--- config ---"; zcat /proc/config.gz | grep -E '^(CONFIG_(SCHED_BORE|SCHED_CACHE|HZ_800|HZ|CACHY|TCP_CONG_BBR|PREEMPT|SMP|KERNEL_ZSTD|SCHED_DEBUG))=' | sort
 echo "--- congestion control ---"; cat /proc/sys/net/ipv4/tcp_available_congestion_control
 echo "--- cache-aware sched features ---"; grep -i cache_hot_buddy /sys/kernel/debug/sched/features
-echo "--- sched_debug (BORE) ---"; grep -m3 -i bore /proc/sched_debug
+echo "--- BORE stats ---"
+# Two facts that make the obvious version of this check vacuous:
+#
+#  * /proc/sched_debug does not exist on 6.18 — upstream moved it to debugfs
+#    (kernel/sched/debug.c:744, debugfs_create_file("debug", 0444,
+#    debugfs_sched, ...)), so the file is /sys/kernel/debug/sched/debug.
+#  * Even there, the BORE score is printed as an *unlabelled* column:
+#    debug.c:970 emits SEQ_printf(m, " %2d", p->bore.score) and the
+#    "runnable tasks:" header (debug.c:988) has no BORE token at all. So the
+#    word "bore" can never appear in that file, and the previous
+#    expect "bore|BORE" was satisfied only by the dmesg banner
+#    "BORE CPU Scheduler" — the check passed while reading nothing.
+#
+# proc_sched_show_task (debug.c:1372) does label the field: P(bore.score)
+# under CONFIG_SCHED_BORE. That is what is checked here, and the two markers
+# are deliberately distinct so the absent case cannot match the expect.
+if grep -qi bore /proc/self/sched 2>/dev/null; then
+  grep -i bore /proc/self/sched | sed 's/^/borescore-ok: /'
+else
+  echo "borescore-missing: no bore field in /proc/self/sched"
+fi
 echo "--- cpus ---"; grep -c '^processor' /proc/cpuinfo
 echo "--- serial integrity ---"
 # Sentinel that exercises the 8250 UART xmit path end to end. Every ttyS0
@@ -198,7 +219,9 @@ expect "SMP compiled in"                   "CONFIG_SMP=y"
 # registration order — "reno bbr bic cubic westwood htcp" on this config —
 # so "bbr" is a mid-line word, not a line starter.
 expect "bbr listed in congestion algos"    "(^| )bbr( |$)"
-expect "BORE stats in sched_debug"         "bore|BORE"
+# Keyed on the in-guest success marker only. "borescore-missing:" must not
+# match, and neither may the dmesg banner — see the guest-side comment.
+expect "BORE score exposed per task"       "^borescore-ok: .*bore"
 expect "2 CPUs online"                     "^2$"
 # Serial-integrity sentinels: must arrive verbatim. A console/xmit bug that
 # drops bytes or splits writes (defect (h), kfifo record-path corruption)

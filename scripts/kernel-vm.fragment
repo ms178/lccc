@@ -31,6 +31,10 @@ CONFIG_PREEMPTION=y
 CONFIG_CGROUP_SCHED=y
 CONFIG_SCHED_BORE=y
 CONFIG_SCHED_CACHE=y
+# No longer a Kconfig symbol on 6.18 (grep '^config SCHED_DEBUG' finds
+# nothing); sched_debug is a debugfs file now, so CONFIG_DEBUG_FS below is
+# what actually enables it. Kept for older trees, where it is a real symbol
+# and olddefconfig drops it silently here.
 CONFIG_SCHED_DEBUG=y
 CONFIG_DEBUG_FS=y
 CONFIG_CACHY=y

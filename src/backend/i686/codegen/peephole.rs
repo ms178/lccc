@@ -11635,7 +11635,14 @@ pub fn peephole_optimize(asm: String) -> String {
     // Phase 6: select-diamond else-hoist runs on the FINAL text — earlier
     // passes shape the diamond (fusing the flag producer, folding prep)
     // that this pass needs to see.
-    else_hoist_diamonds(store.build_result(|i| infos[i].is_nop()))
+    let hoisted = else_hoist_diamonds(store.build_result(|i| infos[i].is_nop()));
+
+    // Phase 7 (terminal): cross-jump duplicate function epilogues.  Every
+    // return site carries its own `addl/popl…/ret` copy; the 32 KiB setup
+    // image measured ≈625 bytes of them across 24 functions.  Runs last so no
+    // structured pass ever sees a planted `label + instruction` replacement.
+    // Kill switch: CCC_NO_I686_EPILOGUE_MERGE.
+    merge_duplicate_epilogues_terminal(hoisted)
 }
 
 // ── Pass: redundant zero-extension elimination (i686 redundant_ext port) ────
@@ -11793,6 +11800,26 @@ fn try_fold_sext_zext_at(
     true
 }
 
+/// Split a two-operand instruction's operand list at the LAST top-level comma.
+///
+/// A memory operand carries its own commas inside balanced parentheses —
+/// `movsbl (%edi,%ebx),%esi` — so `split_once(',')` reads the destination as
+/// `" %ebx)"`, `register_family` answers `REG_NONE`, and every narrow-value
+/// fact an *indexed* load establishes silently evaporates.  Fail-closed, so
+/// never a miscompile, but it cost the redundant re-extension family exactly
+/// the shapes the real-mode string loops are made of: measured on the 23
+/// `arch/x86/boot` objects, 12 back-to-back `movzbl %al,%eax` pairs and the
+/// `movsbl (%base,%idx),%r; movl %r,%r2; movsbl %r2b,%r2` chains survived
+/// only because the load that produced the fact was an SIB address.
+///
+/// `peephole_common::last_top_level_comma` is the shared paren-aware walker
+/// the rest of this file already uses; re-deriving it here is how the two
+/// operand views drift apart.
+fn split_operands_last_comma(operands: &str) -> Option<(&str, &str)> {
+    let comma = crate::backend::peephole_common::last_top_level_comma(operands.as_bytes())?;
+    Some((operands[..comma].trim(), operands[comma + 1..].trim()))
+}
+
 fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     // Same state machine as the x86-64 pass (redundant_ext.rs): flags cleared
     // at labels/calls/barriers, updated by extensions, copies, and
@@ -11819,9 +11846,7 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
 
         // movzbl SRC, %DST
         if let Some(rest) = t.strip_prefix("movzbl ") {
-            if let Some((src, dst)) = rest.split_once(',') {
-                let src = src.trim();
-                let dst = dst.trim();
+            if let Some((src, dst)) = split_operands_last_comma(rest) {
                 let df = register_family(dst);
                 // A full-register byte fact applies to its low byte only.
                 // If EAX < 256 then AH is zero, so deleting
@@ -11861,9 +11886,7 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
         }
         // movzwl SRC, %DST
         if let Some(rest) = t.strip_prefix("movzwl ") {
-            if let Some((src, dst)) = rest.split_once(',') {
-                let src = src.trim();
-                let dst = dst.trim();
+            if let Some((src, dst)) = split_operands_last_comma(rest) {
                 let df = register_family(dst);
                 if df <= REG_GP_MAX && !src.contains('(') && src.starts_with('%') {
                     let sf = register_family(src);
@@ -11970,9 +11993,7 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
 
         // movsbl SRC, %DST
         if let Some(rest) = t.strip_prefix("movsbl ") {
-            if let Some((src, dst)) = rest.split_once(',') {
-                let src = src.trim();
-                let dst = dst.trim();
+            if let Some((src, dst)) = split_operands_last_comma(rest) {
                 let df = register_family(dst);
                 if df <= REG_GP_MAX {
                     // A sign-extension fact describes the full register's
@@ -12014,9 +12035,7 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
         // movzbl SRC, %DST : a zero extension is its own sign extension only
         // when the source is a bool (0/1 == sign-extended 0/1).
         if let Some(rest) = t.strip_prefix("movzbl ") {
-            if let Some((src, dst)) = rest.split_once(',') {
-                let src = src.trim();
-                let dst = dst.trim();
+            if let Some((src, dst)) = split_operands_last_comma(rest) {
                 let df = register_family(dst);
                 if df <= REG_GP_MAX {
                     let src_bool = is_low_byte_register(src) && {
@@ -12331,6 +12350,350 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+// ── Pass: epilogue tail merging (i686 port of the x86-64 terminal pass) ─────
+//
+// # The waste
+//
+// `emit_epilogue_and_ret_impl` runs at EVERY return site, so a function with
+// three returns and four callee-saved registers emits three byte-identical
+// copies of
+//
+// ```text
+//     addl $12, %esp
+//     popl %ebp
+//     popl %edi
+//     popl %esi
+//     popl %ebx
+//     ret
+// ```
+//
+// On the 32 KiB-limited x86 real-mode setup image every one of those copies
+// is 14 bytes of the budget (`arch/x86/boot/a20.c:empty_8042` alone carried
+// three of them: 42 bytes against a 89-byte GCC body).  Measured over the 23
+// setup objects: 24 functions with 63 returns between them, ≈625 bytes of
+// duplicated epilogue.  The x86-64 backend has removed exactly this since
+// `peephole/passes/epilogue_merge.rs`; i686 — the backend the size gate is
+// actually measured on — never got the pass.
+//
+// Cross-jumping keeps one copy and turns every duplicate into a `jmp`.  A
+// longest-common-suffix match additionally lets a shorter exit jump into the
+// middle of a longer one.
+//
+// # Soundness boundary (identical discipline to the x86-64 pass)
+//
+// * Only SysV i386 callee-save restores (`popl %ebx/%esi/%edi/%ebp`),
+//   `addl $imm, %esp` and `leave` form a tail.  A caller-saved temporary
+//   `popl %eax` is not an ABI restore and never merges.
+// * The `ret` line must match textually between host and guest: `ret $4`
+//   (sret/fastcall callee-pop) pops a different amount, so a plain-`ret`
+//   guest must never share a `ret $4` host.
+// * A run containing a label is rejected: a branch may enter its middle.
+// * Grouping is per function (non-local label → `.cfi_endproc`/`.size`), so a
+//   jump can never cross a function boundary.
+// * CFI is allowed only in the unconditional entry prefix; path-sensitive
+//   unwind state declines the whole function.
+// * Labels come from a file-wide occupied-name set, so inline assembly that
+//   defines the same local symbol cannot collide.
+// * The pass is TERMINAL: it runs on the text every other pass produced, so
+//   no later line pass can see a synthetic `label + instruction` replacement
+//   as one opaque line.
+
+use std::collections::{HashMap, HashSet};
+
+/// One exit site: `[start, ret_idx]` is the epilogue run plus its `ret`.
+struct EpiExit {
+    start: usize,
+    ret_idx: usize,
+    /// Epilogue instruction texts in program order, excluding the `ret`.
+    parts: Vec<String>,
+    /// Line index of each entry in `parts`.
+    line_of: Vec<usize>,
+    /// Exact `ret` text (`ret` or `ret $N`); host and guest must agree.
+    ret_text: String,
+}
+
+/// Whether `t` is an ABI restore instruction that may safely appear in an
+/// independently shared epilogue suffix.
+fn is_epilogue_insn_i686(t: &str) -> bool {
+    if t == "leave" {
+        return true;
+    }
+    if let Some(rest) = t.strip_prefix("popl %") {
+        // i386 SysV callee-saved GPRs.  Under -fomit-frame-pointer %ebp joins
+        // the allocatable pool (I686_CALLEE_SAVED_WITH_EBP), so it is an ABI
+        // restore here exactly like the others — which is also what the
+        // kernel's 32 KiB setup code is built with.
+        return matches!(rest, "ebx" | "esi" | "edi" | "ebp");
+    }
+    // `addl $N, %esp`.  A `subl` here would allocate, not restore, a frame.
+    if let Some(rest) = t.strip_prefix("addl $") {
+        return rest.ends_with(", %esp");
+    }
+    false
+}
+
+/// `true` when a CFI operation occurs after control flow has split into the
+/// body.  Entry-prologue CFI is shared by every path and stable; body/exit
+/// CFI describes one particular dynamic stack state and is not.
+fn has_path_sensitive_cfi_i686(
+    store: &LineStore,
+    infos: &[LineInfo],
+    fn_start: usize,
+    fn_end: usize,
+) -> bool {
+    let mut entered_body = false;
+    for k in (fn_start + 1)..fn_end {
+        let text = trimmed(store, &infos[k], k);
+        if text.starts_with(".cfi_") {
+            if entered_body {
+                return true;
+            }
+            continue;
+        }
+        if infos[k].is_nop() {
+            continue;
+        }
+        if matches!(
+            infos[k].kind,
+            LineKind::Label
+                | LineKind::Jmp
+                | LineKind::JmpIndirect
+                | LineKind::CondJmp
+                | LineKind::Ret
+                | LineKind::RetN
+                | LineKind::InlineAsm
+        ) {
+            entered_body = true;
+        }
+    }
+    false
+}
+
+/// Every existing label definition in the translation unit.  GAS local
+/// symbols are file-global, so the sequence must be file-global too.
+fn occupied_label_names_i686(store: &LineStore) -> HashSet<String> {
+    let mut labels = HashSet::new();
+    for i in 0..store.len() {
+        for line in store.get(i).lines() {
+            let text = line.trim();
+            if let Some(label) = text.strip_suffix(':') {
+                if !label.is_empty() {
+                    labels.insert(label.to_string());
+                }
+            }
+        }
+    }
+    labels
+}
+
+/// Allocate a local symbol that cannot collide with an assembler or
+/// inline-asm label already present in the translation unit.
+fn fresh_epilogue_label(seq: &mut u64, occupied: &mut HashSet<String>) -> String {
+    loop {
+        *seq = seq
+            .checked_add(1)
+            .expect("i686 epilogue label sequence exhausted");
+        let label = format!(".L__lccc_epilogue_{seq}");
+        if occupied.insert(label.clone()) {
+            return label;
+        }
+    }
+}
+
+/// Function ranges of a whole TU: `(first_line, one_past_last)`.  Same
+/// boundary idiom as `eliminate_unused_callee_saves` — a non-local label
+/// starts a generated function, `.cfi_endproc`/`.size` closes it — because
+/// `-fno-asynchronous-unwind-tables` (the realmode rule) suppresses the CFI
+/// pair the x86-64 pass keys on, while `.size f, .-f` is always emitted.
+fn function_ranges_i686(store: &LineStore, infos: &[LineInfo]) -> Vec<(usize, usize)> {
+    let len = store.len();
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < len {
+        while start < len {
+            if infos[start].kind == LineKind::Label {
+                let line = trimmed(store, &infos[start], start);
+                if line.ends_with(':') && !line.starts_with('.') {
+                    break;
+                }
+            }
+            start += 1;
+        }
+        if start >= len {
+            break;
+        }
+        let mut end = start + 1;
+        while end < len {
+            let line = trimmed(store, &infos[end], end);
+            if line == ".cfi_endproc" || line.starts_with(".size ") {
+                break;
+            }
+            end += 1;
+        }
+        ranges.push((start, end.min(len)));
+        start = end.saturating_add(1);
+    }
+    ranges
+}
+
+fn merge_epilogue_tails_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_I686_EPILOGUE_MERGE").is_some() {
+        return false;
+    }
+    if store.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    let mut label_seq = 0u64;
+    let mut occupied = occupied_label_names_i686(store);
+    for (start, end) in function_ranges_i686(store, infos) {
+        changed |= merge_one_function_i686(store, infos, start, end, &mut label_seq, &mut occupied);
+    }
+    changed
+}
+
+fn merge_one_function_i686(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    fn_start: usize,
+    fn_end: usize,
+    label_seq: &mut u64,
+    occupied: &mut HashSet<String>,
+) -> bool {
+    // The emitter writes only entry-prefix CFI.  Fail closed on anything that
+    // updates unwind state inside the CFG.
+    if has_path_sensitive_cfi_i686(store, infos, fn_start, fn_end) {
+        return false;
+    }
+
+    let mut exits: Vec<EpiExit> = Vec::new();
+    for k in (fn_start + 1)..fn_end {
+        if infos[k].is_nop() || !matches!(infos[k].kind, LineKind::Ret | LineKind::RetN) {
+            continue;
+        }
+        let ret_text = trimmed(store, &infos[k], k).to_string();
+        // Walk backwards over the epilogue run, skipping nops.  Stop before
+        // labels/directives so the candidate is necessarily a whole basic-tail
+        // fragment with no externally visible entry point in its interior.
+        let mut start = k;
+        let mut parts = Vec::new();
+        let mut lines = Vec::new();
+        let mut j = k;
+        while j > fn_start + 1 {
+            j -= 1;
+            if infos[j].is_nop() || infos[j].kind == LineKind::Empty {
+                continue;
+            }
+            let text = trimmed(store, &infos[j], j);
+            if text.ends_with(':') || text.starts_with('.') || !is_epilogue_insn_i686(text) {
+                break;
+            }
+            parts.push(text.to_string());
+            lines.push(j);
+            start = j;
+        }
+        // A two-instruction tail replaced by a jump is break-even only once it
+        // includes the `ret`; `parts` excludes it, so require two restores.
+        if parts.len() < 2 {
+            continue;
+        }
+        parts.reverse();
+        lines.reverse();
+        exits.push(EpiExit {
+            start,
+            ret_idx: k,
+            parts,
+            line_of: lines,
+            ret_text,
+        });
+    }
+    if exits.len() < 2 {
+        return false;
+    }
+
+    // Longest host first, then source order for reproducible assembly.  A
+    // short exit can jump into the deepest matching suffix of a longer one.
+    let mut order: Vec<usize> = (0..exits.len()).collect();
+    order.sort_unstable_by(|&a, &b| {
+        exits[b]
+            .parts
+            .len()
+            .cmp(&exits[a].parts.len())
+            .then_with(|| exits[a].start.cmp(&exits[b].start))
+    });
+
+    let mut changed = false;
+    let mut consumed = vec![false; exits.len()];
+    // A host may serve several different suffix lengths.  Each length needs a
+    // label at a distinct instruction, but all guests of the same length reuse
+    // it rather than planting duplicate names at the same program point.
+    let mut host_labels: HashMap<(usize, usize), String> = HashMap::new();
+    for hi in 0..order.len() {
+        let host = order[hi];
+        if consumed[host] {
+            continue;
+        }
+        for &guest in order.iter().skip(hi + 1) {
+            if consumed[guest] || guest == host {
+                continue;
+            }
+            if exits[guest].ret_text != exits[host].ret_text {
+                continue;
+            }
+            let (host_parts, guest_parts) = (&exits[host].parts, &exits[guest].parts);
+            if guest_parts.len() < 2 || guest_parts.len() > host_parts.len() {
+                continue;
+            }
+            if host_parts[host_parts.len() - guest_parts.len()..] != guest_parts[..] {
+                continue;
+            }
+
+            let key = (host, guest_parts.len());
+            let label = if let Some(label) = host_labels.get(&key) {
+                label.clone()
+            } else {
+                let label = fresh_epilogue_label(label_seq, occupied);
+                let at = exits[host].line_of[host_parts.len() - guest_parts.len()];
+                store.replace(at, format!("{label}:\n{}", store.get(at).trim_end()));
+                infos[at] = classify_line(store.get(at));
+                host_labels.insert(key, label.clone());
+                label
+            };
+
+            let (start, ret_idx) = (exits[guest].start, exits[guest].ret_idx);
+            store.replace(start, format!("    jmp {label}"));
+            infos[start] = classify_line(store.get(start));
+            for k in (start + 1)..=ret_idx {
+                infos[k].kind = LineKind::Nop;
+            }
+            consumed[guest] = true;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Terminal entry point: re-classify the finished text, merge duplicate
+/// epilogues, and re-emit.  Kept String-in/String-out so it is impossible for
+/// a structured pass to run after it and misread a planted label.
+fn merge_duplicate_epilogues_terminal(asm: String) -> String {
+    if std::env::var_os("CCC_NO_I686_EPILOGUE_MERGE").is_some() {
+        return asm;
+    }
+    let mut store = LineStore::new(asm.clone());
+    let mut infos: Vec<LineInfo> = (0..store.len())
+        .map(|i| classify_line(store.get(i)))
+        .collect();
+    pin_inline_asm_regions(&store, &mut infos);
+    if !merge_epilogue_tails_i686(&mut store, &mut infos) {
+        // Return the caller's buffer untouched: rebuilding it here would make
+        // this pass responsible for any textual normalisation LineStore does,
+        // which is another pass's contract to keep.
+        return asm;
+    }
+    store.build_result(|i| infos[i].is_nop())
+}
 
 #[cfg(test)]
 mod tests {
@@ -14419,11 +14782,16 @@ mod tests {
             1,
             "alloc must not grow:\n{result}"
         );
-        assert_eq!(
-            result.matches("addl $16, %esp").count(),
-            2,
-            "deallocs must not grow:\n{result}"
-        );
+        // Counted as DEALLOCATION SITES, not literal text: the terminal
+        // epilogue-merge pass legitimately cross-jumps the second (textually
+        // identical) epilogue, so one of the two copies may be a `jmp` to the
+        // other.  That does not weaken this pin — every path still executes
+        // the same instruction sequence, so no arrival depth shifts — and what
+        // the pin guards is the REFUSAL of the callee-save/frame transform:
+        // the pairs survive (above) and the allocation never grows (below).
+        let dealloc_sites = result.matches("addl $16, %esp").count()
+            + result.matches("jmp .L__lccc_epilogue_").count();
+        assert_eq!(dealloc_sites, 2, "deallocs must not grow:\n{result}");
     }
 
     #[test]
@@ -17770,5 +18138,354 @@ mod tests {
         st.shift_esp(-32);
         assert!(st.lookup(ESP_SLOT_BIAS - 8, 4).is_none());
         assert!(st.lookup(-12, 4).is_some());
+    }
+
+    // ── epilogue tail merging (i686) ────────────────────────────────────────
+
+    /// Run ONLY the terminal epilogue merge over a fragment (the structured
+    /// passes are irrelevant to these shapes and would rewrite the fixtures).
+    fn merge_epi(asm: &str) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        pin_inline_asm_regions(&store, &mut infos);
+        let changed = merge_epilogue_tails_i686(&mut store, &mut infos);
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert_eq!(changed, out.contains("jmp .L__lccc_epilogue_"), "{out}");
+        out
+    }
+
+    #[test]
+    fn epilogue_merge_shares_one_copy() {
+        // The shape every multi-return i686 function has: three byte-identical
+        // `addl/popl…/ret` copies (measured 625 B of these in the 23 setup
+        // objects).  One copy survives; the other two become jumps.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subl $12, %esp\n",
+            ".Lexit1:\n",
+            "    xorl %eax, %eax\n",
+            "    addl $12, %esp\n",
+            "    popl %ebp\n",
+            "    popl %edi\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".Lexit2:\n",
+            "    movl $1, %eax\n",
+            "    addl $12, %esp\n",
+            "    popl %ebp\n",
+            "    popl %edi\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".Lexit3:\n",
+            "    movl $2, %eax\n",
+            "    addl $12, %esp\n",
+            "    popl %ebp\n",
+            "    popl %edi\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = merge_epi(asm);
+        assert_eq!(out.matches("    ret\n").count(), 1, "{out}");
+        assert_eq!(out.matches("jmp .L__lccc_epilogue_").count(), 2, "{out}");
+        // Every return value must still be set on its own path.
+        for v in ["xorl %eax, %eax", "movl $1, %eax", "movl $2, %eax"] {
+            assert!(out.contains(v), "lost {v}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn epilogue_merge_keeps_a_single_exit_untouched() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    addl $12, %esp\n",
+            "    popl %ebx\n",
+            "    popl %esi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!merge_epilogue_tails_i686(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn epilogue_merge_never_mixes_ret_forms() {
+        // `ret $4` (i386 sret/fastcall callee-pop) pops a different amount
+        // than a plain `ret`.  Sharing the host's `ret` would corrupt the
+        // caller's stack, so the texts must match exactly.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            ".La:\n",
+            "    addl $8, %esp\n",
+            "    popl %ebx\n",
+            "    popl %esi\n",
+            "    ret\n",
+            ".Lb:\n",
+            "    addl $8, %esp\n",
+            "    popl %ebx\n",
+            "    popl %esi\n",
+            "    ret $4\n",
+            ".cfi_endproc\n",
+        );
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!merge_epilogue_tails_i686(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn epilogue_merge_rejects_a_caller_saved_pop() {
+        // `popl %eax` is a temporary restore, not an ABI epilogue: cross-jumping
+        // arbitrary stack-manipulating text is not what this pass licenses.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            ".La:\n",
+            "    addl $8, %esp\n",
+            "    popl %eax\n",
+            "    popl %edx\n",
+            "    ret\n",
+            ".Lb:\n",
+            "    addl $8, %esp\n",
+            "    popl %eax\n",
+            "    popl %edx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!merge_epilogue_tails_i686(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn epilogue_merge_declines_path_sensitive_cfi() {
+        // CFI after the first body label is per-path unwind state; an exit that
+        // jumps into another path's epilogue would land on the wrong CFA.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subl $12, %esp\n",
+            "    .cfi_def_cfa_offset 16\n",
+            ".Lbody:\n",
+            "    .cfi_def_cfa_offset 12\n",
+            ".La:\n",
+            "    addl $12, %esp\n",
+            "    popl %ebx\n",
+            "    popl %esi\n",
+            "    ret\n",
+            ".Lb:\n",
+            "    addl $12, %esp\n",
+            "    popl %ebx\n",
+            "    popl %esi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!merge_epilogue_tails_i686(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn epilogue_merge_jumps_into_the_deepest_matching_suffix() {
+        // A shorter exit shares the tail of a longer one instead of getting
+        // its own copy.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            ".Llong:\n",
+            "    addl $16, %esp\n",
+            "    popl %ebp\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".Lshort:\n",
+            "    popl %ebp\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = merge_epi(asm);
+        assert!(out.contains(".L__lccc_epilogue_1:\n    popl %ebp"), "{out}");
+        assert!(
+            out.contains(".Lshort:\n    jmp .L__lccc_epilogue_1"),
+            "{out}"
+        );
+        assert_eq!(out.matches("    ret\n").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn epilogue_merge_never_crosses_a_function_boundary() {
+        // GAS local symbols are file-global, but a jump must stay inside its
+        // own function: two functions with one exit each must not merge.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    addl $8, %esp\n",
+            "    popl %ebx\n",
+            "    popl %esi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+            "g:\n",
+            ".cfi_startproc\n",
+            "    addl $8, %esp\n",
+            "    popl %ebx\n",
+            "    popl %esi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size g, .-g\n",
+        );
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!merge_epilogue_tails_i686(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn epilogue_merge_skips_an_inline_asm_label_collision() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            ".L__lccc_epilogue_1:\n",
+            "    nop\n",
+            ".La:\n",
+            "    addl $8, %esp\n",
+            "    popl %ebx\n",
+            "    popl %esi\n",
+            "    ret\n",
+            ".Lb:\n",
+            "    addl $8, %esp\n",
+            "    popl %ebx\n",
+            "    popl %esi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = merge_epi(asm);
+        assert_eq!(out.matches(".L__lccc_epilogue_1:").count(), 1, "{out}");
+        assert!(out.contains(".L__lccc_epilogue_2:"), "{out}");
+        assert!(out.contains("jmp .L__lccc_epilogue_2"), "{out}");
+    }
+
+    #[test]
+    fn epilogue_merge_end_to_end_through_the_peephole() {
+        // Integration: the terminal pass must survive the whole pipeline and
+        // leave one shared epilogue behind.  The `#APP` region also proves the
+        // inline-asm pinning still classifies opaque text correctly.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebx\n",
+            "    pushl %esi\n",
+            "    subl $8, %esp\n",
+            // The callee-saved registers must be LIVE: an earlier pass
+            // (eliminate_unused_callee_saves) drops unused push/pop pairs,
+            // and a one-restore tail is deliberately below the merge
+            // break-even.  A real multi-return function uses them.
+            "    movl 12(%esp), %ebx\n",
+            "    xorl %esi, %esi\n",
+            "    cmpl $0, %ebx\n",
+            "    je .Lzero\n",
+            "    movl %ebx, %eax\n",
+            "    addl %esi, %eax\n",
+            "    addl $8, %esp\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".Lzero:\n",
+            "    xorl %eax, %eax\n",
+            "    addl %esi, %eax\n",
+            "    addl $8, %esp\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert_eq!(out.matches("    ret\n").count(), 1, "{out}");
+        assert!(out.contains("jmp .L__lccc_epilogue_"), "{out}");
+    }
+
+    // ── narrow-value facts through indexed (SIB) memory operands ────────────
+
+    #[test]
+    fn redundant_sign_ext_after_indexed_load_is_eliminated() {
+        // `movsbl (%edi,%ebx),%esi` already sign-extends into %esi; the copy
+        // carries the fact to %eax, so the re-extension is a no-op.  Before
+        // the paren-aware operand split the load's destination parsed as
+        // " %ebx)", no fact was recorded, and the pair survived.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movsbl (%edi,%ebx), %esi\n",
+            "    movl %esi, %eax\n",
+            "    movsbl %al, %eax\n",
+            "    movl %eax, (%edx)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert_eq!(
+            out.matches("movsbl").count(),
+            1,
+            "re-sign-extension of an indexed load survived:\n{out}"
+        );
+    }
+
+    #[test]
+    fn adjacent_duplicate_zext_pairs_collapse() {
+        // The measured `zext+zext` shape (12 sites in the setup objects).
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%eax,%ecx), %eax\n",
+            "    movzbl %al, %eax\n",
+            "    movl %eax, (%edx)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert_eq!(out.matches("movzbl").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn indexed_load_never_leaks_a_fact_into_its_index_register() {
+        // SOUNDNESS / mutation detector for the old first-comma split: it read
+        // the destination of `movzbl (%eax,%ecx),%edx` as "%ecx)", which is
+        // REG_NONE today (fail-closed) but would have been %ecx under any
+        // looser parse — and a byte fact on %ecx deletes the later
+        // `movzbl %cl,%ecx` that genuinely needs to zero-extend.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%eax,%ecx), %edx\n",
+            "    movl $300, %ecx\n",
+            "    movzbl %cl, %ecx\n",
+            "    movl %ecx, (%edx)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("movzbl %cl, %ecx"),
+            "the index register inherited a byte fact it does not have:\n{out}"
+        );
     }
 }
