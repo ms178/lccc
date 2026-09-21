@@ -467,6 +467,11 @@ jobs:
           bash tests/regression/check_env_test_hygiene.sh
           bash tests/regression/check_peephole_whitespace.sh
           bash tests/regression/check_atomic_backends.sh
+          # FMA-negation peel deletion invariant, re-derived over the enumerated
+          # shape space: a pure model check (no compiler, sub-second) so a
+          # regression of the absorbability classification is caught even where
+          # the IR verifier is not wired after the pass.
+          python3 tools/ir_shape_check.py
 
       # Kbuild tracks command lines but not the contents of CC/LD executables.
       # A rebuilt compiler at the same path must invalidate every target
