@@ -668,6 +668,67 @@ fn destination_unobserved_between(
     true
 }
 
+/// Hoist every `Alloca` to the head of its block, preserving relative order.
+///
+/// A promotion rewrites a producer's `dest_ptr` to point directly at the
+/// copy destination's slot, but that slot's `Alloca` can sit BELOW the
+/// producer in the block — the inliner appends callee parameter allocas
+/// after the caller's setup, and the caller's setup is exactly where the
+/// vector producers live. The rewrite then leaves a textual use-before-def
+/// (benign for codegen, which treats allocas as position-independent frame
+/// slots, but a violation of the IR contract the verifier enforces and
+/// that every instruction-ordering pass is entitled to rely on). `Alloca`
+/// reads no operand, so moving it earlier within its own block is always
+/// semantics-preserving; hoisting the whole class at once also covers any
+/// future producer shape instead of patching this one site.
+fn hoist_block_allocas(block: &mut BasicBlock) {
+    // Fast path: the lowering emits allocas clustered at the head, so most
+    // blocks have nothing below the first non-alloca. `skip_while` eats the
+    // head cluster; `any` then finds a late alloca iff one exists.
+    let late_alloca = block
+        .instructions
+        .iter()
+        .skip_while(|inst| matches!(inst, Instruction::Alloca { .. }))
+        .any(|inst| matches!(inst, Instruction::Alloca { .. }));
+    if !late_alloca {
+        return;
+    }
+    let is_alloca: Vec<bool> = block
+        .instructions
+        .iter()
+        .map(|inst| matches!(inst, Instruction::Alloca { .. }))
+        .collect();
+    let mut hoisted = Vec::with_capacity(block.instructions.len());
+    let mut rest = Vec::with_capacity(block.instructions.len());
+    for inst in std::mem::take(&mut block.instructions) {
+        if matches!(inst, Instruction::Alloca { .. }) {
+            hoisted.push(inst);
+        } else {
+            rest.push(inst);
+        }
+    }
+    block.instructions = hoisted;
+    block.instructions.extend(rest);
+    // Same positional filter for the spans (the shared discipline: in
+    // lockstep when parallel, cleared when stale).
+    if block.source_spans.len() == is_alloca.len() {
+        let mut hoisted_spans = Vec::with_capacity(is_alloca.len());
+        let mut rest_spans = Vec::with_capacity(is_alloca.len());
+        for (keep_alloca, span) in is_alloca
+            .into_iter()
+            .zip(std::mem::take(&mut block.source_spans))
+        {
+            if keep_alloca {
+                hoisted_spans.push(span);
+            } else {
+                rest_spans.push(span);
+            }
+        }
+        block.source_spans = hoisted_spans;
+        block.source_spans.extend(rest_spans);
+    }
+}
+
 /// Remove instruction indices while maintaining BasicBlock's parallel source
 /// span table.  The input is normalized here so callers can cheaply append
 /// removals from independent rewrites.
@@ -850,6 +911,7 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
 
     for (block, removed) in func.blocks.iter_mut().zip(&mut removals) {
         remove_instructions(block, removed);
+        hoist_block_allocas(block);
     }
     applied
 }

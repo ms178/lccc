@@ -1157,9 +1157,14 @@ pub(crate) fn run_passes(
         // FMA operand-negation peel (same call as the -O2+ tail; see Phase
         // 11f there). GCC folds fma(-a,b,-c) to one vfnmsub at -O1, so the
         // tier that already folds the fma libcall to the intrinsic gets the
-        // sign algebra too.
+        // sign algebra too. The verify hook matters here for the same
+        // reason it does at the -O2+ tail: this is the LAST IR transform,
+        // and nothing downstream would otherwise re-check the module — a
+        // malformed peel was invisible to CCC_VERIFY_IR exactly once
+        // already (the deleted-under-a-surviving-reader chain).
         if !pass_disabled(&disabled, "fmanegpeel") && fma_neg_peel_enabled {
             fma_neg_peel::run(module);
+            verify::verify_after_pass(module, "fmanegpeel");
         }
         resolve_asm::resolve_inline_asm_symbols(module);
         if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
@@ -2643,16 +2648,22 @@ pub(crate) fn run_passes(
     // vectorizer (their SLP matchers must not see the Signed variants) and
     // in phi-SSA form (the rewrite's soundness argument is dominance, and
     // eliminate_phis still runs after us in the driver). Absorbs the
-    // single-use Neg instructions feeding a plain FmaScalarF{32,64} into
-    // the signed families — `__builtin_fma(-a, b, -c)` becomes ONE
-    // vfnmsub instead of vxorpd + vxorpd + vfmadd (GCC parity at -O1 and
-    // above; GCC keeps the negations materialised at -O0 and so do we).
-    // Gated on the same has_fma3 signal as the fma libcall fold, so
-    // targets without the families never see the variant. Kill switches:
-    // CCC_NO_FMA_NEG_PEEL=1 / CCC_DISABLE_PASSES=fmanegpeel (both resolved
-    // once above, with the other pass switches).
+    // operand Negations feeding a FmaScalarF{32,64} site (plain or already
+    // Signed — the flags compose by XOR) into the signed families:
+    // `__builtin_fma(-a, b, -c)` becomes ONE vfnmsub instead of vxorpd +
+    // vxorpd + vfmadd (GCC parity at -O1 and above; GCC keeps the negations
+    // materialised at -O0 and so do we). Gated on the same has_fma3 signal
+    // as the fma libcall fold, so targets without the families never see
+    // the variant. Kill switches: CCC_NO_FMA_NEG_PEEL=1 /
+    // CCC_DISABLE_PASSES=fmanegpeel (both resolved once above, with the
+    // other pass switches). The verify hook is load-bearing: the peel is
+    // the last IR transform in this tier too, so without it a malformed
+    // rewrite here is invisible to CCC_VERIFY_IR (that is exactly how the
+    // chain defect — a Neg deleted under a surviving reader — reached
+    // codegen as an ICE instead of failing the armed regression gates).
     if !pass_disabled(&disabled, "fmanegpeel") && fma_neg_peel_enabled {
         fma_neg_peel::run(module);
+        verify::verify_after_pass(module, "fmanegpeel");
     }
 
     if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {

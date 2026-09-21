@@ -137,15 +137,39 @@ for flag in "-mno-avx2" "-march=x86-64-v3 -mno-avx2"; do
     # The multi-use negation shape: both fma sites fold, the xorpd bracket
     # dies with them. (lccc emits no .size directives; the function range
     # ends at the next column-0 label, which is `main:` in this corpus.)
+    # NOTE the regex: `\bxorpd\b` can never match the VEX spelling `vxorpd`
+    # (no word boundary between v and x), and every 4b target is VEX, so
+    # the pin must be `v?xorpd` to see anything at all.
     check_eq "$flag: shared-negation shape leaves no sign-mask xorpd" \
         "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
-          | grep -cE '\bxorpd\b' || true)" 0
+          | grep -cE '\bv?xorpd\b' || true)" 0
     check_gt0 "$flag: shared-negation shape folds (two vfnmsub present)" \
         "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
           | grep -cE '\bvfnmsub[0-9]*p?sd\b' || true)"
     check_eq "$flag: shared-negation shape is exactly two vfnmsub" \
         "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
           | grep -cE '\bvfnmsub[0-9]*p?sd\b' || true)" 2
+    # The chain shapes (the fixpoint correction). chain_live: the fma reads
+    # the INNER negation while the OUTER survives for the add -- both links
+    # materialise (exactly two sign masks) and NO latitude is taken (the
+    # family stays plain: zero negated families). The source-poisoned rule
+    # deleted the inner link under the outer's surviving read -- an ICE.
+    check_eq "$flag: live-outer chain keeps exactly two sign masks" \
+        "$(sed -n '/^chain_live:/,/^chain_pin:/p' "$tmp/fma-$lbl.s" \
+          | grep -cE '\bv?xorpd\b' || true)" 2
+    check_eq "$flag: live-outer chain takes no sign latitude (no vfnm*)" \
+        "$(sed -n '/^chain_live:/,/^chain_pin:/p' "$tmp/fma-$lbl.s" \
+          | grep -cE '\bvfnm(add|sub)[0-9]*p?sd\b' || true)" 0
+    # chain_pin: the INNER negation is pinned by the add, the site reads
+    # the OUTER -- which peels into the family reading the materialised
+    # inner: ONE sign mask and one vfnmadd (GCC's exact shape; the
+    # source-poisoned rule kept both masks).
+    check_eq "$flag: pinned-inner chain keeps exactly one sign mask" \
+        "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
+          | grep -cE '\bv?xorpd\b' || true)" 1
+    check_eq "$flag: pinned-inner chain folds to one vfnmadd" \
+        "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
+          | grep -cE '\bvfnmadd[0-9]*p?sd\b' || true)" 1
 done
 # The kernel's no-SSE contract also rejects live scalar FP: x86-64 LCCC has
 # no x87 lowering, and silently accepting this TU would be worse than a clear
