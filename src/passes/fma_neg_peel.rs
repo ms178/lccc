@@ -273,7 +273,12 @@ fn peel_function(func: &mut IrFunction) -> usize {
     // what single-use certified), so removal is dead-code elimination with
     // the parallel source_spans discipline (see dce::sweep_block). The keep
     // decision is computed once into a bitmap so instructions and spans walk
-    // the SAME positional filter.
+    // the SAME positional filter. (dce's own "refuse to sweep" guard is
+    // about its EXTERNAL live-flag slice desynchronising — a caller bug it
+    // fails closed on; the spans discipline both passes share is the
+    // clear-on-length-mismatch below, which restores the documented
+    // "empty spans == no debug info" invariant instead of leaving a stale
+    // vector that would desynchronise later debug emission.)
     let mut removed = 0usize;
     for block in &mut func.blocks {
         if !block.instructions.iter().any(|inst| {

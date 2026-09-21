@@ -767,6 +767,22 @@ EOF_PACKED
         want_packed 'vfmsub[0-9]*pd'  'vfmsub..pd (addend-negated loop)'
         want_packed 'vfmadd[0-9]*pd'  'vfmadd..pd (plain loop)'
         want_packed 'vfnmsub[0-9]*ps' 'vfnmsub..ps (f32 loop)'
+        # MEMORY-FORM ratchet (the madd VLFOLD revival): every one of the
+        # six packed loops must FOLD one streamed load into the FMA's
+        # memory operand (`vf..231pd (%rsi,%r10), ...` — ICX/GCC's saxpy
+        # body: one streamed load, one folded memory source, one store).
+        # The whole madd memory-fold path — VLFOLD-IR marking, the
+        # emit_intrinsic_impl safety-net consumer set, the homed-ok
+        # admission, the deferred-store cache-awareness — was dead from
+        # the v6 safety-net tightening until this was revived; a single
+        # broken gate anywhere in that chain drops these to zero and
+        # costs one load + one staging copy per iteration per kernel.
+        n_memfma=$(grep -cE '^[[:space:]]*vf(n?m)(add|sub)[0-9]*p[ds][[:space:]]+\(' "$work/fp.s" || true)
+        if [[ "$n_memfma" -ge 6 ]]; then
+            ok "packed loops fold a streamed load into the FMA memory operand ($n_memfma sites, one per kernel)"
+        else
+            bad "packed-loop memory-fold regression: only $n_memfma of 6 kernels fold a load into the FMA memory operand"
+        fi
         # The contract asymmetry: the builtin loop vectorizes with the
         # contract OFF (C99 semantics), while the mul+add contraction does
         # not -- pinning the one deliberate difference.
@@ -776,6 +792,103 @@ EOF_PACKED
             ok "-ffp-contract=off still vectorizes the builtin loop ($nco packed sites)"
         else
             bad "-ffp-contract=off lost the builtin packed FMA — the contract gate leaked into MapExpr::Fma"
+        fi
+    fi
+
+    # ── D3. SLP packed-FMA contraction at EVERY family width ────────────────
+    # The BB-SLP Fma pack (`r[i] = x[i]*s + z[i]`, uniform s) must lower to
+    # an intrinsic whose REGISTER WIDTH matches the pack's lane count.  The
+    # width-blind op table lowered a width-4 F64 (or width-8 F32) pack
+    # through the 128-bit VecFma/VecFnma family: half the lanes computed,
+    # the store's upper half reading the multiplier pack raw — a silent
+    # miscompile no differential had ever exercised (every existing
+    # packed-FMA test shape was 128-bit).  Pin all four widths by RUNTIME
+    # equality against the reference compiler (the assertion that actually
+    # catches the class) plus a register-width shape check per family (the
+    # documentation of intent: 256-bit packs take the ymm madd families,
+    # 128-bit packs keep the xmm Fma families).
+    cat > "$work/fma_slp_width.c" <<'EOF_SLW'
+    #include <stdio.h>
+    #define NI __attribute__((noinline))
+    NI void slp_fma4(const double * __restrict x, const double * __restrict z,
+                     double s, double * __restrict r) {
+        r[0] = x[0]*s + z[0]; r[1] = x[1]*s + z[1];
+        r[2] = x[2]*s + z[2]; r[3] = x[3]*s + z[3];
+    }
+    NI void slp_fms4(const double * __restrict x, const double * __restrict z,
+                     double s, double * __restrict r) {
+        r[0] = z[0] - x[0]*s; r[1] = z[1] - x[1]*s;
+        r[2] = z[2] - x[2]*s; r[3] = z[3] - x[3]*s;
+    }
+    NI void slp_fma2(const double * __restrict x, const double * __restrict z,
+                     double s, double * __restrict r) {
+        r[0] = x[0]*s + z[0]; r[1] = x[1]*s + z[1];
+    }
+    NI void slp_fma8(const float * __restrict x, const float * __restrict z,
+                     float s, float * __restrict r) {
+        r[0] = x[0]*s + z[0]; r[1] = x[1]*s + z[1]; r[2] = x[2]*s + z[2]; r[3] = x[3]*s + z[3];
+        r[4] = x[4]*s + z[4]; r[5] = x[5]*s + z[5]; r[6] = x[6]*s + z[6]; r[7] = x[7]*s + z[7];
+    }
+    NI void slp_fma4f(const float * __restrict x, const float * __restrict z,
+                      float s, float * __restrict r) {
+        r[0] = x[0]*s + z[0]; r[1] = x[1]*s + z[1]; r[2] = x[2]*s + z[2]; r[3] = x[3]*s + z[3];
+    }
+    int main(void) {
+        double xd[8], zd[8], rd[8];
+        float xf[8], zf[8], rf[8];
+        for (int i = 0; i < 8; i++) {
+            xd[i] = 0.25 * (i + 1) - 3.0; zd[i] = 7.0 - 0.5 * i;
+            xf[i] = 0.25f * (i + 1) - 3.0f; zf[i] = 7.0f - 0.5f * i;
+        }
+        slp_fma4(xd, zd, 0.375, rd);  for (int i = 0; i < 4; i++) printf("%.17g\n", rd[i]);
+        slp_fms4(xd, zd, 0.375, rd);  for (int i = 0; i < 4; i++) printf("%.17g\n", rd[i]);
+        slp_fma2(xd, zd, 0.375, rd);  for (int i = 0; i < 2; i++) printf("%.17g\n", rd[i]);
+        slp_fma8(xf, zf, 0.375f, rf); for (int i = 0; i < 8; i++) printf("%.9g\n", (double)rf[i]);
+        slp_fma4f(xf, zf, 0.375f, rf); for (int i = 0; i < 4; i++) printf("%.9g\n", (double)rf[i]);
+        return 0;
+    }
+EOF_SLW
+    "$LCCC" "${FLAGS[@]}" -ffp-contract=fast -o "$work/slw.lccc" "$work/fma_slp_width.c" 2>/dev/null \
+        && "$LCCC" "${FLAGS[@]}" -ffp-contract=fast -S -o "$work/slw.s" "$work/fma_slp_width.c" 2>/dev/null \
+        && "$ORACLE" -O2 -march=x86-64-v3 -ffp-contract=fast -o "$work/slw.oracle" "$work/fma_slp_width.c" 2>/dev/null
+    if [[ $? -ne 0 ]]; then
+        bad "fma_slp_width.c did not build with both compilers"
+    else
+        "$work/slw.lccc" > "$work/slw.lccc.out" 2>&1; rc_l=$?
+        "$work/slw.oracle" > "$work/slw.oracle.out" 2>&1; rc_o=$?
+        if [[ $rc_l -ne 0 || $rc_o -ne 0 ]]; then
+            bad "SLP width kernels run failed (lccc=$rc_l oracle=$rc_o)"
+        elif ! diff -q "$work/slw.lccc.out" "$work/slw.oracle.out" >/dev/null; then
+            bad "SLP width kernels output differs from $ORACLE:"
+            diff "$work/slw.lccc.out" "$work/slw.oracle.out" | head -6 | note
+        else
+            ok "SLP packed-FMA contraction bit-exact at every family width (4x/2x F64, 8x/4x F32, add and sub) vs $ORACLE"
+        fi
+        # Register-width shape: the 256-bit packs take the YMM madd
+        # families, the 128-bit packs keep the XMM Fma families.  The
+        # width shows in ANY register operand (the src2 and dst slots
+        # are always registers; the first operand may be a folded memory
+        # operand, whose consumer form the memory-fold revival produces).
+        # Exact counts would couple this gate to unrelated emitter
+        # staging choices.
+        fma_lines_pd=$(grep -E '^[[:space:]]*vf(n?m)(add|sub)[0-9]*pd' "$work/slw.s" || true)
+        fma_lines_ps=$(grep -E '^[[:space:]]*vf(n?m)(add|sub)[0-9]*ps' "$work/slw.s" || true)
+        # (An empty grep result must count as zero, not as one blank
+        # non-matching line — hence the emptiness guards.)
+        n_ymm_pd=0; n_xmm_pd=0
+        if [[ -n "$fma_lines_pd" ]]; then
+            n_ymm_pd=$(grep -c '%ymm' <<<"$fma_lines_pd" || true)
+            n_xmm_pd=$(grep -vc '%ymm' <<<"$fma_lines_pd" || true)
+        fi
+        n_ymm_ps=0; n_xmm_ps=0
+        if [[ -n "$fma_lines_ps" ]]; then
+            n_ymm_ps=$(grep -c '%ymm' <<<"$fma_lines_ps" || true)
+            n_xmm_ps=$(grep -vc '%ymm' <<<"$fma_lines_ps" || true)
+        fi
+        if [[ "$n_ymm_pd" -ge 2 && "$n_ymm_ps" -ge 1 && "$n_xmm_pd" -ge 1 && "$n_xmm_ps" -ge 1 ]]; then
+            ok "SLP FMA width shapes pinned ($n_ymm_pd ymm-pd, $n_xmm_pd xmm-pd, $n_ymm_ps ymm-ps, $n_xmm_ps xmm-ps sites)"
+        else
+            bad "SLP FMA width regression: ymm-pd=$n_ymm_pd xmm-pd=$n_xmm_pd ymm-ps=$n_ymm_ps xmm-ps=$n_xmm_ps — a width-4/8 pack lost its 256-bit family (or a 128-bit pack lost its xmm family)"
         fi
     fi
 

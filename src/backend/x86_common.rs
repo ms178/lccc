@@ -474,3 +474,30 @@ pub(crate) fn emit_operand_common(
     // Not handled: %a modifier, or register operand needing arch-specific formatting
     false
 }
+
+/// The 231-family scalar FMA mnemonic for the sign algebra
+/// `dest = (np ? -1 : 1) * (lhs * rhs) + (na ? -1 : 1) * acc`.
+///
+/// The x86 naming composes exactly: `n` negates the PRODUCT, `sub`
+/// subtracts the ADDEND, so
+/// `(false,false) vfmadd · (false,true) vfmsub · (true,false) vfnmadd ·
+/// (true,true) vfnmsub`, each with the 231 form number and an `sd`/`ss`
+/// suffix by lane width. Both the x86-64 and i686 backends lower the
+/// four signed FMA3 families through this one table (the i686 arm used
+/// to inline its own copy — three sites drifted in step only by luck).
+pub(crate) fn fma231_mnemonic(
+    negate_product: bool,
+    negate_addend: bool,
+    is_f64: bool,
+) -> &'static str {
+    match (negate_product, negate_addend, is_f64) {
+        (false, false, true) => "vfmadd231sd",
+        (false, false, false) => "vfmadd231ss",
+        (false, true, true) => "vfmsub231sd",
+        (false, true, false) => "vfmsub231ss",
+        (true, false, true) => "vfnmadd231sd",
+        (true, false, false) => "vfnmadd231ss",
+        (true, true, true) => "vfnmsub231sd",
+        (true, true, false) => "vfnmsub231ss",
+    }
+}

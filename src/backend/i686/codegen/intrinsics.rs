@@ -430,16 +430,7 @@ impl I686Codegen {
                     self.emit_f32_scalar_bits_to_xmm(&args[0], "xmm1");
                     self.emit_f32_scalar_bits_to_xmm(&args[1], "xmm2");
                 }
-                let fma = match (np, na, is_f64) {
-                    (false, false, true) => "vfmadd231sd",
-                    (false, false, false) => "vfmadd231ss",
-                    (false, true, true) => "vfmsub231sd",
-                    (false, true, false) => "vfmsub231ss",
-                    (true, false, true) => "vfnmadd231sd",
-                    (true, false, false) => "vfnmadd231ss",
-                    (true, true, true) => "vfnmsub231sd",
-                    (true, true, false) => "vfnmsub231ss",
-                };
+                let fma = crate::backend::x86_common::fma231_mnemonic(np, na, is_f64);
                 emit!(self.state, "    {} %xmm2, %xmm1, %xmm0", fma);
                 self.state.reg_cache.invalidate_acc();
                 if let Some(d) = dest {

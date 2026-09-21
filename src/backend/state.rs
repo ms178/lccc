@@ -227,6 +227,14 @@ pub struct CodegenState {
     /// elided when the load's destination carries a register home; see
     /// `compute_vector_memfold_homed_ok`.
     pub vector_memfold_homed_ok: FxHashSet<u32>,
+    /// Values with EXACTLY ONE use, that use in the same block as their
+    /// definition (`compute_vector_dying_values`): a destructive-form
+    /// emitter may compute its result into such an operand's register home
+    /// — no dynamic execution can read the home afterwards, because the
+    /// definition re-executes before any re-reach of the use. The
+    /// loop-invariant broadcast is the counter-example this set excludes:
+    /// one STATIC use site, read by every iteration.
+    pub vector_dying_values: FxHashSet<u32>,
     /// The elided load awaiting its consumer. Consumed as a memory operand
     /// by the audited memfold-first emitters, or re-issued as a real load by
     /// the memfold-aware loaders; the safety net in `emit_intrinsic_impl`
@@ -594,6 +602,7 @@ impl CodegenState {
             vector_defer_values: FxHashSet::default(),
             vector_memfold_values: FxHashSet::default(),
             vector_memfold_homed_ok: FxHashSet::default(),
+            vector_dying_values: FxHashSet::default(),
             pending_vec_memfold: None,
             pending_vec_store: None,
             x87_pending: None,

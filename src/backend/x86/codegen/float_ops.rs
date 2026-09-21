@@ -1579,16 +1579,11 @@ impl X86Codegen {
         negate_product: bool,
         negate_addend: bool,
     ) {
-        let fma = match (negate_product, negate_addend, matches!(ty, IrType::F64)) {
-            (false, false, true) => "vfmadd231sd",
-            (false, false, false) => "vfmadd231ss",
-            (false, true, true) => "vfmsub231sd",
-            (false, true, false) => "vfmsub231ss",
-            (true, false, true) => "vfnmadd231sd",
-            (true, false, false) => "vfnmadd231ss",
-            (true, true, true) => "vfnmsub231sd",
-            (true, true, false) => "vfnmsub231ss",
-        };
+        let fma = crate::backend::x86_common::fma231_mnemonic(
+            negate_product,
+            negate_addend,
+            matches!(ty, IrType::F64),
+        );
         self.emit_scalar_fma231_with(fma, mul_lhs, mul_rhs, acc, dest, ty);
     }
 

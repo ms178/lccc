@@ -126,6 +126,15 @@ struct StackLayoutContext {
     /// operand in their adjacent consumer (`compute_vector_memfold_values`).
     vector_memfold_values: FxHashSet<u32>,
     vector_memfold_homed_ok: FxHashSet<u32>,
+    /// VLFOLD dst-homing: values whose EXACTLY ONE use is in the same block
+    /// as their definition (`compute_vector_dying_values`) — the emitter may
+    /// compute a destructive-form result into such an operand's register
+    /// home, because no dynamic execution can read the home afterwards (the
+    /// def re-executes before any re-reach of the use). This is what
+    /// distinguishes a loop's streamed input (defined in the body, dies at
+    /// the FMA) from the loop-invariant broadcast (one STATIC use site but
+    /// read by every iteration — its home must survive the loop).
+    vector_dying_values: FxHashSet<u32>,
     x87_defer_values: FxHashSet<u32>,
     /// Values that appear as incoming operands in Phi instructions.
     /// These must NOT be classified as block-local (Tier 3) because phi
@@ -365,6 +374,7 @@ pub fn calculate_stack_space_common(
     state.vector_defer_values = ctx.vector_defer_values.clone();
     state.vector_memfold_values = ctx.vector_memfold_values.clone();
     state.vector_memfold_homed_ok = ctx.vector_memfold_homed_ok.clone();
+    state.vector_dying_values = ctx.vector_dying_values.clone();
     // i686 x87 top-of-stack deferral: F64 binop results consumed exactly once
     // by the adjacent F64 binop (the x87 twin of the vector deferral above;
     // backends that never set x87_pending ignore it).
@@ -723,6 +733,7 @@ fn build_layout_context(
     // transparent between a deferred def and its consumer.
     let vector_memfold_values = copy_coalescing::compute_vector_memfold_values(func);
     let vector_memfold_homed_ok = copy_coalescing::compute_vector_memfold_homed_ok(func);
+    let vector_dying_values = copy_coalescing::compute_vector_dying_values(func);
     let vector_defer_values =
         copy_coalescing::compute_vector_defer_values(func, &vector_memfold_values);
     let x87_defer_values = copy_coalescing::compute_x87_defer_values(func);
@@ -865,6 +876,7 @@ fn build_layout_context(
         vector_defer_values,
         vector_memfold_values,
         vector_memfold_homed_ok,
+        vector_dying_values,
         x87_defer_values,
         phi_incoming_values,
         memcpy_value_sizes,

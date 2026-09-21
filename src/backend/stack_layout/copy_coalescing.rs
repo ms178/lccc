@@ -1850,6 +1850,7 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecAddF64x4
             | O::VecFmaF64x4
             | O::VecMaddF64x4
+            | O::VecMaddF64x4Signed(..)
             | O::VecAddI32x4
             | O::VecAddI32x8
             | O::VecMulI32x8
@@ -1859,6 +1860,7 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecAddF32x8
             | O::VecFmaF32x8
             | O::VecMaddF32x8
+            | O::VecMaddF32x8Signed(..)
             | O::VecAddF32x4
             | O::VecMulF64x2
             | O::VecMulF64x4
@@ -2154,10 +2156,22 @@ pub(crate) fn is_memfold_vec_load_128(op: &crate::ir::intrinsics::IntrinsicOp) -
 /// Map FMA intrinsics `VecMadd*(input, scale, bias)` (`emit_avx_map_fma`):
 /// the bias folds through the 213 form (`vfmadd213ps mem, %scale, %ymm0` =
 /// scale*input + mem) and the input through the 231 form
-/// (`vfmadd231ps mem, %scale, %ymm0` = scale*mem + bias).
+/// (`vfmadd231ps mem, %scale, %ymm0` = scale*mem + bias).  The SIGNED
+/// families (`VecMaddF{64x4,32x8}Signed(np, na)` — the builtin-semantics
+/// `MapExpr::Fma` lowering) fold EXACTLY like the plain one: the FMA3
+/// sign structure attaches to the algebraic terms (±product ±addend),
+/// not the operand slots, so the 132→213/231 re-encode preserves every
+/// family's semantics (re-derived against the SDM for all four).
+/// Positions 0/1/2 of BOTH spellings are foldable (the multiplicands
+/// commute; the emitter picks the form and keeps the register-homed
+/// operand — typically the loop-invariant broadcast — as the VEX
+/// register source).
 pub(crate) fn memfold_consumer_madd_256(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
-    matches!(op, O::VecMaddF64x4 | O::VecMaddF32x8)
+    matches!(
+        op,
+        O::VecMaddF64x4 | O::VecMaddF32x8 | O::VecMaddF64x4Signed(..) | O::VecMaddF32x8Signed(..)
+    )
 }
 
 /// Three-operand vector consumers (packed FP compare / lane-mask select)
@@ -2388,24 +2402,29 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
 /// emitted by `emit_avx_binary_256`.
 ///
 /// This is the subset for which eliding a REGISTER-HOMED load is provably
-/// safe.  The general set below only guarantees "some adjacent consumer folds
-/// this"; several of those consumers (the FMA/madd family in particular)
-/// resolve their operands through their own ad-hoc lookups in
-/// `reg_assignments`, which for an elided value names a register that was
-/// never written.  `emit_avx_binary_256_inner` instead consults
-/// `pending_vec_memfold` as its FIRST action and either emits the folded
-/// three-operand form or routes the operand through the memfold-aware
-/// loaders, so it is safe for both homed and un-homed elisions.
+/// safe.  The general set below only guarantees "some adjacent consumer
+/// folds this"; a consumer that is not in THIS set resolves its operands
+/// through raw `reg_assignments` lookups, which for an elided value name a
+/// register that was never written.  `emit_avx_binary_256_inner` instead
+/// consults `pending_vec_memfold` as its FIRST action and either emits the
+/// folded three-operand form or routes the operand through the
+/// memfold-aware loaders, so it is safe for both homed and un-homed
+/// elisions.  `emit_avx_map_fma` (the madd family, plain and Signed) and
+/// `emit_vec_fma_128` (the BB-SLP packed FMA/FMS) join it after the same
+/// audit: every operand-resolution path in both emitters now either
+/// consumes the fold (the 2XX memory-operand arm / the acc_fold 132 arm)
+/// or routes through `memfold_operand`/`avx_load_arg_to`/`sse_load_arg`,
+/// which re-issue the elided load instead of reading its phantom home.
 ///
 /// Keeping this a separate, smaller set is deliberate: it turns "every
 /// operand resolver in the backend must be memfold-aware" -- an unbounded
 /// proof obligation that has now failed twice -- into "these consumers are
 /// audited", which is checkable and stays checkable as emitters are added.
 /// The 128-bit packed FMA/FMS consumers (BB-SLP contraction): the
-/// ACCUMULATOR position (args[2]) folds as the 132-form memory operand
-/// (`v{f,n}madd132{ps,pd} %b, MEM_acc, %a_dst`). The multiplicand
-/// positions never fold — the emitter's 132 form puts memory in the
-/// addend slot only.
+/// ACCUMULATOR position (args[2]) folds as the 213-form memory operand
+/// (`v{f,n}madd213{ps,pd} MEM_acc, %b, %a_dst` — 213 is the one FMA3
+/// form whose r/m slot is the ADDEND). The multiplicand positions never
+/// fold — the 132/231 forms put a MULTIPLICAND in r/m.
 pub(crate) fn memfold_consumer_fma_128(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
@@ -2431,13 +2450,22 @@ pub(super) fn compute_vector_memfold_homed_ok(func: &IrFunction) -> FxHashSet<u3
             else {
                 continue;
             };
-            // Only the audited memfold-first emitters; the madd/FMA variants
-            // are excluded on purpose (see the doc comment). The immediate
-            // SHIFT families are NOT admitted: their VEX encodings are
+            // Only the audited memfold-first emitters. The madd family
+            // (plain AND Signed — `emit_avx_map_fma` handles both with
+            // the same operand-resolution code) is now among them: every
+            // resolution path in that emitter is memfold-aware (the
+            // VLFOLD arm consumes the fold as the 2XX memory operand or
+            // declines; the fast path gates on the fold not naming its
+            // register sources; the fallback's `operand_reg_source`
+            // reports an elided value as unhomed and every load/re-issue
+            // routes through the memfold-aware `avx_load_arg_to` or the
+            // `memfold_operand` memory source). The immediate SHIFT
+            // families are NOT admitted: their VEX encodings are
             // register-only (see memfold_consumer_unary_imm_NEVER).
             if memfold_consumer_256(op).is_none()
                 && memfold_consumer_128(op).is_none()
                 && !memfold_consumer_fma_128(op)
+                && !memfold_consumer_madd_256(op)
             {
                 continue;
             }
@@ -2550,21 +2578,47 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
                 if cargs.len() != 3 {
                     continue;
                 }
-                let (Operand::Value(_a), Operand::Value(b), Operand::Value(acc)) =
+                let (Operand::Value(av), Operand::Value(b), Operand::Value(acc)) =
                     (&cargs[0], &cargs[1], &cargs[2])
                 else {
                     continue;
                 };
+                // ALIAS-FREE REQUIREMENT (see the madd arm): the acc
+                // folds; a and b must stay independently resolvable —
+                // `r = x*s + x` contracts to args [a=x, b=s, acc=x] where
+                // the acc IS the a multiplicand as a value (the SLP pack
+                // CSE maps both to the same load pack). Without the
+                // distinctness gate the acc_fold emitter would resolve
+                // the aliased `a` through the never-written home.
+                if av.0 == b.0 || av.0 == acc.0 || b.0 == acc.0 {
+                    continue;
+                }
                 (false, false, b, acc)
             } else if madd {
                 if cargs.len() != 3 {
                     continue;
                 }
-                let (Operand::Value(a0), Operand::Value(_), Operand::Value(a2)) =
+                let (Operand::Value(a0), Operand::Value(a1v), Operand::Value(a2)) =
                     (&cargs[0], &cargs[1], &cargs[2])
                 else {
                     continue;
                 };
+                // ALIAS-FREE REQUIREMENT (the madd twin of the binary
+                // table's a0 != a1 gate, extended to all three
+                // positions): the fold names exactly ONE operand; the
+                // other two references must stay independently
+                // resolvable (register home, deferred scratch, slot, or
+                // the fold's own memory role). With an aliased pair —
+                // fma(x, x, c) or fma(x, s, s) — the elided value would
+                // have to serve two roles at once (memory operand AND
+                // register/slot source), and no consumer path can
+                // honour both: the first resolution consumes the fold,
+                // the second then reads either the never-written RA home
+                // or the never-written slot. Aliased shapes keep the
+                // (correct, merely slower) ordinary load path.
+                if a0.0 == a2.0 || a1v.0 == a0.0 || a1v.0 == a2.0 {
+                    continue;
+                }
                 (true, true, a0, a2)
             } else {
                 let Some((commutative, wide)) = memfold_consumer_256(cop)
@@ -2629,6 +2683,92 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
 
 /// Defer a vector home-slot store when every def is consumed once from the
 /// last-store peephole by a cache-aware intrinsic in the same block.
+/// Values whose EXACTLY ONE use is in the same block as their definition —
+/// the destructive-form dst-homing set for the FMA memory-fold emitters.
+///
+/// Soundness: a value in this set may have its register home OVERWRITTEN by
+/// a consumer that computes its result in place (the madd VLFOLD arm's
+/// `<fam213/231> MEM, %src2, %dst` with dst = the dying operand's home).
+/// A static use-count of one is NOT sufficient for that on its own: a
+/// loop-invariant broadcast has exactly one use SITE (the loop body's madd)
+/// but is read by every dynamic iteration, so overwriting its home after the
+/// first iteration poisons the rest. The block-local definition is the
+/// missing half — when the def and the single use share a block, any dynamic
+/// re-reach of the use must re-execute the def first (the def strictly
+/// precedes the use in the same basic block), so the home is always
+/// re-written before it is re-read. Values with any second reference of any
+/// kind (non-intrinsic operand, value ref, terminator, a second intrinsic
+/// argument) are excluded by the census; so are cross-block single uses
+/// (defined in A, used in B — conservative, and the rare straight-line case
+/// merely keeps the scratch-staging spelling).
+pub(super) fn compute_vector_dying_values(func: &IrFunction) -> FxHashSet<u32> {
+    // Exact total-use census over every reference kind. A value needs
+    // exactly one use, period — the census counts intrinsic arguments,
+    // non-intrinsic instruction operands, explicit value references and
+    // terminator operands alike, so any aliasing read disqualifies.
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut use_block: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut multi_block_def: FxHashSet<u32> = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            // Definition sites: intrinsic SSA dests (loads, broadcasts,
+            // arithmetic — the vector values the emitters home).
+            match inst {
+                Instruction::Intrinsic { dest: Some(d), .. } => {
+                    if def_block.insert(d.0, bi).is_some() {
+                        multi_block_def.insert(d.0);
+                    }
+                }
+                Instruction::BinOp { dest, .. }
+                | Instruction::UnaryOp { dest, .. }
+                | Instruction::Cast { dest, .. } => {
+                    if def_block.insert(dest.0, bi).is_some() {
+                        multi_block_def.insert(dest.0);
+                    }
+                }
+                _ => {}
+            }
+            // Use sites: every operand of every instruction, in the
+            // instruction's block.
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *use_count.entry(v.0).or_default() += 1;
+                    use_block.insert(v.0, bi);
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                *use_count.entry(v.0).or_default() += 1;
+                use_block.insert(v.0, bi);
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *use_count.entry(v.0).or_default() += 1;
+                use_block.insert(v.0, bi);
+            }
+        });
+    }
+    let mut result = FxHashSet::default();
+    for (&v, &n) in &use_count {
+        if n != 1 {
+            continue;
+        }
+        // A use without a recorded def site is a parameter or an
+        // undefined reference — its "home" is not a local def's product.
+        let Some(&db) = def_block.get(&v) else {
+            continue;
+        };
+        if multi_block_def.contains(&v) {
+            continue;
+        }
+        if use_block.get(&v) == Some(&db) {
+            result.insert(v);
+        }
+    }
+    result
+}
+
 pub(super) fn compute_vector_defer_values(
     func: &IrFunction,
     memfold_values: &FxHashSet<u32>,
