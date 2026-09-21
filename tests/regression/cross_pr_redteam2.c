@@ -117,6 +117,11 @@ static double mixed_width(const float *xf, const double *xd, int n) {
 
 /* ---------------- driver ---------------- */
 static uint64_t fbits(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
+/* Print-time canonical-NaN normalisation (the C11 6.5p8 latitude; see
+ * cross_pr_redteam.c for the full rationale and the dedicated gate that
+ * pins the family selection in the asm). Computed fma results canonicalise
+ * on both sides; input echoes and promoted-table loads stay raw. */
+static uint64_t nbits(double d) { return isnan(d) ? 0x7ff8000000000000ULL : fbits(d); }
 int main(void) {
     static const int iv[] = { -2147483647-1, -2147483647, -8, -3, -2, -1, 0,
                               1, 4, 5, 6, 7, 8, 100, 2147483647 };
@@ -146,11 +151,11 @@ int main(void) {
         printf("Q %u %016llx\n", k, (unsigned long long)fbits(promo_dtab(k)));
     for (int i = 0; i < 14; i++) for (int j = 0; j < 14; j += 3)
         printf("C %d %d %016llx %016llx\n", i, j,
-               (unsigned long long)fbits(ce_fma(dv[i], dv[j], dv[(i+3)%14])),
-               (unsigned long long)fbits(ce_fma_call(dv[i], fabs(dv[j]) + 1.0, dv[(i+5)%14])));
+               (unsigned long long)nbits(ce_fma(dv[i], dv[j], dv[(i+3)%14])),
+               (unsigned long long)nbits(ce_fma_call(dv[i], fabs(dv[j]) + 1.0, dv[(i+5)%14])));
     for (int n = 0; n <= 128; n += 16)
-        printf("S %d %016llx\n", n, (unsigned long long)fbits(pressure_fma(xbuf, ybuf, n)));
+        printf("S %d %016llx\n", n, (unsigned long long)nbits(pressure_fma(xbuf, ybuf, n)));
     for (int n = 0; n <= 128; n += 32)
-        printf("M %d %016llx\n", n, (unsigned long long)fbits(mixed_width(xfbuf, xbuf, n)));
+        printf("M %d %016llx\n", n, (unsigned long long)nbits(mixed_width(xfbuf, xbuf, n)));
     return 0;
 }

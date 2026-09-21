@@ -112,7 +112,8 @@ static void alias_loop(const double *x, double *r, int n) {
     for (int i = 0; i < n; i++) r[i] = __builtin_fma(x[i], x[i], x[i]);
 }
 
-/* ---- 7. FMA multi-use negation (peel grammar: single-use only) ---- */
+/* ---- 7. FMA multi-use negation (peel grammar: the absorbability
+ *         fixpoint) ---- */
 static double neg_twouse(double a, double b, double c) {
     double n = -a;
     double r1 = __builtin_fma(n, b, c);
@@ -122,6 +123,34 @@ static double neg_twouse(double a, double b, double c) {
 static double neg_int_reject(int a, double b, double c) {
     /* integer Neg in the product position must NOT peel */
     return __builtin_fma((double)(-a), b, c);
+}
+static double neg_chain_live_outer(double x, double b, double c) {
+    /* The chain defect's own shape: the fma reads the INNER negation while
+     * the OUTER negation survives for the add. NEITHER may peel (the outer
+     * is pinned by the add; the inner is the outer's operand) -- the
+     * source-poisoned rule deleted the inner underneath the outer's
+     * surviving read and reached codegen as an ICE. Bit-exact vs gcc,
+     * which materialises both links for this shape too. */
+    double t = -x;
+    double u = -t;
+    double r = __builtin_fma(t, b, c);
+    return r + u;
+}
+static double neg_chain_pinned_inner(double x, double b, double c) {
+    /* The fold the source-poisoned rule missed: the INNER negation is
+     * pinned by the add, the site reads the OUTER. The outer peels into
+     * the family reading the materialised inner -- one sign mask, not two
+     * (vfnmadd + vxorpd + vaddsd, GCC's exact shape). */
+    double t = -x;
+    double r = __builtin_fma(-t, b, c);
+    return r + t;
+}
+static double neg_chain_full(double x, double b, double c) {
+    /* Both links die: the site peels the whole chain and lands on the
+     * PLAIN family reading x (two flips cancel). */
+    double t = -x;
+    double u = -t;
+    return __builtin_fma(u, b, c);
 }
 
 /* ---- 8. Wide SLP FMA packs (the P0 width fix: F64x4 / F32x8 must go
@@ -185,6 +214,25 @@ static int same(double a, double b) {
     if (isnan(a) && isnan(b)) return 1;
     return fbits(a) == fbits(b);
 }
+/* Print-time canonical-NaN normalisation (the C11 6.5p8 latitude, the
+ * same one the dedicated gate normalises in its diff): when an fma
+ * operand is NaN, WHICH NaN the operation propagates -- and with which
+ * sign -- is implementation-defined. The default baseline here differs
+ * on purpose from the reference compiler's (house v3 default contracts
+ * __builtin_fma into the hardware family, which propagates a source
+ * NaN's sign UNNEGATED, CPU-verified; the reference compiler at its own
+ * default keeps the libm call, which propagates the first NaN operand's
+ * sign). Both are conforming, so the printed oracle canonicalises every
+ * NaN on BOTH sides; every other bit -- including -0.0 signs -- stays
+ * bit-exact, and the asm pins in check_cross_pr_redteam.sh fix the exact
+ * family selection. */
+static uint64_t nbits(double d) {
+    return isnan(d) ? 0x7ff8000000000000ULL : fbits(d);
+}
+static uint32_t nbits32(float f) {
+    uint32_t u; memcpy(&u, &f, 4);
+    return isnan(f) ? 0x7fc00000u : u;
+}
 
 int main(void) {
     static const double xs[] = { 0.0, -0.0, 1.0, -1.0, 0.5, INFINITY,
@@ -203,33 +251,33 @@ int main(void) {
             double g2 = bracket_signed(xs[i], xs[j], xs[m]);
             double g3 = bracket_call(xs[i], fabs(xs[j]) + 1, xs[m]);
             printf("A %d %d %d %016llx %016llx %016llx\n", i, j, m,
-                   (unsigned long long)fbits(g1),
-                   (unsigned long long)fbits(g2),
-                   (unsigned long long)fbits(g3));
+                   (unsigned long long)nbits(g1),
+                   (unsigned long long)nbits(g2),
+                   (unsigned long long)nbits(g3));
         }
     /* 2 */ for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j += 3)
         for (int m = 0; m < NX; m += 5) for (int k = 0; k < 4; k++) {
             double g1 = sel_fma(xs[i], xs[j], xs[m], k);
             double g2 = sel_fma_acc(xs[i], xs[j], xs[m], k);
             printf("B %d %d %d %d %016llx %016llx\n", i, j, m, k,
-                   (unsigned long long)fbits(g1),
-                   (unsigned long long)fbits(g2));
+                   (unsigned long long)nbits(g1),
+                   (unsigned long long)nbits(g2));
         }
     /* 3 */ for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j += 7)
         for (int m = 0; m < NX; m += 3) for (int k = 0; k < 2; k++) {
             double g = phi_fma(xs[i], xs[j], xs[m], k);
             printf("C %d %d %d %d %016llx\n", i, j, m, k,
-                   (unsigned long long)fbits(g));
+                   (unsigned long long)nbits(g));
         }
     /* 4 */ for (int n = 0; n <= 8; n++) {
         for (int i = 0; i < 8; i++) xbuf[i] = xs[(i * 3) % NX];
         double g1 = const_dot(xbuf, n);
         double g2 = const_dot_map(xbuf, r8, xs[5], n);
         printf("D %d %016llx %016llx\n", n,
-               (unsigned long long)fbits(g1),
-               (unsigned long long)fbits(g2));
+               (unsigned long long)nbits(g1),
+               (unsigned long long)nbits(g2));
         for (int i = 0; i < n && i < 8; i++)
-            printf("d %d %016llx\n", i, (unsigned long long)fbits(r8[i]));
+            printf("d %d %016llx\n", i, (unsigned long long)nbits(r8[i]));
     }
     /* 5 */ for (uint32_t k = 0; k < 8; k++)
         printf("E %u %u %u\n", k, nz_scan(k), nz_ctz(k));
@@ -237,23 +285,30 @@ int main(void) {
         double g1 = alias_xx(xs[i], xs[(i * 5) % NX]);
         double g2 = alias_ss(xs[i], xs[(i * 7) % NX]);
         printf("F %d %016llx %016llx\n", i,
-               (unsigned long long)fbits(g1),
-               (unsigned long long)fbits(g2));
+               (unsigned long long)nbits(g1),
+               (unsigned long long)nbits(g2));
     }
     for (int n = 0; n < 64; n += 7) {
         for (int i = 0; i < n; i++) xbuf[i] = xs[i % NX];
         alias_loop(xbuf, big, n);
         for (int i = 0; i < n; i++)
             printf("f %d %d %016llx\n", n, i,
-                   (unsigned long long)fbits(big[i]));
+                   (unsigned long long)nbits(big[i]));
     }
     /* 7 */ for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j += 3)
         for (int m = 0; m < NX; m += 5) {
             double g1 = neg_twouse(xs[i], xs[j], xs[m]);
             double g2 = neg_int_reject((int)(i - 8), xs[j], xs[m]);
-            printf("G %d %d %d %016llx %016llx\n", i, j, m,
-                   (unsigned long long)fbits(g1),
-                   (unsigned long long)fbits(g2));
+            double g3 = neg_chain_live_outer(xs[i], xs[j], xs[m]);
+            double g4 = neg_chain_pinned_inner(xs[i], xs[j], xs[m]);
+            double g5 = neg_chain_full(xs[i], xs[j], xs[m]);
+            printf("G %d %d %d %016llx %016llx %016llx %016llx %016llx\n",
+                   i, j, m,
+                   (unsigned long long)nbits(g1),
+                   (unsigned long long)nbits(g2),
+                   (unsigned long long)nbits(g3),
+                   (unsigned long long)nbits(g4),
+                   (unsigned long long)nbits(g5));
         }
     /* 8 */ for (int i = 0; i + 7 < NX; i += 2) {
         double ad[4], bd[4]; float af[8], bf[8];
@@ -261,31 +316,31 @@ int main(void) {
         for (int t = 0; t < 8; t++) { af[t] = fs[(i + t) % NF]; bf[t] = fs[(i + t + 3) % NF]; }
         wide_f64(ad, bd, xs[4], r8);
         printf("H %d %016llx %016llx %016llx %016llx\n", i,
-               (unsigned long long)fbits(r8[0]), (unsigned long long)fbits(r8[1]),
-               (unsigned long long)fbits(r8[2]), (unsigned long long)fbits(r8[3]));
+               (unsigned long long)nbits(r8[0]), (unsigned long long)nbits(r8[1]),
+               (unsigned long long)nbits(r8[2]), (unsigned long long)nbits(r8[3]));
         wide_signed_f64(ad, bd, xs[6], r8);
         printf("h %d %016llx %016llx %016llx %016llx\n", i,
-               (unsigned long long)fbits(r8[0]), (unsigned long long)fbits(r8[1]),
-               (unsigned long long)fbits(r8[2]), (unsigned long long)fbits(r8[3]));
+               (unsigned long long)nbits(r8[0]), (unsigned long long)nbits(r8[1]),
+               (unsigned long long)nbits(r8[2]), (unsigned long long)nbits(r8[3]));
         float rf[8]; wide_f32(af, bf, fs[5], rf);
         printf("I %d %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
-               *(uint32_t *)&rf[0], *(uint32_t *)&rf[1],
-               *(uint32_t *)&rf[2], *(uint32_t *)&rf[3],
-               *(uint32_t *)&rf[4], *(uint32_t *)&rf[5],
-               *(uint32_t *)&rf[6], *(uint32_t *)&rf[7]);
+               nbits32(rf[0]), nbits32(rf[1]),
+               nbits32(rf[2]), nbits32(rf[3]),
+               nbits32(rf[4]), nbits32(rf[5]),
+               nbits32(rf[6]), nbits32(rf[7]));
     }
     /* 9 */ for (int n = 0; n < 128; n += 13) {
         for (int i = 0; i < n; i++) xbuf[i] = (i & 1) ? xs[i % NX] : -xs[i % NX];
         store_mix(xbuf, xbuf, xs[2], n);
         for (int i = 0; i < n; i += 5)
-            printf("J %d %d %016llx\n", n, i, (unsigned long long)fbits(xbuf[i]));
+            printf("J %d %d %016llx\n", n, i, (unsigned long long)nbits(xbuf[i]));
     }
     /* 10 */ for (int n = 0; n < 200; n += 17) for (int k = 0; k < 2; k++) {
         for (int i = 0; i < n; i++) xbuf[i] = xs[i % NX];
         double g = kitchen(xbuf, big, xs[3], n, k);
-        printf("K %d %d %016llx\n", n, k, (unsigned long long)fbits(g));
+        printf("K %d %d %016llx\n", n, k, (unsigned long long)nbits(g));
         for (int i = 0; i < n && i < 8; i++)
-            printf("k %d %d %016llx\n", n, i, (unsigned long long)fbits(big[i]));
+            printf("k %d %d %016llx\n", n, i, (unsigned long long)nbits(big[i]));
     }
     printf("FAILS %d\n", fails);
     (void)same; (void)fails;

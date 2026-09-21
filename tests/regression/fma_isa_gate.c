@@ -31,6 +31,32 @@ double signed_na(double a, double b, double c) { return __builtin_fma(a, b, -c);
 double signed_np_na(double a, double b, double c) { return __builtin_fma(-a, b, -c); }
 
 /*
+ * The chain shapes (the absorbability-fixpoint correction): a Neg may only
+ * die when every reader of it dies with it. `chain_live` is the shape the
+ * source-poisoned rule miscompiled -- the fma reads the INNER negation
+ * while the OUTER survives for the add, so BOTH must stay materialised
+ * (two sign masks, the plain family; no latitude is taken). Its asm pin:
+ * exactly two sign masks and no negated family. `chain_pin` is the fold
+ * that rule missed -- the INNER negation is pinned, the site reads the
+ * OUTER, which peels into the family reading the materialised inner:
+ * ONE sign mask and one vfnmadd, GCC's exact shape. Both live BEFORE
+ * shared_neg so the per-function sed ranges below stay disjoint.
+ */
+double chain_live(double x, double b, double c)
+{
+    double t = -x;
+    double u = -t;
+    double r = __builtin_fma(t, b, c);
+    return r + u;
+}
+double chain_pin(double x, double b, double c)
+{
+    double t = -x;
+    double r = __builtin_fma(-t, b, c);
+    return r + t;
+}
+
+/*
  * The shared-negation phi shape (one -b/-c read by TWO fma sites): the
  * multi-use absorbability rule must peel both sites at the AVX1-class
  * target too — two vfnmsub, no surviving xorpd bracket.

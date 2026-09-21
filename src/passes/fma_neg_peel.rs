@@ -54,6 +54,16 @@
 //! * Two product-side negations cancel: the instruction stays the PLAIN
 //!   intrinsic with the peeled operands (no degenerate `Signed(false,false)`
 //!   is ever created).
+//! * Sites that are ALREADY `FmaScalar*Signed` peel too: the signed
+//!   families compose by XOR (`Signed(np, na)` absorbing one more Neg on a
+//!   product slot is `Signed(np^1, na)`), so a site the vectorizer's
+//!   scalar remainder mirror already signed can still shed a materialised
+//!   Neg, and a double peel that cancels normalises back to the plain
+//!   spelling. This is what makes the `FmaArg` classification TRUE — every
+//!   read classified as a peelable argument slot really does disappear
+//!   with the rewrite — instead of coincidentally conservative (the
+//!   vector main lanes pin the Neg today only because `VecMadd*` reads
+//!   classify as `Other`).
 //! * NOT contract-gated: `__builtin_fma` carries C99 single-rounding
 //!   semantics regardless of `-ffp-contract`, and the peel changes no
 //!   arithmetic, only the spelling of an already-fused operation.
@@ -63,15 +73,29 @@
 //!   above — GCC keeps the negations materialised at -O0 and so do we.
 //! * Kill switches: `CCC_NO_FMA_NEG_PEEL=1`, `CCC_DISABLE_PASSES=fmanegpeel`.
 //!
-//! The absorbability fixpoint: a Neg whose only readers are fma argument
-//! slots is peelable only if those sites actually peel it, and a site peels
-//! a position only if the Neg there is absorbable — a mutual recursion
-//! whose GREATEST fixpoint is what we want (peel everything that can
-//! consistently peel). Computed as poison propagation: a Neg with any
-//! non-fma reader is bad, and badness flows backward through chain reads
-//! (a materialised outer Neg keeps its read of the inner Neg alive), so
-//! the fixpoint is reached by iterating the backward step to stability —
-//! at most one round per chain link, trivially bounded.
+//! The absorbability fixpoint: a Neg may be DELETED iff
+//!   (i)   none of its reads is non-peeling (an add, a store, a phi, a
+//!         terminator, a width-mismatched slot — a read that survives every
+//!         rewrite pins the materialisation),
+//!   (ii)  every reader of it (every Neg whose `src` is this Neg) is deleted
+//!         with it — a surviving outer Neg keeps its read of the inner Neg
+//!         alive, so the inner one must stay materialised too, and
+//!   (iii) some fma-argument slot reaches it by descending `src` links
+//!         through deleted Negs — otherwise no site substitutes its read.
+//! (ii) and (iii) are mutually recursive — dropping a Neg pins its source
+//! (the dropped Neg is now a surviving reader of it) and shortens every
+//! chain that descended through it — so the answer is the GREATEST
+//! fixpoint: start from every peeling-read-only Neg and remove the ones
+//! that violate (ii) or (iii) until stable. The edge directions are
+//! load-bearing in BOTH directions at once: propagating badness from a
+//! Neg's SOURCE (the direction this pass first shipped with) deletes the
+//! inner link of a chain whose outer link survives — a dangling use that
+//! reached codegen as an ICE; and propagating only from readers (the
+//! one-line repair) still deletes a Neg whose surviving reader no fma
+//! chain reaches. The reader closure and the site reachability must be
+//! computed TOGETHER; tools/ir_shape_check.py enumerates the chain shape
+//! space (4545 deduplicated shapes up to three Negs) and keeps both
+//! failure modes pinned as negative controls.
 //!
 //! The pass is a no-op unless the target lowers the signed families —
 //! the same `has_fma3` signal that admits the fma libcall fold (x86-64 with
@@ -118,8 +142,12 @@ struct Peel {
     inst: usize,
     /// Replacement operands (pre-negation sources).
     args: Vec<Operand>,
-    negate_product: bool,
-    negate_addend: bool,
+    /// The replacement intrinsic: the site's own family with every
+    /// absorbed sign flip folded in (plain seeds start from (false,
+    /// false); Signed seeds XOR into their existing flags). A full cancel
+    /// lands on the PLAIN spelling — no degenerate `Signed(false, false)`
+    /// is ever created.
+    op: IntrinsicOp,
     /// Value ids of the absorbed Neg destinations (deleted in the sweep).
     absorbed: Vec<u32>,
 }
@@ -254,47 +282,97 @@ fn peel_function(func: &mut IrFunction) -> usize {
         }
     }
 
-    // ---- Pass 1c: the absorbability fixpoint (poison propagation). ----
-    // A Neg is absorbable iff every read is an fma argument (peeled) or
-    // the source read of an ABSORBABLE Neg. Compute the greatest fixpoint
-    // by poisoning: start with every Neg whose reads include an `Other`,
-    // then propagate badness backward through chain reads (a materialised
-    // outer Neg keeps its read of the inner Neg alive) until stable.
-    let mut bad: FxHashSet<u32> = FxHashSet::default();
-    for (&vid, kinds) in &neg_use_kinds {
-        if kinds.iter().any(|k| *k == NegUseKind::Other) {
-            bad.insert(vid);
+    // ---- Pass 1c: the absorbability fixpoint (greatest fixpoint). ----
+    // A Neg may be deleted iff
+    //   (i)   none of its reads is `Other` (a read that survives every
+    //         rewrite pins the materialisation),
+    //   (ii)  every reader of it — every Neg whose `src` is this Neg — is
+    //         deleted with it (a surviving outer Neg keeps its read of the
+    //         inner Neg alive), and
+    //   (iii) some fma-argument slot reaches it by descending `src` links
+    //         through deleted Negs (otherwise no site substitutes the
+    //         read; a Neg nothing absorbs is DCE's business, not ours).
+    // (ii) and (iii) are mutually recursive: dropping a Neg pins its source
+    // (the dropped Neg is now a surviving reader of it) and shortens every
+    // chain that descended through it. Compute the GREATEST fixpoint:
+    // start from every `Other`-free Neg and remove the members that
+    // violate (ii) or (iii) until stable. The loop terminates because the
+    // set only shrinks (at most one productive round per Neg). The edge
+    // directions are load-bearing in both directions at once: poisoning a
+    // Neg from its SOURCE (the direction this pass first shipped with)
+    // deletes the inner link of a chain whose outer link survives — a
+    // dangling use; and poisoning only from readers (the one-line repair)
+    // still deletes a Neg whose surviving reader no fma chain reaches. The
+    // reader closure (ii) and the site reachability (iii) must be computed
+    // TOGETHER; tools/ir_shape_check.py enumerates the chain shape space
+    // and keeps both failure modes pinned as negative controls.
+    let mut absorbable: FxHashSet<u32> = neg_use_kinds
+        .iter()
+        .filter(|(_, kinds)| !kinds.iter().any(|k| *k == NegUseKind::Other))
+        .map(|(&vid, _)| vid)
+        .collect();
+    // Reader adjacency, built once: src Neg id -> every Neg reading it.
+    // (A Neg with NO read at all has no `neg_use_kinds` entry, so it never
+    // enters `absorbable`: dead code is DCE's business, and excluding it
+    // also pins its source through (ii) — the conservative and correct
+    // outcome, since the peel must not strand a reader it never rewrote.)
+    let mut readers: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (&vid, &(nb, ni)) in &float_negs {
+        if let Instruction::UnaryOp {
+            src: Operand::Value(s),
+            ..
+        } = &func.blocks[nb].instructions[ni]
+        {
+            if float_negs.contains_key(&s.0) {
+                readers.entry(s.0).or_default().push(vid);
+            }
         }
     }
+    // Seeds for (iii): every Neg an fma-argument slot reads (the
+    // classification already rejected width mismatches as `Other`).
+    let fma_arg_reads: Vec<u32> = neg_use_kinds
+        .iter()
+        .filter(|(_, kinds)| kinds.iter().any(|k| *k == NegUseKind::FmaArg))
+        .map(|(&vid, _)| vid)
+        .collect();
     loop {
-        let mut grew = false;
-        for (&vid, &(nb, ni)) in &float_negs {
-            if bad.contains(&vid) {
+        // (iii): the Negs the sites actually rewrite through, given the
+        // current delete set — from each seed, descend `src` links while
+        // the Neg stays deleted. This is exactly the walk Pass 2 performs.
+        let mut reached: FxHashSet<u32> = FxHashSet::default();
+        let mut stack = fma_arg_reads.clone();
+        while let Some(vid) = stack.pop() {
+            if !absorbable.contains(&vid) || !reached.insert(vid) {
                 continue;
             }
-            let src_id = match &func.blocks[nb].instructions[ni] {
-                Instruction::UnaryOp { src, .. } => match src {
-                    Operand::Value(v) => Some(v.0),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some(s) = src_id {
-                if float_negs.contains_key(&s) && bad.contains(&s) {
-                    bad.insert(vid);
-                    grew = true;
+            if let Some(&(nb, ni)) = float_negs.get(&vid) {
+                if let Instruction::UnaryOp {
+                    src: Operand::Value(s),
+                    ..
+                } = &func.blocks[nb].instructions[ni]
+                {
+                    if float_negs.contains_key(&s.0) {
+                        stack.push(s.0);
+                    }
                 }
             }
         }
-        if !grew {
+        let mut drop: Vec<u32> = Vec::new();
+        for &vid in &absorbable {
+            let stranded_reader = readers
+                .get(&vid)
+                .is_some_and(|rs| rs.iter().any(|r| !absorbable.contains(r)));
+            if !reached.contains(&vid) || stranded_reader {
+                drop.push(vid);
+            }
+        }
+        if drop.is_empty() {
             break;
         }
+        for vid in drop {
+            absorbable.remove(&vid);
+        }
     }
-    let absorbable: FxHashSet<u32> = float_negs
-        .keys()
-        .copied()
-        .filter(|id| !bad.contains(id))
-        .collect();
 
     // ---- Pass 2 (decisions, still immutable): peel each fma site. ----
     let mut decisions: Vec<Peel> = Vec::new();
@@ -303,9 +381,17 @@ fn peel_function(func: &mut IrFunction) -> usize {
             let Instruction::Intrinsic { op, args, .. } = inst else {
                 continue;
             };
-            let expected_ty = match op {
-                IntrinsicOp::FmaScalarF32 => IrType::F32,
-                IntrinsicOp::FmaScalarF64 => IrType::F64,
+            // Both the plain and the already-Signed spellings peel: the
+            // families compose by XOR, so a site the vectorizer's scalar
+            // remainder mirror already signed can still shed a materialised
+            // Neg, and a double peel that cancels normalises back to plain.
+            // This is what makes the `FmaArg` classification true — every
+            // read so classified really does disappear with the rewrite.
+            let (expected_ty, mut negate_product, mut negate_addend) = match op {
+                IntrinsicOp::FmaScalarF32 => (IrType::F32, false, false),
+                IntrinsicOp::FmaScalarF64 => (IrType::F64, false, false),
+                IntrinsicOp::FmaScalarF32Signed(np, na) => (IrType::F32, *np, *na),
+                IntrinsicOp::FmaScalarF64Signed(np, na) => (IrType::F64, *np, *na),
                 _ => continue,
             };
             if args.len() != 3 {
@@ -313,8 +399,6 @@ fn peel_function(func: &mut IrFunction) -> usize {
             }
             let mut absorbed: Vec<u32> = Vec::new();
             let mut new_args = Vec::with_capacity(3);
-            let mut negate_product = false;
-            let mut negate_addend = false;
             for (pos, arg) in args.iter().enumerate() {
                 // Peel the (possibly chained) absorbable Negs off this
                 // operand. Each level flips the position's sign flag; the
@@ -354,6 +438,13 @@ fn peel_function(func: &mut IrFunction) -> usize {
                         0 | 1 => negate_product = !negate_product,
                         _ => negate_addend = !negate_addend,
                     }
+                    // Recorded outermost-first (the walk descends outer →
+                    // inner). Deletion does not care about the order, but
+                    // any future refinement that RETARGETS a surviving
+                    // reader must process this list deepest-first —
+                    // retargeting an outer reader first would hand it the
+                    // not-yet-rewritten inner chain and reintroduce a
+                    // use-before-def.
                     absorbed.push(vid);
                 }
                 new_args.push(current);
@@ -361,12 +452,24 @@ fn peel_function(func: &mut IrFunction) -> usize {
             if absorbed.is_empty() {
                 continue;
             }
+            // The site's family with every absorbed flip folded in; a full
+            // cancel lands on the plain spelling (the doc rule: no
+            // degenerate Signed(false, false) is ever created).
+            let new_op = match expected_ty {
+                IrType::F32 => match (negate_product, negate_addend) {
+                    (false, false) => IntrinsicOp::FmaScalarF32,
+                    (np, na) => IntrinsicOp::FmaScalarF32Signed(np, na),
+                },
+                _ => match (negate_product, negate_addend) {
+                    (false, false) => IntrinsicOp::FmaScalarF64,
+                    (np, na) => IntrinsicOp::FmaScalarF64Signed(np, na),
+                },
+            };
             decisions.push(Peel {
                 block: bi,
                 inst: ii,
                 args: new_args,
-                negate_product,
-                negate_addend,
+                op: new_op,
                 absorbed,
             });
         }
@@ -385,24 +488,43 @@ fn peel_function(func: &mut IrFunction) -> usize {
             func.blocks[dec.block].instructions.get_mut(dec.inst)
         {
             *args = dec.args.clone();
-            if dec.negate_product || dec.negate_addend {
-                *op = match op {
-                    IntrinsicOp::FmaScalarF32 => {
-                        IntrinsicOp::FmaScalarF32Signed(dec.negate_product, dec.negate_addend)
-                    }
-                    IntrinsicOp::FmaScalarF64 => {
-                        IntrinsicOp::FmaScalarF64Signed(dec.negate_product, dec.negate_addend)
-                    }
-                    // The decision pass only records plain FmaScalar sites;
-                    // another decision cannot have touched this instruction
-                    // (distinct sites, applied once).
-                    other => unreachable!("peel decision on non-FmaScalar intrinsic {other:?}"),
-                };
-            }
+            *op = dec.op;
         }
     }
-    // Sweep: every absorbed Neg's destination has no remaining use (that is
-    // what single-use certified), so removal is dead-code elimination with
+    // The precondition the sweep relies on, made self-enforcing: the sweep
+    // deletes by value id with no residual-use check, so the decision pass
+    // must guarantee that every read of every absorbed Neg disappears with
+    // the rewrite. Pass 1c's fixpoint certifies it for the classification;
+    // this re-derives it from the ACTUAL decision set (one pass over the
+    // reader adjacency) so that a future edit desynchronising Pass 1c from
+    // Pass 2's walk — or introducing a new site kind that reads Negs
+    // without peeling them — fails here, in the test suite, instead of
+    // shipping a dangling use to codegen. Unconditional (not a
+    // debug_assert!) for two reasons: the fastbuild/test profile compiles
+    // with debug-assertions off, so a debug_assert would never fire in the
+    // very builds that run the regression suites; and this is a
+    // release-miscompile class — the house discipline for those is to
+    // panic loudly (see the VecRotl/VecShufd immediate guards), which is
+    // exactly how the chain defect surfaced: an ICE on `value has no
+    // register, stack slot, Copy, or GlobalAddr definition`.
+    for &id in &absorbed_ids {
+        let kinds = neg_use_kinds
+            .get(&id)
+            .expect("an absorbed Neg must have a use classification");
+        assert!(
+            !kinds.iter().any(|k| *k == NegUseKind::Other),
+            "fma_neg_peel: absorbed v{id} still has a non-peeling read"
+        );
+        for &r in readers.get(&id).into_iter().flatten() {
+            assert!(
+                absorbed_ids.contains(&r),
+                "fma_neg_peel: absorbed v{id} is still read by surviving v{r}"
+            );
+        }
+    }
+    // Sweep: every absorbed Neg's destination has no remaining use — the
+    // fixpoint certified it and the assert above re-derived it from the
+    // actual decision set — so removal is dead-code elimination with
     // the parallel source_spans discipline (see dce::sweep_block). The keep
     // decision is computed once into a bitmap so instructions and spans walk
     // the SAME positional filter. (dce's own "refuse to sweep" guard is
@@ -917,6 +1039,175 @@ mod tests {
         );
         assert_eq!(super::peel_module(&mut m, false), 0);
         assert_eq!(m.functions[0].blocks[0].instructions.len(), 2);
+    }
+
+    #[test]
+    fn chained_negation_with_surviving_outer_reader_is_never_deleted() {
+        // The chain defect this pass shipped with, as a shape: the fma site
+        // reads the INNER Neg; the OUTER Neg is read by an add. The outer
+        // must stay materialised (the add pins it), and its surviving read
+        // of the inner pins the INNER too — deleting the inner underneath
+        // the outer's feet is a dangling use, which reached codegen as an
+        // ICE before the fixpoint was corrected. Note the direction: the
+        // site must read the INNER link for this to be the defect shape
+        // (a site reading the outer is the safe mirror, pinned directly).
+        //   t = -x; u = -t; r = fma(t, b, c); return r + u;
+        let reader = Instruction::BinOp {
+            dest: crate::ir::reexports::Value(6),
+            op: crate::ir::reexports::IrBinOp::Add,
+            lhs: v(2),
+            rhs: v(5),
+            ty: IrType::F64,
+        };
+        let mut m = module(
+            vec![
+                neg(1, 0, IrType::F64),         // t = -x
+                neg(5, 1, IrType::F64),         // u = -t (reads t)
+                fma(2, v(1), v(3), v(4), true), // r = fma(t, b, c) — INNER
+                reader,                         // r + u — the Other read of u
+            ],
+            7,
+        );
+        m.functions[0].blocks[0].terminator = Terminator::Return(Some(v(6)));
+        assert_eq!(peel(&mut m), 0);
+        let insts = &m.functions[0].blocks[0].instructions;
+        assert_eq!(insts.len(), 4);
+        // Both Negs still present and the intrinsic stays PLAIN reading the
+        // materialised t: no latitude is taken on a mask that survives.
+        assert!(matches!(insts[0], Instruction::UnaryOp { dest, .. } if dest.0 == 1));
+        assert!(matches!(insts[1], Instruction::UnaryOp { dest, .. } if dest.0 == 5));
+        match &insts[2] {
+            Instruction::Intrinsic { op, args, .. } => {
+                assert_eq!(*op, IntrinsicOp::FmaScalarF64);
+                assert_eq!(args, &vec![v(1), v(3), v(4)]);
+            }
+            other => panic!("expected intrinsic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chained_negation_with_dead_outer_reader_stays_put() {
+        // The second negative control from the shape enumeration: the outer
+        // Neg is read by NOTHING (DCE would normally have removed it before
+        // the peel — construct the IR directly). The peel must still not
+        // delete the inner link underneath it: deletion requires every
+        // reader to be deleted too, and a reader no fma chain reaches is
+        // never deleted. Dead code is DCE's business, not the peel's.
+        let mut m = module(
+            vec![
+                neg(1, 0, IrType::F64),
+                neg(5, 1, IrType::F64),         // read by nothing
+                fma(2, v(1), v(3), v(4), true), // reads the INNER
+            ],
+            6,
+        );
+        assert_eq!(peel(&mut m), 0);
+        let insts = &m.functions[0].blocks[0].instructions;
+        assert_eq!(insts.len(), 3);
+        assert!(matches!(insts[0], Instruction::UnaryOp { dest, .. } if dest.0 == 1));
+        assert!(matches!(insts[1], Instruction::UnaryOp { dest, .. } if dest.0 == 5));
+    }
+
+    #[test]
+    fn outer_neg_peels_when_the_inner_neg_is_pinned() {
+        // The fold the source-poisoned rule missed: the INNER Neg is pinned
+        // by an external add, the site reads the OUTER Neg. The outer's
+        // only read is the site, so its sign-mask dies and the latitude is
+        // available; the site peels exactly one level and reads the
+        // materialised inner:
+        //   t = -x; r = fma(-t, b, c); return r + t;
+        // compiles to vxorpd + vfnmadd + vaddsd — one sign mask, not two —
+        // bit-exact against GCC (verified on the metal in the session
+        // record; the landed rule kept both masks).
+        let reader = Instruction::BinOp {
+            dest: crate::ir::reexports::Value(6),
+            op: crate::ir::reexports::IrBinOp::Add,
+            lhs: v(2),
+            rhs: v(1),
+            ty: IrType::F64,
+        };
+        let mut m = module(
+            vec![
+                neg(1, 0, IrType::F64),         // t = -x, pinned by the add
+                neg(5, 1, IrType::F64),         // -t, read only by the site
+                fma(2, v(5), v(3), v(4), true), // r = fma(-t, b, c) — OUTER
+                reader,
+            ],
+            7,
+        );
+        m.functions[0].blocks[0].terminator = Terminator::Return(Some(v(6)));
+        assert_eq!(peel(&mut m), 1);
+        let insts = &m.functions[0].blocks[0].instructions;
+        assert_eq!(insts.len(), 3);
+        // The inner Neg stays materialised; the site now reads it with the
+        // product negated (the dying OUTER mask carried the sign).
+        assert!(matches!(insts[0], Instruction::UnaryOp { dest, .. } if dest.0 == 1));
+        match &insts[1] {
+            Instruction::Intrinsic { op, args, .. } => {
+                assert_eq!(*op, IntrinsicOp::FmaScalarF64Signed(true, false));
+                assert_eq!(args, &vec![v(1), v(3), v(4)]);
+            }
+            other => panic!("expected intrinsic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn already_signed_site_peels_and_normalises_to_plain() {
+        // The XOR composition: a site the vectorizer's scalar remainder
+        // mirror already signed peels too. Signed(true, false) absorbing
+        // the Neg on its multiplier slot flips the product flag back — the
+        // full cancel NORMALISES to the plain spelling (no degenerate
+        // Signed(false, false) is ever created). This is what makes the
+        // FmaArg classification true rather than coincidentally
+        // conservative — the read really does disappear.
+        let mut m = module(
+            vec![
+                neg(1, 0, IrType::F64),
+                Instruction::Intrinsic {
+                    dest: Some(crate::ir::reexports::Value(2)),
+                    op: IntrinsicOp::FmaScalarF64Signed(true, false),
+                    dest_ptr: None,
+                    args: vec![v(1), v(3), v(4)],
+                },
+            ],
+            5,
+        );
+        assert_eq!(peel(&mut m), 1);
+        match sole_inst(&m) {
+            Instruction::Intrinsic { op, args, .. } => {
+                assert_eq!(*op, IntrinsicOp::FmaScalarF64);
+                assert_eq!(args, &vec![v(0), v(3), v(4)]);
+            }
+            other => panic!("expected intrinsic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn already_signed_site_peels_by_xor_into_addend() {
+        // The same composition on the addend slot, where the flags do NOT
+        // cancel: Signed(true, false) absorbing the addend Neg XORs to
+        // Signed(true, true) — the vfnmsub family — reading the
+        // pre-negation addend.
+        let mut m = module(
+            vec![
+                neg(1, 4, IrType::F64),
+                Instruction::Intrinsic {
+                    dest: Some(crate::ir::reexports::Value(2)),
+                    op: IntrinsicOp::FmaScalarF64Signed(true, false),
+                    dest_ptr: None,
+                    args: vec![v(3), v(5), v(1)],
+                },
+            ],
+            6,
+        );
+        assert_eq!(peel(&mut m), 1);
+        match sole_inst(&m) {
+            Instruction::Intrinsic { op, args, .. } => {
+                assert_eq!(*op, IntrinsicOp::FmaScalarF64Signed(true, true));
+                assert_eq!(args, &vec![v(3), v(5), v(4)]);
+            }
+            other => panic!("expected intrinsic, got {other:?}"),
+        }
     }
 
     #[test]

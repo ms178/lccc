@@ -296,13 +296,19 @@ def enumerate_shapes(max_negs: int):
 # the correction may not change any existing expectation. `landed` is asserted too --
 # the two agree on all existing tests, which is exactly why the gap went unnoticed.
 
-RUST_TESTS_TOTAL = 16
-# 14 tests assert on a fold pattern; `source_spans_stay_aligned` asserts on span
+RUST_TESTS_TOTAL = 21
+# 17 tests assert on a fold pattern; `source_spans_stay_aligned` asserts on span
 # bookkeeping for a shape that is itself covered by the last fixture, and
 # `gate_off_is_a_no_op` exercises the capability gate, which has no IR shape.
-SHAPE_MODELLABLE_TESTS = 14
+# The two already-signed-site tests exercise a dimension this model does not
+# carry (the site's own family flags -- the XOR composition), not a shape.
+SHAPE_MODELLABLE_TESTS = 17
 NOT_SHAPE_MODELLABLE = (
     "gate_off_is_a_no_op (capability flag, no IR shape)",
+    "already_signed_site_peels_and_normalises_to_plain (site-kind dimension, "
+    "not a shape)",
+    "already_signed_site_peels_by_xor_into_addend (site-kind dimension, "
+    "not a shape)",
 )
 
 
@@ -312,6 +318,17 @@ class Fixture:
     shape: Shape
     expected: int
     note: str
+    # Discriminating fixtures (added with the fixpoint correction) pin the
+    # shapes where the landed rule and the specified rule DISAGREE: the
+    # Rust test asserts `expected`, which only the specified rule meets.
+    # `landed_expected` records what the landed rule did there -- the wrong
+    # answer for the two unsound shapes (it deleted a Neg under a surviving
+    # reader), the missed fold for the third -- so the fixture doubles as
+    # the historical record of the defect. Non-discriminating fixtures
+    # (every test that predates the correction) keep the original contract:
+    # the landed rule must reproduce them too, which is why the gap went
+    # unnoticed -- the two rules agree on all of them.
+    landed_expected: int | None = None
 
 
 FIXTURES: tuple[Fixture, ...] = (
@@ -360,6 +377,27 @@ FIXTURES: tuple[Fixture, ...] = (
     Fixture("source_spans_stay_aligned (shape half)",
             Shape(((1, 0), (5, 4)), ((1, 1), (5, 1))), 2,
             "the same shape as both_sides_negated; spans must stay parallel"),
+    # The three chain-shape tests added with the fixpoint correction
+    # (PR #574 follow-up). The first is the shipped defect's own shape --
+    # the fma site reads the INNER link while the OUTER has a surviving
+    # non-peeling read; the landed rule deletes the inner underneath the
+    # outer (16.24% of this space), the one-line reader-side flip still
+    # misses the dead-reader variant, only the closure is safe.
+    Fixture("chained_negation_with_surviving_outer_reader_is_never_deleted",
+            Shape(((1, 0), (2, 1)), ((1, 1),), ((2, 1),)), 0,
+            "the shipped defect: fma reads the inner, the outer has an "
+            "external reader -- BOTH stay materialised",
+            landed_expected=1),
+    Fixture("chained_negation_with_dead_outer_reader_stays_put",
+            Shape(((1, 0), (2, 1)), ((1, 1),)), 0,
+            "the one-line repair's miss: the dead outer link still pins "
+            "the inner; dead code is DCE's business",
+            landed_expected=1),
+    Fixture("outer_neg_peels_when_the_inner_neg_is_pinned",
+            Shape(((1, 0), (2, 1)), ((2, 1),), ((1, 1),)), 1,
+            "the fold the source-poisoned rule missed: the pinned inner "
+            "keeps its mask, the outer peels into the family",
+            landed_expected=0),
 )
 
 # --------------------------------------------------------------------------- #
@@ -465,10 +503,12 @@ def check_fixtures(quiet: bool) -> tuple[bool, list[dict]]:
     for f in FIXTURES:
         spec = len(rule_closure(f.shape))
         landed = len(rule_landed(f.shape))
-        good = spec == f.expected and landed == f.expected
+        want_landed = f.landed_expected if f.landed_expected is not None else f.expected
+        good = spec == f.expected and landed == want_landed
         ok &= good
         rows.append({"name": f.name, "expected": f.expected, "closure": spec,
-                     "landed": landed, "ok": good, "note": f.note})
+                     "landed": landed, "landed_expected": want_landed,
+                     "ok": good, "note": f.note})
         if not quiet:
             mark = "ok " if good else "BAD"
             print(f"  [{mark}] {f.name:56s} expected {f.expected} | "

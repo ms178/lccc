@@ -144,13 +144,47 @@ at the pr568 session stands; the corpus re-ran green today (723 PASS /
 ### PR; the fixes folded into it were verified with negative controls
 ### at delivery and the realmode corpus re-runs green)
 
-## The two defects this audit found (both fixed, both gated)
+## The defects this record covers (all fixed, all gated)
+
+0. **The fixpoint's poison direction (found by the post-merge review,
+   PR #574 follow-up)**: the multi-use rule shipped with badness
+   propagating from a Neg's SOURCE to its reader — the exact inverse of
+   the invariant the same patch documented. A Neg read by an fma site
+   AND by a surviving outer Neg was classified absorbable, rewritten,
+   and deleted while the outer link still named it: a live ICE on
+   `t=-x; u=-t; r=fma(t,b,c); return r+u` at -O1/-O2/-O3 (x86 codegen:
+   `value has no register, stack slot, Copy, or GlobalAddr definition`),
+   invisible to the armed corpus because nothing verified after the
+   peel (it was the last IR transform). The one-line edge flip the
+   review note proposed is NOT sufficient (its own model enumeration:
+   90/4545 shapes still unsafe — a surviving reader that no fma chain
+   reaches); the correct rule is the GREATEST FIXPOINT over the reader
+   closure and the fma-reachability TOGETHER (model: 0/4545 unsafe,
+   0/162009 at width 4; and it folds MORE than the shipped rule —
+   1752 vs 1722 shapes — because the source-poisoned direction also
+   over-pinned chains whose inner link alone was external). Fix landed
+   with: the closure fixpoint (`tools/ir_shape_check.py` keeps both
+   failure modes pinned as negative controls); a self-enforcing
+   pre-sweep assert on the ACTUAL decision set; `verify_after_pass`
+   wired after the peel at both call sites; the peel extended to
+   already-Signed sites (families compose by XOR, full cancel
+   normalises to plain) so every `FmaArg`-classified read truly
+   disappears — the classification is true by construction, not by the
+   coincidence of `VecMadd*` reads pinning the Neg; 5 new unit tests
+   (16 → 21); the chain shapes in the batteries + the ISA-gate asm
+   pins. The verify wiring immediately caught a SECOND latent
+   malformation: `vector_temp_promote` leaves `Alloca` defs below the
+   intrinsics that use them as `dest_ptr` (inlined-callee param slots
+   positioned after the caller's producers) — benign for codegen but
+   an IR-contract violation; fixed with a block-head alloca hoist
+   (Alloca reads no operand, so the move is semantics-preserving).
 
 1. **The multi-use peel rejection** (root cause in #572's grammar,
    measured via #573's residual): fixed with the absorbability
    fixpoint; `fma(-a,-a,c)` now cancels like GCC; the phi shape went
    from `vxorpd+vxorpd+vfmadd+vfmadd` to two `vfnmsub231sd`; the full
-   edge matrix is bit-identical to GCC at matched march.
+   edge matrix is bit-identical to GCC at matched march. (The fixpoint's
+   own direction bug is defect 0 above.)
 2. **`-mno-avx2` killed the VEX encoding, not the 256-bit class**: the
    flag set `avx_explicitly_disabled`, so `x86_isa().avx` went false
    and `normalized()`'s `fma && avx` declined the FMA fold —
@@ -209,8 +243,68 @@ at the pr568 session stands; the corpus re-ran green today (723 PASS /
   PASS. Env hygiene, parity (48 commands) PASS.
 * Regression corpus: 723 PASS / 3 known-env i686 multilib / 17 skip,
   AB-diff 0. Benchmark output oracle: 204/204.
-* cargo test: the peel's 16/16 (11 pre-existing incl. the flipped
-  two-position pin + 5 new multi-use/chain/cross-block/external-reader
-  tests).
+* cargo test: the peel's 21/21 — 12 pre-fix tests carried over, of
+  which the two-position pin was REWRITTEN in place
+  (`same_value_in_two_positions_is_not_absorbed` → `..._cancels_to_plain`),
+  plus 4 new multi-use/chain/cross-block/external-reader tests and (with
+  the fixpoint correction) 5 more: the shipped defect's shape, the
+  dead-outer-reader control, the pinned-inner fold, and the two
+  already-Signed-site XOR compositions.
 * Oracle: phi_fma 22 → 20 insns (gcc 10, clang/icx 12) — the family
   selection is now GCC-exact; the remainder is the staging residual #1.
+
+## Post-merge follow-up (2026-09-23, the fixpoint correction)
+
+The post-merge review correctly flagged the multi-use fixpoint's poison
+direction (defect 0 above). Adjudication summary, with every claim
+re-verified against the tree and empirically:
+
+* CONFIRMED live: the chain shape ICEs the shipped compiler at
+  -O1/-O2/-O3 (x86 emit guard); the IR dump shows the deleted inner Neg
+  under the surviving outer read. -O0 is unaffected (GCC-matched gate).
+* CONFIRMED: the review's own one-line remedy is insufficient — its
+  harness (landed here as tools/ir_shape_check.py, 4545 shapes at width
+  3, 162009 at width 4) reproduces 738/4545 unsafe for the shipped rule,
+  90/4545 for the edge flip, 0 for the reader-closure fixpoint.
+* DEVIATED from the review's work order where it was wrong: its STEP 4a
+  and 4c test sketches are the SAFE MIRRORS of the defect shapes (the
+  site reading the OUTER link), which pass on the shipped rule too —
+  false greens. The landed tests use the discriminating shapes (site
+  reads the INNER link; pinned-inner fold). The review's "5 added" test
+  count was also wrong (git: 4 added + 1 rewritten); the doc
+  parenthetical is now the git-verified decomposition.
+* EXTENDED beyond the work order: the peel now also absorbs Negs off
+  already-Signed FmaScalar sites (XOR composition, cancel normalises to
+  plain). Rationale: the FmaArg classification claimed Signed-site reads
+  disappear, but Pass 2 never rewrote Signed sites — sound today only
+  because the vector main lanes pin the Neg (VecMadd reads classify as
+  Other). The audit's residual #2 (the map-side multi-use peel) removes
+  exactly that pin; the class is closed by making the classification
+  true instead of coincidentally conservative.
+* The new verify hooks (both peel call sites) caught a second latent
+  IR-contract violation on their first armed corpus run:
+  vector_temp_promote rewrites producer dest_ptrs to slots whose Alloca
+  sits below them (inlined-callee param slots after the caller's
+  producers). Fixed with a block-head Alloca hoist (no operands, no
+  semantics change; spans in lockstep).
+* Suite integration gaps closed: the batteries now carry matched-arch
+  .flags (the suite's raw oracle was comparing lccc's default-v3
+  contractions against the reference compiler's default no-FMA
+  double-rounding — the C11 6.5p8 latitude, bit-visible in phi_fma's
+  1-ulp rows and bracket_signed's NaN signs; the matched oracle is
+  bit-exact RAW, NaN normalisation kept at print time for the
+  dedicated gate's cross-baseline configs), and the ISA gate's
+  shared-negation xorpd pin was vacuous for VEX (`\bxorpd\b` can never
+  match `vxorpd` — no word boundary between v and x) — now `v?xorpd`,
+  with the counts re-verified by hand.
+
+Validation at the follow-up tip: cargo 3080/0; peel 21/21; harness
+fixtures ok + closure 0 unsafe (both widths) + controls ok; corpus 725
+PASS / 3 known-env i686 / 17 skip / AB-diff 0 with CCC_VERIFY_IR=abort
+armed; cross-PR gate 4x2 bit-exact; ISA gate with the new chain pins
+(chain_live: exactly 2 sign masks, 0 negated families; chain_pin: 1
+mask + 1 vfnmadd; shared_neg: 0 masks + 2 vfnmsub); ci_local --fast
+55/0/4; rustfmt + clippy (lib/tests/bins) clean; CCC_VERIFY_IR=abort
+matrix 30/30 (batteries + chain repro, -O1/-O2/-O3, with/without
+-mno-avx2 -mfma); the live repro computes GCC's exact -5 at every
+optimisation level.
