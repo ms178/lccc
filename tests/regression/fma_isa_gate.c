@@ -18,6 +18,30 @@ float fused(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
 double fused_d(double a, double b, double c) { return __builtin_fma(a, b, c); }
 
 /*
+ * The four signed families (the operand-negation spellings the IR peel
+ * folds into the family flags). Pinned at the AVX1-class target
+ * (-mno-avx2): AVX2 is the 256-bit integer class, a strict subset of the
+ * VEX encoding, so denying it must remove ymm code but keep every VEX.128
+ * family — vfnmadd/vfmsub/vfnmsub included, exactly like GCC's
+ * -march=x86-64-v3 -mno-avx2. The pre-fix ISA ceiling killed `avx` on
+ * this flag, and these spelled xorpd + xorpd + a libm call.
+ */
+double signed_np(double a, double b, double c) { return __builtin_fma(-a, b, c); }
+double signed_na(double a, double b, double c) { return __builtin_fma(a, b, -c); }
+double signed_np_na(double a, double b, double c) { return __builtin_fma(-a, b, -c); }
+
+/*
+ * The shared-negation phi shape (one -b/-c read by TWO fma sites): the
+ * multi-use absorbability rule must peel both sites at the AVX1-class
+ * target too — two vfnmsub, no surviving xorpd bracket.
+ */
+double shared_neg(double a, double b, double c) {
+    double hi = __builtin_fma(1.5, -b, -c);
+    double lo = __builtin_fma(a, -b, -c);
+    return hi * 3.0 + lo;
+}
+
+/*
  * Semantics pin, so the test also builds and runs under
  * scripts/run_regression_suite.sh (which links and A/B-compares every
  * every tests/regression C file against GCC) instead of assembly-only.

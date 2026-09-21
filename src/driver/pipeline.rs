@@ -168,13 +168,26 @@ pub struct Driver {
     /// profiles must not re-enable SSE after that: GCC keeps the disable
     /// (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
     pub(super) sse_explicitly_disabled: bool,
-    /// Set by `-mno-avx`/`-mno-avx2`/`-mno-sse4.x`: the TU explicitly forbade
-    /// 256-bit VEX code. Distinct from `enable_avx2` (which records what was
-    /// explicitly *requested* and drives `__AVX2__`): LCCC's x86-64
-    /// code-generation baseline is x86-64-v3, so AVX2 is legal by default and
+    /// Set by `-mno-avx`/`-mno-sse4.x`/`-mno-sse`: the TU explicitly forbade
+    /// the VEX encoding itself (every VEX form, 128-bit included).
+    /// Distinct from `enable_avx` (which records what was explicitly
+    /// *requested* and drives `__AVX__`): LCCC's x86-64 code-generation
+    /// baseline is x86-64-v3, so AVX (the VEX world) is legal by default and
     /// only an explicit denial removes it. Without this distinction a
-    /// default-flag build would silently lose every 256-bit transform.
+    /// default-flag build would silently lose every VEX transform.
+    /// `-mno-avx2` does NOT set this — AVX2 is the 256-bit integer class,
+    /// a strict subset of what the VEX encoding buys: VEX.128 forms
+    /// (`vmovsd`, `vaddsd`, `vfmadd231sd`, …) require only AVX, and
+    /// `-march=x86-64-v3 -mno-avx2` (the AVX1+FMA target class) must keep
+    /// them, exactly like GCC. That denial is [`Self::avx2_explicitly_disabled`].
     pub(super) avx_explicitly_disabled: bool,
+    /// Set by `-mno-avx2`: the 256-bit class (AVX2 integer ops and every
+    /// `ymm` use) is forbidden while the VEX.128 world stays legal. The
+    /// absent-`-march` ceiling is v3 (ymm on), so this — not
+    /// [`Self::avx_explicitly_disabled`] — is what removes 256-bit code
+    /// under the default baseline; an explicit `-march=` already folds the
+    /// denial into `enable_avx2`.
+    pub(super) avx2_explicitly_disabled: bool,
     /// Set by `-mno-fma` (and by any AVX/SSE denial, since `vfmadd*` is
     /// VEX-encoded and requires AVX): `vfmadd*` must not be emitted.
     pub(super) fma_explicitly_disabled: bool,
@@ -470,6 +483,7 @@ impl Driver {
             no_sse: false,
             sse_explicitly_disabled: false,
             avx_explicitly_disabled: false,
+            avx2_explicitly_disabled: false,
             fma_explicitly_disabled: false,
             sse41_explicitly_disabled: false,
             x86_march_explicit: false,
@@ -2497,7 +2511,11 @@ impl Driver {
             simd: true,
             sse41: ceiling.sse41 && !self.sse41_explicitly_disabled,
             avx: ceiling.avx && !self.avx_explicitly_disabled,
-            ymm: ceiling.ymm && !self.avx_explicitly_disabled,
+            // The 256-bit class dies on EITHER an AVX denial (no VEX at
+            // all) or an AVX2 denial (VEX.128 stays; `-mno-avx2` is the
+            // AVX1+FMA target class, where GCC keeps every VEX.128 form
+            // including the scalar FMA families).
+            ymm: ceiling.ymm && !self.avx_explicitly_disabled && !self.avx2_explicitly_disabled,
             fma: ceiling.fma && !self.fma_explicitly_disabled,
         }
         .normalized()

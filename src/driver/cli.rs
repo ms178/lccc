@@ -1057,7 +1057,16 @@ impl Driver {
                 "-mharden-sls=none" => {}
                 "-mno-avx2" => {
                     self.enable_avx2 = false;
-                    self.avx_explicitly_disabled = true;
+                    // AVX2 is the 256-bit integer class — a strict subset
+                    // of the VEX encoding. Denying it removes `ymm` code
+                    // but NOT the VEX.128 world: `-march=x86-64-v3
+                    // -mno-avx2` (the AVX1+FMA target class, GCC's
+                    // `-march=corei7-avx` relatives) keeps `vmovsd`,
+                    // `vaddsd` and every scalar FMA family. Killing
+                    // `avx` here (the pre-fix behavior) made `-mno-avx2
+                    // -mfma` decline the FMA fold entirely: two `xorpd`
+                    // and a libm call where GCC emits one `vfnmsub132sd`.
+                    self.avx2_explicitly_disabled = true;
                     self.enable_avxvnni = false;
                     self.enable_avxvnniint8 = false;
                     self.enable_avxvnniint16 = false;
@@ -1198,6 +1207,7 @@ impl Driver {
                     self.sse_explicitly_disabled = false;
                     self.sse41_explicitly_disabled = false;
                     self.avx_explicitly_disabled = false;
+                    self.avx2_explicitly_disabled = false;
                     self.enable_x86_avx2_profile();
                 }
                 "-mavx" => {

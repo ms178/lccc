@@ -381,6 +381,15 @@ gate "boot-size-measurement" fast \
 gate "vector-copy-elimination" fast \
     bash tests/regression/check_vector_copy_elimination.sh
 
+# Cross-PR interaction red-team: FMA families x copy brackets x
+# if-conversion x constant promotion x NonZero x the AVX1+FMA target
+# class, bit-exact vs the reference compiler at matched march (canonical
+# NaN patterns normalised per the C11 latitude). Found and pins two real
+# defects the per-PR gates could not see (the multi-use negation peel
+# and the -mno-avx2 VEX.128 ceiling).
+gate "cross-pr-redteam" fast \
+    bash tests/regression/check_cross_pr_redteam.sh
+
 # Process-global state hygiene.  Four invariants, each grep-checkable, each one
 # a defect this tree actually had: tests mutated the environment behind five
 # deferred-audit markers whose premise (single-threaded access) cargo's test

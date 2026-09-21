@@ -32,15 +32,25 @@
 //!
 //! # Rules
 //!
-//! * A `Neg` is absorbable only when its destination has EXACTLY ONE use —
-//!   the fma argument being rewritten (the MulAddFusion discipline). A Neg
-//!   read anywhere else stays materialised. Residual: `fma(-a, -a, c)` (the
-//!   SAME negated value in two argument positions) has use count 2 and is
-//!   left alone; GCC folds it, the shape is a pathological spelling.
+//! * A `Neg` is absorbable when EVERY use of it disappears with the
+//!   rewrite: an argument read of a width-matching `FmaScalar` intrinsic
+//!   (every such site peels it — see the fixpoint below), or the source
+//!   read of another absorbable `Neg` (chain-internal). A Neg read by
+//!   anything else (an add, a store, a phi, a terminator) stays
+//!   materialised. This is the MULTI-USE rule: `fma(-a, b, -c)` twice
+//!   over one shared `-a`/`-c` (the phi-diamond shape) peels BOTH sites —
+//!   GCC contracts the two-use case (two `vfnmsub` where we used to keep
+//!   two `vxorpd` + two `vfmadd`), and `fma(-a, -a, c)` cancels to the
+//!   plain family exactly like GCC. The discipline is: the NaN-sign
+//!   latitude the family absorption takes (the hardware propagates a
+//!   source NaN's sign UNNEGATED through the negated families — CPU-
+//!   verified, see `hw_nan` in the session record) is only taken when the
+//!   materialisation actually dies; a Neg that survives for other readers
+//!   keeps its exact materialised semantics.
 //! * Only float `Neg` of the matching width (F32 for `FmaScalarF32`, F64 for
 //!   `FmaScalarF64`); an integer `Neg` is never touched.
 //! * Chained negations peel transitively (`fma(-(-a), b, c)` → plain
-//!   `fma(a, b, c)`), each level under the same single-use rule.
+//!   `fma(a, b, c)`), each level under the same absorbability rule.
 //! * Two product-side negations cancel: the instruction stays the PLAIN
 //!   intrinsic with the peeled operands (no degenerate `Signed(false,false)`
 //!   is ever created).
@@ -52,6 +62,16 @@
 //!   `eliminate_phis` (the rewrite reasons in phi-SSA dominance). At -O1 and
 //!   above — GCC keeps the negations materialised at -O0 and so do we.
 //! * Kill switches: `CCC_NO_FMA_NEG_PEEL=1`, `CCC_DISABLE_PASSES=fmanegpeel`.
+//!
+//! The absorbability fixpoint: a Neg whose only readers are fma argument
+//! slots is peelable only if those sites actually peel it, and a site peels
+//! a position only if the Neg there is absorbable — a mutual recursion
+//! whose GREATEST fixpoint is what we want (peel everything that can
+//! consistently peel). Computed as poison propagation: a Neg with any
+//! non-fma reader is bad, and badness flows backward through chain reads
+//! (a materialised outer Neg keeps its read of the inner Neg alive), so
+//! the fixpoint is reached by iterating the backward step to stability —
+//! at most one round per chain link, trivially bounded.
 //!
 //! The pass is a no-op unless the target lowers the signed families —
 //! the same `has_fma3` signal that admits the fma libcall fold (x86-64 with
@@ -104,50 +124,40 @@ struct Peel {
     absorbed: Vec<u32>,
 }
 
-fn peel_function(func: &mut IrFunction) -> usize {
-    // ---- Pass 1 (shared, immutable): use counts and float-Neg sites. ----
-    // Uses are counted over instructions AND terminators (the uniform
-    // liveness discipline) so a Neg feeding a terminator can never be
-    // misjudged as single-use.
-    let mut max_id: u32 = 0;
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Some(dest) = inst.dest() {
-                max_id = max_id.max(dest.0);
-            }
-            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op {
-                    max_id = max_id.max(v.0);
-                }
-            });
-            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
-                max_id = max_id.max(v.0);
-            });
-        }
-        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
-            if let Operand::Value(v) = op {
-                max_id = max_id.max(v.0);
-            }
-        });
+/// How one read of a float `Neg` interacts with the peel.
+///
+/// * `FmaArg` — an argument read of a width-matching, 3-arg `FmaScalar`
+///   intrinsic: the use disappears iff the site peels it, which it will
+///   for every absorbable Neg its chains walk through.
+/// * `NegSrc` — the source read of another float `Neg` (a chain link):
+///   the use disappears iff that outer Neg is itself absorbed.
+/// * `Other` — anything else (a plain FP op, a store, a phi, a terminator,
+///   a width-mismatched fma): the use survives every rewrite, pinning the
+///   materialisation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NegUseKind {
+    FmaArg,
+    NegSrc,
+    Other,
+}
+
+fn fma_arg_width(op: &IntrinsicOp) -> Option<IrType> {
+    match op {
+        IntrinsicOp::FmaScalarF32 | IntrinsicOp::FmaScalarF32Signed(..) => Some(IrType::F32),
+        IntrinsicOp::FmaScalarF64 | IntrinsicOp::FmaScalarF64Signed(..) => Some(IrType::F64),
+        _ => None,
     }
-    let mut uses = vec![0u32; max_id as usize + 1];
-    let count_use = |id: u32, uses: &mut [u32]| {
-        if (id as usize) < uses.len() {
-            uses[id as usize] += 1;
-        }
-    };
+}
+
+fn peel_function(func: &mut IrFunction) -> usize {
+    // ---- Pass 1: locate every float-Neg site. ----
     // (block, index) of every float Neg, keyed by destination value id.
+    // The per-use classification below is what decides absorbability; the
+    // old use-COUNT fast path is subsumed by it (a single fma-arg read is
+    // the trivial all-uses-absorbable case).
     let mut float_negs: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
-            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op {
-                    count_use(v.0, &mut uses);
-                }
-            });
-            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
-                count_use(v.0, &mut uses);
-            });
             if let Instruction::UnaryOp {
                 dest,
                 op: crate::ir::reexports::IrUnaryOp::Neg,
@@ -160,12 +170,131 @@ fn peel_function(func: &mut IrFunction) -> usize {
                 }
             }
         }
-        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
-            if let Operand::Value(v) = op {
-                count_use(v.0, &mut uses);
-            }
-        });
     }
+
+    // ---- Pass 1b: classify every read of every float Neg. ----
+    // The classification drives the multi-use absorbability rule: a Neg
+    // may be folded into family flags only when ALL its readers vanish
+    // with the rewrite. Width mismatches (mistyped IR the SSA typing
+    // should have prevented) classify as `Other` — the defensive reject.
+    let mut neg_use_kinds: FxHashMap<u32, Vec<NegUseKind>> =
+        FxHashMap::with_capacity_and_hasher(float_negs.len(), Default::default());
+    let neg_ty = |vid: u32| -> Option<IrType> {
+        float_negs
+            .get(&vid)
+            .and_then(|&(nb, ni)| match &func.blocks[nb].instructions[ni] {
+                Instruction::UnaryOp { ty, .. } => Some(*ty),
+                _ => None,
+            })
+    };
+    {
+        let mut classify_use = |vid: u32, kind: NegUseKind| {
+            neg_use_kinds.entry(vid).or_default().push(kind);
+        };
+        let classify_inst = |inst: &Instruction, classify_use: &mut dyn FnMut(u32, NegUseKind)| {
+            // The kind this instruction imparts to every float-Neg value
+            // it reads (either as an Operand or as a bare Value use).
+            let kind = match inst {
+                Instruction::Intrinsic { op, args, .. }
+                    if args.len() == 3 && fma_arg_width(op).is_some() =>
+                {
+                    // Width check per-Neg below (the arg positions share
+                    // the site's width; the Neg's own ty decides).
+                    NegUseKind::FmaArg
+                }
+                Instruction::UnaryOp {
+                    op: crate::ir::reexports::IrUnaryOp::Neg,
+                    ty,
+                    ..
+                } if matches!(ty, IrType::F32 | IrType::F64) => NegUseKind::NegSrc,
+                _ => NegUseKind::Other,
+            };
+            let fma_width = match inst {
+                Instruction::Intrinsic { op, args, .. } if args.len() == 3 => fma_arg_width(op),
+                _ => None,
+            };
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if let Some(nt) = neg_ty(v.0) {
+                        let k = match kind {
+                            NegUseKind::FmaArg => match fma_width {
+                                Some(w) if w == nt => NegUseKind::FmaArg,
+                                // Width-mismatched fma slot (mistyped IR):
+                                // the defensive reject, same as the peel's
+                                // own type discipline.
+                                _ => NegUseKind::Other,
+                            },
+                            // A chain link's width is fixed by the Neg's own
+                            // typing; NegSrc and Other pass through.
+                            other => other,
+                        };
+                        classify_use(v.0, k);
+                    }
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                if let Some(_nt) = neg_ty(v.0) {
+                    // Intrinsic dest_ptr and pointer-ish uses: a float Neg
+                    // can only appear here in mistyped IR; pin it.
+                    classify_use(v.0, NegUseKind::Other);
+                }
+            });
+        };
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                classify_inst(inst, &mut classify_use);
+            }
+            crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op {
+                    if neg_ty(v.0).is_some() {
+                        classify_use(v.0, NegUseKind::Other);
+                    }
+                }
+            });
+        }
+    }
+
+    // ---- Pass 1c: the absorbability fixpoint (poison propagation). ----
+    // A Neg is absorbable iff every read is an fma argument (peeled) or
+    // the source read of an ABSORBABLE Neg. Compute the greatest fixpoint
+    // by poisoning: start with every Neg whose reads include an `Other`,
+    // then propagate badness backward through chain reads (a materialised
+    // outer Neg keeps its read of the inner Neg alive) until stable.
+    let mut bad: FxHashSet<u32> = FxHashSet::default();
+    for (&vid, kinds) in &neg_use_kinds {
+        if kinds.iter().any(|k| *k == NegUseKind::Other) {
+            bad.insert(vid);
+        }
+    }
+    loop {
+        let mut grew = false;
+        for (&vid, &(nb, ni)) in &float_negs {
+            if bad.contains(&vid) {
+                continue;
+            }
+            let src_id = match &func.blocks[nb].instructions[ni] {
+                Instruction::UnaryOp { src, .. } => match src {
+                    Operand::Value(v) => Some(v.0),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(s) = src_id {
+                if float_negs.contains_key(&s) && bad.contains(&s) {
+                    bad.insert(vid);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let absorbable: FxHashSet<u32> = float_negs
+        .keys()
+        .copied()
+        .filter(|id| !bad.contains(id))
+        .collect();
 
     // ---- Pass 2 (decisions, still immutable): peel each fma site. ----
     let mut decisions: Vec<Peel> = Vec::new();
@@ -187,7 +316,7 @@ fn peel_function(func: &mut IrFunction) -> usize {
             let mut negate_product = false;
             let mut negate_addend = false;
             for (pos, arg) in args.iter().enumerate() {
-                // Peel the (possibly chained) single-use Negs off this
+                // Peel the (possibly chained) absorbable Negs off this
                 // operand. Each level flips the position's sign flag; the
                 // loop terminates because each step moves to a strictly
                 // earlier definition (SSA defs are acyclic).
@@ -200,10 +329,13 @@ fn peel_function(func: &mut IrFunction) -> usize {
                     let Some(&(nb, ni)) = float_negs.get(&vid) else {
                         break;
                     };
-                    // Single-use: the ONLY reader may be this very argument
-                    // slot. A Neg referenced twice (another fma argument,
-                    // another instruction, a terminator) stays materialised.
-                    if uses.get(vid as usize).copied().unwrap_or(0) != 1 {
+                    // Absorbability: every read of this Neg disappears with
+                    // the rewrite (fma argument slots that all peel it, plus
+                    // chain-internal reads by other absorbed Negs). A Neg
+                    // with any other reader stays materialised — peeling it
+                    // here would change its NaN-sign semantics without
+                    // deleting the vxorpd.
+                    if !absorbable.contains(&vid) {
                         break;
                     }
                     // Type discipline: the Neg must be the float negation of
@@ -540,19 +672,188 @@ mod tests {
     }
 
     #[test]
-    fn same_value_in_two_positions_is_not_absorbed() {
-        // fma(n, n, c) with n = -a: use count 2 -> residual, untouched.
+    fn same_value_in_two_positions_cancels_to_plain() {
+        // fma(n, n, c) with n = -a: both product positions read the SAME
+        // Neg, both uses are absorbable fma argument slots, the two flips
+        // cancel -> plain fma(a, a, c), the Neg dies. GCC folds the same
+        // spelling; the old single-use grammar left it materialised.
         let mut m = module(
             vec![neg(1, 0, IrType::F64), fma(2, v(1), v(1), v(4), true)],
             5,
         );
-        assert_eq!(peel(&mut m), 0);
-        match &m.functions[0].blocks[0].instructions[1] {
+        assert_eq!(peel(&mut m), 1);
+        match sole_inst(&m) {
             Instruction::Intrinsic { op, args, .. } => {
                 assert_eq!(*op, IntrinsicOp::FmaScalarF64);
-                assert_eq!(args, &vec![v(1), v(1), v(4)]);
+                assert_eq!(args, &vec![v(0), v(0), v(4)]);
             }
             other => panic!("expected intrinsic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_negation_across_two_fma_sites_peels_both() {
+        // The phi-diamond shape (the session's headline): one -a and one -c
+        // shared by TWO fma sites. All four reads are absorbable argument
+        // slots, so both sites peel and BOTH Negs die — GCC's two
+        // vfnmsub, not two vxorpd + two vfmadd.
+        let mut m = module(
+            vec![
+                neg(1, 0, IrType::F64),
+                neg(5, 4, IrType::F64),
+                fma(2, v(1), v(3), v(5), true),
+                fma(6, v(1), v(7), v(5), true),
+                Instruction::BinOp {
+                    dest: crate::ir::reexports::Value(8),
+                    op: crate::ir::reexports::IrBinOp::Add,
+                    lhs: v(2),
+                    rhs: v(6),
+                    ty: IrType::F64,
+                },
+            ],
+            9,
+        );
+        // The helper returns v(2); extend the return to the sum so both
+        // fma results stay live.
+        m.functions[0].blocks[0].terminator = Terminator::Return(Some(v(8)));
+        assert_eq!(peel(&mut m), 2);
+        let insts = &m.functions[0].blocks[0].instructions;
+        assert_eq!(insts.len(), 3);
+        for (i, want) in [(0, (true, true)), (1, (true, true))] {
+            match &insts[i] {
+                Instruction::Intrinsic { op, args, .. } => {
+                    assert_eq!(
+                        *op,
+                        IntrinsicOp::FmaScalarF64Signed(want.0, want.1),
+                        "site {i}"
+                    );
+                    // Both sites read the PRE-negation sources.
+                    assert!(args.contains(&v(0)), "site {i} must read a");
+                    assert!(args.contains(&v(4)), "site {i} must read c");
+                    assert!(!args.contains(&v(1)) && !args.contains(&v(5)));
+                }
+                other => panic!("expected intrinsic, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn shared_negation_with_external_reader_stays_materialised() {
+        // -a read by two fma sites AND a trailing add: the add survives
+        // every rewrite, so the Neg keeps its exact materialised
+        // semantics and NO site peels (the discipline: the NaN-sign
+        // latitude is only taken when the vxorpd actually dies).
+        let reader = Instruction::BinOp {
+            dest: crate::ir::reexports::Value(6),
+            op: crate::ir::reexports::IrBinOp::Add,
+            lhs: v(1),
+            rhs: v(3),
+            ty: IrType::F64,
+        };
+        let mut m = module(
+            vec![
+                neg(1, 0, IrType::F64),
+                fma(2, v(1), v(3), v(4), true),
+                fma(7, v(1), v(3), v(4), true),
+                reader,
+            ],
+            8,
+        );
+        m.functions[0].blocks[0].terminator = Terminator::Return(Some(v(6)));
+        assert_eq!(peel(&mut m), 0);
+        let insts = &m.functions[0].blocks[0].instructions;
+        assert_eq!(insts.len(), 4);
+        match &insts[1] {
+            Instruction::Intrinsic { op, args, .. } => {
+                assert_eq!(*op, IntrinsicOp::FmaScalarF64);
+                assert_eq!(args, &vec![v(1), v(3), v(4)]);
+            }
+            other => panic!("expected intrinsic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_block_negation_dominating_both_sites_peels() {
+        // The Neg lives in the entry block, the fma in a dominated block:
+        // the rewrite substitutes the Neg's SOURCE, whose definition
+        // dominates the Neg, which dominates the use — transitivity is
+        // the whole soundness argument, and it is block-agnostic.
+        let mut func = IrFunction::new(
+            "t".to_string(),
+            IrType::F64,
+            vec![IrParam {
+                ty: IrType::F64,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                param_align: None,
+                struct_eightbyte_classes: Vec::new(),
+                is_f128_sse: false,
+                riscv_float_class: None,
+            }],
+            false,
+        );
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![neg(1, 0, IrType::F64)],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![fma(2, v(1), v(3), v(4), true)],
+            terminator: Terminator::Return(Some(v(2))),
+            source_spans: vec![],
+        });
+        func.next_value_id = 5;
+        let mut module = IrModule::new();
+        module.functions.push(func);
+        assert_eq!(peel(&mut module), 1);
+        match &module.functions[0].blocks[1].instructions[0] {
+            Instruction::Intrinsic { op, args, .. } => {
+                assert_eq!(*op, IntrinsicOp::FmaScalarF64Signed(true, false));
+                assert_eq!(args, &vec![v(0), v(3), v(4)]);
+            }
+            other => panic!("expected intrinsic, got {other:?}"),
+        }
+        assert!(module.functions[0].blocks[0].instructions.is_empty());
+    }
+
+    #[test]
+    fn chained_shared_negation_peels_transitively_at_both_sites() {
+        // Two sites read the same DOUBLE negation: the outer Neg's two
+        // reads are fma slots, the inner Neg's only read is the outer
+        // chain link — all absorbable, everything collapses.
+        let mut m = module(
+            vec![
+                neg(1, 0, IrType::F64),
+                neg(5, 1, IrType::F64),
+                fma(2, v(5), v(3), v(4), true),
+                fma(6, v(5), v(3), v(4), true),
+                Instruction::BinOp {
+                    dest: crate::ir::reexports::Value(8),
+                    op: crate::ir::reexports::IrBinOp::Add,
+                    lhs: v(2),
+                    rhs: v(6),
+                    ty: IrType::F64,
+                },
+            ],
+            9,
+        );
+        m.functions[0].blocks[0].terminator = Terminator::Return(Some(v(8)));
+        assert_eq!(peel(&mut m), 2);
+        let insts = &m.functions[0].blocks[0].instructions;
+        assert_eq!(insts.len(), 3);
+        for i in 0..2 {
+            match &insts[i] {
+                Instruction::Intrinsic { op, args, .. } => {
+                    // (-(-a)) at a product slot: two flips -> plain family,
+                    // reading a directly.
+                    assert_eq!(*op, IntrinsicOp::FmaScalarF64, "site {i}");
+                    assert_eq!(args, &vec![v(0), v(3), v(4)], "site {i}");
+                }
+                other => panic!("expected intrinsic, got {other:?}"),
+            }
         }
     }
 
