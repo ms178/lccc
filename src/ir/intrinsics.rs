@@ -119,6 +119,37 @@ pub enum IntrinsicOp {
     /// math-use-builtins-fma.h are the canonical consumers).
     FmaScalarF32,
     FmaScalarF64,
+    /// C99 fma()/fmaf() with operand negations folded into the family
+    /// selection: dest = (negate_product ? -1 : +1) * (args[0] * args[1])
+    ///              + (negate_addend ? -1 : +1) * args[2], single rounding.
+    /// Payload: (negate_product, negate_addend). Produced by the IR
+    /// negation peel (fma_neg_peel.rs) from single-use Neg instructions
+    /// feeding a plain FmaScalarF{32,64}; at least one flag is set in
+    /// practice (two product-side negations cancel back to the plain
+    /// intrinsic), and backends handle the (false, false) spelling as the
+    /// plain family defensively rather than panicking.
+    ///
+    /// Soundness: IEEE negation is an exact sign flip, so
+    /// fma(-a, b, -c) = round((-a)·b + (-c)) = round(-(a·b) - c), and every
+    /// supported rounding mode satisfies round(-x) = -round(x); the signed
+    /// families therefore compute the same VALUE as the negation-then-fuse
+    /// spelling (NaN payload/sign may differ bitwise — the established
+    /// implementation-defined position, same as GCC/Clang). NOT subject to
+    /// -ffp-contract: the C99 builtin semantics are fused regardless.
+    ///
+    /// ISA mapping (oracle-verified against aarch64 gcc 12.4 and x86-64
+    /// gcc -march=x86-64-v3; note the AArch64 quirk that `sub` negates the
+    /// PRODUCT and the `n` prefix the ADDEND — the opposite reading of the
+    /// x86 names):
+    /// ```text
+    /// (np, na)   x86-64/i686     AArch64        RISC-V
+    /// (F, F)     vfmadd231s{d}   fmadd          fmadd
+    /// (F, T)     vfmsub231s{d}   fnmsub         fmsub
+    /// (T, F)     vfnmadd231s{d}  fmsub          fnmsub
+    /// (T, T)     vfnmsub231s{d}  fnmadd         fnmadd
+    /// ```
+    FmaScalarF32Signed(bool, bool),
+    FmaScalarF64Signed(bool, bool),
     /// SSE4.1/AVX scalar directed rounding, payload = the ROUNDSS/ROUNDSD
     /// imm8 (GCC-verified at -O2 -march=x86-64-v3):
     ///   floor = 9, ceil = 10, trunc = 11,
@@ -287,6 +318,18 @@ pub enum IntrinsicOp {
     VecFmaF64x4,
     /// Contract-legal affine map: input * scale + bias, AVX 4×F64.
     VecMaddF64x4,
+    /// Builtin-semantics packed FMA with the sign algebra (the element-wise
+    /// map counterpart of `FmaScalarF64Signed`): args = [a, b, acc] →
+    /// (np ? −1 : +1)·(a·b) + (na ? −1 : +1)·acc, AVX2 4×F64, single
+    /// rounding per lane. Produced by the map vectorizer's `MapExpr::Fma`
+    /// arm from `__builtin_fma` loops — NOT contract-gated (the C99
+    /// builtin is fused regardless of -ffp-contract, unlike the
+    /// `VecMaddF64x4` contraction above). Mnemonic table (132 family):
+    /// (F,F) vfmadd132pd · (F,T) vfmsub132pd · (T,F) vfnmadd132pd ·
+    /// (T,T) vfnmsub132pd.
+    VecMaddF64x4Signed(bool, bool),
+    /// Same, AVX2 8×F32 (…132ps family).
+    VecMaddF32x8Signed(bool, bool),
     /// Packed FMA contraction (BB-SLP): args = [a, b, acc] → acc + a·b,
     /// SSE2-register-width 2×F64 (vfmadd231pd under FMA3). Rounding parity
     /// with the scalar fused-mul-add path (single rounding of a·b + acc).
@@ -1650,12 +1693,12 @@ impl IntrinsicOp {
             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
-            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
+            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecMaddF64x4Signed(..) | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
             | VecSubI32x8 | VecAndI32x8 | VecOrI32x8 | VecXorI32x8
             | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4 | VecXorF64x4
             | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8 | VecXorF32x8
             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
-            | VecMulF32x8 | VecFmaF32x8 | VecMaddF32x8
+            | VecMulF32x8 | VecFmaF32x8 | VecMaddF32x8 | VecMaddF32x8Signed(..)
             | VecBroadcastF32x8 | VecZeroF32x8
             | VecMinF32x8 | VecMaxF32x8 | VecCmpF32x8 | VecBlendvF32x8
             | VecMinF64x4 | VecMaxF64x4 | VecCmpF64x4 | VecBlendvF64x4
@@ -1813,6 +1856,7 @@ impl IntrinsicOp {
             IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64 |
             IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64 |
             IntrinsicOp::FmaScalarF32 | IntrinsicOp::FmaScalarF64 |
+            IntrinsicOp::FmaScalarF32Signed(..) | IntrinsicOp::FmaScalarF64Signed(..) |
             IntrinsicOp::RoundScalarF32(_) | IntrinsicOp::RoundScalarF64(_) |
             IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
@@ -2126,7 +2170,9 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecFmaF64x4
                 | IntrinsicOp::VecFmaF32x8
                 | IntrinsicOp::VecMaddF64x4
+                | IntrinsicOp::VecMaddF64x4Signed(..)
                 | IntrinsicOp::VecMaddF32x8
+                | IntrinsicOp::VecMaddF32x8Signed(..)
                 | IntrinsicOp::VecLoadWidenI32ToI64x2
                 | IntrinsicOp::VecLoadI64x2
                 | IntrinsicOp::VecLoadI32x4Pair
@@ -2433,6 +2479,8 @@ mod vector_result_width_tests {
             "VecLoadWidenI32ToI64x2" => IntrinsicOp::VecLoadWidenI32ToI64x2,
             "VecMaddF32x8" => IntrinsicOp::VecMaddF32x8,
             "VecMaddF64x4" => IntrinsicOp::VecMaddF64x4,
+            "VecMaddF64x4Signed" => IntrinsicOp::VecMaddF64x4Signed(false, false),
+            "VecMaddF32x8Signed" => IntrinsicOp::VecMaddF32x8Signed(false, false),
             "VecFmaF64x2" => IntrinsicOp::VecFmaF64x2,
             "VecFnmaF64x2" => IntrinsicOp::VecFnmaF64x2,
             "VecFmaF32x4" => IntrinsicOp::VecFmaF32x4,

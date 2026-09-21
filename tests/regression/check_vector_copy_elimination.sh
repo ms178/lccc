@@ -444,6 +444,20 @@ EOF
     NI static double b_msub(double a, double b, double c) { return __builtin_fma(a, b, -c); }
     NI static double b_nmadd(double a, double b, double c) { return __builtin_fma(-a, b, c); }
     NI static double b_nmsub(double a, double b, double c) { return __builtin_fma(-a, b, -c); }
+    /* ── builtin operand-negation shapes the IR peel absorbs ──
+     * (fma_neg_peel.rs: the Neg instructions feeding the intrinsic fold
+     * into the family selection, so each of these is ONE instruction —
+     * b_cancel and b_chainneg land on the PLAIN family because their two
+     * product-side negations cancel, b_named's negations are non-adjacent
+     * named locals, b_nmsubf is the F32 width.) */
+    NI static double b_cancel(double a, double b, double c) { return __builtin_fma(-a, -b, c); }
+    NI static double b_named(double a, double b, double c) { double na = -a, nc = -c; return __builtin_fma(na, b, nc); }
+    NI static double b_chainneg(double a, double b, double c) { return __builtin_fma(-(-a), b, c); }
+    NI static float b_nmsubf(float a, float b, float c) { return __builtin_fmaf(-a, b, -c); }
+    /* negative control: the negation has a SECOND consumer (the return
+     * reads n again), so the single-use discipline must keep it
+     * materialised — exactly one vxorpd in the whole file below. */
+    NI static double b_shared_neg(double a, double b, double c) { double n = -a; return __builtin_fma(n, b, c) + n; }
     NI static double b_madd_p(double a, double b, const double *p) { return __builtin_fma(a, b, *p); }
     NI static double b_madd_pm(double a, const double *p, double c) { return __builtin_fma(*p, a, c); }
     NI static float b_maddf(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
@@ -571,6 +585,15 @@ EOF
             same("neg_neg_sub", neg_neg_sub(a, b, c), b_madd(a, b, c));
             same("neg_prod_subf", (double)neg_prod_subf(fa, fb, fc), (double)__builtin_fmaf(-fa, fb, -fc));
             same("neg_sumf", (double)neg_sumf(fa, fb, fc), (double)-__builtin_fmaf(fa, fb, fc));
+            /* the operand-negation peel: each builtin sign variant equals
+             * its spelled-out twin, the two cancellations equal the plain
+             * family, and the multi-use control keeps its arithmetic while
+             * materialising the shared negation. */
+            same("b_cancel", b_cancel(a, b, c), b_madd(a, b, c));
+            same("b_named", b_named(a, b, c), b_nmsub(a, b, c));
+            same("b_chainneg", b_chainneg(a, b, c), b_madd(a, b, c));
+            same("b_nmsubf", (double)b_nmsubf(fa, fb, fc), (double)__builtin_fmaf(-fa, fb, -fc));
+            same("b_shared_neg", b_shared_neg(a, b, c), b_nmadd(a, b, c) - a);
             acc += madd_a(a, b, c) + madd_c(a, b, c) + sq_add(a, c);
         }
         char b1[40];
@@ -600,7 +623,7 @@ EOF_ALGEBRA
             bad "builtin FMA output differs from $ORACLE:"
             diff "$work/fa.lccc" "$work/fa.oracle" | head -10 | note
         else
-            ok "FMA algebra kernel bit-exact vs $ORACLE on $(grep -c . "$work/fa.lccc") lines; 23 contracted kernels equal their builtin twins"
+            ok "FMA algebra kernel bit-exact vs $ORACLE on $(grep -c . "$work/fa.lccc") lines; 28 contracted kernels equal their builtin twins"
         fi
         # Anti-vacuity, per encoding: all three forms, a memory operand at
         # operand 0 of a non-231 form, and all four sign families must appear,
@@ -621,18 +644,19 @@ EOF_ALGEBRA
             bad "the algebra kernel does not exercise every encoding (132=$n132 213=$n213 231=$n231 mem-on-non-231=$nmem_non231 families=$nfam)"
         fi
         # Straight-line kernels that must be ONE instruction plus ret -- GCC's
-        # count.  The negation source shapes are held to the same bar: GCC
-        # contracts all six to a single instruction, and so does the
-        # signed-FMA hook.  The BUILTIN sign variants (`fma(-a, b, -c)`) are
-        # still not in this list: their operand negations are separate
-        # `vxorpd`s (absorbing them needs const-pool visibility in the
-        # peephole -- the open item in FOLLOWUP-2026-09-19E).
+        # count.  The negation source shapes AND the builtin sign variants are
+        # both held to that bar: the IR negation peel (fma_neg_peel.rs)
+        # absorbs the operand Negs into the family selection, closing the
+        # open item this list used to document (the separate-vxorpd spelling).
+        # b_cancel/b_chainneg land on the plain family by sign cancellation;
+        # b_named proves non-adjacent negations peel.
         one_insn_ok=1
         for fn in b_madd b_madd_p b_madd_pm b_maddf b_maddf_pm \
                   madd_a msub_a nmadd_a madd_c msub_c nmadd_c madd_m1 madd_m2 madd_ma \
                   sq_add self_add self_add2 maddf_a maddf_m nmaddf_c \
                   neg_prod_sub neg_prod_add neg_sum neg_diff sub_neg_prod neg_neg_sub \
-                  neg_prod_subf neg_sumf; do
+                  neg_prod_subf neg_sumf \
+                  b_msub b_nmadd b_nmsub b_cancel b_named b_chainneg b_nmsubf; do
             n=$(fnbody "$work/fma_algebra.s" "$fn" | wc -l)
             if [[ "$n" -ne 2 ]]; then
                 one_insn_ok=0
@@ -641,7 +665,117 @@ EOF_ALGEBRA
             fi
         done
         if [[ "$one_insn_ok" -eq 1 ]]; then
-            ok "all 28 straight-line FMA kernels are exactly one instruction plus ret (gcc parity, sign families included)"
+            ok "all 35 straight-line FMA kernels are exactly one instruction plus ret (gcc parity, builtin sign variants included)"
+        fi
+        # Anti-vacuity for the operand-negation peel: the ONLY materialised
+        # negation in any kernel body is the multi-use control's (its Neg
+        # feeds the fma AND the return, so single-use discipline must keep
+        # it).  main's reference computations also negate (-a, -b_madd) and
+        # are outside the kernel bodies by construction.  A peel regression
+        # grows the count; a wrongly eager peel that broke the control would
+        # shrink it to 0.
+        nxor=$(fnbody "$work/fma_algebra.s" b_shared_neg | grep -cE '^vxorp[ds][[:space:]]' || true)
+        nxor_all=$(grep -cE '^[[:space:]]*vxorp[ds][[:space:]]' "$work/fma_algebra.s" || true)
+        if [[ "$nxor" -eq 1 ]]; then
+            ok "exactly one materialised negation survives in the kernels: the multi-use control (operand-negation peel anti-vacuity)"
+        else
+            bad "b_shared_neg should keep exactly 1 vxorpd (multi-use control), found $nxor of $nxor_all file-wide — the operand-negation peel regressed or over-fired"
+            fnbody "$work/fma_algebra.s" b_shared_neg | note
+        fi
+    fi
+
+    # ── D2. packed builtin FMA loops (MapExpr::Fma) ─────────────────────────
+    # The element-wise `__builtin_fma` loop now vectorizes through the map
+    # pattern's Fma node — plain AND sign-negated spellings, exactly GCC's
+    # packed forms (vfnmsub132pd etc.).  Three assertions: the packed
+    # families materialize (anti-vacuity: a regression to the scalar loop
+    # shows up as missing pd/ps forms), the runtime output is bit-exact
+    # against the reference compiler (both compute per-element fma; the
+    # 37-element trip count forces the scalar remainder mirror through
+    # every boundary: 36 packed + 1 remainder), and -ffp-contract=off
+    # still vectorizes (builtin semantics are not contract-gated — the
+    # one deliberate asymmetry against the mul+add contraction).
+    cat > "$work/fma_packed.c" <<'EOF_PACKED'
+    #include <stdio.h>
+    #include <math.h>
+    void p_plain(const double *a, const double *b, const double *c, double *r, int n) {
+        for (int i = 0; i < n; i++) r[i] = __builtin_fma(a[i], b[i], c[i]);
+    }
+    void p_both(const double *a, const double *b, const double *c, double *r, int n) {
+        for (int i = 0; i < n; i++) r[i] = __builtin_fma(-a[i], b[i], -c[i]);
+    }
+    void p_prod(const double *a, const double *b, const double *c, double *r, int n) {
+        for (int i = 0; i < n; i++) r[i] = __builtin_fma(-a[i], b[i], c[i]);
+    }
+    void p_addend(const double *a, const double *b, const double *c, double *r, int n) {
+        for (int i = 0; i < n; i++) r[i] = __builtin_fma(a[i], b[i], -c[i]);
+    }
+    void p_f32(const float *a, const float *b, const float *c, float *r, int n) {
+        for (int i = 0; i < n; i++) r[i] = __builtin_fmaf(-a[i], b[i], -c[i]);
+    }
+    void p_inplace(double *a, double *b, double *r, int n) {
+        for (int i = 0; i < n; i++) r[i] = __builtin_fma(-a[i], b[i], r[i]);
+    }
+    int main(void) {
+        double a[37], b[37], c[37];
+        float fa[37], fb[37], fc[37];
+        double xs[] = { 1.0000000000000002, -3.0000000000000004, 0.30000000000000004,
+                        1e16, -1e-16, 0.0, -0.0, INFINITY, -INFINITY, 1e308, 1e-308,
+                        NAN, -NAN, 2.5, -7.7 };
+        int n = (int)(sizeof xs / sizeof *xs);
+        for (int i = 0; i < 37; i++) {
+            a[i] = xs[i % n]; b[i] = xs[(i + 3) % n]; c[i] = xs[(i + 7) % n];
+            fa[i] = (float)xs[i % n]; fb[i] = (float)xs[(i + 3) % n]; fc[i] = (float)xs[(i + 7) % n];
+        }
+        double r[37]; float fr[37];
+        p_plain(a, b, c, r, 37); for (int i = 0; i < 37; i++) printf("%.17g\n", r[i]);
+        p_both(a, b, c, r, 37);  for (int i = 0; i < 37; i++) printf("%.17g\n", r[i]);
+        p_prod(a, b, c, r, 37);  for (int i = 0; i < 37; i++) printf("%.17g\n", r[i]);
+        p_addend(a, b, c, r, 37); for (int i = 0; i < 37; i++) printf("%.17g\n", r[i]);
+        p_f32(fa, fb, fc, fr, 37); for (int i = 0; i < 37; i++) printf("%.9g\n", (double)fr[i]);
+        p_inplace(a, b, r, 37); for (int i = 0; i < 37; i++) printf("%.17g\n", r[i]);
+        return 0;
+    }
+EOF_PACKED
+    "$LCCC" "${FLAGS[@]}" -ffp-contract=fast -o "$work/fp.lccc" "$work/fma_packed.c" 2>/dev/null \
+        && "$LCCC" "${FLAGS[@]}" -ffp-contract=fast -S -o "$work/fp.s" "$work/fma_packed.c" 2>/dev/null \
+        && "$ORACLE" -O2 -march=x86-64-v3 -ffp-contract=fast -o "$work/fp.oracle" "$work/fma_packed.c" 2>/dev/null
+    if [[ $? -ne 0 ]]; then
+        bad "fma_packed.c did not build with both compilers"
+    else
+        "$work/fp.lccc" > "$work/fp.lccc.out" 2>&1; rc_l=$?
+        "$work/fp.oracle" > "$work/fp.oracle.out" 2>&1; rc_o=$?
+        if [[ $rc_l -ne 0 || $rc_o -ne 0 ]]; then
+            bad "packed FMA loop run failed (lccc=$rc_l oracle=$rc_o)"
+        elif ! diff -q "$work/fp.lccc.out" "$work/fp.oracle.out" >/dev/null; then
+            bad "packed FMA loop output differs from $ORACLE:"
+            diff "$work/fp.lccc.out" "$work/fp.oracle.out" | head -6 | note
+        else
+            ok "packed builtin-FMA loops bit-exact vs $ORACLE (37 elements: packed body + scalar remainder + in-place alias)"
+        fi
+        # Anti-vacuity: each spelling must materialize its packed family.
+        # 132/213/231 all acceptable -- the peephole's form algebra may
+        # re-encode -- but the LANE WIDTH (pd/ps) and the FAMILY
+        # (madd/msub/nmadd/nmsub) are semantic and pinned.
+        want_packed() { # family-re, count-name
+            local n
+            n=$(grep -cE "^[[:space:]]*$1" "$work/fp.s" || true)
+            if [[ "$n" -gt 0 ]]; then ok "packed $2 materialized ($n sites)"; else bad "no packed $2 in fma_packed.s — the Fma map node regressed"; fi
+        }
+        want_packed 'vfnmsub[0-9]*pd' 'vfnmsub..pd (double-negated loop)'
+        want_packed 'vfnmadd[0-9]*pd' 'vfnmadd..pd (product-negated loop)'
+        want_packed 'vfmsub[0-9]*pd'  'vfmsub..pd (addend-negated loop)'
+        want_packed 'vfmadd[0-9]*pd'  'vfmadd..pd (plain loop)'
+        want_packed 'vfnmsub[0-9]*ps' 'vfnmsub..ps (f32 loop)'
+        # The contract asymmetry: the builtin loop vectorizes with the
+        # contract OFF (C99 semantics), while the mul+add contraction does
+        # not -- pinning the one deliberate difference.
+        "$LCCC" "${FLAGS[@]}" -ffp-contract=off -S -o "$work/fpco.s" "$work/fma_packed.c" 2>/dev/null
+        nco=$(grep -cE '^[[:space:]]*vfmadd[0-9]*pd' "$work/fpco.s" || true)
+        if [[ "$nco" -gt 0 ]]; then
+            ok "-ffp-contract=off still vectorizes the builtin loop ($nco packed sites)"
+        else
+            bad "-ffp-contract=off lost the builtin packed FMA — the contract gate leaked into MapExpr::Fma"
         fi
     fi
 

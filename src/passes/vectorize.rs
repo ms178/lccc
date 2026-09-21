@@ -3989,6 +3989,22 @@ enum MapExpr {
         l: Box<MapExpr>,
         r: Box<MapExpr>,
     },
+    /// Fused multiply-add with the sign algebra: (np ? −1 : +1)·(l·r) +
+    /// (na ? −1 : +1)·a, single rounding per lane. Source is a
+    /// `FmaScalarF{32,64}[/Signed]` intrinsic — C99 builtin semantics, so
+    /// unlike the BinOp mul+add contraction this node is NOT subject to
+    /// -ffp-contract (the source explicitly asked for the fused form).
+    /// The parser also folds loop-local single-use float Negs on the
+    /// operands into the flags (the loop-body mini-peel: `loop_escape_closed`
+    /// guarantees a loop-local def cannot be read outside, so single-use
+    /// within the loop is the total use count).
+    Fma {
+        l: Box<MapExpr>,
+        r: Box<MapExpr>,
+        a: Box<MapExpr>,
+        negate_product: bool,
+        negate_addend: bool,
+    },
 }
 
 impl MapExpr {
@@ -4001,6 +4017,7 @@ impl MapExpr {
             MapExpr::Select(c, t, f) => 1 + c.node_count() + t.node_count() + f.node_count(),
             MapExpr::MinMax { l, r, .. } => 1 + l.node_count() + r.node_count(),
             MapExpr::MaskConj { l, r, .. } => 1 + l.node_count() + r.node_count(),
+            MapExpr::Fma { l, r, a, .. } => 1 + l.node_count() + r.node_count() + a.node_count(),
         }
     }
 }
@@ -4015,6 +4032,12 @@ struct MapEmitCtx<'a> {
     broadcast_op: IntrinsicOp,
     sqrt_op: Option<IntrinsicOp>,
     madd_op: Option<IntrinsicOp>,
+    /// Packed-FMA op for the BUILTIN-semantics `MapExpr::Fma` node: gated
+    /// on the packed FMA families being available (AVX2+FMA3, FP lanes)
+    /// but NOT on -ffp-contract — the C99 builtin is fused regardless,
+    /// unlike the `madd_op` contraction above. Carries the PLAIN family;
+    /// the emitter derives the Signed variants from the node's flags.
+    builtin_fma_op: Option<IntrinsicOp>,
     bin_op: &'a dyn Fn(&IrBinOp) -> Option<IntrinsicOp>,
     cmp_op: &'a dyn Fn(&IrCmpOp) -> Option<(IntrinsicOp, i32)>,
     minmax_op: &'a dyn Fn(bool) -> Option<IntrinsicOp>,
@@ -4218,6 +4241,40 @@ impl<'a> MapEmitCtx<'a> {
                     op: vec_op,
                     dest_ptr: None,
                     args: vec![Operand::Value(lv), Operand::Value(rv)],
+                });
+                Some(dest)
+            }
+            MapExpr::Fma {
+                l,
+                r,
+                a,
+                negate_product,
+                negate_addend,
+            } => {
+                // Builtin-semantics packed FMA: availability is the packed
+                // FMA families (NOT the contraction switch — see the ctx
+                // field docs). Operand order [input, scale, bias] matches
+                // emit_avx_map_fma's 132-family contract exactly: the
+                // product operands first, the addend last.
+                let Some(plain) = self.builtin_fma_op else {
+                    return None;
+                };
+                let vec_op = match (plain, *negate_product, *negate_addend) {
+                    (IntrinsicOp::VecMaddF64x4, false, false) => IntrinsicOp::VecMaddF64x4,
+                    (IntrinsicOp::VecMaddF64x4, np, na) => IntrinsicOp::VecMaddF64x4Signed(np, na),
+                    (IntrinsicOp::VecMaddF32x8, false, false) => IntrinsicOp::VecMaddF32x8,
+                    (IntrinsicOp::VecMaddF32x8, np, na) => IntrinsicOp::VecMaddF32x8Signed(np, na),
+                    _ => return None,
+                };
+                let lv = self.emit(l)?;
+                let rv = self.emit(r)?;
+                let av = self.emit(a)?;
+                let dest = self.fresh();
+                self.vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: vec_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(lv), Operand::Value(rv), Operand::Value(av)],
                 });
                 Some(dest)
             }
@@ -6211,6 +6268,17 @@ fn analyze_map_pattern(
                     op: IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64,
                     ..
                 } => {}
+                // The C99 builtin fma is pure and tree-parseable the same
+                // way (MapExpr::Fma); the sign variants come from the IR
+                // negation peel.
+                Instruction::Intrinsic {
+                    op:
+                        IntrinsicOp::FmaScalarF32
+                        | IntrinsicOp::FmaScalarF64
+                        | IntrinsicOp::FmaScalarF32Signed(..)
+                        | IntrinsicOp::FmaScalarF64Signed(..),
+                    ..
+                } => {}
                 Instruction::Phi { .. }
                 | Instruction::BinOp { .. }
                 | Instruction::UnaryOp { .. }
@@ -6479,6 +6547,40 @@ fn analyze_map_pattern(
 
 /// Recursive parser for the elementwise map expression (OP-05a).
 ///
+/// How often `needle` is read inside the loop's blocks (instruction
+/// operands, non-operand value uses, terminators). For a loop-LOCAL
+/// definition this is the total use count: `loop_escape_closed` — a
+/// prerequisite of every map pattern — rejects loops whose definitions
+/// are read outside.
+fn count_loop_value_uses(func: &IrFunction, loop_blocks: &FxHashSet<usize>, needle: u32) -> usize {
+    let mut n = 0usize;
+    for &bi in loop_blocks {
+        let block = &func.blocks[bi];
+        for inst in &block.instructions {
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if v.0 == needle {
+                        n += 1;
+                    }
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                if v.0 == needle {
+                    n += 1;
+                }
+            });
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if v.0 == needle {
+                    n += 1;
+                }
+            }
+        });
+    }
+    n
+}
+
 /// Recognizes, bounded by `depth`: stream loads, loop-invariant scalars,
 /// FP Add/Sub/Mul/Div, integer Add/Mul, and FP Sqrt intrinsics. IV-derived
 /// values and anything defined in the loop outside this grammar fail closed.
@@ -6598,6 +6700,104 @@ fn parse_map_expr(
                 depth + 1,
                 allow_ext_fp_ops,
             )?)))
+        }
+        Instruction::Intrinsic {
+            op:
+                op @ (IntrinsicOp::FmaScalarF64
+                | IntrinsicOp::FmaScalarF64Signed(..)
+                | IntrinsicOp::FmaScalarF32
+                | IntrinsicOp::FmaScalarF32Signed(..)),
+            args,
+            ..
+        } if allow_ext_fp_ops && args.len() == 3 => {
+            let op = *op;
+            // C99 builtin fma as the elementwise op: fused semantics per
+            // lane, NOT subject to -ffp-contract (the emission gate is the
+            // packed-FMA availability, not the contraction switch). The
+            // intrinsic may already carry sign flags (the IR peel ran
+            // earlier for straight-line code); loop bodies the peel has
+            // not yet reached still carry their Negs, and the mini-peel
+            // below folds those too — GCC vectorizes `fma(-a[i], b[i],
+            // -c[i])` into one packed vfnmsub, and so does this arm.
+            let (mut np, mut na, ty_ok) = match op {
+                IntrinsicOp::FmaScalarF64 => (false, false, *elem_ty == IrType::F64),
+                IntrinsicOp::FmaScalarF64Signed(p, a) => (p, a, *elem_ty == IrType::F64),
+                IntrinsicOp::FmaScalarF32 => (false, false, *elem_ty == IrType::F32),
+                IntrinsicOp::FmaScalarF32Signed(p, a) => (p, a, *elem_ty == IrType::F32),
+                _ => return None,
+            };
+            if !ty_ok {
+                return None;
+            }
+            // Operand parse with the loop-body sign peel: a chain of
+            // loop-local single-use float Negs folds into the position's
+            // flag. `loop_escape_closed` (a prerequisite of every map
+            // pattern) guarantees a loop-local definition cannot be read
+            // outside the loop, so the loop-local count IS the total.
+            // An invariant operand (including a Neg hoisted OUT of the
+            // loop, or one with other readers) parses as a broadcast of
+            // the negated value — no folding, the value is what it is.
+            let mut parse_fma_arg = |operand: &Operand,
+                                     product_pos: bool,
+                                     np: &mut bool,
+                                     na: &mut bool,
+                                     depth: usize|
+             -> Option<MapExpr> {
+                let mut current = operand.clone();
+                let mut guard = 0usize;
+                loop {
+                    if depth + guard > 6 {
+                        return None;
+                    }
+                    guard += 1;
+                    let Operand::Value(v) = &current else { break };
+                    if is_invariant(&Operand::Value(*v)) {
+                        break;
+                    }
+                    let Some((_, neg_inst)) = find_inst_in_loop(func, loop_blocks, *v) else {
+                        break;
+                    };
+                    let Instruction::UnaryOp {
+                        op: IrUnaryOp::Neg,
+                        src,
+                        ty,
+                        ..
+                    } = neg_inst
+                    else {
+                        break;
+                    };
+                    if *ty != *elem_ty || count_loop_value_uses(func, loop_blocks, v.0) != 1 {
+                        break;
+                    }
+                    current = src.clone();
+                    if product_pos {
+                        *np = !*np;
+                    } else {
+                        *na = !*na;
+                    }
+                }
+                parse_map_operand(
+                    func,
+                    loop_blocks,
+                    load_dests,
+                    iv_derived,
+                    is_invariant,
+                    elem_ty,
+                    &current,
+                    depth + 1,
+                    allow_ext_fp_ops,
+                )
+            };
+            let l = parse_fma_arg(&args[0], true, &mut np, &mut na, depth)?;
+            let r = parse_fma_arg(&args[1], true, &mut np, &mut na, depth)?;
+            let a = parse_fma_arg(&args[2], false, &mut np, &mut na, depth)?;
+            Some(MapExpr::Fma {
+                l: Box::new(l),
+                r: Box::new(r),
+                a: Box::new(a),
+                negate_product: np,
+                negate_addend: na,
+            })
         }
         Instruction::UnaryOp { op, src, ty, .. }
             if !ty.is_float() && *ty == *elem_ty && allow_ext_fp_ops =>
@@ -7072,7 +7272,7 @@ fn is_scalar_zero_one_tree(expr: &MapExpr) -> bool {
             Operand::Const(c) => matches!(c.to_i64(), Some(0) | Some(1)),
             _ => false,
         },
-        MapExpr::Sqrt(_) | MapExpr::MinMax { .. } | MapExpr::Load(_) => false,
+        MapExpr::Sqrt(_) | MapExpr::MinMax { .. } | MapExpr::Load(_) | MapExpr::Fma { .. } => false,
     }
 }
 
@@ -7817,7 +8017,15 @@ fn transform_byte_count_reduction_inner(
             true => Some(IntrinsicOp::VecMaxU8x32),
         }
     };
-    if !map_tree_ops_available(&count_tree, &bin_op, None, &cmp_op, &minmax_op, blendv_op) {
+    if !map_tree_ops_available(
+        &count_tree,
+        &bin_op,
+        None,
+        &cmp_op,
+        &minmax_op,
+        blendv_op,
+        None,
+    ) {
         if debug {
             eprintln!("[VEC-CNT] tree has no lowering; declining");
         }
@@ -8046,6 +8254,7 @@ fn transform_byte_count_reduction_inner(
             broadcast_op: IntrinsicOp::VecBroadcastI32x8,
             sqrt_op: None,
             madd_op: None,
+            builtin_fma_op: None,
             bin_op: &bin_op,
             cmp_op: &cmp_op,
             minmax_op: &minmax_op,
@@ -8485,6 +8694,9 @@ fn emit_scalar_count_tree(
         v
     };
     match expr {
+        // Boolean count trees never contain a fused FMA; failing closed
+        // keeps a grammar extension from silently mis-mirroring.
+        MapExpr::Fma { .. } => return None,
         MapExpr::Load(stream) => {
             let gep = {
                 let v = Value(*next_val_id);
@@ -10019,39 +10231,168 @@ fn map_tree_ops_available(
     cmp_op: &dyn Fn(&IrCmpOp) -> Option<(IntrinsicOp, i32)>,
     minmax_op: &dyn Fn(bool) -> Option<IntrinsicOp>,
     blendv_op: Option<IntrinsicOp>,
+    builtin_fma_op: Option<IntrinsicOp>,
 ) -> bool {
     match expr {
         MapExpr::Load(_) | MapExpr::Invariant(_) => true,
+        MapExpr::Fma { l, r, a, .. } => {
+            // Builtin-semantics FMA: gated on the packed families' raw
+            // availability (NOT -ffp-contract — see MapEmitCtx's field).
+            builtin_fma_op.is_some()
+                && map_tree_ops_available(
+                    l,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
+                && map_tree_ops_available(
+                    r,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
+                && map_tree_ops_available(
+                    a,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
+        }
         MapExpr::BinOp(op, l, r) => {
             bin_op(op).is_some()
-                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    l,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
+                && map_tree_ops_available(
+                    r,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
         }
         MapExpr::Sqrt(x) => {
             sqrt_op.is_some()
-                && map_tree_ops_available(x, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    x,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
         }
         MapExpr::Cmp(op, l, r) => {
             cmp_op(op).is_some()
-                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    l,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
+                && map_tree_ops_available(
+                    r,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
         }
         MapExpr::Select(c, t, f) => {
             blendv_op.is_some()
-                && map_tree_ops_available(c, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(t, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(f, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    c,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
+                && map_tree_ops_available(
+                    t,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
+                && map_tree_ops_available(
+                    f,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
         }
         MapExpr::MinMax { is_max, l, r } => {
             minmax_op(*is_max).is_some()
-                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    l,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
+                && map_tree_ops_available(
+                    r,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
         }
         MapExpr::MaskConj { is_and, l, r } => {
             // The mask AND/OR rides the packed integer And/Or op table.
             bin_op(if *is_and { &IrBinOp::And } else { &IrBinOp::Or }).is_some()
-                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
-                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(
+                    l,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
+                && map_tree_ops_available(
+                    r,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
         }
     }
 }
@@ -10643,6 +10984,19 @@ fn compose_conj_window(
 /// Everything else is returned structurally unchanged.
 fn fold_unsigned_range_masks(expr: &MapExpr, bits: u32) -> MapExpr {
     match expr {
+        MapExpr::Fma {
+            l,
+            r,
+            a,
+            negate_product,
+            negate_addend,
+        } => MapExpr::Fma {
+            l: Box::new(fold_unsigned_range_masks(l, bits)),
+            r: Box::new(fold_unsigned_range_masks(r, bits)),
+            a: Box::new(fold_unsigned_range_masks(a, bits)),
+            negate_product: *negate_product,
+            negate_addend: *negate_addend,
+        },
         MapExpr::MaskConj { is_and, l, r } => {
             // The window fusion MUST be attempted on the UNFOLDED children:
             // folding a child first rewrites `Cmp(Ule, k, X)` into the biased
@@ -11587,6 +11941,19 @@ fn parse_byte_map_operand(
 /// emitters may not have.
 fn strength_reduce_mask_select(expr: &MapExpr) -> MapExpr {
     let rebuilt = match expr {
+        MapExpr::Fma {
+            l,
+            r,
+            a,
+            negate_product,
+            negate_addend,
+        } => MapExpr::Fma {
+            l: Box::new(strength_reduce_mask_select(l)),
+            r: Box::new(strength_reduce_mask_select(r)),
+            a: Box::new(strength_reduce_mask_select(a)),
+            negate_product: *negate_product,
+            negate_addend: *negate_addend,
+        },
         MapExpr::BinOp(op, l, r) => MapExpr::BinOp(
             *op,
             Box::new(strength_reduce_mask_select(l)),
@@ -11662,6 +12029,11 @@ fn expr_uses_stream(expr: &MapExpr, stream: usize) -> bool {
         MapExpr::Invariant(_) => false,
         MapExpr::BinOp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
         MapExpr::Sqrt(x) => expr_uses_stream(x, stream),
+        MapExpr::Fma { l, r, a, .. } => {
+            expr_uses_stream(l, stream)
+                || expr_uses_stream(r, stream)
+                || expr_uses_stream(a, stream)
+        }
         MapExpr::Cmp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
         MapExpr::MaskConj { l, r, .. } => {
             expr_uses_stream(l, stream) || expr_uses_stream(r, stream)
@@ -21420,6 +21792,19 @@ fn transform_map_vector(
     } else {
         None
     };
+    // Packed-FMA availability for the BUILTIN-semantics Fma node: the same
+    // ISA condition as madd_op MINUS the contraction gate —
+    // `__builtin_fma` loops vectorize under every -ffp-contract mode
+    // because the source already pinned the fused semantics (C99).
+    let builtin_fma_op = if avx2 && x86_fma_enabled() {
+        match pattern.elem_ty {
+            IrType::F64 => Some(IntrinsicOp::VecMaddF64x4),
+            IrType::F32 => Some(IntrinsicOp::VecMaddF32x8),
+            _ => None,
+        }
+    } else {
+        None
+    };
     // Packed compare lowers to vcmpps/vcmppd (cmpps/cmppd on the SSE path);
     // the predicate immediate is the encoder's EQ_OQ/LT_OS/LE_OS/NEQ_UQ
     // subset — the parser normalized GT/GE by operand swap.
@@ -21541,6 +21926,7 @@ fn transform_map_vector(
         &cmp_op,
         &minmax_op,
         blendv_op,
+        builtin_fma_op,
     ) {
         if debug {
             eprintln!("[VEC-MAP]   Tree requires an op with no vector lowering");
@@ -21927,7 +22313,15 @@ fn transform_map_vector(
     let packed_expr = match map_lane_bits(&pattern.elem_ty) {
         Some(_) => {
             let reduced = strength_reduce_mask_select(&expr);
-            if map_tree_ops_available(&reduced, &bin_op, sqrt_op, &cmp_op, &minmax_op, blendv_op) {
+            if map_tree_ops_available(
+                &reduced,
+                &bin_op,
+                sqrt_op,
+                &cmp_op,
+                &minmax_op,
+                blendv_op,
+                builtin_fma_op,
+            ) {
                 reduced
             } else {
                 expr.clone()
@@ -21946,6 +22340,7 @@ fn transform_map_vector(
             broadcast_op,
             sqrt_op,
             madd_op,
+            builtin_fma_op,
             bin_op: &bin_op,
             cmp_op: &cmp_op,
             minmax_op: &minmax_op,
@@ -22750,6 +23145,62 @@ fn emit_map_scalar_tree(
             Some(Operand::Value(load))
         }
         MapExpr::Invariant(operand) => Some(operand.clone()),
+        MapExpr::Fma {
+            l,
+            r,
+            a,
+            negate_product,
+            negate_addend,
+        } => {
+            // Lane-exact mirror of the builtin-semantics FMA node: the
+            // remainder re-emits the SCALAR intrinsic with the same sign
+            // flags, so the tail elements compute exactly what the
+            // original scalar loop computed (single rounding, same
+            // family).
+            let lhs = emit_map_scalar_tree(
+                l,
+                src_bases,
+                pattern,
+                byte_offset.clone(),
+                remainder_insts,
+                next_val_id,
+            )?;
+            let rhs = emit_map_scalar_tree(
+                r,
+                src_bases,
+                pattern,
+                byte_offset.clone(),
+                remainder_insts,
+                next_val_id,
+            )?;
+            let acc = emit_map_scalar_tree(
+                a,
+                src_bases,
+                pattern,
+                byte_offset,
+                remainder_insts,
+                next_val_id,
+            )?;
+            let dest = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            let fma_op = match (pattern.elem_ty, *negate_product, *negate_addend) {
+                (IrType::F64, false, false) => IntrinsicOp::FmaScalarF64,
+                (IrType::F64, np, na) => IntrinsicOp::FmaScalarF64Signed(np, na),
+                (IrType::F32, false, false) => IntrinsicOp::FmaScalarF32,
+                (IrType::F32, np, na) => IntrinsicOp::FmaScalarF32Signed(np, na),
+                _ => return None,
+            };
+            remainder_insts.push(Instruction::Intrinsic {
+                dest: Some(dest),
+                op: fma_op,
+                dest_ptr: None,
+                args: vec![lhs, rhs, acc],
+            });
+            Some(Operand::Value(dest))
+        }
         MapExpr::Sqrt(x) => {
             let inner = emit_map_scalar_tree(
                 x,
@@ -25322,6 +25773,8 @@ mod map_expr_interpreter_tests {
             MapExpr::Load(i) => sx(lanes[*i]),
             MapExpr::Invariant(Operand::Const(c)) => sx(c.to_i64().unwrap()),
             MapExpr::Invariant(_) => unreachable!("model covers constants only"),
+            // The Fma node is FP-only; the integer lane model never sees it.
+            MapExpr::Fma { .. } => unreachable!("integer lane model met an FP Fma node"),
             MapExpr::BinOp(op, l, r) => {
                 let (a, b) = (eval_packed(l, lanes, bits), eval_packed(r, lanes, bits));
                 sx(match op {
@@ -25393,6 +25846,8 @@ mod map_expr_interpreter_tests {
             MapExpr::Load(i) => sx(lanes[*i]),
             MapExpr::Invariant(Operand::Const(c)) => sx(c.to_i64().unwrap()),
             MapExpr::Invariant(_) => unreachable!("model covers constants only"),
+            // The Fma node is FP-only; the integer lane model never sees it.
+            MapExpr::Fma { .. } => unreachable!("integer lane model met an FP Fma node"),
             MapExpr::BinOp(op, l, r) => {
                 let (a, b) = (eval_mirror(l, lanes, bits), eval_mirror(r, lanes, bits));
                 sx(match op {
@@ -25469,6 +25924,7 @@ mod map_expr_interpreter_tests {
         fn walk(e: &MapExpr) -> bool {
             match e {
                 MapExpr::Load(_) | MapExpr::Invariant(_) => true,
+                MapExpr::Fma { .. } => unreachable!("mask walker met an FP Fma node"),
                 MapExpr::BinOp(_, l, r) | MapExpr::MinMax { l, r, .. } => {
                     !is_mask(l) && !is_mask(r) && walk(l) && walk(r)
                 }

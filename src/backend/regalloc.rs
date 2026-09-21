@@ -7196,6 +7196,8 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                             | IntrinsicOp::FabsF32
                             | IntrinsicOp::FmaScalarF64
                             | IntrinsicOp::FmaScalarF32
+                            | IntrinsicOp::FmaScalarF64Signed(..)
+                            | IntrinsicOp::FmaScalarF32Signed(..)
                             | IntrinsicOp::RoundScalarF64(_)
                             | IntrinsicOp::RoundScalarF32(_)
                             | IntrinsicOp::CopysignF64
@@ -7883,6 +7885,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecXorF32x8
                     | O::VecSqrtF32x8
                     | O::VecMaddF32x8
+                    | O::VecMaddF32x8Signed(..)
                     | O::VecCmpF32x8
                     | O::VecBlendvF32x8
                     | O::VecMinF32x8
@@ -7897,6 +7900,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecXorF64x4
                     | O::VecSqrtF64x4
                     | O::VecMaddF64x4
+                    | O::VecMaddF64x4Signed(..)
                     | O::VecCmpF64x4
                     | O::VecBlendvF64x4
                     | O::VecMinF64x4
@@ -8111,6 +8115,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecXorF32x8
             | O::VecSqrtF32x8
             | O::VecMaddF32x8
+                    | O::VecMaddF32x8Signed(..)
             | O::VecCmpF32x8
             | O::VecBlendvF32x8
             | O::VecMinF32x8
@@ -8127,6 +8132,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecXorF64x4
             | O::VecSqrtF64x4
             | O::VecMaddF64x4
+                    | O::VecMaddF64x4Signed(..)
             | O::VecCmpF64x4
             | O::VecBlendvF64x4
             | O::VecMinF64x4
@@ -8293,6 +8299,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecDivF32x8
                     | O::VecSqrtF32x8
                     | O::VecMaddF32x8
+                    | O::VecMaddF32x8Signed(..)
                     | O::VecCmpF32x8
                     | O::VecBlendvF32x8
                     | O::VecMinF32x8
@@ -8312,6 +8319,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecDivF64x4
                     | O::VecSqrtF64x4
                     | O::VecMaddF64x4
+                    | O::VecMaddF64x4Signed(..)
                     | O::VecCmpF64x4
                     | O::VecBlendvF64x4
                     | O::VecMinF64x4
@@ -8609,6 +8617,8 @@ fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
                         | O::FabsF32
                         | O::FmaScalarF64
                         | O::FmaScalarF32
+                        | O::FmaScalarF64Signed(..)
+                        | O::FmaScalarF32Signed(..)
                         | O::RoundScalarF64(_)
                         | O::RoundScalarF32(_)
                         | O::CopysignF64
