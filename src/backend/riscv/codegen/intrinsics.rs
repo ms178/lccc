@@ -308,6 +308,48 @@ impl RiscvCodegen {
                     self.store_t0_to(d);
                 }
             }
+            IntrinsicOp::FmaScalarF64Signed(np, na) | IntrinsicOp::FmaScalarF32Signed(np, na) => {
+                // fma(-a, b, -c) & friends after the IR negation peel.
+                // Staging identical to the plain family; the RV family
+                // table carries the famous naming quirk — the `n` prefix
+                // negates the product, and on the NEGATED-product
+                // spellings the madd/sub suffix describes the addend
+                // sign INVERTED (fnmadd = -(rs1*rs2) - rs3,
+                // fnmsub = -(rs1*rs2) + rs3, per the unprivileged ISA
+                // spec's F-extension table).
+                // NOTE: unreachable from C today (the fma libcall fold is
+                // x86/ARM-gated); the arm exists so the target-neutral IR
+                // variant is lowerable on every backend, mirroring how
+                // this file already lowers the plain FmaScalar variants.
+                let is_f64 = matches!(op, IntrinsicOp::FmaScalarF64Signed(..));
+                let (mv, sx) = if is_f64 {
+                    ("fmv.d.x", "fmv.x.d")
+                } else {
+                    ("fmv.s.x", "fmv.x.s")
+                };
+                self.operand_to_t0(&args[0]);
+                self.state.emit_fmt(format_args!("    {} ft0, t0", mv));
+                self.operand_to_t0(&args[1]);
+                self.state.emit_fmt(format_args!("    {} ft1, t0", mv));
+                self.operand_to_t0(&args[2]);
+                self.state.emit_fmt(format_args!("    {} ft2, t0", mv));
+                let fma = match (np, na, is_f64) {
+                    (false, false, true) => "fmadd.d",
+                    (false, false, false) => "fmadd.s",
+                    (false, true, true) => "fmsub.d",
+                    (false, true, false) => "fmsub.s",
+                    (true, false, true) => "fnmsub.d",
+                    (true, false, false) => "fnmsub.s",
+                    (true, true, true) => "fnmadd.d",
+                    (true, true, false) => "fnmadd.s",
+                };
+                self.state
+                    .emit_fmt(format_args!("    {} ft0, ft0, ft1, ft2", fma));
+                self.state.emit_fmt(format_args!("    {} t0, ft0", sx));
+                if let Some(d) = dest {
+                    self.store_t0_to(d);
+                }
+            }
             IntrinsicOp::CopysignF64 => {
                 // native fsgnj.d: |rs1| with rs2's sign bit.
                 self.operand_to_t0(&args[0]);

@@ -404,8 +404,23 @@ impl I686Codegen {
             // i686). VFMADD231 semantics: dst = src1(vvvv) * src2(r/m) + dst
             // => stage c (acc) into %xmm0, a into %xmm1, b into %xmm2:
             // xmm0 = a * b + c, the C99 fma(a,b,c) with single rounding.
-            IntrinsicOp::FmaScalarF32 | IntrinsicOp::FmaScalarF64 => {
-                let is_f64 = matches!(op, IntrinsicOp::FmaScalarF64);
+            IntrinsicOp::FmaScalarF32
+            | IntrinsicOp::FmaScalarF64
+            | IntrinsicOp::FmaScalarF32Signed(..)
+            | IntrinsicOp::FmaScalarF64Signed(..) => {
+                let is_f64 = matches!(
+                    op,
+                    IntrinsicOp::FmaScalarF64 | IntrinsicOp::FmaScalarF64Signed(..)
+                );
+                // Sign flags after the IR negation peel (fma(-a, b, -c)
+                // and friends): the family table maps (np, na) onto
+                // vfmsub / vfnmadd / vfnmsub — identical 231-form operand
+                // movement, only the mnemonic changes.
+                let (np, na) = match op {
+                    IntrinsicOp::FmaScalarF32Signed(np, na)
+                    | IntrinsicOp::FmaScalarF64Signed(np, na) => (*np, *na),
+                    _ => (false, false),
+                };
                 if is_f64 {
                     self.emit_f64_scalar_bits_to_xmm(&args[2], "xmm0");
                     self.emit_f64_scalar_bits_to_xmm(&args[0], "xmm1");
@@ -415,11 +430,17 @@ impl I686Codegen {
                     self.emit_f32_scalar_bits_to_xmm(&args[0], "xmm1");
                     self.emit_f32_scalar_bits_to_xmm(&args[1], "xmm2");
                 }
-                if is_f64 {
-                    self.state.emit("    vfmadd231sd %xmm2, %xmm1, %xmm0");
-                } else {
-                    self.state.emit("    vfmadd231ss %xmm2, %xmm1, %xmm0");
-                }
+                let fma = match (np, na, is_f64) {
+                    (false, false, true) => "vfmadd231sd",
+                    (false, false, false) => "vfmadd231ss",
+                    (false, true, true) => "vfmsub231sd",
+                    (false, true, false) => "vfmsub231ss",
+                    (true, false, true) => "vfnmadd231sd",
+                    (true, false, false) => "vfnmadd231ss",
+                    (true, true, true) => "vfnmsub231sd",
+                    (true, true, false) => "vfnmsub231ss",
+                };
+                emit!(self.state, "    {} %xmm2, %xmm1, %xmm0", fma);
                 self.state.reg_cache.invalidate_acc();
                 if let Some(d) = dest {
                     if let Some(slot) = self.state.get_slot(d.0) {

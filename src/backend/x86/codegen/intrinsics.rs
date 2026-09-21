@@ -1992,6 +1992,33 @@ impl X86Codegen {
             IntrinsicOp::FmaScalarF32 => {
                 self.emit_scalar_fma231(&args[0], &args[1], &args[2], &dest.unwrap(), IrType::F32);
             }
+            IntrinsicOp::FmaScalarF64Signed(np, na) => {
+                // fma(-a, b, -c) & friends after the IR negation peel: the
+                // sign flips ride the family selection (vfmsub / vfnmadd /
+                // vfnmsub), the operand movement is the plain family's.
+                // (np, na) == (false, false) is defensive — the peel emits
+                // the plain intrinsic when both flags cancel.
+                self.emit_scalar_fma_signed(
+                    &args[0],
+                    &args[1],
+                    &args[2],
+                    &dest.unwrap(),
+                    IrType::F64,
+                    *np,
+                    *na,
+                );
+            }
+            IntrinsicOp::FmaScalarF32Signed(np, na) => {
+                self.emit_scalar_fma_signed(
+                    &args[0],
+                    &args[1],
+                    &args[2],
+                    &dest.unwrap(),
+                    IrType::F32,
+                    *np,
+                    *na,
+                );
+            }
             IntrinsicOp::RoundScalarF64(imm) => {
                 self.emit_fp_scalar_round(dest, &args[0], IrType::F64, *imm);
             }
@@ -6152,6 +6179,35 @@ impl X86Codegen {
             IntrinsicOp::VecMaddF64x4 => {
                 if let Some(d) = dest {
                     self.emit_avx_map_fma(d, args, "vfmadd132pd");
+                }
+            }
+            IntrinsicOp::VecMaddF64x4Signed(np, na) => {
+                if let Some(d) = dest {
+                    // Builtin-semantics packed FMA with the sign algebra
+                    // (MapExpr::Fma from __builtin_fma loops): same
+                    // [input, scale, bias] operand movement as the plain
+                    // affine madd, family selected by (np, na). The
+                    // 132-family mnemonic is what emit_avx_map_fma's
+                    // memory-fold re-encoding rewrites (213/231), so the
+                    // signed families fold loads exactly like the plain one.
+                    let mn = match (np, na) {
+                        (false, false) => "vfmadd132pd",
+                        (false, true) => "vfmsub132pd",
+                        (true, false) => "vfnmadd132pd",
+                        (true, true) => "vfnmsub132pd",
+                    };
+                    self.emit_avx_map_fma(d, args, mn);
+                }
+            }
+            IntrinsicOp::VecMaddF32x8Signed(np, na) => {
+                if let Some(d) = dest {
+                    let mn = match (np, na) {
+                        (false, false) => "vfmadd132ps",
+                        (false, true) => "vfmsub132ps",
+                        (true, false) => "vfnmadd132ps",
+                        (true, true) => "vfnmsub132ps",
+                    };
+                    self.emit_avx_map_fma(d, args, mn);
                 }
             }
             IntrinsicOp::VecFmaF64x2

@@ -29,6 +29,7 @@ mod dead_statics;
 pub(crate) mod div_by_const;
 pub(crate) mod dse;
 pub(crate) mod expr_sink;
+pub(crate) mod fma_neg_peel;
 pub(crate) mod fortify_fold;
 pub(crate) mod fp_const_hoist;
 pub(crate) mod global_addr_cse;
@@ -954,6 +955,9 @@ pub(crate) fn run_passes(
     // thread pool.  `tests/regression/check_env_test_hygiene.sh` fails the build
     // if a pass grows an env read again or a test mutates the environment
     // without `test_support::EnvGuard`.
+    // FMA operand-negation peel kill switch (both tier tails below consult
+    // the resolved local; the pass itself never reads the environment).
+    let fma_neg_peel_enabled = std::env::var_os("CCC_NO_FMA_NEG_PEEL").is_none();
     vec_interleave::set_vec_interleave_env(vec_interleave::InterleaveEnv {
         enabled: std::env::var_os("CCC_NO_VEC_INTERLEAVE").is_none(),
         trace: std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some()
@@ -1149,6 +1153,13 @@ pub(crate) fn run_passes(
                 module.for_each_function(cfg_simplify::simplify_cfg);
                 module.for_each_function(dce::eliminate_dead_code);
             }
+        }
+        // FMA operand-negation peel (same call as the -O2+ tail; see Phase
+        // 11f there). GCC folds fma(-a,b,-c) to one vfnmsub at -O1, so the
+        // tier that already folds the fma libcall to the intrinsic gets the
+        // sign algebra too.
+        if !pass_disabled(&disabled, "fmanegpeel") && fma_neg_peel_enabled {
+            fma_neg_peel::run(module);
         }
         resolve_asm::resolve_inline_asm_symbols(module);
         if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
@@ -2626,6 +2637,22 @@ pub(crate) fn run_passes(
     if !pass_disabled(&disabled, "constarr") {
         const_array_promote::run(module);
         module.for_each_function(dce::eliminate_dead_code);
+    }
+
+    // Phase 11f: FMA operand-negation peel. LAST IR transform: after every
+    // vectorizer (their SLP matchers must not see the Signed variants) and
+    // in phi-SSA form (the rewrite's soundness argument is dominance, and
+    // eliminate_phis still runs after us in the driver). Absorbs the
+    // single-use Neg instructions feeding a plain FmaScalarF{32,64} into
+    // the signed families — `__builtin_fma(-a, b, -c)` becomes ONE
+    // vfnmsub instead of vxorpd + vxorpd + vfmadd (GCC parity at -O1 and
+    // above; GCC keeps the negations materialised at -O0 and so do we).
+    // Gated on the same has_fma3 signal as the fma libcall fold, so
+    // targets without the families never see the variant. Kill switches:
+    // CCC_NO_FMA_NEG_PEEL=1 / CCC_DISABLE_PASSES=fmanegpeel (both resolved
+    // once above, with the other pass switches).
+    if !pass_disabled(&disabled, "fmanegpeel") && fma_neg_peel_enabled {
+        fma_neg_peel::run(module);
     }
 
     if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {

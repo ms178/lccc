@@ -740,11 +740,13 @@ impl Instruction {
                 IntrinsicOp::SqrtF32
                 | IntrinsicOp::FabsF32
                 | IntrinsicOp::FmaScalarF32
+                | IntrinsicOp::FmaScalarF32Signed(..)
                 | IntrinsicOp::RoundScalarF32(_)
                 | IntrinsicOp::CopysignF32 => Some(IrType::F32),
                 IntrinsicOp::SqrtF64
                 | IntrinsicOp::FabsF64
                 | IntrinsicOp::FmaScalarF64
+                | IntrinsicOp::FmaScalarF64Signed(..)
                 | IntrinsicOp::RoundScalarF64(_)
                 | IntrinsicOp::CopysignF64 => Some(IrType::F64),
                 // The bit-op F128 builtins produce a full _Float128. Their

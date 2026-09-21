@@ -2777,7 +2777,11 @@ pub(crate) fn set_has_fma3(enabled: bool) {
     HAS_FMA3.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn has_fma3() -> bool {
+/// Also read by the FMA operand-negation peel (`fma_neg_peel.rs`): the same
+/// target set that materialises `FmaScalarF{32,64}` (all via this gate)
+/// carries the four signed family spellings, so the peel rides the signal
+/// instead of growing a parallel static.
+pub(crate) fn has_fma3() -> bool {
     HAS_FMA3.load(std::sync::atomic::Ordering::Relaxed)
 }
 

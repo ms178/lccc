@@ -445,6 +445,31 @@ impl ArmCodegen {
                     self.store_float_reg(d, IrType::F32, "s0");
                 }
             }
+            IntrinsicOp::FmaScalarF64Signed(np, na) => {
+                // fma(-a, b, -c) & friends after the IR negation peel: the
+                // shared signed hook owns the AArch64 family table (note the
+                // ISA quirk: `sub` negates the PRODUCT, `n` the ADDEND).
+                self.emit_fused_fma_signed_impl(
+                    &args[0],
+                    &args[1],
+                    &args[2],
+                    &dest.unwrap(),
+                    IrType::F64,
+                    *np,
+                    *na,
+                );
+            }
+            IntrinsicOp::FmaScalarF32Signed(np, na) => {
+                self.emit_fused_fma_signed_impl(
+                    &args[0],
+                    &args[1],
+                    &args[2],
+                    &dest.unwrap(),
+                    IrType::F32,
+                    *np,
+                    *na,
+                );
+            }
             IntrinsicOp::CopysignF64 => {
                 // result = |x| with y's sign bit: pure integer bit ops on
                 // the F64 bit patterns (no branch, no libm call).
@@ -1077,7 +1102,9 @@ impl ArmCodegen {
             | IntrinsicOp::VecHorizontalMaxI32x8
             | IntrinsicOp::VecLoadF32x8
             | IntrinsicOp::VecMaddF32x8
+            | IntrinsicOp::VecMaddF32x8Signed(..)
             | IntrinsicOp::VecMaddF64x4
+            | IntrinsicOp::VecMaddF64x4Signed(..)
             | IntrinsicOp::VecMaxI32x8
             | IntrinsicOp::VecMinI32x8
             | IntrinsicOp::VecMulF32x8
