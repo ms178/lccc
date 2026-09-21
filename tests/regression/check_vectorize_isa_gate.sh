@@ -110,9 +110,42 @@ check_eq "kernel ISA flags at -O3: ARX chacha20_block xmm refs" \
 # ---- 4. FMA3 gate ----------------------------------------------------------
 "$ccc" -O2 -S "$fmasrc" -o "$tmp/fma-default.s"
 check_gt0 "default fmaf folds to vfmadd" "$(count_vfmadd $tmp/fma-default.s)"
-for flag in -mno-fma -mno-avx; do
+for flag in -mno-fma -mno-avx -march=x86-64-v2; do
     "$ccc" -O2 "$flag" -S "$fmasrc" -o "$tmp/fma.s"
     check_eq "$flag: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
+done
+# ---- 4b. -mno-avx2: the AVX1+FMA target class -------------------------------
+# AVX2 is the 256-bit integer class, a strict SUBSET of the VEX encoding:
+# `-mno-avx2` must remove ymm code but keep the VEX.128 world — including
+# every scalar FMA family (plain AND signed). The pre-fix ISA ceiling killed
+# `avx` on this flag, so `fma(-a,b,-c)` at `-mno-avx2` was two `xorpd` and a
+# libm call where GCC emits one `vfnmsub132sd`; the plain family declined
+# the same way. Both spellings of the target (default baseline minus AVX2,
+# and an explicit v3 profile minus AVX2) are pinned, plus the ymm denial.
+count_fma_family() {
+    grep -cE '\bv(fm|fnm)(add|sub)[0-9]*p?s[sd]?\b|\bv(fm|fnm)(add|sub)' "$1" || true
+}
+for flag in "-mno-avx2" "-march=x86-64-v3 -mno-avx2"; do
+    lbl=$(echo "$flag" | tr -d ' =-')
+    "$ccc" -O2 $flag -S "$fmasrc" -o "$tmp/fma-$lbl.s"
+    check_gt0 "$flag: scalar FMA families stay inline" \
+        "$(count_fma_family $tmp/fma-$lbl.s)"
+    check_gt0 "$flag: the negated families (vfnmsub et al) stay inline" \
+        "$(grep -cE '\bvfnm(add|sub)[0-9]*p?s[dd]?\b' "$tmp/fma-$lbl.s" || true)"
+    check_eq "$flag: no libm fma call" "$(grep -c 'fma@PLT' "$tmp/fma-$lbl.s" || true)" 0
+    check_eq "$flag: no 256-bit code" "$(count_ymm "$tmp/fma-$lbl.s")" 0
+    # The multi-use negation shape: both fma sites fold, the xorpd bracket
+    # dies with them. (lccc emits no .size directives; the function range
+    # ends at the next column-0 label, which is `main:` in this corpus.)
+    check_eq "$flag: shared-negation shape leaves no sign-mask xorpd" \
+        "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
+          | grep -cE '\bxorpd\b' || true)" 0
+    check_gt0 "$flag: shared-negation shape folds (two vfnmsub present)" \
+        "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
+          | grep -cE '\bvfnmsub[0-9]*p?sd\b' || true)"
+    check_eq "$flag: shared-negation shape is exactly two vfnmsub" \
+        "$(sed -n '/^shared_neg:/,/^main:/p' "$tmp/fma-$lbl.s" \
+          | grep -cE '\bvfnmsub[0-9]*p?sd\b' || true)" 2
 done
 # The kernel's no-SSE contract also rejects live scalar FP: x86-64 LCCC has
 # no x87 lowering, and silently accepting this TU would be worse than a clear

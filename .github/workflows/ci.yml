@@ -334,6 +334,23 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_vector_copy_elimination.sh
 
+      # Cross-PR interaction red-team (session 574): the per-feature gates
+      # pin each PR's own contract; this one pins the INTERACTIONS between
+      # the last ten merged PRs — FMA families through copy brackets, calls
+      # and branches; fma under if-conversion; the shared-negation phi
+      # diamond (multi-use peel); constant-table promotion under aliasing;
+      # guarded clz/ctz over promoted arrays; wide SLP FMA packs; the
+      # AVX1+FMA target class (-mno-avx2 keeps VEX.128 and the families);
+      # and the uncontracted SSE2 baseline. Bit-exact against the reference
+      # compiler at matched march (sign of zero and infinities included —
+      # that is what pins the family selection), with only canonical NaN
+      # patterns normalised (C11 6.5p8 latitude; double-NaN propagation
+      # order is operand-placement dependent).
+      - name: Verify cross-PR interaction red-team contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_cross_pr_redteam.sh
+
       # Peephole phi-diamond preinitialisation safety: the hoisted incoming
       # may only be a register, immediate, or plain stack slot — a user-memory
       # source made `c ? *p : *q` dereference a NULL p on the path that never
@@ -450,6 +467,11 @@ jobs:
           bash tests/regression/check_env_test_hygiene.sh
           bash tests/regression/check_peephole_whitespace.sh
           bash tests/regression/check_atomic_backends.sh
+          # FMA-negation peel deletion invariant, re-derived over the enumerated
+          # shape space: a pure model check (no compiler, sub-second) so a
+          # regression of the absorbability classification is caught even where
+          # the IR verifier is not wired after the pass.
+          python3 tools/ir_shape_check.py
 
       # Kbuild tracks command lines but not the contents of CC/LD executables.
       # A rebuilt compiler at the same path must invalidate every target

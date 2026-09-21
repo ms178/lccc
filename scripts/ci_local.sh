@@ -381,6 +381,29 @@ gate "boot-size-measurement" fast \
 gate "vector-copy-elimination" fast \
     bash tests/regression/check_vector_copy_elimination.sh
 
+# Cross-PR interaction red-team: FMA families x copy brackets x
+# if-conversion x constant promotion x NonZero x the AVX1+FMA target
+# class, bit-exact vs the reference compiler at matched march (canonical
+# NaN patterns normalised per the C11 latitude). Found and pins two real
+# defects the per-PR gates could not see (the multi-use negation peel
+# and the -mno-avx2 VEX.128 ceiling).
+gate "cross-pr-redteam" fast \
+    bash tests/regression/check_cross_pr_redteam.sh
+
+# FMA-negation peel: the deletion invariant.  The pass DELETES every Neg it
+# absorbs, by value id and with no residual-use check, so the classification that
+# feeds it must guarantee that every read of an absorbed Neg dies with the rewrite.
+# The landed rule checked the wrong edge (badness flowed source -> reader while its
+# own comment says reader -> source), so a Neg read by an fma argument AND by a
+# materialised Neg was rewritten at the site and deleted underneath its surviving
+# reader; the one-line edge flip that looks like the repair still leaves 90 of the
+# 4545 enumerated shapes orphaned.  This harness re-derives the specified rule over
+# that space (default <= 3 Negs), replays the pass's unit-test shapes, and asserts
+# its own negative controls, so the invariant is checkable with no compiler and the
+# fix can be validated before the Rust is touched.
+gate "fma-peel-invariant" fast \
+    python3 tools/ir_shape_check.py
+
 # Process-global state hygiene.  Four invariants, each grep-checkable, each one
 # a defect this tree actually had: tests mutated the environment behind five
 # deferred-audit markers whose premise (single-threaded access) cargo's test
