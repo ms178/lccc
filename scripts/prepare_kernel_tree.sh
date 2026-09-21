@@ -36,14 +36,17 @@ LCCC_PREPARED_CANARIES=(
 # Usage:
 #   prepare_kernel_tree.sh [kernel-dir]          (default: /home/user/kernel-work/linux-6.18.52)
 # Environment:
+#   PKG_ROOT archpkgbuilds checkout root (default: /home/user/archpkgbuilds).
+#            Point it outside the workspace snapshot (e.g. /opt/archpkgbuilds)
+#            together with KERNEL_DIR to keep the ~55k-file kernel tree off the
+#            size-capped persisted snapshot.
 #   PKGDIR   archpkgbuilds sparse checkout of packages/linux-cachymod-6.18
-#            (default: /home/user/archpkgbuilds/packages/linux-cachymod-6.18)
+#            (default: $PKG_ROOT/packages/linux-cachymod-6.18)
 #   KVER     kernel version (default 6.18.52)
 # ============================================================================
 set -euo pipefail
 
 KDIR=${1:-${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}}
-PKGDIR=${PKGDIR:-/home/user/archpkgbuilds/packages/linux-cachymod-6.18}
 KVER=${KVER:-6.18.52}
 WORK=$(dirname "$KDIR")
 TARBALL="$WORK/linux-$KVER.tar.xz"
@@ -55,12 +58,30 @@ TARBALL="$WORK/linux-$KVER.tar.xz"
 # the script the only prerequisite of every kernel gate.
 PKG_REPO=${PKG_REPO:-https://github.com/ms178/archpkgbuilds.git}
 PKG_ROOT=${PKG_ROOT:-/home/user/archpkgbuilds}
+# PKGDIR is *derived* from PKG_ROOT unless the caller pinned it explicitly.
+# It used to be an absolute default (/home/user/archpkgbuilds/...), so setting
+# PKG_ROOT alone left the two out of step: `rel` below stayed an absolute path
+# and `git sparse-checkout set` rejected it with "specify directories rather
+# than patterns (no leading slash)" — the kernel gate died before downloading
+# anything.  Keeping the kernel tree off the (size-capped) workspace snapshot
+# requires exactly that override, so the default must follow it.
+PKGDIR=${PKGDIR:-$PKG_ROOT/packages/linux-cachymod-6.18}
 ensure_pkgdir() {
   [[ -d $PKGDIR ]] && return 0
   command -v git >/dev/null 2>&1 || return 1
   echo "prepare_kernel_tree: fetching package sources from $PKG_REPO"
   local rel=${PKGDIR#"$PKG_ROOT"/} branch
-  rm -rf "$PKG_ROOT"
+  [[ $rel != /* ]] || { echo "prepare_kernel_tree: PKGDIR must live under PKG_ROOT" >&2; return 1; }
+  # Empty the checkout rather than unlinking the directory itself: the root is
+  # often pre-created (and owned) by whoever owns the parent — e.g. a
+  # /opt-mounted scratch dir outside the persisted snapshot — and `rm -rf
+  # $PKG_ROOT` dies with EACCES on the parent.  `git clone` accepts an empty
+  # existing target directory, so this is equivalent wherever removal is
+  # permitted and strictly more robust where it is not.
+  rm -rf "$PKG_ROOT" 2>/dev/null || true
+  if [[ -d $PKG_ROOT ]]; then
+    find "$PKG_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+  fi
   git clone --quiet --filter=blob:none --no-checkout --depth 1 "$PKG_REPO" "$PKG_ROOT" || return 1
   branch=$(git -C "$PKG_ROOT" symbolic-ref --short HEAD 2>/dev/null || echo main)
   git -C "$PKG_ROOT" sparse-checkout init --cone || return 1
