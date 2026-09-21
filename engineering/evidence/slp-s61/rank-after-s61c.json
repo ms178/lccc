@@ -1,0 +1,1927 @@
+{
+ "flags": "-O2 -march=x86-64-v3",
+ "gaps": {
+  "slp_probe:abs_i16x8": 91,
+  "slp_probe:sha256_schedule": 38,
+  "slp_probe:clamp_u8x16": 28,
+  "slp_probe:copy_bytes": 16,
+  "slp_probe:add4": 14,
+  "slp_probe:scale4": 11,
+  "slp_probe:narrow_i32_to_i16": 11,
+  "slp_probe:deinterleave": 10,
+  "slp_probe:interleave": 10,
+  "slp_probe:widen_i16_to_i32": 10,
+  "slp_probe:u8_to_f32": 9,
+  "slp_probe:two_streams": 9,
+  "slp_probe:call_arg_pack": 8,
+  "slp_probe:cmp_q4": 8,
+  "slp_probe:rev_copy": 6,
+  "slp_probe:zero_i32x4": 5,
+  "slp_probe:popcnt_mix4": 5,
+  "slp_probe:gather4": 5,
+  "slp_probe:dot_f32x4": 3,
+  "slp_probe:sub_i16x8": 3,
+  "slp_probe:struct_copy_q4": 2,
+  "slp_probe:diamond": 2,
+  "slp_probe:rotl_i32x4": 0,
+  "slp_probe:hsum_i32x4": 0
+ },
+ "detail": [
+  {
+   "file": "engineering/evidence/slp-s61/slp_probe.c",
+   "compilers": {
+    "lccc": {
+     "add_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "add_i32x8": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "sub_i64x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "mul_i16x8": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "mul_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "xor_i64x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "andor_i32x4": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "fadd_f64x2": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "fma_f64x2": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "fma_f32x4": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "fadd_f32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "struct_copy_q4": {
+      "insns": 6,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "struct_copy_q3": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "mat4_col_copy": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "zero_i32x4": {
+      "insns": 8,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "splat_i32x4": {
+      "insns": 5,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "zero_i64x4": {
+      "insns": 4,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "zero_i8x16": {
+      "insns": 3,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "shl_i32x4": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "lshr_i64x4": {
+      "insns": 5,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "rotl_i32x4": {
+      "insns": 6,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "fmax_f32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "imax_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "clamp_u8x16": {
+      "insns": 33,
+      "loads": 8,
+      "stores": 2,
+      "spills": 4,
+      "branch": 1,
+      "vector": 14
+     },
+     "sha256_schedule": {
+      "insns": 83,
+      "loads": 21,
+      "stores": 16,
+      "spills": 0,
+      "branch": 3,
+      "vector": 26
+     },
+     "hsum_i32x4": {
+      "insns": 6,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "hsum_f64x4": {
+      "insns": 5,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "dot_f32x4": {
+      "insns": 10,
+      "loads": 8,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "popcnt_mix4": {
+      "insns": 14,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "scale4": {
+      "insns": 16,
+      "loads": 3,
+      "stores": 3,
+      "spills": 6,
+      "branch": 1,
+      "vector": 1
+     },
+     "add4": {
+      "insns": 17,
+      "loads": 4,
+      "stores": 5,
+      "spills": 9,
+      "branch": 1,
+      "vector": 1
+     },
+     "call_arg_pack": {
+      "insns": 13,
+      "loads": 4,
+      "stores": 1,
+      "spills": 1,
+      "branch": 2,
+      "vector": 1
+     },
+     "deinterleave": {
+      "insns": 17,
+      "loads": 8,
+      "stores": 8,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "interleave": {
+      "insns": 17,
+      "loads": 8,
+      "stores": 8,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "rev_copy": {
+      "insns": 9,
+      "loads": 4,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "widen_i16_to_i32": {
+      "insns": 13,
+      "loads": 4,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "narrow_i32_to_i16": {
+      "insns": 17,
+      "loads": 8,
+      "stores": 8,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "u8_to_f32": {
+      "insns": 13,
+      "loads": 4,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "add_i8x16": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "sub_i16x8": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 2,
+      "spills": 1,
+      "branch": 1,
+      "vector": 1
+     },
+     "abs_i16x8": {
+      "insns": 94,
+      "loads": 8,
+      "stores": 8,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "diamond": {
+      "insns": 9,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "two_streams": {
+      "insns": 16,
+      "loads": 10,
+      "stores": 5,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "cmp_q4": {
+      "insns": 15,
+      "loads": 8,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "copy_bytes": {
+      "insns": 20,
+      "loads": 9,
+      "stores": 0,
+      "spills": 0,
+      "branch": 3,
+      "vector": 0
+     },
+     "gather4": {
+      "insns": 13,
+      "loads": 4,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "bc_mul": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     }
+    },
+    "gcc16.2": {
+     "add_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "add_i32x8": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "sub_i64x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "mul_i16x8": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "mul_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "xor_i64x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "andor_i32x4": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "fadd_f64x2": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "fma_f64x2": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "fma_f32x4": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "fadd_f32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "struct_copy_q4": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "struct_copy_q3": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "mat4_col_copy": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "zero_i32x4": {
+      "insns": 3,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "splat_i32x4": {
+      "insns": 4,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "zero_i64x4": {
+      "insns": 4,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "zero_i8x16": {
+      "insns": 3,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "shl_i32x4": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "lshr_i64x4": {
+      "insns": 5,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "rotl_i32x4": {
+      "insns": 6,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 5
+     },
+     "fmax_f32x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "imax_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "clamp_u8x16": {
+      "insns": 10,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 7
+     },
+     "sha256_schedule": {
+      "insns": 66,
+      "loads": 9,
+      "stores": 4,
+      "spills": 0,
+      "branch": 2,
+      "vector": 14
+     },
+     "hsum_i32x4": {
+      "insns": 7,
+      "loads": 1,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "hsum_f64x4": {
+      "insns": 5,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "dot_f32x4": {
+      "insns": 9,
+      "loads": 8,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "popcnt_mix4": {
+      "insns": 12,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "scale4": {
+      "insns": 10,
+      "loads": 2,
+      "stores": 1,
+      "spills": 3,
+      "branch": 1,
+      "vector": 8
+     },
+     "add4": {
+      "insns": 13,
+      "loads": 2,
+      "stores": 1,
+      "spills": 3,
+      "branch": 1,
+      "vector": 12
+     },
+     "call_arg_pack": {
+      "insns": 6,
+      "loads": 3,
+      "stores": 1,
+      "spills": 3,
+      "branch": 1,
+      "vector": 4
+     },
+     "deinterleave": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "interleave": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "rev_copy": {
+      "insns": 3,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "widen_i16_to_i32": {
+      "insns": 7,
+      "loads": 1,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "narrow_i32_to_i16": {
+      "insns": 6,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 5
+     },
+     "u8_to_f32": {
+      "insns": 9,
+      "loads": 2,
+      "stores": 0,
+      "spills": 0,
+      "branch": 2,
+      "vector": 1
+     },
+     "add_i8x16": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "sub_i16x8": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "abs_i16x8": {
+      "insns": 7,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "diamond": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "two_streams": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "cmp_q4": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "copy_bytes": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "gather4": {
+      "insns": 10,
+      "loads": 4,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 9
+     },
+     "bc_mul": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     }
+    },
+    "clang": {
+     "add_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "add_i32x8": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "sub_i64x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "mul_i16x8": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "mul_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "xor_i64x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "andor_i32x4": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "fadd_f64x2": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "fma_f64x2": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "fma_f32x4": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "fadd_f32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "struct_copy_q4": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "struct_copy_q3": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "mat4_col_copy": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "zero_i32x4": {
+      "insns": 3,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "splat_i32x4": {
+      "insns": 4,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "zero_i64x4": {
+      "insns": 4,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "zero_i8x16": {
+      "insns": 3,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "shl_i32x4": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "lshr_i64x4": {
+      "insns": 5,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "rotl_i32x4": {
+      "insns": 9,
+      "loads": 4,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "fmax_f32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "imax_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "clamp_u8x16": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "sha256_schedule": {
+      "insns": 45,
+      "loads": 12,
+      "stores": 2,
+      "spills": 0,
+      "branch": 2,
+      "vector": 8
+     },
+     "hsum_i32x4": {
+      "insns": 6,
+      "loads": 2,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 5
+     },
+     "hsum_f64x4": {
+      "insns": 5,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "dot_f32x4": {
+      "insns": 9,
+      "loads": 8,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "popcnt_mix4": {
+      "insns": 9,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "scale4": {
+      "insns": 5,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "add4": {
+      "insns": 3,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "call_arg_pack": {
+      "insns": 6,
+      "loads": 2,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "deinterleave": {
+      "insns": 11,
+      "loads": 6,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 8
+     },
+     "interleave": {
+      "insns": 8,
+      "loads": 4,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 7
+     },
+     "rev_copy": {
+      "insns": 3,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "widen_i16_to_i32": {
+      "insns": 3,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "narrow_i32_to_i16": {
+      "insns": 6,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 5
+     },
+     "u8_to_f32": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "add_i8x16": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "sub_i16x8": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "abs_i16x8": {
+      "insns": 3,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "diamond": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "two_streams": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "cmp_q4": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "copy_bytes": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "gather4": {
+      "insns": 8,
+      "loads": 4,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 7
+     },
+     "bc_mul": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     }
+    },
+    "icc": {
+     "add_i32x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "add_i32x8": {
+      "insns": 9,
+      "loads": 4,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "sub_i64x4": {
+      "insns": 13,
+      "loads": 8,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "mul_i16x8": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "mul_i32x4": {
+      "insns": 12,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 7
+     },
+     "xor_i64x4": {
+      "insns": 13,
+      "loads": 8,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "andor_i32x4": {
+      "insns": 7,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "fadd_f64x2": {
+      "insns": 7,
+      "loads": 4,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "fma_f64x2": {
+      "insns": 9,
+      "loads": 6,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "fma_f32x4": {
+      "insns": 7,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "fadd_f32x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "struct_copy_q4": {
+      "insns": 9,
+      "loads": 4,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "struct_copy_q3": {
+      "insns": 7,
+      "loads": 3,
+      "stores": 3,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "mat4_col_copy": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "zero_i32x4": {
+      "insns": 6,
+      "loads": 0,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "splat_i32x4": {
+      "insns": 5,
+      "loads": 0,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "zero_i64x4": {
+      "insns": 6,
+      "loads": 0,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "zero_i8x16": {
+      "insns": 3,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "shl_i32x4": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "lshr_i64x4": {
+      "insns": 13,
+      "loads": 4,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "rotl_i32x4": {
+      "insns": 7,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "fmax_f32x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "imax_i32x4": {
+      "insns": 9,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "clamp_u8x16": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "sha256_schedule": {
+      "insns": 325,
+      "loads": 51,
+      "stores": 25,
+      "spills": 46,
+      "branch": 3,
+      "vector": 0
+     },
+     "hsum_i32x4": {
+      "insns": 6,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "hsum_f64x4": {
+      "insns": 5,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "dot_f32x4": {
+      "insns": 12,
+      "loads": 8,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "popcnt_mix4": {
+      "insns": 68,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "scale4": {
+      "insns": 18,
+      "loads": 1,
+      "stores": 4,
+      "spills": 5,
+      "branch": 1,
+      "vector": 1
+     },
+     "add4": {
+      "insns": 22,
+      "loads": 1,
+      "stores": 4,
+      "spills": 5,
+      "branch": 1,
+      "vector": 1
+     },
+     "call_arg_pack": {
+      "insns": 17,
+      "loads": 5,
+      "stores": 4,
+      "spills": 5,
+      "branch": 1,
+      "vector": 1
+     },
+     "deinterleave": {
+      "insns": 8,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "interleave": {
+      "insns": 8,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "rev_copy": {
+      "insns": 9,
+      "loads": 4,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "widen_i16_to_i32": {
+      "insns": 5,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "narrow_i32_to_i16": {
+      "insns": 9,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 5
+     },
+     "u8_to_f32": {
+      "insns": 7,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "add_i8x16": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "sub_i16x8": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 1
+     },
+     "abs_i16x8": {
+      "insns": 35,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 25
+     },
+     "diamond": {
+      "insns": 9,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "two_streams": {
+      "insns": 8,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "cmp_q4": {
+      "insns": 14,
+      "loads": 8,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "copy_bytes": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "gather4": {
+      "insns": 13,
+      "loads": 4,
+      "stores": 4,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "bc_mul": {
+      "insns": 5,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "add_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "add_i32x8": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "sub_i64x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "mul_i16x8": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "mul_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "xor_i64x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "andor_i32x4": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "fadd_f64x2": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "fma_f64x2": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "fma_f32x4": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "fadd_f32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "struct_copy_q4": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "struct_copy_q3": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "mat4_col_copy": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "zero_i32x4": {
+      "insns": 3,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "splat_i32x4": {
+      "insns": 4,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "zero_i64x4": {
+      "insns": 4,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "zero_i8x16": {
+      "insns": 3,
+      "loads": 0,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "shl_i32x4": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "lshr_i64x4": {
+      "insns": 5,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "rotl_i32x4": {
+      "insns": 6,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 5
+     },
+     "fmax_f32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "imax_i32x4": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "clamp_u8x16": {
+      "insns": 5,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "sha256_schedule": {
+      "insns": 752,
+      "loads": 111,
+      "stores": 27,
+      "spills": 2,
+      "branch": 1,
+      "vector": 724
+     },
+     "hsum_i32x4": {
+      "insns": 6,
+      "loads": 2,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 5
+     },
+     "hsum_f64x4": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "dot_f32x4": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 5
+     },
+     "popcnt_mix4": {
+      "insns": 9,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "scale4": {
+      "insns": 5,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "add4": {
+      "insns": 3,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "call_arg_pack": {
+      "insns": 5,
+      "loads": 2,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "deinterleave": {
+      "insns": 17,
+      "loads": 8,
+      "stores": 8,
+      "spills": 0,
+      "branch": 1,
+      "vector": 0
+     },
+     "interleave": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "rev_copy": {
+      "insns": 3,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "widen_i16_to_i32": {
+      "insns": 3,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "narrow_i32_to_i16": {
+      "insns": 6,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 5
+     },
+     "u8_to_f32": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "add_i8x16": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "sub_i16x8": {
+      "insns": 4,
+      "loads": 2,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "abs_i16x8": {
+      "insns": 3,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     },
+     "diamond": {
+      "insns": 7,
+      "loads": 3,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "two_streams": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 2,
+      "spills": 0,
+      "branch": 1,
+      "vector": 6
+     },
+     "cmp_q4": {
+      "insns": 7,
+      "loads": 2,
+      "stores": 0,
+      "spills": 0,
+      "branch": 1,
+      "vector": 4
+     },
+     "copy_bytes": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 3
+     },
+     "gather4": {
+      "insns": 8,
+      "loads": 4,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 7
+     },
+     "bc_mul": {
+      "insns": 4,
+      "loads": 1,
+      "stores": 1,
+      "spills": 0,
+      "branch": 1,
+      "vector": 2
+     }
+    }
+   },
+   "errors": {}
+  }
+ ]
+}

@@ -17,8 +17,19 @@
 # Run this script before every push; it is the contract.
 #
 #   ./scripts/ci_local.sh              # everything (test + bench + clippy)
-#   ./scripts/ci_local.sh --fast       # skip the two slowest oracles
+#   ./scripts/ci_local.sh --fast       # skip ONLY the three slow gates:
+#                                      #   regression-corpus-ssa,
+#                                      #   benchmark-output-oracle,
+#                                      #   peephole-whitespace-invariance
+#                                      # rustfmt and clippy ALWAYS run — they
+#                                      # are the CI lint jobs, and skipping
+#                                      # them locally is how a red PR ships.
 #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
+#
+#   CI_LOCAL_JOBS=N   parallelism for the clippy gate (default 2).  Set 1 on
+#                     low-memory hosts: `cargo clippy --all-targets` peaks
+#                     near 1.6 GB resident for this crate, and OOM-killing
+#                     rustc mid-gate reads as a lint failure.
 #
 # Environment:
 #   LCCC_TEST_REPEATS=N   run the unit-test suite N times (default 1). N > 1
@@ -462,9 +473,14 @@ gate "codegen-quality-gate" fast \
     python3 .github/scripts/ci-codegen-gate.py --lccc "$LCCC"
 
 # ------------------------------------------------------------- job:clippy --
+# BOTH gates are `fast`, i.e. they run under `--fast` too.  The GitHub
+# `clippy` job runs exactly this command with `-D warnings`, so a lint is a
+# hard CI failure, not a slow-oracle nicety: skipping it in the pre-push
+# configuration is how a red PR gets pushed.  A clippy run is ~90 s against
+# the two multi-minute oracles `--fast` exists to skip.
 gate "rustfmt" fast cargo fmt --all -- --check
-gate "clippy" slow \
-    cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
+gate "clippy" fast \
+    cargo clippy --all-targets --profile fastbuild --locked -j "${CI_LOCAL_JOBS:-2}" -- -D warnings
 
 # ------------------------------------------------------------------ done ---
 hr
