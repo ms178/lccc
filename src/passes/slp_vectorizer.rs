@@ -780,27 +780,51 @@ fn minus_zero_const(ty: IrType) -> Option<IrConst> {
     }
 }
 
+/// The direction of a same-source min/max fold derived from a relational
+/// predicate: which side of the ternary the comparison selects. Shared by
+/// the three fold sites (the at-width select path, the sub-word demotion
+/// path, and the recursive arm-pack path) so the concept has one home.
+#[derive(Clone, Copy, PartialEq)]
+enum Fold {
+    Min,
+    Max,
+}
+
 /// Integer lane min/max packed intrinsics. Exact and commutative (no FP
 /// unordered/±0 asymmetry) — every spelling of the same-source ternary
 /// folds. Dword requires SSE4.1 (pminsd/pmaxsd); gate on AVX2 — the SLP
 /// pass's only feature accessor — which implies it (x86-64-v2-only builds
 /// simply keep the cmp+blendv two-op form, which is itself exact).
-/// Halfword (pminsw/pmaxsw) and byte (pminub/pmaxub) are SSE2.
-/// SIGNED lane types ONLY — see the note on the 16/32-bit arms below.
+/// Halfword (pminsw/pmaxsw) and byte (pminub/pmaxub) are SSE2; unsigned
+/// halfword (vpminuw/vpmaxuw) is SSE4.1, hence AVX2-gated here.
 ///
-/// Every intrinsic returned here for a 16- or 32-bit lane lowers to a
-/// SIGNED instruction (`vpmaxsd`/`vpminsd`, `vpmaxsw`/`vpminsw`, and the
-/// 128-bit `pmaxsw`/`pminsw`).  Mapping an unsigned lane onto one is a
-/// miscompile, not a pessimization: for any lane with the top bit set the
-/// signed compare reads it as negative and selects the wrong operand
-/// (`max(0x80000000u32, 5u32)` would return 5).  There is no unsigned word
-/// or dword packed min/max in the intrinsic vocabulary — SSE4.1's
-/// `pmaxud`/`pminud` are encodable but have no `IntrinsicOp` — so the
-/// unsigned cases fail closed and the caller falls through to the
-/// cmp+blendv composite, which handles unsigned predicates correctly by
-/// emulating them with a sign-bit flip.  Only `U8` has a genuine unsigned
-/// form (`pminub`/`pmaxub`, SSE2) and is listed explicitly.
-fn packed_int_minmax(is_max: bool, ty: IrType, width: usize) -> Option<IntrinsicOp> {
+/// `unsigned` is the signedness of the PREDICATE the min/max fold was
+/// derived from, and it MUST agree with the lane type's signedness. The
+/// two are not redundant: `min`/`max` are defined by the order the
+/// comparison uses, and `pminsw` and `pminuw` implement different orders,
+/// so a signed predicate over an unsigned lane (reachable through a
+/// same-width integer reinterpret in the at-width path) has no correct
+/// single-instruction form and is rejected. Mapping either onto the other
+/// is a miscompile, not a pessimization: for any lane with the top bit set
+/// the signed instruction reads it as negative and selects the wrong
+/// operand (`max(0x80000000u32, 5u32)` would return 5).
+///
+/// Where no unsigned form exists — dword (`pminud`/`pmaxud` are encodable
+/// SSE4.1 but have no `IntrinsicOp`) and the 128-bit unsigned halfword —
+/// the lookup fails closed and the caller falls through to the cmp+blendv
+/// composite, which handles unsigned predicates correctly by emulating
+/// them with a sign-bit flip. Signed bytes likewise have no pre-AVX512
+/// packed min/max.
+fn packed_int_minmax(
+    is_max: bool,
+    ty: IrType,
+    width: usize,
+    unsigned: bool,
+) -> Option<IntrinsicOp> {
+    // Signedness of the order must match the instruction's order.
+    if unsigned != !ty.is_signed() {
+        return None;
+    }
     let width = reg_width_for(ty, width);
     let avx2 = x86_avx2_available_pub();
     match (ty, width) {
@@ -824,8 +848,7 @@ fn packed_int_minmax(is_max: bool, ty: IrType, width: usize) -> Option<Intrinsic
         } else {
             IntrinsicOp::VecMinI16x8
         }),
-        // Unsigned bytes: pminub/pmaxub (SSE2). Signed bytes have no
-        // pre-AVX512 packed min/max.
+        // Unsigned bytes: pminub/pmaxub (SSE2).
         (IrType::U8, 16) => Some(if is_max {
             IntrinsicOp::VecMaxU8x16
         } else {
@@ -835,6 +858,14 @@ fn packed_int_minmax(is_max: bool, ty: IrType, width: usize) -> Option<Intrinsic
             IntrinsicOp::VecMaxU8x32
         } else {
             IntrinsicOp::VecMinU8x32
+        }),
+        // Unsigned halfword: vpminuw/vpmaxuw (SSE4.1). One instruction
+        // replaces the two-instruction cmp+blendv composite for the very
+        // common u16 saturation pattern (audio, colour channels, UTF-16).
+        (IrType::U16, 16) if avx2 => Some(if is_max {
+            IntrinsicOp::VecMaxU16x16
+        } else {
+            IntrinsicOp::VecMinU16x16
         }),
         _ => None,
     }
@@ -1183,11 +1214,28 @@ fn demote_cmp_pred(op: IrCmpOp, from_unsigned: bool, to_unsigned: bool) -> Optio
 /// operands additionally require the value to lie in the narrow range of
 /// the final predicate's signedness (checked by the caller — an
 /// out-of-range compare operand changes the predicate's truth value).
-fn narrow_const(cv: i64, ty: IrType) -> IrConst {
-    match ty {
+///
+/// TOTAL over the integer lane widths the demotion can name, and
+/// fail-closed (`None`) for everything else. The returned constant's
+/// variant MUST match `ty`'s width: the demoted select is typed at `ty`,
+/// so an `IrConst` of a different width is not a narrower value but a
+/// MIS-TYPED one — the backend materializes the constant at its own
+/// variant width and the lane silently reads the wrong bit pattern
+/// (`IrConst::I16(100000i16)` is `-31072`, not `100000`). Returning
+/// `None` instead of guessing makes a future lane width that forgets to
+/// register here a rejected seed rather than a miscompile.
+///
+/// `I64` is deliberately absent: the demotion only ever narrows
+/// (`from_ty.size() > ty.size()`), so a 64-bit lane is never the target
+/// of a promoted select and reaching it means the caller's gate is
+/// broken — fail closed and let that surface.
+fn narrow_const(cv: i64, ty: IrType) -> Option<IrConst> {
+    Some(match ty {
         IrType::I8 | IrType::U8 => IrConst::I8(cv as i8),
-        _ => IrConst::I16(cv as i16),
-    }
+        IrType::I16 | IrType::U16 => IrConst::I16(cv as i16),
+        IrType::I32 | IrType::U32 => IrConst::I32(cv as i32),
+        _ => return None,
+    })
 }
 
 /// Does `cv` lie in the narrow lane's range for a predicate of
@@ -1202,17 +1250,22 @@ fn fits_narrow(cv: i64, ty: IrType, unsigned: bool) -> bool {
     }
 }
 
-/// Two operands name the same SOURCE when (after bit-identity cast
-/// stripping — same-width integer reinterprets preserve every bit, so
-/// they name the same loadable value) they are the same value, or two
-/// loads of the same symbolic address with NO memory write between them
-/// — the pre-CSE frontend emits one load per spelling side, and the
-/// interval check is the whole same-value proof (any write between the
-/// two loads could change the observed bytes; rule (c) covers the
-/// pack's own lane range only).
+/// Two operands name the same SOURCE when (after copy and bit-identity
+/// cast stripping — a `Copy` is a pure value move of the same type/bits
+/// and same-width integer reinterprets preserve every bit, so both name
+/// the same loadable value) they are the same value, or two loads of the
+/// same symbolic address with NO memory write between them — the pre-CSE
+/// frontend emits one load per spelling side, and the interval check is
+/// the whole same-value proof (any write between the two loads could
+/// change the observed bytes; rule (c) covers the pack's own lane range
+/// only). Copy stripping matters for the demoted-select min/max fold:
+/// C promotion materializes the re-read arm of `a[i] > k ? k : a[i]` as
+/// a `Copy` of the load, and without seeing through it the false arm and
+/// the compare's lhs never prove same-source, silently demoting the fold
+/// to the two-instruction cmp+blendv.
 fn same_source(ctx: &BlockCtx, a: &Operand, b: &Operand) -> bool {
-    let a = strip_bitidentity_casts(ctx, a);
-    let b = strip_bitidentity_casts(ctx, b);
+    let a = strip_bitidentity_casts(ctx, &strip_copies(ctx, a));
+    let b = strip_bitidentity_casts(ctx, &strip_copies(ctx, b));
     if a == b {
         return true;
     }
@@ -2278,7 +2331,7 @@ fn build_demoted_select_arm(
                             Some((
                                 !ty.is_signed(),
                                 !cty.is_signed(),
-                                Operand::Const(narrow_const(cv, ty)),
+                                Operand::Const(narrow_const(cv, ty)?),
                             ))
                         } else {
                             None
@@ -2342,7 +2395,9 @@ fn build_demoted_select_arm(
                         _ => None,
                     }
                 }
-                Operand::Const(c) => c.to_i64().map(|cv| Operand::Const(narrow_const(cv, ty))),
+                Operand::Const(c) => c
+                    .to_i64()
+                    .and_then(|cv| Some(Operand::Const(narrow_const(cv, ty)?))),
             }
         };
         let t = strip_arm(true_val)?;
@@ -2381,17 +2436,17 @@ fn build_demoted_select_arm(
     };
 
     // (a) the min/max spelling — the same fold table as the at-width path.
+    // Both signed and unsigned relational predicates admit the fold: the
+    // predicate's unsignedness is threaded into `packed_int_minmax`, which
+    // picks the intrinsic whose order matches (or fails closed).
     let spell = match op0 {
-        IrCmpOp::Slt | IrCmpOp::Sle => Some(false),
-        IrCmpOp::Sgt | IrCmpOp::Sge => Some(true),
+        IrCmpOp::Slt | IrCmpOp::Sle => Some((false, false)), // (is_gt, unsigned)
+        IrCmpOp::Sgt | IrCmpOp::Sge => Some((true, false)),
+        IrCmpOp::Ult | IrCmpOp::Ule => Some((false, true)),
+        IrCmpOp::Ugt | IrCmpOp::Uge => Some((true, true)),
         _ => None,
     };
-    if let Some(is_gt) = spell {
-        #[derive(Clone, Copy, PartialEq)]
-        enum Fold {
-            Min,
-            Max,
-        }
+    if let Some((is_gt, cmp_unsigned)) = spell {
         let mut fold: Option<(Fold, bool)> = None;
         let mut shapes_ok = true;
         for (_, l, r, t, f) in &shapes {
@@ -2421,7 +2476,8 @@ fn build_demoted_select_arm(
         }
         if shapes_ok {
             if let Some((kind, arms_swapped)) = fold {
-                if let Some(vec_op) = packed_int_minmax(kind == Fold::Max, ty, width) {
+                if let Some(vec_op) = packed_int_minmax(kind == Fold::Max, ty, width, cmp_unsigned)
+                {
                     let mut src1: Vec<Operand> = Vec::with_capacity(width);
                     let mut src2: Vec<Operand> = Vec::with_capacity(width);
                     for (_, l, r, _, _) in &shapes {
@@ -3181,7 +3237,7 @@ fn build_pack(
                                             Some((
                                                 !ty.is_signed(),
                                                 !cty.is_signed(),
-                                                Operand::Const(narrow_const(cv, ty)),
+                                                Operand::Const(narrow_const(cv, ty)?),
                                             ))
                                         } else {
                                             None
@@ -3273,9 +3329,9 @@ fn build_pack(
                                         _ => None,
                                     }
                                 }
-                                Operand::Const(c) => {
-                                    c.to_i64().map(|cv| Operand::Const(narrow_const(cv, ty)))
-                                }
+                                Operand::Const(c) => c
+                                    .to_i64()
+                                    .and_then(|cv| Some(Operand::Const(narrow_const(cv, ty)?))),
                             }
                         };
                         let Some(t) = strip_arm(true_val) else {
@@ -3296,16 +3352,13 @@ fn build_pack(
                             //     operands — same fold table as the at-width
                             //     2c path.
                             let spell = match op0 {
-                                IrCmpOp::Slt | IrCmpOp::Sle => Some(0),
-                                IrCmpOp::Sgt | IrCmpOp::Sge => Some(1),
+                                IrCmpOp::Slt | IrCmpOp::Sle => Some((0, false)),
+                                IrCmpOp::Sgt | IrCmpOp::Sge => Some((1, false)),
+                                IrCmpOp::Ult | IrCmpOp::Ule => Some((0, true)),
+                                IrCmpOp::Ugt | IrCmpOp::Uge => Some((1, true)),
                                 _ => None,
                             };
-                            if let Some(s) = spell {
-                                #[derive(Clone, Copy, PartialEq)]
-                                enum Fold {
-                                    Min,
-                                    Max,
-                                }
+                            if let Some((s, cmp_unsigned)) = spell {
                                 let mut fold: Option<(Fold, bool)> = None;
                                 let mut shapes_ok = true;
                                 for (op, l, r, t, f) in &shapes {
@@ -3336,9 +3389,12 @@ fn build_pack(
                                 }
                                 if shapes_ok {
                                     if let Some((kind, arms_swapped)) = fold {
-                                        if let Some(vec_op) =
-                                            packed_int_minmax(kind == Fold::Max, ty, width)
-                                        {
+                                        if let Some(vec_op) = packed_int_minmax(
+                                            kind == Fold::Max,
+                                            ty,
+                                            width,
+                                            cmp_unsigned,
+                                        ) {
                                             let mut src1: Vec<Operand> = Vec::with_capacity(width);
                                             let mut src2: Vec<Operand> = Vec::with_capacity(width);
                                             for (_, l, r, _, _) in &shapes {
@@ -3423,7 +3479,7 @@ fn build_pack(
                                             fam,
                                             packs,
                                             dedup,
-                                            depth + 2,
+                                            depth + 1,
                                         ) {
                                             return Some(i);
                                         }
@@ -3876,12 +3932,7 @@ fn build_pack(
             if vals.iter().all(|v| sel_shape(v).is_some()) {
                 let is_fp = matches!(ty, IrType::F32 | IrType::F64);
                 // ── (a) the min/max fold ──────────────────────────────
-                #[derive(Clone, Copy, PartialEq)]
-                enum Fold {
-                    Min,
-                    Max,
-                }
-                let mut fold: Option<(Fold, bool)> = None; // (kind, arms_swapped)
+                let mut fold: Option<(Fold, bool, bool)> = None; // (kind, arms_swapped, unsigned)
                 let mut shapes_ok = true;
                 for v in &vals {
                     let Some((op, l, r, t, f, _)) = sel_shape(v) else {
@@ -3889,25 +3940,30 @@ fn build_pack(
                     };
                     // FP admits only the STRICT spellings (non-strict
                     // differs on ±0); integer lanes admit every relational
-                    // spelling (exactness argument above).
+                    // spelling, signed and unsigned alike (exactness
+                    // argument above). The predicate's unsignedness rides
+                    // along with the fold so the min/max intrinsic's order
+                    // can be checked against the lane type's signedness.
                     let spell = match op {
-                        IrCmpOp::Slt | IrCmpOp::Sle => Some(0),
-                        IrCmpOp::Sgt | IrCmpOp::Sge => Some(1),
+                        IrCmpOp::Slt | IrCmpOp::Sle => Some((0, false)),
+                        IrCmpOp::Sgt | IrCmpOp::Sge => Some((1, false)),
+                        IrCmpOp::Ult | IrCmpOp::Ule => Some((0, true)),
+                        IrCmpOp::Ugt | IrCmpOp::Uge => Some((1, true)),
                         _ => None,
                     };
                     let this = match (spell, is_fp && matches!(op, IrCmpOp::Sle | IrCmpOp::Sge)) {
-                        (Some(s), false) => {
+                        (Some((s, unsigned)), false) => {
                             if same_source(ctx, &t, &l) && same_source(ctx, &f, &r) {
                                 Some(if s == 0 {
-                                    (Fold::Min, false)
+                                    (Fold::Min, false, unsigned)
                                 } else {
-                                    (Fold::Max, false)
+                                    (Fold::Max, false, unsigned)
                                 })
                             } else if same_source(ctx, &t, &r) && same_source(ctx, &f, &l) {
                                 Some(if s == 0 {
-                                    (Fold::Max, true)
+                                    (Fold::Max, true, unsigned)
                                 } else {
-                                    (Fold::Min, true)
+                                    (Fold::Min, true, unsigned)
                                 })
                             } else {
                                 None
@@ -3925,11 +3981,11 @@ fn build_pack(
                     }
                 }
                 if shapes_ok && fold.is_some() {
-                    let (kind, arms_swapped) = fold.unwrap();
+                    let (kind, arms_swapped, cmp_unsigned) = fold.unwrap();
                     let vec_op = if is_fp {
                         packed_minmax(kind == Fold::Max, ty, width)
                     } else {
-                        packed_int_minmax(kind == Fold::Max, ty, width)
+                        packed_int_minmax(kind == Fold::Max, ty, width, cmp_unsigned)
                     };
                     if let Some(vec_op) = vec_op {
                         // src1/src2 lanes per the fold's operand order:
@@ -6145,4 +6201,84 @@ fn rewrite_term_uses_in_place(term: &mut Terminator, map: &FxHashMap<u32, Value>
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `narrow_const` must materialize the constant in an `IrConst`
+    /// variant whose width IS the lane width. The demoted select is typed
+    /// at the lane, so a narrower variant is not a narrowed value but a
+    /// MIS-TYPED constant: `IrConst::I16(100000i16)` is `-31072`, and the
+    /// backend materializes a constant at its own variant width. A
+    /// `_ => IrConst::I16(..)` catch-all satisfies every sub-word caller
+    /// by accident and silently corrupts any wider-lane caller, so pin
+    /// the variant, not just the value.
+    #[test]
+    fn narrow_const_variant_width_matches_lane() {
+        // (lane type, promoted constant, value after reduction to the lane
+        // width and sign-extension back -- exactly what the store's
+        // truncation observes).
+        let cases: [(IrType, i64, i64); 9] = [
+            (IrType::I8, 100, 100),
+            (IrType::I8, -100, -100),
+            (IrType::U8, 200, -56),
+            (IrType::I16, 100000, -31072),
+            (IrType::U16, 40000, -25536),
+            // The 32-bit lanes are the regression: these previously came
+            // back as I16 and lost the high bits.
+            (IrType::I32, 100000, 100000),
+            (IrType::I32, 2_000_000_000, 2_000_000_000),
+            (IrType::U32, 4_000_000_000, -294_967_296),
+            (IrType::I16, -1, -1),
+        ];
+        for (ty, cv, want) in cases {
+            let got = narrow_const(cv, ty)
+                .unwrap_or_else(|| panic!("narrow_const({cv}, {ty:?}) must be Some"));
+            let width = match got {
+                IrConst::I8(_) => 1,
+                IrConst::I16(_) => 2,
+                IrConst::I32(_) => 4,
+                other => panic!("unexpected variant {other:?} for lane {ty:?}"),
+            };
+            assert_eq!(
+                width,
+                ty.size(),
+                "variant width must equal lane width for {ty:?} (const {cv})"
+            );
+            assert_eq!(
+                got.to_i64(),
+                Some(want),
+                "reduced value for lane {ty:?} const {cv}"
+            );
+        }
+    }
+
+    /// Lanes that are never a demotion target must fail closed. The
+    /// demotion requires `from_ty.size() > ty.size()`, so a 64-bit lane
+    /// cannot be the target of a promoted select; reaching one means the
+    /// caller's gate is broken and guessing a constant there would be a
+    /// miscompile rather than a pessimization. Non-integer lanes have no
+    /// integer constant form at all.
+    #[test]
+    fn narrow_const_fails_closed_on_non_narrowable_lanes() {
+        for ty in [
+            IrType::I64,
+            IrType::U64,
+            IrType::I128,
+            IrType::U128,
+            IrType::F32,
+            IrType::F64,
+            IrType::F128,
+            IrType::Ptr,
+            IrType::Void,
+        ] {
+            assert_eq!(
+                narrow_const(1, ty),
+                None,
+                "narrow_const must fail closed for {ty:?}"
+            );
+        }
+    }
 }

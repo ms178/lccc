@@ -283,6 +283,18 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_bb_slp_v8_codegen.sh
 
+      # Nested-diamond if-conversion + sub-word SELECT demotion: the
+      # dominating-load coverage walk, single-entry single-exit arm
+      # regions, recursive promoted-select demotion and Copy transparency.
+      # Enforces the branch-free + vectorized contracts of the whole
+      # conditional-clamp family and the must-branch negative controls
+      # (uncovered load, free-barrier deref, side-effect/volatile arms,
+      # half-covered store), plus the tri-config runtime differential.
+      - name: Verify nested if-conversion + sub-word SELECT demotion contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_bb_slp_nested_ifconv.sh
+
       # Two-block partial unroller + half-wide dword-pair SLP family:
       # guard-free xk unroll of two-block counted loops (phi threading
       # incl. the IV-reference carried-phi miscompile class), I32/U32
