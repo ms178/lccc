@@ -1111,6 +1111,27 @@ impl Driver {
                 "-mpclmul" => self.enable_pclmul = true,
                 "-mf16c" => self.enable_f16c = true,
                 "-mfma" => {
+                    // FMA3 exists only in the VEX encoding — there is no
+                    // legacy-SSE FMA — so -mfma implies -mavx and its full
+                    // prerequisite chain, exactly like GCC's one-directional
+                    // implication (oracle, gcc 14.2 -Q --help=target:
+                    // `-march=x86-64 -mfma` reports avx, sse4.1, sse4.2 all
+                    // ENABLED with avx2 still disabled; `-mavx` alone leaves
+                    // fma disabled). Later-flag-wins keeps both directions:
+                    // a later -mno-avx/-mno-sse4.1/-mno-sse still kills the
+                    // chain (their arms set the denial flags the ceiling
+                    // consults), and -mfma after -mno-sse re-enables the
+                    // vector file (gcc: -mno-sse -mfma -> sse enabled;
+                    // -mfma -mno-sse -> everything off).
+                    self.no_sse = false;
+                    self.sse_explicitly_disabled = false;
+                    self.sse41_explicitly_disabled = false;
+                    self.avx_explicitly_disabled = false;
+                    self.enable_avx = true;
+                    self.enable_sse4_2 = true;
+                    self.enable_sse4_1 = true;
+                    self.enable_ssse3 = true;
+                    self.enable_sse3 = true;
                     self.enable_fma = true;
                     self.fma_explicitly_disabled = false;
                 }
@@ -2197,6 +2218,139 @@ mod cli_tests {
         assert!(d.parse_cli_args(&args).is_ok());
         assert!(!d.no_sse);
         assert!(!d.sse_explicitly_disabled);
+    }
+
+    /// `-mfma` implies the VEX encoding world (GCC oracle, gcc 14.2
+    /// `-Q --help=target`): `-march=x86-64 -mfma` reports avx, sse4.1,
+    /// sse4.2 ENABLED with avx2 still disabled; `-mavx` alone leaves fma
+    /// disabled (one-directional). FMA3 has no legacy-SSE encoding, so
+    /// this is a hardware truth, not a policy choice. Asserted on the
+    /// final ISA the pipeline consults (`x86_isa`), not the raw flags.
+    #[test]
+    fn mfma_implies_vex_chain_gcc_exact() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-march=x86-64-v2", "-mfma", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        let isa = d.x86_isa();
+        assert!(isa.fma, "-mfma at v2 must enable the FMA families");
+        assert!(
+            isa.avx,
+            "-mfma must imply the VEX.128 encoding (no legacy FMA)"
+        );
+        assert!(isa.sse41, "-mfma must pull the -mavx prerequisite chain");
+        assert!(
+            !isa.ymm,
+            "-mfma must NOT enable the 256-bit class (gcc: avx2 disabled)"
+        );
+    }
+
+    /// `-mfma` at the plain SSE2 baseline pulls the whole chain too (GCC
+    /// emits FMA there; the march ceiling is not a hard ceiling for
+    /// explicit -m feature flags).
+    #[test]
+    fn mfma_at_sse2_baseline_pulls_chain() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-march=x86-64", "-mfma", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        let isa = d.x86_isa();
+        assert!(isa.fma && isa.avx && !isa.ymm);
+    }
+
+    /// Reverse order: `-mfma -march=x86-64-v2` — the march level ORs in
+    /// (GCC: the earlier -mfma implications survive; verified with
+    /// `gcc -mfma -march=x86-64-v2 -Q --help=target`: fma/avx enabled).
+    #[test]
+    fn mfma_before_march_survives_gcc_exact() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mfma", "-march=x86-64-v2", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        let isa = d.x86_isa();
+        assert!(isa.fma && isa.avx && !isa.ymm);
+    }
+
+    /// Later denial wins: `-mno-avx` after `-mfma` kills the chain (GCC:
+    /// no FMA emitted under `-march=x86-64-v2 -mfma -mno-avx`).
+    #[test]
+    fn mno_avx_after_mfma_kills_the_chain() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-march=x86-64-v2", "-mfma", "-mno-avx", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        let isa = d.x86_isa();
+        assert!(
+            !isa.fma,
+            "-mno-avx after -mfma must deny the VEX world (and FMA with it)"
+        );
+        assert!(!isa.avx);
+    }
+
+    /// Later denial wins: `-mno-sse4.1` after `-mfma` kills the chain via
+    /// the sse41 prerequisite (GCC: no FMA under
+    /// `-march=x86-64 -mfma -mno-sse4.1`).
+    #[test]
+    fn mno_sse41_after_mfma_kills_the_chain() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-march=x86-64", "-mfma", "-mno-sse4.1", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        let isa = d.x86_isa();
+        assert!(!isa.fma, "-mno-sse4.1 after -mfma must veto the chain");
+    }
+
+    /// `-mno-sse` then `-mfma`: the explicit feature flag re-enables the
+    /// vector file (GCC: -mno-sse -mfma -> sse ENABLED), while the reverse
+    /// order keeps everything off. Both directions pinned.
+    #[test]
+    fn mfma_mno_sse_ordering_matrix() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mno-sse", "-mfma", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        let isa = d.x86_isa();
+        assert!(
+            isa.fma && isa.avx,
+            "-mfma after -mno-sse re-enables (gcc: sse enabled)"
+        );
+
+        let mut d2 = Driver::new();
+        let args2: Vec<String> = ["ccc", "-mfma", "-mno-sse", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d2.parse_cli_args(&args2).is_ok());
+        assert!(
+            !d2.x86_isa().simd,
+            "-mno-sse after -mfma kills the vector file"
+        );
+    }
+
+    /// Regression pin: plain `-march=x86-64-v2` (no -mfma) keeps declining
+    /// the families — the implication only fires on the explicit flag.
+    #[test]
+    fn march_v2_alone_still_declines_fma() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-march=x86-64-v2", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        let isa = d.x86_isa();
+        assert!(!isa.fma && !isa.avx && !isa.ymm);
     }
 
     #[test]

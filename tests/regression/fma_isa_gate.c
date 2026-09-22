@@ -31,16 +31,23 @@ double signed_na(double a, double b, double c) { return __builtin_fma(a, b, -c);
 double signed_np_na(double a, double b, double c) { return __builtin_fma(-a, b, -c); }
 
 /*
- * The chain shapes (the absorbability-fixpoint correction): a Neg may only
- * die when every reader of it dies with it. `chain_live` is the shape the
- * source-poisoned rule miscompiled -- the fma reads the INNER negation
- * while the OUTER survives for the add, so BOTH must stay materialised
- * (two sign masks, the plain family; no latitude is taken). Its asm pin:
- * exactly two sign masks and no negated family. `chain_pin` is the fold
- * that rule missed -- the INNER negation is pinned, the site reads the
- * OUTER, which peels into the family reading the materialised inner:
- * ONE sign mask and one vfnmadd, GCC's exact shape. Both live BEFORE
- * shared_neg so the per-function sed ranges below stay disjoint.
+ * The chain shapes (the absorbability-fixpoint correction, now composed
+ * with the neg-of-neg fold): a Neg may only die when every reader of it
+ * dies with it -- and neg(neg(x)) is x (a bitwise identity), so a double
+ * link folds away before the peel ever runs. `chain_live` is the shape the
+ * source-poisoned rule miscompiled: the fma reads the INNER negation while
+ * the OUTER survives for the add. The fold rewrites the outer link to x,
+ * the inner's only remaining reader is the fma site, and the peel absorbs
+ * it: ZERO sign masks, one vfnmadd reading x -- GCC's exact family. (The
+ * peel-level rule -- a chain that DOES reach it with a surviving outer
+ * reader keeps both links -- stays pinned by the unit test
+ * chained_negation_with_surviving_outer_reader_is_never_deleted.)
+ * `chain_pin`: the INNER negation is pinned by the add, the site reads the
+ * OUTER -- which the fold rewrites to x directly, so the fma takes the
+ * PLAIN family: ONE sign mask (the pinned inner) and one vfmadd. GCC drops
+ * the mask too (r + (-x) -> r - x); that float add-of-neg fold is a
+ * designed follow-up. Both live BEFORE shared_neg so the per-function sed
+ * ranges below stay disjoint.
  */
 double chain_live(double x, double b, double c)
 {
