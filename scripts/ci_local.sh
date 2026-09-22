@@ -200,6 +200,10 @@ gate "strict-computed-recip-codegen" fast \
 
 gate "machinst-window-alloc" fast \
     bash tests/regression/check_machinst_window_alloc_wide_copy.sh
+# Undefined weak addresses must link under the system gcc driver's default
+# PIE mode (weak->GOTPCREL in every code model; PR #581 regression gate).
+gate "weak-undef-pie-link" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_weak_undef_pie_link.sh
 
 gate "overalign-typed-census" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_overalign_typed_census.sh

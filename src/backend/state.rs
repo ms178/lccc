@@ -285,6 +285,9 @@ pub struct CodegenState {
     pub direct_fp_result: Option<u32>,
     /// CCC_ENABLE_VECREG: value id -> physical XMM register name that currently
     /// provably holds the vector data (128-bit vector register allocation).
+    /// Only tracks within a block; reg_assignments is the source of truth at
+    /// block boundaries. ENFORCED: the map is cleared at every label in
+    /// generate_function (generation.rs) — cross-block claims cannot survive.
     pub vec_live_regs: FxHashMap<u32, &'static str>,
     /// True once this function emitted any 256/512-bit vector instruction.
     /// Dirty upper YMM halves trigger the AVX-SSE transition penalty in
@@ -1138,6 +1141,20 @@ impl CodegenState {
         }
         if self.local_symbols.contains(name) {
             return false;
+        }
+        // Weak symbols need GOT indirection in EVERY code model (mirrors
+        // needs_got_aarch64): a weak undefined symbol resolves to zero at
+        // runtime and a weak defined one may be overridden at static-link
+        // time. A direct rip-relative LEA emits R_X86_64_PC32, which the
+        // system linker rejects for undefined weaks in PIE links
+        // ("relocation R_X86_64_PC32 against undefined symbol ... can not
+        // be used when making a PIE object" — lib/common/zstd_trace.h's
+        // ZSTD_trace_compress_begin address compare inside lccc-built
+        // libzstd.a). @GOTPCREL assembles in non-PIE, PIE and shared links
+        // alike, and the linker fills the GOT entry with the final address
+        // (overriding definition or zero) — always semantically correct.
+        if self.weak_extern_symbols.contains(name) {
+            return true;
         }
         if self.pie_mode {
             // RA-01 kill switch restores the old fully-GOT default so workload

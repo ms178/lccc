@@ -188,6 +188,12 @@ impl X86Codegen {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
                 if is_xmm_reg(reg) {
                     let name = phys_reg_name(reg);
+                    if self.dbg_vec_merge {
+                        eprintln!(
+                            "[vec-merge] fn={} v{} homed {} loaded into {}",
+                            self.state.current_func_name, v.0, name, xmm
+                        );
+                    }
                     // A pending deferred store to this value flowed through
                     // the register; anything else must be flushed before we
                     // potentially clobber xmm0/xmm1 scratch.
@@ -209,6 +215,16 @@ impl X86Codegen {
             }
             // CCC_ENABLE_VECREG: value provably in its allocated XMM register.
             if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
+                if self.dbg_vec_merge {
+                    eprintln!(
+                        "[vec-merge] fn={} v{} vec-live {} (want {}) -> {}",
+                        self.state.current_func_name,
+                        v.0,
+                        held,
+                        xmm,
+                        if held == xmm { "ELIDE" } else { "copy" }
+                    );
+                }
                 if held != xmm {
                     self.state
                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
@@ -227,6 +243,16 @@ impl X86Codegen {
             // provably untouched whenever this fires.
             if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0) {
                 let held = self.state.sse_last_store_reg_name.unwrap_or("xmm0");
+                if self.dbg_vec_merge {
+                    eprintln!(
+                        "[vec-merge] fn={} v{} last-store {} (want {}) -> {}",
+                        self.state.current_func_name,
+                        v.0,
+                        held,
+                        xmm,
+                        if held == xmm { "ELIDE" } else { "copy" }
+                    );
+                }
                 if held != xmm {
                     self.state
                         .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
