@@ -169,17 +169,21 @@ for flag in "-mno-avx2" "-march=x86-64-v3 -mno-avx2"; do
           | grep -cE '\bvfnm(add|sub)[0-9]*p?sd\b' || true)" 1
     # chain_pin: the site reads the OUTER negation, the INNER is pinned by
     # the add. The neg-of-neg fold rewrites the outer link (-t where
-    # t = -x) to x directly, so the fma takes the PLAIN family reading x:
-    # ONE sign mask (the pinned inner, still materialised for the add) and
-    # one vfmadd (GCC's family; GCC goes one further with r + (-x) -> r - x,
-    # dropping the mask entirely -- the float add-of-neg fold is a
-    # designed follow-up, NaN-sign-latitude analysis required).
-    check_eq "$flag: pinned-inner chain keeps exactly one sign mask" \
+    # t = -x) to x directly, so the fma takes the PLAIN family reading x;
+    # the float add-of-neg fold then rewrites the add (r + t) to r - x,
+    # which kills the pinned inner's last reader: ZERO sign masks, one
+    # vfmadd and one vsub -- GCC's exact instruction pair (oracle: gcc
+    # emits vfmadd132sd + vsubsd; the remaining delta is the staging
+    # move, the destructive-form dst-preference follow-up).
+    check_eq "$flag: pinned-inner chain needs no sign mask (both folds)" \
         "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
-          | grep -cE '\bv?xorpd\b' || true)" 1
+          | grep -cE '\bv?xorpd\b' || true)" 0
     check_eq "$flag: pinned-inner chain folds to one plain vfmadd" \
         "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
           | grep -cE '\bvfmadd[0-9]*p?sd\b' || true)" 1
+    check_eq "$flag: pinned-inner chain's add is a subtraction (r - x)" \
+        "$(sed -n '/^chain_pin:/,/^shared_neg:/p' "$tmp/fma-$lbl.s" \
+          | grep -cE '\bvsubsd\b' || true)" 1
 done
 
 # ---- 4c. fma implies vex: the explicit -mfma target classes ---------------
