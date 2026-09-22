@@ -454,9 +454,14 @@ EOF
     NI static double b_named(double a, double b, double c) { double na = -a, nc = -c; return __builtin_fma(na, b, nc); }
     NI static double b_chainneg(double a, double b, double c) { return __builtin_fma(-(-a), b, c); }
     NI static float b_nmsubf(float a, float b, float c) { return __builtin_fmaf(-a, b, -c); }
-    /* negative control: the negation has a SECOND consumer (the return
-     * reads n again), so the single-use discipline must keep it
-     * materialised — exactly one vxorpd in the whole file below. */
+    /* composition control (ADVANCED with the add-of-neg fold): the
+     * negation still has a SECOND consumer (the return reads n again),
+     * but x + (neg y) => x - y folds the tail into a subtraction of a,
+     * the freed negation's last reader is the fma, and the peel absorbs
+     * it — ZERO vxorpd, vfnmadd + vsubsd, gcc's exact instruction pair
+     * (measured: gcc -O2 -march=x86-64-v3 emits vfnmadd132sd + vsubsd
+     * for this shape).  This pin is the fold's multi-use adjudication
+     * record: every oracle in the competition set folds unconditionally. */
     NI static double b_shared_neg(double a, double b, double c) { double n = -a; return __builtin_fma(n, b, c) + n; }
     NI static double b_madd_p(double a, double b, const double *p) { return __builtin_fma(a, b, *p); }
     NI static double b_madd_pm(double a, const double *p, double c) { return __builtin_fma(*p, a, c); }
@@ -667,20 +672,27 @@ EOF_ALGEBRA
         if [[ "$one_insn_ok" -eq 1 ]]; then
             ok "all 35 straight-line FMA kernels are exactly one instruction plus ret (gcc parity, builtin sign variants included)"
         fi
-        # Anti-vacuity for the operand-negation peel: the ONLY materialised
-        # negation in any kernel body is the multi-use control's (its Neg
-        # feeds the fma AND the return, so single-use discipline must keep
-        # it).  main's reference computations also negate (-a, -b_madd) and
-        # are outside the kernel bodies by construction.  A peel regression
-        # grows the count; a wrongly eager peel that broke the control would
-        # shrink it to 0.
-        nxor=$(fnbody "$work/fma_algebra.s" b_shared_neg | grep -cE '^vxorp[ds][[:space:]]' || true)
-        nxor_all=$(grep -cE '^[[:space:]]*vxorp[ds][[:space:]]' "$work/fma_algebra.s" || true)
-        if [[ "$nxor" -eq 1 ]]; then
-            ok "exactly one materialised negation survives in the kernels: the multi-use control (operand-negation peel anti-vacuity)"
+        # Anti-vacuity for the operand-negation peel + the add-of-neg
+        # fold, ADVANCED to the composed truth: b_shared_neg's negation
+        # has a second consumer (the return reads n again), and the fold
+        # x + (neg y) => x - y turns the tail into a subtraction of a —
+        # the freed negation dies into the fma, the peel absorbs it, and
+        # the kernel is gcc's exact pair: one vfnmadd-family instruction
+        # plus one vsubsd, ZERO materialised sign masks (gcc -O2 -march=
+        # x86-64-v3: vfnmadd132sd + vsubsd).  main's reference
+        # computations also negate (-a, -b_madd) and are outside the
+        # kernel bodies by construction.  A fold or peel regression
+        # grows the xor count back; a wrongly eager peel on the OTHER
+        # kernels breaks the 35-kernel one-instruction check above.
+        bsn_body=$(fnbody "$work/fma_algebra.s" b_shared_neg)
+        nxor=$(printf '%s\n' "$bsn_body" | grep -cE '^vxorp[ds][[:space:]]' || true)
+        nfnm=$(printf '%s\n' "$bsn_body" | grep -cE '^vfnmadd[0-9]*sd[[:space:]]' || true)
+        nsub=$(printf '%s\n' "$bsn_body" | grep -cE '^vsubsd[[:space:]]' || true)
+        if [[ "$nxor" -eq 0 && "$nfnm" -eq 1 && "$nsub" -eq 1 ]]; then
+            ok "b_shared_neg composes to gcc's exact pair (vfnmadd + vsubsd, zero sign masks — the add-of-neg fold frees the multi-use negation for the peel)"
         else
-            bad "b_shared_neg should keep exactly 1 vxorpd (multi-use control), found $nxor of $nxor_all file-wide — the operand-negation peel regressed or over-fired"
-            fnbody "$work/fma_algebra.s" b_shared_neg | note
+            bad "b_shared_neg should be vfnmadd+vsubsd with 0 vxorpd (the fold/peel composition), found xor=$nxor vfnmadd=$nfnm vsubsd=$nsub"
+            printf '%s\n' "$bsn_body" | note
         fi
     fi
 
@@ -976,14 +988,24 @@ EOF_NEGATE
             ok "negation kernel bit-exact vs $ORACLE on $(grep -c . "$work/neg.oracle") lines at 7 flag sets (-O0..-O3, v2/v3, contract)"
         fi
         # Anti-vacuity: the v3 build must use the xor form and never the GPR
-        # round trip for a scalar negate.
+        # round trip for a scalar negate.  ADVANCED to the post-fold truth:
+        # exactly 17 rip-mask xors — every remaining site is semantically
+        # REQUIRED (a returned negation, a negation read by a non-foldable
+        # consumer, or n_many's leading term).  The folds that got us here,
+        # each GCC-verified: n_twice (neg-of-neg) folds to NOTHING; n_many
+        # (-a + -b + ... + -i, 9 negations) folds to ONE vxorpd + 8 vsubsd
+        # — gcc's exact shape for the same source; n_mul_sub and nf_fma ride
+        # the signed-FMA families (vfnmsub, zero xors); n_a_mul's product
+        # negation is the known residual (gcc folds it; follow-up list).
+        # Any future fold that retires another negation advances this pin in
+        # the same commit — the house style for exact-shape pins.
         "$LCCC" -O2 -march=x86-64-v3 -S -o "$work/negate.s" "$work/negate.c" 2>/dev/null
         n_xor=$(grep -cE '^[[:space:]]*vxorp[sd] \.LCFP_[0-9]+\(%rip\)' "$work/negate.s" || true)
         n_gpr=$(grep -cE 'movabsq \$-9223372036854775808|xorl \$0x80000000, %eax' "$work/negate.s" || true)
-        if [[ "$n_xor" -ge 20 && "$n_gpr" -eq 0 ]]; then
-            ok "every scalar negate is an XMM-domain xor ($n_xor sites, 0 GPR sign-mask round trips)"
+        if [[ "$n_xor" -eq 17 && "$n_gpr" -eq 0 ]]; then
+            ok "every scalar negate is an XMM-domain xor ($n_xor required sites, 0 GPR sign-mask round trips; n_twice folds to nothing, n_many to gcc's 1-vxor+8-vsub shape)"
         else
-            bad "negate lowering: $n_xor xor sites, $n_gpr GPR round trips (expected >= 20 and 0)"
+            bad "negate lowering: $n_xor xor sites, $n_gpr GPR round trips (expected exactly 17 and 0 — a fold retired a negation without advancing the pin, or the lowering regressed)"
         fi
     else
         skipped "reference compiler could not build negate.c"

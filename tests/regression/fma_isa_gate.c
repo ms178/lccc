@@ -43,11 +43,11 @@ double signed_np_na(double a, double b, double c) { return __builtin_fma(-a, b, 
  * reader keeps both links -- stays pinned by the unit test
  * chained_negation_with_surviving_outer_reader_is_never_deleted.)
  * `chain_pin`: the INNER negation is pinned by the add, the site reads the
- * OUTER -- which the fold rewrites to x directly, so the fma takes the
- * PLAIN family: ONE sign mask (the pinned inner) and one vfmadd. GCC drops
- * the mask too (r + (-x) -> r - x); that float add-of-neg fold is a
- * designed follow-up. Both live BEFORE shared_neg so the per-function sed
- * ranges below stay disjoint.
+ * OUTER -- which the neg-of-neg fold rewrites to x directly (PLAIN
+ * family), and the float add-of-neg fold then rewrites the add itself
+ * (r + t, t = -x) to r - x, killing the inner's last reader: ZERO sign
+ * masks, vfmadd + vsub -- GCC's exact pair. Both live BEFORE shared_neg
+ * so the per-function sed ranges below stay disjoint.
  */
 double chain_live(double x, double b, double c)
 {

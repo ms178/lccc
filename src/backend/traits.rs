@@ -951,6 +951,12 @@ pub trait ArchCodegen {
         // the PREVIOUS call's count — a stale low count would drop a real
         // argument read from the liveness oracle's model.
         self.state().call_gp_arg_count = 6;
+        // Same hygiene for the FP count marker: armed by the register-argument
+        // phase below, discharged by the call emission. `None` publishes no
+        // marker and the FP liveness oracle falls back to its census/window
+        // heuristics — a stale count would be worse (it would drop real SSE
+        // argument reads from the model and re-open the staging deletion).
+        self.state().call_fp_arg_count = None;
 
         use super::call_abi::*;
         let config = self.call_abi_config();

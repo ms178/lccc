@@ -625,7 +625,55 @@ fn is_plain_store(mn: &str) -> bool {
 ///
 /// Function-pointer calls through the retpoline thunks and PLT calls all
 /// pass through the same census emitter.
+///
+/// ── THE ORDERING HOLE (PR #584) ──
+///
+/// The census is only "free to keep" at the ABI level; the GP dead-write
+/// pass is ENTITLED to delete `movb $N, %al` before a non-variadic callee
+/// (the accumulator is provably dead there, and deleting it is a real
+/// instruction-count win).  Once it does, this oracle's only source for
+/// the SSE-argument set is the staged-move window below — and that window
+/// walk used to BREAK on the first line that was not itself a staging
+/// move: the hazard-area release `addq $K, %rsp`, the stack-argument
+/// `pushq %rax`, and the GP half of every rax relay (`movq %xmmN, %rax`)
+/// all terminated the scan, so a call that staged its arguments across
+/// any of those was modeled as reading ZERO xmm registers — and
+/// `eliminate_dead_vector_copies` deleted the live argument staging (a
+/// 10-double call compiled with 7 of its 8 register arguments reading
+/// garbage).  Two fixes, layered:
+///
+/// 1. `# LCCC_CALL_FP <n>` (Phase 0 below): the codegen's authoritative
+///    count, published after the call text exactly like `# LCCC_CALL_ARGS`
+///    — a comment, immune to every value-shape pass.  Exact for every
+///    call that went through `emit_call_reg_args_impl`.
+/// 2. The window walk (Phase 2) now SKIPS register-file-transparent lines
+///    (rsp adjustments, pushes/pops) and the GP half of relay pairs, with
+///    a step budget that covers the full 8-register staging window.  This
+///    keeps the hand-emitted libcall sites sound too.
 fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize) -> u64 {
+    // Phase 0: the authority marker. `# LCCC_CALL_FP <n>` is published by
+    // `emit_call_instruction_impl` within a few lines after the call text
+    // (same discharge contract as `# LCCC_CALL_ARGS`); it survives every
+    // peephole pass because it is a comment. n = the exact number of
+    // leading SSE argument registers the callee reads (0..=8).
+    for k in n + 1..(n + 5).min(infos.len()) {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let mk = infos[k].trimmed(store.get(k));
+        if let Some(rest) = mk.strip_prefix("# LCCC_CALL_FP ") {
+            if let Ok(v) = rest.trim().parse::<u32>() {
+                if v <= 8 {
+                    return (1u64 << v) - 1;
+                }
+            }
+            break; // illegible marker: fall through to the heuristics
+        }
+        if mk.starts_with('#') {
+            continue; // a sibling marker (LCCC_CALL_ARGS / VA / CHAIN)
+        }
+        break; // real code: no marker published for this call
+    }
     // Calls whose census (if any) is NOT in the adjacent window: the inline
     // retpoline (`call .Lrpl_inner_N` behind a `jmp`/label pair, census
     // emitted before the `jmp`), the external thunks, and any indirect
@@ -674,24 +722,66 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
     // Phase 2: no census.  Indirect calls without one (`__builtin_apply`'s
     // `call *%r11`, whose eight `movups` loads sit behind a label) stay
     // conservative.  A direct call without a census is either GP-only or a
-    // raw libcall site whose FP operand is staged by the plain XMM moves
-    // IMMEDIATELY before it (`movq %rax, %xmm0` / `movd %eax, %xmm0` /
-    // `movdqu (%rax), %xmm0`, at most two): collect the argument registers
-    // those moves define and stop at the first line that is not such a move.
+    // site whose FP operands are staged by plain XMM moves in the window
+    // before it (`movq %rax, %xmm0` / `movd %eax, %xmm0` /
+    // `movdqu (%rax), %xmm0`): collect the argument registers those moves
+    // define and stop at the first line that is neither such a move nor
+    // REGISTER-FILE-TRANSPARENT.
+    //
+    // Transparent lines (skipped, consuming a step): rsp adjustments
+    // (`addq/subq $K, %rsp` — the hazard-area release, the stack-argument
+    // cleanup, alignment), `pushq`/`popq` (no xmm definition; `pushq %rax`
+    // is the stack-argument staging for an FP value read via rax), and the
+    // GP half of a rax relay (`movq/vmovq/movd/vmovd %xmmN, %rax` — reads
+    // an xmm, DEFINES a GP register, and is immediately followed below by
+    // its xmm-writing partner).  Skipping any of these can only EXTEND the
+    // walk and collect MORE registers — conservative-safe: the failure
+    // mode of the old break-on-first-foreign-line was the opposite
+    // (under-collection), and under-collection is what deleted live
+    // argument staging (PR #584).
+    //
+    // Step budget: 24 = the full SysV staging window (8 SSE argument
+    // registers, up to two lines per relay-staged argument) plus the
+    // transparent adjustments. Anything real that is not staging still
+    // breaks the walk — the contiguous-window soundness guard stands.
     let mut written = 0u64;
     let mut k = n;
     let mut steps = 0;
-    while k > start && steps < 4 {
+    while k > start && steps < 24 {
         k -= 1;
         if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Directive | LineKind::Empty) {
             continue;
+        }
+        // Register-file-transparent lines are checked BEFORE the barrier
+        // test: `pushq`/`popq` ARE barriers (they adjust %rsp, which the
+        // slot-tracking passes must not see through) but they define and
+        // read no XMM register, so the call-reads walk crosses them.  A
+        // stack-argument `pushq %rax` sits between every >=9-FP-argument
+        // call's register staging and its `call`.
+        let tk = infos[k].trimmed(store.get(k));
+        let (mn, operands) = split_mnemonic(tk);
+        if mn == "pushq" || mn == "popq" || mn == "pushfq" || mn == "popfq" {
+            steps += 1;
+            continue;
+        }
+        // rsp adjustment with an immediate (`addq $16, %rsp` /
+        // `subq $8, %rsp`) — the hazard-area release, the stack-argument
+        // cleanup, alignment padding.  Also an %rsp-family barrier shape
+        // for the slot passes; XMM-transparent here.
+        if mn == "addq" || mn == "subq" {
+            let ops = operand_list(operands);
+            if ops.len() == 2
+                && ops[0].starts_with('$')
+                && (ops[1] == "%rsp" || ops[1] == "%rsp)" || ops[1] == "%esp")
+            {
+                steps += 1;
+                continue;
+            }
         }
         if infos[k].is_barrier() {
             break;
         }
         steps += 1;
-        let tk = infos[k].trimmed(store.get(k));
-        let (mn, operands) = split_mnemonic(tk);
         let staging = matches!(
             mn,
             "movq"
@@ -719,7 +809,24 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
         );
         match dest_operand(operands).and_then(xmm_index) {
             Some(d) if staging => written |= 1u64 << d,
-            _ => break,
+            _ => {
+                // GP half of a relay pair: `movq %xmmN, %rax` — an xmm
+                // SOURCE with a GP destination. It defines no xmm register
+                // (nothing to collect) and its partner below was already
+                // collected; skipping it extends the walk to arguments
+                // staged further up. Only the exact xmm→GP move forms;
+                // anything else is real code and stops the scan.
+                let ops = operand_list(operands);
+                let relay_half = matches!(mn, "movq" | "vmovq" | "movd" | "vmovd")
+                    && dest_operand(operands).is_some_and(|d| xmm_index(d).is_none())
+                    && ops[..ops.len().saturating_sub(1)]
+                        .iter()
+                        .any(|s| s.starts_with("%xmm") || s.starts_with("%ymm"));
+                if relay_half {
+                    continue;
+                }
+                break;
+            }
         }
     }
     written & CALL_READS
@@ -1670,6 +1777,207 @@ mod tests {
             let n = line_of(&store, "vmulsd %xmm5");
             assert_eq!(lv.xmm_live_after(n, 5), Some(true), "{call}");
             assert_eq!(lv.xmm_live_after(n, 9), Some(false), "{call}");
+        }
+    }
+
+    /// ── The PR #584 bug class ──
+    ///
+    /// `eliminate_dead_pure_writes` legitimately deletes the `movb $N, %al`
+    /// census before a non-variadic callee (%al is dead there).  Once the
+    /// census is gone, the fallback window walk is the only source for the
+    /// SSE-argument set.  It used to BREAK on the first non-staging line —
+    /// the hazard-area release `addq $K, %rsp`, the stack-argument
+    /// `pushq %rax`, and the GP half of every rax relay all terminated the
+    /// scan — so the call was modeled as reading ZERO xmm registers and
+    /// `eliminate_dead_vector_copies` deleted the live argument staging
+    /// (a 10-double call lost 7 of its 8 register arguments to garbage).
+    /// The `# LCCC_CALL_FP <n>` authority marker fixes the general case;
+    /// the tests below pin every layer.
+
+    /// The authority marker is exact and immune to the census deletion:
+    /// no census anywhere, marker says 8 → all eight argument registers
+    /// read across the hazard-area release.
+    #[test]
+    fn call_fp_marker_is_authoritative_without_census() {
+        let (store, _i, lv) = build(
+            "    movsd %xmm8, %xmm1\n\
+             \x20   movsd %xmm9, %xmm2\n\
+             \x20   movsd %xmm10, %xmm3\n\
+             \x20   movsd %xmm11, %xmm4\n\
+             \x20   movsd %xmm12, %xmm5\n\
+             \x20   movsd %xmm13, %xmm6\n\
+             \x20   movsd %xmm14, %xmm7\n\
+             \x20   movq %xmm7, %rax\n\
+             \x20   movq %rax, %xmm0\n\
+             \x20   addq $16, %rsp\n\
+             \x20   call f10@PLT\n\
+             \x20   # LCCC_CALL_ARGS 0\n\
+             \x20   # LCCC_CALL_FP 8\n",
+        );
+        for (probe, reg) in [
+            ("movsd %xmm8, %xmm1", 1),
+            ("movsd %xmm10, %xmm3", 3),
+            ("movsd %xmm14, %xmm7", 7),
+        ] {
+            let n = line_of(&store, probe);
+            assert_eq!(
+                lv.xmm_live_after(n, reg),
+                Some(true),
+                "{probe}: staged argument read (marker says 8)"
+            );
+        }
+    }
+
+    /// The marker sits among sibling markers (`VA`, `CALL_ARGS`, `CHAIN`)
+    /// and is skipped by their parsers; it must parse through them too.
+    /// The order matches `emit_call_instruction_impl`: CHAIN keeps its
+    /// tight-window position (the GP oracle scans n+1..n+3 for it) and
+    /// CALL_FP is emitted LAST — reordering them regresses nested
+    /// functions (the static-chain staging gets deleted; found via
+    /// nested_functions in the corpus).
+    #[test]
+    fn call_fp_marker_parses_through_sibling_markers() {
+        let (store, _i, lv) = build(
+            "    movsd %xmm3, %xmm1\n\
+             \x20   call g@PLT\n\
+             \x20   # LCCC_VA_CALL\n\
+             \x20   # LCCC_CALL_ARGS 2\n\
+             \x20   # LCCC_CHAIN_CALL\n\
+             \x20   # LCCC_CALL_FP 2\n",
+        );
+        let n = line_of(&store, "movsd %xmm3, %xmm1");
+        assert_eq!(lv.xmm_live_after(n, 1), Some(true));
+        assert_eq!(lv.xmm_live_after(n, 2), Some(false));
+        assert_eq!(lv.xmm_live_after(n, 3), Some(false));
+        assert_eq!(lv.xmm_live_after(n, 7), Some(false));
+    }
+
+    /// A zero-count marker models a GP-only call exactly (Phase 0 wins
+    /// over the census-less window heuristic even when xmm moves happen
+    /// to sit in the window for other reasons).
+    #[test]
+    fn call_fp_zero_marker_is_exact() {
+        let (store, _i, lv) = build(
+            "    movsd %xmm3, %xmm1\n\
+             \x20   call g@PLT\n\
+             \x20   # LCCC_CALL_ARGS 1\n\
+             \x20   # LCCC_CALL_FP 0\n",
+        );
+        let n = line_of(&store, "movsd %xmm3, %xmm1");
+        assert_eq!(lv.xmm_live_after(n, 1), Some(false));
+    }
+
+    /// The hardened window walk (no marker, no census — the hand-emitted
+    /// libcall shape): rsp adjustments, pushes and relay GP-halves are
+    /// register-file-transparent; the staging collected through them all.
+    #[test]
+    fn window_walk_skips_transparent_lines_and_relay_halves() {
+        let (store, _i, lv) = build(
+            "    movsd %xmm8, %xmm1\n\
+             \x20   movq %xmm9, %rax\n\
+             \x20   movq %rax, %xmm2\n\
+             \x20   movq %xmm2, %rax\n\
+             \x20   pushq %rax\n\
+             \x20   subq $8, %rsp\n\
+             \x20   movq %xmm15, %rax\n\
+             \x20   movq %rax, %xmm0\n\
+             \x20   addq $16, %rsp\n\
+             \x20   call raw_helper@PLT\n",
+        );
+        let n = line_of(&store, "movsd %xmm8, %xmm1");
+        assert_eq!(
+            lv.xmm_live_after(n, 1),
+            Some(true),
+            "staging survives the push/addq/window"
+        );
+        assert_eq!(
+            lv.xmm_live_after(n, 9),
+            Some(true),
+            "the relay half below reads %xmm9"
+        );
+        let m = line_of(&store, "movq %rax, %xmm2");
+        assert_eq!(
+            lv.xmm_live_after(m, 2),
+            Some(true),
+            "relay-staged argument read through the relay GP half"
+        );
+        let k = line_of(&store, "movq %xmm9, %rax");
+        assert_eq!(
+            lv.xmm_live_after(k, 9),
+            Some(false),
+            "the relay half consumes its source"
+        );
+    }
+
+    /// The window walk still STOPS at real code: a computation between
+    /// the staging and the call ends the collection, so the staging is
+    /// not modeled as a call argument.
+    #[test]
+    fn window_walk_still_stops_at_real_code() {
+        let (store, _i, lv) = build(
+            "    movsd %xmm5, %xmm1\n\
+             \x20   vaddsd %xmm4, %xmm3, %xmm3\n\
+             \x20   call raw_helper@PLT\n",
+        );
+        let n = line_of(&store, "movsd %xmm5, %xmm1");
+        // The staging is separated from the call by a real instruction:
+        // the collection stopped at the vaddsd, so the call's read set is
+        // empty and the staged xmm1 is dead past its own definition.
+        assert_eq!(
+            lv.xmm_live_after(n, 1),
+            Some(false),
+            "staging behind real code is not a call argument"
+        );
+        assert_eq!(lv.xmm_live_after(n, 5), Some(false));
+    }
+
+    /// Full-depth relay chain: eight arguments staged as rax relays with
+    /// a hazard-area release before the call — the exact f10 shape from
+    /// the PR #584 repro, without any marker or census.  Every staged
+    /// destination must be read by the call, and every relay source must
+    /// stay live until its own relay half.
+    #[test]
+    fn window_walk_covers_the_full_eight_argument_relay_chain() {
+        let mut body = String::new();
+        for d in 0..8u32 {
+            body.push_str(&format!(
+                "    movq %xmm{}, %rax\n    movq %rax, %xmm{}\n",
+                d + 7,
+                d
+            ));
+        }
+        body.push_str("    addq $16, %rsp\n    call f10@PLT\n");
+        let (store, _i, lv) = build(&body);
+        // (a) every staged destination is a call argument: live-out of its
+        // own staging line (the anti-deletion property the bug broke).
+        for d in 0..8u32 {
+            let probe = format!("movq %rax, %xmm{d}");
+            let n = line_of(&store, &probe);
+            assert_eq!(
+                lv.xmm_live_after(n, d),
+                Some(true),
+                "xmm{d} staged argument is read by the call"
+            );
+        }
+        // (b) chain integrity: each relay source stays live out of the
+        // PREVIOUS pair's staging line (its own relay half is next) and
+        // dies at the relay half itself.
+        for d in 1..8u32 {
+            let src = d + 7;
+            let staging_below = format!("movq %rax, %xmm{}", d - 1);
+            let n = line_of(&store, &staging_below);
+            assert_eq!(
+                lv.xmm_live_after(n, src),
+                Some(true),
+                "%xmm{src} live until its relay half"
+            );
+            let half = format!("movq %xmm{src}, %rax");
+            let h = line_of(&store, &half);
+            assert_eq!(
+                lv.xmm_live_after(h, src),
+                Some(false),
+                "the relay half consumes %xmm{src}"
+            );
         }
     }
 

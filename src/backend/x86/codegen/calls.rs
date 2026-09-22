@@ -589,6 +589,31 @@ impl X86Codegen {
         // home is an argument register already written by an earlier-staged
         // argument, and pre-spill those values to a transient stack area
         // BEFORE any staging write.  Symmetric for GPR argument registers.
+        //
+        // REGISTER-CLASS ARGS ONLY: a Stack-class argument's value was
+        // already consumed by `emit_call_stack_args_impl` (the driver runs
+        // the stack-argument pushes BEFORE this phase), so no register
+        // staging can clobber its read.  Pre-spilling it anyway (the old
+        // behavior) bought a dead `movsd %xmmN, K(%rsp)`, the `subq/addq`
+        // pair for a hazard area that protected nothing, and — worse — an
+        // `addq $K, %rsp` between the register staging and the `call` that
+        // the FP liveness oracle's fallback window used to break on (see
+        // `call_xmm_reads`): every ≥9-FP-argument call with a stack arg
+        // homed in a low xmm bank paid the churn (measured on the PR #584
+        // repro: f10 carried a 16-byte hazard area for one stack arg).
+        let arg_stages_into_reg = |cls: &CallArgClass| {
+            matches!(
+                cls,
+                CallArgClass::FloatReg { .. }
+                    | CallArgClass::IntReg { .. }
+                    | CallArgClass::StructSseReg { .. }
+                    | CallArgClass::F128SseReg { .. }
+                    | CallArgClass::StructMixedIntSseReg { .. }
+                    | CallArgClass::StructMixedSseIntReg { .. }
+                    | CallArgClass::I128RegPair { .. }
+                    | CallArgClass::StructByValReg { .. }
+            )
+        };
         let mut written_xmm: [bool; 8] = [false; 8];
         let mut written_gpr: [bool; 6] = [false; 6];
         // (arg index, phys home, is_fp)
@@ -596,27 +621,29 @@ impl X86Codegen {
         for (i, arg) in args.iter().enumerate() {
             if let Operand::Value(v) = arg {
                 if let Some(&phys) = self.reg_assignments.get(&v.0) {
-                    if super::emit::is_xmm_reg(phys) {
-                        // Allocator XMM homes are PhysReg 20..33 = xmm2..xmm15.
-                        let src_idx = phys.0 as i64 - 18;
-                        if (0..=7).contains(&src_idx) && written_xmm[src_idx as usize] {
-                            hazards.push((i, phys, true));
-                        }
-                    } else {
-                        // Allocatable GPR homes that double as SysV arg regs:
-                        // rdi=14→arg0, rsi=15→arg1, rdx=16→arg2, r8=12→arg4,
-                        // r9=13→arg5 (rcx/rax are not allocatable homes).
-                        let src_idx: Option<usize> = match phys.0 {
-                            14 => Some(0),
-                            15 => Some(1),
-                            16 => Some(2),
-                            12 => Some(4),
-                            13 => Some(5),
-                            _ => None,
-                        };
-                        if let Some(si) = src_idx {
-                            if written_gpr[si] {
-                                hazards.push((i, phys, false));
+                    if arg_stages_into_reg(&arg_classes[i]) {
+                        if super::emit::is_xmm_reg(phys) {
+                            // Allocator XMM homes are PhysReg 20..33 = xmm2..xmm15.
+                            let src_idx = phys.0 as i64 - 18;
+                            if (0..=7).contains(&src_idx) && written_xmm[src_idx as usize] {
+                                hazards.push((i, phys, true));
+                            }
+                        } else {
+                            // Allocatable GPR homes that double as SysV arg regs:
+                            // rdi=14→arg0, rsi=15→arg1, rdx=16→arg2, r8=12→arg4,
+                            // r9=13→arg5 (rcx/rax are not allocatable homes).
+                            let src_idx: Option<usize> = match phys.0 {
+                                14 => Some(0),
+                                15 => Some(1),
+                                16 => Some(2),
+                                12 => Some(4),
+                                13 => Some(5),
+                                _ => None,
+                            };
+                            if let Some(si) = src_idx {
+                                if written_gpr[si] {
+                                    hazards.push((i, phys, false));
+                                }
                             }
                         }
                     }
@@ -1082,6 +1109,21 @@ impl X86Codegen {
             // `float_count > 0` arm above).
             self.state.emit("    xorl %eax, %eax");
         }
+        // Arm the FP-count authority marker: the exact number of leading
+        // SSE argument registers this call reads (every FloatReg/
+        // StructSseReg/F128/mixed-fp staging incremented `float_count`, the
+        // hazard-restore path included). The `movb $N, %al` census above
+        // carries the same number, but the GP dead-write pass legitimately
+        // deletes it for non-variadic callees (%al is dead there) — after
+        // which the FP liveness oracle's window heuristic is the only
+        // source left, and it under-collects across hazard-area releases
+        // and deep relay chains (PR #584: a 10-double call lost 7 of its 8
+        // register arguments to `eliminate_dead_vector_copies`). The
+        // marker is a comment: free to keep, exact, and immune to every
+        // value-shape pass. Emitted right after the call text by
+        // `emit_call_instruction_impl` (same discharge contract as
+        // `call_gp_arg_count`).
+        self.state.call_fp_arg_count = Some(float_count.min(8));
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
@@ -1206,9 +1248,30 @@ impl X86Codegen {
         // values may be proven dead across the call. This is what un-pins
         // %r10 (the RA's most common scratch after rax/rcx/rdx) from every
         // call in the text liveness oracles.
+        //
+        // ORDERING CONTRACT: the GP liveness oracle scans a TIGHT window
+        // (the two lines after the call text) for this marker, so it must
+        // stay in the same position the pre-FP-marker emission gave it —
+        // [call][VA?][CALL_ARGS][CHAIN?] with CHAIN at n+1/n+2. The
+        // LCCC_CALL_FP marker below is therefore emitted LAST.
         if self.state.chain_call {
             self.state.emit("    # LCCC_CHAIN_CALL");
             self.state.chain_call = false;
+        }
+        // FP-argument count marker (the same authority contract as
+        // LCCC_CALL_ARGS above): the exact number of leading SSE argument
+        // registers this call reads, armed by `emit_call_reg_args_impl`
+        // from the authoritative classification. Consumed by the FP
+        // liveness oracle's `call_xmm_reads` BEFORE its census/window
+        // heuristics, so the argument staging can never be modeled dead
+        // once the `movb $N, %al` census is dead-eliminated. Absent marker
+        // (hand-written fragments, raw libcall emissions) keeps the
+        // heuristic path: fail-closed to the census first. Emitted LAST:
+        // every earlier marker's consumer scans a tight window measured
+        // from the call text, and this one's parser skips sibling markers.
+        if let Some(fp) = self.state.call_fp_arg_count {
+            self.state
+                .emit_fmt(format_args!("    # LCCC_CALL_FP {}", fp.min(8)));
         }
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();

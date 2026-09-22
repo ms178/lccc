@@ -403,6 +403,17 @@ gate "boot-size-measurement" fast \
 gate "vector-copy-elimination" fast \
     bash tests/regression/check_vector_copy_elimination.sh
 
+# Call-argument staging (PR #584's miscompile class): the FP liveness
+# oracle's call model must never mark live SSE-argument staging dead.
+# The census is legitimately dead-eliminated at non-variadic callees; the
+# `# LCCC_CALL_FP` authority marker and the hardened window walk carry the
+# read set past every rsp adjustment, stack-argument push and relay half.
+# Runtime differential on volatile 8..12-ary f64/f32, mixed GP+SSE, SSE
+# structs, negation compositions, indirect and in-loop calls, plus the
+# marker/census/staging-window shape pins.
+gate "call-arg-staging" fast \
+    bash tests/regression/check_call_arg_staging.sh
+
 # Cross-PR interaction red-team: FMA families x copy brackets x
 # if-conversion x constant promotion x NonZero x the AVX1+FMA target
 # class, bit-exact vs the reference compiler at matched march (canonical
