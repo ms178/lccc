@@ -4733,15 +4733,67 @@ impl X86Codegen {
         let dest_typed = typed_phys_reg_name(dest_phys, ty);
 
         if let Some(imm) = Self::const_as_imm32(rhs) {
-            // Sub-word sources load with their typed form so the home stays
-            // zero-extended; 32/64-bit sources keep the generic staging.
-            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
             // Reduce explicitly instead of leaning on the hardware mask: the
             // emitted immediate then documents the real rotation, and a count
             // of 0 (or any multiple of the width) folds away to the copy that
             // already produced the value, rather than emitting a flag-writing
             // no-op.
             let amount = (imm as i64).rem_euclid(width);
+            // Direct 3-operand rorx: RORX is NON-DESTRUCTIVE (BMI2's whole
+            // point), so a lhs that is provably fresh in a register home can
+            // be read in place — no staging move into the destination first.
+            // sha256's sigma functions homed their inputs in callee-saved
+            // registers and staged `movq %r14, %rbp` before EVERY
+            // `rorxl $k, %ebp, %ebp` — three dead 64-bit moves per round,
+            // ~192 per transform call (measured on the benchmark corpus:
+            // sha256_transform at 1.20x gcc). The typed view is enough:
+            // `rorxl $k, %r14d, %ebp` reads the low 32 bits of the home and
+            // fully defines the destination (the write zero-extends into
+            // the upper half, which the sext32 normalization below then
+            // adjusts for signed results exactly as the staged form did).
+            if amount != 0
+                && self.bmi2_enabled
+                && super::isel::rorx_allowed()
+                && (width == 32 || width == 64)
+            {
+                let direct_src = match lhs {
+                    Operand::Value(v) => {
+                        // Home-freshness gate (operand_to_callee_reg's
+                        // discipline): only a register that provably still
+                        // holds the value may be read directly.
+                        self.reg_assignments
+                            .get(&v.0)
+                            .copied()
+                            .filter(|&r| !is_xmm_reg(r))
+                            .filter(|_| !self.home_clobbered.contains(&v.0))
+                    }
+                    _ => None,
+                };
+                if let Some(src) = direct_src {
+                    // Prefer BMI2 rorx: non-destructive, flag-preserving.
+                    let ror_amount = match op {
+                        IrBinOp::RotateLeft => (width - amount) % width,
+                        IrBinOp::RotateRight => amount,
+                        _ => amount,
+                    };
+                    debug_assert!(ror_amount != 0);
+                    let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
+                    let src_typed = typed_phys_reg_name(src, ty);
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, %{}, %{}",
+                        ror_mnem, ror_amount, src_typed, dest_typed
+                    ));
+                    if width == 32 {
+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    self.note_inplace_compute(dest_phys, dest_value_id);
+                    return;
+                }
+            }
+            // Sub-word sources load with their typed form so the home stays
+            // zero-extended; 32/64-bit sources keep the generic staging.
+            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
             if amount != 0 {
                 if self.bmi2_enabled && super::isel::rorx_allowed() && (width == 32 || width == 64)
                 {

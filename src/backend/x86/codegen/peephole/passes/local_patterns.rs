@@ -4575,6 +4575,7 @@ fn loop_entry_is_unique(
     header: usize,
     latch: usize,
     entry: usize,
+    fallthrough_ok: bool,
 ) -> bool {
     let (func_start, func_end) = function_range(store, infos, header).unwrap_or((0, store.len()));
     let mut labels: Vec<&str> = Vec::new();
@@ -4617,7 +4618,14 @@ fn loop_entry_is_unique(
             _ => {}
         }
     }
-    entries == 1
+    // A jmp-entry loop has exactly one outside edge (the preheader jump,
+    // exempted at `entry`).  A fall-through-entry loop (guarded shape)
+    // has ZERO jump edges — the single entry is the fall-through past the
+    // guard, which the placement scan verified ends in a control-flow
+    // boundary.  `fallthrough_ok` admits that shape; any jump edge into
+    // the loop still returns false above (a second entry bypasses the
+    // hoist placement).
+    entries == 1 || (fallthrough_ok && entries == 0)
 }
 
 // ── Loop-invariant GPR load hoisting ────────────────────────────────────────
@@ -4670,8 +4678,11 @@ fn loop_entry_is_unique(
 // Pinned candidates (volatile / address-taken slots, param-ABI reads) are
 // never touched.
 
-pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-    let len = store.len();
+pub(super) fn hoist_loop_invariant_gpr_load(
+    store: &mut LineStore,
+    infos: &mut Vec<LineInfo>,
+) -> bool {
+    let mut len = store.len();
     let mut changed = false;
 
     let mut i = 0;
@@ -4762,10 +4773,57 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
                 break;
             }
         }
-        // Fall-through or multiple-entry: no dominating placement exists.
-        let Some(entry) = entry_jmp else {
-            i += 1;
-            continue;
+        // Fall-through entry: a guarded loop (`guard: cmp; jcc exit; .p2align*;
+        // header:`) enters by falling through the guard's conditional.
+        // A LOAD cannot be placed there (it would execute even when the
+        // loop body runs zero times — a load may fault), but a PURE LEA
+        // can: it computes a constant address, touches no memory, writes
+        // no flags.  The insertion lands after the last control-flow
+        // boundary before the header's directive run, so the alignment
+        // directives stay adjacent to the header label (the loop's
+        // alignment is preserved exactly).
+        //
+        // `insert_entry` = Some(pos) selects insertion-at-pos placement
+        // (LEA candidates only); `None` keeps the jmp-replacement path.
+        let mut insert_entry: Option<usize> = None;
+        let entry = if let Some(e) = entry_jmp {
+            e
+        } else {
+            let mut q = header;
+            let mut place = None;
+            while q > func_start + 1 {
+                q -= 1;
+                if infos[q].is_nop()
+                    || matches!(infos[q].kind, LineKind::Directive | LineKind::Empty)
+                {
+                    continue; // the alignment/directive run before the label
+                }
+                // The first real instruction above the directive run must
+                // be a control-flow boundary whose fall-through reaches
+                // the header: the LEA lands directly after it, before the
+                // directives.  A compute instruction there could be
+                // feeding flags into the loop body — bail (fail closed)
+                // rather than reason about cross-block flag liveness.
+                // An UNCONDITIONAL `jmp` boundary is refused as well:
+                // it cuts the fall-through, and `loop_entry_is_unique`
+                // (fall-through mode) already proved zero jump edges
+                // into the loop — such a loop is unreachable, and an
+                // insertion after the `jmp` would be dead code dressed
+                // up as a hoist.  `CondJmp` (the guarded-loop shape:
+                // fall through when not taken) and `Label` (preheader
+                // label, entered by its own edges) are the only
+                // boundaries that keep the placement live.
+                if matches!(infos[q].kind, LineKind::CondJmp | LineKind::Label) {
+                    place = Some(q + 1);
+                }
+                break;
+            }
+            let Some(place) = place else {
+                i += 1;
+                continue;
+            };
+            insert_entry = Some(place);
+            place
         };
 
         // Rules 1+3: single entry (no second edge into ANY loop label, no
@@ -4789,7 +4847,10 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
                 _ => {}
             }
         }
-        if has_ret || has_call || !loop_entry_is_unique(store, infos, header, i, entry) {
+        if has_ret
+            || has_call
+            || !loop_entry_is_unique(store, infos, header, i, entry, insert_entry.is_some())
+        {
             i += 1;
             continue;
         }
@@ -4811,6 +4872,122 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
         // Scan body for movq OFFSET(%rsp), %REG (or %rbp) candidates.
         // Only hoist one load per loop per pass (to avoid interactions).
         let mut hoisted_one = false;
+
+        // Shared register-safety rules for a hoist candidate at `pos`
+        // writing `dst_family` (Rules 4, 4b, 5 and 6 from the load path —
+        // they are about REGISTER lifetimes and apply identically to
+        // every pure candidate form):
+        //
+        //   Rule 4:  the destination is written nowhere else in
+        //            `[entry..=i]` (exact implicits plus the
+        //            unknown-destination fallback);
+        //   Rule 4b: no forward edge in `[header..pos)` jumps over the
+        //            candidate into `(pos..i]`;
+        //   Rule 5:  the old value is dead at the hoist point — no mention
+        //            (read) in `[entry..pos)`;
+        //   Rule 6:  the destination is not observed after the loop.
+        let reg_safe_for_hoist = |store: &LineStore,
+                                  infos: &[LineInfo],
+                                  entry: usize,
+                                  header: usize,
+                                  latch: usize,
+                                  func_end: usize,
+                                  len: usize,
+                                  pos: usize,
+                                  dst_family: RegId|
+         -> bool {
+            // Rule 4: written nowhere else.
+            for chk in entry..=latch {
+                if chk == pos || infos[chk].is_nop() {
+                    continue;
+                }
+                if matches!(infos[chk].kind, LineKind::Other { dest_reg }
+                    if dest_reg == REG_NONE)
+                    || writes_family(&infos[chk], infos[chk].trimmed(store.get(chk)), dst_family)
+                {
+                    return false;
+                }
+            }
+            // Rule 4b: skip-edge veto.
+            for chk in header..pos {
+                if infos[chk].is_nop() {
+                    continue;
+                }
+                if !matches!(infos[chk].kind, LineKind::Jmp | LineKind::CondJmp) {
+                    continue;
+                }
+                let jt = infos[chk].trimmed(store.get(chk));
+                let Some(tgt) = jt.split_whitespace().nth(1) else {
+                    continue;
+                };
+                let tgt_label = format!("{tgt}:");
+                let mut tgt_pos = None;
+                for l in 0..len {
+                    if infos[l].kind == LineKind::Label
+                        && infos[l].trimmed(store.get(l)) == tgt_label
+                    {
+                        tgt_pos = Some(l);
+                        break;
+                    }
+                }
+                let Some(tp) = tgt_pos else {
+                    return false;
+                };
+                if tp <= chk {
+                    continue; // backward edge: cannot skip pos
+                }
+                if tp > pos && tp <= latch {
+                    return false;
+                }
+            }
+            // Rule 5: the old value is dead at the hoist point.
+            let dst_bit = 1u16 << dst_family;
+            for chk in entry..pos {
+                if infos[chk].is_nop() {
+                    continue;
+                }
+                if infos[chk].reg_refs & dst_bit != 0 {
+                    return false;
+                }
+                if dst_family < 12 && has_implicit_reg_usage(infos[chk].trimmed(store.get(chk))) {
+                    return false;
+                }
+            }
+            // Rule 6: not READ after the loop.  A full WRITE to the
+            // destination before any read is a pure kill — the hoisted
+            // value is dead from that point backward, so the scan stops
+            // there and the hoist is allowed (sha256's tail stages
+            // `movq %rsi, %rcx` right after the 64-round loop: rcx's
+            // loop value is never read, only overwritten).  `pop %dst`
+            // restores are kills too.  A read (or an implicit-usage line,
+            // or a 128-bit `ret` reading rdx) observes the value and
+            // vetoes.
+            for k in latch + 1..func_end {
+                if infos[k].is_nop() {
+                    continue;
+                }
+                if matches!(infos[k].kind, LineKind::Pop { reg } if reg == dst_family) {
+                    continue;
+                }
+                let text_k = infos[k].trimmed(store.get(k));
+                let kills_it = matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == REG_NONE)
+                    || writes_family(&infos[k], text_k, dst_family);
+                if kills_it {
+                    break; // a full definition: the hoisted value dies here
+                }
+                if infos[k].reg_refs & dst_bit != 0 {
+                    return false;
+                }
+                if matches!(infos[k].kind, LineKind::Ret) && dst_family == 2 {
+                    return false;
+                }
+                if dst_family < 12 && has_implicit_reg_usage(text_k) {
+                    return false;
+                }
+            }
+            true
+        };
+
         for pos in body_start + 1..i {
             if hoisted_one {
                 break;
@@ -4822,11 +4999,92 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
             // Match: movq OFFSET(%rsp), %REG or movq OFFSET(%rbp), %REG
             let t = infos[pos].trimmed(store.get(pos));
             if !t.starts_with("movq ") {
+                // Candidate class 2 — the rip-relative address
+                // materialization: `leaq SYM(%rip), %REG`.  Pure (an
+                // address computation, no memory read), so Rule 2 (slot
+                // stability) does not apply; every register rule does.
+                // This is the rematerialized global base that the array
+                // lowering re-emits per access — sha256's K-table inside
+                // the 64-round loop paid the LEA every round (measured:
+                // sha256_transform at 1.20x gcc; the load through it is
+                // `movl (%rcx, %r10, 4), %r15d`, so the base cannot fold
+                // into the memory operand — RIP-relative addressing
+                // takes no index register, the LEA is load-bearing and
+                // only hoisting removes it).
+                if !t.starts_with("leaq ") {
+                    continue;
+                }
+                if infos[pos].pinned {
+                    continue;
+                }
+                let after_lea = &t[5..];
+                let Some(comma) = after_lea.find(", %") else {
+                    continue;
+                };
+                let src_part = after_lea[..comma].trim();
+                let dst_part = after_lea[comma + 2..].trim();
+                // Exactly `SYM(%rip)` / `SYM+OFF(%rip)`: no base register,
+                // no index/scale — anything else reads a register and is
+                // not a constant.
+                if !src_part.ends_with("(%rip)") || src_part.contains(',') {
+                    continue;
+                }
+                let dst_family = register_family_fast(dst_part);
+                if dst_family == REG_NONE
+                    || dst_family > REG_GP_MAX
+                    || dst_family == 4
+                    || dst_family == 5
+                    || dst_family == 0
+                {
+                    continue;
+                }
+                if !reg_safe_for_hoist(
+                    store, infos, entry, header, i, func_end, len, pos, dst_family,
+                ) {
+                    continue;
+                }
+                let lea_text = store.get(pos).to_string();
+                let lea_text = lea_text.trim_end().to_string();
+                match insert_entry {
+                    Some(ins) => {
+                        // Fall-through entry: INSERT the LEA after the
+                        // control-flow boundary, before the directive run.
+                        // The insertion shifts every line at or above `ins`
+                        // — adjust the backedge `i`, `len`, and the
+                        // candidate `pos` (always > ins: the candidate is
+                        // inside the loop, the insertion before its header).
+                        store.insert_line(ins, lea_text.clone());
+                        let new_info = classify_line(&lea_text);
+                        // Vec splice: the pass contract keeps
+                        // `infos.len() == store.len()` — both grew by
+                        // exactly one line.
+                        infos.insert(ins, new_info);
+                        i += 1;
+                        len += 1;
+                        mark_nop(&mut infos[pos + 1]);
+                    }
+                    None => {
+                        // Jmp entry: the LEA replaces the entry jump and
+                        // falls through into the header (the load path's
+                        // mechanics).
+                        replace_line(store, &mut infos[entry], entry, lea_text);
+                        mark_nop(&mut infos[pos]);
+                    }
+                }
+                changed = true;
+                hoisted_one = true;
                 continue;
             }
             // Pinned lines (volatile / address-taken slots, param-ABI
             // reads) are never hoisted.
             if infos[pos].pinned {
+                continue;
+            }
+            // A LOAD may only take the jmp-replacement placement: on a
+            // fall-through (guarded) entry the hoisted load would execute
+            // even when the loop body runs zero times, and a load may
+            // fault.  Only the pure LEA candidate above may insert.
+            if insert_entry.is_some() {
                 continue;
             }
             // Parse: "movq SRC, %DST"
@@ -4869,132 +5127,13 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
                 continue;
             }
 
-            // Rule 4: the destination is written nowhere else in
-            // `[entry..=i]` — exact implicits plus an unknown-destination
-            // fallback (the implicit-operand table yields `(0, 0)` for
-            // unknown mnemonics).
-            let mut reg_written_elsewhere = false;
-            for chk in entry..=i {
-                if chk == pos {
-                    continue;
-                } // skip the load itself
-                if infos[chk].is_nop() {
-                    continue;
-                }
-                if matches!(infos[chk].kind, LineKind::Other { dest_reg }
-                    if dest_reg == REG_NONE)
-                    || writes_family(&infos[chk], infos[chk].trimmed(store.get(chk)), dst_family)
-                {
-                    reg_written_elsewhere = true;
-                    break;
-                }
-            }
-            if reg_written_elsewhere {
-                continue;
-            }
-
-            // Rule 4b (skip-edge veto): no forward edge in `[header..pos)`
-            // may jump over the candidate into `(pos..i]`. Such an edge
-            // would let a use below `pos` read the pre-loop value while
-            // the hoisted load overwrites it (a backend-valid
-            // partial-redefinition shape: the skipped `dst` definition
-            // normally forces a join copy that Rule 4 vetoes, but this
-            // rule must not depend on that producer invariant).
-            // Backward edges (target at/above the jump) cannot skip `pos`
-            // and are exempt; indirect jumps and inline asm are already
-            // vetoed function-wide by Rule 1.
-            let mut skips_pos = false;
-            'rule4b: for chk in header..pos {
-                if infos[chk].is_nop() {
-                    continue;
-                }
-                if !matches!(infos[chk].kind, LineKind::Jmp | LineKind::CondJmp) {
-                    continue;
-                }
-                let jt = infos[chk].trimmed(store.get(chk));
-                let Some(tgt) = jt.split_whitespace().nth(1) else {
-                    continue;
-                };
-                // Locate the target label; an unresolvable target fails
-                // closed (direct jumps always name a file-local label, so
-                // this only fires on shapes the classifier misjudged).
-                let tgt_label = format!("{tgt}:");
-                let mut tgt_pos = None;
-                for l in 0..len {
-                    if infos[l].kind == LineKind::Label
-                        && infos[l].trimmed(store.get(l)) == tgt_label
-                    {
-                        tgt_pos = Some(l);
-                        break;
-                    }
-                }
-                let Some(tp) = tgt_pos else {
-                    skips_pos = true;
-                    break;
-                };
-                if tp <= chk {
-                    continue; // backward edge: cannot skip pos
-                }
-                if tp > pos && tp <= i {
-                    skips_pos = true;
-                    break 'rule4b;
-                }
-            }
-            if skips_pos {
-                continue;
-            }
-
-            // Rule 5: the old value is dead at the hoist point — any mention
-            // in `[entry..pos)` is a read (rule 4 proved no writes there).
-            // `reg_refs` is textual, so instructions with implicit register
-            // operands additionally veto when the destination is in the
-            // implicitly-readable range (`div`, shifts, `cpuid`, `syscall`,
-            // ... only ever touch families below `%r12`).
-            let dst_bit = 1u16 << dst_family;
-            let mut old_value_observed = false;
-            for chk in entry..pos {
-                if infos[chk].is_nop() {
-                    continue;
-                }
-                if infos[chk].reg_refs & dst_bit != 0 {
-                    old_value_observed = true;
-                    break;
-                }
-                if dst_family < 12 && has_implicit_reg_usage(infos[chk].trimmed(store.get(chk))) {
-                    old_value_observed = true;
-                    break;
-                }
-            }
-            if old_value_observed {
-                continue;
-            }
-
-            // Rule 6: the destination is not observed after the loop — no
-            // mention past the back-edge (same implicit backstop; `ret`
-            // reads `%rdx` for 128-bit returns). `pop %dst` restores are
-            // pure kills, not reads, and are skipped.
-            let mut observed_after_loop = false;
-            for k in i + 1..func_end {
-                if infos[k].is_nop() {
-                    continue;
-                }
-                if matches!(infos[k].kind, LineKind::Pop { reg } if reg == dst_family) {
-                    continue;
-                }
-                if infos[k].reg_refs & dst_bit != 0 {
-                    observed_after_loop = true;
-                    break;
-                }
-                if matches!(infos[k].kind, LineKind::Ret) && dst_family == 2 {
-                    observed_after_loop = true;
-                    break;
-                }
-                if dst_family < 12 && has_implicit_reg_usage(infos[k].trimmed(store.get(k))) {
-                    observed_after_loop = true;
-                    break;
-                }
-            }
-            if observed_after_loop {
+            // Rules 4, 4b, 5 and 6 — the shared register-safety
+            // closure (identical semantics to the original inline block:
+            // written-nowhere-else, skip-edge veto, old-value-dead,
+            // not-observed-after-loop).
+            if !reg_safe_for_hoist(
+                store, infos, entry, header, i, func_end, len, pos, dst_family,
+            ) {
                 continue;
             }
 
@@ -8330,6 +8469,375 @@ mod loop_hoist_tests {
         assert!(
             !out.iter().any(|l| l == "movsd -24(%rbp), %xmm0"),
             "original body load must be gone:\n{}",
+            out.join("\n")
+        );
+    }
+
+    // ── Fall-through (guarded-loop) insertion placement ──────────────────
+    //
+    // The fall-through entry INSERT path (new with the rip-relative LEA
+    // candidate class) had no unit pins — only the shell gate
+    // (`check_lea_hoist_rorx.sh`) exercised it end-to-end.  These pins
+    // cover the placement mechanics directly: after the guard's jcc and
+    // BEFORE the alignment run (so `.p2align` stays adjacent to the
+    // header), the zero-trip LOAD refusal, the boundary-class rules, and
+    // the entry-uniqueness / register-lifetime refusals through the
+    // insert path.
+
+    /// The golden guarded shape: the loop is entered by falling through
+    /// the guard's conditional, and the pure rip-relative LEA hoists to
+    /// directly after the `jcc` — before the `.p2align` run, keeping the
+    /// alignment adjacent to the header exactly as emitted.
+    #[test]
+    fn lea_fallthrough_hoist_places_after_guard_before_alignment() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB4\n",
+            "    .p2align 4\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    leaq .Lk_table(%rip), %r11\n",
+            "    movl (%r11,%rbx,4), %r15d\n",
+            "    addl %r15d, %ecx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let lea_pos = out
+            .iter()
+            .position(|l| l == "leaq .Lk_table(%rip), %r11")
+            .expect("the hoisted LEA must exist");
+        assert_eq!(
+            out.iter()
+                .filter(|l| *l == "leaq .Lk_table(%rip), %r11")
+                .count(),
+            1,
+            "exactly one LEA — the in-loop copy must be gone:\n{}",
+            out.join("\n")
+        );
+        let guard_pos = out
+            .iter()
+            .position(|l| l == "je .LBB4")
+            .expect("the guard must survive");
+        let align_pos = out
+            .iter()
+            .position(|l| l == ".p2align 4")
+            .expect("the alignment directive must survive");
+        let header_pos = out
+            .iter()
+            .position(|l| l == ".LBB2:")
+            .expect("the header label must survive");
+        assert!(
+            guard_pos < lea_pos && lea_pos < align_pos && align_pos < header_pos,
+            "placement must be guard < LEA < .p2align < header (alignment stays \
+             adjacent to the header):\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| l == "movl (%r11,%rbx,4), %r15d"),
+            "the in-loop consumer must survive:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A `Label` boundary (unguarded preheader label above the alignment
+    /// run) is a live placement too: every edge into the label falls
+    /// through the insertion point.
+    #[test]
+    fn lea_fallthrough_hoist_label_boundary() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    xorl %ebx, %ebx\n",
+            ".LBBpre:\n",
+            "    .p2align 4\n",
+            ".LBB2:\n",
+            "    subl $1, %r13d\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    leaq .Lk_table(%rip), %r11\n",
+            "    movl (%r11,%r13,4), %r15d\n",
+            "    addl %r15d, %ecx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let lea_pos = out
+            .iter()
+            .position(|l| l == "leaq .Lk_table(%rip), %r11")
+            .expect("the hoisted LEA must exist");
+        let pre_pos = out
+            .iter()
+            .position(|l| l == ".LBBpre:")
+            .expect("the preheader label must survive");
+        let align_pos = out
+            .iter()
+            .position(|l| l == ".p2align 4")
+            .expect("the alignment directive must survive");
+        assert!(
+            pre_pos < lea_pos && lea_pos < align_pos,
+            "placement must be label < LEA < .p2align:\n{}",
+            out.join("\n")
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|l| *l == "leaq .Lk_table(%rip), %r11")
+                .count(),
+            1,
+            "exactly one LEA:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Zero-trip safety: a LOAD may never take the fall-through
+    /// insertion — it would execute even when the guard skips the loop
+    /// body entirely, and a load may fault.  The identical shape with a
+    /// pure LEA hoists (`lea_fallthrough_hoist_places_...` above), so
+    /// this pin is discriminating: only the load class is refused.
+    #[test]
+    fn lea_fallthrough_refuses_load_candidate() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB4\n",
+            "    .p2align 4\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    movq 136(%rsp), %r11\n",
+            "    addq %r11, %rcx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movq %rcx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let load_pos = out
+            .iter()
+            .position(|l| l == "movq 136(%rsp), %r11")
+            .expect("the load must survive");
+        let body_pos = out
+            .iter()
+            .position(|l| l == ".LBB3:")
+            .expect("the body label must survive");
+        assert!(
+            load_pos > body_pos,
+            "a load must stay inside the loop on a fall-through entry \
+             (zero-trip fault safety):\n{}",
+            out.join("\n")
+        );
+        let guard_pos = out
+            .iter()
+            .position(|l| l == "je .LBB4")
+            .expect("the guard must survive");
+        let align_pos = out
+            .iter()
+            .position(|l| l == ".p2align 4")
+            .expect("the alignment directive must survive");
+        assert!(
+            align_pos == guard_pos + 1,
+            "nothing may be inserted between the guard and the alignment \
+             run for a load candidate:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// An unconditional `jmp` above the directive run cuts the
+    /// fall-through; combined with the zero-entries requirement the loop
+    /// is unreachable, so an insertion there would be dead code.  The
+    /// boundary set must be `CondJmp | Label` only.  (Discriminating for
+    /// the boundary-class fix: the pre-fix tree inserts here.)
+    #[test]
+    fn lea_fallthrough_refuses_unconditional_jmp_boundary() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .Lafter\n",
+            "    .p2align 4\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    leaq .Lk_table(%rip), %r11\n",
+            "    movl (%r11,%rbx,4), %r15d\n",
+            "    addl %r15d, %ecx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movl %ecx, %eax\n",
+            ".Lafter:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let lea_pos = out
+            .iter()
+            .position(|l| l == "leaq .Lk_table(%rip), %r11")
+            .expect("the LEA must survive in the loop");
+        let header_pos = out
+            .iter()
+            .position(|l| l == ".LBB2:")
+            .expect("the header label must survive");
+        assert!(
+            lea_pos > header_pos,
+            "no insertion after an unconditional jmp — the loop below it is \
+             unreachable, the placement would be dead code:\n{}",
+            out.join("\n")
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|l| *l == "leaq .Lk_table(%rip), %r11")
+                .count(),
+            1,
+            "exactly one LEA:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Only the pure rip-relative form is a candidate: a base or
+    /// index/scale LEA reads a register, so hoisting it above the loop
+    /// changes which value feeds the address computation.
+    #[test]
+    fn lea_fallthrough_refuses_base_or_index_lea() {
+        for lea in ["leaq 8(%rbx), %r11", "leaq (%r12,%rbx,4), %r11"] {
+            let out = run_gpr(&format!(
+                concat!(
+                    "foo:\n",
+                    ".cfi_startproc\n",
+                    "    testl %edi, %edi\n",
+                    "    je .LBB4\n",
+                    "    .p2align 4\n",
+                    ".LBB2:\n",
+                    "    subl $1, %ebx\n",
+                    "    jle .LBB4\n",
+                    ".LBB3:\n",
+                    "    {lea}\n",
+                    "    movq (%r11), %r15\n",
+                    "    addq %r15, %rcx\n",
+                    "    jmp .LBB2\n",
+                    ".LBB4:\n",
+                    "    movq %rcx, %rax\n",
+                    "    ret\n",
+                    ".cfi_endproc\n",
+                ),
+                lea = lea
+            ));
+            let lea_pos = out
+                .iter()
+                .position(|l| l == lea)
+                .unwrap_or_else(|| panic!("`{lea}` must survive:\n{}", out.join("\n")));
+            let header_pos = out
+                .iter()
+                .position(|l| l == ".LBB2:")
+                .expect("the header label must survive");
+            assert!(
+                lea_pos > header_pos,
+                "`{lea}` reads a register — it must stay inside the loop:\n{}",
+                out.join("\n")
+            );
+        }
+    }
+
+    /// Fall-through mode demands ZERO jump edges into the loop: a guard
+    /// that jumps straight into the body is a second entry bypassing the
+    /// insertion point (`loop_entry_is_unique` fall-through arm).
+    #[test]
+    fn lea_fallthrough_refuses_second_entry() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB3\n",
+            "    .p2align 4\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    leaq .Lk_table(%rip), %r11\n",
+            "    movl (%r11,%rbx,4), %r15d\n",
+            "    addl %r15d, %ecx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let lea_pos = out
+            .iter()
+            .position(|l| l == "leaq .Lk_table(%rip), %r11")
+            .expect("the LEA must survive");
+        let body_pos = out
+            .iter()
+            .position(|l| l == ".LBB3:")
+            .expect("the body label must survive");
+        assert!(
+            lea_pos > body_pos,
+            "a jump edge into the body bypasses the insertion point — the \
+             hoist must be refused:\n{}",
+            out.join("\n")
+        );
+        let guard_pos = out
+            .iter()
+            .position(|l| l == "je .LBB3")
+            .expect("the guard must survive");
+        let align_pos = out
+            .iter()
+            .position(|l| l == ".p2align 4")
+            .expect("the alignment directive must survive");
+        assert!(
+            align_pos == guard_pos + 1,
+            "nothing may be inserted after the guard when the entry is not \
+             unique:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// Rule 5 through the insert path: the destination's OLD value is
+    /// read before the LEA inside the loop, so hoisting would clobber a
+    /// live pre-loop value on the first iteration.
+    #[test]
+    fn lea_fallthrough_refuses_live_old_value() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rdi, %r11\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB4\n",
+            "    .p2align 4\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    addq %r11, %rcx\n",
+            "    leaq .Lk_table(%rip), %r11\n",
+            "    movl (%r11,%rbx,4), %r15d\n",
+            "    addl %r15d, %ecx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let lea_pos = out
+            .iter()
+            .position(|l| l == "leaq .Lk_table(%rip), %r11")
+            .expect("the LEA must survive");
+        let body_pos = out
+            .iter()
+            .position(|l| l == ".LBB3:")
+            .expect("the body label must survive");
+        assert!(
+            lea_pos > body_pos,
+            "the old %r11 is read on the first iteration — the hoist must \
+             be refused (Rule 5 via the insert path):\n{}",
             out.join("\n")
         );
     }
