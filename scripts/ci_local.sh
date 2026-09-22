@@ -467,6 +467,16 @@ gate "env-test-hygiene" fast \
 gate "peephole-whitespace-invariance" slow \
     env CCC=target/fastbuild/lccc bash tests/regression/check_peephole_whitespace.sh
 
+# The x86 peephole driver's own comment names scripts/peephole_trace_bisect.py
+# as the reliable instrument for a faulty rewrite -- and that script did not
+# exist, which is how a `fold_lea_into_load` miscompile had to be bisected by
+# hand while `CCC_PEEPHOLE_SKIP` named eight different "culprits" for it.  The
+# tool now exists and is gated: its operand parser (the part that decides which
+# dump is reported) is pinned by a self-test with a mutation proof, and the
+# dynamic path is exercised on a real compile.  Sub-second, so: fast.
+gate "peephole-trace-bisect" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_peephole_trace_bisect.sh
+
 # The one-move phi-diamond preinitialisation hoists the cheap incoming
 # above the branch. A memory-source init may fault on the path it lands
 # on: `c ? *p : *q` must never touch a NULL p when c selects q. The

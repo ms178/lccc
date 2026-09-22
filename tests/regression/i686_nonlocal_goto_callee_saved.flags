@@ -1,1 +1,1 @@
--m32 -O2
+-m32 -O2 -nostdlib -static -Wl,-e,_start

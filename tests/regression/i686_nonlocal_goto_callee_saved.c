@@ -9,12 +9,34 @@
  * home; the goto bypasses the child's pop, and the parent dereferences the
  * GOT through the child's garbage %ebx. Requires PIC (no -fno-pic).
  *
- * Proven: aborts with the NonlocalGoto pool-clear reverted (SIGABRT),
+ * Freestanding: the failure signal is a real SIGABRT raised through the i386
+ * syscall path rather than libc's abort(), so the test links with -nostdlib
+ * and needs no 32-bit libc on the host. PIC is retained — it is what makes
+ * the GOT base live in %ebx, which is the whole point of the test.
+ *
+ * Proven: dies with SIGABRT when the NonlocalGoto pool-clear is reverted,
  * passes with it.
  */
-extern void abort(void);
-
 int g = 10;
+
+/* i386 Linux syscalls, entered directly: no libc, no 32-bit headers. */
+static void sys_exit(int status)
+{
+	__asm__ volatile("int $0x80" : : "a"(1), "b"(status) : "memory");
+	for (;;)
+		;
+}
+
+static void sys_abort(void)
+{
+	int pid;
+
+	__asm__ volatile("int $0x80" : "=a"(pid) : "a"(20) : "memory");
+	/* kill(pid, SIGABRT) — the same termination the libc abort() gives,
+	 * so a revert still shows up as SIGABRT rather than a plain exit. */
+	__asm__ volatile("int $0x80" : : "a"(37), "b"(pid), "c"(6) : "memory");
+	sys_exit(134);
+}
 
 __attribute__((noinline))
 static int exercise(int a, int jump) {
@@ -33,8 +55,13 @@ target:
 
 int main(void) {
     if (exercise(1, 1) != 13)
-        abort();
+        sys_abort();
     if (exercise(2, 0) != 14)
-        abort();
+        sys_abort();
     return 0;
+}
+
+void _start(void)
+{
+	sys_exit(main());
 }

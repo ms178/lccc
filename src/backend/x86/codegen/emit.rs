@@ -8313,6 +8313,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_i128_add(&mut self) => emit_i128_add_impl;
         fn emit_i128_sub(&mut self) => emit_i128_sub_impl;
         fn emit_i128_mul(&mut self) => emit_i128_mul_impl;
+        fn emit_i128_mul_const(&mut self, lhs: &Operand, rhs: &Operand, lo: u64, hi: u64) => emit_i128_mul_const_impl;
         fn emit_i128_and(&mut self) => emit_i128_and_impl;
         fn emit_i128_or(&mut self) => emit_i128_or_impl;
         fn emit_i128_xor(&mut self) => emit_i128_xor_impl;
