@@ -6490,8 +6490,23 @@ impl ArchCodegen for X86Codegen {
         // (regression glibc_gottpoff, second read returned 42).  The text
         // path (emit_tls_global_addr_impl) selects the right TLS model, so
         // keep TLS addresses off the fast path.
+        //
+        // Same contract for GOT-indirected and absolute symbols: LeaSym
+        // hardcodes `leaq sym(%rip)` (R_X86_64_PC32), which the system
+        // linker rejects for UNDEFINED WEAK symbols in PIE links
+        // ("relocation R_X86_64_PC32 against undefined symbol
+        // ZSTD_trace_compress_begin can not be used when making a PIE
+        // object" — lccc-built libzstd.a linked by the distro gcc driver).
+        // needs_got_for_addr already returns true for weak symbols in every
+        // code model and for PIC/PIE externals; absolute_symbols need the
+        // `movq $sym` immediate form. The text emitters
+        // (emit_global_addr_impl / emit_global_addr_into_reg) own that
+        // decision — route through them.
         if let crate::ir::reexports::Instruction::GlobalAddr { name, .. } = inst {
-            if self.state.tls_symbols.contains(name) {
+            if self.state.tls_symbols.contains(name)
+                || self.state.needs_got_for_addr(name)
+                || self.state.absolute_symbols.contains(name)
+            {
                 return false;
             }
         }

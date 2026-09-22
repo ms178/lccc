@@ -2252,6 +2252,28 @@ impl X86Codegen {
         {
             return false;
         }
+        // SIB soundness gate — see emit_store_indexed_impl for the full
+        // rationale. base==index in one SIB operand computes base + 2*index
+        // and the in-place index extension clobbers the base; refuse the
+        // fold and let the staging path rematerialise both operands.
+        {
+            let Some(&x) = self.reg_assignments.get(&index.0) else {
+                return false;
+            };
+            if b == x {
+                if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
+                    eprintln!(
+                        "[sib-clash] load v{} (base) and v{} (index) share home {} — refusing SIB fold (shift {}, disp {})",
+                        base.0,
+                        index.0,
+                        phys_reg_name(b),
+                        shift,
+                        disp
+                    );
+                }
+                return false;
+            }
+        }
         if !self.ensure_sib_index_form(index) {
             return false;
         }
@@ -2283,24 +2305,49 @@ impl X86Codegen {
             }
             return false;
         };
-        if is_xmm_reg(b)
-            || self
-                .reg_assignments
-                .get(&index.0)
-                .copied()
-                .is_none_or(is_xmm_reg)
-        {
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        if is_xmm_reg(b) || is_xmm_reg(x) {
+            return false;
+        }
+        // SIB soundness gate: x86 has no meaningful base==index encoding —
+        // `mem(%r, %r, 1)` computes base + 2*index. If the allocator handed
+        // the base and the index the SAME physical register while both are
+        // live at this access, splicing them into one SIB operand not only
+        // computes a wild address, the in-place `ensure_sib_index_form`
+        // extension of the index would also destroy the just-consumed base.
+        // Refusing the fold falls back to the staging path, which
+        // rematerialises both operands independently (always correct).
+        // This gate has caught a real zlib-ng deflateHeaders miscompile
+        // (`put_byte` → `mov %r10b,(%rdi,%rdi,1)` with rdi holding the
+        // freshly-reloaded `s->pending_buf`): treat any firing as an RA
+        // interference bug and make it visible.
+        if b == x {
+            if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
+                eprintln!(
+                    "[sib-clash] fn={} store v{} (base, {:?}) and v{} (index, {:?}) share home {} — refusing SIB fold (shift {}, disp {})",
+                    self.state.current_func_name,
+                    base.0,
+                    self.value_types.get(&base.0),
+                    index.0,
+                    self.value_types.get(&index.0),
+                    phys_reg_name(b),
+                    shift,
+                    disp
+                );
+                for (label, v) in [("base", base.0), ("index", index.0)] {
+                    if let Some(segs) = self.value_live_segments.get(&v) {
+                        eprintln!("[sib-clash]   {label} v{v} segments: {segs:?}");
+                    }
+                }
+            }
             return false;
         }
         if !self.ensure_sib_index_form(index) {
             return false;
         }
-        let mem = Self::sib_mem64(
-            phys_reg_name(b),
-            phys_reg_name(self.reg_assignments[&index.0]),
-            shift,
-            disp,
-        );
+        let mem = Self::sib_mem64(phys_reg_name(b), phys_reg_name(x), shift, disp);
         self.emit_store_indexed_common(val, index, shift, ty, mem)
     }
 
@@ -2331,6 +2378,12 @@ impl X86Codegen {
             return false;
         };
         if is_xmm_reg(x) {
+            return false;
+        }
+        // PIC staging soundness (checked BEFORE the in-place extension so a
+        // refused fold has zero side effects): the %rcx leaq staging below
+        // would overwrite an index homed in %rcx.
+        if self.state.pic_mode && phys_reg_name(x) == "rcx" {
             return false;
         }
         if !self.ensure_sib_index_form(index) {
@@ -2372,6 +2425,11 @@ impl X86Codegen {
             return false;
         };
         if is_xmm_reg(x) {
+            return false;
+        }
+        // PIC staging soundness — mirror of emit_load_indexed_sym_impl: the
+        // %rcx leaq staging must not overwrite an index homed in %rcx.
+        if self.state.pic_mode && phys_reg_name(x) == "rcx" {
             return false;
         }
         if !self.ensure_sib_index_form(index) {

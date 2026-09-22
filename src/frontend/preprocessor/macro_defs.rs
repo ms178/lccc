@@ -52,6 +52,9 @@ fn would_paste_tokens(last: u8, first: u8) -> bool {
         (b'/', b'*') | (b'/', b'/') => true,
         // . followed by digit (e.g., prevent "1." + "5" pasting weirdly)
         (b'.', b'0'..=b'9') => true,
+        // digit followed by '.' (e.g., "1" from a macro + "." from source
+        // would re-lex as the pp-number "1." instead of two tokens)
+        (a, b'.') if a.is_ascii_digit() => true,
         // Identifier/number continuation: letter/digit/_ followed by letter/digit/_
         (a, b) if is_ident_cont_byte(a) && is_ident_cont_byte(b) => true,
         _ => false,
@@ -91,6 +94,27 @@ const BLUE_PAINT_MARKER: u8 = 0x01;
 /// Uses 0x02/0x03 to avoid collision with BLUE_PAINT_MARKER (0x01).
 const PASTE_PROTECT_START: u8 = 0x02;
 const PASTE_PROTECT_END: u8 = 0x03;
+
+/// Token-boundary marker emitted where macro replacement output abuts
+/// surrounding tokens with no intervening whitespace (C11 §6.10.3.4).
+///
+/// Rescanning operates on *preprocessing tokens*, not on the spelling text:
+/// replacement tokens and source tokens never merge into a new token merely
+/// because their spellings are adjacent (e.g. `#define MAJOR 1` followed by
+/// the body `MAJOR.MINOR` yields the three tokens `1`, `.`, `MINOR`, and
+/// `MINOR` is still macro-expandable — it is NOT part of a pp-number
+/// `1.MINOR`). A plain string-based expander cannot see that boundary, which
+/// previously made `expand_identifier`'s pp-number continuation check swallow
+/// identifiers across expansion boundaries and broke glibc/zstd-style
+/// version stringification (`ZSTD_EXPAND_AND_QUOTE(ZSTD_LIB_VERSION)` ->
+/// "1.ZSTD_VERSION_MINOR. 0" instead of "1.6.0").
+///
+/// The barrier marks "token boundary, no whitespace". Consumers:
+/// - `stringify_arg` drops it (adjacent tokens stringify without a space),
+/// - `expand_line_reuse` converts it to a real space only where the two
+///   neighbours would otherwise paste into one token (matches gcc -E output).
+/// Uses 0x04 to avoid collision with the other marker bytes.
+const EXPANSION_BARRIER: u8 = 0x04;
 
 /// Strip all blue-paint markers from a string.
 /// Used when substituting arguments into ## token paste operations,
@@ -301,28 +325,94 @@ impl MacroTable {
         // - 0x01 (BLUE_PAINT_MARKER): prevents re-expansion per C11 §6.10.3.4
         // - 0x02/0x03 (PASTE_PROTECT_START/END): should already be consumed by
         //   substitute_params, but strip defensively in case any leak through.
+        // - 0x04 (EXPANSION_BARRIER): a token boundary with no whitespace.
+        //   For final SPELLING output it becomes a space only where the two
+        //   neighbours would otherwise re-lex as a single token (matching the
+        //   traditional paste-guard behaviour); everywhere else it vanishes,
+        //   so the spelling keeps the whitespace-free form that C11
+        //   §6.10.3.2 stringification and the pp-number continuation check
+        //   downstream rely on.
+        let has_barrier = result.as_bytes().iter().any(|&b| b == EXPANSION_BARRIER);
         if result
             .as_bytes()
             .iter()
             .any(|&b| b == BLUE_PAINT_MARKER || b == PASTE_PROTECT_START || b == PASTE_PROTECT_END)
         {
-            result.replace(
+            let stripped = result.replace(
                 [
                     BLUE_PAINT_MARKER as char,
                     PASTE_PROTECT_START as char,
                     PASTE_PROTECT_END as char,
                 ],
                 "",
-            )
+            );
+            return if has_barrier {
+                Self::resolve_barriers(&stripped)
+            } else {
+                stripped
+            };
+        }
+        if has_barrier {
+            Self::resolve_barriers(&result)
         } else {
             result
         }
     }
 
-    /// Append `expanded` text to `result`, inserting spaces as needed to prevent
-    /// accidental token pasting between the end of `result` and the start/end
-    /// of `expanded`, and between the end of `expanded` and `next_byte` (the
-    /// next byte in the source after the expansion site).
+    /// Replace EXPANSION_BARRIER markers in final output: a barrier becomes a
+    /// real space exactly when its two neighbours would paste into one token;
+    /// otherwise it is dropped (pure token boundary, no whitespace).
+    /// Operates on raw bytes (barriers are single ASCII control bytes, and the
+    /// surrounding text — e.g. UTF-8 string literal contents — must be copied
+    /// through byte-exact).
+    fn resolve_barriers(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b != EXPANSION_BARRIER {
+                out.push(b);
+                i += 1;
+                continue;
+            }
+            let prev = out.last().copied();
+            // Find the next non-barrier byte (defensive: doubled barriers).
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] == EXPANSION_BARRIER {
+                j += 1;
+            }
+            let next = if j < bytes.len() {
+                Some(bytes[j])
+            } else {
+                None
+            };
+            if let (Some(p), Some(n)) = (prev, next) {
+                if would_paste_tokens(p, n) || (is_ident_cont_byte(p) && is_ident_cont_byte(n)) {
+                    out.push(b' ');
+                }
+            }
+            // A barrier at the very edge of the line carries no paste risk;
+            // drop it.
+            i = j;
+        }
+        // The text (barriers included) is pure ASCII-safe bytes — 0x04 is a
+        // valid one-byte UTF-8 sequence — so this cannot fail.
+        String::from_utf8(out)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    }
+
+    /// Append `expanded` text to `result`, inserting token-boundary barriers as
+    /// needed to prevent accidental token pasting between the end of `result`
+    /// and the start/end of `expanded`, and between the end of `expanded` and
+    /// `next_byte` (the next byte in the source after the expansion site).
+    ///
+    /// The barrier is an invisible EXPANSION_BARRIER marker rather than a
+    /// literal space: adjacent replacement tokens stringify WITHOUT whitespace
+    /// (C11 §6.10.3.2 — the spelling records only whitespace that existed in
+    /// the token sequence), while `expand_line_reuse` turns the barrier back
+    /// into a space for final output exactly where the neighbours would
+    /// otherwise re-lex as a single token.
     fn append_with_paste_guard(result: &mut String, expanded: &str, next_byte: Option<u8>) {
         if expanded.is_empty() {
             return;
@@ -334,7 +424,7 @@ impl MacroTable {
             if would_paste_tokens(last, first)
                 || (is_ident_cont_byte(last) && is_ident_cont_byte(first))
             {
-                result.push(' ');
+                result.push(EXPANSION_BARRIER as char);
             }
         }
         result.push_str(expanded);
@@ -342,7 +432,7 @@ impl MacroTable {
         if let Some(next) = next_byte {
             let last_expanded = expanded.as_bytes()[expanded.len() - 1];
             if would_paste_tokens(last_expanded, next) {
-                result.push(' ');
+                result.push(EXPANSION_BARRIER as char);
             }
         }
     }
@@ -1611,6 +1701,17 @@ fn stringify_arg(arg: &str) -> String {
     while i < len {
         // Skip blue-paint markers (they must not appear in stringified output)
         if bytes[i] == BLUE_PAINT_MARKER {
+            i += 1;
+            continue;
+        }
+
+        // Skip EXPANSION_BARRIER markers (token boundaries with no whitespace
+        // introduced where macro replacement output abuts other tokens —
+        // §6.10.3.2 records only whitespace that exists in the token
+        // sequence, and adjacent replacement tokens stringify without a
+        // space). Without this, `EQ(V)` with V expanding to `1.MINOR.RELEASE`
+        // would stringify as "1. MINOR. RELEASE" instead of "1.6.0".
+        if bytes[i] == EXPANSION_BARRIER {
             i += 1;
             continue;
         }

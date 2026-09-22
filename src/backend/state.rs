@@ -1120,6 +1120,20 @@ impl CodegenState {
         if self.local_symbols.contains(name) {
             return false;
         }
+        // Weak symbols need GOT indirection in EVERY code model (mirrors
+        // needs_got_aarch64): a weak undefined symbol resolves to zero at
+        // runtime and a weak defined one may be overridden at static-link
+        // time. A direct rip-relative LEA emits R_X86_64_PC32, which the
+        // system linker rejects for undefined weaks in PIE links
+        // ("relocation R_X86_64_PC32 against undefined symbol ... can not
+        // be used when making a PIE object" — lib/common/zstd_trace.h's
+        // ZSTD_trace_compress_begin address compare inside lccc-built
+        // libzstd.a). @GOTPCREL assembles in non-PIE, PIE and shared links
+        // alike, and the linker fills the GOT entry with the final address
+        // (overriding definition or zero) — always semantically correct.
+        if self.weak_extern_symbols.contains(name) {
+            return true;
+        }
         if self.pie_mode {
             // RA-01 kill switch restores the old fully-GOT default so workload
             // A/B runs isolate direct-global rematerialisation exactly.

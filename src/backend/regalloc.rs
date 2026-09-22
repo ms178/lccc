@@ -3140,6 +3140,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
         for (idx, dests) in &config.folded_index_uses {
             let mut new_end: Option<u32> = None;
+            // Diagnostic (LCCC_DEBUG_SIB_CLASH): trace the folded-index
+            // interval extension end-to-end — per-link required spans, the
+            // post-extension segments, and the returned liveness — so an
+            // extension that silently no-ops (the zlib-ng deflateHeaders
+            // wrong-piece stretch) is visible without a debugger.
+            let dbg_ext = std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some();
             // Real-liveness ranges the operand must survive: one per
             // consumer. dest.start is the GEP, but a peeled index's last
             // IR use is typically a widening Cast / scale BEFORE the GEP
@@ -3181,11 +3187,45 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         };
                         if req_s < e {
                             required.push((req_s, e));
+                            // LOOP-WRAP PROTECTION. Linear [def..use] spans
+                            // assume the emitted access executes after the
+                            // def on every path that reaches it. A loop
+                            // back-edge invalidates that: re-entering the
+                            // body after the def re-executes the folded
+                            // access on the NEXT iteration, by which time
+                            // any sibling that "linearly" started after the
+                            // index's segment may legally own the register
+                            // (select/cmov chains materialise mid-loop).
+                            // zstd_opt lvl16: v2579 home %ebp, def @60003,
+                            // fold `(%r11,%rbp,4)` @60125, back-edge
+                            // `jae 60060` re-enters after the def; rival
+                            // v2911 (linearly disjoint, segs (694,743) vs
+                            // (630,683)) steals %ebp via `cmovne %r13d,
+                            // %ebp` @601d9 → garbage index on iteration 2.
+                            // Require the WHOLE innermost loop cycle that
+                            // contains the access so no sibling claim can
+                            // exist anywhere inside the emitted iteration.
+                            let mut best: Option<(u32, u32)> = None;
+                            for &(h, l) in &liveness.loop_extents {
+                                if h <= e && e <= l && best.map_or(true, |(bh, bl)| l - h < bl - bh)
+                                {
+                                    best = Some((h, l));
+                                }
+                            }
+                            if let Some((h, l)) = best {
+                                required.push((h, l));
+                            }
                         }
                     }
                 }
             }
             if let Some(e) = new_end {
+                if dbg_ext {
+                    eprintln!(
+                        "[sib-clash-ext] fn={} idx=v{idx} dests={dests:?} new_end={e} required={required:?}",
+                        func.name
+                    );
+                }
                 for iv in &mut liveness.intervals {
                     if iv.value_id == *idx && iv.end < e {
                         iv.end = e;
@@ -3226,10 +3266,63 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         insert_segment_union(&mut merged, &required);
                         pieces = merged;
                     } else {
-                        // Historical tail stretch (single-def shapes).
-                        if let Some(last) = pieces.last_mut() {
-                            if last.1 < e {
-                                last.1 = e;
+                        // Single-def shapes. The historical tail stretch
+                        // extended only the LAST piece — a silent NO-OP for
+                        // multi-segment values, whose consumer access sits
+                        // after a NON-last piece's end (the hole between the
+                        // pieces is exactly where the allocator then placed
+                        // another value, e.g. the folded access's own base).
+                        // zlib-ng deflateHeaders `put_byte`: the U32 index
+                        // `s->pending` had segments [(136,146),(606,619)],
+                        // required (146,149); the last-piece stretch left the
+                        // hole open, the base `s->pending_buf` [(147,149)]
+                        // got the index's register, and ensure_sib_index_form
+                        // zero-extended the index IN PLACE over the freshly
+                        // reloaded base → `mov %r10b,(%rdi,%rdi,1)` with
+                        // rdi = base = index (store through a wild address).
+                        //
+                        // Extend instead the piece the access actually
+                        // follows: the piece containing the required span's
+                        // start (the last IR-visible read position), or the
+                        // piece ending latest at or before it. Like the
+                        // historical stretch, a piece END only ever grows —
+                        // no span is invented, no first/last live-unit anchor
+                        // moves (the union-merge anchor effects that required
+                        // gating the merge to multi-def latches do not apply:
+                        // the global max end is untouched whenever any later
+                        // piece exists, and grows exactly to the access when
+                        // the stretched piece IS the last one).
+                        for &(req_s, req_e) in &required {
+                            let containing = pieces.iter_mut().find(|piece| {
+                                let (ss, ee) = *piece;
+                                ss <= req_s && req_s < ee
+                            });
+                            if let Some(piece) = containing {
+                                if piece.1 < req_e {
+                                    piece.1 = req_e;
+                                }
+                                continue;
+                            }
+                            let preceding = pieces
+                                .iter_mut()
+                                .filter(|piece| piece.1 <= req_s)
+                                .max_by_key(|piece| piece.1);
+                            if let Some(piece) = preceding {
+                                if piece.1 < req_e {
+                                    piece.1 = req_e;
+                                }
+                            }
+                        }
+                        // Historical behaviour for the common single-piece
+                        // shape: make sure the envelope target `e` is
+                        // honoured even when `required` came out empty
+                        // (covering-segment case where the piece already
+                        // contains dest.start).
+                        if required.is_empty() {
+                            if let Some(last) = pieces.last_mut() {
+                                if last.1 < e {
+                                    last.1 = e;
+                                }
                             }
                         }
                         pieces.sort_unstable();
@@ -3247,11 +3340,30 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // Values without segment data keep the fat-envelope
                 // extension above (fail-closed: the scan and the verifier
                 // both fall back to the envelope for them).
+            } else if dbg_ext {
+                eprintln!(
+                    "[sib-clash-ext] fn={} idx=v{idx} dests={dests:?} new_end=NONE (no consumer bound found)",
+                    func.name
+                );
             }
         }
         liveness
             .segments
             .sort_unstable_by_key(|segment| (segment.start, segment.value_id, segment.end));
+        if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
+            for (idx, _) in &config.folded_index_uses {
+                let segs: Vec<(u32, u32)> = liveness
+                    .segments
+                    .iter()
+                    .filter(|s| s.value_id == *idx)
+                    .map(|s| (s.start, s.end))
+                    .collect();
+                eprintln!(
+                    "[sib-clash-ext] fn={} post-ext v{idx} segments={segs:?}",
+                    func.name
+                );
+            }
+        }
     }
     let iv_map = interval_map(&liveness);
     let call_points = &liveness.call_points;
@@ -5796,6 +5908,21 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // both locations made downstream behavior depend on insertion order.
     accumulator_assignments.retain(|a| !assignments.contains_key(&a.value_id));
     verify_accumulator_assignments(func, &accumulator_assignments);
+
+    if std::env::var_os("LCCC_DEBUG_SIB_CLASH").is_some() {
+        for (idx, _) in &config.folded_index_uses {
+            let segs: Vec<(u32, u32)> = liveness
+                .segments
+                .iter()
+                .filter(|s| s.value_id == *idx)
+                .map(|s| (s.start, s.end))
+                .collect();
+            eprintln!(
+                "[sib-clash-ext] fn={} at-return v{idx} segments={segs:?}",
+                func.name
+            );
+        }
+    }
 
     RegAllocResult {
         assignments,

@@ -4915,6 +4915,34 @@ fn cond_store_no_escaping_uses(
 /// Fail-closed: any shape deviation (extra side effects, a second load, a
 /// different skip target, volatile access, non-integer compares the flip
 /// table does not cover) leaves the loop untouched.
+///
+/// S04c guard (`cond_store_phi_incoming_safe`): the rewrite deletes every
+/// computation in the guard chain and the store block. A header phi whose
+/// back edge takes its value from one of those blocks is a loop-carried
+/// recurrence — `if (b[i]=='\n') { b[i]=0; lineCount++; }` in
+/// UTIL_processLines — that the select-store silently drops, which zeroed
+/// the line count and broke zstd's `--filelist`. The map transform's own
+/// contract allows no loop-carried value except the induction variable, so
+/// such shapes must not be rewritten at all.
+fn cond_store_phi_incoming_safe(func: &IrFunction, rewritten_blocks: &[usize]) -> bool {
+    let rewritten_labels: FxHashSet<BlockId> = rewritten_blocks
+        .iter()
+        .map(|&bi| func.blocks[bi].label)
+        .collect();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (_op, label) in incoming {
+                    if rewritten_labels.contains(label) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 fn rewrite_conditional_store(
     func: &mut IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
@@ -5237,6 +5265,24 @@ fn rewrite_conditional_store(
         return false;
     }
 
+    if !same_address {
+        return false;
+    }
+
+    // S04c fail-closed: chain blocks + the store block are about to be
+    // deleted; refuse when a phi takes its incoming from any of them (a
+    // loop-carried recurrence the select-store would silently drop).
+    {
+        let mut rewritten: Vec<usize> = chain.iter().map(|&(b, _)| b).collect();
+        rewritten.push(store_block);
+        if !cond_store_phi_incoming_safe(func, &rewritten) {
+            set_reject("conditional store feeds a loop-carried phi");
+            if debug {
+                eprintln!("[VEC-COND] bail: phi incoming from rewritten block");
+            }
+            return false;
+        }
+    }
     // ── Rewrite ──────────────────────────────────────────────────────────
     // Move the store block's value computation into the first chain
     // block, re-point the store at the load's address, and select the
@@ -5862,6 +5908,20 @@ fn rewrite_folded_cond_store(
         negated
     };
 
+    if !same_address {
+        return false;
+    }
+
+    // S04c fail-closed: the guard header + store block are about to be
+    // rewritten; refuse when a phi takes its incoming from either (a
+    // loop-carried recurrence the select-store would silently drop).
+    if !cond_store_phi_incoming_safe(func, &[header_idx, store_block]) {
+        set_reject("conditional store feeds a loop-carried phi");
+        if debug {
+            eprintln!("[VEC-COND] bail: phi incoming from rewritten block (folded)");
+        }
+        return false;
+    }
     // ── Rewrite ──────────────────────────────────────────────────────────
     // The store block's computation, minus the store itself and the
     // store's address GEP (the new store reuses the load's address),
