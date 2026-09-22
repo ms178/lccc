@@ -1491,6 +1491,7 @@ pub fn emit_data_sections(
     module: &IrModule,
     ptr_dir: PtrDirective,
     pic_mode: bool,
+    optimize_size: bool,
 ) {
     // String literals in .rodata
     if !module.string_literals.is_empty()
@@ -1522,22 +1523,32 @@ pub fn emit_data_sections(
     }
 
     // Global variables
-    emit_globals(out, &module.globals, ptr_dir, pic_mode);
+    emit_globals(out, &module.globals, ptr_dir, pic_mode, optimize_size);
 }
 
-/// Compute effective alignment for a global, promoting to 16 when size >= 16.
-/// This matches GCC/Clang behavior on x86-64 and aarch64, enabling aligned SSE/NEON access.
+/// Compute effective alignment for a global.
+///
+/// Default policy (matching GCC/Clang on x86-64 and aarch64 at -O0..-O3):
+/// promote to 16 bytes when size >= 16, enabling aligned SSE/NEON access.
 /// Globals placed in custom sections are excluded from promotion because they may
 /// form contiguous arrays (e.g. the kernel's __param or .init.setup sections) where
 /// the linker expects elements at their natural stride with no extra padding.
 /// Additionally, when the user explicitly specified an alignment via __attribute__((aligned(N)))
 /// or _Alignas, we respect their choice and don't auto-promote. GCC behaves the same way:
 /// explicit aligned(8) on a 24-byte struct gives 8-byte alignment, not 16.
-fn effective_align(g: &IrGlobal) -> usize {
+///
+/// At -Os/-Oz (`optimize_size`) the promotion is skipped entirely: GCC's
+/// i386/x86-64 DATA_ALIGNMENT only promotes when `!optimize_size`, and under
+/// `-Os` a 40-byte `.bss` array gets no `.align` at all (verified against
+/// GCC 16.2 `-Os -m16 -mregparm=3`). Every promoted symbol can pad the flat
+/// image by up to 15 bytes *twice* (before itself and shifted into every
+/// later symbol), which is real budget in size-gated segments such as the
+/// Linux boot setup image. Natural ABI alignment (`g.align`) is always kept.
+fn effective_align(g: &IrGlobal, optimize_size: bool) -> usize {
     if g.section.is_some() || g.has_explicit_align {
         return g.align;
     }
-    if g.size >= 16 && g.align < 16 {
+    if !optimize_size && g.size >= 16 && g.align < 16 {
         16
     } else {
         g.align
@@ -1545,11 +1556,17 @@ fn effective_align(g: &IrGlobal) -> usize {
 }
 
 /// Emit a zero-initialized global variable (used in .bss, .tbss, and custom section zero-init).
-fn emit_zero_global(out: &mut AsmOutput, g: &IrGlobal, obj_type: &str, ptr_dir: PtrDirective) {
+fn emit_zero_global(
+    out: &mut AsmOutput,
+    g: &IrGlobal,
+    obj_type: &str,
+    ptr_dir: PtrDirective,
+    optimize_size: bool,
+) {
     emit_symbol_directives(out, g);
     out.emit_fmt(format_args!(
         ".align {}",
-        ptr_dir.align_arg(effective_align(g))
+        ptr_dir.align_arg(effective_align(g, optimize_size))
     ));
     out.emit_fmt(format_args!(".type {}, {}", g.name, obj_type));
     out.emit_fmt(format_args!(".size {}, {}", g.name, g.size));
@@ -1648,7 +1665,13 @@ fn classify_global(g: &IrGlobal, pic_mode: bool) -> GlobalSection {
 /// Classifies each global once via `classify_global`, then emits all globals
 /// for each section in a fixed order: extern visibility, custom sections,
 /// .rodata, .tdata, .data, .comm, .tbss, .bss.
-fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective, pic_mode: bool) {
+fn emit_globals(
+    out: &mut AsmOutput,
+    globals: &[IrGlobal],
+    ptr_dir: PtrDirective,
+    pic_mode: bool,
+    optimize_size: bool,
+) {
     // Phase 1: classify every global into its target section.
     let classified: Vec<GlobalSection> = globals
         .iter()
@@ -1720,9 +1743,9 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
             section_name, flags, section_type
         ));
         if matches!(g.init, GlobalInit::Zero) || g.size == 0 {
-            emit_zero_global(out, g, "@object", ptr_dir);
+            emit_zero_global(out, g, "@object", ptr_dir, optimize_size);
         } else {
-            emit_global_def(out, g, ptr_dir);
+            emit_global_def(out, g, ptr_dir, optimize_size);
         }
         out.emit("");
     }
@@ -1736,6 +1759,7 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         ".section .rodata",
         false,
         ptr_dir,
+        optimize_size,
     );
 
     // .data.rel.ro: const-qualified globals that need runtime relocation in
@@ -1748,6 +1772,7 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         ".section .data.rel.ro,\"aw\",@progbits",
         false,
         ptr_dir,
+        optimize_size,
     );
 
     // .tdata: thread-local initialized globals
@@ -1759,6 +1784,7 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         ".section .tdata,\"awT\",@progbits",
         false,
         ptr_dir,
+        optimize_size,
     );
 
     // .data: non-const initialized globals
@@ -1770,6 +1796,7 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         ".section .data",
         false,
         ptr_dir,
+        optimize_size,
     );
 
     // .comm: zero-initialized common globals (weak linkage, linker merges duplicates).
@@ -1780,7 +1807,7 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
                 ".comm {},{},{}",
                 g.name,
                 g.size,
-                effective_align(g)
+                effective_align(g, optimize_size)
             ));
         }
     }
@@ -1794,6 +1821,7 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         ".section .tbss,\"awT\",@nobits",
         true,
         ptr_dir,
+        optimize_size,
     );
 
     // .bss: non-TLS zero-initialized globals (includes zero-size globals with
@@ -1806,6 +1834,7 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         ".section .bss",
         true,
         ptr_dir,
+        optimize_size,
     );
 }
 
@@ -1819,6 +1848,7 @@ fn emit_section_group(
     section_header: &str,
     is_zero: bool,
     ptr_dir: PtrDirective,
+    optimize_size: bool,
 ) {
     let mut emitted_header = false;
     for (g, sect) in globals.iter().zip(classified) {
@@ -1835,9 +1865,9 @@ fn emit_section_group(
             } else {
                 "@object"
             };
-            emit_zero_global(out, g, obj_type, ptr_dir);
+            emit_zero_global(out, g, obj_type, ptr_dir, optimize_size);
         } else {
-            emit_global_def(out, g, ptr_dir);
+            emit_global_def(out, g, ptr_dir, optimize_size);
         }
     }
     if emitted_header {
@@ -1875,11 +1905,11 @@ fn emit_symbol_directives(out: &mut AsmOutput, g: &IrGlobal) {
 }
 
 /// Emit a single global variable definition.
-fn emit_global_def(out: &mut AsmOutput, g: &IrGlobal, ptr_dir: PtrDirective) {
+fn emit_global_def(out: &mut AsmOutput, g: &IrGlobal, ptr_dir: PtrDirective, optimize_size: bool) {
     emit_symbol_directives(out, g);
     out.emit_fmt(format_args!(
         ".align {}",
-        ptr_dir.align_arg(effective_align(g))
+        ptr_dir.align_arg(effective_align(g, optimize_size))
     ));
     let obj_type = if g.is_thread_local {
         "@tls_object"

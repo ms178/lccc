@@ -2459,6 +2459,21 @@ pub trait ArchCodegen {
         None
     }
 
+    /// Whether this invocation optimizes for size (`-Os`/`-Oz`).
+    ///
+    /// GCC-parity contract for *data* alignment: GCC's i386/x86-64
+    /// DATA_ALIGNMENT promotes large statics to 16/32-byte alignment only
+    /// when `!optimize_size`; under `-Os` it keeps natural ABI alignment
+    /// (verified against GCC 16.2 `-Os -m16`: a 40-byte `.bss` array gets
+    /// no `.align` at all). Padding between flat-image data costs real
+    /// bytes in size-critical segments (the Linux boot setup gate), so the
+    /// global emitters consult this to skip the >=16-byte promotion.
+    /// Default false: backends without the CodegenOptions flag keep the
+    /// promotion (x86-64 and i686 override).
+    fn optimize_for_size(&self) -> bool {
+        false
+    }
+
     fn function_type_directive(&self) -> &'static str {
         "@function"
     }

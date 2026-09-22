@@ -98,8 +98,48 @@ the range fusion; it used to be a scalar loop.
 3. **Loop Rotation Default-Enable (PF-17):** Hardening remaining 15 edge-case loop shapes to enable loop rotation by default (eliminating the extra entry jump in hot loops).
 4. **MachInst Instruction Selection Coverage Expansion:** Expand MachInst window allocator to 95%+ of instruction forms.
 
+## Session-60 status (rebase onto merged PR #586/#587 + x86-64 push forms)
+
+- **Rebase**: S04 (i686 homing + push staging + -Os align) applied 3-way
+  onto upstream `e08565c0` (their PRs #586/#587: SSE staging liveness
+  authority marker, i686 copy+narrow-ext fold, accum-nohome switch, boot
+  census harnesses). Composition clean; 3126 unit / 783 regression green.
+- **New feature (x86-64)**: direct push forms for MEMORY-class stack args
+  (`pushq $imm` / `pushq %reg` / `pushq slot(%rsp)`; parity pad `pushq $0`),
+  freshness- and shape-gated, `CCC_NO_X64_PUSH_ARG_FORMS` kill switch.
+  Guard: `tests/regression/x64_push_arg_forms.c` (8 rows: imm8 boundaries,
+  zero, non-imm32-fitting unsigned, slots, homes, SSE mix, variadic census,
+  indirect call). Kernel .text **−6,848 B** (11,901,398 → 11,894,550).
+- **Verdict on the competing revision** (data, boot corpus paired A/B):
+  their fold's boot win evaporates under our direct homing (±0 B); homing
+  −89 B and push staging −297 B persist. Fold kept (i686 -O2 corpus wins)
+  + now has the missing bisection switch. Their A/B methodology adopted.
+- **Defects fixed**: session-59 guard test called libc under
+  `-mregparm=3` (ABI violation; freestanding rewrite, all four EXPECT
+  rows oracle-derived — two had drifted); `boot_ab_size.py` cwd
+  robustness; missing `CCC_NO_COPY_NARROW_EXT_FOLD` switch.
+- **ABI conformance closed with 3 oracles**: lccc's 8-byte stride for
+  sub-eightbyte stack scalars matches GCC 16.2 / Clang 23.1 / ICX.
+- **Milestones**: kernel rebuild exit 0 (CC=lccc LD=lccc-ld), QEMU boot
+  ALL CHECKS PASSED (17), defect scan 0. See Part II of
+  `FOLLOWUP-2026-09-22B-i686-boot-size-levers.md`.
+
 ## Kernel-mode status (linux-cachymod-6.18.52, lccc + lccc-ld only)
 
+- **2026-09-22 (session 59) REVALIDATED FROM SCRATCH + boot-size levers
+  landed.** Harness-wiped sandbox re-bootstrapped; 28/28 CachyMod patches
+  re-applied by `prepare_kernel_tree.sh`; full `build_kernel_vm.sh` rebuild:
+  1363 `# CC` lines, zero errors, objtool accepts every object, everything
+  linked by lccc-ld; **bzImage 5,067,776 B (−4096 vs session 58)**;
+  `qemu_boot_test.sh` **ALL 16 CHECKS PASSED** with a warning-free serial
+  log (the session-58 open ACPI `free_large_kmalloc` WARNING is confirmed
+  gone — fixed by 05c9a6ba). Three size-direction codegen fixes landed
+  (stack-param direct homing, push-based outgoing-arg staging, `-Os` data
+  alignment = GCC parity; boot corpus `.text` −386 B, flat setup image
+  −461 B, gate headroom 1600 → 1664 with the package-style boot feature
+  set). Guard tests: `i686_stack_param_direct_home.c`,
+  `i686_push_arg_staging.c`. Full record:
+  `engineering/FOLLOWUP-2026-09-22B-i686-boot-size-levers.md`.
 - **M1 vmlinux link PASS** — 21.5 MB vmlinux, pure lccc-ld, 0 dynamic
   relocations, vdso phdr parity with GNU (regression
   `script_vdso_declared_note_phdrs`).

@@ -3318,7 +3318,18 @@ pub fn generate_module(
 
     let ptr_dir = cg.ptr_directive();
     let pic_mode = cg.state_ref().pic_mode;
-    common::emit_data_sections(&mut cg.state().out, module, ptr_dir, pic_mode);
+    // GCC-parity data-alignment policy: under -Os/-Oz GCC stops promoting
+    // large statics to 16-byte alignment (DATA_ALIGNMENT honors
+    // optimize_size); the padding would be real flat-image bytes in
+    // size-gated segments such as the Linux boot setup.
+    let optimize_size = cg.optimize_for_size();
+    common::emit_data_sections(
+        &mut cg.state().out,
+        module,
+        ptr_dir,
+        pic_mode,
+        optimize_size,
+    );
 
     // Top-level asm("...") (e.g. musl `_start`). Switch to .text first so
     // labels/code land in the correct section.

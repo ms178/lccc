@@ -295,7 +295,17 @@ impl X86Codegen {
             }
             self.dyn_align_cleanup = true;
         } else if stack_arg_space % 16 != 0 {
-            self.state.emit("    subq $8, %rsp");
+            // Parity pad below the outgoing area. `pushq $0` (6A 00, 2 B)
+            // replaces `subq $8, %rsp` (48 83 EC 08, 4 B): identical %rsp
+            // delta, and the dead qword it defines is never read — it sits
+            // BELOW every argument the callee walks, so the argument view
+            // is unchanged. One instruction fewer, two bytes fewer, and no
+            // dependency on the (possibly busy) %rax staging lane.
+            if self.state.ra_config.no_x64_push_arg_forms {
+                self.state.emit("    subq $8, %rsp");
+            } else {
+                self.state.emit("    pushq $0");
+            }
             sp_adjust += 8;
             // Adjust RSP frame size so operand_to_rax slot conversions
             // are correct after the alignment subq.
@@ -470,8 +480,21 @@ impl X86Codegen {
                     sp_adjust += push_bytes;
                 }
                 CallArgClass::Stack => {
-                    self.operand_to_rax(&args[si]);
-                    self.state.emit("    pushq %rax");
+                    // Direct push forms first: `pushq $imm` / `pushq %reg` /
+                    // `pushq slot(%rsp)` are each strictly smaller than the
+                    // materialise-into-%rax fallback (6-9 B -> 1-8 B) and
+                    // keep %rax out of the staging chain, so consecutive
+                    // pushes no longer serialise through the accumulator.
+                    // `try_emit_direct_stack_arg_push` is freshness-gated
+                    // end to end and returns false whenever no proven form
+                    // applies, leaving the classic path as the only writer
+                    // of %rax.
+                    let direct = !self.state.ra_config.no_x64_push_arg_forms
+                        && self.try_emit_direct_stack_arg_push(&args[si]);
+                    if !direct {
+                        self.operand_to_rax(&args[si]);
+                        self.state.emit("    pushq %rax");
+                    }
                     if self.state.out.use_rsp_addressing {
                         self.state.out.rsp_frame_size += 8;
                     }
@@ -500,6 +523,111 @@ impl X86Codegen {
         // Return the total STATIC RSP adjustment so emit_call_reg_args can
         // compensate stack slot offsets when loading register arguments.
         sp_adjust
+    }
+
+    /// Emit one DIRECT push for a MEMORY-class scalar stack argument.
+    ///
+    /// Three forms, in descending win size — each must be provably equal to
+    /// `operand_to_rax` + `pushq %rax` at the moment of the push, or the
+    /// method returns false and the caller takes the fallback:
+    ///
+    /// 1. `pushq $imm` (2/5 B) — [`x64_stack_arg_push_imm`] owns the
+    ///    sign-extension law (imm8 window, narrow-lane ABI latitude,
+    ///    eight-byte fit test);
+    /// 2. `pushq %reg` (1/2 B) — the value's CURRENT home, freshness-gated
+    ///    through `fresh_home_of` (a stale home would push a derived
+    ///    value); %rsp is never a home, and %rbp is only pushed in FPO
+    ///    mode (with an rbp frame it is the frame pointer);
+    /// 3. `pushq slot(%rsp|%rbp)` (5/8 B) — the value's slot, resolved only
+    ///    when it has NO register home at all (`SlotAddr::Direct`; indirect
+    ///    slot addressing falls back), so the displacement is the plain
+    ///    `slot_ref` of the live frame bookkeeping — the same offset
+    ///    `operand_to_rax`'s load would use, because the frame accounting
+    ///    has already absorbed every earlier push of this loop.
+    ///
+    /// The accumulator cache is intentionally NOT invalidated: no form
+    /// writes %rax, so a live cached value stays cached (the fallback path
+    /// overwrites it through `operand_to_rax` as before).
+    fn try_emit_direct_stack_arg_push(&mut self, op: &Operand) -> bool {
+        match op {
+            Operand::Const(c) => {
+                if let Some(imm) = super::emit::x64_stack_arg_push_imm(c) {
+                    self.state.emit_fmt(format_args!("    pushq ${}", imm));
+                    return true;
+                }
+                false
+            }
+            Operand::Value(v) => {
+                // (1) live accumulator: `pushq %rax` is exactly the
+                // fallback's push, minus the materialisation.
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.state.reg_cache.acc_has(v.0, is_alloca) {
+                    self.state.emit("    pushq %rax");
+                    return true;
+                }
+                // (2) secondary cache (%rcx): same law.
+                if self.state.reg_cache.sec_has(v.0, is_alloca) {
+                    self.state.emit("    pushq %rcx");
+                    return true;
+                }
+                // (3) fresh register home — GP only; an XMM home has no
+                // push form and must take the fallback.
+                if let Some(reg) = self.fresh_home_of(v.0) {
+                    if super::emit::is_gpr_reg(reg)
+                        && (reg.0 != 6 || self.state.out.use_rsp_addressing)
+                    {
+                        let name = super::emit::phys_reg_name(reg);
+                        self.state.emit_fmt(format_args!("    pushq %{}", name));
+                        return true;
+                    }
+                    // XMM homes fall through to the fallback.
+                    return false;
+                }
+                // (4) plain scalar slot holding the full value: only when
+                // no register home exists at all (a stale home would need a
+                // reload first — but the slot is then the authoritative
+                // copy, which is exactly what the fallback loads), the
+                // slot resolves DIRECTLY, and the value is none of the
+                // shapes for which the slot is NOT the scalar itself: an
+                // alloca (slot holds locals, the value is its address),
+                // i128/F128/vector payloads (8 bytes are not the value), or
+                // a small slot (its 4 bytes back a narrower datum; the
+                // fallback's load re-establishes the type invariant, a
+                // blind 8-byte push would not).
+                // (4) plain scalar slot holding the full value.  Reached
+                // only with no fresh home: either no register home exists,
+                // or the home is stale — in both cases the slot is the
+                // authoritative copy, which is exactly what the fallback
+                // (operand_to_rax's slot path) loads, so pushing from it is
+                // the same data.  NOTE: `get_slot` (the value's storage
+                // slot), not `resolve_slot_addr` — that API classifies
+                // plain scalars as Indirect because it answers a different
+                // question (the address OF a value for lea/memcpy shapes).
+                // Refused when the slot is NOT the scalar itself: an alloca
+                // (slot holds locals, the value is its address),
+                // i128/F128/vector payloads (8 bytes are not the value), or
+                // a small slot (its 4 bytes back a narrower datum; the
+                // fallback's load re-establishes the type invariant, a
+                // blind 8-byte push would not).
+                let plain_scalar_slot = !is_alloca
+                    && !self.state.i128_values.contains(&v.0)
+                    && !self.state.f128_direct_slots.contains(&v.0)
+                    && !self.state.vector_values.contains(&v.0)
+                    && !self.state.vector128_values.contains(&v.0)
+                    && !self.state.is_small_slot(v.0);
+                if plain_scalar_slot {
+                    if let Some(slot) = self.state.get_slot(v.0) {
+                        let sr = self.slot_ref(slot.0);
+                        self.state.emit_fmt(format_args!("    pushq {}", sr));
+                        return true;
+                    }
+                }
+                false
+            } // Operand is the two-variant (Const | Value) IR operand enum;
+              // the match above is exhaustive on purpose.  A new variant must
+              // decide its own push story here instead of silently falling
+              // through a wildcard.
+        }
     }
 
     /// Spill an indirect function pointer before stack argument setup.

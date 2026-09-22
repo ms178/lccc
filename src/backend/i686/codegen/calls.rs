@@ -8,6 +8,15 @@ use crate::common::types::IrType;
 use crate::emit;
 use crate::ir::reexports::{Operand, Value};
 
+/// A/B gate for push-based outgoing-argument staging: the presence of
+/// `CCC_NO_PUSH_ARG_STAGING` restores the `subl $N,%esp` + store marshalling
+/// verbatim (same presence-means-off convention as the other `CCC_NO_*`
+/// switches). Cached once: consulted per call site.
+fn push_arg_staging_disabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var_os("CCC_NO_PUSH_ARG_STAGING").is_some())
+}
+
 impl I686Codegen {
     pub(super) fn call_abi_config_impl(&self) -> call_abi::CallAbiConfig {
         call_abi::CallAbiConfig {
@@ -69,6 +78,7 @@ impl I686Codegen {
         struct_arg_is_f128_sse: &[bool],
     ) -> usize {
         let mut total = 0usize;
+        let mut max_arg_align = 4usize;
         for (i, ac) in arg_classes.iter().enumerate() {
             let ty = if i < arg_types.len() {
                 arg_types[i]
@@ -76,6 +86,7 @@ impl I686Codegen {
                 IrType::I32
             };
             let align = self.stack_arg_align(i, ac, struct_arg_aligns, struct_arg_is_f128_sse);
+            max_arg_align = max_arg_align.max(align);
             total = (total + align - 1) & !(align - 1);
             match ac {
                 call_abi::CallArgClass::Stack => match ty {
@@ -93,7 +104,16 @@ impl I686Codegen {
                 _ => total += 4,
             }
         }
-        (total + 15) & !15
+        // The outgoing area only needs the strictest alignment of the stack
+        // boundary the TU asked for and the widest per-argument alignment
+        // (TFmode carriers: 16). The previous unconditional 16-byte rounding
+        // ignored -mpreferred-stack-boundary: with the Linux boot's
+        // `-mpreferred-stack-boundary=2` GCC rounds the same call site to 4,
+        // so up to 12 bytes per stack-arg call site were dead flat-image
+        // weight (GCC 16.2 -Os -m16 -mregparm=3 oracle: `subl $12,%esp` for a
+        // 3-arg call, not `subl $16,%esp`).
+        let area_align = self.stack_boundary.max(max_arg_align as i64) as usize;
+        (total + area_align - 1) & !(area_align - 1)
     }
 
     pub(super) fn emit_call_f128_pre_convert_impl(
@@ -104,6 +124,29 @@ impl I686Codegen {
         _stack_arg_space: usize,
     ) -> usize {
         0 // No F128 pre-conversion needed on i686
+    }
+
+    /// True when `ac`/`ty` is a scalar argument the push-staging path can
+    /// marshal with one `pushl`: the 4-byte `Stack` scalars and the same
+    /// classes the staging loop's fallback arm stores as one 4-byte word.
+    /// Everything with sub-4-byte granularity, wide (8/12/16-byte) footprint,
+    /// struct copies, register-param classes and zero-size skips is excluded.
+    fn push_staging_class_ok(ac: &call_abi::CallArgClass, ty: IrType) -> bool {
+        if ty.size() > 4 {
+            return false;
+        }
+        !matches!(
+            ac,
+            call_abi::CallArgClass::ZeroSizeSkip
+                | call_abi::CallArgClass::IntReg { .. }
+                | call_abi::CallArgClass::I64RegPair { .. }
+                | call_abi::CallArgClass::StructByValReg { .. }
+                | call_abi::CallArgClass::F128Stack
+                | call_abi::CallArgClass::I128Stack
+                | call_abi::CallArgClass::StructByValStack { .. }
+                | call_abi::CallArgClass::LargeStructStack { .. }
+                | call_abi::CallArgClass::StructSplitRegStack { .. }
+        )
     }
 
     pub(super) fn emit_call_stack_args_impl(
@@ -118,6 +161,72 @@ impl I686Codegen {
         struct_arg_is_f128_sse: &[bool],
     ) -> i64 {
         if stack_arg_space > 0 {
+            // GCC-style push staging: when every stack argument is a 4-byte
+            // scalar and the outgoing area is exactly the pushed bytes (no
+            // alignment pad, boundary <= 4), push the arguments right-to-left
+            // instead of `subl $N,%esp` + per-arg `movl %eax, N(%esp)` stores.
+            // A `pushl %eax` is 2 bytes in 16-bit mode vs 5-8 for the store,
+            // the `subl` disappears, and the callee's ownership of its
+            // incoming argument slots makes the layout ABI-identical (GCC
+            // 16.2 -Os -m16 -mregparm=3 oracle: `pushl $30; pushl $20; call
+            // f`). esp_adjust tracks each push, so every later operand load
+            // sees the shifted frame exactly as the subl model would. The
+            // caller-side `addl $N,%esp` cleanup in emit_call_cleanup_impl
+            // stays byte-identical because the pushed total equals the old
+            // area size.
+            let pushable: Vec<(usize, usize)> = {
+                let mut v = Vec::new();
+                let mut stack_offset: usize = 0;
+                for (i, ac) in arg_classes.iter().enumerate() {
+                    let ty = arg_types.get(i).copied().unwrap_or(IrType::I32);
+                    let align =
+                        self.stack_arg_align(i, ac, struct_arg_aligns, struct_arg_is_f128_sse);
+                    stack_offset = (stack_offset + align - 1) & !(align - 1);
+                    if Self::push_staging_class_ok(ac, ty) {
+                        v.push((stack_offset, i));
+                    }
+                    stack_offset += match ac {
+                        call_abi::CallArgClass::Stack => match ty {
+                            IrType::F64 | IrType::I64 | IrType::U64 => 8,
+                            _ => 4,
+                        },
+                        call_abi::CallArgClass::F128Stack => 12,
+                        call_abi::CallArgClass::I128Stack => 16,
+                        call_abi::CallArgClass::StructByValStack { size }
+                        | call_abi::CallArgClass::LargeStructStack { size } => (size + 3) & !3,
+                        call_abi::CallArgClass::ZeroSizeSkip
+                        | call_abi::CallArgClass::IntReg { .. }
+                        | call_abi::CallArgClass::I64RegPair { .. }
+                        | call_abi::CallArgClass::StructByValReg { .. } => 0,
+                        _ => 4,
+                    };
+                }
+                v
+            };
+            if pushable.len() * 4 == stack_arg_space
+                && self.stack_boundary <= 4
+                && !push_arg_staging_disabled()
+            {
+                // Push right-to-left so slot 0 lands at the lowest address,
+                // exactly the cdecl layout the callee expects.
+                for &(_, i) in pushable.iter().rev() {
+                    if let Operand::Const(c) = &args[i] {
+                        // `const_stack_arg_imm` is the shared single source of
+                        // truth for the 32-bit image of a constant argument;
+                        // `pushl $imm` stores the same four bytes the store
+                        // path would, and GAS picks the imm8 `6a` encoding
+                        // whenever the value fits.
+                        let imm = super::emit::const_stack_arg_imm(c);
+                        emit!(self.state, "    pushl ${}", imm);
+                        self.esp_adjust += 4;
+                        continue;
+                    }
+                    self.operand_to_eax(&args[i]);
+                    self.state.emit("    pushl %eax");
+                    self.esp_adjust += 4;
+                }
+                return stack_arg_space as i64;
+            }
             emit!(self.state, "    subl ${}, %esp", stack_arg_space);
             self.esp_adjust += stack_arg_space as i64;
         }

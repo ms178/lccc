@@ -1,0 +1,1 @@
+-m32 -Os -mpreferred-stack-boundary=2 -fno-pic
