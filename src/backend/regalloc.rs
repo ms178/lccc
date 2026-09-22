@@ -234,6 +234,14 @@ pub(crate) struct RaConfig {
     /// register-homed operand IN PLACE.  Keep it a switch: the boot corpus
     /// A/B in engineering/journal decides the default, not the theory.
     pub(crate) no_i686_accum_nohome: bool,
+    /// `CCC_NO_X64_PUSH_ARG_FORMS`: disable the x86-64 direct stack-argument
+    /// push forms (default: false).  With the switch off, a MEMORY-class
+    /// scalar argument stages as `pushq $imm` / `pushq %reg` /
+    /// `pushq slot(%rsp)` — each strictly smaller than the fallback
+    /// materialise-into-%rax + `pushq %rax`, and each removes %rax from the
+    /// staging serialisation chain.  Kill switch for bisection, per the
+    /// house rule that every staging change is individually measurable.
+    pub(crate) no_x64_push_arg_forms: bool,
     /// `CCC_X64_NOHOME_CLASSES`: selected no-home consumer classes (default: `ret,store,copy,cast,unary,binop`).
     pub(crate) x64_nohome_classes: String,
     /// `CCC_MI_MAX_LOOP_INSTS`: MachInst loop-size threshold
@@ -371,6 +379,7 @@ impl RaConfig {
             debug_vararg: present("CCC_DEBUG_VARARG"),
             no_x64_immed_nohome: present("CCC_NO_X64_IMMED_NOHOME"),
             no_i686_accum_nohome: present("CCC_NO_I686_ACCUM_NOHOME"),
+            no_x64_push_arg_forms: present("CCC_NO_X64_PUSH_ARG_FORMS"),
             x64_nohome_classes: text("CCC_X64_NOHOME_CLASSES")
                 .unwrap_or_else(|| "ret,store,copy,cast,unary,binop".into()),
             mi_max_loop_insts: number("CCC_MI_MAX_LOOP_INSTS", MI_MAX_LOOP_INSTS_DEFAULT),
@@ -10938,6 +10947,7 @@ mod ra_config_tests {
         switch!(debug_vararg, "CCC_DEBUG_VARARG");
         switch!(no_x64_immed_nohome, "CCC_NO_X64_IMMED_NOHOME");
         switch!(no_i686_accum_nohome, "CCC_NO_I686_ACCUM_NOHOME");
+        switch!(no_x64_push_arg_forms, "CCC_NO_X64_PUSH_ARG_FORMS");
         switch!(mi_all_classic, "CCC_MI_ALL_CLASSIC");
         switch!(mi_force_loops, "CCC_MI_FORCE_LOOPS");
         switch!(mi_debug, "CCC_MI_DEBUG");

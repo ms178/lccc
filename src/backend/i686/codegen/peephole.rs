@@ -11544,7 +11544,13 @@ pub fn peephole_optimize(asm: String) -> String {
     // instruction is the machine's *input* shape (it establishes the
     // byte/word fact), and folding first means the machine can then delete
     // the extension entirely when the source fact already holds.
-    let copy_ext_changed = fold_copy_narrow_ext_pairs(&mut store, &mut infos);
+    // `CCC_NO_COPY_NARROW_EXT_FOLD` is the bisection switch, per the house
+    // rule that every peephole family is individually measurable (this
+    // pass shipped with a missing-space defect that only a real compile
+    // caught — the switch exists so the next one can be isolated in one
+    // A/B instead of a rebase).
+    let copy_ext_changed = std::env::var_os("CCC_NO_COPY_NARROW_EXT_FOLD").is_none()
+        && fold_copy_narrow_ext_pairs(&mut store, &mut infos);
     let zext_changed = eliminate_redundant_zext_i686(&mut store, &mut infos);
     // Redundant SIGN-extension elimination runs right after: it turns
     // `movsbl %al,%REG` into a `movl` copy or a no-op, which the cleanup

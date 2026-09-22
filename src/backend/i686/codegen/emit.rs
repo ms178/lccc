@@ -80,6 +80,21 @@ pub struct I686Codegen {
     /// are captured into 4-byte frame slots instead (allocated in
     /// `calculate_stack_space_impl`) and the ParamRef reloads from there.
     pub(super) conflict_param_slots: FxHashMap<usize, StackSlot>,
+    /// Stack-scalar parameters whose alloca slot is REDIRECTED to the
+    /// caller's argument slot ("direct homing").
+    ///
+    /// The classic i686 model homes every stack argument into a fresh frame
+    /// slot (`movl 220(%esp),%eax; movl %eax,188(%esp)`) and all uses read
+    /// the home. GCC instead reads and writes the caller's argument slot
+    /// directly — the i386 psABI gives the callee ownership of incoming
+    /// stack-argument slots, so no copy is needed. This map records
+    /// `slot id -> incoming ebp-relative offset` for redirected slots;
+    /// `slot_ref`/`slot_ref_offset` translate through `param_ref`, so every
+    /// load, store, spill and coalesced alias transparently hits the
+    /// caller's slot. Eligibility (see emit_store_params_impl): plain
+    /// StackScalar, no over-alignment, <= 4-byte scalar type. Kill switch:
+    /// CCC_NO_PARAM_DIRECT_HOME=1.
+    pub(super) param_direct_homes: FxHashMap<i64, i64>,
     /// Whether %ebx holds the PIC GOT base for the function being emitted.
     ///
     /// Set per function by `function_needs_got`. When false the GOT setup is
@@ -454,6 +469,7 @@ impl I686Codegen {
             fastcall_stack_cleanup: 0,
             fastcall_slots: Vec::new(),
             conflict_param_slots: FxHashMap::default(),
+            param_direct_homes: FxHashMap::default(),
             pic_got_live: false,
             needs_pc_thunk_bx: false,
             regparm: 0,
@@ -505,6 +521,13 @@ impl I686Codegen {
     /// When frame pointer is omitted, converts EBP-relative offsets to ESP-relative
     /// by adding frame_base_offset + esp_adjust.
     pub(super) fn slot_ref(&self, slot: StackSlot) -> String {
+        // Directly-homed stack parameter: the slot *is* the caller's argument
+        // slot (see `param_direct_homes`). Translating here keeps every
+        // consumer — ParamRef loads, spill/reload, coalesced aliases,
+        // peephole-emitted folds — on the single authoritative location.
+        if let Some(&src) = self.param_direct_homes.get(&slot.0) {
+            return self.param_ref(src);
+        }
         if self.omit_frame_pointer {
             let esp_off = slot.0 + self.frame_base_offset + self.esp_adjust;
             format!("{}(%esp)", esp_off)
@@ -516,6 +539,9 @@ impl I686Codegen {
     /// Format a stack slot reference with an additional byte offset.
     /// Used for accessing sub-fields of multi-byte slots (e.g., upper 4 bytes of i64).
     pub(super) fn slot_ref_offset(&self, slot: StackSlot, extra: i64) -> String {
+        if let Some(&src) = self.param_direct_homes.get(&slot.0) {
+            return self.param_ref(src + extra);
+        }
         if self.omit_frame_pointer {
             let esp_off = slot.0 + extra + self.frame_base_offset + self.esp_adjust;
             format!("{}(%esp)", esp_off)
@@ -2175,6 +2201,10 @@ impl ArchCodegen for I686Codegen {
 
     fn ptr_directive(&self) -> PtrDirective {
         PtrDirective::Long
+    }
+
+    fn optimize_for_size(&self) -> bool {
+        self.optimize_for_size
     }
 
     /// fentry/nop/record modes emit through the generic path (i686 assembler

@@ -111,6 +111,7 @@ impl I686Codegen {
         // it after register allocation.
         self.fastcall_slots.clear();
         self.conflict_param_slots.clear();
+        self.param_direct_homes.clear();
         if self.is_fastcall {
             let param_tys: Vec<IrType> = func.params.iter().map(|p| p.ty).collect();
             let struct_sizes: Vec<Option<usize>> =
@@ -787,6 +788,75 @@ impl I686Codegen {
 
     // ---- emit_store_params ----
 
+    /// Eligibility check for redirecting a stack-scalar parameter's frame slot
+    /// onto the caller's argument slot (`param_direct_homes`).
+    ///
+    /// Sound only when the slot can never be accessed beyond its low 4 bytes:
+    /// the caller's argument area is exactly one 4-byte slot per argument, and
+    /// a wider write (`movq`, two-word i64 store, vector save) through a
+    /// coalesced web would clobber the *adjacent argument's* home. The scan is
+    /// therefore closed over every value sharing the slot:
+    ///
+    /// * every typed instruction dest (`result_type`) sharing the slot must be
+    ///   at most 4 bytes wide — a wide value's spill/reload stores all 8 bytes;
+    /// * `Alloca` dests are checked by their DATA size (their `result_type` is
+    ///   `Ptr`): a promoted array/struct home wider than 4 bytes is rejected;
+    /// * the backend's pre-scanned width sets (`wide_values`, `i128_values`,
+    ///   `vector_values`, `vector128_values`) reject Copy-only webs whose width
+    ///   is not locally derivable;
+    /// * over-aligned allocas keep the staging copy (their effective address
+    ///   differs from the raw slot base);
+    /// * sub-int types (I8/U8/I16/U16) are fine: every read re-extends from
+    ///   the slot and every store writes within the low bytes of the 4-byte
+    ///   argument slot.
+    ///
+    /// Kill switch: `CCC_NO_PARAM_DIRECT_HOME=1` restores the homing copy
+    /// verbatim (bisection escape hatch, mirrors the other `CCC_NO_*` gates).
+    fn stack_param_direct_home_eligible(
+        &self,
+        func: &IrFunction,
+        dest_id: u32,
+        slot: StackSlot,
+        ty: IrType,
+    ) -> bool {
+        if std::env::var_os("CCC_NO_PARAM_DIRECT_HOME").is_some() {
+            return false;
+        }
+        if self.state.alloca_over_align(dest_id).is_some() {
+            return false;
+        }
+        if ty.size() > 4 {
+            return false;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Some(dest) = inst.dest() else { continue };
+                if self.state.get_slot(dest.0).map(|s| s.0) != Some(slot.0) {
+                    continue;
+                }
+                if self.state.wide_values.contains(&dest.0)
+                    || self.state.i128_values.contains(&dest.0)
+                    || self.state.vector_values.contains(&dest.0)
+                    || self.state.vector128_values.contains(&dest.0)
+                {
+                    return false;
+                }
+                if let Instruction::Alloca { size, .. } = inst {
+                    if *size > 4 {
+                        return false;
+                    }
+                    continue;
+                }
+                if let Some(res_ty) = inst.result_type() {
+                    if res_ty.size() > 4 {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
         let config = self.call_abi_config();
         let param_classes = classify_params(func, &config);
@@ -1281,6 +1351,19 @@ impl I686Codegen {
                             emit!(self.state, "    movl {}, %eax", src_ref_hi);
                             emit!(self.state, "    movl %eax, {}", dst_ref_hi);
                         }
+                    } else if self.stack_param_direct_home_eligible(func, dest_id, slot, ty) {
+                        // Direct homing (GCC model): the callee owns the
+                        // incoming argument slot, so the ParamRef dest lives
+                        // THERE — no `movl 220(%esp),%eax; movl %eax,
+                        // 188(%esp)` copy pair. `slot_ref`/`slot_ref_offset`
+                        // translate this slot through `param_ref(src_offset)`
+                        // from here on, so every load, store, spill and
+                        // coalesced alias reads/writes the authoritative
+                        // location. Two instructions and four frame bytes
+                        // saved per eligible stack argument (measured on the
+                        // Linux x86 boot corpus: the setup image's .text
+                        // shrinks proportionally to the homing-pair census).
+                        self.param_direct_homes.insert(slot.0, src_offset);
                     } else {
                         let load_instr = self.mov_load_for_type(ty);
                         let src_ref = self.param_ref(src_offset);

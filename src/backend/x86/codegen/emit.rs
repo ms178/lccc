@@ -206,6 +206,60 @@ pub(super) fn is_xmm_reg(reg: PhysReg) -> bool {
     (20..=33).contains(&reg.0)
 }
 
+/// Classify an immediate for the x86-64 direct `pushq $imm` stack-argument
+/// form, returning the push immediate when sign-extension is
+/// value-preserving for this slot.
+///
+/// ENCODING LAW (`push imm32`, opcode 68 id / FF /6 id):
+///
+/// ```text
+///   imm in [-128,127]   pushq $imm8   = 2 B   (vs 6 B for movl+pushq %rax)
+///   imm in imm32        pushq $imm32  = 5 B   (vs 6 B)
+///   zero                pushq $0      = 2 B   (vs 3 B for xorl+pushq %rax)
+/// ```
+///
+/// SOUNDNESS: `pushq $imm32` writes all eight slot bytes as
+/// `sign_extend(imm)`.  For an eight-byte scalar container (I64, F64/D64
+/// bit patterns) that equals the original value only when the value fits a
+/// signed 32-bit integer — the fit test below.  For scalars of at most
+/// four bytes the SysV AMD64 ABI leaves the upper bytes of the eightbyte
+/// unspecified and every reader (lccc callees read `movl`/`movslq`, GCC
+/// and Clang likewise) consumes only the low lane, so any imm32 is exact
+/// for I8/I16/I32/F32/D32.  I128 is refused outright (never a MEMORY-class
+/// scalar; fail closed), as is any eight-byte value outside the imm32
+/// window — those keep the `movabsq`+push fallback.
+pub(super) fn x64_stack_arg_push_imm(c: &IrConst) -> Option<i64> {
+    let fits_imm32 = |v: i64| v >= i32::MIN as i64 && v <= i32::MAX as i64;
+    match c {
+        IrConst::Zero => Some(0),
+        // Narrow scalars: the four bytes pushed land in the slot's low
+        // lane; sign extension into the upper lane is unspecified padding.
+        IrConst::I8(v) => Some(*v as i64),
+        IrConst::I16(v) => Some(*v as i64),
+        IrConst::I32(v) => Some(*v as i64),
+        IrConst::F32(v) => Some(v.to_bits() as i32 as i64),
+        IrConst::D32(v) => Some(*v as i32 as i64),
+        // Eight-byte containers: the sign-extended imm must reproduce the
+        // full 64-bit pattern, so the value must already fit imm32.
+        IrConst::I64(v) if fits_imm32(*v) => Some(*v),
+        IrConst::F64(v) => {
+            let bits = v.to_bits() as i64;
+            fits_imm32(bits).then_some(bits)
+        }
+        IrConst::D64(v) => {
+            let bits = *v as i64;
+            fits_imm32(bits).then_some(bits)
+        }
+        // LongDouble at computation level is treated as F64 (see
+        // operand_to_rax); same container law applies.
+        IrConst::LongDouble(v, _) => {
+            let bits = v.to_bits() as i64;
+            fits_imm32(bits).then_some(bits)
+        }
+        _ => None,
+    }
+}
+
 /// Integer GPR the allocator / emitters may name: legacy file plus APX EGPRs.
 /// XMM scratch (18/19) and the XMM bank (20..=33) are excluded.
 #[inline]
@@ -8040,6 +8094,10 @@ impl ArchCodegen for X86Codegen {
         }
     }
 
+    fn optimize_for_size(&self) -> bool {
+        self.optimize_for_size
+    }
+
     // All remaining methods delegate to self.method_name_impl(args...)
     delegate_to_impl! {
         // CCC_ENABLE_VECREG live-out flush (default no-op on other backends)
@@ -8312,5 +8370,43 @@ mod machinst_resolution_tests {
         // The extra file exists for the gated path only.
         assert_eq!(X86_APX_EGPRS[0], PhysReg(40));
         assert_eq!(phys_reg_name(X86_APX_EGPRS[0]), "r16");
+    }
+
+    #[test]
+    fn x64_push_imm_classifier_follows_the_slot_sign_extension_law() {
+        use super::x64_stack_arg_push_imm;
+        // Narrow scalars: every bit pattern is pushable (upper lane is
+        // ABI-unspecified padding).
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::I8(-1)), Some(-1));
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::I16(-16657)), Some(-16657));
+        assert_eq!(
+            x64_stack_arg_push_imm(&IrConst::I32(i32::MIN)),
+            Some(i32::MIN as i64)
+        );
+        assert_eq!(
+            x64_stack_arg_push_imm(&IrConst::F32(1.5)),
+            Some(1.5f32.to_bits() as i32 as i64)
+        );
+        // Eight-byte containers: only the imm32 window is exact.
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::I64(0)), Some(0));
+        assert_eq!(
+            x64_stack_arg_push_imm(&IrConst::I64(i32::MAX as i64)),
+            Some(i32::MAX as i64)
+        );
+        assert_eq!(
+            x64_stack_arg_push_imm(&IrConst::I64(i32::MIN as i64 - 1)),
+            None
+        );
+        assert_eq!(
+            x64_stack_arg_push_imm(&IrConst::I64(i32::MAX as i64 + 1)),
+            None
+        );
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::I64(1 << 40)), None);
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::I64(-1)), Some(-1)); // sign-extends exactly
+        // 0.0 pushes as $0; other doubles only when their bit pattern fits.
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::F64(0.0)), Some(0));
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::F64(1.0)), None); // 0x3FF00000... > imm32
+        // Fail-closed shapes.
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::Zero), Some(0));
     }
 }
