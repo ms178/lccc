@@ -363,6 +363,17 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_call_arg_staging.sh
 
+      # Loop-invariant LEA hoisting (guarded/fall-through-entry loops) and
+      # the direct 3-operand RORX: two loop-body instruction-quality
+      # contracts from the worst-15 benchmark campaign. The K-table
+      # rematerialization inside the 64-round loop (sha256_transform at
+      # 1.20x gcc) and the staged `movq` before every `rorxl` (BMI2 RORX
+      # is non-destructive; a fresh register home is read in place).
+      - name: Verify LEA hoist and RORX contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_lea_hoist_rorx.sh
+
       # Cross-PR interaction red-team (session 574): the per-feature gates
       # pin each PR's own contract; this one pins the INTERACTIONS between
       # the last ten merged PRs — FMA families through copy brackets, calls
