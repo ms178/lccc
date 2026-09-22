@@ -10,6 +10,10 @@
 //! Weights use the same `10^depth` loop scale as RA so inner-loop copies
 //! win ties against cold ones. CFG matches `liveness.rs` (terminators +
 //! asm-goto). Safe degradation is extra slots, never a wrong merge.
+//!
+//! Values that cannot honour the shared slot's width are excluded up front
+//! (see [`collect_unsound_coalesce_ids`]): inline-asm operands, and narrow
+//! call results, whose spill width is pinned to the ABI return register.
 
 use std::sync::OnceLock;
 
@@ -167,6 +171,42 @@ fn collect_unsound_coalesce_ids(func: &IrFunction) -> FxHashSet<u32> {
     let mut ids = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
+            // CALL RESULTS MUST NOT SHARE A STACK SLOT.
+            //
+            // The width-class unification in `slot_assignment::resolve_copy_aliases`
+            // lets a narrow web member store through `movq` into its wide root's
+            // 8-byte slot, on the documented premise that "every access to the
+            // shared slot is 8 bytes wide and no stale upper half can survive".
+            // A call's return value breaks that premise: it is spilled straight
+            // out of the ABI return register at the *call's* return width, so a
+            // `u32`-returning call emits `movl %eax, slot` no matter how wide the
+            // shared slot is.  The upper half keeps whatever the slot held before,
+            // and the root's 8-byte `movq` reload then reads it.
+            //
+            // tests/regression/acpica_name_string_outparam.c caught exactly this:
+            // `acpi_ex_name_segment`'s `u32` status (v40) was coalesced with the
+            // `status` phi (v155, wide because its `Const(I64(2))` incoming types
+            // it I64), giving
+            //     call acpi_ex_name_segment ; movl %eax,56(%rsp)   <- 4-byte store
+            //     ...                       ; movq 56(%rsp),%r11   <- 8-byte reload
+            // so the caller read uninitialized frame bytes above the status and
+            // `acpi_ex_get_name_string` reported a garbage `out_name_length`.
+            // The value is not widenable at the spill site, so refuse the merge;
+            // the cost is one extra slot per coalesced call result.
+            //
+            // Only a NARROW return is affected. A pointer/64-bit result is
+            // already spilled with `movq`, so it fills the whole slot and can
+            // keep coalescing; that is the common case (every allocator call),
+            // so the restriction costs nothing there.
+            if let Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } = inst {
+                if let Some(dest) = info.dest {
+                    // `scalar_type` is the GPR class the coalescer works in;
+                    // within it, only a sub-8-byte return is spilled narrow.
+                    if scalar_type(info.return_type) && info.return_type.size() <= 4 {
+                        ids.insert(dest.0);
+                    }
+                }
+            }
             if let Instruction::InlineAsm { outputs, .. } = inst {
                 for (_, v, _) in outputs {
                     ids.insert(v.0);
