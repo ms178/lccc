@@ -226,6 +226,14 @@ pub(crate) struct RaConfig {
     pub(crate) debug_vararg: bool,
     /// `CCC_NO_X64_IMMED_NOHOME`: disable x86 immediate-consumer no-home policy (default: false).
     pub(crate) no_x64_immed_nohome: bool,
+    /// `CCC_NO_I686_ACCUM_NOHOME`: disable the i686 "immediately-consumed
+    /// values get no home" policy (default: false).  The i686 twin of
+    /// `CCC_NO_X64_IMMED_NOHOME`; it exists because the policy's premise —
+    /// a register home only ever costs an extra `movl %R,%eax` relay — is
+    /// false for the ops `try_emit_int_binop_direct` handles, which read a
+    /// register-homed operand IN PLACE.  Keep it a switch: the boot corpus
+    /// A/B in engineering/journal decides the default, not the theory.
+    pub(crate) no_i686_accum_nohome: bool,
     /// `CCC_X64_NOHOME_CLASSES`: selected no-home consumer classes (default: `ret,store,copy,cast,unary,binop`).
     pub(crate) x64_nohome_classes: String,
     /// `CCC_MI_MAX_LOOP_INSTS`: MachInst loop-size threshold
@@ -362,6 +370,7 @@ impl RaConfig {
             no_va_root_guard: present("CCC_NO_VA_ROOT_GUARD"),
             debug_vararg: present("CCC_DEBUG_VARARG"),
             no_x64_immed_nohome: present("CCC_NO_X64_IMMED_NOHOME"),
+            no_i686_accum_nohome: present("CCC_NO_I686_ACCUM_NOHOME"),
             x64_nohome_classes: text("CCC_X64_NOHOME_CLASSES")
                 .unwrap_or_else(|| "ret,store,copy,cast,unary,binop".into()),
             mi_max_loop_insts: number("CCC_MI_MAX_LOOP_INSTS", MI_MAX_LOOP_INSTS_DEFAULT),
@@ -10928,6 +10937,7 @@ mod ra_config_tests {
         switch!(no_va_root_guard, "CCC_NO_VA_ROOT_GUARD");
         switch!(debug_vararg, "CCC_DEBUG_VARARG");
         switch!(no_x64_immed_nohome, "CCC_NO_X64_IMMED_NOHOME");
+        switch!(no_i686_accum_nohome, "CCC_NO_I686_ACCUM_NOHOME");
         switch!(mi_all_classic, "CCC_MI_ALL_CLASSIC");
         switch!(mi_force_loops, "CCC_MI_FORCE_LOOPS");
         switch!(mi_debug, "CCC_MI_DEBUG");
