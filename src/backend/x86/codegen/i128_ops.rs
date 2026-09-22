@@ -126,6 +126,36 @@ impl X86Codegen {
     /// multiply by a 128-bit magic constant whose high half is always zero:
     /// `x /u C` is `mulhi(x, M) >> s`, so `hi == 0` and the sequence collapses
     /// to five instructions — matching what GCC, Clang and ICX emit.
+    /// State the accumulator-cache invariant for a raw-emit i128 sequence, and
+    /// start the sequence from a known-empty cache.
+    ///
+    /// A 128-bit value lives in the `%rax:%rdx` PAIR, and `%rax` alone is only
+    /// the low half -- not a valid scalar IR value.  Every sequence opened with
+    /// this call therefore performs raw emits that clobber `%rax`/`%rdx` (and
+    /// `%rcx` or `%rsi` as scratch) and leaves the cache alone until the value
+    /// is committed by `store_rax_rdx_to`, which invalidates on the way out.
+    ///
+    /// THE INVARIANT: between this call and that final invalidation the
+    /// sequence may perform exactly ONE cache-consulting load -- the
+    /// `operand_to_rax_rdx` below, which runs BEFORE the first clobber and is
+    /// therefore sound.  Any further cache-consulting load (an `operand_to_rax`
+    /// on a small constant, say) placed after a clobber would read a cache that
+    /// still claims `%rax` for a value the clobber destroyed, and would hand
+    /// back the wrong register -- silently, since the resulting code still
+    /// assembles.  Keep such a load out of the region, or invalidate again
+    /// after it.
+    ///
+    /// The entry invalidation is cheap insurance rather than a fix for a
+    /// present bug: the pair path never consults the scalar cache (verified by
+    /// inspection -- `operand_to_rax_rdx` contains no `reg_cache` reference at
+    /// all) and the exit invalidation closes the window.  It means the region
+    /// cannot inherit a stale entry from its CALLER, which is the half of the
+    /// hazard the exit invalidation cannot cover.
+    #[inline]
+    fn begin_raw_i128_sequence(&mut self) {
+        self.state.reg_cache.invalidate_all();
+    }
+
     pub(super) fn emit_i128_mul_const_impl(
         &mut self,
         lhs: &Operand,
@@ -133,7 +163,9 @@ impl X86Codegen {
         lo: u64,
         hi: u64,
     ) {
-        // LHS into %rax:%rdx (low:high); %rcx/%r8/%rsi are scratch.
+        self.begin_raw_i128_sequence();
+        // LHS into %rax:%rdx (low:high); %rcx/%r8/%rsi are scratch.  The one
+        // permitted cache-consulting load, before any clobber.
         self.operand_to_rax_rdx(lhs);
         // `mulq` overwrites both accumulator halves, so park the LHS halves
         // that the cross terms still need first. lhs.lo is only needed when
@@ -213,6 +245,9 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_i128_prep_shift_lhs_impl(&mut self, lhs: &Operand) {
+        // Opens the shift sequences, which clobber the pair with raw emits the
+        // same way the multiply does; see `begin_raw_i128_sequence`.
+        self.begin_raw_i128_sequence();
         self.operand_to_rax_rdx(lhs);
     }
 

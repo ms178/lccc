@@ -624,6 +624,52 @@ impl IrConst {
         }
     }
 
+    /// The value `2^bits - 1` -- an all-ones mask over the low `bits` bits --
+    /// represented in `ty`.
+    ///
+    /// A single width-correct constructor exists because getting this wrong is
+    /// invisible in release builds and loud only in debug ones.  The mask MUST
+    /// be accumulated in `u128`: `bits` reaches 127 for the 128-bit types, and
+    /// an `i64` construction fails twice over --
+    ///
+    /// ```text
+    ///   release (overflow-checks off):  1i64 << 64  ==  1i64     (shift masked
+    ///                                   modulo 64), so a 2^64 mask came out 0
+    ///                                   and `x % 2^64` compiled to `x & 0`;
+    ///   debug   (overflow-checks on):   (1i64 << 63) - 1 panics -- "attempt to
+    ///                                   subtract with overflow".
+    /// ```
+    ///
+    /// `from_i64` cannot carry the result either: it sign-extends from 64 bits,
+    /// so a mask with any bit set at or above bit 63 must be built as
+    /// `IrConst::I128` directly.  Both of those bit the `x % 2^k` fold for
+    /// 128-bit operands; see `simplify.rs`'s `SRem | URem` arm.
+    ///
+    /// `bits` is clamped to the type's width: a mask wider than the type is
+    /// all-ones for that type, and clamping keeps the shift in range for every
+    /// caller.
+    pub fn low_mask(ty: IrType, bits: u32) -> Self {
+        let width = ty.size().saturating_mul(8).min(128) as u32;
+        let bits = bits.min(width);
+        let mask: u128 = if bits >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << bits) - 1
+        };
+        match ty {
+            // 128-bit: `from_i64` would sign-extend the low 64 bits, so the
+            // mask is built at full width.  `mask as i128` is a bit-pattern
+            // reinterpretation, which is what the IR constant stores -- for
+            // `bits == 128` it yields all-ones, correct for both signednesses.
+            IrType::I128 | IrType::U128 => IrConst::I128(mask as i128),
+            // Every narrower type: the cast to i64 preserves the low 64 bits,
+            // and `from_i64` narrows to the target width (so `I32` of 2^32-1
+            // becomes the all-ones `I32(-1)`).  For a 64-bit type the i64 cast
+            // is itself the bit pattern (`2^64-1` -> `-1` -> all-ones).
+            _ => IrConst::from_i64(mask as i64, ty),
+        }
+    }
+
     /// Coerce this constant to match a target IrType, with optional source type for signedness.
     pub fn coerce_to_with_src(&self, target_ty: IrType, src_ty: Option<IrType>) -> IrConst {
         // Check if already the right type
@@ -785,6 +831,174 @@ impl IrConst {
             IrType::F64 => IrConst::F64(1.0),
             IrType::F128 => IrConst::long_double(1.0),
             _ => IrConst::I64(1),
+        }
+    }
+}
+
+#[cfg(test)]
+mod low_mask_tests {
+    use super::*;
+
+    /// Read a constant back as a 128-bit BIT PATTERN.  `to_i128` sign-extends
+    /// the narrow variants, so masking to the type's width is what makes the
+    /// all-ones cases comparable for signed and unsigned types alike.
+    fn bits(c: IrConst, ty: IrType) -> u128 {
+        let width = ty.size() * 8;
+        let v = c.to_i128().expect("mask must be an integer constant") as u128;
+        if width >= 128 {
+            v
+        } else {
+            v & ((1u128 << width) - 1)
+        }
+    }
+
+    /// The mask for `bits` in `ty` is exactly `2^bits - 1`, for every width
+    /// and every bit position that a strength-reduced `x % 2^k` can ask for.
+    ///
+    /// This runs in the DEV profile, where `overflow-checks` are on.  A
+    /// reintroduced `(1i64 << shift) - 1` panics here at shift 63 rather than
+    /// silently miscompiling in a release build, which is the whole reason
+    /// this constructor exists.
+    #[test]
+    fn low_mask_is_exact_at_every_width() {
+        let types = [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::I128,
+            IrType::U128,
+        ];
+        for ty in types {
+            let width = ty.size() * 8;
+            let max_bits = if width >= 128 { 128 } else { width };
+            for k in 0..=max_bits {
+                let want: u128 = if k >= 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << k) - 1
+                };
+                let got = bits(IrConst::low_mask(ty, k as u32), ty);
+                // For a mask wider than the type the expectand saturates.
+                let want_c = if k > width {
+                    (1u128 << width) - 1
+                } else {
+                    want
+                };
+                assert_eq!(
+                    got, want_c,
+                    "low_mask({ty:?}, {k}) = {got:#x}, want {want_c:#x}"
+                );
+            }
+        }
+    }
+
+    /// The two shifts that the old i64 construction got wrong, pinned
+    /// individually so a regression names the exact case.
+    #[test]
+    fn low_mask_at_the_i64_boundary_is_not_wrapped_or_truncated() {
+        // Release wrapped `1i64 << 64` to 1, so a 2^64 mask became 0.
+        assert_eq!(
+            bits(IrConst::low_mask(IrType::U128, 64), IrType::U128),
+            u64::MAX as u128
+        );
+        assert_eq!(
+            bits(IrConst::low_mask(IrType::I128, 64), IrType::I128),
+            u64::MAX as u128
+        );
+        // `1i64 << 65` became 2, so the mask came out 1.
+        assert_eq!(
+            bits(IrConst::low_mask(IrType::U128, 65), IrType::U128),
+            ((1u128 << 65) - 1)
+        );
+        // `(1i64 << 63) - 1` overflowed; the value was right only by wrapping.
+        assert_eq!(
+            bits(IrConst::low_mask(IrType::U128, 63), IrType::U128),
+            ((1u128 << 63) - 1)
+        );
+        assert_eq!(
+            bits(IrConst::low_mask(IrType::U64, 63), IrType::U64),
+            ((1u128 << 63) - 1)
+        );
+        // The largest shift `const_power_of_two` can report for a 128-bit type.
+        assert_eq!(
+            bits(IrConst::low_mask(IrType::U128, 127), IrType::U128),
+            ((1u128 << 127) - 1)
+        );
+    }
+
+    /// `bits == width` must give all-ones for the type, including the 128-bit
+    /// case where `mask as i128` reinterprets as -1.
+    #[test]
+    fn low_mask_saturates_to_all_ones() {
+        for ty in [IrType::U8, IrType::U16, IrType::U32, IrType::U64] {
+            let width = (ty.size() * 8) as u32;
+            assert_eq!(
+                bits(IrConst::low_mask(ty, width), ty),
+                ((1u128 << width) - 1),
+                "all-ones for {ty:?}"
+            );
+        }
+        assert_eq!(
+            bits(IrConst::low_mask(IrType::U128, 128), IrType::U128),
+            u128::MAX
+        );
+        assert_eq!(
+            bits(IrConst::low_mask(IrType::I128, 128), IrType::I128),
+            u128::MAX
+        );
+        // A mask wider than the type clamps instead of shifting out of range.
+        assert_eq!(
+            bits(IrConst::low_mask(IrType::I32, 127), IrType::I32),
+            u32::MAX as u128
+        );
+    }
+
+    /// No width, and no over-wide `bits`, may panic -- in any profile.
+    #[test]
+    fn low_mask_never_panics() {
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::I128,
+            IrType::U128,
+            IrType::Ptr,
+        ] {
+            for k in [0u32, 1, 63, 64, 65, 127, 128, 129, u32::MAX] {
+                let _ = IrConst::low_mask(ty, k);
+            }
+        }
+    }
+
+    /// The narrow types keep the exact bit pattern `from_i64` produced before
+    /// this constructor existed, so the change is a no-op below 64 bits.
+    #[test]
+    fn low_mask_matches_from_i64_for_narrow_types() {
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+        ] {
+            let width = (ty.size() * 8) as u32;
+            for k in 0..width {
+                let mask = (1u128 << k) - 1;
+                assert_eq!(
+                    IrConst::low_mask(ty, k),
+                    IrConst::from_i64(mask as i64, ty),
+                    "low_mask({ty:?}, {k}) must equal the previous construction"
+                );
+            }
         }
     }
 }
