@@ -234,6 +234,21 @@ const MAX_ALWAYS_INLINE_BUDGET_PER_CALLER: usize = 200;
 /// safe for stack-frame and I-cache size.
 const MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER: usize = 600;
 
+/// Dedicated budget for inlining SMALL, LOOP-FREE callees at call sites
+/// INSIDE the caller's loops once the normal budgets/caps are exhausted by
+/// the caller's own size. Per-iteration call overhead in the hottest loop of
+/// a function dominates its runtime (zstd `ZSTD_decompressSequences_default`
+/// paid ~9 calls per SEQUENCE — `BIT_readBitsFast` x4, `ZSTD_initFseState`
+/// x3, `ZSTD_execSequence`, `BIT_reloadDStream` — because the caller had
+/// grown past MAX_CALLER_INSTRUCTIONS_AFTER_INLINE/HARD_CAP; fullbench
+/// measured decompress at 383 MB/s vs gcc's 966 MB/s, and gcc/clang inline
+/// these shapes unconditionally). Growth is bounded: at most ~300 small-callee
+/// instructions per caller, and the frame-growth bound that motivates the
+/// caller-size caps holds per small callee (<= ~160 B by the 8-byte-slot
+/// model), so worst-case added frame is ~2.4 KB — within the kernel's 16 KB
+/// stack headroom argument for the existing caps.
+const MAX_HOT_LOOP_INLINE_BUDGET_PER_CALLER: usize = 300;
+
 /// Additional always_inline budget for the second (correctness) pass.
 /// After the main inlining loop exhausts max_rounds, any remaining
 /// always_inline call sites are processed in a second pass with this
@@ -352,6 +367,7 @@ fn select_inline_site(
     budget_remaining: usize,
     always_inline_budget_remaining: usize,
     pgo_force_budget_remaining: usize,
+    hot_loop_budget_remaining: usize,
     size_optimized: bool,
     loop_blocks: &FxHashSet<usize>,
     caller_has_loops: bool,
@@ -597,9 +613,17 @@ fn select_inline_site(
                 && callee_inst_count > MAX_SMALL_INLINE_INSTRUCTIONS;
             let size_cap_exempt = callee_data.is_single_call_site_static
                 && callee_data.size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST;
+            // HOT-LOOP EXEMPTION: a small loop-free callee called from inside
+            // one of the caller's loops executes once per iteration — the
+            // call/ret + argument traffic costs more than the inlined body
+            // ever adds to the frame. Exempt it from the caller-size caps
+            // (bounded by the dedicated hot-loop budget, see the const).
+            let site_in_hot_loop =
+                in_loop && !callee_data.has_loops && callee_inst_count <= MAX_INLINE_INSTRUCTIONS;
             if caller_too_large
                 && !callee_data.is_always_inline
                 && !size_cap_exempt
+                && !site_in_hot_loop
                 && !(in_loop
                     && !callee_data.has_loops
                     && callee_inst_count <= MAX_INLINE_INSTRUCTIONS)
@@ -609,16 +633,21 @@ fn select_inline_site(
             }
             // Absolute cap: stop normal inlining for extremely large callers.
             // always_inline callees MUST still be inlined (C semantic requirement).
-            if caller_at_absolute_cap && !callee_data.is_always_inline {
+            if caller_at_absolute_cap && !callee_data.is_always_inline && !site_in_hot_loop {
                 continue;
             }
             // Hard cap: stop normal inlining to prevent kernel stack overflow.
             // always_inline callees are still inlined (C semantic requirement),
             // but are limited by the always_inline budget.
-            if caller_at_hard_cap && !callee_data.is_always_inline {
+            if caller_at_hard_cap && !callee_data.is_always_inline && !site_in_hot_loop {
                 continue;
             }
         }
+        // Recompute for the second-pass scope (same predicate as the gate
+        // above): small loop-free callee at an in-loop site.
+        let site_in_hot_loop = loop_blocks.contains(&site.block_idx)
+            && !callee_data.has_loops
+            && callee_inst_count <= MAX_INLINE_INSTRUCTIONS;
         let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
         // Budget enforcement: always_inline callees use a separate budget;
         // non-always_inline callees use the normal budget. PGO-forced sites
@@ -636,6 +665,15 @@ fn select_inline_site(
             }
         } else if site.pgo_force {
             if callee_inst_count > pgo_force_budget_remaining {
+                continue;
+            }
+        } else if site_in_hot_loop {
+            // Small in-loop callees draw from the dedicated hot-loop budget,
+            // NOT from the normal per-caller budget: a 800-instruction
+            // decompress loop exhausts the normal budget on its first
+            // sequences, yet every remaining per-iteration call still costs
+            // more than inlining it.
+            if callee_inst_count > hot_loop_budget_remaining {
                 continue;
             }
         } else if !callee_data.is_single_call_site_static && callee_inst_count > budget_remaining {
@@ -766,13 +804,20 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
         let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
         let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
         let mut pgo_force_budget_remaining = MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER;
+        let mut hot_loop_budget_remaining = MAX_HOT_LOOP_INLINE_BUDGET_PER_CALLER;
         // During one -Os inliner invocation, clone a large ordinary callee at
         // most once into a given caller. This permits one profitable
         // specialization while avoiding repeated medium-body expansion.
         let mut size_inlined_large_callees: FxHashSet<String> = FxHashSet::default();
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
         // Limit iterations to prevent infinite loops from recursive inline functions.
-        let max_rounds = 200;
+        // 200 rounds starve large fixed-point callers: inlining one site per
+        // round, a decompressor that absorbs ZSTD_decodeSequence (6 nested
+        // BIT_readBitsFast/ZSTD_initFseState sites) plus ~180 other sites runs
+        // out of rounds with per-sequence calls still emitted. The loop still
+        // early-breaks when a round selects nothing, so the cap is only a
+        // runaway guard.
+        let max_rounds = 2000;
         for _round in 0..max_rounds {
             // Check if the caller has grown too large for further normal inlining.
             // Each SSA value in CCC gets an 8-byte stack slot, so functions with
@@ -945,6 +990,7 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
                 budget_remaining,
                 always_inline_budget_remaining,
                 pgo_force_budget_remaining,
+                hot_loop_budget_remaining,
                 size_optimized,
                 &loop_blocks,
                 caller_has_loops,
@@ -1031,7 +1077,21 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
                     pgo_force_budget_remaining =
                         pgo_force_budget_remaining.saturating_sub(callee_inst_count);
                 } else {
-                    budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
+                    // Mirror of select_inline_site's hot-loop test: small
+                    // loop-free callees at in-loop sites draw from the
+                    // dedicated hot-loop budget.
+                    let site_in_hot_loop = loop_blocks.contains(&site.block_idx)
+                        && !callee_map
+                            .get(&site.callee_name)
+                            .map(|d| d.has_loops)
+                            .unwrap_or(true)
+                        && callee_inst_count <= MAX_INLINE_INSTRUCTIONS;
+                    if site_in_hot_loop {
+                        hot_loop_budget_remaining =
+                            hot_loop_budget_remaining.saturating_sub(callee_inst_count);
+                    } else {
+                        budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
+                    }
                 }
                 total_inlined += 1;
                 module.functions[func_idx].has_inlined_calls = true;

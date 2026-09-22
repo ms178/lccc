@@ -205,6 +205,14 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_machinst_window_alloc_wide_copy.sh
 
+      # undefined-weak symbols must reach the system linker as @GOTPCREL
+      # (R_X86_64_PC32 against an undefined weak is rejected in PIE links);
+      # compiles with lccc, links with the SYSTEM gcc driver, then runs.
+      - name: Verify undefined-weak PIE link (system driver)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_weak_undef_pie_link.sh
+
       - name: Verify over-aligned alloca typed-census admission
         env:
           CCC: target/fastbuild/lccc

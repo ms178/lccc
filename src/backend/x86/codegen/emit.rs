@@ -529,6 +529,9 @@ pub(super) fn shiftx_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
 /// Uses System V AMD64 ABI with linear scan register allocation for callee-saved registers.
 pub struct X86Codegen {
     pub(crate) state: CodegenState,
+    /// Sampled once per codegen instance: env reads are not free on the
+    /// per-vector-value path (F5), so the debug switch is hoisted here.
+    pub(super) dbg_vec_merge: bool,
     pub(super) current_return_type: IrType,
     /// SysV ABI eightbyte classification for the current function's return struct.
     /// Set in prologue, used in emit_return_i128_to_regs for the function's own return.
@@ -1100,6 +1103,7 @@ impl X86Codegen {
         let machinst_disabled_kinds = parse_machinst_disabled_kinds(&ra_config.mi_disable_kinds);
         Self {
             state: CodegenState::new_with_ra_config(ra_config),
+            dbg_vec_merge: std::env::var_os("LCCC_DEBUG_VEC_MERGE").is_some(),
             current_return_type: IrType::I64,
             func_ret_classes: Vec::new(),
             func_set_second_ret: false,
@@ -6596,8 +6600,23 @@ impl ArchCodegen for X86Codegen {
         // (regression glibc_gottpoff, second read returned 42).  The text
         // path (emit_tls_global_addr_impl) selects the right TLS model, so
         // keep TLS addresses off the fast path.
+        //
+        // Same contract for GOT-indirected and absolute symbols: LeaSym
+        // hardcodes `leaq sym(%rip)` (R_X86_64_PC32), which the system
+        // linker rejects for UNDEFINED WEAK symbols in PIE links
+        // ("relocation R_X86_64_PC32 against undefined symbol
+        // ZSTD_trace_compress_begin can not be used when making a PIE
+        // object" — lccc-built libzstd.a linked by the distro gcc driver).
+        // needs_got_for_addr already returns true for weak symbols in every
+        // code model and for PIC/PIE externals; absolute_symbols need the
+        // `movq $sym` immediate form. The text emitters
+        // (emit_global_addr_impl / emit_global_addr_into_reg) own that
+        // decision — route through them.
         if let crate::ir::reexports::Instruction::GlobalAddr { name, .. } = inst {
-            if self.state.tls_symbols.contains(name) {
+            if self.state.tls_symbols.contains(name)
+                || self.state.needs_got_for_addr(name)
+                || self.state.absolute_symbols.contains(name)
+            {
                 return false;
             }
         }

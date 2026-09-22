@@ -4543,9 +4543,30 @@ fn generate_function(
             cg.state().vec_last_store_slot = None;
             cg.state().vec_last_store_val = None;
             cg.state().vec_last_store_reg = false;
+            cg.state().vec_last_store_reg_name = None;
             cg.state().sse_last_store_slot = None;
             cg.state().sse_last_store_val = None;
             cg.state().sse_last_store_reg = false;
+            cg.state().sse_last_store_reg_name = None;
+            // vec_live_regs claims are BLOCK-LOCAL by contract ("vec_live_regs
+            // only tracks within a block; reg_assignments is the source of
+            // truth at block boundaries") — nothing enforced it. A claim
+            // recorded by the final emission of the textually-previous block
+            // survived into this one, and at a JOIN (multiple incoming edges)
+            // the claim only holds on the fall-through edge: the chorba_sse41
+            // miscompile — block 13's `vpxor` claimed its result v109 into
+            // xmm0 (sse_commit_dest_direct), block 14 (also entered via `jne`
+            // from block 12, where xmm0 holds an unrelated Loaddqu) elided
+            // v109's reload and consumed the stale xmm0. Claims are only
+            // sound along straight-line fall-through, but even a
+            // single-predecessor block's textual predecessor can differ from
+            // its CFG predecessor (then/else layout: the then-arm's claims
+            // leak into the else-arm), so the map is cleared at EVERY label.
+            // Cross-block elision remains available through reg_assignments
+            // (RA-managed, liveness-correct) and pending_vec_memfold (a
+            // re-issued slot load, kept defined by the pending_vec_store
+            // flush above).
+            cg.state().vec_live_regs.clear();
             // Tight-loop marker: the structural audit in
             // passes::loop_align qualified this header; the integrated
             // assembler measures the exact encoded body span during its

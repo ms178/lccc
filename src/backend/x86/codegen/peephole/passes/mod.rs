@@ -969,6 +969,17 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed |= c;
             }
         }
+        // Commutative RMW whose fresh destination is copied straight back
+        // into the accumulator operand: swap operands into the accumulator
+        // and drop the copy (fnv-1a hash loop: xorq %r9,%rsi; movq %rsi,%r9
+        // -> xorq %rsi,%r9 — one instruction less in the hottest loop).
+        if !sk("rmw_swap_fold") {
+            {
+                let c = relay_and_lea::fold_rmw_into_copy(&mut store, &mut infos);
+                trace("fold_rmw_into_copy", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
         if !sk("copy_add_lea") {
             {
                 let c = flag_peepholes::fold_copy_add_into_lea(&mut store, &mut infos);
@@ -1649,6 +1660,9 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
 
 #[cfg(test)]
 mod whitespace_invariance;
+
+#[cfg(test)]
+mod rmw_fold_tests;
 
 #[cfg(test)]
 mod tests {

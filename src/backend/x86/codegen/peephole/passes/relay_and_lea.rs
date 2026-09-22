@@ -1239,34 +1239,95 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
         if !is_relayable_family(b_fam) {
             continue;
         }
-        // The adjacent (NOPs apart) copy of the LEA result.
+        // The copy of the LEA result must read exactly the LEA's destination
+        // family and write a different relayable family that the LEA's
+        // source references (the aliased case — unaliased retargeting is the
+        // other pass's job). The copy need not be adjacent: a bounded
+        // straight-line window of intermediate instructions is allowed,
+        // provided none of them writes either family, reads %rA (its old
+        // value still lives there until the copy point), redefines %rB, or
+        // is anything but a plain instruction. Intermediate reads of %rB are
+        // collected into the same rename set the post-copy window applies —
+        // between the LEA and the copy, %rB holds exactly the LEA result,
+        // and after the retarget %rA holds it from the LEA's own position,
+        // so renaming preserves every value (zstd clamp_sum:
+        // `leaq (%r8,%rsi),%r11d; cmpq $1000,%r11d; movq %r11,%r8`).
         let mut j = li + 1;
-        while j < len && infos[j].is_nop() {
-            j += 1;
+        let mut pre_renames: Vec<(usize, String, String)> = Vec::new();
+        let mut found: Option<(u8, RegId)> = None;
+        {
+            let mut scanned = 0usize;
+            while j < len {
+                if infos[j].is_nop() {
+                    j += 1;
+                    continue;
+                }
+                if scanned >= 6 || infos[j].pinned || infos[j].is_barrier() {
+                    break;
+                }
+                let t = infos[j].trimmed(store.get(j)).to_string();
+                if has_implicit_reg_usage(&t) {
+                    break;
+                }
+                // Copy candidate? Tried before the %rA-mention abort below:
+                // the copy itself names both families.
+                let parsed = t
+                    .strip_prefix("movq ")
+                    .map(|r| (64u8, r))
+                    .or_else(|| t.strip_prefix("movl ").map(|r| (32u8, r)));
+                if let Some((cw, crest)) = parsed {
+                    if let Some((csrc, cdst)) = split_two_operands(crest) {
+                        let cfam = plain_gp_operand(cdst);
+                        if register_family_fast(csrc) == b_fam
+                            && plain_gp_operand(csrc).is_some()
+                            && cfam.is_some()
+                            && cfam != Some(b_fam)
+                            && cfam.map(|f| is_relayable_family(f)) == Some(true)
+                        {
+                            found = Some((cw, cfam.unwrap()));
+                            break;
+                        }
+                    }
+                    // Not the copy we own. Fall through to the generic
+                    // collection path below — an unrelated `movl $1000,
+                    // %ecx` between LEA and copy is common (zstd clamp_sum)
+                    // and the late family checks plus the plain-read rename
+                    // keep it correct; a mov that writes or reads either
+                    // family aborts or renames there.
+                }
+                if is_full_write(&infos[j], &t, b_fam) || get_dest_reg(&infos[j]) == b_fam {
+                    break; // %rB redefined (or RMW'd) before its copy
+                }
+                // NOTE: %rA is not known yet (it comes FROM the copy), so a
+                // generic line is only COLLECTED here; the family checks and
+                // the %rB→%rA rename run once a_fam is known. Anything the
+                // checks cannot prove stays unrenamed and aborts.
+                pre_renames.push((j, t, String::new()));
+                scanned += 1;
+                j += 1;
+            }
         }
-        if j >= len || infos[j].pinned || infos[j].is_barrier() {
-            continue;
-        }
-        let copy = infos[j].trimmed(store.get(j)).to_string();
-        let (copy_w, copy_rest) = if let Some(r) = copy.strip_prefix("movq ") {
-            (64u8, r)
-        } else if let Some(r) = copy.strip_prefix("movl ") {
-            (32u8, r)
-        } else {
+        let Some((copy_w, a_fam)) = found else {
             continue;
         };
-        let Some((copy_src, copy_dst)) = split_two_operands(copy_rest) else {
-            continue;
-        };
-        // The copy must read exactly the LEA's destination family and write
-        // a different relayable family that the LEA's source references
-        // (the aliased case — unaliased retargeting is the other pass's job).
-        if register_family_fast(copy_src) != b_fam || plain_gp_operand(copy_src).is_none() {
+        // Late family checks + rename computation for the collected lines.
+        let mut window_ok = true;
+        for (_, t, new_t) in pre_renames.iter_mut() {
+            if line_refs_family(t, a_fam) {
+                window_ok = false;
+                break;
+            }
+            match rename_plain_family_reads(t, b_fam, a_fam) {
+                Some(nt) => *new_t = nt,
+                None => {
+                    window_ok = false;
+                    break;
+                }
+            }
+        }
+        if !window_ok {
             continue;
         }
-        let Some(a_fam) = plain_gp_operand(copy_dst) else {
-            continue;
-        };
         if a_fam == b_fam || !is_relayable_family(a_fam) {
             continue;
         }
@@ -1291,7 +1352,9 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
         // --- family or a barrier. Collect rewrites; abort on any shape we
         // --- cannot rename (RMW of %rB, memory mention, implicit usage).
         let b_mask = 1u16 << b_fam;
-        let mut rewrites: Vec<(usize, String, String)> = Vec::new(); // (idx, orig, new)
+        // Pre-copy window renames merge into the same set so apply/rollback
+        // handles them atomically with the post-copy ones.
+        let mut rewrites: Vec<(usize, String, String)> = pre_renames;
         let mut abort = false;
         let mut k = j + 1;
         while k < len {
@@ -1370,6 +1433,140 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
             }
             // `lv` still describes the restored text.
         }
+    }
+    changed
+}
+
+// ── Pass: commutative RMW + trailing copy → swapped in-place RMW ──────────
+
+/// Commutative two-operand ALU mnemonics (AT&T, destination last) eligible
+/// for the swap fold. `sub`/`shl`/… are NOT commutative and stay excluded —
+/// swapping their operands changes the computed value.
+const COMMUTATIVE_RMW_OPS: &[(&str, u8)] = &[
+    ("addq ", 64),
+    ("addl ", 32),
+    ("andq ", 64),
+    ("andl ", 32),
+    ("orq ", 64),
+    ("orl ", 32),
+    ("xorq ", 64),
+    ("xorl ", 32),
+    ("imulq ", 64),
+    ("imull ", 32),
+];
+
+/// Fold the accumulator round-trip the two-address lowering emits for
+/// `acc = acc OP byte_temp` when RA hands the op a fresh destination:
+///
+/// ```text
+///     xorq %r9, %rsi            xorq %rsi, %r9
+///     movq %rsi, %r9        ->
+/// ```
+///
+/// The op reads BOTH registers and writes `%rT`; the copy moves `%rT` into
+/// `%rD`. Because the mnemonic is commutative, writing `%rD` instead — with
+/// the operands swapped — computes the identical value from the identical
+/// inputs, and the copy dies. Conditions, each checked below:
+/// * the copy is the next real instruction, `movq`/`movl %rT, %rD`, and
+///   `%rD` is exactly the family the op's SOURCE operand names (the swap
+///   preserves the read set only for that shape; an op whose source is NOT
+///   the copy destination would need `%rD`'s old value as an input, which
+///   the original never read);
+/// * width rules match [`retarget_producer_into_copy`]: a 64-bit op under a
+///   32-bit copy is rejected (the copy truncates, the swap would not), the
+///   32-bit-op forms zero-extend so a `movq` copy stays legal;
+/// * `%rT` is provably dead after the copy (same proof as pass 3 — no
+///   reader on any path, back edges, calls and `ret` included);
+/// * the op position is untouched, so flag results are unaffected.
+pub(super) fn fold_rmw_into_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned || infos[i].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let op_line = infos[i].trimmed(store.get(i)).to_string();
+        let Some((opname, w)) = COMMUTATIVE_RMW_OPS
+            .iter()
+            .find(|p| op_line.starts_with(p.0))
+            .map(|&(n, w)| (n, w))
+        else {
+            i += 1;
+            continue;
+        };
+        let Some((src, dst)) = split_two_operands(&op_line[opname.len()..]) else {
+            i += 1;
+            continue;
+        };
+        let Some(t_fam) = plain_gp_operand(dst) else {
+            i += 1;
+            continue;
+        };
+        // The op's source must be a plain register; the copy below pins it
+        // to the copy-destination family.
+        let Some(d_fam) = plain_gp_operand(src) else {
+            i += 1;
+            continue;
+        };
+        if t_fam == d_fam || !is_relayable_family(t_fam) || !is_relayable_family(d_fam) {
+            i += 1;
+            continue;
+        }
+        if has_implicit_reg_usage(&op_line) {
+            i += 1;
+            continue;
+        }
+        // Next real instruction is the copy.
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].pinned || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let copy = infos[j].trimmed(store.get(j)).to_string();
+        let (copy_w, crest) = if let Some(r) = copy.strip_prefix("movq ") {
+            (64u8, r)
+        } else if let Some(r) = copy.strip_prefix("movl ") {
+            (32u8, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((copy_src, copy_dst)) = split_two_operands(crest) else {
+            i += 1;
+            continue;
+        };
+        if register_family_fast(copy_src) != t_fam || plain_gp_operand(copy_src).is_none() {
+            i += 1;
+            continue;
+        }
+        if plain_gp_operand(copy_dst) != Some(d_fam) {
+            i += 1;
+            continue;
+        }
+        // A 64-bit op under a 32-bit copy would keep the upper half.
+        if w == 64 && copy_w == 32 {
+            i += 1;
+            continue;
+        }
+        // %rT must have no reader after the deleted copy.
+        if !provably_dead_lv(&lv, store, infos, j, t_fam, &[i, j]) {
+            i += 1;
+            continue;
+        }
+        let r_t = REG_NAMES[usize::from(w == 32)][t_fam as usize];
+        let r_d = REG_NAMES[usize::from(w == 32)][d_fam as usize];
+        let new_op = format!("    {}{}, {}", opname, r_t, r_d);
+        replace_line(store, &mut infos[i], i, new_op);
+        mark_nop(&mut infos[j]);
+        lv.refresh_at(store, infos, i);
+        changed = true;
+        i = j + 1;
     }
     changed
 }
@@ -4222,9 +4419,16 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(out.contains("andl $2080895, %r8d"), "{out}");
-        assert!(out.contains("addl %eax, %r8d"), "{out}");
-        assert!(out.contains("movl %r8d, %eax"), "{out}");
         assert!(!out.contains("%r10"), "{out}");
+        // Two legal final shapes:
+        // * `addl %eax, %r8d; movl %r8d, %eax` — the coalesced pair;
+        // * `addl %r8d, %eax` — rmw_fold then swaps the commutative add into
+        //   %eax and drops the dead copy: eax = eax + (r8 & K), identical to
+        //   the original's (r8 & K) + eax, with %r8's dead post-add value
+        //   dropped (nothing reads it — the deadness proof guarantees it).
+        let paired = out.contains("addl %eax, %r8d") && out.contains("movl %r8d, %eax");
+        let fused = out.contains("addl %r8d, %eax");
+        assert!(paired || fused, "unexpected shape:\n{out}");
     }
 
     #[test]

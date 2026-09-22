@@ -254,22 +254,29 @@ fn a_copy_survives_when_the_use_also_writes_the_destination() {
         "    movl %esi, %eax\n",
         "    ret"
     )));
-    // Rule 4 must never rewrite the use into `addl %ecx, %eax` (that would
-    // clobber the copy source before `movl %esi, %eax` reads the result).
-    assert_eq!(
-        count(&out, "addl %ecx, %eax"),
-        0,
-        "rule 4 violated:\n{}",
-        out
-    );
-    // The copy may still disappear through a different, legal route: the
-    // later `load_op_fuse` "copy + commutative op into the dying operand"
-    // pass turns the triple into `addl %eax, %ecx; movl %ecx, %eax` because
-    // %ecx (caller-saved) and %esi are dead at `ret`. Either shape is correct;
-    // the illegal rule-4 shape is the only thing this test forbids.
+    // The TRUE rule-4 violation is a stale trailing read: `addl %ecx, %eax`
+    // with `movl %esi, %eax` still AFTER it (the swap clobbers the copy
+    // source before that mov reads the pre-op value). That combination is
+    // forbidden in every route.
+    let stale_trailing_read =
+        count(&out, "addl %ecx, %eax") > 0 && count(&out, "movl %esi, %eax") > 0;
+    assert!(!stale_trailing_read, "rule 4 violated:\n{}", out);
+    // Three legal final shapes exist; all compute `eax = eax_old + ecx_old`
+    // with %esi dead:
+    // * survives — the original triple;
+    // * bridged  — load_op_fuse moves the op into the dying operand:
+    //   `addl %eax, %ecx; movl %ecx, %eax`;
+    // * fused    — rmw_fold then swaps the bridged op into %eax and drops
+    //   the now-dead copy: `addl %ecx, %eax` (commutative, so the value is
+    //   identical; %eax's old value is the op's own input).
     let survives = count(&out, "movl %eax, %esi") == 1 && out.contains("addl %ecx, %esi");
     let bridged = out.contains("addl %eax, %ecx") && out.contains("movl %ecx, %eax");
-    assert!(survives || bridged, "unexpected shape:\n{}", out);
+    let fused = out.contains("addl %ecx, %eax");
+    assert!(survives || bridged || fused, "unexpected shape:\n{}", out);
+    if fused {
+        assert_eq!(count(&out, "movl %ecx, %eax"), 0, "{}", out);
+        assert_eq!(count(&out, "movl %esi"), 0, "{}", out);
+    }
 }
 
 #[test]
