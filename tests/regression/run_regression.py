@@ -176,6 +176,31 @@ def run_checked(cmd: list[str], *, env: dict[str, str], cwd: Path,
         return -9, out, f"TIMEOUT after {timeout}s"
 
 
+def host_lacks_i386_headers(gcc: str, src: str, flags: str) -> bool:
+    """True when a `-m32` compile fails for want of 32-bit libc headers.
+
+    lccc is not blamed for a missing multilib, and the claim is not taken on
+    the wording of lccc's own diagnostics: the oracle compiler is asked to
+    preprocess the same translation unit with the same `-m32`, and only an
+    identical missing-header failure downgrades the result. A `-m32` test
+    that the host's GCC compiles but lccc does not stays a hard failure.
+    """
+    if "-m32" not in flags.split():
+        return False
+    try:
+        probe = subprocess.run([gcc, "-m32", "-fsyntax-only", src],
+                               capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if probe.returncode == 0:
+        # The host can compile it in 32-bit mode, so the failure is lccc's.
+        return False
+    err = probe.stderr
+    # Only a missing multilib header counts. Anything else — a real
+    # preprocessor or parse error — must stay visible as a failure.
+    return "No such file or directory" in err and "bits/" in err
+
+
 def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path) -> Result:
     start = time.monotonic()
     phases: list[str] = []
@@ -226,6 +251,16 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path) -> Result:
     # Plain single-phase test.
     rc, so, se = run_checked(lccc_cmd(test.flags), env=env, cwd=workdir)
     if rc != 0:
+        if host_lacks_i386_headers(gcc, src, test.flags):
+            return Result(
+                test.name,
+                "skip-run",
+                "host image has no 32-bit libc headers; the host's own GCC "
+                "fails the same -m32 translation unit identically",
+                time.monotonic() - start,
+                0.0,
+                phases + ["compile:host-skip"],
+            )
         return Result(test.name, "fail",
                       f"lccc compile failed:\n{se[-2000:]}",
                       time.monotonic() - start, 0.0, phases + ["compile:fail"])

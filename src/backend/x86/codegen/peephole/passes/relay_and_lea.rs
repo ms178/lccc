@@ -836,6 +836,311 @@ fn self_base_reexec_unsafe(
     false
 }
 
+/// One x86-64 memory operand, split into the parts the SIB byte and the
+/// ModRM displacement can actually carry: an optional symbolic displacement,
+/// a numeric displacement, an optional base register (always scale 1) and an
+/// optional index register with a scale of 1, 2, 4 or 8.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SibAddr {
+    /// Symbolic part, e.g. `table` in `table+8(%rax)`.  Two symbols can never
+    /// be added, so composition rejects a pair of them.
+    sym: Option<String>,
+    /// Numeric displacement added to `sym` when one is present.
+    disp: i64,
+    base: Option<String>,
+    index: Option<(String, u8)>,
+}
+
+/// Parse the displacement text of an operand: `""`, `8`, `-8`, `table`,
+/// `table+8`, `table-8`.  Returns `None` for anything else so callers fail
+/// closed rather than invent an address.
+fn parse_disp(text: &str) -> Option<(Option<String>, i64)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some((None, 0));
+    }
+    if let Ok(v) = text.parse::<i64>() {
+        return Some((None, v));
+    }
+    // `sym[+|-]N`: split at the LAST sign so `a-b-4` can never be reached
+    // through a malformed input, and require a non-empty symbol.
+    let bytes = text.as_bytes();
+    for i in (1..text.len()).rev() {
+        if bytes[i] == b'+' || bytes[i] == b'-' {
+            let sym = &text[..i];
+            if sym.is_empty() {
+                return None;
+            }
+            let off = text[i..].parse::<i64>().ok()?;
+            return Some((Some(sym.to_string()), off));
+        }
+    }
+    Some((Some(text.to_string()), 0))
+}
+
+impl SibAddr {
+    /// Parse `[disp][(][%base][, %index[, scale]][)]`.  Returns `None` for
+    /// anything whose composition cannot be reasoned about (RIP-relative
+    /// addressing, malformed fields, three register slots), so callers fail
+    /// closed.
+    fn parse(text: &str) -> Option<Self> {
+        let open = text.find('(')?;
+        let close = text.rfind(')')?;
+        if close <= open {
+            return None;
+        }
+        let (sym, disp) = parse_disp(&text[..open])?;
+        let inner = text[open + 1..close].trim();
+        // x86-64 RIP-relative addressing is ModRM mod=00 r/m=101: there is no
+        // SIB byte, so no index register can be encoded.  An assembler may
+        // silently DROP the index instead of erroring (observed:
+        // `leaq V(%rip,%r11), %r10` encoded as plain `leaq V(%rip), %r10` --
+        // wide_cond_zero_test wrong-code).  Reject it outright.
+        if inner.contains("%rip") {
+            return None;
+        }
+        let mut fields = inner.split(',');
+        let base = fields.next()?.trim();
+        let base = if base.is_empty() {
+            None
+        } else {
+            if !base.starts_with('%') {
+                return None;
+            }
+            Some(base.to_string())
+        };
+        let mut index = None;
+        if let Some(idx) = fields.next() {
+            let idx = idx.trim();
+            if !idx.starts_with('%') {
+                return None;
+            }
+            let scale = match fields.next() {
+                Some(s) => match s.trim() {
+                    "1" => 1,
+                    "2" => 2,
+                    "4" => 4,
+                    "8" => 8,
+                    _ => return None,
+                },
+                // A register in the second slot with no explicit scale is
+                // scale 1 (`(%rax,%rbx)`).
+                None => 1,
+            };
+            // A fourth field would be a second index: no encoding.
+            if fields.next().is_some() {
+                return None;
+            }
+            index = Some((idx.to_string(), scale));
+        } else if fields.next().is_some() {
+            return None;
+        }
+        // A parenthesised operand with no register at all (`()`) is malformed,
+        // and a register-less sum is not an address composition.  Reject so
+        // compose_sib can never be handed (or produce) a degenerate operand.
+        if base.is_none() && index.is_none() {
+            return None;
+        }
+        Some(SibAddr {
+            sym,
+            disp,
+            base,
+            index,
+        })
+    }
+
+    /// Displacement text, empty when it is zero (GAS's canonical form).
+    fn disp_text(&self) -> String {
+        match &self.sym {
+            None => {
+                if self.disp == 0 {
+                    String::new()
+                } else {
+                    self.disp.to_string()
+                }
+            }
+            Some(sym) => {
+                if self.disp == 0 {
+                    sym.clone()
+                } else if self.disp > 0 {
+                    format!("{}+{}", sym, self.disp)
+                } else {
+                    format!("{}{}", sym, self.disp)
+                }
+            }
+        }
+    }
+
+    /// Render back to assembly text in a form GAS and the integrated
+    /// assembler both accept.
+    fn render(&self) -> String {
+        let d = self.disp_text();
+        match (&self.base, &self.index) {
+            (None, None) => {
+                if d.is_empty() {
+                    "0".to_string()
+                } else {
+                    d
+                }
+            }
+            (Some(b), None) => format!("{}({})", d, b),
+            // Scale 1 is implicit in the AT&T form and is omitted, matching
+            // the emitter's canonical output (`8(%rsp, %r8)`, not
+            // `8(%rsp, %r8, 1)`).  Emitting it would also bloat every folded
+            // operand and change output that other passes pattern-match on.
+            (None, Some((i, 1))) => format!("{}(,{})", d, i),
+            (None, Some((i, s))) => format!("{}(,{}, {})", d, i, s),
+            (Some(b), Some((i, 1))) => format!("{}({}, {})", d, b, i),
+            (Some(b), Some((i, s))) => format!("{}({}, {}, {})", d, b, i, s),
+        }
+    }
+}
+
+/// Compose `outer` around `inner`: the consumer operand
+/// `outer.disp(%T, outer.index, outer.scale)` carries `%T` in its BASE slot,
+/// and `%T` holds the value of the producer address `inner`.  The sum is
+///
+/// ```text
+///   outer.disp + inner.disp + inner.base
+///               + inner.index*inner.scale + outer.index*outer.scale
+/// ```
+///
+/// A SIB byte carries ONE base (always scale 1) and ONE index (scale
+/// 1/2/4/8), so the composition is representable only when the summed terms
+/// need at most two distinct registers and at most one of them is scaled.
+/// Anything else returns `None` and the fold must not happen: emitting it
+/// would give an instruction with no encoding, and the assembler may silently
+/// TRUNCATE it into a wrong-but-assemblable one (observed:
+/// `leaq 0(,%r11,4, %r10, 1), %r9` assembled as `leaq 0(,%r11,4), %r9`,
+/// dropping `+ %r10` -- the div/mod-by-constant miscompile at -O1).
+fn compose_sib(inner: &SibAddr, outer: &SibAddr) -> Option<String> {
+    let mut terms: Vec<(String, u8)> = Vec::with_capacity(4);
+    if let Some(b) = &inner.base {
+        terms.push((b.clone(), 1));
+    }
+    if let Some((i, s)) = &inner.index {
+        terms.push((i.clone(), *s));
+    }
+    if let Some(b) = &outer.base {
+        terms.push((b.clone(), 1));
+    }
+    if let Some((i, s)) = &outer.index {
+        terms.push((i.clone(), *s));
+    }
+    // Merge repeated registers: `(%rax) + (%rax,%rbx,2)` folds the two `%rax`
+    // terms into one only when the summed scale is still a legal index scale.
+    let mut merged: Vec<(String, u8)> = Vec::with_capacity(4);
+    for (reg, scale) in terms {
+        match merged.iter_mut().find(|(r, _)| *r == reg) {
+            Some(slot) => {
+                let sum = slot.1 as u32 + scale as u32;
+                if !matches!(sum, 1 | 2 | 4 | 8) {
+                    return None;
+                }
+                slot.1 = sum as u8;
+            }
+            None => merged.push((reg, scale)),
+        }
+    }
+    if merged.len() > 2 {
+        return None;
+    }
+    // Exactly one term may carry a scale != 1, and it becomes the index.
+    let scaled: Vec<usize> = merged
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, s))| *s != 1)
+        .map(|(i, _)| i)
+        .collect();
+    // A term in the BASE slot must be unscaled: the encoding has no scale
+    // field there, so only its register name survives.
+    let (base, index) = match (merged.len(), scaled.len()) {
+        (0, _) => (None, None),
+        (1, 0) => {
+            let (b, _) = merged.remove(0);
+            (Some(b), None)
+        }
+        (1, 1) => (None, Some(merged.remove(0))),
+        (2, 0) => {
+            let (b, _) = merged.remove(0);
+            let i = merged.remove(0);
+            (Some(b), Some(i))
+        }
+        (2, 1) => {
+            let idx = merged.remove(scaled[0]);
+            let (b, bscale) = merged.remove(0);
+            if bscale != 1 {
+                return None;
+            }
+            (Some(b), Some(idx))
+        }
+        _ => return None,
+    };
+    // Two symbolic displacements cannot be summed; one of them survives
+    // verbatim (`leaq table(%rcx), %r8` folded into `8(%r8,%rbp,8)` gives
+    // `table+8(%rcx, %rbp, 8)`).
+    let sym = match (&inner.sym, &outer.sym) {
+        (Some(_), Some(_)) => return None,
+        (Some(a), None) => Some(a.clone()),
+        (None, Some(b)) => Some(b.clone()),
+        (None, None) => None,
+    };
+    let disp = inner.disp.checked_add(outer.disp)?;
+    Some(
+        SibAddr {
+            sym,
+            disp,
+            base,
+            index,
+        }
+        .render(),
+    )
+}
+
+/// Byte offset in `line` of the first character of the operand containing
+/// `pos`: just past the previous operand separator, or just past the mnemonic
+/// when the operand is the first one.  Needed because the index-relay fold
+/// can meet its consumer in ANY operand position, and a store
+/// (`movq %rax, (%rcx,%rbp,8)`) has a register operand before it.
+fn operand_start(line: &str, pos: usize) -> usize {
+    if let Some(c) = line[..pos].rfind(',') {
+        return c + 1;
+    }
+    line.find(|c: char| c.is_whitespace()).unwrap_or(0)
+}
+
+/// Fold a producer `leaq` whose value is `producer_text` into the indexed
+/// consumer operand `line[pos..=close]`, which holds `dst_text` in its base
+/// slot.  Returns the composed operand, or `None` when the sum needs more
+/// register slots than the encoding has (in which case the fold is skipped
+/// and both instructions are kept).
+fn compose_indexed_relay(
+    line: &str,
+    pos: usize,
+    close: usize,
+    dst_text: &str,
+    producer_text: &str,
+) -> Option<String> {
+    let producer = SibAddr::parse(producer_text)?;
+    let op_start = operand_start(line, pos);
+    let cons_text = format!("{}{}", &line[op_start..pos], &line[pos..=close]);
+    let cons = SibAddr::parse(&cons_text)?;
+    // The base slot must be exactly %T.  Comparing the parsed field rather
+    // than a text prefix also closes the `%r1` vs `%r10` prefix hazard.
+    if cons.base.as_deref() != Some(dst_text) {
+        return None;
+    }
+    // %T is substituted away, so only the consumer's own displacement and
+    // index survive into the sum.
+    let cons_rest = SibAddr {
+        sym: cons.sym,
+        disp: cons.disp,
+        base: None,
+        index: cons.index,
+    };
+    compose_sib(&producer, &cons_rest)
+}
+
 /// Requirements: no barrier, no implicit register traffic and no write to
 /// `%base` between the two lines; the only mention of `%T` in the window is the
 /// bare `(%T)` operand being folded; the rewritten line no longer mentions
@@ -939,51 +1244,22 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
                 } else if let Some((pos, _)) = t.match_indices(&idx_pat).find(|(pos, _)| {
                     *pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
                 }) {
-                    if let Some(cl) = t[pos..].find(')').map(|c| pos + c) {
-                        let inner = &t[pos + 1..cl];
-                        if inner.starts_with(dst_text) {
-                            let tail = &inner[dst_text.len()..];
-                            // The spliced operand may hold at most TWO register
-                            // slots (base + index). The leaq's own address may
-                            // already consume both (e.g. `leaq (%rcx,%r9)`):
-                            // folding that into an indexed use would emit an
-                            // invalid three-register SIB
-                            // (`(%rcx, %r9, %r11, 8)` — vectorize_matmul_tail).
-                            let mut extra_regs = 0usize;
-                            let mut fields_ok = true;
-                            for (n, f) in tail.split(',').skip(1).enumerate() {
-                                let f = f.trim();
-                                if f.starts_with('%') {
-                                    extra_regs += 1;
-                                } else if n == 1 && matches!(f, "1" | "2" | "4" | "8") {
-                                    // scale (only meaningful behind an index)
-                                } else {
-                                    fields_ok = false;
-                                }
-                            }
-                            // x86-64 RIP-relative addressing (`disp(%rip)`)
-                            // cannot carry an index register at all — the
-                            // encoding is ModRM mod=00 r/m=101, no SIB. An
-                            // assembler may silently DROP the index instead of
-                            // erroring (observed: `leaq V(%rip,%r11), %r10`
-                            // encoded as plain `leaq V(%rip), %r10` —
-                            // wide_cond_zero_test wrong-code). So a %rip
-                            // leaq may only fold into a BARE `(%T)` use.
-                            if fields_ok
-                                && !folded_addr.contains("%rip")
-                                && addr_fams.len() + extra_regs <= 2
-                            {
-                                if let Some(aopen) = folded_addr.find('(') {
-                                    let new_operand = format!(
-                                        "{}{}{})",
-                                        &folded_addr[..aopen + 1],
-                                        &folded_addr[aopen + 1..folded_addr.len() - 1],
-                                        tail
-                                    );
-                                    matched = Some((pos, cl, new_operand));
-                                }
-                            }
-                        }
+                    if let Some(cl) = t[pos..].find(')').map(|c| pos + c)
+                        && let Some(new_operand) =
+                            compose_indexed_relay(t, pos, cl, dst_text, &folded_addr)
+                    {
+                        // COMPOSE, DO NOT CONCATENATE.  See compose_sib: the
+                        // old code spliced the producer's operand TEXT into
+                        // the base slot, which is only sound when the producer
+                        // occupies the base slot itself.  `leaq 0(,%r11,4), %r8`
+                        // folded into `leaq (%r8, %r10, 1), %r9` used to become
+                        // `leaq 0(,%r11,4, %r10, 1), %r9` -- two index
+                        // registers, no encoding -- which the integrated
+                        // assembler truncated to `leaq 0(,%r11,4), %r9`,
+                        // silently dropping `+ %r10`.  The correct composition
+                        // is `leaq (%r10, %r11, 4), %r9`: one instruction, one
+                        // index register, exactly what GCC and Clang emit.
+                        matched = Some((pos, cl, new_operand));
                     }
                 }
                 if let Some((op, cl, new_operand)) = matched {
@@ -2673,6 +2949,7 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
+    use super::{SibAddr, compose_sib, operand_start};
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
@@ -4884,5 +5161,304 @@ mod tests {
         assert!(out.contains("andl $65535, %edx"), "{out}");
         assert!(out.contains("movl %edx, %eax"), "{out}");
         assert!(!out.contains("%r11d"), "{out}");
+    }
+
+    // ------------------------------------------------------------------
+    // SibAddr parsing and compose_sib: the fold that miscompiled
+    // div/mod-by-constant verification at -O1 lived here.  Every case below
+    // is a shape the fold can actually meet in emitted code.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sib_parse_index_only_scale4() {
+        let a = SibAddr::parse("0(,%r11,4)").expect("index-only lea parses");
+        assert_eq!(a.disp, 0);
+        assert_eq!(a.base, None);
+        assert_eq!(a.index, Some(("%r11".to_string(), 4)));
+    }
+
+    #[test]
+    fn sib_parse_base_and_index() {
+        let a = SibAddr::parse("(%r8, %r10, 1)").expect("base+index parses");
+        assert_eq!(a.base.as_deref(), Some("%r8"));
+        assert_eq!(a.index, Some(("%r10".to_string(), 1)));
+        assert_eq!(a.disp, 0);
+    }
+
+    #[test]
+    fn sib_parse_disp_base_index() {
+        let a = SibAddr::parse("8(%rcx,%rbp,8)").expect("disp+base+index parses");
+        assert_eq!(a.disp, 8);
+        assert_eq!(a.base.as_deref(), Some("%rcx"));
+        assert_eq!(a.index, Some(("%rbp".to_string(), 8)));
+    }
+
+    #[test]
+    fn sib_parse_base_only_renders_canonically() {
+        let a = SibAddr::parse("16(%rax)").unwrap();
+        assert_eq!(a.base.as_deref(), Some("%rax"));
+        assert_eq!(a.index, None);
+        assert_eq!(a.render(), "16(%rax)");
+        let b = SibAddr::parse("(%rax)").unwrap();
+        assert_eq!(b.render(), "(%rax)", "zero disp renders without it");
+    }
+
+    #[test]
+    fn sib_parse_rejects_unencodable_forms() {
+        // %rip-relative: ModRM mod=00 r/m=101, no SIB byte at all.
+        assert!(SibAddr::parse("V(%rip)").is_none());
+        assert!(SibAddr::parse(".Lstr0(%rip)").is_none());
+        // Illegal index scale.
+        assert!(SibAddr::parse("(,%r11,3)").is_none());
+        // Three register slots: no encoding exists.
+        assert!(SibAddr::parse("(%rax,%rbx,%rcx)").is_none());
+        // No operand at all.
+        assert!(SibAddr::parse("()").is_none());
+        assert!(SibAddr::parse("%rax").is_none());
+    }
+
+    /// THE regression: `leaq 0(,%r11,4), %r8` folded into
+    /// `leaq (%r8, %r10, 1), %r9`.  The old code concatenated the two operand
+    /// texts into `0(,%r11,4, %r10, 1)` — two index registers, no base, no
+    /// encoding; the integrated assembler silently dropped `+ %r10` and the
+    /// `q*d + r == n` check compiled to `q*d == n`.
+    #[test]
+    fn compose_index_only_producer_into_indexed_consumer() {
+        let inner = SibAddr::parse("0(,%r11,4)").unwrap();
+        let outer = SibAddr {
+            sym: None,
+            disp: 0,
+            base: None,
+            index: Some(("%r10".to_string(), 1)),
+        };
+        let got = compose_sib(&inner, &outer).expect("must compose");
+        // disp 0 is omitted: `(%r10, %r11, 4)` is the canonical GAS form.
+        assert_eq!(got, "(%r10, %r11, 4)");
+        // And the result must itself be a legal, single-index operand.
+        let reparsed = SibAddr::parse(&got).expect("composition re-parses");
+        assert_eq!(reparsed.base.as_deref(), Some("%r10"));
+        assert_eq!(reparsed.index, Some(("%r11".to_string(), 4)));
+    }
+
+    #[test]
+    fn compose_plain_base_producer_keeps_working() {
+        // The shape the fold was originally written for: a plain
+        // displacement(base) producer folded into an indexed consumer.
+        let inner = SibAddr::parse("16(%rax)").unwrap();
+        let outer = SibAddr {
+            sym: None,
+            disp: 8,
+            base: None,
+            index: Some(("%rbx".to_string(), 8)),
+        };
+        assert_eq!(
+            compose_sib(&inner, &outer).as_deref(),
+            Some("24(%rax, %rbx, 8)")
+        );
+    }
+
+    #[test]
+    fn compose_rejects_two_scaled_registers() {
+        // 4*%rax + 8*%rbx needs two index slots.
+        let inner = SibAddr::parse("(,%rax,4)").unwrap();
+        let outer = SibAddr {
+            sym: None,
+            disp: 0,
+            base: None,
+            index: Some(("%rbx".to_string(), 8)),
+        };
+        assert!(compose_sib(&inner, &outer).is_none());
+    }
+
+    #[test]
+    fn compose_rejects_three_distinct_registers() {
+        let inner = SibAddr::parse("(%rax,%rbx,2)").unwrap();
+        let outer = SibAddr {
+            sym: None,
+            disp: 0,
+            base: None,
+            index: Some(("%rcx".to_string(), 1)),
+        };
+        assert!(compose_sib(&inner, &outer).is_none());
+    }
+
+    #[test]
+    fn compose_merges_repeated_register_into_one_scale() {
+        // %rax + %rax*1 == 2*%rax, which is a legal index scale.
+        let inner = SibAddr::parse("(%rax)").unwrap();
+        let outer = SibAddr {
+            sym: None,
+            disp: 0,
+            base: None,
+            index: Some(("%rax".to_string(), 1)),
+        };
+        assert_eq!(
+            compose_sib(&inner, &outer).as_deref(),
+            Some("(,%rax, 2)")
+        );
+    }
+
+    #[test]
+    fn compose_rejects_unmergeable_repeated_register() {
+        // %rax*1 + %rax*2 == 3*%rax: not an encodable scale.
+        let inner = SibAddr::parse("(,%rax,2)").unwrap();
+        let outer = SibAddr {
+            sym: None,
+            disp: 0,
+            base: None,
+            index: Some(("%rax".to_string(), 1)),
+        };
+        assert!(compose_sib(&inner, &outer).is_none());
+    }
+
+    #[test]
+    fn compose_sums_displacements() {
+        let inner = SibAddr::parse("-8(%rax)").unwrap();
+        let outer = SibAddr {
+            sym: None,
+            disp: 8,
+            base: None,
+            index: None,
+        };
+        assert_eq!(compose_sib(&inner, &outer).as_deref(), Some("(%rax)"));
+    }
+
+    /// End-to-end through the real peephole driver: the exact instruction
+    /// pair from the -O1 div/mod-by-constant miscompile.  The fold must
+    /// produce ONE lea with a single index register; a two-index operand has
+    /// no x86-64 encoding and used to assemble into wrong code.
+    #[test]
+    fn lea_chain_with_index_producer_composes_not_concatenates() {
+        let out = run(concat!(
+            "d4:\n",
+            ".cfi_startproc\n",
+            "    leaq 0(,%r11,4), %r8\n",
+            "    leaq (%r8, %r10, 1), %r9\n",
+            "    cmpq %rbx, %r9\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            !out.contains("%r11,4, %r10"),
+            "two-index lea escaped into the output:\n{out}"
+        );
+        assert!(
+            !out.contains("%r11, 4, %r10"),
+            "two-index lea escaped into the output:\n{out}"
+        );
+        // Either the fold fired and produced the valid composed form, or it
+        // declined and left both instructions intact.  Both are correct; the
+        // concatenation is the only unacceptable answer.
+        if out.contains("leaq (%r10, %r11, 4), %r9") {
+            assert!(!out.contains("leaq 0(,%r11,4), %r8"), "producer not removed");
+        } else {
+            assert!(out.contains("leaq 0(,%r11,4), %r8"), "{out}");
+            assert!(out.contains("leaq (%r8, %r10, 1), %r9"), "{out}");
+        }
+    }
+
+    // -- symbolic displacements and operand position ----------------------
+
+    #[test]
+    fn sib_parse_symbolic_displacements() {
+        let a = SibAddr::parse("table(%rcx)").unwrap();
+        assert_eq!(a.sym.as_deref(), Some("table"));
+        assert_eq!(a.disp, 0);
+        assert_eq!(a.base.as_deref(), Some("%rcx"));
+        assert_eq!(a.render(), "table(%rcx)");
+
+        let b = SibAddr::parse("table+8(%rax)").unwrap();
+        assert_eq!(b.sym.as_deref(), Some("table"));
+        assert_eq!(b.disp, 8);
+        assert_eq!(b.render(), "table+8(%rax)");
+
+        let c = SibAddr::parse("table-4(%rax)").unwrap();
+        assert_eq!(c.sym.as_deref(), Some("table"));
+        assert_eq!(c.disp, -4);
+        assert_eq!(c.render(), "table-4(%rax)");
+    }
+
+    /// The indexed-relay fold must keep working for a symbol-based producer:
+    /// this is the `leaq table(%rcx), %r8; movq (%r8,%rbp,8), %r13` shape the
+    /// pass documents (hash_table, adler32 unrolled loops).  A symbol cannot
+    /// be added, so it is carried through verbatim.
+    #[test]
+    fn compose_symbolic_producer_into_indexed_consumer() {
+        let inner = SibAddr::parse("table(%rcx)").unwrap();
+        let outer = SibAddr {
+            sym: None,
+            disp: 8,
+            base: None,
+            index: Some(("%rbp".to_string(), 8)),
+        };
+        assert_eq!(
+            compose_sib(&inner, &outer).as_deref(),
+            Some("table+8(%rcx, %rbp, 8)")
+        );
+    }
+
+    #[test]
+    fn compose_rejects_two_symbolic_displacements() {
+        let inner = SibAddr::parse("table(%rcx)").unwrap();
+        let outer = SibAddr {
+            sym: Some("other".to_string()),
+            disp: 0,
+            base: None,
+            index: Some(("%rbp".to_string(), 8)),
+        };
+        assert!(compose_sib(&inner, &outer).is_none());
+    }
+
+    #[test]
+    fn operand_start_finds_first_and_later_operands() {
+        // First operand: just past the mnemonic.
+        assert_eq!(operand_start("leaq (%r8, %r10, 1), %r9", 5), 4);
+        // Second operand (a store): just past the separator comma, NOT just
+        // past the mnemonic -- otherwise the displacement parse would choke
+        // on `%rax,` and the fold would silently stop firing for stores.
+        let store = "movq %rax, (%rcx,%rbp,8)";
+        assert_eq!(operand_start(store, 11), 10);
+        assert_eq!(&store[11..], "(%rcx,%rbp,8)");
+    }
+
+    /// The store form must still fold: a register operand precedes the
+    /// memory operand and the displacement extractor has to step over it.
+    #[test]
+    fn indexed_store_still_folds() {
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    leaq 16(%r12), %r8\n",
+            "    movq %rax, (%r8,%rbp,8)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movq %rax, 16(%r12, %rbp, 8)"),
+            "store into an indexed operand stopped folding:\n{out}"
+        );
+    }
+
+    #[test]
+    fn render_omits_implicit_scale_one() {
+        // The canonical AT&T form leaves scale 1 implicit.  The old splicer
+        // produced `8(%rsp, %r8)`; a renderer that wrote `8(%rsp, %r8, 1)`
+        // would be equivalent but would change every folded operand and break
+        // downstream pattern matchers (dead_writes keys on the canonical form).
+        let a = SibAddr::parse("(%rcx, %r8)").unwrap();
+        assert_eq!(a.index, Some(("%r8".to_string(), 1)));
+        assert_eq!(a.render(), "(%rcx, %r8)");
+        // And a scale-1 result still composes into the canonical text.
+        let inner = SibAddr::parse("8(%rsp)").unwrap();
+        let outer = SibAddr {
+            sym: None,
+            disp: 0,
+            base: None,
+            index: Some(("%r8".to_string(), 1)),
+        };
+        assert_eq!(
+            compose_sib(&inner, &outer).as_deref(),
+            Some("8(%rsp, %r8)")
+        );
     }
 }

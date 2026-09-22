@@ -1850,6 +1850,27 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
         // Parse base, index, scale from inside parens
         let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
 
+        // An x86-64 memory operand carries AT MOST base, index and scale.
+        // A fourth field means the operand has two index registers (or is
+        // otherwise malformed) and has NO encoding -- the ModRM/SIB pair has
+        // exactly one of each slot.  Reject it loudly.  This used to take
+        // parts[0..3] and silently IGNORE the rest, so
+        // `0(,%r11,4, %r10, 1)` assembled as `0(,%r11,4)`, dropping the
+        // `+ %r10` addend.  That turned a peephole emitting an invalid
+        // operand into a WRONG-CODE MISCOMPILE instead of a compile error:
+        // `q*4 + r == n` compiled to `q*4 == n` at -O1 and the program still
+        // assembled, ran and printed plausible numbers.  GAS errors on the
+        // same input ('expecting ) after scale factor'), so erroring here
+        // also matches the reference assembler's behaviour.
+        if parts.len() > 3 {
+            return Err(format!(
+                "memory operand has {} comma-separated fields inside the \
+                 parentheses, but at most base,index,scale are encodable: ({})",
+                parts.len(),
+                inner
+            ));
+        }
+
         // Segment override may appear inside the parens, e.g. the TLS
         // initial-exec access `g_tls@TPOFF(%fs:0)` (or `%gs:...`). The first
         // part `%fs:0` must set the segment and leave the base empty — the
@@ -4591,6 +4612,48 @@ main:
         assert!(parse_asm("\t.lccc_tight_loop LBB3\n").is_err());
         assert!(parse_asm("\t.lccc_tight_loop .LBB3\nnop\n").is_ok());
     }
+    // ------------------------------------------------------------------
+    // Memory operand arity.  A SIB byte has exactly one base slot and one
+    // index slot; a fourth field has no encoding and MUST be rejected
+    // rather than ignored.  Silently dropping it turned a peephole that
+    // emitted `0(,%r11,4, %r10, 1)` into a wrong-code miscompile: the
+    // assembler produced `0(,%r11,4)`, so `q*4 + r == n` compiled to
+    // `q*4 == n` and the program still assembled, ran, and printed
+    // plausible numbers.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn memory_operand_rejects_a_fourth_field() {
+        let err = parse_memory_inner("0(,%r11,4, %r10, 1)")
+            .expect_err("two index registers must not be accepted");
+        assert!(
+            err.contains("comma-separated fields"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn memory_operand_rejects_two_index_registers_via_the_full_operand() {
+        // The exact text the fold used to emit, through the real entry point.
+        assert!(parse_memory_operand("0(,%r11,4, %r10, 1)").is_err());
+    }
+
+    #[test]
+    fn memory_operand_accepts_the_canonical_three_field_forms() {
+        // base, index, scale
+        assert!(parse_memory_inner("8(%rcx,%rbp,8)").is_ok());
+        // base, index (implicit scale 1)
+        assert!(parse_memory_inner("(%rcx,%rbp)").is_ok());
+        // index only
+        assert!(parse_memory_inner("0(,%r11,4)").is_ok());
+        // base only
+        assert!(parse_memory_inner("16(%rax)").is_ok());
+        // The composed form the fixed peephole emits: both addends survive.
+        let m = parse_memory_inner("(%r10, %r11, 4)").expect("composed form must parse");
+        assert!(m.index.is_some(), "scale-4 index must survive");
+        assert_eq!(m.scale, Some(4));
+        assert!(m.base.is_some(), "base must survive");
+    }
 }
 
 // ── tests: the integer grammar has exactly one implementation ────────────────
@@ -4978,4 +5041,5 @@ mod integer_grammar_equivalence_tests {
             );
         }
     }
+
 }

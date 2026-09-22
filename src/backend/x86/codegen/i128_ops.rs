@@ -114,6 +114,60 @@ impl X86Codegen {
         self.state.emit("    addq %rsi, %rdx");
     }
 
+    /// Constant-multiplier multiply: `(lhs.lo:lhs.hi) * (lo:hi)`.
+    ///
+    /// The generic sequence above is a full 128x128 schoolbook product and
+    /// costs 13 instructions plus a push/pop pair used purely as a move. With
+    /// the multiplier's halves known at compile time the cross terms that
+    /// involve a zero half disappear, and the constant never has to be loaded
+    /// into the accumulator pair first.
+    ///
+    /// This is the hot shape for strength-reduced division and modulo, which
+    /// multiply by a 128-bit magic constant whose high half is always zero:
+    /// `x /u C` is `mulhi(x, M) >> s`, so `hi == 0` and the sequence collapses
+    /// to five instructions — matching what GCC, Clang and ICX emit.
+    pub(super) fn emit_i128_mul_const_impl(
+        &mut self,
+        lhs: &Operand,
+        _rhs: &Operand,
+        lo: u64,
+        hi: u64,
+    ) {
+        // LHS into %rax:%rdx (low:high); %rcx/%r8/%rsi are scratch.
+        self.operand_to_rax_rdx(lhs);
+        // `mulq` overwrites both accumulator halves, so park the LHS halves
+        // that the cross terms still need first. lhs.lo is only needed when
+        // the multiplier has a high half.
+        self.state.emit("    movq %rdx, %rcx");
+        if hi != 0 {
+            self.state.emit("    movq %rax, %rsi");
+        }
+        self.emit_movabs_to_r8(lo);
+        // Unsigned low product; its high half lands in %rdx.
+        self.state.emit("    mulq %r8");
+        // Cross term lhs.hi * lo.
+        self.state.emit("    imulq %r8, %rcx");
+        self.state.emit("    addq %rcx, %rdx");
+        if hi != 0 {
+            // Second cross term lhs.lo * hi, against the parked lhs.lo.
+            self.emit_movabs_to_r8(hi);
+            self.state.emit("    imulq %r8, %rsi");
+            self.state.emit("    addq %rsi, %rdx");
+        }
+    }
+
+    /// Load a 64-bit immediate into %r8, using the short form when it fits.
+    fn emit_movabs_to_r8(&mut self, v: u64) {
+        if v <= 0x7fff_ffff {
+            // Fits in a sign-extended imm32, so no REX.W movabs is needed.
+            self.state
+                .emit_fmt(format_args!("    movl ${}, %r8d", v));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    movabsq ${}, %r8", v as i64));
+        }
+    }
+
     pub(super) fn emit_i128_and_impl(&mut self) {
         self.state.emit("    andq %rcx, %rax");
         self.state.emit("    andq %rsi, %rdx");
