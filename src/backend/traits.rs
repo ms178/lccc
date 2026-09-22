@@ -2589,6 +2589,14 @@ pub trait ArchCodegen {
                     _ => unreachable!("i128 const-shift matched non-shift op: {:?}", op),
                 }
             }
+            // A constant multiplier lets the backend drop the schoolbook's
+            // cross terms rather than materialising both 64-bit halves and
+            // running the generic three-product sequence.
+            IrBinOp::Mul if get_const_i128_halves(rhs).is_some() => {
+                let (lo, hi) =
+                    get_const_i128_halves(rhs).expect("i128 const halves (guarded by is_some)");
+                self.emit_i128_mul_const(lhs, rhs, lo, hi);
+            }
             _ => {
                 self.emit_i128_prep_binop(lhs, rhs);
                 match op {
@@ -2612,6 +2620,15 @@ pub trait ArchCodegen {
     /// Default implementation uses the full prep_binop with a dummy RHS.
     fn emit_i128_prep_shift_lhs(&mut self, lhs: &Operand) {
         self.emit_i128_prep_binop(lhs, &Operand::Const(IrConst::I128(0)));
+    }
+
+    /// Multiply the accumulator pair by a constant whose 64-bit halves are
+    /// already known. The default ignores the split and runs the generic
+    /// sequence, so every backend stays correct without changes; backends
+    /// whose multiply can exploit the constant override this.
+    fn emit_i128_mul_const(&mut self, lhs: &Operand, rhs: &Operand, _lo: u64, _hi: u64) {
+        self.emit_i128_prep_binop(lhs, rhs);
+        self.emit_i128_mul();
     }
 
     // ---- 128-bit comparison dispatch ----
@@ -2748,6 +2765,21 @@ pub fn get_const_i128_shift_amount(rhs: &Operand) -> Option<u32> {
                 None
             }
         }
+        _ => None,
+    }
+}
+
+/// Split a constant 128-bit operand into its low/high 64-bit halves.
+///
+/// Constant multipliers dominate real i128 arithmetic: strength-reduced
+/// division multiplies by a 128-bit magic constant whose high half is zero,
+/// and generic `__int128` code multiplies by small literals. Handing the
+/// halves to the backend lets it collapse the three-term schoolbook product
+/// — a constant high half of zero removes a whole `imulq` term, and the
+/// constant no longer has to be materialised into the accumulator pair first.
+pub fn get_const_i128_halves(rhs: &Operand) -> Option<(u64, u64)> {
+    match rhs {
+        Operand::Const(IrConst::I128(v)) => Some((*v as u64, (*v >> 64) as u64)),
         _ => None,
     }
 }

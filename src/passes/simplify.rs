@@ -1739,17 +1739,44 @@ fn simplify_gep(
 }
 
 /// Return the log2 of a positive i64 value if it is a power of 2, or None otherwise.
-fn const_power_of_two(op: &Operand) -> Option<u32> {
-    match op {
-        Operand::Const(c) => {
-            let val = c.to_i64()?;
-            if val > 0 && (val & (val - 1)) == 0 {
-                Some(val.trailing_zeros())
-            } else {
-                None
-            }
-        }
-        _ => None,
+/// Recognise a constant power of two and return its exponent.
+///
+/// The constant must be read at the operation's width. Going through
+/// `to_i64()` silently truncates `IrConst::I128`, so the multiplier
+/// `0xffffffffffffffff0000000000000001` came back as `1`, was recognised as
+/// 2^0, and rewrote `x * K` into `x << 0` -- that is, into `x`, a silent
+/// miscompile of every `__int128` multiply by a constant whose low 64 bits
+/// happen to be a power of two. The same signed read also hid the single set
+/// bit of 2^63 in an unsigned 64-bit multiplier, so `x * 0x8000000000000000u`
+/// missed the shift entirely.
+///
+/// Both are fixed by taking the constant's bit pattern and masking it to the
+/// type's width before the power-of-two test.
+fn const_power_of_two(op: &Operand, ty: IrType) -> Option<u32> {
+    let c = match op {
+        Operand::Const(c) => *c,
+        _ => return None,
+    };
+    let raw: u128 = match c {
+        IrConst::I8(v) => v as u8 as u128,
+        IrConst::I16(v) => v as u16 as u128,
+        IrConst::I32(v) => v as u32 as u128,
+        IrConst::I64(v) => v as u64 as u128,
+        IrConst::I128(v) => v as u128,
+        _ => return None,
+    };
+    // Bits above the operation's width are not part of the value and must not
+    // be mistaken for the single set bit of a power of two.
+    let width = ty.size().saturating_mul(8) as u32;
+    let val = if width == 0 || width >= 128 {
+        raw
+    } else {
+        raw & ((1u128 << width) - 1)
+    };
+    if val != 0 && (val & (val - 1)) == 0 {
+        Some(val.trailing_zeros())
+    } else {
+        None
     }
 }
 
@@ -1761,7 +1788,7 @@ fn try_mul_power_of_two(
     pow2: &Operand,
     ty: IrType,
 ) -> Option<Instruction> {
-    let shift = const_power_of_two(pow2)?;
+    let shift = const_power_of_two(pow2, ty)?;
     if shift == 1 {
         // x * 2 => x + x
         Some(Instruction::BinOp {
@@ -1971,7 +1998,7 @@ fn simplify_binop(
             // On 64-bit targets, C integer promotion widens unsigned int ops to I64,
             // but UDiv still has unsigned semantics regardless of type signedness.
             if op == IrBinOp::UDiv && (ty.is_integer() || ty == IrType::Ptr) {
-                if let Some(shift) = const_power_of_two(rhs) {
+                if let Some(shift) = const_power_of_two(rhs, ty) {
                     return Some(Instruction::BinOp {
                         dest,
                         op: IrBinOp::LShr,
@@ -1995,7 +2022,7 @@ fn simplify_binop(
             // On 64-bit targets, C integer promotion widens unsigned int ops to I64,
             // but URem still has unsigned semantics regardless of type signedness.
             if op == IrBinOp::URem && (ty.is_integer() || ty == IrType::Ptr) {
-                if let Some(shift) = const_power_of_two(rhs) {
+                if let Some(shift) = const_power_of_two(rhs, ty) {
                     // x % 2^k => x & (2^k - 1)
                     let mask = (1i64 << shift) - 1;
                     return Some(Instruction::BinOp {

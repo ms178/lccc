@@ -506,6 +506,10 @@ jobs:
           bash tests/regression/check_boot_size_measurement.sh
           bash tests/regression/check_env_test_hygiene.sh
           bash tests/regression/check_peephole_whitespace.sh
+          bash tests/regression/check_peephole_trace_bisect.sh
+          # The trace-bisect tool is also exercised directly, so a broken
+          # operand parser fails CI even if the wrapper gate is skipped.
+          python3 scripts/peephole_trace_bisect.py --selftest
           bash tests/regression/check_atomic_backends.sh
           # FMA-negation peel deletion invariant, re-derived over the enumerated
           # shape space: a pure model check (no compiler, sub-second) so a
