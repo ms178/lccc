@@ -1941,16 +1941,50 @@ fn arm_load_speculation_ok(
     }
 }
 
+/// True of an instruction that may deallocate or unmap memory — a direct
+/// call, an indirect call, or inline assembly. A dereference proven BEFORE
+/// such an instruction is not evidence that the same bytes are still
+/// dereferenceable AFTER it (`free`/`munmap`/`realloc` behind the call may
+/// have released them), so it must not serve as load-speculation coverage
+/// across the barrier. This is the `CanBeFreed` hazard LLVM's
+/// `isDereferenceableAndAlignedPointer` guards. Pure arithmetic, GEPs,
+/// casts, and even atomic accesses and `memcpy` are deliberately NOT
+/// barriers: none of them releases a mapping, so excluding them keeps the
+/// coverage evidence as strong as it safely can be.
+fn may_free_or_unmap(inst: &Instruction) -> bool {
+    matches!(
+        inst,
+        Instruction::Call { .. } | Instruction::CallIndirect { .. } | Instruction::InlineAsm { .. }
+    )
+}
+
+fn block_has_free_barrier(ctx: &IfConvCtx<'_>, block_idx: usize) -> bool {
+    ctx.func.blocks[block_idx]
+        .instructions
+        .iter()
+        .any(may_free_or_unmap)
+}
+
 /// Canonical-address dereference map of one block: for every non-volatile,
 /// default-address-space Load/Store pointer, the WIDEST access made through
 /// that address key.
 ///
+/// FREES BARRIER: the scan is in program order and a potential
+/// free/unmap (see [`may_free_or_unmap`]) clears everything accumulated so
+/// far — a dereference before such a call proves nothing about
+/// dereferenceability at any point after it, and every consumer of this map
+/// (the speculated arm load) executes after the whole block has run. Only
+/// the dereferences that follow the LAST barrier in the block are returned.
 /// The width is the coverage evidence: a key present with width `w` proves
 /// that `w` bytes at that address are dereferenceable on this path, and
 /// nothing about byte `w + 1`.
 fn block_deref_keys(ctx: &IfConvCtx<'_>, block_idx: usize) -> FxHashMap<String, usize> {
     let mut keys: FxHashMap<String, usize> = FxHashMap::default();
     for inst in &ctx.func.blocks[block_idx].instructions {
+        if may_free_or_unmap(inst) {
+            keys.clear();
+            continue;
+        }
         let (ptr, volatile, seg, ty) = match inst {
             Instruction::Load {
                 ptr,
@@ -2006,6 +2040,15 @@ fn dominating_deref_keys(ctx: &IfConvCtx<'_>, block_idx: usize) -> FxHashMap<Str
     let mut keys = block_deref_keys(ctx, block_idx);
     let mut cur = block_idx;
     for _ in 0..MAX_DOM_DEREF_CHAIN {
+        // A barrier anywhere in `cur` executed after every block above it,
+        // so the unique-predecessor chain past it cannot contribute live
+        // coverage: those dereferences may have been freed by the barrier.
+        // (`block_deref_keys` already pruned `cur`'s own pre-barrier
+        // dereferences; this check stops the walk from re-introducing the
+        // ancestors'.)
+        if block_has_free_barrier(ctx, cur) {
+            break;
+        }
         if ctx.preds.len(cur) != 1 {
             break;
         }

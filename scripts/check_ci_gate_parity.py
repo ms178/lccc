@@ -28,6 +28,9 @@ COMMAND = re.compile(
     r"\.github/scripts/[A-Za-z0-9_./-]+\.py)"
 )
 
+REGRESSION_DIR = ROOT / "tests" / "regression"
+ALLOWLIST = ROOT / "scripts" / "ci_gate_allowlist.txt"
+
 
 def run_script_bodies(path: Path) -> str:
     """All `run:` script text of one workflow, comment-stripped.
@@ -82,8 +85,74 @@ def run_script_bodies(path: Path) -> str:
     return "\n".join(pieces)
 
 
+def allowlist_entries() -> set[str]:
+    """Paths named in the orphan allowlist (comments and blanks stripped).
+
+    Each entry is a gate script that is KNOWN to be unwired; the list is a
+    reviewed, shrinking record of coverage debt, never a place to park a new
+    gate (wiring it into ci_local.sh or a workflow deletes its entry).
+    """
+    if not ALLOWLIST.exists():
+        return set()
+    entries = set()
+    for line in ALLOWLIST.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # A trailing "  # reason" annotates the entry; only the path
+        # matters for matching (a reason can never contain whitespace-free
+        # `tests/...sh` shape that would alias another path).
+        path = line.split("#", 1)[0].strip()
+        if path:
+            entries.add(path)
+    return entries
+
+
+def check_orphaned_gates(local_text: str, hosted: str) -> int:
+    """Fail on any tests/regression/check_*.sh executed by nothing.
+
+    The parity check above only sees scripts that ci_local.sh already
+    references; a gate script wired into NEITHER mirror is invisible to it.
+    That blind spot let a whole batch of codegen-contract gates rot
+    unexecuted. Every gate script must therefore be referenced by
+    ci_local.sh, by a hosted workflow, or be explicitly recorded in the
+    allowlist -- and the allowlist must not carry entries that are no
+    longer orphans, so it can only shrink.
+    """
+    if not REGRESSION_DIR.is_dir():
+        return 0
+    allow = allowlist_entries()
+    orphans = []
+    for path in sorted(REGRESSION_DIR.glob("check_*.sh")):
+        rel = str(path.relative_to(ROOT))
+        if rel in local_text or rel in hosted:
+            continue
+        if rel not in allow:
+            orphans.append(rel)
+    stale = sorted(p for p in allow if p in local_text or p in hosted)
+    ok = True
+    if orphans:
+        ok = False
+        print("gate scripts are wired into nothing and not allowlisted:", file=sys.stderr)
+        for p in orphans:
+            print(f"  {p}", file=sys.stderr)
+        print(
+            "  wire the gate into scripts/ci_local.sh and/or a workflow",
+            file=sys.stderr,
+        )
+    if stale:
+        ok = False
+        print("allowlist entries that are no longer orphans (delete them):", file=sys.stderr)
+        for p in stale:
+            print(f"  {p}", file=sys.stderr)
+    if not ok:
+        return 1
+    return 0
+
+
 def main() -> int:
-    local_paths = set(COMMAND.findall(LOCAL.read_text()))
+    local_text = LOCAL.read_text()
+    local_paths = set(COMMAND.findall(local_text))
     bodies = []
     for path in sorted(WORKFLOWS.glob("*.yml")):
         bodies.append(run_script_bodies(path))
@@ -94,6 +163,9 @@ def main() -> int:
         for path in missing:
             print(f"  {path}", file=sys.stderr)
         return 1
+    rc = check_orphaned_gates(local_text, hosted)
+    if rc != 0:
+        return rc
     print(f"CI/local standalone gate parity: PASS ({len(local_paths)} commands)")
     return 0
 

@@ -1,9 +1,6 @@
 # FOLLOWUP — S61 (fix C): nested promoted sub-word SELECT demotion in BB-SLP
 
-**Date**: 2026-09-21 · **Commit**: `8c5814b` on `work` (base `c160d11`)
-**Snapshot**: `S03-s61-slp-nested-subword-demote` (ledger lives outside the repo, in the
-artifacts directory) — `ms178-1.patch` applies clean on `c160d11`, which is still
-upstream `main` (verified with `git ls-remote origin refs/heads/main`).
+**Date**: 2026-09-21 · **Landed in `main`**: `66c8687d` (PR #578, merge `1ff53e85`)
 **Scope**: `src/passes/slp_vectorizer.rs` (+485/−43), 4 test files.
 
 ---

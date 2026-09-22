@@ -325,6 +325,17 @@ gate "bb-slp-v7" fast \
 gate "bb-slp-v8" fast \
     bash tests/regression/check_bb_slp_v8_codegen.sh
 
+# Nested-diamond if-conversion + sub-word SELECT demotion: the
+# unique-predecessor coverage walk (dominating_deref_keys), single-entry
+# single-exit arm regions, the recursive promoted-select demotion, Copy
+# transparency, and the promoted-unary-lane rewrite. Enforces the
+# branch-free + vectorized contracts for the whole conditional-clamp
+# family, the must-branch negative controls (uncovered loads, free-barrier
+# deref, side-effect/volatile arms, half-covered stores), and the
+# tri-config runtime differential.
+gate "bb-slp-nested-ifconv" fast \
+    bash tests/regression/check_bb_slp_nested_ifconv.sh
+
 # Two-block partial unroller + half-wide dword-pair SLP family: the
 # guard-free xk unroll of two-block counted loops (phi threading incl.
 # the IV-reference carried-phi class), the I32/U32 pair load/store/pack

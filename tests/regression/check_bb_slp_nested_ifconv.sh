@@ -38,7 +38,8 @@
 #      c. the loop clamp vectorizes (the 41x runtime win must not silently
 #         regress to the scalar cmov loop);
 #      d. the uncovered-load negative controls still BRANCH (they must not
-#         have been converted at all);
+#         have been converted at all), including the free-barrier control
+#         whose dominating deref sits before a potential-free call;
 #      e. the side-effect arms still BRANCH and still write their sink.
 #      f. the half-covered store set still branches.
 #
@@ -159,6 +160,14 @@ must_branch half_guard \
 must_branch nested_uncovered \
     "nested_uncovered was if-converted despite an uncovered arm load
       (speculating it dereferences NULL — soundness regression)"
+
+# (d3) the free-barrier control: the dominating deref of `p` is followed by
+# an opaque potential-free, so its coverage evidence must not be used to
+# speculate the conditional deref (LLVM's CanBeFreed hazard).
+must_branch after_release \
+    "after_release was if-converted across a potential-free barrier
+      (the speculated load could read freed/unmapped memory — soundness
+      regression)"
 
 # (e) the side-effect arms must stay branchy (their arms write a volatile).
 must_branch side_effect_arms \

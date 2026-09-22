@@ -73,6 +73,27 @@ int nested_uncovered(const int *covered, const int *maybe_null, int sel,
   return r;
 }
 
+/* ── 3b. NEGATIVE control, free barrier: the dominating deref of `p` is
+ *     followed by an opaque potential-free (`may_release`).  Coverage
+ *     evidence does not survive a call that may free or unmap the memory
+ *     (LLVM's `CanBeFreed` hazard), so the conditional deref must NOT be
+ *     speculated across the barrier even though the address was
+ *     dereferenced on every path above it. ---------------------------- */
+__attribute__((noinline)) static void may_release(const void *p) {
+  __asm__ volatile("" : : "r"(p) : "memory");
+}
+int after_release(const int *p, int sel, int *out) {
+  int v = *p; /* dominating deref of p */
+  may_release(p); /* potential free/unmap: invalidates the coverage above */
+  int r;
+  if (sel)
+    r = *p; /* must NOT be hoisted above the barrier */
+  else
+    r = v;
+  *out = r;
+  return r;
+}
+
 /* ── 4. side effects in an arm: must never be speculated ------------- */
 volatile int side_sink;
 int side_effect_arms(const int *a, int *out) {
@@ -253,6 +274,14 @@ int main(void) {
     EXPECT("nested_uncovered sel", nested_uncovered(&cov, &p, 1, &out), 5);
     cov = 500;
     EXPECT("nested_uncovered hi", nested_uncovered(&cov, (const int *)0, 0, &out), 100);
+  }
+
+  /* (3b) free barrier: the dominating deref is invalidated by the call;
+   * the conditional deref must run only when selected. */
+  {
+    int p = 5;
+    EXPECT("after_release nosel", after_release(&p, 0, &out), 5);
+    EXPECT("after_release sel", after_release(&p, 1, &out), 5);
   }
 
   /* (4) side effects: the arm that runs must be the one that wrote */

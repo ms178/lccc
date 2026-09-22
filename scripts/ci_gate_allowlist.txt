@@ -1,0 +1,90 @@
+# Gate scripts in tests/regression/ not yet executed by ci_local.sh or a
+# hosted workflow. check_ci_gate_parity.py fails on any orphan NOT listed
+# here, and on any entry here that is no longer an orphan, so the set can
+# only shrink: wiring a gate means deleting its line. Do not add entries -
+# wire the gate instead.
+#
+# Entries marked "needs triage" / "env" were failing locally at audit time.
+tests/regression/check_abi_reg_hints.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_affine_map_vectorization_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_alu_audit_fixes.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_andn_fusion.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_arm_csinc_select.sh  # needs aarch64-linux-gnu-gcc cross-compiler (not on CI image)
+tests/regression/check_arm_direct_select.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_arm_fp_stack_reload.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_asm_missing_include_fatal.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_backedge_pre_fp_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_backedge_pre_int_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_bit_test_canonical.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_bitop_nonneg_zext.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_cfg_leaf_param_homes.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_clz_ctz_target_isa.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_clz_zero_guard_fold.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_cmp_cast_branch_fusion.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_code16_string_ops.sh  # codegen contract divergence vs GNU as (.code16) — needs triage
+tests/regression/check_copy64_ymm.sh  # empty output — needs triage
+tests/regression/check_crc32_zeroext_moves.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_crc_index_home.sh  # codegen contract (scale-4 SIB) — needs triage
+tests/regression/check_custom_section_progbits.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_empty_leaf_frame.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_f128_copy_fusion.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_fixed_slp_distances_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_fma_dest_coalesce_codegen.sh  # codegen contract (FMA dest coalesce) — needs triage
+tests/regression/check_gas_isa_scan.sh  # GAS rejects vextracti128 operand size on this binutils — env
+tests/regression/check_global_addr_cse.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_global_addr_remat.sh  # weak PIE extern GOT indirection — needs triage
+tests/regression/check_gpr_leaf_param_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_gvn_disjoint_epochs.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_i686_code16_relax.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_i686_const_div.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_i686_overalign_interop.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_imm_store_movl_sib.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_inline_multisite_loop_wrapper_policy.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_integer_reduction_vecreg_codegen.sh  # codegen contract (reduction accumulator homes) — needs triage
+tests/regression/check_licm_alias_disjoint.sh  # .size awk extraction empty — gate script defect
+tests/regression/check_load_widen_cast_no_relay.sh  # .size awk extraction empty — gate script defect
+tests/regression/check_loop_idiom.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_loop_rotate_pressure.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_machinst_fallback_replay.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_machinst_window_alloc.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_mcount.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_memory_fold_liveness.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_movabs_symdiff.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_multi_reduction_vectorize.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_multiple_fp_reductions_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_narrow_cond_width.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_no_sse_fp_diag.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_o0_no_regalloc.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_os_nested_loop_inline_policy.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_os_postinline_size_policy.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_percpu_add_fold.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_percpu_reloc_hide_ice.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_pfe_section.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_ptr_to_float_cast.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_ra_allocstats.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_reduction_vecreg_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_redundant_test_elimination.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_reg_src_fold.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_return_32bit_zeroext.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_riscv_int_canon.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_riscv_nested_fn.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_sema_constraints.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_single_site_static_inline.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_slotaddr_reg.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_static_call_pcrel.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_switch_threshold.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_symver_indirect_fold.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_tier2_graph_default.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_u32_i32_cast_no_relay.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_unary_rmw_copy_propagation.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_vararg_overalign_interop.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_vec_interleave_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_vecreg_new_ops_codegen.sh  # codegen contract (XMM home) — needs triage
+tests/regression/check_vector_dot_fma_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_vector_remainder_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_volatile_access_semantics.sh  # exits 1 after partial pass — needs triage
+tests/regression/check_volatile_pointer_subscript.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_wide_cond_zero_test.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_wide_const_imm_stores.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_widened_byte_chain.sh  # passes locally; not yet wired into ci_local.sh / a workflow
+tests/regression/check_widened_signed_byte_relops.sh  # passes locally; not yet wired into ci_local.sh / a workflow
