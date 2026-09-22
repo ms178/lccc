@@ -11539,12 +11539,18 @@ pub fn peephole_optimize(asm: String) -> String {
     // stores and moves by shortening def-use chains, so it runs before DSE
     // and the liveness cleanup).
     let pair_changed = fold_sext_zext_pairs(&mut store, &mut infos);
+    // Fold `movl %S,%D` + `movX{l,w}l %D<narrow>,%D` into one extension of
+    // %S.  Runs BEFORE the redundant-extension state machine: the fused
+    // instruction is the machine's *input* shape (it establishes the
+    // byte/word fact), and folding first means the machine can then delete
+    // the extension entirely when the source fact already holds.
+    let copy_ext_changed = fold_copy_narrow_ext_pairs(&mut store, &mut infos);
     let zext_changed = eliminate_redundant_zext_i686(&mut store, &mut infos);
     // Redundant SIGN-extension elimination runs right after: it turns
     // `movsbl %al,%REG` into a `movl` copy or a no-op, which the cleanup
     // loop below then propagates/deletes like any other move.
     let sext_changed = eliminate_redundant_sign_ext_i686(&mut store, &mut infos);
-    if pair_changed || zext_changed || sext_changed {
+    if pair_changed || copy_ext_changed || zext_changed || sext_changed {
         let mut changed3 = true;
         let mut pass_count3 = 0;
         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
@@ -11954,6 +11960,120 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
             }
         }
         i += 1;
+    }
+    changed
+}
+
+// ── Pass: fold a 32-bit copy into the narrow extension that follows it ──────
+
+/// One mnemonic of the narrow-extend family, with the source sub-register
+/// width it reads.  `movsbl`/`movzbl` read the low BYTE, `movswl`/`movzwl`
+/// the low WORD; all four write a full 32-bit destination.
+const NARROW_EXT_TO_32: [(&str, MoveSize); 4] = [
+    ("movzbl ", MoveSize::B),
+    ("movsbl ", MoveSize::B),
+    ("movzwl ", MoveSize::W),
+    ("movswl ", MoveSize::W),
+];
+
+/// Fuse `movl %S,%D` followed by `movX{l,w}l %D<narrow>,%D` into the single
+/// instruction `movX{l,w}l %S<narrow>,%D`.
+///
+/// Why this shape exists at all: the i686 backend materialises a sub-int
+/// copy as a full 32-bit move and then re-establishes the narrow type's
+/// invariant with an explicit extension, so a `u16` that is already in a
+/// register costs
+///
+/// ```text
+///     movl   %ebx, %eax        ; 2 bytes — the copy
+///     movzwl %ax, %eax         ; 3 bytes — the type invariant
+/// ```
+///
+/// where one instruction does both.  The fused form is exactly equivalent:
+/// the `movl` wrote `%D = %S`, so the extension's source `%D<narrow>` held
+/// `%S<narrow>`, and the extension overwrites `%D` completely.  Nothing
+/// between the two lines can observe the intermediate value (adjacency),
+/// and `%S` is untouched by both.
+///
+/// Measured on the 32 KiB x86 setup corpus (`arch/x86/boot`, the identical
+/// command lines from `scripts/boot_flags.sh`): 45 `movzwl %ax,%eax` sites
+/// alone, 109 more `movzwl` than GCC emits for the same 21 translation
+/// units — see `scripts/boot_insn_census.py`.  Each fusion is 2 bytes.
+///
+/// Fail-closed rules, each of which has a concrete wrong-code shape behind
+/// it:
+///   * the source must be spelled as a 32-bit register.  `%ah` and `%al`
+///     share a family, and `movzbl %al,%D` after `movl %ah,%D` would read a
+///     different byte than the `movzbl %ah,%D` it replaces;
+///   * `%esp` is never a dataflow register;
+///   * the sub-register must exist on this target (`%sil`/`%dil` are 64-bit
+///     only), which `narrow_reg_name` reports as `None`;
+///   * a barrier or label between the lines kills the fold — the
+///     intermediate value is then observable.
+fn fold_copy_narrow_ext_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = infos.len();
+    let mut i = 0;
+    while i + 1 < len {
+        let LineKind::Move { dst, src } = infos[i].kind else {
+            i += 1;
+            continue;
+        };
+        if infos[i].is_nop() || dst == REG_ESP || src == REG_ESP || dst > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        // Find the next real line; only nops (and debug locations) may sit
+        // between the copy and the extension.
+        let mut j = i + 1;
+        while j < len && (infos[j].is_nop() || is_debug_location(store, infos, j)) {
+            j += 1;
+        }
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let t = trimmed(store, &infos[j], j).to_string();
+        let mut fused = false;
+        for (prefix, width) in NARROW_EXT_TO_32 {
+            let Some(rest) = t.strip_prefix(prefix) else {
+                continue;
+            };
+            let Some((ext_src, ext_dst)) = split_operands_last_comma(rest) else {
+                continue;
+            };
+            // The extension must re-extend the register the copy just wrote.
+            if register_family(ext_dst) != dst {
+                continue;
+            }
+            // ... from that register's own low sub-register.  Comparing the
+            // TEXT (not the family) is what rules out the `%ah`/`%al`
+            // mix-up; a memory source cannot be a self-extension at all.
+            let Some(want) = narrow_reg_name(dst, width) else {
+                continue;
+            };
+            if ext_src != want {
+                continue;
+            }
+            let Some(s_narrow) = narrow_reg_name(src, width) else {
+                continue;
+            };
+            store.replace(
+                i,
+                format!(
+                    "    {} {}, {}",
+                    prefix.trim_end(),
+                    s_narrow,
+                    reg32_name(dst)
+                ),
+            );
+            infos[i] = classify_line(store.get(i));
+            infos[j].kind = LineKind::Nop;
+            changed = true;
+            fused = true;
+            break;
+        }
+        i = if fused { j + 1 } else { i + 1 };
     }
     changed
 }
@@ -18487,5 +18607,98 @@ mod tests {
             out.contains("movzbl %cl, %ecx"),
             "the index register inherited a byte fact it does not have:\n{out}"
         );
+    }
+
+    #[test]
+    fn copy_then_self_narrow_extension_fuses_into_one_extension_of_the_source() {
+        // `movl %ebx,%eax; movzwl %ax,%eax` is one value moved and then
+        // re-typed; `movzwl %bx,%eax` does both.  The boot corpus has 45 of
+        // these for movzwl alone (scripts/boot_insn_census.py).
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    movzwl %ax, %eax\n",
+            "    movl %eax, (%edx)\n",
+            "    movl %ebx, (%ecx)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("movzwl %bx, %eax"),
+            "the copy/extension pair did not fuse:\n{out}"
+        );
+        assert!(
+            !out.contains("movl %ebx, %eax"),
+            "the fused copy is still present:\n{out}"
+        );
+        assert_eq!(
+            out.matches("movzwl").count(),
+            1,
+            "expected exactly one extension after the fold:\n{out}"
+        );
+    }
+
+    #[test]
+    fn copy_then_extension_never_reads_the_high_byte_alias() {
+        // SOUNDNESS for the fusion's "compare the operand TEXT, not the
+        // family" rule.  `%ah` and `%al` are the same register family, so a
+        // family-only comparison would rewrite
+        //     movl %ebx,%eax ; movzbl %ah,%eax
+        // into `movzbl %bl,%eax` -- a different byte, i.e. wrong code.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    movzbl %ah, %eax\n",
+            "    movl %eax, (%edx)\n",
+            "    movl %ebx, (%ecx)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("movzbl %ah, %eax"),
+            "the high-byte extension was rewritten to a different byte:\n{out}"
+        );
+        assert!(
+            !out.contains("movzbl %bl"),
+            "the fold read the low byte where the source needs the high one:\n{out}"
+        );
+    }
+
+    #[test]
+    fn folded_copy_extension_text_reaches_the_assembler_parseable() {
+        // REGRESSION GATE for a defect this pass shipped with: the fused line
+        // was emitted as `movzwl%bx, %eax` (the mnemonic's trailing space was
+        // trimmed and never restored).  The peephole's own classifier filed
+        // it under the `Other` catch-all and every text-level assertion
+        // passed, so only a real compile saw it -- eight boot translation
+        // units died with "unhandled i686 instruction: movzwl%bx".
+        //
+        // A peephole test that only greps its own output cannot catch that
+        // class, so this one routes the result through the actual i686
+        // assembler, which is what the compiler does with it next.
+        let asm = concat!(
+            "    .text\n",
+            "    .globl f\n",
+            "f:\n",
+            "    movl %ebx, %eax\n",
+            "    movzwl %ax, %eax\n",
+            "    movl %eax, (%edx)\n",
+            "    ret\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("movzwl %bx, %eax"),
+            "pair did not fuse:\n{out}"
+        );
+        let obj = std::env::temp_dir().join("lccc_fold_copy_ext_parseable.o");
+        let path = obj.to_string_lossy().into_owned();
+        crate::backend::i686::assembler::assemble(&out, &path).unwrap_or_else(|e| {
+            panic!("peephole emitted assembly the i686 assembler rejects: {e}\n{out}")
+        });
+        let _ = std::fs::remove_file(&path);
     }
 }

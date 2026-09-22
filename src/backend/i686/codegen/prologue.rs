@@ -368,18 +368,24 @@ impl I686Codegen {
                 }
             }
             let _ = &ret_operands; // (ret_operands kept for the PIC-free path)
-            let skip = crate::backend::regalloc::analyze_accumulator_assignments_with_config(
-                func,
-                crate::backend::regalloc::AccumulatorPolicy {
-                    operand_order:
-                        crate::backend::regalloc::AccumulatorOperandOrder::AccumulatorCentric,
-                    return_consumes_accumulator: true,
-                },
-                &self.state.ra_config,
-            )
-            .into_iter()
-            .map(|a| a.value_id)
-            .collect::<crate::common::fx_hash::FxHashSet<_>>();
+            // Kill switch for the whole policy (see RaConfig::no_i686_accum_nohome).
+            let skip: crate::common::fx_hash::FxHashSet<u32> =
+                if self.state.ra_config.no_i686_accum_nohome {
+                    Default::default()
+                } else {
+                    crate::backend::regalloc::analyze_accumulator_assignments_with_config(
+                    func,
+                    crate::backend::regalloc::AccumulatorPolicy {
+                        operand_order:
+                            crate::backend::regalloc::AccumulatorOperandOrder::AccumulatorCentric,
+                        return_consumes_accumulator: true,
+                    },
+                    &self.state.ra_config,
+                )
+                .into_iter()
+                .map(|a| a.value_id)
+                .collect()
+                };
             let extra: Vec<u32> = skip
                 .iter()
                 .copied()
