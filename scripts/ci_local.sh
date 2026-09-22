@@ -414,6 +414,12 @@ gate "vector-copy-elimination" fast \
 gate "call-arg-staging" fast \
     bash tests/regression/check_call_arg_staging.sh
 
+# Loop-invariant LEA hoisting (guarded loops, pure-LEA insertion placement
+# before the alignment run) + direct 3-operand RORX (no movq staging into
+# the destination of a non-destructive BMI2 rotate).
+gate "lea-hoist-rorx" fast \
+    bash tests/regression/check_lea_hoist_rorx.sh
+
 # Cross-PR interaction red-team: FMA families x copy brackets x
 # if-conversion x constant promotion x NonZero x the AVX1+FMA target
 # class, bit-exact vs the reference compiler at matched march (canonical

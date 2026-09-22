@@ -1900,6 +1900,20 @@ fn simplify_binop(
                     });
                 }
             }
+            // Floats: x - (neg y) => x + y — the same four-oracle
+            // consensus fold as the Add mirror above, unconditional for
+            // the same bit-parity reason (see the adjudication there).
+            if is_float && !simplify_skip("addneg") {
+                if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
+                    return Some(Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::Add,
+                        lhs: *lhs,
+                        rhs: neg_src,
+                        ty,
+                    });
+                }
+            }
         }
         IrBinOp::Mul => {
             if !is_float && (rhs_zero || lhs_zero) {

@@ -1981,6 +1981,207 @@ mod tests {
         }
     }
 
+    /// ── The PR #584 bug class ──
+    ///
+    /// `eliminate_dead_pure_writes` legitimately deletes the `movb $N, %al`
+    /// census before a non-variadic callee (%al is dead there).  Once the
+    /// census is gone, the fallback window walk is the only source for the
+    /// SSE-argument set.  It used to BREAK on the first non-staging line —
+    /// the hazard-area release `addq $K, %rsp`, the stack-argument
+    /// `pushq %rax`, and the GP half of every rax relay all terminated the
+    /// scan — so the call was modeled as reading ZERO xmm registers and
+    /// `eliminate_dead_vector_copies` deleted the live argument staging
+    /// (a 10-double call lost 7 of its 8 register arguments to garbage).
+    /// The `# LCCC_CALL_FP <n>` authority marker fixes the general case;
+    /// the tests below pin every layer.
+
+    /// The authority marker is exact and immune to the census deletion:
+    /// no census anywhere, marker says 8 → all eight argument registers
+    /// read across the hazard-area release.
+    #[test]
+    fn call_fp_marker_is_authoritative_without_census() {
+        let (store, _i, lv) = build(
+            "    movsd %xmm8, %xmm1\n\
+             \x20   movsd %xmm9, %xmm2\n\
+             \x20   movsd %xmm10, %xmm3\n\
+             \x20   movsd %xmm11, %xmm4\n\
+             \x20   movsd %xmm12, %xmm5\n\
+             \x20   movsd %xmm13, %xmm6\n\
+             \x20   movsd %xmm14, %xmm7\n\
+             \x20   movq %xmm7, %rax\n\
+             \x20   movq %rax, %xmm0\n\
+             \x20   addq $16, %rsp\n\
+             \x20   call f10@PLT\n\
+             \x20   # LCCC_CALL_ARGS 0\n\
+             \x20   # LCCC_CALL_FP 8\n",
+        );
+        for (probe, reg) in [
+            ("movsd %xmm8, %xmm1", 1),
+            ("movsd %xmm10, %xmm3", 3),
+            ("movsd %xmm14, %xmm7", 7),
+        ] {
+            let n = line_of(&store, probe);
+            assert_eq!(
+                lv.xmm_live_after(n, reg),
+                Some(true),
+                "{probe}: staged argument read (marker says 8)"
+            );
+        }
+    }
+
+    /// The marker sits among sibling markers (`VA`, `CALL_ARGS`, `CHAIN`)
+    /// and is skipped by their parsers; it must parse through them too.
+    /// The order matches `emit_call_instruction_impl`: CHAIN keeps its
+    /// tight-window position (the GP oracle scans n+1..n+3 for it) and
+    /// CALL_FP is emitted LAST — reordering them regresses nested
+    /// functions (the static-chain staging gets deleted; found via
+    /// nested_functions in the corpus).
+    #[test]
+    fn call_fp_marker_parses_through_sibling_markers() {
+        let (store, _i, lv) = build(
+            "    movsd %xmm3, %xmm1\n\
+             \x20   call g@PLT\n\
+             \x20   # LCCC_VA_CALL\n\
+             \x20   # LCCC_CALL_ARGS 2\n\
+             \x20   # LCCC_CHAIN_CALL\n\
+             \x20   # LCCC_CALL_FP 2\n",
+        );
+        let n = line_of(&store, "movsd %xmm3, %xmm1");
+        assert_eq!(lv.xmm_live_after(n, 1), Some(true));
+        assert_eq!(lv.xmm_live_after(n, 2), Some(false));
+        assert_eq!(lv.xmm_live_after(n, 3), Some(false));
+        assert_eq!(lv.xmm_live_after(n, 7), Some(false));
+    }
+
+    /// A zero-count marker models a GP-only call exactly (Phase 0 wins
+    /// over the census-less window heuristic even when xmm moves happen
+    /// to sit in the window for other reasons).
+    #[test]
+    fn call_fp_zero_marker_is_exact() {
+        let (store, _i, lv) = build(
+            "    movsd %xmm3, %xmm1\n\
+             \x20   call g@PLT\n\
+             \x20   # LCCC_CALL_ARGS 1\n\
+             \x20   # LCCC_CALL_FP 0\n",
+        );
+        let n = line_of(&store, "movsd %xmm3, %xmm1");
+        assert_eq!(lv.xmm_live_after(n, 1), Some(false));
+    }
+
+    /// The hardened window walk (no marker, no census — the hand-emitted
+    /// libcall shape): rsp adjustments, pushes and relay GP-halves are
+    /// register-file-transparent; the staging collected through them all.
+    #[test]
+    fn window_walk_skips_transparent_lines_and_relay_halves() {
+        let (store, _i, lv) = build(
+            "    movsd %xmm8, %xmm1\n\
+             \x20   movq %xmm9, %rax\n\
+             \x20   movq %rax, %xmm2\n\
+             \x20   movq %xmm2, %rax\n\
+             \x20   pushq %rax\n\
+             \x20   subq $8, %rsp\n\
+             \x20   movq %xmm15, %rax\n\
+             \x20   movq %rax, %xmm0\n\
+             \x20   addq $16, %rsp\n\
+             \x20   call raw_helper@PLT\n",
+        );
+        let n = line_of(&store, "movsd %xmm8, %xmm1");
+        assert_eq!(
+            lv.xmm_live_after(n, 1),
+            Some(true),
+            "staging survives the push/addq/window"
+        );
+        assert_eq!(
+            lv.xmm_live_after(n, 9),
+            Some(true),
+            "the relay half below reads %xmm9"
+        );
+        let m = line_of(&store, "movq %rax, %xmm2");
+        assert_eq!(
+            lv.xmm_live_after(m, 2),
+            Some(true),
+            "relay-staged argument read through the relay GP half"
+        );
+        let k = line_of(&store, "movq %xmm9, %rax");
+        assert_eq!(
+            lv.xmm_live_after(k, 9),
+            Some(false),
+            "the relay half consumes its source"
+        );
+    }
+
+    /// The window walk still STOPS at real code: a computation between
+    /// the staging and the call ends the collection, so the staging is
+    /// not modeled as a call argument.
+    #[test]
+    fn window_walk_still_stops_at_real_code() {
+        let (store, _i, lv) = build(
+            "    movsd %xmm5, %xmm1\n\
+             \x20   vaddsd %xmm4, %xmm3, %xmm3\n\
+             \x20   call raw_helper@PLT\n",
+        );
+        let n = line_of(&store, "movsd %xmm5, %xmm1");
+        // The staging is separated from the call by a real instruction:
+        // the collection stopped at the vaddsd, so the call's read set is
+        // empty and the staged xmm1 is dead past its own definition.
+        assert_eq!(
+            lv.xmm_live_after(n, 1),
+            Some(false),
+            "staging behind real code is not a call argument"
+        );
+        assert_eq!(lv.xmm_live_after(n, 5), Some(false));
+    }
+
+    /// Full-depth relay chain: eight arguments staged as rax relays with
+    /// a hazard-area release before the call — the exact f10 shape from
+    /// the PR #584 repro, without any marker or census.  Every staged
+    /// destination must be read by the call, and every relay source must
+    /// stay live until its own relay half.
+    #[test]
+    fn window_walk_covers_the_full_eight_argument_relay_chain() {
+        let mut body = String::new();
+        for d in 0..8u32 {
+            body.push_str(&format!(
+                "    movq %xmm{}, %rax\n    movq %rax, %xmm{}\n",
+                d + 7,
+                d
+            ));
+        }
+        body.push_str("    addq $16, %rsp\n    call f10@PLT\n");
+        let (store, _i, lv) = build(&body);
+        // (a) every staged destination is a call argument: live-out of its
+        // own staging line (the anti-deletion property the bug broke).
+        for d in 0..8u32 {
+            let probe = format!("movq %rax, %xmm{d}");
+            let n = line_of(&store, &probe);
+            assert_eq!(
+                lv.xmm_live_after(n, d),
+                Some(true),
+                "xmm{d} staged argument is read by the call"
+            );
+        }
+        // (b) chain integrity: each relay source stays live out of the
+        // PREVIOUS pair's staging line (its own relay half is next) and
+        // dies at the relay half itself.
+        for d in 1..8u32 {
+            let src = d + 7;
+            let staging_below = format!("movq %rax, %xmm{}", d - 1);
+            let n = line_of(&store, &staging_below);
+            assert_eq!(
+                lv.xmm_live_after(n, src),
+                Some(true),
+                "%xmm{src} live until its relay half"
+            );
+            let half = format!("movq %xmm{src}, %rax");
+            let h = line_of(&store, &half);
+            assert_eq!(
+                lv.xmm_live_after(h, src),
+                Some(false),
+                "the relay half consumes %xmm{src}"
+            );
+        }
+    }
+
     #[test]
     fn reg_reg_movsd_merge_keeps_destination_live() {
         let (store, _i, lv) = build(

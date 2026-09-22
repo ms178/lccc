@@ -424,6 +424,30 @@ impl LineStore {
         };
     }
 
+    /// Insert a new line at `idx`, shifting every later line's index up by
+    /// one.  The text lands in the replacements arena (a `REPLACED`-style
+    /// entry pointing at it), so no original-buffer surgery happens.
+    ///
+    /// Only for rare, structural rewrites (the loop-invariant LEA hoist
+    /// placing an instruction on a fall-through entry path): callers MUST
+    /// adjust every index they hold at or above `idx`, including loop
+    /// bounds discovered before the insertion.  O(len) in the entry splice.
+    pub(crate) fn insert_line(&mut self, idx: usize, text: String) {
+        let end = line_len_without_trailing_blanks(text.as_bytes());
+        let mut new_text = text;
+        new_text.truncate(end);
+        let rep_idx = self.replacements.len();
+        debug_assert!(rep_idx <= u32::MAX as usize);
+        self.replacements.push(new_text);
+        self.entries.insert(
+            idx,
+            LineEntry {
+                start: rep_idx as u32,
+                len: REPLACED,
+            },
+        );
+    }
+
     /// Concatenate kept lines, each followed by `\n`.
     pub(crate) fn build_result(&self, skip: impl Fn(usize) -> bool) -> String {
         let mut result = String::with_capacity(self.original.len());

@@ -4575,6 +4575,7 @@ fn loop_entry_is_unique(
     header: usize,
     latch: usize,
     entry: usize,
+    fallthrough_ok: bool,
 ) -> bool {
     let (func_start, func_end) = function_range(store, infos, header).unwrap_or((0, store.len()));
     let mut labels: Vec<&str> = Vec::new();
@@ -4617,7 +4618,14 @@ fn loop_entry_is_unique(
             _ => {}
         }
     }
-    entries == 1
+    // A jmp-entry loop has exactly one outside edge (the preheader jump,
+    // exempted at `entry`).  A fall-through-entry loop (guarded shape)
+    // has ZERO jump edges — the single entry is the fall-through past the
+    // guard, which the placement scan verified ends in a control-flow
+    // boundary.  `fallthrough_ok` admits that shape; any jump edge into
+    // the loop still returns false above (a second entry bypasses the
+    // hoist placement).
+    entries == 1 || (fallthrough_ok && entries == 0)
 }
 
 // ── Loop-invariant GPR load hoisting ────────────────────────────────────────
@@ -4670,8 +4678,11 @@ fn loop_entry_is_unique(
 // Pinned candidates (volatile / address-taken slots, param-ABI reads) are
 // never touched.
 
-pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-    let len = store.len();
+pub(super) fn hoist_loop_invariant_gpr_load(
+    store: &mut LineStore,
+    infos: &mut Vec<LineInfo>,
+) -> bool {
+    let mut len = store.len();
     let mut changed = false;
 
     let mut i = 0;
@@ -4762,10 +4773,51 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
                 break;
             }
         }
-        // Fall-through or multiple-entry: no dominating placement exists.
-        let Some(entry) = entry_jmp else {
-            i += 1;
-            continue;
+        // Fall-through entry: a guarded loop (`guard: cmp; jcc exit; .p2align*;
+        // header:`) enters by falling through the guard's conditional.
+        // A LOAD cannot be placed there (it would execute even when the
+        // loop body runs zero times — a load may fault), but a PURE LEA
+        // can: it computes a constant address, touches no memory, writes
+        // no flags.  The insertion lands after the last control-flow
+        // boundary before the header's directive run, so the alignment
+        // directives stay adjacent to the header label (the loop's
+        // alignment is preserved exactly).
+        //
+        // `insert_entry` = Some(pos) selects insertion-at-pos placement
+        // (LEA candidates only); `None` keeps the jmp-replacement path.
+        let mut insert_entry: Option<usize> = None;
+        let entry = if let Some(e) = entry_jmp {
+            e
+        } else {
+            let mut q = header;
+            let mut place = None;
+            while q > func_start + 1 {
+                q -= 1;
+                if infos[q].is_nop()
+                    || matches!(infos[q].kind, LineKind::Directive | LineKind::Empty)
+                {
+                    continue; // the alignment/directive run before the label
+                }
+                // The first real instruction above the directive run must
+                // be a control-flow boundary: the LEA lands directly after
+                // it, before the directives.  A compute instruction there
+                // could be feeding flags into the loop body — bail (fail
+                // closed) rather than reason about cross-block flag
+                // liveness.
+                if matches!(
+                    infos[q].kind,
+                    LineKind::CondJmp | LineKind::Jmp | LineKind::Label
+                ) {
+                    place = Some(q + 1);
+                }
+                break;
+            }
+            let Some(place) = place else {
+                i += 1;
+                continue;
+            };
+            insert_entry = Some(place);
+            place
         };
 
         // Rules 1+3: single entry (no second edge into ANY loop label, no
@@ -4789,7 +4841,10 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
                 _ => {}
             }
         }
-        if has_ret || has_call || !loop_entry_is_unique(store, infos, header, i, entry) {
+        if has_ret
+            || has_call
+            || !loop_entry_is_unique(store, infos, header, i, entry, insert_entry.is_some())
+        {
             i += 1;
             continue;
         }
@@ -4811,6 +4866,122 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
         // Scan body for movq OFFSET(%rsp), %REG (or %rbp) candidates.
         // Only hoist one load per loop per pass (to avoid interactions).
         let mut hoisted_one = false;
+
+        // Shared register-safety rules for a hoist candidate at `pos`
+        // writing `dst_family` (Rules 4, 4b, 5 and 6 from the load path —
+        // they are about REGISTER lifetimes and apply identically to
+        // every pure candidate form):
+        //
+        //   Rule 4:  the destination is written nowhere else in
+        //            `[entry..=i]` (exact implicits plus the
+        //            unknown-destination fallback);
+        //   Rule 4b: no forward edge in `[header..pos)` jumps over the
+        //            candidate into `(pos..i]`;
+        //   Rule 5:  the old value is dead at the hoist point — no mention
+        //            (read) in `[entry..pos)`;
+        //   Rule 6:  the destination is not observed after the loop.
+        let reg_safe_for_hoist = |store: &LineStore,
+                                  infos: &[LineInfo],
+                                  entry: usize,
+                                  header: usize,
+                                  latch: usize,
+                                  func_end: usize,
+                                  len: usize,
+                                  pos: usize,
+                                  dst_family: RegId|
+         -> bool {
+            // Rule 4: written nowhere else.
+            for chk in entry..=latch {
+                if chk == pos || infos[chk].is_nop() {
+                    continue;
+                }
+                if matches!(infos[chk].kind, LineKind::Other { dest_reg }
+                    if dest_reg == REG_NONE)
+                    || writes_family(&infos[chk], infos[chk].trimmed(store.get(chk)), dst_family)
+                {
+                    return false;
+                }
+            }
+            // Rule 4b: skip-edge veto.
+            for chk in header..pos {
+                if infos[chk].is_nop() {
+                    continue;
+                }
+                if !matches!(infos[chk].kind, LineKind::Jmp | LineKind::CondJmp) {
+                    continue;
+                }
+                let jt = infos[chk].trimmed(store.get(chk));
+                let Some(tgt) = jt.split_whitespace().nth(1) else {
+                    continue;
+                };
+                let tgt_label = format!("{tgt}:");
+                let mut tgt_pos = None;
+                for l in 0..len {
+                    if infos[l].kind == LineKind::Label
+                        && infos[l].trimmed(store.get(l)) == tgt_label
+                    {
+                        tgt_pos = Some(l);
+                        break;
+                    }
+                }
+                let Some(tp) = tgt_pos else {
+                    return false;
+                };
+                if tp <= chk {
+                    continue; // backward edge: cannot skip pos
+                }
+                if tp > pos && tp <= latch {
+                    return false;
+                }
+            }
+            // Rule 5: the old value is dead at the hoist point.
+            let dst_bit = 1u16 << dst_family;
+            for chk in entry..pos {
+                if infos[chk].is_nop() {
+                    continue;
+                }
+                if infos[chk].reg_refs & dst_bit != 0 {
+                    return false;
+                }
+                if dst_family < 12 && has_implicit_reg_usage(infos[chk].trimmed(store.get(chk))) {
+                    return false;
+                }
+            }
+            // Rule 6: not READ after the loop.  A full WRITE to the
+            // destination before any read is a pure kill — the hoisted
+            // value is dead from that point backward, so the scan stops
+            // there and the hoist is allowed (sha256's tail stages
+            // `movq %rsi, %rcx` right after the 64-round loop: rcx's
+            // loop value is never read, only overwritten).  `pop %dst`
+            // restores are kills too.  A read (or an implicit-usage line,
+            // or a 128-bit `ret` reading rdx) observes the value and
+            // vetoes.
+            for k in latch + 1..func_end {
+                if infos[k].is_nop() {
+                    continue;
+                }
+                if matches!(infos[k].kind, LineKind::Pop { reg } if reg == dst_family) {
+                    continue;
+                }
+                let text_k = infos[k].trimmed(store.get(k));
+                let kills_it = matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == REG_NONE)
+                    || writes_family(&infos[k], text_k, dst_family);
+                if kills_it {
+                    break; // a full definition: the hoisted value dies here
+                }
+                if infos[k].reg_refs & dst_bit != 0 {
+                    return false;
+                }
+                if matches!(infos[k].kind, LineKind::Ret) && dst_family == 2 {
+                    return false;
+                }
+                if dst_family < 12 && has_implicit_reg_usage(text_k) {
+                    return false;
+                }
+            }
+            true
+        };
+
         for pos in body_start + 1..i {
             if hoisted_one {
                 break;
@@ -4822,11 +4993,92 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
             // Match: movq OFFSET(%rsp), %REG or movq OFFSET(%rbp), %REG
             let t = infos[pos].trimmed(store.get(pos));
             if !t.starts_with("movq ") {
+                // Candidate class 2 — the rip-relative address
+                // materialization: `leaq SYM(%rip), %REG`.  Pure (an
+                // address computation, no memory read), so Rule 2 (slot
+                // stability) does not apply; every register rule does.
+                // This is the rematerialized global base that the array
+                // lowering re-emits per access — sha256's K-table inside
+                // the 64-round loop paid the LEA every round (measured:
+                // sha256_transform at 1.20x gcc; the load through it is
+                // `movl (%rcx, %r10, 4), %r15d`, so the base cannot fold
+                // into the memory operand — RIP-relative addressing
+                // takes no index register, the LEA is load-bearing and
+                // only hoisting removes it).
+                if !t.starts_with("leaq ") {
+                    continue;
+                }
+                if infos[pos].pinned {
+                    continue;
+                }
+                let after_lea = &t[5..];
+                let Some(comma) = after_lea.find(", %") else {
+                    continue;
+                };
+                let src_part = after_lea[..comma].trim();
+                let dst_part = after_lea[comma + 2..].trim();
+                // Exactly `SYM(%rip)` / `SYM+OFF(%rip)`: no base register,
+                // no index/scale — anything else reads a register and is
+                // not a constant.
+                if !src_part.ends_with("(%rip)") || src_part.contains(',') {
+                    continue;
+                }
+                let dst_family = register_family_fast(dst_part);
+                if dst_family == REG_NONE
+                    || dst_family > REG_GP_MAX
+                    || dst_family == 4
+                    || dst_family == 5
+                    || dst_family == 0
+                {
+                    continue;
+                }
+                if !reg_safe_for_hoist(
+                    store, infos, entry, header, i, func_end, len, pos, dst_family,
+                ) {
+                    continue;
+                }
+                let lea_text = store.get(pos).to_string();
+                let lea_text = lea_text.trim_end().to_string();
+                match insert_entry {
+                    Some(ins) => {
+                        // Fall-through entry: INSERT the LEA after the
+                        // control-flow boundary, before the directive run.
+                        // The insertion shifts every line at or above `ins`
+                        // — adjust the backedge `i`, `len`, and the
+                        // candidate `pos` (always > ins: the candidate is
+                        // inside the loop, the insertion before its header).
+                        store.insert_line(ins, lea_text.clone());
+                        let new_info = classify_line(&lea_text);
+                        // Vec splice: the pass contract keeps
+                        // `infos.len() == store.len()` — both grew by
+                        // exactly one line.
+                        infos.insert(ins, new_info);
+                        i += 1;
+                        len += 1;
+                        mark_nop(&mut infos[pos + 1]);
+                    }
+                    None => {
+                        // Jmp entry: the LEA replaces the entry jump and
+                        // falls through into the header (the load path's
+                        // mechanics).
+                        replace_line(store, &mut infos[entry], entry, lea_text);
+                        mark_nop(&mut infos[pos]);
+                    }
+                }
+                changed = true;
+                hoisted_one = true;
                 continue;
             }
             // Pinned lines (volatile / address-taken slots, param-ABI
             // reads) are never hoisted.
             if infos[pos].pinned {
+                continue;
+            }
+            // A LOAD may only take the jmp-replacement placement: on a
+            // fall-through (guarded) entry the hoisted load would execute
+            // even when the loop body runs zero times, and a load may
+            // fault.  Only the pure LEA candidate above may insert.
+            if insert_entry.is_some() {
                 continue;
             }
             // Parse: "movq SRC, %DST"
@@ -4869,132 +5121,13 @@ pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [
                 continue;
             }
 
-            // Rule 4: the destination is written nowhere else in
-            // `[entry..=i]` — exact implicits plus an unknown-destination
-            // fallback (the implicit-operand table yields `(0, 0)` for
-            // unknown mnemonics).
-            let mut reg_written_elsewhere = false;
-            for chk in entry..=i {
-                if chk == pos {
-                    continue;
-                } // skip the load itself
-                if infos[chk].is_nop() {
-                    continue;
-                }
-                if matches!(infos[chk].kind, LineKind::Other { dest_reg }
-                    if dest_reg == REG_NONE)
-                    || writes_family(&infos[chk], infos[chk].trimmed(store.get(chk)), dst_family)
-                {
-                    reg_written_elsewhere = true;
-                    break;
-                }
-            }
-            if reg_written_elsewhere {
-                continue;
-            }
-
-            // Rule 4b (skip-edge veto): no forward edge in `[header..pos)`
-            // may jump over the candidate into `(pos..i]`. Such an edge
-            // would let a use below `pos` read the pre-loop value while
-            // the hoisted load overwrites it (a backend-valid
-            // partial-redefinition shape: the skipped `dst` definition
-            // normally forces a join copy that Rule 4 vetoes, but this
-            // rule must not depend on that producer invariant).
-            // Backward edges (target at/above the jump) cannot skip `pos`
-            // and are exempt; indirect jumps and inline asm are already
-            // vetoed function-wide by Rule 1.
-            let mut skips_pos = false;
-            'rule4b: for chk in header..pos {
-                if infos[chk].is_nop() {
-                    continue;
-                }
-                if !matches!(infos[chk].kind, LineKind::Jmp | LineKind::CondJmp) {
-                    continue;
-                }
-                let jt = infos[chk].trimmed(store.get(chk));
-                let Some(tgt) = jt.split_whitespace().nth(1) else {
-                    continue;
-                };
-                // Locate the target label; an unresolvable target fails
-                // closed (direct jumps always name a file-local label, so
-                // this only fires on shapes the classifier misjudged).
-                let tgt_label = format!("{tgt}:");
-                let mut tgt_pos = None;
-                for l in 0..len {
-                    if infos[l].kind == LineKind::Label
-                        && infos[l].trimmed(store.get(l)) == tgt_label
-                    {
-                        tgt_pos = Some(l);
-                        break;
-                    }
-                }
-                let Some(tp) = tgt_pos else {
-                    skips_pos = true;
-                    break;
-                };
-                if tp <= chk {
-                    continue; // backward edge: cannot skip pos
-                }
-                if tp > pos && tp <= i {
-                    skips_pos = true;
-                    break 'rule4b;
-                }
-            }
-            if skips_pos {
-                continue;
-            }
-
-            // Rule 5: the old value is dead at the hoist point — any mention
-            // in `[entry..pos)` is a read (rule 4 proved no writes there).
-            // `reg_refs` is textual, so instructions with implicit register
-            // operands additionally veto when the destination is in the
-            // implicitly-readable range (`div`, shifts, `cpuid`, `syscall`,
-            // ... only ever touch families below `%r12`).
-            let dst_bit = 1u16 << dst_family;
-            let mut old_value_observed = false;
-            for chk in entry..pos {
-                if infos[chk].is_nop() {
-                    continue;
-                }
-                if infos[chk].reg_refs & dst_bit != 0 {
-                    old_value_observed = true;
-                    break;
-                }
-                if dst_family < 12 && has_implicit_reg_usage(infos[chk].trimmed(store.get(chk))) {
-                    old_value_observed = true;
-                    break;
-                }
-            }
-            if old_value_observed {
-                continue;
-            }
-
-            // Rule 6: the destination is not observed after the loop — no
-            // mention past the back-edge (same implicit backstop; `ret`
-            // reads `%rdx` for 128-bit returns). `pop %dst` restores are
-            // pure kills, not reads, and are skipped.
-            let mut observed_after_loop = false;
-            for k in i + 1..func_end {
-                if infos[k].is_nop() {
-                    continue;
-                }
-                if matches!(infos[k].kind, LineKind::Pop { reg } if reg == dst_family) {
-                    continue;
-                }
-                if infos[k].reg_refs & dst_bit != 0 {
-                    observed_after_loop = true;
-                    break;
-                }
-                if matches!(infos[k].kind, LineKind::Ret) && dst_family == 2 {
-                    observed_after_loop = true;
-                    break;
-                }
-                if dst_family < 12 && has_implicit_reg_usage(infos[k].trimmed(store.get(k))) {
-                    observed_after_loop = true;
-                    break;
-                }
-            }
-            if observed_after_loop {
+            // Rules 4, 4b, 5 and 6 — the shared register-safety
+            // closure (identical semantics to the original inline block:
+            // written-nowhere-else, skip-edge veto, old-value-dead,
+            // not-observed-after-loop).
+            if !reg_safe_for_hoist(
+                store, infos, entry, header, i, func_end, len, pos, dst_family,
+            ) {
                 continue;
             }
 
