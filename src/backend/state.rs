@@ -426,6 +426,23 @@ pub struct CodegenState {
     /// gate shifted its register allocation).  6 = the conservative
     /// default (i686, hand-written fragments, non-argument call paths).
     pub call_gp_arg_count: usize,
+    /// Number of leading x86-64 SysV SSE argument registers the call being
+    /// emitted actually reads (0..=8).  Armed by the x86-64 register-argument
+    /// phase from the same authoritative `CallArgClass` classification and
+    /// published as `# LCCC_CALL_FP <n>` after the call text (the same
+    /// authority contract as `call_gp_arg_count`).  The FP liveness oracle's
+    /// fallback (no marker) reconstructs the set from the `movb $N, %al`
+    /// census or the staged-move window — but the census is DELETED by the
+    /// GP dead-write pass for non-variadic callees (legitimately: %al is
+    /// dead there), and the window walk is a heuristic; a call site that
+    /// stages FP arguments across a hazard-area release (`addq $K, %rsp`)
+    /// or a deep relay chain was modeled as reading NO xmm register, and
+    /// `eliminate_dead_vector_copies` deleted live argument staging
+    /// (found via PR #584's CI: a 10-double call lost 7 of 8 register
+    /// arguments).  `None` = the marker is not published (hand-written
+    /// fragments, raw `call` emissions, MachInst calls) and the oracle
+    /// falls back to the census/window heuristics; `Some(n)` is exact.
+    pub call_fp_arg_count: Option<usize>,
     /// Patchable function entry: (total_nops, nops_before_entry).
     /// When set, emits NOP padding around function entry points and records
     /// them in __patchable_function_entries for runtime patching (ftrace).
@@ -640,6 +657,7 @@ impl CodegenState {
             call_is_variadic: false,
             chain_call: false,
             call_gp_arg_count: 6,
+            call_fp_arg_count: None,
             patchable_function_entry: None,
             mcount: None,
             pending_classic_mcount_label: None,
@@ -860,6 +878,7 @@ impl CodegenState {
         self.chain_call = false;
         self.call_is_variadic = false;
         self.call_gp_arg_count = 6;
+        self.call_fp_arg_count = None;
         self.value_locations.clear();
         self.alloca_values.clear();
         self.volatile_alloca_values.clear();

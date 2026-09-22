@@ -770,7 +770,7 @@ struct BinOpDef {
 /// Bisection helper for the preboot-ZSTD miscompile. `CCC_SIMPLIFY_SKIP` is a
 /// comma-separated list of fold families to disable:
 /// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`,
-/// `negneg`.
+/// `negneg`, `addneg`.
 fn simplify_skip(family: &str) -> bool {
     static SKIP: std::sync::LazyLock<String> =
         std::sync::LazyLock::new(|| std::env::var("CCC_SIMPLIFY_SKIP").unwrap_or_default());
@@ -978,6 +978,13 @@ fn try_simplify(
         &[],
         &[],
     )
+}
+
+/// Test wrapper for the Neg-def-sensitive folds (neg-of-neg,
+/// add/sub-of-neg): threads the NegDef map with everything else empty.
+#[cfg(test)]
+fn try_simplify_neg(inst: &Instruction, neg_defs: &[Option<NegDef>]) -> Option<Instruction> {
+    try_simplify_with_types(inst, &[], &[], &[], &[], neg_defs, &[], &[], &[], &[], &[])
 }
 
 /// Simplify a Cast instruction.
@@ -1813,6 +1820,41 @@ fn simplify_binop(
                     return Some(inst);
                 }
             }
+            // Floats: x + (neg y) => x - y, plus the commuted spelling —
+            // the four-oracle consensus (GCC 16.2, Clang 23.1, ICX and
+            // local GCC 14.2 all emit the mirrored op; oracle-checked on
+            // add_neg/sub_neg/chain_pin and the MULTI-USE shapes, where
+            // GCC folds just the same — fold-const carries no use
+            // analysis). Exact for every numeric input and both zeros
+            // (IEEE 754 defines sub as the addition of the negation, and
+            // the zero-sign table is symmetric); the qNaN sign of the
+            // result may differ when y's NaN is the propagated one — the
+            // C11 6.5p8 latitude. ADJUDICATION: the house rule "take the
+            // latitude only when the materialisation dies" was derived
+            // when lccc was the conservative outlier; with every oracle
+            // folding unconditionally, NOT folding is what diverges from
+            // the competition on NaN-sign rows. The fold therefore fires
+            // unconditionally, like the oracles — bit-parity with GCC
+            // requires taking the latitude GCC takes.
+            if is_float && !simplify_skip("addneg") {
+                if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
+                    return Some(Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::Sub,
+                        lhs: *lhs,
+                        rhs: neg_src,
+                        ty,
+                    });
+                } else if let Some(neg_src) = get_neg_def(lhs, neg_defs) {
+                    return Some(Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::Sub,
+                        lhs: *rhs,
+                        rhs: neg_src,
+                        ty,
+                    });
+                }
+            }
         }
         IrBinOp::Sub => {
             if rhs_zero && (!is_float || is_positive_zero(rhs)) {
@@ -1834,6 +1876,20 @@ fn simplify_binop(
                     return Some(inst);
                 }
                 // x - (neg y) => x + y (eliminate negation)
+                if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
+                    return Some(Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::Add,
+                        lhs: *lhs,
+                        rhs: neg_src,
+                        ty,
+                    });
+                }
+            }
+            // Floats: x - (neg y) => x + y — the same four-oracle
+            // consensus fold as the Add mirror above, unconditional for
+            // the same bit-parity reason (see the adjudication there).
+            if is_float && !simplify_skip("addneg") {
                 if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
                     return Some(Instruction::BinOp {
                         dest,
@@ -4951,6 +5007,204 @@ mod tests {
         assert!(try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]).is_none());
     }
 
+    // === Float add/sub-of-neg tests (the four-oracle consensus folds) ===
+
+    #[test]
+    fn float_add_of_neg_folds_to_sub() {
+        // x + (neg y) => x - y (GCC 16.2, Clang 23.1, ICX and local GCC
+        // 14.2 all emit the mirrored op — the four-oracle consensus).
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[2] = Some(NegDef {
+            src: Operand::Value(Value(1)),
+        });
+        let inst = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Value(Value(2)),
+            ty: IrType::F64,
+        };
+        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
+        match result {
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                lhs,
+                rhs,
+                ..
+            } => {
+                assert!(matches!(lhs, Operand::Value(v) if v.0 == 0));
+                assert!(matches!(rhs, Operand::Value(v) if v.0 == 1));
+            }
+            _ => panic!("Expected Sub(V0, V1), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn float_add_of_neg_commuted_folds_to_sub() {
+        // (neg y) + x => x - y (Sub is non-commutative: the plain operand
+        // stays the minuend).
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[2] = Some(NegDef {
+            src: Operand::Value(Value(1)),
+        });
+        let inst = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Value(Value(0)),
+            ty: IrType::F64,
+        };
+        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
+        match result {
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                lhs,
+                rhs,
+                ..
+            } => {
+                assert!(
+                    matches!(lhs, Operand::Value(v) if v.0 == 0),
+                    "minuend must be the plain operand"
+                );
+                assert!(matches!(rhs, Operand::Value(v) if v.0 == 1));
+            }
+            _ => panic!("Expected Sub(V0, V1), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn float_sub_of_neg_folds_to_add() {
+        // x - (neg y) => x + y for floats (the extension of the historical
+        // integer fold to the float domain, matching every oracle).
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[2] = Some(NegDef {
+            src: Operand::Value(Value(1)),
+        });
+        let inst = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Value(Value(2)),
+            ty: IrType::F64,
+        };
+        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
+        match result {
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
+                assert!(matches!(lhs, Operand::Value(v) if v.0 == 0));
+                assert!(matches!(rhs, Operand::Value(v) if v.0 == 1));
+            }
+            _ => panic!("Expected Add(V0, V1), got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn float_add_of_neg_f32_folds_to_sub() {
+        // The fold is width-agnostic (f32 mirror).
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[2] = Some(NegDef {
+            src: Operand::Value(Value(1)),
+        });
+        let inst = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Value(Value(2)),
+            ty: IrType::F32,
+        };
+        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
+        assert!(matches!(
+            result,
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn float_add_of_multi_use_neg_folds_too() {
+        // The MULTI-USE adjudication pin: every oracle folds the add even
+        // when the negation has other readers (gcc: `(x + t) + (x * t)`
+        // with t = -y emits vsubsd + vfnmadd132sd — the add folds, the
+        // product's negation rides the family). NOT folding here is what
+        // would diverge from the competition on NaN-sign rows.
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[2] = Some(NegDef {
+            src: Operand::Value(Value(1)),
+        });
+        let inst = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Value(Value(2)),
+            ty: IrType::F64,
+        };
+        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
+        assert!(matches!(
+            result,
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn int_sub_of_neg_still_folds() {
+        // Historical behaviour pin: the INTEGER fold is exact (ring
+        // identity) and keeps firing exactly as before.
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[2] = Some(NegDef {
+            src: Operand::Value(Value(1)),
+        });
+        let inst = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Value(Value(2)),
+            ty: IrType::I32,
+        };
+        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
+        assert!(matches!(
+            result,
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn float_add_of_non_neg_stays() {
+        // Discriminating control: no Neg def, no fold.
+        let inst = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Value(Value(2)),
+            ty: IrType::F64,
+        };
+        assert!(try_simplify_neg(&inst, &[]).is_none());
+    }
+
+    #[test]
+    fn float_add_of_const_stays() {
+        // A constant operand has no def to look through.
+        let inst = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(IrConst::F64(1.5)),
+            ty: IrType::F64,
+        };
+        assert!(try_simplify_neg(&inst, &[]).is_none());
+    }
+
     // === Subtract-of-negation tests ===
 
     #[test]
@@ -4984,7 +5238,17 @@ mod tests {
 
     #[test]
     fn test_sub_neg_float_not_simplified() {
-        // Float x - (neg y) should NOT be simplified (IEEE 754 concerns)
+        // REWRITTEN (the four-oracle adjudication): float x - (neg y) now
+        // DOES fold to x + y. The historical "IEEE 754 concerns" pin was
+        // more conservative than every compiler in the competition set —
+        // GCC 16.2, Clang 23.1, ICX and local GCC 14.2 all emit the
+        // mirrored vaddsd for `x - (-y)` (oracle-verified). The fold is
+        // exact for every numeric input and both zeros (IEEE 754 defines
+        // sub as the addition of the negation); the qNaN-sign latitude is
+        // C11 6.5p8-sanctioned and, with every oracle taking it, NOT
+        // folding is what diverges. The dedicated coverage lives in
+        // float_sub_of_neg_folds_to_add; this pin keeps the historical
+        // name as the record of the flip.
         let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
         neg_defs[2] = Some(NegDef {
             src: Operand::Value(Value(1)),
@@ -4996,8 +5260,14 @@ mod tests {
             rhs: Operand::Value(Value(2)),
             ty: IrType::F64,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]);
-        assert!(result.is_none());
+        let result = try_simplify_neg(&inst, &neg_defs).unwrap();
+        assert!(matches!(
+            result,
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                ..
+            }
+        ));
     }
 
     // === Unsigned comparison simplification tests ===

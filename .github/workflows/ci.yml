@@ -346,6 +346,23 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_vector_copy_elimination.sh
 
+      # Call-argument staging (PR #584's miscompile class): the FP liveness
+      # oracle's call model must never mark live SSE-argument staging dead.
+      # The chain that broke: the GP dead-write pass legitimately deletes the
+      # `movb $N, %al` census at non-variadic callees, the fallback window
+      # walk broke at the hazard-area release / stack-argument pushes / relay
+      # GP halves, and eliminate_dead_vector_copies deleted the staging (a
+      # 10-double call lost 7 of 8 register arguments). Pinned end to end:
+      # runtime equality with the reference compiler on volatile 8..12-ary
+      # f64/f32, mixed GP+SSE, SSE structs, negation compositions, indirect
+      # and in-loop calls; the `# LCCC_CALL_FP` authority-marker counts; the
+      # census lifecycle (deleted at prototyped callees, kept at variadic);
+      # and all eight registers staged in the 10-argument window.
+      - name: Verify call-argument staging contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_call_arg_staging.sh
+
       # Cross-PR interaction red-team (session 574): the per-feature gates
       # pin each PR's own contract; this one pins the INTERACTIONS between
       # the last ten merged PRs — FMA families through copy brackets, calls
