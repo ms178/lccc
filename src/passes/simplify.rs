@@ -769,7 +769,8 @@ struct BinOpDef {
 /// Try to simplify an instruction using algebraic identities and strength reduction.
 /// Bisection helper for the preboot-ZSTD miscompile. `CCC_SIMPLIFY_SKIP` is a
 /// comma-separated list of fold families to disable:
-/// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`.
+/// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`,
+/// `negneg`.
 fn simplify_skip(family: &str) -> bool {
     static SKIP: std::sync::LazyLock<String> =
         std::sync::LazyLock::new(|| std::env::var("CCC_SIMPLIFY_SKIP").unwrap_or_default());
@@ -925,6 +926,30 @@ fn try_simplify_with_types(
             } else {
                 None
             }
+        }
+        Instruction::UnaryOp { dest, op, src, .. } => {
+            // neg(neg(x)) => x. Exact in both domains: float Neg is the
+            // sign-bit XOR, so the double flip is a BITWISE identity —
+            // NaN payloads, NaN signs and ±0 all survive exactly; integer
+            // Neg is its own inverse in the two's-complement ring (INT_MIN
+            // included). The rewrite is a pure work deletion (the folded
+            // Neg chain loses its only reader or keeps exactly the readers
+            // it had), so no use-count profitability guard applies.
+            // Types line up by construction: the outer Neg reads the inner
+            // Neg's value at the inner's SSA type (the same invariant the
+            // `x - (neg y) => x + y` fold below already relies on).
+            // Chains collapse in ONE sweep: the def map links every Neg to
+            // its original source, so neg^3 folds to neg(x) + copies and
+            // neg^4 to x + copies without re-running the pass.
+            if *op == IrUnaryOp::Neg && !simplify_skip("negneg") {
+                if let Some(inner) = get_neg_def(src, neg_defs) {
+                    return Some(Instruction::Copy {
+                        dest: *dest,
+                        src: inner,
+                    });
+                }
+            }
+            None
         }
         _ => None,
     }
@@ -4799,6 +4824,131 @@ mod tests {
             }
             _ => panic!("Expected Mul(V0, 15), got {:?}", result),
         }
+    }
+
+    // === Neg-of-neg tests ===
+
+    #[test]
+    fn test_neg_of_neg_int_folds_to_copy() {
+        // neg(neg(x)) => x (two's-complement self-inverse, INT_MIN included)
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[1] = Some(NegDef {
+            src: Operand::Value(Value(0)),
+        });
+        let inst = Instruction::UnaryOp {
+            dest: Value(2),
+            op: IrUnaryOp::Neg,
+            src: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        };
+        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]).unwrap();
+        assert_copy_value(&result, 0);
+    }
+
+    #[test]
+    fn test_neg_of_neg_float_folds_to_copy() {
+        // neg(neg(x)) => x for floats TOO: Neg is the sign-bit XOR, so the
+        // double flip is a bitwise identity — NaN payloads, NaN signs and
+        // ±0 survive exactly. This is the discriminator vs the integer-only
+        // reassociation folds above.
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[1] = Some(NegDef {
+            src: Operand::Value(Value(0)),
+        });
+        let inst = Instruction::UnaryOp {
+            dest: Value(2),
+            op: IrUnaryOp::Neg,
+            src: Operand::Value(Value(1)),
+            ty: IrType::F64,
+        };
+        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]).unwrap();
+        assert_copy_value(&result, 0);
+    }
+
+    #[test]
+    fn test_neg_of_neg_f32_folds_to_copy() {
+        // Same identity at f32 width (the fold is width-agnostic because
+        // SSA typing forces the outer Neg to read at the inner's width).
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[1] = Some(NegDef {
+            src: Operand::Value(Value(0)),
+        });
+        let inst = Instruction::UnaryOp {
+            dest: Value(2),
+            op: IrUnaryOp::Neg,
+            src: Operand::Value(Value(1)),
+            ty: IrType::F32,
+        };
+        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]).unwrap();
+        assert_copy_value(&result, 0);
+    }
+
+    #[test]
+    fn test_neg_of_non_neg_source_stays() {
+        // neg(x) where x is NOT a Neg def: no fold (the discriminating
+        // negative control — only double negation collapses).
+        let inst = Instruction::UnaryOp {
+            dest: Value(2),
+            op: IrUnaryOp::Neg,
+            src: Operand::Value(Value(1)),
+            ty: IrType::F64,
+        };
+        assert!(try_simplify(&inst, &[], &[], &[], &[], &[], &[]).is_none());
+    }
+
+    #[test]
+    fn test_neg_of_const_stays() {
+        // neg(Const) has no def to look through; constant folding is
+        // handled elsewhere. The fold must not fire (let alone guess).
+        let inst = Instruction::UnaryOp {
+            dest: Value(2),
+            op: IrUnaryOp::Neg,
+            src: Operand::Const(IrConst::F64(1.5)),
+            ty: IrType::F64,
+        };
+        assert!(try_simplify(&inst, &[], &[], &[], &[], &[], &[]).is_none());
+    }
+
+    #[test]
+    fn test_neg_of_neg_chain_link_folds_via_def_map() {
+        // The neg^4 chain's outermost link: dest=4 reads Value(3) whose
+        // def-map entry points at Value(2). One sweep folds every even
+        // link through the ORIGINAL def map — this pins the mechanics.
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 6];
+        neg_defs[1] = Some(NegDef {
+            src: Operand::Value(Value(0)),
+        });
+        neg_defs[2] = Some(NegDef {
+            src: Operand::Value(Value(1)),
+        });
+        neg_defs[3] = Some(NegDef {
+            src: Operand::Value(Value(2)),
+        });
+        let inst = Instruction::UnaryOp {
+            dest: Value(4),
+            op: IrUnaryOp::Neg,
+            src: Operand::Value(Value(3)),
+            ty: IrType::F64,
+        };
+        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]).unwrap();
+        assert_copy_value(&result, 2);
+    }
+
+    #[test]
+    fn test_other_unary_op_never_folds_through_neg_def() {
+        // A non-Neg unary op reading a Neg def must not be touched — the
+        // arm is op-discriminated, not operand-discriminated.
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[1] = Some(NegDef {
+            src: Operand::Value(Value(0)),
+        });
+        let inst = Instruction::UnaryOp {
+            dest: Value(2),
+            op: IrUnaryOp::Clz,
+            src: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        };
+        assert!(try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]).is_none());
     }
 
     // === Subtract-of-negation tests ===
