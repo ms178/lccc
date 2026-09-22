@@ -29,7 +29,15 @@ WMAP = {"movb": 1, "movw": 2, "movl": 4, "movq": 8,
         "shll": 4, "shlq": 8, "testl": 4, "testq": 8}
 
 
-def audit(path: str) -> int:
+# Slots are addressed relative to whichever pointer the frame uses: `%rbp`
+# when a frame pointer is kept (-O0, -Og, and any frame that needs one) and
+# `%rsp` when it is omitted (-O1 and above, which is where the small-slot
+# machinery is active). Matching only one of them silently reports an empty
+# audit on every -O2 listing.
+SLOT_RE = re.compile(r"(-?\d+)\(%r(?:bp|sp)\)")
+
+
+def audit(path: str, verbose: bool = True) -> int:
     cur_fn = None
     fn_slots = {}
     for line in open(path):
@@ -44,24 +52,37 @@ def audit(path: str) -> int:
         w = WMAP.get(mnem)
         if w is None:
             continue
-        for off in re.findall(r"(-?\d+)\(%rbp\)", rest):
+        for off in SLOT_RE.findall(rest):
             fn_slots.setdefault(cur_fn, {}).setdefault(int(off), set()).add((w, mnem))
     total = 0
     for fn, slots in fn_slots.items():
         mixed = {o: ws for o, ws in slots.items() if len({w for w, _ in ws}) > 1}
         if mixed:
             total += len(mixed)
-            print(f"{path}: {fn}:")
-            for o in sorted(mixed):
-                print(f"  {o}(%rbp): {sorted(mixed[o])}")
+            if verbose:
+                print(f"{path}: {fn}:")
+                for o in sorted(mixed):
+                    print(f"  {o}(%%rbp/%%rsp): {sorted(mixed[o])}")
     return total
 
 
 def main() -> None:
+    args = [a for a in sys.argv[1:]]
+    gate = False
+    if "--gate" in args:
+        # CI mode: exit non-zero when any mixed-width slot is found, so the
+        # check can actually fail a build instead of only ever printing.
+        gate = True
+        args.remove("--gate")
+    quiet = "--quiet" in args
+    if quiet:
+        args.remove("--quiet")
     grand = 0
-    for p in sys.argv[1:]:
-        grand += audit(p)
+    for p in args:
+        grand += audit(p, verbose=not quiet)
     print(f"mixed-width slots (per function): {grand}")
+    if gate and grand:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
