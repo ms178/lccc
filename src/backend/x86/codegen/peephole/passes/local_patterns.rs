@@ -1306,7 +1306,12 @@ pub(super) fn eliminate_dead_sign_extensions(
                 let dst_family = super::super::types::register_family_fast(dst);
                 if src_family == dst_family && src_family != super::super::types::REG_NONE {
                     let reg_family = dst_family;
-                    if reg_family != 0 {
+                    // GP-only: the self sign-extension only exists for
+                    // general registers.  A vector spelling (`movslq %xmm0,
+                    // %xmm0`) parses to the same family on both sides and
+                    // would shift the 16-bit reg_ref mask by 24+ — an
+                    // overflow panic, not a pattern hit.
+                    if (1..=super::super::types::REG_GP_MAX).contains(&reg_family) {
                         // rax is handled by cltq pattern
                         let reg_bit = 1u16 << reg_family;
 
@@ -4953,27 +4958,101 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                     return false;
                 }
             }
-            // Rule 6: not READ after the loop.  A full WRITE to the
-            // destination before any read is a pure kill — the hoisted
-            // value is dead from that point backward, so the scan stops
-            // there and the hoist is allowed (sha256's tail stages
-            // `movq %rsi, %rcx` right after the 64-round loop: rcx's
-            // loop value is never read, only overwritten).  `pop %dst`
-            // restores are kills too.  A read (or an implicit-usage line,
-            // or a 128-bit `ret` reading rdx) observes the value and
-            // vetoes.
+            // Rule 6: not READ after the loop.  A line that PROVES a full
+            // redefinition of the destination — a "kill" — lets the scan
+            // stop: the hoisted value is dead from there on (sha256's tail
+            // stages `movq %rsi, %rcx` right after the 64-round loop: rcx's
+            // loop value is never read, only overwritten).
+            //
+            // Only `pure_family_write` qualifies — it is exact on the text:
+            // mov*/lea with the destination spelled at full 32/64-bit width
+            // and NO source in the same family (self-referencing forms like
+            // `movzbl %al, %eax` are refused), plus `xor %r, %r` zeroing.
+            // Everything else OBSERVES the value and must veto, not break:
+            //   * an RMW reads the family (`addq %rax, %r11` computes from
+            //     the hoisted value — miscompile if the scan stopped);
+            //   * a partial write leaves stale high bytes for a later full
+            //     read (`movb $3, %r11b`);
+            //   * an unknown-destination line classified `REG_NONE` may read
+            //     the family (`movq %r11, (%rbx)` stores it);
+            //   * a conditional write (`cmovcc`, `cmpxchg`) may not run.
+            // The pre-#591-kill `writes_family` (any part written) plus the
+            // `REG_NONE` arm answered all four "kill" — the rule6 tests pin
+            // each one.
+            //
+            // A kill dominates the later reads only when no control transfer
+            // can route around it:
+            //   (a) no jump or `call` between the latch and the kill — a
+            //       conditional in the post-loop tail could skip it, and a
+            //       call's clobber/argument effect on the family is unknown;
+            //   (b) no jump from the hoist point through the latch landing
+            //       AFTER the kill — a deep loop `break` would skip it.
+            //       Edges from at or before the hoist point are safe (those
+            //       paths never saw the hoisted value), and a label after
+            //       the kill with no such incoming edge (an epilogue block,
+            //       as in sha256's tail) is harmless.  Indirect jumps,
+            //       jump tables, and inline asm are function-level vetoes
+            //       already enforced by `loop_entry_is_unique`.
+            // A `ret` after the kill needs no special handling: it is a
+            // terminal sink, and the family-2 128-bit-return read is still
+            // vetoed by the mention checks below.  When dominance cannot be
+            // proven the strict rule applies: any mention after the loop
+            // vetoes, no scan stop.
+            let kill_dominates = |k: usize| -> bool {
+                for chk in latch + 1..=k {
+                    if infos[chk].is_nop() {
+                        continue;
+                    }
+                    if matches!(
+                        infos[chk].kind,
+                        LineKind::Jmp | LineKind::CondJmp | LineKind::Call
+                    ) {
+                        return false;
+                    }
+                }
+                for chk in entry + 1..=latch {
+                    if infos[chk].is_nop()
+                        || !matches!(infos[chk].kind, LineKind::Jmp | LineKind::CondJmp)
+                    {
+                        continue;
+                    }
+                    let jt = infos[chk].trimmed(store.get(chk));
+                    let Some(tgt) = jt.split_whitespace().nth(1) else {
+                        return false; // no target: fail closed
+                    };
+                    let tgt_label = format!("{tgt}:");
+                    let mut tp = None;
+                    for l in func_start..func_end {
+                        if infos[l].kind == LineKind::Label
+                            && infos[l].trimmed(store.get(l)) == tgt_label
+                        {
+                            tp = Some(l);
+                        }
+                    }
+                    let Some(tp) = tp else {
+                        return false; // unresolved target: fail closed
+                    };
+                    if tp > k {
+                        return false;
+                    }
+                }
+                true
+            };
             for k in latch + 1..func_end {
                 if infos[k].is_nop() {
                     continue;
                 }
                 if matches!(infos[k].kind, LineKind::Pop { reg } if reg == dst_family) {
+                    // A `pop %dst` IS a full unconditional redefinition, but
+                    // it is deliberately not a scan stop: the popped value is
+                    // observed by whatever reads %dst after it, and the
+                    // mention checks below veto those reads.  Stopping here
+                    // would trade a miss for a risk.
                     continue;
                 }
                 let text_k = infos[k].trimmed(store.get(k));
-                let kills_it = matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == REG_NONE)
-                    || writes_family(&infos[k], text_k, dst_family);
-                if kills_it {
-                    break; // a full definition: the hoisted value dies here
+                if pure_family_write(text_k, dst_family) && kill_dominates(k) {
+                    break; // a proven full definition dominates every later read
                 }
                 if infos[k].reg_refs & dst_bit != 0 {
                     return false;
@@ -8230,6 +8309,215 @@ mod loop_hoist_tests {
         assert!(
             out.iter().any(|l| l == "movq 136(%rsp), %r11"),
             "load with live-after-loop dest must stay:\n{}",
+            out.join("\n")
+        );
+    }
+
+    // ── Rule 6 kill-path pins (audit F1/F4 of PR #591) ─────────────────────
+    // The post-loop "kill" must be a PROVEN full redefinition that dominates
+    // every later read. Each refusal below is a shape where the first
+    // post-loop mention of the destination observes the hoisted value
+    // (RMW read, conditional skip, unknown-destination read, partial-write
+    // stale high bytes, deep break) and the pass must refuse.
+
+    /// M1: an RMW is not a kill — `addq %rax, %r11` READS the family, so
+    /// the hoisted value changes its result.
+    #[test]
+    fn gpr_hoist_refuses_rmw_after_loop() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    leaq K(%rip), %r11\n",
+            "    addq %r11, %rcx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    addq %rax, %r11\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter()
+                .position(|l| l == "leaq K(%rip), %r11")
+                .map(|p| p > out.iter().position(|l| l == ".LBB3:").unwrap())
+                .unwrap_or(false),
+            "LEA under an RMW-after-loop mention must stay in the loop:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// M2: a conditional kill does not dominate — the `je` path skips the
+    /// `movq %rsi, %r11` and still reads %r11.
+    #[test]
+    fn gpr_hoist_refuses_conditional_kill_after_loop() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    leaq K(%rip), %r11\n",
+            "    addq %r11, %rcx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    cmpl $0, %r14d\n",
+            "    je .LBB5\n",
+            "    movq %rsi, %r11\n",
+            ".LBB5:\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter()
+                .position(|l| l == "leaq K(%rip), %r11")
+                .map(|p| p > out.iter().position(|l| l == ".LBB3:").unwrap())
+                .unwrap_or(false),
+            "LEA under a non-dominating conditional kill must stay in the loop:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// M3: an unknown-destination line (a register-based memory store —
+    /// classified `Other { dest_reg: REG_NONE }`) that reads the family is a
+    /// mention, not a kill — it stores the observed value.
+    #[test]
+    fn gpr_hoist_refuses_unknown_dest_read_after_loop() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    leaq K(%rip), %r11\n",
+            "    addq %r11, %rcx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movq %r11, (%rbx)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter()
+                .position(|l| l == "leaq K(%rip), %r11")
+                .map(|p| p > out.iter().position(|l| l == ".LBB3:").unwrap())
+                .unwrap_or(false),
+            "LEA under an unknown-dest read after the loop must stay in the loop:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// M4: a partial write leaves the stale high bytes of the hoisted value
+    /// for the later full read.
+    #[test]
+    fn gpr_hoist_refuses_partial_write_after_loop() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB2\n",
+            ".LBB2:\n",
+            "    subl $1, %ebx\n",
+            "    jle .LBB4\n",
+            ".LBB3:\n",
+            "    leaq K(%rip), %r11\n",
+            "    addq %r11, %rcx\n",
+            "    jmp .LBB2\n",
+            ".LBB4:\n",
+            "    movb $3, %r11b\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter()
+                .position(|l| l == "leaq K(%rip), %r11")
+                .map(|p| p > out.iter().position(|l| l == ".LBB3:").unwrap())
+                .unwrap_or(false),
+            "LEA under a partial write after the loop must stay in the loop:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// The sha256 tail shape (F4 pin): a guarded loop whose destination is
+    /// killed by a PROVEN full write in a straight-line tail.  The epilogue
+    /// block labels after the kill are harmless — no control transfer routes
+    /// around the kill — so the hoist must still fire (regression guard
+    /// against over-refusal).
+    #[test]
+    fn gpr_hoist_fires_on_dominating_kill_after_loop() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    cmpl $0, %edx\n",
+            "    jle .LBB4\n",
+            ".LBB2:\n",
+            "    leaq K(%rip), %r11\n",
+            "    addq %r11, %rcx\n",
+            "    subl $1, %edx\n",
+            "    jg .LBB2\n",
+            ".LBB4:\n",
+            "    movq %rsi, %r11\n",
+            "    addq %r11, %rax\n",
+            ".LBB14:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter()
+                .position(|l| l == "leaq K(%rip), %r11")
+                .map(|p| p < out.iter().position(|l| l == ".LBB2:").unwrap())
+                .unwrap_or(false),
+            "dominating kill must permit the guarded-loop hoist above the header:\n{}",
+            out.join("\n")
+        );
+        assert_eq!(
+            out.iter().filter(|l| *l == "leaq K(%rip), %r11").count(),
+            1,
+            "the hoisted LEA replaces the in-loop one:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A deep loop exit landing AFTER the kill skips it — the `je` path
+    /// reads the destination without passing through the kill.
+    #[test]
+    fn gpr_hoist_refuses_deep_break_past_kill() {
+        let out = run_gpr(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    cmpl $0, %edx\n",
+            "    jle .LBB4\n",
+            ".LBB2:\n",
+            "    leaq K(%rip), %r11\n",
+            "    cmpq $5, %rax\n",
+            "    je .LBB9\n",
+            "    addq %r11, %rcx\n",
+            "    subl $1, %edx\n",
+            "    jg .LBB2\n",
+            ".LBB4:\n",
+            "    movq %rsi, %r11\n",
+            "    addq %r11, %rax\n",
+            "    ret\n",
+            ".LBB9:\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.iter()
+                .position(|l| l == "leaq K(%rip), %r11")
+                .map(|p| p > out.iter().position(|l| l == ".LBB2:").unwrap())
+                .unwrap_or(false),
+            "LEA under a deep break past the kill must stay in the loop:\n{}",
             out.join("\n")
         );
     }
