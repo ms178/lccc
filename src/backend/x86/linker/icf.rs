@@ -519,11 +519,26 @@ fn build_universe(
             }
             let pos = u32::try_from(members.len()).expect("ICF universe exceeds 2^32 sections");
             pos_of[oi][si] = pos;
+            let is_text = is_foldable(&sec.name) && !ifunc_sec[oi][si];
             members.push(Member {
                 id: (oi, si),
-                is_text: is_foldable(&sec.name) && !ifunc_sec[oi][si],
+                is_text,
                 has_relocs: obj.relocations.get(si).is_some_and(|r| !r.is_empty()),
-                output: output_discriminant(map_section_name(&sec.name)),
+                // The discriminant is a fold invariant — consumed only when
+                // both class members are text.  Data members (which inform
+                // but never fold) take the unconsumed 0xFF sentinel WITHOUT
+                // the mapping guard: `.rodata` is a legal, non-foldable
+                // universe member, and running it through
+                // output_discriminant would fire the "new .text* output"
+                // assert on ordinary data sections.  Release builds already
+                // returned 0xFF for every non-text mapping; this keeps the
+                // debug build on the same semantics while the assert keeps
+                // guarding exactly the text mappings it was written for.
+                output: if is_text {
+                    output_discriminant(map_section_name(&sec.name))
+                } else {
+                    0xFF
+                },
                 size: sec.size,
                 content: hash_bytes(data),
                 sketched: 0, // filled below: needs every member's content hash

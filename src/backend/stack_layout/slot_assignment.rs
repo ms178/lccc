@@ -176,6 +176,20 @@ pub(super) fn classify_instructions(
                 break;
             }
         }
+        // Copy/Phi dests fed by zero-extended `I64` constants (from_i64's
+        // U32/U16/U8 storage form) have none of the narrow seeds above:
+        // Copy carries no result type and the constant arm admits only
+        // I8/I16/I32/F32 spellings. Their width is proven by the shared
+        // value-type map's strong def/use evidence instead; admit them to
+        // the single-word class exactly when that evidence is ≤4 bytes.
+        // Decimals are excluded to match the constant arm (no D32 there);
+        // the width invariant (CCC_VERIFY_SLOT_WIDTHS) cross-checks every
+        // admitted value against the same map.
+        for (&v, t) in &crate::backend::common::compute_value_type_map(func) {
+            if t.size() <= 4 && !matches!(t, IrType::D32 | IrType::D64) {
+                compact_i686_values.insert(v);
+            }
+        }
     }
 
     // F128 Copy webs.  Copy carries no result type after phi elimination, so

@@ -8184,16 +8184,23 @@ fn try_fold_memory_operand(
 // -Os is the memory compare; three oracle families (gcc 16.2 i386 -Os, the
 // boot corpus census, clang -m32) all lower this shape to the narrow op.
 //
-// FLAG LAW — why `cmpb $I, K` is EXACTLY `cmpl $I, zext_byte(K)`:
+// FLAG LAW — what `cmpb $I, K` agrees with `cmpl $I, zext_byte(K)` on, and
+// what it does NOT:
 // for 0 <= I <= 127 both views compare the same two mathematical integers
-// (the zero-extended byte lies in [0,255], I in [0,127] — neither has the
-// wide view's sign bit set).  ZF and CF are equality/ordering of those same
-// integers in both views.  In the 32-bit view no wrap can occur (the result
-// lies in [-127,255]), so SF = (result < 0) = unsigned-less and OF = 0.  In
-// the 8-bit view a wrap (> 127) sets both SF and OF together, so
-// SF != OF still holds exactly when the unsigned order says less — every
-// condition code (e/ne/l/ge/le/g/b/ae/a/be + setcc forms) decodes to the
-// same answer.  Word twin: 0 <= I <= 32767, same proof.
+// (the zero-extended byte lies in [0,255], I in [0,127]).  ZF and CF are
+// equality and unsigned borrow of those same integers in both views, so
+// EVERY ZF/CF-based condition code (e/ne, b/ae/a/be + setcc forms) decodes
+// to the same answer.  SF/OF do NOT agree once the byte is >= 128: the
+// narrow subtraction wraps (SF flips) or sign-crosses (OF flips) in ways
+// the non-wrapping 32-bit view does not (b=200, I=50: wide 150 -> SF=0
+// OF=0; narrow 0x96 -> SF=1 OF=0).  So signed-ordering and sign-flag
+// consumers (jl/jg/jle/jge, js/jns, setl/setg/setle/setge, sets) are
+// WRONG under the narrow view, and the fold is gated on a forward scan of
+// every flags reader in the window (flags_reader_window_ok) that vetoes
+// them — a single next-reader check is not enough, because
+// `cmpl $50, %eax; jb X; jg Y` reads the flags twice and only the second
+// reader is the dangerous one.  Word twin: 0 <= I <= 32767, same law with
+// the 32768 range bound.
 //
 // The `testl %R, %R` shape folds to `cmpb $0, K` with ONE divergence: SF.
 // testl always clears SF; cmpb $0 copies bit 7 of the byte.  CF and OF are
@@ -8215,6 +8222,11 @@ fn try_fold_memory_operand(
 //   * the consumer must be ADJACENT (nops only between): anything else may
 //     write the register or the slot, or depend on the load's side effects
 //     (there are none, but adjacency is what makes "no side effects" local);
+//   * EVERY flags reader in the window after the compare (through the
+//     fallthrough path, until a label / unconditional branch / call / ret /
+//     new compare) must be in the ZF/CF-safe sets — the historical
+//     `setg`-after-fold miscompile is a window-reader veto, not an
+//     adjacency one;
 //   * `%esp` is never the loaded register (dataflow only).
 //
 // Kill switch: CCC_NO_NARROW_CMP_FOLD.
@@ -8258,9 +8270,22 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
             if let Some(rest) = s.strip_prefix("cmpl $") {
                 if let Some((imm_str, reg_str)) = rest.split_once(", %") {
                     if let Ok(imm) = imm_str.trim().parse::<i64>() {
+                        // ZF/CF-only reader window: the narrow view and the
+                        // wide view disagree on SF/OF for values above the
+                        // narrow range, so any signed-ordering or sign-flag
+                        // consumer (jl/jg/jle/jge, setl/setg/...) vetoes the
+                        // fold — including consumers AFTER a safe one
+                        // (`cmpl $50; jb X; jg Y`).
                         if register_family(reg_str.trim()) == dst_reg
                             && imm >= 0
                             && imm <= if width == MoveSize::B { 127 } else { 32767 }
+                            && flags_reader_window_ok(
+                                store,
+                                infos,
+                                j,
+                                NARROW_CF_ZF_JCC,
+                                NARROW_CF_ZF_SETCC,
+                            )
                         {
                             let mnem = if width == MoveSize::B { "cmpb" } else { "cmpw" };
                             let operand = match src {
@@ -8279,7 +8304,13 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
                         if ra.starts_with('%')
                             && ra == rb
                             && register_family(ra) == dst_reg
-                            && zf_only_flags_reader(store, infos, j)
+                            && flags_reader_window_ok(
+                                store,
+                                infos,
+                                j,
+                                NARROW_ZF_JCC,
+                                NARROW_ZF_SETCC,
+                            )
                         {
                             test_shape = true;
                             let operand = match src {
@@ -8411,19 +8442,198 @@ fn parse_narrow_zext_src(
 /// must be a `je`/`jne` branch or a `sete`/`setne` writer; anything else
 /// (arithmetic on flags, carry chains, sign tests, other setcc/jcc forms)
 /// refuses the fold.
-fn zf_only_flags_reader(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
-    let k = next_non_nop(infos, j + 1);
-    if k >= infos.len() {
-        return false;
+/// Condition codes the narrow-compare fold preserves exactly.
+///
+/// The fold swaps a 32-bit compare of a zero-extended value for a native
+/// narrow compare; the two agree on ZF and CF for EVERY condition code, but
+/// they DISAGREE on SF/OF for values above the narrow range (byte >= 128,
+/// word >= 32768): in the narrow view the subtraction wraps or sign-crosses,
+/// so `jl`/`jg`/`jle`/`jge`/`js`/`sets`/`setl`/`setg`/`setle`/`setge` read
+/// different flags.  (Historical miscompile: `movzbl 16(%esp), %eax;
+/// cmpl $50, %eax; setg %al` folded to `cmpb $50, %al; setg %al` — for c=200
+/// the wide view says 200 > 50 (true) while `cmpb $50, 200` yields 0x96,
+/// SF=1 OF=0, and setg clears.  The C shape is any promoted `u8 > K` /
+/// `u16 > K` relational: the compare is signed (both operands non-negative
+/// int) but the operand is zero-extended.)
+///
+/// ZF-only set (the `testl %R, %R` form, whose CF is always 0 while
+/// `cmpb $0, mem` sets CF when the operand is 0):
+const NARROW_ZF_JCC: &[&str] = &["je ", "jne ", "jz ", "jnz "];
+const NARROW_ZF_SETCC: &[&str] = &["sete ", "setne ", "setz ", "setnz "];
+/// ZF/CF set (the `cmpl $I, %R` form):
+const NARROW_CF_ZF_JCC: &[&str] = &[
+    "je ", "jne ", "jz ", "jnz ", "jb ", "jbe ", "ja ", "jae ", "jc ", "jnc ",
+];
+const NARROW_CF_ZF_SETCC: &[&str] = &[
+    "sete ", "setne ", "setz ", "setnz ", "setb ", "setbe ", "seta ", "setae ", "setc ", "setnc ",
+];
+
+/// Prove that every flags reader between the compare at `j` and the point
+/// where its flags die is in the caller's allowed mnemonic sets.
+///
+/// The narrow-compare fold rewrites the FLAG-SETTING instruction, so every
+/// consumer of those flags downstream in the same path must be safe under
+/// the ZF/CF-only law — not just the immediately next one (`cmp; jb X;
+/// jg Y` reads the same flags twice, and only the second reader is the
+/// dangerous one).  The scan walks forward:
+///   * CondJmp / SetCC — must be in the allowed sets (they read the flags),
+///     and the scan CONTINUES: a conditional branch's fallthrough path
+///     still carries the flags (`jb X; jg Y` is live code);
+///   * a new Cmp, a Label, an unconditional Jmp/JmpIndirect, a Call or Ret —
+///     the flags cannot be read past it (a new compare overwrites them, a
+///     call clobbers everything): stop, the window is proven.  Stopping at
+///     a Label rests on the emitter's invariants: a block-boundary label
+///     begins a fresh block, and a block that re-uses a Cmp value must
+///     re-emit the compare (the boolean was never materialised when the
+///     first branch fused it); a mid-block label is a select-arm target,
+///     and the arms are flag-blind copies.  No emitter path carries raw
+///     flags across a label;
+///   * mov/lea/stack/nop-class lines (the known flag-preserving,
+///     flag-blind kinds) — continue;
+///   * anything else (an unrecognised `Other` line, inline asm) — reject.
+fn flags_reader_window_ok(
+    store: &LineStore,
+    infos: &[LineInfo],
+    j: usize,
+    allowed_jcc: &[&str],
+    allowed_setcc: &[&str],
+) -> bool {
+    let mut k = next_non_nop(infos, j + 1);
+    while k < infos.len() {
+        let t = trimmed(store, &infos[k], k);
+        match infos[k].kind {
+            LineKind::CondJmp => {
+                if !allowed_jcc.iter().any(|m| t.starts_with(m)) {
+                    return false;
+                }
+            }
+            LineKind::SetCC { .. } => {
+                if !allowed_setcc.iter().any(|m| t.starts_with(m)) {
+                    return false;
+                }
+            }
+            LineKind::Cmp
+            | LineKind::Label
+            | LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::Call
+            | LineKind::Ret
+            | LineKind::RetN => return true,
+            // Opaque user asm may read or write flags for reasons no pass
+            // can see.
+            LineKind::InlineAsm => return false,
+            LineKind::Other { .. } => {
+                let m = t.split_whitespace().next().unwrap_or("");
+                // Flag-preserving AND flag-blind: the compare's flags
+                // survive this line — keep scanning.
+                if matches!(
+                    m,
+                    "movb"
+                        | "movw"
+                        | "movl"
+                        | "movq"
+                        | "movzbw"
+                        | "movzbl"
+                        | "movzwl"
+                        | "movswl"
+                        | "movsl"
+                        | "leal"
+                        | "pushl"
+                        | "popl"
+                        | "xchgl"
+                        | "nop"
+                        | "cdq"
+                        | "cqto"
+                        | "bswapl"
+                        | "leave"
+                        | "enter"
+                        | "notb"
+                        | "notw"
+                        | "notl"
+                        | "cbw"
+                        | "cwde"
+                ) {
+                    // continue the scan
+                } else if matches!(
+                    // Flag-WRITING: this line replaces the compare's flags,
+                    // so no instruction after it can read them — the window
+                    // is proven up to here.  (`xorl %r,%r` is the common
+                    // case: zeroing the result register after a branch.)
+                    m,
+                    "addb"
+                        | "addw"
+                        | "addl"
+                        | "subb"
+                        | "subw"
+                        | "subl"
+                        | "andb"
+                        | "andw"
+                        | "andl"
+                        | "orb"
+                        | "orw"
+                        | "orl"
+                        | "xorb"
+                        | "xorw"
+                        | "xorl"
+                        | "imulb"
+                        | "imulw"
+                        | "imull"
+                        | "incb"
+                        | "incw"
+                        | "incl"
+                        | "decb"
+                        | "decw"
+                        | "decl"
+                        | "negb"
+                        | "negw"
+                        | "negl"
+                        | "adc"
+                        | "sbb"
+                        | "shlb"
+                        | "shlw"
+                        | "shll"
+                        | "shrb"
+                        | "shrw"
+                        | "shrl"
+                        | "sarb"
+                        | "sarw"
+                        | "sarl"
+                        | "divb"
+                        | "divw"
+                        | "divl"
+                        | "idivb"
+                        | "idivw"
+                        | "idivl"
+                        | "rolb"
+                        | "rolw"
+                        | "roll"
+                        | "rorb"
+                        | "rorw"
+                        | "rorl"
+                        | "add"
+                        | "sub"
+                        | "and"
+                        | "or"
+                        | "xor"
+                        | "imul"
+                        | "div"
+                ) {
+                    return true;
+                } else {
+                    // Neither provably preserving nor provably writing:
+                    // fail closed.  (x86 flag readers are only jcc/setcc,
+                    // both classified above, so an unrecognised line can
+                    // only be dangerous if it WRITES flags for us.)
+                    return false;
+                }
+            }
+            // Nop / Empty / Move / SelfMove / StoreEbp / LoadEbp / Push /
+            // Pop / Directive: flag-preserving and flag-blind — continue.
+            _ => {}
+        }
+        k = next_non_nop(infos, k + 1);
     }
-    let t = trimmed(store, &infos[k], k);
-    if infos[k].kind == LineKind::CondJmp {
-        return t.starts_with("je ") || t.starts_with("jne ");
-    }
-    if matches!(infos[k].kind, LineKind::SetCC { .. }) {
-        return t.starts_with("sete ") || t.starts_with("setne ");
-    }
-    false
+    true
 }
 
 // ── Pass: indirect call through a spilled global function pointer ───────────
@@ -11721,6 +11931,9 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
 }
 
 pub fn peephole_optimize(asm: String) -> String {
+    if let Ok(path) = std::env::var("LCCC_DEBUG_PEEPHOLE_IN") {
+        let _ = std::fs::write(path, &asm);
+    }
     if std::env::var_os("CCC_NO_I686_PEEPHOLE").is_some() {
         return asm;
     }
@@ -19224,6 +19437,250 @@ mod tests {
         assert!(
             out.contains("movzbl 12(%esp)") && out.contains("cmpl $57, %ebx"),
             "mismatched consumer was folded:\n{out}"
+        );
+    }
+
+    // ── narrow-cmp flag-reader window (SF/OF law) ──────────────────────────
+
+    #[test]
+    fn narrow_fold_refuses_signed_ordering_reader() {
+        // The historical miscompile: c=200 > 50 is true in the wide view,
+        // but `cmpb $50, 200` yields 0x96 (SF=1 OF=0) and setg clears.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movzbl 16(%esp), %eax\n",
+            "    cmpl $50, %eax\n",
+            "    setg %al\n",
+            "    movzbl %al, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("cmpl $50, %eax"),
+            "setg reader was folded (SF/OF law):\n{out}"
+        );
+    }
+
+    #[test]
+    fn narrow_fold_allows_unsigned_and_equality_readers() {
+        for reader in [
+            "jb .L1\n",
+            "jae .L1\n",
+            "ja .L1\n",
+            "jbe .L1\n",
+            "je .L1\n",
+            "jne .L1\n",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    movzbl 12(%esp), %eax\n    cmpl $57, %eax\n{reader}    xorl %ebx, %ebx\n.L1:\n    xorl %eax, %eax\n    ret\n.cfi_endproc\n"
+            );
+            let out = peephole_optimize(asm.to_string());
+            assert!(
+                out.contains("cmpb $57, 12(%esp)"),
+                "CF/ZF reader {reader:?} was not folded:\n{out}"
+            );
+        }
+        for reader in [
+            "setb %al\n",
+            "setae %al\n",
+            "seta %al\n",
+            "setbe %al\n",
+            "sete %al\n",
+            "setne %al\n",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    movzbl 12(%esp), %eax\n    cmpl $57, %eax\n{reader}    movzbl %al, %eax\n    ret\n.cfi_endproc\n"
+            );
+            let out = peephole_optimize(asm.to_string());
+            assert!(
+                out.contains("cmpb $57, 12(%esp)"),
+                "CF/ZF setcc {reader:?} was not folded:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_fold_refuses_signed_reader_behind_a_safe_one() {
+        // `cmp; jb X; jg Y` reads the flags twice: the first reader is
+        // CF-safe, the second is SF/OF-dangerous. A next-reader-only check
+        // would fold this.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movzbl 12(%esp), %eax\n",
+            "    cmpl $57, %eax\n",
+            "    jb .L1\n",
+            "    jg .L2\n",
+            ".L1:\n",
+            "    xorl %ebx, %ebx\n",
+            "    jmp .L3\n",
+            ".L2:\n",
+            "    incl %ebx\n",
+            ".L3:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("cmpl $57, %eax"),
+            "second flags reader was missed by the window:\n{out}"
+        );
+    }
+
+    #[test]
+    fn narrow_fold_window_stops_at_label_and_new_cmp() {
+        // A label after the safe branch starts another path: the fold must
+        // still fire even though a signed reader exists elsewhere in the
+        // function text.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movzbl 12(%esp), %eax\n",
+            "    cmpl $57, %eax\n",
+            "    jb .L1\n",
+            ".L1:\n",
+            "    cmpl $3, %ecx\n",
+            "    jg .L2\n",
+            ".L2:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("cmpb $57, 12(%esp)"),
+            "window did not stop at the label:\n{out}"
+        );
+        // A following movl keeps the flags alive; the jg after it is still
+        // in the window and vetoes.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movzbl 12(%esp), %eax\n",
+            "    cmpl $57, %eax\n",
+            "    jb .L1\n",
+            "    movl %eax, %ecx\n",
+            "    jg .L2\n",
+            ".L1:\n",
+            "    xorl %ebx, %ebx\n",
+            "    jmp .L3\n",
+            ".L2:\n",
+            "    incl %ebx\n",
+            ".L3:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("cmpl $57, %eax"),
+            "window did not cross the flag-preserving mov:\n{out}"
+        );
+    }
+
+    #[test]
+    fn testl_fold_refuses_cf_reader_behind_a_zf_one() {
+        // testl always clears CF; cmpb $0 sets it when the operand is 0.
+        // `test; je X; jb Y` — the first reader is ZF-safe, the second is
+        // CF-dangerous.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movzbl 12(%esp), %eax\n",
+            "    testl %eax, %eax\n",
+            "    je .L1\n",
+            "    jb .L2\n",
+            ".L1:\n",
+            "    xorl %ebx, %ebx\n",
+            "    jmp .L3\n",
+            ".L2:\n",
+            "    incl %ebx\n",
+            ".L3:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("testl %eax"),
+            "CF reader behind a ZF reader was missed:\n{out}"
+        );
+    }
+
+    #[test]
+    fn narrow_fold_register_source_with_intervening_move() {
+        // Exact pre-peephole shape of `sgt_param` under -Os -mregparm=3
+        // (captured from the pipeline): the emitter zero-extends the
+        // argument twice — into %ebx (a callee-saved home) and again into
+        // %eax right before the compare.  The foldable pair is the SECOND
+        // load (adjacent to the compare); the first pair survives.  The
+        // setg reader vetoes the fold under the flag-law window, so the
+        // wide compare must survive.  Pre-fix, this exact input emitted
+        // `cmpb $50, %al; setg %al` — the historical miscompile.
+        let asm = concat!(
+            "sgt_param:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebx\n",
+            "    subl $8, %esp\n",
+            "    movzbl %al, %ebx\n",
+            "    movl %ebx, %eax\n",
+            "    movzbl %al, %eax\n",
+            "    cmpl $50, %eax\n",
+            "    setg %al\n",
+            "    movzbl %al, %eax\n",
+            "    addl $8, %esp\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("cmpl $50"),
+            "signed reader under a register-source zext was narrowed:\n{out}"
+        );
+        assert!(
+            !out.contains("cmpb $50"),
+            "narrow cmp emitted under a signed reader:\n{out}"
+        );
+        // The non-folding must not have eaten the surviving load pair.
+        assert!(
+            out.contains("movzbl %al, %ebx"),
+            "surviving load lost:\n{out}"
+        );
+    }
+
+    #[test]
+    fn narrow_fold_register_source_cf_zf_reader_still_folds() {
+        // Same shape, CF-safe reader: the fold must still apply (it
+        // deletes the redundant second zero-extend — the whole point of
+        // the pass) and read the byte from the register that holds it.
+        let asm = concat!(
+            "sgt_param:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebx\n",
+            "    subl $8, %esp\n",
+            "    movzbl %al, %ebx\n",
+            "    movl %ebx, %eax\n",
+            "    movzbl %al, %eax\n",
+            "    cmpl $50, %eax\n",
+            "    jb .L1\n",
+            "    xorl %ebx, %ebx\n",
+            "    jmp .L2\n",
+            ".L1:\n",
+            "    incl %ebx\n",
+            ".L2:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("cmpb $50"),
+            "CF-safe reader did not fold:\n{out}"
+        );
+        assert!(
+            !out.contains("cmpl $50"),
+            "wide compare survived a legal fold:\n{out}"
         );
     }
 

@@ -104,13 +104,22 @@ EOF_K
 leaks=$(python3 - "$work/ktab.s" <<'EOF_PY'
 import re, sys
 lines = open(sys.argv[1]).read().splitlines()
-# find labels and jumps
-labels = {l.strip()[:-1]: i for i, l in enumerate(lines) if re.match(r'^\.L\w+:$', l)}
+# A backedge pairs with the label occurrence NEAREST ABOVE the jump (see
+# the C1 pairing note — a reused label name must not stretch a loop span
+# across functions).
+def loop_start_for(tgt, i):
+    best = None
+    for j, x in enumerate(lines):
+        if j < i and re.match(r'^\.L\w+:$', x) and x.strip()[:-1] == tgt:
+            best = j
+    return best
 loops = []
 for i, l in enumerate(lines):
     m = re.match(r'^\s*j\w+\s+(\.L\w+)$', l)
-    if m and m.group(1) in labels and labels[m.group(1)] < i:
-        loops.append((labels[m.group(1)], i))
+    if m:
+        s_ = loop_start_for(m.group(1), i)
+        if s_ is not None:
+            loops.append((s_, i))
 bad = 0
 for start, end in loops:
     for i in range(start, end + 1):
@@ -149,9 +158,19 @@ for i, l in enumerate(lines):
             prev = lines[k].strip()
             if not (prev.startswith('.p2align')):
                 # acceptable: the hoisted LEA directly before the label when
-                # the loop had no alignment directives to begin with
+                # the loop had no alignment directives to begin with.  But a
+                # .p2align ABOVE that LEA means the insertion landed BETWEEN
+                # the directive run and the header label — the alignment no
+                # longer touches the loop header (the audit's A2 escape
+                # hatch).
                 if not prev.startswith('leaq'):
                     ok = False
+                else:
+                    k2 = k - 1
+                    while k2 >= 0 and not lines[k2].strip():
+                        k2 -= 1
+                    if k2 >= 0 and lines[k2].strip().startswith('.p2align'):
+                        ok = False
 print("1" if ok else "0")
 EOF_PY
 )
@@ -229,31 +248,61 @@ if [[ -f tests/benchmark/programs/sha256_transform.c ]]; then
     inloop=$(python3 - "$work/sha.s" <<'EOF_PY'
 import re, sys
 lines = open(sys.argv[1]).read().splitlines()
-labels = {l.strip()[:-1]: i for i, l in enumerate(lines) if re.match(r'^\.L\w+:$', l)}
+# A backedge pairs with the label occurrence NEAREST ABOVE the jump: a
+# later function may reuse a label name, and pairing against the wrong
+# occurrence measures the loop span across functions.
+def loop_start_for(tgt, i):
+    best = None
+    for j, x in enumerate(lines):
+        if j < i and re.match(r'^\.L\w+:$', x) and x.strip()[:-1] == tgt:
+            best = j
+    return best
 backedges = []
 for i, l in enumerate(lines):
     m = re.match(r'^\s*j\w+\s+(\.L\w+)$', l)
-    if m and m.group(1) in labels and labels[m.group(1)] < i:
-        backedges.append((labels[m.group(1)], i))
+    if m:
+        s_ = loop_start_for(m.group(1), i)
+        if s_ is not None:
+            backedges.append((s_, i))
 # Innermost loop around each K-indexed load must not re-materialise the
 # base (one-level-up placement inside an enclosing loop is legitimate).
-loads = [i for i, l in enumerate(lines) if re.match(r'^\s*movl?\s+\(%r\w+, %r\w+d\)', l)]
-bad = 0
-for li in loads:
-    inner = min(
-        ((s, e) for s, e in backedges if s <= li <= e),
-        key=lambda se: se[1] - se[0],
-        default=None,
+# The K-table load shape: `movl (DISP)?(%base, %index[, scale])` — a
+# register base plus a register index, optional displacement, optional
+# 1/2/4/8 scale.  (The pre-audit regex demanded the index spelling end in
+# `d` directly before `)` — no real SIB load satisfies it, the match set
+# was EMPTY, and this check passed vacuously.)  A load-less result must
+# FAIL: this benchmark is supposed to contain the K load.
+loads = [
+    i for i, l in enumerate(lines)
+    if re.match(r'^\s*mov[lq]?\s+([0-9a-fxX+.-]+)?\(%r\w+,\s*%r\w+(,\s*[1248])?\)', l)
+]
+if not loads:
+    cand = [l.strip() for l in lines if re.match(r'^\s*mov[lq]?\s+\(', l)]
+    print(
+        "C1 self-check: no SIB-indexed K-load matched; candidate mov lines: "
+        + repr(cand[:5]),
+        file=sys.stderr,
     )
-    if inner is None:
-        continue
-    for k in range(inner[0], inner[1] + 1):
-        if re.match(r'^\s*leaq K\(%rip\)', lines[k]):
-            bad += 1
-print(bad)
+    print(-1)
+else:
+    bad = 0
+    for li in loads:
+        inner = min(
+            ((s, e) for s, e in backedges if s <= li <= e),
+            key=lambda se: se[1] - se[0],
+            default=None,
+        )
+        if inner is None:
+            continue
+        for k in range(inner[0], inner[1] + 1):
+            if re.match(r'^\s*leaq K\(%rip\)', lines[k]):
+                bad += 1
+    print(bad)
 EOF_PY
     )
-    if [[ "$inloop" -eq 0 ]]; then
+    if [[ "$inloop" == "-1" ]]; then
+        bad "C1 self-check: no SIB-indexed K-load found in sha.s — the hoist check would be vacuous (regex drift or the load disappeared)"
+    elif [[ "$inloop" -eq 0 ]]; then
         ok "sha256_transform's K-table LEA hoisted out of the 64-round loop"
     else
         bad "sha256_transform still materialises the K-table inside the loop ($inloop sites)"

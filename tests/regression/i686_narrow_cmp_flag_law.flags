@@ -1,0 +1,1 @@
+-m32 -Os -mregparm=3 -fno-pic
