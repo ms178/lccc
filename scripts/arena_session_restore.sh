@@ -106,6 +106,14 @@ log "m32 oracle: $(gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/d
 if [[ ! -d .git ]]; then
     log 'RECOVERY: .git is missing entirely (not just .git/config)'
     tmp_git="$(mktemp -d)/lccc"
+    # Primary: the durable bundle the snapshot script publishes (path
+    # agreement, audit F8).  Fallback: a bundle left in the bulk zone by an
+    # older snapshot revision — better than nothing when it survived.
+    if [[ ! -f /home/user/artifacts/lccc.bundle && -f /home/user/target/artifacts/lccc.bundle ]]; then
+        log 'using bulk-zone bundle (legacy snapshot layout)'
+        mkdir -p /home/user/artifacts
+        cp /home/user/target/artifacts/lccc.bundle /home/user/artifacts/lccc.bundle
+    fi
     if [[ -f /home/user/artifacts/lccc.bundle ]] \
         && git clone -q /home/user/artifacts/lccc.bundle "$tmp_git" 2>/dev/null; then
         mv "$tmp_git/.git" ./.git
@@ -160,8 +168,8 @@ log "exec bits restored: $n_modes"
 
 # ---- 5. optional: kernel tree regeneration -----------------------------------
 if [[ ${1:-} == --with-kernel ]]; then
-    if [[ ! -f /home/user/kernel-work/linux-6.18.52/.lccc-prepared ]] \
-       || [[ ! -f /home/user/kernel-work/linux-6.18.52/arch/x86/boot/setup.ld ]]; then
+    if [[ ! -f /home/user/target/kernel-work/linux-6.18.52/.lccc-prepared ]] \
+       || [[ ! -f /home/user/target/kernel-work/linux-6.18.52/arch/x86/boot/setup.ld ]]; then
         log 'regenerating linux-cachymod-6.18.52 tree'
         ./scripts/prepare_kernel_tree.sh || log 'KERNEL TREE RESTORE FAILED'
     else

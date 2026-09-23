@@ -21,7 +21,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}
 OUT=${OUT:-/tmp/bootbuild}
 # Resolve the script directory before `cd "$K"`: $0 is relative to the caller's
 # cwd, so sourcing boot_flags.sh after the cd would look inside the kernel tree.

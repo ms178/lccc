@@ -224,6 +224,8 @@ impl RiscvCodegen {
                 Vec::new(),
                 crate::common::fx_hash::FxHashMap::default(),
                 &self.state.ra_config,
+                // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
+                &mut crate::common::fx_hash::FxHashMap::default(),
             );
 
         self.state.ra_accumulator_values =

@@ -48,6 +48,7 @@ pub fn run_regalloc_and_merge_clobbers(
         Vec::new(),
         crate::common::fx_hash::FxHashMap::default(),
         &Arc::new(RaConfig::from_process_env()),
+        &mut FxHashMap::default(),
     )
 }
 
@@ -158,12 +159,17 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     indirect_target_regs: Vec<PhysReg>,
     folded_index_uses: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
     ra_config: &Arc<RaConfig>,
+    phi_chain_out: &mut FxHashMap<u32, u32>,
 ) -> (
     FxHashMap<u32, PhysReg>,
     Option<super::super::liveness::LivenessResult>,
     FxHashMap<u8, Vec<(u32, u32)>>,
     Vec<super::super::regalloc::AccumulatorAssignment>,
 ) {
+    // `phi_chain_out` receives the allocator's blessed same-value classes
+    // (see RegAllocResult::phi_chain); targets whose emitters are not
+    // alias-aware pass an ignored scratch map and keep the pre-alias
+    // freshness behavior bit-for-bit.
     // Detect x86-64 target by checking for x86 callee-saved PhysReg IDs (1-5).
     // On x86-64, provide XMM registers for F64 allocation.
     let has_scalar_fp = func.blocks.iter().any(|block| {
@@ -462,6 +468,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
             used_regs: Vec::new(),
             caller_save_spans: Default::default(),
             liveness: None,
+            phi_chain: FxHashMap::default(),
         }
     } else {
         super::super::regalloc::allocate_registers(func, &config)
@@ -471,6 +478,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     let accumulator_assignments = alloc_result.accumulator_assignments;
     let caller_save_spans = alloc_result.caller_save_spans;
     let cached_liveness = alloc_result.liveness;
+    *phi_chain_out = alloc_result.phi_chain;
 
     // Merge inline-asm clobbered callee-saved registers into the save/restore
     // list (they need to be preserved per the ABI even though we don't allocate

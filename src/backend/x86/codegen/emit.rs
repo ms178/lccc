@@ -85,6 +85,110 @@ pub(super) const EGPR64: [&str; 16] = [
     "r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23", "r24", "r25", "r26", "r27", "r28",
     "r29", "r30", "r31",
 ];
+
+/// Reverse of the home tables: which allocated home [`PhysReg`] (if any) does
+/// an inline-asm clobber name refer to?
+///
+/// Only registers allocatable as value homes matter to
+/// [`X86Codegen::note_reg_clobbered`] — `rax`/`rcx`/`xmm0`/`xmm1` (codegen
+/// scratch, never homes) and the pseudo-clobbers `cc`/`memory` have no homes
+/// to evict, so they map to `None` and the caller skips the note (which
+/// would be a no-op anyway).  Width suffixes resolve to the same physical
+/// home: clobbering `%dl` clobbers the value homed in `rdx`.
+pub(super) fn home_phys_by_asm_name(clobber: &str) -> Option<u8> {
+    let name = clobber.trim();
+    // The canonical home names, with their PhysReg numbering (mirrors
+    // `phys_reg_name` and the EGPR/XMM windows below it).
+    const HOMES: &[(&str, u8)] = &[
+        ("rbx", 1),
+        ("r12", 2),
+        ("r13", 3),
+        ("r14", 4),
+        ("r15", 5),
+        ("rbp", 6),
+        ("r11", 10),
+        ("r10", 11),
+        ("r8", 12),
+        ("r9", 13),
+        ("rdi", 14),
+        ("rsi", 15),
+        ("rdx", 16),
+        ("xmm2", 20),
+        ("xmm3", 21),
+        ("xmm4", 22),
+        ("xmm5", 23),
+        ("xmm6", 24),
+        ("xmm7", 25),
+        ("xmm8", 26),
+        ("xmm9", 27),
+        ("xmm10", 28),
+        ("xmm11", 29),
+        ("xmm12", 30),
+        ("xmm13", 31),
+        ("xmm14", 32),
+        ("xmm15", 33),
+    ];
+    if let Some((_, phys)) = HOMES.iter().find(|(n, _)| *n == name) {
+        return Some(*phys);
+    }
+    // EGPR homes r16..r31 in any width (r16/r16d/r16w/r16b).
+    let stem = name.trim_end_matches(['d', 'w', 'b']);
+    if let Some(num) = stem.strip_prefix('r') {
+        if let Ok(n) = num.parse::<usize>() {
+            if (16..=31).contains(&n) {
+                return Some(40 + (n - 16) as u8);
+            }
+        }
+    }
+    // 32-bit AT&T spellings of the GP homes (ebx, r12d, edi, esi, edx, ...).
+    // Width spellings of the GP homes: an asm write to any sub-register
+    // rewrites the whole home's physical register.
+    const GP_ALIASES: &[(&str, u8)] = &[
+        ("ebx", 1),
+        ("bx", 1),
+        ("bl", 1),
+        ("r12d", 2),
+        ("r12w", 2),
+        ("r12b", 2),
+        ("r13d", 3),
+        ("r13w", 3),
+        ("r13b", 3),
+        ("r14d", 4),
+        ("r14w", 4),
+        ("r14b", 4),
+        ("r15d", 5),
+        ("r15w", 5),
+        ("r15b", 5),
+        ("ebp", 6),
+        ("bp", 6),
+        ("bpl", 6),
+        ("r11d", 10),
+        ("r11w", 10),
+        ("r11b", 10),
+        ("r10d", 11),
+        ("r10w", 10),
+        ("r10b", 10),
+        ("r8d", 12),
+        ("r8w", 12),
+        ("r8b", 12),
+        ("r9d", 13),
+        ("r9w", 13),
+        ("r9b", 13),
+        ("edi", 14),
+        ("di", 14),
+        ("dil", 14),
+        ("esi", 15),
+        ("si", 15),
+        ("sil", 15),
+        ("edx", 16),
+        ("dx", 16),
+        ("dl", 16),
+    ];
+    GP_ALIASES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, phys)| *phys)
+}
 pub(super) const EGPR32: [&str; 16] = [
     "r16d", "r17d", "r18d", "r19d", "r20d", "r21d", "r22d", "r23d", "r24d", "r25d", "r26d", "r27d",
     "r28d", "r29d", "r30d", "r31d",
@@ -609,6 +713,14 @@ pub struct X86Codegen {
     /// RA homed it for exactly that purpose and the def-writes-home
     /// invariant holds at runtime (the def precedes every runtime consumer).
     pub(super) home_clobbered: FxHashSet<u32>,
+    /// The RA's blessed same-value classes (RegAllocResult::phi_chain):
+    /// member value id → class representative. Two ids in one class denote
+    /// the same value at every program point where both are live — slot
+    /// coalescing webs, applied phi destructive updates, FP webs. A stale
+    /// home of member v is readable whenever a NON-stale class sibling
+    /// shares the register: the register provably holds the class value.
+    /// Empty on targets without alias-aware freshness (behavior unchanged).
+    pub(super) phi_chain: FxHashMap<u32, u32>,
     /// Hole-aware live segments per value (start, end) in program-point
     /// numbering, from the RA's liveness. `note_reg_clobbered` consults them
     /// to mark ONLY the sharers that are actually LIVE at the clobber point —
@@ -1122,6 +1234,7 @@ impl X86Codegen {
             reg_assignments: FxHashMap::default(),
             home_fresh: FxHashSet::default(),
             home_clobbered: FxHashSet::default(),
+            phi_chain: FxHashMap::default(),
             value_live_segments: FxHashMap::default(),
             home_sharers: FxHashMap::default(),
             call_fresh_snapshot: Vec::new(),
@@ -1439,11 +1552,44 @@ impl X86Codegen {
     /// in the register.
     pub(super) fn fresh_home_of(&self, val_id: u32) -> Option<PhysReg> {
         let reg = self.reg_assignments.get(&val_id).copied()?;
-        if self.home_clobbered.contains(&val_id) {
-            None
-        } else {
-            Some(reg)
+        if !self.home_clobbered.contains(&val_id) {
+            return Some(reg);
         }
+        if self.home_readable_via_alias(val_id) {
+            return Some(reg);
+        }
+        None
+    }
+
+    /// chain_rep: the blessed same-value class representative of `v`, or `v`
+    /// itself when it has no class.
+    fn chain_rep(&self, v: u32) -> u32 {
+        *self.phi_chain.get(&v).unwrap_or(&v)
+    }
+
+    /// SOUNDNESS (alias-aware freshness): a home the bookkeeping marked
+    /// clobbered is still readable when a NON-clobbered member of the SAME
+    /// blessed class shares the register — coalescing guarantees both ids
+    /// denote one value wherever both are live, and the fresh sibling is
+    /// exactly the id the last in-place chain update wrote (kernel 6.18.52
+    /// workqueue.c llc_populate_cpu_shard_id: the `cmovnel %r10d,%r13d`
+    /// freshened v109; the consumer of same-chain v103 — slot-less by
+    /// construction — must read r13 instead of ICEing on a value that is
+    /// right there). A stale sibling of a DIFFERENT class never qualifies,
+    /// so unrelated sharers keep the strict rule.
+    pub(super) fn home_readable_via_alias(&self, val_id: u32) -> bool {
+        if self.phi_chain.is_empty() {
+            return false;
+        }
+        let Some(&reg) = self.reg_assignments.get(&val_id) else {
+            return false;
+        };
+        let rep = self.chain_rep(val_id);
+        self.home_sharers.get(&reg.0).is_some_and(|sharers| {
+            sharers.iter().any(|&s| {
+                s != val_id && !self.home_clobbered.contains(&s) && self.chain_rep(s) == rep
+            })
+        })
     }
 
     /// Home-freshness-filtered view of `reg_assignments` for the MachInst
@@ -1459,7 +1605,7 @@ impl X86Codegen {
     fn fresh_ra_for_isel(&self) -> FxHashMap<u32, PhysReg> {
         self.reg_assignments
             .iter()
-            .filter(|(k, _)| !self.home_clobbered.contains(*k))
+            .filter(|(k, _)| !self.home_clobbered.contains(*k) || self.home_readable_via_alias(**k))
             .map(|(k, v)| (*k, *v))
             .collect()
     }
@@ -2141,7 +2287,11 @@ impl X86Codegen {
                 // the second `pgdat->node_zones + i` consumed the zone
                 // POINTER as the index and panicked the boot).
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    if !self.home_clobbered.contains(&v.0) {
+                    // Alias-aware freshness: a clobbered mark on a member of
+                    // a blessed same-value class is readable through a fresh
+                    // sibling (chain_update semantics); see
+                    // home_readable_via_alias for the workqueue.c proof.
+                    if !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0) {
                         if reg.0 != target.0 {
                             if is_xmm_reg(reg) {
                                 // XMM → GPR
@@ -2272,7 +2422,11 @@ impl X86Codegen {
                 // value whose register now holds a derived value must reload
                 // instead of copying the stale content with movq.
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    if !self.home_clobbered.contains(&v.0) {
+                    // Alias-aware freshness: a clobbered mark on a member of
+                    // a blessed same-value class is readable through a fresh
+                    // sibling (chain_update semantics); see
+                    // home_readable_via_alias for the workqueue.c proof.
+                    if !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0) {
                         if reg.0 != target.0 {
                             if is_xmm_reg(reg) {
                                 let xmm_name = phys_reg_name(reg);
@@ -3329,7 +3483,9 @@ impl X86Codegen {
                     .get(&v.0)
                     .copied()
                     .filter(|&r| !is_xmm_reg(r))
-                    .filter(|_| !self.home_clobbered.contains(&v.0))
+                    .filter(|_| {
+                        !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0)
+                    })
                 {
                     let src_typed = typed_phys_reg_name(reg, ty);
                     self.state
@@ -3557,7 +3713,7 @@ impl X86Codegen {
                     .emit_fmt(format_args!("    movq %{}, %{}", xmm_name, reg));
                 return;
             }
-            if !self.home_clobbered.contains(&val.0) {
+            if !self.home_clobbered.contains(&val.0) || self.home_readable_via_alias(val.0) {
                 let reg_name = phys_reg_name(phys_reg);
                 if reg_name != reg {
                     self.state.out.emit_instr_reg_reg("    movq", reg_name, reg);
@@ -4765,7 +4921,10 @@ impl X86Codegen {
                             .get(&v.0)
                             .copied()
                             .filter(|&r| !is_xmm_reg(r))
-                            .filter(|_| !self.home_clobbered.contains(&v.0))
+                            .filter(|_| {
+                                !self.home_clobbered.contains(&v.0)
+                                    || self.home_readable_via_alias(v.0)
+                            })
                     }
                     _ => None,
                 };
@@ -8069,6 +8228,16 @@ impl ArchCodegen for X86Codegen {
             input_symbols,
         );
         self.emit_callee_saved_clobber_annotations(clobbers);
+        // SOUNDNESS (audit F5): the asm template may write any register in
+        // the clobber list, which until now left GP homes marked fresh
+        // across the asm block — a later consumer read the register trusting
+        // the pre-asm value.  Evict every home the clobber list names;
+        // `note_reg_clobbered` is a no-op for non-homes, so this stays cheap.
+        for c in clobbers {
+            if let Some(phys) = home_phys_by_asm_name(c) {
+                self.note_reg_clobbered(phys);
+            }
+        }
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
@@ -8099,6 +8268,12 @@ impl ArchCodegen for X86Codegen {
             seg_overrides,
         );
         self.emit_callee_saved_clobber_annotations(clobbers);
+        // Same clobber accounting as `emit_inline_asm` (audit F5).
+        for c in clobbers {
+            if let Some(phys) = home_phys_by_asm_name(c) {
+                self.note_reg_clobbered(phys);
+            }
+        }
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
@@ -8340,6 +8515,125 @@ impl Default for X86Codegen {
 }
 
 #[cfg(test)]
+mod alias_freshness_tests {
+    use super::*;
+
+    // ── audit F5: inline-asm clobber accounting ──────────────────────────────
+
+    #[test]
+    fn home_phys_by_asm_name_round_trips_every_home() {
+        let mut homes: Vec<u8> = (1..=6).chain(10..=16).collect();
+        homes.extend(20..=33);
+        homes.extend(40..=55);
+        for phys in homes {
+            let name = phys_reg_name(PhysReg(phys));
+            assert_eq!(
+                home_phys_by_asm_name(name),
+                Some(phys),
+                "clobber {name} must evict its home"
+            );
+        }
+        // Scratch and pseudo-clobbers name no home.
+        for name in [
+            "rax", "rcx", "xmm0", "xmm1", "cc", "memory", "dirflag", "fpsr", "flags",
+        ] {
+            assert_eq!(home_phys_by_asm_name(name), None, "{name} is not a home");
+        }
+        // Width suffixes resolve to the same physical home.
+        for (name, phys) in [
+            ("edx", 16u8),
+            ("dl", 16u8),
+            ("ebx", 1),
+            ("bl", 1),
+            ("edi", 14),
+            ("esi", 15),
+            ("r8d", 12),
+            ("r12d", 2),
+            ("r16d", 40),
+            ("r31b", 55),
+        ] {
+            assert_eq!(home_phys_by_asm_name(name), Some(phys), "{name}");
+        }
+    }
+
+    // ── audit F5: the alias-freshness law is fail-closed ─────────────────────
+
+    /// Seed a two-member same-value class sharing one home register.
+    fn seeded_codegen() -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(103, PhysReg(3));
+        cg.reg_assignments.insert(104, PhysReg(3));
+        cg.home_sharers.insert(3, vec![103, 104]);
+        cg.phi_chain.insert(104, 103);
+        cg.value_live_segments.insert(103, vec![(0, 100)]);
+        cg.value_live_segments.insert(104, vec![(0, 100)]);
+        cg.state.current_program_point = 10;
+        cg.home_fresh.insert(103);
+        cg.home_fresh.insert(104);
+        cg
+    }
+
+    #[test]
+    fn fresh_home_reads_directly_and_via_fresh_class_sibling() {
+        let mut cg = seeded_codegen();
+        assert_eq!(cg.fresh_home_of(103), Some(PhysReg(3)));
+        // The kernel-6.18.52 shape: a clobber evicts both sharers, the
+        // in-place chain update re-freshens ONLY the newest id, and the
+        // consumer of the older sibling reads the register through the
+        // blessed class.
+        cg.note_reg_clobbered(3);
+        assert_eq!(cg.fresh_home_of(103), None, "clobbered without sibling");
+        cg.note_home_written(104);
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "fresh class sibling proves the home readable"
+        );
+    }
+
+    #[test]
+    fn stale_sibling_of_same_class_never_blesses_the_home() {
+        let mut cg = seeded_codegen();
+        cg.note_reg_clobbered(3);
+        // An unrelated staging write re-evicts both: NO fresh sibling
+        // exists, so the consumer must reload.
+        cg.note_staging_target(&Operand::Const(IrConst::I32(1)), PhysReg(3));
+        assert_eq!(cg.fresh_home_of(103), None);
+        assert_eq!(cg.fresh_home_of(104), None);
+        // isel pre-coloring follows the same law.
+        let pre = cg.fresh_ra_for_isel();
+        assert!(!pre.contains_key(&103) && !pre.contains_key(&104));
+    }
+
+    #[test]
+    fn fresh_sibling_of_a_different_class_never_blesses_the_home() {
+        let mut cg = seeded_codegen();
+        // Break the class: no phi_chain at all (RA-3 regression shape).
+        cg.phi_chain.clear();
+        cg.note_reg_clobbered(3);
+        cg.note_home_written(104);
+        assert_eq!(
+            cg.fresh_home_of(103),
+            None,
+            "a fresh UNRELATED sharer must not bless a clobbered home"
+        );
+    }
+
+    #[test]
+    fn dead_sharers_survive_a_clobber_until_redefinition() {
+        let mut cg = seeded_codegen();
+        // 105 shares the register but is dead at the clobber point: the
+        // liveness gate must NOT evict it (its next def re-marks it).
+        cg.home_sharers.insert(3, vec![103, 104, 105]);
+        cg.value_live_segments.insert(105, vec![(50, 60)]);
+        cg.note_reg_clobbered(3);
+        assert!(
+            !cg.home_clobbered.contains(&105),
+            "dead sharer keeps its home mark"
+        );
+    }
+}
+
 mod machinst_resolution_tests {
     use super::super::machinst::{MachInst, MachReg, OpSize};
     use super::*;

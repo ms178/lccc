@@ -424,6 +424,8 @@ impl I686Codegen {
                 // intervening calls and accumulator staging.
                 crate::backend::generation::collect_folded_gep_links_all(func),
                 &self.state.ra_config,
+                // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
+                &mut crate::common::fx_hash::FxHashMap::default(),
             );
 
         // %ebx must be saved/restored only when it really holds the GOT base.

@@ -42,7 +42,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
-DEFAULT_KERNEL = os.environ.get("KERNEL_DIR", "/home/user/kernel-work/linux-6.18.52")
+DEFAULT_KERNEL = os.environ.get("KERNEL_DIR", "/home/user/target/kernel-work/linux-6.18.52")
 
 # Sourced from boot_flags.sh rather than duplicated: the whole value of this
 # tool is that both arms see the identical command line.

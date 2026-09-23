@@ -1581,6 +1581,7 @@ impl X86Codegen {
                     links
                 },
                 &self.state.ra_config,
+                &mut self.phi_chain,
             );
 
         // Home-freshness bookkeeping (SOUNDNESS): reg_assignments is now THIS
