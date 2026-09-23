@@ -140,6 +140,45 @@ if $PY "$TOOL" --trace-dir "$TMPD/does-not-exist" >/dev/null 2>&1; then
     : # listing a missing dir raises; only the exit code is contractual
 fi
 
+echo "== phase 5: the tool NAMES the offender on a synthetic bad trace =="
+# Phases 1-3 prove the tool is quiet when the compiler is clean and that its
+# parser agrees with a 21-case table.  Neither proves it can still FAIL, and a
+# tool that silently reports clean on everything would satisfy both.  So: build
+# a trace whose one bad dump is exactly the historical unencodable operand and
+# demand exit 1 plus the offending pass named in the verdict.
+SYN=$TMPD/synthetic
+mkdir -p "$SYN"
+# Two innocuous dumps and the bad one, named so the offender is unambiguous.
+printf 'f:\n    leaq 0(,%%r11,4), %%r8\n    leaq (%%r8, %%r10, 1), %%r9\n' > "$SYN/000-p0-innocent.s"
+printf 'f:\n    leaq (%%r10, %%r11, 4), %%r9\n' > "$SYN/001-p0-also_innocent.s"
+printf 'f:\n    leaq 0(,%%r11,4, %%r10, 1), %%r9\n' > "$SYN/999-p0-synthetic_bad.s"
+if $PY "$TOOL" --trace-dir "$SYN" --quiet >"$TMPD/syn_v" 2>&1; then
+    bad "the tool reported a CLEAN verdict on a trace containing an unencodable operand"
+    sed 's/^/    /' "$TMPD/syn_v"
+else
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+        note "synthetic bad trace -> exit 1"
+    else
+        bad "synthetic bad trace -> exit $rc, expected 1"
+    fi
+    if grep -q 'synthetic_bad' "$TMPD/syn_v"; then
+        note "verdict names the offending pass"
+    else
+        bad "verdict does not name synthetic_bad:"
+        sed 's/^/    /' "$TMPD/syn_v"
+    fi
+fi
+# The same trace must stay clean once the bad operand is repaired, so the
+# phase is measuring the operand and not merely the presence of a third dump.
+printf 'f:\n    leaq (%%r10, %%r11, 4), %%r9\n' > "$SYN/999-p0-synthetic_bad.s"
+if $PY "$TOOL" --trace-dir "$SYN" --quiet >"$TMPD/syn_ok" 2>&1; then
+    note "repaired dump -> clean verdict again (the check is on the operand)"
+else
+    bad "repaired dump still reported bad:"
+    sed 's/^/    /' "$TMPD/syn_ok"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "peephole-trace-bisect: FAIL" >&2
     exit 1

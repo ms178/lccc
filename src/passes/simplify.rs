@@ -2023,13 +2023,19 @@ fn simplify_binop(
             // but URem still has unsigned semantics regardless of type signedness.
             if op == IrBinOp::URem && (ty.is_integer() || ty == IrType::Ptr) {
                 if let Some(shift) = const_power_of_two(rhs, ty) {
-                    // x % 2^k => x & (2^k - 1)
-                    let mask = (1i64 << shift) - 1;
+                    // x % 2^k => x & (2^k - 1).  The mask is built at the
+                    // OPERATION's width, not i64's: `const_power_of_two`
+                    // reports shifts up to 127 for the 128-bit types, and an
+                    // i64 construction of the mask is wrong in two ways --
+                    // `1i64 << 64` is `1` in a release build (the shift amount
+                    // is masked modulo 64), so a 2^64 mask became 0 and
+                    // `x % 2^64` compiled to `x & 0`; and `(1i64 << 63) - 1`
+                    // panics in a debug build.  See `IrConst::low_mask`.
                     return Some(Instruction::BinOp {
                         dest,
                         op: IrBinOp::And,
                         lhs: *lhs,
-                        rhs: Operand::Const(IrConst::from_i64(mask, ty)),
+                        rhs: Operand::Const(IrConst::low_mask(ty, shift)),
                         ty,
                     });
                 }
@@ -5636,5 +5642,222 @@ mod tests {
             ty: IrType::I32,
         };
         assert!(simplify_default(&inst).is_none());
+    }
+
+    // ==================================================================
+    // const_power_of_two: the predicate behind every `x / 2^k` and
+    // `x % 2^k` strength reduction.
+    //
+    // This predicate is a trap detector.  It used to read the operand
+    // through `to_i64()`, which TRUNCATES a 128-bit constant: the value
+    // 0xffffffffffffffff_0000000000000001 arrived as `1`, was judged a
+    // power of two, and `x * that` compiled to a copy of `x`.  It was
+    // rewritten to read the bit pattern at the operation's width, which
+    // then made shifts up to 127 reachable -- and that widening exposed
+    // an i64 mask construction downstream (see `IrConst::low_mask`).
+    //
+    // Both halves of that history are pinned below: the truncation trap,
+    // the full widened range, and the width masking.
+    // ==================================================================
+
+    #[test]
+    fn const_power_of_two_rejects_the_to_i64_truncation_trap() {
+        // The historical miscompile: low 64 bits are a power of two, the
+        // high half is non-zero.  `to_i64()` saw only the low half.
+        let trap = IrConst::I128(0xffffffffffffffff_0000000000000001_u128 as i128);
+        assert_eq!(
+            const_power_of_two(&Operand::Const(trap), IrType::I128),
+            None,
+            "a constant whose low half is a power of two but whose high half is \
+             non-zero is NOT a power of two"
+        );
+        // The same value as an unsigned type.
+        assert_eq!(
+            const_power_of_two(&Operand::Const(trap), IrType::U128),
+            None
+        );
+        // Mirrors of the trap: a power of two PLUS a low bit (here 2^64 + 1),
+        // and one with the bit one position up (2^64 + 2).  Both have a single
+        // set bit in the i64 view and must still be rejected.
+        for v in [
+            0x0000000000000001_0000000000000001_u128, // 2^64 + 1
+            0x0000000000000001_0000000000000002_u128, // 2^64 + 2
+            0x8000000000000000_8000000000000000_u128, // 2^127 + 2^63
+        ] {
+            assert_eq!(
+                const_power_of_two(&Operand::Const(IrConst::I128(v as i128)), IrType::U128),
+                None,
+                "{v:#x} is not a power of two"
+            );
+        }
+        // Sanity: the value that IS 2^64 must be recognised, so the rejections
+        // above are about the extra bits and not about the width.
+        let p64 = IrConst::I128(0x0000000000000001_0000000000000000_u128 as i128);
+        assert_eq!(
+            const_power_of_two(&Operand::Const(p64), IrType::U128),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn const_power_of_two_covers_the_full_128_bit_range() {
+        for k in 0..=127u32 {
+            let v = 1u128 << k;
+            assert_eq!(
+                const_power_of_two(&Operand::Const(IrConst::I128(v as i128)), IrType::I128),
+                Some(k),
+                "I128 2^{k}"
+            );
+            assert_eq!(
+                const_power_of_two(&Operand::Const(IrConst::I128(v as i128)), IrType::U128),
+                Some(k),
+                "U128 2^{k}"
+            );
+        }
+    }
+
+    #[test]
+    fn const_power_of_two_at_the_64_bit_boundary() {
+        // 2^63 is i64::MIN as a bit pattern, and was unreachable before the
+        // predicate stopped demanding a positive i64.  It is the case whose
+        // downstream i64 mask overflowed.
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I64(i64::MIN)), IrType::U64),
+            Some(63)
+        );
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I64(i64::MIN)), IrType::I64),
+            Some(63)
+        );
+        // 2^64 and up only exist in the 128-bit types.
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I64(i64::MIN)), IrType::U128),
+            Some(63),
+            "a 128-bit operation on an I64 constant sees only its low 64 bits"
+        );
+        // An all-ones constant is 2^width - 1: never a power of two, at any
+        // width.  As a 128-bit value `I64(-1)` is 2^64 - 1, one SHORT of a
+        // power of two -- a distinction the old `to_i64()` predicate could not
+        // make, since it could not see past bit 63 at all.
+        for ty in [IrType::I64, IrType::U64, IrType::I128, IrType::U128] {
+            assert_eq!(
+                const_power_of_two(&Operand::Const(IrConst::I64(-1)), ty),
+                None,
+                "all-ones ({ty:?}) is 2^n - 1, not a power of two"
+            );
+        }
+        // ...whereas the neighbouring value, 2^64, is one, at 128 bits.
+        assert_eq!(
+            const_power_of_two(
+                &Operand::Const(IrConst::I128(
+                    0x0000000000000001_0000000000000000_u128 as i128
+                )),
+                IrType::U128
+            ),
+            Some(64)
+        );
+    }
+
+    #[test]
+    fn const_power_of_two_on_narrow_signed_types() {
+        // Signed narrow constants carrying a single set bit.
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I8(0x80u8 as i8)), IrType::I8),
+            Some(7)
+        );
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I16(0x8000u16 as i16)), IrType::I16),
+            Some(15)
+        );
+        assert_eq!(
+            const_power_of_two(
+                &Operand::Const(IrConst::I32(0x0001_0000u32 as i32)),
+                IrType::I32
+            ),
+            Some(16)
+        );
+        assert_eq!(
+            const_power_of_two(
+                &Operand::Const(IrConst::I32(0x4000_0000u32 as i32)),
+                IrType::I32
+            ),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn const_power_of_two_masks_bits_above_the_operation_width() {
+        // Bits above the width are not part of the value: a 2^40 bit in a
+        // 32-bit operation is not a power of two, it is not anything.
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I64(1i64 << 40)), IrType::I32),
+            None
+        );
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I64(1i64 << 40)), IrType::U32),
+            None
+        );
+        // 2^32 is off-width for a 32-bit type but in range for 64.
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I64(1i64 << 32)), IrType::U32),
+            None
+        );
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I64(1i64 << 32)), IrType::U64),
+            Some(32)
+        );
+        // A 2^100 bit in a 64-bit operation likewise vanishes.
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I128(1i128 << 100)), IrType::U64),
+            None
+        );
+    }
+
+    #[test]
+    fn const_power_of_two_rejects_non_constants_and_zero() {
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::I64(0)), IrType::I64),
+            None,
+            "zero has no power-of-two exponent"
+        );
+        assert_eq!(
+            const_power_of_two(&Operand::Const(IrConst::F64(4.0)), IrType::F64),
+            None,
+            "a float constant is not an integer power of two for this fold"
+        );
+        assert_eq!(
+            const_power_of_two(&Operand::Value(Value(0)), IrType::I64),
+            None,
+            "a non-constant must never be classified"
+        );
+    }
+
+    /// End-to-end through the simplification of an actual `urem`: the mask
+    /// that comes out must be the exact `2^k - 1` at the operation's width.
+    /// This is the unit-level twin of tests/regression/i128_divrem_pow2.c.
+    #[test]
+    fn urem_by_pow2_folds_to_the_exact_mask_at_128_bits() {
+        for k in [1u32, 31, 32, 63, 64, 65, 100, 126, 127] {
+            let d = IrConst::I128((1u128 << k) as i128);
+            let inst = binop(
+                IrBinOp::URem,
+                Operand::Value(Value(0)),
+                Operand::Const(d),
+                IrType::U128,
+            );
+            let out = simplify_default(&inst).expect("urem by 2^k must fold");
+            match out {
+                Instruction::BinOp {
+                    op: IrBinOp::And,
+                    rhs: Operand::Const(c),
+                    ..
+                } => {
+                    let got = c.to_i128().expect("mask is an integer") as u128;
+                    let want = (1u128 << k) - 1;
+                    assert_eq!(got, want, "mask for 2^{k} is not exact");
+                }
+                other => panic!("expected an AND fold for 2^{k}, got {other:?}"),
+            }
+        }
     }
 }

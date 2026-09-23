@@ -862,6 +862,35 @@ fn parse_disp(text: &str) -> Option<(Option<String>, i64)> {
     if let Ok(v) = text.parse::<i64>() {
         return Some((None, v));
     }
+    // Hex displacements: the x86 emitter formats `$imm` operands in hex, and
+    // although it does not currently do so for the displacement field, a
+    // numeric literal arriving here must not be mistaken for a SYMBOL.  As a
+    // symbol it would still render (`0x10+8(%rax)` evaluates correctly in
+    // GAS), but the displacement arithmetic in `compose_sib` would be skipped
+    // and two such operands could not be summed -- a silent loss of folding
+    // rather than wrong code, and cheap to rule out.
+    if let Some(d) = text
+        .strip_prefix("-0x")
+        .or_else(|| text.strip_prefix("-0X"))
+    {
+        // Negated hex is parsed as a magnitude and negated, so `-0x8000000000000000`
+        // fails closed instead of wrapping to the same value as the positive form.
+        return i64::from_str_radix(d, 16)
+            .ok()
+            .and_then(|v| v.checked_neg())
+            .map(|v| (None, v));
+    }
+    if let Some(d) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        // UNSIGNED parse, reinterpreted as a bit pattern: the emitter's 64-bit
+        // displacements include values above `i64::MAX`, and `i64::from_str_radix`
+        // would reject `0xffffffffffffffff` outright.  A value too wide for u64
+        // is not a displacement at all, so it fails closed.
+        return u64::from_str_radix(d, 16).ok().map(|v| (None, v as i64));
+    }
+    if text == "-" || text == "+" {
+        // A bare sign is not a displacement and must not become a symbol.
+        return None;
+    }
     // `sym[+|-]N`: split at the LAST sign so `a-b-4` can never be reached
     // through a malformed input, and require a non-empty symbol.
     let bytes = text.as_bytes();
@@ -2949,7 +2978,7 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
-    use super::{SibAddr, compose_sib, operand_start};
+    use super::{SibAddr, compose_sib, operand_start, parse_disp};
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
@@ -5457,5 +5486,43 @@ mod tests {
             index: Some(("%r8".to_string(), 1)),
         };
         assert_eq!(compose_sib(&inner, &outer).as_deref(), Some("8(%rsp, %r8)"));
+    }
+
+    #[test]
+    fn parse_disp_handles_hex_literals() {
+        // A hex displacement must be a NUMBER, not a symbol: as a symbol it
+        // would silently disable displacement arithmetic in compose_sib.
+        assert_eq!(parse_disp("0x10"), Some((None, 16)));
+        assert_eq!(parse_disp("0X10"), Some((None, 16)));
+        assert_eq!(parse_disp("0x4"), Some((None, 4)));
+        assert_eq!(parse_disp(""), Some((None, 0)));
+        assert_eq!(parse_disp("16"), Some((None, 16)));
+        assert_eq!(parse_disp("-8"), Some((None, -8)));
+        // Unsigned reinterpretation: the all-ones word is -1 as a bit pattern.
+        assert_eq!(parse_disp("0xffffffffffffffff"), Some((None, -1)));
+        // Negated hex reaches the full range without the reinterpretation.
+        assert_eq!(parse_disp("-0x10"), Some((None, -16)));
+        // Symbols and symbol+offset still parse as symbols.
+        assert_eq!(parse_disp("table"), Some((Some("table".to_string()), 0)));
+        assert_eq!(parse_disp("table+8"), Some((Some("table".to_string()), 8)));
+        assert_eq!(parse_disp("table-4"), Some((Some("table".to_string()), -4)));
+        // A bare sign is not a displacement.
+        assert_eq!(parse_disp("+"), None);
+    }
+
+    /// Hex displacements feed the composition arithmetic the same way decimal
+    /// ones do, so a hex-addressed producer still folds.
+    #[test]
+    fn compose_sums_hex_displacements() {
+        let inner = SibAddr::parse("0x10(%rax)").expect("hex disp parses to a number");
+        assert_eq!(inner.disp, 16);
+        assert_eq!(inner.sym, None, "a hex literal is not a symbol");
+        let outer = SibAddr {
+            sym: None,
+            disp: 8,
+            base: None,
+            index: None,
+        };
+        assert_eq!(compose_sib(&inner, &outer).as_deref(), Some("24(%rax)"));
     }
 }
