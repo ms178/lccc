@@ -189,6 +189,10 @@ fn peeled_value(
 /// Result of [`match_bool_mux_algebra`]: the consumer's replacement plus
 /// deferred producer rewrites `(block, index, instruction)` for the
 /// pass-end application (dest-verified, like `pending_masks`).
+/// `has_scalar_andn` is the BMI1 ANDN capability resolved once by the
+/// pipeline (target + `-mbmi`/`-march` + the `CCC_NO_ANDN_FUSION` kill
+/// switch): when the backend's Not+And fusion is selectable, Pattern B
+/// defers to it — see the pattern's comment.
 pub(super) fn match_bool_mux_algebra(
     c_lhs: Operand,
     c_rhs: Operand,
@@ -200,6 +204,7 @@ pub(super) fn match_bool_mux_algebra(
     defs: &[Option<Instruction>],
     use_counts: &[u32],
     def_loc: &[Option<(usize, usize)>],
+    has_scalar_andn: bool,
 ) -> Option<(Instruction, Vec<(usize, usize, Instruction)>)> {
     // Structural resolution is COPY-FREE: the consumer must name its
     // producers directly. A producer reached through a `Copy` chain would
@@ -253,10 +258,20 @@ pub(super) fn match_bool_mux_algebra(
     };
 
     // ── Pattern C: majority ────────────────────────────────────────────
-    // consumer {Xor|Or}( inner{Xor|Or}(And(x,y), And(x,z)), And(y,z) )
+    // consumer {Xor|Or}( inner{Xor|Or}(And(·,·), And(·,·)), And(·,·) )
     //   (inner Or with consumer Xor is a DIFFERENT function — rejected)
-    // →  a2 := Xor(x, y);  and3 := And(z, a2);  consumer := Xor(a1, and3)
-    for (inner_opnd, and3_opnd) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
+    // maj(x,y,z) = (x&y) ^ (z & (x^y)): ANY of the three pairwise Ands may
+    // be the KEPT term (it is only read); the other two repurpose — the
+    // earlier-positioned slot becomes Xor(p,q) (the kept term's operands)
+    // and the later becomes And(r, xor) (r = the third variable). Every
+    // sound role assignment is collected and the one whose KEPT term is
+    // defined EARLIEST wins: the composite then computes last, which is
+    // both the tightest live-range schedule and the shape GCC emits
+    // (kept-And first, composite last — nothing parks between the
+    // composite and its consumer). The preference is dominance-safe by
+    // construction: the kept term is only ever READ, at the consumer,
+    // where it already dominates (SSA argument above).
+    for (inner_opnd, third_opnd) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
         let Some(Instruction::BinOp {
             op: inner_op,
             lhs: i_lhs,
@@ -279,65 +294,127 @@ pub(super) fn match_bool_mux_algebra(
         let Some((a2_lhs, a2_rhs)) = and_strict(&i_rhs) else {
             continue;
         };
-        let Some((a3_lhs, a3_rhs)) = and_strict(&and3_opnd) else {
+        let Some((a3_lhs, a3_rhs)) = and_strict(&third_opnd) else {
             continue;
         };
-        let Operand::Value(a1v) = i_lhs else { continue };
-        let Operand::Value(a2v) = i_rhs else { continue };
-        let Operand::Value(a3v) = and3_opnd else {
-            continue;
-        };
-        // a2 and and3 are repurposed: same block as the consumer, and the
-        // single-use proofs (a2, and3, and the inner xor which must die —
-        // its value changes because a2 changes).
-        let (Some((a2b, a2i)), Some((a3b, a3i))) = (loc_of(&i_rhs), loc_of(&and3_opnd)) else {
-            continue;
-        };
-        if a2b != block_bi || a3b != block_bi || !(a2i < a3i) {
-            continue; // and3 reads a2 after the rewrite
-        }
-        if !single_use(&i_rhs) || !single_use(&and3_opnd) || !single_use(&inner_opnd) {
+        // The inner node's value is repurposed away — its only reader
+        // (the consumer) stops reading it — so its dest needs the
+        // single-use proof. The three Ands are named directly
+        // (copy-free), one ty.
+        if !single_use(&inner_opnd) {
             continue;
         }
-        for (x, y) in [(a1_lhs, a1_rhs), (a1_rhs, a1_lhs)] {
-            for (x2, z) in [(a2_lhs, a2_rhs), (a2_rhs, a2_lhs)] {
-                if !same_value(x, x2, defs) || same_value(y, z, defs) {
+        let arm_opnds = [i_lhs, i_rhs, third_opnd];
+        let arm_pairs = [(a1_lhs, a1_rhs), (a2_lhs, a2_rhs), (a3_lhs, a3_rhs)];
+        let is_and_of = |pair: (Operand, Operand), a: Operand, b: Operand| {
+            (same_value(pair.0, a, defs) && same_value(pair.1, b, defs))
+                || (same_value(pair.0, b, defs) && same_value(pair.1, a, defs))
+        };
+        // (rank, new_early, new_late, new_consumer, early_idx, late_idx)
+        let mut best: Option<(
+            (u32, u32),
+            Instruction,
+            Instruction,
+            Instruction,
+            usize,
+            usize,
+        )> = None;
+        for kept in 0..3 {
+            let (k_lhs, k_rhs) = arm_pairs[kept];
+            let others = [(kept + 1) % 3, (kept + 2) % 3];
+            for (p, q) in [(k_lhs, k_rhs), (k_rhs, k_lhs)] {
+                if same_value(p, q, defs) {
                     continue;
                 }
-                let yz = (same_value(a3_lhs, y, defs) && same_value(a3_rhs, z, defs))
-                    || (same_value(a3_lhs, z, defs) && same_value(a3_rhs, y, defs));
-                if !yz {
-                    continue;
+                // r candidates: the operands of the two non-kept Ands. The
+                // pair must be And(p,r) and And(q,r) for one common r.
+                for r in [
+                    arm_pairs[others[0]].0,
+                    arm_pairs[others[0]].1,
+                    arm_pairs[others[1]].0,
+                    arm_pairs[others[1]].1,
+                ] {
+                    if same_value(r, p, defs) || same_value(r, q, defs) {
+                        continue;
+                    }
+                    let roles_ok = (is_and_of(arm_pairs[others[0]], p, r)
+                        && is_and_of(arm_pairs[others[1]], q, r))
+                        || (is_and_of(arm_pairs[others[0]], q, r)
+                            && is_and_of(arm_pairs[others[1]], p, r));
+                    if !roles_ok {
+                        continue;
+                    }
+                    // Repurposed producers: the consumer's own block (v1).
+                    let (Some((b1, i1)), Some((b2, i2))) =
+                        (loc_of(&arm_opnds[others[0]]), loc_of(&arm_opnds[others[1]]))
+                    else {
+                        continue;
+                    };
+                    if b1 != block_bi || b2 != block_bi {
+                        continue;
+                    }
+                    // Both repurposed Ands change value: single-use proofs.
+                    if !single_use(&arm_opnds[others[0]]) || !single_use(&arm_opnds[others[1]]) {
+                        continue;
+                    }
+                    // The And(r, ·) reads the Xor's dest: earlier slot first.
+                    let (early, late, ei, li) = if i1 < i2 {
+                        (others[0], others[1], i1, i2)
+                    } else {
+                        (others[1], others[0], i2, i1)
+                    };
+                    // New operands must dominate their new positions: the
+                    // Xor reads the KEPT term's operands (p, q) at the
+                    // early slot; the And reads r at the late slot.
+                    if !same_block_before(&p, ei) || !same_block_before(&q, ei) {
+                        continue;
+                    }
+                    if !same_block_before(&r, li) {
+                        continue;
+                    }
+                    let (Operand::Value(ev), Operand::Value(lv), Operand::Value(kv)) =
+                        (arm_opnds[early], arm_opnds[late], arm_opnds[kept])
+                    else {
+                        continue;
+                    };
+                    let new_early = Instruction::BinOp {
+                        dest: ev,
+                        op: IrBinOp::Xor,
+                        lhs: p,
+                        rhs: q,
+                        ty: c_ty,
+                    };
+                    let new_late = Instruction::BinOp {
+                        dest: lv,
+                        op: IrBinOp::And,
+                        lhs: r,
+                        rhs: Operand::Value(ev),
+                        ty: c_ty,
+                    };
+                    let new_consumer = Instruction::BinOp {
+                        dest: c_dest,
+                        op: IrBinOp::Xor,
+                        lhs: Operand::Value(kv),
+                        rhs: Operand::Value(lv),
+                        ty: c_ty,
+                    };
+                    // Kept-term rank: entry-available first, then the
+                    // same-block def order.
+                    let rank = match def_loc.get(kv.0 as usize).copied().flatten() {
+                        Some((b, i)) if b == block_bi => (1, i as u32),
+                        _ => (0, 0),
+                    };
+                    if best.as_ref().is_none_or(|(br, ..)| rank < *br) {
+                        // Store the INSTRUCTION indices (ei, li) — the
+                        // pending rewrites address block slots, not arms.
+                        best = Some((rank, new_early, new_late, new_consumer, ei, li));
+                    }
                 }
-                // New operand of the repurposed a2: y (an a1 operand). It
-                // must dominate a2's position.
-                if !same_block_before(&y, a2i) {
-                    continue;
-                }
-                let new_a2 = Instruction::BinOp {
-                    dest: a2v,
-                    op: IrBinOp::Xor,
-                    lhs: x,
-                    rhs: y,
-                    ty: c_ty,
-                };
-                let new_a3 = Instruction::BinOp {
-                    dest: a3v,
-                    op: IrBinOp::And,
-                    lhs: z,
-                    rhs: Operand::Value(a2v),
-                    ty: c_ty,
-                };
-                let new_consumer = Instruction::BinOp {
-                    dest: c_dest,
-                    op: IrBinOp::Xor,
-                    lhs: Operand::Value(a1v),
-                    rhs: Operand::Value(a3v),
-                    ty: c_ty,
-                };
-                let pending = vec![(a2b, a2i, new_a2), (a3b, a3i, new_a3)];
-                return Some((new_consumer, pending));
             }
+        }
+        if let Some((_, new_early, new_late, new_consumer, ei, li)) = best {
+            let pending = vec![(block_bi, ei, new_early), (block_bi, li, new_late)];
+            return Some((new_consumer, pending));
         }
     }
 
@@ -348,6 +425,46 @@ pub(super) fn match_bool_mux_algebra(
     // ((x,y)-side vs (~x,z)-side) are found either way round, and BOTH of
     // the xor's operands (y and z) must dominate the early position — in
     // each role assignment exactly one of them is new to it.
+    //
+    // BMI1 defer: the backend fuses a single-use `Not` that IMMEDIATELY
+    // precedes its `And` into one 3-operand `andn` (detect_and_not_fusions
+    // + emit_and_not_impl) — the shape GCC, Clang and ICX all emit for
+    // CH. Folding here would erase the Not the fusion needs. The fold
+    // defers exactly when that fusion is predictable at THIS point:
+    // `has_scalar_andn` (the pipeline resolved BMI1 + the kill switch),
+    // the Not's type is in the fusion's width domain, its dest is
+    // single-use, and it sits at the immediately preceding index of the
+    // SAME block as the ~x-side And. A Not reached through a Copy chain
+    // never predicts (the fusion needs the raw adjacency).
+    let andn_fusion_predicted = |not_opnd: Operand, and_opnd: Operand| -> bool {
+        let Operand::Value(nv) = not_opnd else {
+            return false;
+        };
+        match defs.get(nv.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::UnaryOp {
+                op: crate::ir::reexports::IrUnaryOp::Not,
+                ty: nty,
+                ..
+            }) => {
+                if *nty != c_ty
+                    || !matches!(nty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+                {
+                    return false;
+                }
+                if use_counts.get(nv.0 as usize).copied() != Some(1) {
+                    return false;
+                }
+                match (
+                    def_loc.get(nv.0 as usize).copied().flatten(),
+                    loc_of(&and_opnd),
+                ) {
+                    (Some((nb, ni)), Some((ab, ai))) => nb == ab && ni + 1 == ai,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    };
     for (first, second) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
         let Some((f_lhs, f_rhs)) = and_strict(&first) else {
             continue;
@@ -377,10 +494,16 @@ pub(super) fn match_bool_mux_algebra(
             } else {
                 (s_lhs, s_rhs)
             };
+            let nz_and = if swap_roles { first } else { second };
             for (x, y) in [(xy_lhs, xy_rhs), (xy_rhs, xy_lhs)] {
                 for (maybe_not, z) in [(nz_lhs, nz_rhs), (nz_rhs, nz_lhs)] {
                     if let Some(nx) = not_source(maybe_not, defs) {
                         if !same_value(nx, x, defs) {
+                            continue;
+                        }
+                        // The andn fusion is the better form under BMI1:
+                        // defer the whole mux fold to the backend.
+                        if has_scalar_andn && andn_fusion_predicted(maybe_not, nz_and) {
                             continue;
                         }
                         // The repurposed early And becomes Xor(y, z); both
@@ -422,6 +545,20 @@ pub(super) fn match_bool_mux_algebra(
     // consumer {Xor|Or}( And(x,y), And(x,z) )  →  repurposed := Xor/Or(y,z);
     // consumer := And(x, repurposed). Creates no new dominance edges beyond
     // the repurposed operand's def, checked below.
+    //
+    // MAJ defer: when this pair is the INNER of a majority tree, firing
+    // here destroys the structure Pattern C needs — the pair's Ands get
+    // folded into `x & (y^z)`, and the third pairwise And is left reading
+    // a composite computed before it (the park the emitter then pays
+    // for; sha256_transform's MAJ was exactly this). Defer when C would
+    // fire at the outer consumer: find the {Xor|Or} that reads this
+    // consumer's dest and ask the matcher, recursively, on the same defs
+    // snapshot. The probe is exact under the scan order (C runs before A
+    // at the outer's own turn, and no pattern between here and there
+    // touches a three-And majority); if an intermediate fold ever did,
+    // the loss is a missed optimization, never a miscompile. The
+    // recursion cannot re-enter: at the outer, both arms' defs must be
+    // Ands for A to fire, and one of them is this consumer (a Xor/Or).
     for (a, b) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
         let Some((a_lhs, a_rhs)) = and_strict(&a) else {
             continue;
@@ -446,6 +583,55 @@ pub(super) fn match_bool_mux_algebra(
                 // z is new to the repurposed `a`.
                 if !same_block_before(&z, ai) {
                     continue;
+                }
+                // Majority-defer probe (cheap pre-filter: the outer
+                // reader exists only when this dest is single-use).
+                if use_counts.get(c_dest.0 as usize).copied() == Some(1) {
+                    let mut deferred = false;
+                    for cand in defs.iter().filter_map(Option::as_ref) {
+                        let Instruction::BinOp {
+                            op: u_op,
+                            lhs: u_lhs,
+                            rhs: u_rhs,
+                            dest: u_dest,
+                            ty: u_ty,
+                        } = cand
+                        else {
+                            continue;
+                        };
+                        if !matches!(u_op, IrBinOp::Xor | IrBinOp::Or)
+                            || *u_ty != c_ty
+                            || (*u_lhs != Operand::Value(c_dest)
+                                && *u_rhs != Operand::Value(c_dest))
+                        {
+                            continue;
+                        }
+                        let Some((ub, ui)) = def_loc.get(u_dest.0 as usize).copied().flatten()
+                        else {
+                            continue;
+                        };
+                        if match_bool_mux_algebra(
+                            *u_lhs,
+                            *u_rhs,
+                            *u_op,
+                            *u_dest,
+                            *u_ty,
+                            ub,
+                            ui,
+                            defs,
+                            use_counts,
+                            def_loc,
+                            has_scalar_andn,
+                        )
+                        .is_some()
+                        {
+                            deferred = true;
+                            break;
+                        }
+                    }
+                    if deferred {
+                        continue;
+                    }
                 }
                 let Operand::Value(av) = a else { continue };
                 let inner_op = if c_op == IrBinOp::Or {
@@ -1178,6 +1364,7 @@ pub(crate) fn recognize_function(
     enable_bit_reverse: bool,
     max_rotate_bits: u32,
     min_rotate_bits: u32,
+    has_scalar_andn: bool,
 ) -> usize {
     let mut defs = vec![None; func.max_value_id() as usize + 1];
     // (block index, instruction index) of each value's defining instruction,
@@ -1415,6 +1602,7 @@ pub(crate) fn recognize_function(
                         &defs,
                         &use_counts,
                         &def_loc,
+                        has_scalar_andn,
                     ) {
                         // Apply producer repurposes (same block, earlier
                         // indices), then the consumer, keeping defs and
@@ -2349,6 +2537,7 @@ mod tests {
             &fx.defs,
             &fx.use_counts,
             &fx.def_loc,
+            false,
         )
         .expect("the shape must match");
         // Apply the rewrite to a copy of the program.
@@ -2492,6 +2681,7 @@ mod tests {
                 &fx.defs,
                 &fx.use_counts,
                 &fx.def_loc,
+                false,
             )
             .is_none()
         );
@@ -2542,6 +2732,7 @@ mod tests {
                 &fx.defs,
                 &fx.use_counts,
                 &fx.def_loc,
+                false,
             )
             .is_none()
         );
@@ -2569,6 +2760,7 @@ mod tests {
                 &fx.defs,
                 &fx.use_counts,
                 &fx.def_loc,
+                false,
             )
             .is_none()
         );
@@ -2598,35 +2790,352 @@ mod tests {
                 &fx.defs,
                 &fx.use_counts,
                 &def_loc,
+                false,
             )
             .is_none()
         );
     }
 
     #[test]
-    fn maj_with_a_new_operand_defined_too_late_declines() {
-        // The repurposed a2 would read y, but y is defined AFTER a2 in the
-        // block (between a2 and a1) — the dominance check must reject.
+    fn maj_new_operand_late_finds_kept_earliest_assignment() {
+        // The literal v1 assignment (repurpose a2@0 into Xor(x,y)) reads y,
+        // which is defined AFTER a2 — rejected. The generalized matcher
+        // instead keeps the EARLIEST And (a2@0 = And(x,z)) and repurposes
+        // the two later Ands, whose new operands all dominate: kept=
+        // earliest is always the dominance-safe choice. The rewrite must
+        // fire and stay bit-exact.
         let fx = fixture(vec![
-            and3(4, v(0), v(2)),                     // a2 = And(x, z) at idx 0  [→ Xor(x,y)]
-            xor3(5, v(1), v(2)),                     // y  = Xor(y_in, z) at idx 1  [AFTER a2]
-            and3(6, v(0), Operand::Value(Value(5))), // a1 = And(x, y) at idx 2
-            and3(7, Operand::Value(Value(5)), v(2)), // a3 = And(y, z) at idx 3
+            and3(4, v(0), v(2)),                     // a2 = And(x, z) at idx 0  [KEPT]
+            xor3(5, v(1), v(2)),                     // y  = Xor(y_in, z) at idx 1
+            and3(6, v(0), Operand::Value(Value(5))), // a1 = And(x, y) at idx 2  [→ Xor(x,z)]
+            and3(7, Operand::Value(Value(5)), v(2)), // a3 = And(y, z) at idx 3  [→ And(y, xor)]
             xor3(8, v(6), v(4)),                     // inner at idx 4
             xor3(9, v(8), v(7)),                     // consumer at idx 5
         ]);
+        assert_rewrite_bit_exact(&fx, 5);
+        // Pin the kept-term choice itself: the consumer reads the earliest
+        // And (v4) as its kept operand and the LATEST slot (v7, the old
+        // And(y,z)) as the composite.
+        let (new_consumer, _) = match_bool_mux_algebra(
+            v(8),
+            v(7),
+            IrBinOp::Xor,
+            Value(9),
+            IrType::U32,
+            0,
+            5,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the kept=earliest assignment must fire");
+        let Instruction::BinOp { lhs, rhs, .. } = &new_consumer else {
+            panic!("consumer stays a BinOp");
+        };
+        assert_eq!(*lhs, v(4), "kept term is the earliest And");
+        assert_eq!(*rhs, v(7), "composite is computed at the latest slot");
+    }
+
+    #[test]
+    fn maj_kept_term_is_the_earliest_and() {
+        // The canonical left-associated MAJ source (sha256's spelling):
+        // ((x&y) ^ (x&z)) ^ (y&z). Three sound kept choices exist; the
+        // matcher must keep And(x,y) — the FIRST And — so the composite
+        // computes last (the GCC shape, no park between composite and
+        // consumer).
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)), // And(x, y) at idx 0  [KEPT]
+            and3(5, v(0), v(2)), // And(x, z) at idx 1  [→ Xor(x,y)]
+            and3(6, v(1), v(2)), // And(y, z) at idx 2  [→ And(z, xor)]
+            xor3(7, v(4), v(5)), // inner at idx 3
+            xor3(8, v(7), v(6)), // consumer at idx 4
+        ]);
+        assert_rewrite_bit_exact(&fx, 4);
+        let (new_consumer, pending) = match_bool_mux_algebra(
+            v(7),
+            v(6),
+            IrBinOp::Xor,
+            Value(8),
+            IrType::U32,
+            0,
+            4,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the majority must fold");
+        let Instruction::BinOp { lhs, rhs, .. } = &new_consumer else {
+            panic!("consumer stays a BinOp");
+        };
+        assert_eq!(*lhs, v(4), "kept term is And(x,y), the earliest");
+        assert_eq!(*rhs, v(6), "composite is the old And(y,z) slot");
+        // The repurposes: idx 1 becomes the Xor, idx 2 the composite And.
+        let mut kinds = [None, None];
+        for (_, ii, inst) in &pending {
+            match *ii {
+                1 => kinds[0] = Some(inst.clone()),
+                2 => kinds[1] = Some(inst.clone()),
+                _ => panic!("unexpected repurpose index"),
+            }
+        }
+        assert!(matches!(
+            kinds[0],
+            Some(Instruction::BinOp {
+                op: IrBinOp::Xor,
+                ..
+            })
+        ));
+        assert!(matches!(
+            kinds[1],
+            Some(Instruction::BinOp {
+                op: IrBinOp::And,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn maj_right_assoc_source_keeps_earliest_too() {
+        // (x&y) ^ ((x&z) ^ (y&z)) — the third And is the consumer's FIRST
+        // arm. Same kept-earliest truth.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)), // And(x, y) at idx 0  [KEPT]
+            and3(5, v(0), v(2)), // And(x, z) at idx 1
+            and3(6, v(1), v(2)), // And(y, z) at idx 2
+            xor3(7, v(5), v(6)), // inner at idx 3
+            xor3(8, v(4), v(7)), // consumer at idx 4
+        ]);
+        let (new_consumer, _) = match_bool_mux_algebra(
+            v(4),
+            v(7),
+            IrBinOp::Xor,
+            Value(8),
+            IrType::U32,
+            0,
+            4,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the majority must fold");
+        let Instruction::BinOp { lhs, .. } = &new_consumer else {
+            panic!("consumer stays a BinOp");
+        };
+        assert_eq!(*lhs, v(4), "kept term is And(x,y), the earliest");
+    }
+
+    #[test]
+    fn distributive_defers_to_majority_outer() {
+        // The sha256 defect shape: at the INNER consumer
+        // ((x&y) ^ (x&z)) the plain distributive fold used to fire first
+        // and destroy the majority tree (fixing the kept term LAST — the
+        // park). With the outer completing the majority, the inner must
+        // DECLINE and leave the tree for Pattern C.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)), // And(x, y)
+            and3(5, v(0), v(2)), // And(x, z)
+            and3(6, v(1), v(2)), // And(y, z)
+            xor3(7, v(4), v(5)), // INNER consumer (the distributive pair)
+            xor3(8, v(7), v(6)), // outer consumer (completes the majority)
+        ]);
         assert!(
             match_bool_mux_algebra(
-                v(8),
-                v(7),
+                v(4),
+                v(5),
                 IrBinOp::Xor,
-                Value(9),
+                Value(7),
                 IrType::U32,
                 0,
-                5,
+                3,
                 &fx.defs,
                 &fx.use_counts,
                 &fx.def_loc,
+                false,
+            )
+            .is_none(),
+            "the inner distributive must defer to the majority"
+        );
+        // ... and the outer fires with kept = the earliest And.
+        let (new_consumer, _) = match_bool_mux_algebra(
+            v(7),
+            v(6),
+            IrBinOp::Xor,
+            Value(8),
+            IrType::U32,
+            0,
+            4,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the outer majority must fold");
+        let Instruction::BinOp { lhs, .. } = &new_consumer else {
+            panic!("consumer stays a BinOp");
+        };
+        assert_eq!(*lhs, v(4), "kept term is And(x,y), the earliest");
+    }
+
+    #[test]
+    fn distributive_still_fires_when_outer_is_not_majority() {
+        // ((x&y) ^ (x&z)) ^ (x&w) — the outer shares the selector but is
+        // NOT a majority (no (y,z)-style third pairwise And): the inner
+        // distributive must still fire (cascading x & ((y^z)^w)).
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            and3(6, v(0), Operand::Value(Value(9))),
+            xor3(7, v(4), v(5)),
+            xor3(8, v(7), v(6)),
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(7),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
+            )
+            .is_some(),
+            "a non-majority outer must not suppress the distributive"
+        );
+    }
+
+    #[test]
+    fn mux_ch_defers_to_andn_fusion_under_bmi() {
+        // Not IMMEDIATELY before its And (the ~x-side arm): the fusion is
+        // predictable, so under BMI1 the mux fold must decline and leave
+        // the Not+And for emit_and_not_impl's 3-operand ANDN.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)), // And(x, y) at idx 0
+            not3(3, v(0)),       // ~x at idx 1 — adjacent to the And below
+            and3(5, v(3), v(2)), // And(~x, z) at idx 2
+            xor3(6, v(4), v(5)), // consumer at idx 3
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                true,
+            )
+            .is_none(),
+            "BMI1 must defer the CH fold to the andn fusion"
+        );
+        // Without BMI1 the same shape folds (the baseline truth).
+        let fx2 = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(0), v(1)),
+            and3(5, v(3), v(2)),
+            xor3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx2, 3);
+    }
+
+    #[test]
+    fn mux_ch_andn_defer_requires_not_single_use() {
+        // The Not feeds a second reader: the backend fusion cannot fire
+        // (detect_and_not_fusions requires the single-use Not), so the
+        // mux fold must fire even under BMI1.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            not3(3, v(0)),
+            and3(5, v(3), v(2)),
+            xor3(6, v(4), v(5)),
+            xor3(7, v(3), v(2)), // second reader of the Not
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                true,
+            )
+            .is_some(),
+            "a multi-use Not cannot fuse; the mux fold must fire"
+        );
+    }
+
+    #[test]
+    fn mux_ch_andn_defer_requires_adjacency() {
+        // The Not is NOT immediately before the ~x-side And (the (x,y)
+        // And sits between): the fusion cannot fire, so the mux fold
+        // must fire even under BMI1.
+        let fx = fixture(vec![
+            not3(3, v(0)),       // ~x at idx 0
+            and3(4, v(0), v(1)), // And(x, y) at idx 1 — in between
+            and3(5, v(3), v(2)), // And(~x, z) at idx 2
+            xor3(6, v(4), v(5)), // consumer at idx 3
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                true,
+            )
+            .is_some(),
+            "a non-adjacent Not cannot fuse; the mux fold must fire"
+        );
+    }
+
+    #[test]
+    fn maj_two_multi_use_terms_decline() {
+        // Two of the three pairwise Ands have second readers: whichever
+        // term is kept, one multi-use And must be repurposed — the
+        // majority fold declines (fail-closed).
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),  // And(x, y) — multi-use below
+            and3(5, v(0), v(2)),  // And(x, z)
+            and3(6, v(1), v(2)),  // And(y, z) — multi-use below
+            xor3(7, v(4), v(5)),  // inner
+            xor3(8, v(7), v(6)),  // consumer
+            xor3(9, v(4), v(2)),  // second reader of And(x,y)
+            xor3(10, v(6), v(0)), // second reader of And(y,z)
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(7),
+                v(6),
+                IrBinOp::Xor,
+                Value(8),
+                IrType::U32,
+                0,
+                4,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
             )
             .is_none()
         );

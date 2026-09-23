@@ -423,6 +423,19 @@ gate "call-arg-staging" fast \
 gate "lea-hoist-rorx" fast \
     bash tests/regression/check_lea_hoist_rorx.sh
 
+# CH/MAJ oracle consensus: andn-gated mux fold, kept-earliest majority,
+# acc-resident ALU consumption, zero exposed forwards (negative-verified
+# against the pre-change tree: 0 andn + the loop slot shape fail there).
+gate "ch-maj-codegen" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_ch_maj_codegen.sh
+
+# Worst-15 follow-up (session 586): nbody pair-loop load CSE and same-value
+# FP squares read the register once. The rbtree derived-IV recurrence was
+# removed after the S46 CI RED post-mortem (scalar flavor = measured net
+# loss, now opt-in via CCC_IVSR_SCALAR_DERIVED=1).
+gate "nbody-rbtree-perf-shapes" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_nbody_rbtree_perf_shapes.sh
+
 # Cross-PR interaction red-team: FMA families x copy brackets x
 # if-conversion x constant promotion x NonZero x the AVX1+FMA target
 # class, bit-exact vs the reference compiler at matched march (canonical

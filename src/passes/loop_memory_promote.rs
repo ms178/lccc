@@ -399,6 +399,7 @@ pub(crate) fn resolve_lin_form(
     defs: &FxHashMap<u32, &Instruction>,
     lp_body: &FxHashSet<usize>,
     def_block: &FxHashMap<u32, usize>,
+    multi_def: &FxHashSet<u32>,
     cur_header: usize,
     v: Value,
     fuel: u8,
@@ -410,13 +411,36 @@ pub(crate) fn resolve_lin_form(
     let inst = *defs.get(&v.0)?;
     let def_bi = def_block.get(&v.0).copied().unwrap_or(usize::MAX);
 
+    // COPY-WEB LEAF: a value with more than one defining instruction (a
+    // post-phi-coalescing induction web: `v ← init` in the preheader,
+    // `v' = v + k; v ← v'` on the latch) has position-dependent content —
+    // no single def describes it. Treat it as an opaque SYMBOL LEAF: the
+    // form stays exact at each use site, and every cross-position
+    // consumer already invalidates on the web's redefinition
+    // (redundant_loads' sym-redefinition guard; LICM/loop-memory-promote
+    // loop-defined gates: a web defined inside the loop is never
+    // invariant, one defined outside it is stable across the loop by
+    // dominance). Before this arm, resolution followed one def into the
+    // init/backedge cycle, burned its fuel and returned `None` — every
+    // copy-web-driven array access (nbody's `bodies[i].*`, `bodies[j].*`)
+    // was opaque to the whole alias engine, so field loads re-loaded
+    // each iteration and same-address loads never merged.
+    if multi_def.contains(&v.0) {
+        return Some(LinForm {
+            root: 0,
+            syms: vec![(v.0, 1)],
+            konst: 0,
+            march: 0,
+        });
+    }
+
     if def_bi == cur_header {
         if matches!(inst, Instruction::Phi { .. }) {
             let (init_op, stride) = striding_phi(defs, v)?;
             let mut f = match init_op {
-                Operand::Value(init_v) => {
-                    resolve_lin_form(func, defs, lp_body, def_block, cur_header, init_v, fuel)?
-                }
+                Operand::Value(init_v) => resolve_lin_form(
+                    func, defs, lp_body, def_block, multi_def, cur_header, init_v, fuel,
+                )?,
                 Operand::Const(c) => LinForm {
                     root: 0,
                     syms: vec![],
@@ -434,24 +458,29 @@ pub(crate) fn resolve_lin_form(
         Instruction::Copy {
             src: Operand::Value(src),
             ..
-        } => resolve_lin_form(func, defs, lp_body, def_block, cur_header, *src, fuel),
+        } => resolve_lin_form(
+            func, defs, lp_body, def_block, multi_def, cur_header, *src, fuel,
+        ),
         Instruction::Cast {
             src: Operand::Value(src),
             from_ty,
             to_ty,
             ..
-        } if from_ty.size() <= to_ty.size() => {
-            resolve_lin_form(func, defs, lp_body, def_block, cur_header, *src, fuel)
-        }
+        } if from_ty.size() <= to_ty.size() => resolve_lin_form(
+            func, defs, lp_body, def_block, multi_def, cur_header, *src, fuel,
+        ),
         Instruction::GetElementPtr { base, offset, .. } => {
-            let mut f = resolve_lin_form(func, defs, lp_body, def_block, cur_header, *base, fuel)?;
+            let mut f = resolve_lin_form(
+                func, defs, lp_body, def_block, multi_def, cur_header, *base, fuel,
+            )?;
             match offset {
                 Operand::Const(c) => {
                     f.konst = f.konst.checked_add(c.to_i64()?)?;
                 }
                 Operand::Value(ov) => {
-                    let g =
-                        resolve_lin_form(func, defs, lp_body, def_block, cur_header, *ov, fuel)?;
+                    let g = resolve_lin_form(
+                        func, defs, lp_body, def_block, multi_def, cur_header, *ov, fuel,
+                    )?;
                     f = merge_forms(f, g)?;
                 }
             }
@@ -464,13 +493,18 @@ pub(crate) fn resolve_lin_form(
             ..
         } => match (lhs, rhs) {
             (Operand::Value(a), Operand::Value(b)) => {
-                let fa = resolve_lin_form(func, defs, lp_body, def_block, cur_header, *a, fuel)?;
-                let fb = resolve_lin_form(func, defs, lp_body, def_block, cur_header, *b, fuel)?;
+                let fa = resolve_lin_form(
+                    func, defs, lp_body, def_block, multi_def, cur_header, *a, fuel,
+                )?;
+                let fb = resolve_lin_form(
+                    func, defs, lp_body, def_block, multi_def, cur_header, *b, fuel,
+                )?;
                 merge_forms(fa, fb)
             }
             (Operand::Value(a), Operand::Const(c)) | (Operand::Const(c), Operand::Value(a)) => {
-                let mut fa =
-                    resolve_lin_form(func, defs, lp_body, def_block, cur_header, *a, fuel)?;
+                let mut fa = resolve_lin_form(
+                    func, defs, lp_body, def_block, multi_def, cur_header, *a, fuel,
+                )?;
                 fa.konst = fa.konst.checked_add(c.to_i64()?)?;
                 Some(fa)
             }
@@ -487,7 +521,9 @@ pub(crate) fn resolve_lin_form(
                 return None;
             }
             let scale = 1i64.checked_shl(shift as u32)?;
-            let mut f = resolve_lin_form(func, defs, lp_body, def_block, cur_header, *value, fuel)?;
+            let mut f = resolve_lin_form(
+                func, defs, lp_body, def_block, multi_def, cur_header, *value, fuel,
+            )?;
             if f.root != 0 {
                 return None;
             }
@@ -510,7 +546,9 @@ pub(crate) fn resolve_lin_form(
                 }
                 _ => return None,
             };
-            let mut f = resolve_lin_form(func, defs, lp_body, def_block, cur_header, val_op, fuel)?;
+            let mut f = resolve_lin_form(
+                func, defs, lp_body, def_block, multi_def, cur_header, val_op, fuel,
+            )?;
             if f.root != 0 {
                 return None;
             }
@@ -573,7 +611,9 @@ pub(crate) fn resolve_lin_form(
                 break;
             }
             let (iv_id, ratio, iv_c0) = iv_sym?;
-            let mut f = resolve_lin_form(func, defs, lp_body, def_block, cur_header, init_v, fuel)?;
+            let mut f = resolve_lin_form(
+                func, defs, lp_body, def_block, multi_def, cur_header, init_v, fuel,
+            )?;
             if f.march != 0 {
                 return None;
             }
@@ -635,6 +675,7 @@ fn affine_disjoint(
     defs: &FxHashMap<u32, &Instruction>,
     lp_body: &FxHashSet<usize>,
     def_block: &FxHashMap<u32, usize>,
+    multi_def: &FxHashSet<u32>,
     header_idx: usize,
     cand: Value,
     cand_ty: IrType,
@@ -649,6 +690,7 @@ fn affine_disjoint(
         defs,
         lp_body,
         def_block,
+        multi_def,
         header_idx,
         cand,
         RESOLVE_FUEL,
@@ -658,6 +700,7 @@ fn affine_disjoint(
         defs,
         lp_body,
         def_block,
+        multi_def,
         header_idx,
         store,
         RESOLVE_FUEL,
@@ -934,18 +977,27 @@ fn next_value(func: &mut IrFunction) -> Option<Value> {
     Some(Value(id))
 }
 
-fn collect_defs(func: &IrFunction) -> (FxHashMap<u32, &Instruction>, FxHashMap<u32, usize>) {
+fn collect_defs(
+    func: &IrFunction,
+) -> (
+    FxHashMap<u32, &Instruction>,
+    FxHashMap<u32, usize>,
+    FxHashSet<u32>,
+) {
     let mut defs = FxHashMap::default();
     let mut def_block = FxHashMap::default();
+    let mut multi_def: FxHashSet<u32> = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             if let Some(dest) = inst.dest() {
-                defs.entry(dest.0).or_insert(inst);
+                if defs.insert(dest.0, inst).is_some() {
+                    multi_def.insert(dest.0);
+                }
                 def_block.entry(dest.0).or_insert(bi);
             }
         }
     }
-    (defs, def_block)
+    (defs, def_block, multi_def)
 }
 
 /// Owned snapshot of a legal promotion. Built while `defs` is borrowed,
@@ -1000,7 +1052,7 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
         return None;
     }
 
-    let (defs, def_block) = collect_defs(func);
+    let (defs, def_block, multi_def) = collect_defs(func);
     let paths = pointer_paths(&defs);
     let volatile_roots: FxHashSet<u64> = func
         .blocks
@@ -1156,7 +1208,8 @@ fn find_promotion(func: &IrFunction) -> Option<PromotePlan> {
             let mut may_alias = |other: Value, other_ty: IrType| {
                 !disjoint(&paths, ptr, load_ty, other, other_ty)
                     && !affine_disjoint(
-                        func, &defs, &lp.body, &def_block, lp.header, ptr, load_ty, other, other_ty,
+                        func, &defs, &lp.body, &def_block, &multi_def, lp.header, ptr, load_ty,
+                        other, other_ty,
                     )
             };
             for (&other_ptr, other_stores) in &stores {
