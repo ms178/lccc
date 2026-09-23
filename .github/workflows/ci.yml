@@ -503,6 +503,7 @@ jobs:
           bash tests/regression/check_tight_loop_align.sh
           bash tests/regression/check_i686_atomics.sh
           bash tests/regression/check_i686_tls_ie_relax.sh
+          bash tests/regression/check_narrow_cmp_flag_law.sh
           bash tests/regression/check_boot_size_measurement.sh
           bash tests/regression/check_env_test_hygiene.sh
           bash tests/regression/check_peephole_whitespace.sh
