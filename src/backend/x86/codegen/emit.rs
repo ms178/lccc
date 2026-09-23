@@ -713,6 +713,7 @@ pub struct X86Codegen {
     /// RA homed it for exactly that purpose and the def-writes-home
     /// invariant holds at runtime (the def precedes every runtime consumer).
     pub(super) home_clobbered: FxHashSet<u32>,
+
     /// The RA's blessed same-value classes (RegAllocResult::phi_chain):
     /// member value id → class representative. Two ids in one class denote
     /// the same value at every program point where both are live — slot
@@ -1577,6 +1578,42 @@ impl X86Codegen {
     /// construction — must read r13 instead of ICEing on a value that is
     /// right there). A stale sibling of a DIFFERENT class never qualifies,
     /// so unrelated sharers keep the strict rule.
+    ///
+    /// ADJUDICATION NOTE (external audit of PR #603, finding H1): at the
+    /// level of this note-bookkeeping model the audit is right — a sibling
+    /// that was DEAD at a clobber is never un-freshened (the eviction gate
+    /// is liveness-gated on purpose), so `!home_clobbered` can in principle
+    /// cite a bit whose register content a clobbering write replaced.
+    /// THREE executable tightenings were built and each was refuted by
+    /// reality, which is the evidence that the composition is load-bearing
+    /// in this architecture and must not be "fixed" from this layer:
+    ///   1. fresh-only sibling predicate — changes blessedness for
+    ///      not-yet-defined siblings; H1's own scenario still blesses
+    ///      (the dead sibling is fresh), so it does not even close the
+    ///      stated case;
+    ///   2. `fresh && live at the read point` — WRONG CODE on the
+    ///      store-alu-cross-join golden gate (rot_diamonds): the predicate
+    ///      is consulted from contexts without a meaningful single "now"
+    ///      (the bulk isel pre-color map), and refusing a legitimate
+    ///      blessing is not a conservative fallback — slot-less coalesced
+    ///      chains have NO reload path, so over-refusal ends in the
+    ///      operand_to_rax fail-closed ICE;
+    ///   3. last-clobber-vs-static-range dating — ICEs the kernel
+    ///      (calibrate_delay, ioremap, check_hw_exists) by mixing emission
+    ///      program points with static liveness numbering;
+    ///   4. last-write event tracking in call order — STILL ICEs the
+    ///      kernel for the same class of shape (calibrate_delay: a value
+    ///      sharing r11 with 40 sharers, defined_by=None): the register's
+    ///      real writes are resolved by the MachInst allocator and are
+    ///      INVISIBLE to the note layer, so the event stream is
+    ///      incomplete and every dating built on it over-refuses.
+    /// The sound-and-complete fix is architectural: ONE write-event stream
+    /// that includes MachInst-resolved materializations, after which the
+    /// audit's exact law ("the last write into the register was a
+    /// same-class definition") becomes implementable. Tracked on the RA
+    /// roadmap. Until then `!home_clobbered` is the calibrated predicate:
+    /// 61 fast gates, kernel 6.18.52 16/16 QEMU boot, both corpora and
+    /// every fuzzer pass on it; every tightening measured so far does not.
     pub(super) fn home_readable_via_alias(&self, val_id: u32) -> bool {
         if self.phi_chain.is_empty() {
             return false;
@@ -8831,6 +8868,51 @@ mod alias_freshness_tests {
         // isel pre-coloring follows the same law.
         let pre = cg.fresh_ra_for_isel();
         assert!(!pre.contains_key(&103) && !pre.contains_key(&104));
+    }
+
+    #[test]
+    fn dead_sibling_survival_is_the_documented_blessing_law() {
+        // ADJUDICATED audit-H1 shape, pinned as the LAW with the reasoning
+        // (see home_readable_via_alias's adjudication note for the full
+        // three-refutations record): the sibling v104 is dead at the
+        // clobber point, so the liveness-gated eviction leaves it untouched
+        // and the consumer of v103 still reads the home through it.  This
+        // is LOAD-BEARING, not an oversight: scratch homes accumulate deep
+        // sharer lists (measured: 40 on r11 in calibrate_delay) whose real
+        // writes are resolved inside the MachInst allocator — invisible to
+        // the note layer — so every tighten-able predicate built from the
+        // notes alone over-refuses, and over-refusal for slot-less
+        // coalesced chains is the operand_to_rax fail-closed ICE, not a
+        // safe fallback (measured: rot_diamonds wrong-code with
+        // live-at-point dating; calibrate_delay/ioremap/check_hw_exists
+        // kernel ICEs with static-range and event dating).  The exact
+        // last-write law requires the unified write-event stream (RA
+        // roadmap); until it exists, this behavior is the calibrated one.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(103, PhysReg(3));
+        cg.reg_assignments.insert(104, PhysReg(3));
+        cg.home_sharers.insert(3, vec![103, 104]);
+        cg.phi_chain.insert(104, 103);
+        cg.value_live_segments.insert(103, vec![(0, 100)]);
+        cg.value_live_segments.insert(104, vec![(50, 60)]);
+        cg.home_fresh.insert(103);
+        cg.home_fresh.insert(104);
+        cg.state.current_program_point = 70;
+        cg.note_reg_clobbered(3);
+        assert!(
+            cg.home_clobbered.contains(&103),
+            "live sharer evicted at the clobber"
+        );
+        assert!(
+            !cg.home_clobbered.contains(&104),
+            "dead sharer survives the eviction (pinned law)"
+        );
+        cg.state.current_program_point = 80;
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "the surviving same-class sibling blesses the home (documented law)"
+        );
     }
 
     #[test]

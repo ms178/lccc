@@ -7251,6 +7251,7 @@ fn eliminate_redundant_test_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
             ("xorw", MoveSize::W),
             ("andb", MoveSize::B),
             ("orb", MoveSize::B),
+            ("xorb", MoveSize::B),
         ];
         for (mnem, size) in candidates {
             if let Some(rest) = s.strip_prefix(mnem) {
@@ -8530,13 +8531,55 @@ fn flags_reader_window_ok(
                     return false;
                 }
             }
-            LineKind::Cmp
-            | LineKind::Label
-            | LineKind::Jmp
-            | LineKind::JmpIndirect
-            | LineKind::Call
-            | LineKind::Ret
-            | LineKind::RetN => return true,
+            // Flag-WRITING control/compare flow: the compare's flags are
+            // replaced (Cmp) or die (Call clobbers them, Ret/RetN end the
+            // path) — the window is proven up to here.
+            LineKind::Cmp | LineKind::Call | LineKind::Ret | LineKind::RetN => return true,
+            // Dynamic target: the flags flow wherever the register points,
+            // and no scan can vet that block.  Fail closed.
+            LineKind::JmpIndirect => return false,
+            // FLAGS CROSS AN UNCONDITIONAL JMP (audit-of-#603 M1): `jmp`
+            // preserves EFLAGS and the `je` before it does not write them,
+            // so the TARGET block's readers decode exactly the flags this
+            // window is vetting — a `jl` at the target reads a rewritten
+            // compare precisely like an adjacent `jl` would.  Follow the
+            // direct target label (a small hop budget covers jmp-to-jmp
+            // chains; backward or unresolvable targets fail closed — the
+            // flags provably reach that block, so refusing the fold is the
+            // only sound linear answer).
+            LineKind::Jmp => {
+                let Some(target) = t.split_whitespace().nth(1) else {
+                    return false;
+                };
+                let want = format!("{target}:");
+                let mut hops = 0;
+                let mut cursor = next_non_nop(infos, k + 1);
+                loop {
+                    if hops >= 8 || cursor >= infos.len() {
+                        return false;
+                    }
+                    hops += 1;
+                    if infos[cursor].kind == LineKind::Label
+                        && trimmed(store, &infos[cursor], cursor) == want
+                    {
+                        break;
+                    }
+                    cursor = next_non_nop(infos, cursor + 1);
+                }
+                // Continue the scan from the target label; the bottom of
+                // the loop advances past it (the label arm below keeps
+                // scanning, so the target block's readers are vetted).
+                k = cursor;
+            }
+            // FLAGS CROSS A LABEL (audit-of-#603 M1): a label emits no
+            // bytes — fallthrough from the compare carries its flags into
+            // the block (`cmp; je L1; L2: jl` decodes the compare's flags
+            // on the fallthrough path).  Other predecessors of the label
+            // bring their own flags, so vetting the subsequent readers as
+            // OUR readers is the conservative reading: an inadmissible
+            // reader after the label vetoes the fold exactly like an
+            // adjacent one would.
+            LineKind::Label => {}
             // Opaque user asm may read or write flags for reasons no pass
             // can see.
             LineKind::InlineAsm => return false,
@@ -8605,8 +8648,14 @@ fn flags_reader_window_ok(
                         | "negb"
                         | "negw"
                         | "negl"
-                        | "adc"
-                        | "sbb"
+                        // NO bare `adc`/`sbb` here on purpose: the emitters
+                        // always spell them `adcl`/`sbbl`, so a bare entry is
+                        // dead — and worse, a booby trap.  adc/sbb are CF
+                        // (and AF) READERS; if someone "fixed" the entry to
+                        // match the suffixed form, an `adcl` inside the
+                        // window would CLOSE it as a flag writer instead of
+                        // vetoing the fold.  They fall to the unknown arm and
+                        // fail closed (audit-of-#603 L2).
                         | "shlb"
                         | "shlw"
                         | "shll"
@@ -8676,7 +8725,9 @@ fn flags_reader_window_ok(
 /// FLAG LAW: a logical op clears CF and OF and sets ZF/SF/PF from its
 /// result; so does `cmpl $0` over that same result — every flag of line i
 /// is already exactly what line j would produce, at ANY width match, so
-/// this fold needs no reader gate whatsoever (unlike the arithmetic
+/// the `test*` spelling of the deleted test needs no reader gate at all
+/// (TEST leaves AF undefined exactly like the logical op, so the deletion
+/// cannot change any flag a consumer could observe — unlike the arithmetic
 /// folds).  WIDTH LAW: the test must read exactly the bits the logical op
 /// wrote and flagged — `testl` after a 32-bit `andl`, `testw %ax,%ax`
 /// after `andw`, `testb` after `andb`.  A narrower test reads bits the
@@ -8756,6 +8807,23 @@ fn fold_logical_zero_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
             }
         };
         if !redundant {
+            i += 1;
+            continue;
+        }
+        // AF LAW (audit-of-#603 M2): `cmpl $0, %R` ARCHITECTURALLY DEFINES
+        // AF=0, while and/or/xor leave AF undefined — deleting the compare
+        // would turn a defined AF into an undefined one for the multi-
+        // precision consumers the kernel emits (`adcl`/`sbbl` read CF AND
+        // AF; `lahf`/`pushf` read everything).  jcc/setcc readers never
+        // touch AF, so admitting every condition mnemonic is exact and the
+        // oracle's unknown arm vetoes any other flag consumer in the
+        // window.  The `test*` spelling needs no gate: TEST leaves AF
+        // undefined exactly like the logical op, so the deletion is
+        // AF-neutral.
+        if width == MoveSize::L
+            && tj == format!("cmpl $0, {dst_text}")
+            && !flags_reader_window_ok(store, infos, j, ZERO_TEST_ALL_JCC, ZERO_TEST_ALL_SETCC)
+        {
             i += 1;
             continue;
         }
@@ -9188,26 +9256,41 @@ fn base_only_indirect(src: &str) -> bool {
 ///   diverges the same way; OF is 0 on the 32-bit side but not on the
 ///   w-bit side (`jo/jno` refuse).
 /// * `sext/sext`: sign-extension is monotone in the signed AND the
-///   unsigned order, so ZF, CF and SF^OF are width-invariant; PF is
-///   width-invariant because the low 8 bits of a difference do not
-///   depend on the width; OF is width-invariant for sign-extended
-///   operands (the classic narrow-vs-wide signed-compare agreement).
-///   **Raw SF is NOT**: `127 - (-1)` gives SF=0 at 32 bits but SF=1 at 8
+///   unsigned order, so ZF, CF and the signed-compare expression SF^OF
+///   are width-invariant; PF is width-invariant because the low 8 bits
+///   of a difference do not depend on the width.  **Raw SF is NOT**: `127 - (-1)` gives SF=0 at 32 bits but SF=1 at 8
 ///   bits (the 8-bit difference wraps bit 7 while the 32-bit difference
 ///   does not reach bit 31).  **Raw OF is NOT either**: `0 - (-128)`
 ///   overflows the byte (OF=1) but not the 32-bit difference (OF=0).
 ///   `js/jns/sets/setns` AND `jo/jno/seto/setno` therefore REFUSE — the
 ///   admissible signed set is exactly the conditions whose Boolean flag
-///   EXPRESSIONS (ZF, CF, PF, SF^OF) are width-invariant — and the
-///   exhaustive 2^16 pair model in `pair_flag_model_exhaustive` proves
-///   every admissible mnemonic decides identically at both widths (it
-///   caught the jo/jno inclusion this comment originally carried).  Anything outside these sets — cmov-style `Other` readers,
+///   EXPRESSIONS (ZF, CF, PF, SF^OF) are width-invariant.
+///   `pair_flag_model_exhaustive` proves every admissible mnemonic decides
+///   identically at both widths EXHAUSTIVELY at w=8 (all 2^16 pairs) and
+///   at the w=16 boundary rows (sign/zero boundaries, wrap points, and
+///   the two divergence corners); the word-width interior rides on the
+///   width-generic identities themselves (the model caught the jo/jno
+///   inclusion this comment originally carried).  Anything outside these sets — cmov-style `Other` readers,
 ///   flag chains — must veto.  The veto is enforced across the WHOLE
 ///   flags-live window by `flags_reader_window_ok` (the adace81a law):
 ///   a second reader further down — `je` then `jl` on the same compare —
 ///   is just as bound by it as the immediate one.
 const PAIR_JCC_EQ_UNSAFE: &[&str] = &["je", "jne", "jb", "jae", "jbe", "ja"];
 const PAIR_SETCC_EQ_UNSAFE: &[&str] = &["sete", "setne", "setb", "setae", "setbe", "seta"];
+/// Every jcc/setcc mnemonic the i686 emitters produce — the "no condition
+/// restriction, everything else vetoes" argument for the AF-sensitive
+/// zero-compare deletion gate.  jcc/setcc read ZF/CF/SF/OF/PF but never
+/// AF, so for that gate they are exactly the safe readers; any OTHER
+/// flag consumer (`adcl`, `sbbl`, `lahf`, `pushf`) is an `Other` line and
+/// fails the window closed (audit-of-#603 M2).
+const ZERO_TEST_ALL_JCC: &[&str] = &[
+    "je", "jne", "js", "jns", "jp", "jnp", "jb", "jae", "jbe", "ja", "jl", "jge", "jle", "jg",
+    "jo", "jno", "jc", "jnc",
+];
+const ZERO_TEST_ALL_SETCC: &[&str] = &[
+    "sete", "setne", "sets", "setns", "setp", "setnp", "setb", "setae", "setbe", "seta", "setl",
+    "setge", "setle", "setg", "seto", "setno", "setc", "setnc",
+];
 const PAIR_JCC_SIGNED_SAFE: &[&str] = &[
     "je", "jne", "jp", "jnp", "jb", "jae", "jbe", "ja", "jl", "jge", "jle", "jg",
 ];
@@ -20627,27 +20710,161 @@ mod tests {
         assert!(out.contains("je .Lok"), "reader kept:\n{out}");
     }
 
+    // ── Counterexamples (external audit of PR #603: M1/M2/L2) ────────────────
+
+    #[test]
+    fn zext_pair_refuses_reader_laundered_through_unconditional_jump() {
+        // M1: flags cross an unconditional `jmp` — the `je` does not write
+        // them, so the `jl` at the jmp's target decodes whatever flags the
+        // rewritten compare produces.  A zext/zext pair must refuse (jl is
+        // not width-invariant there); closing the window at the jmp used to
+        // let the fold through.
+        let asm = pair_fn(
+            "    movzwl %bx, %edi\n    movzwl %si, %eax\n    cmpl %eax, %edi\n    je .Lok\n    jmp .Lx\n.Lx:\n    jl .Llt\n.Lok:\n    movl %ebx, 8(%esp)\n.Llt:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpl %eax, %edi"),
+            "jmp-laundered signed reader must refuse a zext pair:\n{out}"
+        );
+    }
+
+    #[test]
+    fn zext_pair_refuses_reader_at_distant_jmp_target() {
+        // M1 (no-reader arm): the compare's only reader sits at a DISTANT
+        // jmp target — the fallthrough text is flag-blind, so a scan that
+        // closes at the jmp reports a clean window while the real reader
+        // decodes the deleted compare's flags.
+        // The target's jl must be non-trivial (jump over a body), otherwise
+        // the redundant-jump pass deletes it and the premise dissolves.
+        let asm = pair_fn(
+            "    movzwl %bx, %edi\n    movzwl %si, %eax\n    cmpl %eax, %edi\n    jmp .Lfar\n    movl %ebx, 8(%esp)\n.Lfar:\n    jl .Llt\n    movl %ecx, 8(%esp)\n.Llt:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpl %eax, %edi"),
+            "distant-target reader must refuse the fold:\n{out}"
+        );
+        assert!(out.contains("jl .Llt"), "reader kept:\n{out}");
+    }
+
+    #[test]
+    fn sext_pair_still_folds_with_reader_across_a_label() {
+        // M1 positive control: a label is NOT a flag barrier — the window
+        // scan continues past it, and an ADMISSIBLE reader (jl on a
+        // sext/sext pair) must still fold.  Guards against "fixing" M1 by
+        // refusing at labels.
+        let asm = pair_fn(
+            "    movsbl %cl, %edx\n    movsbl %bl, %eax\n    cmpl %eax, %edx\n.Lmid:\n    jl .Llt\n    movl %ebx, 8(%esp)\n.Llt:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpb %bl, %cl"),
+            "admissible reader across a label still folds:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sext_pair_still_folds_with_reader_at_trivial_jmp_target() {
+        // M1 positive control: the scan follows the jmp to its target and
+        // vets the reader THERE — admissible for sext, so the fold stands.
+        let asm = pair_fn(
+            "    movsbl %cl, %edx\n    movsbl %bl, %eax\n    cmpl %eax, %edx\n    jmp .Lnext\n.Lnext:\n    jl .Llt\n    movl %ebx, 8(%esp)\n.Llt:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpb %bl, %cl"),
+            "admissible reader at the jmp target still folds:\n{out}"
+        );
+    }
+
+    #[test]
+    fn zero_test_cmpl_zero_arm_refuses_af_reader_in_window() {
+        // M2: `cmpl $0, %R` ARCHITECTURALLY DEFINES AF=0, while and/or/xor
+        // leave AF undefined — deleting the compare changes defined AF into
+        // undefined AF for any multi-precision consumer (adcl reads CF *and*
+        // AF).  The `test*` spelling is AF-neutral and stays ungated.
+        let asm = pair_fn(
+            "    andl $1, %eax\n    cmpl $0, %eax\n    adcl $0, %edx\n    movl %esi, %eax\n    ret\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpl $0, %eax"),
+            "AF-defining zero-test must survive an AF reader:\n{out}"
+        );
+    }
+
+    #[test]
+    fn zero_test_testl_arm_still_folds_before_af_reader() {
+        // M2 scope control: the self-test spelling leaves AF undefined both
+        // before and after — the deletion is flag-neutral even with an
+        // adcl in the window.
+        let asm = pair_fn(
+            "    andl $1, %eax\n    testl %eax, %eax\n    adcl $0, %edx\n    movl %esi, %eax\n    ret\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            !out.contains("testl %eax, %eax"),
+            "AF-neutral self-test still deletes:\n{out}"
+        );
+    }
+
+    #[test]
+    fn zero_test_cmpl_zero_arm_still_folds_before_jcc_reader() {
+        // M2 scope control: jcc/setcc readers never read AF, so a je in the
+        // window must not block the cmpl-$0 deletion.
+        let asm = pair_fn(
+            "    andl $1, %eax\n    cmpl $0, %eax\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n    movl %esi, %eax\n    ret\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            !out.contains("cmpl $0, %eax"),
+            "jcc-only window still deletes the zero-compare:\n{out}"
+        );
+    }
+
+    #[test]
+    fn redundant_test_pass_deletes_testb_after_xorb_zero_idiom() {
+        // L2: flag_equiv_producer listed andb/orb but omitted xorb — with
+        // the zero-test pass disabled (the layered defense off), the
+        // redundant-test pass must still delete the self-test after the xor
+        // zero idiom (xor clears every flag-write-relevant difference: its
+        // result's flags equal test result,result).
+        let _guard = crate::test_support::EnvGuard::set("CCC_NO_LOGICAL_TEST_FOLD", "1");
+        let asm = pair_fn(
+            "    xorb %al, %al\n    testb %al, %al\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n    movl %esi, %eax\n    ret\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            !out.contains("testb %al, %al"),
+            "xorb zero idiom must kill the redundant self-test:\n{out}"
+        );
+    }
+
     #[test]
     fn dead_and_flags_past_unconditional_jump_are_not_window_readers() {
-        // Old corner (a), now pinned: `js` after the `jmp` reads whatever
-        // flags control flow delivered to .Lx — NOT the AND's flags — so it
-        // must neither veto the fold nor silently bless it as a covered
-        // reader.  The unconditional jump PROVES the window (the oracle's
-        // terminal arm), the je folds, and the distant js stays untouched.
+        // CORRECTED corner (a).  The original pin asserted the fold, on the
+        // reasoning that the `js` at .Lx reads "whatever flags control flow
+        // delivered to .Lx — NOT the AND's flags".  Exactly backwards: `je`
+        // and `jmp` PRESERVE flags, so the only path reaching .Lx delivers
+        // the AND's OWN flags to the js — a real, laundered reader.  The
+        // old fold survived only by luck of the mask ($4 gives SF=0 at both
+        // widths); the window oracle now sees through the laundering and
+        // refuses, which is the sound answer for a narrowing whose SF row
+        // is not width-invariant.  (The zero-TEST deletion is a different
+        // shape: it removes a flag-neutral re-write, so no reader anywhere
+        // can observe it.)
         let asm = pair_fn(
             "    andl $4, %eax\n    je .La\n    jmp .Lx\n.Lx:\n    js .Lb\n.La:\n    movl %ebx, 8(%esp)\n.Lb:\n",
         );
         let out = peephole_optimize(asm);
         assert!(
-            out.contains("testb $4, %al"),
-            "je folds to testb; distant js is not a window reader:\n{out}"
+            out.contains("andl $4, %eax"),
+            "js laundered through je;jmp must refuse the narrowing:\n{out}"
         );
-        assert!(out.contains("je .La"), "reader kept:\n{out}");
-        assert!(
-            out.contains("js .Lb"),
-            "unreachable-side reader untouched:\n{out}"
-        );
-        assert!(!out.contains("andl $4"), "AND deleted by the fold:\n{out}");
+        assert!(out.contains("je .La"), "first reader kept:\n{out}");
+        assert!(out.contains("js .Lb"), "laundered reader kept:\n{out}");
+        assert!(!out.contains("testb $4"), "no narrowing happened:\n{out}");
     }
 
     #[test]
@@ -21204,6 +21421,56 @@ mod tests {
                         decides(w8s, "jo"),
                         decides(w32s, "jo"),
                         "OF must diverge for 0 vs -128"
+                    );
+                }
+            }
+        }
+        // WORD-WIDTH (w=16) evidence: an exhaustive 2^32 sweep is out of
+        // reach, so the admissible sets ride on the width-generic flag
+        // identities; the boundary rows pin them where the identities are
+        // tightest — sign/zero boundaries, the wrap points, and the two
+        // known divergence corners.
+        const B16: [u64; 12] = [
+            0x0000, 0x0001, 0x007F, 0x0080, 0x00FF, 0x3FFF, 0x4000, 0x7FFF, 0x8000, 0x8001, 0xFFFE,
+            0xFFFF,
+        ];
+        for a in B16 {
+            for b in B16 {
+                let w16u = flags(a, b, 16);
+                let w32u = flags(a, b, 32);
+                for m in ZEXT_OK {
+                    assert_eq!(
+                        decides(w16u, m),
+                        decides(w32u, m),
+                        "zext16 {a:#x},{b:#x} {m}"
+                    );
+                }
+                let sa = ((a as u16) as i16) as u64 & 0xffff_ffff;
+                let sb = ((b as u16) as i16) as u64 & 0xffff_ffff;
+                let w16s = flags(a, b, 16);
+                let w32s = flags(sa, sb, 32);
+                for m in SEXT_OK {
+                    assert_eq!(
+                        decides(w16s, m),
+                        decides(w32s, m),
+                        "sext16 {a:#x},{b:#x} {m}"
+                    );
+                }
+                // The word-width divergence corners must exist, mirroring
+                // the byte model: 32767 - (-32768) flips raw SF, and
+                // 0 - (-32768) flips raw OF.
+                if a == 0x7FFF && b == 0x8000 {
+                    assert_ne!(
+                        decides(w16s, "js"),
+                        decides(w32s, "js"),
+                        "SF must diverge for 32767 vs -32768"
+                    );
+                }
+                if a == 0 && b == 0x8000 {
+                    assert_ne!(
+                        decides(w16s, "jo"),
+                        decides(w32s, "jo"),
+                        "OF must diverge for 0 vs -32768"
                     );
                 }
             }
