@@ -374,6 +374,24 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_lea_hoist_rorx.sh
 
+      # CH/MAJ oracle consensus (session 585): the SHA-256 mux fold defers
+      # to the backend's 3-operand ANDN under BMI1, the majority keeps its
+      # earliest And (composite last, no park), and the acc-resident ALU
+      # consumption eliminates the exposed store-to-load forwards.
+      - name: Verify CH/MAJ codegen contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_ch_maj_codegen.sh
+
+      # Worst-15 follow-up (session 586): nbody pair-loop load CSE (copy-web
+      # leaves + stride-period field disjointness), same-value FP squares
+      # reading the register once, and the rbtree hash derived-IV recurrence
+      # (negative-verified against the pre-session base: all four fail there).
+      - name: Verify nbody/rbtree perf shape contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_nbody_rbtree_perf_shapes.sh
+
       # Cross-PR interaction red-team (session 574): the per-feature gates
       # pin each PR's own contract; this one pins the INTERACTIONS between
       # the last ten merged PRs — FMA families through copy brackets, calls

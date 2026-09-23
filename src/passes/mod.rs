@@ -932,6 +932,7 @@ pub(crate) fn run_passes(
     x86_avx2: bool,
     x86_sse4_1: bool,
     x86_fma: bool,
+    x86_bmi1: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
     // x86 SIMD register-file availability for the middle end. Under `-mno-sse`
@@ -1859,6 +1860,16 @@ pub(crate) fn run_passes(
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
             let min_rotate_bits = target_min_rotate_bits(target);
+            // Scalar ANDN (BMI1) for the bool-mux algebra's CH fold: the
+            // mux fold must defer to the backend's Not+And -> andn fusion
+            // when the 3-operand form is selectable (emit_and_not_impl).
+            // The CCC_NO_ANDN_FUSION kill switch is resolved here, once —
+            // the same switch supports_and_not consults at emission — so
+            // the fold-time prediction and the emission-time decision
+            // cannot drift within one compilation.
+            let has_scalar_andn = target == crate::backend::Target::X86_64
+                && x86_bmi1
+                && std::env::var_os("CCC_NO_ANDN_FUSION").is_none();
             let n = timed_pass!(
                 "bit_idioms",
                 run_on_visited(module, &dirty, &mut changed, |func| {
@@ -1867,6 +1878,7 @@ pub(crate) fn run_passes(
                         enable_bit_reverse,
                         max_rotate_bits,
                         min_rotate_bits,
+                        has_scalar_andn,
                     )
                 })
             );
@@ -2029,6 +2041,9 @@ pub(crate) fn run_passes(
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
             let min_rotate_bits = target_min_rotate_bits(target);
+            let has_scalar_andn = target == crate::backend::Target::X86_64
+                && x86_bmi1
+                && std::env::var_os("CCC_NO_ANDN_FUSION").is_none();
             let n = timed_pass!(
                 "bit_idioms_post_ifconv",
                 run_on_visited(module, &dirty, &mut changed, |func| {
@@ -2037,6 +2052,7 @@ pub(crate) fn run_passes(
                         enable_bit_reverse,
                         max_rotate_bits,
                         min_rotate_bits,
+                        has_scalar_andn,
                     )
                 })
             );

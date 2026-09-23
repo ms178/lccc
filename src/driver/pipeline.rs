@@ -1810,6 +1810,10 @@ impl Driver {
                 && !self.no_sse
                 && !self.general_regs_only,
             self.enable_fma,
+            // Scalar BMI1 (ANDN) for the middle end's CH-fold defer —
+            // mirrors CodegenOptions::bmi1 for the x86-64 backend (the
+            // i686 backend has no andn fusion, so it stays false there).
+            self.target == Target::X86_64 && self.enable_bmi,
             ra_config.as_ref(),
         );
         if time_phases {

@@ -2164,15 +2164,20 @@ impl X86Codegen {
                         // Stale home, unwritten slot: the def chain was
                         // re-emitted into @target (e.g. a sign-extended
                         // index re-extended from its narrow source slot).
-                    } else if self.state.get_slot(v.0).is_some() {
-                        // Stale home: reload the value from its slot.
-                        self.value_to_reg(v, target_name);
                     } else if self.state.reg_cache.acc_has(v.0, false)
                         || self.state.reg_cache.acc_has(v.0, true)
                     {
+                        // ACC-RESIDENT FIRST (exposed-forward fix): a value
+                        // parked in %eax must be read from %eax, not reloaded
+                        // from its slot — the reload would store-to-load
+                        // forward the park the very next instruction (the
+                        // sha256 MAJ-chain pathology, measured ~5%).
                         self.state
                             .out
                             .emit_instr_reg_reg("    movq", "rax", target_name);
+                    } else if self.state.get_slot(v.0).is_some() {
+                        // Stale home: reload the value from its slot.
+                        self.value_to_reg(v, target_name);
                     } else {
                         // Stale home with no slot/remat/acc path. Reading the
                         // home register would feed the consumer whatever
@@ -2187,6 +2192,16 @@ impl X86Codegen {
                             v.0, self.state.current_func_name
                         );
                     }
+                } else if self.state.reg_cache.acc_has(v.0, false)
+                    || self.state.reg_cache.acc_has(v.0, true)
+                {
+                    // ACC-RESIDENT FIRST (exposed-forward fix, mirroring the
+                    // stale-home chain): %rax holds the value right now; the
+                    // slot below is a memory read — and right after a park it
+                    // is an exposed store-to-load forward.
+                    self.state
+                        .out
+                        .emit_instr_reg_reg("    movq", "rax", target_name);
                 } else if let Some(slot) = self.state.get_slot(v.0) {
                     // Delegate to value_to_reg: it handles allocas (leaq with
                     // over-alignment), vector values, and — critically — loads
@@ -2196,12 +2211,6 @@ impl X86Codegen {
                     // half that shows up in later 64-bit operations (xorq,
                     // addq, ...).
                     self.value_to_reg(v, target_name);
-                } else if self.state.reg_cache.acc_has(v.0, false)
-                    || self.state.reg_cache.acc_has(v.0, true)
-                {
-                    self.state
-                        .out
-                        .emit_instr_reg_reg("    movq", "rax", target_name);
                 } else {
                     // Value not in any register, stack slot, or accumulator cache.
                     // A rematerialisable GlobalAddr stages straight into
@@ -3444,12 +3453,14 @@ impl X86Codegen {
                     self.state
                         .out
                         .emit_instr_reg_reg("    movq", reg_name, "rcx");
-                } else if self.state.get_slot(v.0).is_some() {
-                    self.value_to_reg(v, "rcx");
                 } else if self.state.reg_cache.acc_has(v.0, false)
                     || self.state.reg_cache.acc_has(v.0, true)
                 {
+                    // ACC-RESIDENT FIRST (exposed-forward fix): read the
+                    // %rax copy before touching the slot.
                     self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
+                } else if self.state.get_slot(v.0).is_some() {
+                    self.value_to_reg(v, "rcx");
                 } else {
                     // value_to_reg rebuilds a rematerialisable GlobalAddr (a
                     // value with deliberately no home) and otherwise fails
@@ -5102,11 +5113,142 @@ pub(super) const X86_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r
 /// For instructions where the vreg is a dst (two-address ALU), we need to use
 /// rax as scratch: load→operate→store (or, now, the window allocator's
 /// reload/operate/store).
+/// Fail-closed %rax-touch scan over a MachInst window.
+///
+/// A window is eligible for the acc-resident substitution only when NO
+/// instruction in it can touch %rax — explicitly (a `Phys(RAX)` operand
+/// anywhere, including memory bases) or implicitly (division's rax:rdx
+/// pair, call/return clobbers, the `Raw` escape hatch whose register
+/// effects are invisible). Anything uncertain fails closed: the window
+/// keeps its slot reads, which are always correct.
+/// Every IR value id a MachInst window DEFINES (a Vreg destination).
+///
+/// The acc-resident substitution may only fire for values the window does
+/// not redefine: a read AFTER an in-window definition must observe the
+/// definition's result (the slot write for a spilled Vreg, the home for a
+/// pre-colored one), never the pre-window image still sitting in %rax.
+/// The rotated-latch shape (phi elimination + loop rotation) puts the
+/// `Copy v_phi <- v_next` and the duplicated exit test in ONE window —
+/// the compare must see the copy's new value, not the previous
+/// iteration's park (latch_dead_at_boundaries_segment:
+/// rounds=4214233 instead of 41).
+fn machinst_window_defs(
+    buf: &[super::machinst::MachInst],
+) -> crate::common::fx_hash::FxHashSet<u32> {
+    use super::machinst::{MachInst, MachOperand, MachReg};
+    fn vreg_ids(op: &MachOperand, out: &mut crate::common::fx_hash::FxHashSet<u32>) {
+        if let MachOperand::Reg(MachReg::Vreg(id)) = op {
+            out.insert(*id);
+        }
+    }
+    fn reg_id(r: &MachReg, out: &mut crate::common::fx_hash::FxHashSet<u32>) {
+        if let MachReg::Vreg(id) = r {
+            out.insert(*id);
+        }
+    }
+    let mut defs = crate::common::fx_hash::FxHashSet::default();
+    for inst in buf {
+        match inst {
+            MachInst::Mov { src, dst, .. } | MachInst::FMov { src, dst, .. } => {
+                vreg_ids(src, &mut defs);
+                vreg_ids(dst, &mut defs);
+            }
+            MachInst::Cmov { src, dst, .. } => {
+                vreg_ids(src, &mut defs);
+                reg_id(dst, &mut defs);
+            }
+            MachInst::Movzx { dst, .. } | MachInst::Movsx { dst, .. } => reg_id(dst, &mut defs),
+            MachInst::SetCC { dst, .. } => reg_id(dst, &mut defs),
+            MachInst::Alu { dst, .. }
+            | MachInst::Imul3 { dst, .. }
+            | MachInst::Neg { dst, .. }
+            | MachInst::Not { dst, .. }
+            | MachInst::Shift { dst, .. }
+            | MachInst::ShiftX { dst, .. }
+            | MachInst::Rorx { dst, .. }
+            | MachInst::LeaSym { dst, .. }
+            | MachInst::LeaSlot { dst, .. } => reg_id(dst, &mut defs),
+            MachInst::Lea {
+                base: _,
+                index,
+                dst,
+                ..
+            } => {
+                reg_id(dst, &mut defs);
+                if let Some((i, _)) = index {
+                    reg_id(i, &mut defs);
+                }
+            }
+            // Fail-closed kinds never coexist with an eligible window
+            // (rax-touch scan rejects them); no def extraction needed.
+            _ => {}
+        }
+    }
+    defs
+}
+
+fn machinst_window_rax_free(buf: &[super::machinst::MachInst]) -> bool {
+    use super::machinst::{MachInst, MachOperand, MachReg};
+    let is_rax = |r: &MachReg| matches!(r, MachReg::Phys(p) if p.0 == super::machinst::RAX.0);
+    let op_rax = |op: &MachOperand| -> bool {
+        match op {
+            MachOperand::Reg(r) => is_rax(r),
+            MachOperand::Mem { base, .. } => is_rax(base),
+            MachOperand::MemIndex { base, index, .. } => is_rax(base) || is_rax(index),
+            _ => false,
+        }
+    };
+    for inst in buf {
+        let touches = match inst {
+            // Implicit rax contracts: fail closed.
+            MachInst::Cqto { .. }
+            | MachInst::Div { .. }
+            | MachInst::Call { .. }
+            | MachInst::CallTyped { .. }
+            | MachInst::Ret
+            | MachInst::Raw(_) => true,
+            MachInst::Mov { src, dst, .. } => op_rax(src) || op_rax(dst),
+            MachInst::FMov { src, dst, .. } => op_rax(src) || op_rax(dst),
+            MachInst::FAlu {
+                src2, src1, dst, ..
+            } => op_rax(src2) || is_rax(src1) || is_rax(dst),
+            MachInst::Mov128 { src, dst } => op_rax(src) || op_rax(dst),
+            MachInst::Movzx { src, dst, .. } => op_rax(src) || is_rax(dst),
+            MachInst::Movsx { src, dst, .. } => op_rax(src) || is_rax(dst),
+            MachInst::Alu { src, dst, .. } => op_rax(src) || is_rax(dst),
+            MachInst::Imul3 { src, dst, .. } => is_rax(src) || is_rax(dst),
+            MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => is_rax(dst),
+            MachInst::Shift { amount, dst, .. } => op_rax(amount) || is_rax(dst),
+            MachInst::ShiftX {
+                count, src, dst, ..
+            } => is_rax(count) || is_rax(src) || is_rax(dst),
+            MachInst::Rorx { src, dst, .. } => is_rax(src) || is_rax(dst),
+            MachInst::Lea {
+                base, index, dst, ..
+            } => is_rax(base) || index.is_some_and(|(i, _)| is_rax(&i)) || is_rax(dst),
+            MachInst::LeaSym { dst, .. } | MachInst::LeaSlot { dst, .. } => is_rax(dst),
+            MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
+                op_rax(lhs) || op_rax(rhs)
+            }
+            MachInst::SetCC { dst, .. } => is_rax(dst),
+            MachInst::Cmov { src, dst, .. } => op_rax(src) || is_rax(dst),
+            MachInst::Jcc { .. } | MachInst::Jmp { .. } | MachInst::Label(_) => false,
+            MachInst::XorRdx => false,
+        };
+        if touches {
+            return false;
+        }
+    }
+    true
+}
+
 fn resolve_stack_vregs(
     inst: &super::machinst::MachInst,
     ra: &FxHashMap<u32, PhysReg>,
     state: &CodegenState,
     reg_classified: &crate::common::fx_hash::FxHashSet<u32>,
+    acc_subst: bool,
+    window_defs: &crate::common::fx_hash::FxHashSet<u32>,
 ) -> super::machinst::MachInst {
     use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
 
@@ -5138,11 +5280,41 @@ fn resolve_stack_vregs(
 
     // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible.
     // Vregs the window allocator owns (reg_classified) are never substituted.
-    let resolve_op = |op: &MachOperand, inst_size: OpSize| -> MachOperand {
+    //
+    // ACC-RESIDENT SUBSTITUTION (acc_subst): when the whole window is
+    // provably %rax-free (see machinst_window_rax_free) and owns no
+    // scratch registers, a Vreg the accumulator cache holds may be read
+    // as %rax directly instead of its slot — the slot read right after a
+    // park is an exposed store-to-load forward (the sha256 loop-counter
+    // compare: `movq %rax, 72(%rsp); movq %rbp, %r11; movq 72(%rsp),
+    // %rax; cmpl $8, %eax`). The value's def executed on the text path
+    // BEFORE the window (only that path maintains the cache), so every
+    // window reference to it is a use of the pre-window image %rax holds.
+    // The slot_fits width discipline is shared with the memory form: a
+    // read wider than the slot never substitutes (the leftover Vreg
+    // trips the fallback, which loads at the true width).
+    let resolve_op = |op: &MachOperand, inst_size: OpSize, is_read: bool| -> MachOperand {
         match op {
             MachOperand::Reg(MachReg::Vreg(id))
                 if !ra.contains_key(id) && !reg_classified.contains(id) =>
             {
+                // READS ONLY. A write position redirected into %rax would
+                // store the result into the accumulator instead of the
+                // value's slot — and for the phi-elimination copies (the
+                // one multi-def shape in the stream) the acc entry can
+                // still name the value from a PREDECESSOR block's text
+                // park, so the slot would keep the stale incoming value
+                // and every later slot reader would see the wrong
+                // iteration's data (latch_dead_at_boundaries_segment:
+                // rounds=4214233 instead of 41).
+                if is_read
+                    && acc_subst
+                    && !window_defs.contains(id)
+                    && slot_fits(id, inst_size)
+                    && state.reg_cache.acc_has(*id, false)
+                {
+                    return MachOperand::Reg(MachReg::Phys(super::machinst::RAX));
+                }
                 if let Some(slot) = state.get_slot(*id) {
                     if slot_fits(id, inst_size) {
                         MachOperand::StackSlot(slot.0)
@@ -5195,13 +5367,13 @@ fn resolve_stack_vregs(
             }
             MachInst::Mov {
                 src: MachOperand::AllocaAddr(*id),
-                dst: resolve_op(dst, *size),
+                dst: resolve_op(dst, *size, false),
                 size: *size,
             }
         }
         MachInst::Mov { src, dst, size } => MachInst::Mov {
-            src: resolve_op(src, *size),
-            dst: resolve_op(dst, *size),
+            src: resolve_op(src, *size, true),
+            dst: resolve_op(dst, *size, false),
             size: *size,
         },
         // FMov never carries vregs: the lowering admits only xmm-homed
@@ -5223,7 +5395,7 @@ fn resolve_stack_vregs(
             size,
         } => MachInst::FAlu {
             op: *op,
-            src2: resolve_op(src2, *size),
+            src2: resolve_op(src2, *size, true),
             src1: *src1,
             dst: *dst,
             size: *size,
@@ -5239,7 +5411,7 @@ fn resolve_stack_vregs(
             }
             MachInst::Alu {
                 op: *op,
-                src: resolve_op(src, *size),
+                src: resolve_op(src, *size, true),
                 dst: *dst,
                 size: *size,
             }
@@ -5256,7 +5428,15 @@ fn resolve_stack_vregs(
             // `from_size` bytes wide, which never exceeds the slot.
             // A slot-backed dst stays a vreg and is caught by
             // has_unresolvable_vreg -> window allocator (or fallback).
-            let src_resolved = resolve_reg_or_slot(src, ra, state, reg_classified, *from_size);
+            let src_resolved = resolve_reg_or_slot(
+                src,
+                ra,
+                state,
+                reg_classified,
+                *from_size,
+                acc_subst,
+                &window_defs,
+            );
             MachInst::Movzx {
                 src: src_resolved,
                 dst: *dst,
@@ -5270,7 +5450,15 @@ fn resolve_stack_vregs(
             from_size,
             to_size,
         } => {
-            let src_resolved = resolve_reg_or_slot(src, ra, state, reg_classified, *from_size);
+            let src_resolved = resolve_reg_or_slot(
+                src,
+                ra,
+                state,
+                reg_classified,
+                *from_size,
+                acc_subst,
+                &window_defs,
+            );
             MachInst::Movsx {
                 src: src_resolved,
                 dst: *dst,
@@ -5279,18 +5467,18 @@ fn resolve_stack_vregs(
             }
         }
         MachInst::Cmp { lhs, rhs, size } => MachInst::Cmp {
-            lhs: resolve_op(lhs, *size),
-            rhs: resolve_op(rhs, *size),
+            lhs: resolve_op(lhs, *size, true),
+            rhs: resolve_op(rhs, *size, true),
             size: *size,
         },
         MachInst::Test { lhs, rhs, size } => MachInst::Test {
-            lhs: resolve_op(lhs, *size),
-            rhs: resolve_op(rhs, *size),
+            lhs: resolve_op(lhs, *size, true),
+            rhs: resolve_op(rhs, *size, true),
             size: *size,
         },
         MachInst::Cmov { cc, src, dst, size } => MachInst::Cmov {
             cc: *cc,
-            src: resolve_op(src, *size),
+            src: resolve_op(src, *size, true),
             dst: *dst,
             size: *size,
         },
@@ -5329,7 +5517,7 @@ fn resolve_stack_vregs(
             signed,
             size,
         } => MachInst::Div {
-            divisor: resolve_op(divisor, *size),
+            divisor: resolve_op(divisor, *size, true),
             signed: *signed,
             size: *size,
         },
@@ -5348,12 +5536,23 @@ fn resolve_reg_or_slot(
     state: &CodegenState,
     reg_classified: &crate::common::fx_hash::FxHashSet<u32>,
     size: super::machinst::OpSize,
+    acc_subst: bool,
+    window_defs: &crate::common::fx_hash::FxHashSet<u32>,
 ) -> MachOperand {
     use super::machinst::MachOperand;
     match op {
         MachOperand::Reg(super::machinst::MachReg::Vreg(id))
             if !ra.contains_key(id) && !reg_classified.contains(id) =>
         {
+            // ACC-RESIDENT (reads only — this helper is only ever applied
+            // to source operands): see resolve_stack_vregs.
+            if acc_subst
+                && !window_defs.contains(id)
+                && !(state.is_small_slot(*id) && matches!(size, super::machinst::OpSize::S64))
+                && state.reg_cache.acc_has(*id, false)
+            {
+                return MachOperand::Reg(super::machinst::MachReg::Phys(super::machinst::RAX));
+            }
             if let Some(slot) = state.get_slot(*id) {
                 let fits = if state.is_small_slot(*id) {
                     matches!(
@@ -7208,11 +7407,30 @@ impl ArchCodegen for X86Codegen {
             &self.machinst_buf,
             Some(&self.state.small_slot_values),
         );
+        // ACC-RESIDENT SUBSTITUTION eligibility, fail-closed on both
+        // axes: the window owns no scratch registers (an owned window may
+        // assign %rax to a vreg behind the substitution's back), and no
+        // instruction in the window touches %rax in any way.
+        let window_rax_free =
+            reg_classified.is_empty() && machinst_window_rax_free(&self.machinst_buf);
+        let acc_subst = window_rax_free;
+        let window_defs = if acc_subst {
+            machinst_window_defs(&self.machinst_buf)
+        } else {
+            crate::common::fx_hash::FxHashSet::default()
+        };
         let resolved: Vec<MachInst> = self
             .machinst_buf
             .iter()
             .map(|inst| {
-                resolve_stack_vregs(inst, &self.reg_assignments, &self.state, &reg_classified)
+                resolve_stack_vregs(
+                    inst,
+                    &self.reg_assignments,
+                    &self.state,
+                    &reg_classified,
+                    acc_subst,
+                    &window_defs,
+                )
             })
             .collect();
         let final_insts = if reg_classified.is_empty() {
@@ -7247,6 +7465,8 @@ impl ArchCodegen for X86Codegen {
                                 inst,
                                 &self.reg_assignments,
                                 &self.state,
+                                &crate::common::fx_hash::FxHashSet::default(),
+                                false,
                                 &crate::common::fx_hash::FxHashSet::default(),
                             )
                         })
@@ -7315,6 +7535,14 @@ impl ArchCodegen for X86Codegen {
         }
 
         super::machinst_emit::emit_machinsts(&final_insts, &mut self.state.out);
+
+        // Register-cache coherence (SOUNDNESS): the window's instructions
+        // may write %rax/%rcx (pre-colored div staging, Phys destinations)
+        // without the text-path cache ever seeing it. A stale acc/sec
+        // entry after the window would hand a later text consumer the
+        // wrong register content. The replay path above needs no such
+        // invalidation — it IS text emission, cache-maintained throughout.
+        self.state.reg_cache.invalidate_all();
 
         // Home-freshness bookkeeping (SOUNDNESS): MachInst-buffered
         // instructions bypass generate_instruction, so their destinations

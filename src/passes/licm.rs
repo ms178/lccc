@@ -784,11 +784,14 @@ struct LoopAliasInfo {
 
 fn build_loop_alias_info(func: &IrFunction, natural_loop: &NaturalLoop) -> LoopAliasInfo {
     let mut def_block = FxHashMap::default();
+    let mut multi_def = FxHashSet::default();
     let mut defs = FxHashMap::default();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             if let Some(dest) = inst.dest() {
-                def_block.insert(dest.0, block_idx);
+                if def_block.insert(dest.0, block_idx).is_some() {
+                    multi_def.insert(dest.0);
+                }
                 defs.insert(dest.0, inst);
             }
         }
@@ -797,6 +800,7 @@ fn build_loop_alias_info(func: &IrFunction, natural_loop: &NaturalLoop) -> LoopA
         def_block,
         frames: vec![(natural_loop.header, natural_loop.body.clone())],
         block_frame: vec![alias::NO_FRAME; func.blocks.len()],
+        multi_def,
     };
 
     let mut pointer_values = FxHashSet::default();
