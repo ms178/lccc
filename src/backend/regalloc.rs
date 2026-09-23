@@ -7154,6 +7154,20 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>
 fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
     let mut non_gpr_values: FxHashSet<u32> = FxHashSet::default();
 
+    // A Copy dest fed by `Const(I64)` on a 32-bit target is ambiguous:
+    // `IrConst::from_i64` stores U32/U16/U8 constants zero-extended in an
+    // `I64` payload, so the spelling cannot say whether the value is a real
+    // 64-bit local (two-register / 64-bit slot territory) or a 32-bit value
+    // in unsigned-safe storage. The value's own width evidence decides
+    // (`compute_value_type_map` is the single source of truth); with no
+    // evidence, keep the historical conservative non-GPR classification.
+    // Without this, `u32 err = 0;` in a loop — lowered to
+    // `Copy v <- Const(I64(0))` by phi elimination + const folding — was
+    // excluded from GPR allocation for the whole function (and its copy web
+    // poisoned via `propagate_copy_web`), the root cause of the boot
+    // corpus's store-to-frame-slot traffic.
+    let value_type_map = crate::backend::common::compute_value_type_map(func);
+
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
@@ -7195,7 +7209,12 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                         | Operand::Const(IrConst::F64(_))
                         | Operand::Const(IrConst::LongDouble(..))
                         | Operand::Const(IrConst::I128(_)) => true,
-                        Operand::Const(IrConst::I64(_)) if is_32bit => true,
+                        // Ambiguous storage form: trust the value's own
+                        // width evidence over the constant's spelling
+                        // (see the value_type_map comment above).
+                        Operand::Const(IrConst::I64(_)) if is_32bit => {
+                            !value_type_map.get(&dest.0).is_some_and(|t| t.size() <= 4)
+                        }
                         _ => false,
                     };
                     if src_is_non_gpr {
@@ -10269,8 +10288,29 @@ fn apply_phi_coalesce_assignments_with_config(
         }
 
         if let Some(&src_iv) = iv_map.get(&backedge_src) {
+            // Same-home class: the values proven to share this home by the
+            // pairs applied so far, plus this candidate's own link. In a
+            // Part-2 chain the phi dest rides with its upstream dest (v48
+            // co-resides with v46 once `{v46, v48}` is applied), and
+            // treating it as a conflicting holder would silently break the
+            // chain link (`{v48, v42}` rejected for "conflict" with v46).
+            let mut same_home: FxHashSet<u32> = FxHashSet::default();
+            same_home.insert(backedge_src);
+            same_home.insert(phi_dest);
+            let mut stack = vec![backedge_src, phi_dest];
+            while let Some(v) = stack.pop() {
+                for p in &applied {
+                    if p.phi_dest == v || p.backedge_src == v {
+                        for &w in [p.phi_dest, p.backedge_src].iter() {
+                            if same_home.insert(w) {
+                                stack.push(w);
+                            }
+                        }
+                    }
+                }
+            }
             let has_conflict = liveness.intervals.iter().any(|iv| {
-                if iv.value_id == backedge_src || iv.value_id == phi_dest {
+                if same_home.contains(&iv.value_id) {
                     return false;
                 }
                 assignments.get(&iv.value_id).is_some_and(|other_reg| {
@@ -10278,6 +10318,12 @@ fn apply_phi_coalesce_assignments_with_config(
                 })
             });
             if has_conflict {
+                if ra_config.debug_phi_coalesce {
+                    eprintln!(
+                        "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: home conflict with another value",
+                        phi_dest, backedge_src, reg.0
+                    );
+                }
                 continue;
             }
         }
@@ -10353,6 +10399,127 @@ fn phi_coalesce_skip_listed_with_config(
 /// makes Part 1's first-wins pick the backedge rather than the preheader
 /// init (the gzip longest_match shuffle).
 /// Compatibility helper for isolated slot-layout/unit-test callers.
+/// Part 2 (FOLLOWUP-2026-09-22B §4): the narrow multi-def-source exception
+/// for the split-latch conditional-update shape.
+///
+/// For the latch copy `dest ← m` where `m` is multi-def, this returns
+/// `(u_block, u_def_idx, m_def_idx)` — the single non-passthrough def
+/// `u`'s site plus `m`'s own def in `u`'s block — exactly when the copy
+/// block sees `m` from a known def on EVERY incoming path:
+///
+///   * every def of `m` is a `Copy`;
+///   * `m` has exactly one non-passthrough def (`m ← u`, `u != dest`) and
+///     at least one passthrough def (`m ← dest`);
+///   * `u` is single-def, its block is a (different) predecessor of the
+///     copy block, and it defines `m` from `u` (the copy `m ← u`);
+///   * every OTHER predecessor of the copy block contains a passthrough
+///     def `m ← dest` — each path without `u` still defines `m`;
+///   * `u`'s block is no shallower than the copy block (the source path
+///     must be loop-carried, not a preheader init — mirrors the
+///     `pred_is_unique` preheader veto).
+///
+/// Then `dest ← m` is a no-op once `m` shares `dest`'s home, and chaining
+/// `m`'s home onto `u`'s register (usually a single-def Part-1 candidate)
+/// lets the update land in place. Kernel `check_cpuflags`
+/// (`err |= 1 << i`, `-m16` boot build) is the canonical instance: the web
+/// `{acc, phi-dest, or-result}` takes one register instead of leaving two
+/// pass-through copies per iteration.
+///
+/// The general multi-def-source guard is NOT relaxed: anything outside
+/// this exact shape returns `None` (session-59 "the exemption stays").
+fn detect_part2_chain(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+    preds: &analysis::FlatAdj,
+    all_defs: &FxHashMap<u32, Vec<&Instruction>>,
+    unique_def_site: &FxHashMap<u32, Option<(usize, usize)>>,
+    phi_dest: u32,
+    m: u32,
+    copy_block: usize,
+) -> Option<(usize, usize, usize)> {
+    let defs = all_defs.get(&m)?;
+    let mut non_passthrough_srcs: Vec<u32> = Vec::new();
+    let mut passthroughs = 0usize;
+    for d in defs {
+        // (1) every def of `m` is a Copy.
+        let Instruction::Copy {
+            src: Operand::Value(s),
+            ..
+        } = d
+        else {
+            return None;
+        };
+        if s.0 == phi_dest {
+            passthroughs += 1;
+        } else {
+            non_passthrough_srcs.push(s.0);
+        }
+    }
+    // (2) exactly one non-passthrough def; (3) at least one passthrough.
+    if non_passthrough_srcs.len() != 1 || passthroughs == 0 {
+        return None;
+    }
+    let u = non_passthrough_srcs[0];
+    // (4) `u` is single-def (the window proof needs its exact site).
+    let Some((u_block, u_def_idx)) = unique_def_site.get(&u).copied().flatten() else {
+        return None;
+    };
+    // The branch that produces `u` always leaves its block, so the copy
+    // block is distinct.
+    if u_block == copy_block {
+        return None;
+    }
+    // (5) `u`'s block is a predecessor of the copy block.
+    if !preds.row(copy_block).iter().any(|&p| p as usize == u_block) {
+        return None;
+    }
+    // (6) `u`'s block defines `m` from `u` (the copy `m ← u`), after `u`.
+    let m_def_idx = func.blocks[u_block].instructions.iter().position(|inst| {
+        matches!(
+            inst,
+            Instruction::Copy {
+                dest,
+                src: Operand::Value(s),
+            } if dest.0 == m && s.0 == u
+        )
+    })?;
+    if m_def_idx <= u_def_idx {
+        return None;
+    }
+    // (7) every other predecessor of the copy block contains a
+    //     passthrough def `m ← dest`.
+    for &p in preds.row(copy_block) {
+        let p = p as usize;
+        if p == u_block {
+            continue;
+        }
+        let has_passthrough = func.blocks[p].instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(s),
+                } if dest.0 == m && s.0 == phi_dest
+            )
+        });
+        if !has_passthrough {
+            return None;
+        }
+    }
+    // (8) born inside the loop (mirrors the `pred_is_unique` preheader
+    //     veto): the source path must be loop-carried.
+    if liveness.block_loop_depth.get(u_block).copied().unwrap_or(0)
+        < liveness
+            .block_loop_depth
+            .get(copy_block)
+            .copied()
+            .unwrap_or(0)
+    {
+        return None;
+    }
+    Some((u_block, u_def_idx, m_def_idx))
+}
+
 pub(crate) fn detect_phi_coalesce_groups(
     func: &IrFunction,
     liveness: &LivenessResult,
@@ -10597,20 +10764,55 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
             else {
                 continue;
             };
-            if !multi_def.contains(&dest.0) || multi_def.contains(&src.0) {
+            if !multi_def.contains(&dest.0) {
                 continue;
             }
-
-            let Some((source_block, source_def_idx)) =
-                unique_def_site.get(&src.0).copied().flatten()
-            else {
-                if debug {
-                    eprintln!(
-                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): source is not single-def",
-                        dest.0, src.0
-                    );
+            // Part 2 (FOLLOWUP-2026-09-22B §4): the narrow multi-def-source
+            // exception. The proofs below run on `u`'s site (the wider
+            // window); the candidate records `m`'s def in `u`'s block so
+            // the apply-phase structural checks and the slot-coalescing
+            // contract see a real def of the backedge source.
+            let part2 = if multi_def.contains(&src.0) {
+                detect_part2_chain(
+                    func,
+                    liveness,
+                    &preds,
+                    &all_defs,
+                    &unique_def_site,
+                    dest.0,
+                    src.0,
+                    block_idx,
+                )
+            } else {
+                None
+            };
+            let (source_block, source_def_idx, cand_def_idx) = if let Some((
+                u_block,
+                u_def_idx,
+                m_def_idx,
+            )) = part2
+            {
+                (u_block, u_def_idx, m_def_idx)
+            } else {
+                if multi_def.contains(&src.0) {
+                    if debug {
+                        eprintln!(
+                            "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): multi-def source outside the Part-2 chain shape",
+                            dest.0, src.0
+                        );
+                    }
+                    continue;
                 }
-                continue;
+                let Some(site) = unique_def_site.get(&src.0).copied().flatten() else {
+                    if debug {
+                        eprintln!(
+                            "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): source is not single-def",
+                            dest.0, src.0
+                        );
+                    }
+                    continue;
+                };
+                (site.0, site.1, site.1)
             };
 
             let same_block = source_block == block_idx;
@@ -10637,7 +10839,12 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                 // 20041011-1 torture failure exposed the preheader case.
                 && liveness.block_loop_depth.get(source_block).copied().unwrap_or(0)
                     >= liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0);
-            if !(same_block && source_def_idx < copy_idx || pred_is_unique) {
+            // Part 2 proves its predecessor structure in `detect_part2_chain`
+            // (`u`'s block is a pred of the copy block and every other pred
+            // carries the passthrough), so it bypasses this gate; the
+            // single-def path keeps it unchanged.
+            let part2_pred_ok = part2.is_some();
+            if !part2_pred_ok && !(same_block && source_def_idx < copy_idx || pred_is_unique) {
                 if debug {
                     eprintln!(
                         "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): def block/index {}:{} cannot feed copy {}:{}",
@@ -10723,12 +10930,17 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                         )
                 })
             });
+            // The candidate records `m`'s def in `u`'s block (not `u`'s
+            // own site): the apply-phase structural checks require the
+            // site to define the backedge source, and the CFG walk from
+            // there sees every path that reaches the copy. The window
+            // proofs above already ran on the wider `u`-site window.
             let source_home_probe = PhiCoalesceCandidate {
                 phi_dest: dest.0,
                 backedge_src: src.0,
                 block_idx,
                 source_block_idx: source_block,
-                source_def_idx,
+                source_def_idx: cand_def_idx,
                 copy_idx,
             };
             let source_home_killed =
@@ -10819,9 +11031,68 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
         }
     }
 
+    // Chain application order (Part 2): a candidate whose backedge source
+    // is another candidate's phi dest must come FIRST — the apply phase
+    // hands the source the dest's CURRENT register, so the top of the
+    // chain (farthest from the update) inherits before the links below
+    // it, and the whole web `{acc, phi-dest, or-result}` collapses onto
+    // one register (check_cpuflags: `{v46, v48}` before `{v48, v42}`).
+    // `rank` = number of candidates strictly above this one in that
+    // link; higher rank sorts first.
+    let dest_index: FxHashMap<u32, Vec<usize>> =
+        candidates
+            .iter()
+            .enumerate()
+            .fold(FxHashMap::default(), |mut acc, (i, c)| {
+                acc.entry(c.phi_dest).or_default().push(i);
+                acc
+            });
+    let mut rank_memo: FxHashMap<usize, u32> = FxHashMap::default();
+    for i in 0..candidates.len() {
+        if rank_memo.contains_key(&i) {
+            continue;
+        }
+        // Walk the chain above candidate i to its end or a memoized rank.
+        let mut walk: Vec<usize> = vec![i];
+        let mut cur = i;
+        loop {
+            if let Some(&base) = rank_memo.get(&cur) {
+                let mut r = base;
+                for idx in walk[..walk.len() - 1].iter().rev() {
+                    r += 1;
+                    rank_memo.insert(*idx, r);
+                }
+                break;
+            }
+            let next = dest_index
+                .get(&candidates[cur].backedge_src)
+                .and_then(|idxs| idxs.iter().max().copied());
+            match next {
+                Some(n) if n != cur && !walk.contains(&n) && walk.len() < 16 => {
+                    walk.push(n);
+                    cur = n;
+                }
+                _ => {
+                    // Chain end (or depth cap / cycle): ranks run down
+                    // from 0 at the bottom.
+                    let mut r = 0u32;
+                    for idx in walk.iter().rev() {
+                        rank_memo.insert(*idx, r);
+                        r += 1;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<(u32, PhiCoalesceCandidate)> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| (rank_memo[&i], c))
+        .collect();
     // Hottest latch first: deeper loop, then later copy in the block
     // (latch sits after the body). Part 1 / claimed_dests first-wins.
-    candidates.sort_by(|a, b| {
+    ranked.sort_by(|(ra, a), (rb, b)| {
         let da = liveness
             .block_loop_depth
             .get(a.block_idx)
@@ -10832,11 +11103,12 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
             .get(b.block_idx)
             .copied()
             .unwrap_or(0);
-        db.cmp(&da)
+        rb.cmp(ra)
+            .then(db.cmp(&da))
             .then(a.copy_idx.cmp(&b.copy_idx).reverse())
             .then(a.phi_dest.cmp(&b.phi_dest))
     });
-
+    let candidates: Vec<PhiCoalesceCandidate> = ranked.into_iter().map(|(_, c)| c).collect();
     candidates
 }
 
@@ -11309,6 +11581,264 @@ mod phi_coalesce_tests {
                 .iter()
                 .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
             "window use of phi must block coalesce: {candidates:?}"
+        );
+    }
+
+    // Part 2 (FOLLOWUP-2026-09-22B §4): the cpucheck `err |= 1 << i`
+    // split-latch shape.  v1 = acc, v2 = i;
+    //   block 2 (body): cond -> 3 / 4
+    //   block 3 (orpath): v5 = 1 << v2; v6 = v1 | v5; v7 = v6
+    //   block 4 (skip):   v7 = v1                (passthrough)
+    //   block 5 (latch):  v8 = v2 + 1; v1 = v7; v2 = v8
+    // `mutate` lets the rejection tests reshape blocks in place.
+    fn part2_shape(mut mutate: impl FnMut(&mut [BasicBlock])) -> Vec<PhiCoalesceCandidate> {
+        let mut func = IrFunction::new("part2_cpucheck".to_string(), IrType::U32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(IrConst::I64(0)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Const(IrConst::I64(0)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::Cmp {
+                    dest: Value(3),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::U32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(3)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(6),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Cmp {
+                    dest: Value(4),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(4)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(4),
+                },
+            ),
+            block(
+                3,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(5),
+                        op: IrBinOp::Shl,
+                        lhs: Operand::Const(IrConst::I64(1)),
+                        rhs: Operand::Value(Value(2)),
+                        ty: IrType::U32,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(6),
+                        op: IrBinOp::Or,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Value(Value(5)),
+                        ty: IrType::U32,
+                    },
+                    Instruction::Copy {
+                        dest: Value(7),
+                        src: Operand::Value(Value(6)),
+                    },
+                ],
+                Terminator::Branch(BlockId(5)),
+            ),
+            block(
+                4,
+                vec![Instruction::Copy {
+                    dest: Value(7),
+                    src: Operand::Value(Value(1)),
+                }],
+                Terminator::Branch(BlockId(5)),
+            ),
+            block(
+                5,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(8),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::U32,
+                    },
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Value(Value(7)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(8)),
+                    },
+                    Instruction::Cmp {
+                        dest: Value(9),
+                        op: IrCmpOp::Ult,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Const(IrConst::I64(8)),
+                        ty: IrType::U32,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(9)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(6),
+                },
+            ),
+            block(
+                6,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            ),
+        ];
+        mutate(&mut func.blocks);
+        func.next_value_id = 10;
+        let liveness = compute_live_intervals(&func);
+        detect_phi_coalesce_groups(&func, &liveness)
+    }
+
+    #[test]
+    fn accepts_part2_split_latch_chain() {
+        // The kernel `check_cpuflags` web: `{acc v1, phi-dest v7,
+        // or-result v6}` must chain — the Part-2 latch candidate
+        // `{v1, v7}` on `u`'s (v6's) site, plus the pre-existing
+        // single-def `{v7, v6}`, and the chain candidate must sort FIRST
+        // so the apply phase cascades the register down the web.
+        let cands = part2_shape(|_| {});
+        let part2 = cands
+            .iter()
+            .position(|c| c.phi_dest == 1 && c.backedge_src == 7)
+            .expect("Part-2 latch candidate {{v1, v7}} missing: {cands:?}");
+        let c = &cands[part2];
+        assert_eq!(c.block_idx, 5, "copy block must be the latch: {cands:?}");
+        assert_eq!(
+            c.source_block_idx, 3,
+            "u's block must be the or-path: {cands:?}"
+        );
+        assert_eq!(
+            c.source_def_idx, 2,
+            "candidate must record v7's def (copy v7 = v6), not u's own def: {cands:?}"
+        );
+        assert_eq!(
+            c.copy_idx, 1,
+            "copy v1 = v7 is latch instruction 1: {cands:?}"
+        );
+        let link = cands
+            .iter()
+            .position(|c| c.phi_dest == 7 && c.backedge_src == 6)
+            .expect("chained single-def candidate {{v7, v6}} missing: {cands:?}");
+        assert!(
+            part2 < link,
+            "chain top must sort first so the register cascades: part2@{part2} link@{link}"
+        );
+        assert!(
+            cands.iter().any(|c| c.phi_dest == 2 && c.backedge_src == 8),
+            "counter web {{v2, v8}} must still coalesce: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_part2_when_other_pred_lacks_passthrough() {
+        // The skip path stops defining v7: the latch copy v1 = v7 would
+        // read an undefined/other value on that path.
+        let cands = part2_shape(|blocks| {
+            blocks[4].instructions.clear();
+        });
+        assert!(
+            !cands.iter().any(|c| c.phi_dest == 1 && c.backedge_src == 7),
+            "latch copy must not coalesce without the passthrough on every other pred: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_part2_when_m_has_non_copy_def() {
+        // v7 is also computed (not copied) on the skip path: the
+        // all-defs-are-Copies clause must reject.
+        let cands = part2_shape(|blocks| {
+            blocks[4].instructions = vec![Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Or,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(1)),
+                ty: IrType::U32,
+            }];
+        });
+        assert!(
+            !cands.iter().any(|c| c.phi_dest == 1 && c.backedge_src == 7),
+            "non-Copy def of the multi-def source must block Part-2: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_part2_with_two_non_passthrough_defs() {
+        // Both preds update v7 from different values (v6 and v5): more
+        // than one non-passthrough def.
+        let cands = part2_shape(|blocks| {
+            blocks[4].instructions = vec![Instruction::Copy {
+                dest: Value(7),
+                src: Operand::Value(Value(5)),
+            }];
+        });
+        assert!(
+            !cands.iter().any(|c| c.phi_dest == 1 && c.backedge_src == 7),
+            "two non-passthrough defs must block Part-2: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_part2_when_u_is_multi_def() {
+        // v6 (u) is defined in both the body and the or-path: the window
+        // proof has no unique `u` site.
+        let cands = part2_shape(|blocks| {
+            blocks[2].instructions.push(Instruction::BinOp {
+                dest: Value(6),
+                op: IrBinOp::Or,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(5)),
+                ty: IrType::U32,
+            });
+        });
+        assert!(
+            !cands.iter().any(|c| c.phi_dest == 1 && c.backedge_src == 7),
+            "multi-def u must block Part-2: {cands:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_part2_on_phi_use_between_u_and_copy() {
+        // The old acc is still read in the latch before the update copy:
+        // the cross-block window proof at `u`'s site must reject.
+        let cands = part2_shape(|blocks| {
+            let mut latch = blocks[5].instructions.clone();
+            latch.insert(
+                0,
+                Instruction::Copy {
+                    dest: Value(10),
+                    src: Operand::Value(Value(1)),
+                },
+            );
+            blocks[5].instructions = latch;
+        });
+        assert!(
+            !cands.iter().any(|c| c.phi_dest == 1 && c.backedge_src == 7),
+            "old-acc read inside the update window must block Part-2: {cands:?}"
         );
     }
 

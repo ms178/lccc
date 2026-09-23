@@ -165,7 +165,12 @@ pub fn build_gnu_bloom(hashes: &[u32], params: &GnuHashParams, class_bits: u32) 
         let bit1 = h & class_mask;
         let bit2 = (h >> params.bloom_shift) & class_mask;
         bloom[w] |= (1u64 << bit1) | (1u64 << bit2);
-        debug_assert_eq!(bloom[w] >> class_bits, 0, "bits must stay in class width");
+        // Shift-check only the 32-bit class: `bloom[w] >> 64` overflows the
+        // word width and panics in debug builds (the 64-bit class trivially
+        // fits in the word — nothing above bit 63 exists to check).
+        if class_bits == 32 {
+            debug_assert_eq!(bloom[w] >> 32, 0, "bits must stay in class width");
+        }
     }
     bloom
 }

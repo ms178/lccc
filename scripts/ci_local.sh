@@ -272,6 +272,9 @@ gate "i686-asm-diff" fast \
 gate "i686-tls-ie-relax" fast \
     bash tests/regression/check_i686_tls_ie_relax.sh
 
+gate "i686-narrow-cmp-flag-law" fast \
+    bash tests/regression/check_narrow_cmp_flag_law.sh
+
 # Kbuild does not fingerprint compiler/linker executable contents.  Preserve
 # the contract that compiler changes clean all products while linker-only
 # changes retain target objects and purge only link outputs.

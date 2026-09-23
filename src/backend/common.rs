@@ -2333,8 +2333,24 @@ pub fn escape_string(s: &str) -> String {
 /// `zstd_decompress_block.c:242`, `HUF_isError(hufSuccess)`).
 ///
 /// Seeded from each defining instruction's `result_type()`, then propagated
-/// along Copy/Phi edges **to a fixed point**, then completed with
-/// `ParamRef`'s declared type — the exact rule the emitters rely on.
+/// to a **fixed point** along three strong-evidence edges, then completed
+/// with `ParamRef`'s declared type — the exact rule the emitters rely on:
+///
+/// * **Copy/Phi sources**: a Copy dest materialises at its source's width
+///   (and vice versa); a Phi's declared type is authoritative for its dest
+///   and every incoming edge. Constant seeds cover the unambiguous spellings
+///   (`I8`/`I16`/`I32`/`I128`/floats/decimals) but NOT `I64`, which is
+///   from_i64's zero-extended storage form for U32/U16/U8 as well as a real
+///   64-bit payload — its width must come from context evidence instead.
+/// * **Consuming contexts**: an operand value materialises at the width its
+///   consuming instruction declares (BinOp/Cmp operand at the op type,
+///   Store value at the store type, call argument at the ABI type, Cast
+///   source at the pre-cast type, pointers at `Ptr`, return value at the
+///   declared return type, ...). Without this, a real 64-bit value whose
+///   only def is a constant would lose its width when the `I64` constant
+///   seed went weak.
+/// * **Phi type**: see the Copy/Phi edge (the phi `ty` subsumes the
+///   per-edge constant seeds, which only ever produced narrower types).
 ///
 /// Why a fixed point (and why the widest type wins):
 /// * Phi destinations can be fed from a value **defined later** (forward
@@ -2349,6 +2365,11 @@ pub fn escape_string(s: &str) -> String {
 ///   must honour, so a narrow late definition must never overwrite a wider
 ///   earlier one.
 ///
+/// A value with NO evidence stays untyped; every consumer treats untyped as
+/// the conservative wide default (emitter `movq`, 8-byte slot) — the
+/// pre-change behavior for such values, so the weak `I64` seed is a pure
+/// precision gain, never a regression.
+///
 /// Types are only ever added, never removed or narrowed, so the fixpoint
 /// terminates after at most `O(#values)` sweeps; the per-sweep work is one
 /// pass over the (already-dense) instruction list.
@@ -2356,7 +2377,7 @@ pub(crate) fn compute_value_type_map(
     func: &crate::ir::reexports::IrFunction,
 ) -> crate::common::fx_hash::FxHashMap<u32, IrType> {
     use crate::common::fx_hash::FxHashMap;
-    use crate::ir::reexports::{Instruction, IrConst, Operand};
+    use crate::ir::reexports::{Instruction, IrConst, Operand, Terminator};
 
     /// Merge `ty` into `map[dest]` keeping the WIDER of the two.
     fn widen(map: &mut FxHashMap<u32, IrType>, dest: u32, ty: IrType) {
@@ -2371,19 +2392,31 @@ pub(crate) fn compute_value_type_map(
     /// The semantic type of a constant operand (the def-site seed for
     /// otherwise untyped Copy dests). `Zero` is context-typed and stays
     /// unknown on purpose.
+    ///
+    /// `I64` is deliberately UNKNOWN: `IrConst::from_i64` stores U32/U16/U8
+    /// constants zero-extended in an `I64` payload to preserve unsigned
+    /// semantics, so an `I64` constant spelling cannot distinguish "a real
+    /// 64-bit value" from "a 32-bit value in zero-extended storage". Seeding
+    /// `I64` from the spelling is how `u32 err = 0;` in a loop got typed
+    /// 64-bit on every path: the preheader init `Copy v <- Const(I64(0))`
+    /// widened the accumulator, i686's `collect_non_gpr_values` then excluded
+    /// it from GPR allocation entirely, and the slot traffic followed. The
+    /// value's real width comes from strong context evidence instead (the
+    /// consuming instruction's declared types, propagated below); a value
+    /// with no such evidence stays untyped, which every consumer treats as
+    /// the conservative wide default.
     fn const_type(c: &IrConst) -> Option<IrType> {
         Some(match c {
             IrConst::I8(_) => IrType::I8,
             IrConst::I16(_) => IrType::I16,
             IrConst::I32(_) => IrType::I32,
-            IrConst::I64(_) => IrType::I64,
             IrConst::I128(_) => IrType::I128,
             IrConst::F32(_) => IrType::F32,
             IrConst::F64(_) => IrType::F64,
             IrConst::D32(_) => IrType::D32,
             IrConst::D64(_) => IrType::D64,
             IrConst::LongDouble(..) => IrType::F128,
-            IrConst::Zero => return None,
+            IrConst::I64(_) | IrConst::Zero => return None,
         })
     }
 
@@ -2404,6 +2437,29 @@ pub(crate) fn compute_value_type_map(
     // no new (or wider) type appears. Values reachable from a wide source
     // through any path — including loop-carried phi cycles and forward
     // references — are therefore typed wide before the classifier runs.
+    //
+    // CONSUMING contexts are strong width evidence in their own right: the
+    // emitters read a value at the width the consuming instruction declares
+    // (an operand of a 64-bit BinOp is reloaded `movq`-wide even when its
+    // def is a constant), so every declared type propagates to its operand
+    // values. This is what makes the I64 constant seed (see `const_type`)
+    // safe to leave weak: a value whose only evidence is `Const(I64)` —
+    // from_i64's zero-extended U32/U16/U8 storage — is typed narrow when
+    // its contexts say narrow, and stays wide when a real 64-bit context
+    // (64-bit binop operand, U64 store, I64 phi, 64-bit call argument,
+    // 64-bit return) proves it. A value with no evidence at all stays
+    // untyped; every consumer treats untyped as the conservative wide
+    // default (emitter `movq`, 8-byte slot), exactly the pre-change
+    // behavior.
+    let mut widen_to = |map: &mut FxHashMap<u32, IrType>, dest: u32, ty: IrType| -> bool {
+        let old = map.get(&dest).copied();
+        if old.is_none_or(|o| o.size() < ty.size()) {
+            map.insert(dest, ty);
+            true
+        } else {
+            false
+        }
+    };
     loop {
         let mut changed = false;
         for block in &func.blocks {
@@ -2412,46 +2468,190 @@ pub(crate) fn compute_value_type_map(
                 // across multi-def webs).
                 if let Some(ty) = inst.result_type() {
                     if let Some(dest) = inst.dest() {
-                        let old = value_types.get(&dest.0).copied();
-                        if old.is_none_or(|o| o.size() < ty.size()) {
-                            widen(&mut value_types, dest.0, ty);
-                            changed = true;
-                        }
+                        changed |= widen_to(&mut value_types, dest.0, ty);
                     }
                 }
                 match inst {
+                    Instruction::BinOp { lhs, rhs, ty, .. }
+                    | Instruction::Cmp { lhs, rhs, ty, .. } => {
+                        // Operands materialise at the operation's width.
+                        for op in [lhs, rhs] {
+                            if let Operand::Value(v) = op {
+                                changed |= widen_to(&mut value_types, v.0, *ty);
+                            }
+                        }
+                    }
+                    Instruction::UnaryOp { src, ty, .. } => {
+                        if let Operand::Value(v) = src {
+                            changed |= widen_to(&mut value_types, v.0, *ty);
+                        }
+                    }
+                    Instruction::Load { ptr, .. } => {
+                        changed |= widen_to(&mut value_types, ptr.0, IrType::Ptr);
+                    }
+                    Instruction::AtomicLoad { ptr, .. } => {
+                        if let Operand::Value(v) = ptr {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                    }
+                    Instruction::Store { val, ptr, ty, .. } => {
+                        if let Operand::Value(v) = val {
+                            changed |= widen_to(&mut value_types, v.0, *ty);
+                        }
+                        changed |= widen_to(&mut value_types, ptr.0, IrType::Ptr);
+                    }
+                    Instruction::Select {
+                        cond,
+                        true_val,
+                        false_val,
+                        ty,
+                        ..
+                    } => {
+                        if let Operand::Value(v) = cond {
+                            changed |= widen_to(&mut value_types, v.0, IrType::I8);
+                        }
+                        for op in [true_val, false_val] {
+                            if let Operand::Value(v) = op {
+                                changed |= widen_to(&mut value_types, v.0, *ty);
+                            }
+                        }
+                    }
+                    Instruction::Cast { src, from_ty, .. } => {
+                        // The source is read at its own (pre-cast) width.
+                        if let Operand::Value(v) = src {
+                            changed |= widen_to(&mut value_types, v.0, *from_ty);
+                        }
+                    }
                     Instruction::Copy { dest, src } => {
+                        // A copy asserts both sides materialise at the same
+                        // width: propagate in both directions.
                         let t = match src {
                             Operand::Value(v) => value_types.get(&v.0).copied(),
                             Operand::Const(c) => const_type(c),
                         };
                         if let Some(t) = t {
-                            let old = value_types.get(&dest.0).copied();
-                            if old.is_none_or(|o| o.size() < t.size()) {
-                                widen(&mut value_types, dest.0, t);
-                                changed = true;
+                            changed |= widen_to(&mut value_types, dest.0, t);
+                        }
+                        if let (Operand::Value(v), Some(t)) =
+                            (src, value_types.get(&dest.0).copied())
+                        {
+                            changed |= widen_to(&mut value_types, v.0, t);
+                        }
+                    }
+                    Instruction::Phi { dest, incoming, ty } => {
+                        // The phi's declared type is authoritative for the
+                        // dest and for every incoming edge (each edge's value
+                        // is converted to it); it subsumes the per-edge
+                        // constant seeds, which only ever produced narrower
+                        // types.
+                        changed |= widen_to(&mut value_types, dest.0, *ty);
+                        for (op, _) in incoming {
+                            if let Operand::Value(v) = op {
+                                changed |= widen_to(&mut value_types, v.0, *ty);
                             }
                         }
                     }
-                    Instruction::Phi { dest, incoming, .. } => {
-                        // Every incoming edge is a def site candidate; keep the
-                        // widest type found on any edge.
-                        for (op, _) in incoming {
-                            let t = match op {
-                                Operand::Value(v) => value_types.get(&v.0).copied(),
-                                Operand::Const(c) => const_type(c),
-                            };
-                            if let Some(t) = t {
-                                let old = value_types.get(&dest.0).copied();
-                                if old.is_none_or(|o| o.size() < t.size()) {
-                                    widen(&mut value_types, dest.0, t);
-                                    changed = true;
-                                }
+                    Instruction::GlobalAddr { dest, .. }
+                    | Instruction::LabelAddr { dest, .. }
+                    | Instruction::Alloca { dest, .. }
+                    | Instruction::DynAlloca { dest, .. }
+                    | Instruction::StackSave { dest }
+                    | Instruction::GetStaticChain { dest } => {
+                        changed |= widen_to(&mut value_types, dest.0, IrType::Ptr);
+                    }
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } => {
+                        changed |= widen_to(&mut value_types, dest.0, IrType::Ptr);
+                        changed |= widen_to(&mut value_types, base.0, IrType::Ptr);
+                        if let Operand::Value(v) = offset {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                    }
+                    Instruction::Call { info, .. } => {
+                        // Arguments materialise at their declared ABI width.
+                        for (idx, arg) in info.args.iter().enumerate() {
+                            if let (Operand::Value(v), Some(&ty)) = (arg, info.arg_types.get(idx)) {
+                                changed |= widen_to(&mut value_types, v.0, ty);
+                            }
+                        }
+                    }
+                    Instruction::CallIndirect { func_ptr, info, .. } => {
+                        if let Operand::Value(v) = func_ptr {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                        for (idx, arg) in info.args.iter().enumerate() {
+                            if let (Operand::Value(v), Some(&ty)) = (arg, info.arg_types.get(idx)) {
+                                changed |= widen_to(&mut value_types, v.0, ty);
+                            }
+                        }
+                    }
+                    Instruction::Memcpy { dest, src, .. } => {
+                        changed |= widen_to(&mut value_types, dest.0, IrType::Ptr);
+                        changed |= widen_to(&mut value_types, src.0, IrType::Ptr);
+                    }
+                    Instruction::VaArg { va_list_ptr, .. }
+                    | Instruction::VaStart { va_list_ptr }
+                    | Instruction::VaEnd { va_list_ptr } => {
+                        changed |= widen_to(&mut value_types, va_list_ptr.0, IrType::Ptr);
+                    }
+                    Instruction::VaArgStruct {
+                        dest_ptr,
+                        va_list_ptr,
+                        ..
+                    } => {
+                        changed |= widen_to(&mut value_types, dest_ptr.0, IrType::Ptr);
+                        changed |= widen_to(&mut value_types, va_list_ptr.0, IrType::Ptr);
+                    }
+                    Instruction::VaCopy { dest_ptr, src_ptr } => {
+                        changed |= widen_to(&mut value_types, dest_ptr.0, IrType::Ptr);
+                        changed |= widen_to(&mut value_types, src_ptr.0, IrType::Ptr);
+                    }
+                    Instruction::AtomicRmw { ptr, val, ty, .. } => {
+                        if let Operand::Value(v) = ptr {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                        if let Operand::Value(v) = val {
+                            changed |= widen_to(&mut value_types, v.0, *ty);
+                        }
+                    }
+                    Instruction::AtomicInc { ptr, .. } => {
+                        if let Operand::Value(v) = ptr {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                    }
+                    Instruction::AtomicCmpxchg {
+                        ptr,
+                        expected,
+                        desired,
+                        ty,
+                        ..
+                    } => {
+                        if let Operand::Value(v) = ptr {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                        for op in [expected, desired] {
+                            if let Operand::Value(v) = op {
+                                changed |= widen_to(&mut value_types, v.0, *ty);
                             }
                         }
                     }
                     _ => {}
                 }
+            }
+            // Terminator operand evidence: the return value materialises at
+            // the declared return width, an indirect branch target at
+            // pointer width.
+            match &block.terminator {
+                Terminator::Return(Some(Operand::Value(v))) => {
+                    changed |= widen_to(&mut value_types, v.0, func.return_type);
+                }
+                Terminator::IndirectBranch { target, .. } => {
+                    if let Operand::Value(v) = target {
+                        changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                    }
+                }
+                _ => {}
             }
         }
         if !changed {
@@ -2480,7 +2680,7 @@ pub(crate) fn wide_typed_values(
 #[cfg(test)]
 mod value_type_map_tests {
     use super::*;
-    use crate::common::types::IrType;
+    use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{
         BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
     };
@@ -2645,5 +2845,240 @@ mod value_type_map_tests {
         assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(4));
         let wide = wide_typed_values(&f);
         assert!(!wide.contains(&0) && !wide.contains(&1));
+    }
+
+    fn call_with_i32_arg(arg: Operand) -> Instruction {
+        use crate::ir::instruction::CallInfo;
+        Instruction::Call {
+            func: "callee".to_string(),
+            info: CallInfo {
+                dest: None,
+                args: vec![arg],
+                arg_types: vec![IrType::I32],
+                return_type: IrType::I32,
+                is_variadic: false,
+                num_fixed_args: 1,
+                struct_arg_sizes: vec![],
+                struct_arg_aligns: vec![],
+                struct_arg_classes: vec![],
+                struct_arg_riscv_float_classes: vec![],
+                struct_arg_is_f128_sse: vec![],
+                ret_is_f128_sse: false,
+                is_sret: false,
+                is_fastcall: false,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
+                ret_eightbyte_classes: vec![],
+            },
+        }
+    }
+
+    /// The exact `check_cpuflags` defect, replayed at IR level: a u32 loop
+    /// accumulator whose preheader init is `Copy v <- Const(I64(0))` — the
+    /// zero-extended `from_i64` storage form for U32 — must resolve to 4
+    /// bytes from its consuming context (the 32-bit BinOp) alone. Before the
+    /// weak-`I64`-seed fix, the const seed widened the whole copy web, i686's
+    /// `collect_non_gpr_values` excluded the accumulator from GPRs, and the
+    /// 21-use slot traffic followed.
+    #[test]
+    fn i64_stored_const_seed_resolves_to_operand_width() {
+        // pre:   v0 = copy Const(I64(0))       (u32 acc init)
+        // body:  v1 = v0 | 1 (I32)             (err |= 1<<i)
+        // latch: v0 = copy v1                  (back edge)
+        let pre = block(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0)),
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let body = block(
+            1,
+            vec![Instruction::BinOp {
+                dest: Value(1),
+                op: IrBinOp::Or,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I64(1)),
+                ty: IrType::I32,
+            }],
+            Terminator::Branch(BlockId(2)),
+        );
+        let latch = block(
+            2,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Value(Value(1)),
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let f = func_with_blocks(vec![pre, body, latch], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(
+            map.get(&0).copied().map(|t| t.size()),
+            Some(4),
+            "accumulator web must be 32-bit: {map:?}"
+        );
+        assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(4));
+        let wide = wide_typed_values(&f);
+        assert!(!wide.contains(&0) && !wide.contains(&1));
+    }
+
+    /// The same `Const(I64)` seed must stay WIDE when the value has a
+    /// genuine 64-bit consumer: width resolution is context-based, not
+    /// blanket narrowing. (A real `u64 x = 5;` must keep an 8-byte slot.)
+    #[test]
+    fn i64_stored_const_seed_stays_wide_for_64bit_consumer() {
+        let pre = block(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0)),
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let body = block(
+            1,
+            vec![i64_add(
+                Value(1),
+                Operand::Value(Value(0)),
+                Operand::Const(IrConst::I64(1)),
+            )],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        );
+        let f = func_with_blocks(vec![pre, body], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(
+            map.get(&0).copied().map(|t| t.size()),
+            Some(8),
+            "64-bit operand context must keep v0 wide: {map:?}"
+        );
+        assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(8));
+        let wide = wide_typed_values(&f);
+        assert!(wide.contains(&0) && wide.contains(&1));
+    }
+
+    /// A value whose only evidence is an ambiguous `Const(I64)` seed (dead
+    /// store to nowhere, never copied, never consumed) must stay UNTYPED:
+    /// every consumer (the non-GPR classifier, the i686 compact-slot gate,
+    /// the x86-64 emitters) treats untyped as the conservative wide default.
+    /// Typing it from the spelling alone would be the bug the weak seed
+    /// removed.
+    #[test]
+    fn unused_i64_stored_const_seed_stays_untyped() {
+        let b = block(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0)),
+            }],
+            Terminator::Return(None),
+        );
+        let f = func_with_blocks(vec![b], 1);
+        let map = compute_value_type_map(&f);
+        assert!(map.get(&0).is_none(), "no context => untyped: {map:?}");
+    }
+
+    /// A phi with a declared 32-bit type takes incoming `Const(I64)` edges:
+    /// the declared type is authoritative (each edge value is converted to
+    /// it), so the dest must be 4 bytes even though the spelling says 8.
+    #[test]
+    fn phi_type_subsumes_wider_const_incoming() {
+        let header = block(
+            0,
+            vec![Instruction::Phi {
+                dest: Value(0),
+                incoming: vec![
+                    (Operand::Const(IrConst::I64(0)), BlockId(99)),
+                    (Operand::Value(Value(1)), BlockId(1)),
+                ],
+                ty: IrType::I32,
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let body = block(
+            1,
+            vec![Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(IrConst::I64(7)),
+            }],
+            Terminator::Branch(BlockId(0)),
+        );
+        let f = func_with_blocks(vec![header, body], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(
+            map.get(&0).copied().map(|t| t.size()),
+            Some(4),
+            "declared phi type must govern: {map:?}"
+        );
+        // The back-edge copy dest inherits the phi edge type too.
+        assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(4));
+    }
+
+    /// A call argument materialises at its declared ABI width: a value
+    /// whose only other evidence is an ambiguous `Const(I64)` seed resolves
+    /// to the argument type. (i386 passes u32 by value in a GPR — the whole
+    /// point of getting this right.)
+    #[test]
+    fn call_arg_width_seeds_operand() {
+        let b = block(
+            0,
+            vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I64(42)),
+                },
+                call_with_i32_arg(Operand::Value(Value(0))),
+            ],
+            Terminator::Return(None),
+        );
+        let f = func_with_blocks(vec![b], 1);
+        let map = compute_value_type_map(&f);
+        assert_eq!(
+            map.get(&0).copied().map(|t| t.size()),
+            Some(4),
+            "ABI width must seed the argument: {map:?}"
+        );
+    }
+
+    /// A store materialises its value at the store type: a `Const(I64)`-
+    /// seeded value stored through a u32 pointer resolves to 4 bytes.
+    #[test]
+    fn store_width_seeds_operand() {
+        let b = block(
+            0,
+            vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::U32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I64(7)),
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(1)),
+                    ptr: Value(0),
+                    ty: IrType::U32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            Terminator::Return(None),
+        );
+        let f = func_with_blocks(vec![b], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(
+            map.get(&1).copied().map(|t| t.size()),
+            Some(4),
+            "store type must seed the value: {map:?}"
+        );
+        // The alloca dest is pointer-width (thread-local target size).
+        assert_eq!(map.get(&0).copied(), Some(IrType::Ptr), "ptr: {map:?}");
     }
 }
