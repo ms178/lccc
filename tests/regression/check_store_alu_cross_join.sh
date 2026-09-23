@@ -186,17 +186,32 @@ done
 run_diff "$work/diamond_soup.c" -O1 "CCC_PEEPHOLE_SKIP=store_alu_fold" || fail=1
 run_diff "$work/rot_diamonds.c" -O1 "CCC_PEEPHOLE_SKIP=store_alu_fold" || fail=1
 
-# ---- Property 3: the pass is still active (straight-line folds survive) --
-# The label-barrier fix must not disable the pass wholesale; a straight-line
-# store->ALU window in a high-pressure straight-line kernel still folds.
-sha="$here/../benchmark/programs/sha256_transform.c"
-[[ -f $sha ]] || sha=$here/../../tests/benchmark/programs/sha256_transform.c
-[[ -f $sha ]] || { echo "check_store_alu_cross_join: sha256_transform.c not found" >&2; exit 1; }
-"$CCC" -O1 -S "$sha" -o "$work/on.s" 2>/dev/null
-env CCC_PEEPHOLE_SKIP=store_alu_fold "$CCC" -O1 -S "$sha" -o "$work/off.s" 2>/dev/null
-if cmp -s "$work/on.s" "$work/off.s"; then
-  echo "FAIL: store_alu_fold made no edits on the straight-line pressure" >&2
-  echo "kernel; the label barrier fix must not disable the pass wholesale." >&2
+# ---- Property 3: the pass is still WIRED and its logic still fires -------
+# HISTORY: this used to pin end-to-end activity on sha256_transform -O1
+# (on.s != off.s).  That producer is GONE as of the S45/S46 tree: the
+# acc-resident emitter paths (alu.rs consuming a parked value in place +
+# the MachInst window substitution) now handle the store->memop-read shape
+# natively, and the fold measured INERT across the whole benchmark corpus
+# and a 60-file regression-corpus sample at -O1 and -O2 (on == off
+# everywhere; measured 2026-09-23).  The pass stays wired as defense in
+# depth — if any emitter path ever regresses to park+memop-read shapes,
+# it self-heals them.  Two pins replace the end-to-end check:
+#   (a) the fold LOGIC stays active: the store_alu_cross_join_tests unit
+#       module (folds_straightline_store_to_alu) feeds the pass synthetic
+#       asm and asserts the straight-line fold fires — run by cargo test,
+#       which CI enforces;
+#   (b) the pass stays REGISTERED in the phase-2 pipeline: a silent
+#       unwiring must fail loudly here and force a conscious decision.
+modrs="$here/../../src/backend/x86/codegen/peephole/passes/mod.rs"
+if [[ ! -f $modrs ]] && [[ -f $here/../../../src/backend/x86/codegen/peephole/passes/mod.rs ]]; then
+  # Alternate layout (gate invoked from the worktree root): one level up.
+  modrs="$here/../../../src/backend/x86/codegen/peephole/passes/mod.rs"
+fi
+if [[ -f $modrs ]] && ! grep -q "fold_store_alu_memop" "$modrs"; then
+  echo "FAIL: store_alu_fold is no longer wired into the peephole pipeline" >&2
+  echo "  ($modrs has no fold_store_alu_memop call).  It is currently inert" >&2
+  echo "  on the corpus (see the comment above) but kept as defense in depth;" >&2
+  echo "  unwiring it is a deliberate decision, not an accidental deletion." >&2
   fail=1
 fi
 

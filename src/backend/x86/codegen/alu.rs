@@ -1125,6 +1125,73 @@ impl X86Codegen {
                     && (use_32bit || !self.state.is_small_slot(rhs_val.0))
                 {
                     if let Some(slot) = self.state.get_slot(rhs_val.0) {
+                        // ACC-RESIDENT SOURCE: the accumulator may already hold
+                        // rhs_val (its own computation, or a `store_eax_to`
+                        // park). Folding the slot in that state is an exposed
+                        // store-to-load forward (measured ~5% end-to-end on
+                        // sha256_transform's MAJ chain) — and staging lhs
+                        // into %eax first would destroy the resident copy.
+                        // Consume %eax in place instead, sourcing the OTHER
+                        // operand without touching the accumulator:
+                        // immediate, register home, or %ecx staging.
+                        // Sub is excluded: `sub src, %eax` would compute
+                        // rhs-lhs, not lhs-rhs (non-commutative).
+                        if !matches!(op, IrBinOp::Sub)
+                            && self.state.reg_cache.acc_has(rhs_val.0, false)
+                        {
+                            let suffix = if use_32bit { "l" } else { "q" };
+                            let acc = if use_32bit { "eax" } else { "rax" };
+                            let src_reg =
+                                if let Some(imm) = Self::const_as_imm32_typed(lhs, use_32bit) {
+                                    self.state.emit_fmt(format_args!(
+                                        "    {}{} ${}, %{}",
+                                        mnem, suffix, imm, acc
+                                    ));
+                                    if use_32bit {
+                                        self.store_eax_to(dest);
+                                    } else {
+                                        self.store_rax_to(dest);
+                                    }
+                                    return;
+                                } else if let Some(lreg) = self
+                                    .operand_reg(lhs)
+                                    .filter(|r| !super::emit::is_xmm_reg(*r))
+                                {
+                                    let name = if use_32bit {
+                                        super::emit::phys_reg_name_32(lreg)
+                                    } else {
+                                        super::emit::phys_reg_name(lreg)
+                                    };
+                                    self.state.emit_fmt(format_args!(
+                                        "    {}{} %{}, %{}",
+                                        mnem, suffix, name, acc
+                                    ));
+                                    if use_32bit {
+                                        self.store_eax_to(dest);
+                                    } else {
+                                        self.store_rax_to(dest);
+                                    }
+                                    return;
+                                } else {
+                                    // %ecx staging: the last resort that still
+                                    // avoids the exposed forward. The staging
+                                    // never writes %rax, so the resident copy
+                                    // survives to be consumed here.
+                                    self.operand_to_rcx(lhs);
+                                    "ecx"
+                                };
+                            let src_name = if use_32bit { src_reg } else { "rcx" };
+                            self.state.emit_fmt(format_args!(
+                                "    {}{} %{}, %{}",
+                                mnem, suffix, src_name, acc
+                            ));
+                            if use_32bit {
+                                self.store_eax_to(dest);
+                            } else {
+                                self.store_rax_to(dest);
+                            }
+                            return;
+                        }
                         if use_32bit {
                             self.operand_to_eax(lhs);
                         } else {
@@ -1159,6 +1226,62 @@ impl X86Codegen {
                         && (use_32bit || !self.state.is_small_slot(lhs_val.0))
                     {
                         if let Some(slot) = self.state.get_slot(lhs_val.0) {
+                            // ACC-RESIDENT SOURCE (the commutative mirror of
+                            // the rhs path above): the accumulator holds
+                            // lhs_val; consume it in place and source rhs
+                            // without touching the accumulator. `op src,
+                            // %eax` computes rhs OP lhs — equal to lhs OP
+                            // rhs for every commutative op that reaches
+                            // here (Sub is excluded above).
+                            if self.state.reg_cache.acc_has(lhs_val.0, false) {
+                                let suffix = if use_32bit { "l" } else { "q" };
+                                let acc = if use_32bit { "eax" } else { "rax" };
+                                if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+                                    self.state.emit_fmt(format_args!(
+                                        "    {}{} ${}, %{}",
+                                        mnem, suffix, imm, acc
+                                    ));
+                                    if use_32bit {
+                                        self.store_eax_to(dest);
+                                    } else {
+                                        self.store_rax_to(dest);
+                                    }
+                                    return;
+                                }
+                                if let Some(rreg) = self
+                                    .operand_reg(rhs)
+                                    .filter(|r| !super::emit::is_xmm_reg(*r))
+                                {
+                                    let name = if use_32bit {
+                                        super::emit::phys_reg_name_32(rreg)
+                                    } else {
+                                        super::emit::phys_reg_name(rreg)
+                                    };
+                                    self.state.emit_fmt(format_args!(
+                                        "    {}{} %{}, %{}",
+                                        mnem, suffix, name, acc
+                                    ));
+                                    if use_32bit {
+                                        self.store_eax_to(dest);
+                                    } else {
+                                        self.store_rax_to(dest);
+                                    }
+                                    return;
+                                }
+                                // %ecx staging (never writes %rax).
+                                self.operand_to_rcx(rhs);
+                                let src_name = if use_32bit { "ecx" } else { "rcx" };
+                                self.state.emit_fmt(format_args!(
+                                    "    {}{} %{}, %{}",
+                                    mnem, suffix, src_name, acc
+                                ));
+                                if use_32bit {
+                                    self.store_eax_to(dest);
+                                } else {
+                                    self.store_rax_to(dest);
+                                }
+                                return;
+                            }
                             if use_32bit {
                                 self.operand_to_eax(rhs);
                             } else {

@@ -391,6 +391,7 @@ fn run_gvn_licm_ivsr_shared(
     run_gvn: bool,
     run_licm: bool,
     run_ivsr: bool,
+    run_ivsr_scalar: bool,
     run_univsr: bool,
     time_passes: bool,
     iter: usize,
@@ -502,7 +503,7 @@ fn run_gvn_licm_ivsr_shared(
             // and phis but not CFG edges, so the shared analysis stays valid.
             let mut n = 0;
             for _ in 0..4 {
-                let round = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
+                let round = iv_strength_reduce::ivsr_with_analysis(func, &cfg, run_ivsr_scalar);
                 verify::verify_after_func_pass(func, "ivsr");
                 n += round;
                 if round == 0 {
@@ -932,6 +933,7 @@ pub(crate) fn run_passes(
     x86_avx2: bool,
     x86_sse4_1: bool,
     x86_fma: bool,
+    x86_bmi1: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
     // x86 SIMD register-file availability for the middle end. Under `-mno-sse`
@@ -1859,6 +1861,16 @@ pub(crate) fn run_passes(
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
             let min_rotate_bits = target_min_rotate_bits(target);
+            // Scalar ANDN (BMI1) for the bool-mux algebra's CH fold: the
+            // mux fold must defer to the backend's Not+And -> andn fusion
+            // when the 3-operand form is selectable (emit_and_not_impl).
+            // The CCC_NO_ANDN_FUSION kill switch is resolved here, once —
+            // the same switch supports_and_not consults at emission — so
+            // the fold-time prediction and the emission-time decision
+            // cannot drift within one compilation.
+            let has_scalar_andn = target == crate::backend::Target::X86_64
+                && x86_bmi1
+                && std::env::var_os("CCC_NO_ANDN_FUSION").is_none();
             let n = timed_pass!(
                 "bit_idioms",
                 run_on_visited(module, &dirty, &mut changed, |func| {
@@ -1867,6 +1879,7 @@ pub(crate) fn run_passes(
                         enable_bit_reverse,
                         max_rotate_bits,
                         min_rotate_bits,
+                        has_scalar_andn,
                     )
                 })
             );
@@ -1960,6 +1973,14 @@ pub(crate) fn run_passes(
             let run_ivsr = iter == 0
                 && std::env::var("CCC_NO_IVSR").is_err()
                 && !pass_disabled(&disabled, "ivsr");
+            // Scalar derived-IV flavor (iv*C without a GEP → secondary
+            // recurrence): OPT-IN via CCC_IVSR_SCALAR_DERIVED=1.  Measured
+            // (2026-09-23) as a net runtime loss on this backend while the
+            // latch phi-web parking exists — the 5-golden-workload codegen
+            // regressions it caused were the PR #602 CI RED.  The full data
+            // lives in the scalar section's comment in iv_strength_reduce.rs;
+            // revisit after the Unit-4 allocator work.
+            let run_ivsr_scalar = run_ivsr && std::env::var("CCC_IVSR_SCALAR_DERIVED").is_ok();
             // Un-IVSR only pays off on targets with scaled-index addressing
             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
             let run_univsr = run_ivsr
@@ -1975,6 +1996,7 @@ pub(crate) fn run_passes(
                     run_gvn,
                     run_licm,
                     run_ivsr,
+                    run_ivsr_scalar,
                     run_univsr,
                     time_passes,
                     iter,
@@ -2029,6 +2051,9 @@ pub(crate) fn run_passes(
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
             let min_rotate_bits = target_min_rotate_bits(target);
+            let has_scalar_andn = target == crate::backend::Target::X86_64
+                && x86_bmi1
+                && std::env::var_os("CCC_NO_ANDN_FUSION").is_none();
             let n = timed_pass!(
                 "bit_idioms_post_ifconv",
                 run_on_visited(module, &dirty, &mut changed, |func| {
@@ -2037,6 +2062,7 @@ pub(crate) fn run_passes(
                         enable_bit_reverse,
                         max_rotate_bits,
                         min_rotate_bits,
+                        has_scalar_andn,
                     )
                 })
             );

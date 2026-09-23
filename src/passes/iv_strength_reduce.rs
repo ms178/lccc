@@ -62,9 +62,18 @@ struct DerivedExpr {
     /// GEPs that use this multiply/shift result as their offset.
     /// (block_idx, inst_idx, GEP dest, GEP base)
     gep_uses: Vec<(usize, usize, Value, Value)>,
+    /// The multiply/shift instruction's destination — the identity of the
+    /// derived value for the scalar flavor below.
+    mul_dest: Value,
+    /// The multiply/shift instruction's type (the derived IV's domain).
+    mul_ty: IrType,
+    /// Whether the derived value has ANY use in the function (GEP offsets
+    /// included). A dead multiply gets no recurrence.
+    has_uses: bool,
 }
 
-/// Run IVSR on a single function.
+/// Run IVSR on a single function (test wrapper: PRODUCTION defaults — the
+/// scalar derived-IV flavor is OFF, matching the pipeline's default).
 #[cfg(test)]
 pub(crate) fn ivsr_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
@@ -74,12 +83,33 @@ pub(crate) fn ivsr_function(func: &mut IrFunction) -> usize {
 
     // Build CFG and dominator tree
     let cfg = analysis::CfgAnalysis::build(func);
-    ivsr_with_analysis(func, &cfg)
+    ivsr_with_analysis(func, &cfg, false)
+}
+
+/// Run IVSR on a single function with the scalar derived-IV flavor armed
+/// (test wrapper for the opt-in path — see the block comment at the scalar
+/// section for why production keeps it off by default).
+#[cfg(test)]
+pub(crate) fn ivsr_function_scalar(func: &mut IrFunction) -> usize {
+    let num_blocks = func.blocks.len();
+    if num_blocks < 2 {
+        return 0;
+    }
+
+    // Build CFG and dominator tree
+    let cfg = analysis::CfgAnalysis::build(func);
+    ivsr_with_analysis(func, &cfg, true)
 }
 
 /// Run IVSR using pre-computed CFG analysis (avoids redundant analysis when
 /// called from a pipeline that shares analysis across GVN, LICM, IVSR).
-pub(crate) fn ivsr_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnalysis) -> usize {
+/// `scalar_derived` arms the scalar derived-IV flavor — off in production;
+/// the pipeline derives it from `CCC_IVSR_SCALAR_DERIVED=1` (opt-in).
+pub(crate) fn ivsr_with_analysis(
+    func: &mut IrFunction,
+    cfg: &analysis::CfgAnalysis,
+    scalar_derived: bool,
+) -> usize {
     if cfg.num_blocks < 2 {
         return 0;
     }
@@ -123,7 +153,7 @@ pub(crate) fn ivsr_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
             }
             continue;
         }
-        let changed = reduce_loop(func, natural_loop, &cfg.preds);
+        let changed = reduce_loop(func, natural_loop, &cfg.preds, scalar_derived);
         if changed > 0 {
             kept_bodies.push(natural_loop.body.clone());
         }
@@ -138,6 +168,7 @@ fn reduce_loop(
     func: &mut IrFunction,
     natural_loop: &NaturalLoop,
     preds: &analysis::FlatAdj,
+    scalar_derived: bool,
 ) -> usize {
     let header = natural_loop.header;
     let dbg = std::env::var("CCC_IVSR_DEBUG").is_ok();
@@ -431,11 +462,239 @@ fn reduce_loop(
         }
     }
 
+    // ── SCALAR DERIVED IVs — OPT-IN (`CCC_IVSR_SCALAR_DERIVED=1`) ──────
+    //
+    // WHY THIS IS OFF BY DEFAULT (measured, 2026-09-23, the S46 CI RED):
+    // the transformation replaces a per-iteration `imull` (short live range)
+    // with a loop-carried recurrence (live the WHOLE loop).  On this backend
+    // that trade measured as a NET LOSS everywhere it fired:
+    //   * static: 5 golden workloads regressed past the codegen-quality
+    //     gate's tolerance bands (gzip_crc32 +6.2% insns, glibc_memcmp +6.4%
+    //     insns/+23.5% stackmem, expat_xml_scan +23.5% stackmem, stencil5
+    //     +7.5% insns, zlib_ng_adler32 +6.2% stackmem) — CI RED on PR #602.
+    //   * runtime (11-rep interleaved A/B, full corpus): expat_xml_scan
+    //     +3.9..4.5%, glibc_strstr +4.3%, loop_patterns +2.1%,
+    //     linux_find_bit +1.8%, linux_rbtree +1.2% (the motivating case!),
+    //     struct_copy +1.1%; zero confirmed wins (hash_table's apparent
+    //     −1.6% was pure noise — its assembly is byte-identical).
+    // The root cause is the known latch phi-web parking (the Unit-4
+    // allocator rock): every added loop-carried web materializes to a slot
+    // home at the latch and costs more than the imull it removes.  GCC
+    // strength-reduces the identical shapes (oracle: `addq $4051`/
+    // `addl $11` in glibc_memcmp's driver) because its RA keeps recurrences
+    // in callee-saved registers across calls — revisit this knob AFTER the
+    // allocator work; the machinery and its unit tests stay armed here.
+    //
+    // `iv * C` with NO GEP-offset uses (linux_rbtree's lookup hash
+    // `i * 104729`, consumed by an And/mask, not a GEP): the multiply is
+    // replaced by a secondary recurrence `j = phi(init*C, j + step*C)`.
+    // The primary IV stays (it feeds the exit test); the multiply becomes
+    // dead and DCE removes it.  EXACTNESS: the recurrence and the multiply
+    // compute the same value in the SAME modulo-2^N domain — the group type
+    // must equal the IV's type, so a widening Cast between them (a
+    // wraparound divergence: sext(i) after an i32 wrap ≠ the accumulated
+    // wide recurrence) disqualifies the group.  Uses after the loop read
+    // the last iteration's value on both formulations (SSA dominance).
+    //
+    // Mixed shapes (a multiply feeding BOTH a GEP offset and other uses)
+    // are left alone here: the pointer path above already handled the GEP,
+    // and the multiply stays for the scalar readers — always correct.
+    if scalar_derived {
+        // Group by (iv, stride, add_offset, ty): several equivalent muls
+        // (pre-GVN frontends) share ONE derived recurrence.
+        let mut scalar_groups: Vec<(usize, i64, i64, IrType, Vec<Value>)> = Vec::new();
+        for d in &derived {
+            if !d.gep_uses.is_empty() || !d.has_uses {
+                continue;
+            }
+            let iv = &basic_ivs[d.iv_index];
+            if iv.ty != d.mul_ty || !d.mul_ty.is_integer() {
+                continue;
+            }
+            if let Some((_, _, _, _, muls)) =
+                scalar_groups
+                    .iter_mut()
+                    .find(|(iv_index, stride, add_offset, ty, _)| {
+                        *iv_index == d.iv_index
+                            && *stride == d.stride
+                            && *add_offset == d.add_offset
+                            && *ty == d.mul_ty
+                    })
+            {
+                muls.push(d.mul_dest);
+            } else {
+                scalar_groups.push((
+                    d.iv_index,
+                    d.stride,
+                    d.add_offset,
+                    d.mul_ty,
+                    vec![d.mul_dest],
+                ));
+            }
+        }
+
+        for (iv_index, stride, add_offset, group_ty, muls) in scalar_groups {
+            let iv = &basic_ivs[iv_index];
+            let inc = iv.step.wrapping_mul(stride);
+            // Both constants must encode in the group's domain BEFORE any
+            // instruction is inserted: a bail-out after the phi insertion
+            // would leave j_next undefined (invalid IR).
+            let (Some(stride_const), Some(inc_const)) = (
+                const_for_int_ty(group_ty, stride),
+                const_for_int_ty(group_ty, inc),
+            ) else {
+                continue;
+            };
+
+            let j_val = Value(next_id);
+            next_id += 1;
+            let j_next_val = Value(next_id);
+            next_id += 1;
+
+            // Preheader: j_init = (init + k) * C, constant-folded when both
+            // parts are constants.  Executed once — the whole point.
+            let init_const = try_resolve_const(&iv.init, func);
+            let j_init_op = match init_const
+                .map(|init_c| init_c.wrapping_add(add_offset).wrapping_mul(stride))
+                .and_then(|folded| const_for_int_ty(group_ty, folded))
+            {
+                Some(c) => Operand::Const(c),
+                None => {
+                    // Runtime init in the preheader.  Only the k == 0 shape
+                    // (plain iv * C) is built here: a non-constant init with
+                    // an affine offset is rare enough to keep the constructor
+                    // minimal — fail closed.
+                    if add_offset != 0 {
+                        continue;
+                    }
+                    let Operand::Value(init_v) = iv.init else {
+                        continue;
+                    };
+                    let j_init_val = Value(next_id);
+                    next_id += 1;
+                    func.blocks[preheader]
+                        .instructions
+                        .push(Instruction::BinOp {
+                            dest: j_init_val,
+                            op: IrBinOp::Mul,
+                            lhs: Operand::Value(init_v),
+                            rhs: Operand::Const(stride_const),
+                            ty: group_ty,
+                        });
+                    if !func.blocks[preheader].source_spans.is_empty() {
+                        func.blocks[preheader]
+                            .source_spans
+                            .push(crate::common::source::Span::dummy());
+                    }
+                    Operand::Value(j_init_val)
+                }
+            };
+
+            // Header: j = phi(j_init, j_next)
+            let phi_inst = Instruction::Phi {
+                dest: j_val,
+                ty: group_ty,
+                incoming: vec![
+                    (j_init_op, preheader_label),
+                    (Operand::Value(j_next_val), back_block_label),
+                ],
+            };
+            let insert_pos = func.blocks[header]
+                .instructions
+                .iter()
+                .position(|inst| !matches!(inst, Instruction::Phi { .. }))
+                .unwrap_or(func.blocks[header].instructions.len());
+            func.blocks[header]
+                .instructions
+                .insert(insert_pos, phi_inst);
+            if !func.blocks[header].source_spans.is_empty() {
+                func.blocks[header]
+                    .source_spans
+                    .insert(insert_pos, crate::common::source::Span::dummy());
+            }
+
+            // Latch: j_next = j + step*C  (same wraparound domain).
+            let inc_inst = Instruction::BinOp {
+                dest: j_next_val,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(j_val),
+                rhs: Operand::Const(inc_const),
+                ty: group_ty,
+            };
+            func.blocks[back_blocks[0]].instructions.push(inc_inst);
+            if !func.blocks[back_blocks[0]].source_spans.is_empty() {
+                func.blocks[back_blocks[0]]
+                    .source_spans
+                    .push(crate::common::source::Span::dummy());
+            }
+
+            // Rewrite every use of every grouped multiply to j.  Operands
+            // (incl. phi incomings and terminators) plus the Value-typed
+            // pointer positions (Load/Store ptr, GEP base) that the operand
+            // walker does not visit.
+            let mut rewritten = 0usize;
+            for block in &mut func.blocks {
+                for rinst in &mut block.instructions {
+                    rinst.for_each_operand_mut(|o| {
+                        if matches!(o, Operand::Value(v) if v.0 != 0 && muls.contains(v)) {
+                            *o = Operand::Value(j_val);
+                            rewritten += 1;
+                        }
+                    });
+                    match rinst {
+                        Instruction::Load { ptr, .. } => {
+                            if muls.contains(ptr) {
+                                *ptr = j_val;
+                                rewritten += 1;
+                            }
+                        }
+                        Instruction::Store { ptr, .. } => {
+                            if muls.contains(ptr) {
+                                *ptr = j_val;
+                                rewritten += 1;
+                            }
+                        }
+                        Instruction::GetElementPtr { base, .. } => {
+                            if muls.contains(base) {
+                                *base = j_val;
+                                rewritten += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                block.terminator.for_each_operand_mut(|o| {
+                    if matches!(o, Operand::Value(v) if v.0 != 0 && muls.contains(v)) {
+                        *o = Operand::Value(j_val);
+                        rewritten += 1;
+                    }
+                });
+            }
+            if rewritten > 0 {
+                reductions += rewritten;
+            }
+        }
+    }
+
     if reductions > 0 {
         func.next_value_id = next_id;
     }
 
     reductions
+}
+
+/// Encode `v` as a constant of integer type `ty`, wrapping into the type's
+/// modulo domain (the derived-IV recurrence is exact under wraparound, so
+/// the encoding must be the wrapping one).  Non-integer or over-wide types
+/// fail closed (`None`).
+fn const_for_int_ty(ty: IrType, v: i64) -> Option<IrConst> {
+    Some(match ty {
+        IrType::I8 | IrType::U8 => IrConst::I8(v as i8),
+        IrType::I16 | IrType::U16 => IrConst::I16(v as i16),
+        IrType::I32 | IrType::U32 => IrConst::I32(v as i32),
+        IrType::I64 | IrType::U64 => IrConst::I64(v),
+        _ => return None,
+    })
 }
 
 /// Find basic induction variables: phis in the header of the form
@@ -684,7 +943,7 @@ fn find_derived_exprs(
                     );
                 }
             }
-            let (mul_dest, iv_idx, stride, add_offset) = match inst {
+            let (mul_dest, mul_ty, iv_idx, stride, add_offset) = match inst {
                 // Multiply by constant (plain `iv * s`, or affine
                 // `(iv + k) * s` via find_affine).
                 Instruction::BinOp {
@@ -692,15 +951,15 @@ fn find_derived_exprs(
                     op: IrBinOp::Mul,
                     lhs,
                     rhs,
-                    ..
+                    ty,
                 } => match (lhs, rhs) {
                     (Operand::Value(v), Operand::Const(c))
                     | (Operand::Const(c), Operand::Value(v)) => {
                         let s = c.to_i64();
                         if let (Some(idx), Some(s)) = (find_iv(v.0), s) {
-                            (*dest, idx, s, 0)
+                            (*dest, *ty, idx, s, 0)
                         } else if let (Some((idx, k)), Some(s)) = (find_affine(v.0), s) {
-                            (*dest, idx, s, k)
+                            (*dest, *ty, idx, s, k)
                         } else {
                             continue;
                         }
@@ -713,11 +972,11 @@ fn find_derived_exprs(
                     op: IrBinOp::Shl,
                     lhs: Operand::Value(v),
                     rhs: Operand::Const(c),
-                    ..
+                    ty,
                 } => {
                     if let (Some(idx), Some(shift)) = (find_iv(v.0), c.to_i64()) {
                         if (0..64).contains(&shift) {
-                            (*dest, idx, 1i64 << shift, 0)
+                            (*dest, *ty, idx, 1i64 << shift, 0)
                         } else {
                             continue;
                         }
@@ -736,11 +995,11 @@ fn find_derived_exprs(
                     op: IrBinOp::Add,
                     lhs: Operand::Value(l),
                     rhs: Operand::Value(r),
-                    ..
+                    ty,
                 } => {
                     if l.0 == r.0 {
                         if let Some(idx) = find_iv(l.0) {
-                            (*dest, idx, 2, 0)
+                            (*dest, *ty, idx, 2, 0)
                         } else {
                             continue;
                         }
@@ -779,12 +1038,33 @@ fn find_derived_exprs(
                 }
             }
 
-            if !gep_uses.is_empty() {
+            // Any use of the derived value anywhere in the function (GEP
+            // offsets included)?  A dead multiply earns no recurrence.
+            let mut use_count = 0usize;
+            for block in &func.blocks {
+                for uinst in &block.instructions {
+                    uinst.for_each_used_value(|u| {
+                        if u == mul_dest_id {
+                            use_count += 1;
+                        }
+                    });
+                }
+                block.terminator.for_each_used_value(|u| {
+                    if u == mul_dest_id {
+                        use_count += 1;
+                    }
+                });
+            }
+
+            if !gep_uses.is_empty() || use_count > 0 {
                 derived.push(DerivedExpr {
                     stride,
                     iv_index: iv_idx,
                     add_offset,
                     gep_uses,
+                    mul_dest,
+                    mul_ty,
+                    has_uses: use_count > 0,
                 });
             } else if std::env::var("CCC_IVSR_DEBUG").is_ok() {
                 eprintln!(
@@ -1140,6 +1420,432 @@ mod tests {
         assert_eq!(
             body_copies[0].1, body_copies[1].1,
             "Expected one shared pointer IV"
+        );
+    }
+
+    /// The linux_rbtree lookup-hash shape: `h = i * 104729` consumed by an
+    /// And/mask (NOT a GEP offset).  The scalar derived-IV flavor must
+    /// replace the multiply with a secondary recurrence.
+    #[test]
+    fn test_scalar_derived_iv_hash_shape() {
+        let mut func = IrFunction::new("hash_lookup".to_string(), IrType::I32, vec![], false);
+
+        // Block 0 (preheader): init = 0
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+
+        // Block 1 (header): i = phi(0, i_next), guard
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(6)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(16384)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+
+        // Block 2 (body/latch): h = i * 104729; m = h & 16383; i_next = i+1
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(104729)),
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(16383)),
+                    ty: IrType::I32,
+                },
+                // m must be observable or DCE-irrelevant here: store it via
+                // the return so the chain has a use.
+                Instruction::Copy {
+                    dest: Value(5),
+                    src: Operand::Value(Value(4)),
+                },
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+
+        // Block 3 (exit)
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+            source_spans: Vec::new(),
+        });
+
+        func.next_value_id = 7;
+
+        let changes = ivsr_function_scalar(&mut func);
+        assert!(changes >= 1, "expected the hash multiply to be reduced");
+
+        // The header must hold a second phi (the derived recurrence) whose
+        // incoming from the preheader is the constant 0*104729 = 0 and
+        // whose latch increment is +104729.
+        let derived_phis: Vec<_> = func.blocks[1]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Phi { dest, incoming, .. } if *dest != Value(1) => {
+                    Some((*dest, incoming.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(derived_phis.len(), 1, "one derived recurrence");
+        let (j_dest, j_incoming) = &derived_phis[0];
+        assert!(
+            j_incoming
+                .iter()
+                .any(|(op, _)| matches!(op, Operand::Const(IrConst::I32(0)))),
+            "constant-folded init 0*104729"
+        );
+        // The latch must add the wrapped stride.
+        let latch_add = func.blocks[2].instructions.iter().any(|i| matches!(i, Instruction::BinOp { op: IrBinOp::Add, rhs: Operand::Const(IrConst::I32(104729)), lhs: Operand::Value(v), .. } if *v == *j_dest));
+        assert!(latch_add, "latch increments the derived IV by 104729");
+        // The And must read the derived phi, not the multiply.
+        let and_reads_j = func.blocks[2].instructions.iter().any(|i| matches!(i, Instruction::BinOp { op: IrBinOp::And, lhs: Operand::Value(v), .. } if *v == *j_dest));
+        assert!(and_reads_j, "the mask consumes the derived recurrence");
+        // The multiply must have no remaining users (dead; DCE's to remove).
+        let mut users = 0usize;
+        for b in &func.blocks {
+            for inst in &b.instructions {
+                inst.for_each_used_value(|u| {
+                    if u == 3 {
+                        users += 1;
+                    }
+                });
+            }
+            b.terminator.for_each_used_value(|u| {
+                if u == 3 {
+                    users += 1;
+                }
+            });
+        }
+        assert_eq!(users, 0, "multiply fully replaced");
+    }
+
+    /// A dead `iv * C` earns no recurrence.
+    #[test]
+    fn test_scalar_derived_iv_dead_mul_untouched() {
+        let mut func = IrFunction::new("dead_mul".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(10)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        // The multiply has NO uses at all.
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(7)),
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 6;
+
+        let changes = ivsr_function_scalar(&mut func);
+        assert_eq!(changes, 0, "a dead multiply must not earn a recurrence");
+        let phis = func.blocks[1]
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Phi { .. }))
+            .count();
+        assert_eq!(phis, 1, "only the original IV phi remains");
+    }
+
+    /// A widening cast between the IV and the multiply disqualifies the
+    /// scalar flavor (wraparound divergence: sext of a wrapped i32 IV is not
+    /// the accumulated wide recurrence).
+    #[test]
+    fn test_scalar_derived_iv_widening_cast_skipped() {
+        let mut func = IrFunction::new("wide_mul".to_string(), IrType::I64, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(7)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(100)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I64(104729)),
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(4)),
+                    rhs: Operand::Const(IrConst::I64(16383)),
+                    ty: IrType::I64,
+                },
+                Instruction::Copy {
+                    dest: Value(6),
+                    src: Operand::Value(Value(5)),
+                },
+                Instruction::BinOp {
+                    dest: Value(7),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 8;
+
+        let _ = ivsr_function_scalar(&mut func);
+        let phis = func.blocks[1]
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Phi { .. }))
+            .count();
+        assert_eq!(phis, 1, "widened domain must fail closed");
+    }
+
+    /// The affine shape `(i + 1) * 56` with no GEP: the derived recurrence
+    /// starts at 56 (constant-folded) and steps by 56.
+    #[test]
+    fn test_scalar_derived_iv_affine_init() {
+        let mut func = IrFunction::new("affine".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(8)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(5)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                // k = i + 1
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                // h = k * 56
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(56)),
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(4)),
+                    rhs: Operand::Const(IrConst::I32(255)),
+                    ty: IrType::I32,
+                },
+                Instruction::Copy {
+                    dest: Value(6),
+                    src: Operand::Value(Value(5)),
+                },
+                Instruction::BinOp {
+                    dest: Value(8),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 9;
+
+        let changes = ivsr_function_scalar(&mut func);
+        assert!(changes >= 1, "affine multiply reduced");
+        let derived: Vec<_> = func.blocks[1]
+            .instructions
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::Phi { dest, incoming, .. } if *dest != Value(1) => {
+                    Some(incoming.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(derived.len(), 1);
+        assert!(
+            derived[0]
+                .iter()
+                .any(|(op, _)| matches!(op, Operand::Const(IrConst::I32(56)))),
+            "init folds to (0+1)*56 = 56"
         );
     }
 }

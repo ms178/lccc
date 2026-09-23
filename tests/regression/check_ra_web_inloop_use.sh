@@ -184,8 +184,28 @@ def insns(lines):
     return [l for l in lines if re.match(r'^\s+[a-z]', l)]
 
 
+# RELOAD-CLASS stack reference: a plain (non-indexed) slot operand on a
+# non-lea instruction. Indexed forms (`16(%rsp, %r10, 4)`) are USER ARRAY
+# accesses and `lea`-materialised bases are ADDRESS computations — neither
+# is a spill reload, and counting them made the concentration metric measure
+# the W[] data array once the S46 tree eliminated the round loop's actual
+# spills (measured 2026-09-23: default arm 0 reload-class loop accesses vs
+# the kill switch's 6; the old metric reported 4-vs-4 by counting the W[]
+# array's own 2 indexed + 2 lea references on both arms).
+IDX_STK = re.compile(r"\(%(?:rsp|rbp|esp|ebp),")
+
+
+def reload_refs(line):
+    if re.match(r'^\s+lea[a-z]*\s', line):
+        return []
+    if IDX_STK.search(line):
+        return []
+    return STK.findall(line)
+
+
 def hottest_loop(lines):
-    """Largest backward-jump loop: (insns, stack-memops, slots, max-per-slot)."""
+    """Largest backward-jump loop: (insns, reload-class stack-memops, slots,
+    max-per-slot)."""
     labels = {}
     for i, l in enumerate(lines):
         m = re.match(r'^(\.L[A-Za-z0-9_]+):', l)
@@ -200,9 +220,9 @@ def hottest_loop(lines):
         if best is None or len(seg) > best[0]:
             slots = collections.Counter()
             for x in seg:
-                for off in STK.findall(x):
+                for off in reload_refs(x):
                     slots[off] += 1
-            stk = sum(len(STK.findall(x)) for x in seg)
+            stk = sum(slots.values())
             best = (len(seg), stk, len(slots), max(slots.values()) if slots else 0)
     return best
 

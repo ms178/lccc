@@ -3603,7 +3603,21 @@ fn rax_elidable_after(store: &LineStore, infos: &[LineInfo], mut at: usize, len:
             && !t.starts_with("stc")
             && !t.starts_with("cmov");
         // `xorl %eax, %eax` / `xorq %rax, %rax` are writes too.
-        let xor_self = t.starts_with("xor") && (t.contains("%eax") || t.contains("%rax"));
+        // SOUNDNESS (S47, the PR #602 CI RED): the old predicate was
+        // `starts_with("xor") && contains("%eax"/"%rax")` — it matched ANY
+        // xor MENTIONING the accumulator, including pure READS such as
+        // `xorl %eax, %r9d` (the MachInst acc-resident substitution's
+        // consumption of a parked value) and RMW forms like
+        // `xorl 28(%rsp), %eax`. Treating a read as a kill made
+        // rax_elidable_after return true at the first READER, the
+        // accumulator-ALU fold then destroyed the %eax copy
+        // (`andl mem,%eax` → `andl mem,%r9d` + a deleted staging mov),
+        // and sha256_transform's CH read the clobbered %eax — the
+        // known-answer self-check failed (legacy phi-order arm; the
+        // differential gates caught it as the S46 CI RED). Only the exact
+        // self-zeroing idioms retire the old value; every other mention
+        // falls through to the READ check below.
+        let xor_self = t == "xorl %eax, %eax" || t == "xorq %rax, %rax";
         if is_write || xor_self {
             return true;
         }

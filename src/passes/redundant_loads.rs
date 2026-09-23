@@ -69,6 +69,18 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             let mut removed: Vec<usize> = Vec::new();
 
             for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
+                // SYM-REDEFINITION GUARD: a form's symbol leaves include
+                // copy-web values (multi-def ids). Any instruction that
+                // (re)defines such an id makes every available form
+                // referencing it position-stale — the web's content at the
+                // load site differs from its content later in the block.
+                // Drop exactly those entries; single-def SSA ids are never
+                // redefined, so the guard costs nothing there.
+                if let Some(dest) = inst.dest() {
+                    if !available.is_empty() {
+                        available.retain(|(f, _, _)| !f.syms.iter().any(|s| s.0 == dest.0));
+                    }
+                }
                 match inst {
                     Instruction::Load {
                         dest,
@@ -140,6 +152,50 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                             None => available.clear(),
                         }
                     }
+                    Instruction::Intrinsic {
+                        op, dest_ptr, args, ..
+                    } => {
+                        // A modeled `VecStore*` is a memory write like any
+                        // scalar Store: resolve its (base, index, disp)
+                        // address and retain only provably-disjoint loads.
+                        // This is what lets the SLP'd nbody pair loop keep
+                        // its `bodies[j].mass` load available across the
+                        // packed vx/vy stores (stride-period field
+                        // disjointness) instead of re-loading it for the
+                        // scalar vz tail. Unmodeled write intrinsics
+                        // (dest_ptr set, family not in the table) and
+                        // unresolvable addresses fail closed: clear.
+                        if let Some((true, ssz, base, index, disp)) =
+                            alias::vec_intrinsic_access(op, args)
+                        {
+                            match alias::resolve_vec_addr_in_frame(
+                                func, &defs, &frames, frame, base, index, disp,
+                            ) {
+                                Some(sform) => {
+                                    let keep = |entry: &(
+                                        alias::LinForm,
+                                        crate::common::types::IrType,
+                                        Value,
+                                    )| {
+                                        match (
+                                            crate::passes::loop_memory_promote::byte_size(entry.1),
+                                            Some(ssz),
+                                        ) {
+                                            (Some(lsz), Some(_)) => alias::forms_disjoint(
+                                                &entry.0, lsz, &sform, ssz, true,
+                                            ),
+                                            _ => false,
+                                        }
+                                    };
+                                    available.retain(keep);
+                                }
+                                None => available.clear(),
+                            }
+                        } else if dest_ptr.is_some() {
+                            available.clear();
+                        }
+                        // Read-only / pure intrinsics: no memory effect.
+                    }
                     // Calls, atomics, inline asm, variadics: unknown memory
                     // effects, kill everything.  Intrinsics with a write
                     // pointer kill everything (read-only intrinsics are fine).
@@ -154,11 +210,6 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     | Instruction::VaStart { .. }
                     | Instruction::VaEnd { .. }
                     | Instruction::VaCopy { .. } => {
-                        available.clear();
-                    }
-                    Instruction::Intrinsic {
-                        dest_ptr: Some(_), ..
-                    } => {
                         available.clear();
                     }
                     Instruction::AtomicLoad { .. } => {

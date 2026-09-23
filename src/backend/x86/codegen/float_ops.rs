@@ -360,6 +360,21 @@ impl X86Codegen {
 
         // dest holds neither operand and neither is XMM-homed (both memory
         // or constants). Load lhs into dest, then op with rhs.
+        // SAME-VALUE SHAPE: `x * x` / `x + x` / `x - x` / `x / x` with x
+        // slot-homed reads the slot TWICE — once staged into dest, once as
+        // the memory source. The staged register already holds the value;
+        // both operands read it (operand order is irrelevant when both are
+        // the same value, so non-commutative sub/div are equally exact).
+        // The nbody d² chain's `movsd -152(%rbp),%xmm5; vmulsd
+        // -152(%rbp),%xmm5,%xmm5` becomes one load + one register mul.
+        if let (Operand::Value(l), Operand::Value(r)) = (lhs, rhs) {
+            if l.0 == r.0 {
+                self.load_fp_to_reg(lhs, ty, reg);
+                emit_vop(self, &format!("%{}", reg), reg);
+                self.state.reg_cache.invalidate_acc();
+                return true;
+            }
+        }
         // NOTE: `0.0 + rhs` is NOT folded to `rhs` here: +0.0 + (-0.0) = +0.0
         // per IEEE-754 (observable via signbit), and GCC keeps the add for
         // exactly this reason at -O2. Only -fno-signed-zeros may fold it,
@@ -1930,6 +1945,21 @@ impl X86Codegen {
                     }
                 }
                 if let Some(slot) = self.state.get_slot(v.0) {
+                    // SAME-VALUE FMA (acc += x*x with x slot-homed): the
+                    // staged src1 already holds x — folding the slot for
+                    // src2 is the second memory read of one value on the
+                    // critical d² chain. Both operands read the register
+                    // (same value — operand order is irrelevant).
+                    if let Operand::Value(lv) = mul_lhs {
+                        if lv.0 == v.0 {
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}, {}, %xmm0",
+                                fma, lhs_src, lhs_src
+                            ));
+                            self.store_xmm0_fp_dest(add_dest, ty);
+                            return;
+                        }
+                    }
                     let sr = self.slot_ref(slot.0);
                     // mem form: encoder wants (mem, vvvv, dst) = src2, src1, dest
                     self.state
