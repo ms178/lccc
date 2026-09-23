@@ -8,7 +8,7 @@ WT=${BISECT_WORKTREE:-/home/user/bisect}
 # contract below (toolchain selection, warning policy) must come from it, not
 # from the historical worktree it is about to create.
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}
 export PATH="$HOME/.cargo/bin:$PATH"
 # Resolve from the live checkout, not from a historical worktree: a bisection
 # must use the current supported compiler toolchain for every candidate.

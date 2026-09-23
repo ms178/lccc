@@ -30,7 +30,7 @@
 #endif
 
 #ifndef EXPECT_A
-#define EXPECT_A 569u
+#define EXPECT_A 683u
 #endif
 
 volatile uint32_t g_sink;
@@ -93,6 +93,36 @@ __attribute__((noinline)) static uint32_t testb_ptr(const uint8_t *p) {
     return r;
 }
 
+
+/* The zext-pair compare law: two sub-word values widened to 32 bits and
+ * compared there fold to one narrow register/memory compare for equality
+ * and unsigned readers, never for signed readers (the top-bit rows
+ * disagree).  Each function drives both classes so a wrong fold is a
+ * wrong exit code. */
+__attribute__((noinline)) static uint32_t pair_cmp_reg(unsigned short a, unsigned short b) {
+    uint32_t r = 0;
+    if (a == b)
+        r |= 1;
+    if (a != b)
+        r |= 2;
+    if (a < b)
+        r |= 4; /* unsigned reader: foldable */
+    if ((short)a < (short)b)
+        r |= 8; /* signed reader: the fold must refuse */
+    return r;
+}
+
+__attribute__((noinline)) static uint32_t pair_cmp_mem(const unsigned short *p, unsigned short v) {
+    uint32_t r = 0;
+    if (*p == v)
+        r |= 1;
+    if (*p > v)
+        r |= 2; /* unsigned */
+    if (*p < v)
+        r |= 4; /* unsigned */
+    return r;
+}
+
 __attribute__((noinline)) static int bool_from_cmp(unsigned char b) {
     /* sete %al; movzbl %al, %eax shapes: the bool materialisation. */
     int t = (b == 7);
@@ -123,6 +153,19 @@ int main(void) {
     r ^= testb_ptr(&bytes[0]) * 41u;
     r ^= testb_ptr(&bytes[1]) * 43u;
     r ^= testb_ptr(&bytes[2]) * 47u;
+    g_sink = r;
+
+    r ^= pair_cmp_reg(0x7FFF, 0x7FFF) * 61u;
+    r ^= pair_cmp_reg(0x8000, 0x0001) * 67u; /* the top-bit row */
+    r ^= pair_cmp_reg(0xFFFE, 0xFFFF) * 71u;
+    g_sink = r;
+
+    {
+        static const unsigned short words[3] = {0x8000, 0x0001, 0xFFFF};
+        r ^= pair_cmp_mem(&words[0], 0x8000) * 73u;
+        r ^= pair_cmp_mem(&words[1], 0x0002) * 79u;
+        r ^= pair_cmp_mem(&words[2], 0xFFFE) * 83u;
+    }
     g_sink = r;
 
     r ^= (uint32_t)bool_from_cmp(7) * 53u;

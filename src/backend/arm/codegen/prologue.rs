@@ -338,6 +338,8 @@ impl ArmCodegen {
                 // allocator must keep the index live to the consumer's end.
                 crate::backend::generation::collect_folded_index_links(func),
                 &self.state.ra_config,
+                // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
+                &mut crate::common::fx_hash::FxHashMap::default(),
             );
 
         if std::env::var_os("CCC_NO_CSINC_FOLD").is_none() {
