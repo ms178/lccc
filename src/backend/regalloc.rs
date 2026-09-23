@@ -575,6 +575,23 @@ pub struct RegAllocResult {
     pub used_regs: Vec<PhysReg>,
     pub caller_save_spans: FxHashMap<u8, Vec<(u32, u32)>>,
     pub liveness: Option<LivenessResult>,
+    /// Coalesced same-value classes: member value id → class representative
+    /// (the minimum id, for determinism). Covers exactly the classes the
+    /// overlap verifier blesses — slot coalescing webs, applied phi-copy
+    /// destructive updates, and FP webs — because those are the groups whose
+    /// members provably denote the SAME value at every program point where
+    /// both are live. The x86 emitter's home-freshness bookkeeping tracks
+    /// freshness per SSA id; an in-place chain update (`cmovnel %r10d,%r13d`
+    /// for the newest id of a coalesced induction chain) legitimately evicts
+    /// the OLDER member ids while the register content is still exactly
+    /// their value (kernel 6.18.52 workqueue.c llc_populate_cpu_shard_id:
+    /// v107→v109→v103 all homed r13 slot-less, the cmov freshened v109 only,
+    /// and the consumer of v103 hit the fail-closed operand_to_rax gate with
+    /// no slot to reload from). Read-side consumers consult this map to
+    /// accept a FRESH class sibling as proof the home is readable. Empty on
+    /// targets whose emitters are not alias-aware (ARM/RISC-V/i686 keep the
+    /// pre-alias behavior).
+    pub phi_chain: FxHashMap<u32, u32>,
 }
 
 /// Whether x86 can preserve incoming parameters directly in caller-saved homes.
@@ -3105,6 +3122,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             used_regs: Vec::new(),
             caller_save_spans: FxHashMap::default(),
             liveness: None,
+            phi_chain: FxHashMap::default(),
         };
     }
 
@@ -5815,12 +5833,49 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     accumulator_assignments.retain(|a| !assignments.contains_key(&a.value_id));
     verify_accumulator_assignments(func, &accumulator_assignments);
 
+    // Collapse the verifier's blessed same-value classes into one union-find
+    // and publish each class under its minimum member id. Only classes the
+    // overlap repair already unions may be published: regular copy webs,
+    // actually-applied phi destructive updates, and FP webs. Rejected phi
+    // candidates never bless overlaps and must not alias here either.
+    let mut chain_parent: FxHashMap<u32, u32> = assignments.keys().map(|&v| (v, v)).collect();
+    for (&member, &leader) in &coalesce_member_of {
+        unite_map(&mut chain_parent, member, leader);
+    }
+    for pair in &applied_phi_coalesce {
+        unite_map(&mut chain_parent, pair.phi_dest, pair.backedge_src);
+    }
+    for (&member, &leader) in &fp_web_member_of {
+        unite_map(&mut chain_parent, member, leader);
+    }
+    let mut chain_roots: FxHashMap<u32, u32> = FxHashMap::default();
+    for v in chain_parent.keys() {
+        let mut r = *v;
+        while chain_parent[&r] != r {
+            r = chain_parent[&r];
+        }
+        chain_roots.insert(*v, r);
+    }
+    let mut class_min: FxHashMap<u32, u32> = FxHashMap::default();
+    for (&member, &root) in &chain_roots {
+        let entry = class_min.entry(root).or_insert(member);
+        *entry = (*entry).min(member);
+    }
+    let mut phi_chain: FxHashMap<u32, u32> = FxHashMap::default();
+    for (&member, &root) in &chain_roots {
+        let rep = class_min[&root].min(root);
+        if member != rep {
+            phi_chain.insert(member, rep);
+        }
+    }
+
     RegAllocResult {
         assignments,
         accumulator_assignments,
         used_regs,
         caller_save_spans,
         liveness: Some(liveness),
+        phi_chain,
     }
 }
 
@@ -13321,6 +13376,107 @@ mod allocation_kernel_tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+        }
+    }
+
+    /// Regression (kernel 6.18.52 workqueue.c llc_populate_cpu_shard_id):
+    /// a coalesced induction chain (v107→v109→v103) homed slot-less in one
+    /// register must be published as ONE same-value class in
+    /// RegAllocResult::phi_chain, so the emitter's alias-aware freshness can
+    /// accept a fresh sibling as proof the home is readable after an
+    /// in-place chain update evicted the older member ids.
+    #[test]
+    fn phi_chain_published_for_applied_coalesce() {
+        // Induction chain with a backedge copy: entry v1 = 0, v7 = v1;
+        // head v9 = v7 (latch-carried); latch v10 = v9 + 1, v7 = v10.
+        // Applied phi pairs (v7<-v10-class links) must be published as one
+        // same-value class in RegAllocResult::phi_chain, each member
+        // resolving to a representative that does not chain further.
+        let mut func = IrFunction::new("chain".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(IrConst::I32(0)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(7),
+                        src: Operand::Value(Value(1)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::Copy {
+                    dest: Value(9),
+                    src: Operand::Value(Value(7)),
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(10),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(9)),
+                        rhs: Operand::Const(IrConst::I32(1)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Copy {
+                        dest: Value(7),
+                        src: Operand::Value(Value(10)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                3,
+                vec![Instruction::Copy {
+                    dest: Value(11),
+                    src: Operand::Value(Value(9)),
+                }],
+                Terminator::Branch(BlockId(4)),
+            ),
+            block(
+                4,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(11)))),
+            ),
+        ];
+        func.next_value_id = 12;
+        let config = RegAllocConfig {
+            available_regs: vec![PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5)],
+            accumulator_policy: AccumulatorPolicy {
+                operand_order: AccumulatorOperandOrder::LhsFirst,
+                return_consumes_accumulator: false,
+            },
+            caller_saved_regs: vec![],
+            call_arg_regs: vec![],
+            indirect_target_regs: vec![],
+            allow_inline_asm_regalloc: false,
+            leaf_caller_saved_homes: false,
+            xmm_regs: Vec::new(),
+            never_materialized: FxHashSet::default(),
+            folded_index_uses: FxHashMap::default(),
+            reg_hints: FxHashMap::default(),
+            ra_config: Arc::new(RaConfig::default()),
+        };
+        let result = allocate_registers(&func, &config);
+        let rep = |v: u32| result.phi_chain.get(&v).copied().unwrap_or(v);
+        for (&member, &r) in &result.phi_chain {
+            assert_eq!(
+                rep(r),
+                r,
+                "representative must not chain further: v{member} -> v{r}"
+            );
         }
     }
 

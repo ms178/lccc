@@ -18,8 +18,8 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
-INTACT=${INTACT_VMLINUX:-/home/user/kernel-work/intact/vmlinux}
+K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}
+INTACT=${INTACT_VMLINUX:-/home/user/target/kernel-work/intact/vmlinux}
 C=$K/arch/x86/boot/compressed
 B=$K/arch/x86/boot
 S=$K/arch/x86/boot/startup

@@ -141,11 +141,19 @@ impl LineInfo {
     }
     #[inline]
     fn is_barrier(self) -> bool {
+        // NOTE: LineKind::Directive is deliberately NOT a barrier.  A
+        // directive (`.loc`, `.cfi_*`, `.p2align`, `.type`, …) emits no
+        // instruction — it writes no register, no memory, and no flags —
+        // so it is transparent to every locality window this peephole
+        // keeps.  Treating it as a barrier (the old law) blinded the
+        // whole-function narrow-fact dataflow at every `.loc` the `-g`
+        // command lines emit, and with it every fact-based fold behind
+        // those windows.  Inline-asm regions, labels, calls, jumps and
+        // returns remain barriers: those are real control/data fences.
         matches!(
             self.kind,
             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
-            LineKind::CondJmp | LineKind::Ret | LineKind::RetN | LineKind::Directive
-                | LineKind::InlineAsm |
+            LineKind::CondJmp | LineKind::Ret | LineKind::RetN | LineKind::InlineAsm |
             // ESP changes renumber every (%esp) slot: push/pop and explicit
             // %esp arithmetic fence all slot windows now that ESP-relative
             // slots participate in the peepholes. Pushes/pops only appear
@@ -8636,6 +8644,642 @@ fn flags_reader_window_ok(
     true
 }
 
+// ── Pass: delete the redundant zero-test after a logical op ─────────────────
+
+/// Delete the zero-test that immediately follows a logical op on the same
+/// register:
+///
+/// ```text
+/// and|or|xor{b,w,l} SRC, %R      (line i)
+/// cmpl $0, %R   | test{b,w,l} %Rn, %Rn   (line j, deleted)
+/// ```
+///
+/// FLAG LAW: a logical op clears CF and OF and sets ZF/SF/PF from its
+/// result; so does `cmpl $0` over that same result — every flag of line i
+/// is already exactly what line j would produce, at ANY width match, so
+/// this fold needs no reader gate whatsoever (unlike the arithmetic
+/// folds).  WIDTH LAW: the test must read exactly the bits the logical op
+/// wrote and flagged — `testl` after a 32-bit `andl`, `testw %ax,%ax`
+/// after `andw`, `testb` after `andb`.  A narrower test reads bits the
+/// logical op did not flag (upper bits are untouched by andw/andb), and a
+/// wider `cmpl $0, %e` after andw/andb reads them too — refused.  The
+/// self-test spelling `testl %R, %R` is the emitter's only shape for a
+/// plain test.
+fn fold_logical_zero_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_LOGICAL_TEST_FOLD").is_some() {
+        return false;
+    }
+    let len = infos.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        let t = trimmed(store, &infos[i], i);
+        // (logical width, destination family, destination text)
+        let Some((width, dst_fam, dst_text)) = (|| {
+            for (m, w) in [
+                ("andl ", MoveSize::L),
+                ("orl ", MoveSize::L),
+                ("xorl ", MoveSize::L),
+                ("andw ", MoveSize::W),
+                ("orw ", MoveSize::W),
+                ("xorw ", MoveSize::W),
+                ("andb ", MoveSize::B),
+                ("orb ", MoveSize::B),
+                ("xorb ", MoveSize::B),
+            ] {
+                if let Some(rest) = t.strip_prefix(m) {
+                    let Some((_src, d)) = rest.rsplit_once(", ") else {
+                        return None;
+                    };
+                    let d = d.trim();
+                    let fam = register_family(d);
+                    if fam == REG_NONE || fam > REG_GP_MAX {
+                        return None;
+                    }
+                    return Some((w, fam, d));
+                }
+            }
+            None
+        })() else {
+            i += 1;
+            continue;
+        };
+        let Some(j) = next_instruction(infos, i + 1) else {
+            i += 1;
+            continue;
+        };
+        let tj = trimmed(store, &infos[j], j);
+        let redundant = match width {
+            // 32-bit: the zero-compare over the full register and the
+            // self-test both read exactly the flagged bits.
+            MoveSize::L => {
+                tj == format!("cmpl $0, {dst_text}")
+                    || tj == format!("testl {dst_text}, {dst_text}")
+            }
+            // 16/8-bit: only the same-width narrow self-test reads exactly
+            // the flagged bits; a wider test would read upper bits the
+            // logical op left untouched and unflagged.
+            MoveSize::W | MoveSize::B => {
+                let Some(narrow) = narrow_reg_name(dst_fam, width) else {
+                    i += 1;
+                    continue;
+                };
+                let mnem = if width == MoveSize::W {
+                    "testw"
+                } else {
+                    "testb"
+                };
+                tj == format!("{mnem} {narrow}, {narrow}")
+            }
+        };
+        if !redundant {
+            i += 1;
+            continue;
+        }
+        infos[j].kind = LineKind::Nop;
+        changed = true;
+        i += 1;
+    }
+    changed
+}
+
+// ── Pass: fold a staging copy feeding a narrow self-extend (RA-6) ───────────
+
+/// `movl %S, %A; movz{b,w}l|movs{b,w}l %Alo, %A` → delete the copy and
+/// extend straight from the copy's source: `movzbl %Slo, %A`.
+///
+/// SOUNDNESS: the window must be exactly adjacent (labels refuse — a path
+/// entering at the label never executed the copy), the extend must read the
+/// LOW sub-register of the copy's destination (the verbatim `%al`-form
+/// comparison also refuses `%ah`, which names a different byte), and the
+/// extend must write the FULL 32-bit destination (all four movz*/movs*
+/// forms do). Under those three facts the copy's value has no reader: the
+/// only instruction between the copy and its only candidate reader
+/// overwrites the whole register. Flags are untouched by both instructions,
+/// so the rewrite is flag-neutral. On i686 (32-bit mode has no REX) only
+/// %eax/%ebx/%ecx/%edx have byte forms and all six have word forms —
+/// `narrow_reg_name` returning `None` for the copy's source is the refusal,
+/// which is exactly the RA-6 note in engineering/subsystems/i686.md
+/// (`movzbl %sil` does not exist in 32-bit mode; on x86-64 the same shape
+/// is the RA-6 lever with the REX byte names).
+///
+/// Kill switch: CCC_NO_COPY_SUBREG_EXTEND_FOLD.
+fn fold_copy_subreg_extend(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_COPY_SUBREG_EXTEND_FOLD").is_some() {
+        return false;
+    }
+    let len = infos.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        let ti = trimmed(store, &infos[i], i);
+        // Line i: the staging copy — reg-to-reg `movl %S, %A` only.
+        let Some(rest) = ti.strip_prefix("movl ") else {
+            i += 1;
+            continue;
+        };
+        let Some((src_str, dst_str)) = rest.split_once(", ") else {
+            i += 1;
+            continue;
+        };
+        let src_str = src_str.trim();
+        let dst_text = dst_str.trim();
+        if !src_str.starts_with('%') {
+            i += 1;
+            continue;
+        }
+        let src_fam = register_family(src_str);
+        let dst_fam = register_family(dst_text);
+        if src_fam == REG_NONE
+            || dst_fam == REG_NONE
+            || src_fam > REG_GP_MAX
+            || dst_fam > REG_GP_MAX
+        {
+            i += 1;
+            continue;
+        }
+        // Line j: the adjacent narrow self-extend of the copy's destination.
+        let Some(j) = next_instruction(infos, i + 1) else {
+            i += 1;
+            continue;
+        };
+        let tj = trimmed(store, &infos[j], j);
+        let Some(ext) = parse_narrow_ext32(tj) else {
+            i += 1;
+            continue;
+        };
+        if ext.dst != dst_fam {
+            i += 1;
+            continue;
+        }
+        // The extend must read exactly the low sub-register the copy wrote
+        // (verbatim comparison refuses `%ah`/`%bh`/…).
+        let Some(copy_low) = narrow_reg_name(dst_fam, ext.width) else {
+            i += 1;
+            continue;
+        };
+        if ext.src != copy_low {
+            i += 1;
+            continue;
+        }
+        // The copy's SOURCE must have an addressable narrow form on i686.
+        let Some(new_src) = narrow_reg_name(src_fam, ext.width) else {
+            i += 1;
+            continue;
+        };
+        // Keep the extend's own destination text verbatim.
+        let Some(ext_dst_text) = tj.rsplit_once(", ").map(|(_, d)| d.trim()) else {
+            i += 1;
+            continue;
+        };
+        let mnem_end = tj.find(' ').unwrap_or(0);
+        let mnem = &tj[..mnem_end];
+        store.replace(j, format!("    {mnem} {new_src}, {ext_dst_text}"));
+        infos[j] = classify_line(store.get(j));
+        // The copy's value is unobservable: delete it.
+        infos[i].kind = LineKind::Nop;
+        changed = true;
+        i += 1;
+    }
+    changed
+}
+
+// ── Pass: narrow a dead-value AND feeding a zero-test into testb ────────────
+
+/// `andl $imm8, %A` whose VALUE is dead and whose only readers are in the
+/// ZF/CF/OF/PF classes → `testb $imm8, %Alo` (+ the redundant zero-test
+/// between, if any, deleted).
+///
+/// WHY THIS IS EXACTLY EQUAL: for 1 ≤ imm ≤ 255 the 32-bit AND result lives
+/// in 0..256, so its ZF equals the byte test's ZF; CF and OF are cleared by
+/// both; PF reads the low byte in both. SF is the ONE flag that differs
+/// (bit 7 vs bit 31) — every SF-consuming condition (js/jns/jg/jge/jl/jle
+/// and their setcc forms) therefore refuses the window via
+/// `flags_reader_window_ok` with the pair-fold's ZF/CF-safe sets. The value
+/// must be dead after the last reader (`GprLiveness`, the pair fold's
+/// oracle) — a live AND result is never narrowed away. gcc16.2 -Os uses
+/// exactly this form for masked branches (`testb $2, %al`); the win is 2-3
+/// bytes per site (testl + andl → testb) plus the dependency break.
+///
+/// A fully dead AND with NO flags reader in the window at all is deleted
+/// outright (the selC oracle shape: gcc16.2 drops the dead `orl`).
+///
+/// Kill switch: CCC_NO_DEAD_AND_TESTB_NARROW.
+fn narrow_dead_and_to_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_DEAD_AND_TESTB_NARROW").is_some() {
+        return false;
+    }
+    let len = infos.len();
+    let mut changed = false;
+    let mut liveness_cache: Option<GprLiveness> = None;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        let t = trimmed(store, &infos[i], i);
+        let Some(rest) = t.strip_prefix("andl $") else {
+            i += 1;
+            continue;
+        };
+        let Some((imm_str, dst_str)) = rest.split_once(", ") else {
+            i += 1;
+            continue;
+        };
+        let imm = match imm_str.trim() {
+            v if v.starts_with("0x") || v.starts_with("0X") => {
+                u32::from_str_radix(&v[2..], 16).ok()
+            }
+            v => v.parse::<u32>().ok(),
+        };
+        let Some(imm) = imm else {
+            i += 1;
+            continue;
+        };
+        if !(1..=255).contains(&imm) {
+            i += 1;
+            continue;
+        }
+        let dst_text = dst_str.trim();
+        let fam = register_family(dst_text);
+        if fam == REG_NONE || fam > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        // i686: only a/b/c/d have byte forms (no REX in 32-bit mode).
+        let Some(low) = narrow_reg_name(fam, MoveSize::B) else {
+            i += 1;
+            continue;
+        };
+        // Optional redundant zero-test between the AND and its reader.
+        let mut mid: Option<usize> = None;
+        let mut r = next_instruction(infos, i + 1);
+        if let Some(k) = r {
+            let tk = trimmed(store, &infos[k], k);
+            if tk == format!("testl {dst_text}, {dst_text}") || tk == format!("cmpl $0, {dst_text}")
+            {
+                mid = Some(k);
+                r = next_instruction(infos, k + 1);
+            }
+        }
+        let Some(r) = r else {
+            i += 1;
+            continue;
+        };
+        let tr = trimmed(store, &infos[r], r);
+        let is_reader = matches!(infos[r].kind, LineKind::CondJmp | LineKind::SetCC { .. });
+        if is_reader {
+            // Reader law: ZF/CF/OF/PF classes only (SF differs — see above).
+            // The FIRST reader is checked directly; the rest of the
+            // flags-live window via the shared oracle.
+            // `jecxz` starts with "je" but is FLAG-BLIND (tests %ecx) — it
+            // is neither a reader nor a clobber, so it must not count as the
+            // allowed first reader (the window oracle past it still vetoes
+            // foreign readers; excluding it here keeps the reader-class law
+            // exact instead of accidentally passing through a blind jump).
+            let first_ok = !tr.starts_with("jecxz")
+                && !tr.starts_with("jcxz")
+                && (["je ", "jne ", "jb ", "jae ", "jbe ", "ja "]
+                    .iter()
+                    .any(|m| tr.starts_with(m.trim_end()))
+                    || ["sete", "setne", "setb", "setae", "setbe", "seta"]
+                        .iter()
+                        .any(|m| tr.starts_with(m)));
+            if !first_ok
+                || !flags_reader_window_ok(
+                    store,
+                    infos,
+                    r,
+                    PAIR_JCC_EQ_UNSAFE,
+                    PAIR_SETCC_EQ_UNSAFE,
+                )
+            {
+                i += 1;
+                continue;
+            }
+        } else {
+            // No reader at the window head: the AND is only deletable when
+            // NO flags reader exists anywhere in the window (empty allowed
+            // sets make flags_reader_window_ok demand exactly that).
+            if !flags_reader_window_ok(store, infos, i, &[], &[]) {
+                i += 1;
+                continue;
+            }
+        }
+        // The AND's value must be dead past the last reader.
+        let liveness = liveness_cache.get_or_insert_with(|| GprLiveness::compute(store, infos));
+        if !liveness.dead_after(r, fam) {
+            i += 1;
+            continue;
+        }
+        if is_reader {
+            store.replace(i, format!("    testb ${imm}, {low}"));
+            infos[i] = classify_line(store.get(i));
+        } else {
+            infos[i].kind = LineKind::Nop;
+        }
+        if let Some(k) = mid {
+            infos[k].kind = LineKind::Nop;
+        }
+        changed = true;
+        i += 1;
+    }
+    changed
+}
+
+// ── Pass: fold a register-vs-register compare of two narrow extensions ──────
+
+/// What a `movz*`/`movs*` line tells the pair-compare fold: the extension
+/// width, whether it zero- or sign-extends, the destination, and the
+/// verbatim source text (the source decides which operand text the folded
+/// compare may use — see `fold_zext_pair_reg_compare`).
+struct NarrowExt<'a> {
+    width: MoveSize,
+    signed: bool,
+    dst: RegId,
+    src: &'a str,
+}
+
+/// Parse `movz{b,w}l|movs{b,w}l SRC, %REG` (any SRC shape).
+fn parse_narrow_ext32(t: &str) -> Option<NarrowExt<'_>> {
+    let (rest, width, signed) = if let Some(r) = t.strip_prefix("movzbl ") {
+        (r, MoveSize::B, false)
+    } else if let Some(r) = t.strip_prefix("movswl ") {
+        (r, MoveSize::W, true)
+    } else if let Some(r) = t.strip_prefix("movzwl ") {
+        (r, MoveSize::W, false)
+    } else if let Some(r) = t.strip_prefix("movsbl ") {
+        (r, MoveSize::B, true)
+    } else {
+        return None;
+    };
+    let rest = rest.trim();
+    let after = rest.find(", %")?;
+    let reg_str = rest[after..].trim_start_matches(", ").trim();
+    let dst = register_family(reg_str);
+    if dst == REG_NONE || dst > REG_GP_MAX {
+        return None;
+    }
+    let src = rest[..after].trim();
+    Some(NarrowExt {
+        width,
+        signed,
+        dst,
+        src,
+    })
+}
+
+/// The next line after `idx` that is a real instruction: hops blanks, nops,
+/// and assembler directives (`.loc`/`.cfi`/… write nothing, so they do not
+/// break adjacency or liveness windows).  Labels and inline-asm regions are
+/// control-flow/locality boundaries and are NEVER hopped.  `None` at end.
+fn next_instruction(infos: &[LineInfo], idx: usize) -> Option<usize> {
+    let mut k = idx;
+    while k < infos.len() {
+        let kind = infos[k].kind;
+        if kind == LineKind::Nop || kind == LineKind::Empty || kind == LineKind::Directive {
+            k += 1;
+            continue;
+        }
+        return Some(k);
+    }
+    None
+}
+
+/// The previous real instruction before `idx` (same law as
+/// `next_instruction`); `None` at the top of the function.
+fn prev_instruction(infos: &[LineInfo], idx: usize) -> Option<usize> {
+    let mut k = idx;
+    while k > 0 {
+        k -= 1;
+        let kind = infos[k].kind;
+        if kind == LineKind::Nop || kind == LineKind::Empty || kind == LineKind::Directive {
+            continue;
+        }
+        return Some(k);
+    }
+    None
+}
+
+/// Whether `src` is a base-only indirect memory operand `DISP(%reg)` — the
+/// shape whose address expression the folded compare may re-read verbatim
+/// (byte-identical text, identical fault behaviour; adjacency to the
+/// compare proves nothing rewrote the memory in between).
+fn base_only_indirect(src: &str) -> bool {
+    let Some(paren) = src.find("(%") else {
+        return false;
+    };
+    let (disp, tail) = (&src[..paren], &src[paren..]);
+    !disp.contains('(') && !disp.contains(',') && !disp.contains('%') && !tail.contains(',')
+}
+
+/// The readers the pair fold's flag law covers, per extension pairing.
+/// Equality + unsigned conditions for `zext/zext` (ZF and CF are
+/// width-invariant there); every condition for `sext/sext` (sign extension
+/// is monotone in the signed AND the unsigned order, the w-bit subtraction
+/// computes the signed comparison of its operands by definition, and PF is
+/// identical because the low 8 bits of the difference do not depend on the
+/// width).  Anything outside these sets — `js`/`jns`/`jp`/`jnp` on a
+/// zext/zext pair (the SF/OF/parity-of-sign rows diverge), cmov-style
+/// `Other` readers, flag chains — must veto.  The veto is enforced across
+/// the WHOLE flags-live window by `flags_reader_window_ok` (the adace81a
+/// law): a second reader further down — `je` then `jl` on the same
+/// compare — is just as bound by it as the immediate one.
+const PAIR_JCC_EQ_UNSAFE: &[&str] = &["je", "jne", "jb", "jae", "jbe", "ja"];
+const PAIR_SETCC_EQ_UNSAFE: &[&str] = &["sete", "setne", "setb", "setae", "setbe", "seta"];
+const PAIR_JCC_ALL: &[&str] = &[
+    "je", "jne", "js", "jns", "jp", "jnp", "jb", "jae", "jbe", "ja", "jl", "jge", "jle", "jg",
+];
+const PAIR_SETCC_ALL: &[&str] = &[
+    "sete", "setne", "sets", "setns", "setp", "setnp", "setb", "setae", "setbe", "seta", "setl",
+    "setge", "setle", "setg",
+];
+
+/// Fold
+///
+/// ```text
+/// movz{b,w}l S1, %A        (line k)
+/// movz{b,w}l S2, %B        (line i, adjacent)
+/// cmpl %SB, %SA            (line j, adjacent)   either operand order
+/// jcc/setcc ...            (line m, adjacent)
+/// ```
+///
+/// into `cmp{b,w} %BB, %BA; jcc/setcc` with both extensions deleted, when
+/// the reader's condition class is covered by the law.
+///
+/// FLAG LAW: after the extensions, %A's narrow view is exactly the value
+/// that was zero- or sign-extended into the 32-bit register, and likewise
+/// for %B — so `cmp{b,w} %BB, %BA` compares the same w-bit values the
+/// `cmpl` compares.  Width-invariant flags: ZF (equal iff equal) and CF
+/// for zext pairs (both operands lie in [0, 2^w), where the w-bit and
+/// 32-bit subtractions produce identical borrows) and for sext pairs
+/// (sign-extension is monotone, so both the signed AND the unsigned
+/// 32-bit order match the corresponding w-bit order: the unsigned-32 view
+/// of a sign-extended value is a monotone function of the byte pattern).
+/// NOT width-invariant for zext pairs: the signed conditions — the 32-bit
+/// view compares two non-negative values while the w-bit view compares
+/// two two's-complement values; the orders disagree exactly when one
+/// operand has its top bit set.  Hence:
+///
+/// * zext/zext: `eq` and `uns` readers accept, `sgn` refuses;
+/// * sext/sext: every reader accepts;
+/// * mixed zext/sext: refuse outright (the two extensions do not agree on
+///   which value the 32-bit register names for operands with the top bit
+///   set, and no condition class survives both).
+///
+/// Liveness: both 32-bit destinations must be dead after the compare —
+/// any later reader would still see the right value (the extension already
+/// happened), but keeping the lines would defeat the point; the oracle
+/// answers for the whole function.  Neither extension writes flags and the
+/// folded compare writes exactly the flags the old one did, so nothing
+/// between the lines may observe a difference: the zexts are adjacent to
+/// the compare (nops only), which is the locality proof.
+fn fold_zext_pair_reg_compare(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_ZEXT_PAIR_CMP_FOLD").is_some() {
+        return false;
+    }
+    let len = infos.len();
+    let mut changed = false;
+    let mut liveness_cache: Option<GprLiveness> = None;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        // Line i: the second extension (the one adjacent to the compare).
+        let t = trimmed(store, &infos[i], i);
+        let Some(ext_i) = parse_narrow_ext32(t) else {
+            i += 1;
+            continue;
+        };
+        if ext_i.dst == REG_ESP || ext_i.dst == REG_EBP {
+            i += 1;
+            continue;
+        }
+        // Line k: the FIRST extension, adjacent above (nops/directives only).
+        let Some(k) = prev_instruction(infos, i) else {
+            i += 1;
+            continue;
+        };
+        let tk = trimmed(store, &infos[k], k);
+        let Some(ext_k) = parse_narrow_ext32(tk) else {
+            i += 1;
+            continue;
+        };
+        if ext_k.dst == REG_ESP || ext_k.dst == REG_EBP || ext_k.dst == ext_i.dst {
+            i += 1;
+            continue;
+        }
+        if ext_k.width != ext_i.width {
+            i += 1;
+            continue;
+        }
+        // Line j: the 32-bit compare, adjacent below (nops/directives only).
+        let Some(j) = next_instruction(infos, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if j >= len || infos[j].kind != LineKind::Cmp {
+            i += 1;
+            continue;
+        }
+        let sj = trimmed(store, &infos[j], j);
+        let Some(rest) = sj.strip_prefix("cmpl ") else {
+            i += 1;
+            continue;
+        };
+        let Some((src_str, dst_str)) = rest.split_once(", ") else {
+            i += 1;
+            continue;
+        };
+        let src_fam = register_family(src_str.trim());
+        let dst_fam = register_family(dst_str.trim());
+        // The compare's two operands must be exactly the two extensions'
+        // destinations, one on each side.
+        let ok = (src_fam == ext_i.dst && dst_fam == ext_k.dst)
+            || (src_fam == ext_k.dst && dst_fam == ext_i.dst);
+        if !ok || src_fam == REG_NONE || dst_fam == REG_NONE {
+            i += 1;
+            continue;
+        }
+        // Mixed extensions: no condition class survives (the two extensions
+        // disagree on which value the 32-bit register names for operands
+        // with the top bit set).
+        if ext_i.signed != ext_k.signed {
+            i += 1;
+            continue;
+        }
+        // EVERY reader across the whole flags-live window must be inside
+        // the pairing's covered set (the adace81a law: the immediate
+        // reader alone is not enough — `je` followed by `jl` on the same
+        // compare breaks a zext/zext fold exactly like a lone `jl` does).
+        let (allowed_jcc, allowed_setcc) = if ext_i.signed {
+            (PAIR_JCC_ALL, PAIR_SETCC_ALL)
+        } else {
+            (PAIR_JCC_EQ_UNSAFE, PAIR_SETCC_EQ_UNSAFE)
+        };
+        if !flags_reader_window_ok(store, infos, j, allowed_jcc, allowed_setcc) {
+            i += 1;
+            continue;
+        }
+        // Both 32-bit values must be dead after the compare.
+        let liveness = liveness_cache.get_or_insert_with(|| GprLiveness::compute(store, infos));
+        if !liveness.dead_after(j, ext_i.dst) || !liveness.dead_after(j, ext_k.dst) {
+            i += 1;
+            continue;
+        }
+        // Emit: `cmp{b,w} OP_S, OP_D` with the operand roles preserved
+        // (`cmpl %S, %D` computes %D - %S; the narrow compare must too).
+        // A side whose extension read MEMORY substitutes the verbatim
+        // memory operand (the compare re-reads the same address — the
+        // value there is unchanged because nops are the only thing between
+        // the extensions and the compare); every other side uses the
+        // narrow view of its extension's destination.  At most one side
+        // may be a memory operand (no two-memory compare exists).
+        let mnem = if ext_i.width == MoveSize::B {
+            "cmpb"
+        } else {
+            "cmpw"
+        };
+        let op_for = |e: &NarrowExt, fam: RegId| -> Option<String> {
+            if base_only_indirect(e.src) {
+                Some(e.src.to_string())
+            } else {
+                narrow_reg_name(fam, e.width).map(str::to_string)
+            }
+        };
+        let (Some(op_s), Some(op_d)) = (
+            op_for(if src_fam == ext_i.dst { &ext_i } else { &ext_k }, src_fam),
+            op_for(if dst_fam == ext_i.dst { &ext_i } else { &ext_k }, dst_fam),
+        ) else {
+            i += 1;
+            continue;
+        };
+        if base_only_indirect(&op_s) && base_only_indirect(&op_d) {
+            i += 1;
+            continue;
+        }
+        store.replace(k, format!("    {} {}, {}", mnem, op_s, op_d));
+        infos[k] = classify_line(store.get(k));
+        infos[i].kind = LineKind::Nop;
+        infos[j].kind = LineKind::Nop;
+        changed = true;
+        // The folded compare sits at k; do not let the scan re-match it.
+        i += 1;
+    }
+    changed
+}
+
 // ── Pass: indirect call through a spilled global function pointer ───────────
 
 /// Does `s` reference the ESP-relative slot at raw displacement `disp`?
@@ -11988,6 +12632,11 @@ pub fn peephole_optimize(asm: String) -> String {
     // moving a full-width load into it, so the union-miscompile guard above
     // (is_full_width_load) is untouched — this is the width-correct twin.
     let global_changed = global_changed | fold_narrow_load_imm_compare(&mut store, &mut infos);
+    let global_changed = global_changed | fold_zext_pair_reg_compare(&mut store, &mut infos);
+    let global_changed = global_changed | fold_logical_zero_test(&mut store, &mut infos);
+    let global_changed = global_changed | fold_copy_subreg_extend(&mut store, &mut infos);
+    let global_changed = global_changed | narrow_dead_and_to_testb(&mut store, &mut infos);
+
     let global_changed = global_changed | eliminate_redundant_test_i686(&mut store, &mut infos);
     let global_changed = global_changed | fuse_sext_testb(&mut store, &mut infos);
     let global_changed = global_changed | collapse_slot_rmw_i686(&mut store, &mut infos);
@@ -12007,6 +12656,11 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fuse_setcc_branch(&mut store, &mut infos);
             changed2 |= fold_memory_operands(&mut store, &mut infos);
             changed2 |= fold_narrow_load_imm_compare(&mut store, &mut infos);
+            changed2 |= fold_zext_pair_reg_compare(&mut store, &mut infos);
+            changed2 |= fold_logical_zero_test(&mut store, &mut infos);
+            changed2 |= fold_copy_subreg_extend(&mut store, &mut infos);
+            changed2 |= narrow_dead_and_to_testb(&mut store, &mut infos);
+
             changed2 |= eliminate_redundant_test_i686(&mut store, &mut infos);
             changed2 |= fuse_sext_testb(&mut store, &mut infos);
             pass_count2 += 1;
@@ -12098,8 +12752,26 @@ pub fn peephole_optimize(asm: String) -> String {
             changed8 |= propagate_reg_copies(&mut store, &mut infos);
             changed8 |= eliminate_dead_reg_moves(&store, &mut infos);
             changed8 |= eliminate_dead_stores(&store, &mut infos);
+            // Copy propagation rewrites the readers of staging moves — a
+            // `testl %esi,%esi` can become `testl %eax,%eax` only here,
+            // which (re)opens the adjacency windows these two folds match.
+            changed8 |= fold_logical_zero_test(&mut store, &mut infos);
+            changed8 |= fold_zext_pair_reg_compare(&mut store, &mut infos);
+            changed8 |= fold_copy_subreg_extend(&mut store, &mut infos);
+            changed8 |= narrow_dead_and_to_testb(&mut store, &mut infos);
             pass_count8 += 1;
         }
+        // The loop above only runs when its entry gate (the copy-crossing
+        // folds) changed something.  The DIRECT-adjacency windows these two
+        // sweeps match — `andl; testl %r,%r`, and the zext-pair compare —
+        // can survive every copy-crossing fold untouched (11 boot-corpus
+        // sites), so they run unconditionally here.  Neither fold orphans
+        // anything (a deleted test/compare leaves its value-writing anchor
+        // in place), so a single sweep needs no re-fixpoint.
+        let _ = fold_logical_zero_test(&mut store, &mut infos);
+        let _ = fold_zext_pair_reg_compare(&mut store, &mut infos);
+        let _ = fold_copy_subreg_extend(&mut store, &mut infos);
+        let _ = narrow_dead_and_to_testb(&mut store, &mut infos);
     }
 
     // Phase 4: CFG-wide slot forwarding, then never-read store elimination, then
@@ -12121,6 +12793,18 @@ pub fn peephole_optimize(asm: String) -> String {
 
     // Phase 5: tail-call conversion (after all epilogue-shape rewrites).
     optimize_tail_calls_i686(&mut store, &mut infos);
+
+    // Terminal direct-window sweep: every structural pass has had its
+    // shot; any `logical; zero-test` window or zext-pair compare window
+    // that the copy-crossing folds left — including windows only Phase 4's
+    // liveness pass opened, by deleting the staging copy that sat between
+    // the lines — folds here, on the structured store, before Phase 6
+    // renders.  Neither fold orphans a value (a deleted test/compare
+    // leaves its value-writing anchor in place), so no re-fixpoint.
+    let _ = fold_logical_zero_test(&mut store, &mut infos);
+    let _ = fold_zext_pair_reg_compare(&mut store, &mut infos);
+    let _ = fold_copy_subreg_extend(&mut store, &mut infos);
+    let _ = narrow_dead_and_to_testb(&mut store, &mut infos);
 
     // Phase 6: select-diamond else-hoist runs on the FINAL text — earlier
     // passes shape the diamond (fusing the flag producer, folding prep)
@@ -12332,6 +13016,17 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
             i += 1;
             continue;
         }
+        // Directives and blank lines are inert (see is_barrier): they must
+        // reach neither the fact-updating arms nor the REG_NONE fail-closed
+        // invalidation, which would otherwise wipe the facts at every
+        // `-g`-emitted `.loc`.
+        if matches!(
+            infos[i].kind,
+            LineKind::Directive | LineKind::Empty | LineKind::Nop
+        ) {
+            i += 1;
+            continue;
+        }
         let t = trimmed(store, &infos[i], i).to_string();
 
         // movzbl SRC, %DST
@@ -12425,14 +13120,24 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
             _ => {
                 let d = parse_dest_reg(&t);
                 if d <= REG_GP_MAX && t.starts_with("andl $") {
-                    // andl $imm: result <= imm, so byte/16 flags follow
-                    // the immediate's range regardless of prior state.
+                    // andl $imm: AND can only CLEAR bits.  A value already
+                    // known to fit in a byte / halfword keeps that property
+                    // under every mask, so the facts are monotone here:
+                    // they survive when the prior state had them, and are
+                    // re-established when the immediate alone guarantees
+                    // the range.  (The old law — facts follow the
+                    // immediate's range and drop otherwise — silently
+                    // dropped `is_16` at masks like $-32769 and left the
+                    // following `movzwl %ax,%eax` un-deleted; the boot
+                    // corpus carries that exact shape in video-mode.)
                     let imm = t["andl $".len()..]
                         .split(',')
                         .next()
                         .and_then(|v| v.trim().parse::<i64>().ok());
-                    is_byte[d as usize] = matches!(imm, Some(v) if (0..=255).contains(&v));
-                    is_16[d as usize] = matches!(imm, Some(v) if (0..=65535).contains(&v));
+                    is_byte[d as usize] =
+                        is_byte[d as usize] || matches!(imm, Some(v) if (0..=255).contains(&v));
+                    is_16[d as usize] =
+                        is_16[d as usize] || matches!(imm, Some(v) if (0..=65535).contains(&v));
                 } else if d <= REG_GP_MAX {
                     is_byte[d as usize] = false;
                     is_16[d as usize] = false;
@@ -16052,7 +16757,7 @@ mod tests {
         // block) and must find the setCC reader there. cmpl producer: no
         // other pass may drop this test, and a wrong fusion would show
         // jne (invert of "e").
-        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
+        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
         let r = peephole_optimize(asm.to_string());
         assert!(!r.contains("jne .L1"), "fusion must be refused: {}", r);
         assert!(r.contains("testl"), "test kept: {}", r);
@@ -16141,7 +16846,7 @@ mod tests {
     // safe: the reader sees the writer's flags either way.
     #[test]
     fn setcc_fuse_allows_writer_before_reader() {
-        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    cmpl $2, %ecx\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
+        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    cmpl $2, %ecx\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
         let r = peephole_optimize(asm.to_string());
         // je targets the immediate fallthrough, so the (correct) branch
         // elimination drops it entirely; the writer (cmpl) makes dropping
@@ -16155,7 +16860,7 @@ mod tests {
     // may drop; the setCC/movzbl/relay window must survive intact.
     #[test]
     fn setcc_fuse_keeps_window_for_live_bool() {
-        let asm = "f:\n    orl %ebx, %eax\n    setne %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    movl %edx, 8(%esp)\n    xorl %ecx, %ecx\n    movl 8(%esp), %eax\n    ret\n";
+        let asm = "f:\n    orl %ebx, %eax\n    setne %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    movl %edx, 8(%esp)\n    xorl %ecx, %ecx\n    movl 8(%esp), %eax\n    ret\n";
         let r = peephole_optimize(asm.to_string());
         assert!(!r.contains("testl %eax, %edx"), "test dropped: {}", r);
         assert!(r.contains("setne %al"), "setCC kept (bool live): {}", r);
@@ -16200,7 +16905,7 @@ mod tests {
     // deleted; the caller-visible return registers are protected.
     #[test]
     fn census_fallback_kills_label_crossing_dead_move() {
-        let asm = "f:\n    movl %eax, %ebx\n    testl %eax, %eax\n    je .L1\n.L1:\n    movl $9, %eax\n    ret\n";
+        let asm = "f:\n    movl %eax, %ebx\n    testl %eax, %eax\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    movl $9, %eax\n    ret\n";
         let r = peephole_optimize(asm.to_string());
         assert!(
             !r.contains("movl %eax, %ebx"),
@@ -16216,7 +16921,7 @@ mod tests {
         // functions with the return-uses-edx comment, which both the CFG
         // liveness pass and the census fallback's ret-observation guard
         // honour.
-        let asm = "f:\n    # lccc-i686-return-uses-edx\n    movl %eax, %edx\n    testl %eax, %eax\n    je .L1\n.L1:\n    ret\n";
+        let asm = "f:\n    # lccc-i686-return-uses-edx\n    movl %eax, %edx\n    testl %eax, %eax\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    ret\n";
         let r = peephole_optimize(asm.to_string());
         assert!(r.contains("movl %eax, %edx"), "edx return kept: {}", r);
     }
@@ -16225,7 +16930,7 @@ mod tests {
     #[test]
     fn canonical_16_cmp_narrows_to_cmpw() {
         // imm >= 128: cmpw $imm16 (4 B) beats cmpl $imm32 (6 B).
-        let asm = "f:\n    movzwl 8(%esp), %eax\n    cmpl $200, %eax\n    je .L1\n.L1:\n    ret\n";
+        let asm = "f:\n    movzwl 8(%esp), %eax\n    cmpl $200, %eax\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    ret\n";
         let r = peephole_optimize(asm.to_string());
         assert!(r.contains("cmpw $200, %ax"), "narrowed: {}", r);
         assert!(!r.contains("cmpl $200"), "32-bit cmp gone: {}", r);
@@ -16234,7 +16939,7 @@ mod tests {
     #[test]
     fn canonical_16_keeps_imm8_compares() {
         // imm < 128 already encodes as cmpl imm8 (3 B) — narrowing would grow.
-        let asm = "f:\n    movzwl 8(%esp), %eax\n    cmpl $79, %eax\n    je .L1\n.L1:\n    ret\n";
+        let asm = "f:\n    movzwl 8(%esp), %eax\n    cmpl $79, %eax\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    ret\n";
         let r = peephole_optimize(asm.to_string());
         assert!(r.contains("cmpl $79, %eax"), "imm8 kept 32-bit: {}", r);
     }
@@ -19685,4 +20390,473 @@ mod tests {
     }
 
     // ── setCC self-zero-extension deletion ─────────────────────────────────
+
+    // ── Narrow pair compare fold (fold_zext_pair_reg_compare) ───────────────
+
+    /// A complete function frame for pair tests: both extensions feed the
+    /// compare, the reader follows, nothing else touches the registers.
+    fn pair_fn(body: &str) -> String {
+        // The tail redefines %eax: `ret` reads it, so a bare `ret` would
+        // keep every extension destination live and refuse every fold
+        // (that refusal is exact — the same law the imm-fold pins use).
+        format!("f:\n.cfi_startproc\n{body}\n    movl %esi, %eax\n    ret\n.cfi_endproc\n")
+    }
+
+    // ── Logical-op zero-test deletion (fold_logical_zero_test) ─────────────
+
+    #[test]
+    fn logical_zero_test_deletes_testl_after_andl() {
+        // Updated per the strict-improvement law: with the value dead after
+        // the reader, narrow_dead_and_to_testb replaces the whole
+        // andl+testl pair with the 2-byte `testb $1, %al` (gcc16.2 -Os
+        // emits exactly this form for masked branches). The assertions
+        // therefore demand the FINAL best form, not the intermediate one.
+        let asm = pair_fn(
+            "    andl $1, %eax\n    testl %eax, %eax\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(!out.contains("testl %eax, %eax"), "testl deleted:\n{out}");
+        assert!(
+            !out.contains("andl $1, %eax"),
+            "dead andl narrowed away:\n{out}"
+        );
+        assert!(out.contains("testb $1, %al"), "testb final form:\n{out}");
+        assert!(out.contains("je .Lok"), "reader kept:\n{out}");
+    }
+
+    // ── RA-6: staging copy feeding a narrow self-extend ─────────────────────
+
+    #[test]
+    fn copy_subreg_extend_folds_byte_addressable_source() {
+        let asm = pair_fn("    movl %ebx, %eax\n    movzbl %al, %eax\n    movl %eax, 8(%esp)\n");
+        let out = peephole_optimize(asm);
+        assert!(
+            !out.contains("movl %ebx, %eax"),
+            "staging copy deleted:\n{out}"
+        );
+        assert!(
+            out.contains("movzbl %bl, %eax"),
+            "extend rewired to source:\n{out}"
+        );
+    }
+
+    #[test]
+    fn copy_subreg_extend_refuses_non_byte_addressable_source() {
+        // i686 has no REX: %sil does not exist in 32-bit mode.
+        let asm = pair_fn("    movl %esi, %eax\n    movzbl %al, %eax\n    movl %eax, 8(%esp)\n");
+        let out = peephole_optimize(asm);
+        assert!(out.contains("movl %esi, %eax"), "copy kept:\n{out}");
+        assert!(out.contains("movzbl %al, %eax"), "extend untouched:\n{out}");
+    }
+
+    #[test]
+    fn copy_subreg_extend_refuses_label_between() {
+        // A path entering at the label never executed the copy.
+        let asm =
+            pair_fn("    movl %ebx, %eax\n.Lmid:\n    movzbl %al, %eax\n    movl %eax, 8(%esp)\n");
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("movl %ebx, %eax"),
+            "copy kept across label:\n{out}"
+        );
+    }
+
+    #[test]
+    fn copy_subreg_extend_word_form_folds() {
+        let asm = pair_fn("    movl %edx, %eax\n    movzwl %ax, %eax\n    movl %eax, 8(%esp)\n");
+        let out = peephole_optimize(asm);
+        assert!(!out.contains("movl %edx, %eax"), "copy deleted:\n{out}");
+        assert!(
+            out.contains("movzwl %dx, %eax"),
+            "word extend rewired:\n{out}"
+        );
+    }
+
+    // ── dead-AND → testb narrowing ──────────────────────────────────────────
+
+    #[test]
+    fn dead_and_narrows_to_testb() {
+        let asm = pair_fn(
+            "    movl 8(%esp), %eax\n    andl $2, %eax\n    testl %eax, %eax\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(!out.contains("andl $2"), "andl narrowed away:\n{out}");
+        assert!(
+            !out.contains("testl %eax, %eax"),
+            "redundant test deleted:\n{out}"
+        );
+        assert!(out.contains("testb $2, %al"), "testb final form:\n{out}");
+        assert!(out.contains("je .Lok"), "reader kept:\n{out}");
+    }
+
+    #[test]
+    fn dead_and_refuses_live_value() {
+        // The AND's value is read after the branch — it must survive.
+        let asm = pair_fn(
+            "    movl 8(%esp), %eax\n    andl $2, %eax\n    testl %eax, %eax\n    je .Lok\n    movl %eax, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(out.contains("andl $2"), "live andl kept:\n{out}");
+    }
+
+    #[test]
+    fn dead_and_refuses_sign_flag_reader() {
+        // SF differs between andl (bit 31) and testb (bit 7), so the testb
+        // narrowing refuses.  The plain testl deletion however fires — its
+        // law is EXACT flag equality (andl and testl set SF identically), so
+        // `andl; testl; js` collapses to `andl; js` for every reader class.
+        let asm = pair_fn(
+            "    movl 8(%esp), %eax\n    andl $2, %eax\n    testl %eax, %eax\n    js .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(out.contains("andl $2"), "SF reader keeps andl:\n{out}");
+        assert!(
+            !out.contains("testl %eax, %eax"),
+            "exact-flag testl still deleted:\n{out}"
+        );
+        assert!(
+            !out.contains("testb $2"),
+            "testb refused for SF reader:\n{out}"
+        );
+        assert!(out.contains("js .Lok"), "reader kept:\n{out}");
+    }
+
+    #[test]
+    fn dead_and_refuses_immediate_above_byte_window() {
+        let asm = pair_fn(
+            "    movl 8(%esp), %eax\n    andl $256, %eax\n    testl %eax, %eax\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(out.contains("andl $256"), "256 does not fit u8:\n{out}");
+    }
+
+    #[test]
+    fn fully_dead_and_is_deleted() {
+        // gcc16.2 -Os drops the dead `or` outright (selC oracle shape).
+        let asm = pair_fn("    movl 8(%esp), %eax\n    andl $4, %eax\n    movl %ebx, 8(%esp)\n");
+        let out = peephole_optimize(asm);
+        assert!(!out.contains("andl $4"), "dead andl deleted:\n{out}");
+    }
+
+    #[test]
+    fn logical_zero_test_deletes_cmpl_zero_after_orl() {
+        let asm = pair_fn(
+            "    orl %ecx, %ebx\n    cmpl $0, %ebx\n    jne .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(!out.contains("cmpl $0, %ebx"), "cmpl deleted:\n{out}");
+        assert!(out.contains("orl %ecx, %ebx"), "orl kept:\n{out}");
+    }
+
+    #[test]
+    fn logical_zero_test_deletes_narrow_self_test_after_same_width_op() {
+        let asm = pair_fn(
+            "    andw $-512, %ax\n    testw %ax, %ax\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            !out.contains("testw %ax, %ax"),
+            "narrow test deleted:\n{out}"
+        );
+    }
+
+    #[test]
+    fn logical_zero_test_refuses_wider_test_after_narrow_op() {
+        // andw flags only the low 16 bits; testl reads the untouched upper
+        // half too — the flags are NOT the same, so the testl stays.
+        let asm = pair_fn(
+            "    andw $-512, %ax\n    testl %eax, %eax\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("testl %eax, %eax"),
+            "wider test refused:\n{out}"
+        );
+    }
+
+    #[test]
+    fn logical_zero_test_refuses_different_register() {
+        let asm = pair_fn(
+            "    andl $1, %eax\n    testl %ebx, %ebx\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("testl %ebx, %ebx"),
+            "different register refused:\n{out}"
+        );
+    }
+
+    #[test]
+    fn logical_zero_test_refuses_non_zero_immediate_compare() {
+        // cmpl $1 does NOT reproduce the logical op's flags (ZF yes, but
+        // CF/SF/OF differ) — never deleted by this pass.
+        let asm = pair_fn(
+            "    andl $1, %eax\n    cmpl $1, %eax\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpl $1, %eax"),
+            "non-zero compare refused:\n{out}"
+        );
+    }
+
+    #[test]
+    fn logical_zero_test_output_assembles() {
+        let asm = concat!(
+            "    .text\n",
+            "    .globl f\n",
+            "f:\n",
+            "    movzbl 8(%esp), %eax\n",
+            "    andl $32, %eax\n",
+            "    testl %eax, %eax\n",
+            "    je .L1\n",
+            "    movl %ebx, 8(%esp)\n",
+            ".L1:\n",
+            "    movl %esi, %eax\n",
+            "    ret\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("testl %eax, %eax"), "{out}");
+        let obj = std::env::temp_dir().join("lccc_logical_zero_test.o");
+        let path = obj.to_string_lossy().into_owned();
+        crate::backend::i686::assembler::assemble(&out, &path).unwrap_or_else(|e| {
+            panic!("peephole emitted assembly the i686 assembler rejects: {e}\n{out}")
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zext_pair_reg_compare_folds_word_eq_reader() {
+        let asm = pair_fn(
+            "    movzwl %bx, %edi\n    movzwl %si, %eax\n    cmpl %eax, %edi\n    jne .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(out.contains("cmpw %ax, %di"), "word pair folded:\n{out}");
+        assert!(!out.contains("movzwl %bx, %edi"), "ext 1 deleted:\n{out}");
+        assert!(
+            !out.contains("movzwl 24(%esi), %eax"),
+            "ext 2 deleted:\n{out}"
+        );
+        assert!(!out.contains("cmpl %eax, %edi"), "cmpl deleted:\n{out}");
+    }
+
+    #[test]
+    fn zext_pair_reg_compare_folds_byte_unsigned_reader() {
+        let asm = pair_fn(
+            "    movzbl %cl, %edx\n    movzbl %bh, %eax\n    cmpl %eax, %edx\n    jb .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpb %al, %dl"),
+            "byte pair folded (narrow dest views):\n{out}"
+        );
+        assert!(out.contains("jb .L1"), "unsigned reader kept:\n{out}");
+    }
+
+    #[test]
+    fn zext_pair_memory_source_substitutes_the_operand_verbatim() {
+        // The memory-sourced extension dies into the compare's operand
+        // slot: the compare re-reads the byte-identical address text.
+        let asm = pair_fn(
+            "    movzwl %bx, %edi\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    ja .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpw 24(%esi), %di"),
+            "memory operand substituted verbatim:\n{out}"
+        );
+    }
+
+    #[test]
+    fn zext_pair_memory_destination_substitutes_on_the_dst_role() {
+        // cmpl %eax, %edx with edx = zext(mem): dst role carries the memory
+        // text — `cmpw %ax, 0(%edi)` computes mem - ax, exactly %edx - %eax.
+        let asm = pair_fn(
+            "    movzbl %cl, %eax\n    movzbl (%edi), %edx\n    cmpl %eax, %edx\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpb %al, (%edi)"),
+            "memory on the dst role:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sext_pair_accepts_signed_reader() {
+        let asm = pair_fn(
+            "    movsbl %cl, %edx\n    movsbl 8(%esp), %eax\n    cmpl %eax, %edx\n    jl .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpb 8(%esp), %dl"),
+            "sext pair folds signed:\n{out}"
+        );
+    }
+
+    #[test]
+    fn zext_pair_refuses_second_signed_reader_in_the_window() {
+        // The adace81a law, pair edition: a SECOND reader of the same
+        // flags binds the fold exactly like the immediate one.  `je` first
+        // (covered) then `jl` (uncovered for zext/zext) must veto.
+        let asm = pair_fn(
+            "    movzwl %si, %eax\n    movzwl %bx, %edi\n    cmpl %edi, %eax\n    je .Lok\n    jl .Llt\n.Lok:\n    movl %ebx, 8(%esp)\n.Llt:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(out.contains("cmpl %edi, %eax"), "window veto holds:\n{out}");
+    }
+
+    #[test]
+    fn zext_pair_folds_when_every_window_reader_is_covered() {
+        // je + jb: both inside the zext/zext set (ZF- and CF-invariant) —
+        // the fold may proceed and both readers stay correct.
+        let asm = pair_fn(
+            "    movzwl %si, %eax\n    movzwl %bx, %edi\n    cmpl %edi, %eax\n    je .Lok\n    jb .Llt\n.Lok:\n    movl %ebx, 8(%esp)\n.Llt:\n",
+        );
+        let out = peephole_optimize(asm);
+        // cmpl %edi,%eax computes %eax-%edi, so the fold must keep the
+        // operand roles: cmpw %di, %ax.
+        assert!(
+            out.contains("cmpw %di, %ax"),
+            "covered window folds:\n{out}"
+        );
+        assert!(out.contains("jb .Llt"), "unsigned reader kept:\n{out}");
+    }
+
+    #[test]
+    fn zext_pair_window_ends_at_a_flag_writer() {
+        // `addl` after the first reader rewrites the flags, so the later
+        // `jl` reads the ADD's flags — no constraint on the fold.
+        let asm = pair_fn(
+            "    movzwl %si, %eax\n    movzwl %bx, %edi\n    cmpl %edi, %eax\n    je .Lok\n    addl $1, %ecx\n    jl .Llt\n.Lok:\n    movl %ebx, 8(%esp)\n.Llt:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpw %di, %ax"),
+            "flag writer closes the window:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sext_pair_folds_with_two_signed_readers() {
+        // sext/sext covers every condition: jl + setg on one compare.
+        let asm = pair_fn(
+            "    movsbl %cl, %edx\n    movsbl 8(%esp), %eax\n    cmpl %eax, %edx\n    jl .Llt\n    setg %al\n    movzbl %al, %eax\n    movl %esi, %eax\n.Llt:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpb 8(%esp), %dl"),
+            "sext/sext folds both readers:\n{out}"
+        );
+    }
+
+    #[test]
+    fn zext_pair_refuses_signed_reader() {
+        // The 32-bit view compares two non-negative values; the word view
+        // compares two's complement — they disagree on the top-bit row.
+        let asm = pair_fn(
+            "    movzwl %bx, %edi\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    jl .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpl %eax, %edi"),
+            "signed reader refused:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pair_refuses_mixed_zext_sext() {
+        let asm = pair_fn(
+            "    movzbl %cl, %edx\n    movsbl %dh, %eax\n    cmpl %eax, %edx\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpl %eax, %edx"),
+            "mixed extensions refused:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pair_refuses_when_a_destination_survives_the_compare() {
+        let asm = pair_fn(
+            "    movzwl %bx, %edi\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n    movl %edi, %ebx\n    ret\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(out.contains("cmpl %eax, %edi"), "live dest refused:\n{out}");
+    }
+
+    #[test]
+    fn pair_refuses_non_adjacent_extensions() {
+        let asm = pair_fn(
+            "    movzwl %bx, %edi\n    movl $7, %ecx\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpl %eax, %edi"),
+            "writer between exts refused:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pair_hops_directives_but_never_labels() {
+        // .loc between the pieces is fine (writes nothing)...
+        let asm = pair_fn(
+            "    movzwl %bx, %edi\n    .loc 1 132 5\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    .loc 1 133 1\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("cmpw 24(%esi), %di"),
+            "directives hopped:\n{out}"
+        );
+        // ...a label is a control-flow boundary and is not.
+        let asm2 = pair_fn(
+            "    movzwl %bx, %edi\n.Lmid:\n    movzwl 24(%esi), %eax\n    cmpl %eax, %edi\n    je .L1\n    movl %ebx, 8(%esp)\n.L1:\n",
+        );
+        let out2 = peephole_optimize(asm2);
+        assert!(
+            out2.contains("cmpl %eax, %edi"),
+            "label between exts refused:\n{out2}"
+        );
+    }
+
+    #[test]
+    fn pair_output_assembles() {
+        // House law (S59): text assertions cannot see encoding damage —
+        // route the folded output through the real i686 assembler.
+        let asm = concat!(
+            "    .text\n",
+            "    .globl f\n",
+            "f:\n",
+            "    movzwl %bx, %edi\n",
+            "    movzwl 24(%esi), %eax\n",
+            "    cmpl %eax, %edi\n",
+            "    je .L1\n",
+            "    movl %ebx, 8(%esp)\n",
+            ".L1:\n",
+            "    movl %esi, %eax\n",
+            "    ret\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("cmpw 24(%esi), %di"), "{out}");
+        let obj = std::env::temp_dir().join("lccc_pair_cmp_assembles.o");
+        let path = obj.to_string_lossy().into_owned();
+        crate::backend::i686::assembler::assemble(&out, &path).unwrap_or_else(|e| {
+            panic!("peephole emitted assembly the i686 assembler rejects: {e}\n{out}")
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn masked_self_zext_refuses_setcc_def_partial_register_merge() {
+        // THE S05 LAW: a setCC byte write MERGES into the register — the
+        // upper bits are garbage, so the self-extension is load-bearing.
+        // This test is the regression pin that keeps it that way.
+        let asm = pair_fn(
+            "    cmpl %eax, %ebx\n    setne %al\n    movzbl %al, %eax\n    movl %eax, %ebx\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("movzbl %al, %eax"),
+            "setCC merge keeps the extend:\n{out}"
+        );
+    }
 }

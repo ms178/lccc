@@ -609,6 +609,14 @@ pub struct X86Codegen {
     /// RA homed it for exactly that purpose and the def-writes-home
     /// invariant holds at runtime (the def precedes every runtime consumer).
     pub(super) home_clobbered: FxHashSet<u32>,
+    /// The RA's blessed same-value classes (RegAllocResult::phi_chain):
+    /// member value id → class representative. Two ids in one class denote
+    /// the same value at every program point where both are live — slot
+    /// coalescing webs, applied phi destructive updates, FP webs. A stale
+    /// home of member v is readable whenever a NON-stale class sibling
+    /// shares the register: the register provably holds the class value.
+    /// Empty on targets without alias-aware freshness (behavior unchanged).
+    pub(super) phi_chain: FxHashMap<u32, u32>,
     /// Hole-aware live segments per value (start, end) in program-point
     /// numbering, from the RA's liveness. `note_reg_clobbered` consults them
     /// to mark ONLY the sharers that are actually LIVE at the clobber point —
@@ -1122,6 +1130,7 @@ impl X86Codegen {
             reg_assignments: FxHashMap::default(),
             home_fresh: FxHashSet::default(),
             home_clobbered: FxHashSet::default(),
+            phi_chain: FxHashMap::default(),
             value_live_segments: FxHashMap::default(),
             home_sharers: FxHashMap::default(),
             call_fresh_snapshot: Vec::new(),
@@ -1439,11 +1448,44 @@ impl X86Codegen {
     /// in the register.
     pub(super) fn fresh_home_of(&self, val_id: u32) -> Option<PhysReg> {
         let reg = self.reg_assignments.get(&val_id).copied()?;
-        if self.home_clobbered.contains(&val_id) {
-            None
-        } else {
-            Some(reg)
+        if !self.home_clobbered.contains(&val_id) {
+            return Some(reg);
         }
+        if self.home_readable_via_alias(val_id) {
+            return Some(reg);
+        }
+        None
+    }
+
+    /// chain_rep: the blessed same-value class representative of `v`, or `v`
+    /// itself when it has no class.
+    fn chain_rep(&self, v: u32) -> u32 {
+        *self.phi_chain.get(&v).unwrap_or(&v)
+    }
+
+    /// SOUNDNESS (alias-aware freshness): a home the bookkeeping marked
+    /// clobbered is still readable when a NON-clobbered member of the SAME
+    /// blessed class shares the register — coalescing guarantees both ids
+    /// denote one value wherever both are live, and the fresh sibling is
+    /// exactly the id the last in-place chain update wrote (kernel 6.18.52
+    /// workqueue.c llc_populate_cpu_shard_id: the `cmovnel %r10d,%r13d`
+    /// freshened v109; the consumer of same-chain v103 — slot-less by
+    /// construction — must read r13 instead of ICEing on a value that is
+    /// right there). A stale sibling of a DIFFERENT class never qualifies,
+    /// so unrelated sharers keep the strict rule.
+    pub(super) fn home_readable_via_alias(&self, val_id: u32) -> bool {
+        if self.phi_chain.is_empty() {
+            return false;
+        }
+        let Some(&reg) = self.reg_assignments.get(&val_id) else {
+            return false;
+        };
+        let rep = self.chain_rep(val_id);
+        self.home_sharers.get(&reg.0).is_some_and(|sharers| {
+            sharers.iter().any(|&s| {
+                s != val_id && !self.home_clobbered.contains(&s) && self.chain_rep(s) == rep
+            })
+        })
     }
 
     /// Home-freshness-filtered view of `reg_assignments` for the MachInst
@@ -1459,7 +1501,7 @@ impl X86Codegen {
     fn fresh_ra_for_isel(&self) -> FxHashMap<u32, PhysReg> {
         self.reg_assignments
             .iter()
-            .filter(|(k, _)| !self.home_clobbered.contains(*k))
+            .filter(|(k, _)| !self.home_clobbered.contains(*k) || self.home_readable_via_alias(**k))
             .map(|(k, v)| (*k, *v))
             .collect()
     }
@@ -2141,7 +2183,11 @@ impl X86Codegen {
                 // the second `pgdat->node_zones + i` consumed the zone
                 // POINTER as the index and panicked the boot).
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    if !self.home_clobbered.contains(&v.0) {
+                    // Alias-aware freshness: a clobbered mark on a member of
+                    // a blessed same-value class is readable through a fresh
+                    // sibling (chain_update semantics); see
+                    // home_readable_via_alias for the workqueue.c proof.
+                    if !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0) {
                         if reg.0 != target.0 {
                             if is_xmm_reg(reg) {
                                 // XMM → GPR
@@ -2272,7 +2318,11 @@ impl X86Codegen {
                 // value whose register now holds a derived value must reload
                 // instead of copying the stale content with movq.
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                    if !self.home_clobbered.contains(&v.0) {
+                    // Alias-aware freshness: a clobbered mark on a member of
+                    // a blessed same-value class is readable through a fresh
+                    // sibling (chain_update semantics); see
+                    // home_readable_via_alias for the workqueue.c proof.
+                    if !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0) {
                         if reg.0 != target.0 {
                             if is_xmm_reg(reg) {
                                 let xmm_name = phys_reg_name(reg);
@@ -3329,7 +3379,9 @@ impl X86Codegen {
                     .get(&v.0)
                     .copied()
                     .filter(|&r| !is_xmm_reg(r))
-                    .filter(|_| !self.home_clobbered.contains(&v.0))
+                    .filter(|_| {
+                        !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0)
+                    })
                 {
                     let src_typed = typed_phys_reg_name(reg, ty);
                     self.state
@@ -3557,7 +3609,7 @@ impl X86Codegen {
                     .emit_fmt(format_args!("    movq %{}, %{}", xmm_name, reg));
                 return;
             }
-            if !self.home_clobbered.contains(&val.0) {
+            if !self.home_clobbered.contains(&val.0) || self.home_readable_via_alias(val.0) {
                 let reg_name = phys_reg_name(phys_reg);
                 if reg_name != reg {
                     self.state.out.emit_instr_reg_reg("    movq", reg_name, reg);
@@ -4765,7 +4817,10 @@ impl X86Codegen {
                             .get(&v.0)
                             .copied()
                             .filter(|&r| !is_xmm_reg(r))
-                            .filter(|_| !self.home_clobbered.contains(&v.0))
+                            .filter(|_| {
+                                !self.home_clobbered.contains(&v.0)
+                                    || self.home_readable_via_alias(v.0)
+                            })
                     }
                     _ => None,
                 };

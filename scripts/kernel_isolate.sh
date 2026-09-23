@@ -24,7 +24,7 @@
 # Usage:
 #   kernel_isolate.sh [bzImage]     (default: $KERNEL_DIR/arch/x86/boot/bzImage)
 # Environment:
-#   KERNEL_DIR     kernel tree (default /home/user/kernel-work/linux-6.18.52)
+#   KERNEL_DIR     kernel tree (default /home/user/target/kernel-work/linux-6.18.52)
 #   QEMU           qemu binary (default qemu-system-x86_64)
 #   QEMU_DATA_DIR  firmware union dir; autodetected from the qemu install
 #   BUSYBOX        static busybox for the initramfs (default /usr/bin/busybox)
@@ -34,7 +34,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}
 BZIMAGE=${1:-$K/arch/x86/boot/bzImage}
 QEMU=${QEMU:-qemu-system-x86_64}
 BUSYBOX=${BUSYBOX:-/usr/bin/busybox}

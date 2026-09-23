@@ -22,7 +22,7 @@
 #          build_kernel_full.sh net/core/ fs/ ...        # selected subdirs
 #
 # Environment:
-#   KERNEL_DIR  patched tree  (default /home/user/kernel-work/linux-6.18.52)
+#   KERNEL_DIR  patched tree  (default /home/user/target/kernel-work/linux-6.18.52)
 #   PKGDIR      archpkgbuilds pkg dir (default .../packages/linux-cachymod-6.18)
 #   LCCC        compiler (default <repo>/target/fastbuild/lccc, where <repo> is
 #               the checkout this script lives in)
@@ -37,7 +37,7 @@
 set -euo pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}
 PKGDIR=${PKGDIR:-/home/user/archpkgbuilds/packages/linux-cachymod-6.18}
 REPO_ROOT=$(CDPATH= cd -- "$here/.." && pwd)
 LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}

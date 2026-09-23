@@ -21,7 +21,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}
 LOG=${BUILD_LOG:-/tmp/kernel-build-lccc.log}
 # Resolve the script directory before `cd "$K"`: the fragment and the compiler
 # defaults must be found relative to THIS script, not to an absolute repo path
