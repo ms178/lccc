@@ -864,8 +864,10 @@ fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
 /// + the `CCC_NO_ANDN_FUSION` kill switch.  Single-sourced (audit P2-12)
 /// so the two bit_idioms invocations — and therefore the fold-time defer
 /// prediction vs. the emission-time fusion decision — can never drift
-/// within one compilation.  The env read happens once per invocation of
-/// the pass runner, not per function.
+/// within one compilation.  `run_passes` snapshots this ONCE at the top and
+/// hands the same value to both bit_idioms invocations (a second resolution
+/// mid-pipeline would re-read the environment and break the snapshot
+/// contract — env reads belong in the runner preamble only).
 fn scalar_andn_available(target: crate::backend::Target, x86_bmi1: bool) -> bool {
     target == crate::backend::Target::X86_64
         && x86_bmi1
@@ -963,6 +965,8 @@ pub(crate) fn run_passes(
     // keeps the kill-switch unit test from racing its siblings (see
     // `TWO_BLOCK_UNROLL_ENABLED` in loop_unroll.rs).
     loop_unroll::set_two_block_unroll_enabled(std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err());
+    loop_unroll::set_persist_gate_legacy(std::env::var("CCC_UNROLL_LEGACY_PERSIST_GATE").is_ok());
+    loop_unroll::set_persist_gate_trace(std::env::var("CCC_UNROLL_GATE_TRACE").is_ok());
     // Every remaining pass switch, resolved here for the same reason.  No pass
     // reads the process environment any more: each of these was an `environ`
     // scan (and an `OsString` or `String` allocation) PER FUNCTION — eight of
@@ -993,6 +997,12 @@ pub(crate) fn run_passes(
     });
     backedge_pre::set_backedge_pre_env(backedge_pre::EnvConfig::from_env());
     loop_align::set_tight_loop_mode(loop_align::TightLoopMode::from_env());
+    // Scalar ANDN (BMI1) capability for the bool-mux algebra's CH fold.
+    // Resolved ONCE per compilation: both bit_idioms invocations below
+    // receive this same snapshot, so the fold-time defer prediction can
+    // never observe a different capability value than its sibling (or a
+    // re-read environment variable mid-pipeline).
+    let has_scalar_andn = scalar_andn_available(target, x86_bmi1);
     // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
     // ignores this.
@@ -1879,8 +1889,8 @@ pub(crate) fn run_passes(
             // Scalar ANDN (BMI1) for the bool-mux algebra's CH fold: the
             // mux fold must defer to the backend's Not+And -> andn fusion
             // when the 3-operand form is selectable (emit_and_not_impl).
-            // See scalar_andn_available for the single-sourced contract.
-            let has_scalar_andn = scalar_andn_available(target, x86_bmi1);
+            // `has_scalar_andn` is the per-compilation snapshot resolved at
+            // the top of run_passes (same value as the post-ifconv call).
             let n = timed_pass!(
                 "bit_idioms",
                 run_on_visited(module, &dirty, &mut changed, |func| {
@@ -2061,7 +2071,8 @@ pub(crate) fn run_passes(
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
             let min_rotate_bits = target_min_rotate_bits(target);
-            let has_scalar_andn = scalar_andn_available(target, x86_bmi1);
+            // Same per-compilation `has_scalar_andn` snapshot as the first
+            // bit_idioms call (resolved at the top of run_passes).
             let n = timed_pass!(
                 "bit_idioms_post_ifconv",
                 run_on_visited(module, &dirty, &mut changed, |func| {

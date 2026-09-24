@@ -6,4 +6,5 @@ pub(crate) mod lowering;
 pub(crate) mod mem2reg;
 pub(crate) mod module;
 pub(crate) mod ops;
+pub(crate) mod provenance;
 pub(crate) mod reexports;

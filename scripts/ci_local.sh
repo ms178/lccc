@@ -423,6 +423,14 @@ gate "call-arg-staging" fast \
 gate "lea-hoist-rorx" fast \
     bash tests/regression/check_lea_hoist_rorx.sh
 
+# Integer-parameter provenance (P1 follow-up): laundered `(T *)(uintptr_t)raw`
+# must not present a Param root. The laundered copy keeps its guard while the
+# genuine pointer-param copy stays guard-free (B3 intact), plus runtime
+# bit-exactness vs the oracle. Negative-verified: the pre-fix tree emits the
+# laundered vector loop with no guard.
+gate "provenance-int-param" fast \
+    bash tests/regression/check_provenance_int_param.sh
+
 # CH/MAJ oracle consensus: andn-gated mux fold, kept-earliest majority,
 # acc-resident ALU consumption, zero exposed forwards (negative-verified
 # against the pre-change tree: 0 andn + the loop slot shape fail there).

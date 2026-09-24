@@ -3851,7 +3851,13 @@ enum ProvenObjectRoot {
 /// parameter. Loads and arbitrary arithmetic stop the proof. The walk is
 /// deliberately bounded/cycle-safe because malformed copy cycles must make an
 /// optimization fail closed, never hang compilation.
+/// Leaf typing and chain following come from `crate::ir::provenance` (shared
+/// with loop_idiom so the two tracers cannot drift): in particular only a
+/// pointer-typed `ParamRef` presents a `Param` root — an integer parameter
+/// converted to a pointer (the frontend erases the conversion) names no
+/// object — and only `Ptr -> Ptr` casts are followed.
 fn proven_object_root(func: &IrFunction, start: Value) -> Option<ProvenObjectRoot> {
+    use crate::ir::provenance::{ChainStep, RootLeaf, chain_step, root_leaf};
     let mut cur = start;
     let mut seen = FxHashSet::default();
     for _ in 0..128 {
@@ -3864,30 +3870,25 @@ fn proven_object_root(func: &IrFunction, start: Value) -> Option<ProvenObjectRoo
                 .iter()
                 .find(|inst| inst.dest() == Some(cur))
         })?;
-        match defining {
-            Instruction::GlobalAddr { name, .. } => {
+        match root_leaf(defining) {
+            RootLeaf::Global(name) => {
                 return Some(ProvenObjectRoot::Global(name.clone()));
             }
-            Instruction::Alloca { dest, .. } => {
-                return Some(ProvenObjectRoot::Alloca(dest.0));
+            RootLeaf::Alloca(id) => {
+                return Some(ProvenObjectRoot::Alloca(id));
             }
-            Instruction::ParamRef { param_idx, .. } => {
-                let noalias = func.params.get(*param_idx).is_some_and(|p| p.noalias);
-                return Some(ProvenObjectRoot::Param {
-                    index: *param_idx,
-                    noalias,
-                });
+            RootLeaf::Param(index) => {
+                let noalias = func.params.get(index).is_some_and(|p| p.noalias);
+                return Some(ProvenObjectRoot::Param { index, noalias });
             }
-            Instruction::GetElementPtr { base, .. } => cur = *base,
-            Instruction::Copy {
-                src: Operand::Value(src),
-                ..
-            }
-            | Instruction::Cast {
-                src: Operand::Value(src),
-                ..
-            } => cur = *src,
-            _ => return None,
+            RootLeaf::NotLeaf => {}
+        }
+        match chain_step(defining) {
+            ChainStep::Follow(next) => cur = next,
+            // Loads, arithmetic, phis, calls, integer↔pointer casts: the
+            // proof ends. (No phi/arithmetic following here by design —
+            // this tracer fails closed on both, unlike loop_idiom's.)
+            ChainStep::Stop => return None,
         }
     }
     None

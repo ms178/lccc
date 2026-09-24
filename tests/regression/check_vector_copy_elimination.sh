@@ -67,6 +67,11 @@ note() { printf '  %s\n' "$*"; }
 ok()   { pass=$((pass+1)); printf 'ok   %s\n' "$*"; }
 bad()  { fail=$((fail+1)); printf 'FAIL %s\n' "$*"; }
 skipped() { skip=$((skip+1)); printf 'skip %s\n' "$*"; }
+# Runtime differentials are correctness checks: a missing/broken reference
+# compiler must FAIL, not silently skip (explicit opt-out only, uniform
+# across regression gates; CI never sets it).
+ALLOW_GCC_SKIP=${LCCC_ALLOW_GCC_SKIP:-0}
+gcc_skip() { if [[ "$ALLOW_GCC_SKIP" = 1 ]]; then skipped "$1"; else bad "$1 (no silent skip: set LCCC_ALLOW_GCC_SKIP=1 to opt out)"; fi; }
 
 # The instruction lines of one function body, `ret` included, with labels,
 # directives, comments and blanks dropped.  [[:space:]] and not \s: GCC indents
@@ -194,7 +199,7 @@ fi
 
 # ── B. runtime equality with GCC over kernels built for the legality rules ────
 if [[ -z "$ORACLE" ]]; then
-    skipped "no reference compiler for the runtime differential (set CCC_ORACLE_CC)"
+    gcc_skip "no reference compiler for the runtime differential (set CCC_ORACLE_CC)"
 else
     cat > "$work/runtime.c" <<'EOF'
     /* Every function here is shaped to hit one legality rule of the vector copy
@@ -373,7 +378,7 @@ EOF
     if [[ $lccc_rc -ne 0 ]]; then
         bad "runtime.c did not compile with lccc:"; head -5 "$work/lccc.err" | note
     elif [[ $oracle_rc -ne 0 ]]; then
-        skipped "reference compiler could not build runtime.c"
+        gcc_skip "reference compiler could not build runtime.c"
     else
         "$work/runtime.lccc" > "$work/out.lccc" 2>&1; rc_l=$?
         "$work/runtime.oracle" > "$work/out.oracle" 2>&1; rc_o=$?
@@ -615,7 +620,7 @@ EOF_ALGEBRA
     if [[ $lccc_rc -ne 0 ]]; then
         bad "fma_algebra.c did not compile with lccc:"; head -5 "$work/fa.err" | note
     elif [[ $oracle_rc -ne 0 ]]; then
-        skipped "reference compiler could not build fma_algebra.c"
+        gcc_skip "reference compiler could not build fma_algebra.c"
     else
         "$work/fma_algebra.lccc" > "$work/fa.lccc" 2>&1; rc_l=$?
         "$work/fma_algebra.oracle" > "$work/fa.oracle" 2>&1; rc_o=$?
@@ -1008,7 +1013,7 @@ EOF_NEGATE
             bad "negate lowering: $n_xor xor sites, $n_gpr GPR round trips (expected exactly 17 and 0 — a fold retired a negation without advancing the pin, or the lowering regressed)"
         fi
     else
-        skipped "reference compiler could not build negate.c"
+        gcc_skip "reference compiler could not build negate.c"
     fi
 
     # AVX-512: the fp liveness oracle treats a writemask destination as a

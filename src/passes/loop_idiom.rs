@@ -153,17 +153,22 @@ fn is_byte_type(ty: IrType) -> bool {
 }
 
 /// Object identity for overlap reasoning: `Global(name)` for globals,
-/// `Alloca(id)` for static stack slots, `Param(idx)` for function
-/// parameters (distinct params are assumed non-overlapping for the
-/// memcpy idiom; if they may alias we use memmove), `Other` for everything
-/// else (dynamic allocas, computed pointers, unknowns).
+/// `Alloca(id)` for static stack slots, `Param(idx)` for POINTER-typed
+/// function parameters (an integer parameter converted to a pointer names
+/// no object — the frontend erases the conversion — so it is `Other`;
+/// distinct `Param` roots still take memmove unless disjoint by the
+/// freshness rule), `Other` for everything else (dynamic allocas, computed
+/// pointers, unknowns).
 ///
-/// The walk sees through `Phi` (preheader-edge init only — the latch edge
-/// marches within the same object), `Copy`, integer `Cast`, `GEP` (base),
-/// and `Add`/`Sub` (the side that resolves; an integer offset contributes
-/// no root, and two rooted sides is nonsense → `Other`). Offsets are
-/// deliberately ignored: cross-object disjointness needs roots only, and
-/// same-object copies bail regardless of offsets (v1).
+/// Leaf typing and chain following come from `crate::ir::provenance` (shared
+/// with the vectorizer's tracer so the two cannot drift): the walk sees
+/// through `Phi` (preheader-edge init only — the latch edge marches within
+/// the same object), `Copy`, `Ptr -> Ptr` `Cast`, `GEP` (base), and
+/// `Add`/`Sub` (the side that resolves; an integer offset contributes no
+/// root, a known-pointer offset rejects the root, and two rooted sides is
+/// nonsense → `Other`). Offsets are deliberately ignored: cross-object
+/// disjointness needs roots only, and same-object copies bail regardless
+/// of offsets (v1).
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum ObjectRoot {
     Global(String),
@@ -194,19 +199,23 @@ fn object_root_inner(
     let Some(inst) = defs.get(&v.0) else {
         return ObjectRoot::Other;
     };
-    match inst {
-        Instruction::GlobalAddr { name, .. } => ObjectRoot::Global(name.clone()),
-        Instruction::Alloca { dest, .. } => ObjectRoot::Alloca(dest.0),
-        Instruction::ParamRef { param_idx, .. } => ObjectRoot::Param(*param_idx as u32),
-        Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => match src {
-            Operand::Value(inner) => {
-                object_root_inner(defs, label_to_idx, preheader_label, *inner, depth + 1)
-            }
-            Operand::Const(_) => ObjectRoot::Other,
-        },
-        Instruction::GetElementPtr { base, .. } => {
-            object_root_inner(defs, label_to_idx, preheader_label, *base, depth + 1)
+    match crate::ir::provenance::root_leaf(inst) {
+        crate::ir::provenance::RootLeaf::Global(name) => {
+            return ObjectRoot::Global(name);
         }
+        crate::ir::provenance::RootLeaf::Alloca(id) => {
+            return ObjectRoot::Alloca(id);
+        }
+        crate::ir::provenance::RootLeaf::Param(idx) => {
+            return ObjectRoot::Param(idx as u32);
+        }
+        crate::ir::provenance::RootLeaf::NotLeaf => {}
+    }
+    if let crate::ir::provenance::ChainStep::Follow(inner) = crate::ir::provenance::chain_step(inst)
+    {
+        return object_root_inner(defs, label_to_idx, preheader_label, inner, depth + 1);
+    }
+    match inst {
         Instruction::Phi { incoming, .. } => {
             for (op, label) in incoming {
                 if *label == preheader_label {
@@ -242,18 +251,40 @@ fn object_root_inner(
                 }
                 Operand::Const(_) => ObjectRoot::Other,
             };
+            // An unrooted side that is a KNOWN pointer (loaded pointer,
+            // call result, outer phi of pointer type, `Ptr`-typed cast of
+            // an integer) rejects the root: adding two addresses is
+            // meaningless. Immediate definitions only — looking through
+            // `Copy` would misclassify the valid `p + (int)q` idiom (whose
+            // `ptrtoint` is an erased `Copy` of a pointer-typed value).
+            // Any other unrooted side is an integer offset or UB in valid
+            // IR (C17 6.5.6 admits only `ptr ± int` / `int + ptr`), so it
+            // cannot disturb the rooted side's object identity. See
+            // `crate::ir::provenance`.
+            let side_known_pointer = |side: &Operand| -> bool {
+                match side {
+                    Operand::Const(_) => false,
+                    Operand::Value(v) => defs
+                        .get(&v.0)
+                        .is_some_and(|d| crate::ir::provenance::produces_pointer(d)),
+                }
+            };
             match (l, r) {
                 (ObjectRoot::Other, ObjectRoot::Other) => ObjectRoot::Other,
                 // `ptr +/- int` keeps the LHS root: it stays in/near the
                 // object and going out-of-bounds is UB, exactly like GEP.
-                (root, ObjectRoot::Other) => root,
+                (root, ObjectRoot::Other) if !side_known_pointer(rhs) => root,
                 // `int + ptr` is commutative with the above.  But `int -
                 // ptr` (a rooted RHS under `Sub`) fails closed: not
                 // valid pointer arithmetic (C17 6.5.6), it can only arise
                 // from integer laundering (`(T*)(c - (intptr_t)p)` cast
                 // back to a pointer), and an int-derived address may
                 // alias anything.
-                (ObjectRoot::Other, root) if matches!(op, IrBinOp::Add) => root,
+                (ObjectRoot::Other, root)
+                    if matches!(op, IrBinOp::Add) && !side_known_pointer(lhs) =>
+                {
+                    root
+                }
                 // Two rooted sides (ptr + ptr, ptr - ptr used as an
                 // address) is nonsense; fail closed.
                 _ => ObjectRoot::Other,
@@ -2140,11 +2171,17 @@ mod tests {
         }
     }
     fn param_def(dest: u32, idx: usize) -> Instruction {
+        param_ty_def(dest, idx, IrType::Ptr)
+    }
+    fn param_ty_def(dest: u32, idx: usize, ty: IrType) -> Instruction {
         Instruction::ParamRef {
             dest: Value(dest),
             param_idx: idx,
-            ty: IrType::Ptr,
+            ty,
         }
+    }
+    fn load_def(dest: u32, ptr: u32, ty: IrType) -> Instruction {
+        load(dest, ptr, ty)
     }
     fn global_def(dest: u32, name: &str) -> Instruction {
         Instruction::GlobalAddr {
@@ -2197,6 +2234,165 @@ mod tests {
     /// Trace `v` through a def map with no phis/labels (pure chain test).
     fn trace_root(defs: &FxHashMap<u32, &Instruction>, v: u32) -> ObjectRoot {
         object_root_inner(defs, &FxHashMap::default(), BlockId(0), Value(v), 0)
+    }
+
+    #[test]
+    fn int_param_to_alloca_copy_uses_memmove() {
+        // P1: an INTEGER parameter converted to a pointer (the frontend
+        // erases the conversion) names no object — it must not present a
+        // `Param` root, so the freshness rule cannot fire and the copy
+        // takes memmove.
+        let mut f = self_loop_copy_with_bases(alloca_def(1), param_ty_def(2, 0, IrType::U64), 1);
+        let n = run_function(&mut f);
+        assert_eq!(n, 1, "laundered-int-param copy must rewrite");
+        assert!(has_call(&f, "memmove"), "unknown provenance needs memmove");
+        assert!(!has_call(&f, "memcpy"), "no memcpy for unknown provenance");
+    }
+
+    #[test]
+    fn int_param_to_param_copy_uses_memmove() {
+        // Same hole, both sides laundered: still memmove, never memcpy.
+        let mut f = self_loop_copy_with_bases(
+            param_ty_def(1, 0, IrType::U64),
+            param_ty_def(2, 1, IrType::U64),
+            2,
+        );
+        let n = run_function(&mut f);
+        assert_eq!(n, 1, "int-param copy must rewrite");
+        assert!(has_call(&f, "memmove"), "unknown provenance needs memmove");
+        assert!(!has_call(&f, "memcpy"), "no memcpy for unknown provenance");
+    }
+
+    #[test]
+    fn typed_chain_matrix() {
+        // Integer param through a laundering chain: no root, even though
+        // the chain ends in pointer-typed operations.
+        let iparam = param_ty_def(1, 0, IrType::U64);
+        let copy = Instruction::Copy {
+            dest: Value(2),
+            src: val(1),
+        };
+        let gep = Instruction::GetElementPtr {
+            dest: Value(3),
+            base: Value(2),
+            offset: i32c(0),
+            ty: IrType::Ptr,
+        };
+        let defs: FxHashMap<u32, &Instruction> =
+            [(1, &iparam), (2, &copy), (3, &gep)].into_iter().collect();
+        assert_eq!(trace_root(&defs, 3), ObjectRoot::Other);
+        // Pointer -> int -> pointer roundtrip through typed casts: the
+        // int↔pointer casts end the proof (Ptr -> Ptr only is followed).
+        let pparam = param_def(4, 0);
+        let ptr_to_int = Instruction::Cast {
+            dest: Value(5),
+            src: val(4),
+            from_ty: IrType::Ptr,
+            to_ty: IrType::U64,
+        };
+        let int_to_ptr = Instruction::Cast {
+            dest: Value(6),
+            src: val(5),
+            from_ty: IrType::U64,
+            to_ty: IrType::Ptr,
+        };
+        let defs: FxHashMap<u32, &Instruction> = [(4, &pparam), (5, &ptr_to_int), (6, &int_to_ptr)]
+            .into_iter()
+            .collect();
+        assert_eq!(trace_root(&defs, 6), ObjectRoot::Other);
+        // Pointer-preserving Ptr -> Ptr cast: still roots.
+        let ppcast = Instruction::Cast {
+            dest: Value(7),
+            src: val(4),
+            from_ty: IrType::Ptr,
+            to_ty: IrType::Ptr,
+        };
+        let defs: FxHashMap<u32, &Instruction> = [(4, &pparam), (7, &ppcast)].into_iter().collect();
+        assert_eq!(trace_root(&defs, 7), ObjectRoot::Param(0));
+    }
+
+    #[test]
+    fn typed_add_side_matrix() {
+        // `p + dynamic_int_param` keeps the root (integer offsets, even
+        // dynamic ones, cannot disturb object identity — wild is UB).
+        let pparam = param_def(1, 0);
+        let iparam = param_ty_def(2, 1, IrType::U64);
+        let p_plus_dyn = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Add,
+            lhs: val(1),
+            rhs: val(2),
+            ty: IrType::U64,
+        };
+        let defs: FxHashMap<u32, &Instruction> = [(1, &pparam), (2, &iparam), (3, &p_plus_dyn)]
+            .into_iter()
+            .collect();
+        assert_eq!(trace_root(&defs, 3), ObjectRoot::Param(0));
+        // `p + loaded_int` keeps the root (loaded integer offset).
+        let loaded_int = load_def(4, 1, IrType::I32);
+        let p_plus_load = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: val(1),
+            rhs: val(4),
+            ty: IrType::U64,
+        };
+        let defs: FxHashMap<u32, &Instruction> =
+            [(1, &pparam), (4, &loaded_int), (5, &p_plus_load)]
+                .into_iter()
+                .collect();
+        assert_eq!(trace_root(&defs, 5), ObjectRoot::Param(0));
+        // `p + loaded_pointer` rejects the root (adding two addresses is
+        // meaningless), both operand orders.
+        let loaded_ptr = load_def(6, 1, IrType::Ptr);
+        let p_plus_ptr = Instruction::BinOp {
+            dest: Value(7),
+            op: IrBinOp::Add,
+            lhs: val(1),
+            rhs: val(6),
+            ty: IrType::Ptr,
+        };
+        let ptr_plus_p = Instruction::BinOp {
+            dest: Value(8),
+            op: IrBinOp::Add,
+            lhs: val(6),
+            rhs: val(1),
+            ty: IrType::Ptr,
+        };
+        let defs: FxHashMap<u32, &Instruction> = [
+            (1, &pparam),
+            (6, &loaded_ptr),
+            (7, &p_plus_ptr),
+            (8, &ptr_plus_p),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(trace_root(&defs, 7), ObjectRoot::Other);
+        assert_eq!(trace_root(&defs, 8), ObjectRoot::Other);
+        // The side check is immediate-def-only: `p + Copy(loaded_ptr)` —
+        // the shape of the valid `p + (int)q` idiom, whose ptrtoint is an
+        // erased Copy — keeps the root. (Copy is transparent; through-Copy
+        // checking would regress valid integer-offset code.)
+        let copy_of_ptr = Instruction::Copy {
+            dest: Value(9),
+            src: val(6),
+        };
+        let p_plus_copy = Instruction::BinOp {
+            dest: Value(10),
+            op: IrBinOp::Add,
+            lhs: val(1),
+            rhs: val(9),
+            ty: IrType::U64,
+        };
+        let defs: FxHashMap<u32, &Instruction> = [
+            (1, &pparam),
+            (6, &loaded_ptr),
+            (9, &copy_of_ptr),
+            (10, &p_plus_copy),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(trace_root(&defs, 10), ObjectRoot::Param(0));
     }
 
     #[test]

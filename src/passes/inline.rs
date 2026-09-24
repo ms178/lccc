@@ -58,8 +58,10 @@ const MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS: usize = 8;
 const MAX_SMALL_STATIC_LOOP_INLINE_CLONES: usize = 4;
 const MAX_STATIC_LOOP_INLINE_INSTRUCTIONS: usize = 128;
 const MAX_STATIC_LOOP_INLINE_BLOCKS: usize = 16;
-/// Bounded-tier call-site cap.  A third site was trialled (PR #607) for the
-/// Linux find_next_andnot_bit shape (60 insns at three sites) but reverted:
+/// Bounded-tier call-site cap.  A third site was trialled for the Linux
+/// find_next_andnot_bit shape (60 insns at three sites) but reverted — it
+/// measured neutral at -O2 and slower at -O3, so the two-site cap stays
+/// until backend evidence improves:
 /// GCC 14.2/16.2 outline it at -O2, and LCCC-side the inline measures as a
 /// tie at -O2 (paired A/B n=7 spans 1; layout-averaged k-sweep n=16 splits
 /// 9–7) and a 3–8% LOSS at -O3 (k-sweep wins 3–13, p≈0.01) — the oracles
