@@ -323,13 +323,6 @@ impl super::InstructionEncoder {
         nf: bool,
         pp: u8,
     ) -> Result<(), String> {
-        let folded = fold_scale1_index(mem);
-        let mem = folded.as_ref().unwrap_or(mem);
-        let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
-            || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
-        if addr32 {
-            self.bytes.push(0x67);
-        }
         let (r, r4) = if reg.is_empty() {
             (false, false)
         } else {
@@ -401,13 +394,6 @@ impl super::InstructionEncoder {
         nf: bool,
         pp: u8,
     ) -> Result<(), String> {
-        let folded = fold_scale1_index(mem);
-        let mem = folded.as_ref().unwrap_or(mem);
-        let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
-            || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
-        if addr32 {
-            self.bytes.push(0x67);
-        }
         let (r, r4) = if reg.is_empty() {
             (false, false)
         } else {
@@ -459,13 +445,6 @@ impl super::InstructionEncoder {
         pp: u8,
         mmm: u8,
     ) -> Result<(), String> {
-        let folded = fold_scale1_index(mem);
-        let mem = folded.as_ref().unwrap_or(mem);
-        let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
-            || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
-        if addr32 {
-            self.bytes.push(0x67);
-        }
         let (r, r4) = if reg.is_empty() {
             (false, false)
         } else {
@@ -514,13 +493,6 @@ impl super::InstructionEncoder {
         scc: u8,
         pp: u8,
     ) -> Result<(), String> {
-        let folded = fold_scale1_index(mem);
-        let mem = folded.as_ref().unwrap_or(mem);
-        let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
-            || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
-        if addr32 {
-            self.bytes.push(0x67);
-        }
         let (r, r4) = if reg.is_empty() {
             (false, false)
         } else {
@@ -555,23 +527,13 @@ impl super::InstructionEncoder {
 
     /// Emit REX prefix for a memory operand where 'reg' is the reg field.
     pub(crate) fn emit_rex_rm(&mut self, size: u8, reg: &str, mem: &MemoryOperand) {
-        // 32-bit address-size override (0x67): required whenever the memory
-        // operand's base or index is a 32-bit register (e.g.
-        // `leal (%edi,%edi,2),%edi`). Emitted BEFORE the REX byte (prefix
-        // order: segment, 66/67, REX, opcode). The old code silently dropped
-        // it — the address was encoded as 64-bit, which GAS-oracle caught as
-        // a one-byte divergence from GNU as (and is semantically wrong for
-        // addresses >= 4 GiB).
+        // The 0x67 address-size override is emitted centrally by
+        // `encode()` (one splice point covers legacy, VEX and EVEX
+        // alike, in canonical [seg][67][66] order); this helper only
+        // computes the REX bits.
         // Fold BEFORE computing REX: if the index moves into the base slot the
         // extension bit for r8-r15 must be REX.B, not REX.X.
-        let folded = fold_scale1_index(mem);
-        let mem = folded.as_ref().unwrap_or(mem);
 
-        let addr32 = mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
-            || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name));
-        if addr32 {
-            self.bytes.push(0x67);
-        }
         let w = size == 8;
         let (r, r4) = if reg.is_empty() {
             (false, false)
@@ -629,7 +591,7 @@ impl super::InstructionEncoder {
 
     /// Skip group-2/3/4 legacy prefixes; return the index of the first
     /// opcode/REX/VEX/EVEX byte of the instruction currently in `self.bytes`.
-    fn prefix_start(&self) -> usize {
+    pub(crate) fn prefix_start(&self) -> usize {
         let mut i = 0;
         while i < self.bytes.len() {
             match self.bytes[i] {
@@ -718,14 +680,61 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Displacement value + deferred relocation for the non-RIP address
+    /// paths, shared by the legacy/VEX (`encode_modrm_mem`) and EVEX
+    /// (`encode_evex_mem`) encoders so both agree on reloc types. Returns
+    /// `(disp_val, has_symbol, deferred_reloc, diff_sym)`; `disp_val` is
+    /// the placeholder (symbols always emit disp32 = 0, never compressed).
+    pub(crate) fn symbol_disp_parts(
+        disp: &Displacement,
+    ) -> (i64, bool, Option<(String, u32, i64)>, Option<String>) {
+        let mut diff_sym: Option<String> = None;
+        let (disp_val, has_symbol, deferred_reloc) = match disp {
+            Displacement::None => (0i64, false, None),
+            Displacement::Integer(v) => (*v, false, None),
+            Displacement::Symbol(sym) => (0i64, true, Some((sym.clone(), R_X86_64_32S, 0i64))),
+            Displacement::SymbolAddend(sym, addend) => {
+                (0i64, true, Some((sym.clone(), R_X86_64_32S, *addend)))
+            }
+            Displacement::SymbolPlusOffset(sym, offset) => {
+                (0i64, true, Some((sym.clone(), R_X86_64_32S, *offset)))
+            }
+            Displacement::SymbolDiff(sym, diff) => {
+                // head_64.S rva(): `((gdt) - startup_32)(%ebp)`. Recorded as
+                // a diff relocation; same-section pairs fold to a constant
+                // after layout, so no reloc reaches the object file.
+                diff_sym = Some(diff.clone());
+                (0i64, true, Some((sym.clone(), R_X86_64_32, 0i64)))
+            }
+            Displacement::SymbolDiffAddend(sym, diff, addend) => {
+                diff_sym = Some(diff.clone());
+                (0i64, true, Some((sym.clone(), R_X86_64_32, *addend)))
+            }
+            Displacement::SymbolMod(sym, modifier) => {
+                // Non-RIP `sym@GOTPCREL(%reg)` is not relaxable: GAS 2.47
+                // emits plain `R_X86_64_GOTPCREL` (9) even when the insn is
+                // REX2 (`addq foo@GOTPCREL(%rax), %r16` → type 9, not 43).
+                // GOTTPOFF/TLSDESC without %rip are rejected by GAS; keep
+                // the classic types if they ever reach the encoder.
+                let reloc_type = match modifier.to_ascii_lowercase().as_str() {
+                    "tpoff" => R_X86_64_TPOFF32,
+                    "gotpcrel" => R_X86_64_GOTPCREL,
+                    "gottpoff" => R_X86_64_GOTTPOFF,
+                    "tlsdesc" => R_X86_64_GOTPC32_TLSDESC,
+                    _ => R_X86_64_32S,
+                };
+                (0i64, true, Some((sym.clone(), reloc_type, 0i64)))
+            }
+        };
+
+        (disp_val, has_symbol, deferred_reloc, diff_sym)
+    }
+
     pub(crate) fn encode_modrm_mem(
         &mut self,
         reg_field: u8,
         mem: &MemoryOperand,
     ) -> Result<(), String> {
-        let folded = fold_scale1_index(mem);
-        let mem = folded.as_ref().unwrap_or(mem);
-
         let base = mem.base.as_ref();
         let index = mem.index.as_ref();
 
@@ -794,44 +803,8 @@ impl super::InstructionEncoder {
         // Handle symbol displacements that need relocations.
         // We defer emitting the relocation until after the ModR/M and SIB bytes
         // so the relocation offset correctly points to the displacement bytes.
-        let mut diff_sym: Option<String> = None;
-        let (disp_val, has_symbol, deferred_reloc) = match &mem.displacement {
-            Displacement::None => (0i64, false, None),
-            Displacement::Integer(v) => (*v, false, None),
-            Displacement::Symbol(sym) => (0i64, true, Some((sym.clone(), R_X86_64_32S, 0i64))),
-            Displacement::SymbolAddend(sym, addend) => {
-                (0i64, true, Some((sym.clone(), R_X86_64_32S, *addend)))
-            }
-            Displacement::SymbolPlusOffset(sym, offset) => {
-                (0i64, true, Some((sym.clone(), R_X86_64_32S, *offset)))
-            }
-            Displacement::SymbolDiff(sym, diff) => {
-                // head_64.S rva(): `((gdt) - startup_32)(%ebp)`. Recorded as
-                // a diff relocation; same-section pairs fold to a constant
-                // after layout, so no reloc reaches the object file.
-                diff_sym = Some(diff.clone());
-                (0i64, true, Some((sym.clone(), R_X86_64_32, 0i64)))
-            }
-            Displacement::SymbolDiffAddend(sym, diff, addend) => {
-                diff_sym = Some(diff.clone());
-                (0i64, true, Some((sym.clone(), R_X86_64_32, *addend)))
-            }
-            Displacement::SymbolMod(sym, modifier) => {
-                // Non-RIP `sym@GOTPCREL(%reg)` is not relaxable: GAS 2.47
-                // emits plain `R_X86_64_GOTPCREL` (9) even when the insn is
-                // REX2 (`addq foo@GOTPCREL(%rax), %r16` → type 9, not 43).
-                // GOTTPOFF/TLSDESC without %rip are rejected by GAS; keep
-                // the classic types if they ever reach the encoder.
-                let reloc_type = match modifier.to_ascii_lowercase().as_str() {
-                    "tpoff" => R_X86_64_TPOFF32,
-                    "gotpcrel" => R_X86_64_GOTPCREL,
-                    "gottpoff" => R_X86_64_GOTTPOFF,
-                    "tlsdesc" => R_X86_64_GOTPC32_TLSDESC,
-                    _ => R_X86_64_32S,
-                };
-                (0i64, true, Some((sym.clone(), reloc_type, 0i64)))
-            }
-        };
+        let (disp_val, has_symbol, deferred_reloc, diff_sym) =
+            Self::symbol_disp_parts(&mem.displacement);
 
         // No base register - need SIB with no-base encoding
         if base.is_none() && index.is_none() {
@@ -1059,32 +1032,180 @@ impl super::InstructionEncoder {
 /// for r8-r15 has to move from REX.X to REX.B along with the register, and
 /// having two code paths decide independently is what made an earlier version
 /// of this fold emit `rex.WX mov -0x1(%rdx)` for `mov -1(,%r10,1)`.
-pub(crate) fn fold_scale1_index(mem: &MemoryOperand) -> Option<MemoryOperand> {
-    if mem.base.is_some() || mem.scale.unwrap_or(1) != 1 {
-        return None;
+/// True when a memory operand needs the 0x67 address-size override:
+/// any 32-bit component (base or index). Checked on the UNFOLDED operand
+/// by `encode()`'s pre-scan; the verdict agrees with the folded operand
+/// the helpers encode (folding moves index->base, preserving width).
+/// (`%eiz` is not a reg32 name, so it never triggers.)
+/// Reconstruct the `disp(base,index,scale)` text for the
+/// `` `...' is not a valid base/index expression `` diagnostic, GAS-style
+/// (no spaces: `(%bx,%si)`; displacement included: `8(%ax)`).
+/// A missing displacement and an explicit `0` both parse to
+/// `Integer(0)`, so `0(%ax)` echoes as `(%ax)` where GAS prints
+/// `0(%ax)` — a cosmetic edge (verdict identical).
+fn mem_expr_echo(mem: &MemoryOperand) -> String {
+    let mut s = String::new();
+    match &mem.displacement {
+        Displacement::None => {}
+        Displacement::Integer(0) => {}
+        Displacement::Integer(v) => s.push_str(&v.to_string()),
+        Displacement::Symbol(x) => s.push_str(x),
+        Displacement::SymbolAddend(x, a) | Displacement::SymbolPlusOffset(x, a) => {
+            s.push_str(x);
+            s.push_str(&format!("{a:+}"));
+        }
+        Displacement::SymbolMod(x, m) => {
+            s.push_str(x);
+            s.push('@');
+            s.push_str(m);
+        }
+        Displacement::SymbolDiff(a, b) => {
+            s.push_str(a);
+            s.push('-');
+            s.push_str(b);
+        }
+        Displacement::SymbolDiffAddend(a, b, c) => {
+            s.push_str(a);
+            s.push('-');
+            s.push_str(b);
+            s.push_str(&format!("{c:+}"));
+        }
     }
-    let idx = mem.index.as_ref()?;
-    // %rsp can never be an index, so an index-only operand naming it is
-    // invalid input; leave it for the validator to reject.
-    if idx.name == "rsp" || idx.name == "esp" {
-        return None;
+    s.push('(');
+    if let Some(b) = &mem.base {
+        s.push('%');
+        s.push_str(&b.name);
     }
-    // Every other register folds, including reg 4 (%r12) and reg 5
-    // (%rbp/%r13). Those two need special ModR/M shapes in the base slot --
-    // %r12 needs a SIB with index=none, and %rbp at mod=00 would mean "no
-    // base", so it needs mod=01 with a zero disp8 -- but the general memory
-    // encoder already produces exactly those forms for a plain base operand
-    // (verified byte-identical to GAS for `lea (%r12)`, `lea 0(%rbp)` and
-    // `mov -1(%r12)`), so rewriting the operand is sufficient and no special
-    // case is needed here.
-    //
-    // This is what lets us reach ICC's encoding for the whole family:
-    // `lea 0(,%r12,1),%rdx` becomes 49 8d 14 24 (4 bytes) instead of
-    // 4a 8d 14 25 00000000 (8 bytes).
-    Some(MemoryOperand {
-        base: mem.index.clone(),
-        index: None,
-        scale: None,
-        ..mem.clone()
-    })
+    if let Some(i) = &mem.index {
+        s.push(',');
+        s.push('%');
+        s.push_str(&i.name);
+    }
+    if let Some(sc) = mem.scale {
+        s.push(',');
+        if mem.index.is_none() {
+            s.push(',');
+        }
+        s.push_str(&sc.to_string());
+    }
+    s.push(')');
+    s
+}
+
+/// Structural validation of a memory operand, with GNU as diagnostics.
+/// Runs centrally in `encode()` (before dispatch) so every mnemonic —
+/// legacy, VEX and EVEX — rejects bad addressing identically instead
+/// of encoding garbage (a 16-bit base silently assembled as its low
+/// 3 bits, i.e. the wrong register, with no diagnostic).
+/// True for every identifier GAS accepts as a register *name* (whether
+/// or not it may appear in an address). Known-but-misplaced names
+/// (`%st`, `%k1`) get the base/index-expression diagnostic; unknown
+/// names (`%foo`) — and `%eiz`, which GAS 2.47 rejects everywhere —
+/// get `bad register name`.
+fn is_known_addr_name(n: &str) -> bool {
+    n == "rip"
+        || n == "st"
+        || (n.starts_with("st(") && n.ends_with(')'))
+        || is_reg8(n)
+        || is_reg16(n)
+        || is_reg32(n)
+        || is_reg64(n)
+        || is_egpr(n)
+        || is_mmx(n)
+        || is_xmm(n)
+        || is_ymm(n)
+        || is_zmm(n)
+        || is_kreg(n)
+        || is_segment_reg(n)
+        || is_control_reg(n)
+        || is_debug_reg(n)
+}
+
+pub(crate) fn validate_mem_operand(mnemonic: &str, mem: &MemoryOperand) -> Result<(), String> {
+    let bad = || {
+        format!(
+            "`{}' is not a valid base/index expression",
+            mem_expr_echo(mem)
+        )
+    };
+    // GAS echoes the offending name with the closing paren when it is
+    // the last component (`bad register name `%eiz)'`) and without it
+    // when a `,scale` follows (`bad register name `%eiz'`).
+    let bad_name =
+        |n: &str, last: bool| format!("bad register name `%{n}{}'", if last { ")" } else { "" });
+    if let Some(base) = &mem.base {
+        let n = base.name.as_str();
+        if n == "eiz" || !is_known_addr_name(n) {
+            let last = mem.index.is_none() && mem.scale.is_none();
+            return Err(bad_name(n, last));
+        }
+        let ok = n == "rip" || is_reg32(n) || is_reg64(n);
+        if !ok {
+            return Err(bad());
+        }
+        if n == "rip" && mem.index.is_some() {
+            return Err(bad());
+        }
+    }
+    if let Some(index) = &mem.index {
+        let n = index.name.as_str();
+        if n == "eiz" || !is_known_addr_name(n) {
+            return Err(bad_name(n, mem.scale.is_none()));
+        }
+        // %rsp/%esp can never be an index (index=100 means "no index").
+        if n == "rsp" || n == "esp" {
+            return Err(bad());
+        }
+        if is_reg32(n) || is_reg64(n) {
+            // Width mixing with the base is diagnosed below.
+        } else if is_xmm(n) || is_ymm(n) || is_zmm(n) {
+            let m = mnemonic.to_ascii_lowercase();
+            let gather = m.starts_with("vgather")
+                || m.starts_with("vpgather")
+                || m.starts_with("vscatter")
+                || m.starts_with("vpscatter");
+            if !gather {
+                return Err(format!(
+                    "unsupported vector index register for `{mnemonic}'"
+                ));
+            }
+        } else {
+            return Err(bad());
+        }
+    }
+    if let (Some(base), Some(index)) = (&mem.base, &mem.index) {
+        let b32 = is_reg32(&base.name);
+        let i32 = is_reg32(&index.name);
+        let b64 = is_reg64(&base.name);
+        let i64 = is_reg64(&index.name);
+        if (b32 && i64) || (b64 && i32) {
+            return Err(bad());
+        }
+    }
+    // An explicit scale with no index (`64(,,1)`, `8(%rax,,1)`) is a
+    // parse error in GAS; without this the scale is silently ignored
+    // and a wrong address assembled.
+    if mem.scale.is_some() && mem.index.is_none() {
+        return Err("expecting scale factor of 1, 2, 4, or 8: got `'".to_string());
+    }
+    // A base/indexed displacement (including %rip-relative) that does
+    // not fit disp32 is rejected before encoding: GAS echoes the value
+    // as unsigned-64 lowercase hex (`2147483648(%rax)` reports
+    // `0x80000000 ...`, verified 2.47).
+    if mem.base.is_some() || mem.index.is_some() {
+        if let Displacement::Integer(v) = mem.displacement {
+            if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                return Err(format!(
+                    "{:#x} out of range of signed 32bit displacement",
+                    v as u64
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn mem_needs_addr32(mem: &MemoryOperand) -> bool {
+    mem.base.as_ref().is_some_and(|b| is_reg32(&b.name))
+        || mem.index.as_ref().is_some_and(|i| is_reg32(&i.name))
 }

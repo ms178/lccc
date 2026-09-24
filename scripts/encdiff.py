@@ -49,9 +49,11 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import random
 import re
 import subprocess
 import sys
+import time
 import tempfile
 import urllib.error
 import urllib.request
@@ -184,6 +186,32 @@ def _post(cid: str, source: str, args: str) -> dict:
     return out
 
 
+_TRANSIENT = (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError)
+
+
+def _post_retry(cid: str, source: str, args: str, *, attempts: int = 5):
+    """POST with retries for transient failures (429/5xx/timeouts/resets).
+
+    One failed batch used to poison 60 instructions; Godbolt rate-limits
+    burst traffic, so back off exponentially with jitter. Non-retryable
+    4xx (other than 429) fail fast: they are deterministic.
+    """
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return _post(cid, source, args)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code != 429 and e.code < 500:
+                raise
+        except _TRANSIENT as e:
+            last = e
+        if attempt + 1 < attempts:
+            time.sleep(0.5 * (2 ** attempt) + random.uniform(0, 0.5))
+    assert last is not None
+    raise last
+
+
 # The instruction is wrapped in a naked function so nothing but our own bytes
 # lands between the markers. The markers are `ud2` runs: unlike int3 (0xCC),
 # ud2 is never emitted as alignment padding, and it cannot be confused with a
@@ -216,7 +244,7 @@ def encode_remote(cid: str, insn: str, args: str = "-O0 -c") -> Encoding:
         body = body + "\\n\\t" + after
     source = _WRAP % _c_escape(body)
     try:
-        r = _post(cid, source, args)
+        r = _post_retry(cid, source, args)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
             json.JSONDecodeError, OSError) as e:
         return Encoding(False, None, f"network: {type(e).__name__}")
@@ -390,7 +418,7 @@ def _encode_group(cid: str, group: list[str], args: str) -> list[Encoding]:
     if not group:
         return []
     try:
-        r = _post(cid, _batch_source(group), args)
+        r = _post_retry(cid, _batch_source(group), args)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
             json.JSONDecodeError, OSError) as e:
         return [Encoding(False, None, f"network: {type(e).__name__}")] * len(group)
@@ -439,7 +467,41 @@ _COMMUTATIVE_VEX = {
     # Integer 0F-map ops LCCC may source-swap to reach VEX2 (not FP add/mul).
     "vpmuludq", "vpsadbw", "vpmaddwd",
 }
+# VEX packed-FP compare pseudos with operand-symmetric predicates
+# ((imm&31)&7 in {eq,unord,neq,ord}, every _q/_s flavor + true/false):
+# objdump always disassembles VEX C2 to these spellings (never `vcmpps $imm`),
+# and LCCC/clang/icx may exchange the sources to reach the 2-byte VEX prefix.
+# Scalar (ss/sd) and ordered-predicate pseudos are deliberately absent: the
+# merge lane makes scalar swaps unsound and no oracle swaps ordered compares.
+_COMMUTATIVE_VEX_CMP = {
+    "vcmpeqps", "vcmpeqpd", "vcmpunordps", "vcmpunordpd",
+    "vcmpneqps", "vcmpneqpd", "vcmpordps", "vcmpordpd",
+    "vcmpeq_uqps", "vcmpeq_uqpd", "vcmpfalseps", "vcmpfalsepd",
+    "vcmpneq_oqps", "vcmpneq_oqpd", "vcmptrueps", "vcmptruepd",
+    "vcmpeq_osps", "vcmpeq_ospd", "vcmpunord_sps", "vcmpunord_spd",
+    "vcmpneq_usps", "vcmpneq_uspd", "vcmpord_sps", "vcmpord_spd",
+    "vcmpeq_usps", "vcmpeq_uspd", "vcmpfalse_osps", "vcmpfalse_ospd",
+    "vcmpneq_osps", "vcmpneq_ospd", "vcmptrue_usps", "vcmptrue_uspd",
+}
 _VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
+_VEXCMP_IMM = re.compile(r"^(vcmpps|vcmppd)\s+\$(0x[0-9a-f]+|\d+),(%\S+),(%\S+),(%\S+)$")
+
+
+def _vcmp_imm_symmetric(text: str) -> bool:
+    """True when a VCMP numbered imm selects an operand-symmetric predicate.
+
+    objdump prints the pseudo-mnemonic only for imm 0-31; larger immediates
+    (GAS accepts the full imm8, e.g. `$0xab`) disassemble numbered. The
+    predicate lives in the low 5 bits; relations eq/unord/neq/ord (imm&7 in
+    {0,3,4,7}) are symmetric in every flavor, true/false included.
+    """
+    try:
+        imm = int(text, 0)
+    except ValueError:
+        return False
+    return ((imm & 31) & 7) in (0, 3, 4, 7)
+
+
 _GP32_TO_64 = {
     "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
     "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
@@ -455,9 +517,13 @@ def _canon_insn(insn: str) -> str:
     insn = _ZERODISP.sub("(", insn)
     insn = re.sub(r"\s+", " ", insn)
     m = _VEX3.match(insn)
-    if m and m.group(1) in _COMMUTATIVE_VEX:
+    if m and (m.group(1) in _COMMUTATIVE_VEX or m.group(1) in _COMMUTATIVE_VEX_CMP):
         a, b = sorted((m.group(2), m.group(3)))
         insn = f"{m.group(1)} {a},{b},{m.group(4)}"
+    m = _VEXCMP_IMM.match(insn)
+    if m and _vcmp_imm_symmetric(m.group(2)):
+        a, b = sorted((m.group(3), m.group(4)))
+        insn = f"{m.group(1)} ${m.group(2)},{a},{b},{m.group(5)}"
     m = _MOV_IMM.match(insn)
     if m:
         val = int(m.group(2), 0)
@@ -537,10 +603,12 @@ def classify(row: Row) -> None:
         row.verdict = "ok"
     elif n < len(ref):
         row.verdict = "BEATS"
-        row.note = f"all oracles agree on {len(ref)}B"
+        row.note = (f"oracles agree on {len(ref)}B"
+                    f" ({','.join(sorted(ok_oracles))})")
     elif n > len(ref):
         row.verdict = "LONGER"
-        row.note = f"all oracles agree on {len(ref)}B"
+        row.note = (f"oracles agree on {len(ref)}B"
+                    f" ({','.join(sorted(ok_oracles))})")
     elif decodes_same(_OBJDUMP, row.lccc.data, ref):
         # Same length, different bytes, but the two decode identically -- a
         # different spelling of the same instruction, not a defect.

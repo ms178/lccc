@@ -1005,6 +1005,7 @@ mod i686_encoding_helper_tests {
             zeroing: false,
             sae: false,
             rounding: None,
+            broadcast: None,
         }
     }
 
@@ -1407,7 +1408,7 @@ mod i686_encoding_helper_tests {
         // mod.rs (the single emission point) rather than any per-arm call.
         let mem = memory_operand(Displacement::Integer(8), base, None, None, segment);
         let instr = Instruction {
-            prefix: None,
+            prefixes: Vec::new(),
             mnemonic: "movl".to_string(),
             operands: vec![Operand::Memory(mem), Operand::Register(register("eax"))],
             nf: false,

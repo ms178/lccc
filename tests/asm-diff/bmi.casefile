@@ -268,6 +268,25 @@ movbew (%rdi), %ax
 movbel (%rdi), %eax
 movbeq (%rdi), %rax
 movbeq %rax, (%rdi)
+;;; adx_movbe_suffixless
+.text
+adcx %edx, %ecx
+adcx %rdx, %rcx
+adcx (%rax), %r8
+adox %edx, %ecx
+adox %rdx, %rcx
+adox (%rax), %rcx
+movbe (%rax), %ecx
+movbe %ecx, (%rax)
+movbe (%rax), %cx
+movbe %r8, (%rdi)
+movbe %ax, %bx
+movbe %eax, %ebx
+movbe %rax, %rbx
+movbe %r8w, %r9w
+;;; adx_movbe_bad reject
+.text
+adcx %ax, %bx
 ;;; bmi_gaps
 .text
 blsil %eax, %ecx

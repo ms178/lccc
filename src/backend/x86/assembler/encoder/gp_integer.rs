@@ -348,6 +348,43 @@ impl super::InstructionEncoder {
         Ok(())
     }
 
+    /// Moffs address emission: [0x66] [REX.W] A0-A3 + moffs64.
+    /// Integer addresses encode inline; symbols take an R_X86_64_64
+    /// relocation (GAS 2.47: `movabs foo,%rax` -> `48 a1 0.. + R64`).
+    fn emit_moffs_addr(
+        &mut self,
+        acc: &str,
+        disp: &Displacement,
+        store: bool,
+    ) -> Result<(), String> {
+        let size = infer_reg_size(acc);
+        if size == 2 {
+            self.bytes.push(0x66);
+        }
+        if size == 8 {
+            self.emit_rex_unary(8, acc);
+        }
+        self.bytes.push(match (store, size == 1) {
+            (false, true) => 0xA0,
+            (false, false) => 0xA1,
+            (true, true) => 0xA2,
+            (true, false) => 0xA3,
+        });
+        match disp {
+            Displacement::Integer(v) => self.bytes.extend_from_slice(&v.to_le_bytes()),
+            Displacement::Symbol(sym) => {
+                self.add_relocation(sym, R_X86_64_64, 0);
+                self.bytes.extend_from_slice(&[0u8; 8]);
+            }
+            Displacement::SymbolPlusOffset(sym, a) => {
+                self.add_relocation(sym, R_X86_64_64, *a);
+                self.bytes.extend_from_slice(&[0u8; 8]);
+            }
+            _ => return Err("movabs moffs requires an absolute address".to_string()),
+        }
+        Ok(())
+    }
+
     pub(crate) fn encode_movabs(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("movabsq requires 2 operands".to_string());
@@ -380,41 +417,16 @@ impl super::InstructionEncoder {
             // store direction `movabs %rax, 0xADDR` (A2/A3).  These are the only
             // instructions that take a full 64-bit absolute address, and they
             // are hard-wired to the accumulator, so no ModRM byte is emitted.
+            // (Also the redirect target for `mov`-family + huge absolute.)
             (Operand::Memory(mem), Operand::Register(dst))
                 if mem.base.is_none() && mem.index.is_none() && is_accum(&dst.name) =>
             {
-                let addr = match &mem.displacement {
-                    Displacement::Integer(v) => *v,
-                    _ => return Err("movabs moffs requires an absolute address".to_string()),
-                };
-                let size = infer_reg_size(&dst.name);
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                if size == 8 {
-                    self.emit_rex_unary(8, &dst.name);
-                }
-                self.bytes.push(if size == 1 { 0xA0 } else { 0xA1 });
-                self.bytes.extend_from_slice(&addr.to_le_bytes());
-                Ok(())
+                self.emit_moffs_addr(&dst.name, &mem.displacement, false)
             }
             (Operand::Register(src), Operand::Memory(mem))
                 if mem.base.is_none() && mem.index.is_none() && is_accum(&src.name) =>
             {
-                let addr = match &mem.displacement {
-                    Displacement::Integer(v) => *v,
-                    _ => return Err("movabs moffs requires an absolute address".to_string()),
-                };
-                let size = infer_reg_size(&src.name);
-                if size == 2 {
-                    self.bytes.push(0x66);
-                }
-                if size == 8 {
-                    self.emit_rex_unary(8, &src.name);
-                }
-                self.bytes.push(if size == 1 { 0xA2 } else { 0xA3 });
-                self.bytes.extend_from_slice(&addr.to_le_bytes());
-                Ok(())
+                self.emit_moffs_addr(&src.name, &mem.displacement, true)
             }
             _ => Err("unsupported movabsq operands".to_string()),
         }
