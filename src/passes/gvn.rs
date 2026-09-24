@@ -276,6 +276,40 @@ struct GvnState {
     /// against the recorded `sext→v1020` and rewired the second zone
     /// computation to read the ZONE POINTER — boot page fault).
     multi_def_values: FxHashSet<u32>,
+    /// Value ids that appear as a Phi INCOMING operand anywhere in the
+    /// function.  Cross-block pure CSE must not delete an instruction whose
+    /// value feeds a phi: the unrollers and the vectorizers structurally
+    /// assume the loop-header IV increment (`Add %iv, step`) is
+    /// latch-local — `find_iv_in_loop` only searches the latch, and the
+    /// two-block unroller threads exit phis off the latch's bookkeeping.
+    /// Sharing the increment Add with a body value (legal SSA, gcc's own
+    /// form) collapses the latch after cfg_simplify and those passes then
+    /// miscompile (measured: 22 corpus failures, the `s += i+1`
+    /// accumulator returning the IV instead of the sum).  Renaming the
+    /// USES of such a dest is fine for every OTHER consumer; the phi
+    /// feeders keep their instruction.
+    ///
+    /// SCOPE: DIRECT feeds only, by design. Every structural consumer in
+    /// the tree keys on the direct feed's instruction inside its block
+    /// (`find_iv_in_loop` scans the latch for the Add producing the
+    /// back-edge value; the reduction matcher requires `added_value`'s
+    /// def in the body) — a value that only reaches a phi THROUGH a
+    /// forwarding op (`v4 = Copy v3; phi(v4)`) is invisible to those
+    /// matchers regardless of what computes it, and the forwarding op
+    /// itself is protected as the direct feed. Deleting `v3` behind such
+    /// a Copy is semantically sound SSA (the dominator's value dominates
+    /// `v3`'s block, which dominates every use) and shape-preserving for
+    /// every existing consumer; a transitive closure through Copy/Cast
+    /// would protect nothing that anything reads (pinned by
+    /// test_cross_block_cse_phi_feed_copy_is_renamable).
+    phi_incoming_feeds: FxHashSet<u32>,
+    /// Value renames to apply after the walk: (dominated dest, dominating
+    /// existing).  Cross-block pure CSE deletes the dominated instruction
+    /// and renames its uses onto the dominator's value — no Copy is
+    /// inserted, so the register allocator sees a plain SSA value with
+    /// dominated uses (the historical Copy-based cross-block form's
+    /// stale-home hazard does not exist for a rename).
+    pending_renames: Vec<(Value, Value)>,
     /// Per-value use info for cross-signedness load CSE: value id ->
     /// (total use count, first-use kind). Computed once per function by
     /// `find_value_use_info`; candidate counts are stable across the GVN
@@ -371,6 +405,8 @@ impl GvnState {
             load_rollback_log: Vec::new(),
             store_fwd_rollback_log: Vec::new(),
             vn_log: Vec::new(),
+            pending_renames: Vec::new(),
+            phi_incoming_feeds: FxHashSet::default(),
             total_eliminated: 0,
             escaped_param_allocas,
             param_allocas,
@@ -1472,9 +1508,142 @@ pub(crate) fn run_gvn_with_analysis_and_context(
         noalias,
         multi_def,
     );
+    state.phi_incoming_feeds = collect_phi_incoming_feeds(func);
     state.xsign_use_info = find_value_use_info(func);
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
+    apply_pending_renames(func, &mut state);
     state.total_eliminated
+}
+
+/// Every value id that appears as a Phi incoming operand anywhere in the
+/// function — the cross-block pure-CSE rename must not delete any of their
+/// defining instructions (see `GvnState::phi_incoming_feeds`).
+fn collect_phi_incoming_feeds(func: &IrFunction) -> FxHashSet<u32> {
+    let mut set = FxHashSet::default();
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (op, _) in incoming {
+                    if let Operand::Value(v) = op {
+                        set.insert(v.0);
+                    }
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Resolve one value through the cross-block rename map to its canonical
+/// target, PROVING termination: an acyclic path through a finite map is at
+/// most `rename.len()` edges long, so exceeding that count demonstrates a
+/// cycle (a collector bug — see `apply_pending_renames` for the invariants
+/// that make one impossible by construction).
+fn resolve_rename(rename: &FxHashMap<u32, Value>, v: Value) -> Value {
+    let mut cur = v;
+    let mut hops = 0usize;
+    while let Some(&next) = rename.get(&cur.0) {
+        hops += 1;
+        if hops > rename.len() {
+            panic!("GVN cross-block rename cycle is reachable from v{}", v.0);
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// Apply the cross-block pure-CSE renames collected during the walk:
+/// every use of a dominated, deleted value reads the dominator's value.
+/// Applied AFTER the DFS so the scoped value-numbering tables never
+/// observe a mid-walk rewrite.
+///
+/// The mapping is validated, not trusted. Every deleted instruction has a
+/// unique dest (the `multi_def_values` guard excludes redefined ids), so a
+/// conflicting double mapping is a collector bug, a cycle is a collector
+/// bug, and a use of a deleted value that survives the rewrite is a
+/// miscompile in the making — each panics loudly instead of silently
+/// leaving a value id whose defining instruction no longer exists (the
+/// backend would lower uses against an undefined virtual register).
+fn apply_pending_renames(func: &mut IrFunction, state: &mut GvnState) {
+    if state.pending_renames.is_empty() {
+        return;
+    }
+    let mut rename: FxHashMap<u32, Value> = FxHashMap::default();
+    for (from, to) in state.pending_renames.drain(..) {
+        debug_assert_ne!(from, to, "self-rename of v{} is a collector bug", from.0);
+        match rename.insert(from.0, to) {
+            Some(prev) if prev != to => panic!(
+                "GVN cross-block rename: v{} was mapped to both v{} and v{}",
+                from.0, prev.0, to.0
+            ),
+            _ => {}
+        }
+    }
+    // Resolve transitively (see `resolve_rename`): the collector points
+    // every deleted value at its table's canonical value, so chains are
+    // not expected — but the resolver PROVES termination instead of
+    // silently stopping after a fixed number of hops and leaving a
+    // deleted value id in a use.
+    for b in func.blocks.iter_mut() {
+        for inst in b.instructions.iter_mut() {
+            inst.for_each_value_use_mut(|v| *v = resolve_rename(&rename, *v));
+            inst.for_each_operand_mut(|o| {
+                if let Operand::Value(v) = o {
+                    *v = resolve_rename(&rename, *v);
+                }
+            });
+        }
+        b.terminator.for_each_operand_mut(|o| {
+            if let Operand::Value(v) = o {
+                *v = resolve_rename(&rename, *v);
+            }
+        });
+    }
+    // Post-check: a deleted value must not survive in ANY use. `resolve`
+    // rewrote every operand the canonical visitors reach; a leftover here
+    // means a use site they do not cover (a future IR variant) or a
+    // mapping gap — either is a miscompile, so it aborts the build rather
+    // than emitting code that reads an undefined value.
+    let deleted: FxHashSet<u32> = rename.keys().copied().collect();
+    for (bi, b) in func.blocks.iter_mut().enumerate() {
+        for inst in b.instructions.iter_mut() {
+            let mut dangling: Option<u32> = None;
+            inst.for_each_value_use_mut(|v| {
+                if dangling.is_none() && deleted.contains(&v.0) {
+                    dangling = Some(v.0);
+                }
+            });
+            inst.for_each_operand_mut(|o| {
+                if let Operand::Value(v) = o {
+                    if dangling.is_none() && deleted.contains(&v.0) {
+                        dangling = Some(v.0);
+                    }
+                }
+            });
+            if let Some(id) = dangling {
+                panic!(
+                    "GVN cross-block rename left a use of deleted v{} in \
+                     block {} after rewriting (visitor gap or mapping bug)",
+                    id, bi
+                );
+            }
+        }
+        let mut dangling: Option<u32> = None;
+        b.terminator.for_each_operand_mut(|o| {
+            if let Operand::Value(v) = o {
+                if dangling.is_none() && deleted.contains(&v.0) {
+                    dangling = Some(v.0);
+                }
+            }
+        });
+        if let Some(id) = dangling {
+            panic!(
+                "GVN cross-block rename left a use of deleted v{} in block \
+                 {}'s terminator after rewriting",
+                id, bi
+            );
+        }
+    }
 }
 
 /// Recursive DFS over the dominator tree for GVN.
@@ -1606,8 +1775,23 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
     // candidate expression. Track definitions explicitly to make large generated
     // basic blocks O(n) instead of O(n^2) without changing CSE legality.
     let mut block_defs: FxHashSet<u32> = FxHashSet::default();
-    // GVN replaces instructions 1:1 (original or Copy), so spans stay parallel
-    let new_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
+    // `source_spans` is parallel to `instructions` by construction (lowering
+    // builds both together); passes that break the parallelism clear the
+    // vector rather than guessing — the convention `restore_phi_prefix` and
+    // the late-vectorizer sweep follow. GVN preserves the invariant under
+    // ANY number of cross-block deletions: 1:1 replacements (original or
+    // Copy) leave the span in place, and a rename deletion drops the
+    // CURRENT instruction's span at index `new_instructions.len()` — the
+    // survivor count IS the current position, because every kept
+    // instruction before it still owns its span and every deleted one has
+    // already dropped its own. (Indexing by the ORIGINAL instruction
+    // position desyncs from the second deletion in one block on: with
+    // spans [s1,s2,s3] and instructions [mul, mul, keep], the second
+    // deletion's original index 3 points past the shrunk vector and
+    // silently removes nothing.)
+    let instructions_len = func.blocks[block_idx].instructions.len();
+    let mut new_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
+    let spans_in_lockstep = new_spans.len() == instructions_len;
 
     for inst in func.blocks[block_idx].instructions.drain(..) {
         // Memory invalidation: true clobbers (calls, atomics, asm, ...) and
@@ -1809,15 +1993,100 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                 // Decide the CSE source value, if any. Returns the canonical
                 // plus, for cross-signedness hits, the (canon, candidate)
                 // exact types for the debug trace.
+                // Cross-block pure hits become RENAMES, not Copies: the
+                // dominator-scoped table guarantees the existing value's
+                // block dominates this one, hence (SSA) every use of
+                // `dest` is dominated by it too — the dominated
+                // instruction is deleted and its uses read the dominator's
+                // value directly.  No Copy is inserted, so the historical
+                // cross-block hazard ("Copies whose source values may have
+                // their registers reused by the allocator before the Copy
+                // executes") does not exist: the register allocator sees a
+                // plain SSA value with dominated uses.  A multi-def dest
+                // keeps its instruction (deleting one definition of a
+                // redefined id would change what the other definitions'
+                // uses observe).
+                let mut pure_cross_block_rename = false;
                 let cse_source: Option<(Value, Option<(IrType, IrType)>)> = if let Some(ev) =
                     existing_pure
                 {
-                    // Only CSE within the same block to avoid cross-block Copy issues.
-                    // Cross-block CSE creates Copies whose source values may have
-                    // their registers reused by the allocator before the Copy executes.
-                    existing_pure
-                        .filter(|v| block_defs.contains(&v.0))
-                        .map(|v| (v, None))
+                    if block_defs.contains(&ev.0) {
+                        Some((ev, None))
+                    } else if !matches!(
+                        inst,
+                        Instruction::BinOp {
+                            op: IrBinOp::Mul,
+                            ty: bin_ty, ..
+                        } if !bin_ty.is_float()
+                    ) {
+                        // Cross-block RENAMING is scoped to INTEGER `Mul`
+                        // — the audited work-order class ("redundant
+                        // multiplications of induction variables"):
+                        //  * GEPs and GlobalAddrs are deliberately RETAINED
+                        //    across blocks (the backend's address
+                        //    materialisation relies on site-local GEP
+                        //    values — see `gep_value_numbers`), and Casts
+                        //    carry the cross-signedness machinery;
+                        //  * FLOAT BinOps are rounding- and shape-sensitive:
+                        //    the FMA contraction passes decide per Add/Mul
+                        //    shape, so deleting a duplicate float op changes
+                        //    which contractions fire and the bit-exact op
+                        //    order the FP gates pin;
+                        //  * INTEGER `Add`s are exact values but load-bearing
+                        //    SHAPES: the loop passes structurally match exit
+                        //    compares (`i + 2 < n` is the stencil matcher's
+                        //    documented form) and IV bookkeeping — measured,
+                        //    a broad Add rename flipped
+                        //    stencil_vectorize's checksum and collapsed 21
+                        //    unroll/vectorize corpus shapes.
+                        // Same-block Copies remain available for the other
+                        // classes.
+                        //
+                        // INTEGER `Mul` DOES have structural consumers — the
+                        // claim "no such consumers" was a post-hoc summary
+                        // of corpus measurements, not a code audit. The
+                        // verified inventory (every body-local Mul lookup
+                        // in the tree) and why each one is safe under a
+                        // cross-block integer-Mul rename:
+                        //  * vectorize.rs F64 matmul (`find_inst_by_dest
+                        //    (body, mul_dest)`), the F32/F64 lane matcher,
+                        //    and the F64 reciprocal peel are FLOAT-typed —
+                        //    excluded by the `!is_float()` gate above;
+                        //  * vectorize.rs's dot-product matcher is
+                        //    integer-capable, but it requires the mul's
+                        //    OPERANDS to be loads DEFINED IN THE LOOP BODY,
+                        //    and GVN invalidates load entries at merge
+                        //    points — a loop header always has >= 2 preds,
+                        //    so body loads carry value numbers that cannot
+                        //    appear in any dominator's pure-expression
+                        //    entry. The body dot-mul can therefore never
+                        //    hit a cross-block table entry and be renamed
+                        //    away (pinned by
+                        //    test_cross_block_cse_preserves_dot_product);
+                        //  * iv_strength_reduce scans loop blocks
+                        //    structurally for `iv * C` wherever the
+                        //    instruction lives — a renamed duplicate keeps
+                        //    its canonical instruction inside the loop
+                        //    (loop-variant `iv * C` cannot exist in a
+                        //    preheader: the preheader sees the init value,
+                        //    not the phi);
+                        //  * vectorize.rs `vector_load_key` degrades
+                        //    gracefully when a GEP-offset Mul is not
+                        //    body-local (`_ => go.0` key fallback).
+                        None
+                    } else if state.multi_def_values.contains(&dest.0) {
+                        None
+                    } else if state.phi_incoming_feeds.contains(&dest.0) {
+                        // The dominated value feeds a phi (an IV increment
+                        // or an exit-merge edge): deleting it would leave
+                        // the phi reading a body-defined value, which the
+                        // unrollers/vectorizers structurally refuse (see
+                        // `phi_incoming_feeds`).  Keep the instruction.
+                        None
+                    } else {
+                        pure_cross_block_rename = true;
+                        Some((ev, None))
+                    }
                 } else if let Some((canon, canon_ty, canon_is_load)) = existing_load {
                     let cand_ty = match &inst {
                         Instruction::Load { ty, .. } => *ty,
@@ -1866,6 +2135,24 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         let old_vn = state.value_numbers[dest_idx];
                         state.vn_log.push((dest_idx, old_vn));
                         state.value_numbers[dest_idx] = existing_vn;
+                    }
+                    if pure_cross_block_rename {
+                        // Delete the dominated instruction outright; the
+                        // uses are renamed onto the dominator's value
+                        // after the walk completes (see
+                        // `apply_pending_renames`).  The CSE debug print
+                        // above already traced this hit.  Drop THIS
+                        // instruction's span at the survivor-count index
+                        // (see the `spans_in_lockstep` comment above);
+                        // a block whose spans were already inconsistent
+                        // is left untouched, matching the repo-wide
+                        // clear-don't-guess convention.
+                        state.pending_renames.push((dest, existing_value));
+                        if spans_in_lockstep {
+                            new_spans.remove(new_instructions.len());
+                        }
+                        eliminated += 1;
+                        continue;
                     }
                     new_instructions.push(Instruction::Copy {
                         dest,
@@ -2001,6 +2288,13 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
         }
     }
 
+    debug_assert!(
+        !spans_in_lockstep || new_spans.len() == func.blocks[block_idx].instructions.len(),
+        "GVN span bookkeeping desynced in block {}: {} spans for {} instructions",
+        block_idx,
+        new_spans.len(),
+        func.blocks[block_idx].instructions.len()
+    );
     func.blocks[block_idx].instructions = new_instructions;
     func.blocks[block_idx].source_spans = new_spans;
     eliminated
@@ -2452,8 +2746,10 @@ mod tests {
 
     #[test]
     fn test_cross_block_cse() {
-        // Cross-block CSE is currently restricted to same-block only.
-        // This test verifies cross-block expressions are NOT CSE'd.
+        // Cross-block pure CSE fires via USE-RENAMING: the dominated
+        // instruction is deleted (no Copy is inserted — the historical
+        // Copy form's stale-register-home hazard does not exist for a
+        // rename) and its uses read the dominator's value directly.
         // CFG: block0 -> block1 (block0 dominates block1)
         let func = IrFunction {
             name: "test".to_string(),
@@ -2464,7 +2760,7 @@ mod tests {
                     label: BlockId(0),
                     instructions: vec![Instruction::BinOp {
                         dest: Value(2),
-                        op: IrBinOp::Add,
+                        op: IrBinOp::Mul,
                         lhs: Operand::Value(Value(0)),
                         rhs: Operand::Value(Value(1)),
                         ty: IrType::I32,
@@ -2475,9 +2771,20 @@ mod tests {
                 BasicBlock {
                     label: BlockId(1),
                     instructions: vec![
-                        // Same expression as in block0 - should be CSE'd
+                        // Same integer Mul as in block0 - CSE'd via rename
                         Instruction::BinOp {
                             dest: Value(3),
+                            op: IrBinOp::Mul,
+                            lhs: Operand::Value(Value(0)),
+                            rhs: Operand::Value(Value(1)),
+                            ty: IrType::I32,
+                        },
+                        // An identical integer Add in the second block: Add
+                        // renames are OUT of scope (the loop passes match
+                        // exit compares and IV bookkeeping by Add shape), so
+                        // this Add must be KEPT.
+                        Instruction::BinOp {
+                            dest: Value(4),
                             op: IrBinOp::Add,
                             lhs: Operand::Value(Value(0)),
                             rhs: Operand::Value(Value(1)),
@@ -2533,15 +2840,762 @@ mod tests {
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
-        assert_eq!(eliminated, 0); // Cross-block CSE disabled (same-block only)
+        assert_eq!(eliminated, 1, "the dominated Mul must be CSE'd (renamed)");
 
-        // The expression in block1 should NOT be replaced (cross-block CSE disabled)
-        match &module.functions[0].blocks[1].instructions[0] {
-            Instruction::BinOp { dest, .. } => {
-                assert_eq!(dest.0, 3); // Original BinOp preserved
+        // The dominated expression is DELETED and the use reads the
+        // dominator's value.
+        assert!(
+            module.functions[0].blocks[1]
+                .instructions
+                .iter()
+                .all(|i| !matches!(i, Instruction::BinOp { dest, .. } if dest.0 == 3)),
+            "the dominated Mul must be deleted"
+        );
+        match &module.functions[0].blocks[1].terminator {
+            Terminator::Return(Some(Operand::Value(v))) => {
+                assert_eq!(v.0, 2, "the return reads the dominator's value");
             }
             other => panic!("Expected BinOp (cross-block CSE disabled), got {:?}", other),
         }
+    }
+
+    /// Minimal function shell for the cross-block tests below — ~20 fields
+    /// of ABI/linkage metadata that GVN never inspects.
+    fn fn_of(name: &str, blocks: Vec<BasicBlock>, next_value_id: u32) -> IrFunction {
+        IrFunction {
+            name: name.to_string(),
+            params: vec![],
+            return_type: IrType::I32,
+            blocks,
+            is_variadic: false,
+            is_fastcall: false,
+            regparm: None,
+            is_naked: false,
+            no_instrument: false,
+            is_static: false,
+            is_inline: false,
+            is_always_inline: false,
+            is_noinline: false,
+            is_declaration: false,
+            next_value_id,
+            fp_expr_tags: Default::default(),
+            next_label: 0,
+            section: None,
+            visibility: None,
+            is_weak: false,
+            is_used: false,
+            has_inlined_calls: false,
+            param_alloca_values: Vec::new(),
+            uses_sret: false,
+            global_init_label_blocks: Vec::new(),
+            ret_eightbyte_classes: Vec::new(),
+            is_gnu_inline_def: false,
+            ret_is_f128_sse: false,
+            loop_promoted_f64_values: Vec::new(),
+        }
+    }
+
+    fn module_of(func: IrFunction) -> IrModule {
+        IrModule {
+            functions: vec![func],
+            function_alignments: crate::common::fx_hash::FxHashMap::default(),
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+            globals: vec![],
+            string_literals: vec![],
+            wide_string_literals: vec![],
+            constructors: vec![],
+            destructors: vec![],
+            aliases: vec![],
+            toplevel_asm: vec![],
+            symbol_attrs: vec![],
+            char16_string_literals: vec![],
+            symver_directives: vec![],
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
+        }
+    }
+
+    fn mul_inst(dest: u32, lhs: u32, rhs: u32, ty: IrType) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(Value(lhs)),
+            rhs: Operand::Value(Value(rhs)),
+            ty,
+        }
+    }
+
+    fn blk(
+        label: u32,
+        instructions: Vec<Instruction>,
+        terminator: Terminator,
+        spans: Vec<crate::common::source::Span>,
+    ) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: spans,
+        }
+    }
+
+    #[test]
+    fn test_cross_block_cse_multiple_deletions_preserve_spans() {
+        // THREE cross-block Mul eliminations in ONE block (two identical,
+        // one commutative-flipped) around two kept instructions: the span
+        // vector must stay parallel AND each survivor must keep ITS OWN
+        // span. Removing by the ORIGINAL instruction index silently
+        // desyncs from the second deletion in a block on: with spans
+        // [s1,s2,s3,s4,s5] and instructions [mul, add, mul, mul, mulI64],
+        // the second deletion's original index 3 points at s4 in a vector
+        // that already lost s1 — the wrong span, or nothing at all.
+        let sp = |n: u32| crate::common::source::Span::new(n * 10, n * 10 + 1, 0);
+        let func = fn_of(
+            "spans",
+            vec![
+                blk(
+                    0,
+                    vec![mul_inst(2, 0, 1, IrType::I32)],
+                    Terminator::Branch(BlockId(1)),
+                    vec![sp(1)],
+                ),
+                blk(
+                    1,
+                    vec![
+                        mul_inst(3, 0, 1, IrType::I32),
+                        Instruction::BinOp {
+                            dest: Value(4),
+                            op: IrBinOp::Add,
+                            lhs: Operand::Value(Value(0)),
+                            rhs: Operand::Value(Value(1)),
+                            ty: IrType::I32,
+                        },
+                        mul_inst(5, 0, 1, IrType::I32),
+                        mul_inst(6, 1, 0, IrType::I32),
+                        mul_inst(7, 0, 1, IrType::I64),
+                    ],
+                    Terminator::Return(Some(Operand::Value(Value(4)))),
+                    vec![sp(2), sp(3), sp(4), sp(5), sp(6)],
+                ),
+            ],
+            8,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(
+            eliminated, 3,
+            "three dominated Muls renamed onto the dominator"
+        );
+        let b1 = &module.functions[0].blocks[1];
+        assert_eq!(
+            b1.instructions.len(),
+            2,
+            "the Add and the first I64 Mul survive"
+        );
+        assert!(
+            matches!(&b1.instructions[0], Instruction::BinOp { dest, op: IrBinOp::Add, .. } if dest.0 == 4),
+            "kept Add first"
+        );
+        assert!(
+            matches!(&b1.instructions[1], Instruction::BinOp { dest, op: IrBinOp::Mul, ty, .. } if dest.0 == 7 && *ty == IrType::I64),
+            "kept I64 Mul (distinct expression) second"
+        );
+        assert_eq!(
+            b1.source_spans,
+            vec![sp(3), sp(6)],
+            "survivors keep THEIR spans: the Add's sp(3) and the I64 Mul's sp(6)"
+        );
+    }
+
+    #[test]
+    fn test_cross_block_cse_pre_broken_spans_left_alone() {
+        // A block whose span vector was ALREADY inconsistent when GVN
+        // arrived: GVN must not guess which span to drop on top of a
+        // pre-existing desync — the vector is left byte-identical, the
+        // same clear-don't-guess convention restore_phi_prefix and the
+        // late-vectorizer sweep follow.
+        let sp = |n: u32| crate::common::source::Span::new(n * 10, n * 10 + 1, 0);
+        let func = fn_of(
+            "prebroken",
+            vec![
+                blk(
+                    0,
+                    vec![mul_inst(2, 0, 1, IrType::I32)],
+                    Terminator::Branch(BlockId(1)),
+                    vec![sp(1)],
+                ),
+                blk(
+                    1,
+                    vec![mul_inst(3, 0, 1, IrType::I32)],
+                    Terminator::Return(Some(Operand::Value(Value(3)))),
+                    vec![sp(2), sp(3)], // TWO spans for ONE instruction: pre-broken
+                ),
+            ],
+            4,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 1);
+        let b1 = &module.functions[0].blocks[1];
+        assert!(b1.instructions.is_empty());
+        assert_eq!(
+            b1.source_spans,
+            vec![sp(2), sp(3)],
+            "a pre-broken span vector is left untouched, not guessed at"
+        );
+    }
+
+    #[test]
+    fn test_cross_block_cse_nested_dominators_map_to_canonical() {
+        // b0 -> b1 -> b2 dominator chain, each level with a duplicate Mul:
+        // every level maps DIRECTLY to the table's canonical value (v2),
+        // never through the intermediate deleted value. pending_renames
+        // therefore contains no a->b->c chains — which is why
+        // resolve_rename's cycle proof is belt-and-braces, not
+        // load-bearing.
+        let func = fn_of(
+            "nested",
+            vec![
+                blk(
+                    0,
+                    vec![mul_inst(2, 0, 1, IrType::I32)],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    1,
+                    vec![mul_inst(3, 0, 1, IrType::I32)],
+                    Terminator::Branch(BlockId(2)),
+                    vec![],
+                ),
+                blk(
+                    2,
+                    vec![mul_inst(4, 0, 1, IrType::I32)],
+                    Terminator::Return(Some(Operand::Value(Value(4)))),
+                    vec![],
+                ),
+            ],
+            5,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 2);
+        assert!(module.functions[0].blocks[1].instructions.is_empty());
+        assert!(module.functions[0].blocks[2].instructions.is_empty());
+        match &module.functions[0].blocks[2].terminator {
+            Terminator::Return(Some(Operand::Value(v))) => assert_eq!(
+                v.0, 2,
+                "the deepest duplicate reads the CANONICAL value, not a chain"
+            ),
+            other => panic!("unexpected terminator {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cross_block_cse_integer_widths() {
+        // The rename is width-agnostic for every integer Mul width:
+        // I8/I16/I32/I64 all CSE across blocks (each width is a distinct
+        // expression key, so this also pins that the type participates in
+        // the key — the I64 duplicate does not accidentally hit the I32
+        // entry). 128-bit is excluded from GVN entirely (the backend's
+        // XMM-pair hazard) and is covered by existing tests.
+        let func = fn_of(
+            "widths",
+            vec![
+                blk(
+                    0,
+                    vec![
+                        mul_inst(2, 0, 1, IrType::I8),
+                        mul_inst(3, 0, 1, IrType::I16),
+                        mul_inst(4, 0, 1, IrType::I32),
+                        mul_inst(5, 0, 1, IrType::I64),
+                    ],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    1,
+                    vec![
+                        mul_inst(6, 0, 1, IrType::I8),
+                        mul_inst(7, 0, 1, IrType::I16),
+                        mul_inst(8, 0, 1, IrType::I32),
+                        mul_inst(9, 0, 1, IrType::I64),
+                    ],
+                    Terminator::Return(Some(Operand::Value(Value(9)))),
+                    vec![],
+                ),
+            ],
+            10,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 4, "every integer width renames cross-block");
+        assert!(module.functions[0].blocks[1].instructions.is_empty());
+        match &module.functions[0].blocks[1].terminator {
+            Terminator::Return(Some(Operand::Value(v))) => assert_eq!(v.0, 5),
+            other => panic!("unexpected terminator {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cross_block_cse_rewrites_every_use_form() {
+        // The dominated Mul's dest is consumed through every
+        // operand-bearing instruction form plus the block terminator: all
+        // of them must read the dominator's value after the rename. The
+        // post-check inside apply_pending_renames would have panicked on
+        // any use form the canonical visitors missed.
+        let func = fn_of(
+            "useforms",
+            vec![
+                blk(
+                    0,
+                    vec![mul_inst(2, 0, 1, IrType::I32)],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    1,
+                    vec![
+                        mul_inst(3, 0, 1, IrType::I32), // renamed -> v2
+                        Instruction::Copy {
+                            dest: Value(4),
+                            src: Operand::Value(Value(3)),
+                        },
+                        Instruction::Cast {
+                            dest: Value(5),
+                            src: Operand::Value(Value(3)),
+                            from_ty: IrType::I32,
+                            to_ty: IrType::I64,
+                        },
+                        Instruction::Select {
+                            dest: Value(6),
+                            cond: Operand::Value(Value(0)),
+                            true_val: Operand::Value(Value(3)),
+                            false_val: Operand::Value(Value(1)),
+                            ty: IrType::I32,
+                        },
+                        Instruction::Call {
+                            func: "sink".to_string(),
+                            info: CallInfo {
+                                dest: None,
+                                args: vec![Operand::Value(Value(3))],
+                                arg_types: vec![IrType::I32],
+                                return_type: IrType::Void,
+                                ..CallInfo::default()
+                            },
+                        },
+                        Instruction::Store {
+                            val: Operand::Value(Value(3)),
+                            ptr: Value(1),
+                            ty: IrType::I32,
+                            seg_override: AddressSpace::Default,
+                            volatile: false,
+                        },
+                        Instruction::GetElementPtr {
+                            dest: Value(7),
+                            base: Value(0),
+                            offset: Operand::Value(Value(3)),
+                            ty: IrType::I8,
+                        },
+                    ],
+                    Terminator::CondBranch {
+                        cond: Operand::Value(Value(3)),
+                        true_label: BlockId(2),
+                        false_label: BlockId(2),
+                    },
+                    vec![],
+                ),
+                blk(
+                    2,
+                    vec![],
+                    Terminator::Return(Some(Operand::Value(Value(3)))),
+                    vec![],
+                ),
+            ],
+            8,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 1, "the dominated Mul is renamed");
+        let b1 = &module.functions[0].blocks[1];
+        let expects = [
+            (
+                "Copy",
+                matches!(b1.instructions.first(), Some(Instruction::Copy { src: Operand::Value(v), .. }) if v.0 == 2),
+            ),
+            (
+                "Cast",
+                matches!(&b1.instructions[1], Instruction::Cast { src: Operand::Value(v), .. } if v.0 == 2),
+            ),
+            (
+                "Select",
+                matches!(&b1.instructions[2], Instruction::Select { true_val: Operand::Value(v), .. } if v.0 == 2),
+            ),
+            (
+                "Call arg",
+                matches!(&b1.instructions[3], Instruction::Call { info, .. }
+                    if matches!(&info.args[0], Operand::Value(v) if v.0 == 2)),
+            ),
+            (
+                "Store val",
+                matches!(&b1.instructions[4], Instruction::Store { val: Operand::Value(v), .. } if v.0 == 2),
+            ),
+            (
+                "GEP offset",
+                matches!(&b1.instructions[5], Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 2),
+            ),
+        ];
+        for (what, ok) in expects {
+            assert!(ok, "use form {} must read the dominator's value", what);
+        }
+        match &b1.terminator {
+            Terminator::CondBranch {
+                cond: Operand::Value(v),
+                ..
+            } => assert_eq!(v.0, 2, "terminator cond rewritten"),
+            other => panic!("unexpected terminator {:?}", other),
+        }
+        match &module.functions[0].blocks[2].terminator {
+            Terminator::Return(Some(Operand::Value(v))) => assert_eq!(v.0, 2),
+            other => panic!("unexpected terminator {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cross_block_cse_phi_feed_direct_kept() {
+        // A dominated Mul whose value DIRECTLY feeds a Phi incoming must
+        // keep its instruction: the loop passes structurally key on the
+        // direct feed's def living in the loop (find_iv_in_loop scans the
+        // latch; the two-block unroller threads exit phis off latch
+        // bookkeeping). Legal SSA, gcc's own form — still refused here.
+        // CFG: b0 (entry) -> b1 (header, phi) -> b2 (latch) -> b1.
+        let func = fn_of(
+            "phidirect",
+            vec![
+                blk(
+                    0,
+                    vec![mul_inst(2, 0, 1, IrType::I32)],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    1,
+                    vec![Instruction::Phi {
+                        dest: Value(5),
+                        ty: IrType::I32,
+                        incoming: vec![
+                            (Operand::Value(Value(0)), BlockId(0)),
+                            (Operand::Value(Value(3)), BlockId(2)),
+                        ],
+                    }],
+                    Terminator::CondBranch {
+                        cond: Operand::Value(Value(1)),
+                        true_label: BlockId(3),
+                        false_label: BlockId(2),
+                    },
+                    vec![],
+                ),
+                blk(
+                    2,
+                    vec![mul_inst(3, 0, 1, IrType::I32)], // direct phi feed: KEPT
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    3,
+                    vec![],
+                    Terminator::Return(Some(Operand::Value(Value(5)))),
+                    vec![],
+                ),
+            ],
+            6,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 0, "the direct phi feeder keeps its instruction");
+        let b2 = &module.functions[0].blocks[2];
+        assert!(
+            matches!(b2.instructions.first(), Some(Instruction::BinOp { dest, op: IrBinOp::Mul, .. }) if dest.0 == 3),
+            "the latch-local Mul feeding the phi survives"
+        );
+    }
+
+    #[test]
+    fn test_cross_block_cse_phi_feed_copy_is_renamable() {
+        // The SAME loop, but the phi is fed THROUGH a Copy: the Copy is the
+        // direct feed (it keeps its instruction, protecting the shape the
+        // structural consumers match), while the Mul behind it is not a
+        // direct feed and IS renamed — semantically sound SSA (the
+        // dominator's value dominates the Mul's block, which dominates
+        // every use) and invisible to every existing consumer, which key
+        // on the Copy, not what feeds the Copy.
+        let func = fn_of(
+            "phicopy",
+            vec![
+                blk(
+                    0,
+                    vec![mul_inst(2, 0, 1, IrType::I32)],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    1,
+                    vec![Instruction::Phi {
+                        dest: Value(5),
+                        ty: IrType::I32,
+                        incoming: vec![
+                            (Operand::Value(Value(0)), BlockId(0)),
+                            (Operand::Value(Value(4)), BlockId(2)),
+                        ],
+                    }],
+                    Terminator::CondBranch {
+                        cond: Operand::Value(Value(1)),
+                        true_label: BlockId(3),
+                        false_label: BlockId(2),
+                    },
+                    vec![],
+                ),
+                blk(
+                    2,
+                    vec![
+                        mul_inst(3, 0, 1, IrType::I32), // not a direct feed: RENAMED -> v2
+                        Instruction::Copy {
+                            dest: Value(4), // the direct feed: KEPT
+                            src: Operand::Value(Value(3)),
+                        },
+                    ],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    3,
+                    vec![],
+                    Terminator::Return(Some(Operand::Value(Value(5)))),
+                    vec![],
+                ),
+            ],
+            6,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(
+            eliminated, 1,
+            "the Mul behind the phi-feeding Copy is renamed"
+        );
+        let b2 = &module.functions[0].blocks[2];
+        assert_eq!(
+            b2.instructions.len(),
+            1,
+            "only the Copy remains in the latch"
+        );
+        match &b2.instructions[0] {
+            Instruction::Copy {
+                dest,
+                src: Operand::Value(v),
+            } => {
+                assert_eq!(dest.0, 4, "the direct feed (the Copy) is kept");
+                assert_eq!(v.0, 2, "the Copy now reads the dominator's value");
+            }
+            other => panic!("expected the phi-feeding Copy, got {:?}", other),
+        }
+        // The phi still reads the Copy — the structural shape is unchanged.
+        match &module.functions[0].blocks[1].instructions[0] {
+            Instruction::Phi { incoming, .. } => {
+                let latch_in = incoming
+                    .iter()
+                    .find(|(_, lbl)| *lbl == BlockId(2))
+                    .map(|(op, _)| op.clone());
+                assert_eq!(latch_in, Some(Operand::Value(Value(4))));
+            }
+            other => panic!("expected the header phi, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cross_block_cse_multi_def_dest_kept() {
+        // A value id defined TWICE (a web, not strict SSA): deleting one
+        // definition would change what the OTHER definition's uses
+        // observe, so the multi-def guard keeps the dominated Mul.
+        let func = fn_of(
+            "multidef",
+            vec![
+                blk(
+                    0,
+                    vec![mul_inst(2, 0, 1, IrType::I32)],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    1,
+                    vec![mul_inst(3, 0, 1, IrType::I32)], // dest 3 defined again in b2
+                    Terminator::Branch(BlockId(2)),
+                    vec![],
+                ),
+                blk(
+                    2,
+                    vec![Instruction::BinOp {
+                        dest: Value(3), // REDEFINITION of the same id
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(1)),
+                        ty: IrType::I32,
+                    }],
+                    Terminator::Return(Some(Operand::Value(Value(3)))),
+                    vec![],
+                ),
+            ],
+            4,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 0, "a multi-def dest keeps its instruction");
+        assert!(
+            matches!(module.functions[0].blocks[1].instructions.first(), Some(Instruction::BinOp { dest, op: IrBinOp::Mul, .. }) if dest.0 == 3)
+        );
+    }
+
+    #[test]
+    fn test_cross_block_cse_preserves_dot_product() {
+        // The F2 invariant at IR level: a loop body containing BOTH a
+        // loop-invariant duplicate Mul (operands are entry values, visible
+        // from the dominator) AND a dot-product Mul over body-local loads.
+        // The invariant Mul renames onto the preheader value; the
+        // dot-product Mul CANNOT — its operands are loads whose value
+        // numbers only exist inside the loop (the header is a merge point
+        // where GVN invalidates load entries), so no dominator table
+        // entry can match it. The vectorizer's body-local requirement on
+        // the dot-product Mul therefore survives this optimization.
+        let func = fn_of(
+            "dotprod",
+            vec![
+                // b0 entry: the canonical invariant Mul.
+                blk(
+                    0,
+                    vec![mul_inst(2, 0, 1, IrType::I64)],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                // b1 loop header (2 preds: b0, b3) — merge point where GVN
+                // invalidates inherited load entries.
+                blk(
+                    1,
+                    vec![Instruction::Phi {
+                        dest: Value(10),
+                        ty: IrType::I64,
+                        incoming: vec![
+                            (Operand::Value(Value(1)), BlockId(0)),
+                            (Operand::Value(Value(11)), BlockId(3)),
+                        ],
+                    }],
+                    Terminator::CondBranch {
+                        cond: Operand::Value(Value(1)),
+                        true_label: BlockId(2),
+                        false_label: BlockId(4),
+                    },
+                    vec![],
+                ),
+                // b2 body: dot-product mul over body loads + invariant duplicate.
+                blk(
+                    2,
+                    vec![
+                        Instruction::Load {
+                            dest: Value(5),
+                            ptr: Value(0),
+                            ty: IrType::I64,
+                            seg_override: AddressSpace::Default,
+                            volatile: false,
+                        },
+                        Instruction::Load {
+                            dest: Value(6),
+                            ptr: Value(1),
+                            ty: IrType::I64,
+                            seg_override: AddressSpace::Default,
+                            volatile: false,
+                        },
+                        // dot-product Mul: operands are body loads — never renamed.
+                        Instruction::BinOp {
+                            dest: Value(7),
+                            op: IrBinOp::Mul,
+                            lhs: Operand::Value(Value(5)),
+                            rhs: Operand::Value(Value(6)),
+                            ty: IrType::I64,
+                        },
+                        Instruction::BinOp {
+                            dest: Value(8),
+                            op: IrBinOp::Add,
+                            lhs: Operand::Value(Value(10)),
+                            rhs: Operand::Value(Value(7)),
+                            ty: IrType::I64,
+                        },
+                        // invariant duplicate of b0's v2 — RENAMED -> v2.
+                        mul_inst(9, 0, 1, IrType::I64),
+                    ],
+                    Terminator::Branch(BlockId(3)),
+                    vec![],
+                ),
+                // b3 latch: the accumulator back-edge value is v8 via a Copy,
+                // so the Phi direct-feed contract is the Copy, not the Add.
+                blk(
+                    3,
+                    vec![Instruction::Copy {
+                        dest: Value(11),
+                        src: Operand::Value(Value(8)),
+                    }],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    4,
+                    vec![],
+                    Terminator::Return(Some(Operand::Value(Value(10)))),
+                    vec![],
+                ),
+            ],
+            12,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 1, "only the invariant duplicate Mul is renamed");
+        let body = &module.functions[0].blocks[2];
+        // The dot-product Mul SURVIVES with its body-local loads.
+        assert!(
+            body.instructions.iter().any(|i| matches!(i, Instruction::BinOp { dest, op: IrBinOp::Mul, lhs: Operand::Value(l), rhs: Operand::Value(r), .. } if dest.0 == 7 && l.0 == 5 && r.0 == 6)),
+            "the dot-product Mul keeps its instruction and body-local load operands"
+        );
+        // The invariant duplicate is gone; the accumulator chain reads v2 nowhere
+        // (it reads the dot product), and the loads are untouched.
+        assert!(
+            !body
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::BinOp { dest, op: IrBinOp::Mul, lhs: Operand::Value(l), rhs: Operand::Value(r), .. } if dest.0 == 9 && l.0 == 0 && r.0 == 1)),
+            "the invariant duplicate Mul is deleted"
+        );
+    }
+
+    #[test]
+    fn test_resolve_rename_chain_and_cycle() {
+        // The resolver itself: transitive chains resolve to the fixpoint,
+        // and a cycle (impossible from the collector — every target is a
+        // KEPT canonical value — but cheap to prove) panics instead of
+        // looping or silently stopping.
+        let mut map: FxHashMap<u32, Value> = FxHashMap::default();
+        map.insert(3, Value(2));
+        assert_eq!(resolve_rename(&map, Value(3)), Value(2));
+        assert_eq!(
+            resolve_rename(&map, Value(7)),
+            Value(7),
+            "unmapped id is identity"
+        );
+        // A synthetic 32-link chain — far past the old fixed 16-hop cutoff —
+        // resolves completely.
+        for i in 0..32u32 {
+            map.insert(i, Value(i + 1));
+        }
+        assert_eq!(resolve_rename(&map, Value(0)), Value(32));
+        // A cycle must be a loud failure, never a silent leftover.
+        map.insert(32, Value(0));
+        let result = std::panic::catch_unwind(|| resolve_rename(&map, Value(5)));
+        assert!(result.is_err(), "cycle must panic");
     }
 
     #[test]
