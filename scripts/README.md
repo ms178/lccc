@@ -118,6 +118,8 @@ them once per translation unit (never per function).
 | `CCC_PEEPHOLE_SKIP` | unset (nothing skipped) | Comma-separated phase-2 peephole sub-pass names to disable for bisection (e.g. `store_alu_fold`).  All peephole passes are ENABLED by default. |
 | `CCC_NO_BOOL_ALGEBRA` | unset | Disables the boolean mux/majority algebra rewrites (bit_idioms Patterns B/C). |
 | `CCC_NO_TWO_BLOCK_UNROLL` | unset | Disables the two-block guard-free unroll (loop_unroll pass B). |
+| `CCC_UNROLL_LEGACY_PERSIST_GATE` | unset (fail-closed gate) | Restores the lenient persisting-inner-loop gate: unrecognized nested inner loops (multi-latch, non-Branch latch, no Add/Sub-IV, no exit on the found IV, no init) are skipped instead of vetoing the outer complete unroll. Bisection/A-B and emergency revert only — pinned by `persist_gate_legacy_restores_lenient` and `e2e_persist_gate_csv_nest_rolled_unless_legacy` in `src/passes/loop_unroll.rs`. Note: recognized-but-dynamic bounds still veto in both modes (no legacy skip on that arm). |
+| `CCC_UNROLL_GATE_TRACE` | unset | Prints `[UNROLL-GATE] veto fn=… outer=… inner=… arm=…` to stderr on every persist-gate veto (veto paths only; no cost when unset). |
 
 ## Oracles
 

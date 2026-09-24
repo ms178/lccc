@@ -84,6 +84,15 @@ EOF_C
 "$LCCC" -O2 -march=x86-64-v3 -DNO_MAIN -S -o "$work/prov.s" "$work/prov.c" 2>/dev/null \
     || { bad "lccc could not compile prov.c"; echo; echo "provenance-int-param gate: PASS=$pass FAIL=$fail SKIP=$skip"; exit 1; }
 
+# Guard jumps are UNSIGNED-compare jumps: the vectorizer's overlap check
+# compares addresses, and the x86 backend (`cmp_jcc` in
+# src/backend/x86/codegen/comparison.rs) maps Ult/Ule/Ugt/Uge to exactly
+# jb/jbe/ja/jae. Signed loop-control jumps (jge/jl from the fixtures' `int`
+# IVs) must NOT count — g64's rolled vector loops contain 8 of them, so the
+# full conditional-jump class would false-fail. Counting the whole unsigned
+# family (not just the jb|jae pair emitted today) also closes both
+# reformulation hazards: a `ja`/`jbe` guard would otherwise false-pass g64
+# and false-fail h64.
 read -r h_vec h_guard g_vec g_guard < <(python3 - "$work/prov.s" <<'EOF_PY'
 import re, sys
 txt = open(sys.argv[1]).read()
@@ -94,7 +103,7 @@ out = []
 for fn in ("h64", "g64"):
     b = body(fn)
     vec = len(re.findall(r'^\s*v\w+\s+.*%ymm', b, re.M))
-    guard = len(re.findall(r'^\s*(?:jb|jae)\s+\.L', b, re.M))
+    guard = len(re.findall(r'^\s*(?:jbe|jae|jb|ja)\s+\.L', b, re.M))
     out.extend((vec, guard))
 print(*out)
 EOF_PY

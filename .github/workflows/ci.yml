@@ -382,6 +382,14 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_provenance_int_param.sh
 
+      # Persist-gate C-level verdicts: the four probe nests (goto-bound
+      # init, runtime limit, IV-decided limit, folded limit) keep their
+      # veto/allow decisions and nest shapes end to end from C sources.
+      - name: Verify unroll-gate verdict contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_unroll_gate_verdicts.sh
+
       # CH/MAJ oracle consensus (session 585): the SHA-256 mux fold defers
       # to the backend's 3-operand ANDN under BMI1, the majority keeps its
       # earliest And (composite last, no park), and the acc-resident ALU
