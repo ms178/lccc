@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Emission + semantics gate for the x86 SIMD ISA contract of the middle end.
 #
-#   default / -march=x86-64          -> AVX2 vectorization (project baseline
-#                                       is x86-64-v3; measured benchmark data
-#                                       depends on this, so it must not
+#   default (no -march)              -> AVX2 vectorization + TZCNT/LZCNT
+#                                       (project baseline is x86-64-v3, SIMD
+#                                       AND integer halves; measured benchmark
+#                                       data depends on this, so it must not
 #                                       silently regress)
+#   -march=x86-64 (explicit v1)      -> BSR/BSF clz/ctz fallback (the
+#                                       explicit ceiling denies the v3 grant)
 #   -mno-avx / -mno-avx2             -> 128-bit SSE2 vectorization: downgraded,
 #                                       NOT disabled, and zero ymm
 #   -mno-sse -mno-mmx -mno-sse2
@@ -46,6 +49,8 @@ count_vfmadd() { grep -cE '\bvfmadd[0-9]*p?[sd]\b|\bvfmadd' "$1" || true; }
 count_bitcount_zero_guards() { grep -cE '^\.Lc[lt]z_nz_' "$1" || true; }
 count_bsf() { grep -cE '\bbsf[lq]\b' "$1" || true; }
 count_bsr() { grep -cE '\bbsr[lq]\b' "$1" || true; }
+count_tzcnt() { grep -cE '\btzcnt[lq]\b' "$1" || true; }
+count_lzcnt() { grep -cE '\blzcnt[lq]\b' "$1" || true; }
 
 run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
     local label=$1; shift
@@ -56,18 +61,40 @@ run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
     check_eq "$label semantics" "$out" "fail=0"
 }
 
-# ---- 1. default: AVX2 baseline must survive -------------------------------
+# ---- 1. default: the x86-64-v3 baseline must survive ----------------------
 run_cfg default
 check_gt0 "default AVX2 vectorization (ymm)" "$(count_ymm $tmp/default.s)"
-# __builtin_clz/ctz have a nonzero source precondition. On baseline x86 the
-# optimal lowering is branchless BSR/BSF; a .Lclz_nz/.Lctz_nz label proves the
-# backend accidentally restored its internal defined-zero semantics.
-check_eq "baseline nonzero clz/ctz zero-fixup guards" \
+# __builtin_clz/ctz have a nonzero source precondition.  The default
+# code-generation baseline is x86-64-v3, which GRANTS LZCNT (the integer
+# half of v3 rides with the AVX2 SIMD ceiling), so the optimal lowering is
+# TZCNT/LZCNT — strictly better than BSR/BSF, which they supersede (defined
+# on zero input too).  The zero-fixup guards (.Lclz_nz/.Lctz_nz) exist only
+# for the BSR/BSF fallback and must never appear on the default path.
+check_eq "default nonzero clz/ctz zero-fixup guards" \
     "$(count_bitcount_zero_guards $tmp/default.s)" 0
-check_gt0 "baseline nonzero ctz uses BSF" "$(count_bsf $tmp/default.s)"
-check_gt0 "baseline nonzero clz uses BSR" "$(count_bsr $tmp/default.s)"
+check_gt0 "default nonzero ctz uses TZCNT" "$(count_tzcnt $tmp/default.s)"
+check_gt0 "default nonzero clz uses LZCNT" "$(count_lzcnt $tmp/default.s)"
+check_eq "default nonzero ctz leaves no BSF behind" \
+    "$(count_bsf $tmp/default.s)" 0
+check_eq "default nonzero clz leaves no BSR behind" \
+    "$(count_bsr $tmp/default.s)" 0
+
+# A sticky -mno-lzcnt denial removes ABM from the v3 projection; the lowering
+# must fall back to the classical branchless BSR/BSF pair.
+run_cfg nolzcnt -mno-lzcnt
+check_gt0 "-mno-lzcnt nonzero ctz falls back to BSF" "$(count_bsf $tmp/nolzcnt.s)"
+check_gt0 "-mno-lzcnt nonzero clz falls back to BSR" "$(count_bsr $tmp/nolzcnt.s)"
 check_eq "baseline direct CTZ has no dead rdi-to-rax preload" \
     "$(grep -c 'movq %rdi, %rax' "$tmp/default.s" || true)" 0
+
+# Explicit baseline profile: the BSR/BSF + zero-fixup-free contract.
+run_cfg march-baseline -march=x86-64
+check_eq "baseline nonzero clz/ctz zero-fixup guards" \
+    "$(count_bitcount_zero_guards $tmp/march-baseline.s)" 0
+check_gt0 "baseline nonzero ctz uses BSF" "$(count_bsf $tmp/march-baseline.s)"
+check_gt0 "baseline nonzero clz uses BSR" "$(count_bsr $tmp/march-baseline.s)"
+check_eq "baseline direct CTZ has no dead rdi-to-rax preload" \
+    "$(grep -c 'movq %rdi, %rax' "$tmp/march-baseline.s" || true)" 0
 
 run_cfg march-v3 -march=x86-64-v3
 check_gt0 "-march=x86-64-v3 AVX2 vectorization (ymm)" "$(count_ymm $tmp/march-v3.s)"

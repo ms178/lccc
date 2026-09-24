@@ -871,6 +871,12 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
 /// disappear into the compare. Flag-for-flag identical: `cmp $0, mem` and
 /// `test %r, %r` over the same value both clear CF/OF and set ZF/SF/PF from
 /// it, and the sign of a sign-extended byte is the sign of the byte.
+/// Width-matched tests (`testb` after a byte load, `testw` after a word
+/// load) are flag-exact for sign AND zero extension, because they read only
+/// the memory bytes themselves; that admits the hot sieve shapes where a
+/// `testb %sil, %sil` follows the widening load.  Pure register staging
+/// (mov/lea, no memory operand, not touching the loaded family) is allowed
+/// between load and test.
 ///
 /// This needs the register to be dead after the test, ACROSS the branch that
 /// follows — which is exactly what the block-local scans could never prove and
@@ -920,9 +926,41 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         };
-        // The very next instruction must be the self-test of that register.
+        // The self-test of the loaded register follows.  Pure, flag-neutral
+        // register staging may sit between the load and the test (sieve
+        // count loop: `leal 1(%r10), %esi` between the `movsbq` and the
+        // `testb`); mov/lea with register operands only neither read nor
+        // write flags nor touch memory, so sliding the compare past them is
+        // invisible to the program.
+        let fam_mask = 1u16 << fam;
         let mut j = i + 1;
-        while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Directive) {
+        while j < len {
+            if infos[j].is_nop() || infos[j].kind == LineKind::Directive {
+                j += 1;
+                continue;
+            }
+            if infos[j].pinned {
+                break;
+            }
+            let st = infos[j].trimmed(store.get(j));
+            // lea only computes an address: no memory access, no flags —
+            // its `(...)` operand is syntax, not an access.  mov is pure
+            // only in the register/immediate forms (no memory operand).
+            let staging =
+                if st.starts_with("leaq ") || st.starts_with("leal ") || st.starts_with("leaw ") {
+                    true
+                } else if st.starts_with("movq ")
+                    || st.starts_with("movl ")
+                    || st.starts_with("movw ")
+                    || st.starts_with("movb ")
+                {
+                    !st.contains('(')
+                } else {
+                    false
+                } && infos[j].reg_refs & fam_mask == 0;
+            if !staging {
+                break;
+            }
             j += 1;
         }
         if j >= len || infos[j].pinned {
@@ -930,13 +968,28 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
             continue;
         }
         let test = infos[j].trimmed(store.get(j)).to_string();
-        let Some(args) = test
+        let Some((width, args)) = test
             .strip_prefix("testq ")
-            .or_else(|| test.strip_prefix("testl "))
+            .map(|r| ('q', r))
+            .or_else(|| test.strip_prefix("testl ").map(|r| ('l', r)))
+            .or_else(|| test.strip_prefix("testw ").map(|r| ('w', r)))
+            .or_else(|| test.strip_prefix("testb ").map(|r| ('b', r)))
         else {
             i += 1;
             continue;
         };
+        // A NARROWER-than-loaded test reads fewer bytes than the compare
+        // would (`testb` of a word load sees only the low byte), so it is
+        // never equivalent; admit narrow tests only at the loaded width.
+        // Wider tests (q/l after a byte/word load) keep the pre-existing
+        // sign-extension rules below.
+        if matches!(
+            (width, *cmp_mnemonic),
+            ('b', "cmpw" | "cmpl") | ('w', "cmpl")
+        ) {
+            i += 1;
+            continue;
+        }
         let Some((a, b)) = split_two_operands(args) else {
             i += 1;
             continue;
@@ -961,8 +1014,17 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
         // would stop at the first writer on the fall-through path.
         let signed_64 = matches!(*prefix, "movsbq " | "movswq " | "movslq ");
         let signed_32 = matches!(*prefix, "movsbl " | "movswl ");
-        let test_is_q = test.starts_with("testq ");
-        if !(signed_64 || (signed_32 && !test_is_q))
+        let test_is_q = width == 'q';
+        // A test whose width matches the loaded width reads exactly the
+        // memory bytes (the low byte / low word are identical under sign
+        // AND zero extension), so every flag — SF included — is provably
+        // identical to the compare; no consumer walk is needed.  This is
+        // what admits `testb` at all: the q/l walks above would reject the
+        // zero-extended byte loads (SF bit 63 = 0 vs the byte's bit 7).
+        let width_matched =
+            (*cmp_mnemonic == "cmpb" && width == 'b') || (*cmp_mnemonic == "cmpw" && width == 'w');
+        if !width_matched
+            && !(signed_64 || (signed_32 && !test_is_q))
             && super::flag_peepholes::flags_reach_an_sf_consumer(store, infos, j + 1)
         {
             i += 1;
@@ -1564,6 +1626,142 @@ mod tests {
         ));
         assert!(out.contains("movzbl (%rbx), %esi"), "{out}");
         assert!(!out.contains("cmpb $0"), "{out}");
+    }
+
+    #[test]
+    fn byte_self_test_folds_to_a_memory_compare() {
+        // Width-matched test: `testb` reads only the low byte, which is the
+        // memory byte itself under sign AND zero extension, so every flag is
+        // identical and the fold needs no SF-consumer walk.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    movsbq (%rbx), %rsi\n",
+            "    testb %sil, %sil\n",
+            "    je .LBB3\n",
+            "    leaq 1(%rbx), %rbx\n",
+            "    jmp .LBB1\n",
+            ".LBB3:\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpb $0, (%rbx)"), "{out}");
+        assert!(!out.contains("movsbq"), "{out}");
+    }
+
+    #[test]
+    fn zero_extended_byte_self_test_folds_even_for_a_sign_consumer() {
+        // `movzbl` + `testq` is the SF-divergent shape (bit 63 = 0 vs the
+        // byte's bit 7), but `testb` after the SAME load is flag-exact, so
+        // a downstream `js` cannot distinguish it from `cmpb $0`.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%rbx), %esi\n",
+            "    testb %sil, %sil\n",
+            "    je .LBB3\n",
+            "    js .LBB4\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".LBB3:\n",
+            ".LBB4:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpb $0, (%rbx)"), "{out}");
+        assert!(!out.contains("movzbl (%rbx)"), "{out}");
+    }
+
+    #[test]
+    fn byte_self_test_folds_across_pure_register_staging() {
+        // The sieve count loop: the count pre-increment (`leal 1(%r10)`)
+        // stages between the load and the `testb`.  mov/lea staging touches
+        // neither flags nor memory nor the loaded family, so the compare
+        // slides past it.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    movsbq (%r11,%r8), %rdi\n",
+            "    leal 1(%r10), %esi\n",
+            "    testb %dil, %dil\n",
+            "    cmovnel %esi, %r10d\n",
+            "    addq $1, %r8\n",
+            "    cmpq $100, %r8\n",
+            "    jle .LBB1\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpb $0, (%r11,%r8)"), "{out}");
+        assert!(!out.contains("movsbq"), "{out}");
+        assert!(out.contains("cmovnel %esi, %r10d"), "{out}");
+    }
+
+    #[test]
+    fn byte_load_test_is_kept_when_staging_sets_flags() {
+        // The intervening `imulq` writes flags; sliding the compare past it
+        // would clobber them.  Not staging — the fold refuses.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movsbq (%rbx), %rsi\n",
+            "    imulq %r9, %r10\n",
+            "    testb %sil, %sil\n",
+            "    je .LBB3\n",
+            "    movq %r10, %rax\n",
+            "    ret\n",
+            ".LBB3:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movsbq (%rbx), %rsi"), "{out}");
+        assert!(!out.contains("cmpb $0"), "{out}");
+    }
+
+    #[test]
+    fn byte_load_test_is_kept_when_staging_writes_memory() {
+        // The intervening store could overwrite the compared byte.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movsbq (%rbx), %rsi\n",
+            "    movb $0, (%r9)\n",
+            "    testb %sil, %sil\n",
+            "    je .LBB3\n",
+            "    movq %r9, %rax\n",
+            "    ret\n",
+            ".LBB3:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movsbq (%rbx), %rsi"), "{out}");
+        assert!(!out.contains("cmpb $0"), "{out}");
+    }
+
+    #[test]
+    fn word_self_test_folds_to_a_memory_compare() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    movswq (%rbx), %rsi\n",
+            "    testw %si, %si\n",
+            "    je .LBB3\n",
+            "    leaq 2(%rbx), %rbx\n",
+            "    jmp .LBB1\n",
+            ".LBB3:\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpw $0, (%rbx)"), "{out}");
+        assert!(!out.contains("movswq"), "{out}");
     }
 
     #[test]

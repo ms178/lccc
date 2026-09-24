@@ -433,8 +433,15 @@ gate "ch-maj-codegen" fast \
 # FP squares read the register once. The rbtree derived-IV recurrence was
 # removed after the S46 CI RED post-mortem (scalar flavor = measured net
 # loss, now opt-in via CCC_IVSR_SCALAR_DERIVED=1).
-gate "nbody-rbtree-perf-shapes" fast \
-    env CCC=target/fastbuild/lccc bash tests/regression/check_nbody_rbtree_perf_shapes.sh
+gate "nbody-perf-shapes" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_nbody_perf_shapes.sh
+
+# linux_find_bit: the inliner's bounded-tier clone-growth budget must
+# admit the three-site kernel clone (two cold self-test calls + one hot
+# in-loop call) that GCC/Clang/ICX all inline, and the inlined shape
+# must keep the tzcnt + andn idiom distillations.
+gate "findbit-inline" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_findbit_inline.sh
 
 # Cross-PR interaction red-team: FMA families x copy brackets x
 # if-conversion x constant promotion x NonZero x the AVX1+FMA target

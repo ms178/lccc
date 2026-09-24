@@ -171,6 +171,12 @@ pub(crate) struct CodegenOptions {
     /// Whether the target has AVX-512F (from -mavx512f / -march=*avx512*).
     /// Enables the 1-uop EVEX GPR-source vpbroadcast for scalar->vector splats.
     pub(crate) avx512: bool,
+    /// Whether the target has AVX-512VL *together with* AVX-512F (GCC
+    /// semantics: `-mavx512vl` alone implies the F base).  Gates the
+    /// 128/256-bit EVEX forms — e.g. xmm `vprold`, which is #UD with F
+    /// alone (EVEX.L'L=00 requires VL).  Drives the single-uop integer
+    /// vector rotate selection in the ARX lowering.
+    pub(crate) avx512vl: bool,
     /// x86-64 code-generation ISA permission (single source of truth for
     /// every VEX / SSE4.1 / FMA3 / ymm emission decision in the backend; see
     /// `x86::isa`).  `NONE` on non-x86-64 targets.

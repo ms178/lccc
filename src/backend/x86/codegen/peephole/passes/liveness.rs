@@ -32,7 +32,7 @@
 //!   and `%r10` (static chain), and clobbers the caller-saved set.
 
 use super::super::types::*;
-use super::helpers::get_dest_reg;
+use super::helpers::{get_dest_reg, is_read_modify_write};
 
 /// All 16 GP families.
 const ALL: u16 = 0xFFFF;
@@ -88,20 +88,27 @@ struct Effect {
 
 /// Mnemonics whose destination operand is written without being read.
 fn is_pure_write_mnemonic(t: &str) -> bool {
-    // `cmov` is deliberately absent: it only conditionally updates its
-    // destination, so the old value stays live.
-    (t.starts_with("mov") && !t.starts_with("movs") || t.starts_with("movs") && t.len() > 5)
-        || t.starts_with("lea")
-        || t.starts_with("set")
-        // Always-writing bit counters. `bsf`/`bsr` are deliberately absent:
-        // they leave the destination untouched when the source is zero.
-        || t.starts_with("lzcnt")
-        || t.starts_with("tzcnt")
-        || t.starts_with("popcnt")
-        // BMI2 three-operand shifts always write their destination.
-        || t.starts_with("shlx")
-        || t.starts_with("shrx")
-        || t.starts_with("sarx")
+    // SINGLE SOURCE OF TRUTH: the dest-only contract lives in
+    // `helpers::is_read_modify_write`.  This module used to keep its own
+    // copy of the list; the two drifted (rorx was missing here), every
+    // `rorxl` became a phantom read of its destination, the K[i]/W[i]
+    // families stayed live around the sha256 loop, and the load→add
+    // fusions died (~9% runtime on Raptor Lake-class cores).  Delegating
+    // makes drift structurally impossible.
+    //
+    // Call-site contract that makes the delegation exact:
+    // * string instructions (`rep movsb`, ...) short-circuit BEFORE this
+    //   predicate via `is_string_instruction`, so the `movs` len<=5
+    //   exclusion the old list carried is a dead path here;
+    // * the caller consults the result only for GP destinations
+    //   (`dest <= REG_GP_MAX`), so scalar-SSE look-alikes whose dest is
+    //   an xmm register (`movsd %xmm0, ...`) never reach it;
+    // * the caller applies its own operand-text guards (source mentions
+    //   the dest, partial-width dest), subsuming the LEA self-address
+    //   exception the helper carries.
+    // `cmov` stays read-modify-write (kept when the condition is false);
+    // `mulx` stays conservative (implicit %rdx read, two destinations).
+    !is_read_modify_write(t)
 }
 
 /// `true` for the x86 string instructions (`movs*`, `stos*`, `lods*`,
@@ -1041,6 +1048,96 @@ impl FileLiveness {
 mod tests {
     use super::*;
     use crate::backend::peephole_common::LineStore;
+
+    /// Drift alarm for the dest-only contract.  Since S03 the liveness
+    /// classifier DELEGATES to `helpers::is_read_modify_write` (the
+    /// sha256 regression was exactly such a drift: rorx present in one
+    /// list, missing in the other).  This table pins the semantic result
+    /// itself, so any future edit of the shared predicate that moves one
+    /// of these mnemonics fails loudly here instead of silently killing
+    /// liveness-driven peepholes on real workloads.
+    #[test]
+    fn pure_write_table_matches_the_shared_rmw_predicate() {
+        // Dest-only: written, never read.
+        let dest_only = [
+            "movq %rax, %rbx",
+            "movl $1, %eax",
+            "movabsq $4611686018427387904, %rax",
+            "movzbl %al, %eax",
+            "movsbl %al, %eax",
+            "movslq %eax, %rbx",
+            "leaq 8(%rcx), %rax",
+            "sete %al",
+            "lzcntq %rbx, %rax",
+            "tzcntl %ebx, %eax",
+            "popcntq %rbx, %rax",
+            "shlxl %ebx, %ecx, %edx",
+            "shrxq %rbx, %rcx, %rdx",
+            "sarxl %ebx, %ecx, %edx",
+            "rorxl $7, %edx, %eax",
+            "andnl %ebx, %ecx, %edx",
+            "bzhil %ebx, %ecx, %edx",
+            "bextrl %ebx, %ecx, %edx",
+            "pextq %rbx, %rcx, %rdx",
+            "pdepq %rbx, %rcx, %rdx",
+            "blsrl %ebx, %eax",
+            "blsil %ebx, %eax",
+            "blsmskl %ebx, %eax",
+        ];
+        for line in dest_only {
+            assert!(
+                is_pure_write_mnemonic(line) && !is_read_modify_write(line),
+                "{line}: must be dest-only in BOTH models"
+            );
+        }
+        // Non-destructive operand forms of otherwise-RMW mnemonics: the
+        // three-operand `imul` (magic-division staple) and the APX NDD
+        // forms write their destination without reading it.
+        let ndd_forms = [
+            "imull $5, %ebx, %r9d",
+            "imulq %rbx, %rcx, %rdx",
+            "imull (%rbx), %ecx, %eax",
+            "addl $1, %eax, %ebx",
+            "subq %rax, %rbx, %r12",
+            "negl %eax, %ebx",
+            "notq %rax, %r11",
+        ];
+        for line in ndd_forms {
+            assert!(
+                is_pure_write_mnemonic(line) && !is_read_modify_write(line),
+                "{line}: extra-destination form must be dest-only in BOTH models"
+            );
+        }
+        // Read-modify-write (or conservatively modelled as such).
+        let rmw = [
+            "addq %rax, %rbx",
+            "imull %ebx, %r9d",     // two-operand imul reads its destination
+            "imulq %rbx",           // one-operand: implicit %rax/%rdx world
+            "addl $1, %eax",        // two-operand ALU reads the destination
+            "negl %eax",            // one-operand unary reads the destination
+            "shldl $2, %esi, %edi", // bits shift THROUGH the destination
+            "addsd %xmm0, %xmm1",   // SSE look-alike stays RMW (exact match)
+            "cmovneq %rax, %rbx",   // dest kept when the condition is false
+            "bsfq %rbx, %rax",      // dest untouched for a zero source
+            "bsrq %rbx, %rax",
+            "mulxl %ebx, %ecx, %edx", // implicit %rdx read, two dests
+            "rolq $1, %rax",          // two-operand rotates read the dest
+            "shrq $1, %rax",
+            "incq %rax",
+            "xchgl %eax, %ebx",
+            "adoxq %rbx, %rax",
+            // LEA with the dest inside its own address reads the dest;
+            // the unified model reports RMW and the classifier keeps the
+            // old value live (soundness over the rare self-address form).
+            "leaq 4(%rax), %rax",
+        ];
+        for line in rmw {
+            assert!(
+                !is_pure_write_mnemonic(line) && is_read_modify_write(line),
+                "{line}: must stay read-modify-write in BOTH models"
+            );
+        }
+    }
 
     fn build(asm: &str) -> (LineStore, Vec<LineInfo>, FileLiveness) {
         let store = LineStore::new(asm.to_string());

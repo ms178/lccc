@@ -7,8 +7,12 @@
 # Checks:
 #   A. runtime differential, bit-exact vs gcc over the opt x march matrix
 #      (incl. both kill switches: CCC_NO_ANDN_FUSION, CCC_NO_BOOL_ALGEBRA)
-#   B. under -mbmi -O2: exactly one 3-operand andn in sha256_transform
-#      (CH = the GCC/Clang/ICX shape), zero andn without BMI
+#   B. the andn census, region-scoped to sha256_transform and
+#      mnemonic-anchored (a substring grep over the whole TU would count
+#      labels/symbols): exactly one 3-operand andn under -mbmi -O2 AND
+#      under the DEFAULT baseline (no -march: the code-generation floor
+#      is x86-64-v3, which grants BMI1); zero under the explicit
+#      baseline (-march=x86-64) and under the explicit -mno-bmi denial
 #   C. the 64-round compression loop is slot-write free (the park class)
 #      and the MAJ region is register-only (no slot reads between the
 #      kept And and its consumer)
@@ -51,21 +55,44 @@ for OPT in -O2 -O3; do
 done
 note "A. runtime differential done (fails so far: $fails)"
 
-# ── B. andn census ──────────────────────────────────────────────────
+# ── B. andn census (sha256_transform region, mnemonic-anchored) ─────
+# Counts ONLY `andn[lq]` mnemonics inside the sha256_transform function
+# body: labels, symbol names and comments elsewhere in the TU can no
+# longer inflate the census.
+region_andn_count() {
+  awk '/^sha256_transform:/{f=1; next} f && /^[A-Za-z_][A-Za-z0-9_]*:$/{f=0} f' "$1" \
+    | grep -cE '^[[:space:]]*andn[lq]?[[:space:]]' || true
+}
 "$CCC" $GCCINC -mbmi -O2 -S "$SRC" -o "$TMP/bmi.s" 2>/dev/null
-N=$(grep -c 'andn' "$TMP/bmi.s" || true)
-[ "$N" -eq 1 ] || bad "-mbmi: expected exactly 1 andn (CH), got $N"
-"$CCC" $GCCINC -O2 -S "$SRC" -o "$TMP/base.s" 2>/dev/null
-N=$(grep -c 'andn' "$TMP/base.s" || true)
-[ "$N" -eq 0 ] || bad "baseline: expected 0 andn, got $N"
+N=$(region_andn_count "$TMP/bmi.s")
+[ "$N" -eq 1 ] || bad "-mbmi: expected exactly 1 andn in sha256_transform (CH), got $N"
+# Default baseline: the project floor is x86-64-v3, so BMI1 (and the CH
+# andn) is granted without any -march/-mbmi.
+"$CCC" $GCCINC -O2 -S "$SRC" -o "$TMP/default.s" 2>/dev/null
+N=$(region_andn_count "$TMP/default.s")
+[ "$N" -eq 1 ] || bad "default (v3 baseline): expected exactly 1 andn in sha256_transform, got $N"
+# Explicit baseline profile: the v3 grant is denied — zero andn.
+"$CCC" $GCCINC -march=x86-64 -O2 -S "$SRC" -o "$TMP/base.s" 2>/dev/null
+N=$(region_andn_count "$TMP/base.s")
+[ "$N" -eq 0 ] || bad "-march=x86-64: expected 0 andn in sha256_transform, got $N"
+# Explicit denial over the default grant: -mno-bmi wins.
+"$CCC" $GCCINC -mno-bmi -O2 -S "$SRC" -o "$TMP/nobmi.s" 2>/dev/null
+N=$(region_andn_count "$TMP/nobmi.s")
+[ "$N" -eq 0 ] || bad "-mno-bmi: expected 0 andn in sha256_transform, got $N"
 
 # ── C. compression-loop slot discipline ─────────────────────────────
-python3 - "$TMP/bmi.s" <<'PYEOF' || bad "compression loop slot/MAJ shape"
+python3 - "$TMP/bmi.s" <<'PYEOF'
 import sys
 lines = [l.strip() for l in open(sys.argv[1]) if l.strip()]
-start = next(i for i, l in enumerate(lines)
-             if l.startswith("rorl $") or l.startswith("rorxl $"))
-end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("jl "))
+try:
+    start = next(i for i, l in enumerate(lines)
+                 if l.startswith("rorl $") or l.startswith("rorxl $"))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("jl "))
+except StopIteration:
+    # Shape drift, NOT a contract break: the loop no longer has the
+    # ror(l/x) ... jl skeleton this census is written against.
+    print("codegen shape changed: expected compression loop shape not found")
+    sys.exit(2)
 loop = lines[start:end + 1]
 def plain_slot_ref(opnd):
     # "N(%rsp)" with no index register inside the parentheses.
@@ -82,12 +109,20 @@ for l in loop:
 if bad_lines:
     print(bad_lines[:3]); sys.exit(1)
 PYEOF
+rc_shape=$?
+if [ "$rc_shape" -eq 1 ]; then
+  bad "compression loop slot/MAJ shape"
+elif [ "$rc_shape" -eq 2 ]; then
+  bad "compression loop shape drifted (census needs re-anchoring, not a contract break)"
+elif [ "$rc_shape" -ne 0 ]; then
+  bad "compression loop census crashed (rc=$rc_shape)"
+fi
 note "B/C. shape census done (fails so far: $fails)"
 
 # ── D. exposed store-to-load forwards ───────────────────────────────
 for CFG in "-mbmi -O2" "-mbmi -O3" "-march=x86-64-v3 -O2" "-march=x86-64-v3 -O3"; do
   "$CCC" $GCCINC $CFG -S "$SRC" -o "$TMP/f.s" 2>/dev/null
-  python3 - "$TMP/f.s" "$CFG" <<'PYEOF' || bad "exposed forwards under $CFG"
+  python3 - "$TMP/f.s" "$CFG" <<'PYEOF'
 import sys
 raw = [l.rstrip() for l in open(sys.argv[1])]
 # Scope to sha256_transform itself: the benchmark driver's outer loop
@@ -98,7 +133,11 @@ try:
     f1 = next(i for i in range(f0 + 1, len(raw))
               if raw[i].strip().endswith(":") and raw[i].strip().startswith("main"))
 except StopIteration:
-    f0, f1 = 0, len(raw)
+    # A silent whole-file re-scope would mix the benchmark driver's
+    # outer-loop phi-copy forward into the census and misreport; fail as
+    # shape drift instead.
+    print(f"{sys.argv[2]}: sha256_transform region not found — codegen shape changed")
+    sys.exit(2)
 lines = [l.strip() for l in raw[f0:f1] if l.strip()]
 forwards = 0; stores = {}
 def park(l):
@@ -124,6 +163,14 @@ for i, l in enumerate(lines):
 if forwards:
     print(f"{sys.argv[2]}: {forwards} exposed store-to-load forwards"); sys.exit(1)
 PYEOF
+  rc_fwd=$?
+  if [ "$rc_fwd" -eq 1 ]; then
+    bad "exposed forwards under $CFG"
+  elif [ "$rc_fwd" -eq 2 ]; then
+    bad "exposed-forward census lost its function region under $CFG (shape drift)"
+  elif [ "$rc_fwd" -ne 0 ]; then
+    bad "exposed-forward census crashed under $CFG (rc=$rc_fwd)"
+  fi
 done
 
 if [ "$fails" -eq 0 ]; then

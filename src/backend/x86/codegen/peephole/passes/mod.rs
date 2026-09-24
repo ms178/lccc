@@ -425,6 +425,23 @@ pub(crate) fn peephole_optimize_with_config(asm: String, ra_config: &RaConfig) -
     out
 }
 
+/// Delete GP pure writes whose value is provably dead, to a local fixpoint:
+/// retiring one relay can expose the next in an `mov A,B; mov B,C; ...` chain
+/// (each proof sees the reads the previous deletion removed).  Shared by the
+/// post-Phase-1 orphan sweeps: every global fold (copy propagation's consumer
+/// retargets, the relay/memory folds, stack-slot DSE, trampoline removal)
+/// orphans staging copies whose value became dead, and Phase 1's
+/// `eliminate_dead_pure_writes` never runs again afterwards.
+/// `CCC_PEEPHOLE_SKIP=dead_pure_writes` disables every site (Phase 1 and
+/// these sweeps alike).
+fn retire_dead_pure_writes(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut any = false;
+    while dead_writes::eliminate_dead_pure_writes(store, infos) {
+        any = true;
+    }
+    any
+}
+
 fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
     // ms178 debug: dump pre-peephole asm
     if let Ok(path) = std::env::var("CCC_DUMP_ASM") {
@@ -1390,6 +1407,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
         if !sk("store_alu_fold") {
             global_changed |= memory_fold::fold_store_alu_memop(&mut store, &mut infos);
         }
+        // Orphan retirement: every fold above can leave a staging copy whose
+        // value became dead.  Sweep them to a local fixpoint in the same
+        // round — the comment at `copy_fold` promised this retirement and the
+        // only instrument that can prove it (`FileLiveness`) sat in Phase 1.
+        if !sk("dead_pure_writes") {
+            global_changed |= retire_dead_pure_writes(&store, &mut infos);
+        }
         global_changed
     };
     if let Some(s) = phase2_start {
@@ -1498,6 +1522,12 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             if !sk("vec_self_move") {
                 changed2 |= local_patterns::eliminate_vector_self_moves(&mut store, &mut infos);
             }
+            // Orphan retirement inside the fixpoint: folds above orphan pure
+            // writes; retiring them lets the next iteration see the cleaner
+            // code (and the while-changed loop then converges).
+            if !sk("dead_pure_writes") {
+                changed2 |= retire_dead_pure_writes(&store, &mut infos);
+            }
             pass_count2 += 1;
         }
     }
@@ -1561,6 +1591,10 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
                 changed3 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
             }
             changed3 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
+            // Orphan retirement inside the fixpoint (see phase 3).
+            if !sk("dead_pure_writes") {
+                changed3 |= retire_dead_pure_writes(&store, &mut infos);
+            }
             pass_count3 += 1;
         }
     }
@@ -1628,6 +1662,15 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
     // line classifier.
     if !sk("epilogue_merge") {
         let _ = epilogue_merge::merge_epilogue_tails(&mut store, &mut infos);
+    }
+
+    // Final orphan sweep: phases 4c–8b (hoisting, rotation, tail calls, slot
+    // DSE, callee-save elimination, frame compaction, block merging) can each
+    // orphan a pure write after the last fixpoint loop above.  This restores
+    // the pipeline's terminal invariant: no provably-dead GP pure write
+    // leaves the peephole.
+    if !sk("dead_pure_writes") {
+        let _ = retire_dead_pure_writes(&store, &mut infos);
     }
 
     // Phase 9: Re-run the always-on text passes on the FINAL text. The early

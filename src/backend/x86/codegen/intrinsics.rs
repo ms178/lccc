@@ -6267,7 +6267,42 @@ impl X86Codegen {
                     };
                     assert!((1..=31).contains(&n), "VecRotlI32x4 bad amount {n}");
                     self.state.invalidate_vec_peephole();
-                    if self.avx2_enabled {
+                    if self.avx512vl_enabled {
+                        // AVX-512VL: `vprold` rotates every lane in ONE µop —
+                        // the AVX2 form spends three (vpslld/vpsrld/vpor) and
+                        // a scratch register.  ChaCha20's double round holds
+                        // eight rotates; measured −18.7% end-to-end vs the
+                        // AVX2 form with -march=native on AVX512VL silicon
+                        // (240.7ms vs 296.1ms median-of-9, taskset;
+                        // PERF-PROVENANCE-S49 §1b).  The xmm form is #UD
+                        // without VL (EVEX.L'L=00), hence the dedicated gate.
+                        let src = self.vex128_source(&args[0], "xmm0");
+                        let dst_home = self.dest_xmm_home_name(d);
+                        let dst = match dst_home {
+                            Some(name) => format!("%{}", name),
+                            None => "%xmm0".to_string(),
+                        };
+                        self.state
+                            .emit_fmt(format_args!("    vprold ${}, {}, {}", n, src, dst));
+                        let dst_static: &'static str = dst_home.unwrap_or("xmm0");
+                        self.sse_commit_dest_direct(d, dst_static);
+                        if dst_home.is_none() {
+                            let deferred = self.state.vector_defer_values.contains(&d.0);
+                            use crate::backend::state::SlotAddr;
+                            if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                                self.state.resolve_slot_addr(d.0)
+                            {
+                                if !deferred {
+                                    self.state.emit_fmt(format_args!(
+                                        "    movdqu %xmm0, {}",
+                                        self.slot_ref(slot.0)
+                                    ));
+                                } else {
+                                    self.state.pending_vec_store = Some((d.0, "xmm0", false));
+                                }
+                            }
+                        }
+                    } else if self.avx2_enabled {
                         let src = self.vex128_source(&args[0], "xmm0");
                         let dst_home = self.dest_xmm_home_name(d);
                         let dst = match dst_home {
@@ -9514,10 +9549,72 @@ impl X86Codegen {
     /// pairs and a punpcklqdq — xmm0/xmm1 only, no third scratch:
     ///   xmm0 = [x0, x1] (punpckldq), xmm1 = [x2, x3] (movq of the packed
     ///   GP pair), xmm0 = [x0, x1, x2, x3] (punpcklqdq).
+    ///
+    /// All-constant fast path: every ARX vectorizer materialises its
+    /// loop-invariant pshufb rotate masks through this pack with four
+    /// `IrConst::I32` lanes, and SLP packs of constants land here too.
+    /// Building such a mask through the GPR staging dance below costs
+    /// eleven instructions (and the rax/rcx scratch pair) PER MASK, once
+    /// per CALL — the chacha20_block kernel runs 2M calls, so the
+    /// prologue cost dominates.  Fold the four lanes into the shared
+    /// `.LCVEC` const pool (deduplicated, 16-byte aligned, so the aligned
+    /// load is legal on every profile) and load it in ONE instruction —
+    /// the exact shape ICX emits for its rotate masks.  The prologue
+    /// shrink (22 staging instructions → 2 loads in chacha20_core,
+    /// verified in emitted asm) plus the chain-homing change (§1b of
+    /// PERF-PROVENANCE-S49) carry the measured default-path delta;
+    /// per-change isolation needs a dedicated A/B build, not prose.
     pub(super) fn emit_int_pack_i32x4(&mut self, dest: &Value, args: &[Operand]) {
         assert!(args.len() == 4, "i32x4 pack: expects four scalars");
         self.state.invalidate_vec_peephole();
         self.flush_pending_vec_store_impl();
+        let mut lanes = [0u32; 4];
+        let all_const = args.iter().enumerate().all(|(i, a)| match a {
+            Operand::Const(c) => match c.to_i64() {
+                Some(v) => {
+                    lanes[i] = v as u32;
+                    true
+                }
+                None => false,
+            },
+            _ => false,
+        });
+        if all_const {
+            let mut bytes = [0u8; 16];
+            for (i, l) in lanes.iter().enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&l.to_le_bytes());
+            }
+            let label = self.state.get_vec_const_label(&bytes);
+            // VEX.128 aligned load under AVX2+, the legacy aligned form on
+            // the SSE2 baseline — the pool's per-entry `.p2align 4`
+            // satisfies both.  Dest-homed values load straight into their
+            // home (zero staging); unhomed values stream through %xmm0
+            // into the dest's slot exactly like the staging path's tail.
+            match self.dest_xmm_home_name(dest) {
+                Some(name) => {
+                    if self.avx2_enabled {
+                        self.state
+                            .emit_fmt(format_args!("    vmovdqa {}(%rip), %{}", label, name));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movdqa {}(%rip), %{}", label, name));
+                    }
+                    self.sse_commit_dest_direct(dest, name);
+                }
+                None => {
+                    if self.avx2_enabled {
+                        self.state
+                            .emit_fmt(format_args!("    vmovdqa {}(%rip), %xmm0", label));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movdqa {}(%rip), %xmm0", label));
+                    }
+                    self.state.sse_last_store_reg = false;
+                    self.sse_store_dest(dest, "xmm0");
+                }
+            }
+            return;
+        }
         self.operand_to_reg(&args[0], "rax");
         self.state.emit("    movd %eax, %xmm0");
         self.operand_to_reg(&args[1], "rcx");

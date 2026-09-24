@@ -131,6 +131,13 @@ thread_local! {
     // spelling (`pmulld`).  `-mno-avx` alone keeps it (x86-64-v2 hardware);
     // `-march=x86-64` / `-mno-sse4.1` clear it.
     static X86_SSE41_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // AVX-512VL (with the F base) availability for the ARX vectorizers:
+    // under VL every 32-bit lane rotate lowers to ONE `vprold` µop, so the
+    // pshufb byte-rotate masks (materialised in the preheader, a register
+    // each) are pure overhead — the passes skip building them and let the
+    // backend emit vprold for every rotate amount.  Default FALSE: the
+    // driver opts in per TU, failing closed exactly like the other gates.
+    static X86_AVX512VL_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Record the x86 SIMD ISA profile for the current translation unit.
@@ -143,12 +150,23 @@ thread_local! {
 ///
 /// AArch64 needs no gate: its entry points pass `neon = true` and NEON is
 /// baseline ISA for every supported ARMv8/v9 target.
-pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool, sse41: bool) {
+pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool, sse41: bool, avx512vl: bool) {
     X86_SIMD_AVAILABLE.with(|available| available.set(simd));
     // AVX2 is a subset of "SIMD at all"; never let a caller assert AVX2 while
     // SIMD itself is forbidden.
     X86_AVX2_AVAILABLE.with(|available| available.set(avx2 && simd));
     X86_SSE41_AVAILABLE.with(|available| available.set(sse41 && simd));
+    // Same subset discipline: VL permission without the SIMD register file
+    // is meaningless.
+    X86_AVX512VL_AVAILABLE.with(|available| available.set(avx512vl && simd));
+}
+
+/// AVX-512VL availability for the ARX vectorizers' rotate-shape choice:
+/// when set, whole-byte rotates keep the generic `VecRotlI32x4` form
+/// (the backend lowers it to `vprold`) instead of materialising pshufb
+/// masks.  Read-only mirror of the per-TU gate above.
+pub(crate) fn x86_avx512vl_available_pub() -> bool {
+    X86_AVX512VL_AVAILABLE.with(|available| available.get())
 }
 
 /// SSE4.1 availability on the 128-bit path, for every consumer: `pmulld`
