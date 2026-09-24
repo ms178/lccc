@@ -190,3 +190,57 @@ movw $1, %ss:(%rdi)
 mov %ds:8(%rax), %rbx
 mov %es:8(%rax), %rbx
 mov %cs:8(%rax), %rbx
+;;; hle
+.text
+lock adcb $1,(%rax)
+lock xacquire adcb $1,(%rax)
+xacquire lock adcb $1,(%rax)
+lock xrelease adcb $1,(%rax)
+xrelease lock adcb $1,(%rax)
+lock xacquire addw $1,(%rax)
+lock xacquire addl %eax,(%rbx)
+lock xrelease orq $7,(%rcx)
+xrelease movb %al,(%rbx)
+xrelease movq %rax,(%rbx)
+xacquire xchg %eax,(%rbx)
+xrelease xchg %rax,(%rbx)
+xacquire lock xchg %eax,(%rbx)
+xrelease lock xchg %eax,(%rbx)
+lock xadd %eax,(%rbx)
+lock btsq $1,(%rax)
+lock incq (%rax)
+lock cmpxchg %eax,(%rbx)
+lock xacquire btsl $3,(%rdx)
+lock xrelease incl (%rsi)
+gs rep movsb
+gs addw $1,(%rax)
+;;; hle_missing_lock_acquire reject
+.text
+xacquire adcb $1,(%rax)
+;;; hle_missing_lock_release reject
+.text
+xrelease adcb $1,(%rax)
+;;; hle_mov_after_acquire reject
+.text
+xacquire movb %al,(%rbx)
+;;; hle_mov_load_after_release reject
+.text
+xrelease movb (%rbx),%al
+;;; hle_bad_insn_after_acquire reject
+.text
+xacquire nop
+;;; hle_bad_insn_after_release reject
+.text
+xrelease nop
+;;; hle_lock_nonlockable reject
+.text
+lock nop
+;;; hle_lock_regonly reject
+.text
+lock addl %eax,%ebx
+;;; hle_dup_lock reject
+.text
+lock lock adcb $1,(%rax)
+;;; hle_dup_rep reject
+.text
+rep repe movsb

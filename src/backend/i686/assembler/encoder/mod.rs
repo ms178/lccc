@@ -185,14 +185,23 @@ impl InstructionEncoder {
     pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
         let start_len = self.bytes.len();
 
-        // Handle prefix
-        if let Some(ref prefix) = instr.prefix {
+        // Handle prefixes. Stacked HLE pairs (`lock xacquire addl ...`)
+        // arrive in source order; F0 sinks past any F2/F3 byte so both
+        // spellings emit the canonical F2/F3 F0 run (GAS 2.47).
+        let mut pfx: Vec<u8> = Vec::new();
+        for prefix in &instr.prefixes {
             match prefix.as_str() {
-                "lock" => self.bytes.push(0xF0),
-                "rep" | "repz" | "repe" => self.bytes.push(0xF3),
-                "repnz" | "repne" => self.bytes.push(0xF2),
+                "lock" => pfx.push(0xF0),
+                "rep" | "repz" | "repe" => pfx.push(0xF3),
+                "repnz" | "repne" => pfx.push(0xF2),
+                "xacquire" => pfx.push(0xF2),
+                "xrelease" => pfx.push(0xF3),
                 _ => return Err(format!("unknown prefix: {}", prefix)),
             }
+        }
+        pfx.sort_by_key(|&b| b == 0xF0);
+        for b in pfx {
+            self.bytes.push(b);
         }
 
         let result = self.encode_mnemonic(instr);
@@ -422,7 +431,34 @@ impl InstructionEncoder {
 
     /// Main mnemonic dispatch.
     fn encode_mnemonic(&mut self, instr: &Instruction) -> Result<(), String> {
-        let mnemonic = instr.mnemonic.as_str();
+        // GAS accepts (and ignores) a `.s` suffix on any instruction
+        // mnemonic, in 32-bit mode too — except on standalone prefixes,
+        // which it rejects. Same rule as the x86-64 encoder.
+        let mnemonic_owned;
+        let mnemonic = match instr.mnemonic.strip_suffix(".s") {
+            Some(base)
+                if !matches!(
+                    base,
+                    "lock"
+                        | "rep"
+                        | "repz"
+                        | "repe"
+                        | "repnz"
+                        | "repne"
+                        | "notrack"
+                        | "cs"
+                        | "ss"
+                        | "ds"
+                        | "es"
+                        | "fs"
+                        | "gs"
+                ) =>
+            {
+                mnemonic_owned = base.to_string();
+                mnemonic_owned.as_str()
+            }
+            _ => instr.mnemonic.as_str(),
+        };
         let ops = &instr.operands;
 
         match mnemonic {
@@ -1798,8 +1834,20 @@ impl InstructionEncoder {
             // only — gas rejects the 2-operand AT&T form for these.
             "vsqrtsd" => self.encode_avx_3op_pp(ops, 0x51, 3),
             "vsqrtss" => self.encode_avx_3op_pp(ops, 0x51, 2),
-            "vpermilps" => self.encode_avx_3op_38(ops, 0x0C, true),
-            "vpermilpd" => self.encode_avx_3op_38(ops, 0x0D, true),
+            "vpermilps" => {
+                if matches!(ops.first(), Some(Operand::Immediate(_))) {
+                    self.encode_avx_shuffle_3a(ops, 0x04, true)
+                } else {
+                    self.encode_avx_3op_38(ops, 0x0C, true)
+                }
+            }
+            "vpermilpd" => {
+                if matches!(ops.first(), Some(Operand::Immediate(_))) {
+                    self.encode_avx_shuffle_3a(ops, 0x05, true)
+                } else {
+                    self.encode_avx_3op_38(ops, 0x0D, true)
+                }
+            }
             "vpermd" => self.encode_avx_3op_38(ops, 0x36, true),
             "vpermps" => self.encode_avx_3op_38(ops, 0x16, true),
             "vpermq" => self.encode_avx_shuffle_3a_w1(ops, 0x00, true),
@@ -1821,7 +1869,9 @@ impl InstructionEncoder {
             "vpmovzxbq" => self.encode_avx_2op_38(ops, 0x32, true),
             "vpmovsxbw" => self.encode_avx_2op_38(ops, 0x20, true),
             "vpmovsxbd" => self.encode_avx_2op_38(ops, 0x21, true),
+            "vpmovsxbq" => self.encode_avx_2op_38(ops, 0x22, true),
             "vpmovsxwd" => self.encode_avx_2op_38(ops, 0x23, true),
+            "vpmovsxwq" => self.encode_avx_2op_38(ops, 0x24, true),
             "vpmovsxdq" => self.encode_avx_2op_38(ops, 0x25, true),
             "vpmovmskb" => self.encode_avx_extract_gp(ops, 0xD7, true),
             "vtestps" => self.encode_avx_2op_38(ops, 0x0E, true),
@@ -1906,7 +1956,11 @@ impl InstructionEncoder {
             "vaesdec" => self.encode_avx_3op_38(ops, 0xDE, true),
             "vaesdeclast" => self.encode_avx_3op_38(ops, 0xDF, true),
             "vaesimc" => self.encode_avx_2op_38(ops, 0xDB, true),
-            "vpclmulqdq" => self.encode_avx_3op_3a_pp_imm8(ops, 0x44, 1),
+            "vpclmulqdq" => self.encode_avx_3op_3a_pp_imm8(ops, 0x44, 1, 0),
+            // VEX GFNI (affine forms are W1: `c4 e3 d1 ce ...`).
+            "vgf2p8mulb" => self.encode_avx_3op_38(ops, 0xCF, true),
+            "vgf2p8affineqb" => self.encode_avx_3op_3a_pp_imm8(ops, 0xCE, 1, 1),
+            "vgf2p8affineinvqb" => self.encode_avx_3op_3a_pp_imm8(ops, 0xCF, 1, 1),
             m if is_fma3_vex(m) => self.encode_fma3_vex(ops, m),
 
             _ => Err(format!(
@@ -1923,7 +1977,7 @@ mod stack_width_tests {
 
     fn instruction(mnemonic: &str, operand: Operand) -> Instruction {
         Instruction {
-            prefix: None,
+            prefixes: Vec::new(),
             mnemonic: mnemonic.to_owned(),
             operands: vec![operand],
             nf: false,

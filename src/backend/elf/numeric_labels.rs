@@ -88,7 +88,7 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
                     .map(|op| resolve_numeric_operand(op, i, &defs))
                     .collect();
                 result.push(AsmItem::Instruction(Instruction {
-                    prefix: instr.prefix.clone(),
+                    prefixes: instr.prefixes.clone(),
                     mnemonic: instr.mnemonic.clone(),
                     operands: new_ops,
                     nf: instr.nf,

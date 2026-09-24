@@ -49,9 +49,11 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import random
 import re
 import subprocess
 import sys
+import time
 import tempfile
 import urllib.error
 import urllib.request
@@ -184,6 +186,32 @@ def _post(cid: str, source: str, args: str) -> dict:
     return out
 
 
+_TRANSIENT = (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError)
+
+
+def _post_retry(cid: str, source: str, args: str, *, attempts: int = 5):
+    """POST with retries for transient failures (429/5xx/timeouts/resets).
+
+    One failed batch used to poison 60 instructions; Godbolt rate-limits
+    burst traffic, so back off exponentially with jitter. Non-retryable
+    4xx (other than 429) fail fast: they are deterministic.
+    """
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return _post(cid, source, args)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code != 429 and e.code < 500:
+                raise
+        except _TRANSIENT as e:
+            last = e
+        if attempt + 1 < attempts:
+            time.sleep(0.5 * (2 ** attempt) + random.uniform(0, 0.5))
+    assert last is not None
+    raise last
+
+
 # The instruction is wrapped in a naked function so nothing but our own bytes
 # lands between the markers. The markers are `ud2` runs: unlike int3 (0xCC),
 # ud2 is never emitted as alignment padding, and it cannot be confused with a
@@ -216,7 +244,7 @@ def encode_remote(cid: str, insn: str, args: str = "-O0 -c") -> Encoding:
         body = body + "\\n\\t" + after
     source = _WRAP % _c_escape(body)
     try:
-        r = _post(cid, source, args)
+        r = _post_retry(cid, source, args)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
             json.JSONDecodeError, OSError) as e:
         return Encoding(False, None, f"network: {type(e).__name__}")
@@ -390,7 +418,7 @@ def _encode_group(cid: str, group: list[str], args: str) -> list[Encoding]:
     if not group:
         return []
     try:
-        r = _post(cid, _batch_source(group), args)
+        r = _post_retry(cid, _batch_source(group), args)
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
             json.JSONDecodeError, OSError) as e:
         return [Encoding(False, None, f"network: {type(e).__name__}")] * len(group)
@@ -537,10 +565,12 @@ def classify(row: Row) -> None:
         row.verdict = "ok"
     elif n < len(ref):
         row.verdict = "BEATS"
-        row.note = f"all oracles agree on {len(ref)}B"
+        row.note = (f"oracles agree on {len(ref)}B"
+                    f" ({','.join(sorted(ok_oracles))})")
     elif n > len(ref):
         row.verdict = "LONGER"
-        row.note = f"all oracles agree on {len(ref)}B"
+        row.note = (f"oracles agree on {len(ref)}B"
+                    f" ({','.join(sorted(ok_oracles))})")
     elif decodes_same(_OBJDUMP, row.lccc.data, ref):
         # Same length, different bytes, but the two decode identically -- a
         # different spelling of the same instruction, not a defect.

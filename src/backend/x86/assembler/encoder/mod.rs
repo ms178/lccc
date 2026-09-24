@@ -100,6 +100,266 @@ pub struct InstructionEncoder {
     apx_dfv: u8,
 }
 
+/// Mnemonic stems that accept `lock` (with a memory operand): the classic
+/// read-modify-write set plus the bit-testers and the atomic exchanges.
+const LOCKABLE_STEMS: [&str; 19] = [
+    "add",
+    "adc",
+    "sub",
+    "sbb",
+    "and",
+    "or",
+    "xor",
+    "inc",
+    "dec",
+    "neg",
+    "not",
+    "btc",
+    "btr",
+    "bts",
+    "cmpxchg",
+    "cmpxchg8b",
+    "cmpxchg16b",
+    "xadd",
+    "xchg",
+];
+
+/// Mnemonic stem for prefix validation: a trailing size letter and any `.s`
+/// length suffix are stripped (`movb` -> `mov`, `addl.s` -> `add`).
+/// Full-stem match wins so `sbb` never mis-strips to `sb`; anything else
+/// passes through for the error message (`nop` stays `nop`).
+fn prefix_stem(mnemonic: &str) -> String {
+    let m = mnemonic.strip_suffix(".s").unwrap_or(mnemonic);
+    if m == "mov" || LOCKABLE_STEMS.contains(&m) {
+        return m.to_string();
+    }
+    if let Some(base) = m.strip_suffix(['b', 'w', 'l', 'q']) {
+        if base == "mov" || LOCKABLE_STEMS.contains(&base) {
+            return base.to_string();
+        }
+    }
+    m.to_string()
+}
+
+/// True when the mnemonic takes a bare label as a branch target (`jmp
+/// foo`, `call foo@PLT`, `loop 1b`). Those labels must survive
+/// [`normalize_bare_label`] untouched; every other mnemonic treats a
+/// bare label in operand position as a memory reference. (`*`-indirect
+/// forms are `Operand::Indirect`, never bare labels, so they are
+/// unaffected either way.)
+fn mnemonic_takes_label(mnemonic: &str) -> bool {
+    let m = mnemonic.strip_suffix(".s").unwrap_or(mnemonic);
+    m == "xbegin"
+        || m.starts_with('j') // jmp/jcc/jecxz/jrcxz/jcxz (all branches)
+        || m.starts_with("loop") // loop/loope/loopne/loopz/loopnz
+        || m.starts_with("call") // call/callq
+        || m.starts_with("lcall")
+        || m.starts_with("ljmp")
+}
+
+/// Displacement for a bare label in memory position: `foo` -> Symbol,
+/// `foo@GOTPCREL` -> SymbolMod, `foo+8`/`foo-8` -> SymbolPlusOffset,
+/// `a-b` (both label-like) -> SymbolDiff. Anything else stays a Symbol
+/// (a bogus name fails loudly at link time).
+fn label_to_disp(s: &str) -> Displacement {
+    if let Some(at) = s.find('@') {
+        return Displacement::SymbolMod(s[..at].to_string(), s[at + 1..].to_string());
+    }
+    if let Some(i) = s
+        .char_indices()
+        .rev()
+        .find_map(|(i, c)| ((c == '+' || c == '-') && i > 0).then_some(i))
+    {
+        let (lhs, rhs) = (&s[..i], &s[i + 1..]);
+        if !lhs.is_empty() && !rhs.is_empty() {
+            if let Ok(off) = crate::backend::asm_expr::parse_integer_expr(rhs) {
+                let off = if s.as_bytes()[i] == b'-' {
+                    off.wrapping_neg()
+                } else {
+                    off
+                };
+                return Displacement::SymbolPlusOffset(lhs.to_string(), off);
+            }
+            if s.as_bytes()[i] == b'-' && is_label_like(lhs) && is_label_like(rhs) {
+                return Displacement::SymbolDiff(lhs.to_string(), rhs.to_string());
+            }
+        }
+    }
+    Displacement::Symbol(s.to_string())
+}
+
+/// Mnemonic as GAS names it in decorator diagnostics: one size suffix
+/// stripped (`addl` -> `add`, `movl` -> `mov`, `leal` -> `lea`).
+/// EVEX mnemonics are never suffixed, so this is the identity there.
+fn decor_stem(mnemonic: &str) -> &str {
+    let m = mnemonic.strip_suffix(".s").unwrap_or(mnemonic);
+    // `*blendvb` ends in a mnemonic `b` (variable-blend), not a width
+    // suffix: GAS keeps it (`vblendvb`, never `vblendv`). (`movb` ends
+    // in `vb` too, so match the full `blendvb`, not the tail.)
+    if m.ends_with("blendvb") {
+        return m;
+    }
+    m.strip_suffix(['b', 'w', 'l', 'q']).unwrap_or(m)
+}
+
+/// `vblendvb` rejection echo: register operands join with commas and
+/// no spaces, exactly as GAS normalizes them (`` `vblendvb
+/// %xmm14,%xmm6,%xmm2,%xmm3' ``). Anything else reports the mnemonic
+/// only (memory/imm echo normalization is unverified).
+fn vblendvb_echo(ops: &[Operand]) -> String {
+    if !ops.is_empty() && ops.iter().all(|op| matches!(op, Operand::Register(_))) {
+        let mut line = String::from("vblendvb ");
+        for (i, op) in ops.iter().enumerate() {
+            if i > 0 {
+                line.push(',');
+            }
+            if let Operand::Register(r) = op {
+                line.push('%');
+                line.push_str(&r.name);
+            }
+        }
+        return format!("no such instruction: `{line}'");
+    }
+    "no such instruction: `vblendvb'".to_string()
+}
+
+/// Moffs-shape gate: a bare absolute address outside disp32 is only
+/// encodable via the accumulator-only moffs forms (A0-A3 + moffs64),
+/// so `mov`-family + exactly 2 operands + an accumulator partner whose
+/// width matches the suffix redirects to the moffs encoder; anything
+/// else with such an address is `operand type mismatch for \`<stem>'`
+/// (GAS 2.47: `movl 0x80000000,%ebx`, `addq 0x80000000,%rbx`,
+/// `vmovaps 0x80000000,%xmm0` all report the stemmed form). `movabs`
+/// takes the same path (its width comes from the register, like the
+/// unsuffixed `mov`).
+fn is_moffs_shape(mnemonic: &str, ops: &[Operand]) -> bool {
+    if ops.len() != 2 {
+        return false;
+    }
+    let acc_ok = |reg: &str| -> bool {
+        if !registers::is_accum(reg) {
+            return false;
+        }
+        let size = registers::infer_reg_size(reg);
+        match mnemonic {
+            "mov" | "movabs" | "movabsq" => matches!(size, 1 | 2 | 4 | 8),
+            "movb" => size == 1,
+            "movw" => size == 2,
+            "movl" => size == 4,
+            "movq" => size == 8,
+            _ => false,
+        }
+    };
+    match (&ops[0], &ops[1]) {
+        (Operand::Memory(_), Operand::Register(dst)) => acc_ok(&dst.name),
+        (Operand::Register(src), Operand::Memory(_)) => acc_ok(&src.name),
+        _ => false,
+    }
+}
+
+/// `mov`-family width check for the moffs gate: a GPR partner whose
+/// width disagrees with a `b`/`w`/`l`/`q` suffix fails before any
+/// range error. Returns the GAS diagnostic, or `None` when the width
+/// agrees (or is inferred: unsuffixed `mov`/`movabs`, non-GPR partner,
+/// or a non-`mov` mnemonic).
+fn moffs_width_error(mnemonic: &str, ops: &[Operand]) -> Option<String> {
+    let (suffix, expect): (char, u8) = match mnemonic {
+        "movb" => ('b', 1),
+        "movw" => ('w', 2),
+        "movl" => ('l', 4),
+        "movq" => ('q', 8),
+        _ => return None,
+    };
+    let mut partner: Option<&str> = None;
+    for op in ops {
+        if let Operand::Register(r) = op {
+            if !matches!(registers::reg_class(&r.name), registers::RegClass::Gp(_)) {
+                return None;
+            }
+            if partner.is_some() {
+                return None;
+            }
+            partner = Some(r.name.as_str());
+        }
+    }
+    let reg = partner?;
+    if registers::infer_reg_size(reg) == expect {
+        return None;
+    }
+    if suffix == 'b' {
+        return Some(format!("`%{reg}' not allowed with `movb'"));
+    }
+    Some(format!(
+        "incorrect register `%{reg}' used with `{suffix}' suffix"
+    ))
+}
+
+/// Decorator presence on one operand (unwrapping `*`-indirect once):
+/// `(masked, zeroing_without_mask, broadcast, sae_token)`.
+fn op_decor(op: &Operand) -> (bool, bool, bool, Option<&str>) {
+    let op = unwrap_indirect(op);
+    match op {
+        Operand::Register(r) => (
+            r.mask.is_some(),
+            r.zeroing && r.mask.is_none(),
+            r.broadcast.is_some(),
+            None,
+        ),
+        Operand::Memory(m) => (
+            m.mask.is_some(),
+            m.zeroing && m.mask.is_none(),
+            m.broadcast.is_some(),
+            None,
+        ),
+        Operand::Label(s) if registers::is_evex_sae_token(s) => (false, false, false, Some(s)),
+        _ => (false, false, false, None),
+    }
+}
+
+/// Unwrap one `*`-indirect layer (for decorator checks).
+fn unwrap_indirect(op: &Operand) -> &Operand {
+    match op {
+        Operand::Indirect(inner) => inner.as_ref(),
+        _ => op,
+    }
+}
+
+/// True when the operand carries any EVEX decorator (mask/zeroing,
+/// broadcast, SAE/rounding, standalone SAE token).
+fn op_decorated(op: &Operand) -> bool {
+    let op = unwrap_indirect(op);
+    match op {
+        Operand::Register(r) => {
+            r.mask.is_some() || r.zeroing || r.broadcast.is_some() || r.sae || r.rounding.is_some()
+        }
+        Operand::Memory(m) => m.mask.is_some() || m.zeroing || m.broadcast.is_some(),
+        Operand::Label(s) => registers::is_evex_sae_token(s),
+        _ => false,
+    }
+}
+
+/// Rewrite one operand: a bare label becomes the SIB-absolute memory
+/// reference GAS assembles (`vmovaps foo,%xmm0` -> disp32 + R_X86_64_32S,
+/// never RIP-relative). Standalone `{...}` decorators are labels too
+/// and must be preserved for the EVEX SAE peel.
+fn normalize_bare_label(op: &mut Operand) {
+    if let Operand::Label(s) = op {
+        if s.starts_with('{') {
+            return;
+        }
+        *op = Operand::Memory(MemoryOperand {
+            segment: None,
+            displacement: label_to_disp(s),
+            base: None,
+            index: None,
+            scale: None,
+            mask: None,
+            zeroing: false,
+            broadcast: None,
+        });
+    }
+}
+
 impl InstructionEncoder {
     pub fn new() -> Self {
         InstructionEncoder {
@@ -115,7 +375,91 @@ impl InstructionEncoder {
 
     /// Encode a single instruction and append bytes.
     pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
+        // Bare labels in memory position (`vmovaps foo,%xmm0`) and `%eiz`
+        // are rewritten centrally so every encoder sees canonical
+        // operands. The clone runs only when a rewrite applies (branches
+        // and plain register/immediate instructions borrow as before).
+        let owned;
+        let instr = if !mnemonic_takes_label(&instr.mnemonic)
+            && instr
+                .operands
+                .iter()
+                .any(|op| matches!(op, Operand::Label(s) if !s.starts_with('{')))
+        {
+            let mut o = instr.clone();
+            for op in &mut o.operands {
+                normalize_bare_label(op);
+            }
+            owned = o;
+            &owned
+        } else {
+            instr
+        };
         let start_len = self.bytes.len();
+        // Structural memory validation + 0x67 accounting, before
+        // dispatch: GAS reports operand-shape errors before prefix /
+        // template errors, and every mnemonic shares the verdict.
+        let mut need67 = false;
+        for op in &instr.operands {
+            if let Operand::Memory(mem) = op {
+                core::validate_mem_operand(&instr.mnemonic, mem)?;
+                need67 |= core::mem_needs_addr32(mem);
+            }
+        }
+        // Moffs gate (operand-level, so before the decorator checks): a
+        // bare absolute address outside disp32 either redirects to the
+        // moffs encoder (`mov`-family + accumulator, see is_moffs_shape)
+        // or fails here — no SIB-abs truncation may reach dispatch.
+        // A `mov`-family width mismatch beats the range error (`movl
+        // huge,%rax` is `incorrect register ... used with `l' suffix'`;
+        // `movb` instead reports `` `%eax' not allowed with `movb' ``).
+        // The range error itself is stemmed, except that `movq` keeps
+        // its name (GAS opcode-entry quirk, verified 2.47).
+        let mut moffs_redirect = false;
+        for op in &instr.operands {
+            if let Operand::Memory(mem) = op {
+                if mem.base.is_none() && mem.index.is_none() {
+                    if let Displacement::Integer(v) = mem.displacement {
+                        if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                            if let Some(err) =
+                                moffs_width_error(&instr.mnemonic, &instr.operands)
+                            {
+                                return Err(err);
+                            }
+                            moffs_redirect =
+                                is_moffs_shape(&instr.mnemonic, &instr.operands);
+                            if !moffs_redirect {
+                                let name = if instr.mnemonic == "movq" {
+                                    "movq"
+                                } else {
+                                    decor_stem(&instr.mnemonic)
+                                };
+                                return Err(format!(
+                                    "operand type mismatch for `{name}'"
+                                ));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // `{z}` without a write mask on the same operand: a bare `{z}`
+        // with no mask anywhere is `zeroing-masking only allowed ...`,
+        // but with a mask on another operand it is `invalid
+        // zeroing-masking `{z}'`. Decorator-level, so it precedes the
+        // mnemonic checks below (and the post-encode support checks).
+        if instr.operands.iter().any(|op| op_decor(op).1) {
+            if instr.operands.iter().any(|op| op_decor(op).0) {
+                return Err("invalid zeroing-masking `{z}'".to_string());
+            }
+            return Err("zeroing-masking only allowed with write mask".to_string());
+        }
+        // Branches never have EVEX forms; any decorator on their operands
+        // (`jmp foo{1to16}`) is `no EVEX encoding for `jmp''.
+        if mnemonic_takes_label(&instr.mnemonic) && instr.operands.iter().any(op_decorated) {
+            return Err(format!("no EVEX encoding for `{}'", instr.mnemonic));
+        }
         self.apx_nf = instr.nf;
         self.apx_evex = instr.force_evex;
         self.apx_rex2 = instr.force_rex2;
@@ -130,30 +474,101 @@ impl InstructionEncoder {
         //
         //     [segment override] [0x66 operand-size] [F0/F2/F3 group-1] [REX]
         //
-        // The instruction body emits the segment override and 0x66 itself, so
-        // a group-1 prefix pushed up front lands BEFORE them and produces e.g.
-        // `f0 66 01 07` where GAS produces `66 f0 01 07`. Both decode
-        // identically, but the non-canonical order defeats byte-comparison
-        // against the reference assembler and breaks tools (including kernel
-        // alternatives patchers) that assume the canonical form. Encode the
-        // body first, then splice the group-1 prefix into its correct slot.
-        let mut group1: Option<u8> = match instr.prefix.as_deref() {
-            None => None,
-            Some("lock") => Some(0xF0),
-            Some("rep") | Some("repz") | Some("repe") => Some(0xF3),
-            Some("repnz") | Some("repne") => Some(0xF2),
-            Some("notrack") => Some(0x3E),
-            // Segment overrides used as standalone prefixes. `notrack` is the
-            // same 0x3E byte; the kernel's `ds wrmsr` relies on it being
-            // emitted so an ALTERNATIVE can patch the instruction in place.
-            Some("cs") => Some(0x2E),
-            Some("ss") => Some(0x36),
-            Some("ds") => Some(0x3E),
-            Some("es") => Some(0x26),
-            Some("fs") => Some(0x64),
-            Some("gs") => Some(0x65),
-            Some(p) => return Err(format!("unknown prefix: {}", p)),
-        };
+        // Prefixes stack (`lock xacquire addl ...` needs two bytes), so the
+        // leading words are partitioned here:
+        // - seg_pre: standalone segment overrides plus `notrack` (0x3E).
+        //   Pushed BEFORE the body: GAS orders them outermost (`gs addw` is
+        //   `65 66 ...`, and `notrack callw` is `3e 66 ff 10` — notrack sits
+        //   with the segment group, ahead of 0x66).
+        // - group1: the F0/F2/F3 bytes. The body is encoded first, then the
+        //   run is spliced in after any segment/0x66/0x67 bytes (a group-1
+        //   byte pushed up front would land before 0x66: `f0 66 01 07`
+        //   where GAS produces `66 f0 01 07`).
+        // Canonical group-1 order is the F2/F3 byte first, F0 second:
+        // `lock xacquire` and `xacquire lock` both emit F2 F0 (GAS 2.47).
+        let mut seg_pre: Vec<u8> = Vec::new();
+        let mut group1: Vec<u8> = Vec::new();
+        let mut has_lock = false;
+        let mut has_xacquire = false;
+        let mut has_xrelease = false;
+        for p in &instr.prefixes {
+            match p.as_str() {
+                "lock" => {
+                    has_lock = true;
+                    group1.push(0xF0);
+                }
+                "xacquire" => {
+                    has_xacquire = true;
+                    group1.push(0xF2);
+                }
+                "xrelease" => {
+                    has_xrelease = true;
+                    group1.push(0xF3);
+                }
+                "rep" | "repz" | "repe" => group1.push(0xF3),
+                "repnz" | "repne" => group1.push(0xF2),
+                "notrack" => seg_pre.push(0x3E),
+                // Segment overrides used as standalone prefixes. The kernel's
+                // `ds wrmsr` relies on the byte being emitted so an
+                // ALTERNATIVE can patch the instruction in place.
+                "cs" => seg_pre.push(0x2E),
+                "ss" => seg_pre.push(0x36),
+                "ds" => seg_pre.push(0x3E),
+                "es" => seg_pre.push(0x26),
+                "fs" => seg_pre.push(0x64),
+                "gs" => seg_pre.push(0x65),
+                other => return Err(format!("unknown prefix: {}", other)),
+            }
+        }
+        // F0 sinks past any F2/F3 byte (stable: singletons keep position).
+        group1.sort_by_key(|&b| b == 0xF0);
+        // The same byte twice (`lock lock`, `rep repe`) is rejected by GAS.
+        if group1.windows(2).any(|w| w[0] == w[1]) {
+            return Err("same type of prefix used twice".to_string());
+        }
+        // Prefix/instruction agreement (GNU as diagnostics, verified 2.47).
+        // `lock` demands a lockable mnemonic with a memory operand; the HLE
+        // hints demand `lock` alongside, except `xchg` (implicitly locked)
+        // and `xrelease` on a `mov` store. The `lock` check fires first.
+        if has_lock || has_xacquire || has_xrelease {
+            let stem = prefix_stem(&instr.mnemonic);
+            let has_mem = instr
+                .operands
+                .iter()
+                .any(|op| matches!(op, Operand::Memory(_)));
+            let lockable = (stem == "xchg" || LOCKABLE_STEMS.contains(&stem.as_str())) && has_mem;
+            if has_lock && !lockable {
+                return Err("expecting lockable instruction after `lock'".to_string());
+            }
+            if has_xacquire {
+                if stem == "mov" {
+                    return Err("instruction `mov' after `xacquire' not allowed".to_string());
+                } else if stem == "xchg" && !has_mem {
+                    return Err("invalid instruction `xchg' after `xacquire'".to_string());
+                } else if stem != "xchg" && !lockable {
+                    return Err(format!("invalid instruction `{}' after `xacquire'", stem));
+                } else if !has_lock && stem != "xchg" {
+                    return Err("missing `lock' with `xacquire'".to_string());
+                }
+            }
+            if has_xrelease {
+                if stem == "mov" {
+                    let mem_dst = matches!(instr.operands.last(), Some(Operand::Memory(_)));
+                    if !mem_dst {
+                        return Err(
+                            "memory destination needed for instruction `mov' after `xrelease'"
+                                .to_string(),
+                        );
+                    }
+                } else if stem == "xchg" && !has_mem {
+                    return Err("invalid instruction `xchg' after `xrelease'".to_string());
+                } else if stem != "xchg" && !lockable {
+                    return Err(format!("invalid instruction `{}' after `xrelease'", stem));
+                } else if !has_lock && stem != "xchg" {
+                    return Err("missing `lock' with `xrelease'".to_string());
+                }
+            }
+        }
 
         let reloc_base = self.relocations.len();
 
@@ -216,22 +631,33 @@ impl InstructionEncoder {
             // A CONFLICTING standalone override (prefix "gs" on an
             // instruction whose memory operand says %fs) is rejected —
             // emitting only one of the two would silently drop the other
-            // (notrack, 0x3E, is exempt: it is a hint prefix, not a
-            // segment override, and GAS orders it after the segment).
-            match group1 {
-                Some(g) if g == b => group1 = None,
-                Some(g @ (0x26 | 0x2E | 0x36 | 0x64 | 0x65)) => {
-                    return Err(format!(
-                        "conflicting segment overrides: prefix byte {:#x} vs operand byte {:#x}",
-                        g, b
-                    ));
-                }
-                _ => {}
+            // (0x3E is exempt either way: neither `ds` (shadowed — %ds is
+            // dropped as the default segment) nor `notrack` (a hint, and
+            // GAS orders it after the segment) can collide with a real
+            // operand override).
+            if let Some(pos) = seg_pre.iter().position(|&g| g == b) {
+                seg_pre.remove(pos);
+            }
+            if let Some(&g) = seg_pre
+                .iter()
+                .find(|&&g| matches!(g, 0x26 | 0x2E | 0x36 | 0x64 | 0x65))
+            {
+                return Err(format!(
+                    "conflicting segment overrides: prefix byte {:#x} vs operand byte {:#x}",
+                    g, b
+                ));
             }
             self.bytes.push(b);
         }
+        for &b in &seg_pre {
+            self.bytes.push(b);
+        }
 
-        let mut result = self.encode_mnemonic(instr);
+        let mut result = if moffs_redirect {
+            self.encode_movabs(&instr.operands)
+        } else {
+            self.encode_mnemonic(instr)
+        };
         if result.is_ok() {
             result = self.fixup_rex2_map1(start_len);
         }
@@ -246,25 +672,43 @@ impl InstructionEncoder {
             }
         }
 
-        if let (Ok(()), Some(pfx)) = (&result, group1) {
+        // Central 0x67 splice: after any segment bytes, before 0x66 /
+        // group-1 / REX / VEX / EVEX (`65 67 66 8b`, `64 67 c5 ..`).
+        // Runs before the group-1 splice, whose skipper already steps
+        // over 0x67.
+        if result.is_ok() && need67 {
             let mut at = start_len;
             while at < self.bytes.len() {
-                let b = self.bytes[at];
-                let is_seg = matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65);
-                // 0x3E is both the DS override and notrack; when inserting
-                // notrack itself, do not skip past a 0x3E.
-                let is_seg = is_seg && !(b == 0x3E && pfx == 0x3E);
-                if is_seg || b == 0x66 || b == 0x67 {
+                if matches!(self.bytes[at], 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) {
                     at += 1;
                 } else {
                     break;
                 }
             }
-            self.bytes.insert(at, pfx);
-            // Relocation offsets recorded by the body are instruction-relative;
-            // the inserted prefix moves all of them by one.
+            self.bytes.insert(at, 0x67);
             for r in &mut self.relocations[reloc_base..] {
                 r.offset += 1;
+            }
+        }
+
+        if result.is_ok() && !group1.is_empty() {
+            let mut at = start_len;
+            while at < self.bytes.len() {
+                let b = self.bytes[at];
+                if matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) || b == 0x66 || b == 0x67 {
+                    at += 1;
+                } else {
+                    break;
+                }
+            }
+            for (i, pfx) in group1.iter().enumerate() {
+                self.bytes.insert(at + i, *pfx);
+            }
+            // Relocation offsets recorded by the body are instruction-relative;
+            // the inserted prefix run moves all of them.
+            let shift = group1.len() as u64;
+            for r in &mut self.relocations[reloc_base..] {
+                r.offset += shift;
             }
         }
 
@@ -272,14 +716,100 @@ impl InstructionEncoder {
             self.offset += (self.bytes.len() - start_len) as u64;
         }
 
+        // Decorator support/placement, with knowledge of the emitted
+        // prefix: GAS checks support against the selected encoding, so
+        // a mask on `addl` is `unsupported masking for `add'' rather
+        // than `mask not on destination'. Runs only when the body
+        // succeeded; body errors (bad operands) take precedence.
+        if result.is_ok() {
+            self.check_decorators(&instr.mnemonic, &instr.operands)?;
+        }
+
         result
+    }
+
+    /// Post-encode EVEX-decorator checks (see `encode()` tail).
+    fn check_decorators(&self, mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+        let stem = decor_stem(mnemonic);
+        let pi = self.prefix_start();
+        let evex = self.bytes.get(pi).copied() == Some(0x62);
+        if !evex {
+            // No EVEX form selected: every decorator is unsupported.
+            // Operand order (a misplaced `{sae}` at op[0] beats a mask
+            // at op[2]); broadcast beats masking within one operand.
+            for op in ops {
+                let (masked, zeroing, bcst, sae_tok) = op_decor(op);
+                if let Some(tok) = sae_tok {
+                    return Err(format!("`{stem}': misplaced `{tok}'"));
+                }
+                if bcst {
+                    return Err(format!("unsupported broadcast for `{stem}'"));
+                }
+                if masked || zeroing {
+                    return Err(format!("unsupported masking for `{stem}'"));
+                }
+            }
+            return Ok(());
+        }
+        // EVEX selected. First the suffixed-`{sae}` kind check (a
+        // decorator-value error, so it precedes placement): the class
+        // comes from the emitted (map, opcode), so no mnemonic table.
+        // (If the body FAILED (arity/shape), that error wins instead;
+        // GAS reports `unknown vector operation' even then, but the
+        // class is unknowable without emitted bytes. Verdict-identical.)
+        if self.bytes.len() >= pi + 5 {
+            let map = self.bytes[pi + 1] & 7;
+            let opcode = self.bytes[pi + 4];
+            for op in ops {
+                if let Operand::Register(r) = unwrap_indirect(op) {
+                    if (is_xmm(&r.name) || is_ymm(&r.name) || is_zmm(&r.name))
+                        && let Some(tok) =
+                            Self::check_evex_sae_token(map, opcode, r.sae, r.rounding)
+                    {
+                        return Err(format!("unknown vector operation: `{tok}'"));
+                    }
+                }
+            }
+        }
+        // Broadcast on a register is never valid, and a write mask
+        // anywhere but the destination (last operand) is misplaced.
+        // Memory broadcast the encoder ignored (`vmovaps` has no
+        // broadcast form) and per-instruction N validity are each EVEX
+        // encoder's job (`evex_forbid_*` audit follow-up).
+        for op in ops {
+            let (_, _, bcst, _) = op_decor(op);
+            if bcst && matches!(unwrap_indirect(op), Operand::Register(_)) {
+                return Err(format!("unsupported broadcast for `{mnemonic}'"));
+            }
+        }
+        if let Some(last) = ops.len().checked_sub(1) {
+            for (i, op) in ops.iter().enumerate() {
+                if i != last {
+                    let (masked, zeroing, _, _) = op_decor(op);
+                    if masked || zeroing {
+                        return Err(format!(
+                            "mask not on destination operand for `{mnemonic}'"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// AVX-512 (EVEX) mnemonic dispatch. Returns None for mnemonics that are
     /// not handled here so the caller can fall through to the VEX/legacy table.
     /// All encodings verified byte-for-byte against GNU as 2.42 (2026-08-12).
     fn try_encode_evex(&mut self, mnemonic: &str, ops: &[Operand]) -> Option<Result<(), String>> {
-        let r = |res: Result<(), String>| Some(res);
+        let r = |res: Result<(), String>| {
+            Some(res.map_err(|e| {
+                if e == avx::SAE_UNSUPPORTED {
+                    format!("{e} for `{mnemonic}'")
+                } else {
+                    e
+                }
+            }))
+        };
         match mnemonic {
             // ---- EVEX.NDS.512.66.0F: packed integer binary (W0=32-bit, W1=64-bit) ----
             "vpaddd" => r(self.encode_evex_binary(ops, 1, 1, 0, 0xFE)),
@@ -388,6 +918,16 @@ impl InstructionEncoder {
             "vpermi2pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x77)),
             "vpermt2pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x7F)),
             "vpermi2b" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x75)),
+            // EVEX VSIB gathers: 2-operand (vsib-mem, dst {%k1-7}). The
+            // 3-operand (mask, mem, dst) spellings stay on the VEX helper.
+            "vgatherdps" => r(self.encode_evex_gather(ops, 0x92, 0)),
+            "vgatherdpd" => r(self.encode_evex_gather(ops, 0x92, 1)),
+            "vgatherqps" => r(self.encode_evex_gather(ops, 0x93, 0)),
+            "vgatherqpd" => r(self.encode_evex_gather(ops, 0x93, 1)),
+            "vpgatherdd" => r(self.encode_evex_gather(ops, 0x90, 0)),
+            "vpgatherdq" => r(self.encode_evex_gather(ops, 0x90, 1)),
+            "vpgatherqd" => r(self.encode_evex_gather(ops, 0x91, 0)),
+            "vpgatherqq" => r(self.encode_evex_gather(ops, 0x91, 1)),
             "vpermt2b" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x7D)),
             "vpermi2w" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x75)),
             "vpermt2w" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x7D)),
@@ -423,6 +963,18 @@ impl InstructionEncoder {
             "vfnmsub213pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xAE)),
             "vfnmsub231ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xBE)),
             "vfnmsub231pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xBE)),
+            "vfmaddsub132ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x96)),
+            "vfmaddsub132pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x96)),
+            "vfmaddsub213ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xA6)),
+            "vfmaddsub213pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xA6)),
+            "vfmaddsub231ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xB6)),
+            "vfmaddsub231pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xB6)),
+            "vfmsubadd132ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x97)),
+            "vfmsubadd132pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x97)),
+            "vfmsubadd213ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xA7)),
+            "vfmsubadd213pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xA7)),
+            "vfmsubadd231ps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0xB7)),
+            "vfmsubadd231pd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xB7)),
             // FP binary (EVEX.NDS.66.0F, W1 for pd)
             "vaddpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x58)),
             "vaddps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x58)),
@@ -485,16 +1037,23 @@ impl InstructionEncoder {
             "vpshufhw" => r(self.encode_evex_imm2(ops, 1, 2, 0, 0x70)),
             "vpermq" => r(self.encode_evex_imm2_ndd(ops, 3, 1, 1, 0x00)),
             "vpermpd" => r(self.encode_evex_imm2_ndd(ops, 3, 1, 1, 0x01)),
-            // shifts by imm8 (vvvv=dest, ModRM.reg = /2 /4 /6)
-            "vpsllw" => r(self.encode_evex_shift_imm(ops, 0, 0x71, 6)),
-            "vpslld" => r(self.encode_evex_shift_imm(ops, 0, 0x72, 6)),
-            "vpsllq" => r(self.encode_evex_shift_imm(ops, 1, 0x73, 6)),
-            "vpsrlw" => r(self.encode_evex_shift_imm(ops, 0, 0x71, 2)),
-            "vpsrld" => r(self.encode_evex_shift_imm(ops, 0, 0x72, 2)),
-            "vpsrlq" => r(self.encode_evex_shift_imm(ops, 1, 0x73, 2)),
-            "vpsraw" => r(self.encode_evex_shift_imm(ops, 0, 0x71, 4)),
-            "vpsrad" => r(self.encode_evex_shift_imm(ops, 0, 0x72, 4)),
-            "vpsraq" => r(self.encode_evex_shift_imm(ops, 1, 0x72, 4)),
+            // EVEX.66.0F3A $imm forms (no variable-count EVEX form exists).
+            "vpermilpd" => r(self.encode_evex_imm2(ops, 3, 1, 1, 0x05)),
+            "vpermilps" => r(self.encode_evex_imm2(ops, 3, 1, 0, 0x04)),
+            // AVX512CD conflict detection (unary, vvvv=1; W selects d/q).
+            "vpconflictd" => r(self.encode_evex_unary(ops, 2, 1, 0, 0xC4)),
+            "vpconflictq" => r(self.encode_evex_unary(ops, 2, 1, 1, 0xC4)),
+            // shifts: $imm takes the imm8 group path (ModRM.reg = /2 /4 /6),
+            // otherwise the count sits in an xmm/m128 r/m (ModRM.reg = dst).
+            "vpsllw" => r(self.encode_evex_shift(mnemonic, ops, 0, 0xF1, 0x71, 6)),
+            "vpslld" => r(self.encode_evex_shift(mnemonic, ops, 0, 0xF2, 0x72, 6)),
+            "vpsllq" => r(self.encode_evex_shift(mnemonic, ops, 1, 0xF3, 0x73, 6)),
+            "vpsrlw" => r(self.encode_evex_shift(mnemonic, ops, 0, 0xD1, 0x71, 2)),
+            "vpsrld" => r(self.encode_evex_shift(mnemonic, ops, 0, 0xD2, 0x72, 2)),
+            "vpsrlq" => r(self.encode_evex_shift(mnemonic, ops, 1, 0xD3, 0x73, 2)),
+            "vpsraw" => r(self.encode_evex_shift(mnemonic, ops, 0, 0xE1, 0x71, 4)),
+            "vpsrad" => r(self.encode_evex_shift(mnemonic, ops, 0, 0xE2, 0x72, 4)),
+            "vpsraq" => r(self.encode_evex_shift(mnemonic, ops, 1, 0xE2, 0x72, 4)),
             // Whole-vector byte shifts share the 0F.73 shift group:
             // VPSLLDQ is /7, VPSRLDQ is /3 (W0; no opmask/broadcast).
             "vpslldq" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
@@ -546,8 +1105,53 @@ impl InstructionEncoder {
             // EVEX packed compare-to-mask (same layout as vpcmp*, opcode C2).
             "vcmpps" => r(self.encode_evex_cmp_mask(ops, 1, 0, 0, 0xC2)),
             "vcmppd" => r(self.encode_evex_cmp_mask(ops, 1, 1, 1, 0xC2)),
-            "vcvtps2dq" => r(self.encode_evex_unary(ops, 1, 1, 0, 0x5B)),
-            "vcvtdq2ps" => r(self.encode_evex_unary(ops, 1, 0, 0, 0x5B)),
+            "vcvtps2dq" => r(self.encode_evex_vcvt(ops, "vcvtps2dq")),
+            "vcvttps2dq" => r(self.encode_evex_vcvt(ops, "vcvttps2dq")),
+            "vcvtdq2ps" => r(self.encode_evex_vcvt(ops, "vcvtdq2ps")),
+            "vcvtps2pd" => r(self.encode_evex_vcvt(ops, "vcvtps2pd")),
+            "vcvtdq2pd" => r(self.encode_evex_vcvt(ops, "vcvtdq2pd")),
+            "vcvtpd2ps" => r(self.encode_evex_vcvt(ops, "vcvtpd2ps")),
+            "vcvtpd2dq" => r(self.encode_evex_vcvt(ops, "vcvtpd2dq")),
+            "vcvttpd2dq" => r(self.encode_evex_vcvt(ops, "vcvttpd2dq")),
+            "vcvtps2qq" => r(self.encode_evex_vcvt(ops, "vcvtps2qq")),
+            "vcvttps2qq" => r(self.encode_evex_vcvt(ops, "vcvttps2qq")),
+            "vcvtpd2qq" => r(self.encode_evex_vcvt(ops, "vcvtpd2qq")),
+            "vcvttpd2qq" => r(self.encode_evex_vcvt(ops, "vcvttpd2qq")),
+            "vcvtqq2pd" => r(self.encode_evex_vcvt(ops, "vcvtqq2pd")),
+            "vcvtqq2ps" => r(self.encode_evex_vcvt(ops, "vcvtqq2ps")),
+            // EVEX scalar unsigned converts (AVX512F-only: GAS 2.47 emits
+            // EVEX even unadorned — `vcvtsd2usi %xmm0,%eax` = 62 f1 7f 08
+            // 79 c0). No masking/broadcast/SAE on any of them.
+            "vcvtsd2usi" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_cvt_to_gp(ops, 3, 0x79, 8))),
+            "vcvtss2usi" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_cvt_to_gp(ops, 2, 0x79, 4))),
+            "vcvttsd2usi" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_cvt_to_gp(ops, 3, 0x78, 8))),
+            "vcvttss2usi" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_cvt_to_gp(ops, 2, 0x78, 4))),
+            "vcvtusi2sdl" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_cvt_from_gp(ops, 3, 0))),
+            "vcvtusi2sdq" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_cvt_from_gp(ops, 3, 1))),
+            "vcvtusi2ssl" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_cvt_from_gp(ops, 2, 0))),
+            "vcvtusi2ssq" => r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                .and_then(|_| self.encode_evex_cvt_from_gp(ops, 2, 1))),
+            // Unsuffixed spellings are legal GAS: a 64-bit register source
+            // selects W1, a 32-bit register or memory source W0.
+            "vcvtusi2sd" => {
+                let w = u8::from(matches!(&ops.first(), Some(Operand::Register(r))
+                    if is_reg64(&r.name)));
+                r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                    .and_then(|_| self.encode_evex_cvt_from_gp(ops, 3, w)))
+            }
+            "vcvtusi2ss" => {
+                let w = u8::from(matches!(&ops.first(), Some(Operand::Register(r))
+                    if is_reg64(&r.name)));
+                r(Self::evex_forbid_mask_bcst(mnemonic, ops)
+                    .and_then(|_| self.encode_evex_cvt_from_gp(ops, 2, w)))
+            }
             // vpcmpeq*/vpcmpgt* aliases: mask-dest forms use the original opcodes;
             // vector-dest forms are VEX-only (512-bit vector-dest compares do not
             // exist — reject like GAS).
@@ -595,6 +1199,19 @@ impl InstructionEncoder {
             "vmovdqa32" => r(self.encode_evex_vmov(ops, 1, 0, 0x6F, 0x7F)),
             // broadcast
             "vpbroadcastb" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vpbroadcastb'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vpbroadcastb", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vpbroadcastb", ops, true) {
+                    return Some(Err(e));
+                }
                 let from_gpr =
                     matches!(ops.first(), Some(Operand::Register(r)) if !is_xmm_or_ymm(&r.name));
                 if from_gpr {
@@ -604,6 +1221,19 @@ impl InstructionEncoder {
                 }
             }
             "vpbroadcastw" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vpbroadcastw'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vpbroadcastw", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vpbroadcastw", ops, true) {
+                    return Some(Err(e));
+                }
                 let from_gpr =
                     matches!(ops.first(), Some(Operand::Register(r)) if !is_xmm_or_ymm(&r.name));
                 if from_gpr {
@@ -613,6 +1243,19 @@ impl InstructionEncoder {
                 }
             }
             "vpbroadcastd" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vpbroadcastd'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vpbroadcastd", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vpbroadcastd", ops, true) {
+                    return Some(Err(e));
+                }
                 let from_gpr =
                     matches!(ops.first(), Some(Operand::Register(r)) if !is_xmm_or_ymm(&r.name));
                 if from_gpr {
@@ -622,6 +1265,19 @@ impl InstructionEncoder {
                 }
             }
             "vpbroadcastq" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vpbroadcastq'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vpbroadcastq", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vpbroadcastq", ops, true) {
+                    return Some(Err(e));
+                }
                 let from_gpr =
                     matches!(ops.first(), Some(Operand::Register(r)) if !is_xmm_or_ymm(&r.name));
                 if from_gpr {
@@ -630,15 +1286,246 @@ impl InstructionEncoder {
                     r(self.encode_evex_broadcast_gpr(ops, 0x59, 1))
                 }
             }
-            "vbroadcasti32x4" => r(self.encode_evex_broadcast_mem(ops, 0x5A, 0)),
-            "vbroadcasti64x2" => r(self.encode_evex_broadcast_mem(ops, 0x5A, 1)),
-            "vbroadcasti32x8" => r(self.encode_evex_broadcast_mem(ops, 0x5B, 0)),
-            "vbroadcasti64x4" => r(self.encode_evex_broadcast_mem(ops, 0x5B, 1)),
+            "vbroadcasti32x4" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vbroadcasti32x4'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vbroadcasti32x4", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vbroadcasti32x4", ops, true) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_broadcast_mem(ops, 0x5A, 0))
+            }
+            "vbroadcasti64x2" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vbroadcasti64x2'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vbroadcasti64x2", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vbroadcasti64x2", ops, true) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_broadcast_mem(ops, 0x5A, 1))
+            }
+            "vbroadcasti32x8" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vbroadcasti32x8'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vbroadcasti32x8", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vbroadcasti32x8", ops, true) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_broadcast_mem(ops, 0x5B, 0))
+            }
+            "vbroadcasti64x4" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vbroadcasti64x4'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vbroadcasti64x4", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vbroadcasti64x4", ops, true) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_broadcast_mem(ops, 0x5B, 1))
+            }
+            "vbroadcastss" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vbroadcastss'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vbroadcastss", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vbroadcastss", ops, true) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_broadcast_gpr(ops, 0x18, 0))
+            }
+            "vbroadcastsd" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vbroadcastsd'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vbroadcastsd", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vbroadcastsd", ops, true) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_broadcast_gpr(ops, 0x19, 1))
+            }
+            "vbroadcastf32x4" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vbroadcastf32x4'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vbroadcastf32x4", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vbroadcastf32x4", ops, true) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_broadcast_mem(ops, 0x1A, 0))
+            }
+            "vbroadcastf32x8" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vbroadcastf32x8'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vbroadcastf32x8", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vbroadcastf32x8", ops, true) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_broadcast_mem(ops, 0x1B, 0))
+            }
+            "vbroadcastf64x2" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vbroadcastf64x2'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vbroadcastf64x2", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vbroadcastf64x2", ops, true) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_broadcast_mem(ops, 0x1A, 1))
+            }
+            "vbroadcastf64x4" => {
+                // SAE/rounding beats arity/shape: GAS reports the decorator
+                // error first, and broadcast never takes SAE. (`r` maps the
+                // bare diagnostic to `.. for `vbroadcastf64x4'`.)
+                let (_, sae) = Self::peel_evex_sae(ops);
+                if let Err(e) = Self::apply_evex_sae(sae, avx::EvexSae::None, 0) {
+                    return r(Err(e));
+                }
+                if let Err(e) = Self::evex_forbid_broadcast("vbroadcastf64x4", ops) {
+                    return Some(Err(e));
+                }
+                if let Err(e) = avx::check_broadcast_shape("vbroadcastf64x4", ops, true) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_broadcast_mem(ops, 0x1B, 1))
+            }
+            "vpcompressd" => {
+                if let Err(e) = Self::evex_forbid_broadcast("vpcompressd", ops) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_compress_expand(ops, "vpcompressd", 0x8B, 0, 4, true))
+            }
+            "vpcompressq" => {
+                if let Err(e) = Self::evex_forbid_broadcast("vpcompressq", ops) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_compress_expand(ops, "vpcompressq", 0x8B, 1, 8, true))
+            }
+            "vpexpandd" => {
+                if let Err(e) = Self::evex_forbid_broadcast("vpexpandd", ops) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_compress_expand(ops, "vpexpandd", 0x89, 0, 4, false))
+            }
+            "vpexpandq" => {
+                if let Err(e) = Self::evex_forbid_broadcast("vpexpandq", ops) {
+                    return Some(Err(e));
+                }
+                r(self.encode_evex_compress_expand(ops, "vpexpandq", 0x89, 1, 8, false))
+            }
             // opmask moves (VEX-encoded, dispatched here because of k operands)
             "kmovq" => r(self.encode_kmov(ops, 8)),
             "kmovd" => r(self.encode_kmov(ops, 4)),
             "kmovw" => r(self.encode_kmov(ops, 2)),
             "kmovb" => r(self.encode_kmov(ops, 1)),
+            // opmask logic, test, unpack (VEX.NDS.0F; pp/W per size class:
+            // b=(66,W0) w=(NP,W0) d=(66,W1) q=(NP,W1) — GAS 2.47 oracle).
+            "kaddb" => r(self.encode_kopmask_3op(ops, 0x4A, 1)),
+            "kaddw" => r(self.encode_kopmask_3op(ops, 0x4A, 2)),
+            "kaddd" => r(self.encode_kopmask_3op(ops, 0x4A, 4)),
+            "kaddq" => r(self.encode_kopmask_3op(ops, 0x4A, 8)),
+            "kandb" => r(self.encode_kopmask_3op(ops, 0x41, 1)),
+            "kandw" => r(self.encode_kopmask_3op(ops, 0x41, 2)),
+            "kandd" => r(self.encode_kopmask_3op(ops, 0x41, 4)),
+            "kandq" => r(self.encode_kopmask_3op(ops, 0x41, 8)),
+            "kandnb" => r(self.encode_kopmask_3op(ops, 0x42, 1)),
+            "kandnw" => r(self.encode_kopmask_3op(ops, 0x42, 2)),
+            "kandnd" => r(self.encode_kopmask_3op(ops, 0x42, 4)),
+            "kandnq" => r(self.encode_kopmask_3op(ops, 0x42, 8)),
+            "korb" => r(self.encode_kopmask_3op(ops, 0x45, 1)),
+            "korw" => r(self.encode_kopmask_3op(ops, 0x45, 2)),
+            "kord" => r(self.encode_kopmask_3op(ops, 0x45, 4)),
+            "korq" => r(self.encode_kopmask_3op(ops, 0x45, 8)),
+            "kxnorb" => r(self.encode_kopmask_3op(ops, 0x46, 1)),
+            "kxnorw" => r(self.encode_kopmask_3op(ops, 0x46, 2)),
+            "kxnord" => r(self.encode_kopmask_3op(ops, 0x46, 4)),
+            "kxnorq" => r(self.encode_kopmask_3op(ops, 0x46, 8)),
+            "kxorb" => r(self.encode_kopmask_3op(ops, 0x47, 1)),
+            "kxorw" => r(self.encode_kopmask_3op(ops, 0x47, 2)),
+            "kxord" => r(self.encode_kopmask_3op(ops, 0x47, 4)),
+            "kxorq" => r(self.encode_kopmask_3op(ops, 0x47, 8)),
+            "kunpckbw" => r(self.encode_kopmask_3op(ops, 0x4B, 1)),
+            "kunpckwd" => r(self.encode_kopmask_3op(ops, 0x4B, 2)),
+            "kunpckdq" => r(self.encode_kopmask_3op(ops, 0x4B, 8)),
+            "knotb" => r(self.encode_kopmask_2op(ops, 0x44, 1)),
+            "knotw" => r(self.encode_kopmask_2op(ops, 0x44, 2)),
+            "knotd" => r(self.encode_kopmask_2op(ops, 0x44, 4)),
+            "knotq" => r(self.encode_kopmask_2op(ops, 0x44, 8)),
+            "kortestb" => r(self.encode_kopmask_2op(ops, 0x98, 1)),
+            "kortestw" => r(self.encode_kopmask_2op(ops, 0x98, 2)),
+            "kortestd" => r(self.encode_kopmask_2op(ops, 0x98, 4)),
+            "kortestq" => r(self.encode_kopmask_2op(ops, 0x98, 8)),
+            "ktestb" => r(self.encode_kopmask_2op(ops, 0x99, 1)),
+            "ktestw" => r(self.encode_kopmask_2op(ops, 0x99, 2)),
+            "ktestd" => r(self.encode_kopmask_2op(ops, 0x99, 4)),
+            "ktestq" => r(self.encode_kopmask_2op(ops, 0x99, 8)),
+            // opmask shifts (0F3A map, hence VEX3-only; pp=66, W picks
+            // the width pair).
+            "kshiftlb" => r(self.encode_kshift(ops, 0x32, 0)),
+            "kshiftlw" => r(self.encode_kshift(ops, 0x32, 1)),
+            "kshiftld" => r(self.encode_kshift(ops, 0x33, 0)),
+            "kshiftlq" => r(self.encode_kshift(ops, 0x33, 1)),
+            "kshiftrb" => r(self.encode_kshift(ops, 0x30, 0)),
+            "kshiftrw" => r(self.encode_kshift(ops, 0x30, 1)),
+            "kshiftrd" => r(self.encode_kshift(ops, 0x31, 0)),
+            "kshiftrq" => r(self.encode_kshift(ops, 0x31, 1)),
             // EVEX rotates (existing encoder, mask support via emit_evex)
             "vprold" => r(self.encode_evex_rotate_imm(ops, 0x72, 1, 0)),
             "vprolq" => r(self.encode_evex_rotate_imm(ops, 0x72, 1, 1)),
@@ -649,45 +1536,185 @@ impl InstructionEncoder {
     }
 
     /// Encode opmask register moves: kmovb/w/d/q (VEX-encoded, no EVEX).
-    /// kmovq k<->r64: VEX.L0.F2.0F.W1 92/93 /r  (92: r64->k, 93: k->r64)
-    /// kmovd k<->r32: VEX.L0.F2.0F.W0 92/93 /r
-    /// kmovw k<->r32: VEX.L0.0F.W0   92/93 /r
-    /// kmovb k<->r32: VEX.L0.66.0F.W0 92/93 /r
+    /// GPR forms — kmovq k<->r64: VEX.L0.F2.0F.W1 92/93 /r (92: r64->k,
+    /// 93: k->r64); kmovd k<->r32: VEX.L0.F2.0F.W0 92/93 /r; kmovw k<->r32:
+    /// VEX.L0.0F.W0 92/93 /r; kmovb k<->r32: VEX.L0.66.0F.W0 92/93 /r.
+    /// k/mem forms use opcodes 90/91 with a different pp/W per size class:
+    /// b=(66,W0) w=(NP,W0) d=(66,W1) q=(NP,W1) — GAS 2.47 oracle.
+    /// Opmask registers are k0-k7 (never need R/B extension); the GPR and
+    /// memory sides do (`kmovq %r8, %k1` = `c4 c1 fb 92 c8`).
     fn encode_kmov(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("kmov requires 2 operands".to_string());
         }
-        let (pp, w) = match size {
+        let (pp_gpr, w_gpr) = match size {
             8 => (3u8, 1u8), // F2, W1
             4 => (3u8, 0u8), // F2, W0
             2 => (0u8, 0u8), // none, W0
             1 => (1u8, 0u8), // 66, W0
             _ => return Err("bad kmov size".to_string()),
         };
+        let (pp_k, w_k) = match size {
+            8 => (0u8, 1u8), // none, W1
+            4 => (1u8, 1u8), // 66, W1
+            2 => (0u8, 0u8), // none, W0
+            1 => (1u8, 0u8), // 66, W0
+            _ => return Err("bad kmov size".to_string()),
+        };
+        // GAS rejects anything but r32 (kmovb/w/d) or r64 (kmovq) on the
+        // GPR side — vector registers are an "operand type mismatch".
+        let gpr_ok = |name: &str| {
+            if size == 8 {
+                is_reg64(name)
+            } else {
+                is_reg32(name)
+            }
+        };
         match (&ops[0], &ops[1]) {
             // k -> GPR (93): ModRM.reg = GPR (dest), r/m = k (src)
             (Operand::Register(src), Operand::Register(dst))
-                if is_kreg(&src.name) && !is_kreg(&dst.name) =>
+                if is_kreg(&src.name) && gpr_ok(&dst.name) =>
             {
                 let k_num = reg_num(&src.name).ok_or("bad k register")?;
                 let gpr_num = reg_num(&dst.name).ok_or("bad gpr register")?;
-                self.emit_vex(false, false, false, 1, w, 0, 0, pp);
+                let r = needs_vex_ext(&dst.name);
+                self.emit_vex(r, false, false, 1, w_gpr, 0, 0, pp_gpr);
                 self.bytes.push(0x93);
                 self.bytes.push(self.modrm(3, gpr_num, k_num));
                 Ok(())
             }
             // GPR -> k (92): ModRM.reg = k (dest), r/m = GPR (src)
             (Operand::Register(src), Operand::Register(dst))
-                if !is_kreg(&src.name) && is_kreg(&dst.name) =>
+                if gpr_ok(&src.name) && is_kreg(&dst.name) =>
             {
                 let gpr_num = reg_num(&src.name).ok_or("bad gpr register")?;
                 let k_num = reg_num(&dst.name).ok_or("bad k register")?;
-                self.emit_vex(false, false, false, 1, w, 0, 0, pp);
+                let b = needs_vex_ext(&src.name);
+                self.emit_vex(false, false, b, 1, w_gpr, 0, 0, pp_gpr);
                 self.bytes.push(0x92);
                 self.bytes.push(self.modrm(3, k_num, gpr_num));
                 Ok(())
             }
-            _ => Err("kmov requires k<->GPR operands".to_string()),
+            // k -> k (90): ModRM.reg = dst, r/m = src
+            (Operand::Register(src), Operand::Register(dst))
+                if is_kreg(&src.name) && is_kreg(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad k register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad k register")?;
+                self.emit_vex(false, false, false, 1, w_k, 0, 0, pp_k);
+                self.bytes.push(0x90);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            // k -> mem (91): ModRM.reg = k (src), r/m = mem (dst)
+            (Operand::Register(src), Operand::Memory(mem)) if is_kreg(&src.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad k register")?;
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(false, x, b_ext, 1, w_k, 0, 0, pp_k);
+                self.bytes.push(0x91);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            // mem -> k (90): ModRM.reg = k (dst), r/m = mem (src)
+            (Operand::Memory(mem), Operand::Register(dst)) if is_kreg(&dst.name) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad k register")?;
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(false, x, b_ext, 1, w_k, 0, 0, pp_k);
+                self.bytes.push(0x90);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("kmov requires k<->GPR, k<->k or k<->mem operands".to_string()),
+        }
+    }
+
+    /// VEX.NDS opmask logic: kadd/kand/kandn/kor/kxnor/kxor/kunpck.
+    /// AT&T (k1, k2, k0): r/m = k1, vvvv = k2, reg = k0. pp/W follow the
+    /// size class — b=(66,W0) w=(NP,W0) d=(66,W1) q=(NP,W1) — verified
+    /// against GAS 2.47 for every size (`kaddb %k1,%k2,%k0` = `c5 ed 4a c1`,
+    /// `kaddq ...` = `c4 e1 ec 4a c1`). VEX.L is *set* (unlike every other
+    /// k-instruction, which uses L=0): with L=0 objdump reports `(bad)`,
+    /// so the length bit is mandatory here, not cosmetic.
+    fn encode_kopmask_3op(&mut self, ops: &[Operand], opcode: u8, size: u8) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("kopmask 3-op requires 3 operands".to_string());
+        }
+        let (pp, w) = match size {
+            8 => (0u8, 1u8),
+            4 => (1u8, 1u8),
+            2 => (0u8, 0u8),
+            1 => (1u8, 0u8),
+            _ => return Err("bad kopmask size".to_string()),
+        };
+        match (&ops[0], &ops[1], &ops[2]) {
+            (Operand::Register(a), Operand::Register(b), Operand::Register(d))
+                if is_kreg(&a.name) && is_kreg(&b.name) && is_kreg(&d.name) =>
+            {
+                let a_num = reg_num(&a.name).ok_or("bad k register")?;
+                let b_num = reg_num(&b.name).ok_or("bad k register")?;
+                let d_num = reg_num(&d.name).ok_or("bad k register")?;
+                self.emit_vex(false, false, false, 1, w, b_num, 1, pp);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, d_num, a_num));
+                Ok(())
+            }
+            _ => Err("kopmask 3-op requires k registers".to_string()),
+        }
+    }
+
+    /// 2-operand opmask: knot/ktest/kortest. AT&T (k1, k2): r/m = k1,
+    /// reg = k2, vvvv unused. Same pp/W size classes as the 3-op forms.
+    fn encode_kopmask_2op(&mut self, ops: &[Operand], opcode: u8, size: u8) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("kopmask 2-op requires 2 operands".to_string());
+        }
+        let (pp, w) = match size {
+            8 => (0u8, 1u8),
+            4 => (1u8, 1u8),
+            2 => (0u8, 0u8),
+            1 => (1u8, 0u8),
+            _ => return Err("bad kopmask size".to_string()),
+        };
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(a), Operand::Register(b))
+                if is_kreg(&a.name) && is_kreg(&b.name) =>
+            {
+                let a_num = reg_num(&a.name).ok_or("bad k register")?;
+                let b_num = reg_num(&b.name).ok_or("bad k register")?;
+                self.emit_vex(false, false, false, 1, w, 0, 0, pp);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, b_num, a_num));
+                Ok(())
+            }
+            _ => Err("kopmask 2-op requires k registers".to_string()),
+        }
+    }
+
+    /// Opmask shift by imm8: kshiftl/r. AT&T ($imm, ksrc, kdst): r/m = src,
+    /// reg = dst, vvvv unused. Unlike every other k-instruction these live
+    /// in the 0F3A map (GAS 2.47: `kshiftrb $3, %k6, %k5` = `c4 e3 79 30 ee
+    /// 03`), which is why GAS ignores `{vex2}` on them — VEX2 cannot encode
+    /// mm=3. pp is always 66; W picks the width pair (b/w share one opcode,
+    /// d/q another): b=W0 w=W1 d=W0 q=W1.
+    fn encode_kshift(&mut self, ops: &[Operand], opcode: u8, w: u8) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("kshift requires 3 operands".to_string());
+        }
+        match (&ops[0], &ops[1], &ops[2]) {
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Register(dst),
+            ) if is_kreg(&src.name) && is_kreg(&dst.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad k register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad k register")?;
+                self.emit_vex(false, false, false, 3, w, 0, 0, 1);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("kshift requires $imm, k, k operands".to_string()),
         }
     }
 
@@ -696,6 +1723,46 @@ impl InstructionEncoder {
         // GNU as treats mnemonics case-insensitively (glibc .S files use
         // uppercase `LOCK`); normalize before dispatch.
         let mnemonic_raw = instr.mnemonic.to_ascii_lowercase();
+        // GAS 2.47 accepts a `.s` suffix on any instruction mnemonic. It is
+        // ignored wherever the encoding is unambiguous (`addl.s (%rax),%ecx`
+        // == `addl`, `vpaddd.s` == `vpaddd`, `nop.s` == `nop`; on branches
+        // `.s` forces the short form, which is already LCCC's default). The
+        // one exception: when both operands are registers of a direction-bit
+        // instruction, GAS flips to the alternate encoding (`movl.s %eax,%ebx`
+        // is `8b d8`, not `89 c3`; `vmovdqa32.s %zmm5,%zmm6` is `7f ee`, not
+        // `6f f5`) — same instruction, same operands, other direction bit.
+        // LCCC strips `.s` and encodes the default direction: full
+        // accept-parity, byte-parity everywhere except reg-reg direction-bit
+        // `.s` forms. Those appear only in GAS's own testsuite (no compiler,
+        // linker, or hand-written code emits `.s`), so threading a direction
+        // override through every ALU/move encoder is deliberately not done.
+        // Standalone prefixes (`lock.s`) are NOT stripped: GAS rejects them,
+        // and stripping would silently drop their operands.
+        let mnemonic_raw = match mnemonic_raw.strip_suffix(".s") {
+            Some(base)
+                if !matches!(
+                    base,
+                    "lock"
+                        | "xacquire"
+                        | "xrelease"
+                        | "rep"
+                        | "repz"
+                        | "repe"
+                        | "repnz"
+                        | "repne"
+                        | "notrack"
+                        | "cs"
+                        | "ss"
+                        | "ds"
+                        | "es"
+                        | "fs"
+                        | "gs"
+                ) =>
+            {
+                base.to_string()
+            }
+            _ => mnemonic_raw,
+        };
         // Infer suffix for unsuffixed mnemonics (e.g., push -> pushq, mov -> movl)
         // This enables assembling hand-written .s files that omit AT&T size suffixes.
         let suffixed = infer_suffix(&mnemonic_raw, &instr.operands);
@@ -751,7 +1818,9 @@ impl InstructionEncoder {
                 | "vpopcntd"
                 | "vpopcntq"
                 | "vpcompressd"
+                | "vpcompressq"
                 | "vpexpandd"
+                | "vpexpandq"
                 | "vpshldw"
                 | "vpshrdw"
                 | "vpshldd"
@@ -799,12 +1868,32 @@ impl InstructionEncoder {
                 | "vbroadcasti64x2"
                 | "vbroadcasti32x8"
                 | "vbroadcasti64x4"
+                | "vbroadcastf32x4"
+                | "vbroadcastf32x8"
+                | "vbroadcastf64x2"
+                | "vbroadcastf64x4"
                 | "vmovdqu8"
                 | "vmovdqu16"
                 | "vmovdqu32"
                 | "vmovdqu64"
                 | "vmovdqa64"
                 | "vmovdqa32"
+                | "vcvtsd2usi"
+                | "vcvtss2usi"
+                | "vcvttsd2usi"
+                | "vcvttss2usi"
+                | "vcvtusi2sd"
+                | "vcvtusi2ss"
+                | "vcvtusi2sdl"
+                | "vcvtusi2sdq"
+                | "vcvtusi2ssl"
+                | "vcvtusi2ssq"
+                | "vcvtps2qq"
+                | "vcvttps2qq"
+                | "vcvtpd2qq"
+                | "vcvttpd2qq"
+                | "vcvtqq2pd"
+                | "vcvtqq2ps"
         );
         if has_zmm_or_k || evex_only {
             if let Some(result) = self.try_encode_evex(mnemonic, ops) {
@@ -812,7 +1901,27 @@ impl InstructionEncoder {
             }
             // No EVEX form: instructions without a 512-bit/masked encoding
             // (vphaddw, vpsignb, vpslldq, vperm2i128, ...) must be REJECTED,
-            // never silently encoded as 128-bit VEX.
+            // never silently encoded as 128-bit VEX. GAS orders the
+            // diagnostic by cause: an impossible zmm operand is `operand
+            // type mismatch', a write mask is `unsupported masking', an
+            // explicit broadcast is `no EVEX encoding' (all stemmed).
+            let stem = decor_stem(mnemonic);
+            let has_zmm = ops
+                .iter()
+                .any(|op| matches!(op, Operand::Register(r) if is_zmm(&r.name)));
+            if has_zmm {
+                return Err(format!("operand type mismatch for `{stem}'"));
+            }
+            let masked = ops.iter().any(|op| op_decor(op).0 || op_decor(op).1);
+            if masked {
+                return Err(format!("unsupported masking for `{stem}'"));
+            }
+            let membcst = ops
+                .iter()
+                .any(|op| matches!(op, Operand::Memory(m) if m.broadcast.is_some()));
+            if membcst {
+                return Err(format!("no EVEX encoding for `{stem}'"));
+            }
             return Err(format!(
                 "{}: no AVX-512/EVEX form for these operands (zmm/k/masked)",
                 mnemonic
@@ -1354,6 +2463,19 @@ impl InstructionEncoder {
             "adcxq" => self.encode_adx(ops, 0x66, 8),
             "adoxl" => self.encode_adx(ops, 0xF3, 4),
             "adoxq" => self.encode_adx(ops, 0xF3, 8),
+            "adcx" | "adox" => {
+                // Suffixless: infer from the first register operand. ADX has
+                // no 16/8-bit forms — GAS rejects those outright.
+                let prefix = if mnemonic == "adcx" { 0x66 } else { 0xF3 };
+                match ops.iter().find_map(|o| match o {
+                    Operand::Register(r) => Some(infer_reg_size(&r.name)),
+                    _ => None,
+                }) {
+                    Some(4) => self.encode_adx(ops, prefix, 4),
+                    Some(8) => self.encode_adx(ops, prefix, 8),
+                    _ => Err(format!("operand size mismatch for `{mnemonic}'")),
+                }
+            }
 
             // Direction flag
             "cld" => {
@@ -2021,6 +3143,52 @@ impl InstructionEncoder {
                     _ => Err("loop requires label".to_string()),
                 }
             }
+            // Short-only counter branches (no long form; GAS 2.47 oracle:
+            // `jecxz there` = `67 e3 fd`, `loope` = `e1`, `loopne` = `e0`).
+            // `jcxz` is correctly rejected: GAS refuses 16-bit addresses here.
+            "jecxz" => {
+                if ops.len() != 1 {
+                    return Err("jecxz requires 1 operand".to_string());
+                }
+                match &ops[0] {
+                    Operand::Label(label) => {
+                        self.bytes.push(0x67);
+                        self.bytes.push(0xE3);
+                        self.add_relocation(label, R_X86_64_PC8_INTERNAL, -1);
+                        self.bytes.push(0); // placeholder for rel8
+                        Ok(())
+                    }
+                    _ => Err("jecxz requires label".to_string()),
+                }
+            }
+            "loope" | "loopz" => {
+                if ops.len() != 1 {
+                    return Err("loope requires 1 operand".to_string());
+                }
+                match &ops[0] {
+                    Operand::Label(label) => {
+                        self.bytes.push(0xE1);
+                        self.add_relocation(label, R_X86_64_PC8_INTERNAL, -1);
+                        self.bytes.push(0); // placeholder for rel8
+                        Ok(())
+                    }
+                    _ => Err("loope requires label".to_string()),
+                }
+            }
+            "loopne" | "loopnz" => {
+                if ops.len() != 1 {
+                    return Err("loopne requires 1 operand".to_string());
+                }
+                match &ops[0] {
+                    Operand::Label(label) => {
+                        self.bytes.push(0xE0);
+                        self.add_relocation(label, R_X86_64_PC8_INTERNAL, -1);
+                        self.bytes.push(0); // placeholder for rel8
+                        Ok(())
+                    }
+                    _ => Err("loopne requires label".to_string()),
+                }
+            }
 
             // ---- cmpxchg16b ----
             "cmpxchg16b" => {
@@ -2161,8 +3329,14 @@ impl InstructionEncoder {
             "vmovapd" => self.encode_avx_mov_np(ops, 0x28, 0x29, true),
             "vmovups" => self.encode_avx_mov_np(ops, 0x10, 0x11, false),
             "vmovupd" => self.encode_avx_mov_np(ops, 0x10, 0x11, true),
-            "vbroadcastss" => self.encode_avx_broadcast(ops, &[0x18]),
-            "vbroadcastsd" => self.encode_avx_broadcast(ops, &[0x19]),
+            "vbroadcastss" => {
+                avx::check_broadcast_shape("vbroadcastss", ops, false)?;
+                self.encode_avx_broadcast(ops, &[0x18])
+            }
+            "vbroadcastsd" => {
+                avx::check_broadcast_shape("vbroadcastsd", ops, false)?;
+                self.encode_avx_broadcast(ops, &[0x19])
+            }
             "vpand" => self.encode_avx_3op_commutative(ops, 0xDB, true, true),
             "vpandn" => self.encode_avx_3op(ops, 0xDF, true),
             "vpor" => self.encode_avx_3op_commutative(ops, 0xEB, true, true),
@@ -2259,7 +3433,9 @@ impl InstructionEncoder {
             "vandnps" => self.encode_avx_3op_np(ops, 0x55),
             "vorpd" => self.encode_avx_3op_commutative(ops, 0x56, true, true),
             "vorps" => self.encode_avx_3op_commutative(ops, 0x56, false, true),
-            "vpshufd" => self.encode_avx_shuffle(ops, 0x70, true),
+            "vpshufd" => self.encode_avx_shuffle(ops, 0x70, 1),
+            "vpshuflw" => self.encode_avx_shuffle(ops, 0x70, 3),
+            "vpshufhw" => self.encode_avx_shuffle(ops, 0x70, 2),
             "vpshufb" => self.encode_avx_3op_38(ops, 0x00, true),
             "vpalignr" => self.encode_avx_3op_3a_imm8(ops, 0x0F, true),
             "vblendps" => self.encode_avx_3op_3a_imm8(ops, 0x0C, true),
@@ -2275,22 +3451,26 @@ impl InstructionEncoder {
             "vpabsw" => self.encode_avx_2op_38(ops, 0x1D, true),
             "vpabsd" => self.encode_avx_2op_38(ops, 0x1E, true),
             "vpmovzxbw" => self.encode_avx_2op_38(ops, 0x30, true),
+            "vpmovzxbd" => self.encode_avx_2op_38(ops, 0x31, true),
+            "vpmovzxbq" => self.encode_avx_2op_38(ops, 0x32, true),
+            "vpmovzxwd" => self.encode_avx_2op_38(ops, 0x33, true),
+            "vpmovzxwq" => self.encode_avx_2op_38(ops, 0x34, true),
             "vpmovzxdq" => self.encode_avx_2op_38(ops, 0x35, true),
+            "vpmovsxbw" => self.encode_avx_2op_38(ops, 0x20, true),
+            "vpmovsxbd" => self.encode_avx_2op_38(ops, 0x21, true),
+            "vpmovsxbq" => self.encode_avx_2op_38(ops, 0x22, true),
+            "vpmovsxwd" => self.encode_avx_2op_38(ops, 0x23, true),
+            "vpmovsxwq" => self.encode_avx_2op_38(ops, 0x24, true),
+            // VEX sign-extend dword→qword (opcode 0x25, the sxdq sibling of
+            // sxwd's 0x23 in the 0F38 family). Needed by the widening
+            // I32→I64 reduction (VecWidenAddI32x4ToI64x2).
+            "vpmovsxdq" => self.encode_avx_2op_38(ops, 0x25, true),
             "vpsllvd" => self.encode_avx_3op_38(ops, 0x47, true),
             "vpsllvq" => self.encode_avx_3op_38_w1(ops, 0x47, true),
             "vpsrlvd" => self.encode_avx_3op_38(ops, 0x45, true),
             "vpsrlvq" => self.encode_avx_3op_38_w1(ops, 0x45, true),
             "vpsravd" => self.encode_avx_3op_38(ops, 0x46, true),
             "vmovntdqa" => self.encode_avx_2op_38(ops, 0x2A, true),
-            "vpmovzxbd" => self.encode_avx_2op_38(ops, 0x31, true),
-            "vpmovzxwd" => self.encode_avx_2op_38(ops, 0x33, true),
-            "vpmovsxbw" => self.encode_avx_2op_38(ops, 0x20, true),
-            "vpmovsxbd" => self.encode_avx_2op_38(ops, 0x21, true),
-            "vpmovsxwd" => self.encode_avx_2op_38(ops, 0x23, true),
-            // VEX sign-extend dword→qword (opcode 0x25, the sxdq sibling of
-            // sxwd's 0x23 in the 0F38 family). Needed by the widening
-            // I32→I64 reduction (VecWidenAddI32x4ToI64x2).
-            "vpmovsxdq" => self.encode_avx_2op_38(ops, 0x25, true),
             "vpmovmskb" => self.encode_avx_extract_gp(ops, 0xD7, true),
             "vmovd" => self.encode_avx_movd(ops),
             "vmovq" => self.encode_avx_movq(ops),
@@ -2322,6 +3502,7 @@ impl InstructionEncoder {
 
             // AVX2 broadcast
             "vpbroadcastb" => {
+                avx::check_broadcast_shape("vpbroadcastb", ops, false)?;
                 if matches!(&ops[0], Operand::Register(r) if !is_xmm_or_ymm(&r.name)) {
                     self.encode_avx_broadcast_evex_gpr(ops, 0x7A, 0)
                 } else {
@@ -2329,6 +3510,7 @@ impl InstructionEncoder {
                 }
             }
             "vpbroadcastw" => {
+                avx::check_broadcast_shape("vpbroadcastw", ops, false)?;
                 if matches!(&ops[0], Operand::Register(r) if !is_xmm_or_ymm(&r.name)) {
                     self.encode_avx_broadcast_evex_gpr(ops, 0x7B, 0)
                 } else {
@@ -2336,6 +3518,7 @@ impl InstructionEncoder {
                 }
             }
             "vpbroadcastd" => {
+                avx::check_broadcast_shape("vpbroadcastd", ops, false)?;
                 if matches!(&ops[0], Operand::Register(r) if !is_xmm_or_ymm(&r.name)) {
                     self.encode_avx_broadcast_evex_gpr(ops, 0x7C, 0)
                 } else {
@@ -2343,6 +3526,7 @@ impl InstructionEncoder {
                 }
             }
             "vpbroadcastq" => {
+                avx::check_broadcast_shape("vpbroadcastq", ops, false)?;
                 if matches!(&ops[0], Operand::Register(r) if !is_xmm_or_ymm(&r.name)) {
                     self.encode_avx_broadcast_evex_gpr(ops, 0x7C, 1)
                 } else {
@@ -2360,6 +3544,10 @@ impl InstructionEncoder {
 
             // AVX blend (additional)
             "vpblendd" => self.encode_avx_3op_3a_imm8(ops, 0x02, true),
+            // GAS 2.47 accepts no `vblendvb` operand order at all (every
+            // mask position verified): byte variable-blend is AVX2-only
+            // (`vpblendvb`, below). Always reject with the GAS echo.
+            "vblendvb" => Err(vblendvb_echo(ops)),
             "vblendvps" => self.encode_avx_4op_3a(ops, 0x4A, true),
             "vblendvpd" => self.encode_avx_4op_3a(ops, 0x4B, true),
             "vpblendvb" => self.encode_avx_4op_3a(ops, 0x4C, true),
@@ -2367,9 +3555,7 @@ impl InstructionEncoder {
             "vpblendw" => self.encode_avx_3op_3a_imm8(ops, 0x0E, true),
             // VEX.256.66.0F38.W0 1A /r — broadcast 128 bits of FP data.
             "vbroadcastf128" => {
-                if !matches!(ops.first(), Some(Operand::Memory(_))) {
-                    return Err("vbroadcastf128 requires memory source".to_string());
-                }
+                avx::check_broadcast_shape("vbroadcastf128", ops, false)?;
                 self.encode_avx_broadcast(ops, &[0x1A])
             }
             // Non-temporal stores: VEX.0F.WIG 2B (ps) / 66.0F.WIG 2B (pd)
@@ -2380,9 +3566,7 @@ impl InstructionEncoder {
 
             // AVX2 broadcast from 128-bit memory
             "vbroadcasti128" => {
-                if !matches!(ops.first(), Some(Operand::Memory(_))) {
-                    return Err("vbroadcasti128 requires memory source".to_string());
-                }
+                avx::check_broadcast_shape("vbroadcasti128", ops, false)?;
                 self.encode_avx_broadcast(ops, &[0x5A])
             }
 
@@ -2430,6 +3614,11 @@ impl InstructionEncoder {
             "gf2p8mulb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xCF]),
             "gf2p8affineqb" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xCE]),
             "gf2p8affineinvqb" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xCF]),
+            // VEX GFNI (GAS 2.47 oracle: `vgf2p8mulb %xmm1,%xmm2,%xmm3` =
+            // `c4 e2 69 cf d9`; affine forms are ($imm, src2, src1, dst)).
+            "vgf2p8mulb" => self.encode_avx_3op_38(ops, 0xCF, true),
+            "vgf2p8affineqb" => self.encode_avx_3op_3a_pp_imm8(ops, 0xCE, 1, 1),
+            "vgf2p8affineinvqb" => self.encode_avx_3op_3a_pp_imm8(ops, 0xCF, 1, 1),
             "vaesimc" => self.encode_avx_2op_38(ops, 0xDB, true),
             "vaeskeygenassist" => self.encode_avx_2op_3a_pp_imm8(ops, 0xDF, 1),
             // VAES 256 + VPCLMULQDQ 256
@@ -2437,7 +3626,7 @@ impl InstructionEncoder {
             "vaesenclast" => self.encode_avx_3op_38(ops, 0xDD, true),
             "vaesdec" => self.encode_avx_3op_38(ops, 0xDE, true),
             "vaesdeclast" => self.encode_avx_3op_38(ops, 0xDF, true),
-            "vpclmulqdq" => self.encode_avx_3op_3a_pp_imm8(ops, 0x44, 1),
+            "vpclmulqdq" => self.encode_avx_3op_3a_pp_imm8(ops, 0x44, 1, 0),
             "vphaddw" => self.encode_avx_3op_38(ops, 0x01, true),
             "vphaddd" => self.encode_avx_3op_38(ops, 0x02, true),
             "vphaddsw" => self.encode_avx_3op_38(ops, 0x03, true),
@@ -2498,11 +3687,11 @@ impl InstructionEncoder {
             "vhsubpd" => self.encode_avx_3op_pp(ops, 0x7D, 1),
             "vaddsubps" => self.encode_avx_3op_pp(ops, 0xD0, 3),
             "vaddsubpd" => self.encode_avx_3op_pp(ops, 0xD0, 1),
-            "vcvtps2pd" => self.encode_avx_2op_0f(ops, 0x5A, 0),
-            "vcvtpd2ps" => self.encode_avx_2op_0f(ops, 0x5A, 1),
-            "vcvtdq2pd" => self.encode_avx_2op_0f(ops, 0xE6, 2),
-            "vcvtpd2dq" => self.encode_avx_2op_0f(ops, 0xE6, 3),
-            "vcvttpd2dq" => self.encode_avx_2op_0f(ops, 0xE6, 1),
+            "vcvtps2pd" => self.encode_vcvt(ops, "vcvtps2pd"),
+            "vcvtpd2ps" => self.encode_vcvt(ops, "vcvtpd2ps"),
+            "vcvtdq2pd" => self.encode_vcvt(ops, "vcvtdq2pd"),
+            "vcvtpd2dq" => self.encode_vcvt(ops, "vcvtpd2dq"),
+            "vcvttpd2dq" => self.encode_vcvt(ops, "vcvttpd2dq"),
             "vtestps" => self.encode_avx_2op_38(ops, 0x0E, true),
             "vtestpd" => self.encode_avx_2op_38(ops, 0x0F, true),
             "vmovmskps" => self.encode_avx_extract_gp(ops, 0x50, false),
@@ -2578,9 +3767,9 @@ impl InstructionEncoder {
             }
 
             // AVX conversions
-            "vcvtps2dq" => self.encode_avx_2op_0f(ops, 0x5B, 1), // VEX.128/256.66.0F 5B /r
-            "vcvtdq2ps" => self.encode_avx_2op_0f(ops, 0x5B, 0), // VEX.128/256.0F 5B /r
-            "vcvttps2dq" => self.encode_avx_2op_0f(ops, 0x5B, 2), // VEX.128/256.F3.0F 5B /r
+            "vcvtps2dq" => self.encode_vcvt(ops, "vcvtps2dq"),
+            "vcvtdq2ps" => self.encode_vcvt(ops, "vcvtdq2ps"),
+            "vcvttps2dq" => self.encode_vcvt(ops, "vcvttps2dq"),
 
             // AVX insert/extract
             "vpinsrb" => self.encode_avx_insert_gp(ops, 0x20, true),
@@ -2592,7 +3781,7 @@ impl InstructionEncoder {
             }
             "vpextrb" => self.encode_avx_extract_byte(ops, 0x14, true),
             "vpextrd" => self.encode_avx_extract_byte(ops, 0x16, true),
-            "vpextrw" => self.encode_avx_extract_byte(ops, 0x15, true),
+            "vpextrw" => self.encode_avx_extract_w(ops),
 
             // ---- AVX-512 (EVEX-encoded) ----
             "vpxord" => self.encode_evex_3op(ops, 0xEF, 1, 0), // EVEX.NDS.{128,256,512}.66.0F.W0 EF /r
@@ -2946,6 +4135,18 @@ impl InstructionEncoder {
                         self.bytes.push(self.modrm(3, dst_num, src_num));
                         Ok(())
                     }
+                    // mem source (GAS 2.47: `vptest (%rdi), %xmm4`
+                    // -> `c4 e2 7d 17 20`).
+                    (Operand::Memory(mem), Operand::Register(dst)) => {
+                        let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                        let l = if is_ymm(&dst.name) { 1 } else { 0 };
+                        let r = needs_vex_ext(&dst.name);
+                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                        self.emit_vex(r, x, b_ext, 2, 0, 0, l, 1);
+                        self.bytes.push(0x17);
+                        self.encode_modrm_mem(dst_num, mem)
+                    }
                     _ => Err("unsupported vptest operands".to_string()),
                 }
             }
@@ -2970,36 +4171,31 @@ impl InstructionEncoder {
                         self.bytes.push(*imm as u8);
                         Ok(())
                     }
-                    _ => Err("unsupported vpextrq operands".to_string()),
-                }
-            }
-            "vpinsrq" => {
-                // VEX.128.66.0F3A.W1 22 /r ib
-                if ops.len() != 4 {
-                    return Err("vpinsrq requires 4 operands".to_string());
-                }
-                match (&ops[0], &ops[1], &ops[2], &ops[3]) {
+                    // mem64 dest (GAS 2.47: `vpextrq $7, %xmm8, (%rdi)`
+                    // -> `c4 e3 f9 16 21 07`).
                     (
                         Operand::Immediate(ImmediateValue::Integer(imm)),
                         Operand::Register(src),
-                        Operand::Register(vvvv),
-                        Operand::Register(dst),
+                        Operand::Memory(mem),
                     ) => {
                         let src_num = reg_num(&src.name).ok_or("bad register")?;
-                        let vvvv_num = reg_num(&vvvv.name).ok_or("bad register")?;
-                        let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                        let r = needs_vex_ext(&dst.name);
-                        let b = needs_vex_ext(&src.name);
-                        let vvvv_enc = vvvv_num | (if needs_vex_ext(&vvvv.name) { 8 } else { 0 });
-                        self.emit_vex(r, false, b, 3, 1, vvvv_enc, 0, 1);
-                        self.bytes.push(0x22);
-                        self.bytes.push(self.modrm(3, dst_num, src_num));
+                        let r = needs_vex_ext(&src.name);
+                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                        self.emit_vex(r, x, b_ext, 3, 1, 0, 0, 1);
+                        self.bytes.push(0x16);
+                        let rc = self.relocations.len();
+                        self.encode_modrm_mem(src_num, mem)?;
                         self.bytes.push(*imm as u8);
+                        self.adjust_rip_reloc_addend(rc, 1);
                         Ok(())
                     }
-                    _ => Err("unsupported vpinsrq operands".to_string()),
+                    _ => Err("unsupported vpextrq operands".to_string()),
                 }
             }
+            // The 4-op form routes to the guarded `"vpinsrq"` arm above
+            // (`encode_avx_insert_gp_w1`); anything else is an arity error.
+            "vpinsrq" => Err("vpinsrq requires 4 operands".to_string()),
 
             // ---- Suffix-less shrd/shld ----
             "shrd" => {
@@ -3289,6 +4485,21 @@ impl InstructionEncoder {
             "movbew" => self.encode_movbe(ops, 2),
             "movbel" => self.encode_movbe(ops, 4),
             "movbeq" => self.encode_movbe(ops, 8),
+            "movbe" => {
+                let size = ops
+                    .iter()
+                    .find_map(|o| match o {
+                        Operand::Register(r) => Some(infer_reg_size(&r.name)),
+                        _ => None,
+                    })
+                    .unwrap_or(4);
+                let size = match size {
+                    2 => 2,
+                    8 => 8,
+                    _ => 4,
+                };
+                self.encode_movbe(ops, size)
+            }
             "prefetcht1" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 2),
             "prefetcht2" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 3),
             "prefetchnta" => self.encode_sse_mem_only(ops, &[0x0F, 0x18], 0),
@@ -3914,6 +5125,317 @@ mod encoding_opt_tests {
         assert_eq!(hex("extractps $0, %xmm0, %r8d"), "66 41 0f 3a 17 c0 00");
         assert_eq!(hex("cvtsi2ss %r8d, %xmm0"), "f3 41 0f 2a c0");
         assert_eq!(hex("cvtsi2ss %r8, %xmm8"), "f3 4d 0f 2a c0");
+    }
+
+    #[test]
+    fn vex_pshuf_lw_hw() {
+        // VEX.128/256.F2/F3.0F.WIG 70 /r ib — byte-exact vs GAS 2.47.
+        assert_eq!(hex("vpshuflw $7, %xmm4, %xmm6"), "c5 fb 70 f4 07");
+        assert_eq!(hex("vpshuflw $7, (%rax), %xmm6"), "c5 fb 70 30 07");
+        assert_eq!(hex("vpshuflw $7, %ymm4, %ymm6"), "c5 ff 70 f4 07");
+        assert_eq!(hex("vpshufhw $7, %xmm4, %xmm6"), "c5 fa 70 f4 07");
+        assert_eq!(hex("vpshufhw $7, (%rax), %xmm6"), "c5 fa 70 30 07");
+        assert_eq!(hex("vpshufhw $7, %ymm4, %ymm6"), "c5 fe 70 f4 07");
+        // High registers force VEX3 (VEX2 has no X/B bits).
+        assert_eq!(hex("vpshuflw $7, %xmm12, %xmm9"), "c4 41 7b 70 cc 07");
+        // vpshufd (66) is unchanged by the pp generalization.
+        assert_eq!(hex("vpshufd $7, %xmm4, %xmm6"), "c5 f9 70 f4 07");
+    }
+
+    #[test]
+    fn vex_mem_source_forms() {
+        // Gap-sweep batch 2: every byte verified against GAS 2.47.
+        // VNNI memory sources deliberately stay VEX (6B) where GAS 2.47
+        // defaults to EVEX (7B); GAS accepts the VEX spelling explicitly.
+        assert_eq!(hex("vpdpbusd (%rax), %xmm1, %xmm2"), "c4 e2 71 50 10");
+        assert_eq!(
+            hex("vpdpbusd 0x20(%rax), %ymm1, %ymm2"),
+            "c4 e2 75 50 50 20"
+        );
+        assert_eq!(hex("vpdpbusds (%rax), %xmm1, %xmm2"), "c4 e2 71 51 10");
+        // Variable-shift count from memory (r/m = count, vvvv = data).
+        assert_eq!(hex("vpslld (%rax), %xmm6, %xmm7"), "c5 c9 f2 38");
+        assert_eq!(
+            hex("vpslld 8(%rdi,%rsi,4), %ymm1, %ymm2"),
+            "c5 f5 f2 54 b7 08"
+        );
+        assert_eq!(hex("vpsrlq (%rax), %xmm0, %xmm1"), "c5 f9 d3 08");
+        assert_eq!(hex("vptest (%rdi), %xmm4"), "c4 e2 79 17 27");
+        assert_eq!(hex("vptest 16(%rax), %ymm3"), "c4 e2 7d 17 58 10");
+        assert_eq!(hex("vpextrq $7, %xmm8, (%rdi)"), "c4 63 f9 16 07 07");
+        assert_eq!(hex("vpinsrq $7, (%rax), %xmm8, %xmm9"), "c4 63 b9 22 08 07");
+        assert_eq!(hex("vpinsrw $1, (%rax), %xmm1, %xmm2"), "c5 f1 c4 10 01");
+        assert_eq!(
+            hex("vpclmulqdq $0, (%rax), %xmm1, %xmm2"),
+            "c4 e3 71 44 10 00"
+        );
+        assert_eq!(
+            hex("vpclmulqdq $16, 32(%rdi), %xmm3, %xmm4"),
+            "c4 e3 61 44 67 20 10"
+        );
+    }
+
+    #[test]
+    fn vex_kmov_all_forms() {
+        // k<->k / k<->mem (90/91); pp/W per size class — GAS 2.47 oracle.
+        assert_eq!(hex("kmovb %k1, %k2"), "c5 f9 90 d1");
+        assert_eq!(hex("kmovw %k1, %k2"), "c5 f8 90 d1");
+        assert_eq!(hex("kmovd %k1, %k2"), "c4 e1 f9 90 d1");
+        assert_eq!(hex("kmovq %k1, %k2"), "c4 e1 f8 90 d1");
+        assert_eq!(hex("kmovb %k1, (%rax)"), "c5 f9 91 08");
+        assert_eq!(hex("kmovw %k1, (%rax)"), "c5 f8 91 08");
+        assert_eq!(hex("kmovd %k1, (%rax)"), "c4 e1 f9 91 08");
+        assert_eq!(hex("kmovq %k1, (%rax)"), "c4 e1 f8 91 08");
+        assert_eq!(hex("kmovb (%rax), %k2"), "c5 f9 90 10");
+        assert_eq!(hex("kmovd (%rax), %k2"), "c4 e1 f9 90 10");
+        assert_eq!(hex("kmovq (%rax), %k2"), "c4 e1 f8 90 10");
+        // GPR forms with high registers (R/B extension bits).
+        assert_eq!(hex("kmovq %r8, %k1"), "c4 c1 fb 92 c8");
+        assert_eq!(hex("kmovq %k1, %r15"), "c4 61 fb 93 f9");
+        assert_eq!(hex("kmovd %r8d, %k1"), "c4 c1 7b 92 c8");
+        assert_eq!(hex("kmovd %k1, %r15d"), "c5 7b 93 f9");
+        assert_eq!(hex("kmovw %r8d, %k1"), "c4 c1 78 92 c8");
+        assert_eq!(hex("kmovb %k1, %r15d"), "c5 79 93 f9");
+        assert!(fails("kmovb %k1"));
+        assert!(fails("kmovb %k1, %xmm2"));
+    }
+
+    #[test]
+    fn vex_kopmask() {
+        // NDS logic: VEX.L=1 is mandatory (L=0 decodes as `(bad)`).
+        assert_eq!(hex("kaddb %k1, %k2, %k0"), "c5 ed 4a c1");
+        assert_eq!(hex("kaddw %k1, %k2, %k0"), "c5 ec 4a c1");
+        assert_eq!(hex("kaddd %k1, %k2, %k0"), "c4 e1 ed 4a c1");
+        assert_eq!(hex("kaddq %k1, %k2, %k0"), "c4 e1 ec 4a c1");
+        assert_eq!(hex("kandb %k1, %k2, %k0"), "c5 ed 41 c1");
+        assert_eq!(hex("kandnb %k1, %k2, %k0"), "c5 ed 42 c1");
+        assert_eq!(hex("korb %k1, %k2, %k0"), "c5 ed 45 c1");
+        assert_eq!(hex("kxnorb %k1, %k2, %k0"), "c5 ed 46 c1");
+        assert_eq!(hex("kxorb %k1, %k2, %k0"), "c5 ed 47 c1");
+        assert_eq!(hex("kxorq %k1, %k2, %k0"), "c4 e1 ec 47 c1");
+        assert_eq!(hex("kunpckbw %k1, %k2, %k0"), "c5 ed 4b c1");
+        assert_eq!(hex("kunpckwd %k1, %k2, %k0"), "c5 ec 4b c1");
+        assert_eq!(hex("kunpckdq %k1, %k2, %k0"), "c4 e1 ec 4b c1");
+        // 2-op: L=0, vvvv unused.
+        assert_eq!(hex("knotb %k1, %k2"), "c5 f9 44 d1");
+        assert_eq!(hex("knotq %k1, %k2"), "c4 e1 f8 44 d1");
+        assert_eq!(hex("kortestb %k1, %k2"), "c5 f9 98 d1");
+        assert_eq!(hex("kortestw %k1, %k2"), "c5 f8 98 d1");
+        assert_eq!(hex("ktestb %k1, %k2"), "c5 f9 99 d1");
+        assert_eq!(hex("ktestd %k1, %k2"), "c4 e1 f9 99 d1");
+        // Shifts: 0F3A map (VEX3-only), pp=66, W=b:W0 w:W1 d:W0 q:W1.
+        assert_eq!(hex("kshiftlb $3, %k6, %k5"), "c4 e3 79 32 ee 03");
+        assert_eq!(hex("kshiftrb $3, %k6, %k5"), "c4 e3 79 30 ee 03");
+        assert_eq!(hex("kshiftlw $3, %k6, %k5"), "c4 e3 f9 32 ee 03");
+        assert_eq!(hex("kshiftrw $3, %k6, %k5"), "c4 e3 f9 30 ee 03");
+        assert_eq!(hex("kshiftld $3, %k6, %k5"), "c4 e3 79 33 ee 03");
+        assert_eq!(hex("kshiftrd $3, %k6, %k5"), "c4 e3 79 31 ee 03");
+        assert_eq!(hex("kshiftlq $3, %k6, %k5"), "c4 e3 f9 33 ee 03");
+        assert_eq!(hex("kshiftrq $3, %k6, %k5"), "c4 e3 f9 31 ee 03");
+        assert!(fails("kaddb %k1, %k2"));
+        assert!(fails("kaddb %eax, %k2, %k0"));
+        assert!(fails("knotb %k1, %xmm2"));
+    }
+
+    #[test]
+    fn legacy_movbe_adx_suffixless() {
+        // Legacy mem<->reg, all sizes — GAS 2.47 oracle.
+        assert_eq!(hex("movbew (%rax), %cx"), "66 0f 38 f0 08");
+        assert_eq!(hex("movbew %cx, (%rax)"), "66 0f 38 f1 08");
+        assert_eq!(hex("movbel (%rax), %ecx"), "0f 38 f0 08");
+        assert_eq!(hex("movbel %ecx, (%rax)"), "0f 38 f1 08");
+        assert_eq!(hex("movbeq (%rax), %rcx"), "48 0f 38 f0 08");
+        assert_eq!(hex("movbeq %rcx, (%rax)"), "48 0f 38 f1 08");
+        // Suffixless size inference from the register operand.
+        assert_eq!(hex("movbe (%rax), %ecx"), "0f 38 f0 08");
+        assert_eq!(hex("movbe %r8, (%rdi)"), "4c 0f 38 f1 07");
+        assert_eq!(hex("movbe (%rax), %cx"), "66 0f 38 f0 08");
+        // reg-reg exists only as APX EVEX (GAS emits it unconditionally).
+        assert_eq!(hex("movbe %ax, %bx"), "62 f4 7d 08 60 d8");
+        assert_eq!(hex("movbe %eax, %ebx"), "62 f4 7c 08 60 d8");
+        assert_eq!(hex("movbe %rax, %rbx"), "62 f4 fc 08 60 d8");
+        assert_eq!(hex("movbe %r8w, %r9w"), "62 54 7d 08 60 c8");
+        // Suffixless ADX inference (no 16/8-bit forms — GAS rejects those).
+        assert_eq!(hex("adcx %edx, %ecx"), "66 0f 38 f6 ca");
+        assert_eq!(hex("adcx %rdx, %rcx"), "66 48 0f 38 f6 ca");
+        assert_eq!(hex("adcx (%rax), %r8"), "66 4c 0f 38 f6 00");
+        assert_eq!(hex("adox %edx, %ecx"), "f3 0f 38 f6 ca");
+        assert_eq!(hex("adox (%rax), %rcx"), "f3 48 0f 38 f6 08");
+        assert!(fails("adcx %ax, %bx"));
+        assert!(fails("adox %al, %bl"));
+        assert!(fails("movbe $1, %eax"));
+        assert!(fails("movbe (%rax), %xmm0"));
+        assert!(fails("movbe (%rax), (%rbx)"));
+    }
+
+    #[test]
+    fn dot_s_suffix_ignored() {
+        // GAS 2.47 accepts `.s` on any instruction mnemonic (case-insensitive).
+        assert_eq!(hex("nop.s"), "90");
+        assert_eq!(hex("nop.s"), hex("nop"));
+        assert_eq!(hex("adcb.s %dl, (%rax)"), hex("adcb %dl, (%rax)"));
+        assert_eq!(hex("adcl.s (%rax), %ecx"), "13 08");
+        assert_eq!(hex("vpcmpeqb.s %xmm1, %xmm2, %xmm3"), "c5 e9 74 d9");
+        assert_eq!(hex("ADDQ.S %rax, (%rbx)"), hex("addq %rax, (%rbx)"));
+        // ... except on standalone prefixes, which GAS rejects.
+        assert!(fails("lock.s addl %eax, %ebx"));
+    }
+
+    #[test]
+    fn evex_fma_addsub_subadd() {
+        // EVEX + VEX packed addsub/subadd — GAS 2.47 oracle.
+        assert_eq!(
+            hex("vfmaddsub132pd %zmm4, %zmm5, %zmm6"),
+            "62 f2 d5 48 96 f4"
+        );
+        assert_eq!(
+            hex("vfmaddsub132ps %zmm4, %zmm5, %zmm6"),
+            "62 f2 55 48 96 f4"
+        );
+        assert_eq!(
+            hex("vfmaddsub213pd %zmm4, %zmm5, %zmm6"),
+            "62 f2 d5 48 a6 f4"
+        );
+        assert_eq!(
+            hex("vfmaddsub231ps %zmm4, %zmm5, %zmm6"),
+            "62 f2 55 48 b6 f4"
+        );
+        assert_eq!(
+            hex("vfmsubadd132pd %zmm4, %zmm5, %zmm6"),
+            "62 f2 d5 48 97 f4"
+        );
+        assert_eq!(
+            hex("vfmsubadd213ps %zmm4, %zmm5, %zmm6"),
+            "62 f2 55 48 a7 f4"
+        );
+        assert_eq!(
+            hex("vfmsubadd231pd %zmm4, %zmm5, %zmm6"),
+            "62 f2 d5 48 b7 f4"
+        );
+        assert_eq!(hex("vfmaddsub132pd %ymm4, %ymm5, %ymm6"), "c4 e2 d5 96 f4");
+        assert_eq!(hex("vfmsubadd231ps %xmm4, %xmm5, %xmm6"), "c4 e2 51 b7 f4");
+    }
+
+    #[test]
+    fn vex_pmovzx_sx_qword() {
+        // The missing *bq/*wq quadword-dest VEX forms — GAS 2.47 oracle.
+        assert_eq!(hex("vpmovzxbq %xmm4, %xmm6"), "c4 e2 79 32 f4");
+        assert_eq!(hex("vpmovzxbq (%rax), %xmm6"), "c4 e2 79 32 30");
+        assert_eq!(hex("vpmovzxbq %xmm4, %ymm6"), "c4 e2 7d 32 f4");
+        assert_eq!(hex("vpmovzxwq %xmm4, %xmm6"), "c4 e2 79 34 f4");
+        assert_eq!(hex("vpmovzxwq %xmm4, %ymm6"), "c4 e2 7d 34 f4");
+        assert_eq!(hex("vpmovsxbq %xmm4, %xmm6"), "c4 e2 79 22 f4");
+        assert_eq!(hex("vpmovsxbq (%rax), %xmm6"), "c4 e2 79 22 30");
+        assert_eq!(hex("vpmovsxbq %xmm4, %ymm6"), "c4 e2 7d 22 f4");
+        assert_eq!(hex("vpmovsxwq %xmm4, %xmm6"), "c4 e2 79 24 f4");
+        assert_eq!(hex("vpmovsxwq %xmm4, %ymm6"), "c4 e2 7d 24 f4");
+    }
+
+    #[test]
+    fn vex_gfni() {
+        // VEX GFNI (affine forms are W1) — GAS 2.47 oracle.
+        assert_eq!(hex("vgf2p8mulb %xmm1, %xmm2, %xmm3"), "c4 e2 69 cf d9");
+        assert_eq!(hex("vgf2p8mulb (%rax), %xmm2, %xmm3"), "c4 e2 69 cf 18");
+        assert_eq!(hex("vgf2p8mulb %ymm1, %ymm2, %ymm3"), "c4 e2 6d cf d9");
+        assert_eq!(
+            hex("vgf2p8affineqb $0xab, %xmm4, %xmm5, %xmm6"),
+            "c4 e3 d1 ce f4 ab"
+        );
+        assert_eq!(
+            hex("vgf2p8affineqb $0xab, (%rax), %xmm5, %xmm6"),
+            "c4 e3 d1 ce 30 ab"
+        );
+        assert_eq!(
+            hex("vgf2p8affineqb $0xab, %ymm4, %ymm5, %ymm6"),
+            "c4 e3 d5 ce f4 ab"
+        );
+        assert_eq!(
+            hex("vgf2p8affineinvqb $0xab, %xmm4, %xmm5, %xmm6"),
+            "c4 e3 d1 cf f4 ab"
+        );
+        assert_eq!(
+            hex("vgf2p8affineinvqb $0xab, (%rax), %xmm5, %xmm6"),
+            "c4 e3 d1 cf 30 ab"
+        );
+        assert_eq!(
+            hex("vgf2p8affineinvqb $0xab, %ymm4, %ymm5, %ymm6"),
+            "c4 e3 d5 cf f4 ab"
+        );
+    }
+
+    #[test]
+    fn evex_cvt_usi() {
+        // EVEX scalar unsigned converts are AVX512F-only: GAS 2.47 emits
+        // EVEX unadorned (vvvv=1, LIG, no mask/broadcast/SAE).
+        assert_eq!(hex("vcvtsd2usi %xmm0, %eax"), "62 f1 7f 08 79 c0");
+        assert_eq!(hex("vcvtsd2usi %xmm0, %rax"), "62 f1 ff 08 79 c0");
+        assert_eq!(hex("vcvtss2usi (%rax), %eax"), "62 f1 7e 08 79 00");
+        assert_eq!(hex("vcvttsd2usi %xmm0, %rax"), "62 f1 ff 08 78 c0");
+        assert_eq!(hex("vcvttss2usi (%rax), %rax"), "62 f1 fe 08 78 00");
+        assert_eq!(hex("vcvtusi2sdl %eax, %xmm1, %xmm2"), "62 f1 77 08 7b d0");
+        assert_eq!(hex("vcvtusi2sdq %rax, %xmm1, %xmm2"), "62 f1 f7 08 7b d0");
+        assert_eq!(hex("vcvtusi2ss (%rax), %xmm1, %xmm2"), "62 f1 76 08 7b 10");
+    }
+
+    #[test]
+    fn prefix_hle_stacking() {
+        // HLE prefix pairs canonicalize to F2/F3 F0 regardless of source
+        // order; xchg/xrelease-mov-store need no `lock` (GAS 2.47 oracle).
+        assert_eq!(hex("lock adcb $1, (%rax)"), "f0 80 10 01");
+        assert_eq!(hex("lock xacquire adcb $1, (%rax)"), "f2 f0 80 10 01");
+        assert_eq!(hex("xacquire lock adcb $1, (%rax)"), "f2 f0 80 10 01");
+        assert_eq!(hex("lock xrelease adcb $1, (%rax)"), "f3 f0 80 10 01");
+        assert_eq!(hex("lock xacquire addw $1, (%rax)"), "66 f2 f0 83 00 01");
+        assert_eq!(hex("xrelease movb %al, (%rbx)"), "f3 88 03");
+        assert_eq!(hex("xacquire xchg %eax, (%rbx)"), "f2 87 03");
+        assert_eq!(hex("xrelease xchg %rax, (%rbx)"), "f3 48 87 03");
+        // Standalone segment overrides ride ahead of the body (`gs addw`
+        // is 65 66, not 66 65).
+        assert_eq!(hex("gs addw $1, (%rax)"), "65 66 83 00 01");
+        assert_eq!(hex("gs rep movsb"), "65 f3 a4");
+    }
+
+    #[test]
+    fn evex_vpermil() {
+        // EVEX.66.0F3A $imm forms — GAS 2.47 oracle.
+        assert_eq!(hex("vpermilpd $0xab, %zmm5, %zmm6"), "62 f3 fd 48 05 f5 ab");
+        assert_eq!(
+            hex("vpermilpd $0xab, (%rax), %zmm6"),
+            "62 f3 fd 48 05 30 ab"
+        );
+        assert_eq!(
+            hex("vpermilpd $0xab, %zmm5, %zmm6{%k7}{z}"),
+            "62 f3 fd cf 05 f5 ab"
+        );
+        assert_eq!(hex("vpermilps $0xab, %zmm5, %zmm6"), "62 f3 7d 48 04 f5 ab");
+        assert_eq!(
+            hex("vpermilps $0xab, %zmm5, %zmm6{%k7}"),
+            "62 f3 7d 4f 04 f5 ab"
+        );
+    }
+
+    #[test]
+    fn evex_vpconflict() {
+        // AVX512CD conflict detection — GAS 2.47 oracle.
+        assert_eq!(hex("vpconflictd %zmm5, %zmm6"), "62 f2 7d 48 c4 f5");
+        assert_eq!(hex("vpconflictd (%rax), %zmm6"), "62 f2 7d 48 c4 30");
+        assert_eq!(hex("vpconflictd %zmm5, %zmm6{%k7}{z}"), "62 f2 7d cf c4 f5");
+        assert_eq!(hex("vpconflictq %zmm5, %zmm6"), "62 f2 fd 48 c4 f5");
+        assert_eq!(hex("vpconflictq (%rax){1to8}, %zmm6"), "62 f2 fd 58 c4 30");
+    }
+
+    #[test]
+    fn evex_shift_count() {
+        // EVEX shifts by xmm/m128 count (ModRM.reg = dst) — GAS 2.47 oracle.
+        assert_eq!(hex("vpsllw %xmm4, %zmm5, %zmm6"), "62 f1 55 48 f1 f4");
+        assert_eq!(hex("vpsllw (%rax), %zmm5, %zmm6"), "62 f1 55 48 f1 30");
+        assert_eq!(hex("vpsllq %xmm4, %zmm5, %zmm6"), "62 f1 d5 48 f3 f4");
+        assert_eq!(hex("vpsraq (%rax), %zmm5, %zmm6"), "62 f1 d5 48 e2 30");
+        assert_eq!(hex("vpsrlq %xmm4, %zmm5, %zmm6"), "62 f1 d5 48 d3 f4");
+        assert_eq!(
+            hex("vpsllw %xmm4, %zmm5, %zmm6{%k7}{z}"),
+            "62 f1 55 cf f1 f4"
+        );
     }
 
     #[test]

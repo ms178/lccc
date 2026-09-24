@@ -1156,11 +1156,15 @@ impl super::InstructionEncoder {
 
     /// 0F3A-map VEX with explicit pp and imm8 where AT&T operands are
     /// (imm, src2, src1, dst) — vpclmulqdq. vvvv = src1, r/m = src2.
+    /// 0F3A AVX ($imm, src2, src1, dst): vpclmulqdq (W0) and the GFNI
+    /// affine forms (W1: GAS emits `c4 e3 d1 ce ...` for `vgf2p8affineqb`).
+    /// Mirrors the x86-64 helper (reg + mem src2).
     pub(crate) fn encode_avx_3op_3a_pp_imm8(
         &mut self,
         ops: &[Operand],
         opcode: u8,
         pp: u8,
+        w: u8,
     ) -> Result<(), String> {
         if ops.len() != 4 {
             return Err("AVX 3A imm8 op requires 4 operands (imm, src2, src1, dst)".to_string());
@@ -1178,9 +1182,22 @@ impl super::InstructionEncoder {
                 let r = needs_vex_ext(&dst.name);
                 let b = needs_vex_ext(&src2.name);
                 let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
-                self.emit_vex(r, false, b, 3, 0, vvvv_enc, l, pp);
+                self.emit_vex(r, false, b, 3, w, vvvv_enc, l, pp);
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src2_num));
+                self.bytes.push(imm);
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(src1), Operand::Register(dst)) => {
+                let src1_num = reg_num(&src1.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                let vvvv_enc = src1_num | (if needs_vex_ext(&src1.name) { 8 } else { 0 });
+                self.emit_vex(r, x, b_ext, 3, w, vvvv_enc, l, pp);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)?;
                 self.bytes.push(imm);
                 Ok(())
             }
@@ -1523,6 +1540,19 @@ mod tests {
             "vpshuflw $1, %xmm2, %xmm0\n",
             "vpshufd $1, (%eax), %xmm0\n",
             "vsqrtss %xmm1, %xmm2, %xmm0\n",
+            "vpmovsxbq %xmm4, %xmm6\n",
+            "vpmovsxbq (%eax), %xmm6\n",
+            "vpmovsxwq %xmm4, %ymm6\n",
+            "vgf2p8mulb %xmm1, %xmm2, %xmm3\n",
+            "vgf2p8mulb (%eax), %xmm2, %xmm3\n",
+            "vgf2p8affineqb $0xab, %xmm4, %xmm5, %xmm6\n",
+            "vgf2p8affineqb $0xab, (%eax), %xmm5, %xmm6\n",
+            "vgf2p8affineinvqb $0xab, %ymm4, %ymm5, %ymm6\n",
+            "vpermilpd $0xab, %xmm5, %xmm6\n",
+            "vpermilpd $0xab, (%eax), %xmm6\n",
+            "vpermilps $0xab, %ymm5, %ymm6\n",
+            "vfmaddsub132ps %ymm1, %ymm2, %ymm3\n",
+            "vpclmulqdq $0x10, %xmm1, %xmm2, %xmm3\n",
         );
         let golden: &[u8] = &[
             0xc4, 0xe2, 0xe9, 0xb9, 0xc3, // vfmadd231sd %xmm3,%xmm2,%xmm0
@@ -1542,6 +1572,19 @@ mod tests {
             0xc5, 0xfb, 0x70, 0xc2, 0x01, // vpshuflw $1,%xmm2,%xmm0
             0xc5, 0xf9, 0x70, 0x00, 0x01, // vpshufd $1,(%eax),%xmm0
             0xc5, 0xea, 0x51, 0xc1, // vsqrtss %xmm1,%xmm2,%xmm0
+            0xc4, 0xe2, 0x79, 0x22, 0xf4, // vpmovsxbq %xmm4,%xmm6
+            0xc4, 0xe2, 0x79, 0x22, 0x30, // vpmovsxbq (%eax),%xmm6
+            0xc4, 0xe2, 0x7d, 0x24, 0xf4, // vpmovsxwq %xmm4,%ymm6
+            0xc4, 0xe2, 0x69, 0xcf, 0xd9, // vgf2p8mulb %xmm1,%xmm2,%xmm3
+            0xc4, 0xe2, 0x69, 0xcf, 0x18, // vgf2p8mulb (%eax),%xmm2,%xmm3
+            0xc4, 0xe3, 0xd1, 0xce, 0xf4, 0xab, // vgf2p8affineqb $0xab,%xmm4,%xmm5,%xmm6
+            0xc4, 0xe3, 0xd1, 0xce, 0x30, 0xab, // vgf2p8affineqb $0xab,(%eax),%xmm5,%xmm6
+            0xc4, 0xe3, 0xd5, 0xcf, 0xf4, 0xab, // vgf2p8affineinvqb $0xab,%ymm4,%ymm5,%ymm6
+            0xc4, 0xe3, 0x79, 0x05, 0xf5, 0xab, // vpermilpd $0xab,%xmm5,%xmm6
+            0xc4, 0xe3, 0x79, 0x05, 0x30, 0xab, // vpermilpd $0xab,(%eax),%xmm6
+            0xc4, 0xe3, 0x7d, 0x04, 0xf5, 0xab, // vpermilps $0xab,%ymm5,%ymm6
+            0xc4, 0xe2, 0x6d, 0x96, 0xd9, // vfmaddsub132ps %ymm1,%ymm2,%ymm3
+            0xc4, 0xe3, 0x69, 0x44, 0xd9, 0x10, // vpclmulqdq $0x10,%xmm1,%xmm2,%xmm3
         ];
         assert_eq!(assemble_text(asm), golden);
     }
