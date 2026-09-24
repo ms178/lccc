@@ -204,7 +204,41 @@ _COMMUTATIVE_VEX = {
     # Integer 0F-map ops LCCC may source-swap to reach VEX2 (not FP add/mul).
     "vpmuludq", "vpsadbw", "vpmaddwd",
 }
+# VEX packed-FP compare pseudos with operand-symmetric predicates
+# ((imm&31)&7 in {eq,unord,neq,ord}, every _q/_s flavor + true/false):
+# objdump always disassembles VEX C2 to these spellings (never `vcmpps $imm`),
+# and LCCC/clang/icx may exchange the sources to reach the 2-byte VEX prefix.
+# Scalar (ss/sd) and ordered-predicate pseudos are deliberately absent: the
+# merge lane makes scalar swaps unsound and no oracle swaps ordered compares.
+_COMMUTATIVE_VEX_CMP = {
+    "vcmpeqps", "vcmpeqpd", "vcmpunordps", "vcmpunordpd",
+    "vcmpneqps", "vcmpneqpd", "vcmpordps", "vcmpordpd",
+    "vcmpeq_uqps", "vcmpeq_uqpd", "vcmpfalseps", "vcmpfalsepd",
+    "vcmpneq_oqps", "vcmpneq_oqpd", "vcmptrueps", "vcmptruepd",
+    "vcmpeq_osps", "vcmpeq_ospd", "vcmpunord_sps", "vcmpunord_spd",
+    "vcmpneq_usps", "vcmpneq_uspd", "vcmpord_sps", "vcmpord_spd",
+    "vcmpeq_usps", "vcmpeq_uspd", "vcmpfalse_osps", "vcmpfalse_ospd",
+    "vcmpneq_osps", "vcmpneq_ospd", "vcmptrue_usps", "vcmptrue_uspd",
+}
 _VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
+_VEXCMP_IMM = re.compile(r"^(vcmpps|vcmppd)\s+\$(0x[0-9a-f]+|\d+),(%\S+),(%\S+),(%\S+)$")
+
+
+def _vcmp_imm_symmetric(text: str) -> bool:
+    """True when a VCMP numbered imm selects an operand-symmetric predicate.
+
+    objdump prints the pseudo-mnemonic only for imm 0-31; larger immediates
+    (GAS accepts the full imm8, e.g. `$0xab`) disassemble numbered. The
+    predicate lives in the low 5 bits; relations eq/unord/neq/ord (imm&7 in
+    {0,3,4,7}) are symmetric in every flavor, true/false included.
+    """
+    try:
+        imm = int(text, 0)
+    except ValueError:
+        return False
+    return ((imm & 31) & 7) in (0, 3, 4, 7)
+
+
 _GP32_TO_64 = {
     "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
     "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
@@ -220,11 +254,16 @@ def _canon_commutative(insn: str) -> str:
     disassembly differs textually while the operation is identical. Restricted
     to integer and bitwise ops: FP add/mul propagate SRC1's NaN payload.
     """
-    m = _VEX3.match(insn.strip())
-    if not m or m.group(1) not in _COMMUTATIVE_VEX:
-        return insn
-    a, b = sorted((m.group(2), m.group(3)))
-    return f"{m.group(1)} {a},{b},{m.group(4)}"
+    s = insn.strip()
+    m = _VEX3.match(s)
+    if m and (m.group(1) in _COMMUTATIVE_VEX or m.group(1) in _COMMUTATIVE_VEX_CMP):
+        a, b = sorted((m.group(2), m.group(3)))
+        return f"{m.group(1)} {a},{b},{m.group(4)}"
+    m = _VEXCMP_IMM.match(s)
+    if m and _vcmp_imm_symmetric(m.group(2)):
+        a, b = sorted((m.group(3), m.group(4)))
+        return f"{m.group(1)} ${m.group(2)},{a},{b},{m.group(5)}"
+    return insn
 
 
 def _canon_mov_imm(insn: str) -> str:

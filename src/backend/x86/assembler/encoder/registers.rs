@@ -752,6 +752,139 @@ fn is_mixed_width_mnemonic(m: &str) -> bool {
     PREFIXES.iter().any(|p| m.starts_with(p))
 }
 
+/// `movd`/`movq`/`vmovd`/`vmovq` shape validation (GAS 2.47 texts).
+///
+/// The GP side is r32/r64 for `movd`, r64-only for `movq` (an r32/r16/r8
+/// there is `operand type mismatch'); the vector side is mm/xmm for SSE,
+/// xmm-only for VEX (an mm, ymm, zmm, k-mask or segment register there is
+/// likewise `operand type mismatch'); mm and xmm never mix; and `movd`
+/// has no vector-vector form (`movd %xmm0,%xmm1` is `operand type
+/// mismatch', only `movq` moves xmm<->xmm). Memory sides are unsized
+/// (m32/m64) and always accepted. Anything else (immediates, labels) is
+/// passed through to the encoder diagnostics.
+fn check_movdq_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+    if ops.len() != 2 {
+        return Err(format!("number of operands mismatch for `{mnemonic}'"));
+    }
+    let type_err = || format!("operand type mismatch for `{mnemonic}'");
+    let quad = mnemonic.ends_with('q');
+    let vex = mnemonic.starts_with('v');
+    for op in ops {
+        if let Operand::Register(r) = op {
+            let ok = match reg_class(&r.name) {
+                RegClass::Gp(4) => !quad,
+                RegClass::Gp(8) => true,
+                RegClass::Mmx => !vex,
+                RegClass::Xmm => true,
+                _ => false,
+            };
+            if !ok {
+                return Err(type_err());
+            }
+        }
+    }
+    let has_mm = ops.iter().any(
+        |op| matches!(op, Operand::Register(r) if matches!(reg_class(&r.name), RegClass::Mmx)),
+    );
+    let has_xmm = ops.iter().any(
+        |op| matches!(op, Operand::Register(r) if matches!(reg_class(&r.name), RegClass::Xmm)),
+    );
+    if has_mm && has_xmm {
+        return Err(type_err());
+    }
+    if !quad && (has_mm || has_xmm) {
+        let both_vec = ops.iter().all(|op| {
+            matches!(op, Operand::Register(r)
+                if matches!(reg_class(&r.name), RegClass::Mmx | RegClass::Xmm))
+        });
+        if both_vec {
+            return Err(type_err());
+        }
+    }
+    Ok(())
+}
+
+/// `pextr`/`pinsr` shape validation, SSE and VEX (GAS 2.47 texts).
+///
+/// Extracts are (imm, xmm, dst), inserts (imm, src, vsrc[, dst]). The
+/// element side takes r32/r64/mem for `b`/`w` (an r8/r16/vec/k-mask
+/// there is `operand type mismatch'), r32/mem for `d` and r64/mem for
+/// `q` (a wrong-width GPR there is `operand size mismatch', a non-GPR
+/// is `operand type mismatch'). The xmm sides accept xmm only (ymm is
+/// `operand size mismatch', anything else `operand type mismatch').
+/// Memory sides are unsized and always accepted; unknown suffixes and
+/// non-register/mem sides pass through to the encoder diagnostics.
+fn check_pextr_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+    let is_ins = mnemonic.contains("pinsr");
+    let dq_width: Option<u8> = match mnemonic.chars().last() {
+        Some('b') | Some('w') => None,
+        Some('d') => Some(4),
+        Some('q') => Some(8),
+        _ => return Ok(()),
+    };
+    let vex = mnemonic.starts_with('v');
+    let expect = if !is_ins {
+        3
+    } else if vex {
+        4
+    } else {
+        3
+    };
+    if ops.len() != expect {
+        return Err(format!("number of operands mismatch for `{mnemonic}'"));
+    }
+    let type_err = || format!("operand type mismatch for `{mnemonic}'");
+    let size_err = || format!("operand size mismatch for `{mnemonic}'");
+    // Element side (extract destination / insert source).
+    let check_elem = |op: &Operand| -> Result<(), String> {
+        match op {
+            Operand::Register(r) => match reg_class(&r.name) {
+                RegClass::Gp(w) => match dq_width {
+                    None => {
+                        if w == 4 || w == 8 {
+                            Ok(())
+                        } else {
+                            Err(type_err())
+                        }
+                    }
+                    Some(ew) => {
+                        if w == ew {
+                            Ok(())
+                        } else {
+                            Err(size_err())
+                        }
+                    }
+                },
+                _ => Err(type_err()),
+            },
+            Operand::Memory(_) => Ok(()),
+            _ => Ok(()),
+        }
+    };
+    // XMM side (extract source / insert vsrc+dest).
+    let check_xmm = |op: &Operand| -> Result<(), String> {
+        match op {
+            Operand::Register(r) => match reg_class(&r.name) {
+                RegClass::Xmm => Ok(()),
+                RegClass::Ymm | RegClass::Zmm => Err(size_err()),
+                _ => Err(type_err()),
+            },
+            _ => Err(type_err()),
+        }
+    };
+    if !is_ins {
+        check_xmm(&ops[1])?;
+        check_elem(&ops[2])?;
+    } else {
+        check_elem(&ops[1])?;
+        check_xmm(&ops[2])?;
+        if vex {
+            check_xmm(&ops[3])?;
+        }
+    }
+    Ok(())
+}
+
 /// Validate that an instruction's operands are mutually consistent.
 ///
 /// This catches the class of malformed input that would otherwise be encoded
@@ -763,25 +896,30 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
     // exempt from the uniform-width rule ONLY when a vector register is
     // actually involved. As a plain GP move, `movq %rax,%eax` is just as
     // malformed as `mov %rax,%eax` and must be rejected.
-    let vector_movdq = matches!(mnemonic, "movd" | "movq" | "vmovd" | "vmovq")
+    // `movd`/`movq` cross register files (`movq %xmm0,%rax`), so they are
+    // exempt from the uniform-width rule ONLY when a vector register is
+    // actually involved. As a plain GP move, `movq %rax,%eax` is just as
+    // malformed as `mov %rax,%eax` and must be rejected. Vector-involved
+    // forms take the GAS-exact shape check (which also rejects ymm/zmm).
+    if matches!(mnemonic, "movd" | "movq" | "vmovd" | "vmovq")
         && ops.iter().any(|op| {
             matches!(op, Operand::Register(r)
             if matches!(reg_class(&r.name),
                         RegClass::Xmm | RegClass::Ymm | RegClass::Zmm | RegClass::Mmx))
-        });
-    if vector_movdq {
-        // Still enforce that no ymm/zmm operand appears: movq is 64-bit only.
-        for op in ops {
-            if let Operand::Register(r) = op {
-                if matches!(reg_class(&r.name), RegClass::Ymm | RegClass::Zmm) {
-                    return Err(format!(
-                        "`{}` operand must be xmm or GPR: %{}",
-                        mnemonic, r.name
-                    ));
-                }
-            }
-        }
-        return Ok(());
+        })
+    {
+        return check_movdq_shape(mnemonic, ops);
+    }
+
+    // `pextr`/`pinsr` (SSE and VEX) take the GAS-exact shape check: the
+    // encoders derive everything from operand position and would
+    // otherwise mis-assemble wrong-width vectors and GPRs silently.
+    if mnemonic.starts_with("pextr")
+        || mnemonic.starts_with("pinsr")
+        || mnemonic.starts_with("vpextr")
+        || mnemonic.starts_with("vpinsr")
+    {
+        return check_pextr_shape(mnemonic, ops);
     }
 
     // 1. SIB scale must be 1/2/4/8; %rsp can never be an index.
@@ -790,8 +928,7 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
             if let Some(scale) = m.scale {
                 if !matches!(scale, 1 | 2 | 4 | 8) {
                     return Err(format!(
-                        "invalid address scale {} (must be 1, 2, 4 or 8)",
-                        scale
+                        "expecting scale factor of 1, 2, 4, or 8: got `{scale}'"
                     ));
                 }
             }
@@ -846,20 +983,6 @@ pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), S
             if let Operand::Register(r) = op {
                 if reg_class(&r.name) == RegClass::Gp(1) {
                     return Err(format!("`{}` has no 8-bit form: %{}", mnemonic, r.name));
-                }
-            }
-        }
-    }
-
-    // 2c. `movd`/`movq` never take a ymm/zmm operand.
-    if matches!(mnemonic, "movd" | "movq" | "vmovd" | "vmovq") {
-        for op in ops {
-            if let Operand::Register(r) = op {
-                if matches!(reg_class(&r.name), RegClass::Ymm | RegClass::Zmm) {
-                    return Err(format!(
-                        "`{}` operand must be xmm or GPR: %{}",
-                        mnemonic, r.name
-                    ));
                 }
             }
         }

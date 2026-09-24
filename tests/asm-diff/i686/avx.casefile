@@ -1,0 +1,62 @@
+;;; pmovsx_qword
+.text
+vpmovsxbq %xmm4, %xmm6
+vpmovsxbq (%eax), %xmm6
+vpmovsxbq %xmm4, %ymm6
+vpmovsxwq %xmm4, %xmm6
+vpmovsxwq (%eax), %xmm6
+vpmovsxwq %xmm4, %ymm6
+;;; gfni_vex
+.text
+vgf2p8mulb %xmm1, %xmm2, %xmm3
+vgf2p8mulb (%eax), %xmm2, %xmm3
+vgf2p8mulb %ymm1, %ymm2, %ymm3
+vgf2p8affineqb $0xab, %xmm4, %xmm5, %xmm6
+vgf2p8affineqb $0xab, (%eax), %xmm5, %xmm6
+vgf2p8affineqb $0xab, %ymm4, %ymm5, %ymm6
+vgf2p8affineinvqb $0xab, %xmm4, %xmm5, %xmm6
+vgf2p8affineinvqb $0xab, (%eax), %xmm5, %xmm6
+vgf2p8affineinvqb $0xab, %ymm4, %ymm5, %ymm6
+;;; permil_imm
+.text
+vpermilpd $0xab, %xmm5, %xmm6
+vpermilpd $0xab, (%eax), %xmm6
+vpermilpd $0xab, %ymm5, %ymm6
+vpermilps $0xab, %xmm5, %xmm6
+vpermilps $0xab, (%eax), %xmm6
+vpermilps $0xab, %ymm5, %ymm6
+vpermilpd %xmm5, %xmm4, %xmm6
+vpermilps %ymm5, %ymm4, %ymm6
+;;; fma_addsub_vex
+.text
+vfmaddsub132ps %xmm1, %xmm2, %xmm3
+vfmaddsub213ps %xmm1, %xmm2, %xmm3
+vfmaddsub231ps %xmm1, %xmm2, %xmm3
+vfmsubadd132ps %ymm1, %ymm2, %ymm3
+vfmsubadd213ps %ymm1, %ymm2, %ymm3
+vfmsubadd231ps %ymm1, %ymm2, %ymm3
+;;; cmp_pseudo_scalar
+.text
+vcmpeqps %xmm6, %xmm2, %xmm3
+vcmpltps %xmm6, %xmm2, %xmm3
+vcmpfalseps %xmm6, %xmm2, %xmm3
+vcmptrueps %xmm6, %xmm2, %xmm3
+vcmpeqpd %xmm6, %xmm2, %xmm3
+vcmpltpd %xmm6, %xmm2, %xmm3
+vcmpfalsepd %xmm6, %xmm2, %xmm3
+vcmptruepd %xmm6, %xmm2, %xmm3
+vcmpeqss %xmm6, %xmm2, %xmm3
+vcmpltss %xmm6, %xmm2, %xmm3
+vcmpfalsess %xmm6, %xmm2, %xmm3
+vcmptruess %xmm6, %xmm2, %xmm3
+vcmpeqsd %xmm6, %xmm2, %xmm3
+vcmpltsd %xmm6, %xmm2, %xmm3
+vcmpfalsesd %xmm6, %xmm2, %xmm3
+vcmptruesd %xmm6, %xmm2, %xmm3
+vcmpps $8, %xmm6, %xmm2, %xmm3
+vcmppd $8, %xmm6, %xmm2, %xmm3
+vcmpss $8, %xmm6, %xmm2, %xmm3
+vcmpsd $8, %xmm6, %xmm2, %xmm3
+vcmpeqps %ymm6, %ymm2, %ymm3
+vcmpeqps (%eax), %xmm2, %xmm3
+vcmpeqss (%eax), %xmm2, %xmm3

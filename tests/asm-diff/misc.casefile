@@ -586,3 +586,37 @@ movq $4294967296, %rax
 movq $-4294967295, %rax
 movabsq $4294967295, %rax
 movl $4294967295, %eax
+;;; dot_s_suffix
+.text
+nop.s
+adcb.s %dl, (%rax)
+adcl.s (%rax), %ecx
+cmpq.s %rdx, (%rax)
+xorb.s $3, (%rax)
+subw.s %dx, (%rax)
+movapd.s %xmm0, (%rax)
+movdqa.s (%rax), %xmm1
+movsd.s %xmm0, (%rax)
+vpcmpeqb.s %xmm1, %xmm2, %xmm3
+ADDQ.S %rax, (%rbx)
+dots_target:
+je.s dots_target
+jne.s dots_target
+jmp.s dots_target
+sb_target:
+jecxz sb_target
+jecxz.s sb_target
+loope sb_target
+loope.s sb_target
+loopz sb_target
+loopne sb_target
+loopne.s sb_target
+loopnz sb_target
+loop.s sb_target
+;;; dot_s_prefix reject
+.text
+lock.s addl %eax, %ebx
+;;; jcxz_64 reject
+.text
+jcxz jcxz_target
+jcxz_target:

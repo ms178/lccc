@@ -215,8 +215,9 @@ pub enum CfiDirective {
 /// An x86-64 instruction with mnemonic and operands.
 #[derive(Debug, Clone)]
 pub struct Instruction {
-    /// Optional prefix (e.g., "lock", "rep")
-    pub prefix: Option<String>,
+    /// Leading prefixes in source order (e.g., ["lock"], ["xacquire", "lock"]).
+    /// Stacking is real: HLE pairs (`lock xacquire addl ...`) need two bytes.
+    pub prefixes: Vec<String>,
     /// Instruction mnemonic (e.g., "movq", "addl", "ret")
     pub mnemonic: String,
     /// Operands in AT&T order (source first, destination last)
@@ -259,6 +260,10 @@ pub struct Register {
     pub sae: bool,
     /// EVEX embedded rounding: 0=rn, 1=rd, 2=ru, 3=rz (`{r*-sae}`).
     pub rounding: Option<u8>,
+    /// Erroneous `{1toN}` on a register (`%zmm1{1to16}`); broadcast is
+    /// memory-only, so the encoder rejects it (`unsupported broadcast`).
+    /// Stored (not parsed away) so the diagnostic names the mnemonic.
+    pub broadcast: Option<u8>,
 }
 
 impl Register {
@@ -282,6 +287,7 @@ impl Register {
             zeroing: false,
             sae: false,
             rounding: None,
+            broadcast: None,
         }
     }
 }
@@ -477,6 +483,11 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
             match parse_line_items(part) {
                 Ok(line_items) => items.extend(line_items),
                 Err(e) => {
+                    // Decorator diagnostics (`\0raw:`) are GAS-bare: GNU as
+                    // reports them without location or source echo.
+                    if let Some(raw) = e.strip_prefix("\0raw:") {
+                        return Err(raw.to_string());
+                    }
                     return Err(format!("line {}: {}: '{}'", line_num, e, part));
                 }
             }
@@ -573,7 +584,7 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
     } else if is_prefixed_instruction(rest) {
         items.push(parse_prefixed_instruction(rest)?);
     } else {
-        items.push(parse_instruction(rest, None)?);
+        items.push(parse_instruction(rest, Vec::new())?);
     }
 
     Ok(items)
@@ -1256,30 +1267,44 @@ fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
 /// hand-written kernel assembly overwhelmingly uses TABS (`rep\tstosl` in
 /// arch/x86/boot/startup/efi-mixed.S). Matching only `"rep "` left the whole
 /// line as a single mnemonic `rep` with `stosl` parsed as a label operand.
+/// Words the assembler treats as leading instruction prefixes (HLE hints
+/// `xacquire`/`xrelease` included: they only ever appear prefix-stacked).
+const INSN_PREFIXES: [&str; 15] = [
+    "lock", "rep", "repz", "repe", "repnz", "repne", "notrack", "cs", "ds", "es", "ss", "fs", "gs",
+    "xacquire", "xrelease",
+];
+
 fn is_prefixed_instruction(rest: &str) -> bool {
     // Segment-override names are legal instruction prefixes in their own right:
     // the kernel writes `ds wrmsr` (arch/x86/include/asm/msr.h) to reserve a
     // byte that ALTERNATIVE can later patch into a different encoding.
-    const PREFIXES: [&str; 13] = [
-        "lock", "rep", "repz", "repe", "repnz", "repne", "notrack", "cs", "ds", "es", "ss", "fs",
-        "gs",
-    ];
     match rest.split_once(|c: char| c.is_whitespace()) {
-        Some((head, tail)) => PREFIXES.contains(&head) && !tail.trim().is_empty(),
+        Some((head, tail)) => INSN_PREFIXES.contains(&head) && !tail.trim().is_empty(),
         None => false,
     }
 }
 
-/// Parse a prefix instruction like "lock cmpxchgq ..." or "rep movsb".
+/// Parse a prefixed instruction like "lock cmpxchgq ..." or "rep movsb".
+/// Prefixes stack: collect every leading prefix word (`lock xacquire addl`
+/// yields ["lock", "xacquire"]) so the encoder can emit the full prefix run.
+/// Duplicate detection lives in the encoder (it compares prefix BYTES:
+// `rep repe movsb` is two spellings of one byte).
 fn parse_prefixed_instruction(line: &str) -> Result<AsmItem, String> {
-    let parts: Vec<&str> = line.splitn(2, |c: char| c.is_whitespace()).collect();
-    let prefix = parts[0].to_string();
-    let rest = parts.get(1).map(|s| s.trim()).unwrap_or("");
-    parse_instruction(rest, Some(prefix))
+    let mut rest = line.trim();
+    let mut prefixes: Vec<String> = Vec::new();
+    while let Some((head, tail)) = rest.split_once(|c: char| c.is_whitespace()) {
+        if INSN_PREFIXES.contains(&head) && !tail.trim().is_empty() {
+            prefixes.push(head.to_string());
+            rest = tail.trim();
+        } else {
+            break;
+        }
+    }
+    parse_instruction(rest, prefixes)
 }
 
 /// Parse an instruction line.
-fn parse_instruction(line: &str, prefix: Option<String>) -> Result<AsmItem, String> {
+fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Ok(AsmItem::Empty);
@@ -1301,7 +1326,7 @@ fn parse_instruction(line: &str, prefix: Option<String>) -> Result<AsmItem, Stri
     };
 
     Ok(AsmItem::Instruction(Instruction {
-        prefix,
+        prefixes,
         mnemonic: mnemonic.to_string(),
         operands,
         nf,
@@ -1495,29 +1520,62 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
             && !stem.is_empty()
             && stem.bytes().all(|c| c.is_ascii_digit())
     };
+    // A trailing `{...}` chain on an absolute/label operand (`64{1to16}`,
+    // `foo{%k1}`) is stripped and validated first; the remainder then
+    // parses as an absolute integer or label as usual.
+    let suf = if s.contains('{') && !s.starts_with('{') {
+        Some(parse_evex_mask_suffix(s, false)?)
+    } else {
+        None
+    };
+    let s = suf.as_ref().map(|suf| suf.rest.as_str()).unwrap_or(s);
     if s.bytes()
         .next()
         .is_some_and(|c| c.is_ascii_digit() || c == b'-')
         && !is_numeric_label
     {
         if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(s) {
+            let (mask, zeroing, broadcast) = suf
+                .as_ref()
+                .map(|suf| (suf.mask.clone(), suf.zeroing, suf.broadcast))
+                .unwrap_or((None, false, None));
             return Ok(Operand::Memory(MemoryOperand {
                 segment: None,
                 displacement: Displacement::Integer(val),
                 base: None,
                 index: None,
                 scale: None,
-                mask: None,
-                zeroing: false,
-                broadcast: None,
+                mask,
+                zeroing,
+                broadcast,
             }));
         }
     }
 
-    // Standalone EVEX decorator: `{rn-sae}`, `{sae}`, `{1to16}`.
-    // GAS writes these as their own AT&T operand (`vaddps {rn-sae}, %zmm1, %zmm2, %zmm3`).
+    // Standalone EVEX decorator: `{sae}` / `{r*-sae}` as their own AT&T
+    // operand (`vaddps {rn-sae}, %zmm1, %zmm2, %zmm3`). Anything else in
+    // standalone position is `unknown vector operation`.
     if s.starts_with('{') && s.ends_with('}') {
+        let inner = s[1..s.len() - 1].trim();
+        if !matches!(inner, "sae" | "rn-sae" | "rd-sae" | "ru-sae" | "rz-sae") {
+            return Err(format!("\0raw:unknown vector operation: `{s}'"));
+        }
         return Ok(Operand::Label(s.to_string()));
+    }
+
+    // A label carrying suffixes (`foo{1to16}`, `foo{%k1}`) is a decorated
+    // memory reference, like a bare label in the encoder's normalizer.
+    if let Some(suf) = &suf {
+        return Ok(Operand::Memory(MemoryOperand {
+            segment: None,
+            displacement: Displacement::Symbol(s.trim().to_string()),
+            base: None,
+            index: None,
+            scale: None,
+            mask: suf.mask.clone(),
+            zeroing: suf.zeroing,
+            broadcast: suf.broadcast,
+        }));
     }
 
     // Plain label reference (for jmp/call targets)
@@ -1532,17 +1590,36 @@ struct EvexSuffix {
     zeroing: bool,
     sae: bool,
     rounding: Option<u8>,
+    /// The `{sae}`/`{r*-sae}` token as written (for the misplaced echo).
+    sae_tok: Option<String>,
     broadcast: Option<u8>,
+}
+
+/// True for a bare `{kN}` / `{%kN}` write-mask number (1-7; `{%k0}` is
+/// a dedicated error, bare `{k0}` is unknown).
+fn evex_mask_num(inner: &str) -> Option<&str> {
+    let n = inner.strip_prefix('k')?;
+    if matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7") {
+        Some(inner)
+    } else {
+        None
+    }
 }
 
 /// Split EVEX suffixes: `%zmm0{%k1}{z}` / `(%rdi){1to16}` / `{rn-sae}`.
 /// Accepts both `{%k1}` and `{k1}` (GNU as tolerates the bare form).
-fn parse_evex_mask_suffix(s: &str) -> EvexSuffix {
+/// Decorator *values* are validated here with GNU as diagnostics;
+/// placement (mask-on-destination, broadcast support) is the encoder's
+/// job — it needs the mnemonic and the emitted prefix. `sae_allowed`
+/// is false for memory/integer/label operands: `{sae}` there is
+/// `unknown vector operation` even for SAE-capable instructions.
+fn parse_evex_mask_suffix(s: &str, sae_allowed: bool) -> Result<EvexSuffix, String> {
     let mut name = s.to_string();
     let mut mask = None;
     let mut zeroing = false;
     let mut sae = false;
     let mut rounding = None;
+    let mut sae_tok = None;
     let mut broadcast = None;
     loop {
         if let Some(pos) = name.find('{') {
@@ -1552,54 +1629,80 @@ fn parse_evex_mask_suffix(s: &str) -> EvexSuffix {
             let before = name[..pos].to_string();
             let after = name[pos + close + 1..].to_string();
             name = before + &after;
+            // Echo with braces, as GAS does (`{1toX}`, `{%k9}`).
+            let tok = format!("{{{inner}}}");
             if inner == "z" {
                 zeroing = true;
-            } else if inner == "sae" {
-                sae = true;
-            } else if inner == "rn-sae" {
-                sae = true;
-                rounding = Some(0);
-            } else if inner == "rd-sae" {
-                sae = true;
-                rounding = Some(1);
-            } else if inner == "ru-sae" {
-                sae = true;
-                rounding = Some(2);
-            } else if inner == "rz-sae" {
-                sae = true;
-                rounding = Some(3);
-            } else if let Some(rest) = inner.strip_prefix("1to") {
-                if let Ok(n) = rest.parse::<u8>() {
-                    if matches!(n, 2 | 4 | 8 | 16 | 32) {
-                        broadcast = Some(n);
-                    }
+            } else if inner == "sae"
+                || inner == "rn-sae"
+                || inner == "rd-sae"
+                || inner == "ru-sae"
+                || inner == "rz-sae"
+            {
+                if !sae_allowed {
+                    return Err(format!("\0raw:unknown vector operation: `{tok}'"));
                 }
+                sae = true;
+                sae_tok = Some(tok);
+                rounding = match inner.as_str() {
+                    "rn-sae" => Some(0),
+                    "rd-sae" => Some(1),
+                    "ru-sae" => Some(2),
+                    "rz-sae" => Some(3),
+                    _ => None,
+                };
+            } else if let Some(rest) = inner.strip_prefix("1to") {
+                if !matches!(rest, "2" | "4" | "8" | "16" | "32") {
+                    return Err(format!("\0raw:Unsupported broadcast: `{tok}'"));
+                }
+                broadcast = Some(rest.parse::<u8>().unwrap_or(0));
             } else if let Some(rest) = inner.strip_prefix('%') {
-                mask = Some(rest.trim().to_string());
-            } else if !inner.is_empty() {
-                mask = Some(inner.to_string());
+                let rest = rest.trim();
+                if rest == "k0" {
+                    return Err("\0raw:`%k0' can't be used for write mask".to_string());
+                }
+                if let Some(k) = evex_mask_num(rest) {
+                    mask = Some(k.to_string());
+                } else {
+                    return Err(format!("\0raw:unknown vector operation: `{tok}'"));
+                }
+            } else if let Some(k) = evex_mask_num(&inner) {
+                mask = Some(k.to_string());
+            } else {
+                return Err(format!("\0raw:unknown vector operation: `{tok}'"));
             }
         } else {
             break;
         }
     }
-    EvexSuffix {
+    Ok(EvexSuffix {
         rest: name,
         mask,
         zeroing,
         sae,
         rounding,
+        sae_tok,
         broadcast,
-    }
+    })
 }
 
 /// Parse a register operand like %rax, %st(0).
 fn parse_register_operand(s: &str) -> Result<Operand, String> {
     // GNU as tolerates whitespace between '%' and the register name
     // (glibc emits `mov % r13, ...` from `% " R13_LP "` macro splicing).
-    let suf = parse_evex_mask_suffix(s);
+    let suf = parse_evex_mask_suffix(s, true)?;
     let s = suf.rest.as_str();
     let name = s[1..].trim_start(); // strip % and any following spaces
+    // `{sae}` only exists on vector registers; on `%eax`, `%k1`, `%mm0`
+    // (anything else) it is `unknown vector operation`.
+    if suf.sae || suf.rounding.is_some() {
+        let vn = name.to_ascii_lowercase();
+        let vec = vn.starts_with("xmm") || vn.starts_with("ymm") || vn.starts_with("zmm");
+        if !vec {
+            let tok = suf.sae_tok.as_deref().unwrap_or("{sae}");
+            return Err(format!("\0raw:unknown vector operation: `{tok}'"));
+        }
+    }
 
     // Handle %st(N)
     if name.starts_with("st(") && name.ends_with(')') {
@@ -1611,6 +1714,10 @@ fn parse_register_operand(s: &str) -> Result<Operand, String> {
         let seg = &name[..colon_pos];
         let rest = &s[1 + colon_pos + 1..]; // after the colon
         if is_segment_name(seg) {
+            if suf.sae || suf.rounding.is_some() {
+                let tok = suf.sae_tok.as_deref().unwrap_or("{sae}");
+                return Err(format!("\0raw:unknown vector operation: `{tok}'"));
+            }
             let mut mem = parse_memory_inner(rest)?;
             mem.segment = Some(seg.to_string());
             mem.mask = suf.mask;
@@ -1625,6 +1732,7 @@ fn parse_register_operand(s: &str) -> Result<Operand, String> {
     reg.zeroing = suf.zeroing;
     reg.sae = suf.sae;
     reg.rounding = suf.rounding;
+    reg.broadcast = suf.broadcast;
     Ok(Operand::Register(reg))
 }
 
@@ -1780,7 +1888,7 @@ fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
 
     // EVEX mask/zeroing suffix on a memory operand: `(%rax){%k1}`.
     if s.contains('{') {
-        let suf = parse_evex_mask_suffix(s);
+        let suf = parse_evex_mask_suffix(s, false)?;
         let mut mem = parse_memory_inner(&suf.rest)?;
         mem.mask = suf.mask;
         mem.zeroing = suf.zeroing;
@@ -2261,7 +2369,7 @@ fn is_segment_name(s: &str) -> bool {
 /// overwhelming majority of call sites, never enter the scan at all.
 /// `is_label_like_agrees_with_the_library_parsers_exhaustively` pins the
 /// equivalence against an independent restatement built on `str::parse`.
-fn is_label_like(s: &str) -> bool {
+pub(crate) fn is_label_like(s: &str) -> bool {
     let bytes = s.as_bytes();
     let Some(&first) = bytes.first() else {
         return false;

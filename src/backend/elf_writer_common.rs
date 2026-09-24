@@ -1908,7 +1908,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
     }
 
     fn get_jump_target_label(&self, instr: &Instruction) -> Option<(String, i64)> {
-        let mnem = &instr.mnemonic;
+        // Same normalization as the encoder and the arch jump detectors:
+        // GAS is case-insensitive and accepts `.s` on any mnemonic, so
+        // `JMP` and `jmp.s` must register for relaxation exactly like `jmp`.
+        let mnem_lower = instr.mnemonic.to_ascii_lowercase();
+        let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
         let is_jump = mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
         if !is_jump || instr.operands.len() != 1 {
             return None;

@@ -5,6 +5,7 @@
 # (once polluted a format-patch with .gcda binary blobs)
 @PROFDIR@/
 /target-sroa/
+/target-quest/
 **/*.rs.bk
 
 # Crash dumps (root-anchored: a bare `core.*` also matched

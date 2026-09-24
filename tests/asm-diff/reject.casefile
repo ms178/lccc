@@ -123,3 +123,27 @@ vphminposuw %ymm0, %ymm1
 vaddps {sae}, %zmm1, %zmm2, %zmm3
 vmaxps {rn-sae}, %zmm1, %zmm2, %zmm3
 vpaddd {sae}, %zmm1, %zmm2, %zmm3
+;;; cmp_k_dest_zeroing reject
+.text
+vpcmpgtd %xmm5, %xmm6, %k5{%k7}{z}
+;;; gather_mask_dst_mismatch reject
+.text
+vgatherdps %ymm2, (%rdi,%xmm1,4), %xmm3
+;;; gather_qps_ymm_dst reject
+.text
+vgatherqps %ymm12, (%r13,%ymm14,2),%ymm11
+;;; gather_dpd_ymm_index reject
+.text
+vgatherdpd %ymm5,(%r13,%ymm4,2),%ymm6
+;;; evex_gather_bare_mask reject
+.text
+vgatherdps (%rdi,%ymm1,4), %ymm3
+;;; evex_gather_zeroing reject
+.text
+vgatherdps (%rdi,%ymm1,4), %ymm3 {%k1}{z}
+;;; evex_gather_mem_mask reject
+.text
+vgatherdps (%rdi,%ymm1,4){%k2}, %ymm3
+;;; evex_gather_qps_zmm_dst reject
+.text
+vgatherqps (%rdi,%zmm1,4), %zmm3 {%k1}

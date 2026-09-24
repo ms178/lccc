@@ -209,24 +209,26 @@ impl super::InstructionEncoder {
             return Err("movd requires 2 operands".to_string());
         }
         match (&ops[0], &ops[1]) {
-            // GP -> MMX: 0F 6E /r
+            // GP -> MMX: 0F 6E /r (REX.W for an r64 source)
             (Operand::Register(src), Operand::Register(dst))
                 if is_mmx(&dst.name) && !is_mmx(&src.name) =>
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.emit_rex_rr(0, &dst.name, &src.name);
+                let size = if is_reg64(&src.name) { 8 } else { 0 };
+                self.emit_rex_rr(size, &dst.name, &src.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x6E]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
             }
-            // MMX -> GP: 0F 7E /r
+            // MMX -> GP: 0F 7E /r (REX.W for an r64 destination)
             (Operand::Register(src), Operand::Register(dst))
                 if is_mmx(&src.name) && !is_mmx(&dst.name) =>
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.emit_rex_rr(0, &src.name, &dst.name);
+                let size = if is_reg64(&dst.name) { 8 } else { 0 };
+                self.emit_rex_rr(size, &src.name, &dst.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x7E]);
                 self.bytes.push(self.modrm(3, src_num, dst_num));
                 Ok(())
@@ -245,26 +247,28 @@ impl super::InstructionEncoder {
                 self.bytes.extend_from_slice(&[0x0F, 0x7E]);
                 self.encode_modrm_mem(src_num, mem)
             }
-            // GP -> XMM: 66 0F 6E /r
+            // GP -> XMM: 66 0F 6E /r (REX.W for an r64 source)
             (Operand::Register(src), Operand::Register(dst))
                 if is_xmm(&dst.name) && !is_xmm(&src.name) =>
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 self.bytes.push(0x66);
-                self.emit_rex_rr(0, &dst.name, &src.name);
+                let size = if is_reg64(&src.name) { 8 } else { 0 };
+                self.emit_rex_rr(size, &dst.name, &src.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x6E]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
             }
-            // XMM -> GP: 66 0F 7E /r
+            // XMM -> GP: 66 0F 7E /r (REX.W for an r64 destination)
             (Operand::Register(src), Operand::Register(dst))
                 if is_xmm(&src.name) && !is_xmm(&dst.name) =>
             {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 self.bytes.push(0x66);
-                self.emit_rex_rr(0, &src.name, &dst.name);
+                let size = if is_reg64(&dst.name) { 8 } else { 0 };
+                self.emit_rex_rr(size, &src.name, &dst.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x7E]);
                 self.bytes.push(self.modrm(3, src_num, dst_num));
                 Ok(())
@@ -386,10 +390,18 @@ impl super::InstructionEncoder {
             return Err("{nf} unsupported for `movbe'".to_string());
         }
         // APX map-4 remaps 0F38 F0/F1 → 60/61; 16-bit uses EVEX.pp=66.
+        // The reg-reg form exists ONLY as APX EVEX (GAS 2.47 emits
+        // `62 f4 7c 08 60 d8` for `movbe %eax, %ebx` unconditionally).
         let use_evex = self.apx_wants_evex() || operands_have_egpr(ops);
         let pp = if size == 2 { 1 } else { 0 };
+        // GAS rejects vector/wrong-size registers ("operand type mismatch").
+        let gpr_ok = |name: &str| match size {
+            2 => is_reg16(name),
+            8 => is_reg64(name),
+            _ => is_reg32(name),
+        };
         match (&ops[0], &ops[1]) {
-            (Operand::Memory(mem), Operand::Register(reg)) => {
+            (Operand::Memory(mem), Operand::Register(reg)) if gpr_ok(&reg.name) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
                 if use_evex {
                     self.emit_apx_evex_rm_pp(size == 8, &reg.name, mem, None, false, pp)?;
@@ -403,7 +415,7 @@ impl super::InstructionEncoder {
                 self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF0]);
                 self.encode_modrm_mem(num, mem)
             }
-            (Operand::Register(reg), Operand::Memory(mem)) => {
+            (Operand::Register(reg), Operand::Memory(mem)) if gpr_ok(&reg.name) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
                 if use_evex {
                     self.emit_apx_evex_rm_pp(size == 8, &reg.name, mem, None, false, pp)?;
@@ -416,6 +428,17 @@ impl super::InstructionEncoder {
                 self.emit_rex_rm(size, &reg.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF1]);
                 self.encode_modrm_mem(num, mem)
+            }
+            // reg -> reg: APX-only (EVEX map-4 0x60, no legacy encoding).
+            (Operand::Register(src), Operand::Register(dst))
+                if gpr_ok(&src.name) && gpr_ok(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.emit_apx_evex_rr_pp(size == 8, &dst.name, &src.name, None, false, pp)?;
+                self.bytes.push(0x60);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
             }
             _ => Err("movbe requires one memory and one register operand".to_string()),
         }
@@ -1039,17 +1062,32 @@ impl super::InstructionEncoder {
             None => None,
         };
         let index_num = match &mem.index {
+            // A vector index is VSIB (gather/scatter): the SIB index field
+            // is the low 3 bits either way; the prefix X/V' bits are the
+            // caller's job (see encode_evex_gather).
             Some(i) => Some(
                 Self::evex_gp_num(&i.name)
+                    .or_else(|| vec_reg_id(&i.name))
                     .ok_or_else(|| format!("bad EVEX index register: {}", i.name))?,
             ),
             None => None,
         };
-        let disp: i64 = match &mem.displacement {
-            Displacement::None => 0,
-            Displacement::Integer(v) => *v,
-            _ => return Err("unsupported EVEX symbol displacement".to_string()),
-        };
+        let (disp, has_symbol, deferred_reloc, diff_sym) =
+            Self::symbol_disp_parts(&mem.displacement);
+        // Absolute: SIB-absolute (mod=00 rm=100, SIB base=101) + disp32,
+        // like the legacy encoder and GAS — never the mod=05/RIP form.
+        if base_num.is_none() && index_num.is_none() {
+            self.bytes.push(self.modrm(0, reg_field, 4));
+            self.bytes.push(self.sib(1, 4, 5));
+            if let Some((sym, reloc_type, addend)) = deferred_reloc {
+                match &diff_sym {
+                    Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
+                    None => self.add_relocation(&sym, reloc_type, addend),
+                }
+            }
+            self.bytes.extend_from_slice(&(disp as i32).to_le_bytes());
+            return Ok(());
+        }
         let scale = mem.scale.unwrap_or(1);
         let scale_bits = match scale {
             1 => 0u8,
@@ -1058,8 +1096,11 @@ impl super::InstructionEncoder {
             8 => 3,
             _ => 0,
         };
-        let d8_ok =
-            disp % i64::from(scale_n) == 0 && i8::try_from(disp / i64::from(scale_n)).is_ok();
+        // Symbols always take disp32 (the value is a reloc placeholder,
+        // never compressible).
+        let d8_ok = !has_symbol
+            && disp % i64::from(scale_n) == 0
+            && i8::try_from(disp / i64::from(scale_n)).is_ok();
         // rsp-like (low 3 bits = 4) always need SIB; rbp-like (low 3 = 5)
         // always need a displacement. r20/r28 and r21/r29 share those lows.
         let needs_sib = index_num.is_some() || base_num.is_some_and(|b| (b & 7) == 4);
@@ -1075,7 +1116,9 @@ impl super::InstructionEncoder {
         let (mod_, rm, disp_bytes) = match (base_num, index_num) {
             (Some(b), _) => {
                 let rm = if needs_sib { 4 } else { b & 7 };
-                if disp == 0 && !rbp_like {
+                if has_symbol {
+                    (2u8, rm, (disp as i32).to_le_bytes().to_vec())
+                } else if disp == 0 && !rbp_like {
                     (0u8, rm, Vec::new())
                 } else if d8_ok {
                     (1u8, rm, vec![(disp / i64::from(scale_n)) as u8])
@@ -1088,13 +1131,18 @@ impl super::InstructionEncoder {
                 (0u8, 4u8, (disp as i32).to_le_bytes().to_vec())
             }
             (None, None) => {
-                // absolute: mod=00, rm=101, disp32
-                (0u8, 5u8, (disp as i32).to_le_bytes().to_vec())
+                unreachable!("EVEX absolute takes the SIB-absolute arm above")
             }
         };
 
         self.bytes.push(self.modrm(mod_, reg_field, rm));
         self.bytes.extend_from_slice(&sib_bytes);
+        if let Some((sym, reloc_type, addend)) = deferred_reloc {
+            match &diff_sym {
+                Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
+                None => self.add_relocation(&sym, reloc_type, addend),
+            }
+        }
         self.bytes.extend_from_slice(&disp_bytes);
         Ok(())
     }
