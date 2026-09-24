@@ -6951,7 +6951,7 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn supports_and_not(&self) -> bool {
-        self.bmi1_enabled && std::env::var_os("CCC_NO_ANDN_FUSION").is_none()
+        self.bmi1_enabled && crate::backend::generation::andn_fusion_env_enabled()
     }
 
     fn supports_fused_bit_test_branch(&self) -> bool {

@@ -3911,9 +3911,98 @@ fn roots_proven_distinct(a: &ProvenObjectRoot, b: &ProvenObjectRoot) -> bool {
                 noalias: b_noalias, ..
             },
         ) => *a_noalias || *b_noalias,
+        // Fresh-object vs outside-pointer disjointness (no `restrict`
+        // needed): an `Alloca` names an object created by THIS activation
+        // while a `Param` pointer value was formed BEFORE this activation
+        // existed — or derives from one that was, through the
+        // provenance-preserving GEP/Copy/Cast chains `proven_object_root`
+        // traces (BinOp/Phi/Call break the trace and fail closed, so no
+        // int-laundered, re-pointed, or phi-merged address can present a
+        // Param root — Phi is NOT traced).  Two distinct live objects
+        // never overlap (C17 6.2.4, 6.5.6); the param cannot name our
+        // future alloca without UB (use of an indeterminate pointer).
+        // A mid-function `p = &x` reassignment re-roots the SSA chain AT
+        // the alloca, so `a == b` above (or a broken trace) still
+        // catches it — no valid reassignment is misclassified.
+        // (Param,Global) is deliberately NOT disjoint: a caller may
+        // legally pass `&global+k` for a plain `T *p`, so overlap is
+        // real there (a forward unguarded loop is wrong for the
+        // src-less-than-dst shifted case; see the loop_idiom comment).
+        // (Param,Param) still needs `restrict`: different SSA values
+        // prove nothing there (the old unsound inference that
+        // miscompiled shifted in-place maps).  loop_idiom.rs carries
+        // the same (Param,Alloca) rule for its memcpy/memmove choice,
+        // with one extra guard its preheader-phi tracing needs — see
+        // `object_root_inner`'s `through_phi` there.
+        (ProvenObjectRoot::Param { .. }, ProvenObjectRoot::Alloca(_))
+        | (ProvenObjectRoot::Alloca(_), ProvenObjectRoot::Param { .. }) => true,
         (ProvenObjectRoot::Param { noalias, .. }, _)
         | (_, ProvenObjectRoot::Param { noalias, .. }) => *noalias,
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod roots_proven_distinct_tests {
+    use super::ProvenObjectRoot::*;
+    use super::roots_proven_distinct;
+
+    fn param(idx: usize, noalias: bool) -> super::ProvenObjectRoot {
+        Param {
+            index: idx,
+            noalias,
+        }
+    }
+
+    #[test]
+    fn param_alloca_disjoint_without_restrict() {
+        // Fresh-object rule: the alloca postdates the param value, so no
+        // aliasing `restrict` is needed to skip runtime versioning.
+        assert!(roots_proven_distinct(&param(0, false), &Alloca(7)));
+        assert!(roots_proven_distinct(&Alloca(7), &param(0, false)));
+    }
+
+    #[test]
+    fn param_global_still_needs_noalias() {
+        // A caller may legally pass `&global+k` for a plain `T *p`.
+        assert!(!roots_proven_distinct(
+            &param(0, false),
+            &Global("g".into())
+        ));
+        assert!(!roots_proven_distinct(
+            &Global("g".into()),
+            &param(0, false)
+        ));
+        assert!(roots_proven_distinct(&param(0, true), &Global("g".into())));
+    }
+
+    #[test]
+    fn param_param_needs_restrict() {
+        // Distinct SSA values prove nothing (the old unsound inference
+        // miscompiled shifted in-place maps).
+        assert!(!roots_proven_distinct(&param(0, false), &param(1, false)));
+        assert!(roots_proven_distinct(&param(0, true), &param(1, false)));
+        assert!(roots_proven_distinct(&param(0, false), &param(1, true)));
+    }
+
+    #[test]
+    fn same_root_never_distinct() {
+        assert!(!roots_proven_distinct(&Alloca(3), &Alloca(3)));
+        assert!(!roots_proven_distinct(&param(0, true), &param(0, true)));
+        assert!(!roots_proven_distinct(
+            &Global("g".into()),
+            &Global("g".into())
+        ));
+    }
+
+    #[test]
+    fn static_pairs_stay_distinct() {
+        assert!(roots_proven_distinct(&Alloca(1), &Alloca(2)));
+        assert!(roots_proven_distinct(
+            &Global("a".into()),
+            &Global("b".into())
+        ));
+        assert!(roots_proven_distinct(&Global("a".into()), &Alloca(1)));
     }
 }
 

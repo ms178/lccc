@@ -435,6 +435,8 @@ gate "ch-maj-codegen" fast \
 # loss, now opt-in via CCC_IVSR_SCALAR_DERIVED=1).
 gate "nbody-perf-shapes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_nbody_perf_shapes.sh
+gate "ivsr-scalar-derived-default" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_scalar_derived_default.sh
 
 # linux_find_bit: the inliner's bounded-tier clone-growth budget must
 # admit the three-site kernel clone (two cold self-test calls + one hot

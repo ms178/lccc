@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
-# linux_find_bit inlining gate — pins the inliner's bounded-tier
-# clone-growth budget on a real-workload kernel: Linux 6.18.42
-# find_next_andnot_bit (static, THREE call sites — two cold self-test
-# calls + one hot in-loop call).  Before the growth budget landed, the
-# flat two-site cap kept this kernel outlined while GCC 16.2 / Clang
-# 23.1 / ICX all inline it (godbolt oracle, pinned alias set); the
-# per-call frame cost 6–12% in paired A/B.  The inlined shape must also
-# keep the idiom distillations: the generic __ffs decision tree folded
-# to tzcnt and the `& ~addr2` arm folded to andn.  Both hold WITHOUT an
-# explicit -march because the absent-march baseline projects x86-64-v3
-# (BMI1 carries ANDN, ABM carries TZCNT); `-march=x86-64-v3` must match.
+# linux_find_bit inlining gate — pins the inliner's opt-level gradient on a
+# real-workload kernel: Linux 6.18.42 find_next_andnot_bit (static, THREE
+# call sites — two cold self-test calls + one hot in-loop call).
+#
+# Policy (godbolt pinned oracles + LCCC-side A/B, 2026-09-24): at -O2
+# GCC 14.2 AND GCC 16.2 keep the 60-insn kernel OUTLINED (only the LLVM
+# family inlines); LCCC-side the inline measures as a tie (paired A/B
+# n=7 spans 1; layout-averaged k-sweep n=16 splits 9–7). At -O3 the
+# oracles unanimously inline — but LCCC-side the inline measures as a
+# 3–8% LOSS (k-sweep wins 3–13, p≈0.01): the oracle backends exploit
+# the inline and LCCC's does not. So the bounded tier holds the
+# historical 2-site cap at EVERY level: a deliberate, measured
+# divergence from the -O3 oracle row. Revisit with backend evidence.
+#
+# Both shapes must keep the idiom distillations: the generic __ffs
+# decision tree folded to tzcnt and the `& ~addr2` arm folded to andn.
+# Both hold WITHOUT an explicit -march because the absent-march baseline
+# projects x86-64-v3 (BMI1 carries ANDN, ABM carries TZCNT).
 #
 # Runtime differentials belong to the benchmark-output gate (204 cases);
 # this gate pins the CODEGEN contract and fails loudly if future
-# inliner tuning silently re-outlines this kernel class.
+# inliner tuning silently moves this kernel class across the gradient.
 set -u
 CCC=${CCC:-target/fastbuild/lccc}
 SRC=$(dirname "$0")/../benchmark/programs/linux_find_bit.c
@@ -24,12 +31,15 @@ fails=0
 note() { printf '%s\n' "$*"; }
 bad()  { note "FAIL: $*"; fails=$((fails+1)); }
 
-for CFG in "-O2" "-O3 -march=x86-64-v3"; do
+check_cfg() {
+  CFG=$1
+  WANT_CALLS=$2
+  WHY=$3
   "$CCC" $CFG -S "$SRC" -o "$TMP/fb.s" 2>/dev/null \
-    || { bad "$CFG: lccc compile"; continue; }
+    || { bad "$CFG: lccc compile"; return; }
   CALLS=$(grep -c 'call linux_find_next_andnot_bit' "$TMP/fb.s" || true)
-  [ "$CALLS" -eq 0 ] \
-    || bad "$CFG: $CALLS outlined calls remain (growth budget must admit the 3-site clone)"
+  [ "$CALLS" -eq "$WANT_CALLS" ] \
+    || bad "$CFG: $CALLS outlined calls (want $WANT_CALLS: $WHY)"
   TZ=$(grep -cE '^[[:space:]]*tzcnt[lq]' "$TMP/fb.s" || true)
   [ "$TZ" -ge 1 ] \
     || bad "$CFG: generic __ffs tree did not fold to tzcnt (got $TZ)"
@@ -39,7 +49,7 @@ for CFG in "-O2" "-O3 -march=x86-64-v3"; do
 
   # Bit-exact runtime differential vs the host C compiler.
   "$CCC" $CFG "$SRC" -o "$TMP/l.x" 2>/dev/null \
-    || { bad "$CFG: lccc link"; continue; }
+    || { bad "$CFG: lccc link"; return; }
   L=$("$TMP/l.x"; echo "rc=$?")
   if "$GCC" $CFG "$SRC" -o "$TMP/g.x" 2>/dev/null; then
     G=$("$TMP/g.x"; echo "rc=$?")
@@ -47,7 +57,10 @@ for CFG in "-O2" "-O3 -march=x86-64-v3"; do
   else
     note "skip $CFG runtime differential (no host gcc)"
   fi
-done
+}
+
+check_cfg "-O2" 3 "historical 2-site cap holds: GCC outlines at -O2"
+check_cfg "-O3 -march=x86-64-v3" 3 "measured divergence: inline loses 3-8% at -O3"
 
 if [ "$fails" -eq 0 ]; then
   note "findbit inline gate: PASS"

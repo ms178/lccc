@@ -225,7 +225,7 @@ fn object_root_inner(
             ObjectRoot::Other
         }
         Instruction::BinOp {
-            op: IrBinOp::Add | IrBinOp::Sub,
+            op: op @ (IrBinOp::Add | IrBinOp::Sub),
             lhs,
             rhs,
             ..
@@ -244,8 +244,18 @@ fn object_root_inner(
             };
             match (l, r) {
                 (ObjectRoot::Other, ObjectRoot::Other) => ObjectRoot::Other,
-                (root, ObjectRoot::Other) | (ObjectRoot::Other, root) => root,
-                // Two rooted sides (ptr + ptr) is nonsense; fail closed.
+                // `ptr +/- int` keeps the LHS root: it stays in/near the
+                // object and going out-of-bounds is UB, exactly like GEP.
+                (root, ObjectRoot::Other) => root,
+                // `int + ptr` is commutative with the above.  But `int -
+                // ptr` (a rooted RHS under `Sub`) fails closed: not
+                // valid pointer arithmetic (C17 6.5.6), it can only arise
+                // from integer laundering (`(T*)(c - (intptr_t)p)` cast
+                // back to a pointer), and an int-derived address may
+                // alias anything.
+                (ObjectRoot::Other, root) if matches!(op, IrBinOp::Add) => root,
+                // Two rooted sides (ptr + ptr, ptr - ptr used as an
+                // address) is nonsense; fail closed.
                 _ => ObjectRoot::Other,
             }
         }
@@ -1083,16 +1093,43 @@ fn try_match_copy_loop(
         dlog!("{name} loop@{header}: bail (same root {store_root:?})");
         return None;
     }
-    // memcpy only for provably-distinct Global/Alloca pairs (same-name
-    // roots bailed above); every Param/Other involvement uses memmove.
+    // memcpy for provably-disjoint root pairs (same-init and same-root
+    // copies bailed above).  Distinct-identity Global/Global and
+    // Alloca/Alloca pairs and Global/Alloca pairs are disjoint by object
+    // identity.  (Param,Alloca) pairs are disjoint by FRESHNESS: the
+    // alloca names an object created by this activation while the param
+    // value was formed before this activation existed — or derives from
+    // one that was, through provenance-preserving GEP/Copy/Cast/Add and
+    // `ptr - int` chains.  Nothing else can present a Param root: Mul
+    // and friends, Call, and Load break the trace; a rooted RHS under
+    // `Sub` fails closed (integer laundering); every traced def
+    // dominates the preheader (inits are checked above, and each step
+    // moves to a def dominating the current one), so no inner-loop phi
+    // is reachable and every reachable phi is an outer phi without an
+    // edge from the preheader label (the preheader's sole successor is
+    // the header, checked above) — also `Other`.  A mid-function
+    // `p = &x` reassignment re-roots the SSA chain at the alloca and
+    // either bails or presents Alloca.  Two distinct live objects never
+    // overlap (C17 6.2.4, 6.5.6), so memcpy's no-overlap contract holds.
+    // Deliberately NOT pairs: (Param,Param) — distinct SSA values prove
+    // nothing without `restrict`, which loop_idiom does not track;
+    // (Param,Global) — a caller may legally pass `&global+k` for a plain
+    // `T *p`, and a forward copy corrupts the src-less-than-dst shifted
+    // case; anything `Other` — unknown provenance may alias anything
+    // (this is the LZ4 path: params through outer phis resolve to
+    // `Other` and take memmove, unchanged).  Every non-pair takes
+    // memmove, which subsumes the old trailing Param/Other clauses: any
+    // such pair is outside the match set by construction, so the bare
+    // `!matches!` below is exactly equivalent and cannot drift.
     let use_memmove = !matches!(
         (&store_root, &load_root),
         (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
             | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
             | (ObjectRoot::Global(_), ObjectRoot::Global(_))
             | (ObjectRoot::Alloca(_), ObjectRoot::Alloca(_))
-    ) || matches!(store_root, ObjectRoot::Param(_) | ObjectRoot::Other)
-        || matches!(load_root, ObjectRoot::Param(_) | ObjectRoot::Other);
+            | (ObjectRoot::Param(_), ObjectRoot::Alloca(_))
+            | (ObjectRoot::Alloca(_), ObjectRoot::Param(_))
+    );
 
     // Bound loads: every header load must be THE bound — resolving
     // through copies to the `Ult` rhs — read through a bare
@@ -2062,5 +2099,155 @@ mod tests {
             f.blocks.iter().any(|b| b.label.0 == 2),
             "bailed loop left intact"
         );
+    }
+
+    /// Single-block indexed copy with caller-chosen preheader defs for the
+    /// D (value 1) and S (value 2) bases; header is the shared values
+    /// 10..=15 shape. `n_params` pointer params are declared.
+    fn self_loop_copy_with_bases(
+        d_def: Instruction,
+        s_def: Instruction,
+        n_params: usize,
+    ) -> IrFunction {
+        let mut f = IrFunction::new(
+            "self_loop_bases".into(),
+            IrType::I32,
+            vec![ptr_param(); n_params],
+            false,
+        );
+        f.next_value_id = 30;
+        f.next_label = 3;
+        f.blocks.push(block(
+            0, // P
+            vec![d_def, s_def],
+            Terminator::Branch(BlockId(1)),
+        ));
+        let mut g = self_loop_copy_func(IrType::U8);
+        let header = g.blocks.remove(1);
+        f.blocks.push(header);
+        f.blocks
+            .push(block(2, vec![], Terminator::Return(Some(i32c(0)))));
+        f
+    }
+    fn alloca_def(dest: u32) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::U8,
+            size: 16,
+            align: 1,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+    fn param_def(dest: u32, idx: usize) -> Instruction {
+        Instruction::ParamRef {
+            dest: Value(dest),
+            param_idx: idx,
+            ty: IrType::Ptr,
+        }
+    }
+    fn global_def(dest: u32, name: &str) -> Instruction {
+        Instruction::GlobalAddr {
+            dest: Value(dest),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn param_to_alloca_copy_uses_memcpy() {
+        // Fresh-object disjointness: the alloca postdates the param value,
+        // so no `restrict` is needed for memcpy's no-overlap contract.
+        let mut f = self_loop_copy_with_bases(alloca_def(1), param_def(2, 0), 1);
+        let n = run_function(&mut f);
+        assert_eq!(n, 1, "param->alloca copy must rewrite");
+        assert!(has_call(&f, "memcpy"), "disjoint pair lowers to memcpy");
+        assert!(!has_call(&f, "memmove"), "no memmove for disjoint pair");
+    }
+
+    #[test]
+    fn alloca_to_param_copy_uses_memcpy() {
+        // Same rule, store side: alloca destination, param source.
+        let mut f = self_loop_copy_with_bases(param_def(1, 0), alloca_def(2), 1);
+        let n = run_function(&mut f);
+        assert_eq!(n, 1, "alloca->param copy must rewrite");
+        assert!(has_call(&f, "memcpy"), "disjoint pair lowers to memcpy");
+        assert!(!has_call(&f, "memmove"), "no memmove for disjoint pair");
+    }
+
+    #[test]
+    fn param_to_global_copy_uses_memmove() {
+        // A caller may legally pass `&global+k` for a plain `T *p`; overlap
+        // is real, so (Param,Global) must NOT take the memcpy pair rule.
+        let mut f = self_loop_copy_with_bases(global_def(1, "G"), param_def(2, 0), 1);
+        let n = run_function(&mut f);
+        assert_eq!(n, 1, "param->global copy must rewrite");
+        assert!(has_call(&f, "memmove"), "maybe-overlap needs memmove");
+        assert!(!has_call(&f, "memcpy"), "no memcpy for maybe-overlap");
+    }
+
+    #[test]
+    fn global_to_param_copy_uses_memmove() {
+        let mut f = self_loop_copy_with_bases(param_def(1, 0), global_def(2, "G"), 1);
+        let n = run_function(&mut f);
+        assert_eq!(n, 1, "global->param copy must rewrite");
+        assert!(has_call(&f, "memmove"), "maybe-overlap needs memmove");
+        assert!(!has_call(&f, "memcpy"), "no memcpy for maybe-overlap");
+    }
+
+    /// Trace `v` through a def map with no phis/labels (pure chain test).
+    fn trace_root(defs: &FxHashMap<u32, &Instruction>, v: u32) -> ObjectRoot {
+        object_root_inner(defs, &FxHashMap::default(), BlockId(0), Value(v), 0)
+    }
+
+    #[test]
+    fn sub_traced_roots() {
+        // `ptr - int` keeps the pointer's root (stays in/near the object;
+        // out-of-bounds is UB), exactly like `Add`.
+        let pref = param_def(1, 0);
+        let p_minus_c = Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::Sub,
+            lhs: val(1),
+            rhs: i32c(4),
+            ty: IrType::Ptr,
+        };
+        let defs: FxHashMap<u32, &Instruction> =
+            [(1, &pref), (2, &p_minus_c)].into_iter().collect();
+        assert_eq!(trace_root(&defs, 2), ObjectRoot::Param(0));
+        // `int - ptr` is integer laundering, not pointer arithmetic: the
+        // int-derived address may alias anything, so it fails closed.
+        let c_minus_p = Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Sub,
+            lhs: i32c(100),
+            rhs: val(1),
+            ty: IrType::Ptr,
+        };
+        let defs: FxHashMap<u32, &Instruction> =
+            [(1, &pref), (3, &c_minus_p)].into_iter().collect();
+        assert_eq!(trace_root(&defs, 3), ObjectRoot::Other);
+        // `int + ptr` is commutative with `ptr + int`: keeps the root.
+        let c_plus_p = Instruction::BinOp {
+            dest: Value(4),
+            op: IrBinOp::Add,
+            lhs: i32c(100),
+            rhs: val(1),
+            ty: IrType::Ptr,
+        };
+        let defs: FxHashMap<u32, &Instruction> = [(1, &pref), (4, &c_plus_p)].into_iter().collect();
+        assert_eq!(trace_root(&defs, 4), ObjectRoot::Param(0));
+        // Two rooted sides (ptr+ptr, or ptrdiff reused as an address).
+        let pref2 = param_def(5, 1);
+        let p_plus_p = Instruction::BinOp {
+            dest: Value(6),
+            op: IrBinOp::Add,
+            lhs: val(1),
+            rhs: val(5),
+            ty: IrType::Ptr,
+        };
+        let defs: FxHashMap<u32, &Instruction> = [(1, &pref), (5, &pref2), (6, &p_plus_p)]
+            .into_iter()
+            .collect();
+        assert_eq!(trace_root(&defs, 6), ObjectRoot::Other);
     }
 }

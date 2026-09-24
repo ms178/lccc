@@ -60,6 +60,10 @@ fn allows_address_copy_propagation(trimmed: &str) -> bool {
 //             covers self-RMW forms, where retargeting BOTH operands would
 //             redirect the result);
 //         (c) no implicit register usage (break, as in the 64-bit arm);
+//         (d) no legacy high-byte name of ANY family next to an
+//             introduced REX-requiring low byte (%spl/%bpl/%sil/%dil/
+//             %r8b-%r15b) — that mix is unencodable (the 64-bit arm
+//             holds the same line);
 //       Memory address operands are intrinsically safe to refuse: base and
 //       index registers are 64-bit names, so (a) rejects any line that
 //       references `F` inside an address.
@@ -70,15 +74,19 @@ fn allows_address_copy_propagation(trimmed: &str) -> bool {
 //       barrier clears the tables, every write invalidates the family, and
 //       the line is reclassified after each rewrite.
 
-/// Whole-name occurrence test: `%r8` must not match inside `%r8d`.
-fn contains_whole_name(line: &str, name: &str) -> bool {
+/// Whole-name occurrence test mirroring `replace_reg_name_exact`'s
+/// boundary rule: `%r8` must not match inside `%r8d`.
+fn contains_reg_name(line: &str, name: &str) -> bool {
     let bytes = line.as_bytes();
     let nb = name.as_bytes();
     let mut pos = 0;
     while pos + nb.len() <= bytes.len() {
         if &bytes[pos..pos + nb.len()] == nb {
             let after = pos + nb.len();
-            if after >= bytes.len() || !bytes[after].is_ascii_alphanumeric() {
+            if (after == bytes.len() || matches!(bytes[after], b',' | b')' | b' ' | b'\t' | b'\n'))
+                && line.is_char_boundary(pos)
+                && line.is_char_boundary(after)
+            {
                 return true;
             }
         }
@@ -87,40 +95,29 @@ fn contains_whole_name(line: &str, name: &str) -> bool {
     false
 }
 
-/// Replace every whole-name occurrence of `from` with `to`.
-fn replace_whole_name(line: &str, from: &str, to: &str) -> String {
-    if !contains_whole_name(line, from) {
-        return line.to_string();
-    }
-    let mut out = String::with_capacity(line.len());
-    let bytes = line.as_bytes();
-    let fb = from.as_bytes();
-    let mut pos = 0;
-    while pos < bytes.len() {
-        if pos + fb.len() <= bytes.len() && &bytes[pos..pos + fb.len()] == fb {
-            let after = pos + fb.len();
-            if after >= bytes.len() || !bytes[after].is_ascii_alphanumeric() {
-                out.push_str(to);
-                pos = after;
-                continue;
-            }
-        }
-        out.push(bytes[pos] as char);
-        pos += 1;
-    }
-    out
-}
-
 /// N2(a): true when `line` never reads family `fam` outside bits 0..=31.
 fn only_narrow_uses_of(line: &str, fam: RegId) -> bool {
-    if contains_whole_name(line, REG_NAMES[0][fam as usize]) {
+    if contains_reg_name(line, REG_NAMES[0][fam as usize]) {
         return false;
     }
-    const HIGH_BYTES: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
-    if (fam as usize) < 4 && contains_whole_name(line, HIGH_BYTES[fam as usize]) {
+    if (fam as usize) < 4 && contains_reg_name(line, HIGH_BYTE_NAMES[fam as usize]) {
         return false;
     }
     true
+}
+
+/// True when introducing family `new_fam` into `line` would mix a
+/// REX-requiring low-byte name (`%spl`/`%bpl`/`%sil`/`%dil`/`%r8b`-`%r15b`)
+/// with a legacy high-byte name (`%ah`/`%ch`/`%dh`/`%bh`) — unencodable
+/// (the assembler rejects it). Rewrites never touch high bytes
+/// themselves, so any high byte present in the instruction (comments
+/// stripped) stays. Guards BOTH copy arms.
+fn mixes_rex_with_high_byte(line: &str, new_fam: RegId) -> bool {
+    if (new_fam as usize) < 4 || (new_fam as usize) >= REG_NAMES[3].len() {
+        return false; // low fams need no REX for their low byte
+    }
+    let code = line.split('#').next().unwrap_or(line);
+    HIGH_BYTE_NAMES.iter().any(|hb| contains_reg_name(code, hb))
 }
 
 /// Try to replace uses of `dst_id` with `src_id` in instruction at index `j`.
@@ -173,6 +170,12 @@ fn try_propagate_into(
 
     // Skip shift/rotate when propagating into %rcx (they need %cl)
     if dst_id == 1 && is_shift_or_rotate(trimmed) {
+        return false;
+    }
+
+    // ENCODING: introducing a REX low-byte name next to a legacy high
+    // byte (%ah/%ch/%dh/%bh) is unencodable — refuse the rewrite.
+    if mixes_rex_with_high_byte(trimmed, src_id) {
         return false;
     }
 
@@ -240,11 +243,12 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
     // copy_src[dst] = src means "dst currently holds the same value as src"
     let mut copy_src: [RegId; 16] = [REG_NONE; 16];
     // copy_src32 holds the same relation for the LOW 32 bits (from movl
-    // reg-reg chains). Used only to shorten movl chains to their ultimate
-    // 32-bit source — never to propagate into other instructions (the upper
-    // 32 bits of a 32-bit chain are not tracked here) and never to delete
-    // (a movl self-copy zeroes the upper 32 bits, so only the zero-upper
-    // pass may remove it).
+    // reg-reg chains). Besides shortening movl chains to their ultimate
+    // 32-bit source it feeds the narrow N2 consumers (the upper 32 bits
+    // of a 32-bit chain are not tracked here, so a line reading the
+    // 64-bit name is refused) and the N3 scalar-store source rewrite;
+    // only the zero-upper pass may DELETE a movl (a movl self-copy
+    // zeroes the upper 32 bits).
     let mut copy_src32: [RegId; 16] = [REG_NONE; 16];
 
     let mut i = 0;
@@ -328,7 +332,7 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
                                         let mnemonic = String::from(
                                             &line_text[..line_text.len() - rest.len()],
                                         );
-                                        let new_src = replace_whole_name(
+                                        let new_src = replace_reg_name_exact(
                                             src_op,
                                             REG_NAMES[width_row][fam as usize],
                                             REG_NAMES[width_row][tracked as usize],
@@ -425,10 +429,11 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
                 }
             }
             copy_src32[dst_id as usize] = ultimate_src;
-            // The movl overwrites only the low 32 bits of dst, so the 64-bit
+            // A movl establishes only the low 32 bits of dst, so the 64-bit
             // copy graph through/downstream-of dst is dead — its value is no
-            // longer equal to any tracked register (the upper 32 bits are
-            // preserved, unknown). Failing to invalidate let a later movq
+            // longer equal to any tracked register (a 32-bit write zeroes
+            // bits 32..=63, and the resulting value is not the source's
+            // full-width value). Failing to invalidate let a later movq
             // propagate a stale full-width identity (miscompiled
             // vla_struct_sizeof / small_slot_* / phi tests).
             copy_src[dst_id as usize] = REG_NONE;
@@ -512,9 +517,16 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
             if !only_narrow_uses_of(cur_trimmed, reg) {
                 continue;
             }
+            // N2(d): refuse a REX low-byte introduction next to a legacy
+            // high byte (unencodable). Uses the shared UTF-8-safe
+            // rewriter: a byte-wise `as char` copy recodes non-ASCII
+            // comment bytes even when nothing is replaced.
+            if mixes_rex_with_high_byte(cur_trimmed, src) {
+                continue;
+            }
             let mut new_text = cur_trimmed.to_string();
             for row in 1..=3usize {
-                new_text = replace_whole_name(
+                new_text = replace_reg_name_exact(
                     &new_text,
                     REG_NAMES[row][reg as usize],
                     REG_NAMES[row][src as usize],
@@ -940,5 +952,51 @@ mod tests {
             (0..store.len()).any(|i| store.get(i).trim() == "addq $1, %rax"),
             "user asm bytes are immutable"
         );
+    }
+
+    #[cfg(test)]
+    mod redteam_repro_cp {
+        //! Red-team repros for narrow copy propagation (Agent-B audit).
+        use super::super::super::peephole_optimize;
+
+        fn run(asm: &str) -> String {
+            peephole_optimize(asm.to_string())
+        }
+
+        #[test]
+        fn narrow_prop_refuses_high_byte_lines_needing_rex() {
+            // Introducing %bpl (REX-requiring) next to %ah (REX-forbidden)
+            // produces unencodable assembly. The narrow arm must refuse.
+            let out = run(concat!(
+                "f:\n",
+                ".cfi_startproc\n",
+                "    movl %ebp, %ecx\n",
+                "    cmpb %cl, %ah\n",
+                "    sete %al\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ));
+            assert!(
+                !out.contains("%bpl"),
+                "must not introduce a REX byte next to %ah: {out}"
+            );
+        }
+
+        #[test]
+        fn narrow_prop_preserves_utf8_comment_bytes() {
+            // Non-ASCII comment bytes must round-trip byte-identically.
+            let out = run(concat!(
+                "f:\n",
+                ".cfi_startproc\n",
+                "    movl %ebx, %eax\n",
+                "    cmpl %eax, %esi # caf\u{e9} na\u{ef}ve \u{3b1}\u{3b2}\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ));
+            assert!(
+                out.contains("caf\u{e9} na\u{ef}ve \u{3b1}\u{3b2}"),
+                "UTF-8 comment bytes must round-trip: {out}"
+            );
+        }
     }
 }

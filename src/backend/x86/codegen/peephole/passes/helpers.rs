@@ -835,6 +835,38 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
     true
 }
 
+/// Legacy high-byte aliases: REX-forbidden, never rewritten, always checked.
+pub(super) const HIGH_BYTE_NAMES: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
+
+/// True when any SOURCE operand of `trimmed` mentions family `fam` at any
+/// width (64/32/16/8-low, plus the legacy high byte for fams 0..=3).
+/// Sources = everything before the last comma, so the NDD middle operand
+/// is covered: `imull $5, %r9d, %r9d` reads the family AS A SOURCE even
+/// though the shared dest-only predicate reports it dest-only. Trailing
+/// `#` comments are stripped so comment commas never move the boundary.
+/// Single source of truth for the source-mentions-dest guard: EVERY caller
+/// that treats a dest-only line as a fresh overwrite must ALSO consult
+/// this (the predicate alone cannot see middle==dst reads). No-comma
+/// lines have no source operands (vacuously false; their RMW-ness is the
+/// predicate's job and every caller consults both).
+pub(super) fn src_mentions_family(trimmed: &str, fam: RegId) -> bool {
+    if fam as usize >= REG_NAMES[0].len() {
+        return true; // fail-closed on out-of-range families
+    }
+    let code = trimmed.split('#').next().unwrap_or(trimmed);
+    let Some(comma) = code.rfind(',') else {
+        return false;
+    };
+    let src_part = &code[..comma];
+    if REG_NAMES
+        .iter()
+        .any(|row| src_part.contains(row[fam as usize]))
+    {
+        return true;
+    }
+    (fam as usize) < 4 && src_part.contains(HIGH_BYTE_NAMES[fam as usize])
+}
+
 /// Count AT&T operands in `ops`, honoring the balanced-paren scanner so a SIB
 /// address's internal commas (`disp(%base,%idx,4)`) never split an operand.
 fn count_top_level_operands(ops: &str) -> usize {

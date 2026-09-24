@@ -199,6 +199,23 @@ Timing data is available via:
 CCC_TIME_PASSES=1 ./target/fastbuild/lccc input.c -o output 2>&1 | grep PASS
 ```
 
+## Performance-Relevant Knobs (measured defaults)
+
+The tree carries 300+ environment knobs; most are debug switches with
+neutral defaults. Two change CODE GENERATION and have measured,
+data-backed defaults — a build that flips either silently changes the
+benchmark standings:
+
+| Knob | Default | What it controls | Why this default |
+|---|---|---|---|
+| `CCC_IVSR_SCALAR_DERIVED=1` | **off** (opt-in) | The scalar derived-IV flavor of `ivsr`: rewrites loop-recurrence-derived scalars (rbtree subtree pointers) into IV increments. | Measured net LOSS at default-on: linux_rbtree +1.2%, expat +4.0%, glibc_strstr +4.3%, five golden workloads past the codegen-quality bands (data in `src/passes/iv_strength_reduce.rs`; re-verified 2026-09-24 on x86-64: expat opt-in ≈+20%, glibc_strstr ≈+6.5%, linux_rbtree tie). Pinned opt-in by `tests/regression/check_ivsr_scalar_derived_default.sh`, which also proves the knob stays LIVE (knob-set and knob-unset asm must differ) so it cannot silently rot into a no-op. |
+| `CCC_NO_ANDN_FUSION` | **unset** (fusion on) | Kill switch for the Not+And → 3-operand `andn` fusion (BMI1) and, with it, the middle-end CH-mux defer that leaves the Not for the backend to fuse. | The fused shape is the GCC/Clang/ICX four-oracle consensus for SHA-256's CH (`tests/regression/check_ch_maj_codegen.sh` pins exactly one `andn` under `-mbmi`, zero without). The switch exists for bisection parity with the other branch fusions, not as a supported configuration. |
+
+The andn knob is resolved ONCE per `run_passes` (the `scalar_andn_available`
+spelling shared by both `bit_idioms` tiers) and re-read at emission
+(`supports_and_not`), so fold-time prediction and emission-time decision
+cannot drift within one compilation.
+
 ## Verifying IR Between Passes
 
 `CCC_VERIFY_IR` runs a structural check on the IR after **every** pass, so the

@@ -16,7 +16,7 @@
 //!   to a register the address depends on.
 
 use super::super::types::*;
-use super::helpers::{has_implicit_reg_usage, writes_family};
+use super::helpers::{HIGH_BYTE_NAMES, get_dest_reg, has_implicit_reg_usage, writes_family};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     is_relayable_family, plain_gp_operand, provably_dead_lv, split_two_operands,
@@ -927,12 +927,17 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
             continue;
         };
         // The self-test of the loaded register follows.  Pure, flag-neutral
-        // register staging may sit between the load and the test (sieve
-        // count loop: `leal 1(%r10), %esi` between the `movsbq` and the
-        // `testb`); mov/lea with register operands only neither read nor
-        // write flags nor touch memory, so sliding the compare past them is
-        // invisible to the program.
+        // register staging may sit between the load and the test, but the
+        // compare is emitted at the TEST site with the ORIGINAL memory
+        // text, so the staging must be disjoint from the fold's registers:
+        // it may neither mention the LOADED family (a read would see
+        // garbage once the load is gone; a write would test a value the
+        // memory compare cannot reproduce) nor WRITE an ADDRESS family
+        // (redefining the base/index between load and test changes what
+        // the slid memory operand denotes).  Reads of the address
+        // registers stay allowed: their values are untouched by the fold.
         let fam_mask = 1u16 << fam;
+        let addr_mask = infos[i].reg_refs & !fam_mask;
         let mut j = i + 1;
         while j < len {
             if infos[j].is_nop() || infos[j].kind == LineKind::Directive {
@@ -946,6 +951,7 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
             // lea only computes an address: no memory access, no flags —
             // its `(...)` operand is syntax, not an access.  mov is pure
             // only in the register/immediate forms (no memory operand).
+            let dest_j = get_dest_reg(&infos[j]);
             let staging =
                 if st.starts_with("leaq ") || st.starts_with("leal ") || st.starts_with("leaw ") {
                     true
@@ -957,7 +963,9 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
                     !st.contains('(')
                 } else {
                     false
-                } && infos[j].reg_refs & fam_mask == 0;
+                } && infos[j].reg_refs & fam_mask == 0
+                    && dest_j <= REG_GP_MAX
+                    && addr_mask & (1u16 << dest_j) == 0;
             if !staging {
                 break;
             }
@@ -995,6 +1003,15 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
             continue;
         };
         if a != b || register_family_fast(a) != fam {
+            i += 1;
+            continue;
+        }
+        // A high-byte self-test (`testb %ah, %ah`) reads bits 8..=15 —
+        // the extension bits, not the loaded byte — so it can never match
+        // a memory compare. (`register_family_fast` maps %ah to family 0,
+        // so the family check above is blind to it; `a == b` here, so one
+        // check covers both operands.)
+        if HIGH_BYTE_NAMES.contains(&a) {
             i += 1;
             continue;
         }
@@ -2401,5 +2418,178 @@ mod tests {
             1,
             "full pipeline must eliminate the second slot read:\n{out}"
         );
+    }
+
+    #[cfg(test)]
+    mod redteam_repro_dw {
+        //! Red-team repros for the load-test fold extensions (Agent-B audit).
+        //! Each test asserts CORRECT behavior: refusal-pins must PASS on base
+        //! (feature absent) and on fixed code, and FAIL on the buggy revision.
+        use super::super::super::peephole_optimize;
+
+        fn run(asm: &str) -> String {
+            peephole_optimize(asm.to_string())
+        }
+
+        #[test]
+        fn staging_address_write_refuses_load_test_fold() {
+            // The compare is emitted at the TEST site. Staging that redefines
+            // the load's ADDRESS base (%rbx) between load and test changes what
+            // `(%rbx)` means — folding would compare the NEW address's byte
+            // against semantics computed from the OLD one. The fold must refuse.
+            let out = run(concat!(
+                "foo:\n",
+                ".cfi_startproc\n",
+                ".LBB1:\n",
+                "    movsbq (%rbx), %rsi\n",
+                "    movq %rax, %rbx\n",
+                "    testb %sil, %sil\n",
+                "    je .LBB3\n",
+                "    movq %r9, %rax\n",
+                "    ret\n",
+                ".LBB3:\n",
+                "    xorl %eax, %eax\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ));
+            assert!(
+                !out.contains("cmpb $0"),
+                "fold must refuse address-write staging: {out}"
+            );
+        }
+
+        #[test]
+        fn staging_lea_bump_of_address_base_refuses_fold() {
+            // Same address-write hazard in LEA form: `leaq 1(%rbx), %rbx`
+            // redefines the base; sliding the compare past it tests *(p+1).
+            let out = run(concat!(
+                "foo:\n",
+                ".cfi_startproc\n",
+                ".LBB1:\n",
+                "    movsbq (%rbx), %rsi\n",
+                "    leaq 1(%rbx), %rbx\n",
+                "    testb %sil, %sil\n",
+                "    je .LBB3\n",
+                "    movq %rbx, %rax\n",
+                "    ret\n",
+                ".LBB3:\n",
+                "    xorl %eax, %eax\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ));
+            assert!(
+                !out.contains("cmpb $0"),
+                "fold must refuse lea-bump staging: {out}"
+            );
+        }
+
+        #[test]
+        fn staging_disjoint_still_folds_to_a_memory_compare() {
+            // Positive control: staging on a family disjoint from BOTH the
+            // loaded value and the address must still fold (the feature works).
+            let out = run(concat!(
+                "foo:\n",
+                ".cfi_startproc\n",
+                ".LBB1:\n",
+                "    movsbq (%rbx), %rsi\n",
+                "    movq %rax, %rcx\n",
+                "    testb %sil, %sil\n",
+                "    je .LBB3\n",
+                "    movq %r9, %rax\n",
+                "    ret\n",
+                ".LBB3:\n",
+                "    xorl %eax, %eax\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ));
+            assert!(
+                out.contains("cmpb $0, (%rbx)"),
+                "disjoint staging must fold: {out}"
+            );
+        }
+
+        #[test]
+        fn high_byte_self_test_refuses_load_test_fold() {
+            // `testb %ah, %ah` tests bits 8..15 (sign-extension bits under
+            // movsbq), NOT the loaded memory byte — folding to `cmpb $0, mem`
+            // compares the wrong value. The fold must refuse high-byte tests.
+            let out = run(concat!(
+                "foo:\n",
+                ".cfi_startproc\n",
+                ".LBB1:\n",
+                "    movsbq (%rbx), %rax\n",
+                "    testb %ah, %ah\n",
+                "    je .LBB3\n",
+                "    movq %r9, %rax\n",
+                "    ret\n",
+                ".LBB3:\n",
+                "    xorl %eax, %eax\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ));
+            assert!(
+                !out.contains("cmpb $0"),
+                "fold must refuse %ah self-test: {out}"
+            );
+        }
+
+        #[test]
+        fn movslq_relay_survives_imul_middle_read() {
+            // The relay feeds an NDD-middle read: `imull $26, %eax, %eax`
+            // reads %eax as its MIDDLE (source) operand. Retargeting the
+            // movslq to %r14 and deleting the relay leaves the imul reading
+            // a never-written register. The relay must survive.
+            let out = run(concat!(
+                "f:\n",
+                ".cfi_startproc\n",
+                "    movslq %edi, %rax\n",
+                "    movq %rax, %r14\n",
+                "    imull $26, %eax, %eax\n",
+                "    movq %r14, %rbx\n",
+                "    movq %rbx, %rax\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ));
+            assert!(
+                out.contains("movq %rax, %r14"),
+                "relay feeding an imul middle-read must survive: {out}"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod redteam_twin64 {
+        //! B3-twin: 64-bit copy arm introducing a REX low-byte name next to %ah.
+        use super::super::super::peephole_optimize;
+
+        #[test]
+        fn wide_prop_refuses_rex_next_to_high_byte() {
+            let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    movq %r12, %rcx\n    cmpb %cl, %ah\n    sete %al\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+            assert!(
+                !out.contains("%r12b"),
+                "must not introduce a REX byte next to %ah: {out}"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod redteam_b1b {
+        //! B1b: 16-bit first-operand read invisible to the relay fold's guard.
+        use super::super::super::peephole_optimize;
+
+        #[test]
+        fn relay_survives_16bit_first_operand_read() {
+            let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    movslq %edi, %rax\n    movq %rax, %r14\n    movzwl %ax, %eax\n    movl %r14d, (%rbx)\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+            assert!(
+                out.contains("movslq %edi, %rax"),
+                "movslq must not be retargeted across a 16-bit read: {out}"
+            );
+        }
     }
 }
