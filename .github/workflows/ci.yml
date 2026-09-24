@@ -374,6 +374,14 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_lea_hoist_rorx.sh
 
+      # Integer-parameter provenance (P1 follow-up): a laundered
+      # `(T *)(uintptr_t)raw` copy keeps its runtime guard while a genuine
+      # pointer-param copy stays guard-free, plus runtime bit-exactness.
+      - name: Verify integer-parameter provenance contracts
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_provenance_int_param.sh
+
       # CH/MAJ oracle consensus (session 585): the SHA-256 mux fold defers
       # to the backend's 3-operand ANDN under BMI1, the majority keeps its
       # earliest And (composite last, no park), and the acc-resident ALU

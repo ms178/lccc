@@ -22,6 +22,11 @@
 #      flipped on (the measured regression is back) or the machinery
 #      died (the knob is a no-op nobody noticed rotting).
 set -u
+# GCC availability: this is a CORRECTNESS gate (differentials A/B), so a
+# missing/broken reference compiler must FAIL, not silently skip both
+# comparisons. Set LCCC_ALLOW_GCC_SKIP=1 only for exotic environments
+# without any GCC (explicit opt-out, uniform across regression gates;
+# CI never sets it).
 CCC=${CCC:-target/fastbuild/lccc}
 RB=$(dirname "$0")/../benchmark/programs/linux_rbtree.c
 TMP=$(mktemp -d)
@@ -43,12 +48,15 @@ for MODE in default optin; do
     TAG="opt-in (CCC_IVSR_SCALAR_DERIVED=1)"
   fi
   "$GCC" -O2 -o "$TMP/g_$MODE.x" "$RB" 2>/dev/null \
-    || { note "skip $TAG (gcc build)"; continue; }
+    || { if [ "$ALLOW_GCC_SKIP" = 1 ]; then note "skip $TAG (gcc build; LCCC_ALLOW_GCC_SKIP=1)"; continue; else bad "$TAG gcc build failed (no silent skip: set LCCC_ALLOW_GCC_SKIP=1 to opt out)"; continue; fi; }
   if [ -n "$ENVBIN" ]; then
     env $ENVBIN "$CCC" $GCCINC -O2 -o "$TMP/l_$MODE.x" "$RB" 2>/dev/null \
       || { bad "$TAG lccc compile"; continue; }
   else
-    "$CCC" $GCCINC -O2 -o "$TMP/l_$MODE.x" "$RB" 2>/dev/null \
+    # The default arm MUST force the default: an inherited exported
+    # CCC_IVSR_SCALAR_DERIVED would otherwise make this "default" build
+    # secretly opt-in (and the C pin below would compare opt-in vs opt-in).
+    env -u CCC_IVSR_SCALAR_DERIVED "$CCC" $GCCINC -O2 -o "$TMP/l_$MODE.x" "$RB" 2>/dev/null \
       || { bad "$TAG lccc compile"; continue; }
   fi
   G=$("$TMP/g_$MODE.x"; echo "rc=$?")
@@ -58,7 +66,9 @@ done
 note "A/B. runtime differentials done (fails so far: $fails)"
 
 # ── C. the default pin: knob unset vs set must DIFFER in asm ─────────
-"$CCC" $GCCINC -O2 -S "$RB" -o "$TMP/def.s" 2>/dev/null \
+# (default arm forces the knob unset — see above — so ambient exports
+# cannot make this compare opt-in against itself).
+env -u CCC_IVSR_SCALAR_DERIVED "$CCC" $GCCINC -O2 -S "$RB" -o "$TMP/def.s" 2>/dev/null \
   || bad "default -S compile"
 env CCC_IVSR_SCALAR_DERIVED=1 "$CCC" $GCCINC -O2 -S "$RB" -o "$TMP/opt.s" 2>/dev/null \
   || bad "opt-in -S compile"

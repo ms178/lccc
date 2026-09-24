@@ -27,6 +27,9 @@ SRC=$(dirname "$0")/../benchmark/programs/linux_find_bit.c
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 GCC=${GCC_BIN:-gcc}
+# The runtime differential is a correctness check: a broken reference
+# build must FAIL, not silently skip (explicit opt-out only).
+ALLOW_GCC_SKIP=${LCCC_ALLOW_GCC_SKIP:-0}
 fails=0
 note() { printf '%s\n' "$*"; }
 bad()  { note "FAIL: $*"; fails=$((fails+1)); }
@@ -55,7 +58,11 @@ check_cfg() {
     G=$("$TMP/g.x"; echo "rc=$?")
     [ "$G" = "$L" ] || bad "$CFG: runtime differs (gcc=[$G] lccc=[$L])"
   else
-    note "skip $CFG runtime differential (no host gcc)"
+    if [ "$ALLOW_GCC_SKIP" = 1 ]; then
+      note "skip $CFG runtime differential (no host gcc; LCCC_ALLOW_GCC_SKIP=1)"
+    else
+      bad "$CFG gcc build failed (no silent skip: set LCCC_ALLOW_GCC_SKIP=1 to opt out)"
+    fi
   fi
 }
 

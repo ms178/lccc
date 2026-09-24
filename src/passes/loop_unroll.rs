@@ -73,6 +73,49 @@ fn two_block_unroll_enabled() -> bool {
     TWO_BLOCK_UNROLL_ENABLED.with(|cell| cell.get())
 }
 
+thread_local! {
+    /// Whether the persisting-inner-loop gate uses the pre-S20 lenient
+    /// behavior (skip unrecognized nested inners instead of refusing the
+    /// outer unroll) — the `CCC_UNROLL_LEGACY_PERSIST_GATE` kill switch for
+    /// A/B and emergency revert.  Resolved once by the driver into
+    /// per-thread state for the same reason as
+    /// `TWO_BLOCK_UNROLL_ENABLED` above: an ambient `std::env` read here
+    /// would race parallel tests that toggle it.  Defaults to false (the
+    /// fail-closed gate), so unit tests exercise the shipped behavior.
+    static PERSIST_GATE_LEGACY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record whether the legacy lenient persist gate is active.  Called by
+/// `run_passes` before any unroll entry point runs on this thread.
+pub(crate) fn set_persist_gate_legacy(enabled: bool) {
+    PERSIST_GATE_LEGACY.with(|cell| cell.set(enabled));
+}
+
+thread_local! {
+    /// Whether veto-path tracing is active (`CCC_UNROLL_GATE_TRACE`).  Like
+    /// `PERSIST_GATE_LEGACY` above, resolved once by the driver into
+    /// per-thread state: the pass pipeline must not read the process
+    /// environment per call (`check_env_test_hygiene.sh` ratchets the
+    /// remaining sites).  Defaults to false.
+    static PERSIST_GATE_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record whether persist-gate veto tracing is active.  Called by
+/// `run_passes` before any unroll entry point runs on this thread.
+pub(crate) fn set_persist_gate_trace(enabled: bool) {
+    PERSIST_GATE_TRACE.with(|cell| cell.set(enabled));
+}
+
+#[inline]
+fn persist_gate_trace() -> bool {
+    PERSIST_GATE_TRACE.with(|cell| cell.get())
+}
+
+#[inline]
+fn persist_gate_legacy() -> bool {
+    PERSIST_GATE_LEGACY.with(|cell| cell.get())
+}
+
 /// Maximum number of body-work blocks (body excluding header and latch) for
 /// a loop to be eligible. Prevents excessive code size growth.
 const MAX_UNROLL_BODY_BLOCKS: usize = 12; // increased for hot loops via PGO
@@ -689,7 +732,7 @@ fn analyze_loop(
         exit_limit,
         iv_is_lhs,
         exit_cond_positive,
-    ) = find_exit_condition(func, header, &lp.body, iv_phi)?;
+    ) = find_exit_condition(func, header, &lp.body, iv_phi, true)?;
 
     // 8b. The IV phi may only be referenced by a phi OUTSIDE the loop when
     //     that phi lives in the DIRECT exit block — Step 5 threads exactly
@@ -1225,6 +1268,20 @@ fn depends_only_on_const_and_iv(func: &IrFunction, op: &Operand, iv: Value, dept
     }
 }
 
+/// Observability for the persist gate: with `CCC_UNROLL_GATE_TRACE=1`, every
+/// veto prints the function, the outer/inner headers, and the arm that fired.
+/// Veto-path only (never on allow): the flag read runs solely when the gate is
+/// about to refuse, so steady-state compilation pays nothing for it.  The
+/// flag itself is resolved once by the driver (see `PERSIST_GATE_TRACE`).
+fn trace_persist_veto(func: &IrFunction, outer_header: usize, inner_header: usize, arm: &str) {
+    if persist_gate_trace() {
+        eprintln!(
+            "[UNROLL-GATE] veto fn={} outer={} inner={} arm={}",
+            func.name, outer_header, inner_header, arm
+        );
+    }
+}
+
 /// True when completely unrolling the outer loop `outer` would leave an inner
 /// natural loop alive as a runtime loop in every clone.  That happens when a
 /// properly-nested inner loop's IV/bound depends on a runtime value (anything
@@ -1236,12 +1293,64 @@ fn depends_only_on_const_and_iv(func: &IrFunction, op: &Operand, iv: Value, dept
 /// wrong elements while GCC returns the correct value).  A CONSTANT-trip inner
 /// loop is fine: the fixpoint fully unrolls it too.  Refusing keeps the outer
 /// loop rolled, which is correct and matches GCC.
+///
+/// Fail-closed: the ONLY nested inner loop that does not persist is a clean
+/// counted loop (single latch with an unconditional Branch to the header, an
+/// Add/Sub-IV, a header exit on that IV) whose init and limit depend solely
+/// on constants and the outer IV — the triangular-cascade shape, which the
+/// fixpoint unrolls in the next round.  Every other nested inner loop
+/// (multi-latch, non-Branch latch, no Add/Sub-IV, no exit on the found IV,
+/// no recognizable init) is one the complete cloner cannot cascade by
+/// construction, so it persists in every clone and the outer unroll is
+/// refused.  This is a correctness AND a codegen rule: cloning a surviving
+/// runtime loop K times is pure growth (csv_field_sum's 6-trip column loop
+/// over two data-dependent digit while-loops: 19→89 blocks, +345 IR insns,
+/// +156% .text, +8% runtime; the digit extractor's exit reads the
+/// magic-divided value rather than its Add counter, and the digit emitter
+/// carries an Add counter but exits on its Sub countdown — an exit/IV
+/// mismatch in both cases, invisible to the old skip-on-unrecognized gate).
+/// Refusing reproduces GCC's rolled shape for these nests.
+///
+/// The exit match is deliberately VALUE-based, not syntactic: the limit is
+/// accepted whenever it depends only on constants and the outer IV, even
+/// when it is recomputed in the inner header rather than hoisted (g3's
+/// `i + 8`, invariant in value but defined in-body).  Substitution plus the
+/// fold/copyprop between fixpoint rounds makes such a limit per-clone
+/// constant, so the fixpoint still cascades — requiring syntactic
+/// loop-invariance here would veto unrolls the fixpoint completes.  The gate
+/// therefore predicts EXACTLY what the fixpoint can cascade: first-IV-only
+/// (matching the fixpoint's own finder — an exit/IV mismatch vetoes because
+/// the fixpoint would fail to unroll the inner too, so it would persist),
+/// with init/limit constability decided by value.
+///
+/// Detached cycles need no special handling: a natural loop's header
+/// dominates its body, so a block that is unreachable from the outer header
+/// can never sit in `outer.body` — the membership test below already excludes
+/// every dead mid-fixpoint artifact (`find_natural_loops` itself is
+/// dominance-rooted and cannot even report one).
+///
+/// Known conservative case: an inner loop carrying two IVs where the exit
+/// reads the SECOND one (csv's digit emitter: an Add o-counter plus a Sub
+/// t-countdown with the exit on the countdown). The IV finder returns the
+/// first IV, the exit match fails, and the gate refuses — even if the
+/// exit's own IV were cascade-able. Trying every IV until one matches an
+/// exit would recover that rare shape, but the added search in a
+/// correctness-critical gate is not worth a missed unroll the corpus has
+/// never shown; revisit with data if one appears.
+///
+/// `CCC_UNROLL_LEGACY_PERSIST_GATE=1` restores the pre-S20 lenient gate (skip
+/// unrecognized inners instead of refusing) for A/B and emergency revert.
 fn body_contains_persisting_inner_loop(
     func: &IrFunction,
     cfg: &CfgAnalysis,
     outer: &loop_analysis::NaturalLoop,
     outer_iv: Value,
 ) -> bool {
+    // Fail-closed (see the doc comment): every nested inner loop the complete
+    // cloner cannot cascade persists in every clone, so every unrecognized
+    // shape refuses the outer unroll.  The legacy knob restores the old
+    // skip-on-unrecognized behavior for A/B and emergency revert.
+    let legacy = persist_gate_legacy();
     let all = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
     for inner in &all {
         if inner.header == outer.header {
@@ -1252,10 +1361,13 @@ fn body_contains_persisting_inner_loop(
         }
         let latches = inner.latches(&cfg.preds);
         if latches.len() != 1 {
-            // Multi-latch inner loops aren't handled by name here; the general
-            // cloner treats other shapes separately and they are not the
-            // chained-reduction miscompile this gate guards.
-            continue;
+            // Multi-latch inner loops can never complete-unroll (the cloner
+            // requires a single latch), so they always persist.
+            if legacy {
+                continue;
+            }
+            trace_persist_veto(func, outer.header, inner.header, "multi-latch");
+            return true;
         }
         let latch = latches[0];
         let latch_label = func.blocks[latch].label;
@@ -1263,38 +1375,89 @@ fn body_contains_persisting_inner_loop(
             &func.blocks[latch].terminator,
             Terminator::Branch(l) if *l == func.blocks[inner.header].label
         ) {
-            continue;
+            // Without a Branch latch the cloner cannot cascade this inner
+            // loop — it persists.
+            if legacy {
+                continue;
+            }
+            trace_persist_veto(func, outer.header, inner.header, "latch-shape");
+            return true;
         }
         // Clean counted inner loop: IV, exit condition, and its initial value.
+        // Anything else (a div/mul-driven while whose exit reads no
+        // Add/Sub-IV, an exit/IV mismatch where the exit reads a different
+        // phi than the finder's first IV, a loop with no recognizable exit
+        // or init) persists: the fixpoint's own first-IV finder would fail
+        // on it too.
         let Some((iv_phi, _ty, _step, _)) =
             find_iv_in_loop_ext(func, inner.header, latch, latch_label)
         else {
-            continue;
+            if legacy {
+                continue;
+            }
+            trace_persist_veto(func, outer.header, inner.header, "no-iv");
+            return true;
         };
+        // Value-based exit: no syntactic-invariance requirement (see
+        // `find_exit_condition`).  A limit recomputed in the inner header
+        // from the outer IV still cascades — substitution plus the
+        // fold/copyprop between fixpoint rounds makes it per-clone
+        // constant — so invariance is decided by `depends_only...` below.
+        // Legacy mode keeps the SYNTACTIC exit (`true`): the lenient gate
+        // must skip exactly the nests it skipped pre-S20, and a value exit
+        // would send unrecognized nests down the refuse path instead of
+        // the skip path (fse's main: 552 -> 405 in legacy mode).
         let Some((_et, _be, _cmp, _cty, limit, _islhs, _pos)) =
-            find_exit_condition(func, inner.header, &inner.body, iv_phi)
+            find_exit_condition(func, inner.header, &inner.body, iv_phi, legacy)
         else {
-            continue;
+            if legacy {
+                continue;
+            }
+            trace_persist_veto(func, outer.header, inner.header, "no-exit");
+            return true;
         };
-        let mut init_op = None;
+        // Every non-latch incoming of the IV phi is an entry value the inner
+        // loop can start from.  A multi-entry inner header (irreducible CFG)
+        // is per-clone constant only if ALL of them are — testing just one
+        // would bless a bound that varies by entry, and the fixpoint's
+        // `resolve_const_operand` cannot see through multi-entry phis
+        // anyway, so the inner would persist.  (Legacy mode keeps the old
+        // last-incoming-only test for exact A/B restoration.)
+        let mut init_ops = Vec::new();
         for inst in &func.blocks[inner.header].instructions {
             if let Instruction::Phi { dest, incoming, .. } = inst {
                 if dest.0 == iv_phi.0 {
                     for (op, lbl) in incoming {
                         if *lbl != latch_label {
-                            init_op = Some(op.clone());
+                            init_ops.push(op.clone());
                         }
                     }
                 }
             }
         }
-        let Some(init_op) = init_op else { continue };
+        if init_ops.is_empty() {
+            if legacy {
+                continue;
+            }
+            trace_persist_veto(func, outer.header, inner.header, "no-init");
+            return true;
+        }
+        let inits_to_test: &[Operand] = if legacy {
+            &init_ops[init_ops.len() - 1..]
+        } else {
+            &init_ops
+        };
         // If the inner IV's initial value or its bound depends on a runtime
         // value (not a constant and not the OUTER IV), the inner loop persists
-        // after the outer unroll -> unsafe to unroll the outer loop.
-        if !depends_only_on_const_and_iv(func, &init_op, outer_iv, 0)
+        // after the outer unroll -> unsafe to unroll the outer loop.  No
+        // legacy skip here (unlike the unrecognized-shape arms above): a
+        // recognized-but-dynamic bound persists under EITHER gate.
+        if inits_to_test
+            .iter()
+            .any(|op| !depends_only_on_const_and_iv(func, op, outer_iv, 0))
             || !depends_only_on_const_and_iv(func, &limit, outer_iv, 0)
         {
+            trace_persist_veto(func, outer.header, inner.header, "dynamic-bound");
             return true;
         }
     }
@@ -1617,10 +1780,12 @@ fn try_complete_unroll_general(
         return false;
     };
 
-    // Fail closed (correctness, see `body_contains_persisting_inner_loop`):
-    // refuse to unroll when the body contains a nested inner loop whose trip
-    // count depends on a runtime value (so it survives as a runtime loop in
-    // every clone).  The surviving sibling runtime reductions reuse one
+    // Fail closed (correctness AND codegen, see
+    // `body_contains_persisting_inner_loop`): refuse to unroll when the body
+    // contains a nested inner loop that would survive as a runtime loop in
+    // every clone — either its trip count depends on a runtime value, or it
+    // is a shape the complete cloner cannot cascade (no Add-IV, no clean
+    // latch/exit).  The surviving sibling runtime reductions reuse one
     // accumulator, which the downstream late vectorizer miscompiles; staying
     // rolled is correct and matches GCC for these shapes.
     if body_contains_persisting_inner_loop(func, cfg, lp, iv_phi) {
@@ -1629,7 +1794,7 @@ fn try_complete_unroll_general(
 
     // Exit from the header's CondBranch.
     let Some((exit_target, body_entry, raw_cmp_op, cmp_ty, exit_limit, iv_is_lhs, exit_pos)) =
-        find_exit_condition(func, header, &lp.body, iv_phi)
+        find_exit_condition(func, header, &lp.body, iv_phi, true)
     else {
         return false;
     };
@@ -2168,7 +2333,7 @@ fn try_complete_unroll_two_block(
         exit_limit,
         iv_is_lhs,
         exit_cond_positive,
-    )) = find_exit_condition(func, header, &lp.body, iv_phi)
+    )) = find_exit_condition(func, header, &lp.body, iv_phi, true)
     else {
         return false;
     };
@@ -2730,7 +2895,7 @@ fn try_partial_unroll_two_block(
         exit_limit,
         iv_is_lhs,
         exit_cond_positive,
-    )) = find_exit_condition(func, header, &lp.body, iv_phi)
+    )) = find_exit_condition(func, header, &lp.body, iv_phi, true)
     else {
         return false;
     };
@@ -3549,11 +3714,22 @@ fn find_iv_in_loop_ext(
 ///
 /// Returns `(exit_target, body_entry, cmp_op, cmp_ty, limit, iv_is_lhs, exit_cond_positive)`.
 /// `exit_cond_positive` is `true` when the condition evaluating to `true` means "exit".
+///
+/// `require_loop_invariant_limit` is true at every trip-computing caller:
+/// the closed form is only valid for a limit that is fixed for the whole
+/// loop.  The persisting-inner-loop gate passes false: it predicts
+/// post-substitution cascade-ability by VALUE (`depends_only_on_const_and_iv`
+/// on the limit), and a value-invariant limit recomputed in the inner header
+/// (g3's `i + 8`: invariant in value, defined in-body) still folds to a
+/// per-clone constant once the outer IV is substituted and fold/copyprop run
+/// before the next fixpoint round.  Requiring syntactic invariance there
+/// vetoes cascades the fixpoint would complete.
 fn find_exit_condition(
     func: &IrFunction,
     header: usize,
     loop_body: &FxHashSet<usize>,
     iv_phi: Value,
+    require_loop_invariant_limit: bool,
 ) -> Option<(BlockId, BlockId, IrCmpOp, IrType, Operand, bool, bool)> {
     let header_block = &func.blocks[header];
 
@@ -3626,13 +3802,17 @@ fn find_exit_condition(
 
     let iv_id = iv_phi.0;
 
-    // One Cmp operand must be exactly the IV phi; the other must be loop-invariant.
+    // One Cmp operand must be exactly the IV phi; the other is the limit.
+    // Trip-computing callers additionally require a syntactically
+    // loop-invariant limit (the closed form is only valid for a fixed
+    // limit); the persist gate passes false and decides invariance by
+    // VALUE instead (see the doc comment above).
     let (iv_is_lhs, limit_op) = if matches!(cmp_lhs, Operand::Value(v) if v.0 == iv_id)
-        && is_loop_invariant_op(cmp_rhs, loop_body, func)
+        && (!require_loop_invariant_limit || is_loop_invariant_op(cmp_rhs, loop_body, func))
     {
         (true, cmp_rhs)
     } else if matches!(cmp_rhs, Operand::Value(v) if v.0 == iv_id)
-        && is_loop_invariant_op(cmp_lhs, loop_body, func)
+        && (!require_loop_invariant_limit || is_loop_invariant_op(cmp_lhs, loop_body, func))
     {
         (false, cmp_lhs)
     } else {
@@ -6290,6 +6470,829 @@ mod tests {
             }
             other => panic!("outer latch terminator corrupted: {:?}", other),
         }
+    }
+
+    // ── Persisting-inner-loop gate (fail-closed) ──────────────────────────────
+    //
+    // `body_contains_persisting_inner_loop` refuses an outer complete unroll
+    // unless every nested inner loop is a clean counted loop whose bound and
+    // init the outer IV substitution makes per-clone constant (the
+    // triangular-cascade shape).  These tests pin both directions of that
+    // predicate directly at the gate, plus end-to-end through `unroll_loops`.
+
+    /// Verdict of the persist gate for a hand-declared outer loop.
+    fn persist_gate_verdict(func: &IrFunction, outer_body: &[usize], outer_iv: Value) -> bool {
+        let cfg = CfgAnalysis::build(func);
+        let outer = loop_analysis::NaturalLoop {
+            header: 1,
+            body: outer_body.iter().copied().collect(),
+        };
+        body_contains_persisting_inner_loop(func, &cfg, &outer, outer_iv)
+    }
+
+    /// Push B0 (preheader) + B1 (`for (i = 0; i < limit; i++)` header, body
+    /// at B2, outer latch `latch`, exit `exit`) of a nest fixture.
+    fn persist_gate_push_outer_prefix(
+        func: &mut IrFunction,
+        limit: i32,
+        latch: BlockId,
+        exit: BlockId,
+    ) {
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(8)), latch),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(10),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(limit)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(10)),
+                true_label: BlockId(2),
+                false_label: exit,
+            },
+            source_spans: Vec::new(),
+        });
+    }
+
+    /// Push the outer latch (`%8 = %1 + 1`, back to B1) + the returning exit.
+    fn persist_gate_push_outer_suffix(func: &mut IrFunction, latch: u32, exit: u32) {
+        func.blocks.push(BasicBlock {
+            label: BlockId(latch),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(8),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(exit),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 32;
+    }
+
+    /// Triangular nest (`for i` / `for j = i+1; j < 4`): the cascade shape —
+    /// the inner init depends only on the outer IV, so the inner becomes
+    /// per-clone constant-trip and the fixpoint unrolls it next. Allowed.
+    fn persist_gate_triangular() -> IrFunction {
+        let mut func = IrFunction::new("tri".to_string(), IrType::Void, vec![], false);
+        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
+        // B1 also computes the triangular init j = i + 1.
+        func.blocks[1].instructions.push(Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(2)), BlockId(1)),
+                        (Operand::Value(Value(7)), BlockId(4)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(11),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(4)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(3),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(3)),
+            }],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(3)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        persist_gate_push_outer_suffix(&mut func, 5, 6);
+        func
+    }
+
+    #[test]
+    fn persist_gate_triangular_inner_allowed() {
+        let func = persist_gate_triangular();
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "triangular inner (init on outer IV) must not veto the outer unroll"
+        );
+    }
+
+    #[test]
+    fn persist_gate_rectangular_inner_allowed() {
+        // Const-init/const-bound inner: per-clone constant-trip. Allowed.
+        let mut func = persist_gate_triangular();
+        // Rectangularize: inner init becomes const 0 (drop the i+1 use).
+        if let Instruction::Phi { incoming, .. } = &mut func.blocks[2].instructions[0] {
+            incoming[0].0 = Operand::Const(IrConst::I32(0));
+        }
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "rectangular const inner must not veto the outer unroll"
+        );
+    }
+
+    #[test]
+    fn persist_gate_clean_countdown_inner_allowed() {
+        // Single Sub-IV with the exit on it and const init/limit: a clean
+        // countdown, which the complete cloner (negative steps) cascades.
+        // Allowed — countdown unrolling is pinned by
+        // `unroll_countdown_chain_body.c` and must keep working nested.
+        let mut func = persist_gate_triangular();
+        func.blocks[2].instructions = vec![
+            Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(4)), BlockId(1)),
+                    (Operand::Value(Value(7)), BlockId(4)),
+                ],
+            },
+            Instruction::Cmp {
+                dest: Value(11),
+                op: IrCmpOp::Sgt,
+                lhs: Operand::Value(Value(3)),
+                rhs: Operand::Const(IrConst::I32(0)),
+                ty: IrType::I32,
+            },
+        ];
+        func.blocks[4].instructions = vec![Instruction::BinOp {
+            dest: Value(7),
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(Value(3)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        }];
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "clean countdown inner must not veto the outer unroll"
+        );
+    }
+
+    /// csv_field_sum's digit EXTRACTOR shape: the inner loop carries an Add
+    /// counter, but the exit reads the magic-divided value — no exit on any
+    /// Add-IV. The inner persists in every clone. Must refuse.
+    fn persist_gate_div_driven() -> IrFunction {
+        let mut func = IrFunction::new("divinner".to_string(), IrType::Void, vec![], false);
+        persist_gate_push_outer_prefix(&mut func, 6, BlockId(5), BlockId(6));
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(4),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(0)), BlockId(1)),
+                        (Operand::Value(Value(6)), BlockId(4)),
+                    ],
+                },
+                Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        // Const init ON PURPOSE: the refusal comes from the
+                        // exit/IV mismatch (exit reads the div-driven phi),
+                        // not from the bound.
+                        (Operand::Const(IrConst::I32(7)), BlockId(1)),
+                        (Operand::Value(Value(5)), BlockId(4)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(11),
+                    op: IrCmpOp::Sgt,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(3),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(3)),
+            }],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(4)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                // Non-Add update of the exit phi (stands in for the
+                // magic-div chain): no Add-IV explains the exit.
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Value(Value(3)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        persist_gate_push_outer_suffix(&mut func, 5, 6);
+        func
+    }
+
+    #[test]
+    fn persist_gate_div_driven_inner_refused() {
+        let func = persist_gate_div_driven();
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "div-driven inner (exit on non-IV phi) must veto the outer unroll"
+        );
+    }
+
+    /// csv_field_sum's digit EMITTER shape: an Add o-counter listed FIRST
+    /// plus a Sub t-countdown, with the exit on the countdown. The IV
+    /// finder returns the Add-IV, the exit match fails, and the loop
+    /// persists. Must refuse.
+    fn persist_gate_two_iv_exit_on_second() -> IrFunction {
+        let mut func = persist_gate_div_driven();
+        // Turn the div update into a Sub countdown; keep the Add-phi first.
+        func.blocks[4].instructions[1] = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(Value(3)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        };
+        func
+    }
+
+    #[test]
+    fn persist_gate_exit_on_second_iv_refused() {
+        let func = persist_gate_two_iv_exit_on_second();
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "inner with the exit on its second IV must veto the outer unroll"
+        );
+    }
+
+    /// Multi-latch inner: B3 is the Branch latch, B4 re-enters the header
+    /// conditionally. The unmerged loop with tail B3 has two latches, which
+    /// the complete cloner can never cascade. Must refuse. (Tail order only
+    /// selects WHICH arm fires first — B3 < B4 puts the two-latch loop
+    /// first — but the verdict is order-independent: the other unmerged
+    /// loop is latch-malformed and refuses on its own.)
+    fn persist_gate_multi_latch() -> IrFunction {
+        let mut func = IrFunction::new("multilatch".to_string(), IrType::Void, vec![], false);
+        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(7)), BlockId(4)),
+                        (Operand::Value(Value(6)), BlockId(3)),
+                        (Operand::Value(Value(0)), BlockId(1)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(11),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(10)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(4),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(6),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(3)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(7),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cmp {
+                    dest: Value(12),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(5)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(12)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        persist_gate_push_outer_suffix(&mut func, 5, 6);
+        func
+    }
+
+    #[test]
+    fn persist_gate_multi_latch_inner_refused() {
+        let func = persist_gate_multi_latch();
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "multi-latch inner must veto the outer unroll"
+        );
+    }
+
+    #[test]
+    fn persist_gate_detached_cycle_no_veto() {
+        // A disconnected B5↔B6 cycle next to a clean unrollable outer loop:
+        // dead code must never veto optimization. The membership test
+        // excludes it even if loop detection ever learns to see detached
+        // cycles (a natural header dominates its body, so an unreachable
+        // block can never sit in `outer.body`); the second assertion pins
+        // today's invisibility as the tripwire for that analysis change.
+        let mut func = IrFunction::new("detached".to_string(), IrType::Void, vec![], false);
+        persist_gate_push_outer_prefix(&mut func, 4, BlockId(3), BlockId(4));
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(1)),
+            }],
+            terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
+        });
+        persist_gate_push_outer_suffix(&mut func, 3, 4);
+        func.blocks.push(BasicBlock {
+            label: BlockId(5),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(6)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(6),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(5)),
+            source_spans: Vec::new(),
+        });
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3], Value(1)),
+            "detached cycle must not veto the outer unroll"
+        );
+        let cfg = CfgAnalysis::build(&func);
+        let all =
+            loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+        assert!(
+            all.iter().all(|lp| lp.header != 5 && lp.header != 6),
+            "tripwire: loop detection learned to see detached cycles — \
+             re-examine the persist gate's membership argument"
+        );
+    }
+
+    #[test]
+    fn persist_gate_legacy_restores_lenient() {
+        // Differential pin: under the legacy knob the four refusing shapes
+        // above are allowed again (the pre-S20 skip-on-unrecognized gate),
+        // while the three cascade shapes stay allowed in both modes.
+        let prev = persist_gate_legacy();
+        set_persist_gate_legacy(true);
+        assert!(!persist_gate_verdict(
+            &persist_gate_triangular(),
+            &[1, 2, 3, 4, 5],
+            Value(1)
+        ));
+        let mut rect = persist_gate_triangular();
+        if let Instruction::Phi { incoming, .. } = &mut rect.blocks[2].instructions[0] {
+            incoming[0].0 = Operand::Const(IrConst::I32(0));
+        }
+        assert!(!persist_gate_verdict(&rect, &[1, 2, 3, 4, 5], Value(1)));
+        assert!(!persist_gate_verdict(
+            &persist_gate_affine_limit_in_header(),
+            &[1, 2, 3, 4, 5],
+            Value(1)
+        ));
+        assert!(!persist_gate_verdict(
+            &persist_gate_div_driven(),
+            &[1, 2, 3, 4, 5],
+            Value(1)
+        ));
+        assert!(!persist_gate_verdict(
+            &persist_gate_two_iv_exit_on_second(),
+            &[1, 2, 3, 4, 5],
+            Value(1)
+        ));
+        assert!(!persist_gate_verdict(
+            &persist_gate_multi_latch(),
+            &[1, 2, 3, 4, 5],
+            Value(1)
+        ));
+        assert!(!persist_gate_verdict(
+            &persist_gate_multi_entry_inner(),
+            &[1, 2, 3, 4, 5],
+            Value(1)
+        ));
+        set_persist_gate_legacy(prev);
+        // Restore verified: the refusing shapes veto again.
+        assert!(persist_gate_verdict(
+            &persist_gate_div_driven(),
+            &[1, 2, 3, 4, 5],
+            Value(1)
+        ));
+        assert!(persist_gate_verdict(
+            &persist_gate_two_iv_exit_on_second(),
+            &[1, 2, 3, 4, 5],
+            Value(1)
+        ));
+        assert!(persist_gate_verdict(
+            &persist_gate_multi_latch(),
+            &[1, 2, 3, 4, 5],
+            Value(1)
+        ));
+        assert!(persist_gate_verdict(
+            &persist_gate_multi_entry_inner(),
+            &[1, 2, 3, 4, 5],
+            Value(1)
+        ));
+    }
+
+    /// g3's affine-limit shape (`for j = 2; j < i + 8; j++` with the limit
+    /// recomputed in the INNER header from the outer IV): invariant in value
+    /// but not hoisted, so no SYNTACTIC exit exists — yet substitution plus
+    /// the fold/copyprop between fixpoint rounds makes it per-clone
+    /// constant, and the fixpoint cascades. Must allow. (S20's syntactic
+    /// gate vetoed this: +20 insns on g3 plus a lost ipcp fold in main.
+    /// Legacy allows it too, but for the wrong reason — skipping the
+    /// unrecognized exit — while S20b allows it by value prediction.)
+    fn persist_gate_affine_limit_in_header() -> IrFunction {
+        let mut func = IrFunction::new("afflim".to_string(), IrType::Void, vec![], false);
+        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(2)), BlockId(1)),
+                        (Operand::Value(Value(7)), BlockId(4)),
+                    ],
+                },
+                // The limit, computed HERE (in-body, hence not
+                // syntactically invariant) from the OUTER iv %1.
+                Instruction::BinOp {
+                    dest: Value(12),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(8)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cmp {
+                    dest: Value(11),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Value(Value(12)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(3),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(3)),
+            }],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(3)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        persist_gate_push_outer_suffix(&mut func, 5, 6);
+        func
+    }
+
+    #[test]
+    fn persist_gate_affine_limit_in_header_allowed() {
+        let func = persist_gate_affine_limit_in_header();
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "value-invariant limit recomputed in the inner header must not veto"
+        );
+    }
+
+    /// Multi-entry inner header (irreducible CFG): the IV phi has TWO
+    /// non-latch incomings, one const (B1) and one opaque-dynamic (B7, a
+    /// syntactic-only predecessor — Value(99) is deliberately undefined).
+    /// Per-clone constancy needs ALL entries constable. Must refuse. (The
+    /// const incoming is listed LAST so a last-incoming-wins test would
+    /// bless this nest — the S20/legacy false-negative this pins shut.)
+    fn persist_gate_multi_entry_inner() -> IrFunction {
+        let mut func = IrFunction::new("multientry".to_string(), IrType::Void, vec![], false);
+        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(99)), BlockId(7)),
+                        (Operand::Const(IrConst::I32(0)), BlockId(1)),
+                        (Operand::Value(Value(7)), BlockId(4)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(11),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(4)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(3),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(3)),
+            }],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(3)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        persist_gate_push_outer_suffix(&mut func, 5, 6);
+        // Syntactic-only second entry into the inner header.
+        func.blocks.push(BasicBlock {
+            label: BlockId(7),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        func
+    }
+
+    #[test]
+    fn persist_gate_multi_entry_inner_refused() {
+        let func = persist_gate_multi_entry_inner();
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "multi-entry inner with a dynamic entry value must veto the outer unroll"
+        );
+    }
+
+    /// fse's shape: a value-only exit (affine limit recomputed in the inner
+    /// header) PLUS a dynamic init (Value(99) is deliberately undefined, an
+    /// opaque runtime value). The new gate finds the value exit, then
+    /// refuses on the unconstable init; the legacy gate must SKIP the nest
+    /// (no SYNTACTIC exit) exactly as pre-S20. Pins the legacy-fidelity fix:
+    /// with a value exit in legacy mode this nest would refuse (fse's main
+    /// 552 -> 405 with the knob set) instead of restoring the lenient gate.
+    fn persist_gate_dynamic_init_affine_limit() -> IrFunction {
+        let mut func = IrFunction::new("dyninit".to_string(), IrType::Void, vec![], false);
+        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(99)), BlockId(1)),
+                        (Operand::Value(Value(7)), BlockId(4)),
+                    ],
+                },
+                Instruction::BinOp {
+                    dest: Value(12),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(8)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cmp {
+                    dest: Value(11),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Value(Value(12)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(3),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(3)),
+            }],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(3)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        persist_gate_push_outer_suffix(&mut func, 5, 6);
+        func
+    }
+
+    #[test]
+    fn persist_gate_dynamic_init_affine_limit_vetoes_unless_legacy() {
+        let func = persist_gate_dynamic_init_affine_limit();
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "value exit with a dynamic init must veto the outer unroll"
+        );
+        let prev = persist_gate_legacy();
+        set_persist_gate_legacy(true);
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "legacy gate must skip the unrecognized nest, not refuse it"
+        );
+        set_persist_gate_legacy(prev);
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "restored gate must veto again"
+        );
+    }
+
+    #[test]
+    fn e2e_persist_gate_csv_nest_rolled_unless_legacy() {
+        // End-to-end through `unroll_loops`: the csv-shaped nest (const-6
+        // outer, div-driven inner) keeps its outer back-edge under the
+        // fail-closed gate, and unrolls it under the legacy knob — the
+        // committed differential proving this test discriminates the fix.
+        let mut func = persist_gate_div_driven();
+        let n = unroll_loops(&mut func, UnrollPhase::Early);
+        let latch = func.blocks.iter().find(|b| b.label == BlockId(5)).unwrap();
+        assert!(
+            matches!(&latch.terminator, Terminator::Branch(lbl) if *lbl == BlockId(1)),
+            "csv-shaped outer must stay rolled (n={n})"
+        );
+        assert!(
+            matches!(&func.blocks[1].terminator, Terminator::CondBranch { .. }),
+            "csv-shaped outer header must keep its loop exit"
+        );
+
+        let prev = persist_gate_legacy();
+        set_persist_gate_legacy(true);
+        let mut legacy_func = persist_gate_div_driven();
+        let legacy_n = unroll_loops(&mut legacy_func, UnrollPhase::Early);
+        let legacy_latch = legacy_func
+            .blocks
+            .iter()
+            .find(|b| b.label == BlockId(5))
+            .unwrap();
+        assert!(
+            !matches!(&legacy_latch.terminator, Terminator::Branch(lbl) if *lbl == BlockId(1)),
+            "legacy gate must still unroll the csv-shaped outer (n={legacy_n})"
+        );
+        assert!(legacy_n >= 1, "legacy gate must report the unroll");
+        set_persist_gate_legacy(prev);
+    }
+
+    #[test]
+    fn e2e_persist_gate_triangular_cascade_allowed() {
+        // The triangular nest still complete-unrolls outer→inner through
+        // `unroll_loops`: the gate's allow-path end-to-end.
+        let mut func = persist_gate_triangular();
+        let n = unroll_loops(&mut func, UnrollPhase::Early);
+        assert!(n >= 2, "triangular nest must cascade outer+inner (n={n})");
+        let latch = func.blocks.iter().find(|b| b.label == BlockId(5)).unwrap();
+        assert!(
+            !matches!(&latch.terminator, Terminator::Branch(lbl) if *lbl == BlockId(1)),
+            "triangular outer latch must feed the clone chain"
+        );
+        assert!(
+            func.blocks
+                .iter()
+                .any(|b| matches!(b.terminator, Terminator::Return(None))),
+            "triangular exit must still exist and return"
+        );
     }
 
     #[test]

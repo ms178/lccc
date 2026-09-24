@@ -190,10 +190,14 @@ fn peeled_value(
 /// (`detect_and_not_fusions` + `emit_and_not_impl`): a single-use `Not`
 /// whose type is `c_ty` inside the shared ALU-fusion width domain, sitting
 /// at the immediately preceding index of the SAME block as `and_opnd`'s
-/// And.  Extracted from the Pattern-B closure so the contract test can run
-/// BOTH predicates (this one and the backend detector) over the same
-/// constructed scenarios — the audit's point was that the two spellings
-/// of the criteria must never drift apart silently.
+/// And.  The predicate is COMPLETE — it validates `and_opnd`'s own
+/// definition (an `And` of the Not's type reading the Not's dest) rather
+/// than trusting a caller precondition — so it agrees with the backend
+/// detector on every shape, including non-And consumers. Extracted from
+/// the Pattern-B closure so the contract test can run BOTH predicates
+/// (this one and the backend detector) over the same constructed
+/// scenarios — the audit's point was that the two spellings of the
+/// criteria must never drift apart silently.
 pub(super) fn andn_fusion_predicted_at(
     defs: &[Option<Instruction>],
     use_counts: &[u32],
@@ -216,6 +220,26 @@ pub(super) fn andn_fusion_predicted_at(
             }
             if use_counts.get(nv.0 as usize).copied() != Some(1) {
                 return false;
+            }
+            // The consumer must BE an `And` of the Not's type reading the
+            // Not's dest — mirroring `detect_and_not_fusions` exactly. No
+            // caller precondition: Pattern B establishes this anyway (via
+            // `and_strict`), but the prediction is only meaningful as a
+            // standalone predicate if it checks the full shape itself.
+            let Operand::Value(av) = and_opnd else {
+                return false;
+            };
+            match defs.get(av.0 as usize).and_then(Option::as_ref) {
+                Some(Instruction::BinOp {
+                    op: IrBinOp::And,
+                    lhs,
+                    rhs,
+                    ty: aty,
+                    ..
+                }) if *aty == *nty
+                    && (matches!(lhs, Operand::Value(v) if *v == nv)
+                        || matches!(rhs, Operand::Value(v) if *v == nv)) => {}
+                _ => return false,
             }
             let loc = |op: &Operand| -> Option<(usize, usize)> {
                 match op {
@@ -3480,11 +3504,11 @@ mod tests {
         // (label, block instructions, the Not operand value, the And operand
         // value, the And's index inside the block, the mux type, expected)
         //
-        // Caller preconditions respected: `and_opnd`'s def is always an
-        // And of `c_ty` reading the Not's dest (that is what the mux
-        // matcher's `and_strict` guarantees before the prediction is
-        // consulted) — the scenarios vary only the properties BOTH
-        // predicates are responsible for deciding on their own.
+        // No caller preconditions: the helper validates the COMPLETE shape
+        // itself (Not def/type/use-count, And def/type/operand, adjacency),
+        // exactly like the backend detector. The "adjacent consumer is not
+        // an And" / "does not consume" / "type differs" scenarios fail
+        // against any helper that trusts `and_opnd` blindly.
         let scenarios: Vec<(&str, Vec<Instruction>, u32, u32, usize, IrType, bool)> = vec![
             (
                 "adjacent single-use U32",
@@ -3587,6 +3611,47 @@ mod tests {
             (
                 "operand is not a Not",
                 vec![and3(3, v(0), v(2)), typed_and(4, v(3), v(1), IrType::U32)],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "adjacent consumer is not an And",
+                // The Not is single-use and adjacent, but its consumer is a
+                // Xor: a helper that checks only the Not side predicts a
+                // fusion the backend will never perform.
+                vec![typed_not(3, v(0), IrType::U32), xor3(4, v(3), v(1))],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "adjacent And does not consume the Not",
+                // Single-use (elsewhere) and adjacent, but the And reads
+                // other values: no fusion either way.
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(1), v(2), IrType::U32),
+                    xor3(5, v(3), v(0)),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "adjacent And type differs from the Not",
+                // The backend requires And.ty == Not.ty; U32 Not with a U64
+                // And consumer must not predict.
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(3), v(1), IrType::U64),
+                ],
                 3,
                 4,
                 1,

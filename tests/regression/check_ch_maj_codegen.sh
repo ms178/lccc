@@ -29,13 +29,16 @@ GCCINC=$("$GCC" -print-file-name=include 2>/dev/null)
 fails=0
 note() { printf '%s\n' "$*"; }
 bad()  { note "FAIL: $*"; fails=$((fails+1)); }
+# Correctness gate: a broken reference build must FAIL, not silently skip
+# the differential (explicit opt-out only; CI never sets it).
+ALLOW_GCC_SKIP=${LCCC_ALLOW_GCC_SKIP:-0}
 
 # ── A. runtime differential ─────────────────────────────────────────
 for MARCH in "" "-mbmi" "-march=x86-64-v3"; do
   for OPT in -O1 -O2 -O3 -Os; do
     TAG="$MARCH $OPT"
     "$GCC" $MARCH $OPT -o "$TMP/g.x" "$SRC" -lm 2>/dev/null \
-      || { note "skip $TAG (gcc)"; continue; }
+      || { if [ "$ALLOW_GCC_SKIP" = 1 ]; then note "skip $TAG (gcc; LCCC_ALLOW_GCC_SKIP=1)"; else bad "$TAG gcc build failed (no silent skip: set LCCC_ALLOW_GCC_SKIP=1 to opt out)"; fi; continue; }
     "$CCC" $GCCINC $MARCH $OPT -o "$TMP/l.x" "$SRC" -lm 2>/dev/null \
       || { bad "$TAG lccc compile"; continue; }
     G=$("$TMP/g.x"; echo "rc=$?")

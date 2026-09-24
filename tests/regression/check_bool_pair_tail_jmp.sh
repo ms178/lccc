@@ -85,7 +85,11 @@ fi
 python3 - "$work/chains.s" <<'PYEOF'
 import re, sys
 
-jcc = re.compile(r"^[ \t]*(j[a-z]{2,3})[ \t]+(\.L\S+)$")
+# Conditional jumps only: 2-letter (jb/jl/je/...) and 3-letter (jae/jge/...)
+# alike — S20's rolled nests emit `jb` where the unrolled shape emitted
+# `jae`, and the old `{2,3}` class was blind to them.  `jmp` is excluded
+# (unconditional; it must never count as a chain edge).
+jcc = re.compile(r"^[ \t]*(?!jmp[ \t])(j[a-z]{1,3})[ \t]+(\.L\S+)$")
 lbl = re.compile(r"^[ \t]*(\.L\S+):")
 
 lines = open(sys.argv[1]).read().splitlines()
