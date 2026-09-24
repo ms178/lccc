@@ -81,3 +81,183 @@ vcmpps $0, %zmm1, %zmm2, %k1
 vcmpps $0, (%rdi), %zmm2, %k1
 vpmovzxbw 32(%rdi), %zmm1{%k1}{z}
 vpaddd (%rdi){1to16}, %zmm1, %zmm2{%k1}{z}
+;;; kmov_all
+.text
+kmovb %k1, %k2
+kmovw %k1, %k2
+kmovd %k1, %k2
+kmovq %k1, %k2
+kmovb %k1, (%rax)
+kmovw %k1, (%rax)
+kmovd %k1, (%rax)
+kmovq %k1, (%rax)
+kmovb (%rax), %k2
+kmovw (%rax), %k2
+kmovd (%rax), %k2
+kmovq (%rax), %k2
+kmovq %r8, %k1
+kmovq %k1, %r15
+kmovd %r8d, %k1
+kmovd %k1, %r15d
+kmovw %r8d, %k1
+kmovb %k1, %r15d
+;;; kopmask_logic
+.text
+kaddb %k1, %k2, %k0
+kaddw %k1, %k2, %k0
+kaddd %k1, %k2, %k0
+kaddq %k1, %k2, %k0
+kandb %k1, %k2, %k0
+kandw %k1, %k2, %k0
+kandd %k1, %k2, %k0
+kandq %k1, %k2, %k0
+kandnb %k1, %k2, %k0
+kandnw %k1, %k2, %k0
+kandnd %k1, %k2, %k0
+kandnq %k1, %k2, %k0
+korb %k1, %k2, %k0
+korw %k1, %k2, %k0
+kord %k1, %k2, %k0
+korq %k1, %k2, %k0
+kxnorb %k1, %k2, %k0
+kxnorw %k1, %k2, %k0
+kxnord %k1, %k2, %k0
+kxnorq %k1, %k2, %k0
+kxorb %k1, %k2, %k0
+kxorw %k1, %k2, %k0
+kxord %k1, %k2, %k0
+kxorq %k1, %k2, %k0
+kunpckbw %k1, %k2, %k0
+kunpckwd %k1, %k2, %k0
+kunpckdq %k1, %k2, %k0
+;;; kopmask_test
+.text
+knotb %k1, %k2
+knotw %k1, %k2
+knotd %k1, %k2
+knotq %k1, %k2
+kortestb %k1, %k2
+kortestw %k1, %k2
+kortestd %k1, %k2
+kortestq %k1, %k2
+ktestb %k1, %k2
+ktestw %k1, %k2
+ktestd %k1, %k2
+ktestq %k1, %k2
+;;; kshift
+.text
+kshiftlb $3, %k6, %k5
+kshiftrb $3, %k6, %k5
+kshiftlw $3, %k6, %k5
+kshiftrw $3, %k6, %k5
+kshiftld $3, %k6, %k5
+kshiftrd $3, %k6, %k5
+kshiftlq $3, %k6, %k5
+kshiftrq $3, %k6, %k5
+;;; kmov_bad_gpr reject
+.text
+kmovb %k1, %xmm2
+;;; kmov_bad_size reject
+.text
+kmovd %k1, %rax
+;;; kopmask_bad_reg reject
+.text
+kaddb %eax, %k2, %k0
+;;; fma_addsub
+.text
+vfmaddsub132pd %zmm4, %zmm5, %zmm6
+vfmaddsub132ps %zmm4, %zmm5, %zmm6
+vfmaddsub213pd %zmm4, %zmm5, %zmm6
+vfmaddsub213ps %zmm4, %zmm5, %zmm6
+vfmaddsub231pd %zmm4, %zmm5, %zmm6
+vfmaddsub231ps %zmm4, %zmm5, %zmm6
+vfmsubadd132pd %zmm4, %zmm5, %zmm6
+vfmsubadd132ps %zmm4, %zmm5, %zmm6
+vfmsubadd213pd %zmm4, %zmm5, %zmm6
+vfmsubadd213ps %zmm4, %zmm5, %zmm6
+vfmsubadd231pd %zmm4, %zmm5, %zmm6
+vfmsubadd231ps %zmm4, %zmm5, %zmm6
+;;; cvt_usi
+.text
+vcvtsd2usi %xmm0, %eax
+vcvtsd2usi %xmm0, %rax
+vcvtsd2usi (%rax), %eax
+vcvtsd2usi (%rax), %rax
+vcvtss2usi %xmm0, %eax
+vcvtss2usi %xmm0, %rax
+vcvtss2usi (%rax), %eax
+vcvtss2usi (%rax), %rax
+vcvttsd2usi %xmm0, %eax
+vcvttsd2usi %xmm0, %rax
+vcvttsd2usi (%rax), %eax
+vcvttsd2usi (%rax), %rax
+vcvttss2usi %xmm0, %eax
+vcvttss2usi %xmm0, %rax
+vcvttss2usi (%rax), %eax
+vcvttss2usi (%rax), %rax
+vcvtusi2sdl %eax, %xmm1, %xmm2
+vcvtusi2sdl (%rax), %xmm1, %xmm2
+vcvtusi2sdq %rax, %xmm1, %xmm2
+vcvtusi2sdq (%rax), %xmm1, %xmm2
+vcvtusi2ssl %eax, %xmm1, %xmm2
+vcvtusi2ssl (%rax), %xmm1, %xmm2
+vcvtusi2ssq %rax, %xmm1, %xmm2
+vcvtusi2ssq (%rax), %xmm1, %xmm2
+vcvtusi2sd %eax, %xmm1, %xmm2
+vcvtusi2sd %rax, %xmm1, %xmm2
+vcvtusi2sd (%rax), %xmm1, %xmm2
+vcvtusi2ss %eax, %xmm1, %xmm2
+vcvtusi2ss %rax, %xmm1, %xmm2
+vcvtusi2ss (%rax), %xmm1, %xmm2
+;;; vpermil
+.text
+vpermilpd $0xab, %zmm5, %zmm6
+vpermilpd $0xab, (%rax), %zmm6
+vpermilpd $0xab, %zmm5, %zmm6{%k7}
+vpermilpd $0xab, %zmm5, %zmm6{%k7}{z}
+vpermilpd $0xab, %ymm5, %ymm6{%k7}
+vpermilps $0xab, %zmm5, %zmm6
+vpermilps $0xab, (%rax), %zmm6
+vpermilps $0xab, %zmm5, %zmm6{%k7}
+vpermilps $0xab, %zmm5, %zmm6{%k7}{z}
+vpermilps $0xab, %ymm5, %ymm6{%k7}
+vpermilpd $0xab, (%rax){1to8}, %zmm6
+vpermilps $0xab, (%rax){1to16}, %zmm6
+;;; vpconflict
+.text
+vpconflictd %zmm5, %zmm6
+vpconflictd (%rax), %zmm6
+vpconflictd %zmm5, %zmm6{%k7}
+vpconflictd %zmm5, %zmm6{%k7}{z}
+vpconflictd (%rax){1to16}, %zmm6
+vpconflictq %zmm5, %zmm6
+vpconflictq (%rax), %zmm6
+vpconflictq %zmm5, %zmm6{%k7}
+vpconflictq %zmm5, %zmm6{%k7}{z}
+vpconflictq (%rax){1to8}, %zmm6
+;;; shift_count
+.text
+vpsllw %xmm4, %zmm5, %zmm6
+vpsllw (%rax), %zmm5, %zmm6
+vpslld %xmm4, %zmm5, %zmm6
+vpslld (%rax), %zmm5, %zmm6
+vpsllq %xmm4, %zmm5, %zmm6
+vpsllq (%rax), %zmm5, %zmm6
+vpsraw %xmm4, %zmm5, %zmm6
+vpsraw (%rax), %zmm5, %zmm6
+vpsrad %xmm4, %zmm5, %zmm6
+vpsrad (%rax), %zmm5, %zmm6
+vpsraq %xmm4, %zmm5, %zmm6
+vpsraq (%rax), %zmm5, %zmm6
+vpsrlw %xmm4, %zmm5, %zmm6
+vpsrlw (%rax), %zmm5, %zmm6
+vpsrld %xmm4, %zmm5, %zmm6
+vpsrld (%rax), %zmm5, %zmm6
+vpsrlq %xmm4, %zmm5, %zmm6
+vpsrlq (%rax), %zmm5, %zmm6
+vpsllw %xmm4, %zmm5, %zmm6{%k7}
+vpsllw %xmm4, %zmm5, %zmm6{%k7}{z}
+vpsraw (%rax), %zmm5, %zmm6{%k2}
+vpsrlq %xmm4, %ymm5, %ymm6{%k1}
+vpsllw %xmm4, %xmm5, %xmm6{%k1}
+vpsllw (%rax), %xmm5, %xmm6{%k1}

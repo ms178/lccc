@@ -335,7 +335,11 @@ def _norm_disasm(text: str) -> str:
     Two encodings are equivalent when they decode to the same instruction with
     the same effective address. The two spellings that differ purely by
     encoding choice are a redundant scale-1 index (`-0x1(,%rdi,1)` is the same
-    address as `-0x1(%rdi)`) and an explicit zero displacement.
+    address as `-0x1(%rdi)`) and an explicit zero displacement. objdump's
+    `{vex}`/`{evex}` annotations likewise describe only which legal encoding
+    was chosen (LCCC prefers the shorter VEX form for VNNI memory sources
+    where GAS defaults to EVEX), so they are stripped too. `{nf}` is NOT
+    stripped: it changes flags semantics.
     """
     out = []
     for line in text.splitlines():
@@ -343,6 +347,7 @@ def _norm_disasm(text: str) -> str:
         if not m:
             continue
         insn = m.group(2).strip()
+        insn = re.sub(r"^\{(?:vex|evex)\} ", "", insn)
         insn = _SCALE1.sub(r"(%\1)", insn)
         insn = _ZERODISP.sub("(", insn)
         insn = re.sub(r"\s+", " ", insn)

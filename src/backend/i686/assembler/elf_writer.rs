@@ -32,12 +32,14 @@ impl X86Arch for I686Arch {
 
         // Detect jump instructions for relaxation
         let jump = {
-            let mnem = &instr.mnemonic;
+            // `.s`-tolerant matching (see the x86-64 writer): `jmp.s`
+            // relaxes exactly like `jmp`.
+            let mnem: &str = instr.mnemonic.strip_suffix(".s").unwrap_or(&instr.mnemonic);
             let is_jump =
                 mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
             if is_jump && instr.operands.len() == 1 {
                 if let Operand::Label(_) = &instr.operands[0] {
-                    let is_short_only = matches!(mnem.as_str(), "jecxz" | "jcxz" | "loop");
+                    let is_short_only = matches!(mnem, "jecxz" | "jcxz" | "loop");
                     let is_conditional = mnem != "jmp";
                     if is_short_only && instr_len == 2 {
                         // Short-only jumps have no long form; register as already relaxed
@@ -198,7 +200,10 @@ impl X86Arch for I686Arch {
 
         // Detect jump instructions for relaxation (same logic as x86-64)
         let jump = {
-            let mnem = &instr.mnemonic;
+            // `.s`-tolerant, case-insensitive matching: this path encodes
+            // with the x86-64 encoder, so `JMP`/`jmp.s` must relax like `jmp`.
+            let mnem_lower = instr.mnemonic.to_ascii_lowercase();
+            let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
             let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
             if is_jump && instr.operands.len() == 1 {
                 if let Operand::Label(_) = &instr.operands[0] {

@@ -185,14 +185,23 @@ impl InstructionEncoder {
     pub fn encode(&mut self, instr: &Instruction) -> Result<(), String> {
         let start_len = self.bytes.len();
 
-        // Handle prefix
-        if let Some(ref prefix) = instr.prefix {
+        // Handle prefixes. Stacked HLE pairs (`lock xacquire addl ...`)
+        // arrive in source order; F0 sinks past any F2/F3 byte so both
+        // spellings emit the canonical F2/F3 F0 run (GAS 2.47).
+        let mut pfx: Vec<u8> = Vec::new();
+        for prefix in &instr.prefixes {
             match prefix.as_str() {
-                "lock" => self.bytes.push(0xF0),
-                "rep" | "repz" | "repe" => self.bytes.push(0xF3),
-                "repnz" | "repne" => self.bytes.push(0xF2),
+                "lock" => pfx.push(0xF0),
+                "rep" | "repz" | "repe" => pfx.push(0xF3),
+                "repnz" | "repne" => pfx.push(0xF2),
+                "xacquire" => pfx.push(0xF2),
+                "xrelease" => pfx.push(0xF3),
                 _ => return Err(format!("unknown prefix: {}", prefix)),
             }
+        }
+        pfx.sort_by_key(|&b| b == 0xF0);
+        for b in pfx {
+            self.bytes.push(b);
         }
 
         let result = self.encode_mnemonic(instr);
@@ -422,7 +431,34 @@ impl InstructionEncoder {
 
     /// Main mnemonic dispatch.
     fn encode_mnemonic(&mut self, instr: &Instruction) -> Result<(), String> {
-        let mnemonic = instr.mnemonic.as_str();
+        // GAS accepts (and ignores) a `.s` suffix on any instruction
+        // mnemonic, in 32-bit mode too — except on standalone prefixes,
+        // which it rejects. Same rule as the x86-64 encoder.
+        let mnemonic_owned;
+        let mnemonic = match instr.mnemonic.strip_suffix(".s") {
+            Some(base)
+                if !matches!(
+                    base,
+                    "lock"
+                        | "rep"
+                        | "repz"
+                        | "repe"
+                        | "repnz"
+                        | "repne"
+                        | "notrack"
+                        | "cs"
+                        | "ss"
+                        | "ds"
+                        | "es"
+                        | "fs"
+                        | "gs"
+                ) =>
+            {
+                mnemonic_owned = base.to_string();
+                mnemonic_owned.as_str()
+            }
+            _ => instr.mnemonic.as_str(),
+        };
         let ops = &instr.operands;
 
         match mnemonic {
@@ -1923,7 +1959,7 @@ mod stack_width_tests {
 
     fn instruction(mnemonic: &str, operand: Operand) -> Instruction {
         Instruction {
-            prefix: None,
+            prefixes: Vec::new(),
             mnemonic: mnemonic.to_owned(),
             operands: vec![operand],
             nf: false,

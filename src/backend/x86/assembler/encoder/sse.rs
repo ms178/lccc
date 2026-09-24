@@ -386,10 +386,18 @@ impl super::InstructionEncoder {
             return Err("{nf} unsupported for `movbe'".to_string());
         }
         // APX map-4 remaps 0F38 F0/F1 → 60/61; 16-bit uses EVEX.pp=66.
+        // The reg-reg form exists ONLY as APX EVEX (GAS 2.47 emits
+        // `62 f4 7c 08 60 d8` for `movbe %eax, %ebx` unconditionally).
         let use_evex = self.apx_wants_evex() || operands_have_egpr(ops);
         let pp = if size == 2 { 1 } else { 0 };
+        // GAS rejects vector/wrong-size registers ("operand type mismatch").
+        let gpr_ok = |name: &str| match size {
+            2 => is_reg16(name),
+            8 => is_reg64(name),
+            _ => is_reg32(name),
+        };
         match (&ops[0], &ops[1]) {
-            (Operand::Memory(mem), Operand::Register(reg)) => {
+            (Operand::Memory(mem), Operand::Register(reg)) if gpr_ok(&reg.name) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
                 if use_evex {
                     self.emit_apx_evex_rm_pp(size == 8, &reg.name, mem, None, false, pp)?;
@@ -403,7 +411,7 @@ impl super::InstructionEncoder {
                 self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF0]);
                 self.encode_modrm_mem(num, mem)
             }
-            (Operand::Register(reg), Operand::Memory(mem)) => {
+            (Operand::Register(reg), Operand::Memory(mem)) if gpr_ok(&reg.name) => {
                 let num = reg_num(&reg.name).ok_or("bad register")?;
                 if use_evex {
                     self.emit_apx_evex_rm_pp(size == 8, &reg.name, mem, None, false, pp)?;
@@ -416,6 +424,17 @@ impl super::InstructionEncoder {
                 self.emit_rex_rm(size, &reg.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF1]);
                 self.encode_modrm_mem(num, mem)
+            }
+            // reg -> reg: APX-only (EVEX map-4 0x60, no legacy encoding).
+            (Operand::Register(src), Operand::Register(dst))
+                if gpr_ok(&src.name) && gpr_ok(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.emit_apx_evex_rr_pp(size == 8, &dst.name, &src.name, None, false, pp)?;
+                self.bytes.push(0x60);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
             }
             _ => Err("movbe requires one memory and one register operand".to_string()),
         }

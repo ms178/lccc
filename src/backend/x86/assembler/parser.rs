@@ -215,8 +215,9 @@ pub enum CfiDirective {
 /// An x86-64 instruction with mnemonic and operands.
 #[derive(Debug, Clone)]
 pub struct Instruction {
-    /// Optional prefix (e.g., "lock", "rep")
-    pub prefix: Option<String>,
+    /// Leading prefixes in source order (e.g., ["lock"], ["xacquire", "lock"]).
+    /// Stacking is real: HLE pairs (`lock xacquire addl ...`) need two bytes.
+    pub prefixes: Vec<String>,
     /// Instruction mnemonic (e.g., "movq", "addl", "ret")
     pub mnemonic: String,
     /// Operands in AT&T order (source first, destination last)
@@ -573,7 +574,7 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
     } else if is_prefixed_instruction(rest) {
         items.push(parse_prefixed_instruction(rest)?);
     } else {
-        items.push(parse_instruction(rest, None)?);
+        items.push(parse_instruction(rest, Vec::new())?);
     }
 
     Ok(items)
@@ -1256,30 +1257,44 @@ fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
 /// hand-written kernel assembly overwhelmingly uses TABS (`rep\tstosl` in
 /// arch/x86/boot/startup/efi-mixed.S). Matching only `"rep "` left the whole
 /// line as a single mnemonic `rep` with `stosl` parsed as a label operand.
+/// Words the assembler treats as leading instruction prefixes (HLE hints
+/// `xacquire`/`xrelease` included: they only ever appear prefix-stacked).
+const INSN_PREFIXES: [&str; 15] = [
+    "lock", "rep", "repz", "repe", "repnz", "repne", "notrack", "cs", "ds", "es", "ss", "fs", "gs",
+    "xacquire", "xrelease",
+];
+
 fn is_prefixed_instruction(rest: &str) -> bool {
     // Segment-override names are legal instruction prefixes in their own right:
     // the kernel writes `ds wrmsr` (arch/x86/include/asm/msr.h) to reserve a
     // byte that ALTERNATIVE can later patch into a different encoding.
-    const PREFIXES: [&str; 13] = [
-        "lock", "rep", "repz", "repe", "repnz", "repne", "notrack", "cs", "ds", "es", "ss", "fs",
-        "gs",
-    ];
     match rest.split_once(|c: char| c.is_whitespace()) {
-        Some((head, tail)) => PREFIXES.contains(&head) && !tail.trim().is_empty(),
+        Some((head, tail)) => INSN_PREFIXES.contains(&head) && !tail.trim().is_empty(),
         None => false,
     }
 }
 
-/// Parse a prefix instruction like "lock cmpxchgq ..." or "rep movsb".
+/// Parse a prefixed instruction like "lock cmpxchgq ..." or "rep movsb".
+/// Prefixes stack: collect every leading prefix word (`lock xacquire addl`
+/// yields ["lock", "xacquire"]) so the encoder can emit the full prefix run.
+/// Duplicate detection lives in the encoder (it compares prefix BYTES:
+// `rep repe movsb` is two spellings of one byte).
 fn parse_prefixed_instruction(line: &str) -> Result<AsmItem, String> {
-    let parts: Vec<&str> = line.splitn(2, |c: char| c.is_whitespace()).collect();
-    let prefix = parts[0].to_string();
-    let rest = parts.get(1).map(|s| s.trim()).unwrap_or("");
-    parse_instruction(rest, Some(prefix))
+    let mut rest = line.trim();
+    let mut prefixes: Vec<String> = Vec::new();
+    while let Some((head, tail)) = rest.split_once(|c: char| c.is_whitespace()) {
+        if INSN_PREFIXES.contains(&head) && !tail.trim().is_empty() {
+            prefixes.push(head.to_string());
+            rest = tail.trim();
+        } else {
+            break;
+        }
+    }
+    parse_instruction(rest, prefixes)
 }
 
 /// Parse an instruction line.
-fn parse_instruction(line: &str, prefix: Option<String>) -> Result<AsmItem, String> {
+fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Ok(AsmItem::Empty);
@@ -1301,7 +1316,7 @@ fn parse_instruction(line: &str, prefix: Option<String>) -> Result<AsmItem, Stri
     };
 
     Ok(AsmItem::Instruction(Instruction {
-        prefix,
+        prefixes,
         mnemonic: mnemonic.to_string(),
         operands,
         nf,

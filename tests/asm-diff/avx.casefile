@@ -1038,3 +1038,74 @@ vaddps (%r20), %zmm1, %zmm2
 vaddps (%r21), %zmm1, %zmm2
 vaddps (%r16,%r17,4), %zmm1, %zmm2
 vaddps 64(%r16), %zmm1, %zmm2
+
+;;; vex_pshuf_lw_hw
+.text
+vpshuflw $7, %xmm4, %xmm6
+vpshuflw $7, (%rax), %xmm6
+vpshuflw $7, %ymm4, %ymm6
+vpshuflw $7, 16(%rdi,%rcx,4), %ymm12
+vpshuflw $7, %xmm12, %xmm9
+vpshufhw $7, %xmm4, %xmm6
+vpshufhw $7, (%rax), %xmm6
+vpshufhw $7, %ymm4, %ymm6
+vpshufhw $255, %ymm9, %ymm15
+;;; vex_mem_forms
+.text
+vpslld (%rax), %xmm6, %xmm7
+vpslld 8(%rdi,%rsi,4), %ymm1, %ymm2
+vpsrlq (%rax), %xmm0, %xmm1
+vptest (%rdi), %xmm4
+vptest 16(%rax), %ymm3
+vpextrq $7, %xmm8, (%rdi)
+vpinsrq $7, (%rax), %xmm8, %xmm9
+vpinsrw $1, (%rax), %xmm1, %xmm2
+vpclmulqdq $0, (%rax), %xmm1, %xmm2
+vpclmulqdq $16, 32(%rdi), %xmm3, %xmm4
+;;; vnni_mem betterok
+.text
+vpdpbusd (%rax), %xmm1, %xmm2
+vpdpbusd 0x20(%rax), %ymm1, %ymm2
+vpdpbusds (%rax), %xmm1, %xmm2
+vpdpbusds 0x40(%rdi,%rsi,8), %ymm3, %ymm4
+;;; vex_rip_trailing_imm8
+.text
+.extern sym
+vroundps $3, sym(%rip), %xmm0
+vpblendvb %xmm3, sym(%rip), %xmm1, %xmm1
+vextractps $1, %xmm2, sym(%rip)
+vpextrq $0, %xmm0, sym(%rip)
+vpinsrq $0, sym(%rip), %xmm1, %xmm2
+;;; fma_addsub_vex
+.text
+vfmaddsub132pd %ymm4, %ymm5, %ymm6
+vfmaddsub213ps %ymm4, %ymm5, %ymm6
+vfmaddsub231pd %xmm4, %xmm5, %xmm6
+vfmsubadd132ps %ymm4, %ymm5, %ymm6
+vfmsubadd213pd %xmm4, %xmm5, %xmm6
+vfmsubadd231ps %xmm4, %xmm5, %xmm6
+;;; pmovzx_sx_qword
+.text
+vpmovzxbq %xmm4, %xmm6
+vpmovzxbq (%rax), %xmm6
+vpmovzxbq %xmm4, %ymm6
+vpmovzxwq %xmm4, %xmm6
+vpmovzxwq (%rax), %xmm6
+vpmovzxwq %xmm4, %ymm6
+vpmovsxbq %xmm4, %xmm6
+vpmovsxbq (%rax), %xmm6
+vpmovsxbq %xmm4, %ymm6
+vpmovsxwq %xmm4, %xmm6
+vpmovsxwq (%rax), %xmm6
+vpmovsxwq %xmm4, %ymm6
+;;; gfni_vex
+.text
+vgf2p8mulb %xmm1, %xmm2, %xmm3
+vgf2p8mulb (%rax), %xmm2, %xmm3
+vgf2p8mulb %ymm1, %ymm2, %ymm3
+vgf2p8affineqb $0xab, %xmm4, %xmm5, %xmm6
+vgf2p8affineqb $0xab, (%rax), %xmm5, %xmm6
+vgf2p8affineqb $0xab, %ymm4, %ymm5, %ymm6
+vgf2p8affineinvqb $0xab, %xmm4, %xmm5, %xmm6
+vgf2p8affineinvqb $0xab, (%rax), %xmm5, %xmm6
+vgf2p8affineinvqb $0xab, %ymm4, %ymm5, %ymm6
