@@ -103,25 +103,8 @@ pub struct InstructionEncoder {
 /// Mnemonic stems that accept `lock` (with a memory operand): the classic
 /// read-modify-write set plus the bit-testers and the atomic exchanges.
 const LOCKABLE_STEMS: [&str; 19] = [
-    "add",
-    "adc",
-    "sub",
-    "sbb",
-    "and",
-    "or",
-    "xor",
-    "inc",
-    "dec",
-    "neg",
-    "not",
-    "btc",
-    "btr",
-    "bts",
-    "cmpxchg",
-    "cmpxchg8b",
-    "cmpxchg16b",
-    "xadd",
-    "xchg",
+    "add", "adc", "sub", "sbb", "and", "or", "xor", "inc", "dec", "neg", "not", "btc", "btr", "bts",
+    "cmpxchg", "cmpxchg8b", "cmpxchg16b", "xadd", "xchg",
 ];
 
 /// Mnemonic stem for prefix validation: a trailing size letter and any `.s`
