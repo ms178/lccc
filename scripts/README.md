@@ -44,6 +44,24 @@ Developer and research tooling. None of these are needed to build LCCC.
 | `symstr_migrate.py` | Span-driven `String` → `SymStr` migration helper. Its diagnostic build resolves the manifest-selected Rust channel, locates the persisted Cargo proxy, and denies warnings unless explicitly opted out. |
 | `gen_lcccsimd.py`, `strip_scalar_dups.py` | SIMD intrinsic header generation helpers. |
 
+## Codegen kill switches and opt-ins
+
+Environment knobs that gate the SHA/CH-style scalar codegen work; every
+one is resolved once per compilation and several gates consult the same
+resolution so fold-time prediction and emission cannot drift. Any value
+disables (they are presence checks unless noted).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CCC_NO_ANDN_FUSION` | unset (fusion on) | Disables the BMI1 3-operand `andn` fusion (backend `detect_and_not_fusions` + `emit_and_not_impl`) AND the bool-mux algebra's defer-to-fusion prediction (`has_scalar_andn`), in one shared resolution. |
+| `CCC_NO_BOOL_ALGEBRA` | unset (pass on) | Disables the whole `bit_idioms` bool-mux algebra (CH mux fold, MAJ majority fold, distributive). |
+| `CCC_NO_RORX` | unset (emission on) | Independent kill switch for BMI2 `rorx` instruction selection (does not affect the ANDN/bool-algebra gates). |
+| `CCC_IVSR_SCALAR_DERIVED` | **opt-in** (`=1` to enable) | Enables the scalar derived-IV flavor of IV strength reduction (`iv*C` without a GEP). Off by default: measured net runtime loss while latch phi-web parking exists (the PR #602 golden-workload regressions). |
+
+The `-mbmi`/`-mno-bmi`/`-march` front-end flags are the primary control;
+these switches exist for bisection and for pinning the pre-BMI shapes in
+the golden codegen gates.
+
 ## Why more than one oracle
 
 `insndiff.py` and `asmdiff.py` compare against a single local GNU as. That is
@@ -86,6 +104,20 @@ left undone:
   That is not equivalent: the xchg is a 32-bit register write and zeroes the
   upper half of RAX, while NOP does nothing. Measured from
   RAX=0x1122334455667788, `87 c0` leaves 0x0000000055667788.
+
+## Optimization environment knobs (registry)
+
+Codegen kill switches read from the environment, kept here so a bisection
+preset or a gate can never rely on an undocumented one.  Passes resolve
+them once per translation unit (never per function).
+
+| Knob | Default | Effect |
+| ---- | ------- | ------ |
+| `CCC_NO_ANDN_FUSION` | unset (fusion ON) | Disables the scalar `Not`+`And` → 3-operand `andn` fusion.  Gates BOTH halves of the contract: the backend emission (`supports_and_not` / `emit_and_not_impl`) AND the middle end's CH-mux fold defer (`scalar_andn_available` in passes/mod.rs) — with fusion off, the mux fold takes the shape back instead of deferring to a fusion that will never fire. |
+| `CCC_IVSR_SCALAR_DERIVED` | unset (OFF) | Opt-in: arms the scalar derived-IV strength-reduction flavor (induction `i * stride` → a dedicated `+stride` recurrence).  Default OFF because it measured as a net loss on the current allocator (the extra recurrence raises register pressure past the win); revisit after the Unit-4 allocator work.  Pinned by `test_production_default_leaves_scalar_derived_ivs_off` (default) vs `test_scalar_derived_iv_hash_shape` (armed). |
+| `CCC_PEEPHOLE_SKIP` | unset (nothing skipped) | Comma-separated phase-2 peephole sub-pass names to disable for bisection (e.g. `store_alu_fold`).  All peephole passes are ENABLED by default. |
+| `CCC_NO_BOOL_ALGEBRA` | unset | Disables the boolean mux/majority algebra rewrites (bit_idioms Patterns B/C). |
+| `CCC_NO_TWO_BLOCK_UNROLL` | unset | Disables the two-block guard-free unroll (loop_unroll pass B). |
 
 ## Oracles
 

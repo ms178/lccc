@@ -392,7 +392,16 @@ jobs:
       - name: Verify nbody/rbtree perf shape contracts
         env:
           CCC: target/fastbuild/lccc
-        run: bash tests/regression/check_nbody_rbtree_perf_shapes.sh
+        run: bash tests/regression/check_nbody_perf_shapes.sh
+
+      # linux_find_bit: the inliner's bounded-tier clone-growth budget must
+      # admit the three-site kernel clone (two cold self-test calls + one
+      # hot in-loop call) that GCC/Clang/ICX all inline, and the inlined
+      # shape must keep the tzcnt + andn idiom distillations.
+      - name: Verify linux_find_bit inlining contract
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_findbit_inline.sh
 
       # Cross-PR interaction red-team (session 574): the per-feature gates
       # pin each PR's own contract; this one pins the INTERACTIONS between

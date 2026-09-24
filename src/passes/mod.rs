@@ -858,6 +858,20 @@ fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
     })
 }
 
+/// Scalar ANDN (BMI1) fusion permission as the middle end sees it — the
+/// mirror of the x86-64 backend's emission-time contract
+/// (`supports_and_not` in codegen/emit.rs): target class + resolved BMI1
+/// + the `CCC_NO_ANDN_FUSION` kill switch.  Single-sourced (audit P2-12)
+/// so the two bit_idioms invocations — and therefore the fold-time defer
+/// prediction vs. the emission-time fusion decision — can never drift
+/// within one compilation.  The env read happens once per invocation of
+/// the pass runner, not per function.
+fn scalar_andn_available(target: crate::backend::Target, x86_bmi1: bool) -> bool {
+    target == crate::backend::Target::X86_64
+        && x86_bmi1
+        && std::env::var_os("CCC_NO_ANDN_FUSION").is_none()
+}
+
 fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32) {
     if !code16gcc || opt_level < 4 {
         return;
@@ -934,6 +948,7 @@ pub(crate) fn run_passes(
     x86_sse4_1: bool,
     x86_fma: bool,
     x86_bmi1: bool,
+    x86_avx512vl: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
     // x86 SIMD register-file availability for the middle end. Under `-mno-sse`
@@ -941,7 +956,7 @@ pub(crate) fn run_passes(
     // the vectorizer must not rewrite a single loop (see the gate in
     // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
     // 128-bit SSE2 instead of disabling vectorization outright.
-    vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41);
+    vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41, x86_avx512vl);
     // Pass B (two-block guard-free unroll) kill switch, resolved once here for
     // the same reason as the ISA gates above: the unroller is a hot path and
     // must not read the process environment per call, and per-thread state
@@ -1864,13 +1879,8 @@ pub(crate) fn run_passes(
             // Scalar ANDN (BMI1) for the bool-mux algebra's CH fold: the
             // mux fold must defer to the backend's Not+And -> andn fusion
             // when the 3-operand form is selectable (emit_and_not_impl).
-            // The CCC_NO_ANDN_FUSION kill switch is resolved here, once —
-            // the same switch supports_and_not consults at emission — so
-            // the fold-time prediction and the emission-time decision
-            // cannot drift within one compilation.
-            let has_scalar_andn = target == crate::backend::Target::X86_64
-                && x86_bmi1
-                && std::env::var_os("CCC_NO_ANDN_FUSION").is_none();
+            // See scalar_andn_available for the single-sourced contract.
+            let has_scalar_andn = scalar_andn_available(target, x86_bmi1);
             let n = timed_pass!(
                 "bit_idioms",
                 run_on_visited(module, &dirty, &mut changed, |func| {
@@ -1980,7 +1990,7 @@ pub(crate) fn run_passes(
             // regressions it caused were the PR #602 CI RED.  The full data
             // lives in the scalar section's comment in iv_strength_reduce.rs;
             // revisit after the Unit-4 allocator work.
-            let run_ivsr_scalar = run_ivsr && std::env::var("CCC_IVSR_SCALAR_DERIVED").is_ok();
+            let run_ivsr_scalar = ivsr_scalar_derived_enabled(run_ivsr);
             // Un-IVSR only pays off on targets with scaled-index addressing
             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
             let run_univsr = run_ivsr
@@ -2051,9 +2061,7 @@ pub(crate) fn run_passes(
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
             let min_rotate_bits = target_min_rotate_bits(target);
-            let has_scalar_andn = target == crate::backend::Target::X86_64
-                && x86_bmi1
-                && std::env::var_os("CCC_NO_ANDN_FUSION").is_none();
+            let has_scalar_andn = scalar_andn_available(target, x86_bmi1);
             let n = timed_pass!(
                 "bit_idioms_post_ifconv",
                 run_on_visited(module, &dirty, &mut changed, |func| {
@@ -2696,6 +2704,45 @@ pub(crate) fn run_passes(
         eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
         eprintln!("{:#?}", module);
         eprintln!("==== END IR after all passes ====");
+    }
+}
+
+/// Opt-in gate for the scalar derived-IV flavor of IVSR (`iv*C` without a
+/// GEP → secondary recurrence).  Factored out of `run_passes` so the
+/// default-OFF contract is unit-testable: the flavor measured as a net
+/// runtime loss while latch phi-web parking exists (the PR #602 golden
+/// regressions), so an unset environment must NEVER enable it.
+fn ivsr_scalar_derived_enabled(run_ivsr: bool) -> bool {
+    run_ivsr && std::env::var("CCC_IVSR_SCALAR_DERIVED").is_ok()
+}
+
+#[cfg(test)]
+mod ivsr_scalar_derived_gate_tests {
+    use super::ivsr_scalar_derived_enabled;
+    use crate::test_support::EnvGuard;
+
+    #[test]
+    fn scalar_derived_ivsr_is_off_by_default() {
+        // Unset environment: the measured-regression flavor stays off even
+        // when IVSR itself runs.
+        let _guard = EnvGuard::unset("CCC_IVSR_SCALAR_DERIVED");
+        assert!(
+            !ivsr_scalar_derived_enabled(true),
+            "default (unset) must not enable scalar derived IVs"
+        );
+    }
+
+    #[test]
+    fn scalar_derived_ivsr_opt_in_and_ivsr_gate() {
+        let _set = EnvGuard::set("CCC_IVSR_SCALAR_DERIVED", "1");
+        assert!(
+            ivsr_scalar_derived_enabled(true),
+            "explicit opt-in enables the flavor when IVSR runs"
+        );
+        assert!(
+            !ivsr_scalar_derived_enabled(false),
+            "opt-in still requires IVSR itself to be on"
+        );
     }
 }
 

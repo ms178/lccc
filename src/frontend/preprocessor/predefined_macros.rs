@@ -719,6 +719,7 @@ impl Preprocessor {
         bmi: bool,
         bmi2: bool,
         lzcnt: bool,
+        popcnt: bool,
         movbe: bool,
         rdrnd: bool,
         avx512f: bool,
@@ -800,6 +801,12 @@ impl Preprocessor {
         }
         if lzcnt {
             self.define_simple_macro("__LZCNT__", "1");
+        }
+        // GCC defines __POPCNT__ under -mpopcnt (the codegen lowering is
+        // resolved-popcnt-gated; the macro must mirror it so #ifdef-guarded
+        // _mm_popcnt_* paths agree with the scalar contract).
+        if popcnt {
+            self.define_simple_macro("__POPCNT__", "1");
         }
         if movbe {
             self.define_simple_macro("__MOVBE__", "1");

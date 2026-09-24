@@ -1426,8 +1426,16 @@ mod tests {
     /// The linux_rbtree lookup-hash shape: `h = i * 104729` consumed by an
     /// And/mask (NOT a GEP offset).  The scalar derived-IV flavor must
     /// replace the multiply with a secondary recurrence.
-    #[test]
-    fn test_scalar_derived_iv_hash_shape() {
+    /// The hash-multiply loop shape the scalar derived-IV flavor targets:
+    /// `for i in 0..16384 { m = (i * 104729) & 16383 }` with the mask
+    /// observable.  Shared by the opt-in test and the production-default
+    /// pin (audit work order P1-6): if someone inverts the wrapper pair /
+    /// the pipeline's `CCC_IVSR_SCALAR_DERIVED` opt-in, the default test
+    /// below starts seeing a derived recurrence and fails — the asm gate
+    /// that used to pin this was removed because pinning the SHAPE would
+    /// pin a measured regression; the default-OFF invariant still needs a
+    /// pin, and this differential pair is it.
+    fn hash_lookup_fixture() -> IrFunction {
         let mut func = IrFunction::new("hash_lookup".to_string(), IrType::I32, vec![], false);
 
         // Block 0 (preheader): init = 0
@@ -1514,6 +1522,12 @@ mod tests {
         });
 
         func.next_value_id = 7;
+        func
+    }
+
+    #[test]
+    fn test_scalar_derived_iv_hash_shape() {
+        let mut func = hash_lookup_fixture();
 
         let changes = ivsr_function_scalar(&mut func);
         assert!(changes >= 1, "expected the hash multiply to be reduced");
@@ -1562,6 +1576,33 @@ mod tests {
             });
         }
         assert_eq!(users, 0, "multiply fully replaced");
+    }
+
+    /// A dead `iv * C` earns no recurrence.
+    #[test]
+    fn test_production_default_leaves_scalar_derived_ivs_off() {
+        // Same fixture the opt-in flavor reduces: the PRODUCTION wrapper
+        // (scalar derived-IVs off) must leave the loop untouched — one
+        // header phi, the multiply alive, the And still reading it.  This
+        // pins the default-off invariant the removed rbtree asm gate used
+        // to protect.
+        let mut func = hash_lookup_fixture();
+        let changes = ivsr_function(&mut func);
+        assert_eq!(changes, 0, "production IVSR must not derive scalar IVs");
+        let header_phis = func.blocks[1]
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Phi { .. }))
+            .count();
+        assert_eq!(header_phis, 1, "no derived recurrence under defaults");
+        let mul_alive = func.blocks[2].instructions.iter().any(
+            |i| matches!(i, Instruction::BinOp { dest, op: IrBinOp::Mul, .. } if *dest == Value(3)),
+        );
+        assert!(mul_alive, "the hash multiply stays");
+        let and_reads_mul = func.blocks[2].instructions.iter().any(|i| {
+            matches!(i, Instruction::BinOp { op: IrBinOp::And, lhs: Operand::Value(v), .. } if *v == Value(3))
+        });
+        assert!(and_reads_mul, "the mask still consumes the multiply");
     }
 
     /// A dead `iv * C` earns no recurrence.

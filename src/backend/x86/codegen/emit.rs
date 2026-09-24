@@ -796,6 +796,10 @@ pub struct X86Codegen {
     pub(super) isa: super::super::isa::X86Isa,
     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
     pub(super) avx512_enabled: bool,
+    /// AVX-512VL *with* the F base (see `CodegenOptions::avx512vl`): the
+    /// 128/256-bit EVEX permission.  Gates the xmm/ymm `vprold` rotate —
+    /// one µop where the AVX2 form needs vpslld+vpsrld+vpor.
+    pub(super) avx512vl_enabled: bool,
     /// -Os/-Oz: prefer the shorter sequence over the faster one (codegen-side
     /// strength reduction for constant mul/div is skipped in favour of imul/idiv).
     pub(super) optimize_for_size: bool,
@@ -1258,6 +1262,7 @@ impl X86Codegen {
             avx2_enabled: false,
             isa: super::super::isa::X86Isa::default(),
             avx512_enabled: false,
+            avx512vl_enabled: false,
             optimize_for_size: false,
             skip_i32_sext: false,
             needs_sext_values: FxHashSet::default(),
@@ -1393,6 +1398,10 @@ impl X86Codegen {
         // upper lanes under VEX.256 loads/stores.
         self.avx2_enabled = opts.isa.ymm;
         self.avx512_enabled = opts.avx512 && opts.isa.ymm;
+        // VL carries the same ymm precondition as F here: the ARX rotator
+        // only ever lowers a 128-bit xmm form, and the option already
+        // encodes the F base (GCC semantics).  Keep the single gate.
+        self.avx512vl_enabled = opts.avx512vl && opts.isa.ymm;
         self.isa = opts.isa;
         // Publish for the emitters without `&self` (MachInst, peepholes).
         super::super::isa::set_current(opts.isa);
@@ -5377,6 +5386,18 @@ fn machinst_window_defs(
             }
             // Fail-closed kinds never coexist with an eligible window
             // (rax-touch scan rejects them); no def extraction needed.
+            //
+            // MAINTENANCE CONTRACT (audit P2-10): this catch-all and
+            // `machinst_window_rax_free`'s exhaustive match have OPPOSITE
+            // semantics by design — the rax scan must enumerate every
+            // variant (a new MachInst is a COMPILE ERROR there), while
+            // this one may stay silent because any variant the rax scan
+            // admits but this match misses merely makes the substitution
+            // conservatively decline (a perf slip, never a miscompile —
+            // the acc substitution only fires for values absent from the
+            // def set).  When MachInst grows a NEW Vreg-DEFINING variant,
+            // review BOTH matches together; the machinst_window_tests
+            // module pins the def arms that exist today.
             _ => {}
         }
     }
@@ -5464,15 +5485,10 @@ fn resolve_stack_vregs(
     // width: the leftover Vreg trips has_unresolvable_vreg and the
     // buffered window falls back to the default (accumulator) path, which
     // loads every value at its true width.
-    let slot_fits = |id: &u32, inst_size: OpSize| -> bool {
-        if state.is_small_slot(*id) {
-            // 4-byte slot: only 8/16/32-bit reads are in-bounds.
-            matches!(inst_size, OpSize::S8 | OpSize::S16 | OpSize::S32)
-        } else {
-            // 8-byte slot: every instruction width reads in-bounds.
-            true
-        }
-    };
+    // The width rule is single-sourced (slot_fits_width); see its doc for
+    // why a too-wide substitution must be refused, not widened.
+    let slot_fits =
+        |id: &u32, inst_size: OpSize| -> bool { slot_fits_width(state, *id, inst_size) };
 
     // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible.
     // Vregs the window allocator owns (reg_classified) are never substituted.
@@ -5503,10 +5519,19 @@ fn resolve_stack_vregs(
                 // and every later slot reader would see the wrong
                 // iteration's data (latch_dead_at_boundaries_segment:
                 // rounds=4214233 instead of 41).
+                // Register-class guard (audit P2-9): %rax is an INTEGER
+                // accumulator — the substitution is blind to register
+                // classes, so a vector/FP-class value ever named by the
+                // acc cache would be rewritten to read a GPR.  Today the
+                // cache is written exclusively by integer paths
+                // (set_acc / store_eax_to / store_rax_to), so this is a
+                // fail-closed belt, not an active filter — keep it if a
+                // future path ever caches xmm-class values.
                 if is_read
                     && acc_subst
                     && !window_defs.contains(id)
                     && slot_fits(id, inst_size)
+                    && !state.vector_values.contains(id)
                     && state.reg_cache.acc_has(*id, false)
                 {
                     return MachOperand::Reg(MachReg::Phys(super::machinst::RAX));
@@ -5724,8 +5749,33 @@ fn resolve_stack_vregs(
 }
 
 /// Resolve a single operand that may substitute to a memory form, honoring
-/// the window allocator's `reg_classified` skip set. Shared by the extending
+/// Width discipline shared by every vreg→stack-slot substitution
+/// (`resolve_stack_vregs` and `resolve_reg_or_slot`), gated on the window
+/// allocator's `reg_classified` skip set. Shared by the extending
 /// moves (movzx/movsx), whose source width is `from_size`, not the inst size.
+/// The slot-width discipline shared by BOTH vreg-resolution paths (audit
+/// work order P0-4: was spelled twice — here and as a closure inside
+/// `resolve_stack_vregs` — and the two spellings must never drift): a
+/// 4-byte ("small") slot only admits 8/16/32-bit reads in-bounds; an
+/// 8-byte slot admits every instruction width.  A wider read must NOT
+/// substitute the slot — the leftover Vreg trips `has_unresolvable_vreg`
+/// and the window falls back to the default path, which loads at the true
+/// width (a `movl` reload zero-extends; a silent memory operand would not).
+fn slot_fits_width(state: &CodegenState, id: u32, inst_size: super::machinst::OpSize) -> bool {
+    if state.is_small_slot(id) {
+        // 4-byte slot: only 8/16/32-bit reads are in-bounds.
+        matches!(
+            inst_size,
+            super::machinst::OpSize::S8
+                | super::machinst::OpSize::S16
+                | super::machinst::OpSize::S32
+        )
+    } else {
+        // 8-byte slot: every instruction width reads in-bounds.
+        true
+    }
+}
+
 fn resolve_reg_or_slot(
     op: &MachOperand,
     ra: &FxHashMap<u32, PhysReg>,
@@ -5741,26 +5791,19 @@ fn resolve_reg_or_slot(
             if !ra.contains_key(id) && !reg_classified.contains(id) =>
         {
             // ACC-RESIDENT (reads only — this helper is only ever applied
-            // to source operands): see resolve_stack_vregs.
+            // to source operands): see resolve_stack_vregs.  The
+            // vector-class exclusion mirrors resolve_op's (audit P2-9):
+            // the acc cache only ever names integer-class values today.
             if acc_subst
                 && !window_defs.contains(id)
-                && !(state.is_small_slot(*id) && matches!(size, super::machinst::OpSize::S64))
+                && slot_fits_width(state, *id, size)
+                && !state.vector_values.contains(id)
                 && state.reg_cache.acc_has(*id, false)
             {
                 return MachOperand::Reg(super::machinst::MachReg::Phys(super::machinst::RAX));
             }
             if let Some(slot) = state.get_slot(*id) {
-                let fits = if state.is_small_slot(*id) {
-                    matches!(
-                        size,
-                        super::machinst::OpSize::S8
-                            | super::machinst::OpSize::S16
-                            | super::machinst::OpSize::S32
-                    )
-                } else {
-                    true
-                };
-                if fits {
+                if slot_fits_width(state, *id, size) {
                     MachOperand::StackSlot(slot.0)
                 } else {
                     op.clone()
@@ -9065,5 +9108,432 @@ mod machinst_resolution_tests {
         assert_eq!(x64_stack_arg_push_imm(&IrConst::F64(1.0)), None); // 0x3FF00000... > imm32
         // Fail-closed shapes.
         assert_eq!(x64_stack_arg_push_imm(&IrConst::Zero), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod machinst_window_tests {
+    //! Unit tests for the two MachInst window predicates the acc-resident
+    //! substitution depends on (audit work order P0-1): the fail-closed
+    //! %rax-touch scan and the vreg-def extraction.  Every arm of both
+    //! matches is pinned here — deleting or weakening an arm fails a test
+    //! instead of silently degrading the substitution's safety net.
+    use super::super::machinst::{
+        AluOp, CallArgMove, CallTarget, CondCode, FAluOp, MachInst, MachOperand, MachReg, OpSize,
+        RAX, ShiftOp,
+    };
+    use super::machinst_window_defs;
+    use super::machinst_window_rax_free;
+    use crate::backend::regalloc::PhysReg;
+
+    fn vreg(id: u32) -> MachReg {
+        MachReg::Vreg(id)
+    }
+    fn phys(id: u8) -> MachReg {
+        MachReg::Phys(PhysReg(id))
+    }
+    fn vop(id: u32) -> MachOperand {
+        MachOperand::Reg(vreg(id))
+    }
+
+    // ── machinst_window_rax_free ────────────────────────────────────
+
+    /// Each of these either reads/writes %rax by architectural contract
+    /// (Cqto, Div) or destroys the caller-saved world incl. %rax
+    /// (Call, CallTyped, Ret) — or is opaque text the scanner cannot
+    /// prove (Raw). One instruction is enough to poison the window.
+    #[test]
+    fn window_rax_free_rejects_implicit_clobbers() {
+        let clobbers = [
+            MachInst::Cqto { size: OpSize::S64 },
+            MachInst::Div {
+                divisor: MachOperand::Reg(vreg(7)),
+                signed: true,
+                size: OpSize::S64,
+            },
+            MachInst::Call { target: "f".into() },
+            MachInst::CallTyped {
+                caller_saves: Vec::new(),
+                args: vec![CallArgMove {
+                    src: MachOperand::Reg(vreg(3)),
+                    dst_reg: PhysReg(7),
+                    size: OpSize::S64,
+                }],
+                target: CallTarget::Direct("f".into()),
+                ret: None,
+            },
+            MachInst::Ret,
+            MachInst::Raw("lock cmpxchg16b (%rdi)".into()),
+        ];
+        for inst in clobbers {
+            assert!(
+                !machinst_window_rax_free(std::slice::from_ref(&inst)),
+                "implicit rax contract must fail closed: {inst:?}",
+            );
+        }
+    }
+
+    /// %rax must be seen in EVERY operand position the substitution could
+    /// redirect: plain register, memory base, indexed memory (base and
+    /// index), and in both source and dest slots. A vreg-only window of
+    /// the same shapes stays free.
+    #[test]
+    fn window_rax_free_sees_operand_positions() {
+        let rax = phys(RAX.0);
+        let rcx = phys(7); // another phys reg: must NOT poison
+        let poisons = [
+            MachInst::Mov {
+                src: MachOperand::Reg(rax),
+                dst: MachOperand::Reg(vreg(1)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(1)),
+                dst: MachOperand::Reg(rax),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Mem {
+                    base: rax,
+                    offset: 8,
+                },
+                dst: MachOperand::Reg(vreg(1)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: AluOp::Add,
+                src: MachOperand::MemIndex {
+                    base: vreg(1),
+                    index: rax,
+                    scale: 4,
+                    offset: 0,
+                },
+                dst: vreg(2),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: AluOp::Add,
+                src: vop(1),
+                dst: MachReg::Phys(RAX),
+                size: OpSize::S64,
+            },
+            MachInst::Cmp {
+                lhs: MachOperand::Reg(rax),
+                rhs: MachOperand::Imm(0),
+                size: OpSize::S64,
+            },
+            MachInst::ShiftX {
+                op: ShiftOp::Shr,
+                count: rax,
+                src: vreg(1),
+                dst: vreg(2),
+                size: OpSize::S64,
+            },
+        ];
+        for inst in poisons {
+            assert!(
+                !machinst_window_rax_free(std::slice::from_ref(&inst)),
+                "{inst:?} touches %rax and must poison the window",
+            );
+        }
+        // Same shapes with vregs / a non-rax phys reg: free.
+        let clean = [
+            MachInst::Mov {
+                src: MachOperand::Mem {
+                    base: vreg(1),
+                    offset: 8,
+                },
+                dst: MachOperand::Reg(vreg(2)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: AluOp::Add,
+                src: MachOperand::Reg(rcx),
+                dst: vreg(2),
+                size: OpSize::S64,
+            },
+            MachInst::SetCC {
+                cc: CondCode::Ne,
+                dst: vreg(3),
+            },
+        ];
+        assert!(
+            machinst_window_rax_free(&clean),
+            "vreg-only / non-rax phys window must be rax-free",
+        );
+    }
+
+    #[test]
+    fn window_rax_free_is_exhaustive_over_new_variants_by_construction() {
+        // Jcc/Jmp/Label/XorRdx are the documented rax-free control forms.
+        let free: Vec<MachInst> = vec![
+            MachInst::Jcc {
+                cc: CondCode::E,
+                target: String::from(".L1"),
+            },
+            MachInst::Jmp {
+                target: String::from(".L1"),
+            },
+            MachInst::Label(String::from(".L1")),
+            MachInst::XorRdx,
+        ];
+        for inst in free {
+            assert!(
+                machinst_window_rax_free(std::slice::from_ref(&inst)),
+                "control/xorrdx forms never touch rax: {inst:?}",
+            );
+        }
+    }
+
+    // ── machinst_window_defs ────────────────────────────────────────
+
+    #[test]
+    fn window_defs_extracts_every_dst_position() {
+        // One instruction per defining variant; the destination vreg id must
+        // always land in the def set (the substitution may never fire for a
+        // value the window redefines).
+        let cases: Vec<(MachInst, u32)> = vec![
+            (
+                MachInst::Mov {
+                    src: vop(90),
+                    dst: vop(10),
+                    size: OpSize::S64,
+                },
+                10,
+            ),
+            (
+                MachInst::FMov {
+                    src: vop(91),
+                    dst: vop(11),
+                    size: OpSize::S64,
+                },
+                11,
+            ),
+            (
+                MachInst::Movzx {
+                    src: vop(92),
+                    dst: vreg(12),
+                    from_size: OpSize::S8,
+                    to_size: OpSize::S64,
+                },
+                12,
+            ),
+            (
+                MachInst::Movsx {
+                    src: vop(93),
+                    dst: vreg(13),
+                    from_size: OpSize::S32,
+                    to_size: OpSize::S64,
+                },
+                13,
+            ),
+            (
+                MachInst::Alu {
+                    op: AluOp::And,
+                    src: vop(94),
+                    dst: vreg(14),
+                    size: OpSize::S64,
+                },
+                14,
+            ),
+            (
+                MachInst::Imul3 {
+                    imm: 5,
+                    src: vreg(95),
+                    dst: vreg(15),
+                    size: OpSize::S64,
+                },
+                15,
+            ),
+            (
+                MachInst::Neg {
+                    dst: vreg(16),
+                    size: OpSize::S64,
+                },
+                16,
+            ),
+            (
+                MachInst::Not {
+                    dst: vreg(17),
+                    size: OpSize::S64,
+                },
+                17,
+            ),
+            (
+                MachInst::Shift {
+                    op: ShiftOp::Shl,
+                    amount: MachOperand::Imm(2),
+                    dst: vreg(18),
+                    size: OpSize::S64,
+                },
+                18,
+            ),
+            (
+                MachInst::ShiftX {
+                    op: ShiftOp::Shl,
+                    count: phys(1),
+                    src: vreg(96),
+                    dst: vreg(19),
+                    size: OpSize::S64,
+                },
+                19,
+            ),
+            (
+                MachInst::Rorx {
+                    amount: 7,
+                    src: vreg(97),
+                    dst: vreg(20),
+                    size: OpSize::S32,
+                },
+                20,
+            ),
+            (
+                MachInst::Lea {
+                    base: vreg(98),
+                    index: Some((vreg(21), 2)),
+                    offset: 0,
+                    dst: vreg(22),
+                },
+                22,
+            ),
+            (
+                MachInst::LeaSym {
+                    sym: String::from("s"),
+                    dst: vreg(23),
+                },
+                23,
+            ),
+            (
+                MachInst::LeaSlot {
+                    slot: 8,
+                    dst: vreg(24),
+                },
+                24,
+            ),
+            (
+                MachInst::SetCC {
+                    cc: CondCode::Ne,
+                    dst: vreg(25),
+                },
+                25,
+            ),
+            (
+                MachInst::Cmov {
+                    cc: CondCode::Ne,
+                    src: vop(99),
+                    dst: vreg(26),
+                    size: OpSize::S64,
+                },
+                26,
+            ),
+        ];
+        for (inst, want) in &cases {
+            let defs = machinst_window_defs(std::slice::from_ref(inst));
+            assert!(
+                defs.contains(want),
+                "dst vreg {want} of {inst:?} must be in the def set",
+            );
+        }
+        // Lea's INDEX is also a two-address write (lea (,%idx,2),%dst
+        // semantics never reach here — but the extractor is conservative on
+        // purpose): pin that behavior too.
+        let lea = MachInst::Lea {
+            base: vreg(98),
+            index: Some((vreg(21), 2)),
+            offset: 0,
+            dst: vreg(22),
+        };
+        assert!(machinst_window_defs(std::slice::from_ref(&lea)).contains(&21));
+        // Mov's SOURCE is deliberately in the set as well: the conservative
+        // over-approximation keeps the substitution from reading a pre-window
+        // image through a same-window move.
+        let mov = MachInst::Mov {
+            src: vop(90),
+            dst: vop(10),
+            size: OpSize::S64,
+        };
+        assert!(machinst_window_defs(std::slice::from_ref(&mov)).contains(&90));
+    }
+
+    /// Position contract (companion to the per-variant table above):
+    /// the SOURCE/base positions that must stay OUT of the def set —
+    /// Movzx's operand src, ShiftX's count/src MachRegs, Lea's base.
+    /// Recording them can only forbid substitutions (fail-safe), but
+    /// the omission is the documented contract and is pinned here.
+    #[test]
+    fn window_defs_omits_source_and_base_positions() {
+        let window = [
+            MachInst::Movzx {
+                src: MachOperand::Reg(vreg(105)),
+                dst: vreg(106),
+                from_size: OpSize::S32,
+                to_size: OpSize::S64,
+            },
+            MachInst::ShiftX {
+                op: ShiftOp::Shl,
+                count: vreg(107),
+                src: vreg(108),
+                dst: vreg(109),
+                size: OpSize::S64,
+            },
+            MachInst::Lea {
+                base: vreg(110),
+                index: Some((vreg(111), 4)),
+                offset: 0,
+                dst: vreg(112),
+            },
+        ];
+        let defs = machinst_window_defs(&window);
+        for id in [106u32, 109, 111, 112] {
+            assert!(defs.contains(&id), "vreg {id}: dst/index must be recorded");
+        }
+        for id in [105u32, 107, 108, 110] {
+            assert!(
+                !defs.contains(&id),
+                "vreg {id}: source/base/count positions stay out of the def set",
+            );
+        }
+    }
+
+    #[test]
+    fn window_defs_omits_xmm_defs() {
+        // FAlu and Mov128 destinations are XMM-class values; the acc-resident
+        // substitution only rewrites integer-class acc names, so the def
+        // scanner currently (and soundly, given the acc cache only ever names
+        // integer values) skips them.  Pin the present behavior: if a future
+        // MachInst variant starts defining GPR-class values through one of
+        // these shapes, THIS test is the reminder to extend the scan — see
+        // the `_ => {}` arm's comment in machinst_window_defs.
+        let falu = MachInst::FAlu {
+            op: FAluOp::Add,
+            src2: vop(50),
+            src1: phys(20),
+            dst: vreg(51),
+            size: OpSize::S64,
+        };
+        assert!(!machinst_window_defs(std::slice::from_ref(&falu)).contains(&51));
+        let mov128 = MachInst::Mov128 {
+            src: MachOperand::StackSlot(8),
+            dst: MachOperand::StackSlot(24),
+        };
+        assert!(machinst_window_defs(std::slice::from_ref(&mov128)).is_empty());
+        // The XMM-class shapes are rax-free for the sibling scan — and the
+        // rax scan, by contrast, DOES see FAlu operands: the two siblings
+        // have opposite maintenance semantics by design.
+        let fm = MachInst::FMov {
+            src: MachOperand::Reg(vreg(201)),
+            dst: MachOperand::Reg(vreg(202)),
+            size: OpSize::S64,
+        };
+        assert!(machinst_window_rax_free(std::slice::from_ref(&fm)));
+        assert!(machinst_window_rax_free(std::slice::from_ref(&mov128)));
+        let falu_rax = MachInst::FAlu {
+            op: FAluOp::Add,
+            src2: MachOperand::Reg(MachReg::Phys(RAX)),
+            src1: phys(20),
+            dst: vreg(51),
+            size: OpSize::S64,
+        };
+        assert!(!machinst_window_rax_free(std::slice::from_ref(&falu_rax)));
     }
 }

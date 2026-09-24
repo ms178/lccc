@@ -6725,6 +6725,35 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
             }
         }
     }
+    // Backward copy propagation of chain homes: the ARX vectorizer lowers
+    // a loop-header phi's ENTRY edge to `Copy { dest: entry_val, src:
+    // preheader_pack }`, and the same shape appears wherever a chain
+    // value is renamed.  With only the chain dest homed, the copy still
+    // round-trips its source through the slot (store in the preheader,
+    // reload at the edge — the chacha20 0xd0-frame staging dance).  A
+    // Copy source whose dest is a chain candidate earns a home too: the
+    // destructive allocator below still runs its interference check over
+    // every candidate's hole-aware coverage, so an overlapping value is
+    // never displaced — admission is unconditionally sound.  Iterate to a
+    // fixpoint so copy chains propagate fully (bounded by the copy count;
+    // each round either inserts a new id or stops).
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src } = inst {
+                    if out.contains(&dest.0) {
+                        if let Operand::Value(s) = src {
+                            if out.insert(s.0) {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     out
 }
 

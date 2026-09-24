@@ -265,12 +265,18 @@ pub(super) fn match_bool_mux_algebra(
     // earlier-positioned slot becomes Xor(p,q) (the kept term's operands)
     // and the later becomes And(r, xor) (r = the third variable). Every
     // sound role assignment is collected and the one whose KEPT term is
-    // defined EARLIEST wins: the composite then computes last, which is
-    // both the tightest live-range schedule and the shape GCC emits
-    // (kept-And first, composite last — nothing parks between the
-    // composite and its consumer). The preference is dominance-safe by
-    // construction: the kept term is only ever READ, at the consumer,
-    // where it already dominates (SSA argument above).
+    // defined EARLIEST wins: the composite then computes last — the shape
+    // GCC emits (kept-And first, composite last — nothing parks between
+    // the composite and its consumer) and the empirically best ordering
+    // measured on the sha256 corpus.  NOTE: "earliest kept" does NOT
+    // minimise the kept term's live-range LENGTH — keeping an early def
+    // alive to the consumer lengthens it; the preference is an
+    // entry-availability heuristic (a kept term already available at loop
+    // entry costs no intra-loop register), validated by measurement, not
+    // by a live-range optimality proof.  The preference is dominance-safe
+    // by construction: the kept term is only ever READ, at the consumer,
+    // where it already dominates (SSA argument above); a wrong pick is
+    // therefore a perf slip, never a miscompile.
     for (inner_opnd, third_opnd) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
         let Some(Instruction::BinOp {
             op: inner_op,
@@ -2439,6 +2445,51 @@ mod tests {
         }
     }
 
+    /// Multi-block variant of [`fixture`] (audit work order P0-3): one
+    /// instruction list per block; every def's location records the block
+    /// it actually lives in, so rank and cross-block logic can be pinned.
+    /// `insts` carries the LAST block (the consumer's) flattened.
+    fn fixture_blocks(blocks: &[Vec<Instruction>]) -> BoolFixture {
+        let mut n = 4usize;
+        for blk in blocks {
+            for inst in blk {
+                if let Some(dest) = inst.dest() {
+                    n = n.max(dest.0 as usize + 1);
+                }
+                crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(vv) = op {
+                        n = n.max(vv.0 as usize + 1);
+                    }
+                });
+            }
+        }
+        let mut defs = vec![None; n];
+        let mut def_loc = vec![None; n];
+        let mut use_counts = vec![0u32; n];
+        for (bi, blk) in blocks.iter().enumerate() {
+            for (ii, inst) in blk.iter().enumerate() {
+                if let Some(dest) = inst.dest() {
+                    defs[dest.0 as usize] = Some(inst.clone());
+                    def_loc[dest.0 as usize] = Some((bi, ii));
+                }
+                crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(vv) = op {
+                        use_counts[vv.0 as usize] += 1;
+                    }
+                });
+                crate::backend::liveness::for_each_value_use_in_instruction(inst, |vv| {
+                    use_counts[vv.0 as usize] += 1;
+                });
+            }
+        }
+        BoolFixture {
+            defs,
+            def_loc,
+            use_counts,
+            insts: blocks.last().cloned().unwrap_or_default(),
+        }
+    }
+
     fn and3(d: u32, a: Operand, b: Operand) -> Instruction {
         Instruction::BinOp {
             dest: Value(d),
@@ -2472,6 +2523,32 @@ mod tests {
             op: IrUnaryOp::Not,
             src: a,
             ty: IrType::U32,
+        }
+    }
+    fn and_ty(d: u32, ty: IrType, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::And,
+            lhs: a,
+            rhs: b,
+            ty,
+        }
+    }
+    fn xor_ty(d: u32, ty: IrType, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Xor,
+            lhs: a,
+            rhs: b,
+            ty,
+        }
+    }
+    fn not_ty(d: u32, ty: IrType, a: Operand) -> Instruction {
+        Instruction::UnaryOp {
+            dest: Value(d),
+            op: IrUnaryOp::Not,
+            src: a,
+            ty,
         }
     }
 
@@ -3106,6 +3183,281 @@ mod tests {
             )
             .is_some(),
             "a non-adjacent Not cannot fuse; the mux fold must fire"
+        );
+    }
+
+    /// Audit work order P0-2: the andn-defer predicate exists in THREE
+    /// layers that must agree or the CH shape silently loses its fusion
+    /// (a perf cliff no test would catch):
+    ///   1. `andn_fusion_predicted` here (fold-time defer),
+    ///   2. `detect_and_not_fusions` in backend/generation.rs (the actual
+    ///      fusion scan the emitter runs),
+    ///   3. `supports_and_not` + the `has_scalar_andn` resolution in
+    ///      passes/mod.rs (the permission both consult).
+    /// This test runs the PRODUCTION middle-end prediction (layer 1, via
+    /// `match_bool_mux_algebra`) over a table of shapes and asserts it
+    /// against a reference transcription of layer 2's criteria, written
+    /// out HERE so a future edit to either side surfaces as a loud
+    /// "middle-end and backend andn predicates disagree" failure.
+    ///
+    /// Layer-2 reference (backend/generation.rs :: detect_and_not_fusions):
+    /// a Not/And window fuses iff
+    ///   (a) pair[0] = UnaryOp Not with ty in {I32,U32,I64,U64},
+    ///   (b) use_counts[not_dest] == 1,
+    ///   (c) pair[1] = BinOp And with ty == not_ty,
+    ///   (d) the Not's dest is one of the And's two operands,
+    ///   (e) the two instructions are ADJACENT in the SAME block.
+    /// Layer 3 contributes the multiplicative `has_scalar_andn` gate
+    /// (x86-64 + BMI1 + no CCC_NO_ANDN_FUSION — resolved once per TU).
+    fn backend_andn_fusion_reference(fx: &BoolFixture, not_id: u32, and_idx: usize) -> bool {
+        let Some((nb, ni)) = fx.def_loc[not_id as usize] else {
+            return false;
+        };
+        if nb != 0 {
+            return false; // (e) different block
+        }
+        let insts = &fx.insts;
+        let Some(Instruction::UnaryOp {
+            op: crate::ir::reexports::IrUnaryOp::Not,
+            ty: not_ty,
+            ..
+        }) = insts.get(ni)
+        else {
+            return false; // (a) not a Not
+        };
+        if !matches!(
+            not_ty,
+            IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64
+        ) {
+            return false; // (a) outside the fusion width domain
+        }
+        if fx.use_counts[not_id as usize] != 1 {
+            return false; // (b)
+        }
+        if ni + 1 != and_idx {
+            return false; // (e) not adjacent
+        }
+        let Some(Instruction::BinOp {
+            op: IrBinOp::And,
+            lhs,
+            rhs,
+            ty: and_ty,
+            ..
+        }) = insts.get(and_idx)
+        else {
+            return false; // (c) not an And
+        };
+        *and_ty == *not_ty // (c)
+            && (matches!(lhs, Operand::Value(vv) if vv.0 == not_id)
+                || matches!(rhs, Operand::Value(vv) if vv.0 == not_id)) // (d)
+    }
+
+    fn ch_mux_case(
+        not_ty: IrType,
+        and_ty: IrType,
+        extra_between: bool,
+        cross_block: bool,
+        multi_use_not: bool,
+        has_scalar_andn: bool,
+    ) -> (
+        Option<(Instruction, Vec<(usize, usize, Instruction)>)>,
+        bool,
+    ) {
+        // The CH mux over (x=v0, y=v1, z=v2): And(x,y)=v4, ~x=v3,
+        // And(~x,z)=v5, consumer Xor(v4,v5)=v6.  And(~x,z) sits at the
+        // index the prediction is checked against (idx 2, or 3 when a
+        // spacer instruction is inserted between the Not and the And).
+        let v = |id| Operand::Value(Value(id));
+        let mut insts: Vec<Instruction> = vec![
+            Instruction::BinOp {
+                dest: Value(4),
+                op: IrBinOp::And,
+                lhs: v(0),
+                rhs: v(1),
+                ty: and_ty,
+            },
+            Instruction::UnaryOp {
+                dest: Value(3),
+                op: crate::ir::reexports::IrUnaryOp::Not,
+                src: v(0),
+                ty: not_ty,
+            },
+        ];
+        if extra_between {
+            insts.push(Instruction::BinOp {
+                dest: Value(8),
+                op: IrBinOp::Or,
+                lhs: v(1),
+                rhs: v(2),
+                ty: and_ty,
+            });
+        }
+        insts.push(Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::And,
+            lhs: v(3),
+            rhs: v(2),
+            ty: and_ty,
+        });
+        insts.push(Instruction::BinOp {
+            dest: Value(6),
+            op: IrBinOp::Xor,
+            lhs: v(4),
+            rhs: v(5),
+            ty: and_ty,
+        });
+        if multi_use_not {
+            insts.push(Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Xor,
+                lhs: v(3),
+                rhs: v(2),
+                ty: and_ty,
+            });
+        }
+        let mut fx = fixture(insts);
+        if cross_block {
+            // The Not lives in block 1 — the adjacency in block 0 must not
+            // predict a fusion the per-block backend scan can never see.
+            fx.def_loc[3] = Some((1, 0));
+        }
+        let and_idx = if extra_between { 3 } else { 2 };
+        let predicted_backend = backend_andn_fusion_reference(&fx, 3, and_idx);
+        let consumer_idx = fx.insts.len() - if multi_use_not { 2 } else { 1 };
+        (
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                and_ty,
+                0,
+                consumer_idx,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                has_scalar_andn,
+            ),
+            predicted_backend,
+        )
+    }
+
+    #[test]
+    fn andn_defer_predicate_agrees_with_the_backend_fusion_scan() {
+        // (not_ty, and_ty, spacer between Not and And, cross-block Not,
+        //  multi-use Not, resolved has_scalar_andn) — every row asserts:
+        // the middle end defers (returns None) EXACTLY when the backend
+        // scan would fuse and the permission is on.
+        let rows: [(IrType, IrType, bool, bool, bool, bool); 12] = [
+            // canonical defer
+            (IrType::U32, IrType::U32, false, false, false, true),
+            (IrType::I32, IrType::I32, false, false, false, true),
+            (IrType::U64, IrType::U64, false, false, false, true),
+            (IrType::I64, IrType::I64, false, false, false, true),
+            // permission off (kill switch / no BMI1): never defer
+            (IrType::U32, IrType::U32, false, false, false, false),
+            // rejection reasons, permission on: must fold
+            (IrType::U32, IrType::U32, false, false, true, true), // multi-use
+            (IrType::U32, IrType::U32, true, false, false, true), // not adjacent
+            (IrType::U32, IrType::U32, false, true, false, true), // cross-block
+            (IrType::U64, IrType::U32, false, false, false, true), // ty mismatch (wide not)
+            (IrType::U32, IrType::U64, false, false, false, true), // ty mismatch (wide and)
+            (IrType::U16, IrType::U16, false, false, false, true), // below domain
+            (IrType::U8, IrType::U8, false, false, false, true),  // below domain
+        ];
+        for (not_ty, and_ty, spacer, cross, multi, andn) in rows {
+            let (fold, backend_fuses) = ch_mux_case(not_ty, and_ty, spacer, cross, multi, andn);
+            let expect_defer = andn && backend_fuses;
+            assert_eq!(
+                fold.is_none(),
+                expect_defer,
+                "middle-end and backend andn predicates disagree: \
+                 not_ty={not_ty:?} and_ty={and_ty:?} spacer={spacer} \
+                 cross_block={cross} multi_use_not={multi} \
+                 has_scalar_andn={andn} (backend fuses: {backend_fuses})"
+            );
+        }
+    }
+
+    #[test]
+    fn maj_prefers_entry_available_kept_term() {
+        // Audit P0-3: the kept-term rank has TWO branches — a same-block
+        // def ranks (1, index), anything else (an entry-available def in a
+        // dominator) ranks (0, 0) and must WIN.  Here all three pairwise
+        // Ands are valid kept candidates; the one defined in block 0 must
+        // be chosen, so the composite computes last and nothing parks
+        // between it and the consumer.
+        let fx = fixture_blocks(&[
+            vec![and3(4, v(0), v(1))], // block 0: a1 = And(x, y)
+            vec![
+                and3(5, v(0), v(2)), // block 1 idx 0: a2 = And(x, z)
+                and3(6, v(1), v(2)), //          idx 1: a3 = And(y, z)
+                xor3(7, v(5), v(6)), //          idx 2: inner = a2 ^ a3
+                xor3(8, v(7), v(4)), //          idx 3: consumer = inner ^ a1
+            ],
+        ]);
+        let (new_consumer, pending) = match_bool_mux_algebra(
+            v(7),
+            v(4),
+            IrBinOp::Xor,
+            Value(8),
+            IrType::U32,
+            1,
+            3,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the majority shape must match across blocks");
+        let Instruction::BinOp { lhs, rhs, .. } = &new_consumer else {
+            panic!("the consumer rewrite must stay a BinOp");
+        };
+        let names = |op: &Operand, id: u32| matches!(op, Operand::Value(vv) if vv.0 == id);
+        assert!(
+            names(lhs, 4) || names(rhs, 4),
+            "the entry-available And(x,y) (rank (0,0)) must beat both \
+             same-block kept candidates (rank (1,i))"
+        );
+        // The repurposed rewrites stay in the consumer's block (v1).
+        for (bi, _, _) in &pending {
+            assert_eq!(*bi, 1, "repurposes belong to the consumer's block");
+        }
+    }
+
+    #[test]
+    fn maj_declines_when_repurposed_and_is_in_another_block() {
+        // Audit P0-3: the cross-block rejection — a repurposed And whose
+        // def lives in a dominator block can never be rewritten in place
+        // (the pending rewrites address the consumer's block), so EVERY
+        // kept assignment declines and the shape stays untouched.
+        let fx = fixture_blocks(&[
+            vec![
+                and3(4, v(0), v(1)), // block 0: a1 = And(x, y)
+                and3(6, v(1), v(2)), // block 0: a3 = And(y, z) — dominator
+            ],
+            vec![
+                and3(5, v(0), v(2)), // block 1 idx 0: a2 = And(x, z)
+                xor3(7, v(5), v(6)), //          idx 1: inner = a2 ^ a3
+                xor3(8, v(7), v(4)), //          idx 2: consumer = inner ^ a1
+            ],
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(7),
+                v(4),
+                IrBinOp::Xor,
+                Value(8),
+                IrType::U32,
+                1,
+                2,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
+            )
+            .is_none(),
+            "a repurposed And outside the consumer's block must decline"
         );
     }
 

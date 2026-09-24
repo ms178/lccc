@@ -1665,7 +1665,11 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     if !crate::passes::vectorize::x86_simd_available_pub() {
         return 0;
     }
-    let use_pshufb = crate::passes::vectorize::x86_sse41_available_pub();
+    // AVX-512VL: every rotate lowers to one `vprold` µop, so the pshufb
+    // byte-rotate masks (preheader pack + a mask register each) are pure
+    // overhead — decline them and keep the generic rotate form.
+    let use_pshufb = crate::passes::vectorize::x86_sse41_available_pub()
+        && !crate::passes::vectorize::x86_avx512vl_available_pub();
 
     let num_blocks = func.blocks.len();
     let cfg = CfgAnalysis::build(func);

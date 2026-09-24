@@ -207,11 +207,45 @@ if [[ ! -f $modrs ]] && [[ -f $here/../../../src/backend/x86/codegen/peephole/pa
   # Alternate layout (gate invoked from the worktree root): one level up.
   modrs="$here/../../../src/backend/x86/codegen/peephole/passes/mod.rs"
 fi
-if [[ -f $modrs ]] && ! grep -q "fold_store_alu_memop" "$modrs"; then
-  echo "FAIL: store_alu_fold is no longer wired into the peephole pipeline" >&2
-  echo "  ($modrs has no fold_store_alu_memop call).  It is currently inert" >&2
-  echo "  on the corpus (see the comment above) but kept as defense in depth;" >&2
-  echo "  unwiring it is a deliberate decision, not an accidental deletion." >&2
+if [[ -f $modrs ]]; then
+  # (b1) the fold is CALLED from the phase-2 pipeline — at BOTH scan sites.
+  wired=$(grep -c "fold_store_alu_memop" "$modrs" || true)
+  if [[ "$wired" -lt 2 ]]; then
+    echo "FAIL: store_alu_fold is no longer fully wired into the peephole" >&2
+    echo "  pipeline ($modrs has $wired fold_store_alu_memop call(s); the" >&2
+    echo "  straight-line and the restart scans each need one).  The pass is" >&2
+    echo "  currently inert on the corpus (see the comment above) but kept as" >&2
+    echo "  defense in depth; unwiring it is a deliberate decision, not an" >&2
+    echo "  accidental deletion." >&2
+    fail=1
+  fi
+  # (b2) every call sits behind the sk() kill-switch gate — an ungated
+  # call would bypass CCC_PEEPHOLE_SKIP bisection: the number of gates
+  # must equal the number of call sites.
+  gated=$(grep -c 'if !sk("store_alu_fold")' "$modrs" || true)
+  if [[ "$gated" -ne "$wired" ]]; then
+    echo "FAIL: store_alu_fold call sites without the sk() gate ($gated/$wired)" >&2
+    fail=1
+  fi
+  # (b3) no DEFAULT disable: the pass must not appear in any static
+  # skip/disable list (ALL peephole passes are enabled by default — the
+  # only runtime off switch is the CCC_PEEPHOLE_SKIP environment variable,
+  # which bisection controls and no CI gate sets for production builds).
+  if grep -nE '(DEFAULT|default)[A-Z_]*(SKIP|DISABLE)[A-Z_]*[^;]*store_alu_fold' "$modrs"; then
+    echo "FAIL: store_alu_fold appears in a default skip/disable list" >&2
+    fail=1
+  fi
+  # Residual hole, stated for the record: this pin proves the pass is
+  # wired, gated and default-on, and the cargo-test unit module proves the
+  # fold LOGIC fires on synthetic asm; nothing here proves a REAL C
+  # program reaches the fold at runtime, because the S45/S46 emitters
+  # removed every producer shape from the measured corpus.  If a future
+  # emitter regresses to park+memop-read shapes, the differential oracle
+  # and this gate's runtime arms (cases 1-2) catch a MISFOLD, and the
+  # unit test catches a dead LOGIC — the gap between (a fold becoming
+  # live-producing again unnoticed) is accepted as defense-in-depth depth.
+else
+  echo "FAIL: peephole pass registry not found at $modrs" >&2
   fail=1
 fi
 

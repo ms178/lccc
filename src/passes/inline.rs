@@ -58,7 +58,23 @@ const MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS: usize = 8;
 const MAX_SMALL_STATIC_LOOP_INLINE_CLONES: usize = 4;
 const MAX_STATIC_LOOP_INLINE_INSTRUCTIONS: usize = 128;
 const MAX_STATIC_LOOP_INLINE_BLOCKS: usize = 16;
-const MAX_STATIC_LOOP_INLINE_CALLS: usize = 2;
+/// Bounded-tier call-site cap.  Two sites was the historical limit; the
+/// third is admitted ONLY under the clone-growth budget below (the
+/// Linux find_next_andnot_bit shape: a 60-instruction scan kernel at
+/// three sites — two cold self-test calls plus one hot in-loop call —
+/// stayed outlined and lost 6–12% runtime to call overhead where GCC
+/// and Clang inline; measured paired A/B 2026-09-24, Intel).
+const MAX_STATIC_LOOP_INLINE_CALLS: usize = 3;
+/// Net clone-growth budget for the bounded tier:
+/// `inst_count * (direct_call_count - 1)` (the outlined body dies when
+/// every direct site is inlined and the address is never taken).  128
+/// reproduces the historical worst permitted case EXACTLY (two sites of
+/// a 128-instruction body) while the new third site is admitted only
+/// for bodies small enough that three copies stay within the same
+/// pressure envelope.  The glibc-memcmp clone regression (five 27-insn
+/// clones: caller 93→183 insns, 18 stack refs, −7.1%) sits in the small
+/// tier and is governed by MAX_SMALL_STATIC_LOOP_INLINE_CLONES instead.
+const MAX_STATIC_LOOP_INLINE_GROWTH_INSTRUCTIONS: usize = 128;
 /// At -Os, larger loop bodies stay out of enclosing loops even when inlining
 /// their final call site would remove the standalone copy. LCCC's current
 /// register allocator spills the merged nest heavily (zlib-ng Adler-32).
@@ -1988,7 +2004,12 @@ fn fits_static_loop_inline_limits(
 ) -> bool {
     let small = inst_count <= MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS
         && block_count <= MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS;
+    // Bounded tier: the growth budget is the real pressure proxy, the
+    // site cap a backstop.  `inst * (sites - 1)` counts the extra
+    // copies the module keeps after the outlined body dies.
+    let clone_growth = inst_count.saturating_mul(direct_call_count.saturating_sub(1));
     let bounded_clone = direct_call_count <= MAX_STATIC_LOOP_INLINE_CALLS
+        && clone_growth <= MAX_STATIC_LOOP_INLINE_GROWTH_INSTRUCTIONS
         && inst_count <= MAX_STATIC_LOOP_INLINE_INSTRUCTIONS
         && block_count <= MAX_STATIC_LOOP_INLINE_BLOCKS;
     small || bounded_clone
@@ -4358,6 +4379,18 @@ mod inline_limit_tests {
         assert!(!fits_static_loop_inline_limits(128, 16, 3));
         assert!(!fits_static_loop_inline_limits(129, 16, 1));
         assert!(!fits_static_loop_inline_limits(128, 17, 1));
+        // Growth budget: a third site is admitted while the net clone
+        // growth stays within 128 instructions — the Linux
+        // find_next_andnot_bit shape (60 insns, 13 blocks, three sites:
+        // two cold self-test calls + one hot in-loop call), measured a
+        // 6–12% runtime loss while it stayed outlined.
+        assert!(fits_static_loop_inline_limits(60, 13, 3));
+        assert!(fits_static_loop_inline_limits(64, 16, 3)); // 128 == budget
+        assert!(!fits_static_loop_inline_limits(65, 13, 3)); // 130 > budget
+        assert!(!fits_static_loop_inline_limits(40 + 1, 8 + 1, 5)); // 164 > budget
+        // The site cap backstops even tiny growth (four sites need the
+        // small tier, not the bounded tier).
+        assert!(!fits_static_loop_inline_limits(41, 9, 4));
     }
     #[test]
     fn aggregate_frame_veto_is_size_optimized_and_multisite_only() {

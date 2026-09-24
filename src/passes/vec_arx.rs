@@ -896,7 +896,10 @@ fn try_transform_loop(
     //        right after the entry loads they will follow into the
     //        preheader.  ChaCha's rot16/rot8 land here; rot12/rot7 keep
     //        the shift triple.
-    let use_pshufb = crate::passes::vectorize::x86_sse41_available_pub();
+    // AVX-512VL: `vprold` is one µop for EVERY rotate amount, so the
+    // byte-rotate mask materialisation is dead weight — decline it.
+    let use_pshufb = crate::passes::vectorize::x86_sse41_available_pub()
+        && !crate::passes::vectorize::x86_avx512vl_available_pub();
     let mut rot_masks: FxHashMap<i64, Value> = FxHashMap::default();
     if use_pshufb {
         let mut amounts: Vec<i64> = body

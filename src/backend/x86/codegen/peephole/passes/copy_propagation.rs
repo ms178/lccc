@@ -18,6 +18,7 @@
 
 use super::super::types::*;
 use super::helpers::*;
+use super::relay_and_lea::{plain_gp_operand, split_two_operands};
 
 /// Dynamic memory operands are normally alias-analysis barriers, but a single
 /// ordinary move/LEA has fully explicit register semantics.  It is safe to
@@ -29,6 +30,97 @@ fn allows_address_copy_propagation(trimmed: &str) -> bool {
     (mnemonic.starts_with("mov") || mnemonic.starts_with("lea"))
         && !trimmed.contains(';')
         && !has_implicit_reg_usage(trimmed)
+}
+
+// ── narrow-identity substitution ─────────────────────────────────────────────
+//
+// A `movl` reg-reg copy establishes a LOW-32 identity: bits 0..=31 of the
+// destination family equal bits 0..=31 of the source family (the upper half
+// is zeroed on BOTH sides of the identity — it is not tracked).  The 64-bit
+// arm of the pass below consumes `copy_src` only; two hot shapes were left
+// paying for staging relays because their consumers read the 32-bit part:
+//
+//   movzbl (%r10,%r9), %eax      movl %ebp, %eax
+//   movl   %eax, %r9d            movl %eax, (%r8,%r9,4)
+//   cmpl   %r9d, %esi
+//
+// Both are value-identical operand substitutions under the low-32 identity.
+// The exact contract each substitution honors:
+//
+//   N1  `copy_src32[F] == S` claims equality of bits 0..=31 ONLY.
+//   N2  A consumer substitution rewrites every occurrence of family `F`
+//       whose width is 32 bits or narrower and requires:
+//         (a) NO occurrence of the 64-bit name of `F` (reads bits 32..=63,
+//             outside the identity) and NO legacy high-byte name of `F`
+//             (%ah/%ch/%dh/%bh) — those stay unrewritten, and a line mixing
+//             rewritten and unrewritten occurrences of one family is
+//             refused outright;
+//         (b) the line does not WRITE family `F` at any width — the result
+//             must land in the register the program expects (this also
+//             covers self-RMW forms, where retargeting BOTH operands would
+//             redirect the result);
+//         (c) no implicit register usage (break, as in the 64-bit arm);
+//       Memory address operands are intrinsically safe to refuse: base and
+//       index registers are 64-bit names, so (a) rejects any line that
+//       references `F` inside an address.
+//   N3  A scalar store `movX %S, MEM` reads exactly width X of family `S`,
+//       so `movq` needs the FULL identity (`copy_src`) while `movl/movw/
+//       movb` need only `copy_src32`; only the source operand is rewritten.
+//   N4  Both sites run under the pass's existing state discipline: every
+//       barrier clears the tables, every write invalidates the family, and
+//       the line is reclassified after each rewrite.
+
+/// Whole-name occurrence test: `%r8` must not match inside `%r8d`.
+fn contains_whole_name(line: &str, name: &str) -> bool {
+    let bytes = line.as_bytes();
+    let nb = name.as_bytes();
+    let mut pos = 0;
+    while pos + nb.len() <= bytes.len() {
+        if &bytes[pos..pos + nb.len()] == nb {
+            let after = pos + nb.len();
+            if after >= bytes.len() || !bytes[after].is_ascii_alphanumeric() {
+                return true;
+            }
+        }
+        pos += 1;
+    }
+    false
+}
+
+/// Replace every whole-name occurrence of `from` with `to`.
+fn replace_whole_name(line: &str, from: &str, to: &str) -> String {
+    if !contains_whole_name(line, from) {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let fb = from.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if pos + fb.len() <= bytes.len() && &bytes[pos..pos + fb.len()] == fb {
+            let after = pos + fb.len();
+            if after >= bytes.len() || !bytes[after].is_ascii_alphanumeric() {
+                out.push_str(to);
+                pos = after;
+                continue;
+            }
+        }
+        out.push(bytes[pos] as char);
+        pos += 1;
+    }
+    out
+}
+
+/// N2(a): true when `line` never reads family `fam` outside bits 0..=31.
+fn only_narrow_uses_of(line: &str, fam: RegId) -> bool {
+    if contains_whole_name(line, REG_NAMES[0][fam as usize]) {
+        return false;
+    }
+    const HIGH_BYTES: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
+    if (fam as usize) < 4 && contains_whole_name(line, HIGH_BYTES[fam as usize]) {
+        return false;
+    }
+    true
 }
 
 /// Try to replace uses of `dst_id` with `src_id` in instruction at index `j`.
@@ -195,7 +287,10 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
         // because doing so can interfere with stronger SIB/LEA folds.
         let trimmed = infos[i].trimmed(store.get(i));
         if infos[i].has_indirect_mem {
-            if allows_address_copy_propagation(trimmed) {
+            // Owned copy: `trimmed` borrows the store, and the mutable
+            // rewrite calls below must not see a live borrow.
+            let line_text = trimmed.to_string();
+            if allows_address_copy_propagation(&line_text) {
                 let dest = get_dest_reg(&infos[i]);
                 for reg in 0..16u8 {
                     let src = copy_src[reg as usize];
@@ -204,6 +299,56 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
                             changed = true;
                         }
                         break;
+                    }
+                }
+                // N3: a scalar store whose SOURCE register is a tracked
+                // copy can read the copy's origin directly — the memory
+                // destination is untouched and the store width selects the
+                // identity level (`movq` needs the full 64-bit identity,
+                // the narrow forms need only low-32).  All text is
+                // materialised into owned strings before the rewrite so
+                // the mutable store call borrows nothing stale.
+                if !infos[i].pinned {
+                    let parsed: Option<(usize, &str)> = line_text
+                        .strip_prefix("movq ")
+                        .map(|rest| (0usize, rest))
+                        .or_else(|| line_text.strip_prefix("movl ").map(|rest| (1, rest)))
+                        .or_else(|| line_text.strip_prefix("movw ").map(|rest| (2, rest)))
+                        .or_else(|| line_text.strip_prefix("movb ").map(|rest| (3, rest)));
+                    if let Some((width_row, rest)) = parsed {
+                        if let Some((src_op, dst_op)) = split_two_operands(rest) {
+                            if dst_op.contains('(') && src_op.starts_with('%') {
+                                if let Some(fam) = plain_gp_operand(src_op) {
+                                    let tracked = if width_row == 0 {
+                                        copy_src[fam as usize]
+                                    } else {
+                                        copy_src32[fam as usize]
+                                    };
+                                    if tracked != REG_NONE && tracked != fam {
+                                        let mnemonic = String::from(
+                                            &line_text[..line_text.len() - rest.len()],
+                                        );
+                                        let new_src = replace_whole_name(
+                                            src_op,
+                                            REG_NAMES[width_row][fam as usize],
+                                            REG_NAMES[width_row][tracked as usize],
+                                        );
+                                        let dst_owned = dst_op.to_string();
+                                        let full = store.get(i).to_string();
+                                        let lead_len = full.len() - line_text.len();
+                                        let new_line = format!(
+                                            "{}{}{}, {}",
+                                            &full[..lead_len],
+                                            mnemonic,
+                                            new_src,
+                                            dst_owned
+                                        );
+                                        replace_line(store, &mut infos[i], i, new_line);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -331,6 +476,62 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
             }
         }
 
+        // N2: low-32 identities into consumers that read only the 32-bit
+        // (or narrower) part of the family.  `movl` zero-extends
+        // identically on both sides of the identity, so those reads see
+        // exactly the same value for the copy and its origin.  This kills
+        // the staging relays the 64-bit arm cannot touch (`movl %ebp,
+        // %eax` before a `cmpl`/store; `movl %eax, %r9d` between a
+        // `movzbl` load and its compare).
+        for reg in 0..16u8 {
+            let src = copy_src32[reg as usize];
+            if src == REG_NONE || src == reg {
+                continue;
+            }
+            if infos[i].reg_refs & (1u16 << reg) == 0 {
+                continue;
+            }
+            // N2(b): the identity covers READS only — a line writing the
+            // family must keep its destination register.
+            if get_dest_reg(&infos[i]) == reg {
+                continue;
+            }
+            let cur_trimmed = infos[i].trimmed(store.get(i));
+            // N2(c): mirrors the 64-bit arm above.
+            if has_implicit_reg_usage(cur_trimmed) {
+                break;
+            }
+            // Shift/rotate counts are %cl by architecture: the 64-bit arm
+            // refuses to propagate into %rcx for exactly this reason, and
+            // the narrow arm must hold the same line even though %cl is a
+            // byte-width (narrow) occurrence.
+            if reg == 1 && is_shift_or_rotate(cur_trimmed) {
+                continue;
+            }
+            // N2(a): refuse 64-bit reads and mixed high-byte lines.
+            if !only_narrow_uses_of(cur_trimmed, reg) {
+                continue;
+            }
+            let mut new_text = cur_trimmed.to_string();
+            for row in 1..=3usize {
+                new_text = replace_whole_name(
+                    &new_text,
+                    REG_NAMES[row][reg as usize],
+                    REG_NAMES[row][src as usize],
+                );
+            }
+            if new_text != cur_trimmed {
+                let new_line = {
+                    let full = store.get(i);
+                    let lead_len = full.len() - cur_trimmed.len();
+                    format!("{}{}", &full[..lead_len], new_text)
+                };
+                replace_line(store, &mut infos[i], i, new_line);
+                changed = true;
+                break;
+            }
+        }
+
         // If we propagated, don't increment i - re-process.
         // But we still need to do invalidation below.
         let _ = did_propagate;
@@ -416,6 +617,283 @@ mod tests {
             }
         }
         (store, infos)
+    }
+
+    /// Run `propagate_register_copies` to a local fixpoint (the pipeline
+    /// drives it repeatedly; two iterations expose chain-then-consume).
+    fn propagate(asm: &str) -> String {
+        let (mut store, mut infos) = build_pinned(asm);
+        for _ in 0..2 {
+            propagate_register_copies(&mut store, &mut infos);
+        }
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // NOTE on the choice of copy sources in these tests: the reg-reg copy
+    // parsers reject the frame families (%rsp/%rbp) by design, so every
+    // fixture uses %ebx/%edx-class sources.
+
+    #[test]
+    fn narrow_consumer_is_retargeted_to_the_movl_origin() {
+        // N2: `cmpl` reads only the low 32 bits of %eax, which the movl
+        // identity pins to %ebx — the read is retargeted.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    cmpl %eax, %esi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpl %ebx, %esi"), "{out}");
+    }
+
+    #[test]
+    fn byte_and_word_reads_are_retargeted() {
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    testb %al, %al\n",
+            "    movl %edx, %ecx\n",
+            "    testw %cx, %cx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("testb %bl, %bl"), "{out}");
+        assert!(out.contains("testw %dx, %dx"), "{out}");
+    }
+
+    #[test]
+    fn movl_store_source_is_retargeted() {
+        // N3: the store reads exactly the low 32 bits the identity covers.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    movl %eax, (%r8,%r9,4)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %ebx, (%r8,%r9,4)"), "{out}");
+    }
+
+    #[test]
+    fn movq_store_source_uses_the_full_identity() {
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rdx, %rax\n",
+            "    movq %rax, (%r8)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movq %rdx, (%r8)"), "{out}");
+    }
+
+    #[test]
+    fn movq_store_refuses_a_low32_only_identity() {
+        // `movl` zeroes the upper half — the 64-bit store must keep %rax.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    movq %rax, (%r8)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movq %rax, (%r8)"), "{out}");
+        assert!(!out.contains("movq %rbx"), "{out}");
+    }
+
+    #[test]
+    fn sixty_four_bit_reader_keeps_the_copy() {
+        // N2(a): `addq` reads bits 32..=63, outside the movl identity.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    addq %rax, %r9\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("addq %rax, %r9"), "{out}");
+    }
+
+    #[test]
+    fn address_use_keeps_the_copy() {
+        // N2(a)/(d): a base/index reference is a 64-bit read.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    movl (%rax), %esi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl (%rax), %esi"), "{out}");
+    }
+
+    #[test]
+    fn dest_write_keeps_the_copy() {
+        // N2(b): the result must land in %eax.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    subl %edx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("subl %edx, %eax"), "{out}");
+    }
+
+    #[test]
+    fn high_byte_line_keeps_the_copy() {
+        // N2(a): %ah stays unrewritten; a mixed line is refused outright.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    addb %ah, %cl\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("addb %ah, %cl"), "{out}");
+        assert!(!out.contains("%bh"), "{out}");
+    }
+
+    #[test]
+    fn shift_count_in_cl_is_never_retargeted() {
+        // The count of a variable shift is %cl by architecture; the
+        // 64-bit arm refuses %rcx propagation there and the narrow arm
+        // must not sneak the byte-width occurrence through.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rdi, %rcx\n",
+            "    shlq %cl, %r8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("shlq %cl, %r8"), "{out}");
+        assert!(!out.contains("%dil"), "{out}");
+    }
+
+    #[test]
+    fn setcc_destination_is_never_retargeted() {
+        // SetCC writes the family at 8-bit width — N2(b) refuses it.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %eax\n",
+            "    sete %al\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("sete %al"), "{out}");
+    }
+
+    #[test]
+    fn store_relay_dies_end_to_end_when_the_dest_is_redefined() {
+        // The fannkuch store shape through the full peephole pipeline:
+        // the store source is retargeted, then the now-dead relay is
+        // deleted (%eax is fully redefined before any read).
+        let out = super::super::super::peephole_optimize(
+            concat!(
+                "f:\n",
+                ".cfi_startproc\n",
+                "    movl %ebx, %eax\n",
+                "    movl %eax, (%r8,%r9,4)\n",
+                "    movl %edx, %eax\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            )
+            .to_string(),
+        );
+        assert!(out.contains("movl %ebx, (%r8,%r9,4)"), "{out}");
+        assert!(!out.contains("movl %ebx, %eax"), "{out}");
+        assert!(out.contains("movl %edx, %eax"), "{out}");
+    }
+
+    #[test]
+    fn imul_three_operand_overwrite_kills_the_relay_end_to_end() {
+        // The magic-division staple: `imull $imm, %src, %r9d` writes %r9d
+        // without reading it, so the staging relay in front of it dies.
+        // Regression pin for the phantom-RMW bug that kept the glibc_strstr
+        // `movl %eax, %r9d` alive one instruction per hot iteration.
+        let out = super::super::super::peephole_optimize(
+            concat!(
+                "f:\n",
+                ".cfi_startproc\n",
+                "    movl %eax, %r9d\n",
+                "    imull $5, %ebx, %r9d\n",
+                "    movq %r9, %rbx\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            )
+            .to_string(),
+        );
+        assert!(!out.contains("movl %eax, %r9d"), "{out}");
+        assert!(out.contains("imull $5, %ebx, %r9d"), "{out}");
+        assert!(out.contains("movq %r9, %rbx"), "{out}");
+    }
+
+    #[test]
+    fn imul_two_operand_still_reads_its_destination() {
+        // The two-operand form genuinely reads the destination: the relay
+        // must survive.
+        let out = super::super::super::peephole_optimize(
+            concat!(
+                "f:\n",
+                ".cfi_startproc\n",
+                "    movl %eax, %r9d\n",
+                "    imull %ebx, %r9d\n",
+                "    movq %r9, %rbx\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            )
+            .to_string(),
+        );
+        assert!(out.contains("movl %eax, %r9d"), "{out}");
+    }
+
+    #[test]
+    fn movl_store_source_is_retargeted_from_a_frame_family() {
+        // fannkuch's swap-loop shape: the RA homes perm[i] in %ebp and the
+        // store source is retargeted through the low-32 identity.
+        let out = propagate(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebp, %eax\n",
+            "    movl %eax, (%r8,%r9,4)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %ebp, (%r8,%r9,4)"), "{out}");
+    }
+
+    #[test]
+    fn frame_family_relay_dies_end_to_end_when_the_dest_is_redefined() {
+        let out = super::super::super::peephole_optimize(
+            concat!(
+                "f:\n",
+                ".cfi_startproc\n",
+                "    movl %ebp, %eax\n",
+                "    movl %eax, (%r8,%r9,4)\n",
+                "    movl %edx, %eax\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            )
+            .to_string(),
+        );
+        assert!(out.contains("movl %ebp, (%r8,%r9,4)"), "{out}");
+        assert!(!out.contains("movl %ebp, %eax"), "{out}");
+        assert!(out.contains("movl %edx, %eax"), "{out}");
     }
 
     #[test]
