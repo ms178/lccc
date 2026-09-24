@@ -600,6 +600,18 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Dump rustfmt diff (temporary debug)
+        if: always()
+        run: |
+          cargo fmt --all -- --check > fmtdiff.txt 2>&1 || true
+          wc -c fmtdiff.txt
+          git config user.name "fmt-dump"
+          git config user.email "fmt-dump@users.noreply.github.com"
+          git add fmtdiff.txt
+          git commit -m "fmtdiff artifact" || true
+          git push -f origin HEAD:ci-fmt-debug || echo "(push denied)"
+          head -30 fmtdiff.txt | while IFS= read -r line; do echo "::error::FDIFF| $line"; done || true
+
       - name: Run strict Clippy
         env:
           CARGO_BUILD_JOBS: "2"
