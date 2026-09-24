@@ -434,6 +434,14 @@ gate "lea-hoist-rorx" fast \
 gate "provenance-int-param" fast \
     bash tests/regression/check_provenance_int_param.sh
 
+# Persist-gate C-level verdicts: the four probe nests (goto-bound init,
+# runtime limit, IV-decided limit, folded limit) must keep their veto /
+# allow decisions and nest shapes end to end from C sources. Negative-
+# verified: a const-limit mutation of the runtime-limit probe fails exactly
+# its two pins.
+gate "unroll-gate-verdicts" fast \
+    bash tests/regression/check_unroll_gate_verdicts.sh
+
 # CH/MAJ oracle consensus: andn-gated mux fold, kept-earliest majority,
 # acc-resident ALU consumption, zero exposed forwards (negative-verified
 # against the pre-change tree: 0 andn + the loop slot shape fail there).

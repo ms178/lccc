@@ -1224,14 +1224,19 @@ fn complete_unroll_trip(
     }
     i64::try_from(trip).ok()
 }
-/// True when `op` denotes a value that depends only on integer constants and
-/// (possibly) `iv`.  Complete unrolling substitutes the OUTER IV with a
-/// per-clone constant, so once such an operand is used in an inner loop's own
-/// IV/bound, that inner loop becomes constant-trip after the outer unroll.
-/// Intended for the persisting-inner-loop gate; a dependency on anything else
-/// (a function parameter, a memory load, a non-IV-dependent phi) means the
-/// inner loop's trip stays dynamic.
-fn depends_only_on_const_and_iv(func: &IrFunction, op: &Operand, iv: Value, depth: usize) -> bool {
+/// FROZEN pre-S20 leniency for the legacy revert knob — DO NOT TIGHTEN.
+/// This is the exact S20 `depends_only_on_const_and_iv` (any BinOp, any
+/// Cast, recurse into EVERY all-const/IV phi, depth cap 8). The legacy knob
+/// must restore bit-exact old verdicts (warts included): bisection and
+/// emergency revert are meaningless if legacy quietly inherits new vetoes.
+/// Pinned by the legacy halves of the persist-gate tests. Any change here is
+/// a revert-contract break, not an improvement.
+fn depends_only_on_const_and_iv_legacy(
+    func: &IrFunction,
+    op: &Operand,
+    iv: Value,
+    depth: usize,
+) -> bool {
     if depth > 8 {
         return false;
     }
@@ -1255,15 +1260,113 @@ fn depends_only_on_const_and_iv(func: &IrFunction, op: &Operand, iv: Value, dept
     let Some(inst) = def else { return false };
     match inst {
         Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => {
-            depends_only_on_const_and_iv(func, src, iv, depth + 1)
+            depends_only_on_const_and_iv_legacy(func, src, iv, depth + 1)
         }
         Instruction::BinOp { lhs, rhs, .. } => {
-            depends_only_on_const_and_iv(func, lhs, iv, depth + 1)
-                && depends_only_on_const_and_iv(func, rhs, iv, depth + 1)
+            depends_only_on_const_and_iv_legacy(func, lhs, iv, depth + 1)
+                && depends_only_on_const_and_iv_legacy(func, rhs, iv, depth + 1)
         }
         Instruction::Phi { incoming, .. } => incoming
             .iter()
-            .all(|(op, _)| depends_only_on_const_and_iv(func, op, iv, depth + 1)),
+            .all(|(op, _)| depends_only_on_const_and_iv_legacy(func, op, iv, depth + 1)),
+        _ => false,
+    }
+}
+
+/// True when `op` denotes a value that depends only on integer constants and
+/// (possibly) `iv`.  Complete unrolling substitutes the OUTER IV with a
+/// per-clone constant, so once such an operand is used in an inner loop's own
+/// IV/bound, that inner loop becomes constant-trip after the outer unroll.
+/// Intended for the persisting-inner-loop gate; a dependency on anything else
+/// (a function parameter, a memory load, a select, a non-header phi) means
+/// the inner loop's trip stays dynamic.
+///
+/// This is an EXACT mirror of `resolve_const_operand` — the evaluator the
+/// cloners run on the substituted per-clone body — and must stay one:
+/// Copy (follow), int->int Cast only, fixed-width-int Add/Sub/Mul only,
+/// depth cap 6 counted cap-first exactly like the resolver (a Const reached
+/// past the cap refuses in BOTH). Anything this rejects, the resolver
+/// rejects too, so every veto below is a persist the fixpoint provably
+/// cannot cascade; anything this accepts, the per-clone bound resolves.
+/// Keep the two in sync (see the cap cross-reference there).
+///
+/// The one deliberate asymmetry is Phi, and it is exact, not lenient: only a
+/// phi DEFINED IN THE OUTER HEADER (`outer_header`) may recurse into its
+/// incomings — the cloners' LoopPhiModel substitutes every outer-header phi
+/// with a per-clone value, so the phi itself vanishes and only its incoming
+/// chains matter. EVERY OTHER phi (inner headers, body diamonds, preheaders)
+/// is refused outright: no pass runs between the rounds of one `unroll_loops`
+/// call, the Early->post-vectorize handoff carries only loop-idiom and
+/// vectorization (neither folds phis), iters 1-2 never unroll, and trivial
+/// (single-valued) phis were already folded by cfg_simplify1 before any
+/// unrolling — so a surviving phi can never become constant in a later
+/// unroll round. Cyclic header-phi chains (accumulators, cross-phi swaps)
+/// still veto via the depth cap, which is the correct verdict there too:
+/// the model's per-clone expression nests one level per iteration and the
+/// resolver's own cap refuses it alike.
+fn depends_only_on_const_and_iv(
+    func: &IrFunction,
+    op: &Operand,
+    iv: Value,
+    outer_header: usize,
+    depth: usize,
+) -> bool {
+    // Cap-first, mirroring `resolve_const_operand` (depth 6 there): keep the
+    // two caps identical or the allow/veto boundary drifts from what the
+    // cloners can resolve.
+    if depth > 6 {
+        return false;
+    }
+    // `Operand` is closed over {Const, Value}; both handled above.  The
+    // `Value` arm falls through to a def-chain walk; a def that is a memory /
+    // opaque instruction returns false (never constant after substitution).
+    let value = match op {
+        Operand::Const(_) => return true,
+        Operand::Value(v) => v,
+    };
+    if value.0 == iv.0 {
+        return true;
+    }
+    let mut found: Option<(&Instruction, usize)> = None;
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if let Some(inst) = block.instructions.iter().find(|i| i.dest() == Some(*value)) {
+            found = Some((inst, bi));
+            break;
+        }
+    }
+    let Some((inst, def_block)) = found else {
+        return false;
+    };
+    match inst {
+        Instruction::Copy { src, .. } => {
+            depends_only_on_const_and_iv(func, src, iv, outer_header, depth + 1)
+        }
+        Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        } => {
+            is_fixed_width_int(*from_ty)
+                && is_fixed_width_int(*to_ty)
+                && depends_only_on_const_and_iv(func, src, iv, outer_header, depth + 1)
+        }
+        Instruction::BinOp {
+            op, lhs, rhs, ty, ..
+        } => {
+            matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul)
+                && is_fixed_width_int(*ty)
+                && depends_only_on_const_and_iv(func, lhs, iv, outer_header, depth + 1)
+                && depends_only_on_const_and_iv(func, rhs, iv, outer_header, depth + 1)
+        }
+        Instruction::Phi { incoming, .. } => {
+            if def_block != outer_header {
+                return false;
+            }
+            incoming
+                .iter()
+                .all(|(op, _)| depends_only_on_const_and_iv(func, op, iv, outer_header, depth + 1))
+        }
         _ => false,
     }
 }
@@ -1295,14 +1398,16 @@ fn trace_persist_veto(func: &IrFunction, outer_header: usize, inner_header: usiz
 /// loop rolled, which is correct and matches GCC.
 ///
 /// Fail-closed: the ONLY nested inner loop that does not persist is a clean
-/// counted loop (single latch with an unconditional Branch to the header, an
-/// Add/Sub-IV, a header exit on that IV) whose init and limit depend solely
-/// on constants and the outer IV — the triangular-cascade shape, which the
-/// fixpoint unrolls in the next round.  Every other nested inner loop
-/// (multi-latch, non-Branch latch, no Add/Sub-IV, no exit on the found IV,
-/// no recognizable init) is one the complete cloner cannot cascade by
-/// construction, so it persists in every clone and the outer unroll is
-/// refused.  This is a correctness AND a codegen rule: cloning a surviving
+/// counted loop (single-entry with exactly one non-latch incoming — both
+/// cloners refuse multi-entry loops outright — single latch with an
+/// unconditional Branch to the header, an Add/Sub-IV, a header exit on that
+/// IV) whose init and limit depend solely on constants and the outer IV —
+/// the triangular-cascade shape, which the fixpoint unrolls in the next
+/// round.  Every other nested inner loop (multi-entry, multi-latch,
+/// non-Branch latch, no Add/Sub-IV, no exit on the found IV, no recognizable
+/// init) is one the complete cloner cannot cascade by construction, so it
+/// persists in every clone and the outer unroll is refused.  This is a
+/// correctness AND a codegen rule: cloning a surviving
 /// runtime loop K times is pure growth (csv_field_sum's 6-trip column loop
 /// over two data-dependent digit while-loops: 19→89 blocks, +345 IR insns,
 /// +156% .text, +8% runtime; the digit extractor's exit reads the
@@ -1315,13 +1420,20 @@ fn trace_persist_veto(func: &IrFunction, outer_header: usize, inner_header: usiz
 /// accepted whenever it depends only on constants and the outer IV, even
 /// when it is recomputed in the inner header rather than hoisted (g3's
 /// `i + 8`, invariant in value but defined in-body).  Substitution plus the
-/// fold/copyprop between fixpoint rounds makes such a limit per-clone
-/// constant, so the fixpoint still cascades — requiring syntactic
-/// loop-invariance here would veto unrolls the fixpoint completes.  The gate
-/// therefore predicts EXACTLY what the fixpoint can cascade: first-IV-only
-/// (matching the fixpoint's own finder — an exit/IV mismatch vetoes because
-/// the fixpoint would fail to unroll the inner too, so it would persist),
-/// with init/limit constability decided by value.
+/// const-expression evaluation INSIDE the unroll rounds (`resolve_const_-
+/// operand` over the substituted per-clone body) makes such a limit
+/// per-clone constant, so the fixpoint still cascades — requiring syntactic
+/// loop-invariance here would veto unrolls the fixpoint completes.  No pass
+/// runs between the rounds of one `unroll_loops` call (only CFG rebuilds),
+/// and the Early->post-vectorize handoff carries only loop-idiom and
+/// vectorization, so a bound that is still non-constant after substitution
+/// (a surviving phi, a select, a shift/divide, a chain deeper than the
+/// resolver) can never resolve in a later unroll round.  The gate therefore
+/// predicts EXACTLY what the fixpoint can cascade: first-IV-only (matching
+/// the fixpoint's own finder — an exit/IV mismatch vetoes because the
+/// fixpoint would fail to unroll the inner too, so it would persist), with
+/// init/limit constability decided by value through an exact mirror of the
+/// cloners' own resolver.
 ///
 /// Detached cycles need no special handling: a natural loop's header
 /// dominates its body, so a block that is unreachable from the outer header
@@ -1337,6 +1449,16 @@ fn trace_persist_veto(func: &IrFunction, outer_header: usize, inner_header: usiz
 /// exit would recover that rare shape, but the added search in a
 /// correctness-critical gate is not worth a missed unroll the corpus has
 /// never shown; revisit with data if one appears.
+///
+/// Known lenient case: the gate predicts constability, not feasibility. An
+/// inner loop whose substituted trip is constant but huge (or over the
+/// cloners' budgets) is ALLOWED exactly as the pre-S20 gate allowed every
+/// recognized nest — the cloners then refuse it on trip/budget grounds and
+/// it persists. Predicting feasibility would need the trip evaluated under
+/// substitution (a second const-evaluator shadowing the cloners'), which no
+/// corpus case has ever needed; revisit with data if a bloat case appears.
+/// This leniency is legacy-equivalent (the old gate allowed these too), so
+/// it cannot regress any previously good shape.
 ///
 /// `CCC_UNROLL_LEGACY_PERSIST_GATE=1` restores the pre-S20 lenient gate (skip
 /// unrecognized inners instead of refusing) for A/B and emergency revert.
@@ -1401,8 +1523,9 @@ fn body_contains_persisting_inner_loop(
         // Value-based exit: no syntactic-invariance requirement (see
         // `find_exit_condition`).  A limit recomputed in the inner header
         // from the outer IV still cascades — substitution plus the
-        // fold/copyprop between fixpoint rounds makes it per-clone
-        // constant — so invariance is decided by `depends_only...` below.
+        // const-expression evaluation inside the unroll rounds makes it
+        // per-clone constant — so invariance is decided by `depends_only...`
+        // below, which mirrors the cloners' own resolver exactly.
         // Legacy mode keeps the SYNTACTIC exit (`true`): the lenient gate
         // must skip exactly the nests it skipped pre-S20, and a value exit
         // would send unrecognized nests down the refuse path instead of
@@ -1442,21 +1565,37 @@ fn body_contains_persisting_inner_loop(
             trace_persist_veto(func, outer.header, inner.header, "no-init");
             return true;
         }
+        // A multi-entry inner (two or more non-latch incomings) can NEVER
+        // cascade no matter what the entry values are — even all-constant
+        // ones: both complete cloners refuse multi-entry loops outright
+        // (`collect_header_phis` demands exactly two incomings, and the
+        // general cloner additionally requires a unique preheader), so the
+        // inner persists in every clone. Veto outright. Legacy keeps the
+        // pre-S20 last-incoming-only leniency for bit-exact revert.
+        if !legacy && init_ops.len() >= 2 {
+            trace_persist_veto(func, outer.header, inner.header, "multi-entry");
+            return true;
+        }
         let inits_to_test: &[Operand] = if legacy {
             &init_ops[init_ops.len() - 1..]
         } else {
             &init_ops
         };
-        // If the inner IV's initial value or its bound depends on a runtime
-        // value (not a constant and not the OUTER IV), the inner loop persists
-        // after the outer unroll -> unsafe to unroll the outer loop.  No
-        // legacy skip here (unlike the unrecognized-shape arms above): a
-        // recognized-but-dynamic bound persists under EITHER gate.
-        if inits_to_test
-            .iter()
-            .any(|op| !depends_only_on_const_and_iv(func, op, outer_iv, 0))
-            || !depends_only_on_const_and_iv(func, &limit, outer_iv, 0)
-        {
+        // If the inner IV's initial value or its bound depends on anything
+        // beyond constants and the OUTER IV, the inner loop persists after
+        // the outer unroll -> unsafe to unroll the outer loop. The constancy
+        // test itself is mode-dependent: the new gate uses the exact
+        // `resolve_const_operand` mirror (int->int casts, int Add/Sub/Mul,
+        // outer-header phis only, depth 6), while legacy uses the frozen
+        // pre-S20 leniency so the knob restores bit-exact old verdicts.
+        let mut bound_is_dynamic = |op: &Operand| {
+            if legacy {
+                !depends_only_on_const_and_iv_legacy(func, op, outer_iv, 0)
+            } else {
+                !depends_only_on_const_and_iv(func, op, outer_iv, outer.header, 0)
+            }
+        };
+        if inits_to_test.iter().any(&mut bound_is_dynamic) || bound_is_dynamic(&limit) {
             trace_persist_veto(func, outer.header, inner.header, "dynamic-bound");
             return true;
         }
@@ -3488,6 +3627,10 @@ fn operand_has_pointer_origin(func: &IrFunction, op: &Operand) -> bool {
 }
 
 fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Option<i64> {
+    // The persist gate's `depends_only_on_const_and_iv` mirrors this
+    // evaluator exactly (accepted opcodes, int-only casts, this cap): keep
+    // the two in sync or the gate's allow/veto boundary drifts from what
+    // the cloners can resolve.
     if depth > 6 {
         return None;
     }
@@ -6998,8 +7141,8 @@ mod tests {
     /// g3's affine-limit shape (`for j = 2; j < i + 8; j++` with the limit
     /// recomputed in the INNER header from the outer IV): invariant in value
     /// but not hoisted, so no SYNTACTIC exit exists — yet substitution plus
-    /// the fold/copyprop between fixpoint rounds makes it per-clone
-    /// constant, and the fixpoint cascades. Must allow. (S20's syntactic
+    /// the const-expression evaluation inside the unroll rounds makes it
+    /// per-clone constant, and the fixpoint cascades. Must allow. (S20's syntactic
     /// gate vetoed this: +20 insns on g3 plus a lost ipcp fold in main.
     /// Legacy allows it too, but for the wrong reason — skipping the
     /// unrecognized exit — while S20b allows it by value prediction.)
@@ -7078,9 +7221,13 @@ mod tests {
     /// Multi-entry inner header (irreducible CFG): the IV phi has TWO
     /// non-latch incomings, one const (B1) and one opaque-dynamic (B7, a
     /// syntactic-only predecessor — Value(99) is deliberately undefined).
-    /// Per-clone constancy needs ALL entries constable. Must refuse. (The
-    /// const incoming is listed LAST so a last-incoming-wins test would
-    /// bless this nest — the S20/legacy false-negative this pins shut.)
+    /// Must refuse: multi-entry vetoes unconditionally (both cloners refuse
+    /// multi-entry loops outright, so no cascade is possible whatever the
+    /// entry values are — even all-constant ones, see the const/same-init
+    /// twins below). (The const incoming is listed LAST so a
+    /// last-incoming-wins test would bless this nest — the S20/legacy
+    /// false-negative this pins shut; legacy still allows it, pinned in
+    /// the legacy test.)
     fn persist_gate_multi_entry_inner() -> IrFunction {
         let mut func = IrFunction::new("multientry".to_string(), IrType::Void, vec![], false);
         persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
@@ -7237,6 +7384,375 @@ mod tests {
         assert!(
             persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
             "restored gate must veto again"
+        );
+    }
+
+    /// Shared skeleton for the gate-rule fixtures below: outer prefix (B0
+    /// preheader, B1 `for (i = 0; i < 4; i++)` header) + inner nest (B2
+    /// header with the IV phi `Value(3)`, `inner_header_extra` instructions
+    /// and the exit Cmp on `limit`; B3 body; B4 latch) + outer suffix (B5
+    /// latch, B6 return). `init_incoming` is the inner IV phi's non-latch
+    /// incoming list (multi-entry fixtures pass two); `second_entry` adds
+    /// the syntactic-only B7 predecessor for them.
+    fn persist_gate_custom_inner(
+        name: &str,
+        init_incoming: Vec<(Operand, BlockId)>,
+        inner_header_extra: Vec<Instruction>,
+        limit: Operand,
+        second_entry: bool,
+    ) -> IrFunction {
+        let mut func = IrFunction::new(name.to_string(), IrType::Void, vec![], false);
+        persist_gate_push_outer_prefix(&mut func, 4, BlockId(5), BlockId(6));
+        let mut header_insns = vec![Instruction::Phi {
+            dest: Value(3),
+            ty: IrType::I32,
+            incoming: {
+                let mut inc = init_incoming;
+                inc.push((Operand::Value(Value(7)), BlockId(4)));
+                inc
+            },
+        }];
+        header_insns.extend(inner_header_extra);
+        header_insns.push(Instruction::Cmp {
+            dest: Value(11),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(3)),
+            rhs: limit,
+            ty: IrType::I32,
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: header_insns,
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(3),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(3)),
+            }],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(3)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        persist_gate_push_outer_suffix(&mut func, 5, 6);
+        if second_entry {
+            func.blocks.push(BasicBlock {
+                label: BlockId(7),
+                instructions: vec![],
+                terminator: Terminator::Branch(BlockId(2)),
+                source_spans: Vec::new(),
+            });
+        }
+        func
+    }
+
+    /// Multi-entry inner with all-CONSTANT but DIFFERING inits ([2 from B7,
+    /// 0 from B1]): the shape the all-const rule allowed and the two-block
+    /// cloner would mis-resolve via last-incoming-wins. Both cloners refuse
+    /// multi-entry loops outright, so no cascade is possible whatever the
+    /// entry values are: must veto. Legacy still allows it
+    /// (last-incoming-only leniency), pinned below.
+    #[test]
+    fn persist_gate_multi_entry_const_inits_refused() {
+        let func = persist_gate_custom_inner(
+            "multientryconst",
+            vec![
+                (Operand::Const(IrConst::I32(2)), BlockId(7)),
+                (Operand::Const(IrConst::I32(0)), BlockId(1)),
+            ],
+            vec![],
+            Operand::Const(IrConst::I32(4)),
+            true,
+        );
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "multi-entry inner must veto even with all-constant inits"
+        );
+        let prev = persist_gate_legacy();
+        set_persist_gate_legacy(true);
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "legacy gate must allow the const multi-entry nest (last-only leniency)"
+        );
+        set_persist_gate_legacy(prev);
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "restored gate must veto the const multi-entry nest again"
+        );
+    }
+
+    /// Multi-entry inner with all-SAME inits ([5 from B7, 5 from B1]): looks
+    /// safe (any entry resolves to 5) but the cloners refuse multi-entry
+    /// loops before ever reading the values, so the inner still persists:
+    /// must veto. Legacy still allows it, pinned below.
+    #[test]
+    fn persist_gate_multi_entry_same_init_refused() {
+        let func = persist_gate_custom_inner(
+            "multientrysame",
+            vec![
+                (Operand::Const(IrConst::I32(5)), BlockId(7)),
+                (Operand::Const(IrConst::I32(5)), BlockId(1)),
+            ],
+            vec![],
+            Operand::Const(IrConst::I32(4)),
+            true,
+        );
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "multi-entry inner must veto even with all-same inits"
+        );
+        let prev = persist_gate_legacy();
+        set_persist_gate_legacy(true);
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "legacy gate must allow the same-init multi-entry nest (last-only leniency)"
+        );
+        set_persist_gate_legacy(prev);
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "restored gate must veto the same-init multi-entry nest again"
+        );
+    }
+
+    /// Inner limit is an all-const phi defined in a NON-header block (B5,
+    /// the outer latch — the unitized P2/P3 shape: a bound decided by
+    /// outer-body control flow). No pass folds phis between unroll rounds,
+    /// so the phi survives substitution and the inner persists: must veto.
+    /// (Incoming labels are placeholders — the gate reads only operands.)
+    /// Legacy allows it (recurse-into-any-phi leniency), pinned below.
+    #[test]
+    fn persist_gate_non_header_phi_limit_refused() {
+        let mut func = persist_gate_custom_inner(
+            "nonheaderphilimit",
+            vec![(Operand::Const(IrConst::I32(0)), BlockId(1))],
+            vec![],
+            Operand::Value(Value(21)),
+            false,
+        );
+        // B5 is blocks[5] (B0, B1, B2, B3, B4, B5, B6); the phi leads it.
+        func.blocks[5].instructions.insert(
+            0,
+            Instruction::Phi {
+                dest: Value(21),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(8)), BlockId(1)),
+                    (Operand::Const(IrConst::I32(4)), BlockId(2)),
+                ],
+            },
+        );
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "non-header phi limit must veto the outer unroll"
+        );
+        let prev = persist_gate_legacy();
+        set_persist_gate_legacy(true);
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "legacy gate must allow the non-header phi limit (any-phi leniency)"
+        );
+        set_persist_gate_legacy(prev);
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "restored gate must veto the non-header phi limit again"
+        );
+    }
+
+    /// Inner limit is an all-const then-set phi defined IN THE OUTER HEADER
+    /// B1 ([0 from B0, 5 from B5]): the cloners' LoopPhiModel substitutes a
+    /// per-clone value for every outer-header phi, so the phi vanishes and
+    /// the bound resolves — the cascade completes. Must allow in BOTH modes
+    /// (this pins the header-only phi recursion: only B1 phis recurse).
+    #[test]
+    fn persist_gate_outer_header_phi_limit_allowed() {
+        let mut func = persist_gate_custom_inner(
+            "headerphilimit",
+            vec![(Operand::Const(IrConst::I32(0)), BlockId(1))],
+            vec![],
+            Operand::Value(Value(20)),
+            false,
+        );
+        // B1 is blocks[1] ([IV phi, Cmp]); the new phi joins the leading phis.
+        func.blocks[1].instructions.insert(
+            1,
+            Instruction::Phi {
+                dest: Value(20),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                    (Operand::Const(IrConst::I32(5)), BlockId(5)),
+                ],
+            },
+        );
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "outer-header phi limit must allow the cascade"
+        );
+        let prev = persist_gate_legacy();
+        set_persist_gate_legacy(true);
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "legacy gate must allow the outer-header phi limit too"
+        );
+        set_persist_gate_legacy(prev);
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "restored gate must still allow the outer-header phi limit"
+        );
+    }
+
+    /// Inner limit is a pure-const EXPRESSION the cloners cannot evaluate:
+    /// `1 << 3` recomputed in the inner header. The resolver only folds
+    /// Add/Sub/Mul, so the substituted bound never resolves and the inner
+    /// persists: must veto DESPITE every leaf being constant. Legacy allows
+    /// it (any-BinOp leniency), pinned below.
+    #[test]
+    fn persist_gate_shift_limit_refused() {
+        let func = persist_gate_custom_inner(
+            "shiftlimit",
+            vec![(Operand::Const(IrConst::I32(0)), BlockId(1))],
+            vec![Instruction::BinOp {
+                dest: Value(20),
+                op: IrBinOp::Shl,
+                lhs: Operand::Const(IrConst::I32(1)),
+                rhs: Operand::Const(IrConst::I32(3)),
+                ty: IrType::I32,
+            }],
+            Operand::Value(Value(20)),
+            false,
+        );
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "shift-expression limit must veto the outer unroll"
+        );
+        let prev = persist_gate_legacy();
+        set_persist_gate_legacy(true);
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "legacy gate must allow the shift limit (any-BinOp leniency)"
+        );
+        set_persist_gate_legacy(prev);
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "restored gate must veto the shift limit again"
+        );
+    }
+
+    /// An N-Add const chain as the inner limit: `%30 = %31 + 1`, ... down
+    /// to a const+const Add. Pins the depth-cap mirror with
+    /// `resolve_const_operand` (cap-first, depth 6).
+    fn persist_gate_add_chain_limit(n_adds: usize) -> IrFunction {
+        let mut extra = Vec::new();
+        for k in 0..n_adds {
+            let (lhs, rhs) = if k + 1 == n_adds {
+                (
+                    Operand::Const(IrConst::I32(1)),
+                    Operand::Const(IrConst::I32(2)),
+                )
+            } else {
+                (
+                    Operand::Value(Value((31 + k) as u32)),
+                    Operand::Const(IrConst::I32(1)),
+                )
+            };
+            extra.push(Instruction::BinOp {
+                dest: Value((30 + k) as u32),
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty: IrType::I32,
+            });
+        }
+        persist_gate_custom_inner(
+            "depthchain",
+            vec![(Operand::Const(IrConst::I32(0)), BlockId(1))],
+            extra,
+            Operand::Value(Value(30)),
+            false,
+        )
+    }
+
+    /// The depth cap mirrors `resolve_const_operand` EXACTLY (cap-first,
+    /// depth 6): six Adds (deepest Const at depth 6) allow; seven (deepest
+    /// Const at depth 7) veto. Synthetic by necessity — cleanup folds
+    /// pure-const chains before unrolling — but the pin guards the
+    /// exactness contract: changing either cap without the other breaks
+    /// this test instead of silently drifting the allow/veto boundary.
+    /// Legacy (cap 8) allows both, pinned below.
+    #[test]
+    fn persist_gate_depth_cap_mirrors_resolver() {
+        let shallow = persist_gate_add_chain_limit(6);
+        assert!(
+            !persist_gate_verdict(&shallow, &[1, 2, 3, 4, 5], Value(1)),
+            "6-deep Add chain (deepest Const at depth 6) must allow"
+        );
+        let deep = persist_gate_add_chain_limit(7);
+        assert!(
+            persist_gate_verdict(&deep, &[1, 2, 3, 4, 5], Value(1)),
+            "7-deep Add chain (deepest Const at depth 7) must veto"
+        );
+        let prev = persist_gate_legacy();
+        set_persist_gate_legacy(true);
+        assert!(
+            !persist_gate_verdict(&deep, &[1, 2, 3, 4, 5], Value(1)),
+            "legacy gate (cap 8) must allow the 7-deep chain"
+        );
+        set_persist_gate_legacy(prev);
+        assert!(
+            persist_gate_verdict(&deep, &[1, 2, 3, 4, 5], Value(1)),
+            "restored gate must veto the 7-deep chain again"
+        );
+    }
+
+    /// Inner limit is a non-int CAST of a constant (`(float)5`): the
+    /// resolver only folds int->int casts, so the bound never resolves and
+    /// the inner persists: must veto. Legacy allows it (any-Cast
+    /// leniency), pinned below.
+    #[test]
+    fn persist_gate_non_int_cast_limit_refused() {
+        let func = persist_gate_custom_inner(
+            "castlimit",
+            vec![(Operand::Const(IrConst::I32(0)), BlockId(1))],
+            vec![Instruction::Cast {
+                dest: Value(20),
+                src: Operand::Const(IrConst::I32(5)),
+                from_ty: IrType::I32,
+                to_ty: IrType::F32,
+            }],
+            Operand::Value(Value(20)),
+            false,
+        );
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "non-int cast limit must veto the outer unroll"
+        );
+        let prev = persist_gate_legacy();
+        set_persist_gate_legacy(true);
+        assert!(
+            !persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "legacy gate must allow the non-int cast limit (any-Cast leniency)"
+        );
+        set_persist_gate_legacy(prev);
+        assert!(
+            persist_gate_verdict(&func, &[1, 2, 3, 4, 5], Value(1)),
+            "restored gate must veto the non-int cast limit again"
         );
     }
 
