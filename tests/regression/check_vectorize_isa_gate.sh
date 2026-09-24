@@ -46,6 +46,8 @@ count_vfmadd() { grep -cE '\bvfmadd[0-9]*p?[sd]\b|\bvfmadd' "$1" || true; }
 count_bitcount_zero_guards() { grep -cE '^\.Lc[lt]z_nz_' "$1" || true; }
 count_bsf() { grep -cE '\bbsf[lq]\b' "$1" || true; }
 count_bsr() { grep -cE '\bbsr[lq]\b' "$1" || true; }
+count_tzcnt() { grep -cE '\btzcnt[lq]\b' "$1" || true; }
+count_lzcnt() { grep -cE '\blzcnt[lq]\b' "$1" || true; }
 
 run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
     local label=$1; shift
@@ -59,13 +61,25 @@ run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
 # ---- 1. default: AVX2 baseline must survive -------------------------------
 run_cfg default
 check_gt0 "default AVX2 vectorization (ymm)" "$(count_ymm $tmp/default.s)"
-# __builtin_clz/ctz have a nonzero source precondition. On baseline x86 the
-# optimal lowering is branchless BSR/BSF; a .Lclz_nz/.Lctz_nz label proves the
-# backend accidentally restored its internal defined-zero semantics.
+# __builtin_clz/ctz have a nonzero source precondition.  The absent-march
+# baseline projects x86-64-v3, and v3 carries ABM, so the optimal lowering is
+# branchless LZCNT/TZCNT — strictly better than BSR/BSF, which they supersede
+# (defined on zero input too); a .Lclz_nz/.Lctz_nz label proves the backend
+# accidentally restored its internal defined-zero semantics.
 check_eq "baseline nonzero clz/ctz zero-fixup guards" \
     "$(count_bitcount_zero_guards $tmp/default.s)" 0
-check_gt0 "baseline nonzero ctz uses BSF" "$(count_bsf $tmp/default.s)"
-check_gt0 "baseline nonzero clz uses BSR" "$(count_bsr $tmp/default.s)"
+check_gt0 "baseline nonzero ctz uses TZCNT" "$(count_tzcnt $tmp/default.s)"
+check_gt0 "baseline nonzero clz uses LZCNT" "$(count_lzcnt $tmp/default.s)"
+check_eq "baseline nonzero ctz leaves no BSF behind" \
+    "$(count_bsf $tmp/default.s)" 0
+check_eq "baseline nonzero clz leaves no BSR behind" \
+    "$(count_bsr $tmp/default.s)" 0
+
+# A sticky -mno-lzcnt denial removes ABM from the v3 projection; the lowering
+# must fall back to the classical branchless BSR/BSF pair.
+run_cfg nolzcnt -mno-lzcnt
+check_gt0 "-mno-lzcnt nonzero ctz falls back to BSF" "$(count_bsf $tmp/nolzcnt.s)"
+check_gt0 "-mno-lzcnt nonzero clz falls back to BSR" "$(count_bsr $tmp/nolzcnt.s)"
 check_eq "baseline direct CTZ has no dead rdi-to-rax preload" \
     "$(grep -c 'movq %rdi, %rax' "$tmp/default.s" || true)" 0
 

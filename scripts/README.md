@@ -44,6 +44,24 @@ Developer and research tooling. None of these are needed to build LCCC.
 | `symstr_migrate.py` | Span-driven `String` → `SymStr` migration helper. Its diagnostic build resolves the manifest-selected Rust channel, locates the persisted Cargo proxy, and denies warnings unless explicitly opted out. |
 | `gen_lcccsimd.py`, `strip_scalar_dups.py` | SIMD intrinsic header generation helpers. |
 
+## Codegen kill switches and opt-ins
+
+Environment knobs that gate the SHA/CH-style scalar codegen work; every
+one is resolved once per compilation and several gates consult the same
+resolution so fold-time prediction and emission cannot drift. Any value
+disables (they are presence checks unless noted).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CCC_NO_ANDN_FUSION` | unset (fusion on) | Disables the BMI1 3-operand `andn` fusion (backend `detect_and_not_fusions` + `emit_and_not_impl`) AND the bool-mux algebra's defer-to-fusion prediction (`has_scalar_andn`), in one shared resolution. |
+| `CCC_NO_BOOL_ALGEBRA` | unset (pass on) | Disables the whole `bit_idioms` bool-mux algebra (CH mux fold, MAJ majority fold, distributive). |
+| `CCC_NO_RORX` | unset (emission on) | Independent kill switch for BMI2 `rorx` instruction selection (does not affect the ANDN/bool-algebra gates). |
+| `CCC_IVSR_SCALAR_DERIVED` | **opt-in** (`=1` to enable) | Enables the scalar derived-IV flavor of IV strength reduction (`iv*C` without a GEP). Off by default: measured net runtime loss while latch phi-web parking exists (the PR #602 golden-workload regressions). |
+
+The `-mbmi`/`-mno-bmi`/`-march` front-end flags are the primary control;
+these switches exist for bisection and for pinning the pre-BMI shapes in
+the golden codegen gates.
+
 ## Why more than one oracle
 
 `insndiff.py` and `asmdiff.py` compare against a single local GNU as. That is

@@ -7,8 +7,11 @@
 # Checks:
 #   A. runtime differential, bit-exact vs gcc over the opt x march matrix
 #      (incl. both kill switches: CCC_NO_ANDN_FUSION, CCC_NO_BOOL_ALGEBRA)
-#   B. under -mbmi -O2: exactly one 3-operand andn in sha256_transform
-#      (CH = the GCC/Clang/ICX shape), zero andn without BMI
+#   B. under -mbmi -O2 and under the bare v3-default build: exactly one
+#      3-operand andn in sha256_transform (CH = the GCC/Clang/ICX shape);
+#      zero andn under the sticky -mno-bmi denial (BMI is ON by default
+#      since the v3 baseline change, so "no flags" is no longer the
+#      no-BMI case)
 #   C. the 64-round compression loop is slot-write free (the park class)
 #      and the MAJ region is register-only (no slot reads between the
 #      kept And and its consumer)
@@ -52,20 +55,32 @@ done
 note "A. runtime differential done (fails so far: $fails)"
 
 # ── B. andn census ──────────────────────────────────────────────────
+# Anchored mnemonic census: an unanchored `grep -c 'andn'` also counts
+# comment/label text; the fusion emits `andnl`/`andnq` instructions.
+ANDN_RE='^[[:space:]]*andn[lq][[:space:]]'
 "$CCC" $GCCINC -mbmi -O2 -S "$SRC" -o "$TMP/bmi.s" 2>/dev/null
-N=$(grep -c 'andn' "$TMP/bmi.s" || true)
+N=$(grep -cE "$ANDN_RE" "$TMP/bmi.s" || true)
 [ "$N" -eq 1 ] || bad "-mbmi: expected exactly 1 andn (CH), got $N"
-"$CCC" $GCCINC -O2 -S "$SRC" -o "$TMP/base.s" 2>/dev/null
-N=$(grep -c 'andn' "$TMP/base.s" || true)
-[ "$N" -eq 0 ] || bad "baseline: expected 0 andn, got $N"
+# BMI is the v3 default baseline: the bare build carries the CH andn too.
+"$CCC" $GCCINC -O2 -S "$SRC" -o "$TMP/def.s" 2>/dev/null
+N=$(grep -cE "$ANDN_RE" "$TMP/def.s" || true)
+[ "$N" -eq 1 ] || bad "v3 default: expected exactly 1 andn (CH), got $N"
+# Only the sticky -mno-bmi denial may drop it.
+"$CCC" $GCCINC -mno-bmi -O2 -S "$SRC" -o "$TMP/base.s" 2>/dev/null
+N=$(grep -cE "$ANDN_RE" "$TMP/base.s" || true)
+[ "$N" -eq 0 ] || bad "-mno-bmi: expected 0 andn, got $N"
 
 # ── C. compression-loop slot discipline ─────────────────────────────
 python3 - "$TMP/bmi.s" <<'PYEOF' || bad "compression loop slot/MAJ shape"
 import sys
 lines = [l.strip() for l in open(sys.argv[1]) if l.strip()]
-start = next(i for i, l in enumerate(lines)
-             if l.startswith("rorl $") or l.startswith("rorxl $"))
-end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("jl "))
+try:
+    start = next(i for i, l in enumerate(lines)
+                 if l.startswith("rorl $") or l.startswith("rorxl $"))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("jl "))
+except StopIteration:
+    print("compression loop bounds not found (ror/rorx .. jl) — shape changed?")
+    sys.exit(1)
 loop = lines[start:end + 1]
 def plain_slot_ref(opnd):
     # "N(%rsp)" with no index register inside the parentheses.

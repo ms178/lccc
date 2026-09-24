@@ -2474,6 +2474,32 @@ mod tests {
             ty: IrType::U32,
         }
     }
+    fn and_ty(d: u32, ty: IrType, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::And,
+            lhs: a,
+            rhs: b,
+            ty,
+        }
+    }
+    fn xor_ty(d: u32, ty: IrType, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Xor,
+            lhs: a,
+            rhs: b,
+            ty,
+        }
+    }
+    fn not_ty(d: u32, ty: IrType, a: Operand) -> Instruction {
+        Instruction::UnaryOp {
+            dest: Value(d),
+            op: IrUnaryOp::Not,
+            src: a,
+            ty,
+        }
+    }
 
     /// Evaluate a value under an environment for the def-less inputs
     /// (ids 0,1,2 = x,y,z) — the exhaustive truth-table oracle.
@@ -3107,6 +3133,226 @@ mod tests {
             .is_some(),
             "a non-adjacent Not cannot fuse; the mux fold must fire"
         );
+    }
+
+    /// Agreement pin across the andn boundary: the middle-end's fusion
+    /// DEFER prediction (`andn_fusion_predicted`, inside the mux matcher)
+    /// must fire exactly when the backend would actually emit the
+    /// 3-operand ANDN (`detect_and_not_fusions` in generation.rs ∩
+    /// `supports_and_not` in emit.rs ∩ the pipeline BMI1 gate). Either
+    /// direction of drift is a silent perf cliff — defer without fusion
+    /// loses BOTH the mux fold and the andn; fusion without defer loses
+    /// the andn to the fold. `backend_fuses` below is a hand
+    /// transcription of the backend criteria; every row must land on the
+    /// same side. (The rorx liveness-list drift that broke sha256
+    /// fusion under BMI2 is the exact bug class this table guards.)
+    #[test]
+    fn mux_ch_andn_defer_matches_backend_fusion_criteria() {
+        enum Place {
+            Adjacent,
+            Gap,
+        }
+        // (name, bmi1, not_ty, consumer_ty, extra Not reader, placement)
+        let rows: [(&str, bool, IrType, IrType, bool, Place); 8] = [
+            (
+                "u32 baseline",
+                true,
+                IrType::U32,
+                IrType::U32,
+                false,
+                Place::Adjacent,
+            ),
+            (
+                "bmi1 off",
+                false,
+                IrType::U32,
+                IrType::U32,
+                false,
+                Place::Adjacent,
+            ),
+            (
+                "i64 agreement",
+                true,
+                IrType::I64,
+                IrType::I64,
+                false,
+                Place::Adjacent,
+            ),
+            (
+                "not wider than consumer",
+                true,
+                IrType::I64,
+                IrType::U32,
+                false,
+                Place::Adjacent,
+            ),
+            (
+                "consumer wider than not",
+                true,
+                IrType::U32,
+                IrType::I64,
+                false,
+                Place::Adjacent,
+            ),
+            (
+                "narrow not outside domain",
+                true,
+                IrType::I8,
+                IrType::U32,
+                false,
+                Place::Adjacent,
+            ),
+            (
+                "multi-use not",
+                true,
+                IrType::U32,
+                IrType::U32,
+                true,
+                Place::Adjacent,
+            ),
+            (
+                "gap between not and and",
+                true,
+                IrType::U32,
+                IrType::U32,
+                false,
+                Place::Gap,
+            ),
+        ];
+        for (name, bmi, nty, cty, extra_reader, place) in rows {
+            // Canonical CH shape; the ~x-side And always directly
+            // consumes the Not, so the backend's operand-wiring check is
+            // satisfied by construction and the matrix isolates the
+            // capability/type/use/adjacency criteria.
+            let mut insts = vec![
+                and_ty(4, cty, v(0), v(1)), // And(x, y)  @ 0
+                not_ty(3, nty, v(0)),       // ~x         @ 1
+            ];
+            if matches!(place, Place::Gap) {
+                insts.push(and_ty(8, cty, v(1), v(2))); // filler @ 2
+            }
+            insts.push(and_ty(5, cty, v(3), v(2))); // And(~x, z)
+            insts.push(xor_ty(6, cty, v(4), v(5))); // consumer
+            if extra_reader {
+                insts.push(xor_ty(7, cty, v(3), v(2))); // 2nd Not reader
+            }
+            let fx = fixture(insts);
+            // Transcription of the backend criteria: capability on, Not
+            // width in the fusion domain, single-use Not, type agreement
+            // between Not and And, raw same-block adjacency.
+            let backend_fuses = bmi
+                && matches!(nty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+                && nty == cty
+                && !extra_reader
+                && matches!(place, Place::Adjacent);
+            let deferred = match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                cty,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                bmi,
+            )
+            .is_none();
+            assert_eq!(
+                deferred, backend_fuses,
+                "row '{name}': middle-end defer must agree with backend fusion"
+            );
+        }
+    }
+
+    /// Majority kept-term rank across block boundaries: the fixture
+    /// builder pins every def to block 0, so these cases rewrite the
+    /// def_loc table afterwards to cover the rank arms — same-block
+    /// ordering, cross-block def (`b != block_bi` ⇒ entry-available
+    /// rank (0,0)), and missing location (`None` ⇒ (0,0)). The kept
+    /// term is only ever READ at the consumer, so ranking cross-block
+    /// or location-less defs as entry-available is dominance-safe; the
+    /// test pins that contract against silent reordering. It also pins
+    /// the repurposed-slot gate: the two Ands that change value must
+    /// have known same-block positions (their slots receive the pending
+    /// rewrites), so the fold fails CLOSED when two Ands lack
+    /// locations — which is also why the strict `<` rank tie-break can
+    /// never see two equal (0,0) candidates.
+    #[test]
+    fn maj_kept_term_rank_prefers_entry_and_cross_block_defs() {
+        // And(x,y)@0 (A=v4), And(x,z)@1 (B=v5), And(y,z)@2 (C=v6),
+        // inner Xor(A,B)@3, consumer Xor(inner, C)@4.
+        let build = || {
+            fixture(vec![
+                and3(4, v(0), v(1)),
+                and3(5, v(0), v(2)),
+                and3(6, v(1), v(2)),
+                xor3(7, v(4), v(5)),
+                xor3(8, v(7), v(6)),
+            ])
+        };
+        let call = |fx: &BoolFixture| {
+            match_bool_mux_algebra(
+                v(7),
+                v(6),
+                IrBinOp::Xor,
+                Value(8),
+                IrType::U32,
+                0,
+                4,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
+            )
+        };
+        let kept_dest_and_slots = |fx: &BoolFixture| -> (u32, std::collections::BTreeSet<usize>) {
+            let (consumer, pending) = call(fx).expect("majority shape must fold");
+            let Instruction::BinOp { lhs, .. } = &consumer else {
+                panic!("consumer must stay a BinOp");
+            };
+            let Operand::Value(kv) = *lhs else {
+                panic!("consumer lhs must name the kept And");
+            };
+            let slots: std::collections::BTreeSet<usize> =
+                pending.iter().map(|(_, idx, _)| *idx).collect();
+            (kv.0, slots)
+        };
+
+        // Baseline: every def in block 0 — earliest same-block def wins.
+        let fx = build();
+        assert_eq!(
+            kept_dest_and_slots(&fx),
+            (4, [1usize, 2].into_iter().collect())
+        );
+
+        // B defined in ANOTHER block: the `b != block_bi` arm ranks it
+        // entry-available (0,0) — it beats both same-block candidates
+        // (A and C stay in-block, so their repurpose slots are known).
+        let mut fx = build();
+        fx.def_loc[5] = Some((1, 7));
+        assert_eq!(
+            kept_dest_and_slots(&fx),
+            (5, [0usize, 2].into_iter().collect())
+        );
+
+        // A's location unknown (None): flatten() ranks it (0,0) — it
+        // wins over B (1,1) and C (1,2).
+        let mut fx = build();
+        fx.def_loc[4] = None;
+        assert_eq!(
+            kept_dest_and_slots(&fx),
+            (4, [1usize, 2].into_iter().collect())
+        );
+
+        // A AND B lack locations: every role assignment repurposes at
+        // least one of them, and the repurposed slots need concrete
+        // same-block positions — the fold declines (fail-closed).
+        let mut fx = build();
+        fx.def_loc[4] = None;
+        fx.def_loc[5] = None;
+        assert!(call(&fx).is_none(), "two location-less Ands must decline");
     }
 
     #[test]

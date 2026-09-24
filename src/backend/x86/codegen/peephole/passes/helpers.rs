@@ -316,6 +316,18 @@ pub(super) fn parse_reg_to_reg_movq(info: &LineInfo, trimmed: &str) -> Option<(R
     None
 }
 
+/// Parse a `movl %src, %dst` reg-reg copy.  Unlike [`parse_reg_to_reg_movq`]
+/// this admits `%ebp` as a SOURCE: the RA legitimately homes values in the
+/// frame family (fannkuch's swap loop keeps `perm[i]` in `%ebp` and paid a
+/// `movl %ebp, %eax` staging relay in front of every store), and a `movl`
+/// identity is low-32 only — the narrow substitution sites refuse any line
+/// naming the 64-bit register, so `%rbp` can never leak into an address or a
+/// frame-manipulation form (`leave`/`popq %rbp`/`movq %rsp, %rbp` are
+/// implicit-reg barriers or write family 5, which invalidates the copy).
+/// `%rsp` stays excluded at both ends: its implicit writers (`push`/`pop`/
+/// `call`/`ret`/`andq`-style alignment) are too numerous to audit for one
+/// missed model entry, and the RA never copies `%esp` in real output.
+/// Destinations in families 4/5 stay excluded (frame-setup shapes).
 pub(super) fn parse_reg_to_reg_movl(info: &LineInfo, trimmed: &str) -> Option<(RegId, RegId)> {
     if let LineKind::Other { dest_reg } = info.kind {
         if dest_reg == REG_NONE || dest_reg > REG_GP_MAX {
@@ -333,7 +345,6 @@ pub(super) fn parse_reg_to_reg_movl(info: &LineInfo, trimmed: &str) -> Option<(R
                 if sfam == REG_NONE
                     || sfam > REG_GP_MAX
                     || sfam == 4
-                    || sfam == 5
                     || dfam == REG_NONE
                     || dfam > REG_GP_MAX
                     || dfam == 4
@@ -703,12 +714,142 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
         || trimmed.starts_with("shlx")
         || trimmed.starts_with("shrx")
         || trimmed.starts_with("sarx")
+        // RORX (BMI2) is the three-operand rotate: it never reads its
+        // destination.  Forgetting it here turns every `rorxl` into a
+        // phantom RMW, inflating the destination's liveness and killing
+        // every liveness-driven peephole around it (measured: the sha256
+        // K[i]/W[i] load→add fusions died and the loop ran ~9% slower on
+        // a Raptor Lake-class core with BMI2 on).  The plain `rol`/`ror`
+        // two-operand forms ARE read-modify-write and stay in the default.
+        || trimmed.starts_with("rorx")
     {
         return false;
     }
 
+    // ── non-destructive operand forms of the read-modify-write set ─────────
+    //
+    // The legacy two-operand forms (`imull %ebx, %r9d`, `addl $1, %eax`) and
+    // one-operand unary forms (`negl %eax`) READ their destination.  The
+    // extra-destination forms do not:
+    //   * `imul s1, s2, dst` (three operands) — the magic-division lowering
+    //     emits this on every division-by-constant (glibc_strstr's `% 26`,
+    //     fannkuch's index math, gzip's CRC folds);
+    //   * APX NDD `add/sub/adc/sbb/and/or/xor s1, s2, dst` (three operands);
+    //   * APX NDD unary `neg/not/inc/dec src, dst` (two operands).
+    // Calling those read-modify-write is a PHANTOM READ of the destination's
+    // old value: liveness then reports every staging relay in front of them
+    // live (`movl %eax, %r9d` before `imull $1664525, %ebx, %r9d` in the
+    // glibc_strstr Horspool loop) and dead-pure-write elimination refuses to
+    // delete it — one wasted instruction per hot iteration.
+    //
+    // `shld`/`shrd` are the deliberate counterexample that keeps this table
+    // exact: their three-operand form shifts bits THROUGH the destination and
+    // genuinely reads it, so they stay in the conservative default (as do all
+    // mnemonics not named below: `bsf`, `mul`, `div`, `xchg`, ...).  Mnemonic
+    // matching is EXACT so SSE look-alikes (`addss`, `imulsd`) never enter.
+    // The degenerate `src == dst` spellings (`imull $5, %r9d, %r9d`) still
+    // read the family — as the SOURCE operand; callers that care consult
+    // their own source-mentions-dest guard (see `is_pure_write_mnemonic`'s
+    // contract), which subsumes that case exactly as it does for `popcnt`.
+    {
+        let mnemonic_end = trimmed
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(trimmed.len());
+        let mnemonic = &trimmed[..mnemonic_end];
+        let ndd_unary = matches!(
+            mnemonic,
+            "neg"
+                | "negb"
+                | "negw"
+                | "negl"
+                | "negq"
+                | "not"
+                | "notb"
+                | "notw"
+                | "notl"
+                | "notq"
+                | "inc"
+                | "incb"
+                | "incw"
+                | "incl"
+                | "incq"
+                | "dec"
+                | "decb"
+                | "decw"
+                | "decl"
+                | "decq"
+        );
+        let ndd_binary = matches!(
+            mnemonic,
+            "add"
+                | "addb"
+                | "addw"
+                | "addl"
+                | "addq"
+                | "sub"
+                | "subb"
+                | "subw"
+                | "subl"
+                | "subq"
+                | "adc"
+                | "adcb"
+                | "adcw"
+                | "adcl"
+                | "adcq"
+                | "sbb"
+                | "sbbb"
+                | "sbbw"
+                | "sbbl"
+                | "sbbq"
+                | "and"
+                | "andb"
+                | "andw"
+                | "andl"
+                | "andq"
+                | "or"
+                | "orb"
+                | "orw"
+                | "orl"
+                | "orq"
+                | "xor"
+                | "xorb"
+                | "xorw"
+                | "xorl"
+                | "xorq"
+                | "imul"
+                | "imulb"
+                | "imulw"
+                | "imull"
+                | "imulq"
+        );
+        if ndd_unary || ndd_binary {
+            let ops = trimmed[mnemonic_end..].split('#').next().unwrap_or("");
+            let operands = count_top_level_operands(ops);
+            if (ndd_binary && operands >= 3) || (ndd_unary && operands >= 2) {
+                return false;
+            }
+        }
+    }
+
     // Default: assume read-modify-write (conservative)
     true
+}
+
+/// Count AT&T operands in `ops`, honoring the balanced-paren scanner so a SIB
+/// address's internal commas (`disp(%base,%idx,4)`) never split an operand.
+fn count_top_level_operands(ops: &str) -> usize {
+    let mut n = 0usize;
+    let mut rest = ops.trim();
+    if rest.is_empty() {
+        return 0;
+    }
+    loop {
+        n += 1;
+        match crate::backend::peephole_common::last_top_level_comma(rest.as_bytes()) {
+            Some(i) => rest = rest[..i].trim(),
+            None => return n,
+        }
+    }
 }
 
 // ── tests: register rewriting and redefinition predicates ───────────────────

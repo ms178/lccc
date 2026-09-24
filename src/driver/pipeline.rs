@@ -197,6 +197,24 @@ pub struct Driver {
     /// `avx_explicitly_disabled` because `-mno-avx` alone keeps SSE4.1 legal
     /// (x86-64-v2 hardware).
     pub(super) sse41_explicitly_disabled: bool,
+    /// Set by `-mno-bmi`: BMI1 (ANDN and the rest of the class) is denied
+    /// even though the absent-`-march` baseline is x86-64-v3, which carries
+    /// BMI1.  GCC keeps the last-explicit ISA decision sticky; the default
+    /// baseline must not revive the class behind the user's back.
+    pub(super) bmi1_explicitly_disabled: bool,
+    /// Set by `-mno-bmi2`: the BMI2 class (RORX, SHLX/SHRX/SARX, BZHI, …)
+    /// is denied against the v3 default baseline for the same reason as
+    /// [`Self::bmi1_explicitly_disabled`].
+    pub(super) bmi2_explicitly_disabled: bool,
+    /// Set by `-mno-lzcnt`: LZCNT/TZCNT (ABM) is denied against the v3
+    /// default baseline for the same reason as
+    /// [`Self::bmi1_explicitly_disabled`].
+    pub(super) lzcnt_explicitly_disabled: bool,
+    /// Set by `-mno-popcnt`: POPCNT is denied against the v3 default
+    /// baseline for the same reason as [`Self::bmi1_explicitly_disabled`]
+    /// (POPCNT joined the baseline one level earlier, at x86-64-v2, so v3
+    /// carries it a fortiori).
+    pub(super) popcnt_explicitly_disabled: bool,
     /// An explicit x86 `-march=` was seen.  Under an explicit profile the
     /// requested feature set (`enable_*`) is the *ceiling* (GCC semantics);
     /// without one the code-generation baseline is x86-64-v3 and only
@@ -486,6 +504,10 @@ impl Driver {
             avx2_explicitly_disabled: false,
             fma_explicitly_disabled: false,
             sse41_explicitly_disabled: false,
+            bmi1_explicitly_disabled: false,
+            lzcnt_explicitly_disabled: false,
+            popcnt_explicitly_disabled: false,
+            bmi2_explicitly_disabled: false,
             x86_march_explicit: false,
             skip_rax_setup: false,
             no_x87: false,
@@ -1813,7 +1835,9 @@ impl Driver {
             // Scalar BMI1 (ANDN) for the middle end's CH-fold defer —
             // mirrors CodegenOptions::bmi1 for the x86-64 backend (the
             // i686 backend has no andn fusion, so it stays false there).
-            self.target == Target::X86_64 && self.enable_bmi,
+            // Resolved through bmi1_effective so the v3 default baseline
+            // arms the fold exactly when the backend will fuse it.
+            self.bmi1_effective(),
             ra_config.as_ref(),
         );
         if time_phases {
@@ -2402,12 +2426,12 @@ impl Driver {
             general_regs_only: self.general_regs_only,
             code_model_kernel: self.code_model_kernel,
             no_jump_tables: self.no_jump_tables,
-            bmi1: self.enable_bmi,
-            bmi2: self.enable_bmi2,
+            bmi1: self.bmi1_effective(),
+            bmi2: self.bmi2_effective(),
             apx: self.enable_apxf,
             tune,
-            lzcnt: self.enable_lzcnt,
-            popcnt: self.enable_popcnt,
+            lzcnt: self.lzcnt_effective(),
+            popcnt: self.popcnt_effective(),
             avx512: self.enable_avx512f,
             isa: self.x86_isa(),
             no_relax: self.riscv_no_relax,
@@ -2483,6 +2507,52 @@ impl Default for Driver {
 }
 
 impl Driver {
+    /// Effective BMI1 (ANDN class) availability for this translation unit.
+    ///
+    /// Policy is the same contract as [`Self::x86_isa`]: no explicit
+    /// `-march` means the project baseline x86-64-v3 — and BMI1 is part of
+    /// v3 — while an explicit `-march=` makes the requested feature set the
+    /// ceiling (GCC-exact).  Sticky `-mno-bmi` denials win in both worlds.
+    /// BMI is an INTEGER class, so `-mno-sse` / `-mgeneral-regs-only` do not
+    /// remove it (kernel builds keep it; the xmm denials only kill SIMD).
+    /// i686 keeps its historical explicit-flags-only behavior — its backend
+    /// has no andn fusion, and the 32-bit baseline story is different.
+    pub(crate) fn bmi1_effective(&self) -> bool {
+        let baseline = self.target == Target::X86_64 && !self.x86_march_explicit;
+        (self.enable_bmi || baseline) && !self.bmi1_explicitly_disabled
+    }
+
+    /// Effective BMI2 (RORX/SHLX/BZHI class) availability; same contract as
+    /// [`Self::bmi1_effective`] — BMI2 is likewise an x86-64-v3 member.
+    pub(crate) fn bmi2_effective(&self) -> bool {
+        let baseline = self.target == Target::X86_64 && !self.x86_march_explicit;
+        (self.enable_bmi2 || baseline) && !self.bmi2_explicitly_disabled
+    }
+
+    /// Effective LZCNT/TZCNT (ABM) availability; same contract as
+    /// [`Self::bmi1_effective`].  ABM is an x86-64-v3 member, so the
+    /// absent-`-march` baseline projects it; a sticky `-mno-lzcnt` denial
+    /// wins.  Soundness: `tzcnt` is at least as correct as the `bsf` it
+    /// replaces (defined on zero input), and `lzcnt` replaces `bsr` the
+    /// same way, so defaulting them ON never changes a defined program's
+    /// results — it only removes the undefined-zero-input hole.
+    pub(crate) fn lzcnt_effective(&self) -> bool {
+        let baseline = self.target == Target::X86_64 && !self.x86_march_explicit;
+        (self.enable_lzcnt || baseline) && !self.lzcnt_explicitly_disabled
+    }
+
+    /// Effective POPCNT availability; same contract as
+    /// [`Self::bmi1_effective`].  POPCNT joined the baseline at
+    /// x86-64-v2, so the v3 default projects it too.  Soundness is
+    /// trivial: the instruction IS the builtin's semantics — enabling it
+    /// only changes which lowering of `__builtin_popcount` wins (the
+    /// `popcnt` instruction vs. a bit-count idiom sequence), never a
+    /// defined program's results.
+    pub(crate) fn popcnt_effective(&self) -> bool {
+        let baseline = self.target == Target::X86_64 && !self.x86_march_explicit;
+        (self.enable_popcnt || baseline) && !self.popcnt_explicitly_disabled
+    }
+
     /// x86-64 code-generation ISA permission for this translation unit.
     ///
     /// Policy (`backend::x86::isa`):

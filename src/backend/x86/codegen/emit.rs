@@ -5438,6 +5438,24 @@ fn machinst_window_rax_free(buf: &[super::machinst::MachInst]) -> bool {
     true
 }
 
+/// Width discipline shared by every vreg→stack-slot substitution
+/// (`resolve_stack_vregs` and `resolve_reg_or_slot`): a 4-byte slot only
+/// admits 8/16/32-bit reads — a wider access (e.g. `cmpq $0, 28(%rsp)`)
+/// pulls the adjacent slot's garbage into the high bits (kernel lib/zstd
+/// ZSTD_decodeLiteralsBlock read `flags` from the neighboring slot and
+/// took the wrong HUF dispatch). Refusing the substitution leaves the
+/// Vreg in place; has_unresolvable_vreg then trips and the buffered
+/// window falls back to the default path, which loads at the true width.
+fn slot_width_fits(state: &CodegenState, id: u32, size: OpSize) -> bool {
+    if state.is_small_slot(id) {
+        // 4-byte slot: only 8/16/32-bit accesses are in-bounds.
+        matches!(size, OpSize::S8 | OpSize::S16 | OpSize::S32)
+    } else {
+        // 8-byte slot: every integer instruction width is in-bounds.
+        true
+    }
+}
+
 fn resolve_stack_vregs(
     inst: &super::machinst::MachInst,
     ra: &FxHashMap<u32, PhysReg>,
@@ -5454,25 +5472,10 @@ fn resolve_stack_vregs(
     // WIDTH SOUNDNESS: a spilled vreg's slot is 4 bytes (small slot) or 8
     // bytes. Substituting it into an instruction whose size is WIDER than
     // the slot makes the emitter read bytes past the slot — e.g.
-    // `cmpq $0, 28(%rsp)` on a 4-byte slot pulls the adjacent slot's
-    // garbage into the high 32 bits (kernel lib/zstd
-    // ZSTD_decodeLiteralsBlock: the 64-bit `!lhlCode` predicate read
-    // `flags` from the neighboring slot and took the wrong HUF dispatch).
-    // A register-form consumer is safe — a `movl` reload zero-extends —
-    // but memory-operand substitution silently loses that extension.
-    // Refuse the substitution when the instruction size exceeds the slot
-    // width: the leftover Vreg trips has_unresolvable_vreg and the
-    // buffered window falls back to the default (accumulator) path, which
-    // loads every value at its true width.
-    let slot_fits = |id: &u32, inst_size: OpSize| -> bool {
-        if state.is_small_slot(*id) {
-            // 4-byte slot: only 8/16/32-bit reads are in-bounds.
-            matches!(inst_size, OpSize::S8 | OpSize::S16 | OpSize::S32)
-        } else {
-            // 8-byte slot: every instruction width reads in-bounds.
-            true
-        }
-    };
+    // Slot-width discipline (see slot_width_fits): a register-form
+    // consumer is safe — a `movl` reload zero-extends — but
+    // memory-operand substitution silently loses that extension.
+    let slot_fits = |id: &u32, inst_size: OpSize| slot_width_fits(state, *id, inst_size);
 
     // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible.
     // Vregs the window allocator owns (reg_classified) are never substituted.
@@ -5744,23 +5747,13 @@ fn resolve_reg_or_slot(
             // to source operands): see resolve_stack_vregs.
             if acc_subst
                 && !window_defs.contains(id)
-                && !(state.is_small_slot(*id) && matches!(size, super::machinst::OpSize::S64))
+                && slot_width_fits(state, *id, size)
                 && state.reg_cache.acc_has(*id, false)
             {
                 return MachOperand::Reg(super::machinst::MachReg::Phys(super::machinst::RAX));
             }
             if let Some(slot) = state.get_slot(*id) {
-                let fits = if state.is_small_slot(*id) {
-                    matches!(
-                        size,
-                        super::machinst::OpSize::S8
-                            | super::machinst::OpSize::S16
-                            | super::machinst::OpSize::S32
-                    )
-                } else {
-                    true
-                };
-                if fits {
+                if slot_width_fits(state, *id, size) {
                     MachOperand::StackSlot(slot.0)
                 } else {
                     op.clone()
@@ -9065,5 +9058,239 @@ mod machinst_resolution_tests {
         assert_eq!(x64_stack_arg_push_imm(&IrConst::F64(1.0)), None); // 0x3FF00000... > imm32
         // Fail-closed shapes.
         assert_eq!(x64_stack_arg_push_imm(&IrConst::Zero), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod machinst_window_predicate_tests {
+    // Unit coverage for the two MachInst-window predicates that gate the
+    // accumulator-resident substitution (F1 of the review audit: they had
+    // none). `machinst_window_rax_free` is an exhaustive scan;
+    // `machinst_window_defs` is a deliberately partial extractor — these
+    // tests pin BOTH behaviours so a variant added to MachInst cannot
+    // silently change either contract.
+    use super::{machinst_window_defs, machinst_window_rax_free};
+    use crate::backend::regalloc::PhysReg;
+    use crate::backend::x86::codegen::machinst::{
+        AluOp, CallArgMove, CallTarget, CondCode, MachInst, MachOperand, MachReg, OpSize, RAX,
+        ShiftOp,
+    };
+
+    fn vreg(id: u32) -> MachReg {
+        MachReg::Vreg(id)
+    }
+    fn phys(id: u8) -> MachReg {
+        MachReg::Phys(PhysReg(id))
+    }
+
+    /// Each of these either reads/writes %rax by architectural contract
+    /// (Cqto, Div) or destroys the caller-saved world incl. %rax
+    /// (Call, CallTyped, Ret) — or is opaque text the scanner cannot
+    /// prove (Raw). One instruction is enough to poison the window.
+    #[test]
+    fn window_rax_free_rejects_implicit_clobbers() {
+        let clobbers = [
+            MachInst::Cqto { size: OpSize::S64 },
+            MachInst::Div {
+                divisor: MachOperand::Reg(vreg(7)),
+                signed: true,
+                size: OpSize::S64,
+            },
+            MachInst::Call { target: "f".into() },
+            MachInst::CallTyped {
+                caller_saves: Vec::new(),
+                args: vec![CallArgMove {
+                    src: MachOperand::Reg(vreg(3)),
+                    dst_reg: PhysReg(7),
+                    size: OpSize::S64,
+                }],
+                target: CallTarget::Direct("f".into()),
+                ret: None,
+            },
+            MachInst::Ret,
+            MachInst::Raw("lock cmpxchg16b (%rdi)".into()),
+        ];
+        for inst in clobbers {
+            assert!(
+                !machinst_window_rax_free(std::slice::from_ref(&inst)),
+                "{inst:?} must poison the rax-free window"
+            );
+        }
+    }
+
+    /// %rax must be seen in EVERY operand position the substitution could
+    /// redirect: plain register, memory base, indexed memory (base and
+    /// index), and in both source and dest slots. A vreg-only window of
+    /// the same shapes stays free.
+    #[test]
+    fn window_rax_free_sees_operand_positions() {
+        let rax = phys(RAX.0);
+        let rcx = phys(7); // another phys reg: must NOT poison
+        let poisons = [
+            MachInst::Mov {
+                src: MachOperand::Reg(rax),
+                dst: MachOperand::Reg(vreg(1)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(1)),
+                dst: MachOperand::Reg(rax),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Mem {
+                    base: rax,
+                    offset: 8,
+                },
+                dst: MachOperand::Reg(vreg(1)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: AluOp::Add,
+                src: MachOperand::MemIndex {
+                    base: vreg(1),
+                    index: rax,
+                    scale: 4,
+                    offset: 0,
+                },
+                dst: vreg(2),
+                size: OpSize::S64,
+            },
+            MachInst::Cmp {
+                lhs: MachOperand::Reg(rax),
+                rhs: MachOperand::Imm(0),
+                size: OpSize::S64,
+            },
+            MachInst::ShiftX {
+                op: ShiftOp::Shr,
+                count: rax,
+                src: vreg(1),
+                dst: vreg(2),
+                size: OpSize::S64,
+            },
+        ];
+        for inst in poisons {
+            assert!(
+                !machinst_window_rax_free(std::slice::from_ref(&inst)),
+                "{inst:?} touches %rax and must poison the window"
+            );
+        }
+        // Same shapes with vregs / a non-rax phys reg: free.
+        let clean = [
+            MachInst::Mov {
+                src: MachOperand::Mem {
+                    base: vreg(1),
+                    offset: 8,
+                },
+                dst: MachOperand::Reg(vreg(2)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: AluOp::Add,
+                src: MachOperand::Reg(rcx),
+                dst: vreg(2),
+                size: OpSize::S64,
+            },
+            MachInst::SetCC {
+                cc: CondCode::Ne,
+                dst: vreg(3),
+            },
+        ];
+        assert!(
+            machinst_window_rax_free(&clean),
+            "vreg-only / non-rax phys window must be rax-free"
+        );
+    }
+
+    /// Def-set extraction per arm. Mov/FMov deliberately over-approximate
+    /// (their SOURCE operand is recorded too — a mov's src is a use, but
+    /// recording it can only forbid substitutions, never permit unsound
+    /// ones). Dst-only arms record exactly the dest; ShiftX's MachReg
+    /// count/src are NOT recorded (only MachOperand positions and dsts
+    /// get the treatment), and Lea records dst + index but not the base.
+    #[test]
+    fn window_defs_extracts_every_dst_position() {
+        let window = [
+            // Mov: src AND dst vregs recorded (source-side over-approx).
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(101)),
+                dst: MachOperand::Reg(vreg(102)),
+                size: OpSize::S64,
+            },
+            // Cmov: operand src + reg dst.
+            MachInst::Cmov {
+                cc: CondCode::Ne,
+                src: MachOperand::Reg(vreg(103)),
+                dst: vreg(104),
+                size: OpSize::S64,
+            },
+            // Movzx: dst only — the operand src stays out.
+            MachInst::Movzx {
+                src: MachOperand::Reg(vreg(105)),
+                dst: vreg(106),
+                from_size: OpSize::S32,
+                to_size: OpSize::S64,
+            },
+            // ShiftX: dst only — count/src MachRegs stay out.
+            MachInst::ShiftX {
+                op: ShiftOp::Shl,
+                count: vreg(107),
+                src: vreg(108),
+                dst: vreg(109),
+                size: OpSize::S64,
+            },
+            // Lea: dst + index; the base stays out.
+            MachInst::Lea {
+                base: vreg(110),
+                index: Some((vreg(111), 4)),
+                offset: 0,
+                dst: vreg(112),
+            },
+            // SetCC: dst.
+            MachInst::SetCC {
+                cc: CondCode::E,
+                dst: vreg(113),
+            },
+        ];
+        let defs = machinst_window_defs(&window);
+        for id in [101u32, 102, 103, 104, 106, 109, 111, 112, 113] {
+            assert!(defs.contains(&id), "vreg {id}: def must be recorded");
+        }
+        for id in [105u32, 107, 108, 110] {
+            assert!(
+                !defs.contains(&id),
+                "vreg {id}: source/base positions stay out of the def set"
+            );
+        }
+    }
+
+    /// XMM-family pinning: FMov records both operand vregs (it shares the
+    /// Mov arm) and is rax-free, while Mov128 falls through the extractor's
+    /// `_ => {}` arm — the omission is fail-safe because the rax_free scan
+    /// covers Mov128 and the accumulator cache only ever holds integer
+    /// values, so acc-substitution can never fire for its vregs.
+    #[test]
+    fn window_xmm_forms_pinned() {
+        let fm = MachInst::FMov {
+            src: MachOperand::Reg(vreg(201)),
+            dst: MachOperand::Reg(vreg(202)),
+            size: OpSize::S64,
+        };
+        assert!(machinst_window_rax_free(std::slice::from_ref(&fm)));
+        let m128 = MachInst::Mov128 {
+            src: MachOperand::Reg(vreg(301)),
+            dst: MachOperand::Reg(vreg(302)),
+        };
+        assert!(machinst_window_rax_free(std::slice::from_ref(&m128)));
+        let defs = machinst_window_defs(&[fm.clone(), m128]);
+        for id in [201u32, 202] {
+            assert!(defs.contains(&id), "FMov vreg {id} recorded (Mov arm)");
+        }
+        for id in [301u32, 302] {
+            assert!(
+                !defs.contains(&id),
+                "Mov128 vreg {id}: extractor fall-through (`_ => {{}}`) pinned"
+            );
+        }
     }
 }

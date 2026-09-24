@@ -1135,10 +1135,30 @@ impl Driver {
                     self.enable_fma = true;
                     self.fma_explicitly_disabled = false;
                 }
-                "-mbmi" => self.enable_bmi = true,
-                "-mbmi2" => self.enable_bmi2 = true,
-                "-mlzcnt" => self.enable_lzcnt = true,
-                "-mpopcnt" => self.enable_popcnt = true,
+                "-mbmi" => {
+                    // Last-explicit ISA decision wins (GCC): a later `-mbmi`
+                    // lifts an earlier `-mno-bmi` sticky denial.
+                    self.enable_bmi = true;
+                    self.bmi1_explicitly_disabled = false;
+                }
+                "-mbmi2" => {
+                    self.enable_bmi2 = true;
+                    self.bmi2_explicitly_disabled = false;
+                }
+                "-mlzcnt" => {
+                    // Last-explicit ISA decision wins (GCC): a later
+                    // `-mlzcnt` lifts an earlier `-mno-lzcnt` sticky denial.
+                    self.enable_lzcnt = true;
+                    self.lzcnt_explicitly_disabled = false;
+                }
+                "-mpopcnt" => {
+                    // Last-explicit ISA decision wins (GCC): a later
+                    // `-mpopcnt` lifts an earlier `-mno-popcnt` sticky
+                    // denial.
+                    self.enable_popcnt = true;
+                    self.popcnt_explicitly_disabled = false;
+                }
+
                 "-mmovbe" => self.enable_movbe = true,
                 "-mrdrnd" => self.enable_rdrnd = true,
                 // AVX-512 / AVX10 feature flags (completeness; backend coverage
@@ -1203,10 +1223,32 @@ impl Driver {
                     self.enable_fma = false;
                     self.fma_explicitly_disabled = true;
                 }
-                "-mno-bmi" => self.enable_bmi = false,
-                "-mno-bmi2" => self.enable_bmi2 = false,
-                "-mno-lzcnt" => self.enable_lzcnt = false,
-                "-mno-popcnt" => self.enable_popcnt = false,
+                "-mno-bmi" => {
+                    self.enable_bmi = false;
+                    // Sticky denial: the absent-march baseline is x86-64-v3,
+                    // which carries BMI1; only this explicit denial removes
+                    // the class from a default build (GCC keeps the denial
+                    // sticky across a later `-march=native` probe too).
+                    self.bmi1_explicitly_disabled = true;
+                }
+                "-mno-bmi2" => {
+                    self.enable_bmi2 = false;
+                    self.bmi2_explicitly_disabled = true;
+                }
+                "-mno-lzcnt" => {
+                    self.enable_lzcnt = false;
+                    // Sticky denial: the absent-march baseline is x86-64-v3,
+                    // which carries ABM (LZCNT/TZCNT); only this explicit
+                    // denial removes it from a default build.
+                    self.lzcnt_explicitly_disabled = true;
+                }
+                "-mno-popcnt" => {
+                    self.enable_popcnt = false;
+                    // Sticky denial: the absent-march baseline is x86-64-v3,
+                    // which carries POPCNT (since v2); only this explicit
+                    // denial removes it from a default build.
+                    self.popcnt_explicitly_disabled = true;
+                }
                 "-mno-movbe" => self.enable_movbe = false,
                 "-mno-rdrnd" => self.enable_rdrnd = false,
                 "-mno-avx512f" => self.enable_avx512f = false,
@@ -2600,5 +2642,201 @@ mod cli_tests {
         assert!(d.parse_cli_args(&args).is_ok());
         assert!(!d.no_sse);
         assert!(d.enable_avx);
+    }
+
+    /// The absent-`-march` code-generation baseline is x86-64-v3 (the same
+    /// contract as `Driver::x86_isa` returning `X86Isa::V3`), and BMI1/BMI2
+    /// are v3 members: a default build must arm ANDN/RORX-class selection
+    /// without any explicit `-mbmi*`.  Before this policy the flags stayed
+    /// explicit-only, so default `-O2` emitted `notq;andq` where `-mbmi`
+    /// emitted one `andn` — while AVX2 (also v3) was already on by default.
+    #[test]
+    fn bmi_defaults_to_v3_baseline() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.bmi1_effective(), "v3 default baseline carries BMI1");
+        assert!(d.bmi2_effective(), "v3 default baseline carries BMI2");
+    }
+
+    /// `-mno-bmi` is a STICKY denial against the v3 default baseline — the
+    /// default must not revive the class behind the user's back (GCC keeps
+    /// the last-explicit ISA decision).
+    #[test]
+    fn mno_bmi_sticky_denial_beats_default_baseline() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mno-bmi", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(!d.bmi1_effective(), "-mno-bmi must deny the v3 default");
+        assert!(d.bmi2_effective(), "-mno-bmi leaves the BMI2 class alone");
+
+        let mut d2 = Driver::new();
+        let args2: Vec<String> = ["ccc", "-mno-bmi2", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d2.parse_cli_args(&args2).is_ok());
+        assert!(!d2.bmi2_effective());
+        assert!(d2.bmi1_effective());
+    }
+
+    /// GCC last-explicit ISA semantics: a later `-mbmi` lifts an earlier
+    /// `-mno-bmi` sticky denial (mirrors `-msse` after `-mno-sse`).
+    #[test]
+    fn mbmi_after_mno_bmi_reenables() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mno-bmi", "-mbmi", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.bmi1_effective());
+    }
+
+    /// ABM (LZCNT/TZCNT) is an x86-64-v3 member: the absent-`-march`
+    /// baseline projects it, so `tzcnt`/`lzcnt` are the default codegen
+    /// choices (they supersede `bsf`/`bsr` and are defined on zero input).
+    #[test]
+    fn lzcnt_baseline_default_on() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.lzcnt_effective(), "v3 baseline must project ABM");
+    }
+
+    /// Sticky `-mno-lzcnt` denial beats the v3 default baseline; the BMI
+    /// classes are unaffected (independent ISA groups).
+    #[test]
+    fn mno_lzcnt_sticky_denial_beats_default_baseline() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mno-lzcnt", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(!d.lzcnt_effective(), "-mno-lzcnt must deny the v3 default");
+        assert!(d.bmi1_effective());
+        assert!(d.bmi2_effective());
+    }
+
+    /// GCC last-explicit ISA semantics: a later `-mlzcnt` lifts an earlier
+    /// `-mno-lzcnt` sticky denial.
+    #[test]
+    fn mlzcnt_after_mno_lzcnt_reenables() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mno-lzcnt", "-mlzcnt", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.lzcnt_effective());
+    }
+
+    /// POPCNT joined the baseline at x86-64-v2, so the v3 default
+    /// projects it; sticky `-mno-popcnt` wins; a later `-mpopcnt` lifts
+    /// the denial; an explicit v1 ceiling removes it.
+    #[test]
+    fn popcnt_baseline_default_on_sticky_denial_and_ceiling() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.popcnt_effective(), "v3 baseline must project POPCNT");
+
+        let mut d2 = Driver::new();
+        let args2: Vec<String> = ["ccc", "-mno-popcnt", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d2.parse_cli_args(&args2).is_ok());
+        assert!(
+            !d2.popcnt_effective(),
+            "-mno-popcnt must deny the v3 default"
+        );
+
+        let mut d3 = Driver::new();
+        let args3: Vec<String> = ["ccc", "-mno-popcnt", "-mpopcnt", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d3.parse_cli_args(&args3).is_ok());
+        assert!(d3.popcnt_effective(), "-mpopcnt lifts the sticky denial");
+
+        let mut d4 = Driver::new();
+        let args4: Vec<String> = ["ccc", "-march=x86-64", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d4.parse_cli_args(&args4).is_ok());
+        assert!(!d4.popcnt_effective(), "v1 ceiling must not carry POPCNT");
+    }
+
+    /// An explicit `-march=x86-64` (v1) ceiling removes ABM from the
+    /// default projection — the baseline only applies without `-march`.
+    #[test]
+    fn explicit_v1_march_removes_lzcnt_baseline() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-march=x86-64", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(!d.lzcnt_effective(), "v1 ceiling must not carry ABM");
+
+        let mut d2 = Driver::new();
+        let args2: Vec<String> = ["ccc", "-march=x86-64-v3", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d2.parse_cli_args(&args2).is_ok());
+        assert!(d2.lzcnt_effective(), "v3 profile carries ABM");
+    }
+
+    /// An explicit `-march=` is the ceiling (GCC-exact): v1 has no BMI, so
+    /// the default-baseline BMI dies — unless an explicit `-mbmi` re-adds
+    /// the feature on top of the ceiling.
+    #[test]
+    fn explicit_march_is_the_bmi_ceiling() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-march=x86-64", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(!d.bmi1_effective(), "v1 ceiling has no BMI1");
+        assert!(!d.bmi2_effective(), "v1 ceiling has no BMI2");
+
+        let mut d2 = Driver::new();
+        let args2: Vec<String> = ["ccc", "-march=x86-64", "-mbmi", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d2.parse_cli_args(&args2).is_ok());
+        assert!(d2.bmi1_effective(), "explicit -mbmi adds the feature");
+
+        let mut d3 = Driver::new();
+        let args3: Vec<String> = ["ccc", "-march=x86-64-v3", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d3.parse_cli_args(&args3).is_ok());
+        assert!(d3.bmi1_effective());
+        assert!(d3.bmi2_effective());
+    }
+
+    /// BMI is an INTEGER class: `-mno-sse` denies the xmm world but leaves
+    /// ANDN/RORX legal — the v3 default baseline still applies.
+    #[test]
+    fn bmi_baseline_survives_mno_sse() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mno-sse", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.bmi1_effective(), "integer BMI survives the xmm denial");
+        assert!(d.bmi2_effective());
     }
 }

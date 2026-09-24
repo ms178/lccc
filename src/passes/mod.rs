@@ -1980,7 +1980,7 @@ pub(crate) fn run_passes(
             // regressions it caused were the PR #602 CI RED.  The full data
             // lives in the scalar section's comment in iv_strength_reduce.rs;
             // revisit after the Unit-4 allocator work.
-            let run_ivsr_scalar = run_ivsr && std::env::var("CCC_IVSR_SCALAR_DERIVED").is_ok();
+            let run_ivsr_scalar = ivsr_scalar_derived_enabled(run_ivsr);
             // Un-IVSR only pays off on targets with scaled-index addressing
             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
             let run_univsr = run_ivsr
@@ -2696,6 +2696,45 @@ pub(crate) fn run_passes(
         eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
         eprintln!("{:#?}", module);
         eprintln!("==== END IR after all passes ====");
+    }
+}
+
+/// Opt-in gate for the scalar derived-IV flavor of IVSR (`iv*C` without a
+/// GEP → secondary recurrence).  Factored out of `run_passes` so the
+/// default-OFF contract is unit-testable: the flavor measured as a net
+/// runtime loss while latch phi-web parking exists (the PR #602 golden
+/// regressions), so an unset environment must NEVER enable it.
+fn ivsr_scalar_derived_enabled(run_ivsr: bool) -> bool {
+    run_ivsr && std::env::var("CCC_IVSR_SCALAR_DERIVED").is_ok()
+}
+
+#[cfg(test)]
+mod ivsr_scalar_derived_gate_tests {
+    use super::ivsr_scalar_derived_enabled;
+    use crate::test_support::EnvGuard;
+
+    #[test]
+    fn scalar_derived_ivsr_is_off_by_default() {
+        // Unset environment: the measured-regression flavor stays off even
+        // when IVSR itself runs.
+        let _guard = EnvGuard::unset("CCC_IVSR_SCALAR_DERIVED");
+        assert!(
+            !ivsr_scalar_derived_enabled(true),
+            "default (unset) must not enable scalar derived IVs"
+        );
+    }
+
+    #[test]
+    fn scalar_derived_ivsr_opt_in_and_ivsr_gate() {
+        let _set = EnvGuard::set("CCC_IVSR_SCALAR_DERIVED", "1");
+        assert!(
+            ivsr_scalar_derived_enabled(true),
+            "explicit opt-in enables the flavor when IVSR runs"
+        );
+        assert!(
+            !ivsr_scalar_derived_enabled(false),
+            "opt-in still requires IVSR itself to be on"
+        );
     }
 }
 
