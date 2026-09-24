@@ -20,7 +20,7 @@ use super::fp_liveness::FpLiveness;
 use super::helpers::{
     extract_jump_target, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
     is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family,
-    self_zeroing_full_write, writes_family, writes_family_full,
+    self_zeroing_full_write, src_mentions_family, writes_family, writes_family_full,
 };
 use super::liveness::FileLiveness;
 use super::relay_and_lea::function_range;
@@ -6144,7 +6144,12 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
                 let bit = 1u16 << dest_reg;
                 defs[i] = bit;
                 let t = infos[i].trimmed(store.get(i));
-                uses[i] = if is_read_modify_write(t) {
+                // Dest-only is not enough: an NDD middle==dst read
+                // (`imull $k, %r, %r`) reads the family AS A SOURCE.
+                // Without the source check the middle read is erased from
+                // the uses and a later transform treats the family as
+                // unread here.
+                uses[i] = if is_read_modify_write(t) || src_mentions_family(t, dest_reg) {
                     refs
                 } else {
                     refs & !bit
@@ -7864,16 +7869,34 @@ mod windowed_liveness_tests {
         assert!(!changed, "lahf consumes the orq's flags: must refuse");
 
         // The same shape with a plain flag-writing ALU op as the first
-        // flag event: the orq's flags are dead before anything reads them
-        // → the rotate synthesis still folds (precision control).
+        // flag event and genuinely dead temps: the orq's flags are dead
+        // before anything reads them → the rotate synthesis still folds
+        // (precision control).
         let with_kill = format!(
-            "{}    movl %edx, %edx\n    addl $1, %esi\n    movl %edx, %edx\n    movl %esi, %eax\n    ret\n.cfi_endproc\n",
+            "{}    movl $0, %edx\n    addl $1, %esi\n    movl %edx, %eax\n    movl %esi, %eax\n    ret\n.cfi_endproc\n",
             head
         );
         let (mut store, mut infos) = build(&with_kill);
         let changed = fold_rotate_idiom(&mut store, &mut infos);
         assert!(changed, "flag kill before any reader must still fold");
         assert!(text_of(&store).contains("rolq $3, %rsi"));
+        // A `movl %edx, %edx` self-copy is NOT a kill: it reads the low
+        // half of %rdx and copies it forward, so a temp flowing through
+        // self-copies to `ret` (which reads %rax AND %rdx under the
+        // family model) is LIVE and the fold must refuse.  The pre-V3
+        // model treated the self-copy as def-only and folded here,
+        // deleting the `shrq $61, %rdx` producer while %rdx flowed to the
+        // return — a changed %rdx for 128-bit returns.
+        let with_self_copy_flow = format!(
+            "{}    movl %edx, %edx\n    addl $1, %esi\n    movl %edx, %edx\n    movl %esi, %eax\n    ret\n.cfi_endproc\n",
+            head
+        );
+        let (mut store, mut infos) = build(&with_self_copy_flow);
+        let changed = fold_rotate_idiom(&mut store, &mut infos);
+        assert!(
+            !changed,
+            "temp flowing through self-copies to ret must refuse"
+        );
     }
 }
 

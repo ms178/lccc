@@ -150,14 +150,18 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
         return FlagsEffect::Writes;
     }
     // BMI2 VEX shifts (`shlx/shrx/sarx`) and the other flag-neutral BMI2
-    // ops leave EFLAGS untouched; they must be classified before the prefix
-    // table below, which would otherwise match them as "shl"/"shr"/"sar"
-    // writers and let a later scan treat an earlier `cmp`'s flags as dead.
-    // The BMI1 siblings (andn/bextr/bzhi/blsi/blsmsk/blsr) are equally
-    // VEX-encoded and flag-neutral; the old WRITERS list carried
-    // andn/blsi/blsmsk/blsr as flag writers, which is factually wrong and
-    // lets `flags_dead_after` delete a live producer between a `cmp` and a
-    // later reader (`cmp; andn; je` — andn never touches ZF).
+    // ops (rorx/pdep/pext/mulx) leave EFLAGS untouched per the SDM; they
+    // must be classified before the prefix table below, which would
+    // otherwise match them as "shl"/"shr"/"sar" writers and let a later
+    // scan treat an earlier `cmp`'s flags as dead.
+    // The BMI1 VEX siblings (andn/bextr/bzhi/blsi/blsmsk/blsr) are NOT
+    // neutral — the SDM documents flag writes for all of them (andn:
+    // SF/ZF/PF set, OF/CF cleared; blsi/blsr/blsmsk: ZF/CF/SF/OF;
+    // bextr/bzhi: ZF/CF), proven on hardware 2026-09-24 (`cmp; andn; je`
+    // takes the branch iff andn wrote ZF — it does).  They are classified
+    // as writers in the WRITERS table below: in `cmp; andn; je` the branch
+    // reads ANDN's flags, so the cmp's flags are dead, not live — the old
+    // comment had the dataflow exactly backwards.
     if t.starts_with("shlx")
         || t.starts_with("shrx")
         || t.starts_with("sarx")
@@ -165,12 +169,6 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
         || t.starts_with("pdep")
         || t.starts_with("pext")
         || t.starts_with("mulx")
-        || t.starts_with("andn")
-        || t.starts_with("bextr")
-        || t.starts_with("bzhi")
-        || t.starts_with("blsi")
-        || t.starts_with("blsmsk")
-        || t.starts_with("blsr")
     {
         return FlagsEffect::Neutral;
     }
@@ -238,11 +236,14 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
     // Generic flag-writing ALU stems, matched with an exact size suffix
     // (l/q/w/b), a blank, or end-of-mnemonic — never `sd`/`ss`/`ps`/`pd`
     // (those are FP forms, handled above) and never sibling mnemonics
-    // (`andn`, `shld`, `cmpxchg` are classified by their own rules).
+    // (`shld`, `cmpxchg` are classified by their own rules; the BMI1
+    // `andn`/`bextr`/`bzhi`/`blsi`/`blsmsk`/`blsr` stems below are exact
+    // writers — the SSE `andnps`/`andnpd` do NOT match: `ps`/`pd` are not
+    // integer suffixes, and the FP table above claims them first anyway).
     const WRITERS: &[&str] = &[
         "add", "sub", "and", "or", "xor", "cmp", "test", "inc", "dec", "neg", "imul", "mul", "div",
         "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bsf", "bsr", "popcnt", "lzcnt",
-        "tzcnt", "cmpxchg", "xadd", "lock",
+        "tzcnt", "cmpxchg", "xadd", "lock", "andn", "bextr", "bzhi", "blsi", "blsmsk", "blsr",
     ];
     if WRITERS.iter().any(|p| suffix_exact_writer(base, p)) {
         return FlagsEffect::Writes;
@@ -2439,11 +2440,14 @@ mod tests {
     }
 
     #[test]
-    fn bmi1_vex_ops_are_flag_neutral_not_flag_writers() {
-        // BMI1 is VEX-encoded and leaves EFLAGS untouched.  The old WRITERS
-        // list carried andn/blsi/blsmsk/blsr as flag writers; classifying
-        // them as Writes lets `flags_dead_after` delete a live `cmp` that a
-        // later `je` still reads (`cmp; andn; je` miscompiles).
+    fn bmi1_vex_ops_are_flag_writers_not_flag_neutral() {
+        // BMI1 is VEX-encoded but WRITES EFLAGS (SDM: andn sets SF/ZF/PF
+        // and clears OF/CF; blsi/blsr/blsmsk write ZF/CF/SF/OF; bextr/bzhi
+        // write ZF/CF — proven on hardware 2026-09-24: `cmp; andn; je`
+        // takes the branch iff andn wrote ZF, and it does).  In
+        // `cmp; andn; je` the branch reads ANDN's flags, so the cmp's flags
+        // are dead, not live — Neutral here hid that and pinned the missed
+        // optimization as a contract.
         let tag = |e: FlagsEffect| match e {
             FlagsEffect::Neutral => "neutral",
             FlagsEffect::Writes => "writes",
@@ -2458,6 +2462,15 @@ mod tests {
             "bextrq %rcx, %rax, %rdx",
             "bzhiq %rcx, %rax, %rdx",
         ] {
+            assert!(
+                matches!(flags_effect(m), FlagsEffect::Writes),
+                "{m} classified {}",
+                tag(flags_effect(m))
+            );
+        }
+        // The SSE lookalikes stay neutral (claimed by the FP table above,
+        // and unreachable through the integer-suffix WRITERS stems anyway).
+        for m in ["andnps %xmm1, %xmm2", "andnpd %xmm1, %xmm2"] {
             assert!(
                 matches!(flags_effect(m), FlagsEffect::Neutral),
                 "{m} classified {}",
@@ -2561,11 +2574,13 @@ mod tests {
     }
 
     #[test]
-    fn cmp_survives_across_a_bmi1_op_the_branch_reads() {
+    fn add_folds_to_lea_across_a_bmi1_op_the_branch_reads() {
         // End-to-end: `copy + add` folds to a scaled LEA only when the add's
-        // flags are dead (`flags_dead_after`).  With `andn` misclassified as
-        // a flags writer the add's flags looked dead although the later
-        // `jne` reads them — the fold then changed control flow.
+        // flags are dead (`flags_dead_after`).  The `andn` WRITES flags
+        // (hardware-proven), so the `jne` reads ANDN's flags and the add's
+        // flags are dead: the fold fires and control flow is unchanged.
+        // (This test used to pin the backwards reading — that the jne reads
+        // the ADD's flags "through" the andn — as a contract.)
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -2579,8 +2594,8 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(
-            out.contains("addq $5, %rax"),
-            "the add's flags feed the jne through a flag-neutral andn: {out}"
+            out.contains("leaq 5(%r9), %rax"),
+            "the add's flags are dead across the flag-writing andn: {out}"
         );
         assert!(out.contains("andnq %rdx, %rbx, %rbx"), "{out}");
     }

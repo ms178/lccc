@@ -32,7 +32,7 @@
 //!   and `%r10` (static chain), and clobbers the caller-saved set.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, is_read_modify_write};
+use super::helpers::{get_dest_reg, is_read_modify_write, src_mentions_family};
 
 /// All 16 GP families.
 const ALL: u16 = 0xFFFF;
@@ -959,15 +959,13 @@ impl FileLiveness {
                     // A pure write does not read its destination; anything else
                     // (add, cmov, inc, shifts, xchg) does.
                     if is_pure_write_mnemonic(t) {
-                        let src_part = &t[..t.rfind(',').unwrap_or(t.len())];
+                        // Shared source-mentions-dest guard (covers the NDD
+                        // middle operand, 16-bit and high-byte reads, and
+                        // strips `#` comments so comment commas never move
+                        // the source boundary).
+                        let src_reads_dest = src_mentions_family(t, dest);
                         let name64 = REG_NAMES[0][dest as usize];
                         let name32 = REG_NAMES[1][dest as usize];
-                        let name16 = REG_NAMES[2][dest as usize];
-                        let name8 = REG_NAMES[3][dest as usize];
-                        let src_reads_dest = src_part.contains(name64)
-                            || src_part.contains(name32)
-                            || src_part.contains(name16)
-                            || src_part.contains(name8);
                         // A partial write (8/16-bit destination) preserves the
                         // rest of the register, so the old value stays live.
                         let dst_text = t[t.rfind(',').map(|c| c + 1).unwrap_or(0)..].trim();
@@ -1056,6 +1054,13 @@ mod tests {
     /// itself, so any future edit of the shared predicate that moves one
     /// of these mnemonics fails loudly here instead of silently killing
     /// liveness-driven peepholes on real workloads.
+    ///
+    /// SCOPE: these rows pin the SHARED PREDICATE. Liveness additionally
+    /// gates on `mnemonic_is_known` (unknown mnemonics take the
+    /// reads-everything/writes-nothing path without consulting the
+    /// predicate), so the bzhi/bextr/pext/pdep rows below are LATENT pins:
+    /// they pass today, and they go live the day those mnemonics join
+    /// KNOWN (the backend emits none of them yet).
     #[test]
     fn pure_write_table_matches_the_shared_rmw_predicate() {
         // Dest-only: written, never read.

@@ -186,6 +186,52 @@ fn peeled_value(
 // own block. Producers that are only KEPT (read, not rewritten) may live
 // anywhere.
 
+/// Fold-time prediction of the backend's Not+And → `andn` fusion
+/// (`detect_and_not_fusions` + `emit_and_not_impl`): a single-use `Not`
+/// whose type is `c_ty` inside the shared ALU-fusion width domain, sitting
+/// at the immediately preceding index of the SAME block as `and_opnd`'s
+/// And.  Extracted from the Pattern-B closure so the contract test can run
+/// BOTH predicates (this one and the backend detector) over the same
+/// constructed scenarios — the audit's point was that the two spellings
+/// of the criteria must never drift apart silently.
+pub(super) fn andn_fusion_predicted_at(
+    defs: &[Option<Instruction>],
+    use_counts: &[u32],
+    def_loc: &[Option<(usize, usize)>],
+    c_ty: IrType,
+    not_opnd: Operand,
+    and_opnd: Operand,
+) -> bool {
+    let Operand::Value(nv) = not_opnd else {
+        return false;
+    };
+    match defs.get(nv.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::UnaryOp {
+            op: crate::ir::reexports::IrUnaryOp::Not,
+            ty: nty,
+            ..
+        }) => {
+            if *nty != c_ty || !crate::backend::generation::alu_fusion_width_ok(*nty) {
+                return false;
+            }
+            if use_counts.get(nv.0 as usize).copied() != Some(1) {
+                return false;
+            }
+            let loc = |op: &Operand| -> Option<(usize, usize)> {
+                match op {
+                    Operand::Value(v) => def_loc.get(v.0 as usize).copied().flatten(),
+                    _ => None,
+                }
+            };
+            match (loc(&not_opnd), loc(&and_opnd)) {
+                (Some((nb, ni)), Some((ab, ai))) => nb == ab && ni + 1 == ai,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Result of [`match_bool_mux_algebra`]: the consumer's replacement plus
 /// deferred producer rewrites `(block, index, instruction)` for the
 /// pass-end application (dest-verified, like `pending_masks`).
@@ -443,33 +489,7 @@ pub(super) fn match_bool_mux_algebra(
     // SAME block as the ~x-side And. A Not reached through a Copy chain
     // never predicts (the fusion needs the raw adjacency).
     let andn_fusion_predicted = |not_opnd: Operand, and_opnd: Operand| -> bool {
-        let Operand::Value(nv) = not_opnd else {
-            return false;
-        };
-        match defs.get(nv.0 as usize).and_then(Option::as_ref) {
-            Some(Instruction::UnaryOp {
-                op: crate::ir::reexports::IrUnaryOp::Not,
-                ty: nty,
-                ..
-            }) => {
-                if *nty != c_ty
-                    || !matches!(nty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
-                {
-                    return false;
-                }
-                if use_counts.get(nv.0 as usize).copied() != Some(1) {
-                    return false;
-                }
-                match (
-                    def_loc.get(nv.0 as usize).copied().flatten(),
-                    loc_of(&and_opnd),
-                ) {
-                    (Some((nb, ni)), Some((ab, ai))) => nb == ab && ni + 1 == ai,
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
+        andn_fusion_predicted_at(defs, use_counts, def_loc, c_ty, not_opnd, and_opnd)
     };
     for (first, second) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
         let Some((f_lhs, f_rhs)) = and_strict(&first) else {
@@ -3422,6 +3442,210 @@ mod tests {
         // The repurposed rewrites stay in the consumer's block (v1).
         for (bi, _, _) in &pending {
             assert_eq!(*bi, 1, "repurposes belong to the consumer's block");
+        }
+    }
+
+    // ── audit P0-2: the andn-fusion contract test ────────────────────────────
+    //
+    // The fusion criteria used to exist in two independent spellings: the
+    // middle-end fold prediction (this file) and the backend detector
+    // (backend::generation::detect_and_not_fusions).  If they drift, the
+    // mux fold either erases a Not the backend cannot fuse (CH loses the
+    // 3-operand andn) or leaves one the backend would have fused.  This
+    // contract test runs BOTH REAL predicates over the same constructed
+    // scenarios and asserts they agree.
+    #[test]
+    fn andn_prediction_contract_with_backend_detector() {
+        use crate::backend::generation::detect_and_not_fusions;
+        use crate::ir::instruction::{BasicBlock, BlockId, Terminator};
+
+        fn typed_not(dest: u32, src: Operand, ty: IrType) -> Instruction {
+            Instruction::UnaryOp {
+                dest: Value(dest),
+                op: IrUnaryOp::Not,
+                src,
+                ty,
+            }
+        }
+        fn typed_and(dest: u32, a: Operand, b: Operand, ty: IrType) -> Instruction {
+            Instruction::BinOp {
+                dest: Value(dest),
+                op: IrBinOp::And,
+                lhs: a,
+                rhs: b,
+                ty,
+            }
+        }
+
+        // (label, block instructions, the Not operand value, the And operand
+        // value, the And's index inside the block, the mux type, expected)
+        //
+        // Caller preconditions respected: `and_opnd`'s def is always an
+        // And of `c_ty` reading the Not's dest (that is what the mux
+        // matcher's `and_strict` guarantees before the prediction is
+        // consulted) — the scenarios vary only the properties BOTH
+        // predicates are responsible for deciding on their own.
+        let scenarios: Vec<(&str, Vec<Instruction>, u32, u32, usize, IrType, bool)> = vec![
+            (
+                "adjacent single-use U32",
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(3), v(1), IrType::U32),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                true,
+            ),
+            (
+                "adjacent single-use I64",
+                vec![
+                    typed_not(3, v(0), IrType::U64),
+                    typed_and(4, v(3), v(1), IrType::U64),
+                ],
+                3,
+                4,
+                1,
+                IrType::U64,
+                true,
+            ),
+            (
+                "Not feeds a second reader",
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(3), v(1), IrType::U32),
+                    xor3(5, v(3), v(2)),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "intervening instruction breaks adjacency",
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    xor3(9, v(1), v(2)),
+                    typed_and(4, v(3), v(1), IrType::U32),
+                ],
+                3,
+                4,
+                2,
+                IrType::U32,
+                false,
+            ),
+            (
+                "I16 outside the fusion width domain",
+                vec![
+                    typed_not(3, v(0), IrType::U16),
+                    typed_and(4, v(3), v(1), IrType::U16),
+                ],
+                3,
+                4,
+                1,
+                IrType::U16,
+                false,
+            ),
+            (
+                "I8 outside the fusion width domain",
+                vec![
+                    typed_not(3, v(0), IrType::I8),
+                    typed_and(4, v(3), v(1), IrType::I8),
+                ],
+                3,
+                4,
+                1,
+                IrType::I8,
+                false,
+            ),
+            (
+                "And does not read the Not's dest",
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(1), v(2), IrType::U32),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "And reads the Not twice (use_count 2)",
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(3), v(3), IrType::U32),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "operand is not a Not",
+                vec![and3(3, v(0), v(2)), typed_and(4, v(3), v(1), IrType::U32)],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "Not defined in another block",
+                // The block handed to the backend detector contains only the
+                // And: the Not lives in a foreign block, so no in-block
+                // windows(2) pair can contain both.
+                vec![typed_and(4, v(3), v(1), IrType::U32)],
+                3,
+                4,
+                0,
+                IrType::U32,
+                false,
+            ),
+        ];
+
+        for (label, insts, not_v, and_v, and_idx, c_ty, expected) in scenarios {
+            let mut fx = fixture(insts.clone());
+            if label == "Not defined in another block" {
+                // Give the Not a def + a FOREIGN block location (block 1).
+                fx.defs[not_v as usize] = Some(typed_not(not_v, v(0), IrType::U32));
+                fx.def_loc[not_v as usize] = Some((1, 0));
+                fx.use_counts[not_v as usize] = 1;
+            }
+            // The REAL middle-end predicate (the extracted closure body).
+            let predicted = andn_fusion_predicted_at(
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                c_ty,
+                Operand::Value(Value(not_v)),
+                Operand::Value(Value(and_v)),
+            );
+            // The REAL backend detector over the same instructions.
+            let block = BasicBlock {
+                label: BlockId(0),
+                instructions: insts,
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+            };
+            let fused = detect_and_not_fusions(&block, &fx.use_counts);
+            let backend = fused.contains(&and_idx);
+            assert_eq!(
+                predicted, expected,
+                "{label}: middle-end prediction wrong (got {predicted})"
+            );
+            assert_eq!(
+                backend, expected,
+                "{label}: backend detector wrong (got {backend})"
+            );
+            assert_eq!(
+                predicted, backend,
+                "{label}: CONTRACT VIOLATION — the fold prediction and the \
+                 backend detector disagree"
+            );
         }
     }
 

@@ -212,8 +212,14 @@ def hottest_loop(lines):
         if m:
             labels[m.group(1)] = i
     best = None
+    # NOTE (B3 repair): lccc emits conditional jumps at column 0 and only
+    # `jmp` indented, so `^\s+` never matched a real loop backedge — the
+    # only indented backedge in sha256 was the vectorizer's dead
+    # guard-fallback `jmp`, and the "hottest loop" was that dead span
+    # (exposed when the B3 freshness rule removed the guard).  `^\s*`
+    # measures the true hottest loop on both arms, like the gcc arm.
     for i, l in enumerate(lines):
-        m = re.match(r'^\s+(j\w+)\s+\.?(\.L[A-Za-z0-9_]+)', l)
+        m = re.match(r'^\s*(j\w+)\s+\.?(\.L[A-Za-z0-9_]+)', l)
         if not m or m.group(2) not in labels or labels[m.group(2)] > i:
             continue
         seg = insns(lines[labels[m.group(2)]:i + 1])

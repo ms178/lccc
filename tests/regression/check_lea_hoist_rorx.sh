@@ -266,18 +266,22 @@ for i, l in enumerate(lines):
             backedges.append((s_, i))
 # Innermost loop around each K-indexed load must not re-materialise the
 # base (one-level-up placement inside an enclosing loop is legitimate).
-# The K-table load shape: `movl (DISP)?(%base, %index[, scale])` — a
-# register base plus a register index, optional displacement, optional
-# 1/2/4/8 scale.  (The pre-audit regex demanded the index spelling end in
+# The K-table reference shape: `movl|addl (DISP)?(%base, %index[, scale])`
+# — the round loop folds K into an `addl (%rcx, %idx, 4)` mem operand, so a
+# mov-only regex NEVER matched it: it matched the vectorizer's dead scalar
+# tail (`movl (%rsi, %idx, 4)`, provably skipped) instead, and the B3
+# freshness rule's tail-reshape emptied even that (B3 repair).  Stack bases
+# (rsp/rbp) are excluded: those are W[]/local traffic, while K arrives via
+# a LEA'd GPR.  (The pre-audit regex demanded the index spelling end in
 # `d` directly before `)` — no real SIB load satisfies it, the match set
 # was EMPTY, and this check passed vacuously.)  A load-less result must
 # FAIL: this benchmark is supposed to contain the K load.
 loads = [
     i for i, l in enumerate(lines)
-    if re.match(r'^\s*mov[lq]?\s+([0-9a-fxX+.-]+)?\(%r\w+,\s*%r\w+(,\s*[1248])?\)', l)
+    if re.match(r'^\s*(?:mov[lq]?|addl)\s+([0-9a-fxX+.-]+)?\(%(?!rsp|rbp|esp|ebp)(?:r\w+),\s*%r\w+(,\s*[1248])?\)', l)
 ]
 if not loads:
-    cand = [l.strip() for l in lines if re.match(r'^\s*mov[lq]?\s+\(', l)]
+    cand = [l.strip() for l in lines if re.match(r'^\s*(?:mov[lq]?|addl)\s+\(?\(', l)]
     print(
         "C1 self-check: no SIB-indexed K-load matched; candidate mov lines: "
         + repr(cand[:5]),

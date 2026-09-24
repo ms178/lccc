@@ -3186,6 +3186,25 @@ fn detect_gap_fma_fusions(
     out
 }
 
+/// The GPR ALU-fusion width domain: scalar 32/64-bit integers.  Shared
+/// by the middle-end fold prediction (bit_idioms' andn defer) and the
+/// backend detectors below so the criteria exist in exactly one place
+/// (audit P0-4: three independent spellings had to stay in sync by luck).
+pub(crate) fn alu_fusion_width_ok(ty: IrType) -> bool {
+    matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+}
+
+/// The `CCC_NO_ANDN_FUSION` kill switch as ONE spelling: the middle-end
+/// defer prediction (`scalar_andn_available` in passes/mod.rs) and the
+/// backend emission gate (`supports_and_not`) must consult the same
+/// switch, or the fold would defer to a fusion that never fires (or
+/// fuse a shape the fold took back).  Read once per `run_passes`
+/// invocation on the middle-end side, per emission on the backend side —
+/// the value cannot change within one compilation either way.
+pub(crate) fn andn_fusion_env_enabled() -> bool {
+    std::env::var_os("CCC_NO_ANDN_FUSION").is_none()
+}
+
 /// Adjacent `shift-imm; logical` that AArch64 encodes as one instruction.
 fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
     let mut logical_indices = FxHashSet::default();
@@ -3198,7 +3217,7 @@ fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxH
                 ty,
                 ..
             } if matches!(op, IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr)
-                && matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) =>
+                && alu_fusion_width_ok(*ty) =>
             {
                 (dest, ty, c)
             }
@@ -3233,7 +3252,13 @@ fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxH
     logical_indices
 }
 
-fn detect_and_not_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
+/// Detect `Not` + `And` pairs fusable into one 3-operand `andn`.
+/// `pub(crate)` so the bit_idioms contract test can run the REAL backend
+/// detector next to the middle-end fold prediction over the same
+/// scenarios (audit P0-2): the two predicates must agree, or the fold
+/// would either erase a fusion the backend cannot emit or leave a Not
+/// the backend would have fused.
+pub(crate) fn detect_and_not_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<usize> {
     let mut and_indices = FxHashSet::default();
     for (idx, pair) in block.instructions.windows(2).enumerate() {
         let (not_dest, not_ty) = match &pair[0] {
@@ -3242,9 +3267,7 @@ fn detect_and_not_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<u
                 op: crate::ir::reexports::IrUnaryOp::Not,
                 ty,
                 ..
-            } if matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) => {
-                (*dest, *ty)
-            }
+            } if alu_fusion_width_ok(*ty) => (*dest, *ty),
             _ => continue,
         };
         if use_counts.get(not_dest.0 as usize).copied().unwrap_or(0) != 1 {

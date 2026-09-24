@@ -20,7 +20,8 @@ use super::dead_writes::label_is_fallthrough_only;
 use super::fma_forms::{FmaWidth, parse_scalar_fma};
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
-    implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, writes_family,
+    implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, src_mentions_family,
+    writes_family,
 };
 
 /// True when a line transfers control or merges paths, so that textual line
@@ -1139,9 +1140,14 @@ fn is_reg_dead_after(
     len: usize,
     reg: u8,
 ) -> bool {
+    if reg > REG_GP_MAX {
+        return false; // fail-closed (also guards the shift below)
+    }
     let scan_limit = (start + 64).min(len);
     let mask = 1u16 << reg;
-    let (reg64, reg32, reg8) = reg_names(reg);
+    // Complete family names (all 16 fams, every width): the old two-family
+    // mini-table fail-closed the relay fold for tmp >= rsi.
+    let names = reg_names_family(reg);
     let mut scan = start;
     while scan < scan_limit {
         if infos[scan].is_nop() {
@@ -1169,28 +1175,23 @@ fn is_reg_dead_after(
                 LineKind::Pop { reg: r } if r == reg => return true,
                 LineKind::Other { dest_reg } if dest_reg == reg => {
                     let t = infos[scan].trimmed(store.get(scan));
-                    if t == format!("xorl {}, {}", reg32, reg32) {
+                    if t == format!("xorl {}, {}", names[1], names[1]) {
                         return true;
                     }
-                    if t.ends_with(&format!(", %{}", reg64)) || t.ends_with(&format!(", {}", reg32))
+                    if t.ends_with(&format!(", {}", names[0]))
+                        || t.ends_with(&format!(", {}", names[1]))
                     {
                         // The instruction WRITES the register. It is only dead
                         // (free to retarget) if this write establishes a FRESH
                         // value that does NOT depend on the current value — a
                         // self-move or sign-extension FROM the register still
-                        // depends on it, so it is NOT dead.
-                        let src = t
-                            .split_once(',')
-                            .map(|(s, _)| {
-                                let mut toks = s.splitn(2, char::is_whitespace);
-                                let _mnem = toks.next();
-                                toks.next().unwrap_or("")
-                            })
-                            .unwrap_or("");
-                        let reads = src.contains(reg32)
-                            || src.contains(&format!("%{}", reg64))
-                            || src.contains(reg8);
-                        if !reads && !is_read_modify_write(t) {
+                        // depends on it, so it is NOT dead. The guard covers
+                        // EVERY source operand (first AND middle: NDD
+                        // `imull $k, %r, %r` reads the family as its middle
+                        // operand) at EVERY width (16-bit and high-byte
+                        // included) — checking only the first operand, or only
+                        // 3 widths, silently miscompiled the relay fold.
+                        if !src_mentions_family(t, reg) && !is_read_modify_write(t) {
                             return true;
                         }
                     }
@@ -1219,8 +1220,12 @@ fn scratch_dead_after_relaxed(
     len: usize,
     reg: u8,
 ) -> bool {
+    if reg > REG_GP_MAX {
+        return false; // fail-closed (also guards the shift below)
+    }
     let scan_limit = (start + 64).min(len);
     let mask = 1u16 << reg;
+    let names = reg_names_family(reg);
     let mut scan = start;
     while scan < scan_limit {
         if infos[scan].is_nop() {
@@ -1252,24 +1257,16 @@ fn scratch_dead_after_relaxed(
                 LineKind::LoadRbp { reg: r, .. } if r == reg => return true,
                 LineKind::Other { dest_reg } if dest_reg == reg => {
                     let t = infos[scan].trimmed(store.get(scan));
-                    let (reg64, reg32, _reg8) = reg_names(reg);
-                    if t == format!("xorl {}, {}", reg32, reg32) {
+                    if t == format!("xorl {}, {}", names[1], names[1]) {
                         return true;
                     }
-                    if t.ends_with(&format!(", %{}", reg64)) || t.ends_with(&format!(", {}", reg32))
+                    if t.ends_with(&format!(", {}", names[0]))
+                        || t.ends_with(&format!(", {}", names[1]))
                     {
-                        let src = t
-                            .split_once(',')
-                            .map(|(s, _)| {
-                                let mut toks = s.splitn(2, char::is_whitespace);
-                                let _mnem = toks.next();
-                                toks.next().unwrap_or("")
-                            })
-                            .unwrap_or("");
-                        let reads = src.contains(reg32)
-                            || src.contains(&format!("%{}", reg64))
-                            || src.contains(_reg8);
-                        if !reads && !is_read_modify_write(t) {
+                        // All-sources, all-widths guard (see
+                        // `is_reg_dead_after`): first-operand-only missed
+                        // NDD middle reads and 16-bit reads.
+                        if !src_mentions_family(t, reg) && !is_read_modify_write(t) {
                             return true;
                         }
                     }
@@ -1419,15 +1416,6 @@ fn resolve_alu_memfold_target(
         }
     }
     None
-}
-
-/// Register names for family id 0=rax, 1=rcx, 2=rdx: (64-bit, 32-bit, 8-bit).
-fn reg_names(reg: u8) -> (&'static str, &'static str, &'static str) {
-    match reg {
-        0 => ("rax", "%eax", "%al"),
-        1 => ("rcx", "%ecx", "%cl"),
-        _ => ("rdx", "%edx", "%dl"),
-    }
 }
 
 fn is_rax_dead_after(store: &LineStore, infos: &[LineInfo], start: usize, len: usize) -> bool {

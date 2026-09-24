@@ -869,7 +869,7 @@ fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
 fn scalar_andn_available(target: crate::backend::Target, x86_bmi1: bool) -> bool {
     target == crate::backend::Target::X86_64
         && x86_bmi1
-        && std::env::var_os("CCC_NO_ANDN_FUSION").is_none()
+        && crate::backend::generation::andn_fusion_env_enabled()
 }
 
 fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32) {
