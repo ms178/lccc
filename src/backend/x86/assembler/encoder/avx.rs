@@ -691,8 +691,18 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(src), Operand::Register(dst)) => {
-                let dst_num =
-                    self.emit_evex_memop(&dst.name, mem, Some(&src.name), 1, w, 1, ll, z, aaa, false)?;
+                let dst_num = self.emit_evex_memop(
+                    &dst.name,
+                    mem,
+                    Some(&src.name),
+                    1,
+                    w,
+                    1,
+                    ll,
+                    z,
+                    aaa,
+                    false,
+                )?;
                 self.bytes.push(count_op);
                 // The count is always a fixed 128-bit tuple (N=16), whatever
                 // the destination vector length.
