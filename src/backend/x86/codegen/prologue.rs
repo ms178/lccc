@@ -1,8 +1,8 @@
 //! X86Codegen: prologue, epilogue, parameter storage.
 
 use super::emit::{
-    X86_APX_EGPRS, X86_ARG_REGS, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP, X86_CALLER_SAVED,
-    X86Codegen, collect_inline_asm_callee_saved_x86, is_xmm_reg, phys_reg_name,
+    HomeWrite, X86_APX_EGPRS, X86_ARG_REGS, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP,
+    X86_CALLER_SAVED, X86Codegen, collect_inline_asm_callee_saved_x86, is_xmm_reg, phys_reg_name,
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
@@ -1593,6 +1593,12 @@ impl X86Codegen {
         self.home_clobbered.clear();
         self.home_sharers.clear();
         self.value_live_segments.clear();
+        self.home_write_state.clear();
+        self.home_branch_snapshots.clear();
+        self.home_branch_edge_srcs.clear();
+        self.home_fallthrough = false;
+        self.home_entry_pending = true;
+        self.home_indirect_seen = false;
         for (&v, &reg) in &self.reg_assignments {
             self.home_sharers.entry(reg.0).or_default().push(v);
         }
@@ -3731,6 +3737,56 @@ impl X86Codegen {
             for (dest, is_f32, scratch) in scratch_saves {
                 let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
                 self.state.out.emit_instr_reg_reg(mnemonic, scratch, dest);
+            }
+        }
+
+        // ── Entry write-state seeds (the exact alias-freshness law) ────────
+        // A parameter is entry-established — its home register provably
+        // holds the value from the first emitted body instruction on — in
+        // exactly two regimes, both known here at the end of the prologue:
+        //   * pre-stored: the prologue itself emitted the establishing move
+        //     (immediate callee-saved copy, ordered caller-saved parallel
+        //     copy, FP pre-store, or the early ABI read), recorded in
+        //     `param_pre_stored`; and
+        //   * ABI-stay: the caller-homed entry prefix leaves the value in
+        //     its incoming SysV integer-argument register, which IS its
+        //     home, and `emit_param_ref` emits nothing for it.
+        // Every other regime writes the home at its own definition site and
+        // records itself through the normal definition notes.
+        {
+            let caller_homes = crate::backend::regalloc::x86_param_caller_homes_safe_with_config(
+                func,
+                &self.state.ra_config,
+            );
+            // SysV integer-argument register name -> home PhysReg id (rcx is
+            // reserved scratch and never a home).
+            let abi_home: fn(&str) -> Option<u8> = |name| match name {
+                "rdi" => Some(14),
+                "rsi" => Some(15),
+                "rdx" => Some(16),
+                "r8" => Some(12),
+                "r9" => Some(13),
+                _ => None,
+            };
+            for (i, param) in func.params.iter().enumerate() {
+                let Some(dest) = paramref_dests[i] else {
+                    continue;
+                };
+                let Some(&home) = self.reg_assignments.get(&dest.0) else {
+                    continue;
+                };
+                if self.state.param_pre_stored.contains(&i) {
+                    self.home_write_state.insert(home.0, HomeWrite::Def(dest.0));
+                    continue;
+                }
+                if caller_homes {
+                    if let ParamClass::IntReg { reg_idx } = param_classes[i] {
+                        let abi_name = X86_ARG_REGS[reg_idx];
+                        if abi_home(abi_name) == Some(home.0) {
+                            self.home_write_state.insert(home.0, HomeWrite::Def(dest.0));
+                        }
+                    }
+                }
             }
         }
     }

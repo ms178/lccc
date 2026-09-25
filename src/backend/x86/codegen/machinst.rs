@@ -494,6 +494,48 @@ pub enum MachInst {
     Raw(String),
 }
 
+impl MachInst {
+    /// Push every register this instruction WRITES in a destination
+    /// POSITION (an explicit dst operand, post-allocation `MachReg::Phys`).
+    /// Implicit architecture-mandated writes (Cqto/Div → rax:rdx,
+    /// XorRdx → rdx, call caller-clobbers, Raw barriers) are deliberately
+    /// NOT included — the window write-state classifier adds them from the
+    /// variant itself, because their register targets carry a DIFFERENT
+    /// meaning (ABI-fixed scratch, not a pre-colored definition).
+    pub fn dst_write_regs(&self, out: &mut Vec<MachReg>) {
+        match self {
+            MachInst::Mov { dst, .. } | MachInst::FMov { dst, .. } => match dst {
+                MachOperand::Reg(r) => out.push(*r),
+                _ => {}
+            },
+            MachInst::FAlu { dst, .. }
+            | MachInst::Movzx { dst, .. }
+            | MachInst::Movsx { dst, .. }
+            | MachInst::Alu { dst, .. }
+            | MachInst::Imul3 { dst, .. }
+            | MachInst::Neg { dst, .. }
+            | MachInst::Not { dst, .. }
+            | MachInst::Shift { dst, .. }
+            | MachInst::ShiftX { dst, .. }
+            | MachInst::Rorx { dst, .. }
+            | MachInst::Lea { dst, .. }
+            | MachInst::LeaSym { dst, .. }
+            | MachInst::LeaSlot { dst, .. }
+            | MachInst::SetCC { dst, .. }
+            | MachInst::Cmov { dst, .. } => out.push(*dst),
+            MachInst::Mov128 { dst, .. } => match dst {
+                MachOperand::Reg(r) => out.push(*r),
+                _ => {}
+            },
+            // No destination-position register write: flag-only (Cmp,
+            // Test), control flow (Jcc/Jmp/Label/Ret/Call), implicit-only
+            // (Cqto/XorRdx/Div/CallTyped — the caller models their writes),
+            // and the Raw barrier.
+            _ => {}
+        }
+    }
+}
+
 // ── Well-known physical register IDs ─────────────────────────────────────
 //
 // PhysReg IDs match the existing codegen convention (emit.rs:79-88).

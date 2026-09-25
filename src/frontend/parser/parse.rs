@@ -180,6 +180,11 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_cleanup_fn: Option<String>,
     /// `__attribute__((symver("name@@VERSION")))` symbol version string.
     pub parsing_symver: Option<String>,
+    /// `__attribute__((__diagnose_as(__builtin_NAME, ...)))` — the builtin
+    /// the declared function is an alias of (the kernel's fortify-string
+    /// family).  Calls that survive inlining must fold to the builtin, or
+    /// the extern declaration resolves to nothing at link time.
+    pub parsing_diagnose_as: Option<String>,
     /// `__attribute__((regparm(N)))` register-argument count.
     pub parsing_regparm: Option<u8>,
     /// `__attribute__((vector_size(N)))` total vector size in bytes.
@@ -1274,6 +1279,14 @@ impl Parser {
                 self.advance();
                 self.attrs.parsing_section = self.parse_string_attr_arg();
             }
+            "__diagnose_as"
+            | "diagnose_as"
+            | "__diagnose_as__"
+            | "__diagnose_as_builtin__"
+            | "diagnose_as_builtin" => {
+                self.advance();
+                self.parse_diagnose_as_attr();
+            }
             "symver" | "__symver__" => {
                 self.advance();
                 self.attrs.parsing_symver = self.parse_string_attr_arg();
@@ -1446,6 +1459,35 @@ impl Parser {
     }
 
     /// Parse cleanup(func_name) attribute.
+    /// Parse `__diagnose_as(__builtin_NAME, ...)`: record the builtin NAME
+    /// (the `__builtin_` prefix is stripped) and skip the remaining
+    /// argument-position list (analyzer metadata; every folding consumer
+    /// maps the declared arguments onto the builtin identically).
+    fn parse_diagnose_as_attr(&mut self) {
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return;
+        }
+        self.advance();
+        if let TokenKind::Identifier(name) = self.peek() {
+            if let Some(builtin) = name.strip_prefix("__builtin_") {
+                self.attrs.parsing_diagnose_as = Some(builtin.to_string());
+            }
+            self.advance();
+        }
+        // Skip the comma-separated argument-position list to the matching
+        // closing paren (depth tracks nested parens inside the attr args).
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.peek() {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth -= 1,
+                TokenKind::Eof => break,
+                _ => {}
+            }
+            self.advance();
+        }
+    }
+
     fn parse_cleanup_attr(&mut self) {
         if !matches!(self.peek(), TokenKind::LParen) {
             return;

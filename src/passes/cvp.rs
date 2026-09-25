@@ -236,6 +236,74 @@ fn truth_set(op: IrCmpOp, c: i128, bits: u32) -> Set {
     normalize(raw)
 }
 
+/// True when `op` provably evaluates to a never-null address at runtime:
+/// the address of a defined symbol, a frame alloca, a code label, or the
+/// stack pointer — possibly through Copy residue left by earlier passes.
+/// C11 gives every object a distinct, non-null address (6.5.3.2, 7.19),
+/// and frame/stack addresses derive from %rsp, so comparing any of them
+/// against NULL has a compile-time answer.  Deliberately NOT covered:
+/// casts (an inttoptr round-trip can re-enter 0), GEPs (offset arithmetic
+/// on a null base is C undefined behavior, but the IR-level value is not
+/// provably non-null without UB reasoning), and GetStaticChain (zero for
+/// functions without a static chain).
+fn never_null_address(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    op: &Operand,
+    depth: u8,
+) -> bool {
+    let Operand::Value(v) = op else {
+        return false;
+    };
+    let Some(&(bi, ii)) = defs.get(v) else {
+        return false;
+    };
+    match &func.blocks[bi].instructions[ii] {
+        Instruction::GlobalAddr { .. }
+        | Instruction::Alloca { .. }
+        | Instruction::DynAlloca { .. }
+        | Instruction::LabelAddr { .. }
+        | Instruction::StackSave { .. } => true,
+        Instruction::Copy { src, .. } if depth > 0 => {
+            never_null_address(func, defs, src, depth - 1)
+        }
+        _ => false,
+    }
+}
+
+fn is_null_const(op: &Operand) -> bool {
+    matches!(op, Operand::Const(k) if k.to_i128() == Some(0))
+}
+
+/// The compile-time verdict of comparing a never-null address against NULL
+/// (either operand order).  Pointer comparisons are unsigned by ABI, so
+/// the full unsigned predicate set has an answer; signed predicates on
+/// pointers never occur from C lowering and stay unfolded by choice.
+fn null_compare_verdict(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> Option<bool> {
+    let verdict = match op {
+        IrCmpOp::Eq => Some(false),
+        IrCmpOp::Ne => Some(true),
+        IrCmpOp::Ult => Some(false),
+        IrCmpOp::Ule => Some(true),
+        IrCmpOp::Ugt => Some(false),
+        IrCmpOp::Uge => Some(true),
+        _ => None,
+    }?;
+    if never_null_address(func, defs, lhs, 4) && is_null_const(rhs) {
+        return Some(verdict);
+    }
+    if never_null_address(func, defs, rhs, 4) && is_null_const(lhs) {
+        return Some(verdict);
+    }
+    None
+}
+
 fn swap_op(op: IrCmpOp) -> IrCmpOp {
     match op {
         IrCmpOp::Eq => IrCmpOp::Eq,
@@ -543,7 +611,8 @@ fn decide_bool(
                     Instruction::Copy { src, .. } => go(stack, func, defs, src, depth - 1),
                     Instruction::Cmp {
                         op, lhs, rhs, ty, ..
-                    } => decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?),
+                    } => decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?)
+                        .or_else(|| null_compare_verdict(func, defs, *op, lhs, rhs)),
                     _ => None,
                 }
             }
@@ -606,10 +675,15 @@ pub fn run_function(func: &mut IrFunction) -> usize {
     let mut selects: FxHashMap<Value, (Operand, Operand, Operand)> = FxHashMap::default();
     for (bi, b) in func.blocks.iter().enumerate() {
         for (ii, inst) in b.instructions.iter().enumerate() {
+            // `defs` covers EVERY value definition, not just compares: the
+            // never-null-address law must see the GlobalAddr/Alloca/LabelAddr
+            // producer behind a null test.  Consumers that only care about
+            // compares guard with `if let Instruction::Cmp`, so the wider
+            // map is behavior-identical for them.
+            if let Some(dest) = inst.dest() {
+                defs.insert(dest, (bi, ii));
+            }
             match inst {
-                Instruction::Cmp { dest, .. } => {
-                    defs.insert(*dest, (bi, ii));
-                }
                 Instruction::Copy { dest, src } => {
                     copies.insert(*dest, *src);
                 }
@@ -732,6 +806,7 @@ pub fn run_function(func: &mut IrFunction) -> usize {
                         ty,
                     } => canonical_pred(*op, lhs, rhs, *ty)
                         .and_then(|p| decide_pred(&stack, p))
+                        .or_else(|| null_compare_verdict(func, &defs, *op, lhs, rhs))
                         .map(|t| Instruction::Copy {
                             dest: *dest,
                             src: bool_const(t),
@@ -993,6 +1068,150 @@ mod tests {
             bits: 32,
         };
         assert_eq!(decide_pred(&stack, narrow), None);
+    }
+
+    fn global_addr_null_compare_case(op: IrCmpOp, swap: bool) -> IrFunction {
+        // b0: v0 = &global; v1 = (v0 OP NULL); br v1, b1, b2
+        let lhs = if swap {
+            Operand::Const(IrConst::I64(0))
+        } else {
+            Operand::Value(Value(0))
+        };
+        let rhs = if swap {
+            Operand::Value(Value(0))
+        } else {
+            Operand::Const(IrConst::I64(0))
+        };
+        let mut f = IrFunction::new("nullcmp".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(0),
+                        name: "bench_data".to_string(),
+                    },
+                    Instruction::Cmp {
+                        dest: Value(1),
+                        op,
+                        lhs,
+                        rhs,
+                        ty: IrType::U64,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(
+                1,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(1)))),
+            ),
+            mk(
+                2,
+                vec![],
+                Terminator::Return(Some(Operand::Const(IrConst::I64(2)))),
+            ),
+        ];
+        f.next_value_id = 3;
+        f
+    }
+
+    #[test]
+    fn global_addr_never_null_folds_eq_null_compare_and_prunes_guard() {
+        // &global == NULL is always false (C11 6.5.3.2: every object has a
+        // distinct non-null address), so the compare folds to 0 and the
+        // guard prunes to the false edge.
+        let mut f = global_addr_null_compare_case(IrCmpOp::Eq, false);
+        let n = run_function(&mut f);
+        assert!(
+            n >= 1,
+            "null-compare against &global must fold (folded {n})"
+        );
+        assert!(matches!(
+            f.blocks[0].instructions[1],
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(0)),
+                ..
+            }
+        ));
+        // The guard is now decidable and must have pruned to the false edge.
+        assert!(matches!(
+            f.blocks[0].terminator,
+            Terminator::Branch(BlockId(2))
+        ));
+    }
+
+    #[test]
+    fn global_addr_never_null_folds_swapped_ne_compare() {
+        // NULL != &global is always true, operand order notwithstanding.
+        let mut f = global_addr_null_compare_case(IrCmpOp::Ne, true);
+        run_function(&mut f);
+        assert!(matches!(
+            f.blocks[0].instructions[1],
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(1)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.blocks[0].terminator,
+            Terminator::Branch(BlockId(1))
+        ));
+    }
+
+    #[test]
+    fn global_addr_null_law_reaches_through_gvn_copy_residue() {
+        // v0 = &global; v2 = copy v0; v3 = (v2 == NULL) — the copy chain
+        // (GVN residue) must not hide the never-null fact.
+        let mut f = global_addr_null_compare_case(IrCmpOp::Eq, false);
+        f.blocks[0].instructions.insert(
+            1,
+            Instruction::Copy {
+                dest: Value(3),
+                src: Operand::Value(Value(0)),
+            },
+        );
+        f.blocks[0].instructions[2] = Instruction::Cmp {
+            dest: Value(1),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(3)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::U64,
+        };
+        f.next_value_id = 4;
+        run_function(&mut f);
+        assert!(matches!(
+            f.blocks[0].instructions[2],
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(0)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_value_null_compare_stays_untouched() {
+        // A null test on a function PARAMETER has no compile-time verdict;
+        // the law must not fold it (soundness of the never-null premise).
+        let mut f = global_addr_null_compare_case(IrCmpOp::Eq, false);
+        f.blocks[0].instructions[0] = Instruction::Cmp {
+            dest: Value(1),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(4)), // undefined/param-ish value
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::U64,
+        };
+        f.next_value_id = 5;
+        let n = run_function(&mut f);
+        assert_eq!(n, 0, "no fold without a never-null producer");
+        assert!(matches!(
+            f.blocks[0].instructions[0],
+            Instruction::Cmp { .. }
+        ));
     }
 
     fn mk(id: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {

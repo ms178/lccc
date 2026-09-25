@@ -553,6 +553,12 @@ jobs:
           bash tests/regression/check_tight_loop_align.sh
           bash tests/regression/check_i686_atomics.sh
           bash tests/regression/check_i686_tls_ie_relax.sh
+          bash tests/regression/check_i686_integer_isa_parity.sh
+          bash tests/regression/check_fortify_diagnose_as.sh
+          bash tests/regression/check_asm_case_insensitive.sh
+          bash tests/regression/check_debug_info_flags.sh
+          bash tests/regression/check_dep_files.sh
+          bash tests/regression/check_i686_boot_asm.sh
           bash tests/regression/check_narrow_cmp_flag_law.sh
           bash tests/regression/check_boot_size_measurement.sh
           bash tests/regression/check_env_test_hygiene.sh

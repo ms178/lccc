@@ -781,6 +781,91 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
         // most once into a given caller. This permits one profitable
         // specialization while avoiding repeated medium-body expansion.
         let mut size_inlined_large_callees: FxHashSet<String> = FxHashSet::default();
+        // ── Phase 0: mandatory always_inline drain ───────────────────────
+        // `__always_inline` is GCC's FORCE contract, not a scheduling
+        // preference: the call must never survive (`extern __gnu_inline__
+        // __always_inline__` wrappers — the kernel's whole fortify-string
+        // family — have no out-of-line body, so one surviving call is a
+        // hard undefined-symbol link error).  The contract cannot be left
+        // to the economics below: the ordinary fixpoint inlines ONE site
+        // per round under a 200-round cap, and always_inline callees that
+        // replicate through macro dispatchers (each inlined clone
+        // re-entering the same dispatcher) burn rounds faster than the
+        // queue drains — integrity_audit.o's single fortify_memset_chk site
+        // was starved exactly so and the vmlinux link died on the undefined
+        // extern.
+        //
+        // Three laws make the phase sound:
+        //   * priority: sites present at phase entry — every block whose
+        //     label is <= the module-wide label maximum snapshot, since
+        //     cloned blocks always take labels strictly above
+        //     `global_max_block_id` — are drained before any clone-born
+        //     site, so the contract never queues behind churn;
+        //   * termination: each entry site is consumed by its own inlining
+        //     (|entry sites| steps), and clone-born sites share one bounded
+        //     work counter (2x entry sites + 16), so a recursive dispatcher
+        //     chain cannot chase the phase forever;
+        //   * no budget gate: a mandatory inline is not an allocation
+        //     decision, and phase successes do not touch the economics
+        //     budgets the ordinary passes then spend purely on profit.
+        let entry_max_label = global_max_block_id;
+        let entry_always_inline_sites = find_inline_call_sites(
+            &module.functions[func_idx],
+            &callee_map,
+            &skip_list,
+            caller_has_section,
+        )
+        .into_iter()
+        .filter(|s| {
+            callee_map
+                .get(&s.callee_name)
+                .is_some_and(|d| d.is_always_inline)
+        })
+        .count();
+        let mut phase0_budget = 2 * entry_always_inline_sites + 16;
+        while phase0_budget > 0 {
+            let sites = find_inline_call_sites(
+                &module.functions[func_idx],
+                &callee_map,
+                &skip_list,
+                caller_has_section,
+            );
+            let is_mandatory = |s: &InlineCallSite| {
+                callee_map
+                    .get(&s.callee_name)
+                    .is_some_and(|d| d.is_always_inline)
+            };
+            // Original-label sites first; clone-born sites only once the
+            // last original is gone.
+            let site = sites
+                .iter()
+                .find(|s| {
+                    is_mandatory(s)
+                        && module.functions[func_idx].blocks[s.block_idx].label.0 <= entry_max_label
+                })
+                .or_else(|| sites.iter().find(|s| is_mandatory(s)))
+                .cloned();
+            let Some(site) = site else { break };
+            let callee_data = &callee_map[&site.callee_name];
+            if !inline_call_site(
+                &mut module.functions[func_idx],
+                &site,
+                callee_data,
+                &mut global_max_block_id,
+            ) {
+                break;
+            }
+            phase0_budget -= 1;
+            total_inlined += 1;
+            module.functions[func_idx].has_inlined_calls = true;
+            if debug_inline {
+                eprintln!(
+                    "[INLINE] Phase-0 drained always_inline '{}' in '{}'",
+                    site.callee_name, module.functions[func_idx].name
+                );
+            }
+        }
+
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
         // Limit iterations to prevent infinite loops from recursive inline functions.
         let max_rounds = 200;
@@ -4681,5 +4766,139 @@ mod value_reference_tests {
             });
         let (referenced, asm) = collect_value_referenced_functions(&module);
         assert!(function_referenced_as_value("callee", &referenced, &asm));
+    }
+}
+
+#[cfg(test)]
+mod phase0_drain_tests {
+    use super::*;
+    use crate::common::types::EightbyteClass;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, CallInfo, Instruction, IrBinOp, IrConst, IrFunction, IrModule,
+        IrParam, Operand, Terminator, Value,
+    };
+
+    fn param0() -> Operand {
+        Operand::Value(Value(0))
+    }
+
+    fn void_call(callee: &str, arg: Operand) -> Instruction {
+        Instruction::Call {
+            func: callee.to_string(),
+            info: CallInfo {
+                args: vec![arg],
+                arg_types: vec![IrType::I32],
+                return_type: IrType::Void,
+                num_fixed_args: 1,
+                ..crate::ir::reexports::CallInfo::default()
+            },
+        }
+    }
+
+    /// The scheduler-starvation shape behind kernel integrity_audit.o's
+    /// surviving `fortify_memset_chk` call (F12): an always_inline callee
+    /// that REPLICATES its own call sites through macro dispatchers (each
+    /// inlined clone re-entering the same dispatcher — modeled by two
+    /// self-calls, net +1 site per inline) sits in front of a plain
+    /// always_inline callee in block order.  The economics passes inline
+    /// ONE site per round under a 200-round cap, so the replicator burns
+    /// every round and the plain callee's contract call survives — a hard
+    /// undefined-symbol link error for `extern __gnu_inline__` wrappers.
+    /// Phase 0 must drain the entry sites BEFORE the churn can matter.
+    #[test]
+    fn phase0_drains_contract_sites_despite_replicating_dispatchers() {
+        let mut replicator = IrFunction::new("replicator".to_string(), IrType::Void, vec![], false);
+        replicator.is_static = true;
+        replicator.is_always_inline = true;
+        replicator.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: param0(),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                // Two self-calls: every inlining of this body leaves ONE
+                // more replicator site behind than it consumed.
+                void_call("replicator", Operand::Value(Value(1))),
+                void_call("replicator", Operand::Value(Value(1))),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let _ = replicator.next_value_id;
+
+        let mut fortify_like =
+            IrFunction::new("fortify_like".to_string(), IrType::I32, vec![], false);
+        fortify_like.is_static = true;
+        fortify_like.is_always_inline = true;
+        // 8 adds: above the tiny threshold, so the old selector never
+        // reached it once the replicator's tiny sites monopolized rounds.
+        let mut insts = Vec::new();
+        for i in 1..=8u32 {
+            insts.push(Instruction::BinOp {
+                dest: Value(i),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(i - 1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            });
+        }
+        fortify_like.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut caller = IrFunction::new("f".to_string(), IrType::Void, vec![], false);
+        caller.next_value_id = 10;
+        caller.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+                void_call("replicator", param0()),
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        caller.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![Instruction::Call {
+                func: "fortify_like".to_string(),
+                info: CallInfo {
+                    dest: Some(Value(9)),
+                    args: vec![param0()],
+                    arg_types: vec![IrType::I32],
+                    return_type: IrType::I32,
+                    num_fixed_args: 1,
+                    ..crate::ir::reexports::CallInfo::default()
+                },
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+
+        let mut module = IrModule::new();
+        module.functions = vec![caller, replicator, fortify_like];
+
+        super::inline_run(&mut module, false);
+
+        let caller = &module.functions[0];
+        let survives = caller.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Call { func, .. } if func == "fortify_like"))
+        });
+        assert!(
+            !survives,
+            "always_inline contract site survived the inliner: \
+             Phase 0 must drain entry sites before clone churn"
+        );
     }
 }

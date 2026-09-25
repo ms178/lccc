@@ -2187,6 +2187,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
             // that a `.pushsection` data block referencing back into `.text`
             // is emitted lexically after the code it describes.
             let resolve = |me: &Self, sym: &String| -> Option<(usize, u64)> {
+                // `.` is the location counter at THIS directive (GAS
+                // data-directive semantics; the SymbolDiffScaled path
+                // materializes the same anchor as a synthetic .Ldot label).
+                // The compressed boot's IDT limit uses it:
+                // `.word . - boot32_idt - 1`.
+                if sym == "." {
+                    return Some((*sec_idx, *offset as u64));
+                }
                 if let Some(p) = me.label_positions.get(sym).copied() {
                     return Some(p);
                 }

@@ -34,6 +34,9 @@ pub struct FunctionAttributes {
     pub visibility: Option<String>,
     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
     pub symver: Option<String>,
+    /// __attribute__((__diagnose_as(__builtin_NAME, ...))) - builtin alias
+    /// (mirrored from DeclAttributes for definitions; see expr_calls.rs).
+    pub diagnose_as: Option<String>,
     /// __attribute__((regparm(N))) - pass N integer args in EAX/EDX/ECX.
     /// None = attribute absent; Some(N) with N in 0..=3 (GCC semantics:
     /// bare `regparm` means N = 3; the global -mregparm flag applies only
@@ -595,6 +598,10 @@ pub struct DeclAttributes {
     pub cleanup_fn: Option<String>,
     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
     pub symver: Option<String>,
+    /// __attribute__((__diagnose_as(__builtin_NAME, ...))) - the declared
+    /// function is an analyzer alias of builtin NAME; calls that survive
+    /// inlining fold to the builtin (kernel fortify-string family).
+    pub diagnose_as: Option<String>,
     /// __attribute__((regparm(N))) on a function declaration.
     pub regparm: Option<u8>,
 }

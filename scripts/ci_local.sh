@@ -270,6 +270,24 @@ gate "seg-prefix-full-matrix" fast \
 gate "i686-atomics" fast \
     bash tests/regression/check_i686_atomics.sh
 
+gate "i686-integer-isa-parity" fast \
+    bash tests/regression/check_i686_integer_isa_parity.sh
+
+gate "fortify-diagnose-as" fast \
+    bash tests/regression/check_fortify_diagnose_as.sh
+
+gate "asm-case-insensitive" fast \
+    bash tests/regression/check_asm_case_insensitive.sh
+
+gate "debug-info-flags" fast \
+    bash tests/regression/check_debug_info_flags.sh
+
+gate "dep-files" fast \
+    bash tests/regression/check_dep_files.sh
+
+gate "i686-boot-asm" fast \
+    bash tests/regression/check_i686_boot_asm.sh
+
 gate "i686-asm-diff" fast \
     python3 scripts/asmdiff.py --32 --lccc target/fastbuild/lccc-i686
 gate "i686-tls-ie-relax" fast \

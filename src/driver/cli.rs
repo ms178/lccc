@@ -743,9 +743,56 @@ impl Driver {
                     self.omit_frame_pointer = true;
                 }
 
-                // Debug info
-                "-g" => self.debug_info = true,
-                arg if arg.starts_with("-g") && arg.len() > 2 => self.debug_info = true,
+                // Debug info — GCC flag semantics, honored exactly:
+                //   -g / -ggdb / -g<N> / -ggdb<N> / -gdwarf-<N>  enable debug
+                //     info (level and version selectors all mean "emit debug").
+                //   -g0 / -ggdb0                                 explicitly
+                //     DISABLE debug info (the old `starts_with("-g")` blanket
+                //     inverted GCC's meaning of -g0).
+                //   -gno-*                                       modifier forms
+                //     that switch a debug FEATURE off; they must never turn
+                //     debug info ON for a TU compiled without -g.
+                //   -gsplit-dwarf: split DWARF (.dwo side files) is not
+                //     implemented — warn and continue with non-split debug
+                //     info rather than silently ignoring the request.
+                //   -gz / -gz=<type>: compressed debug sections are not
+                //     implemented — warn; the flag only selects compression,
+                //     so it changes nothing about whether debug info is built.
+                // Unknown `-g*` selectors keep the historical blanket-enable:
+                // a future spelling must not silently turn debug OFF.
+                "-g0" | "-ggdb0" => self.debug_info = false,
+                "-g" | "-ggdb" => self.debug_info = true,
+                "-gsplit-dwarf" => {
+                    self.debug_info = true;
+                    eprintln!(
+                        "lccc: warning: -gsplit-dwarf is not supported; \
+                         emitting non-split debug info"
+                    );
+                }
+                "-gz" => eprintln!(
+                    "lccc: warning: compressed debug sections (-gz) are not \
+                     supported; emitting uncompressed debug info"
+                ),
+                arg if arg.starts_with("-gz=") => eprintln!(
+                    "lccc: warning: compressed debug sections ({}) are not \
+                     supported; emitting uncompressed debug info",
+                    arg
+                ),
+                arg if arg.starts_with("-gno-") => {}
+                arg if arg.starts_with("-gdwarf-") => self.debug_info = true,
+                arg if arg.len() > 5
+                    && arg.starts_with("-ggdb")
+                    && arg[5..].bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    self.debug_info = true
+                }
+                arg if arg.len() > 2
+                    && arg.starts_with("-g")
+                    && arg[2..].bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    self.debug_info = true
+                }
+                arg if arg.starts_with("-g") => self.debug_info = true,
 
                 // Verbose/diagnostic flags
                 "-v" | "--verbose" => self.verbose = true,
@@ -806,11 +853,17 @@ impl Driver {
                     }
                 }
 
-                // Preprocessor pass-through: -Wp,-MMD,path or -Wp,-MD,path
+                // Preprocessor pass-through: -Wp,-MMD,path / -Wp,-MD,path /
+                // -Wp,-MP.  The kernel build compiles with -Wp,-MMD,$@; the
+                // system-header verdict MUST follow the flag (MMD filters,
+                // MD keeps), exactly like the bare spellings above.
                 arg if arg.starts_with("-Wp,") => {
                     let flags: Vec<&str> = arg[4..].splitn(2, ',').collect();
                     if flags.len() == 2 && (flags[0] == "-MMD" || flags[0] == "-MD") {
                         self.dep_file = Some(flags[1].to_string());
+                        self.dep_exclude_system = flags[0] == "-MMD";
+                    } else if flags.len() == 1 && flags[0] == "-MP" {
+                        self.dep_phony = true;
                     }
                 }
 
@@ -1925,19 +1978,36 @@ impl Driver {
                     }
                 }
 
-                // Dependency generation flags
-                "-MD" | "-MMD" => {
+                // Dependency generation flags — GCC semantics:
+                //   -MD: deps including system-directory headers,
+                //   -MMD: deps with system-directory headers filtered out
+                //   (the filter is DIRECTORY-based, not bracket-based),
+                //   -MP: emit phony rules so deleting a header doesn't
+                //   break an unchanged make graph,
+                //   -M / -MM: dependency-only mode (implies -E); -MM
+                //   applies the same system-directory filter as -MMD.
+                "-MD" => {
                     if self.dep_file.is_none() {
                         self.dep_file = Some(String::new());
                     }
+                    self.dep_exclude_system = false;
                 }
-                "-MP" => {}
-                "-M" | "-MM" => {
-                    // -M/-MM: dependency-only mode. Preprocess and output
-                    // make rules instead of compiling. GCC treats -M/-MM
-                    // as implying -E.
+                "-MMD" => {
+                    if self.dep_file.is_none() {
+                        self.dep_file = Some(String::new());
+                    }
+                    self.dep_exclude_system = true;
+                }
+                "-MP" => self.dep_phony = true,
+                "-M" => {
                     self.dep_only = true;
                     self.mode = CompileMode::PreprocessOnly;
+                    self.dep_exclude_system = false;
+                }
+                "-MM" => {
+                    self.dep_only = true;
+                    self.mode = CompileMode::PreprocessOnly;
+                    self.dep_exclude_system = true;
                 }
                 "-MF" => {
                     i += 1;

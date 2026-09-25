@@ -148,7 +148,14 @@ fn prefix_stem(mnemonic: &str) -> String {
 /// forms are `Operand::Indirect`, never bare labels, so they are
 /// unaffected either way.)
 fn mnemonic_takes_label(mnemonic: &str) -> bool {
-    let m = mnemonic.strip_suffix(".s").unwrap_or(mnemonic);
+    // GAS mnemonics are case-insensitive (`CALL foo` == `call foo`); the
+    // kernel's assembly uses both spellings.  Normalize before matching or
+    // `CALL`/`JMP` lose their label classification and the bare label
+    // falls through to the generic-expression path.
+    let m = mnemonic
+        .strip_suffix(".s")
+        .unwrap_or(mnemonic)
+        .to_ascii_lowercase();
     m == "xbegin"
         || m.starts_with('j') // jmp/jcc/jecxz/jrcxz/jcxz (all branches)
         || m.starts_with("loop") // loop/loope/loopne/loopz/loopnz
@@ -4108,7 +4115,12 @@ impl InstructionEncoder {
                 }
             }
             "vptest" => {
-                // VEX.128.66.0F38 17 /r
+                // VEX.NDS.128/256.66.0F38 17 /r. Both the register and the
+                // memory form are load-bearing: the kernel's
+                // aes-gcm-aesni-x86_64.S tests unaligned memory operands
+                // directly (`vptest \mem, \reg` in its _test_mem macro),
+                // and a fresh tree assembles that file with lccc as the
+                // integrated assembler.
                 if ops.len() != 2 {
                     return Err("vptest requires 2 operands".to_string());
                 }
@@ -4129,7 +4141,10 @@ impl InstructionEncoder {
                         Ok(())
                     }
                     // mem source (GAS 2.47: `vptest (%rdi), %xmm4`
-                    // -> `c4 e2 7d 17 20`).
+                    // -> `c4 e2 7d 17 20`).  The modrm.reg field holds the
+                    // (Intel) destination register, modrm.rm the memory
+                    // operand; L follows the register width; VEX.B/X come
+                    // from the memory base/index.
                     (Operand::Memory(mem), Operand::Register(dst)) => {
                         let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                         let l = if is_ymm(&dst.name) { 1 } else { 0 };

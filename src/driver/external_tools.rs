@@ -396,17 +396,41 @@ impl Driver {
             };
             // Prefer the -MT/-MQ target when given (glibc passes -MT $@).
             let target = self.dep_target.as_deref().unwrap_or(output_file);
-            if input_file == "-" {
+            // GCC-format rule: source first, then every header actually
+            // opened during preprocessing in first-open order (preprocessor
+            // dep tracking), with -MMD applying GCC's directory-based
+            // system filter.  Short lists are a single line, byte-identical
+            // to GCC's output; long lists stay unwrapped (valid make, and
+            // exactly what fixdep/scons/ninja-style consumers parse).
+            let mut prereqs: Vec<String> = Vec::new();
+            if input_file != "-" {
+                prereqs.push(input_file.to_string());
+            }
+            for (path, system_dir) in self.last_dep_files.borrow().iter() {
+                if self.dep_exclude_system && *system_dir {
+                    continue;
+                }
+                prereqs.push(path.to_string_lossy().into_owned());
+            }
+            let content = if prereqs.is_empty() {
                 // Input came from stdin (glibc compiles syscall stubs with
                 // `-x assembler-with-cpp -`). GCC omits the stdin pseudo-source
                 // from the dependency rule; writing "<stdin>" here makes make
                 // fail with "No rule to make target '<stdin>'". Emit a bare
                 // "target:" rule (valid make syntax) plus no prerequisites.
-                let _ = std::fs::write(&dep_path, format!("{}:\n", target));
+                format!("{}:\n", target)
             } else {
-                let content = format!("{}: {}\n", target, input_file);
-                let _ = std::fs::write(&dep_path, content);
+                format!("{}: {}\n", target, prereqs.join(" "))
+            };
+            let mut content = content;
+            if self.dep_phony {
+                // -MP: one phony rule per prerequisite (GCC emits these after
+                // the main rule, separated by blank lines).
+                for p in prereqs.iter().skip(usize::from(input_file != "-")) {
+                    content.push_str(&format!("\n{}:\n", p));
+                }
             }
+            let _ = std::fs::write(&dep_path, content);
         }
     }
 }

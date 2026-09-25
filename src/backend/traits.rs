@@ -2042,6 +2042,32 @@ pub trait ArchCodegen {
         out.newline();
     }
 
+    // ── Register home write-state dataflow (x86-64 alias-freshness law) ────
+    // The x86-64 backend keeps, per home-carrying physical register, WHAT
+    // the last write along every path reaching the current emission point
+    // was; the alias-blessing predicate reads it (audit-of-#603 H1).  These
+    // hooks feed the CFG structure into that state.  Default
+    // implementations are no-ops for every target without the law.
+
+    /// Announce that emission reached the top of the block `label`: the
+    /// target's write state merges its recorded branch-edge snapshots
+    /// (and the fallthrough state, when the previous block falls through).
+    fn begin_home_write_block(&mut self, _label: BlockId) {}
+
+    /// Announce a terminator control edge to `label`.  Called AFTER the
+    /// branch's register effects were emitted, so the snapshot reflects
+    /// the state on that edge exactly.
+    fn record_branch_edge(&mut self, _label: BlockId) {}
+
+    /// Announce whether the just-emitted terminator falls through into the
+    /// textually next block (false after unconditional branches, returns,
+    /// indirect branches and switch dispatchers).
+    fn set_home_fallthrough(&mut self, _falls_through: bool) {}
+
+    /// Poison the write state: from here on, no register's last write is
+    /// provable (computed-Goto targets: every label is a potential edge).
+    fn poison_home_write_state(&mut self) {}
+
     /// Emit an unreachable trap instruction.
     fn emit_unreachable(&mut self) {
         let trap = self.trap_instruction();

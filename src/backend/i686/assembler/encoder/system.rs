@@ -204,6 +204,35 @@ impl super::InstructionEncoder {
     /// 0F 00 /r group (sldt/lldt/ltr/str): register form only, r/m16.
     /// GAS encodes `lldt %ax` as `0f 00 d0` — no operand-size prefix; the
     /// operand is architecturally 16-bit regardless of spelling.
+    /// RDRAND/RDSEED register form: 0F C7 /6|/7 with mod=11.  The ISA
+    /// defines no memory form.  An %ax destination takes the operand-size
+    /// prefix; 32-bit destinations encode bare (no REX in i686).
+    pub(super) fn encode_rdrand_rdseed(
+        &mut self,
+        ops: &[Operand],
+        reg_ext: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("rdrand/rdseed requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let rm = reg_num(&reg.name)
+                    .ok_or_else(|| format!("bad register for rdrand/rdseed: {}", reg.name))?;
+                if matches!(
+                    reg.name.as_str(),
+                    "ax" | "cx" | "dx" | "bx" | "sp" | "bp" | "si" | "di"
+                ) {
+                    self.bytes.push(0x66);
+                }
+                self.bytes.extend_from_slice(&[0x0F, 0xC7]);
+                self.bytes.push(self.modrm(3, reg_ext, rm));
+                Ok(())
+            }
+            _ => Err("rdrand/rdseed requires a register operand".to_string()),
+        }
+    }
+
     pub(super) fn encode_system_reg16(
         &mut self,
         ops: &[Operand],
