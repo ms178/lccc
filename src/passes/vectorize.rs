@@ -5183,11 +5183,14 @@ fn rewrite_conditional_store(
                     if *cond != Operand::Value(cmp_dest) {
                         return false; // branch condition is not the block's compare
                     }
+                    let Some((_, cmp_inst)) = cmp_seen else {
+                        return false;
+                    };
                     let Instruction::Cmp {
                         op, lhs, rhs, ty, ..
-                    } = cmp_seen.expect("validated above").1
+                    } = cmp_inst
                     else {
-                        unreachable!()
+                        return false;
                     };
                     // A storeward FALSE edge flips the compare; the first
                     // block's unflipped compare reuses its SSA value.

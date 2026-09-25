@@ -1625,7 +1625,16 @@ fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize
     let len: Operand = match &bound_ult {
         Operand::Const(c) => {
             // Validated in the pre-scan (in-range int, I32/I64 size_t).
-            let raw = c.to_i64().expect("loop-idiom: const bound validated") as u64;
+            // Fail-closed: if the const is not an int (e.g. float that
+            // slipped through), abort this idiom rewrite rather than panic.
+            let Some(raw_i) = c.to_i64() else {
+                dlog!(
+                    "{fname} loop@{}: rewrite abort (const bound not int)",
+                    m.header
+                );
+                return false;
+            };
+            let raw = raw_i as u64;
             let width_bytes = m.ult_ty.size();
             let mask: u64 = if width_bytes >= 8 {
                 u64::MAX

@@ -65,8 +65,12 @@ jumps_in_fn() {
     # and would have let a \"fully unrolled\" nest slip through if it kept
     # e.g. a parity test. `j[a-z]+` is the complete x86 jump family and
     # nothing else starts with `j` in AT&T asm.
+    # Use [[:blank:]] for space+tab (audit F4): AT&T asm may indent with
+    # tabs, and \t in bracket expressions is not portable to all greps.
+    # Self-test: grep -cE '^[[:blank:]]*j[a-z]+[[:blank:]]' must count
+    # both " jmp foo" and tab-indented "	jmp foo".
     sed -n "/^$fn:/,/^.size $fn,/p" "$work/$stem.s" \
-        | grep -cE "^[ \t]*j[a-z]+[ \t]"
+        | grep -cE "^[[:blank:]]*j[a-z]+[[:blank:]]"
 }
 
 expect_veto() {

@@ -1011,3 +1011,121 @@ mod low_mask_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod float_narrow_tests {
+    use super::*;
+    use crate::common::types::IrType;
+
+    #[test]
+    fn narrowed_to_f64_to_f32_basic() {
+        let c = IrConst::F64(1.0);
+        let narrowed = c.narrowed_to(IrType::F32);
+        assert!(matches!(narrowed, IrConst::F32(v) if v == 1.0f32));
+    }
+
+    #[test]
+    fn narrowed_to_f32_to_f64_basic() {
+        let c = IrConst::F32(1.0f32);
+        let narrowed = c.narrowed_to(IrType::F64);
+        assert!(matches!(narrowed, IrConst::F64(v) if v == 1.0f64));
+    }
+
+    #[test]
+    fn narrowed_to_float_rounding() {
+        // Value that rounds: 1.0000001f64 -> F32
+        let c = IrConst::F64(1.0000001);
+        let narrowed = c.narrowed_to(IrType::F32);
+        if let IrConst::F32(v) = narrowed {
+            assert_eq!(v, 1.0000001f64 as f32);
+        } else {
+            panic!("expected F32");
+        }
+    }
+
+    #[test]
+    fn narrowed_to_float_overflow_inf() {
+        // Large F64 that overflows F32 -> inf
+        let c = IrConst::F64(1e40);
+        let narrowed = c.narrowed_to(IrType::F32);
+        if let IrConst::F32(v) = narrowed {
+            assert!(v.is_infinite() && v.is_sign_positive());
+        } else {
+            panic!("expected F32 inf");
+        }
+    }
+
+    #[test]
+    fn narrowed_to_float_signed_zero() {
+        let c_pos = IrConst::F64(0.0);
+        let c_neg = IrConst::F64(-0.0);
+        let n_pos = c_pos.narrowed_to(IrType::F32);
+        let n_neg = c_neg.narrowed_to(IrType::F32);
+        if let (IrConst::F32(vp), IrConst::F32(vn)) = (n_pos, n_neg) {
+            assert!(vp == 0.0f32 && vp.is_sign_positive());
+            assert!(vn == 0.0f32 && vn.is_sign_negative());
+        } else {
+            panic!("expected F32 zeros");
+        }
+    }
+
+    #[test]
+    fn narrowed_to_float_infinities() {
+        let c_inf = IrConst::F64(f64::INFINITY);
+        let c_ninf = IrConst::F64(f64::NEG_INFINITY);
+        let n_inf = c_inf.narrowed_to(IrType::F32);
+        let n_ninf = c_ninf.narrowed_to(IrType::F32);
+        assert!(matches!(n_inf, IrConst::F32(v) if v.is_infinite() && v.is_sign_positive()));
+        assert!(matches!(n_ninf, IrConst::F32(v) if v.is_infinite() && v.is_sign_negative()));
+    }
+
+    #[test]
+    fn narrowed_to_float_subnormal() {
+        // Smallest positive subnormal f64 -> should become 0 or subnormal f32
+        let c = IrConst::F64(f64::MIN_POSITIVE / 2.0);
+        let narrowed = c.narrowed_to(IrType::F32);
+        // Just check it doesn't panic and returns F32
+        assert!(matches!(narrowed, IrConst::F32(_)));
+    }
+
+    #[test]
+    fn narrowed_to_float_nan_payload_same_width() {
+        // Same-width NaN payload must be preserved bit-exact
+        let bits: u32 = 0x7fc00001;
+        let c = IrConst::F32(f32::from_bits(bits));
+        let narrowed = c.narrowed_to(IrType::F32);
+        if let IrConst::F32(v) = narrowed {
+            assert_eq!(v.to_bits(), bits);
+        } else {
+            panic!("expected F32");
+        }
+        let bits64: u64 = 0x7ff8000000000001;
+        let c64 = IrConst::F64(f64::from_bits(bits64));
+        let narrowed64 = c64.narrowed_to(IrType::F64);
+        if let IrConst::F64(v) = narrowed64 {
+            assert_eq!(v.to_bits(), bits64);
+        } else {
+            panic!("expected F64");
+        }
+    }
+
+    #[test]
+    fn coerce_to_float_cross() {
+        let c = IrConst::F64(2.5);
+        let coerced = c.coerce_to(IrType::F32);
+        assert!(matches!(coerced, IrConst::F32(v) if v == 2.5f32));
+        let c2 = IrConst::F32(2.5f32);
+        let coerced2 = c2.coerce_to(IrType::F64);
+        assert!(matches!(coerced2, IrConst::F64(v) if v == 2.5f64));
+    }
+
+    #[test]
+    fn coerce_to_int_to_float() {
+        let c = IrConst::I64(0);
+        let coerced = c.coerce_to(IrType::F64);
+        assert!(matches!(coerced, IrConst::F64(v) if v == 0.0));
+        let c2 = IrConst::I64(42);
+        let coerced2 = c2.coerce_to(IrType::F32);
+        assert!(matches!(coerced2, IrConst::F32(v) if v == 42.0f32));
+    }
+}

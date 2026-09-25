@@ -2497,13 +2497,16 @@ upper-half protection via existing full-width reader check.
 `CCC_DISABLE_PASSES` does not gate this lowering (it is part of expr
 lowering, not an opt pass).
 
-**Measured evidence (from S25 commit, not invented).** `trunc` 32→26,
-`floor` 16→12 beats all honest oracles (GCC 16.2, Clang 23.1, ICX) on
--02 -march=x86-64-v3; `rint` holds 7 (blendv path). Corpus 51/51
-byte-identical vs GCC for runtime, codegen delta only in FP merges.
+**Measured evidence (from S25 commit, no invented numbers).**
+`trunc` 32→26, `floor` 16→12 on -O2 -march=x86-64-v3 (GCC 16.2 19/15,
+Clang 23.1 15/13, ICX 2025 18/14 on same flags in our oracle runs —
+numbers are per our lab runs, not universal claims). `rint` holds 7
+(blendv path). Corpus 51/51 byte-identical vs GCC for runtime, codegen
+delta only in FP merges.
 
 **Tests.** `ternary_float_merge.c` pins F64 const into F32 slot, int 0
-into double, F32 const into F64 slot, and NaN payload preservation.
+into double, F32 const into F64 slot, and NaN payload preservation via
+volatile/noinline runtime conditions (no constant-folded `1 ? x : y`).
 
 ## S26 (2026-09-24) — CVP correlated-select use rewriting + edge_facts Copy lookthrough
 
@@ -2527,9 +2530,11 @@ through copies are still decided.
 **Ordering.** Runs in CVP, before GVN, after mem2reg. No new disable switch
 (covered by `cvp`).
 
-**Measured evidence.** `trunc` 32→17 (S26 final, beats GCC 16.2 19 and ICC
-21, 2 behind Clang 15 — honest gap is 2 tail movsds, queued). 16/16 new
-`cvp` unit tests.
+**Measured evidence (lab runs, -O2 -march=x86-64-v3).** `trunc` 32→17
+(S26 final) vs GCC 16.2 19, ICC 21, Clang 15 15 in our oracle runs — gap
+to Clang is 2 tail movsds, queued. 16/16 new `cvp` unit tests. No claim
+of universal “beats all oracles”; numbers are per our Godbolt/mold
+oracle runs on 14700KF target.
 
 ## S28 (2026-09-24) — union-punned copysign through memory → intrinsic
 
@@ -2552,9 +2557,11 @@ side-effect check (hence `pub(crate)`).
 
 **Ordering.** Runs in `bit_idioms` after SROA, before DCE. No new knob.
 
-**Measured evidence.** `copysign` 9→4 insns, ties all oracles (GCC 16.2,
-Clang 23.1, ICX). All other TUs bit-identical (no over-fire). 8 new unit
-tests.
+**Measured evidence (lab runs).** `copysign` 9→4 insns on -O2
+-march=x86-64-v3, matches GCC 16.2 / Clang 23.1 / ICX output shape in our
+oracle runs (andps/orps). All other TUs bit-identical (no over-fire). 8
+new unit tests. No universal “ties all oracles” claim — per our measured
+corpus on 14700KF.
 
 **Tests.** `copysign_union_mem.c` covers ±0.0, NaN with payload, ±inf,
 printing result bits.
@@ -2610,9 +2617,10 @@ Avoids cloning use lists (iterates slice directly).
 
 **Disable switch.** `CCC_DISABLE_PASSES=globaldse` (Phase 11a).
 
-**Measured evidence.** `round_family_pass` 56→50 (-6 = 2 stores + addr math
-+ DCE), `out` BSS gone, `buf` path intact. Corpus 51/51, 3431 lib tests,
-68/68 ci_local --fast green after ordering fix.
+**Measured evidence (lab runs, -O2).** `round_family_pass` 56→50 (-6 = 2
+stores + addr math + DCE) on x86-64, `out` BSS gone, `buf` path intact in
+our corpus run. Corpus 51/51, 3431 lib tests, 68/68 ci_local --fast green
+after ordering fix on our CI image.
 
 **Tests.** 14 unit tests (incl. `phi_cycle_fires`, `hostile_phi_bails`,
 `latch_cycle_fires`, `hostile_redefinition_bails`, `alias_target_bails`,
@@ -2621,7 +2629,7 @@ Avoids cloning use lists (iterates slice directly).
 `globaldse_alias_kept.c` (alias escape must keep stores),
 `globaldse_asm_template.c` (inline-asm template mention must keep).
 
-**Follow-up fixes (2026-09-25 audit).**
+**Follow-up fixes (2026-09-25 audit, first Review AI).**
 - F1 alias: built `alias_named` set from `module.aliases` (both alias and
   target) and skip globals in set; added unit test.
 - F2 float ternary: `emit_ternary_merge_store` now converts F32/F64 consts
@@ -2634,3 +2642,32 @@ Avoids cloning use lists (iterates slice directly).
   variants (js/jns/jp/jnp/jo/jno/jb/jc etc.).
 - F4 process: added this DECISIONS entry per transform; no invented numbers.
 
+**Follow-up fixes (2026-09-25 audit, second Review AI — F1..F7).**
+- F1 high $g matcher: `asm_mentions_symbol` now handles AT&T `$g`
+  immediate prefix (`movabsq $g, %rax`, `movl $g+4`) while preserving
+  embedded `$` safety (`foo$bar` must not match `bar` or `foo`). Impl:
+  two-char lookbehind: `$` preceded by non-ident or start => immediate,
+  preceded by ident => embedded. Added 6 unit tests:
+  `asm_mentions_symbol_basic`, `immediate_prefix`, `immediate_bails`,
+  `static_function_via_asm_template_survives` (transitive helper),
+  `unrelated_static_still_removed`, `symbol_attrs_template_only_survives`.
+- F2 float regressions no-merge: rewrote `ternary_float_merge.c` to avoid
+  literal `1 ? x : y` (which folds before merge slots). All selections via
+  `noinline` + volatile-driven runtime conditions, NaN payload preservation
+  via `cond_nan_f32/f64`. Added Rust unit tests for `narrowed_to`/`coerce_to`
+  covering F64→F32, F32→F64, rounding, subnormals, overflow→inf, signed zero,
+  infinities, NaN payload same-width.
+- F3 fail-open assert: replaced `.expect("pre-validated: ...")` in
+  `bool_thread.rs`, `loop_idiom.rs`, `vectorize.rs` with fail-closed bail
+  (continue / return false) so unexpected IR does not panic the compiler
+  (`ccc: internal error`) but keeps the transform conservative.
+- F4 tab jumps: `jumps_in_fn` now uses `[[:blank:]]` instead of `[ \t]`
+  for portability; added self-test comment that both space and tab indent
+  must be counted.
+- F5 missing reachability/attr tests: covered by new dead_statics tests
+  above (transitive reachability, unrelated removal, template-only attr).
+- F6 docs overstated: toned down “beats all oracles” to lab-run numbers
+  with explicit flags and target (14700KF), no invented universal claims.
+- F7 alloc: confirmed no-clone iteration over `use_locs` slice, GlobalAddr
+  map O(F*I+G*refs) not O(G*F*I), and no unnecessary `clone()` of templates
+  beyond required owned string for map key.
