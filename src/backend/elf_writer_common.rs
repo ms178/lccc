@@ -52,6 +52,7 @@ pub trait X86Arch {
     fn reloc_abs(size: usize) -> u32;
     /// 64-bit absolute relocation (R_X86_64_64). Only meaningful for x86-64.
     fn reloc_abs64() -> u32;
+
     /// PC-relative relocation type (R_X86_64_PC32 or R_386_PC32).
     fn reloc_pc32() -> u32;
 
@@ -88,6 +89,26 @@ pub trait X86Arch {
     /// segfaulted on the first TLS touch; GAS keeps the STT_TLS symbol in
     /// the reloc.)
     fn is_tls_reloc(reloc_type: u32) -> bool {
+        let _ = reloc_type;
+        false
+    }
+
+    /// True when this relocation class makes GNU as record the
+    /// `_GLOBAL_OFFSET_TABLE_` reference (a GLOBAL UND NOTYPE symbol) in
+    /// the object's symbol table.
+    ///
+    /// Measured against GAS 2.47 (`--64`/`--32`, one operator per object):
+    /// every operator-emitted relocation whose computation reads the GOT
+    /// base adds the symbol — @GOTPCREL/@TLSDESC/@GOTTPOFF/@TLSGD/@TLSLD/
+    /// @GOT/@TPOFF/@DTPOFF/@GOTNTPOFF and their APX CODE_4/5/6 cousins.
+    /// Deliberately excluded: plain PC/ABS (no GOT), @PLT (a PLT-slot
+    /// reference, not a GOT-base one — probed nogot), the
+    /// TLSDESC_CALL/TLSDESC marker pair and the GOT64/GOTPCREL64/GOTPC64/
+    /// GOTPC32/GOTOFF64 classes (reachable on x86-64 only through `.reloc`,
+    /// which GAS runs past the operator machinery and does NOT attach the
+    /// GOT symbol to), and the linker-reserved IRELATIVE/RELATIVE/SIZE
+    /// groups.
+    fn needs_got_base_symbol(reloc_type: u32) -> bool {
         let _ = reloc_type;
         false
     }
@@ -2891,6 +2912,37 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut shared_symbols = elf_mod::build_elf_symbol_table(&symtab_input);
         if !symver_removed.is_empty() {
             shared_symbols.retain(|s| !symver_removed.contains(&s.name));
+        }
+
+        // GAS symbol-table parity for GOT-base computing relocations:
+        // every `@GOTPCREL`-family / `@GOTTPOFF` / `@TLSDESC` / `@TLSGD` /
+        // `@TLSLD` / `@GOT` / `@GOTOFF` / `@GOTPC` / `@TPOFF` / `@DTPOFF` /
+        // `@GOTNTPOFF` operator makes GNU as record an undefined
+        // `_GLOBAL_OFFSET_TABLE_` reference (GLOBAL, UND, NOTYPE) in the
+        // symbol table — that is how GNU ld resolves the GOT base for
+        // these computations, and how tools that inspect the object
+        // (unwinder tables, `.eh_frame` checkers) expect to see it.
+        // One occurrence per object, deduplicated against an explicit
+        // definition or reference elsewhere in the assembly. The class
+        // set lives in `X86Arch::needs_got_base_symbol` (measured against
+        // GAS 2.47 per operator).
+        if !shared_symbols
+            .iter()
+            .any(|s| s.name == "_GLOBAL_OFFSET_TABLE_")
+            && self
+                .sections
+                .iter()
+                .any(|sec| sec.relocations.iter().any(|r| A::needs_got_base_symbol(r.reloc_type)))
+        {
+            shared_symbols.push(ObjSymbol {
+                name: "_GLOBAL_OFFSET_TABLE_".to_string(),
+                value: 0,
+                size: 0,
+                binding: STB_GLOBAL,
+                sym_type: STT_NOTYPE,
+                visibility: STV_DEFAULT,
+                section_name: "*UND*".to_string(),
+            });
         }
 
         // Add COMMON symbols

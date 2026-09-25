@@ -868,15 +868,21 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
 /// `movsbq (%rbx), %rsi; testq %rsi, %rsi; je` → `cmpb $0, (%rbx); je`.
 ///
 /// The loaded value is only used to be compared against zero, so the load can
-/// disappear into the compare. Flag-for-flag identical: `cmp $0, mem` and
-/// `test %r, %r` over the same value both clear CF/OF and set ZF/SF/PF from
-/// it, and the sign of a sign-extended byte is the sign of the byte.
+/// disappear into the compare. CF/OF are cleared by both forms and ZF/SF/PF
+/// are set from the same value (and the sign of a sign-extended byte is the
+/// sign of the byte), but the rewrite is NOT flag-for-flag identical:
+/// `cmp $0, mem` DEFINES AF (a subtraction from a zero subtrahend never
+/// borrows, so AF=0) while `test` leaves AF carrying whatever the previous
+/// writer left.  A whole-flags reader (`lahf`, `pushf`, inline asm) in the
+/// window before the next flag writer therefore vetoes the fold -- see
+/// [`super::flag_peepholes::flags_reach_a_whole_flags_reader`].  Condition-code
+/// consumers cannot select AF, so they never veto on that account.
 /// Width-matched tests (`testb` after a byte load, `testw` after a word
-/// load) are flag-exact for sign AND zero extension, because they read only
-/// the memory bytes themselves; that admits the hot sieve shapes where a
-/// `testb %sil, %sil` follows the widening load.  Pure register staging
-/// (mov/lea, no memory operand, not touching the loaded family) is allowed
-/// between load and test.
+/// load) are flag-exact for SF and ZF (they read only the memory bytes
+/// themselves), which admits the hot sieve shapes where a `testb %sil, %sil`
+/// follows the widening load.  Pure register staging (mov/lea, no memory
+/// operand, not touching the loaded family NOR any register the load's
+/// address names) is allowed between load and test.
 ///
 /// This needs the register to be dead after the test, ACROSS the branch that
 /// follows — which is exactly what the block-local scans could never prove and
@@ -1022,28 +1028,31 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
         //   * any zero-extending load (byte 0x80: test SF=0, cmpb SF=1);
         //   * `movsbl`/`movswl` + `testq` (the 32-bit write zero-extends,
         //     so testq SF is bit 63 = 0 for a negative byte).
-        // ZF, PF, CF and OF are identical in every case and both forms leave AF
-        // undefined, so SF is the ONLY flag this rewrite can change. The
-        // consumers that matter are therefore exactly the ones that read SF --
-        // a narrower question than "is every consumer ZF-only", which keeps the
-        // fold alive under a downstream `jc`, `jo`, `jp` or `adc`. The walk
-        // covers the taken edges of conditional jumps too, where a linear scan
-        // would stop at the first writer on the fall-through path.
+        // A test whose width matches the loaded width reads exactly the
+        // memory bytes (the low byte / low word are identical under sign
+        // AND zero extension), so SF is provably identical to the compare.
         let signed_64 = matches!(*prefix, "movsbq " | "movswq " | "movslq ");
         let signed_32 = matches!(*prefix, "movsbl " | "movswl ");
         let test_is_q = width == 'q';
-        // A test whose width matches the loaded width reads exactly the
-        // memory bytes (the low byte / low word are identical under sign
-        // AND zero extension), so every flag — SF included — is provably
-        // identical to the compare; no consumer walk is needed.  This is
-        // what admits `testb` at all: the q/l walks above would reject the
-        // zero-extended byte loads (SF bit 63 = 0 vs the byte's bit 7).
         let width_matched =
             (*cmp_mnemonic == "cmpb" && width == 'b') || (*cmp_mnemonic == "cmpw" && width == 'w');
-        if !width_matched
-            && !(signed_64 || (signed_32 && !test_is_q))
+        let sf_provably_identical = width_matched || signed_64 || (signed_32 && !test_is_q);
+        if !sf_provably_identical
             && super::flag_peepholes::flags_reach_an_sf_consumer(store, infos, j + 1)
         {
+            i += 1;
+            continue;
+        }
+        // AF diverges in EVERY variant of this fold: `cmp $0, mem` defines
+        // it (zero subtrahend, no borrow, AF=0) while `test` leaves it
+        // carrying the previous writer's value.  Whole-flags readers
+        // (`lahf`, `pushf`, inline asm) observe the difference, so they
+        // veto on every path -- width-matched included, whose ZF/SF/PF/CF/
+        // OF exactness says nothing about AF.  Condition-code consumers
+        // cannot read AF (there is no AF predicate), and the
+        // NON_SF_FLAG_READERS whitelist reads CF/OF only, so `je`/`js`/
+        // `cmovne`/`adc` never trigger this veto.
+        if super::flag_peepholes::flags_reach_a_whole_flags_reader(store, infos, j + 1) {
             i += 1;
             continue;
         }
@@ -1716,6 +1725,179 @@ mod tests {
         assert!(out.contains("cmpb $0, (%r11,%r8)"), "{out}");
         assert!(!out.contains("movsbq"), "{out}");
         assert!(out.contains("cmovnel %esi, %r10d"), "{out}");
+    }
+
+    #[test]
+    fn staged_write_to_the_load_base_blocks_the_fold_in_isolation() {
+        // The audit's exact F2 shape, pinned against the PASS in isolation:
+        // the full pipeline happens to block the `movq`-to-callee-saved
+        // staging through an unrelated rewrite, which must not be what
+        // soundness rests on.
+        let out = run_fold(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    movsbq (%rbx), %rsi\n",
+            "    movq %rcx, %rbx\n",
+            "    testb %sil, %sil\n",
+            "    je .LBB3\n",
+            "    leaq 1(%rbx), %rbx\n",
+            "    jmp .LBB1\n",
+            ".LBB3:\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movsbq"), "fold must not fire: {out}");
+        assert!(!out.contains("cmpb $0, (%rbx)"), "{out}");
+    }
+
+    #[test]
+    fn staged_lea_write_to_the_load_base_blocks_the_fold() {
+        // The lea form: `leaq 8(%rcx), %rbx` rewrites the base between the
+        // load and the test; the folded compare reads the NEW base.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    movsbq (%rbx), %rsi\n",
+            "    leaq 8(%rcx), %rbx\n",
+            "    testb %sil, %sil\n",
+            "    je .LBB3\n",
+            "    leaq 1(%rbx), %rbx\n",
+            "    jmp .LBB1\n",
+            ".LBB3:\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movsbq"), "fold must not fire: {out}");
+        assert!(!out.contains("cmpb $0, (%rbx)"), "{out}");
+    }
+
+    #[test]
+    fn staged_write_to_the_load_index_blocks_the_fold() {
+        // The same hole through the INDEX register of a SIB address: the
+        // staging lea writes %r8 (index), so the folded compare would read
+        // (%rbx,%r8) with the NEW index.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    movsbq (%rbx,%r8), %rsi\n",
+            "    leaq 0(,%r9,8), %r8\n",
+            "    testb %sil, %sil\n",
+            "    je .LBB3\n",
+            "    leaq 1(%rbx), %rbx\n",
+            "    jmp .LBB1\n",
+            ".LBB3:\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movsbq"), "fold must not fire: {out}");
+        assert!(!out.contains("cmpb $0, (%rbx,%r8)"), "{out}");
+    }
+
+    #[test]
+    fn dest_in_address_self_test_still_folds() {
+        // Positive control for the address-family guard: a load whose
+        // DESTINATION also names the address (`movsbq (%rsi), %rsi`) folds
+        // soundly when the value is dead after the test — deleting the load
+        // keeps %rsi at its pre-load value, which IS the address, and the
+        // loaded-family mask already forbids every staging write to it.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    movsbq (%rsi), %rsi\n",
+            "    testb %sil, %sil\n",
+            "    je .LBB3\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".LBB3:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpb $0, (%rsi)"), "fold must fire: {out}");
+        assert!(!out.contains("movsbq"), "{out}");
+    }
+
+    #[test]
+    fn width_matched_fold_does_not_cross_a_whole_flags_reader() {
+        // F3 (audit of PR #607): `cmp $0, mem` DEFINES AF (a subtraction
+        // from zero never borrows, so AF=0) while `test` leaves AF carrying
+        // whatever the previous writer left.  A whole-flags reader (`lahf`,
+        // `pushf`, inline asm) between the fold point and the next flag
+        // writer therefore observes a different value after the fold.  The
+        // width-matched path used to skip the consumer walk entirely — the
+        // fold must be vetoed here.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    movl $15, %eax\n",
+            "    addl $1, %eax\n", // nibble carry: AF=1
+            "    movsbq (%rbx), %rsi\n",
+            "    testb %sil, %sil\n", // AF still 1 (test leaves it)
+            "    lahf\n",             // reads every flag incl. AF
+            "    movb %ah, %dl\n",
+            "    je .LBB3\n",
+            "    leaq 1(%rbx), %rbx\n",
+            "    jmp .LBB1\n",
+            ".LBB3:\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movsbq"), "fold must not fire: {out}");
+        assert!(!out.contains("cmpb $0, (%rbx)"), "{out}");
+    }
+
+    #[test]
+    fn width_matched_fold_survives_a_cc_only_consumer() {
+        // Positive control for the AF veto: condition-code consumers
+        // (`je`/`js`/`cmovne`) cannot read AF, so the width-matched fold
+        // stays alive under them — even an SF reader, whose value is
+        // provably identical at the matched width.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    movsbq (%rbx), %rsi\n",
+            "    testb %sil, %sil\n",
+            "    jns .LBB4\n",
+            "    leaq 1(%rbx), %rbx\n",
+            "    jmp .LBB1\n",
+            ".LBB4:\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".LBB3:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmpb $0, (%rbx)"), "fold must fire: {out}");
+        assert!(!out.contains("movsbq"), "{out}");
+    }
+
+    /// Run ONLY `fold_load_test_into_cmp` and return the surviving lines, so
+    /// an assertion is about this pass rather than about whatever the rest
+    /// of the pipeline would do to the same input (the full pipeline can
+    /// block a shape through an unrelated pass's rewrite, which would make
+    /// a soundness test pass for the wrong reason).
+    fn run_fold(asm: &str) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fold_load_test_into_cmp(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]

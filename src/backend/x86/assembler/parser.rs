@@ -281,8 +281,13 @@ impl Register {
     pub fn new(name: &str) -> Self {
         let n = name.trim();
         let n = n.strip_prefix('%').map(str::trim_start).unwrap_or(n);
+        // GNU as register names are case-insensitive (`push %FS` == `push
+        // %fs`, `mov %RAX, %rbx` == `mov %rax, %rbx` — GAS 2.47 accepts
+        // and encodes both identically). Normalizing here covers every
+        // encoder table (all of which key on lowercase names) and every
+        // parse path at once.
         Register {
-            name: n.to_string(),
+            name: n.to_ascii_lowercase().to_string(),
             mask: None,
             zeroing: false,
             sae: false,
@@ -3057,7 +3062,8 @@ static MACRO_INVOCATION_COUNTER: std::sync::atomic::AtomicU64 =
 fn expand_gas_macros(lines: &[String]) -> Result<Vec<String>, String> {
     let mut macros = crate::common::fx_hash::FxHashMap::default();
     let mut symbols = crate::common::fx_hash::FxHashMap::default();
-    let expanded = expand_gas_macros_with_state(lines, &mut macros, &mut symbols)?;
+    let mut labels = crate::common::fx_hash::FxHashSet::default();
+    let expanded = expand_gas_macros_with_state(lines, &mut macros, &mut symbols, &mut labels)?;
     Ok(substitute_register_aliases(expanded))
 }
 
@@ -3185,12 +3191,33 @@ fn expand_gas_macros_with_state(
     lines: &[String],
     macros: &mut crate::common::fx_hash::FxHashMap<String, GasMacro>,
     symbols: &mut crate::common::fx_hash::FxHashMap<String, i64>,
+    labels: &mut crate::common::fx_hash::FxHashSet<String>,
 ) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut i = 0;
 
     while i < lines.len() {
         let trimmed = strip_comment(&lines[i]).trim().to_string();
+
+        // Label definitions are recorded SEQUENTIALLY (GAS semantics: a
+        // label only counts as "defined" for a later .ifdef — forward
+        // references do not; verified against GAS 2.47). `name:` may carry
+        // trailing content on the same line; numeric-only local labels
+        // (1:, 2:) are not symbol-table names for .ifdef purposes.
+        if let Some(colon) = trimmed.find(':') {
+            let name = trimmed[..colon].trim();
+            if !name.is_empty()
+                && name
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'.')
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$')
+            {
+                labels.insert(name.to_string());
+            }
+        }
 
         // .macro name param1:req param2:req ...
         if let Some(rest) = directive_arg(&trimmed, ".macro") {
@@ -3351,7 +3378,7 @@ fn expand_gas_macros_with_state(
                     all_expanded.push(expanded);
                 }
             }
-            let processed = expand_gas_macros_with_state(&all_expanded, macros, symbols)?;
+            let processed = expand_gas_macros_with_state(&all_expanded, macros, symbols, labels)?;
             result.extend(processed);
             i += 1;
             continue;
@@ -3389,165 +3416,39 @@ fn expand_gas_macros_with_state(
                     all_expanded.push(expanded);
                 }
             }
-            let processed = expand_gas_macros_with_state(&all_expanded, macros, symbols)?;
+            let processed = expand_gas_macros_with_state(&all_expanded, macros, symbols, labels)?;
             result.extend(processed);
             i += 1;
             continue;
         }
 
-        // .if expr / .elseif expr / .else / .endif
-        // (`.if(` — a paren directly after the directive, no whitespace — is
-        // legal GAS tokenization and kept as an explicit fallback form.)
-        if let Some(rest) = directive_arg(&trimmed, ".if")
-            .or_else(|| trimmed.starts_with(".if(").then(|| &trimmed[".if".len()..]))
-        {
-            let cond = eval_if_expr(rest, symbols);
-            // Collect branches: a chain of (condition, lines) pairs ending with optional else
-            let mut branches: Vec<(bool, Vec<String>)> = vec![(cond, Vec::new())];
-            let mut current_idx = 0;
-            let mut depth = 1;
-            i += 1;
-            while i < lines.len() {
-                let inner = strip_comment(&lines[i]).trim().to_string();
-                if is_if_start(&inner) {
-                    depth += 1;
-                    branches[current_idx].1.push(lines[i].clone());
-                } else if inner == ".endif" {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                    branches[current_idx].1.push(lines[i].clone());
-                } else if depth == 1 && directive_arg(&inner, ".elseif").is_some() {
-                    let elseif_rest = directive_arg(&inner, ".elseif").unwrap_or("");
-                    // All branch conditions are evaluated eagerly; harmless for pure comparisons.
-                    let elseif_cond = eval_if_expr(elseif_rest, symbols);
-                    branches.push((elseif_cond, Vec::new()));
-                    current_idx += 1;
-                } else if inner == ".else" && depth == 1 {
-                    // .else is like .elseif with condition=true (fallback)
-                    branches.push((true, Vec::new()));
-                    current_idx += 1;
-                } else {
-                    branches[current_idx].1.push(lines[i].clone());
-                }
+        // ─── Conditional-assembly family (GAS 2.47 parity) ───
+        //
+        // One branch-collection mechanism over the full head family:
+        // `.if`, `.ifdef`, `.ifndef`, `.ifnotdef`, `.ifeq`, `.ifne`,
+        // `.iflt`, `.ifle`, `.ifgt`, `.ifge`, `.ifb`, `.ifnb`, `.ifc`,
+        // `.ifnc`, `.ifeqs`, `.ifnes`. Every head reduces to a boolean
+        // (with GAS-verbatim diagnostics on malformed arguments) and the
+        // `.elseif`/`.else`/`.endif` collection below is shared, so a new
+        // family member cannot drift from the nesting rules — the three
+        // pre-family copy-pasted collectors had exactly that drift risk.
+        let head = eval_conditional_head(&trimmed, symbols, labels);
+        match head {
+            Some(Ok(cond)) => {
+                let branches = collect_conditional_branches(lines, &mut i, cond, symbols)?;
+                let empty: Vec<String> = Vec::new();
+                let chosen_lines: &Vec<String> = branches
+                    .iter()
+                    .find(|(bcond, _)| *bcond)
+                    .map(|(_, blines)| blines)
+                    .unwrap_or(&empty);
+                let expanded = expand_gas_macros_with_state(chosen_lines, macros, symbols, labels)?;
+                result.extend(expanded);
                 i += 1;
+                continue;
             }
-            // Choose the first branch whose condition is true
-            let empty: Vec<String> = Vec::new();
-            let mut chosen_lines: &Vec<String> = &empty;
-            for (bcond, blines) in &branches {
-                if *bcond {
-                    chosen_lines = blines;
-                    break;
-                }
-            }
-            let expanded = expand_gas_macros_with_state(chosen_lines, macros, symbols)?;
-            result.extend(expanded);
-            i += 1;
-            continue;
-        }
-
-        // .ifb string / .ifnb string / .endif
-        // GAS tests whether the argument text is blank after macro substitution.
-        // Linux/FFmpeg x86 macro code uses these heavily for optional operands.
-        // (`.ifb\t%1` — tab-separated — was silently dropped by this matcher
-        // once before; `directive_arg` makes the whole whitespace family
-        // unreachable as a defect class.)
-        let ifb_form = directive_arg(&trimmed, ".ifb").map(|rest| (rest, false));
-        let ifnb_form = directive_arg(&trimmed, ".ifnb").map(|rest| (rest, true));
-        if let Some((rest, is_ifnb)) = ifb_form.or(ifnb_form) {
-            let cond = if is_ifnb {
-                !eval_ifb(rest)
-            } else {
-                eval_ifb(rest)
-            };
-            let mut branches: Vec<(bool, Vec<String>)> = vec![(cond, Vec::new())];
-            let mut current_idx = 0;
-            let mut depth = 1;
-            i += 1;
-            while i < lines.len() {
-                let inner = strip_comment(&lines[i]).trim().to_string();
-                if is_if_start(&inner) {
-                    depth += 1;
-                    branches[current_idx].1.push(lines[i].clone());
-                } else if inner == ".endif" {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                    branches[current_idx].1.push(lines[i].clone());
-                } else if depth == 1 && directive_arg(&inner, ".elseif").is_some() {
-                    let elseif_rest = directive_arg(&inner, ".elseif").unwrap_or("");
-                    let elseif_cond = eval_if_expr(elseif_rest, symbols);
-                    branches.push((elseif_cond, Vec::new()));
-                    current_idx += 1;
-                } else if inner == ".else" && depth == 1 {
-                    branches.push((true, Vec::new()));
-                    current_idx += 1;
-                } else {
-                    branches[current_idx].1.push(lines[i].clone());
-                }
-                i += 1;
-            }
-            let empty: Vec<String> = Vec::new();
-            let mut chosen_lines: &Vec<String> = &empty;
-            for (bcond, blines) in &branches {
-                if *bcond {
-                    chosen_lines = blines;
-                    break;
-                }
-            }
-            let expanded = expand_gas_macros_with_state(chosen_lines, macros, symbols)?;
-            result.extend(expanded);
-            i += 1;
-            continue;
-        }
-
-        // .ifc str1, str2 / .endif
-        if let Some(rest) = directive_arg(&trimmed, ".ifc") {
-            let cond = eval_ifc(rest);
-            let mut branches: Vec<(bool, Vec<String>)> = vec![(cond, Vec::new())];
-            let mut current_idx = 0;
-            let mut depth = 1;
-            i += 1;
-            while i < lines.len() {
-                let inner = strip_comment(&lines[i]).trim().to_string();
-                if is_if_start(&inner) {
-                    depth += 1;
-                    branches[current_idx].1.push(lines[i].clone());
-                } else if inner == ".endif" {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                    branches[current_idx].1.push(lines[i].clone());
-                } else if depth == 1 && directive_arg(&inner, ".elseif").is_some() {
-                    let elseif_rest = directive_arg(&inner, ".elseif").unwrap_or("");
-                    // All branch conditions are evaluated eagerly; harmless for pure comparisons.
-                    let elseif_cond = eval_if_expr(elseif_rest, symbols);
-                    branches.push((elseif_cond, Vec::new()));
-                    current_idx += 1;
-                } else if inner == ".else" && depth == 1 {
-                    branches.push((true, Vec::new()));
-                    current_idx += 1;
-                } else {
-                    branches[current_idx].1.push(lines[i].clone());
-                }
-                i += 1;
-            }
-            let empty: Vec<String> = Vec::new();
-            let mut chosen_lines: &Vec<String> = &empty;
-            for (bcond, blines) in &branches {
-                if *bcond {
-                    chosen_lines = blines;
-                    break;
-                }
-            }
-            let expanded = expand_gas_macros_with_state(chosen_lines, macros, symbols)?;
-            result.extend(expanded);
-            i += 1;
-            continue;
+            Some(Err(msg)) => return Err(msg),
+            None => {}
         }
 
         // .error "message" - assembler error directive
@@ -3698,7 +3599,7 @@ fn expand_gas_macros_with_state(
             }
             expanded_body = split_body;
             // Recursively expand the body (handles nested .irp, .set, .if, etc.)
-            expanded_body = expand_gas_macros_with_state(&expanded_body, macros, symbols)?;
+            expanded_body = expand_gas_macros_with_state(&expanded_body, macros, symbols, labels)?;
             result.extend(expanded_body);
             // Emit remaining semicolon-separated parts as separate lines.
             //
@@ -3717,7 +3618,8 @@ fn expand_gas_macros_with_state(
                 .filter(|sp| !sp.is_empty())
                 .collect();
             if !rest_parts.is_empty() {
-                let expanded_rest = expand_gas_macros_with_state(&rest_parts, macros, symbols)?;
+                let expanded_rest =
+                    expand_gas_macros_with_state(&rest_parts, macros, symbols, labels)?;
                 result.extend(expanded_rest);
             }
             i += 1;
@@ -4149,19 +4051,195 @@ fn is_ident_char(b: u8) -> bool {
 
 /// Check if a line starts a new conditional assembly block (.if, .ifc, .ifdef, .ifndef).
 fn is_if_start(trimmed: &str) -> bool {
-    // All conditional directives, whitespace-insensitively (`.ifb\t%1`
-    // matched here too — a nested conditional whose tab form was dropped
-    // mis-nested the whole `.if/.endif` stack). `.if(` is legal GAS
-    // tokenization without whitespace; `.ifdef`/`.ifndef` are separate
-    // directives (the whitespace requirement of `directive_arg` keeps
-    // `.if` from swallowing them).
-    trimmed.starts_with(".if(")
-        || directive_arg(trimmed, ".if").is_some()
-        || directive_arg(trimmed, ".ifc").is_some()
-        || directive_arg(trimmed, ".ifb").is_some()
-        || directive_arg(trimmed, ".ifnb").is_some()
-        || directive_arg(trimmed, ".ifdef").is_some()
-        || directive_arg(trimmed, ".ifndef").is_some()
+    conditional_head_arg(trimmed).is_some()
+}
+
+/// Match a conditional-assembly head directive and return its argument.
+///
+/// The full GAS 2.47 family, whitespace-insensitively (`.ifb\t%1` matched
+/// here too — a nested conditional whose tab form was dropped mis-nested
+/// the whole `.if/.endif` stack). Order matters: the longer spellings are
+/// matched before the prefix-colliding shorter ones (`.ifeqs` before
+/// `.ifeq`, `.ifdef` before `.if`), though `directive_arg`'s
+/// whitespace-after-directive requirement already keeps `.if` from
+/// swallowing the longer names. `.if(` — a paren directly after the
+/// directive, no whitespace — is legal GAS tokenization and kept as an
+/// explicit fallback form.
+fn conditional_head_arg(trimmed: &str) -> Option<&str> {
+    for dir in [
+        ".ifdef",
+        ".ifndef",
+        ".ifnotdef",
+        ".ifeqs",
+        ".ifnes",
+        ".ifeq",
+        ".ifne",
+        ".iflt",
+        ".ifle",
+        ".ifgt",
+        ".ifge",
+        ".ifc",
+        ".ifnc",
+        ".ifb",
+        ".ifnb",
+    ] {
+        if let Some(rest) = directive_arg(trimmed, dir) {
+            return Some(rest);
+        }
+    }
+    directive_arg(trimmed, ".if")
+        .or_else(|| trimmed.starts_with(".if(").then(|| &trimmed[".if".len()..]))
+}
+
+/// Evaluate the head of a conditional-assembly block.
+///
+/// * `None` — `trimmed` does not open a conditional block.
+/// * `Some(Ok(cond))` — head with evaluated condition.
+/// * `Some(Err(msg))` — it IS a conditional head, but the argument is
+///   malformed. The message reproduces GAS 2.47 verbatim (`invalid
+///   identifier for ".ifdef"`, `missing string`, `.ifeqs syntax error`,
+///   `non-constant expression in ".if" statement`), so the differential
+///   suites can pin diagnostics byte-for-byte.
+///
+/// GAS rejects undefined symbols in conditional heads ("non-constant
+/// expression") rather than silently reading them as 0 — a head over an
+/// unknown name is a bug in the assembly, and silently taking the false
+/// branch once hid every branch the enclosing macro expected to run.
+fn eval_conditional_head(
+    trimmed: &str,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+    labels: &crate::common::fx_hash::FxHashSet<String>,
+) -> Option<Result<bool, String>> {
+    let rest = conditional_head_arg(trimmed)?;
+    let head_dir = trimmed.split(|c: char| c.is_ascii_whitespace()).next()?; // directive token itself
+
+    // `.ifdef symbol` / `.ifndef symbol` / `.ifnotdef symbol`: the argument
+    // must be a valid GAS identifier; the condition is set-membership in
+    // the `.set`/assignment namespace (labels are parsed later, so a
+    // forward reference is "not defined" exactly as GAS's sequential
+    // parser sees it).
+    if head_dir == ".ifdef" || head_dir == ".ifndef" || head_dir == ".ifnotdef" {
+        let bad = format!("invalid identifier for \"{head_dir}\"");
+        let sym = rest.trim();
+        if !is_valid_gas_identifier(sym) {
+            return Some(Err(bad));
+        }
+        // GAS sequential semantics: a label counts as defined only if it
+        // has already been seen on this walk (forward refs are undefined).
+        let defined = symbols.contains_key(sym) || labels.contains(sym);
+        return Some(Ok(match head_dir {
+            ".ifdef" => defined,
+            _ => !defined,
+        }));
+    }
+
+    // `.ifeqs "a", "b"` / `.ifnes "a", "b"`: strict string comparison. GAS
+    // demands quoted strings on both sides of a comma (missing comma →
+    // `<directive> syntax error`, unquoted operand → `missing string`).
+    if head_dir == ".ifeqs" || head_dir == ".ifnes" {
+        let negate = head_dir == ".ifnes";
+        let (a, b) = match parse_ifeqs_strings(rest, head_dir) {
+            Ok(pair) => pair,
+            Err(e) => return Some(Err(e)),
+        };
+        return Some(Ok(if negate { a != b } else { a == b }));
+    }
+
+    // Numeric comparison family: `.ifeq`/`.ifne`/`.iflt`/`.ifle`/
+    // `.ifgt`/`.ifge` are `.if (expr CMP 0)` in GAS. All share the
+    // non-constant-expression gate; note GAS names ".if" in that
+    // diagnostic even for `.ifeq` (one shared evaluator), while `.elseif`
+    // names itself.
+    if let Some(cmp) = numeric_family(head_dir) {
+        return Some(eval_numeric_head(rest, symbols, cmp));
+    }
+
+    // `.ifb`/`.ifnb`: argument blankness (after macro substitution, which
+    // already happened upstream).
+    if head_dir == ".ifb" {
+        return Some(Ok(eval_ifb(rest)));
+    }
+    if head_dir == ".ifnb" {
+        return Some(Ok(!eval_ifb(rest)));
+    }
+
+    // `.ifc`/`.ifnc`: case-sensitive string equality (unquoted operands,
+    // comma-separated).
+    if head_dir == ".ifc" {
+        return Some(Ok(eval_ifc(rest)));
+    }
+    if head_dir == ".ifnc" {
+        return Some(Ok(!eval_ifc(rest)));
+    }
+
+    // `.if expr` / `.if(expr)` — the plain expression head.
+    Some(eval_if_expr_strict(rest, symbols, ".if"))
+}
+
+/// The numeric comparison family, as a compare-with-zero code:
+/// 0=`==`, 1=`!=`, 2=`<`, 3=`<=`, 4=`>`, 5=`>=`.
+fn numeric_family(head_dir: &str) -> Option<u8> {
+    match head_dir {
+        ".ifeq" => Some(0),
+        ".ifne" => Some(1),
+        ".iflt" => Some(2),
+        ".ifle" => Some(3),
+        ".ifgt" => Some(4),
+        ".ifge" => Some(5),
+        _ => None,
+    }
+}
+
+/// Evaluate a `.ifeq`-family head: strictly resolve the expression to an
+/// assembly-time constant and compare it against zero.
+fn eval_numeric_head(
+    rest: &str,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+    cmp: u8,
+) -> Result<bool, String> {
+    let resolved = resolve_set_expr(rest, symbols);
+    reject_non_constant(&resolved, ".if")?;
+    let value = asm_expr::parse_integer_expr(&resolved)
+        .map_err(|_| "non-constant expression in \".if\" statement".to_string())?;
+    Ok(match cmp {
+        0 => value == 0,
+        1 => value != 0,
+        2 => value < 0,
+        3 => value <= 0,
+        4 => value > 0,
+        5 => value >= 0,
+        _ => unreachable!("numeric_family only yields 0..=5"),
+    })
+}
+
+/// Parse `.ifeqs`/`.ifnes` arguments: two quoted strings separated by a
+/// comma. Diagnostics reproduce GAS 2.47: a missing comma is
+/// `<directive> syntax error`; an unquoted operand is `missing string`.
+fn parse_ifeqs_strings(rest: &str, directive: &str) -> Result<(String, String), String> {
+    let comma = rest.find(',').ok_or_else(|| format!("{directive} syntax error"))?;
+    let unquote = |s: &str| -> Result<String, String> {
+        let t = s.trim();
+        if !(t.starts_with('"') && t.ends_with('"') && t.len() >= 2) {
+            return Err("missing string".to_string());
+        }
+        Ok(t[1..t.len() - 1].to_string())
+    };
+    Ok((unquote(&rest[..comma])?, unquote(&rest[comma + 1..])?))
+}
+
+/// Is `s` a valid GAS identifier for `.ifdef` and friends? GAS's
+/// `invalid identifier for ".ifdef"` covers the empty argument, numbers,
+/// register spellings and every other non-`[A-Za-z_.$][A-Za-z0-9_.$]*`
+/// token.
+fn is_valid_gas_identifier(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    match bytes.first() {
+        Some(c) if c.is_ascii_alphabetic() || *c == b'_' || *c == b'.' || *c == b'$' => {}
+        _ => return false,
+    }
+    bytes[1..]
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$'))
 }
 
 /// Evaluate a `.if` expression for the x86 assembler.
@@ -4174,6 +4252,142 @@ fn eval_if_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<String, 
     asm_preprocess::eval_if_condition_with_resolver(&resolved, |s| {
         asm_preprocess::resolve_x86_registers(s)
     })
+}
+
+/// Strictly evaluate a `.if`-family expression, rejecting the inputs GAS
+/// rejects: after `.set` substitution, any remaining bare identifier that
+/// is neither a register spelling nor a number makes the expression
+/// non-constant. The existing [`eval_if_expr`] tolerates those (they
+/// silently read as 0 / MIN / MAX inside the boolean evaluator), which is
+/// the right behavior for the permissive internal uses but a silent
+/// mis-branching hazard for user-facing conditional heads.
+fn eval_if_expr_strict(
+    expr: &str,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+    directive: &str,
+) -> Result<bool, String> {
+    let resolved = resolve_set_expr(expr, symbols);
+    reject_non_constant(&resolved, directive)?;
+    Ok(eval_if_expr(expr, symbols))
+}
+
+/// Reject expressions containing identifiers that cannot be assembly-time
+/// constants. Scans the `.set`-resolved text for identifier-shaped runs
+/// and requires each to be a register spelling (which the boolean
+/// evaluator resolves per-operand). Numbers — decimal, hex (`0x…`),
+/// octal, binary, and char/character-style quoted tokens — never qualify.
+fn reject_non_constant(expr: &str, directive: &str) -> Result<(), String> {
+    let bytes = expr.as_bytes();
+    let mut k = 0;
+    while k < bytes.len() {
+        let c = bytes[k];
+        if c == b'"' || c == b'\'' {
+            // Quoted string/char literal: no identifiers inside count.
+            k += 1;
+            while k < bytes.len() && bytes[k] != c {
+                k += 1;
+            }
+            k += 1;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            // Number token (incl. 0x1F / 0b1010 / 0777 / trailing h/f
+            // hex spellings): swallow the whole alphanumeric run.
+            while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                k += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c == b'%' {
+            let start = k;
+            while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || matches!(bytes[k], b'_' | b'$' | b'@')) {
+                k += 1;
+            }
+            let ident = &expr[start..k];
+            // Register spellings (with or without %) are resolved by the
+            // boolean evaluator; GAS's register names are not assembly-time
+            // constants either, but the long-standing resolver contract
+            // here maps them to numbers and kernel code relies on it.
+            if ident.starts_with('%') || asm_preprocess::resolve_x86_registers(ident) != ident {
+                continue;
+            }
+            return Err(format!("non-constant expression in \"{directive}\" statement"));
+        }
+        // `.L`-style local symbols and any other leading-`.` token are
+        // identifiers too (GAS rejects an undefined `.Lsym` in `.if` the
+        // same way); a directive-shaped token inside an expression is
+        // equally non-constant.
+        if c == b'.' {
+            return Err(format!("non-constant expression in \"{directive}\" statement"));
+        }
+        k += 1;
+    }
+    Ok(())
+}
+
+/// Collect the branches of a conditional block whose head sits at
+/// `lines[*i]`.
+///
+/// One mechanism for the whole family: a chain of `(condition, lines)`
+/// pairs ending with an optional `.else`, nested `.if*`/`.endif` tracked
+/// by depth. `.elseif` is evaluated LAZILY, exactly like GAS: once a
+/// branch has matched, the remaining `.elseif` conditions are skipped
+/// without being evaluated — an undefined symbol inside a dead `.elseif`
+/// is not an error, while the same token in a live one is. `*i` is left
+/// ON the `.endif`; the caller advances past it. Diagnostics reproduce
+/// GAS 2.47: `duplicate ".else"` and `end of file inside conditional`.
+fn collect_conditional_branches(
+    lines: &[String],
+    i: &mut usize,
+    head_cond: bool,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+) -> Result<Vec<(bool, Vec<String>)>, String> {
+    let mut branches: Vec<(bool, Vec<String>)> = vec![(head_cond, Vec::new())];
+    let mut any_true = head_cond;
+    let mut saw_else = false;
+    let mut current_idx = 0;
+    let mut depth = 1;
+    *i += 1;
+    while *i < lines.len() {
+        let inner = strip_comment(&lines[*i]).trim().to_string();
+        if is_if_start(&inner) {
+            depth += 1;
+            branches[current_idx].1.push(lines[*i].clone());
+        } else if inner == ".endif" {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+            branches[current_idx].1.push(lines[*i].clone());
+        } else if depth == 1 && directive_arg(&inner, ".elseif").is_some() {
+            let elseif_rest = directive_arg(&inner, ".elseif").unwrap_or("");
+            let elseif_cond = if any_true {
+                // Dead branch: GAS never evaluates it.
+                false
+            } else {
+                eval_if_expr_strict(elseif_rest, symbols, ".elseif")?
+            };
+            any_true |= elseif_cond;
+            branches.push((elseif_cond, Vec::new()));
+            current_idx += 1;
+        } else if inner == ".else" && depth == 1 {
+            if saw_else {
+                return Err("duplicate \".else\"".to_string());
+            }
+            saw_else = true;
+            // .else is the fallback: taken only when nothing matched.
+            branches.push((!any_true, Vec::new()));
+            any_true = true;
+            current_idx += 1;
+        } else {
+            branches[current_idx].1.push(lines[*i].clone());
+        }
+        *i += 1;
+    }
+    if depth != 0 {
+        return Err("end of file inside conditional".to_string());
+    }
+    Ok(branches)
 }
 
 #[cfg(test)]

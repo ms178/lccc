@@ -10,13 +10,19 @@
 # and built (no ld/gold/gdb/sim), which keeps the build at a few minutes
 # on the 2-vCPU sandbox.
 #
+# ftp.gnu.org is NOT universally reachable from the sandbox (connection
+# blackholed), so the tarball fetch walks a mirror chain and takes the
+# first one that answers. The download cache and build tree are
+# parametrised (GAS_DL_DIR / GAS_CACHE) so a persistent workspace can keep
+# the tarball across wipes; the install prefix is arg 2.
+#
 # Usage: scripts/ensure_gas_247.sh [target-triple] [install-prefix]
 #   target-triple defaults to riscv64-linux-gnu. The assembler is installed
 #   as <prefix>/bin/as and its version is printed on success.
 set -euo pipefail
 
 target=${1:-riscv64-linux-gnu}
-prefix=${2:-/home/user/.cache/gas-2.47-${target}}
+prefix=${2:-${HOME}/.cache/gas-2.47-${target}}
 as="$prefix/bin/as"
 
 if [[ -x "$as" ]]; then
@@ -25,16 +31,35 @@ if [[ -x "$as" ]]; then
 fi
 
 ver=2.47
-tarball=/home/user/dl/binutils-$ver.tar.xz
+dl_dir=${GAS_DL_DIR:-${HOME}/dl}
+cache=${GAS_CACHE:-${HOME}/.cache}
+tarball="$dl_dir/binutils-$ver.tar.xz"
+mkdir -p "$dl_dir" "$cache"
+
+# Mirror chain: ftp.gnu.org first (canonical), then well-known mirrors that
+# answer from the sandbox network. --connect-timeout keeps a blackholed
+# host from stalling the provision.
 if [[ ! -f "$tarball" ]]; then
-    mkdir -p "$(dirname "$tarball")"
-    curl -sSLo "$tarball" "https://ftp.gnu.org/gnu/binutils/binutils-$ver.tar.xz"
+    fetched=""
+    for base in \
+        "https://ftp.gnu.org/gnu/binutils" \
+        "https://mirrors.kernel.org/gnu/binutils" \
+        "https://mirror.csclub.uwaterloo.ca/gnu/binutils"; do
+        echo "fetch: trying $base/binutils-$ver.tar.xz" >&2
+        if curl --connect-timeout 10 --max-time 300 -sSLo "$tarball.part" \
+            "$base/binutils-$ver.tar.xz"; then
+            mv -f "$tarball.part" "$tarball"
+            fetched=1
+            break
+        fi
+        rm -f "$tarball.part"
+    done
+    [[ -n "$fetched" ]] || { echo "FATAL: no mirror reachable for binutils-$ver" >&2; exit 1; }
 fi
 
-src=/home/user/.cache/binutils-$ver
+src="$cache/binutils-$ver"
 build="$src-build-${target//-/_}"
-mkdir -p /home/user/.cache
-[[ -d $src ]] || tar -xJf "$tarball" -C /home/user/.cache
+[[ -d $src ]] || tar -xJf "$tarball" -C "$cache"
 rm -rf "$build"
 mkdir -p "$build"
 cd "$build"

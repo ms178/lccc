@@ -1534,6 +1534,14 @@ struct ConsumerFacts {
     /// A consumer that reads SF -- or the whole EFLAGS word, which contains it
     /// -- was reached.
     saw_sf_reader: bool,
+    /// A consumer with no condition code -- `lahf`, `pushf`, inline asm, any
+    /// unknown mnemonic -- was reached.  This is exactly the class that can
+    /// observe **AF**, which no `jcc`/`setcc`/`cmovcc` predicate can select
+    /// and which the `NON_SF_FLAG_READERS` whitelist (`adc`/`sbb`/`adox`/...)
+    /// provably does not read.  `test`-vs-`cmp` rewrites diverge on AF (a
+    /// `cmp` defines it, `test` leaves it), so folds that are not
+    /// flag-for-flag identical must veto on this fact.
+    saw_whole_reader: bool,
     /// False when the walk had to give up: an indirect branch, a target it
     /// could not resolve, or a branch leaving the function. The flags may then
     /// reach consumers nobody looked at, so the facts are a lower bound and
@@ -1564,6 +1572,7 @@ fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> Co
         saw_consumer: false,
         saw_non_zf: false,
         saw_sf_reader: false,
+        saw_whole_reader: false,
         proved: true,
     };
     // Label table for the enclosing function, so a branch target can be turned
@@ -1673,6 +1682,7 @@ fn walk_flag_consumers(store: &LineStore, infos: &[LineInfo], from: usize) -> Co
                             facts.saw_non_zf = true;
                             if !NON_SF_FLAG_READERS.iter().any(|p| t.starts_with(p)) {
                                 facts.saw_sf_reader = true;
+                                facts.saw_whole_reader = true;
                             }
                         }
                     }
@@ -1751,6 +1761,28 @@ pub(super) fn flags_reach_an_sf_consumer(
 ) -> bool {
     let f = walk_flag_consumers(store, infos, from);
     !f.proved || f.saw_sf_reader
+}
+
+/// True when some consumer of the current flags reads the WHOLE EFLAGS word
+/// (or is opaque enough that it might): `lahf`, `pushf`, inline-asm blocks,
+/// unknown mnemonics.  This is the reader class that can observe **AF**;
+/// condition-code consumers cannot select AF and the
+/// [`NON_SF_FLAG_READERS`] whitelist (`adc`/`sbb`/`adox`/`rcl`/`rcr`/`cmc`/
+/// `salc`/`into`) reads CF/OF only.  Fails closed exactly like
+/// [`flags_reach_an_sf_consumer`]: an incomplete walk must not license an
+/// AF-divergent rewrite.
+///
+/// Used by `test`→`cmp` zero-compare folds: `cmp $0, mem` DEFINES AF (a
+/// subtraction from zero never borrows, so AF=0) while `test` leaves it
+/// carrying the previous writer's value -- the only flag the rewrite can
+/// change when SF/ZF/PF/CF/OF are provably identical.
+pub(super) fn flags_reach_a_whole_flags_reader(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from);
+    !f.proved || f.saw_whole_reader
 }
 
 /// Whole-name occurrence test: `%r8` must not match inside `%r8d`.

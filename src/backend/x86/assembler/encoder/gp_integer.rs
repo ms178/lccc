@@ -655,6 +655,24 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Register(reg) => {
+                // Segment registers (GAS 2.47, byte-probed): only %fs/%gs
+                // are pushable in long mode (`0f a0/a8`); es/cs/ss/ds are
+                // rejected verbatim. Formerly the generic r32 path fired
+                // and `push %fs` silently encoded as `push %rsp` (0x54) —
+                // a wrong-code bug, not a diagnostic.
+                match reg.name.to_ascii_lowercase().as_str() {
+                    "fs" | "gs" => {
+                        self.bytes
+                            .push(0x0F);
+                        self.bytes
+                            .push(if reg.name.eq_ignore_ascii_case("fs") { 0xA0 } else { 0xA8 });
+                        return Ok(());
+                    }
+                    "es" | "cs" | "ss" | "ds" => {
+                        return Err(format!("you can't `push %{}'", reg.name));
+                    }
+                    _ => {}
+                }
                 let num = reg_num(&reg.name).ok_or("bad register")?;
                 self.emit_rex_unary(4, &reg.name);
                 self.bytes.push(0x50 + (num & 7));
@@ -705,6 +723,21 @@ impl super::InstructionEncoder {
         }
         match &ops[0] {
             Operand::Register(reg) => {
+                // Segment registers: %fs/%gs only in long mode — same
+                // treatment as push (GAS 2.47: `0f a1/a9`, es/cs/ss/ds
+                // rejected verbatim).
+                match reg.name.to_ascii_lowercase().as_str() {
+                    "fs" | "gs" => {
+                        self.bytes.push(0x0F);
+                        self.bytes
+                            .push(if reg.name.eq_ignore_ascii_case("fs") { 0xA1 } else { 0xA9 });
+                        return Ok(());
+                    }
+                    "es" | "cs" | "ss" | "ds" => {
+                        return Err(format!("you can't `pop %{}'", reg.name));
+                    }
+                    _ => {}
+                }
                 let num = reg_num(&reg.name).ok_or("bad register")?;
                 self.emit_rex_unary(4, &reg.name);
                 self.bytes.push(0x58 + (num & 7));
