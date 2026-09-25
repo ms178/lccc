@@ -693,10 +693,10 @@ impl super::InstructionEncoder {
 
     /// Encode LSL (Load Segment Limit): 66 r/w 0F 03 /r — same destination
     /// width law as LAR (the selector source is always r/m16): the operand
-    /// size is the DESTINATION register's width, 66 for r16 spellings in
-    /// either operand slot position is decided by the destination alone
-    /// (GAS 2.47 byte-verified; the previous name-shape heuristic missed
-    /// sp/bp and the whole memory form).
+    /// size is the DESTINATION register's width, 66 for r16 spellings,
+    /// decided by the destination alone (GAS 2.47 byte-verified; the
+    /// previous name-shape heuristic missed sp/bp and the whole memory
+    /// form).
     pub(crate) fn encode_lsl(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("lsl requires 2 operands".to_string());

@@ -1,7 +1,7 @@
 //! EVEX-promoted SSE/SSE2/CET forms — the `{evex}` encoding hint.
 //!
 //! Every encoding in this module was byte-probed against GNU as 2.47
-//! (`62 ...` rows recorded 2026-09-25 during the ms178-1 red-team audit).
+//! (`62 ...` rows recorded 2026-09-25/26 during the promoted-set audit).
 //! The promoted instructions are xmm-only (EVEX.LIG: L'L fixed 00) and
 //! take no opmask/zeroing/`{1toN}` decorators; the compressed-displacement
 //! scale N follows the memory operand's element size exactly as GAS
@@ -38,8 +38,10 @@ impl super::InstructionEncoder {
     }
 
     /// `vmovd` / `vmovq`: EVEX.66.0F.W0 (vmovd) / EVEX.F2.0F.W1 (vmovq),
-    /// opcode 6E (into xmm) / 7E (out of xmm). The xmm→xmm spelling is the
-    /// F3 7E row (pp=2) — same instruction as the legacy 66 0F 7E move.
+    /// opcode 6E (into xmm) / 7E (out of xmm). The xmm→xmm spelling is
+    /// the F3 7E row (pp=2) — same instruction as the legacy 66 0F 7E
+    /// move; GAS 2.47 ACCEPTS it (`{evex} vmovd %xmm1,%xmm2` =
+    /// `62 f1 7e 08 7e d1`), it is not an undefined encoding.
     pub(crate) fn encode_evex_vmovd_vmovq(
         &mut self,
         ops: &[Operand],
@@ -111,10 +113,15 @@ impl super::InstructionEncoder {
     }
 
     /// `vextractps`/`vpextrb`/`vpextrd`/`vpextrq`: `$imm, %xmm, r/m`.
-    /// xmm in ModRM.reg, r/m in rm, imm8 last. `vpextrw` has TWO rows:
-    /// register destination = EVEX.66.0F.W0 C5, memory destination =
-    /// EVEX.66.0F3A.W0 15 (the SSE4.1 PEXTRW row promoted) — GAS 2.47
-    /// byte-probed both.
+    /// xmm in ModRM.reg, r/m in rm, imm8 last. `vpextrw` has TWO rows
+    /// with OPPOSITE register placement (GAS 2.47, byte-probed):
+    /// register destination = EVEX.66.0F.W0 C5 with the GP register in
+    /// ModRM.reg and the xmm in r/m (`{evex} vpextrw $1,%xmm1,%eax` =
+    /// `62 f1 7d 08 c5 c1 01`) — the promoted SSE4.1 PEXTRW row flips
+    /// the fields relative to every other extract; memory destination =
+    /// EVEX.66.0F3A.W0 15 with the xmm in ModRM.reg and N=2, like the
+    /// rest of the family. `gp_in_reg` selects the register-destination
+    /// placement (true only for vpextrw).
     pub(crate) fn encode_evex_promoted_extract(
         &mut self,
         ops: &[Operand],
@@ -125,25 +132,31 @@ impl super::InstructionEncoder {
         mem_map: Option<u8>,
         mem_opcode: Option<u8>,
         mem_n: u32,
+        gp_in_reg: bool,
         mnemonic: &str,
     ) -> Result<(), String> {
         if ops.len() != 3 {
             return Err(format!("number of operands mismatch for `{mnemonic}'"));
         }
         Self::check_promoted_shape(mnemonic, ops, &[1])?;
-        let imm = match &ops[0] {
-            Operand::Immediate(ImmediateValue::Integer(v)) => {
-                if !(0..=255).contains(v) {
-                    return Err(format!("constant doesn't fit in 8 bits for `{mnemonic}'"));
-                }
-                *v as u8
-            }
-            _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
-        };
+        let imm = promoted_imm8(ops, mnemonic)?;
         match (&ops[1], &ops[2]) {
             (Operand::Register(src), Operand::Register(dst)) => {
-                let (dst_num, rm_num) = self
-                    .emit_evex_mod3(&src.name, &dst.name, None, map, w, pp, 0, false, 0, false)?;
+                // vpextrw's C5 row: GP destination in ModRM.reg (with the
+                // full R/R' extension range — `{evex} vpextrw
+                // $1,%xmm16,%r9d` = `62 31 7d 08 c5 c8 01`), xmm source in
+                // r/m (X extension for r16-r31). An xmm destination is
+                // `operand type mismatch` on the C5 row in every mode
+                // (GAS 2.47 byte-probed). Every other extract: xmm in
+                // ModRM.reg, GP in r/m.
+                if gp_in_reg && is_xmm(&dst.name) {
+                    return Err(format!("operand type mismatch for `{mnemonic}'"));
+                }
+                let (dst_num, rm_num) = if gp_in_reg {
+                    self.emit_evex_mod3(&dst.name, &src.name, None, map, w, pp, 0, false, 0, false)?
+                } else {
+                    self.emit_evex_mod3(&src.name, &dst.name, None, map, w, pp, 0, false, 0, false)?
+                };
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, dst_num, rm_num));
                 self.bytes.push(imm);
@@ -182,15 +195,7 @@ impl super::InstructionEncoder {
             return Err(format!("number of operands mismatch for `{mnemonic}'"));
         }
         Self::check_promoted_shape(mnemonic, ops, &[2, 3])?;
-        let imm = match &ops[0] {
-            Operand::Immediate(ImmediateValue::Integer(v)) => {
-                if !(0..=255).contains(v) {
-                    return Err(format!("constant doesn't fit in 8 bits for `{mnemonic}'"));
-                }
-                *v as u8
-            }
-            _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
-        };
+        let imm = promoted_imm8(ops, mnemonic)?;
         let dst_name = match &ops[3] {
             Operand::Register(r) => &r.name,
             _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
@@ -240,38 +245,55 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// `vcvtsd2si`/`vcvtss2si`/`vcvttsd2si`/`vcvttss2si`: `%xmm, r/m` with
-    /// the destination a GP register — EVEX.0F.{F2|F3} W{0,1} {2C|2D}, W
-    /// taken from the GP width (r32 = W0, r64 = W1), N = 8 (sd) / 4 (ss)
-    /// for the memory source.
+    /// `vcvtsd2si`/`vcvtss2si`/`vcvttsd2si`/`vcvttss2si`: `(src, dst)` with
+    /// the destination a GP register — EVEX.0F.{F2|F3} W{0,1} {2C|2D}.
+    /// Register placement is OPPOSITE the legacy VEX row (GAS 2.47,
+    /// byte-probed): the GP DESTINATION sits in ModRM.reg and the xmm
+    /// source in r/m (`{evex} vcvtsd2si %xmm1,%eax` = `62 f1 7f 08 2d
+    /// c1`; the swapped spelling silently encodes `%xmm0,%ecx`). W is
+    /// taken from the GP width (r32 = W0, r64 = W1), or from the `l`/`q`
+    /// mnemonic suffix when present (which must then AGREE with the
+    /// destination register — GAS: `incorrect register `%rax' used with
+    /// `l' suffix'). The memory source is (mem, GP) with N = 8 (sd) /
+    /// 4 (ss): `{evex} vcvtsd2si 8(%rax),%eax` = `62 f1 7f 08 2d 40 01`.
     pub(crate) fn encode_evex_promoted_cvt_to_gp(
         &mut self,
         ops: &[Operand],
         pp: u8,
         opcode: u8,
         sd: bool,
+        suffix_w: Option<u8>,
         mnemonic: &str,
     ) -> Result<(), String> {
         if ops.len() != 2 {
             return Err(format!("number of operands mismatch for `{mnemonic}'"));
         }
         Self::check_promoted_shape(mnemonic, ops, &[0])?;
-        let w = match &ops[1] {
-            Operand::Register(r) => u8::from(is_reg64(&r.name)),
-            Operand::Memory(_) => 0,
+        let dst_name = match &ops[1] {
+            Operand::Register(r) => &r.name,
             _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
         };
-        match (&ops[0], &ops[1]) {
-            (Operand::Register(src), Operand::Register(dst)) => {
+        let w = u8::from(is_reg64(dst_name));
+        if let Some(sw) = suffix_w {
+            if sw != w {
+                return Err(format!(
+                    "incorrect register `%{}' used with `{}' suffix",
+                    dst_name.trim_start_matches('%'),
+                    if sw == 1 { 'q' } else { 'l' }
+                ));
+            }
+        }
+        match &ops[0] {
+            Operand::Register(src) => {
                 let (dst_num, rm_num) =
-                    self.emit_evex_mod3(&src.name, &dst.name, None, 1, w, pp, 0, false, 0, false)?;
+                    self.emit_evex_mod3(dst_name, &src.name, None, 1, w, pp, 0, false, 0, false)?;
                 self.bytes.push(opcode);
                 self.bytes.push(self.modrm(3, dst_num, rm_num));
                 Ok(())
             }
-            (Operand::Register(src), Operand::Memory(mem)) => {
+            Operand::Memory(mem) => {
                 let dst_num =
-                    self.emit_evex_memop(&src.name, mem, None, 1, w, pp, 0, false, 0, false)?;
+                    self.emit_evex_memop(dst_name, mem, None, 1, w, pp, 0, false, 0, false)?;
                 self.bytes.push(opcode);
                 self.encode_evex_mem(dst_num, mem, if sd { 8 } else { 4 })
             }
@@ -280,25 +302,44 @@ impl super::InstructionEncoder {
     }
 
     /// `vcvtsi2sd`/`vcvtsi2ss`: `$gp/mem, %xmm2, %xmm3` — dst in
-    /// ModRM.reg, vvvv = src2, rm = the GP source; W from the GP width
-    /// (register r64 = W1, r32 or memory = W0), pp = F2 (sd) / F3 (ss).
-    /// Memory tuple is element-sized: N = 8 (sd, m64) / 4 (ss, m32).
+    /// ModRM.reg, vvvv = src2, rm = the GP source; W from the SOURCE
+    /// width (register r64 = W1, r32 = W0, memory m64 = W1, m32 = W0 —
+    /// the `l`/`q` suffix defines it for memory and must agree for
+    /// registers, exactly like the to-GP family), pp = F2 (sd) / F3
+    /// (ss). The memory tuple is element-sized (GAS 2.47, byte-probed):
+    /// `vcvtsi2sdl 508(%r20),...` = disp8 0x7f (N=4) but
+    /// `vcvtsi2sdq 1016(%r20),...` = disp8 0x7f (N=8) — the old
+    /// hardcoded N=4 silently mis-addressed every m64 source.
     pub(crate) fn encode_evex_promoted_cvt_from_gp(
         &mut self,
         ops: &[Operand],
         pp: u8,
         sd: bool,
+        suffix_w: Option<u8>,
         mnemonic: &str,
     ) -> Result<(), String> {
         if ops.len() != 3 {
             return Err(format!("number of operands mismatch for `{mnemonic}'"));
         }
         Self::check_promoted_shape(mnemonic, ops, &[1, 2])?;
+        // Source width: register r64 = W1 / r32 = W0; memory follows the
+        // `l`/`q` suffix, defaulting to m32 (W0) for the unsuffixed
+        // spelling (GAS: `vcvtsi2sd (%rax),...` is the W0 form).
         let w = match &ops[0] {
             Operand::Register(r) => u8::from(is_reg64(&r.name)),
-            Operand::Memory(_) => 0,
+            Operand::Memory(_) => suffix_w.unwrap_or(0),
             _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
         };
+        if let (Some(sw), Operand::Register(r)) = (suffix_w, &ops[0]) {
+            let rw = u8::from(is_reg64(&r.name));
+            if sw != rw {
+                return Err(format!(
+                    "incorrect register `%{}' used with `{}' suffix",
+                    r.name.trim_start_matches('%'),
+                    if sw == 1 { 'q' } else { 'l' }
+                ));
+            }
+        }
         let dst_name = match &ops[2] {
             Operand::Register(r) => &r.name,
             _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
@@ -339,9 +380,10 @@ impl super::InstructionEncoder {
                     false,
                 )?;
                 self.bytes.push(0x2A);
-                // Tuple1 scalar at N=4 for BOTH widths: GAS 2.47 scales
-                // vcvtsi2sd's m64 source by 4 as well (`8(%rax)` -> disp8=2).
-                self.encode_evex_mem(dst_num, mem, 4)
+                // Element-sized tuple: N = 4 << W — m32 sources scale by
+                // 4, m64 sources by 8 (GAS 2.47: `vcvtsi2sdl 508(%r20),...`
+                // disp8 0x7f, `vcvtsi2sdq 1016(%r20),...` disp8 0x7f).
+                self.encode_evex_mem(dst_num, mem, 4u32 << w)
             }
             _ => Err(format!("operand type mismatch for `{mnemonic}'")),
         }
@@ -396,18 +438,14 @@ impl super::InstructionEncoder {
     }
 }
 
-/// The legacy mnemonics that have an APX map-4 promotion, matched against
-/// the suffixed spellings the central suffix inference produces
-/// (`"cmpl"` → `Some(("cmp", 4))`, `"cmp"` → `Some(("cmp", 0))`; size 0
-/// means "infer from the operands"). `"mul"`/`"imul"`/`"shl"`/`"sal"` end
-/// in a suffix-shaped letter, so a generic strip would mis-split them —
-/// the stem set is explicit instead.
+/// The legacy mnemonics that promote to APX CCMP/CTEST under `{evex}`,
+/// matched against the suffixed spellings the central suffix inference
+/// produces (`"cmpl"` → `Some(("cmp", 4))`, `"cmp"` → `Some(("cmp", 0))`;
+/// size 0 means "infer from the operands"). Only cmp/test promote this
+/// way — every other ALU/unary/shift mnemonic has an internal APX arm in
+/// its own encoder, so the stem set is exactly these two.
 pub(crate) fn promoted_stem_size(m: &str) -> Option<(&'static str, u8)> {
-    const STEMS: &[&str] = &[
-        "cmp", "test", "add", "or", "adc", "sbb", "and", "sub", "xor", "neg", "not", "inc", "dec",
-        "mul", "div", "idiv", "imul", "rol", "ror", "rcl", "rcr", "shl", "sal", "shr", "sar",
-    ];
-    for &stem in STEMS {
+    for stem in ["cmp", "test"] {
         if m == stem {
             return Some((stem, 0));
         }
@@ -418,4 +456,19 @@ pub(crate) fn promoted_stem_size(m: &str) -> Option<(&'static str, u8)> {
         }
     }
     None
+}
+
+/// The pextr/pinsr-family imm8: an Integer in the FIRST operand, unsigned
+/// 0..255 (GAS 2.47 rejects `$256` and `$-2` with `operand type mismatch`
+/// on every row of both families — byte-probed).
+fn promoted_imm8(ops: &[Operand], mnemonic: &str) -> Result<u8, String> {
+    match &ops[0] {
+        Operand::Immediate(ImmediateValue::Integer(v)) => {
+            if !(0..=255).contains(v) {
+                return Err(format!("operand type mismatch for `{mnemonic}'"));
+            }
+            Ok(*v as u8)
+        }
+        _ => Err(format!("operand type mismatch for `{mnemonic}'")),
+    }
 }

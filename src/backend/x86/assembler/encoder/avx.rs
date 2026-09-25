@@ -610,36 +610,6 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// Validate a *suffixed* `{sae}`/`{r*-sae}` (on a vector register)
-    /// against the emitted instruction's SAE class. Returns the
-    /// offending token (`{sae}` / `{rn-sae}` / ...) when GAS would say
-    /// `unknown vector operation`, `None` when absent or legitimate.
-    /// (`sae` = bare suffix present; `rounding` = `{r*-sae}` rc if any.)
-    pub(crate) fn check_evex_sae_token(
-        map: u8,
-        opcode: u8,
-        sae: bool,
-        rounding: Option<u8>,
-    ) -> Option<String> {
-        if !sae && rounding.is_none() {
-            return None;
-        }
-        let tok = match rounding {
-            None => "{sae}".to_string(),
-            Some(0) => "{rn-sae}".to_string(),
-            Some(1) => "{rd-sae}".to_string(),
-            Some(2) => "{ru-sae}".to_string(),
-            Some(3) => "{rz-sae}".to_string(),
-            Some(rc) => format!("{{r{rc}-sae}}"),
-        };
-        let bad = match Self::evex_sae_class(map, opcode) {
-            EvexSae::None => true,
-            EvexSae::Er => rounding.is_none(),
-            EvexSae::Sae => rounding.is_some(),
-        };
-        bad.then_some(tok)
-    }
-
     /// EVEX vector length from operands: 00=128(xmm), 01=256(ymm), 10=512(zmm).
     /// EVEX LL from the WIDEST vector register in the operand list. Max, not
     /// first-found: `vinserti32x8 $imm, %ymm28, %zmm29, %zmm30` carries its
@@ -670,15 +640,6 @@ impl super::InstructionEncoder {
                 if let Some(tok) = evex_sae_rounding(s) {
                     return (&ops[1..], Some(tok));
                 }
-            }
-            Some(Operand::Register(r))
-                if (r.sae || r.rounding.is_some())
-                    && !is_xmm(&r.name)
-                    && !is_ymm(&r.name)
-                    && !is_zmm(&r.name)
-                    && !is_kreg(&r.name) =>
-            {
-                return (&ops[1..], Some(r.rounding));
             }
             _ => {}
         }
@@ -2650,6 +2611,136 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// AVX10.2 `vmpsadbw` EVEX row (EVEX.F3.0F3A.W0 42): ymm/zmm capable
+    /// with full L'L and mask-on-destination support; the memory tuple is
+    /// the FULL vector (N = VL bytes — GAS 2.47: `vmpsadbw $1,4096(%rax),
+    /// %zmm1,%zmm3` = disp8 0x40, i.e. N=64; 16(%rax) is not 64-aligned
+    /// and takes disp32). Under `{evex}` even the ymm spelling takes THIS
+    /// row rather than the legacy VEX one (`{evex} vmpsadbw
+    /// $1,%ymm2,%ymm1,%ymm3` = `62 f3 76 28 42 da 01`). The imm8 is
+    /// unsigned 0..255 (GAS rejects `$-2` with `no EVEX encoding` /
+    /// `operand type mismatch` on these rows — byte-probed).
+    pub(crate) fn encode_evex_vmpsadbw_avx10(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 4 {
+            return Err("number of operands mismatch for `vmpsadbw'".to_string());
+        }
+        let imm = match &ops[0] {
+            Operand::Immediate(ImmediateValue::Integer(v)) => {
+                if !(0..=255).contains(v) {
+                    return Err("operand type mismatch for `vmpsadbw'".to_string());
+                }
+                *v as u8
+            }
+            _ => return Err("operand type mismatch for `vmpsadbw'".to_string()),
+        };
+        let ll = Self::evex_ll(ops);
+        let (aaa, z) = Self::evex_mask_info(&ops[3]);
+        match (&ops[1], &ops[2], &ops[3]) {
+            (Operand::Register(src), Operand::Register(vvvv), Operand::Register(dst)) => {
+                let (dst_num, src_num) = self.emit_evex_mod3(
+                    &dst.name,
+                    &src.name,
+                    Some(&vvvv.name),
+                    3,
+                    0,
+                    2,
+                    ll,
+                    z,
+                    aaa,
+                    false,
+                )?;
+                self.bytes.push(0x42);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.push(imm);
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(vvvv), Operand::Register(dst)) => {
+                let dst_num = self.emit_evex_memop(
+                    &dst.name,
+                    mem,
+                    Some(&vvvv.name),
+                    3,
+                    0,
+                    2,
+                    ll,
+                    z,
+                    aaa,
+                    false,
+                )?;
+                self.bytes.push(0x42);
+                // Full-vector tuple: N = VL bytes (GAS 2.47:
+                // `vmpsadbw $1,4096(%rax),%zmm1,%zmm3` = disp8 0x40).
+                self.encode_evex_mem(dst_num, mem, 16u32 << ll)?;
+                self.bytes.push(imm);
+                Ok(())
+            }
+            _ => Err("operand type mismatch for `vmpsadbw'".to_string()),
+        }
+    }
+
+    /// Central scalar-Tuple1 sniff from the EMITTED bytes:
+    /// `(map, pp, W, opcode) -> N` for every scalar row that has a memory
+    /// form (GAS 2.47, distilled byte-probe by byte-probe). Drives the
+    /// decorator check's scalar-broadcast rejection — `{1toN}` on a
+    /// Tuple1 scalar is rejected by GAS for EVERY such row
+    /// (`unsupported broadcast for `vaddss'', `operand type mismatch'
+    /// for the scalar movs, `no EVEX encoding' for the scalar compares),
+    /// so the check covers every present and future scalar caller with
+    /// no per-arm chaining. Packed neighbors that must NOT match:
+    /// map-1 pp0/1, the even packed-FMA opcodes, the odd-but-packed
+    /// vfmsubadd 97/A7/B7, the VNNI pp-tricks in map 2, the packed
+    /// vmovsldup (pp2 12) / vmovshdup (pp2 16), and the packed
+    /// scalar-control rows (26/54/56/08/09).
+    pub(crate) fn evex_scalar_tuple_n(map: u8, pp: u8, w: u8, opcode: u8) -> Option<u32> {
+        match (map, pp) {
+            // 0F F3/F2: ss/sd arithmetic + cmp + cvt + scalar moves.
+            // N is the element size (4 for pp=2/ss, 8 for pp=3/sd).
+            (1, 2) | (1, 3) => {
+                let n = if pp == 2 { 4 } else { 8 };
+                match opcode {
+                    0x51 | 0x58 | 0x59 | 0x5A | 0x5C | 0x5D | 0x5E | 0x5F // sqrt/add/mul/cvt/sub/min/div/max
+                    | 0xC2 | 0x2A | 0x2C | 0x2D | 0x78 | 0x79 | 0x7B // cmp, cvt both ways
+                    | 0x10 | 0x11 => Some(n), // scalar mov load/store
+                    0x12 if pp == 3 => Some(n), // vmovddup (F2); pp=2 is packed vmovsldup
+                    _ => None,
+                }
+            }
+            // 0F38 pp=1: scalar FMA (the odd opcodes; the even ones are
+            // the packed ps/pd rows and 97/A7/B7 stay packed) plus the
+            // scalar vscalef (2D) and vgetexp (43).
+            (2, 1) => match opcode {
+                0x99 | 0x9B | 0x9D | 0x9F | 0xA9 | 0xAB | 0xAD | 0xAF | 0xB9 | 0xBB | 0xBD
+                | 0xBF | 0x2D | 0x43 => Some(if w == 1 { 8 } else { 4 }),
+                _ => None,
+            },
+            // 0F3A pp=1: scalar-control (getmant/range/fixupimm/reduce/
+            // rndscale scalar rows; the 26/54/56/08/09 neighbors are packed).
+            (3, 1) => match opcode {
+                0x27 | 0x51 | 0x55 | 0x57 | 0x0A | 0x0B => Some(if w == 1 { 8 } else { 4 }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Scalar-row class for the broadcast diagnostic text (GAS 2.47 uses
+    /// a different message per row family — byte-probed).
+    pub(crate) fn evex_scalar_bcst_class(
+        map: u8,
+        pp: u8,
+        w: u8,
+        opcode: u8,
+    ) -> Option<&'static str> {
+        Self::evex_scalar_tuple_n(map, pp, w, opcode)?;
+        Some(match (map, opcode) {
+            // Scalar movs: the {1toN} row does not exist at all.
+            (1, 0x10) | (1, 0x11) | (1, 0x12) => "operand type mismatch",
+            // Scalar compares: GAS falls through to `no EVEX encoding'.
+            (1, 0xC2) => "no EVEX encoding",
+            _ => "unsupported broadcast",
+        })
+    }
+
     /// Encode AVX scalar comparison (vcmpss/vcmpsd) with F3/F2 prefix
     /// pp: 2=F3 (vcmpss), 3=F2 (vcmpsd)
     pub(crate) fn encode_avx_cmp_scalar(
@@ -3083,6 +3174,17 @@ impl super::InstructionEncoder {
         if ops.len() != 4 {
             return Err("AVX 3-op+imm8 requires 4 operands".to_string());
         }
+        // GAS 2.47 range law for the VEX 0F3A imm8 (vmpsadbw, the only
+        // caller): the full imm8 byte, -128..=255 — `$-2` and `$200`
+        // assemble, `$300` is `operand type mismatch` (byte-probed on
+        // both the xmm and ymm rows). The EVEX rows take the unsigned
+        // 0..255 range instead (see the promoted insert encoder and
+        // encode_evex_vmpsadbw_avx10).
+        if let Operand::Immediate(ImmediateValue::Integer(v)) = &ops[0] {
+            if !(-128..=255).contains(v) {
+                return Err("operand type mismatch for `vmpsadbw'".to_string());
+            }
+        }
         let l = self.vex_l_from_ops(ops);
         let pp = if has_66 { 1 } else { 0 };
 
@@ -3365,9 +3467,10 @@ impl super::InstructionEncoder {
     /// EVEX down-conversion (AVX512F/DQ/BW vpmov*): EVEX.F3.0F38.W0
     /// 10–35. AT&T `(src, dst reg|mem{k}{z})`: ModRM.reg = the wide
     /// SOURCE, r/m = the narrow destination, EVEX.L'L encodes the SOURCE
-    /// width, memory tuple N = source-lanes × dst-elem (byte-verified:
-    /// vpmovwb zmm → 32, ymm → 16; vpmovdb xmm → 4 — i.e. VL/lanes…
-    /// constant div = 4/dst_elem at every VL).
+    /// width. Memory tuple N = the narrow RESULT byte count at every
+    /// source VL (byte-verified: vpmovwb zmm → 32, ymm → 16, xmm → 8;
+    /// vpmovqb zmm → 8 — i.e. VL divided by the lane-count ratio, with
+    /// the qword-source rows carrying half the lanes of their siblings).
     pub(crate) fn encode_evex_narrow(
         &mut self,
         ops: &[Operand],
@@ -3587,6 +3690,7 @@ impl super::InstructionEncoder {
         ops: &[Operand],
         pp: u8,
         w: u8,
+        mnemonic: &str,
     ) -> Result<(), String> {
         match ops.len() {
             3 => {
@@ -3594,7 +3698,7 @@ impl super::InstructionEncoder {
                     (Operand::Register(a), Operand::Register(b), Operand::Register(d)) => {
                         (&a.name, &b.name, &d.name)
                     }
-                    _ => return Err("operand type mismatch".to_string()),
+                    _ => return Err(format!("operand type mismatch for `{mnemonic}'")),
                 };
                 let (aaa, z) = Self::evex_mask_info(&ops[2]);
                 let (dst_num, rm_num) =
@@ -3623,11 +3727,11 @@ impl super::InstructionEncoder {
                     self.encode_evex_mem(src_num, mem, if w == 1 { 8 } else { 4 })
                 }
                 (Operand::Register(_), Operand::Register(_)) => {
-                    Err("operand type mismatch".to_string())
+                    Err(format!("operand type mismatch for `{mnemonic}'"))
                 }
-                _ => Err("operand type mismatch".to_string()),
+                _ => Err(format!("operand type mismatch for `{mnemonic}'")),
             },
-            _ => Err("operand type mismatch".to_string()),
+            _ => Err(format!("operand type mismatch for `{mnemonic}'")),
         }
     }
 

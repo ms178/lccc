@@ -1003,8 +1003,6 @@ mod i686_encoding_helper_tests {
             name: name.to_owned(),
             mask: None,
             zeroing: false,
-            sae: false,
-            rounding: None,
             broadcast: None,
         }
     }
