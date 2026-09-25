@@ -582,10 +582,13 @@ fn thread_round(func: &mut IrFunction) -> usize {
                     Instruction::Phi { incoming, .. } => incoming,
                     _ => break, // phis lead the block
                 };
-                let k = incoming
-                    .iter()
-                    .position(|(_, l)| *l == ml)
-                    .expect("pre-validated: exactly one merge-edge arm");
+                let Some(k) = incoming.iter().position(|(_, l)| *l == ml) else {
+                    // Fail-closed: if the merge edge is missing, the CFG
+                    // changed under us (or validation missed it). Keep the
+                    // phi as-is rather than panicking — the thread for this
+                    // merge will be incomplete but the IR stays well-formed.
+                    continue;
+                };
                 let merge_edge_op = incoming[k].0;
                 for (pos, threaded) in threadable.iter().enumerate() {
                     if !*threaded {

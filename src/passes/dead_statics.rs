@@ -549,6 +549,15 @@ fn is_asm_ident_char(c: u8) -> bool {
 /// True iff `name` occurs in `asm` as its own token, not as a substring of a
 /// longer identifier (`log` must not match `logarithm`; `foo` must not match
 /// `foobar`). Names that themselves contain `@`/`+` still match exactly.
+///
+/// AT&T syntax: `$symbol` is an immediate reference to `symbol`'s address
+/// (e.g. `movabsq $g, %rax`). The `$` is NOT part of the identifier, but
+/// `is_asm_ident_char` includes `$` to handle embedded `$` in symbol names
+/// like `foo$bar`. Therefore `$g` must be recognized as a reference to `g`,
+/// while `foo$bar` must NOT be recognized as a reference to `bar`.
+/// We handle this by treating a preceding `$` as an immediate prefix when
+/// the char before `$` is NOT an ident char (or `$` is at start); if the
+/// char before `$` IS ident, then `$` is embedded and the match is rejected.
 fn asm_mentions_symbol(asm: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -557,7 +566,24 @@ fn asm_mentions_symbol(asm: &str, name: &str) -> bool {
     let mut search_from = 0;
     while let Some(rel) = asm[search_from..].find(name) {
         let abs = search_from + rel;
-        let before_ok = abs == 0 || !is_asm_ident_char(bytes[abs - 1]);
+        let before_ok = if abs == 0 {
+            true
+        } else {
+            let prev = bytes[abs - 1];
+            if !is_asm_ident_char(prev) {
+                true
+            } else if prev == b'$' {
+                // `$` preceded by non-ident or start => immediate prefix `$g`
+                // `$` preceded by ident => embedded `$` like `foo$bar`
+                if abs >= 2 {
+                    !is_asm_ident_char(bytes[abs - 2])
+                } else {
+                    true
+                }
+            } else {
+                false
+            }
+        };
         let after = abs + name.len();
         let after_ok = after == bytes.len() || !is_asm_ident_char(bytes[after]);
         if before_ok && after_ok {
@@ -1578,5 +1604,186 @@ mod tests {
         m.functions.push(f);
         eliminate_dead_global_stores(&mut m);
         assert_eq!(store_count(&m), 0, "unrelated inline-asm: store gone");
+    }
+
+    #[test]
+    fn asm_mentions_symbol_basic() {
+        assert!(asm_mentions_symbol("movl g(%%rip), %0", "g"));
+        assert!(asm_mentions_symbol("movl g@GOTPCREL(%%rip), %0", "g"));
+        assert!(!asm_mentions_symbol("movl other(%%rip), %0", "g"));
+        assert!(!asm_mentions_symbol("movl foobar, %0", "foo"));
+        assert!(!asm_mentions_symbol("movl foo, %0", "foobar"));
+    }
+
+    #[test]
+    fn asm_mentions_symbol_immediate_prefix() {
+        // $g forms must be recognized
+        assert!(asm_mentions_symbol("movabsq $g, %rax", "g"), "$g immediate");
+        assert!(
+            asm_mentions_symbol("movl $g+4, %eax", "g"),
+            "$g+4 immediate"
+        );
+        assert!(asm_mentions_symbol("leaq $g, %rax", "g"), "leaq $g");
+        // Embedded $ must NOT spuriously match
+        assert!(
+            !asm_mentions_symbol("movl foo$bar, %0", "bar"),
+            "foo$bar should not match bar"
+        );
+        assert!(
+            !asm_mentions_symbol("movl foo$bar, %0", "foo"),
+            "foo$bar should not match foo (whole token is foo$bar)"
+        );
+        // Longer identifier must not match shorter
+        assert!(!asm_mentions_symbol("movl g_long, %0", "g"));
+        assert!(!asm_mentions_symbol("movl my_g, %0", "g"));
+        // $ embedded case: foo$bar contains $ but bar is not separate
+        // $ at start with no preceding ident is immediate, not embedded
+        assert!(asm_mentions_symbol("$g", "g"));
+    }
+
+    #[test]
+    fn inline_asm_template_immediate_bails() {
+        // $g form must also bail the global store elimination
+        let mut m = IrModule::new();
+        m.globals.push(gs_global("g"));
+        let mut f = IrFunction::new(String::from("w"), IrType::Void, vec![], false);
+        f.blocks = vec![gs_block(
+            vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: String::from("g"),
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(5)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::InlineAsm {
+                    template: String::from("movabsq $g, %0"),
+                    outputs: vec![("=r".to_string(), Value(1), None)],
+                    inputs: vec![],
+                    clobbers: vec![],
+                    operand_types: vec![IrType::I64],
+                    goto_labels: vec![],
+                    input_symbols: vec![],
+                    seg_overrides: vec![AddressSpace::Default],
+                },
+            ],
+            Terminator::Return(None),
+        )];
+        f.next_value_id = 2;
+        m.functions.push(f);
+        eliminate_dead_global_stores(&mut m);
+        assert_eq!(store_count(&m), 1, "$g immediate template must keep store");
+    }
+
+    #[test]
+    fn static_function_via_asm_template_survives() {
+        // Static function mentioned only in inline-asm template must survive
+        // dead_static elimination, and its dependencies must survive too.
+        let mut m = IrModule::new();
+        // Helper static function that is called by the mentioned function
+        let mut helper = IrFunction::new(String::from("helper"), IrType::Void, vec![], false);
+        helper.is_static = true;
+        helper.blocks = vec![gs_block(vec![], Terminator::Return(None))];
+        m.functions.push(helper);
+        // Main static function that calls helper
+        let mut main_static =
+            IrFunction::new(String::from("my_static_fn"), IrType::Void, vec![], false);
+        main_static.is_static = true;
+        main_static.blocks = vec![gs_block(
+            vec![Instruction::Call {
+                func: String::from("helper"),
+                info: crate::ir::reexports::CallInfo::default(),
+            }],
+            Terminator::Return(None),
+        )];
+        m.functions.push(main_static);
+        // Extern function that mentions my_static_fn only via asm template
+        let mut extern_fn =
+            IrFunction::new(String::from("extern_user"), IrType::Void, vec![], false);
+        extern_fn.is_static = false;
+        extern_fn.blocks = vec![gs_block(
+            vec![Instruction::InlineAsm {
+                template: String::from("call my_static_fn"),
+                outputs: vec![],
+                inputs: vec![],
+                clobbers: vec![],
+                operand_types: vec![],
+                goto_labels: vec![],
+                input_symbols: vec![],
+                seg_overrides: vec![],
+            }],
+            Terminator::Return(None),
+        )];
+        m.functions.push(extern_fn);
+        // Before elimination: 3 funcs
+        assert_eq!(m.functions.len(), 3);
+        eliminate_dead_static_functions(&mut m);
+        // my_static_fn must survive because template mentions it, and helper must survive because my_static_fn calls it
+        assert!(
+            m.functions.iter().any(|f| f.name == "my_static_fn"),
+            "asm-mentioned static fn must survive"
+        );
+        assert!(
+            m.functions.iter().any(|f| f.name == "helper"),
+            "dependency of asm-mentioned fn must survive"
+        );
+    }
+
+    #[test]
+    fn unrelated_static_still_removed() {
+        let mut m = IrModule::new();
+        let mut dead = IrFunction::new(String::from("dead_static"), IrType::Void, vec![], false);
+        dead.is_static = true;
+        dead.blocks = vec![gs_block(vec![], Terminator::Return(None))];
+        m.functions.push(dead);
+        // No roots
+        eliminate_dead_static_functions(&mut m);
+        assert!(m.functions.is_empty(), "unrelated static must be removed");
+    }
+
+    #[test]
+    fn symbol_attrs_template_only_survives() {
+        // Visibility attr for external symbol mentioned only via template must survive
+        let mut m = IrModule::new();
+        // External symbol (not defined in module)
+        m.symbol_attrs
+            .push((String::from("ext_sym"), false, Some(String::from("hidden"))));
+        // Function mentioning ext_sym via template
+        let mut f = IrFunction::new(String::from("user"), IrType::Void, vec![], false);
+        f.is_static = false;
+        f.blocks = vec![gs_block(
+            vec![Instruction::InlineAsm {
+                template: String::from("call ext_sym"),
+                outputs: vec![],
+                inputs: vec![],
+                clobbers: vec![],
+                operand_types: vec![],
+                goto_labels: vec![],
+                input_symbols: vec![],
+                seg_overrides: vec![],
+            }],
+            Terminator::Return(None),
+        )];
+        m.functions.push(f);
+        eliminate_dead_static_functions(&mut m);
+        assert!(
+            m.symbol_attrs.iter().any(|(n, _, _)| n == "ext_sym"),
+            "attr for template-only ext symbol must survive"
+        );
+        // Unrelated attr must be removed
+        m.symbol_attrs.push((
+            String::from("unrelated"),
+            false,
+            Some(String::from("hidden")),
+        ));
+        filter_symbol_attrs(&mut m);
+        assert!(
+            !m.symbol_attrs.iter().any(|(n, _, _)| n == "unrelated"),
+            "unrelated attr must be removed"
+        );
     }
 }
