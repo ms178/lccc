@@ -413,6 +413,81 @@ impl super::InstructionEncoder {
         Ok(())
     }
 
+    /// APX EVEX with ND=0 and vvvv present as a SOURCE — the IDIV promoted
+    /// shape (`idiv %ecx, %eax`: vvvv = the dividend's high half, the
+    /// destination stays the implicit rDX:rA pair; GAS 2.47 byte-verified).
+    pub(crate) fn emit_apx_evex_rr_nd0(
+        &mut self,
+        size: u8,
+        reg: &str,
+        rm: &str,
+        vvvv: &str,
+        nf: bool,
+    ) -> Result<(), String> {
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = gp_ext_bits(rm);
+        let id = Self::gp_id_or_err(vvvv)?;
+        self.emit_evex_apx(
+            r,
+            false,
+            b,
+            r4,
+            false,
+            b4,
+            size == 8,
+            id,
+            false,
+            nf,
+            Self::apx_pp(size),
+        );
+        Ok(())
+    }
+
+    /// Memory-operand variant of [`emit_apx_evex_rr_nd0`].
+    pub(crate) fn emit_apx_evex_rm_nd0(
+        &mut self,
+        size: u8,
+        reg: &str,
+        mem: &MemoryOperand,
+        vvvv: &str,
+        nf: bool,
+    ) -> Result<(), String> {
+        let (r, r4) = if reg.is_empty() {
+            (false, false)
+        } else {
+            gp_ext_bits(reg)
+        };
+        let (b, b4) = mem
+            .base
+            .as_ref()
+            .map(|b| gp_ext_bits(&b.name))
+            .unwrap_or((false, false));
+        let (x, x4) = mem
+            .index
+            .as_ref()
+            .map(|i| gp_ext_bits(&i.name))
+            .unwrap_or((false, false));
+        let id = Self::gp_id_or_err(vvvv)?;
+        self.emit_evex_apx(
+            r,
+            x,
+            b,
+            r4,
+            x4,
+            b4,
+            size == 8,
+            id,
+            false,
+            nf,
+            Self::apx_pp(size),
+        );
+        Ok(())
+    }
+
     /// BMI/BMI2 EVEX: dest in ModRM.reg, vvvv is a source (ND=0), map 2 or 3.
     pub(crate) fn emit_apx_evex_vvvv_rr(
         &mut self,

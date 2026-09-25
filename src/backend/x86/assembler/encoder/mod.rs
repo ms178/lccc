@@ -7,6 +7,7 @@ mod apx;
 mod avx;
 mod core;
 mod gp_integer;
+mod promoted;
 mod registers;
 mod sse;
 mod system;
@@ -422,9 +423,22 @@ impl InstructionEncoder {
         // Structural memory validation + 0x67 accounting, before
         // dispatch: GAS reports operand-shape errors before prefix /
         // template errors, and every mnemonic shares the verdict.
+        // Indirect branch targets (`call *(%eax)`, `jmp *table(,%rax)`)
+        // wrap the memory operand in `Operand::Indirect`, so they must be
+        // unwrapped here — they used to skip BOTH the structural
+        // validation and the 0x67 address-size splice, silently encoding
+        // `call *(%eax)` with 64-bit addressing (GAS: `67 ff 10`).
         let mut need67 = false;
         for op in &instr.operands {
-            if let Operand::Memory(mem) = op {
+            let mem = match op {
+                Operand::Memory(mem) => Some(mem),
+                Operand::Indirect(inner) => match inner.as_ref() {
+                    Operand::Memory(mem) => Some(mem),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(mem) = mem {
                 core::validate_mem_operand(&instr.mnemonic, mem)?;
                 need67 |= core::mem_needs_addr32(mem);
             }
@@ -619,23 +633,32 @@ impl InstructionEncoder {
         for op in &instr.operands {
             if let Operand::Memory(mem) = op {
                 if let Some(seg) = &mem.segment {
+                    // GAS 2.47 drops an override equal to the DEFAULT
+                    // segment of the addressing form: %ss is the default
+                    // when the base register is rbp/ebp/rsp/esp (mod != 00
+                    // or SIB base), %ds otherwise (`ss:(%rbp)` -> no 0x36,
+                    // `ds:(%rsp)` -> 0x3e KEPT, `ds:(%rax)` -> dropped,
+                    // `ss:(%rax)` -> 0x36 kept — all byte-probed).
+                    let base_is_ss_default = mem.base.as_ref().is_some_and(|b| {
+                        matches!(
+                            b.name.to_ascii_lowercase().as_str(),
+                            "rbp" | "ebp" | "rsp" | "esp"
+                        )
+                    });
                     operand_seg = match seg.as_str() {
                         "es" => Some(0x26),
                         "cs" => Some(0x2E),
-                        // %ds is the default segment for every addressing
-                        // form in 64-bit mode: an explicit override is a
-                        // pure no-op and GAS drops it
-                        // (`mov %ds:8(%rax),%rbx` -> 48 8b 58 08).
-                        // %ss is NOT dropped: even though it selects the
-                        // same flat segment, GAS still emits 0x36, and
-                        // hardware treats the prefix as significant in a
-                        // few corner cases (it is also in the documented
-                        // CET no-track prefix's neighborhood). GAS
-                        // 2.47-verified.
-                        "ds" => None,
-                        "ss" => Some(0x36),
+                        // %fs/%gs/%es/%cs are never a default segment: an
+                        // explicit override is always emitted.
                         "fs" => Some(0x64),
                         "gs" => Some(0x65),
+                        "ds" if base_is_ss_default => Some(0x3E),
+                        "ss" if !base_is_ss_default => Some(0x36),
+                        // %ds is the default for non-rbp/rsp addressing and
+                        // %ss for rbp/rsp addressing: an explicit override
+                        // naming the default is a pure no-op and GAS drops
+                        // it (`mov %ds:8(%rax),%rbx` -> 48 8b 58 08).
+                        "ds" | "ss" => None,
                         other => return Err(format!("unsupported segment override: %{}", other)),
                     };
                     break;
@@ -676,6 +699,35 @@ impl InstructionEncoder {
         } else {
             self.encode_mnemonic(instr)
         };
+        // `{evex}` post-check: the instruction must have taken an EVEX
+        // (0x62) or REX2 (0xD5) arm. A body that starts with the legacy
+        // prefix run and then a non-APX opcode byte means a silent legacy
+        // fallback — exactly GAS 2.47's `no EVEX encoding for `<m>''
+        // reject. Checking the byte SHAPE (prefix run + 0x62/0xD5) rather
+        // than only the first byte keeps segment/lock/0x66 splices working
+        // while still catching `push`/`ret`-style false positives where a
+        // 0x62 immediate could appear mid-body.
+        if result.is_ok() && self.apx_evex {
+            let body = &self.bytes[start_len..];
+            let is_prefix = |b: u8| {
+                matches!(
+                    b,
+                    0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67 | 0x66 | 0xF0 | 0xF2 | 0xF3
+                )
+            };
+            let mut k = 0;
+            while k < body.len() && is_prefix(body[k]) {
+                k += 1;
+            }
+            if k >= body.len() || (body[k] != 0x62 && body[k] != 0xD5) {
+                self.bytes.truncate(start_len);
+                self.relocations.truncate(reloc_base);
+                result = Err(format!(
+                    "no EVEX encoding for `{}'",
+                    instr.mnemonic.to_ascii_lowercase()
+                ));
+            }
+        }
         if result.is_ok() {
             result = self.fixup_rex2_map1(start_len);
         }
@@ -1019,18 +1071,23 @@ impl InstructionEncoder {
             "vorpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x56)),
             "vxorps" => r(self.encode_evex_binary(ops, 1, 0, 0, 0x57)),
             "vxorpd" => r(self.encode_evex_binary(ops, 1, 1, 1, 0x57)),
-            "vaddss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x58)),
-            "vaddsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x58)),
-            "vsubss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5C)),
-            "vsubsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5C)),
-            "vmulss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x59)),
-            "vmulsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x59)),
-            "vdivss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5E)),
-            "vdivsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5E)),
-            "vminss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5D)),
-            "vminsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5D)),
-            "vmaxss" => r(self.encode_evex_binary(ops, 1, 2, 0, 0x5F)),
-            "vmaxsd" => r(self.encode_evex_binary(ops, 1, 3, 1, 0x5F)),
+            // Scalar-FP binary rows take the ELEMENT-sized memory tuple
+            // (N=4 for ss/W0, N=8 for sd/W1): EVEX compressed disp8 divides
+            // the displacement by the element size, not the full vector VL
+            // (`vsubss -512(%eax),...{k7}` disp8=-128, not -32 — GAS 2.47
+            // byte-verified). The packed rows above keep the Full tuple.
+            "vaddss" => r(self.encode_evex_binary_scalar(ops, 1, 2, 0, 0x58)),
+            "vaddsd" => r(self.encode_evex_binary_scalar(ops, 1, 3, 1, 0x58)),
+            "vsubss" => r(self.encode_evex_binary_scalar(ops, 1, 2, 0, 0x5C)),
+            "vsubsd" => r(self.encode_evex_binary_scalar(ops, 1, 3, 1, 0x5C)),
+            "vmulss" => r(self.encode_evex_binary_scalar(ops, 1, 2, 0, 0x59)),
+            "vmulsd" => r(self.encode_evex_binary_scalar(ops, 1, 3, 1, 0x59)),
+            "vdivss" => r(self.encode_evex_binary_scalar(ops, 1, 2, 0, 0x5E)),
+            "vdivsd" => r(self.encode_evex_binary_scalar(ops, 1, 3, 1, 0x5E)),
+            "vminss" => r(self.encode_evex_binary_scalar(ops, 1, 2, 0, 0x5D)),
+            "vminsd" => r(self.encode_evex_binary_scalar(ops, 1, 3, 1, 0x5D)),
+            "vmaxss" => r(self.encode_evex_binary_scalar(ops, 1, 2, 0, 0x5F)),
+            "vmaxsd" => r(self.encode_evex_binary_scalar(ops, 1, 3, 1, 0x5F)),
             "vmovaps" => r(self.encode_evex_vmov(ops, 0, 0, 0x28, 0x29)),
             "vmovapd" => r(self.encode_evex_vmov(ops, 1, 1, 0x28, 0x29)),
             "vmovups" => r(self.encode_evex_vmov(ops, 0, 0, 0x10, 0x11)),
@@ -1092,7 +1149,7 @@ impl InstructionEncoder {
             // 0F.W 12/16): full unary machinery (mem, {k}{z}; no broadcast).
             "vmovddup" => r(self.encode_evex_unary(ops, 1, 3, 1, 0x12)),
             "vmovshdup" => r(self.encode_evex_unary(ops, 1, 2, 0, 0x16)),
-            "vmovsldup" => r(self.encode_evex_unary(ops, 1, 3, 0, 0x16)),
+            "vmovsldup" => r(self.encode_evex_unary(ops, 1, 2, 0, 0x12)),
             // AVX512DQ vbroadcasti32x2 (EVEX.66.0F38.W0 59): register
             // sources broadcast an xmm pair; memory loads a fixed N=8
             // tuple (handled by the extended broadcast-mem table).
@@ -1310,8 +1367,8 @@ impl InstructionEncoder {
             // member ({r*-sae} head form; class comes from evex_sae_class).
             "vscalefps" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x2C)),
             "vscalefpd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x2C)),
-            "vscalefss" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x2D)),
-            "vscalefsd" => r(self.encode_evex_binary(ops, 2, 1, 1, 0x2D)),
+            "vscalefss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0x2D)),
+            "vscalefsd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0x2D)),
             // vpmadd52* (AVX512IFMA, EVEX.0F38.W1 B4/B5): no SAE.
             "vpmadd52luq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xB4)),
             "vpmadd52huq" => r(self.encode_evex_binary(ops, 2, 1, 1, 0xB5)),
@@ -1351,6 +1408,69 @@ impl InstructionEncoder {
             "vgetexpps" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x42)),
             "vgetexppd" => r(self.encode_evex_unary(ops, 2, 1, 1, 0x42)),
             "vgetexpss" => r(self.encode_evex_binary_scalar(ops, 2, 1, 0, 0x43)),
+            // ---- EVEX-promoted SSE/SSE2 forms ({evex} hint; xmm-only,
+            // LIG, no mask/broadcast). Rows byte-probed against GAS 2.47;
+            // see encoder/promoted.rs for the shape contracts. ----
+            "vmovd" => r(self.encode_evex_vmovd_vmovq(ops, 1, 0, "vmovd")),
+            "vmovq" => r(self.encode_evex_vmovd_vmovq(ops, 1, 1, "vmovq")),
+            "vextractps" => r(self.encode_evex_promoted_extract(
+                ops,
+                3,
+                1,
+                0,
+                0x17,
+                None,
+                None,
+                4,
+                "vextractps",
+            )),
+            "vpextrb" => {
+                r(self.encode_evex_promoted_extract(ops, 3, 1, 0, 0x14, None, None, 1, "vpextrb"))
+            }
+            // vpextrw: register dest = map1 C5, memory dest = map3 op 15.
+            "vpextrw" => r(self.encode_evex_promoted_extract(
+                ops,
+                1,
+                1,
+                0,
+                0xC5,
+                Some(3),
+                Some(0x15),
+                2,
+                "vpextrw",
+            )),
+            "vpextrd" => {
+                r(self.encode_evex_promoted_extract(ops, 3, 1, 0, 0x16, None, None, 4, "vpextrd"))
+            }
+            "vpextrq" => {
+                r(self.encode_evex_promoted_extract(ops, 3, 1, 1, 0x16, None, None, 8, "vpextrq"))
+            }
+            "vpinsrb" => r(self.encode_evex_promoted_insert(ops, 3, 1, 0, 0x20, 1, "vpinsrb")),
+            "vpinsrw" => r(self.encode_evex_promoted_insert(ops, 1, 1, 0, 0xC4, 2, "vpinsrw")),
+            "vpinsrd" => r(self.encode_evex_promoted_insert(ops, 3, 1, 0, 0x22, 4, "vpinsrd")),
+            "vpinsrq" => r(self.encode_evex_promoted_insert(ops, 3, 1, 1, 0x22, 8, "vpinsrq")),
+            "vinsertps" => r(self.encode_evex_promoted_insert(ops, 3, 1, 0, 0x21, 4, "vinsertps")),
+            // GAS 2.47 promotes VMPSADBW with the F3 prefix (pp=2), not the
+            // legacy 66 — byte-probed ({evex} vmpsadbw $2, %xmm0, %xmm1, %xmm2
+            // = 62 f3 76 08 42 d0 02).
+            "vmpsadbw" => r(self.encode_evex_promoted_insert(ops, 3, 2, 0, 0x42, 16, "vmpsadbw")),
+            "vcvtsd2si" => r(self.encode_evex_promoted_cvt_to_gp(ops, 3, 0x2D, true, "vcvtsd2si")),
+            "vcvtss2si" => r(self.encode_evex_promoted_cvt_to_gp(ops, 2, 0x2D, false, "vcvtss2si")),
+            "vcvttsd2si" => {
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 3, 0x2C, true, "vcvttsd2si"))
+            }
+            "vcvttss2si" => {
+                r(self.encode_evex_promoted_cvt_to_gp(ops, 2, 0x2C, false, "vcvttss2si"))
+            }
+            "vcvtsi2sd" => r(self.encode_evex_promoted_cvt_from_gp(ops, 3, true, "vcvtsi2sd")),
+            "vcvtsi2ss" => r(self.encode_evex_promoted_cvt_from_gp(ops, 2, false, "vcvtsi2ss")),
+            // APX map-4 promotions of the CET/system stores ({evex} only;
+            // the legacy paths below keep the 66-0F38 forms).
+            "wrssd" => r(self.encode_evex_wrss(ops, false, 0, 0x66, "wrssd")),
+            "wrssq" => r(self.encode_evex_wrss(ops, true, 0, 0x66, "wrssq")),
+            "wrussd" => r(self.encode_evex_wrss(ops, false, 1, 0x65, "wrussd")),
+            "wrussq" => r(self.encode_evex_wrss(ops, true, 1, 0x65, "wrussq")),
+            "invpcid" => r(self.encode_evex_invpcid(ops, "invpcid")),
             "vgetexpsd" => r(self.encode_evex_binary_scalar(ops, 2, 1, 1, 0x43)),
             "vplzcntd" => r(self.encode_evex_unary(ops, 2, 1, 0, 0x44)),
             "vplzcntq" => r(self.encode_evex_unary(ops, 2, 1, 1, 0x44)),
@@ -2016,6 +2136,37 @@ impl InstructionEncoder {
         let suffixed = infer_suffix(&mnemonic_raw, &instr.operands);
         let mnemonic = suffixed.as_str();
         let ops = &instr.operands;
+
+        // `{evex}` forces the EVEX encoding (GAS 2.47 semantics, byte-probed
+        // over the whole promoted set): AVX/EVEX-native instructions take
+        // their EVEX arm via try_encode_evex; `cmp`/`test` promote to
+        // CCMP/CTEST with the always-true condition (SCC = 0xA, the APX
+        // replacement for the parity codes); everything else falls through
+        // — arms with internal APX handling (ALU, unary, shifts, BMI2,
+        // crc32, ...) emit the map-4 promotion, and the post-check in
+        // `encode()` turns any silent legacy fallback into GAS's exact
+        // `no EVEX encoding for `<m>'' reject.
+        if self.apx_evex {
+            if let Some(result) = self.try_encode_evex(mnemonic, ops) {
+                return result;
+            }
+            if let Some(("cmp", size)) = promoted::promoted_stem_size(mnemonic) {
+                let size = if size == 0 {
+                    apx::infer_ccmp_size(ops)
+                } else {
+                    size
+                };
+                return self.encode_ccmp_test(ops, size, apx::APX_CC_T, false);
+            }
+            if let Some(("test", size)) = promoted::promoted_stem_size(mnemonic) {
+                let size = if size == 0 {
+                    apx::infer_ccmp_size(ops)
+                } else {
+                    size
+                };
+                return self.encode_ccmp_test(ops, size, apx::APX_CC_T, true);
+            }
+        }
 
         // SOUNDNESS GATE. Reject malformed operands BEFORE dispatch.
         //
@@ -4315,12 +4466,22 @@ impl InstructionEncoder {
                     Err("xchg requires 2 operands".to_string())
                 }
             }
-            "imul" => self.encode_imul(ops, 8), // default to 64-bit for suffix-less
+            "imul" => {
+                // GAS 2.47 size law: the register operand decides;
+                // memory-only defaults to 32 bits (`imul (%rax)` = f7 28,
+                // byte-verified), matching mul/div/idiv above.
+                let size = match ops.last() {
+                    Some(Operand::Register(r)) => infer_reg_size(&r.name),
+                    _ => 4,
+                };
+                self.encode_imul(ops, size)
+            }
             "mul" => {
-                let size = if let Some(Operand::Register(r)) = ops.first() {
-                    infer_reg_size(&r.name)
-                } else {
-                    8
+                // GAS 2.47 size law (see encode_suffixless_unary): the
+                // register operand decides; memory-only defaults to 32-bit.
+                let size = match ops.last() {
+                    Some(Operand::Register(r)) => infer_reg_size(&r.name),
+                    _ => 4,
                 };
                 if size == 2 {
                     self.bytes.push(0x66);
@@ -4328,10 +4489,9 @@ impl InstructionEncoder {
                 self.encode_unary_rm(ops, 4, size)
             }
             "div" => {
-                let size = if let Some(Operand::Register(r)) = ops.first() {
-                    infer_reg_size(&r.name)
-                } else {
-                    8
+                let size = match ops.last() {
+                    Some(Operand::Register(r)) => infer_reg_size(&r.name),
+                    _ => 4,
                 };
                 if size == 2 {
                     self.bytes.push(0x66);
@@ -4339,10 +4499,9 @@ impl InstructionEncoder {
                 self.encode_unary_rm(ops, 6, size)
             }
             "idiv" => {
-                let size = if let Some(Operand::Register(r)) = ops.first() {
-                    infer_reg_size(&r.name)
-                } else {
-                    8
+                let size = match ops.last() {
+                    Some(Operand::Register(r)) => infer_reg_size(&r.name),
+                    _ => 4,
                 };
                 if size == 2 {
                     self.bytes.push(0x66);

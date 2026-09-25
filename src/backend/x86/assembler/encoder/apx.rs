@@ -5,6 +5,12 @@
 
 use super::*;
 
+/// APX SCC code for the always-true condition (T). The APX SCC field
+/// replaces the legacy parity conditions (P/NP) with T (0xA) / F (0xB);
+/// `ccmpp`/`ccmpnp` do not exist (GAS 2.47: "no such instruction"), and
+/// `{evex} cmp`/`{evex} test` promote exactly to ccmpt/ctestt.
+pub(crate) const APX_CC_T: u8 = 0xA;
+
 impl super::InstructionEncoder {
     /// `pushp %reg` / `popp %reg`: REX2 with W=1, opcode 50+rd / 58+rd.
     /// Distinct from `pushq %r16` which is REX2 W=0.
@@ -142,7 +148,7 @@ impl super::InstructionEncoder {
         self.encode_ccmp_test(ops, size, cc, true)
     }
 
-    fn encode_ccmp_test(
+    pub(crate) fn encode_ccmp_test(
         &mut self,
         ops: &[Operand],
         size: u8,
@@ -150,7 +156,10 @@ impl super::InstructionEncoder {
         is_test: bool,
     ) -> Result<(), String> {
         if ops.len() != 2 {
-            return Err("ccmp/ctest requires 2 operands".to_string());
+            return Err(format!(
+                "number of operands mismatch for `{}'",
+                if is_test { "ctest" } else { "ccmp" }
+            ));
         }
         let dfv = self.apx_dfv;
         let pp = if size == 2 { 1 } else { 0 };
@@ -393,7 +402,17 @@ fn split_apx_cc_size(rest: &str) -> Result<(u8, u8), String> {
     if rest.is_empty() {
         return Err("missing condition code".to_string());
     }
-    if let Ok(cc) = cc_from_mnemonic(rest) {
+    // APX condition set: the legacy codes minus parity (P/NP do not exist
+    // in the SCC field), plus T (always true) and F (always false).
+    let apx_cc = |s: &str| -> Option<u8> {
+        match s {
+            "t" => Some(APX_CC_T),
+            "f" => Some(0xB),
+            "p" | "np" => None,
+            other => cc_from_mnemonic(other).ok(),
+        }
+    };
+    if let Some(cc) = apx_cc(rest) {
         return Ok((cc, 0));
     }
     let (cc_str, size) = match rest.as_bytes().last() {
@@ -403,11 +422,11 @@ fn split_apx_cc_size(rest: &str) -> Result<(u8, u8), String> {
         Some(b'b') => (&rest[..rest.len() - 1], 1),
         _ => return Err(format!("unknown ccmp/ctest condition: {rest}")),
     };
-    let cc = cc_from_mnemonic(cc_str)?;
+    let cc = apx_cc(cc_str).ok_or_else(|| format!("unknown ccmp/ctest condition: {rest}"))?;
     Ok((cc, size))
 }
 
-fn infer_ccmp_size(ops: &[Operand]) -> u8 {
+pub(crate) fn infer_ccmp_size(ops: &[Operand]) -> u8 {
     for op in ops {
         if let Operand::Register(r) = op {
             return infer_reg_size(&r.name);

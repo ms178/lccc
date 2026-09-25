@@ -510,15 +510,28 @@ pub(crate) fn infer_suffix(mnemonic: &str, ops: &[Operand]) -> String {
         return mnemonic.to_string();
     }
 
-    // For shift/rotate instructions, infer size from the *destination* (last) operand,
-    // not %cl (the first operand). E.g., "shl %cl, %edx" should become "shll", not "shlb".
+    // For shift/rotate instructions, infer size from the *destination*
+    // register, never from %cl: the classic 2-operand form has the
+    // destination second (`shl %cl, %edx` -> `shll`), the APX NDD
+    // 3-operand form has it LAST (`shl %cl, %ecx, %edx` -> `shll` — the
+    // old first-register scan picked %cl and produced `shlb`, silently
+    // encoding an 8-bit shift of %cl), and the 1-operand shift-by-1 form
+    // has it first (`shl %edx` -> `shll`). Scanning from the end and
+    // skipping %cl covers all three shapes with one rule.
+    // A memory-only shift has no register to consult; it stays unsuffixed
+    // and the encoder applies the GAS 32-bit default (`shl (%rax)` is
+    // `d1 20`, not `48 d1 20` — byte-verified against GAS 2.47).
     let is_shift = matches!(mnemonic, "shl" | "shr" | "sar" | "rol" | "ror");
-    if is_shift && ops.len() == 2 {
-        if let Operand::Register(r) = &ops[1] {
+    if is_shift {
+        if let Some(r) = ops.iter().rev().find_map(|op| match op {
+            Operand::Register(r) if r.name != "cl" => Some(r),
+            _ => None,
+        }) {
             if let Some(suffix) = register_size_suffix(&r.name) {
                 return format!("{}{}", mnemonic, suffix);
             }
         }
+        return mnemonic.to_string();
     }
 
     // Find the first register operand to determine size

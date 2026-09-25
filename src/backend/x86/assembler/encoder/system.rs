@@ -655,7 +655,10 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// Encode LAR (Load Access Rights): 0F 02 /r
+    /// Encode LAR (Load Access Rights): 66 r/w 0F 02 /r — the operand size
+    /// comes from the DESTINATION register (the source selector is r/m16);
+    /// `lar %dx,%dx` needs 66, `lar (%edx),%dx` needs 67+66, and a 32/64-bit
+    /// destination takes none/REX.W respectively (GAS 2.47 byte-verified).
     pub(crate) fn encode_lar(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("lar requires 2 operands".to_string());
@@ -666,6 +669,9 @@ impl super::InstructionEncoder {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 // Infer size from destination register
                 let size = infer_reg_size(&dst.name);
+                if size == 2 {
+                    self.bytes.push(0x66); // operand-size prefix (before REX)
+                }
                 self.emit_rex_rr(size, &dst.name, &src.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x02]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
@@ -674,6 +680,9 @@ impl super::InstructionEncoder {
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
                 let size = infer_reg_size(&dst.name);
+                if size == 2 {
+                    self.bytes.push(0x66); // operand-size prefix (before REX)
+                }
                 self.emit_rex_rm(size, &dst.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x02]);
                 self.encode_modrm_mem(dst_num, mem)
@@ -682,7 +691,12 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// Encode LSL (Load Segment Limit): 0F 03 /r
+    /// Encode LSL (Load Segment Limit): 66 r/w 0F 03 /r — same destination
+    /// width law as LAR (the selector source is always r/m16): the operand
+    /// size is the DESTINATION register's width, 66 for r16 spellings in
+    /// either operand slot position is decided by the destination alone
+    /// (GAS 2.47 byte-verified; the previous name-shape heuristic missed
+    /// sp/bp and the whole memory form).
     pub(crate) fn encode_lsl(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("lsl requires 2 operands".to_string());
@@ -691,30 +705,22 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                // 16-bit operand size prefix
-                if src.name.starts_with('w')
-                    || src.name.len() == 2 && src.name.ends_with('x')
-                    || src.name.ends_with('i')
-                        && !src.name.starts_with('e')
-                        && !src.name.starts_with('r')
-                {
-                    // Heuristic: check if it's 16-bit register
-                    let is_16 = matches!(
-                        src.name.as_str(),
-                        "ax" | "bx" | "cx" | "dx" | "si" | "di" | "sp" | "bp"
-                    );
-                    if is_16 {
-                        self.bytes.push(0x66);
-                    }
+                let size = infer_reg_size(&dst.name);
+                if size == 2 {
+                    self.bytes.push(0x66); // operand-size prefix (before REX)
                 }
-                self.emit_rex_rr(4, &dst.name, &src.name);
+                self.emit_rex_rr(size, &dst.name, &src.name);
                 self.bytes.extend_from_slice(&[0x0F, 0x03]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
                 Ok(())
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.emit_rex_rm(4, &dst.name, mem);
+                let size = infer_reg_size(&dst.name);
+                if size == 2 {
+                    self.bytes.push(0x66); // operand-size prefix (before REX)
+                }
+                self.emit_rex_rm(size, &dst.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, 0x03]);
                 self.encode_modrm_mem(dst_num, mem)
             }

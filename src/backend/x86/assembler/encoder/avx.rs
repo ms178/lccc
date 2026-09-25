@@ -3262,8 +3262,11 @@ impl super::InstructionEncoder {
         // (%rax)` encodes LL=ymm).
         let reg_i = if is_compress { 0 } else { 1 };
         let ll = Self::evex_ll(std::slice::from_ref(&ops[reg_i]));
-        // Half-mem tuple: N = VL/2 at every VL → tuple_div = 2.
-        let tuple_div = 2;
+        // COMPRESSED tuple (byte-probed vs GAS 2.47): N = the ELEMENT
+        // size at every VL — `vcompressps %zmm30, -512(%rdx)` -> disp8
+        // 0x80 (N=4), `vcompresspd %zmm30, -1024(%rdx)` -> 0x80 (N=8);
+        // the old VL/2 rule emitted the wrong compressed address.
+        let tuple_n: u32 = if w == 1 { 8 } else { 4 };
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let (a, b) = if is_compress {
@@ -3279,15 +3282,13 @@ impl super::InstructionEncoder {
                 let src_num =
                     self.emit_evex_memop(&src.name, mem, None, 2, w, 1, ll, z, aaa, false)?;
                 self.bytes.push(opcode);
-                let (_, scale_n) = Self::evex_mem_scale(mem, ll, tuple_div);
-                self.encode_evex_mem(src_num, mem, scale_n)
+                self.encode_evex_mem(src_num, mem, tuple_n)
             }
             (Operand::Memory(mem), Operand::Register(dst)) if !is_compress => {
                 let dst_num =
                     self.emit_evex_memop(&dst.name, mem, None, 2, w, 1, ll, z, aaa, false)?;
                 self.bytes.push(opcode);
-                let (_, scale_n) = Self::evex_mem_scale(mem, ll, tuple_div);
-                self.encode_evex_mem(dst_num, mem, scale_n)
+                self.encode_evex_mem(dst_num, mem, tuple_n)
             }
             _ => Err("operand type mismatch".to_string()),
         }
@@ -3391,10 +3392,19 @@ impl super::InstructionEncoder {
         };
         let src_ll = Self::evex_ll(&[ops[0].clone()]);
         let (aaa, z) = Self::evex_mask_info(&ops[1]);
-        let tuple_div = match dst_elem {
-            1 => 4,
-            2 => 2,
-            _ => 1,
+        // Memory tuple N = the narrow RESULT byte count at every source VL:
+        // vpmovqb zmm -> 8 (VL/8), vpmovqw zmm -> 16 (VL/4), vpmovqd zmm
+        // -> 32 (VL/2), vpmovdb xmm -> 4 (VL/4), vpmovdw ymm -> 16 (VL/2),
+        // vpmovwb zmm -> 32 (VL/2) — all byte-probed against GAS 2.47.
+        // The divisors below are those VL ratios, doubling for the
+        // qword-source rows (half the lanes of the dword/word rows).
+        let tuple_div = match (dst_elem, src_is_q) {
+            (1, false) => 4, // *db family
+            (2, false) => 2, // *dw and *wb families
+            (_, false) => 1, // (no widening rows here)
+            (1, true) => 8,  // *qb family
+            (2, true) => 4,  // *qw family
+            (_, true) => 2,  // *qd family
         };
         // Destination-width rule (GAS 2.47 byte-probed): the narrow
         // result keeps the source lane count, so the destination register
@@ -3599,14 +3609,18 @@ impl super::InstructionEncoder {
                     let dst_num =
                         self.emit_evex_memop(&dst.name, mem, None, 1, w, pp, 0, z, aaa, false)?;
                     self.bytes.push(0x10);
-                    self.encode_evex_mem(dst_num, mem, 1)
+                    // Element-sized compressed disp (N=4 ss / N=8 sd —
+                    // `vmovsd %xmm30, -1024(%rdx){%k7}` -> disp8 0x80,
+                    // GAS 2.47 byte-probed; the raw N=1 rule forced a
+                    // disp32 fallback GAS never takes).
+                    self.encode_evex_mem(dst_num, mem, if w == 1 { 8 } else { 4 })
                 }
                 (Operand::Register(src), Operand::Memory(mem)) => {
                     let (aaa, z) = Self::evex_mask_info(&ops[1]);
                     let src_num =
                         self.emit_evex_memop(&src.name, mem, None, 1, w, pp, 0, z, aaa, false)?;
                     self.bytes.push(0x11);
-                    self.encode_evex_mem(src_num, mem, 1)
+                    self.encode_evex_mem(src_num, mem, if w == 1 { 8 } else { 4 })
                 }
                 (Operand::Register(_), Operand::Register(_)) => {
                     Err("operand type mismatch".to_string())
