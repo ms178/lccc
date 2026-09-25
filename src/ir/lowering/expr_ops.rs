@@ -1211,10 +1211,36 @@ impl Lowerer {
     /// narrowed here. narrowing keeps mem2reg's Phi, and therefore the
     /// Select/cmov, at the natural width.
     fn emit_ternary_merge_store(&mut self, val: Operand, ptr: Value, ty: IrType) {
+        // Integer literals are lowered at target-int width; float literals
+        // may be F64 even when the slot is F32 (or vice-versa via promotion).
+        // Narrow/convert constants to the exact slot type so the Store's
+        // value type matches its slot type — otherwise we would emit a
+        // type-incorrect Store (F64 const into F32 slot) which is UB in the
+        // IR and miscompiles on backends that trust the Store's ty.
         let val = match val {
             Operand::Const(c) if ty.is_integer() => Operand::Const(c.narrowed_to(ty)),
+            Operand::Const(c) if matches!(ty, IrType::F32 | IrType::F64) => {
+                Operand::Const(c.coerce_to(ty))
+            }
             other => other,
         };
+        // Defensive: after conversion the constant's IR type must match the
+        // slot type for the float cases we just handled.
+        #[cfg(debug_assertions)]
+        if let Operand::Const(ref c) = val {
+            if matches!(ty, IrType::F32 | IrType::F64) {
+                let const_ty = match c {
+                    crate::ir::reexports::IrConst::F32(_) => IrType::F32,
+                    crate::ir::reexports::IrConst::F64(_) => IrType::F64,
+                    _ => ty,
+                };
+                debug_assert_eq!(
+                    const_ty, ty,
+                    "ternary merge: float const type {:?} must match slot {:?}",
+                    const_ty, ty
+                );
+            }
+        }
         self.emit(Instruction::Store {
             volatile: false,
             val,

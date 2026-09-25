@@ -774,6 +774,15 @@ impl IrConst {
             (IrConst::I32(_), IrType::I32) => self,
             (IrConst::F32(_), IrType::F32) => self,
             (IrConst::F64(_), IrType::F64) => self,
+            // Float cross conversion: F64 const into F32 slot and vice-versa.
+            // This is not strictly \"narrowing\" but is required for exact
+            // float merge slots (S25) where a constant of the other float
+            // width reaches the store — e.g. `c ? 1.0 : f` with float `f`
+            // would otherwise leave an F64 const in an F32 slot, which is
+            // type-incorrect IR. The conversion is bit-exact per IEEE 754
+            // (round-to-nearest, may overflow to inf, underflow to zero).
+            (IrConst::F64(v), IrType::F32) => IrConst::F32(*v as f32),
+            (IrConst::F32(v), IrType::F64) => IrConst::F64(*v as f64),
             // Wide integer constant being stored to a narrower slot
             (IrConst::I64(v), IrType::I8) => IrConst::I8(*v as i8),
             (IrConst::I64(v), IrType::U8) => IrConst::I64(*v as u8 as i64),
