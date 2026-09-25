@@ -385,7 +385,27 @@ impl Driver {
     /// Format: "output: input\n"
     /// This is a minimal dependency file that tells make the object depends
     /// on its source file. A full implementation would also list included headers.
-    pub(super) fn write_dep_file(&self, input_file: &str, output_file: &str) {
+    /// Escape a path for a make rule the way GCC's -M output does:
+    /// whitespace and make-significant characters are backslash-escaped
+    /// so `my headers/x.h` survives as ONE prerequisite.
+    pub(super) fn escape_dep_path(path: &str) -> String {
+        let mut out = String::with_capacity(path.len() + 8);
+        for c in path.chars() {
+            match c {
+                ' ' | '\t' | '#' | ':' => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                '$' => {
+                    out.push_str("$$");
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    pub(super) fn write_dep_file(&self, input_file: &str, output_file: &str) -> Result<(), String> {
         if let Some(ref dep_path) = self.dep_file {
             let dep_path = if dep_path.is_empty() {
                 // Derive from output: replace extension with .d
@@ -396,17 +416,45 @@ impl Driver {
             };
             // Prefer the -MT/-MQ target when given (glibc passes -MT $@).
             let target = self.dep_target.as_deref().unwrap_or(output_file);
-            if input_file == "-" {
+            // GCC-format rule: source first, then every header actually
+            // opened during preprocessing in first-open order (preprocessor
+            // dep tracking), with -MMD applying GCC's directory-based
+            // system filter.  Short lists are a single line, byte-identical
+            // to GCC's output; long lists stay unwrapped (valid make, and
+            // exactly what fixdep/scons/ninja-style consumers parse).
+            let mut prereqs: Vec<String> = Vec::new();
+            if input_file != "-" {
+                prereqs.push(Self::escape_dep_path(input_file));
+            }
+            for (path, system_dir) in self.last_dep_files.borrow().iter() {
+                if self.dep_exclude_system && *system_dir {
+                    continue;
+                }
+                prereqs.push(Self::escape_dep_path(&path.to_string_lossy()));
+            }
+            let content = if prereqs.is_empty() {
                 // Input came from stdin (glibc compiles syscall stubs with
                 // `-x assembler-with-cpp -`). GCC omits the stdin pseudo-source
                 // from the dependency rule; writing "<stdin>" here makes make
                 // fail with "No rule to make target '<stdin>'". Emit a bare
                 // "target:" rule (valid make syntax) plus no prerequisites.
-                let _ = std::fs::write(&dep_path, format!("{}:\n", target));
+                format!("{}:\n", target)
             } else {
-                let content = format!("{}: {}\n", target, input_file);
-                let _ = std::fs::write(&dep_path, content);
+                format!("{}: {}\n", target, prereqs.join(" "))
+            };
+            let mut content = content;
+            if self.dep_phony {
+                // -MP: one phony rule per prerequisite (GCC emits these after
+                // the main rule, separated by blank lines).  Phony targets
+                // are escaped with the same rules as the main line.
+                for p in prereqs.iter().skip(usize::from(input_file != "-")) {
+                    content.push_str(&format!("\n{}:\n", p));
+                }
             }
+            std::fs::write(&dep_path, content)
+                .map_err(|e| format!("Cannot write dependency file {}: {}", dep_path, e))
+        } else {
+            Ok(())
         }
     }
 }

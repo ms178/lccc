@@ -1,5 +1,19 @@
 use super::*;
 
+/// True when the memory operand is EXACTLY the port-I/O DX-indirect form
+/// GAS accepts for IN/INS/OUT/OUTS: base `%dx`, no index, no scale, no
+/// displacement.  The encoding carries no ModRM (DX is implicit in the
+/// opcode), so any other spelling must not silently encode as DX I/O.
+fn is_dx_indirect(mem: &MemoryOperand) -> bool {
+    mem.base.as_ref().is_some_and(|b| b.name == "dx")
+        && mem.index.is_none()
+        && mem.scale.is_none()
+        && matches!(
+            mem.displacement,
+            Displacement::None | Displacement::Integer(0)
+        )
+}
+
 impl super::InstructionEncoder {
     /// Encode OUT instruction: outb/outw/outl
     /// AT&T syntax: outb %al, %dx  OR  outb %al, $imm8
@@ -36,8 +50,18 @@ impl super::InstructionEncoder {
                 self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
                 Ok(())
             }
-            (Operand::Register(_), Operand::Memory(_)) => {
-                // outl %eax, (%dx)  =>  same encoding as register form
+            (Operand::Register(_), Operand::Memory(mem)) => {
+                // outl %eax, (%dx): the memory form shares the implicit-DX
+                // opcode with the register form, but ONLY when the operand
+                // really is DX-indirect — anything else here used to encode
+                // silently as DX I/O (a wrong-port corruption), and the
+                // central validator only admits exact DX-indirect operands.
+                if !is_dx_indirect(mem) {
+                    return Err(format!(
+                        "`{}' is not a valid base/index expression",
+                        "(%dx)"
+                    ));
+                }
                 if size == 2 {
                     self.bytes.push(0x66);
                 }
@@ -92,8 +116,16 @@ impl super::InstructionEncoder {
                 self.bytes.push(if size == 1 { 0xEC } else { 0xED });
                 Ok(())
             }
-            (Operand::Memory(_), Operand::Register(_)) => {
-                // inl (%dx), %eax  =>  same encoding as register form
+            (Operand::Memory(mem), Operand::Register(_)) => {
+                // inl (%dx), %eax: shares the implicit-DX opcode with the
+                // register form; only exact DX-indirect operands may take
+                // this path (see the OUT arm).
+                if !is_dx_indirect(mem) {
+                    return Err(format!(
+                        "`{}' is not a valid base/index expression",
+                        "(%dx)"
+                    ));
+                }
                 if size == 2 {
                     self.bytes.push(0x66);
                 }

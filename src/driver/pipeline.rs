@@ -350,6 +350,22 @@ pub struct Driver {
     /// When set, overrides the default target in the dependency rule.
     /// Default: derive from input filename (replace extension with .o).
     pub(super) dep_target: Option<String>,
+    /// -MMD/-MM system-directory filter: when true, headers resolved in a
+    /// system directory (-isystem, default system dirs, -idirafter, the
+    /// bundled-header set) are omitted from make dependencies.  GCC's
+    /// filter is directory-based, so the verdict comes from the include
+    /// search step that matched (preprocessor dep tracking), NOT from the
+    /// `<>` vs `""` spelling of the directive.
+    pub(super) dep_exclude_system: bool,
+    /// -MP: after the main rule, emit one phony rule per prerequisite so
+    /// deleting a prerequisite doesn't break an unchanged make graph.
+    pub(super) dep_phony: bool,
+    /// Make-dependency files actually opened for the CURRENT input, in
+    /// first-open order, with their system-directory verdicts.  Published
+    /// by the preprocessor run inside the pipeline (compile / -E) and
+    /// consumed by write_dep_file.  RefCell because the pipeline takes
+    /// &self per compile while the preprocessor is method-local.
+    pub(super) last_dep_files: std::cell::RefCell<Vec<(std::path::PathBuf, bool)>>,
     /// Whether to suppress line markers in preprocessor output (-P flag).
     /// When true, `# <line> "<file>"` directives are stripped from -E output.
     /// Used by the Linux kernel's cc-version.sh to detect the compiler.
@@ -577,6 +593,9 @@ impl Driver {
             code16gcc: false,
             dep_only: false,
             dep_target: None,
+            dep_exclude_system: false,
+            dep_phony: false,
+            last_dep_files: std::cell::RefCell::new(Vec::new()),
             suppress_line_markers: false,
             nostdinc: false,
             undef_macros: Vec::new(),
@@ -653,12 +672,43 @@ impl Driver {
                 continue;
             }
 
-            // -M/-MM: dependency-only mode. Output make rules and exit.
-            // TODO: Currently only lists the source file as a dependency.
-            // A full implementation should preprocess and list all #included
-            // headers in the dependency rule (like GCC's -M output).
+            // -M/-MM: dependency-only mode (GCC implies -E).  Preprocess and
+            // emit a real make rule: the source, every header actually
+            // opened (force-includes included; __has_include probes
+            // excluded), each tagged user/system so -MM applies GCC's
+            // directory-based filter.  -MP adds phony rules.
             if self.dep_only {
-                // Determine the target for the dependency rule.
+                let source = Self::read_source(input_file)?;
+                let mut preprocessor = Preprocessor::new();
+                self.configure_preprocessor(&mut preprocessor);
+                let filename = if input_file == "-" {
+                    "<stdin>"
+                } else {
+                    input_file
+                };
+                preprocessor.set_filename(filename);
+                self.process_force_includes(&mut preprocessor)?;
+                let _ = preprocessor.preprocess(&source);
+
+                // GCC exits nonzero on preprocessor errors even in -M/-MM
+                // mode: a dependency file built from a failed TU would
+                // under-approximate the rebuild set, so propagate like the
+                // compile paths do.
+                let pp_errors = preprocessor.errors();
+                if !pp_errors.is_empty() {
+                    for err in pp_errors {
+                        eprintln!(
+                            "{}:{}:{}: error: {}",
+                            err.file, err.line, err.col, err.message
+                        );
+                    }
+                    return Err(format!(
+                        "{} preprocessor error(s) in {}",
+                        preprocessor.errors().len().max(1),
+                        filename
+                    ));
+                }
+
                 let target = if let Some(ref t) = self.dep_target {
                     t.clone()
                 } else {
@@ -667,18 +717,32 @@ impl Driver {
                     let stem = p.file_stem().unwrap_or_default().to_string_lossy();
                     format!("{}.o", stem)
                 };
-                let input_name = if input_file == "-" {
-                    "<stdin>"
+                let mut prereqs: Vec<String> = Vec::new();
+                if input_file != "-" {
+                    prereqs.push(Self::escape_dep_path(input_file));
+                }
+                for (path, system_dir) in preprocessor.take_dep_files() {
+                    if self.dep_exclude_system && system_dir {
+                        continue;
+                    }
+                    prereqs.push(Self::escape_dep_path(&path.to_string_lossy()));
+                }
+                let mut dep_text = if prereqs.is_empty() {
+                    format!("{}:\n", target)
                 } else {
-                    input_file
+                    format!("{}: {}\n", target, prereqs.join(" "))
                 };
-                let dep_line = format!("{}: {}\n", target, input_name);
+                if self.dep_phony {
+                    for p in &prereqs {
+                        dep_text.push_str(&format!("\n{}:\n", p));
+                    }
+                }
 
                 if self.output_path_set {
-                    std::fs::write(&self.output_path, &dep_line)
+                    std::fs::write(&self.output_path, &dep_text)
                         .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
                 } else {
-                    print!("{}", dep_line);
+                    print!("{}", dep_text);
                 }
                 continue;
             }
@@ -725,6 +789,7 @@ impl Driver {
                 }
             } else {
                 let preprocessed = preprocessor.preprocess(&source);
+                *self.last_dep_files.borrow_mut() = preprocessor.take_dep_files();
 
                 // Output the preprocessed text first, even if there are #error
                 // directives. GCC and Clang also emit the full preprocessed
@@ -743,7 +808,7 @@ impl Driver {
                     // Write dependency file if requested (e.g., -Wp,-MMD,<depfile>).
                     // The kernel build uses this when preprocessing linker scripts
                     // (.lds.S -> .lds) and fixdep expects the .d file to exist.
-                    self.write_dep_file(input_file, &self.output_path);
+                    self.write_dep_file(input_file, &self.output_path)?;
                 } else {
                     print!("{}", output);
                 }
@@ -802,6 +867,7 @@ impl Driver {
             preprocessor.set_filename(filename);
             self.process_force_includes(&mut preprocessor)?;
             let preprocessed = preprocessor.preprocess(&source);
+            *self.last_dep_files.borrow_mut() = preprocessor.take_dep_files();
 
             let pp_errors = preprocessor.errors();
             if !pp_errors.is_empty() {
@@ -915,6 +981,7 @@ impl Driver {
             self.process_force_includes(&mut preprocessor)
                 .map_err(|e| format!("Preprocessing {} failed: {}", input_file, e))?;
             let preprocessed = preprocessor.preprocess(&source);
+            *self.last_dep_files.borrow_mut() = preprocessor.take_dep_files();
 
             // A missing #include in a .S file is fatal (GCC aborts).  Without
             // this, header.S once preprocessed with an EMPTY voffset.h and the
@@ -944,7 +1011,7 @@ impl Driver {
             if self.output_path_set {
                 std::fs::write(&self.output_path, &output)
                     .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
-                self.write_dep_file(input_file, &self.output_path);
+                self.write_dep_file(input_file, &self.output_path)?;
             } else {
                 print!("{}", output);
             }
@@ -1028,7 +1095,7 @@ impl Driver {
             if self.code16gcc && Self::is_c_source(input_file) {
                 use super::external_tools::GccM16Mode;
                 self.compile_with_gcc_m16(input_file, &out_path, GccM16Mode::Assembly)?;
-                self.write_dep_file(input_file, &out_path);
+                self.write_dep_file(input_file, &out_path)?;
                 if self.verbose {
                     eprintln!("Assembly output (GCC -m16): {}", out_path);
                 }
@@ -1038,7 +1105,7 @@ impl Driver {
             let asm = self.compile_to_assembly(input_file)?;
             std::fs::write(&out_path, &asm)
                 .map_err(|e| format!("Cannot write {}: {}", out_path, e))?;
-            self.write_dep_file(input_file, &out_path);
+            self.write_dep_file(input_file, &out_path)?;
             if self.verbose {
                 eprintln!("Assembly output: {}", out_path);
             }
@@ -1058,7 +1125,7 @@ impl Driver {
                 if self.code16gcc {
                     use super::external_tools::GccM16Mode;
                     self.compile_with_gcc_m16(input_file, &out_path, GccM16Mode::Object)?;
-                    self.write_dep_file(input_file, &out_path);
+                    self.write_dep_file(input_file, &out_path)?;
                     if self.verbose {
                         eprintln!("Object output (GCC -m16): {}", out_path);
                     }
@@ -1069,7 +1136,7 @@ impl Driver {
                 let extra = self.build_asm_extra_args();
                 self.target.assemble_with_extra(&asm, &out_path, &extra)?;
             }
-            self.write_dep_file(input_file, &out_path);
+            self.write_dep_file(input_file, &out_path)?;
             if self.verbose {
                 eprintln!("Object output: {}", out_path);
             }
@@ -1110,7 +1177,7 @@ impl Driver {
                     if self.verbose {
                         eprintln!("Compiled (GCC -m16): {}", input_file);
                     }
-                    self.write_dep_file(input_file, &self.output_path);
+                    self.write_dep_file(input_file, &self.output_path)?;
                     temp_guards.push(tmp);
                     continue;
                 }
@@ -1125,7 +1192,7 @@ impl Driver {
                 // linking in one step, GCC's -Wp,-MMD uses the .o name as the
                 // dependency target. We use the output executable path as target,
                 // which is sufficient for kernel build's fixdep processing.
-                self.write_dep_file(input_file, &self.output_path);
+                self.write_dep_file(input_file, &self.output_path)?;
                 temp_guards.push(tmp);
             }
         }
@@ -1503,6 +1570,7 @@ impl Driver {
         preprocessor.set_filename(filename);
         self.process_force_includes(&mut preprocessor)?;
         let preprocessed = preprocessor.preprocess(&source);
+        *self.last_dep_files.borrow_mut() = preprocessor.take_dep_files();
         if time_phases {
             eprintln!("[TIME] preprocess: {:.3}s", t0.elapsed().as_secs_f64());
         }
@@ -2493,6 +2561,23 @@ impl Driver {
                 ));
             }
         }
+        // Debug-info honesty law: `-g` must never be silently dropped.
+        // lccc's debug support today is line tables (.file/.loc →
+        // .debug_line); it does not emit .debug_info (DIEs/types), and
+        // optimization may erase every source span a TU was lowered with,
+        // leaving objects with NO debug sections while -g was requested.
+        // Downstream consumers (the kernel build's pahole/BTF step,
+        // debuggers, addr2line) must be able to trust the toolchain to say
+        // so instead of failing later with an unrelated error — the same
+        // never-silently-wrong law that guards port-I/O and SSE lowering.
+        if self.debug_info && !asm_contains_debug_records(&asm) {
+            eprintln!(
+                "{}: warning: -g requested but no debug information was \
+                 generated for this translation unit (lccc emits line tables \
+                 only; .debug_info/type info is not implemented)",
+                input_file
+            );
+        }
         if time_phases {
             eprintln!(
                 "[TIME] codegen: {:.3}s ({} bytes asm)",
@@ -2564,19 +2649,52 @@ impl Driver {
     /// the `bsf` it replaces (defined on zero input) and `lzcnt` likewise
     /// supersedes `bsr`, so defaulting ABM ON never changes a defined
     /// program's results — it only removes the undefined-zero-input hole.
+    ///
+    /// i686 parity (ISA-parity audit): the i686 backend's ctz/clkz emitters
+    /// are fully wired for the tzcnt forms (`lzcnt_enabled` consumers in
+    /// i686/codegen/alu.rs, `tzcntl` in the integrated assembler), and the
+    /// `F3 0F BC` encoding is hardware-universal — pre-ABM CPUs decode it
+    /// as plain BSF, identical for every nonzero input, and the emitters'
+    /// stop-bit/explicit-fixup sequences keep the narrow-width and
+    /// zero-input results defined on BOTH hardware classes. The grant is
+    /// EXPLICIT-FLAG-ONLY for i686: its baseline contract is broad
+    /// compatibility (a default-granted `tzcnt`/`lzcnt` would #UD on
+    /// pre-2008 silicon), so unlike x86-64 there is no implicit default
+    /// grant — only `-mlzcnt`/an ISA-implying `-march=` (which GCC's
+    /// `-m32 -mbmi/-march=...` behavior matches), always under the
+    /// `-mno-lzcnt` veto.
     pub(super) fn resolved_lzcnt(&self) -> bool {
-        self.target == Target::X86_64
-            && !self.lzcnt_explicitly_disabled
-            && (self.enable_lzcnt || !self.x86_march_explicit)
+        if self.lzcnt_explicitly_disabled {
+            return false;
+        }
+        match self.target {
+            Target::X86_64 => self.enable_lzcnt || !self.x86_march_explicit,
+            Target::I686 => self.enable_lzcnt,
+            _ => false,
+        }
     }
 
     /// Soundness: the instruction IS the builtin's semantics — the choice
     /// is only which lowering of `__builtin_popcount` wins (`popcnt` vs.
     /// the bit-count idiom), never a defined program's results.
+    ///
+    /// i686 parity (ISA-parity audit): the i686 backend has a wired
+    /// `popcnt_enabled` consumer (i686/codegen/alu.rs) and the integrated
+    /// assembler owns `popcntl` (`F3 0F B8`). Explicit-flag-only, exactly
+    /// like [`Self::resolved_lzcnt`]: `popcntl` is #UD on pre-SSE4.2
+    /// silicon, and the i686 baseline promises compatibility with that
+    /// silicon — so the capability arm arms only under `-mpopcnt`/an
+    /// ISA-implying `-march=`, under the `-mno-popcnt` veto. There is no
+    /// i686 default grant even for these legacy-encoding forms.
     pub(super) fn resolved_popcnt(&self) -> bool {
-        self.target == Target::X86_64
-            && !self.popcnt_explicitly_disabled
-            && (self.enable_popcnt || !self.x86_march_explicit)
+        if self.popcnt_explicitly_disabled {
+            return false;
+        }
+        match self.target {
+            Target::X86_64 => self.enable_popcnt || !self.x86_march_explicit,
+            Target::I686 => self.enable_popcnt,
+            _ => false,
+        }
     }
 
     pub(super) fn resolved_movbe(&self) -> bool {
@@ -2623,6 +2741,15 @@ impl Driver {
 /// enclosing function's symbol.  Inline-asm bodies (`#APP` … `#NO_APP`) are
 /// the user's own responsibility and are skipped; comments and directives
 /// never count.
+/// True when the final assembly text carries at least one DWARF debug
+/// record.  lccc's debug emission is `.file`/`.loc` line-table directives
+/// (GAS lowers them to `.debug_line`); either directive present means the
+/// TU got some debug information, neither means `-g` was effectively
+/// dropped and the honesty warning in the pipeline must fire.
+fn asm_contains_debug_records(asm: &str) -> bool {
+    asm.contains(".file ") || asm.contains(".loc ")
+}
+
 fn first_sse_reference(asm: &str) -> Option<(String, String)> {
     let mut func = String::from("<toplevel>");
     let mut in_app = false;

@@ -418,8 +418,10 @@ impl Preprocessor {
             return None;
         }
 
-        // Resolve the include path to an actual file
-        if let Some(resolved_path) = self.resolve_include_path(&include_path, is_system) {
+        // Resolve the include path to an actual file (and record it for
+        // make-dependency output; __has_include probes never reach here)
+        if let Some(resolved_path) = self.resolve_and_record_include_path(&include_path, is_system)
+        {
             // Check for #pragma once (path and device/inode identity).
             if self.is_pragma_once_file(&resolved_path) {
                 return Some(String::new());
@@ -565,10 +567,13 @@ impl Preprocessor {
         // Get the current file path for include_next resolution
         let current_file = self.include_stack.last().cloned();
 
-        // Resolve using include_next semantics
+        // Resolve using include_next semantics (and record for make deps;
+        // the system verdict follows the resolved path's directory).
         if let Some(resolved_path) =
             self.resolve_include_next_path(&include_path, current_file.as_ref())
         {
+            let system_dir = self.is_system_directory(&resolved_path);
+            self.record_dep_file(resolved_path.clone(), system_dir);
             // Check for #pragma once (path and device/inode identity).
             if self.is_pragma_once_file(&resolved_path) {
                 return Some(String::new());
@@ -732,6 +737,56 @@ impl Preprocessor {
         result
     }
 
+    /// Record a successfully resolved include for make-dependency output
+    /// (-MD/-MMD).  First occurrence wins (GCC lists each file once, even
+    /// when guard-less includes reprocess the content); the bool is the
+    /// system-directory verdict consumed by the -MMD/-MM filter.
+    pub(super) fn record_dep_file(&mut self, path: PathBuf, system_dir: bool) {
+        if self.dep_seen.insert(path.clone()) {
+            self.dep_files.push((path, system_dir));
+        }
+    }
+
+    /// True when `path` lives in a SYSTEM directory (-isystem, the default
+    /// system search paths, -idirafter, or the compiler's bundled-header
+    /// set).  GCC's -MMD/-MM dependency filter is directory-based, and the
+    /// verdict must follow the FILE's location — not the directive's
+    /// `<>`/`""` spelling and not the search step that matched: a quoted
+    /// include resolved next to an including file that itself sits in a
+    /// system directory IS a system header (`/usr/include/x.h` including
+    /// `"y.h"` from the same directory), which neither spelling- nor
+    /// step-based verdicts get right.
+    pub(super) fn is_system_directory(&self, path: &Path) -> bool {
+        let bundled = Preprocessor::bundled_include_dir();
+        for dir in self
+            .isystem_include_paths
+            .iter()
+            .chain(self.system_include_paths.iter())
+            .chain(self.after_include_paths.iter())
+            .chain(bundled.iter())
+        {
+            if path.starts_with(dir) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Resolve an include AND record it for dependency output: the entry
+    /// point for `#include` / `#include_next`, i.e. files actually opened.
+    /// `__has_include` probes must keep using the plain resolver — GCC
+    /// does not list probed-but-not-included headers in deps.
+    pub(super) fn resolve_and_record_include_path(
+        &mut self,
+        include_path: &str,
+        is_system: bool,
+    ) -> Option<PathBuf> {
+        let resolved = self.resolve_include_path(include_path, is_system)?;
+        let system_dir = self.is_system_directory(&resolved);
+        self.record_dep_file(resolved.clone(), system_dir);
+        Some(resolved)
+    }
+
     /// Uncached include path resolution. Called by `resolve_include_path` on cache miss.
     fn resolve_include_path_uncached(
         &self,
@@ -801,7 +856,7 @@ impl Preprocessor {
             }
         }
 
-        // Step 3: Search -I paths
+        // Step 3: Search -I paths (user directories)
         for dir in &self.include_paths {
             let candidate = dir.join(include_path);
             if candidate.is_file() {
@@ -809,7 +864,7 @@ impl Preprocessor {
             }
         }
 
-        // Step 4: Search -isystem paths
+        // Step 4: Search -isystem paths (system directories)
         for dir in &self.isystem_include_paths {
             let candidate = dir.join(include_path);
             if candidate.is_file() {
@@ -825,7 +880,7 @@ impl Preprocessor {
             }
         }
 
-        // Step 6: Search -idirafter paths
+        // Step 6: Search -idirafter paths (system directories, GCC parity)
         for dir in &self.after_include_paths {
             let candidate = dir.join(include_path);
             if candidate.is_file() {

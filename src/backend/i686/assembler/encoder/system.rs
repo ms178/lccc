@@ -204,6 +204,53 @@ impl super::InstructionEncoder {
     /// 0F 00 /r group (sldt/lldt/ltr/str): register form only, r/m16.
     /// GAS encodes `lldt %ax` as `0f 00 d0` — no operand-size prefix; the
     /// operand is architecturally 16-bit regardless of spelling.
+    /// RDRAND/RDSEED register form: 0F C7 /6|/7 with mod=11.  The ISA
+    /// defines no memory form, and only 16- and 32-bit GPR destinations
+    /// exist — byte registers and every non-GPR class are rejected
+    /// explicitly instead of silently encoding a wrong reg field (the
+    /// shared reg_num table also answers for x87/MMX/XMM names).
+    ///
+    /// Operand-size handling joins the central `.code16` inversion
+    /// (`sized_op`): the encoder is written for 32-bit semantics — 0x66
+    /// on a 16-bit destination, none on 32-bit — and
+    /// `fixup_code16_prefixes` inverts both directions in real mode
+    /// (%eax gains the prefix, %ax loses it).  Hand-rolling mode logic
+    /// here would be one more site to get the matrix wrong.
+    pub(super) fn encode_rdrand_rdseed(
+        &mut self,
+        ops: &[Operand],
+        reg_ext: u8,
+    ) -> Result<(), String> {
+        const GPR16: [&str; 8] = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"];
+        const GPR32: [&str; 8] = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"];
+        if ops.len() != 1 {
+            return Err("rdrand/rdseed requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let name = reg.name.as_str();
+                let is16 = GPR16.contains(&name);
+                let is32 = GPR32.contains(&name);
+                if !is16 && !is32 {
+                    return Err(format!(
+                        "rdrand/rdseed requires a 16- or 32-bit general register, got '%{}'",
+                        name
+                    ));
+                }
+                let rm = reg_num(name)
+                    .ok_or_else(|| format!("bad register for rdrand/rdseed: {}", name))?;
+                if is16 {
+                    self.bytes.push(0x66);
+                }
+                self.sized_op = true;
+                self.bytes.extend_from_slice(&[0x0F, 0xC7]);
+                self.bytes.push(self.modrm(3, reg_ext, rm));
+                Ok(())
+            }
+            _ => Err("rdrand/rdseed requires a register operand".to_string()),
+        }
+    }
+
     pub(super) fn encode_system_reg16(
         &mut self,
         ops: &[Operand],

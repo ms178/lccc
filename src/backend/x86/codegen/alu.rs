@@ -54,11 +54,19 @@ impl X86Codegen {
         direct_return: bool,
     ) {
         let narrow = matches!(ty, IrType::I32 | IrType::U32);
-        let home = |this: &Self, operand: &Operand| -> Option<String> {
+        let suffix = if narrow { "l" } else { "q" };
+        // Fresh-home read: the register must hold the operand's value NOW.
+        // Reading unconditionally consumed whatever clobbering write (earlier
+        // staging, an in-place compute, a MachInst window) last left in the
+        // home — the free_area_init_node class, here reachable through every
+        // Not+And consumer once BMI is enabled. `fresh_home_of` applies the
+        // same composed freshness law as every other staging site (mark bits
+        // narrowed by the exact write-state dataflow).
+        let fresh_reg_of = |this: &Self, operand: &Operand| -> Option<String> {
             let Operand::Value(value) = operand else {
                 return None;
             };
-            let reg = this.reg_assignments.get(&value.0).copied()?;
+            let reg = this.fresh_home_of(value.0)?;
             if super::emit::is_xmm_reg(reg) || this.state.is_alloca(value.0) {
                 return None;
             }
@@ -68,7 +76,54 @@ impl X86Codegen {
                 super::emit::phys_reg_name(reg).to_string()
             })
         };
-        let not_name = match home(self, not_src) {
+        // The non-negated source, resolved in preference order:
+        //   1. MEMORY-FORM FOLD (BMI `andn r/m, reg, reg`): no fresh home but
+        //      a sound direct slot image — one instruction instead of
+        //      load-then-andn, no rcx staging dependency (kernel linux_find_bit:
+        //      5 -> 4 insns per scanned word). The image is sound exactly when
+        //      the slot is SSA-stable (written at the definition, never aliased
+        //      while the value is live — the stack-slot contract) and wide
+        //      enough for the instruction width (slot_fits_width: a 4-byte
+        //      small slot must not feed a 64-bit andn — it would read 4 bytes
+        //      of the neighboring slot into the high half).
+        //   2. Fresh home register.
+        //   3. Stage through rcx (last resort).
+        enum OtherSrc {
+            Mem(String),
+            Reg(String),
+        }
+        let other_src: OtherSrc = match other {
+            Operand::Value(v) if fresh_reg_of(self, other).is_none() => {
+                let width_ok = || {
+                    super::emit::slot_fits_width(
+                        &self.state,
+                        v.0,
+                        if narrow {
+                            super::machinst::OpSize::S32
+                        } else {
+                            super::machinst::OpSize::S64
+                        },
+                    )
+                };
+                match self.state.resolve_slot_addr(v.0) {
+                    Some(crate::backend::state::SlotAddr::Direct(slot)) if width_ok() => {
+                        OtherSrc::Mem(self.slot_ref(slot.0))
+                    }
+                    _ => {
+                        self.operand_to_rcx(other);
+                        OtherSrc::Reg(if narrow { "ecx".into() } else { "rcx".into() })
+                    }
+                }
+            }
+            _ => match fresh_reg_of(self, other) {
+                Some(name) => OtherSrc::Reg(name),
+                None => {
+                    self.operand_to_rcx(other);
+                    OtherSrc::Reg(if narrow { "ecx".into() } else { "rcx".into() })
+                }
+            },
+        };
+        let not_name = match fresh_reg_of(self, not_src) {
             Some(name) => name,
             None => {
                 if narrow {
@@ -79,49 +134,76 @@ impl X86Codegen {
                 if narrow { "eax".into() } else { "rax".into() }
             }
         };
-        let other_name = match home(self, other) {
-            Some(name) => name,
-            None => {
-                self.operand_to_rcx(other);
-                if narrow { "ecx".into() } else { "rcx".into() }
+        // The not_src staging cannot invalidate `other_src`: the memory form
+        // is rbp/rsp-addressed, and register homes never alias rax/rcx (they
+        // are not allocatable), so the freshness computed above still holds.
+        match (direct_return, other_src) {
+            (true, OtherSrc::Reg(other_name)) => {
+                self.state.emit_fmt(format_args!(
+                    "    andn{} %{}, %{}, %{}",
+                    suffix,
+                    other_name,
+                    not_name,
+                    if narrow { "eax" } else { "rax" }
+                ));
+                self.state.reg_cache.set_acc(dest.0, false);
             }
-        };
-
-        if direct_return {
-            let suffix = if narrow { "l" } else { "q" };
-            self.state.emit_fmt(format_args!(
-                "    andn{} %{}, %{}, %{}",
-                suffix,
-                other_name,
-                not_name,
-                if narrow { "eax" } else { "rax" }
-            ));
-            self.state.reg_cache.set_acc(dest.0, false);
-            return;
-        }
-
-        if let Some(reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
-            let name = if narrow {
-                super::emit::phys_reg_name_32(reg)
-            } else {
-                super::emit::phys_reg_name(reg)
-            };
-            let suffix = if narrow { "l" } else { "q" };
-            self.state.emit_fmt(format_args!(
-                "    andn{} %{}, %{}, %{}",
-                suffix, other_name, not_name, name
-            ));
-            self.state.reg_cache.invalidate_acc();
-        } else {
-            let suffix = if narrow { "l" } else { "q" };
-            self.state.emit_fmt(format_args!(
-                "    andn{} %{}, %{}, %{}",
-                suffix,
-                other_name,
-                not_name,
-                if narrow { "eax" } else { "rax" }
-            ));
-            self.store_rax_to(dest);
+            (true, OtherSrc::Mem(mem)) => {
+                self.state.emit_fmt(format_args!(
+                    "    andn{} {}, %{}, %{}",
+                    suffix,
+                    mem,
+                    not_name,
+                    if narrow { "eax" } else { "rax" }
+                ));
+                self.state.reg_cache.set_acc(dest.0, false);
+            }
+            (false, OtherSrc::Reg(other_name)) => {
+                if let Some(reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
+                    let name = if narrow {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    };
+                    self.state.emit_fmt(format_args!(
+                        "    andn{} %{}, %{}, %{}",
+                        suffix, other_name, not_name, name
+                    ));
+                    self.state.reg_cache.invalidate_acc();
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    andn{} %{}, %{}, %{}",
+                        suffix,
+                        other_name,
+                        not_name,
+                        if narrow { "eax" } else { "rax" }
+                    ));
+                    self.store_rax_to(dest);
+                }
+            }
+            (false, OtherSrc::Mem(mem)) => {
+                if let Some(reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
+                    let name = if narrow {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    };
+                    self.state.emit_fmt(format_args!(
+                        "    andn{} {}, %{}, %{}",
+                        suffix, mem, not_name, name
+                    ));
+                    self.state.reg_cache.invalidate_acc();
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    andn{} {}, %{}, %{}",
+                        suffix,
+                        mem,
+                        not_name,
+                        if narrow { "eax" } else { "rax" }
+                    ));
+                    self.store_rax_to(dest);
+                }
+            }
         }
     }
 

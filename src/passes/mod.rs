@@ -1913,9 +1913,12 @@ pub(crate) fn run_passes(
             // zero guards it materializes are folded on paths that already
             // established non-zero.  Pass name for CCC_DISABLE_PASSES: "cvp".
             if !pass_disabled(&disabled, "cvp") {
+                let defined_syms = cvp::defined_nonweak_symbols(module);
                 let n = timed_pass!(
                     "cvp",
-                    run_on_visited(module, &dirty, &mut changed, cvp::run_function)
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        cvp::run_function_with_symbols(f, &defined_syms)
+                    })
                 );
                 cur_pass_changes[3] += n;
                 total_changes += n;
@@ -2116,9 +2119,12 @@ pub(crate) fn run_passes(
         // `v == 0 ? 63 : ctz(v)` guard whose block is dominated by the
         // `while (!v)` exit edge; only a dominance-scoped fold removes it.
         if !pass_disabled(&disabled, "cvp") {
+            let defined_syms = cvp::defined_nonweak_symbols(module);
             let n = timed_pass!(
                 "cvp_post_ifconv",
-                run_on_visited(module, &dirty, &mut changed, cvp::run_function)
+                run_on_visited(module, &dirty, &mut changed, |f| {
+                    cvp::run_function_with_symbols(f, &defined_syms)
+                })
             );
             total_changes += n;
             total_changes_excl_dce += n;

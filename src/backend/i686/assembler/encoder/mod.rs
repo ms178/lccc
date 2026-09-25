@@ -928,6 +928,26 @@ impl InstructionEncoder {
                 self.bytes.extend_from_slice(&[0x0F, 0x09]);
                 Ok(())
             }
+            // VMX/SEV hypercalls: the kernel's .code32 compressed-boot and
+            // SEV-ES paths issue `vmcall` (0F 01 C1) / `vmmcall`
+            // (0F 01 D9) — fixed no-operand opcodes, identical encoding in
+            // 32- and 64-bit modes.
+            "vmcall" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xC1]);
+                Ok(())
+            }
+            "vmmcall" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xD9]);
+                Ok(())
+            }
+            // RDRAND/RDSEED (0F C7 /6, /7): the SEV boot path draws
+            // randomness in .code32.  Register form only (the only form
+            // the ISA defines); %ax sizes take the 66 prefix, 32-bit
+            // register names encode bare — no REX in i686.
+            "rdrand" | "rdrandl" => self.encode_rdrand_rdseed(ops, 6),
+            "rdrandw" => self.encode_rdrand_rdseed(ops, 6),
+            "rdseed" | "rdseedl" => self.encode_rdrand_rdseed(ops, 7),
+            "rdseedw" => self.encode_rdrand_rdseed(ops, 7),
             "invlpg" => self.encode_invlpg(ops),
             "verw" => self.encode_verw(ops),
             "lsl" => self.encode_lsl(ops),

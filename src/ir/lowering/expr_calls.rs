@@ -131,6 +131,43 @@ impl Lowerer {
                 return result;
             }
 
+            // __attribute__((__diagnose_as(__builtin_NAME, ...))) folding
+            // (GCC semantics): a call to a diagnosed declaration that
+            // survived inlining IS a call to the builtin.  The kernel's
+            // fortify-string family (__FORTIFY_INLINE = extern __always_inline)
+            // depends on BOTH halves of GCC's ladder — inline, else fold —
+            // because the declarations are extern and resolve to nothing at
+            // link time.  A missed fold here surfaced as undefined
+            // `__fortify_strlen` / `fortify_memset_chk` at the vmlinux link.
+            // GCC folds EVERY call to a __diagnose_as declaration to the
+            // named builtin — the attribute is a declarative alias, not an
+            // inlining fallback.  For the fortify family the definitions
+            // reduce to the underlying builtin plus __builtin_constant_p-
+            // guarded COMPILE-TIME diagnostics; folding drops only those
+            // diagnostics (a missed lint), never a defined program's
+            // runtime semantics — the same license GCC's own fold runs on.
+            let alias = self.diagnose_as_builtins.get(name).cloned();
+            if std::env::var_os("CCC_DBG_DA").is_some() {
+                if name.contains("strlen") {
+                    eprintln!(
+                        "[DA-call] {} map={:?}",
+                        name,
+                        self.diagnose_as_builtins.get(name)
+                    );
+                }
+            }
+            if let Some(builtin) = alias {
+                // try_lower_builtin_call dispatches on the canonical
+                // __builtin_-prefixed spelling.
+                let builtin_name = format!("__builtin_{builtin}");
+                if let Some(result) = self.try_lower_builtin_call(&builtin_name, args) {
+                    return result;
+                }
+                // The builtin name is not one this backend expands: fall
+                // through to the ordinary call (same behavior as before the
+                // attribute existed) rather than fabricating semantics.
+            }
+
             // Functions declared with __attribute__((error("..."))) are compile-time
             // assertion functions (e.g., kernel's __bad_mask, __field_overflow).
             // In GCC, these calls are eliminated by inlining + constant folding,
